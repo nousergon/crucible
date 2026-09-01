@@ -1,0 +1,102 @@
+name: CI
+
+# Plan §4.11. Target: <= 5 min per PR, <= 300 GHA minutes/month, CodeBuild $0,
+# ECR $0, Inspector $0. This repository is public, so those minutes are free
+# and unmetered — zero private minutes for the harness.
+#
+# Two workflows in this repo and no others. Every guard the v1 repos carry as
+# a per-repo workflow is a pytest in `tests/` here, or it is not carried:
+# sixteen workflows per repo is how a fleet spends 66% of its metered CI
+# minutes on one private repo. deploy.yml is track C's.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'docs/**']
+  pull_request:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'docs/**']
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: lint + foundation tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # --frozen, never a re-resolve. The lockfile is the supply chain: a CI
+      # run that resolves its own dependencies has not tested what ships.
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check
+
+      - name: Format check
+        run: uv run ruff format --check
+
+      # The blocking gate. tests/acceptance is excluded here and run as its
+      # own reporting job below — see the comment there for why that is not a
+      # suppression.
+      - name: Foundation tests
+        run: uv run pytest -q --ignore=tests/acceptance
+
+  acceptance:
+    name: acceptance gate (RED until the phase exits — reporting only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # NOT a blocking check, and deliberately so. tests/acceptance holds the
+    # plan §2 clauses written BEFORE the code that satisfies them (plan §6
+    # phase-0 exit: "acceptance tests written as failing pytest"). They fail
+    # today by design and go green one at a time as tracks A, B and C land.
+    #
+    # This is not a suppression: the tests are not skipped, not xfailed and
+    # not marked — nothing in the tree hides them, and
+    # tests/test_no_suppressions.py enforces that. They are RUN, in full, and
+    # their pass count is published on every commit as the phase gate's
+    # reading. A gate that reads is the point; a gate wired to block the
+    # branch it is measuring would simply be turned off.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Acceptance clauses (plan §2)
+        run: |
+          set +e
+          uv run pytest tests/acceptance -q -p no:cacheprovider > acceptance.txt 2>&1
+          code=$?
+          set -e
+          tail -40 acceptance.txt
+          summary=$(tail -1 acceptance.txt)
+          # A run that collected NOTHING is an unobserved gate, not a pass:
+          # 'no data' never renders as green (principle 7).
+          if grep -q "no tests ran" acceptance.txt; then
+            echo "::error::the acceptance suite collected no tests — the gate is dark, not green"
+            exit 1
+          fi
+          echo "### Acceptance gate (plan §2)" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$summary\`" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "Passing clauses are satisfied objectives. Failing clauses are the phase-1/2 definition of done — see tests/acceptance/README.md." >> "$GITHUB_STEP_SUMMARY"
+          exit $code
