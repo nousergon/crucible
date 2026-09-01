@@ -16,6 +16,19 @@ that are missing the tag — which is the thing an operator acts on.
 the template there is nothing to tag, and an empty difference over an empty
 stack is vacuous truth (principle 7). :class:`StackNotAppliedError` is raised
 so the acceptance clause fails with the apply command as its remedy.
+
+**Tags live behind more than one API, and reading one of them is the bug this
+module was nearly an instance of.** The first revision resolved every resource
+through `resourcegroupstaggingapi`, which **does not cover IAM at all**: run
+live against the applied stack on 2026-09-01 it reported five correctly-tagged
+roles as untagged, while `aws iam list-role-tags` returned
+`system=crucible-v2` for every one of them. A checker that reads one of
+several channels and reports the rest as absent is the fleet's own recurring
+defect (`bugclass_a_checker_that_read_one_of_four_channels_260901`), and it
+fails in the direction that looks like diligence. :data:`TAG_READERS` is the
+per-type resolution table, and a type with no entry falls through to the
+tagging API — so adding a service the API does not cover is a row here, not a
+silent false positive.
 """
 
 from __future__ import annotations
@@ -25,6 +38,7 @@ from typing import Any
 
 __all__ = [
     "TAG_KEY",
+    "TAG_READERS",
     "TAG_VALUE",
     "UNTAGGABLE_TYPES",
     "StackNotAppliedError",
@@ -40,6 +54,19 @@ TAG_VALUE = "crucible-v2"
 #: resource has no tags" and "this resource cannot have tags" are the same
 #: observation and only one of them is a finding.
 UNTAGGABLE_TYPES: dict[str, str] = {
+    # EventBridge Scheduler exposes NO `Tags` property on
+    # `AWS::Scheduler::Schedule`, and `scheduler:ListTagsForResource` accepts
+    # only a schedule-GROUP arn — measured 2026-09-01: passing a schedule arn
+    # returns `ValidationException ... Member must satisfy ...schedule-group/`.
+    # The group is the tagging surface, so the stack carries its own
+    # `AWS::Scheduler::ScheduleGroup`, tagged, rather than putting schedules in
+    # the account-wide `default` group and tagging that — which would label
+    # every other system's schedules `crucible-v2` and corrupt the very
+    # denominator this audit exists to establish.
+    "AWS::Scheduler::Schedule": (
+        "schedules carry no tags of their own; their schedule GROUP does, and it "
+        "is a resource of this stack"
+    ),
     # An instance profile is a container for a role; the role carries the tag
     # and the profile has no tag surface in IAM.
     "AWS::IAM::InstanceProfile": "IAM instance profiles have no tag surface",
@@ -92,6 +119,31 @@ class TagAudit:
         return f"{len(self.untagged)} of {len(self.resources)} resources untagged: {names}"
 
 
+def _iam_role_tagged(clients: dict[str, Any], physical_id: str) -> bool:
+    """Whether an IAM role carries the tag, read from IAM itself.
+
+    `resourcegroupstaggingapi` does not cover IAM, and it does not say so — it
+    simply omits the resource, which is indistinguishable from an untagged one.
+    """
+    iam = clients.get("iam")
+    if iam is None:
+        raise ValueError(
+            "auditing an AWS::IAM::Role needs an `iam` client: the tagging API does "
+            "not cover IAM, so falling back to it would report every correctly "
+            "tagged role as untagged."
+        )
+    tags = iam.list_role_tags(RoleName=physical_id).get("Tags", [])
+    return any(t["Key"] == TAG_KEY and t["Value"] == TAG_VALUE for t in tags)
+
+
+#: Per-type tag resolution. A type absent from this table resolves through
+#: `resourcegroupstaggingapi`, which is right for most services and wrong for
+#: the ones it does not cover.
+TAG_READERS: dict[str, Any] = {
+    "AWS::IAM::Role": _iam_role_tagged,
+}
+
+
 def _stack_resources(cfn: Any, stack: str) -> list[dict[str, Any]]:
     resources: list[dict[str, Any]] = []
     try:
@@ -135,10 +187,11 @@ def _tagged_identifiers(tagging: Any) -> set[str]:
     return found
 
 
-def audit_stack_tags(*, stack: str, cfn: Any, tagging: Any) -> TagAudit:
+def audit_stack_tags(*, stack: str, cfn: Any, tagging: Any, iam: Any = None) -> TagAudit:
     """Which of ``stack``'s taggable resources lack `system=crucible-v2`."""
     summaries = _stack_resources(cfn, stack)
     tagged = _tagged_identifiers(tagging)
+    clients = {"iam": iam}
 
     resources: list[tuple[str, str, str]] = []
     untagged: list[tuple[str, str, str]] = []
@@ -151,6 +204,11 @@ def audit_stack_tags(*, stack: str, cfn: Any, tagging: Any) -> TagAudit:
             skipped.append((logical, UNTAGGABLE_TYPES[kind]))
             continue
         resources.append((logical, kind, physical))
+        reader = TAG_READERS.get(kind)
+        if reader is not None:
+            if not reader(clients, physical):
+                untagged.append((logical, kind, physical))
+            continue
         if physical not in tagged and physical.rsplit("/", 1)[-1] not in tagged:
             untagged.append((logical, kind, physical))
     return TagAudit(

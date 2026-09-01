@@ -273,6 +273,11 @@ class TestCost:
                 stack=stack,
                 cfn=boto3.client("cloudformation"),
                 tagging=boto3.client("resourcegroupstaggingapi"),
+                # IAM is not a service `resourcegroupstaggingapi` covers, and
+                # it does not say so — it omits the resource, which reads as
+                # untagged. Measured live 2026-09-01: five correctly tagged
+                # roles reported as untagged.
+                iam=boto3.client("iam"),
             )
         except StackNotAppliedError as exc:
             _unmet(clause, requirement, exc)
