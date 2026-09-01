@@ -55,12 +55,53 @@ class TestTheRegistry:
             assert site.owner and site.purpose and site.capability_class
             assert site.max_usd_per_call > 0
 
-    def test_no_row_names_a_provider_model(self) -> None:
+    def test_every_row_names_a_DECLARED_capability_class(self) -> None:
         """Principle 8: the registry addresses capability classes. A model id
-        here would put the lock-in one indirection away rather than remove it."""
+        here would put the lock-in one indirection away rather than remove it.
+
+        Asserted by membership in the allowlist, not by four vendor
+        substrings — and note that the shape this replaces was also a test
+        that could not fail: the registry is empty in phase 1, so its loop
+        body never ran, and it restated the same denylist `llm.py` carried.
+        The vacuity guard below is the part that makes the loop meaningful
+        when a row finally exists.
+        """
+        from crucible.llm import _capability_classes
+
+        allowed = _capability_classes()
         for site in LLM_CALLSITE_REGISTRY.values():
-            lowered = site.capability_class.lower()
-            assert not any(m in lowered for m in ("gpt-", "claude-", "gemini-", "glm-"))
+            assert site.capability_class in allowed, (
+                f"{site.callsite_id} names {site.capability_class!r}, which neither the "
+                f"router nor llm_callsites.yaml declares"
+            )
+
+    def test_the_allowlist_is_declared_and_non_empty(self) -> None:
+        """The guard on the test above: an allowlist read as empty, or a
+        registry file with no `capability_classes` key at all, would make
+        every membership assertion here vacuous in one direction and every
+        call refused in the other."""
+        from crucible.llm import _capability_classes, load_capability_classes
+
+        assert load_capability_classes(), "phase 1 declares at least one class"
+        assert len(_capability_classes()) >= 4
+
+    def test_a_registry_file_with_no_allowlist_raises(self, tmp_path) -> None:
+        import crucible.llm as llm
+
+        broken = tmp_path / "llm_callsites.yaml"
+        broken.write_text(
+            "schema_version: llm_callsite_registry.v1\ncallsites: {}\n", encoding="utf-8"
+        )
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(llm, "CALLSITE_REGISTRY_PATH", broken)
+            llm.load_capability_classes.cache_clear()
+            llm._capability_classes.cache_clear()
+            try:
+                with pytest.raises(ValueError, match="capability_classes"):
+                    llm.load_capability_classes()
+            finally:
+                llm.load_capability_classes.cache_clear()
+                llm._capability_classes.cache_clear()
 
 
 class TestCoverageOfThePackage:

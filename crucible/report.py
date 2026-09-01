@@ -20,6 +20,16 @@ Rendering an unmeasured layer as a number would be the failure principle 7
 names: *no data* is never rendered as green, and a five-row table with three
 rows in it is a report card that has quietly stopped grading three layers.
 
+**Every row declares the span it was reduced over.** The document header
+carries the data-freshness window (row 1's, and the anchor the LLM cap is
+paced across); each row additionally carries ``window_trading_days``,
+``window_start`` and ``window_end``, because the layers settle at different
+rates and a single header window would have to be a lie about four rows to be
+true about one. A slot verdict settles on a 21-trading-day horizon at a weekly
+decision cadence, so the slot rows are graded over twelve trading weeks
+(:data:`SLOT_WINDOW_TRADING_DAYS`) — bounded, so no regime stays in the score
+forever, and declared, so the denominator travels with the number.
+
 **The reducer computes nothing a producer already computes.** The coverage row
 is reduced from the ``universe_coverage_ratio`` MetricRecords that `data.daily`
 already emits; the slot rows are reduced from the verdict artifacts the arena
@@ -58,6 +68,7 @@ __all__ = [
     "ATTRIBUTION_SCHEMA_VERSION",
     "ROWS",
     "REPORT_WINDOW_TRADING_DAYS",
+    "SLOT_WINDOW_TRADING_DAYS",
     "RowSpec",
     "attribution_key",
     "build_attribution",
@@ -66,11 +77,40 @@ __all__ = [
 
 ATTRIBUTION_SCHEMA_VERSION = "attribution.v1"
 
-#: The freshness window, in TRADING days (§4.12). One trading week: the
-#: attribution table is written weekly, so a window shorter than a week would
+#: The DATA-FRESHNESS window, in TRADING days (§4.12). One trading week: the
+#: coverage row is written weekly, so a window shorter than a week would
 #: leave sessions no report card ever looked at, and a longer one would let a
 #: dead day age out of view before the next report noticed it.
+#:
+#: **It is row 1's window, not the document's.** See :data:`SLOT_WINDOW_
+#: TRADING_DAYS` and ``window_scope`` below for why every row declares its
+#: own and what the alternative measured.
 REPORT_WINDOW_TRADING_DAYS = 5
+
+#: The window the SLOT rows are graded over, in trading days: twelve trading
+#: weeks.
+#:
+#: **Why the rows do not share row 1's five sessions.** A slot verdict is a
+#: settled decision date, and the arena decides weekly on a 21-trading-day
+#: horizon — so the five most recent sessions contain at most one decision
+#: date and none of them have settled. Clamping the slot rows to five
+#: sessions would make every slot row permanently ``N/A-LOW-N`` against a
+#: floor of :data:`SLOT_N_FLOOR`, which is a report card that has stopped
+#: grading three of its five layers.
+#:
+#: **Why it is not the champion's whole history either.** That is what this
+#: constant replaces, and it was measured on 2026-09-01: a document declaring
+#: ``window_trading_days: 5`` and sessions ``2026-08-24..2026-08-28`` carried
+#: an R row of ``n_samples = 8`` averaging verdicts back to January. A weekly
+#: report card whose slot rows are lifetime means under a five-session header
+#: is a number with the wrong denominator, and an unbounded window means no
+#: regime ever ages out of the champion's score.
+#:
+#: Sized off the floor rather than picked: :data:`SLOT_N_FLOOR` settled
+#: decision dates at a weekly cadence is 30 trading days, doubled so that a
+#: missed cycle does not drop the row below its floor. It is a quarter, which
+#: is also the shortest span over which a regime claim is worth making.
+SLOT_WINDOW_TRADING_DAYS = 60
 
 #: Settled decision dates a slot row needs before its value is read as a
 #: measurement rather than as noise. Below half of it the row is
@@ -192,6 +232,11 @@ def build_attribution(
             "trading_day": trading_day.isoformat(),
             "generated_utc": _utc(now),
             "run_id": run_id,
+            # Row 1's window, and the anchor `crucible.track_e` paces the LLM
+            # cap across. NOT the document's window: the rows are graded over
+            # different spans because the layers settle at different rates,
+            # and each row carries its own `window_*` fields saying which.
+            "window_scope": "per-row",
             "window_trading_days": REPORT_WINDOW_TRADING_DAYS,
             "window_sessions": [d.isoformat() for d in sessions],
             "rows": rows,
@@ -246,10 +291,27 @@ def _coverage_row(
 ) -> dict[str, Any]:
     """Freshness and coverage in one number, and it is one number on purpose.
 
-    A session whose `data.daily` run is absent or failed contributes 0.0: it
-    covered nothing. Reporting the mean over the days that DID run would be
-    the "coverage of 100% computed over whatever arrived" defect — the number
-    would read best exactly when the most days were missing.
+    **An absent session is absent, not an observation of zero.** The shape
+    here used to append 0.0 for every session with no `data.daily` manifest
+    and then report ``n_samples = len(sessions)`` against
+    ``n_floor = len(sessions)`` — so one real observation out of five read as
+    five samples, cleared its own floor, and carried a
+    ``bootstrap-percentile-2000`` interval computed over four numbers nobody
+    measured (reproduced 2026-09-01). ``n`` and a CI are claims about data,
+    and a zero-fill on an absent input is the exact defect §4.3 names.
+
+    So the mean is taken over the sessions that RAN, and the sessions that
+    did not are what collapses ``n_samples`` against a floor of the full
+    window. That is not the "coverage of 100% computed over whatever arrived"
+    escape it looks like at first glance: with four of five sessions missing
+    the value may read 1.0, but ``n_samples = 1`` against ``n_floor = 5`` is
+    ``N/A-LOW-N``, the reason names every absent session, and the row can
+    never reach GREEN until the window is whole. Missing days degrade the
+    row's *evidence*, which is what they are, rather than its *value*, which
+    they are not.
+
+    A session whose `data.daily` run exists and FAILED still contributes 0.0:
+    that layer ran and covered nothing, which is a measurement.
 
     When NO session in the window has a data.daily manifest at all, the row is
     ``N/A-NOT-RUN`` rather than 0.0. A layer that never ran and a layer that
@@ -272,8 +334,6 @@ def _coverage_row(
             continue
         ratio = _metric_value(manifest, "universe_coverage_ratio")
         observed.append(0.0 if ratio is None else float(ratio))
-    for _ in missing:
-        observed.append(0.0)
 
     if not ran:
         return _row(
@@ -285,6 +345,7 @@ def _coverage_row(
             now=now,
             source_path=manifest_key("data.daily", sessions[-1].isoformat()),
             ran=False,
+            window=sessions,
             reason=(
                 f"no data.daily manifest exists for any of the {len(sessions)} sessions "
                 f"{sessions[0]}..{sessions[-1]}; the data layer has not run, which is an "
@@ -295,13 +356,16 @@ def _coverage_row(
     mean = sum(observed) / len(observed)
     low, high = _bootstrap_ci(observed)
     detail = (
-        f"mean universe coverage {mean:.3f} over {len(sessions)} session(s) against a "
-        f"floor of {COVERAGE_FLOOR_RATIO:.2f}"
+        f"mean universe coverage {mean:.3f} over the {len(ran)} session(s) that ran, of "
+        f"{len(sessions)} in {sessions[0]}..{sessions[-1]}, against a floor of "
+        f"{COVERAGE_FLOOR_RATIO:.2f}"
     )
     if missing:
         detail += (
-            f"; {len(missing)} session(s) have no data.daily manifest and count as 0.0 "
-            f"({', '.join(d.isoformat() for d in missing)})"
+            f"; {len(missing)} session(s) have no data.daily manifest and are ABSENT rather "
+            f"than zero ({', '.join(d.isoformat() for d in missing)}) — they are what holds "
+            f"n_samples at {len(observed)} against a floor of {len(sessions)}, so this row "
+            "cannot read GREEN until the window is whole"
         )
     return _row(
         spec,
@@ -315,6 +379,7 @@ def _coverage_row(
         n_floor=len(sessions),
         target=COVERAGE_FLOOR_RATIO,
         red_line=COVERAGE_FLOOR_RATIO * 0.5,
+        window=sessions,
     )
 
 
@@ -326,15 +391,40 @@ def _slot_row(
     now: dt.datetime,
     sources: list[str],
 ) -> dict[str, Any]:
-    """One slot's champion, graded on its own settled verdicts.
+    """One slot's champion, graded on its own settled verdicts IN A WINDOW.
 
     The population benchmark makes the baseline 0.0 without an argument: a
     verdict's ``score_ratio`` is the selection's realized return minus the
     equal-weight return of the population it drew from, so an arm with no edge
     scores zero in expectation and the row's question is whether the champion
     is distinguishable from a coin flip over the same names.
+
+    **The window is declared and bounded** (:data:`SLOT_WINDOW_TRADING_DAYS`).
+    This used to read every verdict the champion had ever produced on or
+    before the trading day; the row then carried a lifetime mean under a
+    header declaring a five-session week. The window is twelve trading weeks
+    rather than the header's five sessions because a decision date settles on
+    a 21-trading-day horizon and the arena decides weekly — the five most
+    recent sessions hold no settled verdict at all — and each row now carries
+    ``window_trading_days``/``window_start``/``window_end``, so the span a
+    number was reduced over travels with the number instead of with the
+    document.
+
+    **Status calibration is two-state, deliberately, and says so here.**
+    ``target`` and ``red_line`` are both 0.0, so `krepis.metrics.derive_status`
+    returns RED for any champion whose bootstrap CI reaches zero and GREEN
+    only for one whose whole interval clears it. There is no amber band
+    between them, and there is no honest way to add one from this module: an
+    amber band needs a *minimum detectable effect* — a per-slot excess return
+    below which the champion is uninteresting rather than harmful — and the
+    plan declares none. SOTA is a pre-registered MDE per slot in the arena's
+    `ArenaConfig`; the delta is that inventing one here would be a threshold
+    with no provenance sitting between a report card and a promotion. The
+    conservative reading (not distinguishable from the population ⇒ RED) is
+    the one that cannot render *no evidence* as green.
     """
     pointer_key = champion_key(spec.slot or "")
+    window = _window(trading_day, SLOT_WINDOW_TRADING_DAYS)
     pointer = _read_json(store, pointer_key)
     if pointer is None:
         return _row(
@@ -346,6 +436,7 @@ def _slot_row(
             now=now,
             source_path=pointer_key,
             ran=False,
+            window=window,
             reason=(
                 f"slot {spec.slot!r} has no champion pointer at {pointer_key}; the slot has "
                 "not run an arena cycle, so there is no champion whose alpha this row could "
@@ -355,14 +446,18 @@ def _slot_row(
     sources.append(pointer_key)
     arm_id = pointer["arm_id"]
 
+    first, last = window[0], window[-1]
     prefix = f"experiments/{arm_key_segment(arm_id)}/"
     scores: list[float] = []
     horizons: set[int] = set()
+    outside = 0
     for key in sorted(store.list_keys(prefix)):
         if not key.endswith("/verdict.json"):
             continue
         verdict = json.loads(store.get_bytes(key).decode("utf-8"))
-        if dt.date.fromisoformat(verdict["trading_day"]) > trading_day:
+        day = dt.date.fromisoformat(verdict["trading_day"])
+        if not first <= day <= last:
+            outside += 1
             continue
         sources.append(key)
         scores.append(float(verdict["score_ratio"]))
@@ -378,10 +473,12 @@ def _slot_row(
             now=now,
             source_path=prefix,
             input_present=False,
+            window=window,
             reason=(
-                f"champion {arm_id} holds no settled verdict on or before {trading_day} under "
-                f"{prefix}; a decision date's verdict does not exist until its horizon "
-                "settles, so this is a horizon that has not passed, not an arm with no edge"
+                f"champion {arm_id} holds no settled verdict in the {len(window)}-session "
+                f"window {first}..{last} under {prefix} ({outside} verdict(s) exist outside "
+                "it); a decision date's verdict does not exist until its horizon settles, "
+                "so this is a horizon that has not passed, not an arm with no edge"
             ),
         )
     if len(horizons) != 1:
@@ -402,11 +499,13 @@ def _slot_row(
         now=now,
         source_path=prefix,
         horizon_trading_days=next(iter(horizons)),
+        window=window,
         reason=(
             f"champion {arm_id}: mean realized excess return {mean:+.5f} against its own "
-            f"population over {len(scores)} settled decision date(s), "
-            f"{_ci_phrase(low, high)}; the baseline is 0.0 because the benchmark is the "
-            "equal-weight population the selection drew from"
+            f"population over {len(scores)} settled decision date(s) in the "
+            f"{len(window)}-session window {first}..{last}, {_ci_phrase(low, high)}; the "
+            "baseline is 0.0 because the benchmark is the equal-weight population the "
+            "selection drew from"
         ),
         n_floor=SLOT_N_FLOOR,
         target=0.0,
@@ -461,6 +560,7 @@ def _row(
     implemented: bool = True,
     ran: bool = True,
     input_present: bool = True,
+    window: list[dt.date] | None = None,
 ) -> dict[str, Any]:
     """Assemble one row, and REFUSE to emit one that is not a MetricRecord.
 
@@ -505,15 +605,29 @@ def _row(
     row = json.loads(record.model_dump_json())
     row["plan_row"] = spec.plan_row
     row["baseline"] = baseline
+    # Every row declares the span it was reduced over. A row whose window is
+    # only stated in the document header is a row that can silently be read
+    # over a different span than the header claims — measured 2026-09-01, the
+    # three slot rows were lifetime means under a five-session header.
+    row["window_trading_days"] = None if window is None else len(window)
+    row["window_start"] = None if window is None else window[0].isoformat()
+    row["window_end"] = None if window is None else window[-1].isoformat()
     row["last_updated_utc"] = _utc(now)
     if horizon_trading_days is not None:
         row["horizon_trading_days"] = horizon_trading_days
     return row
 
 
-def _window(trading_day: dt.date) -> list[dt.date]:
+def _window(trading_day: dt.date, length: int = REPORT_WINDOW_TRADING_DAYS) -> list[dt.date]:
+    """The ``length`` trading sessions ending at ``trading_day``, inclusive.
+
+    Trading days (§4.12), never calendar days, so a holiday week is four
+    sessions of five rather than five days of which one can never arrive.
+    """
+    if length < 1:
+        raise ValueError(f"a window is a count of sessions and is at least 1; got {length}")
     days = [trading_day]
-    for _ in range(REPORT_WINDOW_TRADING_DAYS - 1):
+    for _ in range(length - 1):
         days.append(previous_trading_day(days[-1]))
     return sorted(days)
 
@@ -545,8 +659,9 @@ def _ci_phrase(low: float | None, high: float | None) -> str:
     """
     if low is None or high is None:
         return (
-            "no confidence interval — a single observation has none, and a zero-width "
-            "one would read as certainty"
+            "no confidence interval — a single observation has none, identical "
+            "observations give a bootstrap nothing to resample, and a zero-width interval "
+            "would read as certainty"
         )
     return f"95% bootstrap CI [{low:+.5f}, {high:+.5f}]"
 
@@ -567,7 +682,18 @@ def _bootstrap_ci(values: list[float]) -> tuple[float | None, float | None]:
         sample = [values[rng.randrange(n)] for _ in range(n)]
         means.append(sum(sample) / n)
     means.sort()
-    return (means[int(0.025 * BOOTSTRAP_RESAMPLES)], means[int(0.975 * BOOTSTRAP_RESAMPLES) - 1])
+    low = means[int(0.025 * BOOTSTRAP_RESAMPLES)]
+    high = means[int(0.975 * BOOTSTRAP_RESAMPLES) - 1]
+    if low == high:
+        # Every resample produced the same mean, which happens when every
+        # observation is identical. The interval is zero-width, and a
+        # zero-width interval is not certainty — it is a bootstrap with
+        # nothing to resample. Emitting it would put GREEN on the row off an
+        # interval the method could not have produced, and would stamp
+        # `ci_method: bootstrap-percentile-2000` on a claim the bootstrap did
+        # not make. None, and `_ci_phrase` says why.
+        return (None, None)
+    return (low, high)
 
 
 def _utc(now: dt.datetime) -> str:

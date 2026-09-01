@@ -10,9 +10,16 @@ Three things live here, and they are one thing:
    `crucible.config.Settings.llm_cap_usd`. A call that would carry the run
    past it RAISES :class:`LlmSpendCapExceeded` **before the provider is
    touched**, so the run fails with a reason naming the cap and the spend
-   that would have happened does not happen. Pacing through the week comes
-   from `krepis.usage_pacing`, which is what turns "we blew the budget on
-   Saturday" into "we were ahead of pace on Tuesday".
+   that would have happened does not happen. Three ceilings bind, and each
+   one REFUSES rather than adjusts: an estimate above the call site's own
+   `max_usd_per_call` is refused (:class:`LlmCallCeilingExceeded`), never
+   admitted at a lowered reservation; admission against the weekly cap is on
+   the site's ceiling, the largest bill the call may produce, not on an
+   optimistic estimate; and the actual cost is re-checked against what was
+   admitted after the provider bills (:class:`LlmSpendOverrun`), so an
+   overrun fails the run instead of being booked in silence. Pacing through
+   the week comes from `krepis.usage_pacing`, which is what turns "we blew
+   the budget on Saturday" into "we were ahead of pace on Tuesday".
 
 2. **A call-site registry.** ``LLM_CALLSITE_REGISTRY`` is loaded from
    ``llm_callsites.yaml``; :func:`call` refuses an id that is not in it. The
@@ -57,12 +64,15 @@ __all__ = [
     "DEFAULT_LLM_CAP_USD",
     "Finding",
     "LLM_CALLSITE_REGISTRY",
+    "LlmCallCeilingExceeded",
     "LlmSpendCapExceeded",
+    "LlmSpendOverrun",
     "PACING_PERIOD",
     "PROVIDER_MODULES",
     "SpendCap",
     "audit_call_sites",
     "call",
+    "load_capability_classes",
     "load_registry",
     "spend_pace",
     "week_to_date_llm_spend",
@@ -126,6 +136,38 @@ class LlmSpendCapExceeded(RuntimeError):
     happens. It propagates: the runner writes `status: failed` with this
     reason, which is the plan's answer to "what does a run do when it would
     exceed the cap" — it fails, rather than overspending and reporting `ok`.
+
+    The two subclasses below name the other two ways spend can escape a
+    declared ceiling. They subclass rather than stand beside it because every
+    consumer of the cap wants the same answer to all three — the run failed
+    because the money would not fit — and only a reader diagnosing *which*
+    ceiling bound needs the distinction.
+    """
+
+
+class LlmCallCeilingExceeded(LlmSpendCapExceeded):
+    """An estimate above the call site's own declared per-call ceiling.
+
+    **This is a refusal, never a smaller reservation.** The defect this class
+    exists to make impossible: reserving ``min(estimate, ceiling)`` admits a
+    call estimated at $100 against $0.05 of headroom because the `min` shrinks
+    the *reservation* to something that fits, while the call itself still
+    costs $100. A ceiling that lowers what is booked rather than refusing what
+    is asked is not a ceiling — measured 2026-09-01: provider constructed,
+    weekly spend $9.85 against a declared $5.00 cap, run status ``ok``.
+    """
+
+
+class LlmSpendOverrun(LlmSpendCapExceeded):
+    """A completed call billed more than the ceiling it was admitted under.
+
+    The money is already spent, so this is raised AFTER the cost is booked
+    into :attr:`SpendCap.spent_usd` and after the call lands in the run
+    manifest's ``llm_calls``: the durable record tells the truth about what
+    happened, and the run then fails rather than continuing to spend on top
+    of an overrun nobody has looked at. Booking silently and returning `ok`
+    is the failure mode plan §2 row 3 forbids — the overrun would exist only
+    in the provider's invoice.
     """
 
 
@@ -175,6 +217,7 @@ def load_registry() -> dict[str, CallSite]:
                 "is required: a row that names no owner or no ceiling records the id and "
                 "nothing anyone can act on."
             )
+        _require_capability_class(str(row["capability_class"]), callsite_id=str(callsite_id))
         registry[str(callsite_id)] = CallSite(
             callsite_id=str(callsite_id),
             purpose=str(row["purpose"]),
@@ -183,6 +226,32 @@ def load_registry() -> dict[str, CallSite]:
             owner=str(row["owner"]),
         )
     return registry
+
+
+@lru_cache(maxsize=1)
+def load_capability_classes() -> tuple[str, ...]:
+    """``capability_classes`` from ``llm_callsites.yaml``.
+
+    A missing key RAISES, like a missing ``callsites`` mapping: an allowlist
+    read as empty would refuse every call, which looks like a broken router
+    rather than a broken registry, and an allowlist that silently defaulted
+    to "anything" would be the denylist this replaced with extra steps. An
+    empty allowlist is written ``capability_classes: []``.
+    """
+    document = yaml.safe_load(CALLSITE_REGISTRY_PATH.read_text(encoding="utf-8"))
+    if not isinstance(document, dict) or "capability_classes" not in document:
+        raise ValueError(
+            f"{CALLSITE_REGISTRY_PATH} declares no `capability_classes` list. It is the "
+            "allowlist `crucible.llm.call` admits against; its absence is a broken build, "
+            "not an empty allowlist, which is written `capability_classes: []`."
+        )
+    rows = document["capability_classes"] or []
+    if not isinstance(rows, list) or any(not isinstance(r, str) or not r for r in rows):
+        raise ValueError(
+            f"{CALLSITE_REGISTRY_PATH}: `capability_classes` must be a list of non-empty "
+            "strings naming router capability classes."
+        )
+    return tuple(rows)
 
 
 #: The registry itself. A mapping id -> :class:`CallSite`; empty in phase 1,
@@ -250,28 +319,69 @@ class SpendCap:
     def headroom_usd(self) -> float:
         return self.cap_usd - self.spent_usd
 
-    def reserve(self, estimate_usd: float, *, callsite_id: str) -> None:
-        """Admit a call of at most ``estimate_usd``, or refuse it.
+    def reserve(self, ceiling_usd: float, *, callsite_id: str) -> float:
+        """Admit a call that may cost up to ``ceiling_usd``, or refuse it.
 
-        Called before the provider is reached. A call admitted here may still
-        cost more than its estimate — providers bill what they bill — so
-        :meth:`record` is what closes the loop, and the next `reserve` sees
-        the real figure.
+        **Admission is on the worst case, not on the estimate.** The amount
+        checked against the cap is the call's declared per-call ceiling —
+        `CallSite.max_usd_per_call` — because that is the largest bill the
+        call is allowed to produce, and a cap that admits on an optimistic
+        estimate is a cap that is crossed every time an estimate is low. The
+        pessimism is transient: :meth:`record` books what the call actually
+        cost, so the headroom the next `reserve` sees is the real figure, not
+        the reservation.
+
+        Returns the admitted ceiling, which the caller hands back to
+        :meth:`record` so an actual cost above it is caught rather than
+        booked.
         """
-        if estimate_usd < 0:
-            raise ValueError(f"a call estimate cannot be negative; got {estimate_usd}")
-        if self.spent_usd + estimate_usd > self.cap_usd:
+        if ceiling_usd < 0:
+            raise ValueError(f"a call ceiling cannot be negative; got {ceiling_usd}")
+        if self.spent_usd + ceiling_usd > self.cap_usd:
             raise LlmSpendCapExceeded(
                 f"call site {callsite_id!r} was refused: it would carry this weekly run to "
-                f"${self.spent_usd + estimate_usd:.4f} against a declared cap of "
+                f"${self.spent_usd + ceiling_usd:.4f} against a declared cap of "
                 f"${self.cap_usd:.2f} (already spent ${self.spent_usd:.4f}). The run fails "
                 "rather than overspending; raise `llm_cap_usd` deliberately in config, or "
                 "cut what the run asks for."
             )
+        return ceiling_usd
 
-    def record(self, usd: float) -> None:
-        """Book what a completed call actually cost."""
-        self.spent_usd += float(usd)
+    def record(self, usd: float, *, reserved_usd: float, callsite_id: str) -> None:
+        """Book what a completed call actually cost, and RE-CHECK it.
+
+        ``reserved_usd`` is what :meth:`reserve` admitted. The cost is booked
+        first — the money is gone and the ledger says so whatever happens
+        next — and then a bill above the reservation, or a total above the
+        cap, raises :class:`LlmSpendOverrun`. Booking without the re-check is
+        how an overrun becomes silent: the old shape here added the actual
+        cost to ``spent_usd`` and returned, so a run could finish ``ok``
+        having spent double its declared cap and nothing in the artifacts
+        said so.
+
+        Both arguments are keyword-only and required, so a caller cannot
+        reach the un-checked path by omitting them.
+        """
+        usd = float(usd)
+        if usd < 0:
+            raise ValueError(f"a completed call cannot have cost {usd}")
+        self.spent_usd += usd
+        if usd > reserved_usd:
+            raise LlmSpendOverrun(
+                f"call site {callsite_id!r} was admitted under a per-call ceiling of "
+                f"${reserved_usd:.4f} and billed ${usd:.4f}. The cost is booked and in the "
+                "run manifest — the money is spent — and the run now fails rather than "
+                "continuing on top of an overrun. Either the provider's price moved or the "
+                "site's `max_usd_per_call` is wrong; both are edits somebody makes on "
+                "purpose."
+            )
+        if self.spent_usd > self.cap_usd:
+            raise LlmSpendOverrun(
+                f"call site {callsite_id!r} carried this weekly run to "
+                f"${self.spent_usd:.4f} against a declared cap of ${self.cap_usd:.2f}. The "
+                "cost is booked and in the run manifest; the run fails rather than "
+                "reporting `ok` over a breached cap."
+            )
 
 
 def cap_metric(cap: SpendCap, *, now: dt.datetime, source_path: str) -> dict[str, Any]:
@@ -345,13 +455,19 @@ def call(
             "class, per-call ceiling and owner — before it can spend; an unregistered "
             "call site is spend nobody can attribute."
         )
-    if _looks_like_a_model_id(capability_class):
-        raise ValueError(
-            f"call site {callsite_id!r} asked for {capability_class!r}, which is a provider "
-            "model id. Ask the router for a capability class or a registry group; a model "
-            "id at a call site is the lock-in principle 8 forbids."
+    _require_capability_class(capability_class, callsite_id=callsite_id)
+    if estimate_usd < 0:
+        raise ValueError(f"a call estimate cannot be negative; got {estimate_usd}")
+    if estimate_usd > site.max_usd_per_call:
+        raise LlmCallCeilingExceeded(
+            f"call site {callsite_id!r} estimates ${estimate_usd:.4f} against its own "
+            f"declared ceiling of ${site.max_usd_per_call:.4f}. The call is REFUSED. A "
+            "ceiling that reserved the smaller of the two would admit this call and then "
+            "let it bill the estimate, which is a cap that binds the bookkeeping and not "
+            "the spend; raise `max_usd_per_call` in llm_callsites.yaml deliberately, or "
+            "ask for less."
         )
-    cap.reserve(min(estimate_usd, site.max_usd_per_call), callsite_id=callsite_id)
+    reserved_usd = cap.reserve(site.max_usd_per_call, callsite_id=callsite_id)
 
     from krepis.llm import LLMClient
     from krepis.llm_config import resolve_model_spec
@@ -364,7 +480,9 @@ def call(
     result = client.complete(messages=messages, **kwargs)
     usage = result.usage
     usd = float(usage.provider_cost_usd or 0.0)
-    cap.record(usd)
+    # The manifest is written BEFORE the cap re-check, so an overrun that
+    # raises below still lands in `llm_calls` and `cost_usd`: the run fails
+    # AND the artifact says what the money bought (§2 row 7).
     ctx.record_llm_call(
         {
             "callsite_id": callsite_id,
@@ -377,25 +495,56 @@ def call(
             "usd": usd,
         }
     )
+    cap.record(usd, reserved_usd=reserved_usd, callsite_id=callsite_id)
     return result
 
 
-_MODEL_ID_MARKERS = (
-    "gpt-",
-    "claude-",
-    "gemini-",
-    "llama",
-    "mistral",
-    "glm-",
-    "deepseek",
-    "o3",
-    "o4",
-)
+@lru_cache(maxsize=1)
+def _capability_classes() -> frozenset[str]:
+    """Every capability class this package may ask the router for.
+
+    **An ALLOWLIST, not a denylist of vendor name fragments.** The shape here
+    used to be nine substrings — ``gpt-``, ``claude-``, ``llama`` and so on —
+    and ``grok-``, ``qwen``, ``command-r``, ``nova-`` and ``kimi`` all walked
+    straight through it, as did a bare base url and a bare provider name.
+    Principle 8 is not "refuse the model ids somebody thought of"; it is that
+    a call site addresses a capability and nothing else, which is a
+    *membership* question and therefore has a positive answer. A denylist is
+    wrong by default and wrong again with every vendor that launches.
+
+    Two sources, unioned, and neither is a restatement of the other:
+
+    ``krepis.router.TIER_GROUPS``
+        the router's own tier-to-group mapping, read rather than copied, so a
+        group added there is askable here without an edit and a group removed
+        there stops being askable.
+
+    ``capability_classes`` in ``llm_callsites.yaml``
+        the classes this deployment's router serves beyond the bare tiers,
+        declared once beside the call sites that use them. A call site cannot
+        add its own — the list is a deliberate edit in the file where the
+        reason for each name is written down.
+    """
+    from krepis.router import TIER_GROUPS
+
+    return (
+        frozenset(TIER_GROUPS)
+        | frozenset(TIER_GROUPS.values())
+        | frozenset(load_capability_classes())
+    )
 
 
-def _looks_like_a_model_id(value: str) -> bool:
-    lowered = value.lower()
-    return any(marker in lowered for marker in _MODEL_ID_MARKERS)
+def _require_capability_class(value: str, *, callsite_id: str) -> None:
+    allowed = _capability_classes()
+    if value in allowed:
+        return
+    raise ValueError(
+        f"call site {callsite_id!r} asked for {value!r}, which is not a router capability "
+        f"class. The router declares {sorted(allowed)}; anything else — a vendor model id, "
+        "a base url, a provider name — is the lock-in principle 8 forbids, and is refused "
+        "by membership rather than by a list of model-name fragments that a new vendor "
+        "walks through."
+    )
 
 
 # --------------------------------------------------------------------------

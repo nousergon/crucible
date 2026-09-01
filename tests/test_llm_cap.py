@@ -4,6 +4,17 @@ Plan §2 row 3. The clause is not "a cap exists" — it is that *a run which
 would exceed it FAILS rather than overspending*, so the tests that matter here
 assert what did NOT happen: no provider was constructed, no cost was recorded,
 and the manifest says `failed` with the cap in its reason.
+
+Three ceilings are exercised separately because they failed separately. The
+per-call ceiling used to LOWER the reservation rather than refuse the call —
+`reserve(min(estimate, site.max_usd_per_call))` admitted a $100 call against
+$0.05 of headroom — and the actual cost was booked with no re-check at all, so
+a run finished `ok` having spent $9.85 against a declared $5.00 cap. The test
+that was supposed to cover the first computed the same `min` in its own body
+(`cap.reserve(min(1.0, cheap.max_usd_per_call), ...)`), which asserts the
+implementation against itself and passes for any implementation of it. It is
+replaced below by tests that go through `call()` — the only door — and that
+fail against the shape they describe.
 """
 
 from __future__ import annotations
@@ -17,7 +28,9 @@ from crucible.config import DEFAULT_LLM_CAP_USD, settings
 from crucible.llm import (
     PACING_PERIOD,
     CallSite,
+    LlmCallCeilingExceeded,
     LlmSpendCapExceeded,
+    LlmSpendOverrun,
     SpendCap,
     call,
     cap_metric,
@@ -34,7 +47,7 @@ NOW = dt.datetime(2026, 8, 29, 12, 0, tzinfo=dt.UTC)
 SITE = CallSite(
     callsite_id="test.cap_probe",
     purpose="exercise the cap without a provider",
-    capability_class="reasoning_high",
+    capability_class="high",
     max_usd_per_call=10.0,
     owner="tests.test_llm_cap",
 )
@@ -77,9 +90,26 @@ class TestEnforcement:
 
     def test_a_call_within_the_cap_is_admitted(self) -> None:
         cap = SpendCap(cap_usd=1.0, spent_usd=0.4)
-        cap.reserve(0.5, callsite_id="test.cap_probe")
-        cap.record(0.55)
-        assert cap.headroom_usd() == pytest.approx(0.05)
+        reserved = cap.reserve(0.5, callsite_id="test.cap_probe")
+        assert reserved == 0.5
+        cap.record(0.45, reserved_usd=reserved, callsite_id="test.cap_probe")
+        assert cap.headroom_usd() == pytest.approx(0.15)
+
+    def test_record_refuses_to_book_an_overrun_in_silence(self) -> None:
+        """The cost IS booked — the money is gone — and then it raises."""
+        cap = SpendCap(cap_usd=5.0, spent_usd=0.0)
+        reserved = cap.reserve(0.01, callsite_id="test.cap_probe")
+        with pytest.raises(LlmSpendOverrun, match="0.0100"):
+            cap.record(4.90, reserved_usd=reserved, callsite_id="test.cap_probe")
+        assert cap.spent_usd == pytest.approx(4.90), (
+            "the ledger tells the truth about what was spent even when the run fails"
+        )
+
+    def test_record_raises_when_the_booked_total_crosses_the_cap(self) -> None:
+        cap = SpendCap(cap_usd=1.0, spent_usd=0.95)
+        with pytest.raises(LlmSpendOverrun, match=r"\$1\.00"):
+            cap.record(0.10, reserved_usd=0.50, callsite_id="test.cap_probe")
+        assert cap.spent_usd == pytest.approx(1.05)
 
     def test_the_run_fails_and_the_provider_is_never_reached(self, tmp_path) -> None:
         """The whole clause in one assertion set: `failed`, the cap named in
@@ -97,7 +127,7 @@ class TestEnforcement:
             call(
                 ctx,
                 callsite_id="test.cap_probe",
-                capability_class="reasoning_high",
+                capability_class="high",
                 messages=[{"role": "user", "content": "hello"}],
                 cap=cap,
                 estimate_usd=0.50,
@@ -122,7 +152,7 @@ class TestEnforcement:
             call(
                 ctx,
                 callsite_id="not.registered",
-                capability_class="reasoning_high",
+                capability_class="high",
                 messages=[],
                 cap=SpendCap(cap_usd=100.0),
                 estimate_usd=0.0,
@@ -131,30 +161,219 @@ class TestEnforcement:
         with pytest.raises(KeyError, match="not.registered"):
             run_job("report", body, store=store, trading_day=DAY, now=NOW, transient_retry=False)
 
-    def test_a_provider_model_id_is_refused_at_the_call_site(self, tmp_path) -> None:
-        """Principle 8: a call site names a capability class, never a model."""
+    @pytest.mark.parametrize(
+        "asked",
+        [
+            "claude-opus-4",
+            "gpt-5",
+            # The five the nine-entry substring DENYLIST let straight through.
+            # Each of these reached a provider under the old shape; under an
+            # allowlist of the router's declared groups they are refused by
+            # membership, and so is the next vendor nobody has heard of yet.
+            "grok-4",
+            "qwen3-max",
+            "command-r-plus",
+            "nova-pro",
+            "kimi-k2",
+            # Not model ids at all — a base url and a provider name, neither
+            # of which a list of model-name fragments can see.
+            "https://api.example.com/v1",
+            "openrouter",
+        ],
+    )
+    def test_only_a_declared_capability_class_is_askable(self, tmp_path, asked) -> None:
+        """Principle 8, by ALLOWLIST: a call site names a class the router
+        declares; everything else is refused."""
         store = LocalStore(tmp_path)
 
         def body(ctx):
             call(
                 ctx,
                 callsite_id="test.cap_probe",
-                capability_class="claude-opus-4",
+                capability_class=asked,
                 messages=[],
                 cap=SpendCap(cap_usd=100.0),
                 estimate_usd=0.0,
                 registry={SITE.callsite_id: SITE},
             )
 
-        with pytest.raises(ValueError, match="model id"):
+        with pytest.raises(ValueError, match="not a router capability class"):
             run_job("report", body, store=store, trading_day=DAY, now=NOW, transient_retry=False)
 
-    def test_the_site_ceiling_binds_even_when_the_estimate_is_smaller(self) -> None:
-        cap = SpendCap(cap_usd=0.5)
-        cheap = CallSite("x", "p", "reasoning_high", max_usd_per_call=0.25, owner="t")
-        cap.reserve(min(1.0, cheap.max_usd_per_call), callsite_id="x")
+    def test_the_allowlist_reads_the_router_rather_than_restating_it(self) -> None:
+        """A second copy of the router's groups is the copy that drifts, so
+        the router's tier groups are READ; the registry file declares only the
+        classes this deployment serves beyond them."""
+        from krepis.router import TIER_GROUPS
+
+        from crucible.llm import _capability_classes, load_capability_classes
+
+        allowed = _capability_classes()
+        assert frozenset(TIER_GROUPS) <= allowed
+        assert frozenset(TIER_GROUPS.values()) <= allowed
+        assert frozenset(load_capability_classes()) <= allowed
+        assert allowed == (
+            frozenset(TIER_GROUPS)
+            | frozenset(TIER_GROUPS.values())
+            | frozenset(load_capability_classes())
+        ), "nothing is askable that neither the router nor the registry declares"
+
+    def test_a_registry_row_naming_an_undeclared_class_is_refused_at_load(self, tmp_path) -> None:
+        """The allowlist binds the REGISTRY too, not only the call.
+
+        A row could otherwise declare `capability_class: gpt-5`, and the
+        refusal would only fire at the call — after the row had passed review
+        as a registered, attributable call site.
+        """
+        import crucible.llm as llm
+
+        registry = tmp_path / "llm_callsites.yaml"
+        registry.write_text(
+            "schema_version: llm_callsite_registry.v1\n"
+            "capability_classes: []\n"
+            "callsites:\n"
+            "  bad.site:\n"
+            "    purpose: p\n"
+            "    capability_class: gpt-5\n"
+            "    max_usd_per_call: 0.01\n"
+            "    owner: t\n",
+            encoding="utf-8",
+        )
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(llm, "CALLSITE_REGISTRY_PATH", registry)
+            llm.load_registry.cache_clear()
+            llm.load_capability_classes.cache_clear()
+            llm._capability_classes.cache_clear()
+            try:
+                with pytest.raises(ValueError, match="not a router capability class"):
+                    llm.load_registry()
+            finally:
+                llm.load_registry.cache_clear()
+                llm.load_capability_classes.cache_clear()
+                llm._capability_classes.cache_clear()
+
+    def test_an_estimate_above_the_site_ceiling_is_REFUSED_not_shrunk(self, tmp_path) -> None:
+        """The E1 reproduction, as a test.
+
+        Measured against the shape this replaces: a $100 estimate at a site
+        with a $0.01 ceiling and $0.05 of headroom was ADMITTED, because
+        `reserve(min(estimate, ceiling))` shrank the reservation to something
+        that fit; the provider was constructed, the call billed $4.90, and the
+        run ended `ok` with the week at $9.85 against a $5.00 cap. Every
+        assertion below is false under that shape.
+        """
+        store = LocalStore(tmp_path)
+        cheap = CallSite(
+            callsite_id="test.cap_probe",
+            purpose="a site whose own ceiling is tighter than the ask",
+            capability_class="high",
+            max_usd_per_call=0.01,
+            owner="tests.test_llm_cap",
+        )
+        cap = SpendCap(cap_usd=5.00, spent_usd=4.95)
+        reached: list[str] = []
+
+        def never(*args, **kwargs):
+            reached.append("provider")
+            raise AssertionError("the provider was constructed after the ceiling refused")
+
+        def body(ctx):
+            call(
+                ctx,
+                callsite_id="test.cap_probe",
+                capability_class="high",
+                messages=[{"role": "user", "content": "hello"}],
+                cap=cap,
+                estimate_usd=100.0,
+                client_factory=never,
+                registry={cheap.callsite_id: cheap},
+            )
+
+        with pytest.raises(LlmCallCeilingExceeded) as excinfo:
+            run_job("report", body, store=store, trading_day=DAY, now=NOW, transient_retry=False)
+        assert "0.0100" in str(excinfo.value) and "REFUSED" in str(excinfo.value)
+        assert reached == [], "a refused call never reaches a provider"
+        assert cap.spent_usd == pytest.approx(4.95), "a refused call books nothing"
+        manifest = json.loads(store.get_bytes(manifest_key("report", DAY.isoformat())).decode())
+        assert manifest["status"] == "failed"
+        assert manifest["cost_usd"] == 0.0
+        assert manifest["llm_calls"] == []
+
+    def test_admission_is_on_the_site_ceiling_not_on_the_estimate(self) -> None:
+        """A cheap estimate does not buy a call whose worst case does not fit.
+
+        The ceiling is the largest bill the call may produce, so the cap is
+        checked against it. Admitting on an optimistic estimate is a cap
+        crossed every time an estimate is low.
+        """
+        site = CallSite("x", "p", "high", max_usd_per_call=0.40, owner="t")
+        cap = SpendCap(cap_usd=1.0, spent_usd=0.80)
         with pytest.raises(LlmSpendCapExceeded):
-            SpendCap(cap_usd=0.2).reserve(cheap.max_usd_per_call, callsite_id="x")
+            cap.reserve(site.max_usd_per_call, callsite_id="x")
+        assert cap.reserve(0.05, callsite_id="x") == 0.05, (
+            "a site whose ceiling fits is still admitted"
+        )
+
+    def test_a_bill_above_the_admitted_ceiling_fails_the_run_and_is_recorded(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The second half of E1: the actual cost was never re-checked.
+
+        A provider that bills past the site ceiling used to be booked into
+        `spent_usd` and returned; the run finished `ok`. Now the call lands in
+        the manifest — the money is spent and the artifact says so — and the
+        run fails.
+        """
+        store = LocalStore(tmp_path)
+        site = CallSite("test.cap_probe", "p", "high", max_usd_per_call=0.10, owner="t")
+        cap = SpendCap(cap_usd=5.00)
+
+        class _Usage:
+            input_tokens = 1000
+            output_tokens = 1000
+            cache_read_tokens = 0
+            cache_create_tokens = 0
+            provider_cost_usd = 4.90
+
+        class _Result:
+            model = "router:high:primary"
+            usage = _Usage()
+
+        class _Client:
+            def complete(self, **_kw):
+                return _Result()
+
+        def factory(*args, **kwargs):
+            return _Client()
+
+        # The router edge is stubbed at the adapter's own two imports rather
+        # than at a network boundary: this test is about what the cap does
+        # with a bill, and reaching a real router would make it a test of
+        # SSM permissions instead.
+        monkeypatch.setattr("krepis.llm_config.resolve_model_spec", lambda **_kw: object())
+        monkeypatch.setattr("krepis.llm.LLMClient", lambda *a, **k: factory())
+
+        def body(ctx):
+            call(
+                ctx,
+                callsite_id="test.cap_probe",
+                capability_class="high",
+                messages=[{"role": "user", "content": "hello"}],
+                cap=cap,
+                estimate_usd=0.05,
+                client_factory=factory,
+                registry={site.callsite_id: site},
+            )
+
+        with pytest.raises(LlmSpendOverrun, match="4.9000"):
+            run_job("report", body, store=store, trading_day=DAY, now=NOW, transient_retry=False)
+        assert cap.spent_usd == pytest.approx(4.90)
+        manifest = json.loads(store.get_bytes(manifest_key("report", DAY.isoformat())).decode())
+        assert manifest["status"] == "failed"
+        assert manifest["cost_usd"] == pytest.approx(4.90), (
+            "the overrun is in the durable record, not only in the provider's invoice"
+        )
+        assert [c["usd"] for c in manifest["llm_calls"]] == [pytest.approx(4.90)]
 
 
 class TestWindow:
@@ -165,8 +384,8 @@ class TestWindow:
             ctx.record_llm_call(
                 {
                     "callsite_id": "test.cap_probe",
-                    "model_requested": "reasoning_high",
-                    "model_served": "router:reasoning_high:primary",
+                    "model_requested": "high",
+                    "model_served": "router:high:primary",
                     "tokens_in": 10,
                     "tokens_out": 5,
                     "cache_read": 0,
