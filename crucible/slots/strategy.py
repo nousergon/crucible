@@ -40,6 +40,7 @@ trader switched off.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -171,7 +172,27 @@ class CostModel:
 
 @dataclass(frozen=True)
 class WalkForwardSpec:
-    """Fold geometry, in trading days (§4.12)."""
+    """Fold geometry, in trading days (§4.12).
+
+    Three of these five fields have a meaning a reader can get wrong, so they
+    are stated here rather than left to the caller's assumption:
+
+    * ``purge`` is the LABEL HORIZON in trading days, not a gap width. A label
+      stamped on training row ``i`` spans ``i .. i + purge``, so the last row
+      that may be trained on is ``test_start_idx - purge - 1`` and the fold
+      carries ``purge`` fully excluded rows between train and test. Reading it
+      as a gap width yields ``test_start_idx - purge``, whose label lands ON
+      the first test day — a one-day overlap that looks like a purge.
+    * ``min_train`` is the MINIMUM NUMBER OF TRAINING ROWS a fold must have
+      after the purge, not merely the index the first test block may start at.
+      A fold that cannot reach it is skipped rather than emitted short.
+    * under ``train_mode="rolling"`` the training block is ``min_train`` rows
+      long. The lifted source
+      (`crucible-backtester/synthetic/pit_folds.py:111-112`) sizes the rolling
+      window by ``test_window`` instead, which makes a spec declaring
+      ``min_train=504`` train on 21 rows; that reading is not carried over,
+      because it leaves ``min_train`` naming nothing the folds honour.
+    """
 
     test_window: int = 21
     min_train: int = 504
@@ -325,10 +346,30 @@ def build_walk_forward_folds(
     Lifted from `crucible-backtester/synthetic/pit_folds.py`. Two properties
     are the reason it is lifted rather than reinvented:
 
-    * the training block ends ``purge`` days BEFORE the test block, removing
-      the overlapping-label leak that a naive expanding split carries;
+    * ``purge`` whole trading days are excluded between the training block and
+      the test block, removing the overlapping-label leak that a naive
+      expanding split carries;
     * when ``embargo > purge`` the next fold starts later, so the serial
       correlation immediately after a test block is not scored either.
+
+    **The purge is an off-by-one trap, and this function had the bug.** With
+    ``purge`` read as the label horizon, the label on training row ``i`` spans
+    ``i .. i + purge``. Setting ``train_end_idx = test_start_idx - purge``
+    therefore keeps a row whose own label is realized ON the first test day:
+    the fold reports a purge and leaks a day. The invariant this function now
+    holds, and :mod:`tests.test_slot_strategy` asserts directly, is
+
+        ``train_end_idx + purge < test_start_idx``
+
+    — no training row's label may extend into the test window. That is the
+    same arithmetic the CPCV purge in :mod:`crucible.slots.model` already
+    used (``lo = a - label_horizon_trading_days``, excluding through ``a - 1``
+    and leaving ``a - h - 1`` as the last trainable row); two purge
+    implementations in one repository must not differ by a day.
+
+    ``min_train`` is enforced as a minimum training LENGTH: a candidate fold
+    whose training block would be shorter is skipped, not emitted short. Under
+    ``train_mode="rolling"`` the training block is exactly ``min_train`` rows.
 
     ``dates`` are opaque here: the caller supplies trading days, and this
     function never derives one, so there is no second calendar to drift.
@@ -352,14 +393,16 @@ def build_walk_forward_folds(
             break
         test_start_idx = fold_start_idx
         test_end_idx = min(fold_start_idx + test_window - 1, n - 1)
-        train_end_idx = fold_start_idx - purge
-        if train_end_idx < min_train // 2:
+        # `purge` is the label horizon, so the last trainable row is the one
+        # whose label is fully realized BEFORE the test window opens.
+        train_end_idx = fold_start_idx - purge - 1
+        if train_end_idx + 1 < min_train:
             fold_start_idx += test_window
             continue
         if train_mode == "expanding":
             train_start_idx = 0
         else:
-            train_start_idx = max(0, train_end_idx - test_window + 1)
+            train_start_idx = train_end_idx - min_train + 1
         if train_end_idx < train_start_idx:
             fold_start_idx += test_window
             continue
@@ -416,8 +459,8 @@ class PitParityVerdict:
 
 def pit_parity(
     *,
-    contaminated: list[float],
-    point_in_time: list[float],
+    contaminated: Mapping[str, float],
+    point_in_time: Mapping[str, float],
     coverage: dict[str, Any],
     alpha: float = 0.05,
 ) -> PitParityVerdict:
@@ -440,13 +483,53 @@ def pit_parity(
 
     ``UNKNOWN`` and ``PARTIAL`` are refusals at the reader
     (:mod:`crucible.champion`), so neither can be rounded up to a grade.
+
+    **The two passes are paired by DATE KEY, and a mismatch raises.** Both
+    arguments are mappings of trading day to that day's score, never parallel
+    sequences. Positional pairing over two lists — the shape this function
+    carried — truncated to ``min(len(a), len(b))`` and then paired by index,
+    which is wrong in the one way that matters: a single extra element on one
+    side shifts every pair by a day, and a shifted pair is uncorrelated noise
+    around the true delta. Measured on a series carrying +150bp/day of real
+    look-ahead alpha over full proven coverage: clean pairing renders ``FAIL``
+    (mean delta 0.0150, interval excluding zero) and an off-by-one pairing of
+    the same data renders ``PASS`` (mean delta 0.0155, interval straddling
+    zero) with no exception raised. Since
+    :func:`crucible.champion._assert_attested` treats that ``PASS`` as the
+    sole gate on an S champion, one stray element promoted a contaminated arm.
+    A ``strict=True`` on a ``zip`` of two already-truncated sequences cannot
+    see it, because the truncation happened first.
+
+    So misalignment is an exception, not a verdict. A date present on one side
+    and absent on the other means the two passes scored different windows, and
+    there is no answer to render from that — the same refusal
+    :class:`Book` makes when a per-date series is shorter than its dates.
     """
     fraction = coverage.get("coverage_fraction")
     budget_stopped = bool(coverage.get("budget_stopped"))
     measured = bool(coverage.get("measured"))
 
-    n = min(len(contaminated), len(point_in_time))
-    deltas = [float(a) - float(b) for a, b in zip(contaminated[:n], point_in_time[:n], strict=True)]
+    for name, series in (("contaminated", contaminated), ("point_in_time", point_in_time)):
+        if not isinstance(series, Mapping):
+            raise TypeError(
+                f"pit_parity {name}= must be a mapping of trading day to score, not "
+                f"{type(series).__name__}. Positional pairing is the defect this "
+                "signature exists to make unexpressible."
+            )
+    only_contaminated = sorted(set(contaminated) - set(point_in_time))
+    only_pit = sorted(set(point_in_time) - set(contaminated))
+    if only_contaminated or only_pit:
+        raise ValueError(
+            "the look-ahead and point-in-time passes scored different dates: "
+            f"{len(only_contaminated)} only in contaminated (e.g. {only_contaminated[:3]}), "
+            f"{len(only_pit)} only in point_in_time (e.g. {only_pit[:3]}). Pairing what "
+            "is left over would compare a date against a different date, and the "
+            "resulting delta reads as noise — which renders PASS."
+        )
+
+    days = sorted(contaminated)
+    n = len(days)
+    deltas = [float(contaminated[d]) - float(point_in_time[d]) for d in days]
     material: bool | None = None
     mean_delta: float | None = None
     ci: tuple[float, float] | None = None
@@ -460,13 +543,31 @@ def pit_parity(
         material = ci[0] > 0.0 or ci[1] < 0.0
 
     if material is True:
+        # The materiality test is deliberately TWO-SIDED. A negative delta —
+        # the point-in-time pass beating the look-ahead pass — is not
+        # contamination; a look-ahead pass that loses to its own point-in-time
+        # counterpart means the harness is wired wrong, and rendering that
+        # PASS would be a fail-open on the one gate an S champion has. It
+        # stays a FAIL, but it is told to the operator as what it is: the two
+        # directions need different remediations, and a broken-harness result
+        # reported as "MATERIAL contamination" sends the reader to look for a
+        # leak that is not there.
+        interval = (
+            f"averages {mean_delta:.6g} with a {int((1 - alpha) * 100)}% interval "
+            f"[{ci[0]:.6g}, {ci[1]:.6g}] that excludes zero"
+        )
+        if mean_delta is not None and mean_delta < 0.0:
+            reason = (
+                f"INVERTED attestation: the per-date look-ahead delta {interval}. The "
+                "point-in-time pass BEAT the look-ahead pass, which no leak produces — "
+                "the two passes are mismatched, mislabelled or scoring different books. "
+                "Fix the harness; this is not a contamination finding."
+            )
+        else:
+            reason = f"MATERIAL contamination: the per-date look-ahead delta {interval}"
         return PitParityVerdict(
             "FAIL",
-            (
-                f"MATERIAL contamination: the per-date look-ahead delta averages "
-                f"{mean_delta:.6g} with a {int((1 - alpha) * 100)}% interval "
-                f"[{ci[0]:.6g}, {ci[1]:.6g}] that excludes zero"
-            ),
+            reason,
             mean_delta,
             ci,
             fraction,
