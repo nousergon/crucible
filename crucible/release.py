@@ -46,6 +46,8 @@ from crucible.store import ETAG_ABSENT, PointerConflictError, Store, sha256_hex
 __all__ = [
     "POINTER_KEY",
     "PointerConflictError",
+    "ReleaseImmutabilityError",
+    "assert_immutable_write",
     "flip_on_smoke",
     "RELEASE_SCHEMA_VERSION",
     "ReleaseRecord",
@@ -89,6 +91,55 @@ class StaleReleasePointerError(RuntimeError):
     faults (§10.7) — the failure path is proven by inducing it, not by
     reading this docstring.
     """
+
+
+class ReleaseImmutabilityError(RuntimeError):
+    """A publish would have changed the bytes of an already-published release.
+
+    §4.11 claims "immutable versioned artifacts", and the whole rollback
+    story rests on it: `crucible release.pin <prior-sha>` is only a rollback
+    if the wheel under that prefix is still the wheel that was tested and
+    installed. The IAM grant is `s3:PutObject` on `crucible/releases/*` with
+    no Object Lock, so nothing below this line stops a second
+    `workflow_dispatch` for the same sha from rebuilding the wheel and
+    overwriting the one a consumer already installed — at which point
+    `release.json.wheel_sha256` changes under it and the rollback target is a
+    different artifact wearing the same name.
+
+    A distinct type because it is a distinct operator action: re-promoting an
+    existing build is `crucible release.pin <sha>`, which needs no rebuild,
+    and re-publishing a *changed* build needs a new commit. Neither is
+    "retry the deploy".
+    """
+
+
+def assert_immutable_write(store: Store, key: str, payload: bytes) -> bool:
+    """Whether ``key`` still needs writing. Refuses a differing overwrite.
+
+    Returns True when the key is absent (write it) and False when it already
+    holds exactly ``payload`` (an idempotent re-publish — a re-run of the
+    same workflow against the same artifact is a no-op, not a failure).
+    Raises :class:`ReleaseImmutabilityError` when the key exists with
+    different bytes.
+
+    The comparison is on the bytes rather than on a recorded digest: a digest
+    the writer supplies about its own payload is a claim, and the thing being
+    protected here is precisely the case where the claim and the object have
+    diverged.
+    """
+    if not store.exists(key):
+        return True
+    existing = store.get_bytes(key)
+    if existing == payload:
+        return False
+    raise ReleaseImmutabilityError(
+        f"{key} already exists with different bytes "
+        f"({sha256_hex(existing)[:12]} on the store, {sha256_hex(payload)[:12]} offered). "
+        "A published release is immutable: overwriting it would change the artifact a "
+        "prior consumer installed and make the rollback target a build nobody tested. "
+        "To re-promote this build use `crucible release.pin <sha>` (no rebuild); to "
+        "publish different bytes, publish them under their own commit."
+    )
 
 
 def _assert_sha(sha: str) -> str:
@@ -159,6 +210,10 @@ def publish_release(
     repeatable, and moving the pointer is the act with consequences. A single
     function doing both would make "publish it but do not promote it yet"
     impossible to express, and the smoke gate sits precisely in between.
+
+    "Repeatable" means **byte-identical**, not "overwrites whatever is
+    there": re-publishing a sha whose prefix already holds different bytes
+    raises :class:`ReleaseImmutabilityError`. See that class for why.
     """
     _assert_sha(sha)
     if not wheel:
@@ -173,8 +228,15 @@ def publish_release(
         test_summary=test_summary,
         workflow_run_url=workflow_run_url,
     )
-    store.put_bytes(wheel_key(sha), wheel)
-    store.put_bytes(release_json_key(sha), record.to_json())
+    # Immutability is enforced BEFORE the first of the two writes, so a
+    # refusal cannot leave a prefix half-overwritten: a wheel from one build
+    # beside a release.json from another is worse than either.
+    payloads = ((wheel_key(sha), wheel), (release_json_key(sha), record.to_json()))
+    needed = [
+        (key, payload) for key, payload in payloads if assert_immutable_write(store, key, payload)
+    ]
+    for key, payload in needed:
+        store.put_bytes(key, payload)
     return record
 
 

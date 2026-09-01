@@ -13,7 +13,9 @@ import pytest
 from crucible.release import (
     POINTER_KEY,
     TRADER_PIN_KEY,
+    ReleaseImmutabilityError,
     StaleReleasePointerError,
+    assert_immutable_write,
     current_release,
     flip_on_smoke,
     pin,
@@ -194,3 +196,86 @@ class TestSmokeGate:
         pin(store, SHA_B, expect=version)  # the other deploy wins
         with pytest.raises(PointerConflictError):
             flip_on_smoke(store, sha=SHA_A, smoke_manifest=_smoke_manifest(), expect=version)
+
+
+class TestImmutability:
+    """§4.11 claims "immutable versioned artifacts", and the whole rollback
+    story rests on it: `crucible release.pin <prior-sha>` is a rollback only
+    if the wheel under that prefix is still the wheel that was tested.
+
+    The IAM grant is `s3:PutObject` on `crucible/releases/*` with no Object
+    Lock, so nothing below the application layer prevents an overwrite. These
+    are the application half; the CloudFormation half lives in
+    `nous-ergon-ops`.
+    """
+
+    def test_republishing_a_sha_with_different_bytes_is_refused(self, tmp_path) -> None:
+        """A `workflow_dispatch` re-run for the same sha rebuilds the wheel.
+        Overwriting it changes the artifact a prior consumer installed, and
+        `release.json.wheel_sha256` changes under it."""
+        store = LocalStore(tmp_path)
+        _published(store)
+        original = store.get_bytes(wheel_key(SHA_A))
+        with pytest.raises(ReleaseImmutabilityError, match="already exists with different bytes"):
+            publish_release(
+                store,
+                sha=SHA_A,
+                wheel=b"a REBUILT wheel",
+                lockfile=b"# uv.lock",
+                test_summary="42 passed",
+                workflow_run_url="",
+                now=dt.datetime(2026, 8, 28, 21, 0, tzinfo=dt.UTC),
+            )
+        assert store.get_bytes(wheel_key(SHA_A)) == original
+
+    def test_the_refusal_names_the_operation_that_is_correct_instead(self, tmp_path) -> None:
+        """Re-promoting an existing build is `release.pin` and needs no
+        rebuild; publishing different bytes needs a new commit. Neither is
+        "retry the deploy", so the message has to say which."""
+        store = LocalStore(tmp_path)
+        _published(store)
+        with pytest.raises(ReleaseImmutabilityError, match="release.pin"):
+            publish_release(
+                store,
+                sha=SHA_A,
+                wheel=b"different",
+                lockfile=b"x",
+                test_summary="",
+                workflow_run_url="",
+            )
+
+    def test_nothing_is_written_when_the_wheel_is_refused(self, tmp_path) -> None:
+        """A wheel from one build beside a release.json from another is worse
+        than either, so both keys are checked before either is written."""
+        store = LocalStore(tmp_path)
+        _published(store)
+        before = store.get_bytes(release_json_key(SHA_A))
+        with pytest.raises(ReleaseImmutabilityError):
+            publish_release(
+                store,
+                sha=SHA_A,
+                wheel=b"different",
+                lockfile=b"x",
+                test_summary="",
+                workflow_run_url="",
+            )
+        assert store.get_bytes(release_json_key(SHA_A)) == before
+
+    def test_an_identical_republish_is_a_no_op_not_a_failure(self, tmp_path) -> None:
+        """A retried deploy against the same artifact must stay idempotent, or
+        it becomes indistinguishable from a corrupted one."""
+        store = LocalStore(tmp_path)
+        _published(store)
+        _published(store)  # same bytes, same `now` — must not raise
+        assert store.exists(wheel_key(SHA_A))
+
+    def test_the_comparison_is_on_the_bytes_not_on_a_recorded_digest(self, tmp_path) -> None:
+        """The thing being protected is precisely the case where a recorded
+        claim and the object have diverged, so a digest the writer supplies
+        about its own payload cannot be the comparison."""
+        store = LocalStore(tmp_path)
+        store.put_bytes("releases/x", b"one")
+        assert assert_immutable_write(store, "releases/x", b"one") is False
+        assert assert_immutable_write(store, "releases/absent", b"one") is True
+        with pytest.raises(ReleaseImmutabilityError):
+            assert_immutable_write(store, "releases/x", b"two")
