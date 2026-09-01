@@ -11,6 +11,15 @@ every plan clause is — an honest failure naming the requirement and the
 owning track, which goes green the moment both PRs are on `main` with no
 marker for anyone to remember to remove.
 
+**It lives in `tests/acceptance/` for exactly that reason.** This directory is
+the repository's declared home for clauses written before the code that
+satisfies them: `ci.yml` runs it in full on every commit and publishes the
+count, and does not block on it. A cross-track clause in the BLOCKING job
+would red `main` for tracks A and C over work neither of them has started —
+a public signal the groom loop reads — and the alternatives (an xfail, or a
+path exclusion in `ci.yml`) are both suppressions wearing different clothes.
+Reusing the mechanism that already exists is neither. See `README.md` here.
+
 What track B commits to here is the CONSUMER side: the M slot resolves its
 feature columns through `crucible.features`' registry interface and records
 the layer's version and hash as a manifest input, so R and M provably read
