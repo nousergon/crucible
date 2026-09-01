@@ -1,0 +1,218 @@
+"""The slot registry: four slots, one engine.
+
+Normative source: plan §4.4; binding source `champion-challenger-policy.md`.
+
+| Slot | Decision | Champion feeds |
+|---|---|---|
+| **U** | which names reach the predictor | `universe/{trading_day}/members.json` |
+| **R** | how names are scored into signals | `signals/{trading_day}/signals.json` |
+| **M** | which trained recipe emits `predicted_alpha` | `predictions/{trading_day}.json` |
+| **S** | exit / risk rules | `strategies/current` |
+
+**This module configures the arena; it never re-implements it.** The ladder,
+the paired windows, the anytime-valid confidence sequence, the Condorcet
+ranking, the pointer decision and the cap-with-grace retirement rule all live
+in `nousergon_lib.arena` and are CALLED. A slot that re-implements policy
+§§3–6 is a defect (policy §10), and `arena_config_for` returning the
+library's own `ArenaConfig` — rather than a look-alike — is what keeps that
+honest: a crucible-local copy would pass every value assertion and diverge
+silently the first time the library gained a field.
+
+**One field is not the library's.** `promote_min_weeks` (Brian's ruling,
+2026-09-01: a new arm is promotable only after 4 paired weeks — 20 paired
+trading days — against the incumbent) has no counterpart on the installed
+`ArenaConfig`. It is carried on :class:`SlotSpec` until the policy amendment
+named in I9751 lands it in the library, at which point it moves and this
+comment goes with it. It is deliberately NOT smuggled into the library object
+by monkey-patching: a config field that exists on some processes and not
+others is worse than one that lives in a declared second place.
+
+**Strategy content is not here.** An arm is an immutable recipe living in the
+private config repository, loaded at runtime; its id is the hash of its spec.
+This module holds the slot *shape* only, which is why it is publishable.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Literal
+
+from nousergon_lib.arena.engine import ArenaConfig
+
+__all__ = [
+    "SLOTS",
+    "ControlArm",
+    "SlotSpec",
+    "arena_config_for",
+    "get_slot",
+    "promotable_arms",
+]
+
+#: §10.1. Two controls per slot, every cycle: one with a KNOWN injected edge
+#: and one that is pure noise. If the grader does not rank planted >
+#: real-or-null > null with the expected margin, the grader is broken and the
+#: cycle's verdicts are void. This is the only way to know the harness itself
+#: works — the audit's central finding was a grading loop that ran for months
+#: while measuring nothing.
+ControlKind = Literal["planted", "null"]
+_CONTROL_KINDS: tuple[str, ...] = ("planted", "null")
+
+
+@dataclass(frozen=True)
+class ControlArm:
+    """A synthetic arm scored beside the real ones and never served.
+
+    ``control`` is a field rather than an implied property so it appears
+    explicitly in the register row, where the exclusion rules read it. A
+    control arm whose flag was forgotten is a look-ahead arm sitting in the
+    promotion pool, so the constructor refuses ``control=False`` outright.
+    """
+
+    arm_id: str
+    kind: ControlKind
+    control: bool = True
+
+    def __post_init__(self) -> None:
+        if self.kind not in _CONTROL_KINDS:
+            raise ValueError(
+                f"control kind must be one of {_CONTROL_KINDS}; got {self.kind!r}. "
+                "A control that is neither a planted edge nor pure noise cannot "
+                "establish that the grader ranks them in the expected order."
+            )
+        if not self.control:
+            raise ValueError(
+                f"control arm {self.arm_id!r} must carry control=True. The flag is "
+                "what excludes it from the pointer and from the cap; a planted-edge "
+                "arm without it is a look-ahead arm eligible for promotion."
+            )
+
+
+@dataclass(frozen=True)
+class SlotSpec:
+    """One slot's shape and its arena parameters.
+
+    Frozen: this is read in many places and written in one, and a mutable
+    spec is a per-slot parameter that can differ between two readers inside
+    the same process.
+    """
+
+    slot: str
+    slot_kind: str
+    benchmark: str
+    #: Brian's ruling, 2026-09-01. Four paired weeks = 20 paired trading
+    #: days; a holiday week is still one rung (§4.12). Scored and laddered
+    #: from week one, but the pointer cannot move to the arm before week 4;
+    #: within eligibility the decision is the confidence sequence alone.
+    promote_min_weeks: int = 4
+    #: §4.4: cap 5 (a RETIREMENT criterion, never an admission gate), grace
+    #: 4 weeks, floor 3 active arms, retired arms scored 8 trailing cycles.
+    cap: int = 5
+    grace_weeks: int = 4
+    min_active_arms: int = 3
+    retired_trailing_cycles: int = 8
+    diff_clip: float = 0.05
+    alpha: float = 0.05
+    control_arms: tuple[ControlArm, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if self.promote_min_weeks < 1:
+            raise ValueError(
+                f"promote_min_weeks must be >= 1; got {self.promote_min_weeks}. Zero "
+                "would promote an arm on its first cycle, which is the eligibility "
+                "age Brian's 2026-09-01 ruling exists to set."
+            )
+
+    @property
+    def arena(self) -> ArenaConfig:
+        """The library config for this slot.
+
+        Constructed on demand rather than stored, so the library's own
+        validation (`ArenaConfigError` on a selection slot benchmarked
+        against SPY, on `min_active_arms > cap`, and so on) runs against
+        these values every time they are read.
+        """
+        return ArenaConfig(
+            slot=self.slot,
+            slot_kind=self.slot_kind,
+            benchmark=self.benchmark,
+            alpha=self.alpha,
+            diff_clip=self.diff_clip,
+            cap=self.cap,
+            grace_weeks=self.grace_weeks,
+            min_active_arms=self.min_active_arms,
+            retired_trailing_cycles=self.retired_trailing_cycles,
+        )
+
+
+def _controls(slot: str) -> tuple[ControlArm, ...]:
+    return (
+        ControlArm(arm_id=f"control_planted_{slot}", kind="planted"),
+        ControlArm(arm_id=f"control_null_{slot}", kind="null"),
+    )
+
+
+SLOTS: dict[str, SlotSpec] = {
+    "u": SlotSpec(
+        slot="u",
+        slot_kind="universe_cut",
+        # A selection stage is graded against the population it drew from,
+        # count-matched. Never SPY.
+        benchmark="population",
+        control_arms=_controls("u"),
+    ),
+    "r": SlotSpec(
+        slot="r",
+        slot_kind="selection_producer",
+        benchmark="population",
+        control_arms=_controls("r"),
+    ),
+    "m": SlotSpec(
+        slot="m",
+        slot_kind="model",
+        # CPCV OOS IC on canonical 21 trading-day labels; the population is
+        # the scored cross-section, not an index.
+        benchmark="population",
+        control_arms=_controls("m"),
+    ),
+    "s": SlotSpec(
+        slot="s",
+        slot_kind="strategy",
+        # S is not a selection stage: market-relative canonical alpha net of
+        # the cost model, against SPY, is the correct axis here. The
+        # population rule above must not be over-applied into a second defect.
+        benchmark="SPY",
+        control_arms=_controls("s"),
+    ),
+}
+
+
+def get_slot(slot: str) -> SlotSpec:
+    """The spec for ``slot``. Raises on an unknown slot — never returns None."""
+    try:
+        return SLOTS[slot]
+    except KeyError as exc:
+        raise KeyError(
+            f"unknown slot {slot!r}; the four slots are {sorted(SLOTS)}. A slot that "
+            "is not registered has no benchmark and no arena config, so a cycle run "
+            "for it would produce an unlabelled number."
+        ) from exc
+
+
+def arena_config_for(slot: str) -> ArenaConfig:
+    """The `nousergon_lib.arena` config for ``slot``."""
+    return get_slot(slot).arena
+
+
+def promotable_arms(spec: SlotSpec, arm_ids: list[str]) -> list[str]:
+    """``arm_ids`` minus the slot's control arms, order preserved.
+
+    §10.1: controls are scored every cycle and are excluded from the pointer
+    and from the cap. Excluded from the pointer because the planted arm reads
+    next-period returns and promoting it would be a look-ahead in production;
+    excluded from the cap because the cap is a retirement criterion over
+    competing arms, and two controls counting against it would mean every
+    slot starts two arms into its own retirement pressure — a cap of 5 that
+    behaves as 3.
+    """
+    control_ids = {c.arm_id for c in spec.control_arms}
+    return [a for a in arm_ids if a not in control_ids]

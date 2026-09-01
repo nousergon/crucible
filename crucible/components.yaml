@@ -1,0 +1,240 @@
+# The observability registry (plan §9.2).
+#
+# One row per CLI job. Registry coverage is DERIVED from this file against
+# crucible/cli.py's job table, in both directions — never hand-listed, because
+# a hand-written list of things to check is written from the jobs someone
+# remembered. tests/test_components_registry.py is that derivation.
+#
+# A component with no row here is unobserved, not healthy. Its absence cannot
+# page (§4.6 reads `deadline` from this file), its logs have no declared
+# location or retention, and the console has no surface to render it on.
+#
+# Five signal classes per row, always all five (§9.2). A class the job
+# legitimately does not emit is `null` — declared, not omitted, because an
+# omitted class is indistinguishable from a forgotten one.
+#
+# `deadline` is expressed relative to the TRADING calendar (§4.12): "present
+# by T after the close of trading day d". A Monday holiday therefore raises no
+# page, without anyone muting anything.
+#
+# `log_retention_days` is CALENDAR days — one of §4.12's exhaustive
+# exceptions, because retention is an AWS property billed by calendar time.
+# Manifests are `forever` (retain-archives preference).
+
+version: 1
+
+defaults:
+  # §4.6: exactly two page conditions, and this is the only channel either
+  # reaches. Everything else is a row on a page nobody is paged to.
+  page_channel: telegram:crucible-pages
+  quiet_channel: none
+
+components:
+  data.daily:
+    description: Compile one trading day of market and fundamental data.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs,rows_in,rows_out,rows_rejected
+      outcome: run.json:metrics[data_freshness_trading_days]
+    log_location: /crucible/data.daily
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    schedule: weekdays after close
+    deadline: 3h after the close of trading day d
+
+  data.weekly:
+    description: Weekly data refresh and coverage pass.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs,rows_in,rows_out,rows_rejected
+      outcome: run.json:metrics[universe_coverage_ratio]
+    log_location: /crucible/data.weekly
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    schedule: weekly, Saturday
+    deadline: 09:00 ET the day after the last trading day of the week
+
+  data.heal:
+    description: Repair a named gap in the store, idempotently.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:rows_in,rows_out,rows_rejected
+      # A heal produces no graded outcome; it repairs an input. Declared null
+      # rather than omitted.
+      outcome: null
+    log_location: /crucible/data.heal
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    schedule: null
+    deadline: null
+
+  experiment.new:
+    description: Register an immutable arm from a recipe spec.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:outputs[arms/{slot}/{arm_id}.json]
+      outcome: null
+    log_location: /crucible/experiment.new
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/arms
+    artifact_retention: forever
+    schedule: null
+    deadline: null
+
+  experiment.run:
+    description: Score one arm for one trading day.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd,llm_calls
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs
+      outcome: run.json:metrics[arm_score]
+    log_location: /crucible/experiment.run
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/arms
+    artifact_retention: forever
+    schedule: weekly, Saturday
+    deadline: 12:00 ET the day after the last trading day of the week
+
+  experiment.grade:
+    description: Run one slot's arena cycle — ladder, pairings, pointer, retirements.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs[arena_cycle]
+      outcome: run.json:metrics[slot_leader_bound]
+    log_location: /crucible/experiment.grade
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/slots
+    artifact_retention: forever
+    schedule: weekly, Saturday
+    deadline: 14:00 ET the day after the last trading day of the week
+
+  promote:
+    description: Move a slot's champion pointer, evidence-gated.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[arena_cycle],outputs[champions/{slot}/current.json]
+      outcome: run.json:metrics[pointer_moved]
+    log_location: /crucible/promote
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/slots
+    artifact_retention: forever
+    schedule: null
+    deadline: null
+
+  report:
+    description: Reduce the week's manifests into the five-row attribution table.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[runs/**],outputs[report/{trading_day}/attribution.json]
+      outcome: run.json:metrics[attribution_rows_complete]
+    log_location: /crucible/report
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/report
+    artifact_retention: forever
+    schedule: weekly, Saturday
+    deadline: 16:00 ET the day after the last trading day of the week
+
+  explain:
+    description: Walk a run_id or verdict back to everything that produced it.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[runs/**]
+      # A read-only lineage walk grades nothing.
+      outcome: null
+    log_location: /crucible/explain
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    schedule: null
+    deadline: null
+
+  migrate.history:
+    description: Import v1 arm history, flagged with its provenance.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs[arms/**]
+      outcome: run.json:metrics[arms_migrated]
+    log_location: /crucible/migrate.history
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/arms
+    artifact_retention: forever
+    schedule: null
+    deadline: null
+
+  release.pin:
+    description: Repoint releases/current, or pin the trader to a release.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:outputs[releases/current]
+      outcome: null
+    log_location: /crucible/release.pin
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/releases
+    artifact_retention: forever
+    schedule: null
+    deadline: null
+
+  smoke:
+    description: A real end-to-end run against live data that gates a release flip.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs
+      outcome: run.json:metrics[smoke_ok]
+    log_location: /crucible/smoke
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/releases
+    artifact_retention: forever
+    # Runs on every merge to main, which is wall-clock, not scheduled work
+    # whose absence is a fact about the system.
+    schedule: null
+    deadline: null
