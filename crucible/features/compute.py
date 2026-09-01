@@ -28,12 +28,43 @@ from crucible.features.registry import CATALOG, FeatureSpec, feature_version
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import pandas as pd
 
-__all__ = ["LIQUIDITY_FLOOR_USD", "build_features"]
+__all__ = [
+    "BETA_WINDOW_TRADING_DAYS",
+    "LIQUIDITY_FLOOR_USD",
+    "MOMENTUM_CHANGE_WINDOW_TRADING_DAYS",
+    "RESIDUAL_MOMENTUM_CUM_TRADING_DAYS",
+    "RESIDUAL_MOMENTUM_SKIP_TRADING_DAYS",
+    "RESIDUAL_MOMENTUM_WINDOW_TRADING_DAYS",
+    "RESIDUAL_VOL_WINDOW_TRADING_DAYS",
+    "build_features",
+]
 
 #: The liquidity gate, in USD of mean 20-session traded notional. A single
 #: declared constant read by the one feature that expresses the gate, so no
 #: arm re-derives a threshold of its own.
 LIQUIDITY_FLOOR_USD = 5_000_000.0
+
+#: The residual-momentum window set, lifted verbatim from the v1 recipe this
+#: layer reproduces (`crucible-predictor/config/predictor.sample.yaml::
+#: residual_momentum`, alpha-engine-config-I9765). Named constants rather
+#: than literals in the expressions below because the registry's `expression`
+#: strings quote these numbers, and two declarations of one window is how a
+#: recipe and its implementation drift apart.
+BETA_WINDOW_TRADING_DAYS = 60
+RESIDUAL_MOMENTUM_WINDOW_TRADING_DAYS = 252
+RESIDUAL_MOMENTUM_SKIP_TRADING_DAYS = 21
+RESIDUAL_VOL_WINDOW_TRADING_DAYS = 20
+MOMENTUM_CHANGE_WINDOW_TRADING_DAYS = 21
+
+#: The cumulation window of the 12-1 residual momentum: the lookback less the
+#: skipped month, exactly as v1 computed it.
+RESIDUAL_MOMENTUM_CUM_TRADING_DAYS = (
+    RESIDUAL_MOMENTUM_WINDOW_TRADING_DAYS - RESIDUAL_MOMENTUM_SKIP_TRADING_DAYS
+)
+
+#: Guards the information-ratio division. v1's `_EPS`, carried across so the
+#: two implementations do not disagree on a near-zero denominator.
+_EPS = 1e-8
 
 
 def _rank01(series: pd.Series) -> pd.Series:
@@ -124,6 +155,73 @@ def build_features(
         lambda s: s.rolling(20, min_periods=20).mean()
     )
 
+    # -- the residual / idiosyncratic-momentum block (I9765) ---------------
+    #
+    # The market leg is the day's equal-weighted cross-sectional mean log
+    # return. It is a same-day statistic, so it reaches no further forward
+    # than the row it sits on, and truncating the panel at a day leaves every
+    # earlier day's value unchanged — the property `TestNoLookAhead` asserts.
+    frame["market_return_1d_log_return"] = frame.groupby("trading_day", sort=False)[
+        "return_1d_log_return"
+    ].transform("mean")
+
+    # Point-in-time beta by the population moments of the two return series
+    # over the window. Written as moments rather than `rolling().cov()` so the
+    # numerator and denominator share one ddof and it cancels exactly.
+    frame["_rrm"] = frame["return_1d_log_return"] * frame["market_return_1d_log_return"]
+    frame["_rm2"] = frame["market_return_1d_log_return"] ** 2
+    by_ticker = frame.groupby("ticker", sort=False)
+
+    def _rolling_mean(column: str, window: int) -> pd.Series:
+        return by_ticker[column].transform(lambda s: s.rolling(window, min_periods=window).mean())
+
+    mean_r = _rolling_mean("return_1d_log_return", BETA_WINDOW_TRADING_DAYS)
+    mean_rm = _rolling_mean("market_return_1d_log_return", BETA_WINDOW_TRADING_DAYS)
+    mean_rrm = _rolling_mean("_rrm", BETA_WINDOW_TRADING_DAYS)
+    mean_rm2 = _rolling_mean("_rm2", BETA_WINDOW_TRADING_DAYS)
+    covariance = mean_rrm - mean_r * mean_rm
+    variance = mean_rm2 - mean_rm**2
+    # A market leg with no dispersion over the window leaves beta NULL, not
+    # zero: an unmeasurable beta is not a beta of zero, and a zero would make
+    # the residual return equal to the raw return without saying so.
+    frame["beta_60d_raw"] = (
+        (covariance / variance.where(variance > 0)).groupby(frame["ticker"], sort=False).shift(1)
+    )
+
+    frame["residual_return_1d_log_return"] = (
+        frame["return_1d_log_return"] - frame["beta_60d_raw"] * frame["market_return_1d_log_return"]
+    )
+
+    residual_by_ticker = frame.groupby("ticker", sort=False)["residual_return_1d_log_return"]
+    frame["residual_vol_20d_ratio"] = residual_by_ticker.transform(
+        lambda s: s.rolling(
+            RESIDUAL_VOL_WINDOW_TRADING_DAYS, min_periods=RESIDUAL_VOL_WINDOW_TRADING_DAYS
+        ).std(ddof=0)
+    )
+    cumulative_residual = residual_by_ticker.transform(
+        lambda s: (
+            s.rolling(
+                RESIDUAL_MOMENTUM_CUM_TRADING_DAYS,
+                min_periods=RESIDUAL_MOMENTUM_CUM_TRADING_DAYS,
+            )
+            .sum()
+            .shift(RESIDUAL_MOMENTUM_SKIP_TRADING_DAYS)
+        )
+    )
+    frame["residual_momentum_252d_skip21d_ratio"] = cumulative_residual / (
+        frame["residual_vol_20d_ratio"] * np.sqrt(RESIDUAL_MOMENTUM_CUM_TRADING_DAYS) + _EPS
+    )
+
+    recent_momentum = by_ticker["return_1d_log_return"].transform(
+        lambda s: s.rolling(
+            MOMENTUM_CHANGE_WINDOW_TRADING_DAYS,
+            min_periods=MOMENTUM_CHANGE_WINDOW_TRADING_DAYS,
+        ).sum()
+    )
+    frame["momentum_change_21d_log_return"] = recent_momentum - recent_momentum.groupby(
+        frame["ticker"], sort=False
+    ).shift(MOMENTUM_CHANGE_WINDOW_TRADING_DAYS)
+
     cross = frame[frame["trading_day"] == day].copy()
     if cross.empty:
         raise ValueError(
@@ -142,6 +240,8 @@ def build_features(
         ("momentum_20d_log_return", "momentum_20d_zscore"),
         ("return_60d_log_return", "return_60d_zscore"),
         ("mom_12_1_log_return", "mom_12_1_zscore"),
+        ("residual_momentum_252d_skip21d_ratio", "residual_momentum_252d_skip21d_zscore"),
+        ("momentum_change_21d_log_return", "momentum_change_21d_zscore"),
     ):
         cross[target] = float("nan")
         # Z-scored over the LIQUID set only: an illiquid tail with wild

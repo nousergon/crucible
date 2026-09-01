@@ -48,6 +48,9 @@ import yaml
 from nousergon_lib.arena import ArmSeries, ServingPrecondition, derive_arm_id
 from nousergon_lib.arena.engine import TrainingIntegrityError, TrainingStatus
 
+from crucible.features.registry import UNIT_SUFFIXES
+from crucible.keys import features_key
+
 __all__ = [
     "DISPERSION_METRICS",
     "FLOOR_VETO_METRICS",
@@ -102,7 +105,14 @@ FLOOR_VETO_METRICS: dict[str, float] = {"model_hit_rate_30d": 0.50}
 #: The fleet's units-suffix contract (`AGENTS.md`): `avg_volume_20d` was
 #: emitted as a normalized ratio and consumed as raw shares, silently failing
 #: 901 of 903 tickers for months. A recipe may not name a bare column.
-UNITS_SUFFIXES: tuple[str, ...] = ("_raw", "_ratio", "_pct", "_zscore", "_log_return")
+#:
+#: **Re-exported, not re-declared** (`alpha-engine-config-I9772`). This module
+#: and `crucible.features.registry` carried two declarations of one contract,
+#: one character apart in their names, which is how the duplication survived
+#: review. The producer's is canonical — it is enforced at `FeatureSpec`
+#: construction — and the consumer's name is kept as an alias so a recipe and
+#: the column it names can never be checked against different rules.
+UNITS_SUFFIXES: tuple[str, ...] = UNIT_SUFFIXES
 
 
 @dataclass(frozen=True)
@@ -365,7 +375,14 @@ class FeaturePanel:
 
 
 class FeatureRegistry(Protocol):
-    """The registry interface track A's `crucible/features/` exposes."""
+    """The registry interface track A's `crucible/features/` exposes.
+
+    A tuple of :class:`crucible.features.FeatureSpec`, iterated for its specs
+    and read for their names. It is deliberately NOT a tuple of strings: a
+    registry of names is enough for a units check and nothing else, and the
+    lineage each spec carries is what `explain` answers "which data produced
+    this column" from (`alpha-engine-config-I9772`).
+    """
 
     def __iter__(self) -> Any: ...
 
@@ -374,32 +391,169 @@ class FeatureRegistry(Protocol):
 class FeatureLayerSource:
     """Reads a versioned feature panel through track A's registry.
 
-    Track B commits to the CONSUMER side of plan §10.4: the M slot resolves
-    its declared columns through the registry and records the layer's version
-    and hash as a manifest input, so R and M provably read the same artifact.
-    The producer — `features/{version}/{trading_day}.parquet`, its registry
-    and its lineage — is track A's, and until it lands this raises rather
-    than falling back to recomputing features locally. A local recomputation
-    is the precise defect the feature layer exists to remove: R and M
-    computing from different code, so "the signal degraded" cannot be
-    separated from "the feature changed".
+    Plan §10.4: the M slot resolves its declared columns through the registry
+    and records the layer's version and hash as a manifest input, so R and M
+    provably read the same artifact. **It never recomputes a feature.** A
+    local recomputation is the precise defect the feature layer exists to
+    remove: R and M computing from different code, so "the signal degraded"
+    cannot be separated from "the feature changed". Every value here comes
+    from `features/{version}/{trading_day}.parquet` as track A wrote it.
+
+    **The version is resolved, never named by a consumer**
+    (`alpha-engine-config-I9772`). `version=None` resolves
+    `crucible.features.DEFAULT_FEATURE_VERSION`, which is derived by hashing
+    the catalogue — so an edited recipe writes to a new prefix and cannot
+    overwrite the layer an earlier verdict was computed from. A consumer
+    hard-coding `"v1"` would defeat that mechanism silently.
     """
 
-    registry: Any
-    version: str
+    store: Any
+    registry: Any = None
+    version: str | None = None
+
+    def __post_init__(self) -> None:
+        from crucible.features import CATALOG, DEFAULT_FEATURE_VERSION  # noqa: PLC0415
+
+        if self.registry is None:
+            object.__setattr__(self, "registry", CATALOG)
+        if self.version is None:
+            object.__setattr__(self, "version", DEFAULT_FEATURE_VERSION)
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        """Every column this layer version produces, from the registry."""
+        return tuple(spec.name for spec in self.registry)
 
     def key(self, trading_day: str) -> str:
-        """The documented path shape, single-sourced here."""
-        return f"features/{self.version}/{trading_day}.parquet"
+        """The documented path shape, single-sourced in `crucible.keys`."""
+        return features_key(str(self.version), trading_day)
 
-    def panel(self, *, trading_day: str, columns: tuple[str, ...]) -> FeaturePanel:
-        raise NotImplementedError(
-            "the feature layer producer is track A's (crucible/features/, "
-            "alpha-engine-config-I9757, plan §10.4). This consumer reads "
-            f"{self.key(trading_day)} through the registry; it deliberately does NOT "
-            "fall back to recomputing features locally, which would put R and M on "
-            "different code and make a signal change indistinguishable from a "
-            "feature change."
+    def _read(self, trading_day: str, ctx: Any = None) -> Any:
+        """One day's cross-section, recorded as a manifest input when asked.
+
+        The recorded entry is byte-for-byte what `crucible.slots.cycle`
+        records for the R slot — same key, same sha256, same schema version —
+        which is what makes the §10.4 identity an assertion rather than a
+        convention.
+        """
+        from crucible.features import read_features  # noqa: PLC0415
+        from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415
+
+        key = self.key(trading_day)
+        if not self.store.exists(key):
+            raise MissingArtifactError(
+                f"the feature layer is absent at {key}. The M slot reads this artifact "
+                "and nothing else (§10.4) — it does NOT recompute features locally, "
+                "which would put R and M on different code. Compile it with:\n"
+                f"    crucible data.daily --date {trading_day}"
+            )
+        payload = self.store.get_bytes(key)
+        if ctx is not None:
+            ctx.record_input(key, payload, schema_version="features.v1")
+        return read_features(payload)
+
+    def _sessions(self, trading_day: str, lookback_trading_days: int) -> list[str]:
+        """The days to read, listed from the STORE rather than from a calendar.
+
+        A date range derived from the calendar would name days the layer was
+        never compiled for and turn a producer gap into a run of nulls. The
+        store knows which days exist; a gap therefore raises by name below.
+        """
+        prefix = f"features/{self.version}/"
+        available = sorted(
+            key[len(prefix) : -len(".parquet")]
+            for key in self.store.list_keys(prefix)
+            if key.endswith(".parquet")
+        )
+        earlier = [d for d in available if d <= trading_day]
+        if trading_day not in earlier:
+            earlier.append(trading_day)
+        wanted = earlier[-(lookback_trading_days + 1) :]
+        return wanted
+
+    def panel(
+        self,
+        *,
+        trading_day: str,
+        columns: tuple[str, ...],
+        lookback_trading_days: int = 0,
+        label_horizon_trading_days: int | None = None,
+        ctx: Any = None,
+    ) -> FeaturePanel:
+        """The declared ``columns`` for ``trading_day``, read from the layer.
+
+        ``lookback_trading_days`` extends the panel backwards over the days
+        the layer has actually been compiled for; ``label_horizon_trading_days``
+        fills `forward_returns` from the layer's own ``close_raw`` over that
+        many SESSIONS of the panel's own date axis (§4.12), leaving a row
+        whose horizon has not settled NULL rather than zero — an unsettled
+        return is not a flat one, and training raises on the null instead of
+        banking it.
+        """
+        import numpy as np  # noqa: PLC0415
+
+        requested = tuple(columns)
+        if not requested:
+            raise ValueError(
+                "panel() needs at least one column; a panel of no features would train "
+                "an arm on an empty design matrix"
+            )
+        unknown = sorted(set(requested) - set(self.columns))
+        if unknown:
+            raise KeyError(
+                f"column(s) {unknown} are not produced by feature layer version "
+                f"{self.version!r}; the registry produces {sorted(self.columns)}. A "
+                "recipe naming a column the layer does not produce fails HERE, at "
+                "load, and is never trained on a silently substituted zero "
+                "(the 2026-08-28 seven-hard-zeroed-features condition)."
+            )
+
+        dates = tuple(self._sessions(trading_day, lookback_trading_days))
+        frames = {day: self._read(day, ctx=ctx) for day in dates}
+
+        anchor = frames[trading_day]
+        names = tuple(str(t) for t in sorted(anchor["ticker"]))
+        needed = sorted(set(requested) | {"close_raw"})
+
+        blocks: dict[str, np.ndarray] = {}
+        closes = np.full((len(dates), len(names)), np.nan, dtype="float64")
+        for column in needed:
+            block = np.full((len(dates), len(names)), np.nan, dtype="float64")
+            for row, day in enumerate(dates):
+                frame = frames[day].set_index("ticker")
+                if column not in frame.columns:
+                    raise KeyError(
+                        f"feature {column!r} is absent from {self.key(day)}, which the "
+                        f"registry for version {self.version!r} says it produces. The "
+                        "artifact and the registry disagree; nothing is substituted."
+                    )
+                series = frame[column].reindex(list(names))
+                block[row, :] = series.to_numpy(dtype="float64")
+            if column == "close_raw":
+                closes = block
+            if column in requested:
+                blocks[column] = block
+
+        forward = np.full((len(dates), len(names)), np.nan, dtype="float64")
+        if label_horizon_trading_days is not None:
+            if label_horizon_trading_days < 1:
+                raise ValueError(
+                    "label_horizon_trading_days is a count of SESSIONS and is at least "
+                    "one (plan §4.12)"
+                )
+            settled = len(dates) - label_horizon_trading_days
+            for row in range(max(settled, 0)):
+                start = closes[row, :]
+                end = closes[row + label_horizon_trading_days, :]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    forward[row, :] = np.where(start > 0, end / start - 1.0, np.nan)
+
+        return FeaturePanel(
+            dates=dates,
+            names=names,
+            features=blocks,
+            forward_returns=forward,
+            feature_version=str(self.version),
         )
 
 

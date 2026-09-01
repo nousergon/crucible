@@ -239,6 +239,126 @@ CATALOG: tuple[FeatureSpec, ...] = (
         inputs=("mom_12_1_log_return", "liquidity_pass_raw"),
         cross_sectional=True,
     ),
+    # -- the M slot's declared demand (alpha-engine-config-I9765) ----------
+    #
+    # Lifted from the v1 implementation named in that issue's origin table,
+    # `crucible-predictor/data/residual_momentum_features.py` with the
+    # windows from `config/predictor.sample.yaml::residual_momentum`
+    # (beta_window 60, window 252, skip_days 21, vol_window 20,
+    # change_window 21). Two DECLARED deltas from v1, both documented on the
+    # columns below: the market leg is the equal-weighted cross-section
+    # rather than a sector ETF with a SPY fallback (plan §4.4 — the
+    # benchmark is the population drawn from, never SPY; and this layer
+    # carries no sector map), and the return stream is the layer's log
+    # return rather than v1's simple `pct_change`, so a cumulative residual
+    # is a sum rather than an approximation of one.
+    FeatureSpec(
+        name="market_return_1d_log_return",
+        unit="log_return",
+        expression="mean(return_1d_log_return) over the day's cross-section",
+        description=(
+            "The market leg: the equal-weighted mean one-session log return across "
+            "the day's whole cross-section. Identical for every ticker on a day, by "
+            "construction — it is a market factor carried as a column so the beta "
+            "below has a named input rather than a hidden intermediate. Not SPY: "
+            "plan §4.4 grades against the population drawn from, and this layer "
+            "carries no sector map to reproduce v1's sector-ETF benchmark."
+        ),
+        inputs=("return_1d_log_return",),
+        window_trading_days=1,
+        cross_sectional=True,
+    ),
+    FeatureSpec(
+        name="beta_60d_raw",
+        unit="beta",
+        expression=(
+            "cov(return_1d_log_return, market_return_1d_log_return, 60) / "
+            "var(market_return_1d_log_return, 60), shifted one session"
+        ),
+        description=(
+            "Point-in-time market beta over 60 sessions. SHIFTED BY ONE SESSION, "
+            "which is load-bearing: the beta used to residualize the return at t is "
+            "estimated only on data through t-1, so the residual at t is not "
+            "explained partly by itself."
+        ),
+        inputs=("return_1d_log_return", "market_return_1d_log_return"),
+        window_trading_days=60,
+    ),
+    FeatureSpec(
+        name="residual_return_1d_log_return",
+        unit="log_return",
+        expression="return_1d_log_return - beta_60d_raw * market_return_1d_log_return",
+        description=(
+            "The idiosyncratic one-session return: what is left after the market "
+            "leg is removed at the ticker's own point-in-time beta."
+        ),
+        inputs=(
+            "return_1d_log_return",
+            "market_return_1d_log_return",
+            "beta_60d_raw",
+        ),
+        window_trading_days=1,
+    ),
+    FeatureSpec(
+        name="residual_vol_20d_ratio",
+        unit="ratio",
+        expression="std(residual_return_1d_log_return, 20)",
+        description=(
+            "Standard deviation of 20 sessions of residual daily log returns. Not "
+            "annualized, matching `volatility_20d_ratio`. This is the denominator of "
+            "the vol scaling below and an M-arm column in its own right."
+        ),
+        inputs=("residual_return_1d_log_return",),
+        window_trading_days=20,
+    ),
+    FeatureSpec(
+        name="residual_momentum_252d_skip21d_ratio",
+        unit="ratio",
+        expression=(
+            "sum(residual_return_1d_log_return, 231).shift(21) / "
+            "(residual_vol_20d_ratio * sqrt(231))"
+        ),
+        description=(
+            "Vol-scaled cumulative residual momentum (Blitz/Hanauer): 252 sessions "
+            "back to 21 sessions back — the 12-1 skip-month convention, because the "
+            "most recent month is short-horizon reversal — divided by the "
+            "window-level residual volatility. An information ratio, so `_ratio`: "
+            "a raw cumulative residual return would put the signal on a magnitude "
+            "scale rather than a Sharpe-like one."
+        ),
+        inputs=("residual_return_1d_log_return", "residual_vol_20d_ratio"),
+        window_trading_days=252,
+    ),
+    FeatureSpec(
+        name="residual_momentum_252d_skip21d_zscore",
+        unit="zscore",
+        expression="zscore(residual_momentum_252d_skip21d_ratio)",
+        description=(
+            "Cross-sectional z-score of vol-scaled residual momentum, over the "
+            "liquid set. This is the column both M arms rank first."
+        ),
+        inputs=("residual_momentum_252d_skip21d_ratio", "liquidity_pass_raw"),
+        cross_sectional=True,
+    ),
+    FeatureSpec(
+        name="momentum_change_21d_log_return",
+        unit="log_return",
+        expression=("sum(return_1d_log_return, 21) - sum(return_1d_log_return, 21).shift(21)"),
+        description=(
+            "Momentum acceleration: the trailing 21-session return minus the 21 "
+            "sessions before it. Two consecutive windows, so 42 sessions of history."
+        ),
+        inputs=("return_1d_log_return",),
+        window_trading_days=42,
+    ),
+    FeatureSpec(
+        name="momentum_change_21d_zscore",
+        unit="zscore",
+        expression="zscore(momentum_change_21d_log_return)",
+        description=("Cross-sectional z-score of momentum acceleration, over the liquid set."),
+        inputs=("momentum_change_21d_log_return", "liquidity_pass_raw"),
+        cross_sectional=True,
+    ),
 )
 
 
