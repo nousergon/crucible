@@ -920,3 +920,45 @@ class TestOneProducerPerKeyShape:
                 f"crucible.promote.{name} re-declares a key shape crucible.keys already "
                 "produces; keys.py is the single producer (plan §4.12)"
             )
+
+
+class TestArmSeriesKeyUsesTheSharedSeparator:
+    """`alpha-engine-config-I9784`: `arm_series_key` built `scores/{slot}/{arm_id}/series.json`
+    from the RAW arm id, so it carried colons while `shadow_key`/`verdict_key` both routed
+    through `arm_key_segment` (`crucible/keys.py`'s own docstring: "the one translation").
+    Same class as F11's duplicate `arm_register_key` (`crucible-PR11`), and deliberately left
+    out of that PR's scope because it changes a key shape.
+    """
+
+    def test_the_series_key_has_a_single_producer(self) -> None:
+        import crucible.keys as keys
+        import crucible.promote as promote
+
+        assert promote.arm_series_key is keys.arm_series_key
+        assert promote.arm_series_key.__module__ == "crucible.keys"
+
+    def test_a_colon_bearing_arm_id_round_trips_through_every_arm_scoped_key(self) -> None:
+        """The round trip the module's own docstring requires: a future change to
+        `ARM_SEGMENT_SEPARATOR` cannot orphan `scores/` artifacts silently while leaving
+        `experiments/` ones intact, because all three keys are asserted against the same
+        segment here.
+        """
+        from crucible.keys import (
+            arm_id_from_segment,
+            arm_key_segment,
+            arm_series_key,
+            shadow_key,
+            verdict_key,
+        )
+
+        arm_id = "m:momentum_sleeve:ab12cd"
+        segment = arm_key_segment(arm_id)
+        assert arm_id_from_segment(segment) == arm_id
+
+        for key in (
+            arm_series_key("m", arm_id),
+            shadow_key(arm_id, "2026-08-28"),
+            verdict_key(arm_id, "2026-08-28"),
+        ):
+            assert ":" not in key, f"a colon-bearing arm id leaked into {key!r}"
+            assert segment in key, f"{key!r} does not route through arm_key_segment"

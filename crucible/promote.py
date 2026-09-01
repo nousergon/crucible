@@ -62,7 +62,7 @@ from crucible.champion import (
     read_champion_etag,
     write_champion,
 )
-from crucible.keys import arm_register_key
+from crucible.keys import arm_register_key, arm_series_key
 from crucible.slots import SlotSpec, is_control_arm
 from crucible.store import ETAG_ABSENT, Store
 
@@ -73,10 +73,11 @@ __all__ = [
     "SlotInputs",
     "apply_eligibility_age",
     # Re-exported from `crucible.keys`, which is the single producer of every
-    # key shape (plan §4.12). It appears here because `arm_register_key` is
-    # part of what a promote consumer imports, NOT because this module also
-    # declares it: it did, in two places producing the same string, until
-    # `alpha-engine-config-I9757` F11 collapsed them.
+    # key shape (plan §4.12). They appear here because a promote consumer
+    # imports them from this module, NOT because promote.py also declares
+    # them: `arm_register_key` did, in two places producing the same string,
+    # until `alpha-engine-config-I9757` F11 collapsed them; `arm_series_key`
+    # did the same until I9784 moved it here too.
     "arm_register_key",
     "arm_series_key",
     "experiments_key",
@@ -125,17 +126,6 @@ def experiments_key(trading_day: str) -> str:
     private doc someone remembered to update is not a record.
     """
     return f"experiments/{trading_day}/events.jsonl"
-
-
-def arm_series_key(slot: str, arm_id: str) -> str:
-    """One arm's per-date score series, as produced by `experiment.grade`.
-
-    The scores are already expressed against the SLOT's benchmark: the arena
-    never applies a benchmark, because the correct one is a per-slot fact
-    (policy §4). A series written against the wrong benchmark is therefore
-    caught at the grader, not here.
-    """
-    return f"scores/{slot}/{arm_id}/series.json"
 
 
 @dataclass(frozen=True)
