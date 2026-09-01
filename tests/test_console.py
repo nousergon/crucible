@@ -16,7 +16,7 @@ import pytest
 
 from crucible.components import Component, Deadline, load_registry
 from crucible.console import STATES, build_page, classify, render_html
-from crucible.console.render import write_page
+from crucible.console.render import ATTRIBUTION_STATUSES, STATUS_COLORS, _state_class, write_page
 from crucible.manifest import manifest_key
 from crucible.store import LocalStore
 
@@ -43,7 +43,7 @@ def _component(**over) -> Component:
     return Component(**base)
 
 
-def _manifest(status="ok", reason="", attempts=1):
+def _manifest(status="ok", reason="", attempts=1, metrics=None):
     return {
         "run_id": "01JG0000000000000000000001",
         "trading_day": FRIDAY.isoformat(),
@@ -51,7 +51,12 @@ def _manifest(status="ok", reason="", attempts=1):
         "reason": reason,
         "cost_usd": 0.5,
         "attempts": [{"n": i + 1, "reason": "initial"} for i in range(attempts)],
+        "metrics": metrics or [],
     }
+
+
+def _metric(name: str, status: str) -> dict:
+    return {"name": name, "status": status, "value": None, "unit": "ratio"}
 
 
 class TestVocabulary:
@@ -136,6 +141,50 @@ class TestClassifier:
         state = classify(_component(lifecycle="DISABLED"), None, now=SATURDAY_NIGHT).state
         assert state != "MISSED"
 
+    def test_an_ok_run_with_every_metric_unreported_is_not_healthy(self) -> None:
+        """alpha-engine-config-I9757, C5. A manifest can carry `status: ok`
+        and declare metrics that all carry no value — reproduced by the
+        drift job over structurally-present, semantically-empty inputs
+        (`crucible.drift.drift_metrics` now refuses to let THAT combination
+        reach a manifest, by raising before the caller can write `status:
+        ok` — see `tests/test_drift.py`). This is the systemic backstop:
+        any other metric-emitting component that has not been given that
+        producer-side guard must still not render green here.
+        """
+        manifest = _manifest(
+            metrics=[
+                _metric("feature_psi_max_ratio", "UNREPORTED"),
+                _metric("ic_decay_ratio", "UNREPORTED"),
+            ]
+        )
+        c = classify(_component(), manifest, now=SATURDAY_NIGHT)
+        assert c.state == "UNREPORTED"
+        assert "feature_psi_max_ratio" in c.reason and "ic_decay_ratio" in c.reason
+
+    def test_an_ok_run_with_some_metrics_unreported_is_degraded_not_healthy(self) -> None:
+        """The exact C5 reproduction: two of three drift MetricRecords carry
+        no value (`feature_psi_max_ratio`, `ic_decay_ratio`) while the third
+        (`prediction_psi_ratio`) is a real 0.0. The run legitimately
+        measured something, so it is not the total-blindness case above —
+        but it must not read as a clean HEALTHY either, or the blind
+        metrics are invisible on the one row that owns them."""
+        manifest = _manifest(
+            metrics=[
+                _metric("feature_psi_max_ratio", "UNREPORTED"),
+                _metric("prediction_psi_ratio", "OK"),
+                _metric("ic_decay_ratio", "UNREPORTED"),
+            ]
+        )
+        c = classify(_component(), manifest, now=SATURDAY_NIGHT)
+        assert c.state == "DEGRADED"
+        assert "feature_psi_max_ratio" in c.reason and "ic_decay_ratio" in c.reason
+        assert "prediction_psi_ratio" not in c.reason
+
+    def test_an_ok_run_with_no_unreported_metrics_is_still_healthy(self) -> None:
+        """The new branches must not fire when there is nothing to flag."""
+        manifest = _manifest(metrics=[_metric("prediction_psi_ratio", "OK")])
+        assert classify(_component(), manifest, now=SATURDAY_NIGHT).state == "HEALTHY"
+
 
 class TestPage:
     def test_the_population_is_the_whole_registry(self, tmp_path) -> None:
@@ -214,6 +263,42 @@ class TestPage:
         assert store.exists(html_key) and store.exists(json_key)
         assert json.loads(store.get_bytes(json_key))["population"] == len(load_registry())
 
+    def test_the_transparency_gap_count_sees_metric_statuses_not_only_component_states(
+        self, tmp_path
+    ) -> None:
+        """alpha-engine-config-I9757, C5. Before this fix `page.unreported`
+        was `sum(1 for r in rows if r["state"] == "UNREPORTED")` — a
+        component classified DEGRADED (partial metric blindness) or even
+        HEALTHY (a future producer without the classify.py backstop)
+        contributed zero, so the objective-0 count could read 0 while real
+        metrics were silently unmeasured. It must count those metrics too.
+        """
+        store = LocalStore(tmp_path)
+        registry = load_registry()
+        name = next(iter(registry))
+        store.put_bytes(
+            manifest_key(name, FRIDAY.isoformat()),
+            json.dumps(
+                {
+                    "job": name,
+                    "trading_day": FRIDAY.isoformat(),
+                    "status": "ok",
+                    "reason": "",
+                    "cost_usd": 0.0,
+                    "run_id": "01JG0000000000000000000001",
+                    "metrics": [
+                        {"name": "a_ratio", "status": "UNREPORTED", "value": None, "unit": "ratio"},
+                        {"name": "b_ratio", "status": "OK", "value": 0.01, "unit": "ratio"},
+                        {"name": "c_ratio", "status": "UNREPORTED", "value": None, "unit": "ratio"},
+                    ],
+                }
+            ).encode(),
+        )
+        page = build_page(store, registry=registry, now=SATURDAY_NIGHT)
+        row = next(r for r in page.rows if r["component"] == name)
+        assert row["state"] == "DEGRADED"  # not counted as UNREPORTED itself
+        assert page.unreported == 2  # the two blind metrics are counted anyway
+
     def test_the_render_escapes_what_it_puts_in_the_page(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
         store.put_bytes(
@@ -232,3 +317,88 @@ class TestPage:
         html = render_html(build_page(store, now=SATURDAY_NIGHT))
         assert "<script>alert(1)</script>" not in html
         assert "&lt;script&gt;" in html
+
+    def test_the_attribution_tables_own_statuses_render_with_a_stylesheet_rule(
+        self, tmp_path
+    ) -> None:
+        """alpha-engine-config-I9757, C14. `render.py` used to emit
+        `class="state s-{status}"` with CSS rules hand-listed against the
+        fourteen COMPONENT states only. The attribution table's own
+        vocabulary — `OK`, `RED`, `GREEN`, `BREACH`, `N/A-NOT-RUN`,
+        `N/A-NOT-IMPL` — had no rule at all, so a fully-unmeasured report
+        card rendered visually identical to a green one. Reproduced here
+        with all five real attribution statuses in one table.
+        """
+        store = LocalStore(tmp_path)
+        store.put_bytes(
+            f"report/{FRIDAY.isoformat()}/attribution.json",
+            json.dumps(
+                {
+                    "rows": [
+                        {
+                            "name": "data_freshness",
+                            "value": None,
+                            "unit": None,
+                            "status": "N/A-NOT-RUN",
+                            "status_reason": "not run this week",
+                        },
+                        {
+                            "name": "signal_ic",
+                            "value": None,
+                            "unit": None,
+                            "status": "N/A-NOT-IMPL",
+                            "status_reason": "track A not built",
+                        },
+                        {
+                            "name": "prediction_ic",
+                            "value": 0.04,
+                            "unit": "ratio",
+                            "status": "OK",
+                            "status_reason": "within band",
+                        },
+                        {
+                            "name": "portfolio_alpha",
+                            "value": 0.30,
+                            "unit": "ratio",
+                            "status": "BREACH",
+                            "status_reason": "over band",
+                        },
+                        {
+                            "name": "execution_shortfall",
+                            "value": None,
+                            "unit": None,
+                            "status": "RED",
+                            "status_reason": "critical",
+                        },
+                        {
+                            "name": "contamination_attestation",
+                            "value": 1.0,
+                            "unit": "ratio",
+                            "status": "GREEN",
+                            "status_reason": "clean",
+                        },
+                    ]
+                }
+            ).encode(),
+        )
+        html = render_html(build_page(store, now=SATURDAY_NIGHT))
+        for status in ATTRIBUTION_STATUSES:
+            assert f".s-{status} {{" in html, f"no stylesheet rule rendered for {status!r}"
+            assert f'class="state s-{status}"' in html, f"{status!r} did not render at all"
+
+    def test_status_colors_covers_every_declared_status(self) -> None:
+        """The completeness guard `render.py` asserts at import time,
+        exercised here so a broken guard fails a test rather than only an
+        import. `STATUS_COLORS` is the single source the stylesheet is
+        generated from — it must carry a rule for every component state
+        AND every attribution status, or one of them renders with no color
+        (C14)."""
+        assert set(STATES) <= set(STATUS_COLORS)
+        assert set(ATTRIBUTION_STATUSES) <= set(STATUS_COLORS)
+
+    def test_a_status_with_no_registered_color_is_refused_not_rendered_plain(self) -> None:
+        """The mapping cannot silently go stale: a status reaching the
+        template with no entry in `STATUS_COLORS` raises rather than
+        rendering with no CSS rule — the exact silent failure C14 was."""
+        with pytest.raises(KeyError, match="no entry in STATUS_COLORS"):
+            _state_class("SOMETHING_NOBODY_REGISTERED")

@@ -184,3 +184,37 @@ class TestRecords:
         )
         assert records[0]["status"] == "UNREPORTED"
         assert records[2]["status"] == "UNREPORTED"
+
+    def test_a_run_that_measured_nothing_at_all_raises_rather_than_ending_ok(self) -> None:
+        """alpha-engine-config-I9757, C5. Inputs can be STRUCTURALLY present
+        and empty at the same time — a features file with `psi_by_feature:
+        {}`, an IC file with `decay_by_horizon: {}`, a predictions file
+        whose `psi` is null. None of those trip a file-existence check, so
+        without this the caller (`crucible.track_c.drift_handler`) would
+        write `status: ok` over three `UNREPORTED` rows and the console
+        would render `drift` HEALTHY — reproducing, inside the one module
+        built to close it, the audit's "the system stopped thinking on
+        07-19 while every detector was green."
+        """
+        with pytest.raises(ValueError, match="all three metrics carry no value"):
+            drift_metrics(
+                trading_day=FRIDAY,
+                feature_psi_by_name={},
+                prediction_psi=None,
+                ic_decay_by_horizon={},
+                now=NOW,
+            )
+
+    def test_a_partially_measured_run_does_not_raise(self) -> None:
+        """Only TOTAL blindness raises here. A run that measured even one
+        of the three metrics is not the "measuring nothing" failure mode —
+        that partial case is the console's job (DEGRADED, not HEALTHY),
+        covered in `tests/test_console.py`."""
+        records = drift_metrics(
+            trading_day=FRIDAY,
+            feature_psi_by_name={},
+            prediction_psi=0.0,
+            ic_decay_by_horizon={},
+            now=NOW,
+        )
+        assert [r["status"] for r in records] == ["UNREPORTED", "OK", "UNREPORTED"]

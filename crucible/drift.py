@@ -346,7 +346,7 @@ def drift_metrics(
     *,
     trading_day: dt.date,
     feature_psi_by_name: dict[str, float],
-    prediction_psi: float,
+    prediction_psi: float | None,
     ic_decay_by_horizon: dict[int, float],
     now: dt.datetime | None = None,
 ) -> list[dict[str, Any]]:
@@ -356,6 +356,14 @@ def drift_metrics(
     grows a row per feature is the 185-rule fleet again with a different
     noun. The per-feature numbers are carried in the row's `detail`, so the
     worst offender is named without every feature getting its own tile.
+
+    ``prediction_psi`` is ``float | None`` rather than a bare ``float``: a
+    caller whose predictions input carries a null `psi` (structurally
+    present, nothing measured) is a legitimate absence to represent, not a
+    type error to mask.
+
+    Raises :class:`ValueError` when every one of the three records would
+    render `UNREPORTED` — see the check at the end of this function.
     """
     moment = now or dt.datetime.now(dt.UTC)
     day = trading_day.isoformat()
@@ -371,7 +379,7 @@ def drift_metrics(
         else (None, None)
     )
 
-    return [
+    records = [
         _record(
             "feature_psi_max_ratio",
             worst_value,
@@ -391,7 +399,11 @@ def drift_metrics(
             unit="psi",
             now=moment,
             source_path=f"drift/{day}/predictions.json",
-            detail=(f"Prediction distribution against the training window: {prediction_psi:.4f}."),
+            detail=(
+                f"Prediction distribution against the training window: {prediction_psi:.4f}."
+                if prediction_psi is not None and not math.isnan(prediction_psi)
+                else "The prediction distribution was not measured."
+            ),
         ),
         _record(
             "ic_decay_ratio",
@@ -408,3 +420,25 @@ def drift_metrics(
             horizon=worst_horizon,
         ),
     ]
+
+    # alpha-engine-config-I9757 (C5): inputs can be STRUCTURALLY present and
+    # semantically empty — a features file with `psi_by_feature: {}`, an IC
+    # file with `decay_by_horizon: {}`, a predictions file whose `psi` is
+    # null. None of those trip the caller's file-existence check, so a run
+    # over them would otherwise return three `UNREPORTED` rows and let the
+    # caller write `status: ok`. That is the exact blind spot the audit
+    # named — "the system stopped thinking on 07-19 while every detector
+    # was green" — reproduced inside the one module built to close it.
+    # Raising here, at the point every record's status is already known,
+    # makes the run fail the same way the missing-artifact case already
+    # does, rather than requiring every future caller to re-derive this
+    # check for itself (principle 6: one place carries the rule).
+    if all(r["status"] == "UNREPORTED" for r in records):
+        raise ValueError(
+            f"drift {day}: all three metrics carry no value — zero features were "
+            "compared, zero horizons were compared, and the prediction distribution "
+            "was not measured. Inputs were structurally present but empty, which is "
+            "the same failure as absent inputs wearing a different shape, and this "
+            "run must not exit `ok` over it."
+        )
+    return records

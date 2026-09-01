@@ -128,6 +128,53 @@ def classify(
             )
         if status == "ok":
             note = " after one transient-class retry" if retried else ""
+            # alpha-engine-config-I9757 (C5): the run's own exit status is
+            # not the whole story — its metrics can carry no value even
+            # though the run "succeeded". Reading only `manifest["status"]`
+            # let a drift cycle whose inputs were structurally present but
+            # empty (feature_psi_max_ratio and ic_decay_ratio both
+            # UNREPORTED) render HEALTHY, which is principle 7 violated:
+            # a component emitting nothing is unobserved, not healthy.
+            metrics = manifest.get("metrics") or []
+            unreported_metrics = [
+                m.get("name", "?") for m in metrics if m.get("status") == "UNREPORTED"
+            ]
+            if metrics and len(unreported_metrics) == len(metrics):
+                # Total blindness: the run reports OK and declared metrics,
+                # and every one of them carries no value. Its own status is
+                # not evidence when nothing behind it was actually
+                # measured, so this renders the same as an unreadable
+                # producer — UNREPORTED, never green. (`drift_metrics`
+                # already refuses to let this combination reach the
+                # manifest for the drift job specifically, by raising
+                # before the caller can record `status: ok`; this branch is
+                # the systemic backstop for every other metric-emitting
+                # component, present or future, that has not been given
+                # the same producer-side guard.)
+                return Classification(
+                    component.name,
+                    "UNREPORTED",
+                    f"ran and ended ok, but all {len(metrics)} of its declared "
+                    f"metric(s) carry no value ({', '.join(unreported_metrics)}). A "
+                    "run that measured nothing is not evidence of health, whatever "
+                    "its own exit status claims.",
+                    trading_day=day,
+                    run_id=run_id,
+                )
+            if unreported_metrics:
+                # Partial blindness: some metrics are real, some are silent.
+                # This is not a failure — the run did measure something —
+                # but it is not a clean HEALTHY either, or the silent
+                # metric is invisible on the one row that owns it.
+                return Classification(
+                    component.name,
+                    "DEGRADED",
+                    f"ran inside its declared window and ended ok{note}, but "
+                    f"{len(unreported_metrics)} of its {len(metrics)} declared "
+                    f"metric(s) carry no value ({', '.join(unreported_metrics)}).",
+                    trading_day=day,
+                    run_id=run_id,
+                )
             return Classification(
                 component.name,
                 "HEALTHY",

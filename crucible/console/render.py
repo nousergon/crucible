@@ -16,11 +16,19 @@ from typing import Any
 
 from crucible.calendar import previous_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
-from crucible.console.classify import Classification, classify
+from crucible.console.classify import STATES, Classification, classify
 from crucible.manifest import manifest_key
 from crucible.store import Store
 
-__all__ = ["CONSOLE_KEY", "ConsolePage", "build_page", "render_html", "write_page"]
+__all__ = [
+    "ATTRIBUTION_STATUSES",
+    "CONSOLE_KEY",
+    "ConsolePage",
+    "STATUS_COLORS",
+    "build_page",
+    "render_html",
+    "write_page",
+]
 
 CONSOLE_KEY = "console/index.html"
 CONSOLE_JSON_KEY = "console/index.json"
@@ -32,7 +40,11 @@ class ConsolePage:
 
     ``unreported`` is a top-level field rather than something a reader counts
     off the rows: §8.4 makes it the transparency-gap count with an objective
-    of zero, and a number nobody publishes is a number nobody is held to.
+    of zero, and a number nobody publishes is a number nobody is held to. It
+    is the sum of components classified `UNREPORTED` *and* every individual
+    metric, on any row, whose own status is `UNREPORTED` — a component can
+    classify `HEALTHY` or `DEGRADED` overall and still owe this count a
+    metric that went blind underneath it (alpha-engine-config-I9757, C5).
     """
 
     trading_day: str
@@ -97,6 +109,7 @@ def build_page(
     day_set = {d.isoformat() for d in days}
 
     rows: list[dict[str, Any]] = []
+    metric_gap = 0
     for name, component in sorted(reg.items()):
         manifest = _read_json(store, manifest_key(name, trading_day.isoformat()))
         classification = classify(
@@ -106,6 +119,18 @@ def build_page(
             history=manifest is not None or _has_history(store, name),
         )
         rows.append(_row(component, classification, manifest))
+        # alpha-engine-config-I9757 (C5): the transparency-gap count read
+        # only component STATES, never the metric statuses inside a
+        # manifest that classified HEALTHY or DEGRADED — so a run with two
+        # of three metrics UNREPORTED (§10.5) contributed zero to "objective
+        # 0". Counting each UNREPORTED metric directly, in addition to
+        # UNREPORTED component rows below, makes the count see what the row
+        # color alone cannot: a component can be DEGRADED rather than
+        # UNREPORTED and still owe the gap count every metric it went blind
+        # on.
+        metric_gap += sum(
+            1 for m in (manifest or {}).get("metrics", []) if m.get("status") == "UNREPORTED"
+        )
 
     week_cost = 0.0
     deploys: list[dict[str, Any]] = []
@@ -142,7 +167,7 @@ def build_page(
         champions=champions,
         deploys=sorted(deploys, key=lambda d: str(d.get("trading_day"))),
         week_cost_usd=round(week_cost, 4),
-        unreported=sum(1 for r in rows if r["state"] == "UNREPORTED"),
+        unreported=sum(1 for r in rows if r["state"] == "UNREPORTED") + metric_gap,
         population=len(rows),
     )
 
@@ -183,7 +208,90 @@ def _champions(store: Store) -> dict[str, Any]:
     return out
 
 
-_STYLE = """
+#: alpha-engine-config-I9757 (C14): the stylesheet used to hand-list CSS
+#: rules against the fourteen component states only, so any OTHER status
+#: rendered through the same `class="state s-{status}"` template — the
+#: attribution table's own `OK`/`RED`/`GREEN`/`BREACH`/`N/A-NOT-RUN`/
+#: `N/A-NOT-IMPL`, or a drift `Band` status — had no rule at all and
+#: rendered in plain text, visually identical to a HEALTHY green row. A
+#: fully-unmeasured report card was indistinguishable from a green one.
+#:
+#: `STATUS_COLORS` is the single source of every color a status can render
+#: in; the stylesheet's `.s-*` rules are generated FROM it below rather than
+#: hand-listed a second time, so the two structurally cannot drift apart.
+#: `_state_class` (used at every render call site) raises for any status not
+#: a key here — a rendered status with no color is refused rather than
+#: silently rendered plain, per the fleet's no-silent-swallow rule.
+_GREEN = "#1a7f37"
+_GRAY = "#6e7781"
+_AMBER = "#9a6700"
+_RED = "#cf222e"
+_PURPLE = "#8250df"
+
+#: Attribution rows carry their own closed vocabulary, not `classify.STATES`
+#: — owned by whichever module reduces the week's manifests into
+#: `report/{trading_day}/attribution.json` (plan §4.5, track A; the handler
+#: is currently a stub). No schema is registered for it yet, so this tuple
+#: is the vocabulary the C14 reproduction demonstrated as actually
+#: rendered — kept here, next to the stylesheet it must cover, until track A
+#: lands a real schema this can import instead.
+ATTRIBUTION_STATUSES: tuple[str, ...] = (
+    "OK",
+    "GREEN",
+    "RED",
+    "BREACH",
+    "N/A-NOT-RUN",
+    "N/A-NOT-IMPL",
+)
+
+STATUS_COLORS: dict[str, str] = {
+    # The fourteen component states (`crucible.console.classify.STATES`).
+    "HEALTHY": _GREEN,
+    "RUNNING": _GRAY,
+    "ARMED": _GRAY,
+    "DEGRADED": _AMBER,
+    "FAILED": _RED,
+    "STALLED": _RED,
+    "MISSED": _RED,
+    "ABSENT": _RED,
+    "UNREPORTED": _RED,
+    "UNREGISTERED": _RED,
+    "NEVER_RAN": _RED,
+    "DISABLED": _PURPLE,
+    "DEPRECATED": _PURPLE,
+    "RETIRED": _PURPLE,
+    # `crucible.drift.Band.status()` — not yet rendered through a dedicated
+    # Metrics section, colored here so that day does not repeat C14.
+    "WATCH": _AMBER,
+    # The attribution table's own vocabulary (`ATTRIBUTION_STATUSES`). `OK`
+    # and `GREEN` alias `HEALTHY`'s color, `BREACH`/`RED` alias `FAILED`'s,
+    # and the two `N/A-*` statuses are red rather than a neutral gray:
+    # principle 7 — no data is never rendered as green, and a status meaning
+    # "not measured" earns the same loud color as one meaning "measured and
+    # bad", never the calm one.
+    "OK": _GREEN,
+    "GREEN": _GREEN,
+    "RED": _RED,
+    "BREACH": _RED,
+    "N/A-NOT-RUN": _RED,
+    "N/A-NOT-IMPL": _RED,
+}
+
+# Completeness guard, enforced at import time rather than left to be
+# noticed at render time: every declared component state and every declared
+# attribution status must have a color. A 15th component state (impossible
+# under `console-policy`'s add-by-PR-only closed vocabulary, but checked
+# anyway) or a new attribution status added to `ATTRIBUTION_STATUSES`
+# without a matching entry here fails the import, not a rendered page.
+_missing = (set(STATES) | set(ATTRIBUTION_STATUSES)) - set(STATUS_COLORS)
+assert not _missing, (
+    f"STATUS_COLORS is missing a rule for {sorted(_missing)} — every status in "
+    "classify.STATES or ATTRIBUTION_STATUSES must have a color before it can render "
+    "(alpha-engine-config-I9757, C14)."
+)
+
+_STYLE = (
+    """
 :root { color-scheme: light dark; --fg:#111; --bg:#fff; --muted:#666; --line:#ddd; }
 @media (prefers-color-scheme: dark) {
   :root { --fg:#e8e8e8; --bg:#111; --muted:#999; --line:#333; }
@@ -201,19 +309,37 @@ th { font-weight: 600; white-space: nowrap; }
 code { font: 12px ui-monospace, monospace; }
 .reason { color: var(--muted); max-width: 60ch; }
 .state { font-weight: 600; white-space: nowrap; }
-.s-HEALTHY { color: #1a7f37; } .s-RUNNING, .s-ARMED { color: #6e7781; }
-.s-DEGRADED, .s-WATCH { color: #9a6700; }
-.s-FAILED, .s-MISSED, .s-STALLED, .s-ABSENT, .s-UNREPORTED,
-.s-UNREGISTERED, .s-NEVER_RAN { color: #cf222e; }
-.s-DISABLED, .s-DEPRECATED, .s-RETIRED { color: #8250df; }
+"""
+    + "\n".join(f".s-{name} {{ color: {color}; }}" for name, color in STATUS_COLORS.items())
+    + """
 .gap { font-weight: 600; }
 .gap-zero { color: #1a7f37; } .gap-nonzero { color: #cf222e; }
 .empty { color: var(--muted); font-style: italic; }
 """
+)
 
 
 def _e(value: Any) -> str:
     return html.escape("" if value is None else str(value))
+
+
+def _state_class(status: Any) -> str:
+    """The `s-{status}` class for a status, refusing one with no color.
+
+    C14 was exactly the absence of this check: a status could reach the
+    template and render with no stylesheet rule at all, silently
+    indistinguishable from HEALTHY. Raising here is the fail-loud posture
+    every producer in this repo takes — a console page that errors is a
+    worse-looking but more honest outcome than one that quietly mis-colors
+    an unmeasured row as green.
+    """
+    if status not in STATUS_COLORS:
+        raise KeyError(
+            f"status {status!r} has no entry in STATUS_COLORS, so it has no "
+            "stylesheet rule — register a color for it before it can render "
+            "(alpha-engine-config-I9757, C14)."
+        )
+    return f"s-{_e(status)}"
 
 
 def render_html(page: ConsolePage) -> str:
@@ -246,7 +372,7 @@ def render_html(page: ConsolePage) -> str:
         parts.append(
             "<tr>"
             f"<td><code>{_e(row['component'])}</code></td>"
-            f'<td class="state s-{_e(row["state"])}">{_e(row["state"])}</td>'
+            f'<td class="state {_state_class(row["state"])}">{_e(row["state"])}</td>'
             f"<td>{_e(row['schedule'])}</td>"
             f"<td>{_e(row['deadline'])}</td>"
             f"<td><code>{_e(row['absence_watched_by'])}</code></td>"
@@ -268,7 +394,7 @@ def render_html(page: ConsolePage) -> str:
                 "<tr>"
                 f"<td><code>{_e(row.get('name'))}</code></td>"
                 f"<td>{_e(row.get('value'))} {_e(row.get('unit'))}</td>"
-                f'<td class="state s-{_e(row.get("status"))}">{_e(row.get("status"))}</td>'
+                f'<td class="state {_state_class(row.get("status"))}">{_e(row.get("status"))}</td>'
                 f'<td class="reason">{_e(row.get("status_reason"))}</td>'
                 "</tr>"
             )
@@ -309,7 +435,7 @@ def render_html(page: ConsolePage) -> str:
             state = "HEALTHY" if dep.get("status") == "ok" else "FAILED"
             parts.append(
                 f"<tr><td>{_e(dep.get('trading_day'))}</td>"
-                f'<td class="state s-{state}">{_e(dep.get("status"))}</td>'
+                f'<td class="state {_state_class(state)}">{_e(dep.get("status"))}</td>'
                 f"<td><code>{_e(str(dep.get('release_sha'))[:12])}</code></td>"
                 f'<td class="reason">{_e(dep.get("reason"))}</td></tr>'
             )
