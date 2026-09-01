@@ -1,0 +1,24 @@
+# LLM_CALLSITE_REGISTRY — every v2 LLM call site, by id.
+#
+# Normative source: plan §4.8. Every call site the crucible package can reach
+# a model through has a row here, and `tests/test_llm_callsites.py` proves the
+# coverage by ENUMERATING call sites out of the AST — not by reading this file
+# and trusting it. A registry checked against itself measures nothing.
+#
+# EMPTY IS THE CORRECT STATE TODAY, and it is a measured one rather than an
+# unwritten one: phase 1 carries zero LLM arms (the LLM research arms enter in
+# phase 5), and `crucible.llm.audit_call_sites` walks the package on every CI
+# run and fails the moment a call site exists without a row. An empty registry
+# beside a passing enumerator is evidence of no call sites; an empty registry
+# beside no enumerator would be evidence of nothing.
+#
+# Each row:
+#   purpose            what this call site asks a model for, in one sentence.
+#   capability_class   the router GROUP or capability class asked for —
+#                      never a provider model id, a base url or an SDK client
+#                      (principle 8). `crucible.llm.call` refuses anything
+#                      that looks like a vendor model id.
+#   max_usd_per_call   this site's own ceiling, under the per-run cap.
+#   owner              the module that holds the call.
+schema_version: llm_callsite_registry.v1
+callsites: {}

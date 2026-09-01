@@ -31,7 +31,7 @@ import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from crucible import __version__, track_c  # track-C
+from crucible import __version__, track_c, track_e  # track-C, track-E
 from crucible.calendar import resolve_trading_day
 from crucible.track_a import HANDLERS as TRACK_A_HANDLERS
 from crucible.track_a import add_track_a_arguments
@@ -241,11 +241,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     ),
     # track-B
     "promote": _promote,
-    "report": _todo(
-        "report",
-        "track A",
-        "Five MetricRecord rows: data, signal IC, prediction IC, portfolio alpha, execution.",
-    ),
+    "report": track_e.report_handler,
     "explain": _todo(
         "explain",
         "track A",
