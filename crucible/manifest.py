@@ -86,8 +86,7 @@ def validate(manifest: dict[str, Any]) -> None:
     if not errors:
         return
     detail = "\n".join(
-        f"  - {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}"
-        for e in errors
+        f"  - {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors
     )
     raise ManifestValidationError(
         f"run manifest does not conform to {RUN_MANIFEST_SCHEMA_VERSION}:\n{detail}"
