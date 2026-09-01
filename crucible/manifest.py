@@ -121,10 +121,19 @@ def manifest_key(job: str, trading_day: str) -> str:
     return f"runs/{job}/{trading_day}/run.json"
 
 
-def read_manifest(*args: Any, **kwargs: Any) -> dict[str, Any]:
-    """Read and validate one manifest from a store. Track A."""
-    raise NotImplementedError(
-        "read_manifest is track A's (alpha-engine-config-I9757). It validates on "
-        "read as well as on write — a manifest written by an older release is "
-        "still refused if it does not conform."
-    )
+def read_manifest(store: Any, job: str, trading_day: str) -> dict[str, Any]:
+    """Read and validate one manifest from ``store``.
+
+    Validated on READ as well as on write. A manifest written by an older
+    release is still refused if it does not conform: a consumer that read a
+    document it could not check would be reasoning from a shape nobody
+    guarantees, which is the whole thing the schema exists to prevent.
+
+    Raises :class:`KeyError` when the manifest is absent — never returns
+    ``None``, because absence is one of the two page conditions (§4.6) and a
+    caller that cannot tell "absent" from "empty" cannot raise it.
+    """
+    payload = store.get_bytes(manifest_key(job, trading_day))
+    document = json.loads(payload.decode("utf-8"))
+    validate(document)
+    return document

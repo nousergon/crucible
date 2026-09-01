@@ -20,6 +20,28 @@ from crucible.cli import HANDLERS, JOBS, build_parser, is_stub, main, resolve_da
 
 FRIDAY = dt.date(2026, 8, 28)
 
+#: The jobs still carrying a `_todo` placeholder, DERIVED from the dispatch
+#: table via `cli.is_stub` rather than listed here. A hand-written list would
+#: be written from the jobs someone remembered, and would go stale silently
+#: the first time a track landed one.
+UNIMPLEMENTED = sorted(job for job in JOBS if is_stub(HANDLERS[job]))
+
+
+def _minimal_argv(job: str) -> list[str]:
+    """The fewest arguments that make ``job`` parse."""
+    argv = [job]
+    if job in ("experiment.run", "experiment.grade", "promote", "experiment.new"):
+        argv += ["--slot", "r"]
+    if job in ("experiment.run", "experiment.new"):
+        argv += ["--arm", "arm_abc"]
+    if job == "explain":
+        argv += ["01JG0000000000000000000000"]
+    if job == "release.pin":
+        argv += ["a" * 40]
+    if job == "data.heal":
+        argv += ["--gap", "missing-panel", "--from", "2026-08-24", "--to", "2026-08-28"]
+    return argv
+
 
 class TestJobSurface:
     def test_the_thirteen_jobs_of_the_plan_are_registered(self) -> None:
@@ -40,19 +62,7 @@ class TestJobSurface:
 
     @pytest.mark.parametrize("job", sorted(JOBS))
     def test_every_job_parses(self, job: str) -> None:
-        parser = build_parser()
-        argv = [job]
-        if job in ("experiment.run", "experiment.grade", "promote", "experiment.new"):
-            argv += ["--slot", "r"]
-        if job in ("experiment.run", "experiment.new"):
-            argv += ["--arm", "arm_abc"]
-        if job == "explain":
-            argv += ["01JG0000000000000000000000"]
-        if job == "release.pin":
-            argv += ["a" * 40]
-        if job == "data.heal":
-            argv += ["--gap", "2026-08-28"]
-        assert parser.parse_args(argv).job == job
+        assert build_parser().parse_args(_minimal_argv(job)).job == job
 
     def test_an_unknown_job_exits_rather_than_defaulting(self) -> None:
         with pytest.raises(SystemExit):
@@ -69,7 +79,7 @@ class TestJobSurface:
         in JOBS with no handler at all would silently drop out of both."""
         assert set(HANDLERS) == set(JOBS)
 
-    @pytest.mark.parametrize("job", sorted(j for j in JOBS if is_stub(HANDLERS[j])))
+    @pytest.mark.parametrize("job", UNIMPLEMENTED)
     def test_an_unimplemented_job_raises_and_never_returns_zero(self, job: str) -> None:
         """A stub that exits 0 is indistinguishable from a job that ran and
         had nothing to do — the exact shape §11 says agent-built systems
@@ -77,20 +87,22 @@ class TestJobSurface:
 
         The parametrisation reads `is_stub` off the handler, so a track
         landing an implementation flips this by IMPLEMENTING, with no
-        exclusion list for anyone to remember to edit."""
-        argv = [job]
-        if job in ("experiment.run", "experiment.grade", "promote", "experiment.new"):
-            argv += ["--slot", "r"]
-        if job in ("experiment.run", "experiment.new"):
-            argv += ["--arm", "arm_abc"]
-        if job == "explain":
-            argv += ["01JG0000000000000000000000"]
-        if job == "release.pin":
-            argv += ["a" * 40]
-        if job == "data.heal":
-            argv += ["--gap", "2026-08-28"]
+        exclusion list for anyone to remember to edit.
+        """
         with pytest.raises(NotImplementedError, match="I9757"):
-            main(argv)
+            main(_minimal_argv(job))
+
+    def test_the_stub_set_shrinks_rather_than_being_declared(self) -> None:
+        """The other half of the derivation: an implemented job is NOT here.
+
+        Without this, `UNIMPLEMENTED` going empty would silently turn the
+        test above into zero assertions — a parametrized test over an empty
+        list passes, reports nothing, and looks exactly like a green gate.
+        """
+        assert set(UNIMPLEMENTED) <= set(JOBS)
+        assert set(UNIMPLEMENTED).isdisjoint(
+            {"data.daily", "data.weekly", "data.heal", "experiment.run", "explain"}
+        ), "track A landed these; they are no longer stubs"
 
 
 class TestDateResolution:

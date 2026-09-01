@@ -1,0 +1,210 @@
+"""`crucible data.daily` — compile one trading day's inputs.
+
+Normative source: plan §4.3, §9.7, §4.12.
+
+One job, three writes and one refusal:
+
+* ``data/{trading_day}/panel.parquet`` — the day's compiled price panel,
+  covering the trailing window the feature layer needs, not just the day;
+* ``data/{trading_day}/coverage.json`` — what was read, from which source,
+  under which snapshot, with the per-gate coverage figures;
+* ``features/{version}/{trading_day}.parquet`` plus its registry — the
+  materialized feature layer (§10.4), because R and M recomputing features
+  from different code is exactly what makes "the signal degraded"
+  inseparable from "the feature changed".
+
+The refusal: **a missing source is `status: failed`, never a zero-fill.**
+That is not a policy this module states, it is the only behaviour available
+to it — `PriceSource` raises, and `crucible.runner.run_job` writes the
+failed manifest and re-raises. There is no branch here that could write a
+partial panel and return.
+
+Coverage is a MetricRecord with a declared baseline, not a log line: §9.2
+class 5, so `report` reduces it and the console renders it. A day whose
+coverage falls below the floor FAILS — a panel covering a third of the
+universe is a well-formed artifact containing nothing, and every gate
+downstream passes on it.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+from typing import TYPE_CHECKING, Any
+
+from crucible.calendar import assert_trading_day
+from crucible.data.sources import MissingSourceError, PriceSource
+from crucible.features import DEFAULT_FEATURE_VERSION, build_features, registry_payload
+from crucible.keys import (
+    coverage_key,
+    data_panel_key,
+    feature_registry_key,
+    features_key,
+)
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    import pandas as pd
+
+    from crucible.runner import RunContext
+
+__all__ = [
+    "COVERAGE_FLOOR_RATIO",
+    "DEFAULT_LOOKBACK_DAYS",
+    "CoverageError",
+    "run_daily",
+    "write_panel",
+]
+
+#: The trailing window the feature layer needs. 400 calendar days is a little
+#: over 252 sessions plus slack: the longest feature horizon is 252 trading
+#: days, and a window that only just covers it produces a first row of NaN on
+#: every holiday-heavy year.
+DEFAULT_LOOKBACK_DAYS = 400
+
+#: A day covering less of the expected universe than this FAILS. Not a
+#: warning: 901 of 903 tickers silently failing a gate for months is the bug
+#: class this floor exists to make loud, and a threshold nothing enforces is
+#: a number on a dashboard.
+COVERAGE_FLOOR_RATIO = 0.90
+
+
+class CoverageError(RuntimeError):
+    """The panel was readable but too thin to compute on."""
+
+
+def write_panel(ctx: RunContext, panel: pd.DataFrame, key: str) -> bytes:
+    """Serialize ``panel`` to parquet, write it, and record it as an output."""
+    import io
+
+    buffer = io.BytesIO()
+    # `index=False` and a fixed compression so the same panel serializes to
+    # the same bytes: the replay gate asserts a rerun reproduces the verdict,
+    # and a content hash that moved because pyarrow chose a different codec
+    # would make every replay diff unattributable.
+    panel.to_parquet(buffer, index=False, compression="snappy")
+    payload = buffer.getvalue()
+    ctx.record_output(key, payload, schema_version="panel.v1")
+    return payload
+
+
+def run_daily(
+    ctx: RunContext,
+    *,
+    source: PriceSource,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    expected_symbols: list[str] | None = None,
+    feature_version: str = DEFAULT_FEATURE_VERSION,
+    coverage_floor: float = COVERAGE_FLOOR_RATIO,
+) -> dict[str, Any]:
+    """Compile the day. Called through `crucible.runner.run_job`, never directly.
+
+    ``expected_symbols`` is the denominator of the coverage ratio. When it is
+    absent the ratio has no denominator, and the run says so in the metric's
+    `status_reason` rather than reporting 1.0 — a coverage of 100% computed
+    over whatever arrived is the shape that renders an outage as green.
+    """
+    trading_day = ctx.trading_day
+    assert_trading_day(trading_day, context=f"data.daily --date {trading_day}")
+
+    panel = source.load_panel(
+        end=trading_day,
+        lookback_days=lookback_days,
+        symbols=expected_symbols,
+    )
+
+    day_rows = panel[panel["trading_day"] == trading_day]
+    if day_rows.empty:
+        raise MissingSourceError(
+            f"source {source.name!r} returned a panel with NO rows for {trading_day} "
+            f"itself (it carried {len(panel)} rows over the trailing window). The day "
+            "is an NYSE session, so an absent close is an outage or an unsettled "
+            "feed — not an empty market, and not something to carry forward."
+        )
+
+    observed = sorted(str(t) for t in day_rows["ticker"].unique())
+    if expected_symbols is None:
+        coverage_ratio: float | None = None
+        coverage_reason = (
+            f"{len(observed)} tickers closed on {trading_day}; no expected-symbol set "
+            "was supplied, so there is no denominator and no ratio is reported. A "
+            "ratio computed over whatever arrived would always read 1.0."
+        )
+    else:
+        expected = sorted(set(expected_symbols))
+        coverage_ratio = len(observed) / len(expected) if expected else 0.0
+        absent = sorted(set(expected) - set(observed))
+        coverage_reason = (
+            f"{len(observed)} of {len(expected)} expected tickers closed on "
+            f"{trading_day}"
+            + (f"; absent: {absent[:20]}{'…' if len(absent) > 20 else ''}" if absent else "")
+        )
+        if absent:
+            ctx.record_rejected("no close on the trading day", len(absent))
+
+    ctx.record_rows(rows_in=int(len(panel)), rows_out=int(len(panel)))
+    ctx.record_metric(
+        {
+            "name": "universe_coverage_ratio",
+            "module": "crucible.data.daily",
+            "metric_type": "coverage",
+            "value": coverage_ratio,
+            "unit": "ratio" if coverage_ratio is not None else None,
+            "n_floor": 1,
+            "status": (
+                "OK" if coverage_ratio is None or coverage_ratio >= coverage_floor else "FAIL"
+            ),
+            "status_reason": coverage_reason,
+            "source_path": coverage_key(trading_day.isoformat()),
+            "last_updated_utc": _utc_now(),
+            "baseline": coverage_floor,
+        }
+    )
+
+    if coverage_ratio is not None and coverage_ratio < coverage_floor:
+        raise CoverageError(
+            f"universe coverage {coverage_ratio:.3f} is below the floor {coverage_floor:.2f} "
+            f"on {trading_day}: {coverage_reason}. A thin panel is a FAILED day, not a "
+            "degraded one — every downstream gate passes on a well-formed artifact "
+            "containing a third of the market."
+        )
+
+    panel_key = data_panel_key(trading_day.isoformat())
+    write_panel(ctx, panel, panel_key)
+
+    features, registry = build_features(panel, version=feature_version)
+    feature_key = features_key(feature_version, trading_day.isoformat())
+    write_panel(ctx, features, feature_key)
+
+    registry_key = feature_registry_key(feature_version)
+    ctx.record_output(
+        registry_key,
+        json.dumps(registry_payload(registry), indent=2, sort_keys=True).encode("utf-8"),
+        schema_version="feature_registry.v1",
+    )
+
+    coverage = {
+        "schema_version": "coverage.v1",
+        "trading_day": trading_day.isoformat(),
+        "source": source.name,
+        "data_snapshot_id": source.snapshot_id(),
+        "lookback_days": lookback_days,
+        "rows_total": int(len(panel)),
+        "rows_on_day": int(len(day_rows)),
+        "tickers_on_day": observed,
+        "expected_tickers": sorted(set(expected_symbols)) if expected_symbols else None,
+        "coverage_ratio": coverage_ratio,
+        "coverage_floor": coverage_floor,
+        "panel_key": panel_key,
+        "features_key": feature_key,
+        "feature_version": feature_version,
+    }
+    ctx.record_output(
+        coverage_key(trading_day.isoformat()),
+        json.dumps(coverage, indent=2, sort_keys=True).encode("utf-8"),
+        schema_version="coverage.v1",
+    )
+    return coverage
+
+
+def _utc_now() -> str:
+    return dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
