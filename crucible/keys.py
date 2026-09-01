@@ -26,6 +26,7 @@ __all__ = [
     "arm_id_from_segment",
     "arm_key_segment",
     "arm_register_key",
+    "arm_series_key",
     "champion_key",
     "coverage_key",
     "data_panel_key",
@@ -117,6 +118,17 @@ def shadow_key(arm_id: str, trading_day: str) -> str:
 def verdict_key(arm_id: str, trading_day: str) -> str:
     """What that selection turned out to be worth, once the horizon settled."""
     return f"experiments/{arm_key_segment(arm_id)}/{trading_day}/verdict.json"
+
+
+def arm_series_key(slot: str, arm_id: str) -> str:
+    """One arm's per-date score series, as produced by `experiment.grade`.
+
+    The scores are already expressed against the SLOT's benchmark: the arena
+    never applies a benchmark, because the correct one is a per-slot fact
+    (policy §4). A series written against the wrong benchmark is therefore
+    caught at the grader, not here.
+    """
+    return f"scores/{slot}/{arm_key_segment(arm_id)}/series.json"
 
 
 def arena_cycle_key(slot: str, trading_day: str) -> str:
