@@ -943,7 +943,13 @@ class TestArmSeriesKeyUsesTheSharedSeparator:
         `experiments/` ones intact, because all three keys are asserted against the same
         segment here.
         """
-        from crucible.keys import arm_id_from_segment, arm_key_segment, arm_series_key, shadow_key, verdict_key
+        from crucible.keys import (
+            arm_id_from_segment,
+            arm_key_segment,
+            arm_series_key,
+            shadow_key,
+            verdict_key,
+        )
 
         arm_id = "m:momentum_sleeve:ab12cd"
         segment = arm_key_segment(arm_id)
