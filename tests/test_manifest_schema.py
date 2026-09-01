@@ -1,0 +1,260 @@
+"""Contract test for `crucible/schemas/run_manifest.v1.json`.
+
+Written before the schema (fleet TDD rule) and seen failing.
+
+The manifest schema is not documentation — it is the *enforcement surface*
+for the plan's hardest guarantee (§4.2): "A run either writes a complete
+run.json with `status: ok` or it is FAILED and pages. The manifest schema
+forbids the third state." Every assertion below tests that the schema
+refuses something, because a schema that only accepts valid documents has
+not been shown to constrain anything.
+"""
+
+from __future__ import annotations
+
+import copy
+
+import pytest
+from jsonschema import Draft202012Validator, ValidationError
+
+from crucible.manifest import RUN_MANIFEST_SCHEMA_VERSION, load_schema
+
+# Every state the v1 system produced that v2 excludes BY SCHEMA, not by
+# policy: the audit's `cycle_verdict: "unknown"` (I9729) and the 32-of-33
+# no-op skip flags (I9721). `degraded` is the "degraded-SUCCEEDED" shape §2
+# names outright.
+FORBIDDEN_STATUSES = ("partial", "skipped", "unknown", "degraded", "success", "OK", "")
+
+# §4.12: a horizon expressed in a calendar unit fails schema validation.
+CALENDAR_UNIT_HORIZONS = ("1 month", "3mo", "1y", "30d_calendar", "quarter")
+
+
+def _valid_manifest() -> dict:
+    """The minimum a job must write. Kept deliberately close to the floor:
+    a fixture carrying every optional field would not prove the required
+    ones are required."""
+    return {
+        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "run_id": "01JG0000000000000000000000",
+        "job": "experiment.run",
+        "trading_day": "2026-08-28",
+        "calendar_date": "2026-08-29",
+        "status": "ok",
+        "reason": "",
+        "started": "2026-08-29T13:00:00Z",
+        "finished": "2026-08-29T13:04:11Z",
+        "code_sha": "0" * 40,
+        "release_sha": "1" * 40,
+        "seed": 20260828,
+        "inputs": [
+            {
+                "key": "features/v3/2026-08-28.parquet",
+                "sha256": "a" * 64,
+                "schema_version": "v3",
+            }
+        ],
+        "outputs": [
+            {
+                "key": "signals/2026-08-28/signals.json",
+                "sha256": "b" * 64,
+                "schema_version": "v1",
+            }
+        ],
+        "rows_in": 903,
+        "rows_out": 40,
+        "rows_rejected": [{"reason": "no_price_history", "count": 3}],
+        "cost_usd": 0.41,
+        "llm_calls": [
+            {
+                "callsite_id": "research.rank.v1",
+                "model_requested": "tier:high",
+                "model_served": "glm-4.6",
+                "tokens_in": 12000,
+                "tokens_out": 900,
+                "cache_read": 11000,
+                "cache_write": 0,
+                "usd": 0.41,
+            }
+        ],
+        "resource": {
+            "instance_type": "c7i.xlarge",
+            "spot": True,
+            "escalated_to_on_demand": False,
+            "interruptions": 0,
+            "mem_peak_mb": 2100,
+            "disk_free_mb": 41000,
+        },
+        "metrics": [
+            {
+                "name": "signal_ic_21d",
+                "module": "research",
+                "metric_type": "ic",
+                "value": 0.031,
+                "unit": "ratio",
+                "n_floor": 60,
+                "status": "PASS",
+                "status_reason": "Rank IC over 903 paired names, 21 trading-day horizon.",
+                "source_path": "s3://crucible/signals/2026-08-28/signals.json",
+                "last_updated_utc": "2026-08-29T13:04:11Z",
+                "horizon_trading_days": 21,
+            }
+        ],
+        "attempts": [{"n": 1, "reason": "initial"}],
+    }
+
+
+@pytest.fixture(scope="module")
+def validator() -> Draft202012Validator:
+    schema = load_schema()
+    Draft202012Validator.check_schema(schema)
+    return Draft202012Validator(schema)
+
+
+def test_a_complete_manifest_validates(validator: Draft202012Validator) -> None:
+    validator.validate(_valid_manifest())
+
+
+def test_schema_is_closed(validator: Draft202012Validator) -> None:
+    """additionalProperties: false, at the top level and inside every object.
+
+    An open schema silently accepts `skip_reason: "no new data"` — the exact
+    field the plan exists to make unrepresentable."""
+    doc = _valid_manifest()
+    doc["skip_reason"] = "no new data"
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+
+@pytest.mark.parametrize("bad_status", FORBIDDEN_STATUSES)
+def test_only_ok_and_failed_are_representable(
+    validator: Draft202012Validator, bad_status: str
+) -> None:
+    doc = _valid_manifest()
+    doc["status"] = bad_status
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+
+def test_failed_requires_a_non_empty_reason(validator: Draft202012Validator) -> None:
+    """`reason` is mandatory on failure. A failed run with an empty reason is
+    the shape that made three Saturdays' failures indistinguishable."""
+    doc = _valid_manifest()
+    doc["status"] = "failed"
+    doc["reason"] = ""
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+    doc["reason"] = "SpotInterruption: instance reclaimed at 13:02Z"
+    validator.validate(doc)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "schema_version",
+        "run_id",
+        "job",
+        "trading_day",
+        "calendar_date",
+        "status",
+        "reason",
+        "started",
+        "finished",
+        "code_sha",
+        "inputs",
+        "outputs",
+        "cost_usd",
+        "llm_calls",
+        "resource",
+        "metrics",
+        "attempts",
+    ],
+)
+def test_every_required_field_is_required(validator: Draft202012Validator, field: str) -> None:
+    doc = _valid_manifest()
+    del doc[field]
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+
+def test_trading_day_and_calendar_date_are_separate_typed_fields(
+    validator: Draft202012Validator,
+) -> None:
+    """§4.12: the key is the trading day; `calendar_date` is provenance.
+
+    They are separate fields precisely so a Saturday run keyed to Friday is
+    representable and legible."""
+    doc = _valid_manifest()
+    assert doc["trading_day"] != doc["calendar_date"]
+    validator.validate(doc)
+
+    doc["trading_day"] = "2026/08/28"
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+
+@pytest.mark.parametrize("horizon", CALENDAR_UNIT_HORIZONS)
+def test_a_calendar_unit_horizon_fails_validation(
+    validator: Draft202012Validator, horizon: str
+) -> None:
+    """§4.12: "a horizon expressed as a calendar unit fails schema
+    validation". The horizon is an integer count of TRADING days; there is no
+    string form for it to smuggle a month into."""
+    doc = _valid_manifest()
+    doc["metrics"][0]["horizon_trading_days"] = horizon
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+
+def test_llm_call_records_the_model_actually_served(validator: Draft202012Validator) -> None:
+    """§9.2 class 2: requested AND served, because a routed call that
+    silently served a different model is the failure this field exists for."""
+    doc = _valid_manifest()
+    del doc["llm_calls"][0]["model_served"]
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+
+def test_rejected_rows_carry_a_reason(validator: Draft202012Validator) -> None:
+    """§9.2 class 4: rows rejected WITH REASON. A bare count cannot be acted
+    on, and a rejected-row count with no reason is how 901 of 903 tickers
+    failed a liquidity gate for months."""
+    doc = _valid_manifest()
+    doc["rows_rejected"] = [{"count": 3}]
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+
+def test_resource_class_records_spot_escalation(validator: Draft202012Validator) -> None:
+    """§9.2 class 3 / I5727: spot-to-on-demand fallback is a COUNTABLE
+    metric, so it is a required boolean, not an optional annotation."""
+    doc = _valid_manifest()
+    del doc["resource"]["escalated_to_on_demand"]
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+
+def test_attempts_records_the_declared_transient_retry(
+    validator: Draft202012Validator,
+) -> None:
+    """§11 risk 2: a retried run carries BOTH attempts in the manifest, so a
+    silent retry cannot look like a clean first-attempt run."""
+    doc = _valid_manifest()
+    doc["attempts"] = [
+        {"n": 1, "reason": "spot_interruption"},
+        {"n": 2, "reason": "initial"},
+    ]
+    validator.validate(doc)
+
+    doc["attempts"] = []
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+
+def test_the_valid_fixture_is_not_mutated_between_tests() -> None:
+    """Guards the parametrized tests above: they all mutate a fresh copy."""
+    a = _valid_manifest()
+    b = _valid_manifest()
+    a["status"] = "failed"
+    assert b["status"] == "ok"
+    assert b == copy.deepcopy(_valid_manifest())
