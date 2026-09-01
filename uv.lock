@@ -137,6 +137,7 @@ name = "crucible"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "boto3" },
     { name = "jsonschema" },
     { name = "krepis" },
     { name = "nousergon-lib" },
@@ -159,6 +160,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "boto3", specifier = ">=1.35" },
     { name = "jsonschema", specifier = ">=4.23" },
     { name = "krepis", specifier = "==0.59.44" },
     { name = "nousergon-lib", specifier = "==0.124.106" },

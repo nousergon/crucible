@@ -134,3 +134,151 @@ def strategy_dir(tmp_path):
         body.append(f"notes: fixture recipe for {name}")
         (arms / f"{name}.yaml").write_text("\n".join(body) + "\n", encoding="utf-8")
     return root
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Track C fixtures (alpha-engine-config-I9757): a capturing alert transport
+# and a fake S3.
+#
+# Both are real implementations of the contracts they stand in for, not mocks
+# that agree with whatever the caller does. A test double that cannot fail the
+# way the real thing fails proves nothing — the audit's central finding was a
+# grading loop that ran for months while measuring nothing.
+# ──────────────────────────────────────────────────────────────────────────
+
+from dataclasses import dataclass, field  # noqa: E402
+from typing import Any  # noqa: E402
+
+
+@dataclass
+class CapturedPublish:
+    """One call to the transport, recorded verbatim."""
+
+    message: str
+    kwargs: dict[str, Any]
+
+
+@dataclass
+class CapturingTransport:
+    """Stands in for `krepis.alerts.publish` and counts what was delivered.
+
+    §10.7 requires each scripted fault to produce *exactly one* page, so the
+    count has to be observable. It also honours `dedup_key` the way krepis
+    does — same key, one delivery — because a transport that delivered twice
+    for one key would make the fault-injection assertions pass for the wrong
+    reason.
+    """
+
+    calls: list[CapturedPublish] = field(default_factory=list)
+    seen: set[str] = field(default_factory=set)
+    fail: bool = False
+
+    def __call__(self, message: str, **kwargs: Any) -> Any:
+        if self.fail:
+            raise RuntimeError("transport unreachable")
+        key = kwargs.get("dedup_key")
+        if key is not None and key in self.seen:
+            return _Result(any_ok=True, destination="deduped")
+        if key is not None:
+            self.seen.add(key)
+        self.calls.append(CapturedPublish(message, kwargs))
+        return _Result(any_ok=True, destination="operator_chat")
+
+    @property
+    def pages(self) -> int:
+        return len(self.calls)
+
+
+@dataclass
+class _Result:
+    any_ok: bool
+    destination: str
+
+
+@pytest.fixture
+def transport() -> CapturingTransport:
+    return CapturingTransport()
+
+
+class FakeS3:
+    """An in-memory S3 with the three behaviours the store depends on.
+
+    Pagination, the absent/unreadable distinction, and conditional PUT — the
+    three things :class:`crucible.store.S3Store` exists to get right. A fake
+    without them would let the store's pagination bug through, which is the
+    `--limit N` class that once made a published report 7 of 9 false.
+    """
+
+    def __init__(self, page_size: int = 2) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.page_size = page_size
+        self.denied: set[str] = set()
+
+    # -- the boto3 surface the store uses -------------------------------
+    def put_object(self, **kw: Any) -> dict[str, Any]:
+        key, body = kw["Key"], kw["Body"]
+        if "IfNoneMatch" in kw and key in self.objects:
+            raise self._client_error("PreconditionFailed")
+        if "IfMatch" in kw and self._etag(key) != kw["IfMatch"]:
+            raise self._client_error("PreconditionFailed")
+        self.objects[key] = body
+        return {"ETag": f'"{self._etag(key)}"'}
+
+    def get_object(self, **kw: Any) -> dict[str, Any]:
+        key = kw["Key"]
+        self._guard(key)
+        if key not in self.objects:
+            raise self._client_error("NoSuchKey")
+        return {"Body": _Body(self.objects[key])}
+
+    def head_object(self, **kw: Any) -> dict[str, Any]:
+        key = kw["Key"]
+        self._guard(key)
+        if key not in self.objects:
+            raise self._client_error("404")
+        return {"ETag": f'"{self._etag(key)}"'}
+
+    def get_paginator(self, name: str) -> Any:
+        assert name == "list_objects_v2"
+        return _Paginator(self)
+
+    # -- helpers --------------------------------------------------------
+    def _guard(self, key: str) -> None:
+        if key in self.denied:
+            raise self._client_error("AccessDenied")
+
+    def _etag(self, key: str) -> str:
+        import hashlib
+
+        return hashlib.md5(self.objects.get(key, b""), usedforsecurity=False).hexdigest()
+
+    @staticmethod
+    def _client_error(code: str) -> Exception:
+        from botocore.exceptions import ClientError
+
+        return ClientError({"Error": {"Code": code}}, "op")
+
+
+class _Body:
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    def read(self) -> bytes:
+        return self._payload
+
+
+class _Paginator:
+    def __init__(self, fake: FakeS3) -> None:
+        self.fake = fake
+
+    def paginate(self, **kw: Any) -> Any:
+        prefix = kw.get("Prefix") or ""
+        keys = sorted(k for k in self.fake.objects if k.startswith(prefix))
+        size = self.fake.page_size
+        for i in range(0, len(keys), size) or [0]:
+            yield {"Contents": [{"Key": k} for k in keys[i : i + size]]}
+
+
+@pytest.fixture
+def fake_s3() -> FakeS3:
+    return FakeS3()

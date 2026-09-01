@@ -134,3 +134,102 @@ class TestVocabulary:
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
         enum = set(schema["properties"]["job"]["enum"])
         assert enum - set(components["components"]) == {"deploy"}
+
+
+class TestDeadlinesAreMachineReadable:
+    """§4.6 reads the deadline table; a prose deadline needs its parse written
+    twice, and a contract restated twice has already drifted."""
+
+    def test_every_deadline_is_structured_not_prose(self, components: dict) -> None:
+        for name, row in components["components"].items():
+            if row["deadline"] is None:
+                continue
+            assert isinstance(row["deadline"], dict), (
+                f"{name}'s deadline is {row['deadline']!r}. A deadline the alerter has "
+                "to parse out of English is a second declaration of the same contract."
+            )
+
+    def test_every_anchor_is_in_the_closed_set(self, components: dict) -> None:
+        from crucible.components import ANCHORS
+
+        for name, row in components["components"].items():
+            if row["deadline"]:
+                assert row["deadline"]["anchor"] in ANCHORS, name
+
+    def test_the_sentence_is_rendered_from_the_structure(self) -> None:
+        """Not stored beside it. The prose is a projection of the data, so
+        the two cannot disagree."""
+        import datetime as dt
+
+        from crucible.components import load_registry
+
+        deadline = load_registry()["data.daily"].deadline
+        assert deadline is not None
+        assert deadline.describe(dt.date(2026, 8, 28)) == (
+            "3h after the close of trading day 2026-08-28"
+        )
+
+    def test_a_deadline_resolves_against_the_trading_calendar(self) -> None:
+        """A Monday holiday moves the deadline rather than producing a page
+        that has to be dismissed."""
+        import datetime as dt
+
+        from crucible.calendar import NonTradingDayKeyError
+        from crucible.components import load_registry
+
+        deadline = load_registry()["data.daily"].deadline
+        assert deadline is not None
+        due = deadline.due_at(dt.date(2026, 8, 28))
+        assert due == dt.datetime(2026, 8, 28, 23, 0, tzinfo=dt.UTC)  # 19:00 ET
+        with pytest.raises(NonTradingDayKeyError):
+            deadline.due_at(dt.date(2026, 8, 29))  # a Saturday
+
+
+class TestNothingWatchesItself:
+    """Detection blindness outranks the defects it hides."""
+
+    def test_no_component_is_its_own_absence_watcher(self, components: dict) -> None:
+        for name, row in components["components"].items():
+            assert row.get("absence_watched_by", "alerts.sweep") != name, (
+                f"{name} declares itself its own absence watcher. A component that "
+                "never ran cannot report itself missing, so the row would be unwatched "
+                "while reading as covered."
+            )
+
+    def test_every_machine_watcher_is_a_real_component(self, components: dict) -> None:
+        """A watcher naming a job that does not exist is a row watched by
+        nothing, indistinguishable from one that is watched."""
+        for name, row in components["components"].items():
+            watcher = row.get("absence_watched_by", "alerts.sweep")
+            assert watcher == "operator" or watcher in components["components"], (
+                f"{name} is watched by {watcher!r}, which is neither `operator` nor a "
+                "registered component."
+            )
+
+    def test_exactly_one_row_is_watched_by_a_human_and_it_is_the_heartbeat(
+        self, components: dict
+    ) -> None:
+        """Naming it is what keeps it from being mistaken for coverage that
+        does not exist. A second human-watched row is a gap that has been
+        declared rather than closed."""
+        human = {
+            name
+            for name, row in components["components"].items()
+            if row.get("absence_watched_by") == "operator"
+        }
+        assert human == {"heartbeat"}
+
+
+class TestSignalClassesAreDeclaredForEveryRow:
+    def test_the_five_classes_survive_the_track_c_additions(self, components: dict) -> None:
+        for name in ("alerts.sweep", "heartbeat", "drift", "console"):
+            assert set(components["components"][name]["signals"]) == SIGNAL_CLASSES, name
+
+    def test_the_registry_parses_into_typed_rows(self) -> None:
+        """The loader is the only reader, so a row the loader refuses is a
+        row that never reaches the alerter."""
+        from crucible.components import load_registry
+
+        registry = load_registry()
+        assert set(registry) == set(JOBS)
+        assert all(c.lifecycle == "ACTIVE" for c in registry.values())

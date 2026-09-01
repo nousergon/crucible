@@ -1,0 +1,209 @@
+name: Deploy
+
+# Plan §4.11 — one artifact, one pointer, one verified flip.
+#
+#   uv build  ->  s3://…/releases/{sha}/{wheel, release.json}
+#             ->  crucible smoke --release {sha}   (a REAL run, live S3 reads)
+#             ->  status: ok  ->  releases/current repointed by conditional PUT
+#                 anything else -> pointer untouched, this workflow FAILS
+#
+# Nothing is installed anywhere by this workflow. A job pulls `releases/current`
+# at start, so there is no box to SSH into, no `git pull` on boot, and none of
+# the fix-boot-pull-netrc bug class. Rollback is `crucible release.pin <sha>`:
+# a pointer move, ~2s, no rebuild.
+#
+# Automated ON merge, from code committed in this repository
+# (pull-request-policy §4.2 form 1). There is deliberately no "run this after
+# merging" step anywhere in a crucible PR body: hitting merge is Brian's LAST
+# action.
+#
+# ── Why the role check is a job of its own ────────────────────────────────
+# Until the v2 CloudFormation stack is applied, the deploy role does not exist.
+# The failure mode being designed out is NOT "the workflow errors" — it is the
+# workflow quietly falling back to the research role
+# (github-actions-lambda-deploy), which exists and has write access to a
+# DIFFERENT bucket. Measured 2026-09-01: that role's trust policy lists
+# twenty-three repos and `nousergon/crucible` is not among them, so a fallback
+# would fail at assume time TODAY — but adding one line to that list is a
+# routine change, and after it the fallback would succeed and publish v2
+# releases into v1's prefix. A guard whose correctness depends on a list
+# somebody else maintains is not a guard. So the role ARN is asserted against
+# the one this repository declares, before any credential is configured, and
+# the message names the stack that creates it.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'docs/**']
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Release sha to re-verify and re-promote (defaults to HEAD)'
+        required: false
+
+permissions: {}
+
+# Deploys are serialised, and a superseded one is NOT cancelled: cancelling a
+# deploy mid-smoke would leave a release published with no verdict, and the
+# next run would have no way to tell that from one that was never attempted.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  # Declared here, asserted in `guard`, and created by
+  # nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml. One literal,
+  # one place.
+  DEPLOY_ROLE_ARN: arn:aws:iam::711398986525:role/crucible-v2-github-deploy
+  STORE_URI: s3://alpha-engine-crucible-v2/crucible
+
+jobs:
+  guard:
+    name: the v2 deploy role is the only role this may use
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      # No credentials configured in this job, deliberately: the assertion
+      # runs before any identity that could act on it exists.
+      - name: Refuse any role but the v2 deploy role
+        run: |
+          if [ "${DEPLOY_ROLE_ARN}" != "arn:aws:iam::711398986525:role/crucible-v2-github-deploy" ]; then echo "::error::DEPLOY_ROLE_ARN is ${DEPLOY_ROLE_ARN}. This workflow may assume ONLY crucible-v2-github-deploy. The research role (github-actions-lambda-deploy) writes a DIFFERENT bucket; it does not trust this repository today, but one line added to its trust list would make a silent fallback succeed and publish v2 releases into v1 prefix. Apply nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml (stack crucible-v2) to create the v2 roles."; exit 1; fi
+          echo "deploy role: ${DEPLOY_ROLE_ARN}"
+
+  build:
+    name: build the wheel and record what it is
+    needs: [guard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --frozen
+
+      # The wheel is only worth publishing if the tests that gate it ran
+      # against the same lockfile. Re-run rather than trust ci.yml's result:
+      # a deploy that promoted an artifact on another workflow's green is a
+      # deploy gated on a check it cannot see.
+      - name: Foundation tests
+        id: tests
+        run: |
+          uv run pytest -q --ignore=tests/acceptance | tee pytest.txt
+          echo "summary=$(tail -1 pytest.txt | tr -d '\r')" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: uv build --wheel
+
+      - name: Name the artifact by its commit
+        id: meta
+        run: |
+          sha='${{ inputs.sha || github.sha }}'
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          mkdir -p out
+          cp dist/*.whl "out/crucible-${sha}-py3-none-any.whl"
+          python3 - <<'PY' > "out/release.json"
+          import hashlib, json, os, pathlib
+          sha = os.environ["SHA"]
+          wheel = pathlib.Path(f"out/crucible-{sha}-py3-none-any.whl").read_bytes()
+          lock = pathlib.Path("uv.lock").read_bytes()
+          print(json.dumps({
+              "schema_version": "release.v1",
+              "sha": sha,
+              "built_at": os.environ["BUILT_AT"],
+              "lockfile_sha256": hashlib.sha256(lock).hexdigest(),
+              "wheel_sha256": hashlib.sha256(wheel).hexdigest(),
+              "test_summary": os.environ["TEST_SUMMARY"],
+              "workflow_run_url": os.environ["RUN_URL"],
+              "python_requires": ">=3.12,<3.13",
+              "extra": {},
+          }, indent=2, sort_keys=True))
+          PY
+        env:
+          SHA: ${{ inputs.sha || github.sha }}
+          BUILT_AT: ${{ github.event.repository.updated_at }}
+          TEST_SUMMARY: ${{ steps.tests.outputs.summary }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: release-${{ steps.meta.outputs.sha }}
+          path: out/
+          retention-days: 7
+
+  release:
+    name: publish, smoke, then flip
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --frozen
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: release-${{ needs.build.outputs.sha }}
+          path: out
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df  # v4.2.1
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Publish the IMMUTABLE half. Safe and repeatable; it promotes nothing.
+      - name: Publish the release artifacts
+        run: |
+          uv run python -m crucible.deploy publish --sha '${{ needs.build.outputs.sha }}' --wheel 'out/crucible-${{ needs.build.outputs.sha }}-py3-none-any.whl' --release-json out/release.json --store "$STORE_URI"
+
+      # The gate. A REAL run against live S3 read paths, writing
+      # runs/smoke/{trading_day}/run.json through the ordinary runner — so the
+      # gate produces the same telemetry every other job does, and a smoke that
+      # "ran and had nothing to do" is not expressible (§4.2).
+      - name: Smoke
+        id: smoke
+        run: |
+          uv run crucible smoke --release '${{ needs.build.outputs.sha }}' --store "$STORE_URI"
+
+      # Reads the smoke MANIFEST, not this workflow's exit codes. A
+      # caller-supplied "it passed" is the shape that promotes a build whose
+      # smoke quietly did nothing.
+      - name: Flip releases/current on an ok smoke
+        run: |
+          uv run python -m crucible.deploy flip --sha '${{ needs.build.outputs.sha }}' --store "$STORE_URI"
+
+      # Written on BOTH paths, in the run-manifest schema, so §4.5's page shows
+      # deploys beside runs and a failed deploy is as visible as a failed job.
+      - name: Record the deploy manifest
+        if: always()
+        run: |
+          uv run python -m crucible.deploy record --sha '${{ needs.build.outputs.sha }}' --store "$STORE_URI" --outcome '${{ job.status }}' --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+  # A failed DEPLOY on main means live no longer matches main — and unlike a
+  # failed test it blocks nothing and is green to the next author, so nothing
+  # announces it. Measured 2026-08-12: a router config sat undeployed for 16
+  # hours behind exactly this gap (alpha-engine-config-I7169).
+  notify-main-failure:
+    needs: [guard, build, release]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5363e60b9343e270be9a44d41e85516068b4226e
+    secrets: inherit

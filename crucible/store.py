@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from pathlib import Path
@@ -32,7 +33,31 @@ from crucible.calendar import (
     is_trading_day,
 )
 
-__all__ = ["LocalStore", "S3Store", "Store", "sha256_hex"]
+__all__ = [
+    "ETAG_ABSENT",
+    "LocalStore",
+    "PointerConflictError",
+    "S3Store",
+    "Store",
+    "open_store",
+    "sha256_hex",
+]
+
+#: The version token that means "this key does not exist yet". Passed as
+#: ``expected`` to :meth:`Store.compare_and_swap` to express "create it,
+#: and fail if someone beat me to it" — the create half of the same
+#: primitive, so a pointer's first write and its every later write go
+#: through one code path rather than two with different race properties.
+ETAG_ABSENT = "\x00absent"
+
+
+class PointerConflictError(RuntimeError):
+    """A conditional write lost. The caller re-reads and decides.
+
+    Never retried inside the store. A pointer flip that silently retried
+    would overwrite whatever the winner just published, which is exactly
+    the last-writer-wins failure the conditional PUT exists to prevent.
+    """
 
 
 def sha256_hex(payload: bytes) -> str:
@@ -73,6 +98,27 @@ class Store(ABC):
     @abstractmethod
     def list_keys(self, prefix: str = "") -> Iterator[str]:
         """Every key under ``prefix``, in no guaranteed order."""
+
+    @abstractmethod
+    def etag(self, key: str) -> str:
+        """An opaque version token for ``key``, or :data:`ETAG_ABSENT`.
+
+        Absence is a token rather than ``None`` so a caller cannot forget to
+        handle it: passing the token straight back to
+        :meth:`compare_and_swap` is the create case, and there is no third
+        thing to write.
+        """
+
+    @abstractmethod
+    def compare_and_swap(self, key: str, expected: str, payload: bytes) -> str:
+        """Write ``payload`` at ``key`` only if its version is ``expected``.
+
+        Returns the new version token. Raises :class:`PointerConflictError`
+        when the current version differs — which is the whole point: the
+        release pointer and the champion pointers are single objects written
+        by more than one actor, and last-writer-wins gives the verdict to
+        whichever writer finished last rather than to the one that checked.
+        """
 
     def assert_keys_bind_to_trading_days(self, prefix: str = "") -> None:
         """Walk the store and refuse any key whose date is not a session.
@@ -144,6 +190,45 @@ class LocalStore(Store):
     def exists(self, key: str) -> bool:
         return self._path(key).is_file()
 
+    def etag(self, key: str) -> str:
+        """The object's sha256, or :data:`ETAG_ABSENT`.
+
+        Content-derived rather than a mtime or a counter, so it survives a
+        copy of the store directory — a laptop backend whose version tokens
+        changed when the tree was moved would refuse every conditional write
+        after a `cp -r`.
+        """
+        path = self._path(key)
+        if not path.is_file():
+            return ETAG_ABSENT
+        return sha256_hex(path.read_bytes())
+
+    def compare_and_swap(self, key: str, expected: str, payload: bytes) -> str:
+        """Check-then-write under an exclusive create, then rename.
+
+        **Weaker than S3's conditional PUT, and deliberately named so.** Two
+        processes racing on the same directory could both observe the same
+        `expected` before either writes. The exclusive temp file narrows the
+        window to the check itself rather than removing it, which is honest
+        for the backend whose stated purpose is "a developer runs the whole
+        thing against a directory": the production pointer lives in S3, where
+        :class:`S3Store` makes this atomic at the service.
+        """
+        current = self.etag(key)
+        if current != expected:
+            raise PointerConflictError(
+                f"{key!r} is at version {current[:12]!r}, not the expected "
+                f"{expected[:12]!r}. Re-read it and decide — a retry here would "
+                "overwrite whatever the winning writer just published."
+            )
+        path = self._path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        with open(tmp, "xb") as fh:
+            fh.write(payload)
+        os.replace(tmp, path)
+        return sha256_hex(payload)
+
     def list_keys(self, prefix: str = "") -> Iterator[str]:
         for path in sorted(self.root.rglob("*")):
             if not path.is_file():
@@ -156,37 +241,164 @@ class LocalStore(Store):
 class S3Store(Store):
     """The production backend: one bucket, one prefix, no other AWS resource.
 
-    Track C fills this in. It is stubbed rather than absent so the interface
-    is fixed before three tracks build against it, and so the trading-day
-    walk it inherits is written once.
+    Three things it does that a naive wrapper does not, each because the
+    naive version has already cost the fleet something:
+
+    * **It paginates.** A truncated listing read as complete is the
+      `--limit N` bug class — five sweeps once read a 2049-item backlog under
+      a limit and one published report was 7 of 9 false.
+    * **It distinguishes absent from unreadable.** Absence is one of the two
+      page conditions (§4.6); an `AccessDenied` rendered as "not there yet"
+      would page for a missing artifact that exists and is simply unreachable,
+      and the operator would go looking for the wrong thing.
+    * **It swaps conditionally.** `IfMatch` / `IfNoneMatch` on the pointer
+      objects, so the release flip is a compare-and-swap at the service rather
+      than a read-then-write with a window in the middle.
+
+    ``boto3`` is imported lazily, inside the client property. The laptop path,
+    the tests and `crucible --help` all import this module; none of them
+    should need an AWS SDK on the import path, and a Lambda cold start should
+    not pay for one it may never call.
     """
 
     def __init__(self, bucket: str, prefix: str = "", *, client: Any = None) -> None:
+        if not bucket:
+            raise ValueError("S3Store needs a bucket; an empty one would write nowhere")
         self.bucket = bucket
-        self.prefix = prefix
+        self.prefix = prefix.strip("/")
         self._client = client
 
+    @property
+    def client(self) -> Any:
+        if self._client is None:
+            import boto3  # noqa: PLC0415 - lazy on purpose; see the class docstring
+
+            self._client = boto3.client("s3")
+        return self._client
+
+    def _s3_key(self, key: str) -> str:
+        if key.startswith("/") or ".." in key.split("/"):
+            raise ValueError(f"refusing key {key!r}: store keys are relative and never traverse.")
+        return f"{self.prefix}/{key}" if self.prefix else key
+
+    def _strip(self, s3_key: str) -> str:
+        if self.prefix and s3_key.startswith(f"{self.prefix}/"):
+            return s3_key[len(self.prefix) + 1 :]
+        return s3_key
+
+    @staticmethod
+    def _error_code(exc: Any) -> str:
+        return str(exc.response.get("Error", {}).get("Code", ""))
+
     def put_bytes(self, key: str, payload: bytes) -> str:
-        raise NotImplementedError(
-            "S3Store is track C's (crucible-v2 phase 1, alpha-engine-config-I9757). "
-            "It must return the same sha256 LocalStore does and use a conditional "
-            "PUT for pointer objects (releases/current, champions/{slot}/current.json)."
+        self.client.put_object(
+            Bucket=self.bucket,
+            Key=self._s3_key(key),
+            Body=payload,
+            ContentType=(
+                "application/json" if key.endswith(".json") else "application/octet-stream"
+            ),
+            Metadata={"sha256": sha256_hex(payload)},
         )
+        return sha256_hex(payload)
 
     def get_bytes(self, key: str) -> bytes:
-        raise NotImplementedError(
-            "S3Store is track C's (alpha-engine-config-I9757). A missing key raises "
-            "KeyError, matching LocalStore — never returns None."
-        )
+        from botocore.exceptions import ClientError  # noqa: PLC0415
+
+        try:
+            return self.client.get_object(Bucket=self.bucket, Key=self._s3_key(key))["Body"].read()
+        except ClientError as exc:
+            if self._error_code(exc) in ("NoSuchKey", "404"):
+                raise KeyError(
+                    f"{key!r} is not present in s3://{self.bucket}/{self.prefix}"
+                ) from exc
+            raise
 
     def exists(self, key: str) -> bool:
-        raise NotImplementedError(
-            "S3Store is track C's (alpha-engine-config-I9757). Absence is a page "
-            "condition (§4.6), so this must distinguish absent from unreadable."
-        )
+        """True/False for present/absent; RAISES for unreadable.
+
+        The third case is the one that matters. An `AccessDenied` returned as
+        `False` is an absence page for an artifact that is there, and the
+        operator spends the morning looking for a producer that ran fine.
+        """
+        from botocore.exceptions import ClientError  # noqa: PLC0415
+
+        try:
+            self.client.head_object(Bucket=self.bucket, Key=self._s3_key(key))
+            return True
+        except ClientError as exc:
+            if self._error_code(exc) in ("404", "NoSuchKey"):
+                return False
+            raise
 
     def list_keys(self, prefix: str = "") -> Iterator[str]:
-        raise NotImplementedError(
-            "S3Store is track C's (alpha-engine-config-I9757). Must paginate — a "
-            "truncated listing read as complete is the `--limit N` bug class."
+        paginator = self.client.get_paginator("list_objects_v2")
+        scope = self._s3_key(prefix) if prefix else self.prefix
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=scope):
+            for obj in page.get("Contents", []):
+                yield self._strip(obj["Key"])
+
+    def etag(self, key: str) -> str:
+        from botocore.exceptions import ClientError  # noqa: PLC0415
+
+        try:
+            head = self.client.head_object(Bucket=self.bucket, Key=self._s3_key(key))
+        except ClientError as exc:
+            if self._error_code(exc) in ("404", "NoSuchKey"):
+                return ETAG_ABSENT
+            raise
+        return str(head["ETag"]).strip('"')
+
+    def compare_and_swap(self, key: str, expected: str, payload: bytes) -> str:
+        """`IfNoneMatch='*'` to create, `IfMatch=<etag>` to replace.
+
+        The same primitive `krepis.locks` uses for the universe-writer lock,
+        applied to a pointer rather than a lock. S3 returns
+        `PreconditionFailed` on both conditions; older SDK mocks surface the
+        bare `412`, and both are accepted for the same reason krepis accepts
+        both.
+        """
+        from botocore.exceptions import ClientError  # noqa: PLC0415
+
+        condition = {"IfNoneMatch": "*"} if expected == ETAG_ABSENT else {"IfMatch": expected}
+        try:
+            resp = self.client.put_object(
+                Bucket=self.bucket,
+                Key=self._s3_key(key),
+                Body=payload,
+                ContentType="application/json",
+                Metadata={"sha256": sha256_hex(payload)},
+                **condition,
+            )
+        except ClientError as exc:
+            conflicts = ("PreconditionFailed", "412", "ConditionalRequestConflict", "409")
+            if self._error_code(exc) in conflicts:
+                raise PointerConflictError(
+                    f"conditional write of {key!r} lost: expected version "
+                    f"{expected[:12]!r}. Re-read the pointer and decide."
+                ) from exc
+            raise
+        return str(resp.get("ETag", "")).strip('"')
+
+
+def open_store(uri: str | None) -> Store:
+    """`s3://bucket/prefix` or a directory path, resolved to a backend.
+
+    One factory so `--store` means the same thing to every job, and so the
+    default lives in exactly one place. The default is the environment's
+    `CRUCIBLE_STORE`; there is deliberately no hardcoded production bucket
+    fallback — a job that silently wrote to production because a flag was
+    missing is the kind of default that is only noticed once.
+    """
+    target = uri or os.environ.get("CRUCIBLE_STORE")
+    if not target:
+        raise ValueError(
+            "no store: pass --store s3://bucket/prefix or a directory path, or set "
+            "CRUCIBLE_STORE. There is no default production bucket on purpose — a job "
+            "that wrote to production because a flag was missing is noticed once."
         )
+    if target.startswith("s3://"):
+        rest = target[len("s3://") :]
+        bucket, _, prefix = rest.partition("/")
+        return S3Store(bucket, prefix)
+    return LocalStore(target)

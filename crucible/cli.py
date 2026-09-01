@@ -31,7 +31,7 @@ import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from crucible import __version__
+from crucible import __version__, track_c  # track-C
 from crucible.calendar import resolve_trading_day
 from crucible.track_a import HANDLERS as TRACK_A_HANDLERS
 from crucible.track_a import add_track_a_arguments
@@ -87,27 +87,23 @@ def is_stub(handler: Callable[[argparse.Namespace], int]) -> bool:
 def _resolve_store(args: argparse.Namespace):
     """The store this invocation writes to.
 
-    `--store` wins, then `CRUCIBLE_STORE`. An `s3://` URI is track C's
-    backend; a path is the laptop backend. There is no default root: a job
-    that silently wrote into the current working directory would produce
-    artifacts nobody could find and a manifest that named them confidently.
+    `--store` wins, then `CRUCIBLE_STORE`. An `s3://` URI is the S3 backend; a
+    path is the laptop backend. There is no default root: a job that silently
+    wrote into the current working directory would produce artifacts nobody
+    could find and a manifest that named them confidently.
+
+    The resolution itself lives in `crucible.store.open_store` — one factory,
+    so `--store` means the same thing to every job and to
+    `python -m crucible.deploy`, which does not go through this CLI. All this
+    adds is the CLI's exit convention: a missing store is a usage error, and
+    a traceback for one is noise in front of a one-line fix.
     """
-    import os
+    from crucible.store import open_store
 
-    from crucible.store import LocalStore, S3Store
-
-    raw = getattr(args, "store", None) or os.environ.get("CRUCIBLE_STORE")
-    if not raw:
-        raise SystemExit(
-            "no store: pass --store <s3://bucket/prefix|path> or set CRUCIBLE_STORE. "
-            "There is deliberately no default — a job writing into the working "
-            "directory produces artifacts nobody can find."
-        )
-    if raw.startswith("s3://"):
-        rest = raw[len("s3://") :]
-        bucket, _, prefix = rest.partition("/")
-        return S3Store(bucket=bucket, prefix=prefix)
-    return LocalStore(raw)
+    try:
+        return open_store(getattr(args, "store", None))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _promote(args: argparse.Namespace) -> int:
@@ -211,6 +207,13 @@ JOBS: dict[str, JobSpec] = {
     ),
     "release.pin": JobSpec("release.pin", "Repoint a release, or pin the trader to one", False),
     "smoke": JobSpec("smoke", "A real end-to-end run that gates a release flip", False),
+    # track-C (alpha-engine-config-I9757): the observing surfaces themselves.
+    # They are jobs like any other, so they write manifests like any other and
+    # the thing that watches the fleet is watched on the same terms.
+    "alerts.sweep": JobSpec("alerts.sweep", "Evaluate the two page conditions and page", True),
+    "heartbeat": JobSpec("heartbeat", "Weekly proof the alerting path itself is alive", True),
+    "drift": JobSpec("drift", "Feature PSI, prediction drift and IC decay", True),
+    "console": JobSpec("console", "Render the static console page from the manifests", True),
 }
 
 HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
@@ -255,17 +258,14 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
         "Carries R's `operator_bootstrap` champion flag into v2 so the first "
         "evidence-won promotion is visible as such.",
     ),
-    "release.pin": _todo(
-        "release.pin",
-        "track C",
-        "S3 conditional PUT on releases/current; the trader pins separately and never "
-        "follows current automatically.",
-    ),
-    "smoke": _todo(
-        "smoke",
-        "track C",
-        "A REAL run against live S3/ArcticDB. status: ok is what flips releases/current.",
-    ),
+    # track-C handlers live in crucible/track_c.py so three tracks can land
+    # code in parallel without editing one another's lines.
+    "release.pin": track_c.release_pin_handler,
+    "smoke": track_c.smoke_handler,
+    "alerts.sweep": track_c.sweep_handler,
+    "heartbeat": track_c.heartbeat_handler,
+    "drift": track_c.drift_handler,
+    "console": track_c.console_handler,
 }
 
 
@@ -356,6 +356,17 @@ def build_parser() -> argparse.ArgumentParser:
         if spec.name == "release.pin":
             sub.add_argument("sha", metavar="RELEASE_SHA")
             sub.add_argument("--target", choices=["current", "trader"], default="current")
+        if spec.name == "smoke":  # track-C
+            sub.add_argument(
+                "--release",
+                metavar="SHA",
+                required=True,
+                help=(
+                    "The release sha this smoke is verifying. Recorded as the "
+                    "manifest's release_sha; the pointer flip refuses a smoke "
+                    "manifest belonging to another build."
+                ),
+            )
         if spec.name == "data.heal":
             sub.add_argument("--gap", required=True, help="The named gap to repair.")
 
