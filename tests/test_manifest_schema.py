@@ -319,3 +319,72 @@ def test_the_valid_fixture_is_not_mutated_between_tests() -> None:
     a["status"] = "failed"
     assert b["status"] == "ok"
     assert b == copy.deepcopy(_valid_manifest())
+
+
+class TestTheMetricStatusVocabularyIsDerivedNotRestated:
+    """`main` was red for eleven minutes on 2026-09-01 because it was restated.
+
+    One PR closed `metricRecord.status` to an enum built by auditing the call
+    sites that existed on its branch. Another, on a different branch, added
+    `crucible.report`'s five attribution rows, whose statuses come from
+    `krepis.metrics.derive_status`. Both were green; together they were red,
+    and every `crucible report` run failed schema validation at the moment it
+    tried to write its manifest.
+
+    The enum stays closed — that is the point of it, and `§2 row 4` is a claim
+    about every level a human reads. What changes is that the requirement is
+    now DERIVED from the producer's own type rather than transcribed from it,
+    so a state krepis adds fails this test instead of failing a Saturday run.
+    """
+
+    def test_the_enum_admits_every_status_krepis_can_return(self) -> None:
+        from typing import get_args
+
+        from krepis.metrics import StatusLiteral
+
+        from crucible.manifest import load_schema
+
+        schema = load_schema()
+        enum = set(_status_enum(schema))
+        missing = set(get_args(StatusLiteral)) - enum
+        assert not missing, (
+            f"`metricRecord.status` cannot spell {sorted(missing)}, which "
+            "`krepis.metrics.derive_status` returns and `crucible.report` writes. A "
+            "manifest carrying one fails validation inside the runner, so the job "
+            "fails on the path where its telemetry is written."
+        )
+
+    def test_the_enum_is_still_closed(self) -> None:
+        """Derived, not opened. A metric that could spell any word would
+        reintroduce the third state the top-level `status` enum forbids —
+        `migrate.history --allow-missing` once wrote
+        `DEGRADED_BY_OPERATOR_CONSENT` here, inside an `ok` manifest."""
+        from crucible.manifest import load_schema
+
+        enum = _status_enum(load_schema())
+        assert enum, "the status property must carry an enum, not a bare string type"
+        assert "DEGRADED_BY_OPERATOR_CONSENT" not in enum
+
+
+def _status_enum(schema: dict) -> list[str]:
+    """The `metricRecord.status` enum, found wherever the schema keeps it."""
+
+    def walk(node: object) -> list[str] | None:
+        if isinstance(node, dict):
+            if node.get("type") == "string" and isinstance(node.get("enum"), list):
+                if "BREACH" in node["enum"]:
+                    return node["enum"]
+            for value in node.values():
+                found = walk(value)
+                if found is not None:
+                    return found
+        elif isinstance(node, list):
+            for value in node:
+                found = walk(value)
+                if found is not None:
+                    return found
+        return None
+
+    found = walk(schema)
+    assert found is not None, "no metricRecord status enum in the schema"
+    return found

@@ -12,7 +12,9 @@ import datetime as dt
 import html
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, get_args
+
+from krepis.metrics import StatusLiteral
 
 from crucible.calendar import previous_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
@@ -235,14 +237,15 @@ _PURPLE = "#8250df"
 #: is the vocabulary the C14 reproduction demonstrated as actually
 #: rendered — kept here, next to the stylesheet it must cover, until track A
 #: lands a real schema this can import instead.
-ATTRIBUTION_STATUSES: tuple[str, ...] = (
-    "OK",
-    "GREEN",
-    "RED",
-    "BREACH",
-    "N/A-NOT-RUN",
-    "N/A-NOT-IMPL",
-)
+#: Every status an attribution row can carry. DERIVED from
+#: `krepis.metrics.StatusLiteral` — the vocabulary `derive_status` returns —
+#: plus the two the report adds itself. The hand-written form of this tuple
+#: omitted `WATCH`, `N/A-LOW-N` and `N/A-MISSING-INPUT`, all three of which
+#: `derive_status` returns and `crucible.report` therefore writes: with
+#: `_state_class` now raising on an unregistered status, a WATCH row would
+#: have taken the console down. A list of things to keep in sync is a list
+#: that goes stale in the direction of omitting the case nobody hit yet.
+ATTRIBUTION_STATUSES: tuple[str, ...] = ("OK", "BREACH", *get_args(StatusLiteral))
 
 STATUS_COLORS: dict[str, str] = {
     # The fourteen component states (`crucible.console.classify.STATES`).
@@ -273,8 +276,13 @@ STATUS_COLORS: dict[str, str] = {
     "GREEN": _GREEN,
     "RED": _RED,
     "BREACH": _RED,
+    # Every `N/A-*` state is RED, not gray. Principle 7: a row that measured
+    # nothing is unobserved, not healthy, and rendering it in the same colour
+    # as a quiet-but-fine state is how `no data` becomes green by degrees.
     "N/A-NOT-RUN": _RED,
     "N/A-NOT-IMPL": _RED,
+    "N/A-LOW-N": _RED,
+    "N/A-MISSING-INPUT": _RED,
 }
 
 # Completeness guard, enforced at import time rather than left to be

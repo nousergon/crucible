@@ -424,7 +424,7 @@
           "minimum": 0
         },
         "status": {
-          "description": "Closed set (alpha-engine-config-I9757, defect #3): a run's own `status` above is `ok`/`failed` by schema so a third state cannot be spelled there, but §2 row 4 ('no degraded-SUCCEEDED') is a claim about every level a human reads, and a metric nested inside an `ok` manifest is one of them — `migrate.history --allow-missing` once wrote `DEGRADED_BY_OPERATOR_CONSENT` here, inside a manifest whose own `status` said `ok`, which reintroduces exactly the third state the top-level enum exists to forbid. Enumerated rather than left open: `OK`/`FAIL`/`BREACH` are the coverage-and-ceiling vocabulary shared by `crucible.data`, `crucible.alerts`, `crucible.deploy`, `crucible.slots.cycle` and `crucible.track_c`; `unservable`/`bootstrap`/`unmeasurable`/`measured`/`decided`/`held` are `nousergon_lib.arena.engine`'s own champion/challenger decision vocabulary, forwarded verbatim by `crucible.promote`'s `pointer_moved` metric rather than re-encoded into a second vocabulary that could drift from the first. A producer needing a value outside this set grows the enum by PR, with the new state named here, same discipline as `TRANSIENT_CLASSIFIERS` — never by writing a word this schema does not know and letting `additionalProperties` wave it through.",
+          "description": "Closed set (alpha-engine-config-I9757, defect #3): a run's own `status` above is `ok`/`failed` by schema so a third state cannot be spelled there, but \u00a72 row 4 ('no degraded-SUCCEEDED') is a claim about every level a human reads, and a metric nested inside an `ok` manifest is one of them \u2014 `migrate.history --allow-missing` once wrote `DEGRADED_BY_OPERATOR_CONSENT` here, inside a manifest whose own `status` said `ok`, which reintroduces exactly the third state the top-level enum exists to forbid. Enumerated rather than left open: `OK`/`FAIL`/`BREACH` are the coverage-and-ceiling vocabulary shared by `crucible.data`, `crucible.alerts`, `crucible.deploy`, `crucible.slots.cycle` and `crucible.track_c`; `unservable`/`bootstrap`/`unmeasurable`/`measured`/`decided`/`held` are `nousergon_lib.arena.engine`'s own champion/challenger decision vocabulary, forwarded verbatim by `crucible.promote`'s `pointer_moved` metric rather than re-encoded into a second vocabulary that could drift from the first. `GREEN`/`WATCH`/`RED` and the four `N/A-*` states are `krepis.metrics.StatusLiteral` \u2014 the vocabulary `krepis.metrics.derive_status` returns and `MetricRecord` carries \u2014 forwarded verbatim by `crucible.report`'s five attribution rows for the same reason the arena's vocabulary is: re-encoding them into a second set is how two spellings of one state drift apart. They were MISSING when the enum was closed, because the audit that built it read the call sites that existed on that branch and `crucible.report` was on another one: two PRs green apart and red together, which is what `main` looked like for eleven minutes on 2026-09-01. `tests/test_manifest_schema.py` now derives the requirement from `typing.get_args(StatusLiteral)` rather than restating it. A producer needing a value outside this set grows the enum by PR, with the new state named here, same discipline as `TRANSIENT_CLASSIFIERS` \u2014 never by writing a word this schema does not know and letting `additionalProperties` wave it through.",
           "type": "string",
           "enum": [
             "OK",
@@ -435,7 +435,14 @@
             "unmeasurable",
             "measured",
             "decided",
-            "held"
+            "held",
+            "GREEN",
+            "WATCH",
+            "RED",
+            "N/A-NOT-IMPL",
+            "N/A-NOT-RUN",
+            "N/A-LOW-N",
+            "N/A-MISSING-INPUT"
           ]
         },
         "status_reason": {
