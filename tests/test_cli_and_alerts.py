@@ -16,7 +16,7 @@ import datetime as dt
 import pytest
 
 from crucible.alerts import PAGE_CONDITIONS, Page, dedup_key
-from crucible.cli import JOBS, build_parser, main, resolve_date
+from crucible.cli import HANDLERS, JOBS, build_parser, is_stub, main, resolve_date
 
 FRIDAY = dt.date(2026, 8, 28)
 
@@ -64,11 +64,20 @@ class TestJobSurface:
         with pytest.raises(SystemExit):
             build_parser().parse_args([])
 
-    @pytest.mark.parametrize("job", sorted(JOBS))
+    def test_every_job_has_a_handler(self) -> None:
+        """The guard below only covers stubs, so this covers the rest: a job
+        in JOBS with no handler at all would silently drop out of both."""
+        assert set(HANDLERS) == set(JOBS)
+
+    @pytest.mark.parametrize("job", sorted(j for j in JOBS if is_stub(HANDLERS[j])))
     def test_an_unimplemented_job_raises_and_never_returns_zero(self, job: str) -> None:
         """A stub that exits 0 is indistinguishable from a job that ran and
         had nothing to do — the exact shape §11 says agent-built systems
-        drift toward."""
+        drift toward.
+
+        The parametrisation reads `is_stub` off the handler, so a track
+        landing an implementation flips this by IMPLEMENTING, with no
+        exclusion list for anyone to remember to edit."""
         argv = [job]
         if job in ("experiment.run", "experiment.grade", "promote", "experiment.new"):
             argv += ["--slot", "r"]

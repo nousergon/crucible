@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from crucible import __version__
 from crucible.calendar import resolve_trading_day
 
-__all__ = ["JOBS", "JobSpec", "build_parser", "main"]
+__all__ = ["HANDLERS", "JOBS", "JobSpec", "build_parser", "is_stub", "main"]
 
 
 @dataclass(frozen=True)
@@ -64,7 +64,134 @@ def _todo(job: str, track: str, note: str) -> Callable[[argparse.Namespace], int
             f"`crucible {job}` is not implemented yet — {track}, alpha-engine-config-I9757. {note}"
         )
 
+    # Marked so the "a stub never returns 0" guard can enumerate stubs from the
+    # CODE rather than from a list a track has to remember to edit. A
+    # hard-coded exclusion list is itself the suppression-collection bug class
+    # (§11.1): it goes stale in the direction of exempting more.
+    handler.is_stub = True  # type: ignore[attr-defined]
     return handler
+
+
+def is_stub(handler: Callable[[argparse.Namespace], int]) -> bool:
+    """Whether ``handler`` is an unimplemented placeholder."""
+    return bool(getattr(handler, "is_stub", False))
+
+
+# --------------------------------------------------------------------------
+# track-B handlers.
+# --------------------------------------------------------------------------
+
+
+def _resolve_store(args: argparse.Namespace):
+    """The store this invocation writes to.
+
+    `--store` wins, then `CRUCIBLE_STORE`. An `s3://` URI is track C's
+    backend; a path is the laptop backend. There is no default root: a job
+    that silently wrote into the current working directory would produce
+    artifacts nobody could find and a manifest that named them confidently.
+    """
+    import os
+
+    from crucible.store import LocalStore, S3Store
+
+    raw = getattr(args, "store", None) or os.environ.get("CRUCIBLE_STORE")
+    if not raw:
+        raise SystemExit(
+            "no store: pass --store <s3://bucket/prefix|path> or set CRUCIBLE_STORE. "
+            "There is deliberately no default — a job writing into the working "
+            "directory produces artifacts nobody can find."
+        )
+    if raw.startswith("s3://"):
+        rest = raw[len("s3://") :]
+        bucket, _, prefix = rest.partition("/")
+        return S3Store(bucket=bucket, prefix=prefix)
+    return LocalStore(raw)
+
+
+def _promote(args: argparse.Namespace) -> int:
+    """`crucible promote --slot <s> [--revert-to <arm> --reason <why>]`.
+
+    Runs through `run_job` like every other job, so the manifest exists on
+    both paths — including the one where the arena raises
+    `TrainingIntegrityError` and the whole slot fails (policy §3).
+    """
+    import os
+
+    from crucible.promote import load_slot_inputs, revert_champion, run_promotion
+    from crucible.runner import run_job
+    from crucible.slots import get_slot
+
+    spec = get_slot(args.slot)
+    store = _resolve_store(args)
+    revert_to = getattr(args, "revert_to", None)
+    if revert_to and not getattr(args, "reason", None):
+        raise SystemExit(
+            "--revert-to requires --reason: an operator override with no recorded "
+            "reason cannot be reviewed later (principles.md §2.1)."
+        )
+
+    def job(ctx) -> None:
+        as_of = ctx.trading_day.isoformat()
+        if revert_to:
+            pointer = revert_champion(
+                spec=spec,
+                register=load_slot_inputs(store, args.slot).register,
+                store=store,
+                arm_id=revert_to,
+                as_of=as_of,
+                operator=getattr(args, "operator", None) or os.environ.get("USER", "unknown"),
+                reason=args.reason,
+                manifest_key=f"runs/promote/{as_of}/run.json",
+                run_id=ctx.run_id,
+            )
+            _record_written(ctx, store, (f"champions/{pointer.slot}/current.json",))
+            return
+
+        inputs = load_slot_inputs(store, args.slot)
+        result = run_promotion(
+            spec=spec,
+            as_of=as_of,
+            register=inputs.register,
+            series_by_arm=inputs.series_by_arm,
+            incumbent=inputs.incumbent,
+            store=None if args.dry_run else store,
+            manifest_key=f"runs/promote/{as_of}/run.json",
+            run_id=ctx.run_id,
+        )
+        _record_written(ctx, store, result.keys_written)
+        # §11: the console renders "cycles since the pointer last moved", and
+        # a pointer that has never moved on evidence is a FINDING. It can only
+        # be that if the movement is a metric rather than a log line.
+        ctx.record_metric(
+            {
+                "name": "pointer_moved",
+                "module": "crucible.promote",
+                "metric_type": "gauge",
+                "value": 1.0 if result.decision.moved else 0.0,
+                "unit": "count",
+                "n_floor": 1,
+                "status": result.decision.status,
+                "status_reason": result.decision.reason or "pointer held",
+                "source_path": f"arena/{args.slot}/{as_of}/arena_cycle.json",
+                "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+
+    run_job("promote", job, store=store, trading_day=args.trading_day)
+    return 0
+
+
+def _record_written(ctx, store, keys) -> None:
+    """Record artifacts the job wrote through the store directly.
+
+    Re-reads each key and records it through `ctx.record_output`, which
+    re-PUTs identical bytes — a no-op by content addressing. The alternative
+    is appending to `ctx.outputs` by hand, which would let a caller record an
+    output it never actually wrote; here the manifest can only name bytes
+    that are really in the store.
+    """
+    for key in keys:
+        ctx.record_output(key, store.get_bytes(key))
 
 
 JOBS: dict[str, JobSpec] = {
@@ -107,12 +234,8 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
         "track A",
         "Calls nousergon_lib.arena.engine.run_cycle; re-implementing §§3-6 is a defect.",
     ),
-    "promote": _todo(
-        "promote",
-        "track A",
-        "Pointer moves only on a confidence-sequence-supported lead, and never before "
-        "promote_min_weeks paired weeks.",
-    ),
+    # track-B
+    "promote": _promote,
     "report": _todo(
         "report",
         "track A",
@@ -179,6 +302,29 @@ def build_parser() -> argparse.ArgumentParser:
         )
         if spec.name in ("experiment.run", "experiment.grade", "promote", "experiment.new"):
             sub.add_argument("--slot", choices=["u", "r", "m", "s"], required=True)
+        if spec.name == "promote":
+            # track-B. The revert is one command by design: a rollback that
+            # needs three steps is a rollback nobody performs under pressure.
+            sub.add_argument(
+                "--revert-to",
+                metavar="ARM_ID",
+                help=(
+                    "Point the slot at ARM_ID by operator authority instead of running "
+                    "the cycle. Recorded as promotion_source=operator_bootstrap, never "
+                    "as evidence. Requires --reason."
+                ),
+            )
+            sub.add_argument(
+                "--operator",
+                default=None,
+                help="Who is reverting. Defaults to $USER; recorded in the pointer.",
+            )
+            sub.add_argument(
+                "--reason",
+                default=None,
+                help="Why. Mandatory with --revert-to: an unexplained operator "
+                "override is the one pointer movement nobody can reconstruct later.",
+            )
         if spec.name in ("experiment.run", "experiment.new"):
             sub.add_argument("--arm", metavar="ARM_ID", required=True)
         if spec.name == "explain":
