@@ -111,14 +111,34 @@ def normalize_panel(frames: dict[str, Any], *, end: dt.date, lookback_days: int)
     renaming and the window trim happen once. A source that normalized its
     own way would produce a panel differing from another source's in a way
     no test would see.
+
+    **A ticker present in ``frames`` with a `None` or empty value is a
+    per-ticker read failure, and it RAISES rather than being dropped.**
+    Before this, a `continue` here silently thinned the panel by exactly the
+    tickers a partial source outage failed on, while the ONLY loud failure
+    in this module was zero tickers surviving at all — a partial ArcticDB
+    outage produced a well-formed, thin panel and nothing downstream could
+    tell. `ArcticPriceSource` and every other :class:`PriceSource` must
+    either omit a failed ticker's key entirely (caught below, at
+    :func:`ArcticPriceSource.load_panel`, when the caller named it in
+    ``symbols``) or raise before handing this function a frame it knows is
+    empty — never carry the empty value in silently.
     """
     import pandas as pd
 
     start = end - dt.timedelta(days=lookback_days)
+    dropped = sorted(t for t, f in frames.items() if f is None or len(f) == 0)
+    if dropped:
+        raise MissingSourceError(
+            f"source frame(s) for {dropped} are `None` or empty. A per-ticker read "
+            "failure that survives into `normalize_panel` as an empty value is a "
+            "partial outage, and dropping it silently is the shape that turns a "
+            "well-formed panel into one covering a fraction of the universe with "
+            "nothing downstream able to tell (plan §4.3, principle 7 — no data is "
+            "never rendered as green)."
+        )
     rows: list[pd.DataFrame] = []
     for ticker, frame in sorted(frames.items()):
-        if frame is None or len(frame) == 0:
-            continue
         block = frame.rename(columns=_OHLCV_RENAME).copy()
         if "trading_day" not in block.columns:
             index = pd.to_datetime(block.index)
@@ -253,6 +273,26 @@ class ArcticPriceSource(PriceSource):
                 "per-ticker read failures at WARNING and returns what it got, so an "
                 "empty result is an outage or a wrong bucket, not an empty market."
             )
+        if symbols is not None:
+            # `load_universe_ohlcv` "drops per-ticker read failures at WARNING and
+            # returns what it got" (its own docstring) — a PARTIAL outage returns a
+            # non-empty `frames` dict that is simply missing the failed tickers'
+            # keys. Checked here, the same way `FramePriceSource` checks it, so a
+            # dropped ticker is loud instead of invisible: a caller who asked for
+            # 903 names and got 850 back with no error is exactly the 901-of-903
+            # bug class the coverage floor exists to catch, and it must not be
+            # able to happen upstream of that floor by way of a source that never
+            # names what it silently lost.
+            absent = sorted(set(symbols) - set(frames))
+            if absent:
+                raise MissingSourceError(
+                    f"ArcticDB universe library on bucket {self.bucket!r} dropped "
+                    f"{len(absent)} of {len(symbols)} requested symbol(s) for the window "
+                    f"ending {end}: {absent[:20]}{'…' if len(absent) > 20 else ''}. A "
+                    "requested symbol that silently drops out of the panel is "
+                    "survivorship bias introduced by the source — a partial outage must "
+                    "fail the run, not thin the panel."
+                )
         return normalize_panel(frames, end=end, lookback_days=lookback_days)
 
     def snapshot_id(self) -> str:

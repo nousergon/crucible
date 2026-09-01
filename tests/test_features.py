@@ -45,6 +45,65 @@ class TestUnits:
                 inputs=(),
             )
 
+    def test_a_ratio_suffix_with_a_raw_unit_is_refused(self) -> None:
+        """The reproduced defect: `avg_volume_20d_raw` emitted as a `ratio`.
+
+        Root cause this rule exists: `avg_volume_20d` was emitted as a
+        normalized ratio and consumed as raw shares, and 901 of 903 tickers
+        silently failed the liquidity gate for months. The suffix alone
+        being legal is not the contract — the suffix and the declared
+        `unit` must agree.
+        """
+        with pytest.raises(ValueError, match="NORMALIZED unit"):
+            FeatureSpec(
+                name="avg_volume_20d_raw",
+                unit="ratio",
+                expression="mean(volume, 20) / something",
+                description="the exact defect this registry exists to catch",
+                inputs=("volume_raw",),
+            )
+
+    def test_a_zscore_suffix_with_a_non_zscore_unit_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="means unit='zscore'"):
+            FeatureSpec(
+                name="foo_zscore",
+                unit="USD",
+                expression="zscore(foo)",
+                description="a z-score claiming a currency unit",
+                inputs=("close_raw",),
+                cross_sectional=True,
+            )
+
+    def test_a_raw_suffix_may_not_claim_a_normalized_unit(self) -> None:
+        """The mirror image: `_raw` promises unnormalized, `unit='pct'` says otherwise."""
+        with pytest.raises(ValueError, match="NORMALIZED unit"):
+            FeatureSpec(
+                name="foo_raw",
+                unit="pct",
+                expression="foo",
+                description="a raw column claiming to already be normalized",
+                inputs=("close_raw",),
+            )
+
+    def test_every_catalogue_column_agrees_with_its_suffix(self) -> None:
+        """Every shipped `FeatureSpec` must pass its own construction-time check.
+
+        Constructing each entry a second time re-runs `__post_init__` on the
+        real catalogue rather than on a synthetic example, so a future
+        catalogue edit that violates the suffix/unit contract fails here
+        even if no test names that specific column.
+        """
+        for spec in CATALOG:
+            FeatureSpec(
+                name=spec.name,
+                unit=spec.unit,
+                expression=spec.expression,
+                description=spec.description,
+                inputs=spec.inputs,
+                window_trading_days=spec.window_trading_days,
+                cross_sectional=spec.cross_sectional,
+            )
+
     def test_a_calendar_window_cannot_be_expressed(self) -> None:
         with pytest.raises(ValueError, match="count of SESSIONS"):
             FeatureSpec(
