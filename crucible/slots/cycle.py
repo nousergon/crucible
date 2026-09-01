@@ -54,12 +54,18 @@ from crucible.slots.arms import (
 )
 from crucible.slots.grading import (
     DEFAULT_HORIZON_TRADING_DAYS,
+    ForwardReturnWindow,
+    GraderControlError,
+    PopulationIntegrityError,
+    SelectionMissError,
     ShadowSelection,
+    assert_label_control,
     control_selection,
     forward_returns,
     grade_slot,
     produce_shadow,
     raise_training_integrity,
+    reference_forward_returns,
     score_selection,
     training_ok,
     write_shadow,
@@ -280,26 +286,39 @@ def run_grade(
     # forward return of a ticker from date d does not depend on who picked it,
     # and recomputing it per arm is how two arms end up scored against two
     # slightly different benchmarks.
-    returns_cache: dict[str, dict[str, float]] = {}
+    returns_cache: dict[str, ForwardReturnWindow] = {}
     unsettled_days: dict[str, str] = {}
     verdicts: dict[str, dict[str, float]] = {}
     unsettled: dict[str, list[str]] = {}
+    misses: dict[str, list[str]] = {}
+    label_control: dict[str, dict[str, Any]] = {}
 
-    def _returns_for(day: str) -> dict[str, float] | None:
-        """The settled forward returns from ``day``, or None if unsettled.
+    def _returns_for(day: str) -> ForwardReturnWindow | None:
+        """The settled forward-return window from ``day``, or None if unsettled.
 
         Cached BOTH ways. An unsettled date is remembered as unsettled, so a
         second arm holding a shadow for the same day does not re-derive the
         same refusal — and, more to the point, cannot land on a different
         answer than the first arm did. Two arms scored against two different
         benchmarks for one date is the defect this cache exists to preclude.
+
+        **The label control runs here, once per settled date, before any arm
+        is scored against the date** (§10.1). The planted/null pair cannot
+        see this class: both controls are generated from and scored against
+        this very mapping, so a label defect moves them identically and their
+        margin survives it. `assert_label_control` recomputes the labels
+        through a second construction and raises
+        :class:`~crucible.slots.grading.GraderControlError` when the two
+        disagree or when the span measured is not the span declared — which
+        is the reproduced defect: a forced 5-session horizon published a
+        clean cycle while every verdict claimed 21.
         """
         if day in returns_cache:
             return returns_cache[day]
         if day in unsettled_days:
             return None
         try:
-            returns_cache[day] = forward_returns(
+            window = forward_returns(
                 panel,
                 start=dt.date.fromisoformat(day),
                 horizon_trading_days=horizon_trading_days,
@@ -310,35 +329,68 @@ def run_grade(
             # cycle after it settles.
             unsettled_days[day] = str(exc)
             return None
-        return returns_cache[day]
+        label_control[day] = assert_label_control(
+            window,
+            reference_forward_returns(
+                panel,
+                start=dt.date.fromisoformat(day),
+                horizon_trading_days=horizon_trading_days,
+            ),
+            slot=slot,
+            declared_horizon_trading_days=horizon_trading_days,
+        )
+        returns_cache[day] = window
+        return window
 
     for arm_id in scored_arms:
         if arm_id in control_ids:
             continue
         verdicts.setdefault(arm_id, {})
         for day in _shadow_dates(ctx.store, arm_id):
-            returns = _returns_for(day)
-            if returns is None:
+            window = _returns_for(day)
+            if window is None:
                 unsettled.setdefault(arm_id, []).append(day)
                 continue
             shadow = json.loads(ctx.store.get_bytes(shadow_key(arm_id, day)).decode("utf-8"))
-            score, detail = score_selection(
-                tuple(shadow["selection"]), tuple(shadow["population"]), returns
-            )
-            verdicts[arm_id][day] = score
-            write_verdict(
-                ctx.store,
-                arm_id=arm_id,
-                trading_day=day,
-                slot=slot,
-                score=score,
-                horizon_trading_days=horizon_trading_days,
-                benchmark=slot_spec.benchmark,
-                detail=detail,
-                control=False,
-            )
+            try:
+                score, detail = score_selection(
+                    tuple(shadow["selection"]), tuple(shadow["population"]), window.returns
+                )
+            except SelectionMissError:
+                # plan §4.4 / policy §3: "a cycle in which an arm legitimately
+                # selects nothing is a MISS", and a miss is data. Every name
+                # this arm picked delisted or was halted, while the population
+                # it drew from is intact and every other arm scores normally.
+                #
+                # This is the ONLY swallow in this loop and it is not a
+                # degrade: the failure mode absorbed is "one arm's picks are
+                # all unscoreable on one date", the date is recorded on the
+                # `misses` surface of this run's manifest and on the
+                # `arm_misses` metric below, and it stays OUT of the arm's
+                # series so a miss can never render as a zero. What is NOT
+                # absorbed is one line down.
+                misses.setdefault(arm_id, []).append(day)
+                continue
+            except PopulationIntegrityError as exc:
+                # The other half of the distinction, and it still fails the
+                # slot. The benchmark could not be formed, every arm is scored
+                # against it, so the cycle's shared inputs are compromised.
+                raise_training_integrity(arm_id, exc)
+            else:
+                verdicts[arm_id][day] = score
+                write_verdict(
+                    ctx.store,
+                    arm_id=arm_id,
+                    trading_day=day,
+                    slot=slot,
+                    score=score,
+                    window=window,
+                    benchmark=slot_spec.benchmark,
+                    detail=detail,
+                    control=False,
+                )
 
-    settled_days = sorted(d for d, r in returns_cache.items() if r)
+    settled_days = sorted(d for d, w in returns_cache.items() if w.returns)
     if not settled_days:
         raise MissingArtifactError(
             f"slot {slot!r} has no shadow whose {horizon_trading_days}-session horizon has "
@@ -355,7 +407,8 @@ def run_grade(
     for control in controls:
         verdicts.setdefault(control.arm_id, {})
         for day in settled_days:
-            returns = returns_cache[day]
+            window = returns_cache[day]
+            returns = window.returns
             top_n = _control_top_n(specs)
             selection = control_selection(
                 control.control_kind,
@@ -363,6 +416,11 @@ def run_grade(
                 top_n=top_n,
                 seed=int(day.replace("-", "")),
             )
+            # No miss handler here, deliberately. A control draws its picks
+            # FROM the settled returns, so every pick is settled by
+            # construction; a `SelectionMissError` on a control would be a
+            # defect in the harness itself and must reach the operator as a
+            # failed run rather than as a control that quietly missed.
             score, detail = score_selection(selection, tuple(sorted(returns)), returns)
             verdicts[control.arm_id][day] = score
             detail["control_kind"] = control.control_kind
@@ -372,7 +430,7 @@ def run_grade(
                 trading_day=day,
                 slot=slot,
                 score=score,
-                horizon_trading_days=horizon_trading_days,
+                window=window,
                 benchmark=slot_spec.benchmark,
                 detail=detail,
                 control=True,
@@ -420,6 +478,37 @@ def run_grade(
         training=training_ok(list(register.active_arms())),
     )
 
+    # §10.1: the cycle's control record is BOTH halves of the grader. The
+    # planted/null margin checks the scoring half; the label control checks
+    # the half that constructs the number being scored, and until it existed
+    # a `verdicts void` finding could only ever come from one of the two.
+    control_detail["label_control"] = {
+        "dates_checked": sorted(label_control),
+        "n_dates_checked": len(label_control),
+        "declared_horizon_trading_days": horizon_trading_days,
+        "measured_horizon_trading_days": sorted(
+            {d["horizon_trading_days"] for d in label_control.values()}
+        ),
+        "max_relative_disagreement": max(
+            (d["max_relative_disagreement"] for d in label_control.values()), default=0.0
+        ),
+        "per_date": {day: dict(detail) for day, detail in sorted(label_control.items())},
+    }
+
+    # The horizon EVERY verdict this run wrote actually claims, read back off
+    # the measurements rather than off the argument. One value or the label
+    # control would already have raised; asserted here so a future edit that
+    # bypasses that control cannot quietly reintroduce a mixed-horizon run.
+    measured_horizons = {w.horizon_trading_days for w in returns_cache.values()}
+    if measured_horizons != {horizon_trading_days}:
+        raise GraderControlError(
+            f"slot {slot!r} measured horizons {sorted(measured_horizons)} while declaring "
+            f"{horizon_trading_days}. A cycle whose verdicts span more than one horizon "
+            "compares arms on different axes (policy §4: same benchmark and horizon "
+            "across every arm in a slot), so its verdicts are void."
+        )
+    measured_horizon = measured_horizons.pop()
+
     cycle_key = arena_cycle_key(slot, as_of.isoformat())
     ctx.record_output(
         cycle_key,
@@ -459,8 +548,55 @@ def run_grade(
             ),
             "source_path": cycle_key,
             "last_updated_utc": _utc_now(),
-            "horizon_trading_days": horizon_trading_days,
+            # The horizon MEASURED, not the one requested. §4.12 wants this
+            # number to be a count of trading days; I9757 wants it to be a
+            # count of the trading days that were actually walked.
+            "horizon_trading_days": measured_horizon,
             "baseline": 0.0,
+        }
+    )
+    ctx.record_metric(
+        {
+            "name": "label_control_max_disagreement_ratio",
+            "module": f"crucible.slots.{slot}",
+            "metric_type": "control",
+            "value": float(control_detail["label_control"]["max_relative_disagreement"]),
+            "unit": "ratio",
+            "n_floor": 1,
+            "status": "OK",
+            "status_reason": (
+                f"two independent label constructions agreed on "
+                f"{len(label_control)} settled date(s) over a measured horizon of "
+                f"{measured_horizon} session(s); the cycle declared "
+                f"{horizon_trading_days}. A disagreement, or a measured horizon other "
+                "than the declared one, voids the cycle (§10.1)"
+            ),
+            "source_path": cycle_key,
+            "last_updated_utc": _utc_now(),
+            "horizon_trading_days": measured_horizon,
+            "baseline": 0.0,
+        }
+    )
+    ctx.record_metric(
+        {
+            # A miss is DATA, so it gets a surface. Policy §3: silent absence
+            # and a genuine zero must never render identically — a miss that
+            # only ever appeared as a gap in a series would be exactly that.
+            "name": "arm_miss_dates",
+            "module": f"crucible.slots.{slot}",
+            "metric_type": "count",
+            "value": float(sum(len(days) for days in misses.values())),
+            "unit": "arm_dates",
+            "n_floor": 0,
+            "status": "OK",
+            "status_reason": (
+                f"{sum(len(d) for d in misses.values())} arm-date(s) across "
+                f"{len(misses)} arm(s) had every selected name unscoreable while the "
+                "population was intact: a miss, not a failure and not a zero. Arms: "
+                f"{sorted(misses) or 'none'}"
+            ),
+            "source_path": cycle_key,
+            "last_updated_utc": _utc_now(),
         }
     )
     ctx.record_metric(
@@ -478,15 +614,46 @@ def run_grade(
         }
     )
 
+    # §10.1 as an EXCLUSION that BINDS here, not as a field this run reports.
+    #
+    # `promotable_arms` is the slot registry's filter and stays the shared
+    # implementation of the rule. What it cannot know is the identity a
+    # control actually carries in the register: an arm is
+    # `{slot}:{name}:{spec_hash}` everywhere it is scored — `u:control_null_u:
+    # 082d1c6a2c86` — while the slot spec holds the bare name `control_null_u`.
+    # This call site is the one place that holds BOTH, because it derived the
+    # registered ids from `control_specs` to score them, so it passes what it
+    # knows rather than leaving the exclusion to a filter matching on the
+    # other half of the identity. Once the registry filter resolves registered
+    # ids itself this intersection is a no-op, which is the correct end state:
+    # the same names removed twice, never a control removed by neither.
+    promotable = [
+        a for a in promotable_arms(slot_spec, list(cycle.active_arms)) if a not in control_ids
+    ]
+    leaked = sorted(set(promotable) & control_ids)
+    if leaked:
+        raise GraderControlError(
+            f"control arm(s) {leaked} reached the promotion pool for slot {slot!r}. The "
+            "planted control ranks on the realized forward return, so an arm of this "
+            "kind in the promotable pool is a look-ahead one promotion away from "
+            "production (§10.1)."
+        )
+
     return {
         "slot": slot,
         "as_of": as_of.isoformat(),
         "arena_cycle_key": cycle_key,
         "scored_arms": list(cycle.scored_arms),
         "active_arms": list(cycle.active_arms),
-        "promotable_arms": promotable_arms(slot_spec, list(cycle.active_arms)),
+        "promotable_arms": promotable,
         "settled_dates": settled_days,
+        "horizon_trading_days": measured_horizon,
         "unsettled": {a: sorted(d) for a, d in unsettled.items()},
+        # A miss is recorded, never inferred from a gap. `unsettled` and
+        # `misses` are separate keys because they are separate events: the
+        # first is "not yet a measurement", the second is "measured, and this
+        # arm had nothing scoreable to say" (plan §4.4).
+        "misses": {a: sorted(d) for a, d in misses.items()},
         "pointer": cycle.decision.to_dict(),
         "controls": control_detail,
         "trial_rows_appended": len(rows),

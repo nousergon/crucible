@@ -23,10 +23,15 @@ from crucible.slots import universe
 from crucible.slots.cycle import MissingArtifactError
 from crucible.slots.grading import (
     CONTROL_PLANTED_IC,
+    ForwardReturnWindow,
     GraderControlError,
+    PopulationIntegrityError,
+    SelectionMissError,
     assert_controls_ordered,
+    assert_label_control,
     control_selection,
     forward_returns,
+    reference_forward_returns,
     score_selection,
 )
 
@@ -91,9 +96,30 @@ class TestScoreIsCountMatchedAgainstThePopulation:
         assert detail["n_selected_settled"] == 1
         assert score == pytest.approx(0.10 - (0.10 + 0.05 - 0.05) / 3)
 
-    def test_a_selection_with_nothing_settled_raises_rather_than_scoring_zero(self) -> None:
-        with pytest.raises(ValueError, match="cannot be scored"):
-            score_selection(("GONE",), ("A", "B"), {"A": 0.1, "B": 0.2})
+    def test_a_selection_with_nothing_settled_is_a_MISS_not_a_slot_failure(self) -> None:
+        """Rewritten (§11 risk 1). The previous assertion was
+        `pytest.raises(ValueError)`, which is true of any implementation that
+        refuses at all — including the one that took the whole slot down. The
+        claim under test is the DISTINCTION: an arm whose picks are all
+        unscoreable, against an intact population, is a miss."""
+        with pytest.raises(SelectionMissError) as exc:
+            score_selection(("GONE",), ("A", "B", "C"), {"A": 0.1, "B": 0.2, "C": 0.0})
+        assert "MISS" in str(exc.value)
+        assert not isinstance(exc.value, PopulationIntegrityError)
+
+    def test_an_unusable_population_is_compromised_inputs_not_a_miss(self) -> None:
+        """The other half. Every arm in the slot is benchmarked against the
+        population, so a population that cannot form a benchmark is a defect
+        in the cycle's shared inputs — plan §4.4, and it still fails the run."""
+        with pytest.raises(PopulationIntegrityError, match="not a benchmark"):
+            score_selection(("A",), ("A",), {"A": 0.1})
+
+    def test_the_population_is_judged_before_the_selection(self) -> None:
+        """Both conditions hold at once when the population has collapsed.
+        Reporting that as a miss would file broken inputs under "this arm had
+        nothing to say", which is the confusion policy §3 forbids."""
+        with pytest.raises(PopulationIntegrityError):
+            score_selection(("GONE",), ("A",), {"A": 0.1})
 
     def test_an_unsettled_horizon_raises_and_names_what_is_missing(
         self, source, cycle_date
@@ -240,6 +266,228 @@ class TestControlArms:
         )
 
 
+class TestLabelControl:
+    """§10.1 over the half of the grader the planted/null pair cannot see.
+
+    Both controls are generated from and scored against the same `returns`
+    mapping the real arms are scored against, so a defect in
+    :func:`forward_returns` moves planted and null identically and their
+    margin survives it. Reproduced before the fix: forcing a 5-session
+    horizon published a clean cycle at `control margin=0.025838, n_paired=6`
+    while every `verdict.json` in the run claimed `horizon_trading_days: 21`.
+    """
+
+    def test_the_two_label_constructions_agree_on_a_healthy_panel(self, source, cycle_date) -> None:
+        """The control's positive case: it must not fire on a correct run, or
+        it would be a gate nobody could leave switched on."""
+        panel = source.load_panel(end=cycle_date, lookback_days=1200)
+        start = sessions_ending(cycle_date, HORIZON + 2)[0]
+        window = forward_returns(panel, start=start, horizon_trading_days=HORIZON)
+        reference = reference_forward_returns(panel, start=start, horizon_trading_days=HORIZON)
+        detail = assert_label_control(
+            window, reference, slot="u", declared_horizon_trading_days=HORIZON
+        )
+        assert detail["n_names"] > 0
+        assert detail["horizon_trading_days"] == HORIZON
+        assert detail["max_relative_disagreement"] == pytest.approx(0.0, abs=1e-12)
+
+    def test_a_horizon_that_is_not_the_declared_one_voids_the_cycle(
+        self, source, cycle_date
+    ) -> None:
+        """The reproduced defect, at the unit: labels measured over 5 sessions
+        while the cycle declares 21. Before the fix the horizon was a literal
+        passed beside the returns, so nothing in the system could disagree."""
+        panel = source.load_panel(end=cycle_date, lookback_days=1200)
+        start = sessions_ending(cycle_date, HORIZON + 2)[0]
+        short = forward_returns(panel, start=start, horizon_trading_days=5)
+        reference = reference_forward_returns(panel, start=start, horizon_trading_days=HORIZON)
+        with pytest.raises(GraderControlError, match="span 5 session"):
+            assert_label_control(short, reference, slot="u", declared_horizon_trading_days=HORIZON)
+
+    def test_a_corrupted_label_value_voids_the_cycle(self, source, cycle_date) -> None:
+        """The class where the session count is right and the NUMBERS are
+        wrong — a close paired with the wrong session, a pivot aggregating
+        duplicate rows. The planted/null margin is blind to it because both
+        controls read the corrupted mapping."""
+        panel = source.load_panel(end=cycle_date, lookback_days=1200)
+        start = sessions_ending(cycle_date, HORIZON + 2)[0]
+        window = forward_returns(panel, start=start, horizon_trading_days=HORIZON)
+        reference = reference_forward_returns(panel, start=start, horizon_trading_days=HORIZON)
+        victim = sorted(window.returns)[0]
+        corrupted = dict(window.returns)
+        corrupted[victim] = corrupted[victim] + 0.01
+        with pytest.raises(GraderControlError, match="disagree by"):
+            assert_label_control(
+                ForwardReturnWindow(
+                    start=window.start,
+                    end=window.end,
+                    horizon_trading_days=window.horizon_trading_days,
+                    returns=corrupted,
+                ),
+                reference,
+                slot="u",
+                declared_horizon_trading_days=HORIZON,
+            )
+
+    def test_a_name_present_in_only_one_construction_voids_the_cycle(self) -> None:
+        """A silently dropped or silently invented ticker means the selection
+        and its benchmark were drawn from different cross-sections."""
+        window = ForwardReturnWindow(
+            start="2026-07-01",
+            end="2026-07-31",
+            horizon_trading_days=21,
+            returns={"A": 0.1, "B": 0.2},
+        )
+        with pytest.raises(GraderControlError, match="WHICH names settled"):
+            assert_label_control(window, {"A": 0.1}, slot="u", declared_horizon_trading_days=21)
+
+    def test_a_mutated_label_horizon_fails_the_whole_grade_run(
+        self, store, source, strategy_dir, cycle_date, tmp_path, monkeypatch
+    ) -> None:
+        """The mutation harness's own case, driven through the real cycle.
+
+        Before the fix this published a clean cycle: `control margin` positive,
+        `n_paired=6`, verdicts written, pointer decided — and every verdict
+        claiming a 21-session horizon it had not measured. The run must now
+        FAIL rather than publish."""
+        settings, _ = _seed_cycle(store, source, strategy_dir, cycle_date, tmp_path)
+
+        from crucible.slots import cycle as cycle_module
+
+        real = cycle_module.forward_returns
+
+        def five_session_labels(panel, *, start, horizon_trading_days):
+            return real(panel, start=start, horizon_trading_days=5)
+
+        monkeypatch.setattr(cycle_module, "forward_returns", five_session_labels)
+        with pytest.raises(GraderControlError, match="span 5 session"):
+            run_job(
+                "experiment.grade",
+                lambda c: universe.grade(c, settings=settings),
+                store=store,
+                trading_day=cycle_date,
+                transient_retry=False,
+            )
+
+    def test_a_verdict_states_the_horizon_THE_PANEL_actually_walked(
+        self, store, source, strategy_dir, cycle_date, tmp_path
+    ) -> None:
+        """The horizon on a verdict is checked against the panel, not against
+        the constant the test passed in.
+
+        The previous assertion — `verdict["horizon_trading_days"] == HORIZON`
+        — was true for any implementation, because that literal was written
+        straight through from the caller. Here the claim is falsifiable: the
+        artifact names the session its return settled at, and the count of
+        panel sessions between anchor and settle must equal the horizon it
+        claims."""
+        settings, decision_days = _seed_cycle(store, source, strategy_dir, cycle_date, tmp_path)
+        run_job(
+            "experiment.grade",
+            lambda c: universe.grade(c, settings=settings),
+            store=store,
+            trading_day=cycle_date,
+        )
+        from crucible.slots.arms import load_arm_specs
+
+        arm = load_arm_specs("u", strategy_dir=strategy_dir)[0]
+        settled = decision_days[0].isoformat()
+        verdict = json.loads(store.get_bytes(verdict_key(arm.arm_id, settled)))
+
+        panel = source.load_panel(end=cycle_date, lookback_days=1200)
+        sessions = sorted({str(d) for d in panel["trading_day"].unique()})
+        walked = sessions.index(verdict["settled_on"]) - sessions.index(verdict["trading_day"])
+        assert verdict["horizon_trading_days"] == walked, (
+            "the horizon a verdict claims must be a property of the returns behind it"
+        )
+        assert walked == HORIZON
+
+
+class TestOneBrokenArmDoesNotTakeTheSlotDown:
+    """`I9757` defect 6: the `ChallengerShadowGapError` shape, one step later.
+
+    `score_selection` raised on an all-delisted selection and the `run_grade`
+    call site had no handler, so the raise propagated and the whole slot
+    failed: no arena cycle and no verdict for any healthy arm.
+    """
+
+    @staticmethod
+    def _break_one_arm(store, tmp_path, strategy_dir, day, *, population=None):
+        """Rewrite one arm's shadow so every name it picked is unscoreable."""
+        from crucible.slots.arms import load_arm_specs
+
+        specs = load_arm_specs("u", strategy_dir=strategy_dir)
+        broken = specs[0]
+        path = tmp_path / "store" / shadow_key(broken.arm_id, day.isoformat())
+        shadow = json.loads(path.read_text())
+        shadow["selection"] = ["DELISTED1", "DELISTED2"]
+        if population is not None:
+            shadow["population"] = population
+        path.write_text(json.dumps(shadow, indent=2, sort_keys=True))
+        return broken, specs
+
+    def test_an_all_delisted_selection_is_a_miss_and_the_slot_still_grades(
+        self, store, source, strategy_dir, cycle_date, tmp_path
+    ) -> None:
+        settings, decision_days = _seed_cycle(store, source, strategy_dir, cycle_date, tmp_path)
+        day = decision_days[0]
+        broken, specs = self._break_one_arm(store, tmp_path, strategy_dir, day)
+
+        result: dict = {}
+        run_job(
+            "experiment.grade",
+            lambda c: result.update(universe.grade(c, settings=settings)),
+            store=store,
+            trading_day=cycle_date,
+        )
+
+        # The miss is recorded as a miss — on a durable surface, named by arm
+        # and date. Policy §3: silent absence and a genuine zero must never
+        # render identically, and a gap in a series is silent absence.
+        assert result["misses"] == {broken.arm_id: [day.isoformat()]}
+        assert day.isoformat() not in result["unsettled"].get(broken.arm_id, []), (
+            "a miss is not an unsettled horizon; the two are separate events"
+        )
+
+        # ... and it is a miss for THAT ARM ON THAT DATE only.
+        cycle = json.loads(store.get_bytes(arena_cycle_key("u", cycle_date.isoformat())))
+        ladders = {ladder["arm_id"]: ladder for ladder in cycle["ladders"]}
+        assert broken.arm_id in ladders, "a missing arm is still scored, not dropped"
+        assert not store.exists(verdict_key(broken.arm_id, day.isoformat())), (
+            "an unscoreable date must not get a verdict — scoring it as zero would "
+            "credit a delisting as a flat month"
+        )
+        for other in specs[1:]:
+            assert store.exists(verdict_key(other.arm_id, day.isoformat())), (
+                "one arm's miss must not cost a healthy arm its verdict for the same "
+                "date: that is the whole defect"
+            )
+        # The arm keeps its other dates. A miss costs one observation, not a series.
+        assert store.exists(verdict_key(broken.arm_id, decision_days[1].isoformat()))
+
+    def test_a_population_that_cannot_form_a_benchmark_still_fails_the_slot(
+        self, store, source, strategy_dir, cycle_date, tmp_path
+    ) -> None:
+        """The distinction, from the other side. Making the failure survivable
+        must not make it silent: compromised inputs are a TASK FAILURE (plan
+        §4.4, Brian's 2026-08-29 ruling), never a miss and never a degraded
+        verdict."""
+        from nousergon_lib.arena.engine import TrainingIntegrityError
+
+        settings, decision_days = _seed_cycle(store, source, strategy_dir, cycle_date, tmp_path)
+        day = decision_days[0]
+        self._break_one_arm(store, tmp_path, strategy_dir, day, population=["T000"])
+
+        with pytest.raises(TrainingIntegrityError, match="compromised"):
+            run_job(
+                "experiment.grade",
+                lambda c: universe.grade(c, settings=settings),
+                store=store,
+                trading_day=cycle_date,
+                transient_retry=False,
+            )
+
+
 class TestReplayDeterminism:
     def test_grading_the_same_date_twice_reproduces_the_verdict(
         self, store, source, strategy_dir, cycle_date, tmp_path
@@ -348,7 +596,11 @@ class TestVerdictArtifacts:
         arm = load_arm_specs("u", strategy_dir=strategy_dir)[0]
         settled = decision_days[0].isoformat()
         verdict = json.loads(store.get_bytes(verdict_key(arm.arm_id, settled)))
-        assert verdict["horizon_trading_days"] == HORIZON
+        # The horizon claim moved to
+        # `TestLabelControl::test_a_verdict_states_the_horizon_THE_PANEL_actually_walked`
+        # (§11 risk 1). Asserting it equals the constant this test passed in
+        # was true for any implementation, because the constant was written
+        # straight through to the artifact — which is the defect, not the test.
         assert verdict["benchmark"] == "population", "never SPY for a selection slot"
         assert isinstance(verdict["score_ratio"], float)
         assert dt.date.fromisoformat(verdict["trading_day"]) == decision_days[0]
