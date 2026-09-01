@@ -50,7 +50,9 @@ __all__ = [
     "EstimatorSpec",
     "SlotSpec",
     "arena_config_for",
+    "arm_name",
     "get_slot",
+    "is_control_arm",
     "load_arm_specs",
     "load_model_recipes",
     "load_strategy_recipes",
@@ -212,6 +214,52 @@ def arena_config_for(slot: str) -> ArenaConfig:
     return get_slot(slot).arena
 
 
+def arm_name(arm_id: str) -> str:
+    """The NAME component of a registered arm id, or a bare name unchanged.
+
+    `nousergon_lib.arena.derive_arm_id` returns ``{slot}:{name}:{spec_hash}``
+    and forbids ``:`` inside either the slot or the name, so a registered id
+    has exactly three colon-separated parts and the middle one is the name.
+    A string with no colon at all is a bare name — what a recipe file and a
+    :class:`ControlArm` carry before registration — and is returned as it is.
+
+    **Anything else raises.** This function is what
+    :func:`is_control_arm` and :func:`promotable_arms` bind on, so an id
+    shape neither branch understands must not be quietly reported as "not a
+    control": that is the F4 failure mode inverted, and a look-ahead arm
+    would reach the pointer through it.
+    """
+    if not arm_id:
+        raise ValueError("arm_id must be non-empty")
+    if ":" not in arm_id:
+        return arm_id
+    parts = arm_id.split(":")
+    if len(parts) != 3 or not all(parts):
+        raise ValueError(
+            f"arm_id {arm_id!r} is neither a bare name nor a "
+            "'{slot}:{name}:{spec_hash}' id from nousergon_lib.arena.derive_arm_id. "
+            "Refusing rather than guessing: the control-arm exclusion reads the NAME "
+            "component, and an id this function cannot parse would be reported as a "
+            "non-control and become eligible to serve."
+        )
+    return parts[1]
+
+
+def is_control_arm(spec: SlotSpec, arm_id: str) -> bool:
+    """Whether ``arm_id`` is one of ``spec``'s control arms.
+
+    **Matched on the NAME component, never on the whole string.** A
+    :class:`ControlArm` carries the bare name (``control_planted_m``) because
+    that is what `crucible.slots.arms.control_specs` passes to
+    `derive_arm_id` as the recipe's name; the arm the register, the series
+    and the pointer all speak about is ``m:control_planted_m:7e8059f49558``.
+    An equality test against the literal therefore matched nothing that had
+    ever been registered — the exclusion existed and could not fire
+    (`alpha-engine-config-I9757`, F4).
+    """
+    return arm_name(arm_id) in {c.arm_id for c in spec.control_arms}
+
+
 def promotable_arms(spec: SlotSpec, arm_ids: list[str]) -> list[str]:
     """``arm_ids`` minus the slot's control arms, order preserved.
 
@@ -222,9 +270,13 @@ def promotable_arms(spec: SlotSpec, arm_ids: list[str]) -> list[str]:
     competing arms, and two controls counting against it would mean every
     slot starts two arms into its own retirement pressure — a cap of 5 that
     behaves as 3.
+
+    Accepts registered ids and bare names alike (:func:`arm_name`), because
+    both shapes exist: a recipe is loaded by name and scored by id, and a
+    filter that only understood one of them is a filter that never fired on
+    the path that matters.
     """
-    control_ids = {c.arm_id for c in spec.control_arms}
-    return [a for a in arm_ids if a not in control_ids]
+    return [a for a in arm_ids if not is_control_arm(spec, a)]
 
 
 # ---------------------------------------------------------------------------
