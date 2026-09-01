@@ -639,13 +639,28 @@ class TestFaultInjection:
         "the S3 release pointer is stale": "TestFaultFourStaleReleasePointer",
     }
 
+    #: The production entry point each fault must be induced THROUGH, not
+    #: raised inline. alpha-engine-config-I9780: faults 2 and 3 used to
+    #: `raise RuntimeError(...)` directly in the job body and assert the
+    #: manifest carried the string the test itself wrote — neither could
+    #: fail from a defect in the data layer or the LLM path. A fault class
+    #: that never calls its named seam is making the same claim again.
+    SEAMS = {
+        "spot instance terminated mid-job": frozenset({"spot_interruption_guard"}),
+        "a data source withheld": frozenset({"run_daily"}),
+        "the LLM router returns 500": frozenset({"call", "llm_call"}),
+        "the S3 release pointer is stale": frozenset({"resolve_release"}),
+    }
+
     @pytest.mark.parametrize("fault", sorted(FAULTS))
     def test_each_scripted_fault_produces_one_failed_run_and_exactly_one_page(
         self, fault: str
     ) -> None:
         """MET by track C. Each fault is scripted in `tests/faults/`, and each
         asserts the same four properties: status failed, the RIGHT reason,
-        full telemetry, and EXACTLY ONE page against a captured transport."""
+        full telemetry, and EXACTLY ONE page against a captured transport —
+        AND is induced through the production module named in `SEAMS`, never
+        raised inline in the test body (alpha-engine-config-I9780)."""
         import importlib
 
         module = importlib.import_module("tests.faults.test_four_scripted_faults")
@@ -677,11 +692,13 @@ class TestFaultInjection:
                 "that omits the page count proves the run failed, not that the "
                 "operator was told once."
             )
-        # Recorded, not asserted: faults 2 and 3 raise a message rather than
-        # inducing the condition at the seam that would produce it, so they
-        # cannot fail because of a defect in the data layer or the LLM path.
-        # Tracked as alpha-engine-config-I9780; this clause asserts the shape
-        # every fault must have, and that issue closes the two that fake it.
+        seam = self.SEAMS[fault]
+        assert called & seam, (
+            f"{cls.__name__} never calls into {sorted(seam)}. A fault raised "
+            "directly inside the test body — `raise RuntimeError('...')` — cannot "
+            "fail because of a defect in the production module it claims to "
+            "exercise; alpha-engine-config-I9780 is exactly that shape, twice."
+        )
 
 
 class TestFeatureLayer:

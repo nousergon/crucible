@@ -2,7 +2,17 @@
 
 Nothing here is mocked except the two things that would otherwise reach the
 outside world: the alert transport (captured, so "exactly one page" is
-observable) and the data source (a stub that raises, which is the fault).
+observable), the data source (`FramePriceSource` withholding every requested
+ticker, which is the fault fault 2 induces) and the LLM transport
+(`krepis.llm.LLMClient` itself, replaced with a stub whose `complete()`
+raises the fault fault 3 induces — the same seam `tests/test_llm_cap.py`
+patches to exercise the cap without a provider).
+
+Faults 2 and 3 used to `raise RuntimeError(...)` directly in the job body
+and then assert the manifest carried the string the test itself wrote —
+alpha-engine-config-I9780. Neither could fail from a defect in the data
+layer or the LLM path; both now run the real production seam
+(`crucible.data.daily.run_daily` / `crucible.llm.call`) and let IT raise.
 """
 
 from __future__ import annotations
@@ -15,6 +25,10 @@ import signal
 import pytest
 
 from crucible.alerts import sweep
+from crucible.data.daily import run_daily
+from crucible.data.sources import FramePriceSource
+from crucible.llm import CallSite, SpendCap
+from crucible.llm import call as llm_call
 from crucible.manifest import manifest_key, validate
 from crucible.release import POINTER_KEY, publish_release, resolve_release, wheel_key
 from crucible.runner import RunContext, SpotInterruptionError, run_job, spot_interruption_guard
@@ -104,16 +118,28 @@ class TestFaultTwoDataSourceWithheld:
     def test_it_fails_with_the_right_reason_full_telemetry_and_one_page(
         self, tmp_path, transport
     ) -> None:
+        """Induced at the seam: `FramePriceSource` withholds every ticker
+        `run_daily` asks for — the same shape a live ArcticDB outage takes,
+        since `ArcticPriceSource.load_panel` raises `MissingSourceError` the
+        identical way when a requested symbol is absent from what it read.
+        `run_daily` never gets to compute a coverage ratio; the source
+        refuses before the panel exists. A change that made either source
+        zero-fill an absent ticker instead of raising turns this test red —
+        the 901-of-903 bug class the coverage floor exists to catch, moved
+        one layer up to where it would never reach the floor at all."""
         store = LocalStore(tmp_path)
 
         def withheld(ctx: RunContext) -> None:
-            ctx.record_rejected("data source withheld", 903)
-            raise RuntimeError("data source yfinance returned no rows for 903 tickers")
+            run_daily(
+                ctx,
+                source=FramePriceSource({}),
+                expected_symbols=["AAA", "BBB", "CCC"],
+            )
 
         manifest = _run_and_capture(store, "data.daily", withheld)
         assert manifest["status"] == "failed"
-        assert "data source" in manifest["reason"]
-        assert manifest["rows_rejected"] == [{"reason": "data source withheld", "count": 903}]
+        assert "MissingSourceError" in manifest["reason"]
+        assert "AAA" in manifest["reason"]
         _assert_full_telemetry(manifest)
         assert _failure_pages(store, transport) == 1
 
@@ -121,12 +147,26 @@ class TestFaultTwoDataSourceWithheld:
         """It pages immediately. A vendor that returned nothing is not a
         thing a fresh instance fixes, and retrying it would delay the page by
         the length of a second run."""
+        from crucible.data.sources import MissingSourceError
         from crucible.runner import classify_transient
 
-        assert classify_transient(RuntimeError("data source yfinance returned no rows")) is None
+        assert classify_transient(MissingSourceError("source frame(s) are empty")) is None
 
     def test_five_jobs_hitting_one_outage_produce_one_page(self, tmp_path, transport) -> None:
-        """§9.3's requirement, induced rather than asserted about."""
+        """§9.3's requirement, induced rather than asserted about — the same
+        outage hit by five different jobs collapses to one page.
+
+        This asserts `crucible.alerts.group_pages`, not the fault: what
+        makes five reasons "the same outage" is `CAUSE_MATCHERS` in
+        `crucible/alerts.py` keying on a substring in `reason` (`"data
+        source"` / `"yfinance"` / `"fred"`), and no production exception in
+        `crucible.data.sources` carries that literal phrase — the file this
+        test does not own. The fault itself (`FramePriceSource` withholding
+        a ticker through `run_daily`) is induced in full, once, above; this
+        test is entitled to script the reason text because the grouping
+        behaviour it exercises lives in a different module than the one the
+        fault touches.
+        """
         store = LocalStore(tmp_path)
         for job in ("data.daily", "experiment.run", "experiment.grade", "report", "drift"):
 
@@ -137,43 +177,90 @@ class TestFaultTwoDataSourceWithheld:
         assert _failure_pages(store, transport) == 1
 
 
+_ROUTER_500_SITE = CallSite(
+    callsite_id="faults.router_probe",
+    purpose="induce a provider 5xx through crucible.llm.call",
+    capability_class="high",
+    max_usd_per_call=1.0,
+    owner="tests.faults",
+)
+
+
+class _Provider5xxClient:
+    """The transport `crucible.llm.call` reaches. `.complete()` is the one
+    call surface `LLMClient.complete` invokes on it (`messages.create` /
+    `chat.completions.create` on a real transport); raising here is a
+    provider 5xx arriving on the wire, upstream of `LLMClient` itself."""
+
+    def complete(self, **_kwargs: object) -> None:
+        raise RuntimeError("provider_5xx: router returned 503 service unavailable")
+
+
 class TestFaultThreeRouterReturns500:
     def test_it_fails_with_the_right_reason_full_telemetry_and_one_page(
-        self, tmp_path, transport
+        self, tmp_path, transport, monkeypatch
     ) -> None:
+        """Induced at the seam: `krepis.llm.LLMClient` — what `crucible.llm.call`
+        constructs and calls `.complete()` on — is replaced with a stub that
+        raises a 503. The cap reservation, the registry lookup and the
+        ceiling check in `crucible.llm.call` all run unmocked; only the
+        provider transport is faked. A change that swallowed the provider
+        error (a bare `except` around `client.complete(...)`) turns this test
+        red — no manifest would carry `status: failed` at all."""
         store = LocalStore(tmp_path)
+        # `resolve_model_spec` would otherwise reach SSM/env for a real
+        # deployment spec — irrelevant here. Same seam `test_llm_cap.py`'s
+        # overrun test patches, so `crucible.llm.call`'s cap admission runs
+        # for real and only the provider transport is faked.
+        monkeypatch.setattr("krepis.llm_config.resolve_model_spec", lambda **_kw: object())
+        monkeypatch.setattr("krepis.llm.LLMClient", lambda *a, **k: _Provider5xxClient())
 
         def router_500(ctx: RunContext) -> None:
-            ctx.record_llm_call(
-                {
-                    "callsite_id": "crucible.faults.router_probe",
-                    "model_requested": "research-class",
-                    "model_served": "none",
-                    "tokens_in": 0,
-                    "tokens_out": 0,
-                    "cache_read": 0,
-                    "cache_write": 0,
-                    "usd": 0.0,
-                }
+            llm_call(
+                ctx,
+                callsite_id=_ROUTER_500_SITE.callsite_id,
+                capability_class=_ROUTER_500_SITE.capability_class,
+                messages=[{"role": "user", "content": "probe"}],
+                cap=SpendCap(cap_usd=5.0),
+                estimate_usd=0.01,
+                client_factory=lambda *a, **k: _Provider5xxClient(),
+                registry={_ROUTER_500_SITE.callsite_id: _ROUTER_500_SITE},
             )
-            raise RuntimeError("provider_5xx: router returned 503 service unavailable")
 
         # Retry disabled so the FIRST failure is what is asserted; the retry
         # path has its own test above.
         manifest = _run_and_capture(store, "experiment.run", router_500, retry=False)
         assert manifest["status"] == "failed"
         assert "provider_5xx" in manifest["reason"]
-        assert manifest["llm_calls"][0]["model_served"] == "none"
+        assert manifest["llm_calls"] == [], (
+            "the call raised before `crucible.llm.call` could record it — nothing "
+            "was billed for a call that never completed"
+        )
         _assert_full_telemetry(manifest)
         assert _failure_pages(store, transport) == 1
 
     def test_a_router_500_that_survives_the_retry_still_pages_exactly_once(
-        self, tmp_path, transport
+        self, tmp_path, transport, monkeypatch
     ) -> None:
         store = LocalStore(tmp_path)
+        # `resolve_model_spec` would otherwise reach SSM/env for a real
+        # deployment spec — irrelevant here. Same seam `test_llm_cap.py`'s
+        # overrun test patches, so `crucible.llm.call`'s cap admission runs
+        # for real and only the provider transport is faked.
+        monkeypatch.setattr("krepis.llm_config.resolve_model_spec", lambda **_kw: object())
+        monkeypatch.setattr("krepis.llm.LLMClient", lambda *a, **k: _Provider5xxClient())
 
         def router_500(ctx: RunContext) -> None:
-            raise RuntimeError("provider_5xx: 503")
+            llm_call(
+                ctx,
+                callsite_id=_ROUTER_500_SITE.callsite_id,
+                capability_class=_ROUTER_500_SITE.capability_class,
+                messages=[{"role": "user", "content": "probe"}],
+                cap=SpendCap(cap_usd=5.0),
+                estimate_usd=0.01,
+                client_factory=lambda *a, **k: _Provider5xxClient(),
+                registry={_ROUTER_500_SITE.callsite_id: _ROUTER_500_SITE},
+            )
 
         manifest = _run_and_capture(store, "experiment.run", router_500, retry=True)
         assert len(manifest["attempts"]) == 2
