@@ -17,6 +17,13 @@ dependencies = [
     # dependency, not a test-only one.
     "jsonschema>=4.23",
     "PyYAML>=6.0",
+    # The M slot's linear estimators and the CPCV grader operate on a
+    # (trading_day x name) panel. Pure-Python normal equations over ~450k
+    # rows is ~20s per fold and 15 folds per cycle, so the arithmetic is
+    # vectorised rather than hand-rolled (principle 4). numpy only: parquet
+    # and the feature layer's I/O are track A's, so nothing here pulls
+    # pandas or pyarrow into a Lambda cold start.
+    "numpy>=2.1",
 ]
 
 [project.scripts]

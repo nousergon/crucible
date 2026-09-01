@@ -1,0 +1,678 @@
+"""The S slot: exit and risk rules, graded market-relative and net of cost.
+
+Normative sources: `champion-challenger-policy.md` §3.1, §4, §5.3; plan §4.4,
+§9.1 (contamination attestation), §10.2 (the real cost model is phase 3).
+
+Lifted, not imported, from `crucible-executor/executor/strategies/` (the
+`ExitRule` contract and the seven `stock_registry()` rules),
+`crucible-backtester/synthetic/pit_folds.py` (walk-forward folds) and
+`crucible-backtester/analysis/pit_parity.py` (the contamination attestation).
+
+**S is the one slot benchmarked against SPY.** Its output IS a market
+position, so market-relative canonical alpha is the correct axis. The
+population rule that protects U and R — a selection stage must beat the
+population it drew from, never an index — would be the wrong benchmark here,
+and over-applying it would be a second defect rather than a fix. The
+`ArenaConfig` for U and R refuses SPY; S declares it deliberately.
+
+**Three things this module refuses to do quietly:**
+
+1. **Grade without naming its cost model.** §10.2's real transaction-cost
+   model lands in phase 3. Phase 1 therefore requires each arm file to NAME a
+   placeholder and carry its constants, so a grade is reproducible from the
+   recipe. A cost constant living in the grader would silently re-price every
+   arm's history the day it changed.
+2. **Render a grade without an attestation.** Plan §9.1: "a card without
+   `attestation: PASS` renders UNVERIFIED, never a grade."
+   :func:`render_verdict` omits the grade key entirely rather than showing a
+   number beside a caveat nobody reads.
+3. **Treat missing coverage as clean.** `pit_parity` returns `UNKNOWN`, never
+   `PASS`, when the walk-forward pass scored nothing. A contamination check
+   that did not answer must not read as an answer of "no contamination".
+
+**Point-in-time exit-rule EXECUTION is not in this module.** The rules'
+runtime lives with the trader; what S grades is the recipe's realized book,
+which arrives as a :class:`Book`. That is the plan §3 separation held at the
+module boundary: the harness must complete every acceptance test with the
+trader switched off.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any
+
+import yaml
+from nousergon_lib.arena import ArmSeries, derive_arm_id
+
+__all__ = [
+    "ATTESTATION_STATUSES",
+    "EXIT_RULES",
+    "Book",
+    "CostModel",
+    "ExitRuleSpec",
+    "PitParityVerdict",
+    "StrategyGrade",
+    "StrategyRecipe",
+    "WalkForwardFold",
+    "WalkForwardSpec",
+    "build_walk_forward_folds",
+    "grade_arm",
+    "load_strategy_recipes",
+    "pit_parity",
+    "render_verdict",
+]
+
+#: The registered exit rules, in the canonical `stock_registry()` order, with
+#: the parameters each declares. The IMPLEMENTATIONS and this registry are
+#: framework and therefore public; the tuned VALUES are strategy edge and live
+#: in `alpha-engine-config/strategy/arms/s/` (`repository-tiering-policy`
+#: test 2). A recipe naming a rule absent from here is refused at load.
+#:
+#: `position_loss_floor` is first and stays first: it is the hard MAE floor,
+#: stance-agnostic, and a chain that can reach a profit-take before its loss
+#: floor has a different risk shape whatever its parameters say.
+EXIT_RULES: dict[str, tuple[str, ...]] = {
+    "position_loss_floor": ("position_loss_floor_pct",),
+    "catalyst_hard_exit": ("catalyst_followthrough_days",),
+    "atr_trailing_stop": (
+        "atr_period",
+        "atr_multiplier",
+        "sector_relative_outperform_threshold",
+    ),
+    "fallback_stop": ("fallback_stop_pct",),
+    "profit_take": ("profit_take_pct",),
+    "momentum_exit": ("momentum_exit_threshold", "momentum_exit_rsi"),
+    "time_decay": ("time_decay_reduce_days", "time_decay_exit_days"),
+}
+
+#: The attestation vocabulary, closed. `PARTIAL` and `UNKNOWN` exist so that
+#: "the check could not answer" never has to be rounded to a pass or a fail.
+ATTESTATION_STATUSES: tuple[str, ...] = ("PASS", "FAIL", "PARTIAL", "UNKNOWN")
+
+BASIS_POINT = 1e-4
+
+
+# ---------------------------------------------------------------------------
+# The recipe.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExitRuleSpec:
+    """One rule in the chain, with its parameters. Part of the recipe hash."""
+
+    rule_id: str
+    params: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.rule_id not in EXIT_RULES:
+            raise ValueError(
+                f"unknown exit rule {self.rule_id!r}; registered rules are "
+                f"{sorted(EXIT_RULES)}. A rule resolved at runtime rather than from "
+                "this registry is a chain whose recipe does not describe what it runs."
+            )
+        expected = set(EXIT_RULES[self.rule_id])
+        unknown = sorted(set(self.params) - expected)
+        if unknown:
+            raise ValueError(
+                f"exit rule {self.rule_id!r} does not take parameter(s) {unknown}; it "
+                f"takes {sorted(expected)}. A parameter nothing reads is a tuning "
+                "someone believes is live."
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"rule_id": self.rule_id, "params": dict(self.params)}
+
+
+@dataclass(frozen=True)
+class CostModel:
+    """The cost model a grade is net of. NAMED in the arm file, never here.
+
+    ``placeholder`` is a required field rather than an inference from the
+    name: §10.2's real model lands in phase 3, and a verdict graded against a
+    stand-in must say so on its face. A card that hid it would read as a
+    net-of-cost result the day it was not one.
+    """
+
+    name: str
+    placeholder: bool
+    params: dict[str, float]
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("a cost model must be named; an anonymous cost is unreproducible")
+        missing = sorted({"half_spread_bps", "commission_bps", "slippage_bps"} - set(self.params))
+        if missing:
+            raise ValueError(
+                f"cost model {self.name!r} is missing constant(s) {missing}. A grade net "
+                "of a partially declared cost is not reproducible from the recipe."
+            )
+
+    def bps_per_unit_turnover(self) -> float:
+        """Round-trip cost in basis points per unit of turnover.
+
+        A flat model on purpose: §10.2's square-root market-impact term needs
+        an ADV series the harness does not carry until phase 3, and a
+        half-implemented impact model would be worse than a declared flat one
+        because its number would look like an impact estimate.
+        """
+        return (
+            2.0 * float(self.params["half_spread_bps"])
+            + float(self.params["commission_bps"])
+            + float(self.params["slippage_bps"])
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "placeholder": self.placeholder, "params": dict(self.params)}
+
+
+@dataclass(frozen=True)
+class WalkForwardSpec:
+    """Fold geometry, in trading days (§4.12)."""
+
+    test_window: int = 21
+    min_train: int = 504
+    purge: int = 21
+    embargo: int = 2
+    train_mode: str = "expanding"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "test_window": self.test_window,
+            "min_train": self.min_train,
+            "purge": self.purge,
+            "embargo": self.embargo,
+            "train_mode": self.train_mode,
+        }
+
+
+@dataclass(frozen=True)
+class StrategyRecipe:
+    """One S arm: an ordered exit-rule chain, a cost model, a fold geometry.
+
+    The chain is FIRST-DECISION-WINS, so its order is semantic. Reordering it
+    changes the arm's behaviour and therefore its id — which is why
+    :meth:`with_rules` produces a new arm carrying `supersedes` rather than
+    mutating one (policy §3.1).
+    """
+
+    name: str
+    rules: tuple[ExitRuleSpec, ...]
+    cost_model: CostModel
+    walk_forward: WalkForwardSpec = field(default_factory=WalkForwardSpec)
+    benchmark: str = "SPY"
+    supersedes: str | None = None
+    slot: str = "s"
+
+    def __post_init__(self) -> None:
+        if not self.rules:
+            raise ValueError(f"arm {self.name!r} declares no exit rules")
+        seen = [r.rule_id for r in self.rules]
+        duplicates = sorted({r for r in seen if seen.count(r) > 1})
+        if duplicates:
+            raise ValueError(
+                f"arm {self.name!r} lists rule(s) {duplicates} more than once. The chain "
+                "is first-decision-wins, so a second copy can never fire and is a "
+                "parameter someone believes is live."
+            )
+
+    @property
+    def spec(self) -> dict[str, Any]:
+        return {
+            "rules": [r.to_dict() for r in self.rules],
+            "cost_model": self.cost_model.to_dict(),
+            "walk_forward": self.walk_forward.to_dict(),
+            "benchmark": self.benchmark,
+        }
+
+    @property
+    def arm_id(self) -> str:
+        return derive_arm_id(self.slot, self.name, self.spec)
+
+    def with_rules(self, rules: tuple[ExitRuleSpec, ...]) -> StrategyRecipe:
+        """A NEW arm with a different chain, carrying `supersedes` (§3.1)."""
+        return replace(self, rules=rules, supersedes=self.arm_id)
+
+    def with_rule_params(self, rule_id: str, params: dict[str, Any]) -> StrategyRecipe:
+        """A NEW arm with one rule retuned, carrying `supersedes` (§3.1)."""
+        if rule_id not in {r.rule_id for r in self.rules}:
+            raise ValueError(f"arm {self.name!r} does not run rule {rule_id!r}")
+        return self.with_rules(
+            tuple(
+                ExitRuleSpec(rule_id=r.rule_id, params={**r.params, **params})
+                if r.rule_id == rule_id
+                else r
+                for r in self.rules
+            )
+        )
+
+
+REQUIRED_STRATEGY_FIELDS: tuple[str, ...] = ("rules", "cost_model")
+
+
+def load_strategy_recipes(directory: Path | str) -> tuple[StrategyRecipe, ...]:
+    """Load every `*.yaml` S recipe under ``directory``, sorted by filename.
+
+    `alpha-engine-config/strategy/arms/s/` in production. Tuned values stay
+    private; this repository holds the registry the values are checked against.
+    """
+    root = Path(directory)
+    recipes: list[StrategyRecipe] = []
+    for path in sorted(root.glob("*.yaml")):
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        spec = payload.get("spec") or {}
+        missing = [f for f in REQUIRED_STRATEGY_FIELDS if f not in spec]
+        if missing:
+            raise ValueError(
+                f"{path}: recipe is missing pre-registration field(s) {missing}. Plan §9.1: "
+                "missing fields mean the arm does not register."
+            )
+        cost = spec["cost_model"]
+        recipes.append(
+            StrategyRecipe(
+                slot=payload.get("slot", "s"),
+                name=payload["name"],
+                rules=tuple(
+                    ExitRuleSpec(rule_id=r["rule_id"], params=dict(r.get("params") or {}))
+                    for r in spec["rules"]
+                ),
+                cost_model=CostModel(
+                    name=cost["name"],
+                    placeholder=bool(cost["placeholder"]),
+                    params={k: float(v) for k, v in (cost.get("params") or {}).items()},
+                ),
+                walk_forward=WalkForwardSpec(**(spec.get("walk_forward") or {})),
+                benchmark=spec.get("benchmark", "SPY"),
+                supersedes=payload.get("supersedes"),
+            )
+        )
+    return tuple(recipes)
+
+
+# ---------------------------------------------------------------------------
+# Walk-forward folds.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WalkForwardFold:
+    """One expanding-or-rolling fold, as index bounds and dates."""
+
+    train_start_idx: int
+    train_end_idx: int
+    test_start_idx: int
+    test_end_idx: int
+    train_start_date: str
+    train_end_date: str
+    test_start_date: str
+    test_end_date: str
+
+
+def build_walk_forward_folds(
+    dates: list[str],
+    *,
+    test_window: int,
+    min_train: int,
+    purge: int,
+    embargo: int,
+    train_mode: str = "expanding",
+) -> list[WalkForwardFold]:
+    """Purged, embargoed walk-forward folds over ``dates``.
+
+    Lifted from `crucible-backtester/synthetic/pit_folds.py`. Two properties
+    are the reason it is lifted rather than reinvented:
+
+    * the training block ends ``purge`` days BEFORE the test block, removing
+      the overlapping-label leak that a naive expanding split carries;
+    * when ``embargo > purge`` the next fold starts later, so the serial
+      correlation immediately after a test block is not scored either.
+
+    ``dates`` are opaque here: the caller supplies trading days, and this
+    function never derives one, so there is no second calendar to drift.
+    """
+    if test_window <= 0 or min_train <= 0:
+        raise ValueError("test_window and min_train must be positive")
+    if purge < 0 or embargo < 0:
+        raise ValueError("purge and embargo must be non-negative")
+    if train_mode not in ("expanding", "rolling"):
+        raise ValueError(
+            f"unknown train_mode {train_mode!r}; expanding|rolling. A window rule this "
+            "function does not implement must not be silently treated as expanding."
+        )
+
+    n = len(dates)
+    folds: list[WalkForwardFold] = []
+    fold_start_idx = min_train
+    while fold_start_idx < n:
+        remaining = n - fold_start_idx
+        if remaining < test_window // 2:
+            break
+        test_start_idx = fold_start_idx
+        test_end_idx = min(fold_start_idx + test_window - 1, n - 1)
+        train_end_idx = fold_start_idx - purge
+        if train_end_idx < min_train // 2:
+            fold_start_idx += test_window
+            continue
+        if train_mode == "expanding":
+            train_start_idx = 0
+        else:
+            train_start_idx = max(0, train_end_idx - test_window + 1)
+        if train_end_idx < train_start_idx:
+            fold_start_idx += test_window
+            continue
+        folds.append(
+            WalkForwardFold(
+                train_start_idx=train_start_idx,
+                train_end_idx=train_end_idx,
+                test_start_idx=test_start_idx,
+                test_end_idx=test_end_idx,
+                train_start_date=dates[train_start_idx],
+                train_end_date=dates[train_end_idx],
+                test_start_date=dates[test_start_idx],
+                test_end_date=dates[test_end_idx],
+            )
+        )
+        advance = test_window
+        if embargo > purge:
+            advance = max(test_window, test_window + (embargo - purge))
+        fold_start_idx += advance
+    return folds
+
+
+# ---------------------------------------------------------------------------
+# The contamination attestation.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PitParityVerdict:
+    """Whether the look-ahead-vs-point-in-time delta is distinguishable from 0."""
+
+    status: str
+    reason: str
+    mean_delta: float | None = None
+    ci: tuple[float, float] | None = None
+    coverage_fraction: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in ATTESTATION_STATUSES:
+            raise ValueError(
+                f"attestation status {self.status!r} is not one of {ATTESTATION_STATUSES}"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": "pit_parity",
+            "status": self.status,
+            "reason": self.reason,
+            "mean_delta": self.mean_delta,
+            "ci": list(self.ci) if self.ci else None,
+            "coverage_fraction": self.coverage_fraction,
+        }
+
+
+def pit_parity(
+    *,
+    contaminated: list[float],
+    point_in_time: list[float],
+    coverage: dict[str, Any],
+    alpha: float = 0.05,
+) -> PitParityVerdict:
+    """Compare the look-ahead pass against the point-in-time pass, per date.
+
+    Materiality is a confidence interval on the per-date delta that EXCLUDES
+    zero, not a fixed threshold on a summary statistic: the fixed-threshold
+    version answers "is the number big" rather than "is the difference
+    distinguishable from noise", and a wide, noisy series passes it by being
+    noisy.
+
+    Coverage governs everything else, and the ordering is deliberate:
+
+    * material delta → ``FAIL``, whatever the coverage;
+    * budget exhausted with zero folds scored → ``FAIL`` (the pass ran and
+      produced nothing, which is a broken check, not an absent one);
+    * nothing measurable at all → ``UNKNOWN``;
+    * partial or unproven coverage → ``PARTIAL``;
+    * otherwise → ``PASS``.
+
+    ``UNKNOWN`` and ``PARTIAL`` are refusals at the reader
+    (:mod:`crucible.champion`), so neither can be rounded up to a grade.
+    """
+    fraction = coverage.get("coverage_fraction")
+    budget_stopped = bool(coverage.get("budget_stopped"))
+    measured = bool(coverage.get("measured"))
+
+    n = min(len(contaminated), len(point_in_time))
+    deltas = [float(a) - float(b) for a, b in zip(contaminated[:n], point_in_time[:n], strict=True)]
+    material: bool | None = None
+    mean_delta: float | None = None
+    ci: tuple[float, float] | None = None
+    if n >= 2:
+        mean_delta = sum(deltas) / n
+        variance = sum((d - mean_delta) ** 2 for d in deltas) / (n - 1)
+        stderr = math.sqrt(variance / n)
+        # Normal quantile at 1 - alpha/2; 1.959964 at alpha = 0.05.
+        z = 1.959963984540054 if abs(alpha - 0.05) < 1e-12 else _z(alpha)
+        ci = (mean_delta - z * stderr, mean_delta + z * stderr)
+        material = ci[0] > 0.0 or ci[1] < 0.0
+
+    if material is True:
+        return PitParityVerdict(
+            "FAIL",
+            (
+                f"MATERIAL contamination: the per-date look-ahead delta averages "
+                f"{mean_delta:.6g} with a {int((1 - alpha) * 100)}% interval "
+                f"[{ci[0]:.6g}, {ci[1]:.6g}] that excludes zero"
+            ),
+            mean_delta,
+            ci,
+            fraction,
+        )
+    if budget_stopped and fraction == 0.0:
+        return PitParityVerdict(
+            "FAIL",
+            "the walk-forward pass exhausted its budget without scoring a single fold; "
+            "a check that ran and produced nothing is broken, not absent",
+            mean_delta,
+            ci,
+            fraction,
+        )
+    if material is None or fraction in (None, 0.0):
+        return PitParityVerdict(
+            "UNKNOWN",
+            "the contamination check did not answer this cycle: "
+            f"{n} paired date(s), coverage_fraction={fraction!r}. Not a pass — an "
+            "unmeasured gate reported as clean is the defect the gate prevents "
+            "(champion-challenger-policy.md §5.1).",
+            mean_delta,
+            ci,
+            fraction,
+        )
+    if budget_stopped or (fraction is not None and fraction < 1.0) or not measured:
+        return PitParityVerdict(
+            "PARTIAL",
+            f"no material delta over the {float(fraction) * 100:.0f}% of the window that "
+            "was scored, but coverage is incomplete or unproven",
+            mean_delta,
+            ci,
+            fraction,
+        )
+    return PitParityVerdict(
+        "PASS",
+        "the look-ahead-vs-point-in-time delta is not statistically distinguishable "
+        "from zero over full, proven coverage",
+        mean_delta,
+        ci,
+        fraction,
+    )
+
+
+def _z(alpha: float) -> float:
+    """Two-sided normal quantile, Acklam's rational approximation.
+
+    Closed form rather than a scipy dependency: one quantile at one or two
+    levels does not justify carrying scipy into every consumer of this module.
+    """
+    p = 1.0 - alpha / 2.0
+    a = [
+        -39.69683028665376,
+        220.9460984245205,
+        -275.9285104469687,
+        138.3577518672690,
+        -30.66479806614716,
+        2.506628277459239,
+    ]
+    b = [
+        -54.47609879822406,
+        161.5858368580409,
+        -155.6989798598866,
+        66.80131188771972,
+        -13.28068155288572,
+    ]
+    c = [
+        -0.007784894002430293,
+        -0.3223964580411365,
+        -2.400758277161838,
+        -2.549732539343734,
+        4.374664141464968,
+        2.938163982698783,
+    ]
+    d = [0.007784695709041462, 0.3224671290700398, 2.445134137142996, 3.754408661907416]
+    plow, phigh = 0.02425, 1 - 0.02425
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / (
+            (((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1
+        )
+    if p > phigh:
+        q = math.sqrt(-2 * math.log(1 - p))
+        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / (
+            (((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1
+        )
+    q = p - 0.5
+    r = q * q
+    return (
+        (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5])
+        * q
+        / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1)
+    )
+
+
+def render_verdict(
+    *,
+    arm_id: str,
+    as_of: str,
+    alpha_vs_spy: float,
+    attestation: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The S-slot verdict card. **No attestation PASS, no grade.**
+
+    Plan §9.1: "a card without `attestation: PASS` renders UNVERIFIED, never
+    a grade." The grade key is OMITTED rather than set alongside a caveat: a
+    number rendered beside a warning is a number people quote.
+    """
+    status = (attestation or {}).get("status")
+    card: dict[str, Any] = {
+        "arm_id": arm_id,
+        "as_of": as_of,
+        "attestation": attestation,
+    }
+    if status != "PASS":
+        card["rendered"] = "UNVERIFIED"
+        card["reason"] = (
+            f"contamination attestation is {status!r}, not 'PASS'; an unsigned backtest "
+            "is not a grade (plan §9.1)"
+        )
+        return card
+    card["rendered"] = "GRADED"
+    card["grade"] = {"alpha_vs_spy": alpha_vs_spy, "benchmark": "SPY"}
+    return card
+
+
+# ---------------------------------------------------------------------------
+# Grading.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Book:
+    """One arm's realized daily book, already reduced to per-date returns.
+
+    ``turnover`` is the fraction of the book traded on that date; it is what
+    the cost model prices. It is a required field rather than an optional one
+    because a cost model applied to an assumed turnover would produce a
+    net-of-cost number whose cost nobody supplied.
+    """
+
+    dates: tuple[str, ...]
+    portfolio_returns: tuple[float, ...]
+    benchmark_returns: tuple[float, ...]
+    turnover: tuple[float, ...]
+    benchmark_symbol: str = "SPY"
+
+    def __post_init__(self) -> None:
+        n = len(self.dates)
+        for name in ("portfolio_returns", "benchmark_returns", "turnover"):
+            if len(getattr(self, name)) != n:
+                raise ValueError(
+                    f"Book.{name} has {len(getattr(self, name))} entries for {n} dates; "
+                    "a per-date series shorter than its dates is a silent truncation"
+                )
+
+
+@dataclass(frozen=True)
+class StrategyGrade:
+    """One S arm's cycle grade: the market-relative series, net of cost."""
+
+    series: ArmSeries
+    benchmark: str
+    cost_model_name: str
+    cost_model_is_placeholder: bool
+    total_cost_bps: float
+
+
+def grade_arm(
+    recipe: StrategyRecipe,
+    book: Book,
+    *,
+    as_of: str,
+    apply_costs: bool = True,
+) -> StrategyGrade:
+    """Score ``recipe`` per trading day: portfolio return minus SPY, net of cost.
+
+    ``apply_costs=False`` exists for the one comparison that needs it — the
+    gross-vs-net delta on the verdict card — and is never the production
+    path: a gross grade promoted an arm on turnover it never paid for.
+    """
+    if book.benchmark_symbol != recipe.benchmark:
+        raise ValueError(
+            f"arm {recipe.name!r} declares benchmark {recipe.benchmark!r} and the book "
+            f"carries {book.benchmark_symbol!r}. Grading against a benchmark the recipe "
+            "did not declare is how a selection stage was graded against SPY on "
+            "2026-08-17, inverting wins and losses outright."
+        )
+    rate = recipe.cost_model.bps_per_unit_turnover() * BASIS_POINT if apply_costs else 0.0
+    scores: dict[str, float] = {}
+    total_cost = 0.0
+    for day, port, bench, turn in zip(
+        book.dates,
+        book.portfolio_returns,
+        book.benchmark_returns,
+        book.turnover,
+        strict=True,
+    ):
+        if day > as_of:
+            continue
+        cost = rate * float(turn)
+        total_cost += cost
+        scores[day] = float(port) - float(bench) - cost
+    return StrategyGrade(
+        series=ArmSeries(arm_id=recipe.arm_id, scores=scores),
+        benchmark=recipe.benchmark,
+        cost_model_name=recipe.cost_model.name,
+        cost_model_is_placeholder=recipe.cost_model.placeholder,
+        total_cost_bps=total_cost / BASIS_POINT,
+    )

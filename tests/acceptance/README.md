@@ -30,6 +30,20 @@ foundation commit and to climb as tracks A, B and C land. A run of this
 directory that reports **no tests at all** is not a pass — it is an
 unobserved gate, and CI treats it as a failure.
 
+## Cross-track clauses belong here too
+
+A clause one track can only satisfy with another track's code is the same
+shape as a §2 objective: written first, failing honestly, going green when
+the code lands. `test_feature_layer_binding.py` is the first —
+track B's M slot consuming track A's feature layer (plan §10 component 4).
+
+It is here rather than in the blocking job because a cross-track clause that
+reds `main` reds it for the tracks that have not started the work, which is a
+public signal the groom loop reads. The two alternatives — an `xfail`, or a
+path exclusion in `ci.yml` — are both suppressions wearing different clothes.
+This directory already runs in full and publishes its count, so nothing had
+to be invented and nothing is hidden.
+
 ## What is deliberately not here
 
 Anything measured against live AWS: the four-consecutive-Saturday window, the
