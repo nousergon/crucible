@@ -41,7 +41,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from crucible.store import ETAG_ABSENT, PointerConflictError, Store, sha256_hex
+from crucible.store import ETAG_ABSENT, PointerConflictError, S3Store, Store, sha256_hex
 
 __all__ = [
     "POINTER_KEY",
@@ -80,6 +80,57 @@ TRADER_PIN_KEY = "trader/release_pin"
 PIN_TARGETS: tuple[str, ...] = ("current", "trader")
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+#: How long a published release object (the wheel, `release.json`) is locked
+#: under S3 Object Lock once it lands, applied in GOVERNANCE mode. Ten years:
+#: chosen to outlast any plausible rollback target for the practical lifetime
+#: of this system, not to match a specific compliance horizon — a release a
+#: decade old is not a rollback candidate, it is history (`preference:
+#: retain ALL archives — data is an asset`). GOVERNANCE rather than
+#: COMPLIANCE: an operator holding `s3:BypassGovernanceRetention` can still
+#: remove a genuinely bad artifact (a leaked secret baked into a wheel, say),
+#: where COMPLIANCE mode cannot be overridden by anyone, including the
+#: account root, for the retention's whole duration — turning a legitimate
+#: takedown into a decade-long wait. `releases/current` (:data:`POINTER_KEY`)
+#: is never locked: it is a pointer, mutable by design, moved by conditional
+#: PUT (see the module docstring).
+RELEASE_OBJECT_LOCK_RETENTION = dt.timedelta(days=3650)
+
+
+def _lock_release_object(store: Store, key: str, *, now: dt.datetime | None = None) -> None:
+    """Apply GOVERNANCE-mode Object Lock retention to a just-written object.
+
+    A no-op off S3 — :class:`crucible.store.LocalStore` (the laptop and test
+    backend) has no Object Lock concept, and the bucket-level
+    ``ObjectLockEnabled`` flag this defends against being inert without it is
+    an S3-only condition (issue's "Gotcha").
+
+    Called only for the wheel and ``release.json`` keys, never for
+    :data:`POINTER_KEY` — the caller decides which keys pass through here,
+    and the pointer flip goes through :func:`pin` / ``compare_and_swap``,
+    a different code path that never reaches this function.
+
+    ``crucible.store.Store.put_bytes`` — the single write path shared by
+    every backend — has no retention parameters, and ``crucible/store.py``
+    is not owned by this change. Retention is therefore applied as a
+    **separate** ``PutObjectRetention`` call immediately after the write,
+    rather than as ``ObjectLockMode`` / ``ObjectLockRetainUntilDate`` on the
+    PUT itself. That leaves a window, bounded by this one extra round trip,
+    in which the object exists unlocked. The correct fix is for
+    ``Store.put_bytes`` (and its `S3Store` implementation) to accept the
+    retention parameters so the lock is set atomically on the PUT; that
+    signature change is out of scope here (see the PR description).
+    """
+    if not isinstance(store, S3Store):
+        return
+    stamp = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
+    retain_until = stamp + RELEASE_OBJECT_LOCK_RETENTION
+    s3_key = f"{store.prefix}/{key}" if store.prefix else key
+    store.client.put_object_retention(
+        Bucket=store.bucket,
+        Key=s3_key,
+        Retention={"Mode": "GOVERNANCE", "RetainUntilDate": retain_until},
+    )
 
 
 class StaleReleasePointerError(RuntimeError):
@@ -214,6 +265,13 @@ def publish_release(
     "Repeatable" means **byte-identical**, not "overwrites whatever is
     there": re-publishing a sha whose prefix already holds different bytes
     raises :class:`ReleaseImmutabilityError`. See that class for why.
+
+    When ``store`` is an :class:`~crucible.store.S3Store`, each key actually
+    written here is also locked under S3 Object Lock GOVERNANCE mode for
+    :data:`RELEASE_OBJECT_LOCK_RETENTION` — see :func:`_lock_release_object`.
+    `assert_immutable_write` refuses a differing overwrite at THIS writer;
+    the lock is the defense against a writer that skips this function
+    entirely (a hand-rolled `aws s3 cp`, a second `workflow_dispatch`).
     """
     _assert_sha(sha)
     if not wheel:
@@ -237,6 +295,7 @@ def publish_release(
     ]
     for key, payload in needed:
         store.put_bytes(key, payload)
+        _lock_release_object(store, key, now=now)
     return record
 
 
