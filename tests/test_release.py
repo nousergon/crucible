@@ -25,10 +25,52 @@ from crucible.release import (
     resolve_release,
     wheel_key,
 )
-from crucible.store import ETAG_ABSENT, LocalStore, PointerConflictError
+from crucible.store import ETAG_ABSENT, LocalStore, PointerConflictError, S3Store
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
+
+
+class _FakeS3Client:
+    """Just enough of the boto3 S3 surface for the Object Lock test below.
+
+    Deliberately NOT `tests/conftest.py`'s `FakeS3` fixture: this module owns
+    only `crucible/release.py`'s tests, and `put_object_retention` is not
+    part of that shared fake's boto3 surface (its owner is a sibling change
+    in this same issue's session) — adding it there would edit a fixture
+    other tests in this suite depend on. This fake exists to prove one
+    thing: that `PutObjectRetention` is actually requested on the object,
+    not merely that the bucket-level flag exists (the issue's Gotcha).
+    """
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.retentions: dict[str, dict] = {}
+
+    def put_object(self, **kw) -> dict:
+        self.objects[kw["Key"]] = kw["Body"]
+        return {"ETag": '"fake"'}
+
+    def get_object(self, **kw) -> dict:
+        class _Body:
+            def __init__(self, payload: bytes) -> None:
+                self._payload = payload
+
+            def read(self) -> bytes:
+                return self._payload
+
+        return {"Body": _Body(self.objects[kw["Key"]])}
+
+    def head_object(self, **kw) -> dict:
+        if kw["Key"] not in self.objects:
+            from botocore.exceptions import ClientError
+
+            raise ClientError({"Error": {"Code": "404"}}, "head_object")
+        return {"ETag": '"fake"'}
+
+    def put_object_retention(self, **kw) -> dict:
+        self.retentions[kw["Key"]] = kw["Retention"]
+        return {}
 
 
 def _published(store, sha=SHA_A):
@@ -90,6 +132,45 @@ class TestLayout:
                 test_summary="",
                 workflow_run_url="",
             )
+
+
+class TestObjectLock:
+    """§4.11's immutability claim, defended past the writer (I9782).
+
+    `assert_immutable_write` (`TestImmutability` below) refuses a differing
+    overwrite from THIS code path; these tests are for the layer that
+    defends against a writer that skips this module entirely.
+    """
+
+    def test_publish_locks_the_wheel_and_release_json_in_governance_mode(self) -> None:
+        client = _FakeS3Client()
+        store = S3Store("bucket", "crucible", client=client)
+        _published(store)
+        for key in (wheel_key(SHA_A), release_json_key(SHA_A)):
+            s3_key = f"crucible/{key}"
+            assert s3_key in client.retentions, f"no PutObjectRetention requested for {key}"
+            retention = client.retentions[s3_key]
+            assert retention["Mode"] == "GOVERNANCE"
+            assert retention["RetainUntilDate"] > dt.datetime(2026, 8, 28, 21, 0, tzinfo=dt.UTC)
+
+    def test_the_pointer_is_never_locked(self) -> None:
+        """`releases/current` is a pointer, mutable by design, moved by
+        conditional PUT — the exact opposite of what Object Lock defends."""
+        client = _FakeS3Client()
+        store = S3Store("bucket", "crucible", client=client)
+        _published(store)
+        pin(store, SHA_A, expect=ETAG_ABSENT)
+        assert f"crucible/{POINTER_KEY}" not in client.retentions
+        # And no PUT to the pointer's key was ever asked to lock the wheel's key
+        # or vice versa — the two writes go through entirely separate calls.
+        assert all(key != f"crucible/{POINTER_KEY}" for key in client.retentions)
+
+    def test_object_lock_is_never_requested_off_s3(self, tmp_path) -> None:
+        """`LocalStore` has no Object Lock concept; the helper is a no-op
+        there rather than an error, so the laptop/test backend needs no
+        special-casing."""
+        store = LocalStore(tmp_path)
+        _published(store)  # would raise on any attempt to reach a client
 
 
 class TestPointer:

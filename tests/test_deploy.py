@@ -9,6 +9,7 @@ becomes a pytest here, or is not carried.
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 from pathlib import Path
@@ -16,6 +17,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from crucible.deploy import _publish
 from crucible.deploy import main as deploy_main
 from crucible.manifest import manifest_key, validate
 from crucible.release import (
@@ -28,7 +30,33 @@ from crucible.release import (
     release_json_key,
     wheel_key,
 )
-from crucible.store import LocalStore, sha256_hex
+from crucible.store import LocalStore, S3Store, sha256_hex
+
+
+class _FakeS3Client:
+    """Just enough of the boto3 S3 surface to prove `deploy._publish` asks
+    S3 to lock what it writes, per I9782. See `test_release._FakeS3Client`
+    for why this is not `tests/conftest.py`'s shared `FakeS3`."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.retentions: dict[str, dict] = {}
+
+    def put_object(self, **kw) -> dict:
+        self.objects[kw["Key"]] = kw["Body"]
+        return {"ETag": '"fake"'}
+
+    def head_object(self, **kw) -> dict:
+        if kw["Key"] not in self.objects:
+            from botocore.exceptions import ClientError
+
+            raise ClientError({"Error": {"Code": "404"}}, "head_object")
+        return {"ETag": '"fake"'}
+
+    def put_object_retention(self, **kw) -> dict:
+        self.retentions[kw["Key"]] = kw["Retention"]
+        return {}
+
 
 SHA = "a" * 40
 OTHER = "b" * 40
@@ -157,6 +185,26 @@ class TestPublish:
         store_dir = tmp_path / "store"
         self._publish(tmp_path, store_dir)
         assert self._publish(tmp_path, store_dir) == 0
+
+    def test_publish_locks_the_wheel_and_release_json_on_s3_but_not_the_pointer(
+        self, tmp_path
+    ) -> None:
+        """The `deploy._publish` half of I9782: the same Object Lock request
+        `crucible.release.publish_release` makes, made here too, since this
+        is the code path `deploy.yml` actually drives in CI."""
+        wheel_path = tmp_path / "a.whl"
+        wheel_path.write_bytes(WHEEL_BYTES)
+        meta = tmp_path / "a-release.json"
+        meta.write_text(_release_json(SHA, wheel=WHEEL_BYTES))
+        client = _FakeS3Client()
+        store = S3Store("bucket", "crucible", client=client)
+        args = argparse.Namespace(sha=SHA, wheel=str(wheel_path), release_json=str(meta))
+        assert _publish(args, store) == 0
+        for key in (wheel_key(SHA), release_json_key(SHA)):
+            s3_key = f"crucible/{key}"
+            assert s3_key in client.retentions
+            assert client.retentions[s3_key]["Mode"] == "GOVERNANCE"
+        assert f"crucible/{POINTER_KEY}" not in client.retentions
 
     def test_a_refused_overwrite_leaves_neither_key_half_written(self, tmp_path) -> None:
         """A wheel from one build beside a release.json from another is worse

@@ -48,6 +48,7 @@ from crucible.manifest import RUN_MANIFEST_SCHEMA_VERSION, manifest_key
 from crucible.release import (
     POINTER_KEY,
     ReleaseRecord,
+    _lock_release_object,
     assert_immutable_write,
     current_release,
     flip_on_smoke,
@@ -82,6 +83,12 @@ def _publish(args: argparse.Namespace, store: Store) -> int:
       installs the wheel next week.
     * **the prefix is not already occupied by different bytes.** See
       :class:`crucible.release.ReleaseImmutabilityError`.
+
+    On S3, each key actually written is also locked under S3 Object Lock
+    GOVERNANCE mode (`crucible.release.RELEASE_OBJECT_LOCK_RETENTION`) — see
+    `crucible.release._lock_release_object`. `assert_immutable_write` defends
+    at this writer only; the lock defends against a writer that skips it
+    (a hand-rolled `aws s3 cp`, a second `workflow_dispatch`).
     """
     wheel = Path(args.wheel).read_bytes()
     record = ReleaseRecord(**json.loads(Path(args.release_json).read_text(encoding="utf-8")))
@@ -110,6 +117,7 @@ def _publish(args: argparse.Namespace, store: Store) -> int:
     ]
     for key, payload in writes:
         store.put_bytes(key, payload)
+        _lock_release_object(store, key)
     if not writes:
         print(f"releases/{args.sha}/ already holds exactly these bytes; nothing to publish")
         return 0
