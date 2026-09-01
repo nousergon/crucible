@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -46,26 +48,36 @@ from crucible.store import Store
 
 __all__ = [
     "ALERT_BUS_SCHEMA_VERSION",
+    "CATCH_UP_TRADING_DAYS",
     "CAUSE_MATCHERS",
     "CEILING_WINDOW_TRADING_DAYS",
     "MUTED_TOPIC",
+    "MUTED_TOPIC_ARN_VAR",
     "PAGES_PER_MONTH_CEILING",
+    "PAGES_TOPIC",
+    "PAGES_TOPIC_ARN_VAR",
     "PAGE_CONDITIONS",
+    "SWEEP_JOB",
     "Page",
     "PageGroup",
+    "TopicUnresolvedError",
     "bus_key",
     "bus_row",
     "cause_key",
     "ceiling_metric",
+    "days_to_evaluate",
     "dedup_key",
     "emit",
     "evaluate_absence",
     "evaluate_failure",
     "group_pages",
     "heartbeat",
+    "incident_id",
+    "incident_key",
     "pages_in_window",
     "send",
     "sweep",
+    "topic_arn",
 ]
 
 #: Exhaustive. Adding a third member is a design change, and it is visible in
@@ -110,15 +122,24 @@ class Page:
             )
 
 
-def dedup_key(condition: str, job: str, trading_day: dt.date) -> str:
-    """One key per (job, trading day). §4.6.
+def dedup_key(condition: str, subject: str, trading_day: dt.date) -> str:
+    """One key per (condition, incident SUBJECT, trading day). §4.6.
 
     Not per attempt and not per condition-instance: a job that fails, is
     retried by the declared transient class and fails again is ONE incident,
     and paging twice for it is how a two-page-per-month ceiling is blown by a
     single bad Saturday.
+
+    ``subject`` is what the incident is ABOUT — the cause its members share
+    (:func:`incident_key` supplies it from the group's own cause key), never
+    one member's job. The defect this parameter's name records: the key was
+    built from ``group.members[0].job``, the alphabetically-first member, so
+    it CHANGED as membership changed. One absent Friday artifact observed by
+    three consecutive nightly sweeps produced two different keys — the
+    forever-dedup window never engaged, and one incident paged three times
+    against a ceiling of two a month.
     """
-    return f"{condition}:{job}:{trading_day.isoformat()}"
+    return f"{condition}:{subject}:{trading_day.isoformat()}"
 
 
 @dataclass(frozen=True)
@@ -220,6 +241,129 @@ def group_pages(pages: Sequence[Page]) -> list[PageGroup]:
     ]
 
 
+# ── Incident identity ─────────────────────────────────────────────────────
+#
+# One INCIDENT, not one observation of it. The sweep runs nightly; a wrongness
+# that persists is observed by every sweep until it clears, and §2 row 6
+# ("alerts only when wrong") means a persistent, unchanged wrongness is ONE
+# alert. Everything downstream — the transport dedup key, the bus key, and
+# therefore the ceiling metric — is derived from this identity rather than
+# from the observation that happened to notice it.
+
+#: A store-key segment. Deliberately narrow: an incident id becomes a path
+#: component, and a subject carrying `/`, `:` or a date would either break
+#: the key or smuggle a second date past
+#: :meth:`Store.assert_keys_bind_to_trading_days`.
+INCIDENT_ID_RE = re.compile(r"[A-Za-z0-9_.]+")
+
+
+def _incident_subject(group: PageGroup) -> str:
+    """The cause half of ``group.cause_key`` — what the incident is about.
+
+    :func:`cause_key` renders ``"{subject}:{trading_day}"``. The trading day
+    is carried separately by every consumer here, so it is split off rather
+    than repeated. A cause key with no separator at all (a hand-built group
+    in a test) is its own subject; that is a defined answer rather than a
+    raise, because the subject is only ever an identity component and a
+    hand-built one is still stable.
+    """
+    subject, separator, _day = group.cause_key.rpartition(":")
+    return subject if separator else group.cause_key
+
+
+def incident_key(group: PageGroup) -> str:
+    """The stable identity of one incident. §4.6, §2 row 6.
+
+    Stable across SWEEPS — the same absence seen on Friday, Saturday and
+    Sunday nights yields one key — and stable across MEMBERSHIP changes,
+    because it is derived from the shared cause rather than from whichever
+    member happens to sort first. Those are the two properties the previous
+    key lacked, and between them they are why one absent artifact could page
+    three times.
+    """
+    return dedup_key(group.condition, _incident_subject(group), group.trading_day)
+
+
+def incident_id(group: PageGroup) -> str:
+    """:func:`incident_key` as ONE store-key segment.
+
+    The trading day is dropped because the bus key already carries it, and a
+    second date inside the segment would be a second date in the key.
+
+    Raises rather than sanitising an unexpected subject: silently rewriting
+    two distinct subjects into one id would merge two incidents into one bus
+    row, which is the failure this whole identity exists to prevent.
+    """
+    subject = _incident_subject(group)
+    if not INCIDENT_ID_RE.fullmatch(subject):
+        raise ValueError(
+            f"{subject!r} is not usable as an incident id segment (expected "
+            f"{INCIDENT_ID_RE.pattern}). Sanitising it would risk mapping two distinct "
+            "causes onto one bus row, which would hide one of them entirely."
+        )
+    return f"{group.condition}.{subject}"
+
+
+# ── The days a sweep is answerable for ────────────────────────────────────
+
+#: The name of the sweep's own registry row. Used to read the sweep's own
+#: manifests — which is how the sweep knows which days it did not run.
+SWEEP_JOB = "alerts.sweep"
+
+#: How far back a sweep looks for days it did not run. One trading week.
+#:
+#: Both page conditions used to evaluate ONLY ``resolve_trading_day(now)``, so
+#: a failed or absent artifact on a day the sweep did not run was never paged
+#: once the trading day advanced past it — a permanent blind spot, not a
+#: delayed page. A gap longer than a week is the sweep itself being down,
+#: which is the heartbeat's row to raise (§9.3), not something a longer
+#: window here would fix.
+CATCH_UP_TRADING_DAYS = TRADING_DAYS_PER_WEEK
+
+
+def days_to_evaluate(
+    store: Store,
+    moment: dt.datetime,
+    *,
+    window_trading_days: int = CATCH_UP_TRADING_DAYS,
+) -> list[dt.date]:
+    """Today's trading day, plus every recent day the sweep did not run.
+
+    The sweep writes its own ``run.json`` like every other job, so the days
+    it was down are readable from the store rather than inferred. A day whose
+    sweep manifest is absent is a day nothing evaluated either condition, and
+    re-evaluating it now is the difference between a late page and no page
+    ever.
+
+    **Bounded below by the sweep's own first observed run in the window.**
+    The sweep was not blind on a day before it existed; claiming otherwise
+    would make a cold start report a week of absences it was never there to
+    watch, and a first run that BREACHES the ceiling is a false reading of
+    the one metric §11 risk 2 holds this module to.
+
+    Re-paging is impossible by construction, not by luck: a caught-up day
+    resolves to the same :func:`incident_key` the missed sweep would have
+    produced, and :func:`emit` records a second observation of an open
+    incident rather than sending again.
+    """
+    today = resolve_trading_day(moment)
+    candidates: list[dt.date] = []
+    day = today
+    for _ in range(window_trading_days):
+        day = previous_trading_day(day)
+        candidates.append(day)
+    ran = {d for d in candidates if store.exists(manifest_key(SWEEP_JOB, d.isoformat()))}
+    if not ran:
+        # No evidence the sweep ran on any day in the window: either it is a
+        # cold start or the sweep has been down for longer than the window,
+        # and the second is the heartbeat's finding (§9.3) rather than a
+        # backlog this run should invent.
+        return [today]
+    first_seen = min(ran)
+    missed = [d for d in candidates if d >= first_seen and d not in ran]
+    return sorted({today, *missed})
+
+
 # ── The two page conditions ───────────────────────────────────────────────
 
 
@@ -228,6 +372,7 @@ def evaluate_absence(
     *,
     now: dt.datetime | None = None,
     registry: dict[str, Component] | None = None,
+    watched_by: str = SWEEP_JOB,
 ) -> list[Page]:
     """Page for every scheduled job whose manifest is missing past its deadline.
 
@@ -240,38 +385,44 @@ def evaluate_absence(
     the future is not absent, it is not due; reporting it would make the
     absence condition fire every time the sweep ran early.
 
-    **A row declaring another watcher is skipped, by declaration.** That is
-    `heartbeat`, whose absence a human notices precisely because the sweep
-    that would have noticed it is the thing that may be dead. The skip is
-    read from the registry, so it is visible in the file rather than being a
-    name embedded in this function.
+    **Only the rows this watcher owns are evaluated, by declaration.**
+    ``watched_by`` is matched against the registry's `absence_watched_by`, so
+    the split is read from the file rather than being a name embedded in this
+    function. The sweep passes the default and therefore never evaluates
+    `alerts.sweep` itself; :func:`heartbeat` passes ``"heartbeat"`` and
+    evaluates exactly that row, which is what makes the registry's declared
+    watcher a real one rather than a claim.
+
+    **Every day the sweep is answerable for**, not only today's — see
+    :func:`days_to_evaluate`. A missed sweep day used to be a permanent
+    blind spot; it is now a caught-up page carrying the day it belongs to.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     reg = scheduled_components(registry)
-    trading_day = resolve_trading_day(moment)
     pages: list[Page] = []
-    for name, component in sorted(reg.items()):
-        if component.absence_watched_by != "alerts.sweep":
-            continue
-        assert component.deadline is not None  # Component.__post_init__ guarantees it
-        due = component.deadline.due_at(trading_day)
-        if moment < due:
-            continue
-        if store.exists(manifest_key(name, trading_day.isoformat())):
-            continue
-        pages.append(
-            Page(
-                condition="absence",
-                job=name,
-                trading_day=trading_day,
-                reason=(
-                    f"no manifest at {manifest_key(name, trading_day.isoformat())}; due "
-                    f"{component.deadline.describe(trading_day)} "
-                    f"({due.strftime('%Y-%m-%dT%H:%M:%SZ')}), now "
-                    f"{moment.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-                ),
+    for trading_day in days_to_evaluate(store, moment):
+        for name, component in sorted(reg.items()):
+            if component.absence_watched_by != watched_by:
+                continue
+            assert component.deadline is not None  # Component.__post_init__ guarantees it
+            due = component.deadline.due_at(trading_day)
+            if moment < due:
+                continue
+            if store.exists(manifest_key(name, trading_day.isoformat())):
+                continue
+            pages.append(
+                Page(
+                    condition="absence",
+                    job=name,
+                    trading_day=trading_day,
+                    reason=(
+                        f"no manifest at {manifest_key(name, trading_day.isoformat())}; due "
+                        f"{component.deadline.describe(trading_day)} "
+                        f"({due.strftime('%Y-%m-%dT%H:%M:%SZ')}), now "
+                        f"{moment.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+                    ),
+                )
             )
-        )
     return pages
 
 
@@ -291,40 +442,45 @@ def evaluate_failure(
     A manifest that will not parse or will not validate is itself a failure
     page: an unreadable manifest is indistinguishable from a lie, and reading
     past it would drop the very run most likely to be broken.
+
+    **Every day the sweep is answerable for**, not only today's — see
+    :func:`days_to_evaluate`. A `status: failed` manifest written on a day
+    the sweep did not run used to go unpaged forever once the trading day
+    advanced past it.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     reg = registry if registry is not None else load_registry()
-    trading_day = resolve_trading_day(moment)
     pages: list[Page] = []
-    for name, component in sorted(reg.items()):
-        if component.lifecycle != "ACTIVE":
-            continue
-        key = manifest_key(name, trading_day.isoformat())
-        if not store.exists(key):
-            continue
-        try:
-            manifest = json.loads(store.get_bytes(key).decode("utf-8"))
-        except (ValueError, UnicodeDecodeError) as exc:
-            pages.append(
-                Page(
-                    condition="failure",
-                    job=name,
-                    trading_day=trading_day,
-                    reason=f"manifest at {key} is unreadable: {type(exc).__name__}: {exc}",
-                    run_id=_UNPARSEABLE_RUN_ID,
+    for trading_day in days_to_evaluate(store, moment):
+        for name, component in sorted(reg.items()):
+            if component.lifecycle != "ACTIVE":
+                continue
+            key = manifest_key(name, trading_day.isoformat())
+            if not store.exists(key):
+                continue
+            try:
+                manifest = json.loads(store.get_bytes(key).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError) as exc:
+                pages.append(
+                    Page(
+                        condition="failure",
+                        job=name,
+                        trading_day=trading_day,
+                        reason=f"manifest at {key} is unreadable: {type(exc).__name__}: {exc}",
+                        run_id=_UNPARSEABLE_RUN_ID,
+                    )
                 )
-            )
-            continue
-        if manifest.get("status") == "failed":
-            pages.append(
-                Page(
-                    condition="failure",
-                    job=name,
-                    trading_day=trading_day,
-                    reason=manifest.get("reason") or "(the manifest recorded no reason)",
-                    run_id=manifest.get("run_id") or _UNPARSEABLE_RUN_ID,
+                continue
+            if manifest.get("status") == "failed":
+                pages.append(
+                    Page(
+                        condition="failure",
+                        job=name,
+                        trading_day=trading_day,
+                        reason=manifest.get("reason") or "(the manifest recorded no reason)",
+                        run_id=manifest.get("run_id") or _UNPARSEABLE_RUN_ID,
+                    )
                 )
-            )
     return pages
 
 
@@ -338,52 +494,102 @@ _UNPARSEABLE_RUN_ID = "0" * 26
 # ── The bus, the transport, and the ceiling ───────────────────────────────
 
 
-def bus_key(group: PageGroup, alert_id: str) -> str:
-    """`alerts/{trading_day}/{run_id}.json` (§9.3).
+def bus_key(group: PageGroup) -> str:
+    """`alerts/{trading_day}/{incident_id}.json` (§9.3).
 
-    ``alert_id`` is the group's own correlation identity. For a single-member
-    FAILURE group it IS the failed run's id, which is what makes the bus row
-    joinable to the manifest; for an ABSENCE group there is no run, so the
-    sweep's own ULID stands in and the row says which of the two it is. A
-    machine reader gets a stable key either way, and the field it needs to
-    join on is never silently empty.
+    **One row per INCIDENT, not per observation.** §9.3 writes the shape as
+    `alerts/{date}/{run_id}.json`; keying on the observation's id meant the
+    nightly sweep wrote a fresh row for the same unchanged absence every
+    night — three rows, three transport sends and three counts against a
+    two-a-month ceiling for one absent artifact. The delta is deliberate and
+    it costs nothing a reader needs: `alert_id` and every member's `run_id`
+    are fields ON the row, so the join to the manifest §9.3 asks for is
+    intact, while the key is now the thing the ceiling should be counting.
     """
-    return f"alerts/{group.trading_day.isoformat()}/{alert_id}.json"
+    return f"alerts/{group.trading_day.isoformat()}/{incident_id(group)}.json"
 
 
-def bus_row(group: PageGroup, *, alert_id: str, sent: bool, destination: str) -> dict[str, Any]:
+def bus_row(
+    group: PageGroup,
+    *,
+    alert_id: str | None,
+    sent: bool,
+    destination: str,
+    first_observed_utc: str,
+    last_observed_utc: str,
+    observations: int = 1,
+) -> dict[str, Any]:
     """The machine-readable row. §7.3: a human-only alert is invisible.
 
     ``sent`` records what actually happened on the transport, not what was
     intended. A row claiming delivery for a page that never left is worse
     than no row: the response plane would read it as handled.
+
+    ``observations`` is how many sweeps have seen this incident still open.
+    It is what makes one row per incident lossless: "absent since Friday,
+    seen by three sweeps" is strictly more information than three rows that
+    each look like a separate incident.
     """
     return {
         "schema_version": ALERT_BUS_SCHEMA_VERSION,
         "alert_id": alert_id,
-        "alert_id_is_run_id": alert_id != _sweep_alert_id_marker(alert_id),
+        "alert_id_is_run_id": _alert_id_joins_to_a_manifest(group, alert_id),
         "condition": group.condition,
         "cause_key": group.cause_key,
         "trading_day": group.trading_day.isoformat(),
-        "dedup_key": dedup_key(group.condition, group.members[0].job, group.trading_day),
-        "members": [
-            {"job": m.job, "run_id": m.run_id, "reason": m.reason}
-            for m in sorted(group.members, key=lambda x: x.job)
-        ],
+        "dedup_key": incident_key(group),
+        "incident_key": incident_key(group),
+        # `members` and `rendered` are a record of the page that WENT OUT and
+        # are never rewritten; `members_now` is the latest observation. An
+        # incident that grows from three arms to five is one incident, and
+        # both facts are worth keeping — but not in one field, where a reader
+        # could not tell which vintage they were holding.
+        "members": _members(group),
+        "members_now": _members(group),
         "sent": sent,
         "destination": destination,
+        "first_observed_utc": first_observed_utc,
+        "last_observed_utc": last_observed_utc,
+        "observations": observations,
         "rendered": group.render(),
     }
 
 
-def _sweep_alert_id_marker(alert_id: str) -> str:
-    """Identity. Present so `alert_id_is_run_id` reads as a computed field
-    rather than a hardcoded True, and so the one caller that knows the
-    difference (:func:`emit`) sets it by passing the run's id or not."""
-    return alert_id
+def _members(group: PageGroup) -> list[dict[str, Any]]:
+    return [
+        {"job": m.job, "run_id": m.run_id, "reason": m.reason}
+        for m in sorted(group.members, key=lambda x: x.job)
+    ]
 
 
-ALERT_BUS_SCHEMA_VERSION = "alert_bus.v1"
+def _alert_id_joins_to_a_manifest(group: PageGroup, alert_id: str | None) -> bool:
+    """Does ``alert_id`` actually join to a run manifest's `run_id`?
+
+    §9.3 says the response plane reads this bus, so this is the field that
+    decides whether a machine reader goes looking for a manifest. It was
+    wrong in both directions at once: `bus_row` computed it as
+    ``alert_id != _sweep_alert_id_marker(alert_id)`` where that helper was
+    the IDENTITY function, so it was always False even for a real run id;
+    and :func:`emit` then overwrote it with ``condition == "failure"``, which
+    is True for a failure page whose manifest would not parse and whose
+    "run id" is therefore the all-zeros sentinel joining to nothing.
+
+    Computed once, here, from the only three facts that decide it: an
+    absence has no run, a sentinel is not a run id, and the id must be one
+    the group's own members carry.
+    """
+    if alert_id is None or group.condition != "failure":
+        return False
+    if alert_id == _UNPARSEABLE_RUN_ID:
+        return False
+    return any(member.run_id == alert_id for member in group.members)
+
+
+#: Bumped from `alert_bus.v1` with the incident-keyed row: the key shape
+#: changed and `first_observed_utc`, `last_observed_utc`, `observations` and
+#: `incident_key` are new. A consumer pinned to v1 should see a version it
+#: does not know rather than a v1-shaped row that means something else.
+ALERT_BUS_SCHEMA_VERSION = "alert_bus.v2"
 
 #: §11 risk 2 / §2 row 6: pages per month is a metric with a CEILING.
 #: Exceeding it is a defect in this module — never a reason to add a
@@ -398,7 +604,79 @@ CEILING_WINDOW_TRADING_DAYS = 20
 #: three-week overlap (§11 risk 5). Muting at the destination rather than at
 #: the producer: a mute implemented by not emitting is indistinguishable from
 #: a producer that died.
+#:
+#: A topic NAME, and named as one. It was previously passed straight into
+#: `krepis.alerts.publish(sns_topic_arn=...)`, whose resolver returns an
+#: explicit value VERBATIM — so the legacy path would have handed SNS a bare
+#: name where an ARN is required and taken an `InvalidParameter`. Resolved
+#: through :func:`topic_arn` now, like every other topic.
 MUTED_TOPIC = "alpha-engine-alerts-muted"
+
+#: The topic v2 pages go to. Created, tagged and exported by the `crucible-v2`
+#: CloudFormation stack, and the ONLY topic besides :data:`MUTED_TOPIC` the
+#: v2 RuntimeRole is granted `sns:Publish` on.
+PAGES_TOPIC = "crucible-v2-pages"
+
+#: The declared adapter's inputs (principle 8): the topic ARN is read from
+#: the environment, never composed from a literal here and never left to a
+#: provider default. `CRUCIBLE_PAGES_TOPIC_ARN` carries the `crucible-v2`
+#: stack's `PagesTopicArn` output; a `crucible.config` setting for it is the
+#: right long-term home and is tracked on alpha-engine-config-I9757.
+PAGES_TOPIC_ARN_VAR = "CRUCIBLE_PAGES_TOPIC_ARN"
+MUTED_TOPIC_ARN_VAR = "CRUCIBLE_MUTED_TOPIC_ARN"
+
+
+class TopicUnresolvedError(RuntimeError):
+    """The SNS half of a page has no topic it is allowed to publish to.
+
+    Raised rather than falling through to `krepis.alerts`' own default. That
+    default is `alpha-engine-alerts`, which the v2 RuntimeRole is NOT granted
+    — so every page's SNS half would have been `AccessDenied` on the day the
+    stack was applied, while Telegram succeeded, `any_ok` stayed True and
+    nothing failed loudly. A page delivered on one of its two channels, with
+    no surface saying so, is the shape of failure this module exists to
+    remove from everything else.
+    """
+
+
+def topic_arn(*, legacy: bool = False) -> str | None:
+    """The SNS topic ARN this process publishes to. ONE resolution point.
+
+    Principle 8: no topic ARN, account id or region is composed at a call
+    site. The value comes from the environment — an output of the stack that
+    grants the publish, so the grant and the target cannot drift apart — and
+    this function is the whole adapter.
+
+    Returns ``None`` when unset, which :func:`_krepis_publish` turns into a
+    :class:`TopicUnresolvedError` at the point of a REAL send. The check is
+    there rather than here so that an injected transport (the fault-injection
+    suite, every unit test) needs no AWS configuration to exercise the
+    grouping and bus logic, while nothing can ever reach SNS without a topic
+    this deployment was actually granted.
+
+    A value that is set but is not an ARN raises immediately: that is the
+    exact defect the legacy path carried, and it is a configuration error
+    everywhere, not only on the send path.
+    """
+    variable = MUTED_TOPIC_ARN_VAR if legacy else PAGES_TOPIC_ARN_VAR
+    expected_name = MUTED_TOPIC if legacy else PAGES_TOPIC
+    raw = os.environ.get(variable, "").strip()
+    if not raw:
+        return None
+    if not raw.startswith("arn:aws:sns:"):
+        raise TopicUnresolvedError(
+            f"{variable}={raw!r} is not an SNS topic ARN. `krepis.alerts` returns an "
+            "explicit topic value verbatim, so a bare topic NAME reaches SNS as one and "
+            "is refused with InvalidParameter."
+        )
+    if raw.rsplit(":", 1)[-1] != expected_name:
+        raise TopicUnresolvedError(
+            f"{variable}={raw!r} names topic {raw.rsplit(':', 1)[-1]!r}, not "
+            f"{expected_name!r}. The v2 RuntimeRole is granted sns:Publish on "
+            f"{PAGES_TOPIC} and {MUTED_TOPIC} only; publishing anywhere else is an "
+            "AccessDenied that Telegram's success would hide."
+        )
+    return raw
 
 
 def send(
@@ -425,19 +703,71 @@ def send(
     ``transport`` is injectable for the fault-injection suite, which asserts
     "exactly one page" against a captured transport. It defaults to the real
     one; a test double is never the default.
+
+    ``alert_id`` is the row's correlation identity, carried here so the call
+    site reads as one act. The dedup identity is deliberately NOT it: an id
+    that changes per observation is exactly what stopped krepis' forever
+    window from ever engaging.
     """
     publish = transport if transport is not None else _krepis_publish
     result = publish(
         group.render(),
         severity=group.severity,
         source=f"crucible-v2/{group.condition}",
-        dedup_key=dedup_key(group.condition, group.members[0].job, group.trading_day),
+        dedup_key=incident_key(group),
         dedup_window_min=None,
-        sns_topic_arn=MUTED_TOPIC if legacy else None,
+        sns_topic_arn=topic_arn(legacy=legacy),
         raise_on_total_failure=True,
     )
-    destination = getattr(result, "destination", "muted" if legacy else "operator_chat")
-    sent = bool(getattr(result, "any_ok", True))
+    return _transport_outcome(result, legacy=legacy)
+
+
+def _transport_outcome(result: Any, *, legacy: bool) -> tuple[bool, str]:
+    """What the transport ACTUALLY did — never what was asked of it.
+
+    `PublishResult.any_ok` is True on a DEDUP-SUPPRESSED and on a MUTED
+    publish, by krepis' own documented contract: the alert is "logically in
+    the operator's hands" by virtue of an earlier send. That is a reasonable
+    thing for a Bash caller's `|| echo failed` to want and a false thing to
+    write into `sent`, whose docstring says it records what happened on the
+    transport and whose reader is the response plane. Both suppression flags
+    are subtracted here.
+
+    There is no optimistic default left. `sent` used to be
+    ``bool(getattr(result, "any_ok", True))`` — a transport whose result did
+    not answer the question was recorded as having delivered.
+
+    ``dedup_skipped`` and ``muted`` are read with ``False`` defaults, and
+    that is the one accommodation: they are fields of krepis'
+    `PublishResult` (defaulting to False there) and a test double that omits
+    them is asserting no suppression occurred. FAILURE MODE SWALLOWED: a
+    double that suppresses a send without setting either flag would still be
+    recorded as delivered. RECORDING SURFACE: the bus row's `sent` field,
+    and `tests/test_alerts_grouping.py::TestDeliveryHonesty`, which drives
+    the real flags. Closing it fully needs `tests/conftest.py`'s
+    `CapturingTransport` to set `dedup_skipped` on its own dedup branch —
+    named in the PR body, not this agent's file to change.
+    """
+    if not hasattr(result, "any_ok"):
+        raise TypeError(
+            f"{type(result).__name__} carries no `any_ok`; a transport result that "
+            "cannot say whether the page was delivered cannot be recorded as delivered. "
+            "`krepis.alerts.PublishResult` is the contract."
+        )
+    suppressed = bool(getattr(result, "dedup_skipped", False)) or bool(
+        getattr(result, "muted", False)
+    )
+    sent = bool(result.any_ok) and not suppressed
+    # krepis names it `telegram_destination` and leaves it None when the
+    # Telegram leg was not reached; the previous `getattr(result,
+    # "destination", ...)` read an attribute `PublishResult` has never had,
+    # so every real bus row recorded the literal default rather than a
+    # destination. Both names are read, in the order of authority.
+    destination = (
+        getattr(result, "telegram_destination", None)
+        or getattr(result, "destination", None)
+        or ("suppressed" if suppressed else "muted" if legacy else "sns_only")
+    )
     return sent, str(destination)
 
 
@@ -447,7 +777,20 @@ def _krepis_publish(*args: Any, **kwargs: Any) -> Any:
     Lazy because `crucible --help`, the tests and every laptop run import
     this module, and none of them should pull an SNS client onto the import
     path.
+
+    Refuses a publish with no topic. `krepis.alerts._resolve_sns_topic_arn`
+    composes `alpha-engine-alerts` when it is handed None, and the v2
+    RuntimeRole holds no grant on that topic — the publish would be
+    AccessDenied, Telegram would succeed, `any_ok` would be True, and the
+    only symptom would be an SNS subscriber that never heard from v2.
     """
+    if kwargs.get("sns_topic_arn") is None:
+        raise TopicUnresolvedError(
+            f"{PAGES_TOPIC_ARN_VAR} (or {MUTED_TOPIC_ARN_VAR} for the legacy path) is "
+            f"unset, so this page has no topic. Set it to the `crucible-v2` stack's "
+            f"PagesTopicArn output. Falling through would publish to "
+            f"alpha-engine-alerts, where this role has no grant."
+        )
     from krepis.alerts import publish  # noqa: PLC0415
 
     return publish(*args, **kwargs)
@@ -457,30 +800,99 @@ def emit(
     store: Store,
     groups: Sequence[PageGroup],
     *,
-    sweep_run_id: str,
+    sweep_run_id: str | None,
     legacy: bool = False,
     transport: Callable[..., Any] | None = None,
+    now: dt.datetime | None = None,
 ) -> list[str]:
-    """Send each group once and write its bus row. Returns the bus keys.
+    """Send each INCIDENT once and write its bus row. Returns the bus keys.
 
     The bus row is written **after** the send and records the send's real
     outcome. Writing it first would produce a durable claim about something
     that had not happened yet, and the response plane reads the bus.
+
+    **An incident whose row already exists is not sent again.** §2 row 6 is
+    "alerts only when wrong", and a persistent, unchanged wrongness is one
+    wrongness: the nightly sweep re-observing Friday's missing artifact on
+    Saturday and again on Sunday is one incident, not three. The suppression
+    is not silence — the existing row's `observations` and
+    `last_observed_utc` advance, so "still open, seen by three sweeps" is
+    readable from the artifact, and the incident is counted once against the
+    ceiling instead of once per sweep execution.
+
+    Suppressing HERE rather than relying on the transport's dedup marker is
+    deliberate: the marker lives in another bucket and its absence is
+    invisible from these artifacts, while this store is the thing principle 1
+    says the account must be reconstructible from. The transport's own
+    `dedup_key` is still passed, as a second line.
+
+    ``sweep_run_id`` may be None for an observer that has no run of its own;
+    the row then records `alert_id: null` rather than a fabricated id.
     """
+    moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
+    stamp = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
     keys: list[str] = []
     for gp in groups:
-        alert_id = (
-            gp.members[0].run_id
-            if gp.condition == "failure" and gp.members[0].run_id
-            else sweep_run_id
-        )
+        key = bus_key(gp)
+        if store.exists(key):
+            _record_reobservation(store, key, gp, stamp)
+            keys.append(key)
+            continue
+        alert_id = _alert_id_for(gp, sweep_run_id)
         sent, destination = send(gp, alert_id=alert_id, legacy=legacy, transport=transport)
-        row = bus_row(gp, alert_id=alert_id, sent=sent, destination=destination)
-        row["alert_id_is_run_id"] = gp.condition == "failure"
-        key = bus_key(gp, alert_id)
-        store.put_bytes(key, json.dumps(row, indent=2, sort_keys=True).encode("utf-8"))
+        row = bus_row(
+            gp,
+            alert_id=alert_id,
+            sent=sent,
+            destination=destination,
+            first_observed_utc=stamp,
+            last_observed_utc=stamp,
+        )
+        store.put_bytes(key, _dump_row(row))
         keys.append(key)
     return keys
+
+
+def _alert_id_for(group: PageGroup, sweep_run_id: str | None) -> str | None:
+    """The correlation id the row carries.
+
+    A failure group's is the failed run's id — that is the join §9.3 wants.
+    The all-zeros sentinel is explicitly NOT used: it joins to nothing, and a
+    row whose `alert_id` is a plausible-looking id that resolves to no
+    manifest costs a reader more than a row that names the sweep that saw it.
+    """
+    first = group.members[0]
+    if group.condition == "failure" and first.run_id and first.run_id != _UNPARSEABLE_RUN_ID:
+        return first.run_id
+    return sweep_run_id
+
+
+def _record_reobservation(store: Store, key: str, group: PageGroup, stamp: str) -> None:
+    """Advance an open incident's row instead of paging for it again.
+
+    `sent`, `destination`, `alert_id`, `members` and `rendered` describe the
+    page that was DELIVERED and are left alone — rewriting a delivery record
+    with facts from a later observation would make the row claim it sent
+    something it did not. `members_now`, `observations` and
+    `last_observed_utc` are the current picture.
+
+    Conditional on the row's version. This is one key written by more than
+    one execution — the fleet's last-writer-wins class — and a blind
+    overwrite here would let a concurrent sweep drop an observation. A lost
+    conditional write RAISES (:class:`crucible.store.PointerConflictError`)
+    rather than retrying: two sweeps racing on one incident is itself a fact
+    an operator should see.
+    """
+    expected = store.etag(key)
+    row = json.loads(store.get_bytes(key).decode("utf-8"))
+    row["observations"] = int(row["observations"]) + 1
+    row["last_observed_utc"] = stamp
+    row["members_now"] = _members(group)
+    store.compare_and_swap(key, expected, _dump_row(row))
+
+
+def _dump_row(row: dict[str, Any]) -> bytes:
+    return json.dumps(row, indent=2, sort_keys=True).encode("utf-8")
 
 
 def pages_in_window(
@@ -489,11 +901,21 @@ def pages_in_window(
     now: dt.datetime | None = None,
     window_trading_days: int = CEILING_WINDOW_TRADING_DAYS,
 ) -> int:
-    """How many page GROUPS were emitted over the trailing window.
+    """How many INCIDENTS were paged over the trailing window.
 
-    Groups, not members: one outage is one page. Counted from the bus rather
-    than from a counter, so the number is reconstructible from artifacts by
-    someone who was not here (principle 1).
+    Three properties, and the ceiling means nothing without all three:
+
+    * **Groups, not members** — five arms failing on one data outage is one
+      page (§9.3), and counting members would read a single bad Saturday as
+      five incidents against a two-a-month target.
+    * **Incidents, not observations** — one bus row per incident, advanced
+      rather than re-created by each later sweep that still sees it. The row
+      shape used to be per-observation, so this number counted SWEEP CADENCE:
+      one absent Friday artifact read as 1 on Friday night, 2 on Saturday and
+      3 — a BREACH — on Sunday, without anything new having gone wrong.
+    * **Counted from the bus**, not from an in-process counter, so it is
+      reconstructible from artifacts by someone who was not here (principle
+      1).
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     end = resolve_trading_day(moment)
@@ -531,8 +953,8 @@ def ceiling_metric(count: int, *, now: dt.datetime) -> dict[str, Any]:
         "n_floor": 0,
         "status": "BREACH" if breach else "OK",
         "status_reason": (
-            f"{count} page group(s) in the trailing {CEILING_WINDOW_TRADING_DAYS} trading "
-            f"days against a ceiling of {PAGES_PER_MONTH_CEILING}. "
+            f"{count} incident(s) paged in the trailing {CEILING_WINDOW_TRADING_DAYS} "
+            f"trading days against a ceiling of {PAGES_PER_MONTH_CEILING}. "
             + (
                 "Exceeding the ceiling is a defect in crucible.alerts, never a reason to "
                 "add a suppression."
@@ -551,6 +973,7 @@ def heartbeat(
     *,
     now: dt.datetime | None = None,
     transport: Callable[..., Any] | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Emit proof that the alerting path itself ran, and return its summary.
 
@@ -563,32 +986,71 @@ def heartbeat(
     carried by a healthy second channel would prove that channel alive and say
     nothing about the one the pages use — which is the failure it exists to
     detect, dressed as its own detector.
+
+    **And it evaluates the rows that declare IT as their watcher.**
+    `components.yaml` gives `alerts.sweep` `absence_watched_by: heartbeat` —
+    the one row the sweep cannot honestly watch, because a sweep that never
+    ran cannot report itself missing. That declaration was a claim and not a
+    mechanism: this function read the sweep's manifests nowhere, so the row
+    rendered as covered while a sweep that stopped running was noticed by
+    nobody. It now runs the same absence condition over its own rows, through
+    the same :func:`evaluate_absence` — one implementation, selected by the
+    declared watcher — and a finding is a real page with a real bus row,
+    counted against the same ceiling. A dead sweep is an incident, not a
+    footnote in an info-severity message.
+
+    ``run_id`` is this heartbeat's own run id, carried onto any bus row it
+    writes. Absent, the row records `alert_id: null`: an absence page has no
+    run to join to anyway, and inventing an id would be worse than saying
+    there is none.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     trading_day = resolve_trading_day(moment)
+    watched = evaluate_absence(store, now=moment, watched_by="heartbeat")
+    bus_keys = emit(
+        store,
+        group_pages(watched),
+        sweep_run_id=run_id,
+        transport=transport,
+        now=moment,
+    )
+    # After emit, so a sweep-absence raised by THIS run is inside the number
+    # the same run reports. A count taken first would publish a heartbeat
+    # whose own finding was missing from its own metric.
     pages = pages_in_window(store, now=moment)
     runs_ok, runs_failed, spend = _week_summary(store, trading_day)
+    unwatched = sorted({page.job for page in watched})
     summary = {
         "trading_day": trading_day.isoformat(),
         "runs_ok": runs_ok,
         "runs_failed": runs_failed,
         "cost_usd": round(spend, 4),
         "pages_in_window": pages,
+        "watched_absences": unwatched,
+        "bus_keys": bus_keys,
         "metric": ceiling_metric(pages, now=moment),
     }
     message = (
         f"[crucible-v2] alive {trading_day.isoformat()}: {runs_ok} run(s) ok, "
-        f"{runs_failed} failed, ${spend:.2f}, {pages} page group(s) in the trailing "
+        f"{runs_failed} failed, ${spend:.2f}, {pages} incident(s) paged in the trailing "
         f"{CEILING_WINDOW_TRADING_DAYS} trading days "
         f"(ceiling {PAGES_PER_MONTH_CEILING})."
     )
+    if unwatched:
+        message += (
+            " ABSENT, and watched by nothing else: "
+            + ", ".join(unwatched)
+            + ". The alerting path did not run; neither page condition was evaluated "
+            "on the day(s) named in the bus row."
+        )
     publish = transport if transport is not None else _krepis_publish
     publish(
         message,
-        severity="info",
+        severity="error" if unwatched else "info",
         source="crucible-v2/heartbeat",
         dedup_key=f"heartbeat:{trading_day.isoformat()}",
         dedup_window_min=None,
+        sns_topic_arn=topic_arn(),
         raise_on_total_failure=True,
     )
     return summary
@@ -653,10 +1115,16 @@ def sweep(
         store, now=moment, registry=registry
     )
     groups = group_pages(pages)
-    keys = emit(store, groups, sweep_run_id=sweep_run_id, transport=transport)
+    # Read before emitting: `pages_emitted` is what this run actually SENT,
+    # not how many incidents it saw. A run that re-observed three open
+    # incidents and paged for none of them reporting "3 pages emitted" is the
+    # same false claim the bus rows used to make, one layer up.
+    already_open = {bus_key(gp) for gp in groups if store.exists(bus_key(gp))}
+    keys = emit(store, groups, sweep_run_id=sweep_run_id, transport=transport, now=moment)
     count = pages_in_window(store, now=moment)
     return {
-        "pages_emitted": len(groups),
+        "pages_emitted": len([k for k in keys if k not in already_open]),
+        "incidents_open": len(groups),
         "members": len(pages),
         "bus_keys": keys,
         "metric": ceiling_metric(count, now=moment),
