@@ -59,7 +59,9 @@
         "heartbeat",
         "drift",
         "console",
-        "deploy"
+        "deploy",
+        "weekly",
+        "gate"
       ]
     },
     "trading_day": {

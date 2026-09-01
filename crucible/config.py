@@ -20,7 +20,12 @@ explicit argument, then environment variable, then the declared default:
   absent, arms are read from the store under ``strategy/current/``, which is
   what a spot instance sees;
 * the **ArcticDB bucket** (``CRUCIBLE_ARCTIC_BUCKET``), the production price
-  source's backing bucket.
+  source's backing bucket;
+* the **CloudTrail archive** (``CRUCIBLE_CLOUDTRAIL_ARCHIVE``), an
+  ``s3://bucket/prefix`` URI the autonomy gate reads human-originated mutating
+  calls from (§11 risk 8);
+* the **stack name** (``CRUCIBLE_STACK``), the CloudFormation stack whose
+  resources must all carry `system=crucible-v2` (§11 risk 7).
 
 A resolution that fell through to a default says so in
 :attr:`Settings.origins`, so `explain` can report *why* a run read what it
@@ -39,6 +44,8 @@ from crucible.store import LocalStore, S3Store, Store
 
 __all__ = [
     "DEFAULT_ARCTIC_BUCKET",
+    "DEFAULT_CLOUDTRAIL_ARCHIVE",
+    "DEFAULT_STACK_NAME",
     "DEFAULT_LLM_CAP_USD",
     "DEFAULT_STORE_URI",
     "STRATEGY_PREFIX",
@@ -47,11 +54,15 @@ __all__ = [
     "store_from_uri",
 ]
 
-#: Recorded as an ASSUMPTION on alpha-engine-config-I9757, not as a fact: the
-#: v2 bucket arrives with track C's CloudFormation template. Until then v2
-#: artifacts live under an existing research bucket at a v2-only prefix, so
-#: nothing v1 writes and nothing v1 reads can collide with them.
-DEFAULT_STORE_URI = "s3://alpha-engine-research/crucible"
+#: **There is no default store, deliberately.** An earlier revision defaulted
+#: to a production research bucket, which contradicted `store.open_store`'s own
+#: refusal — "a job that wrote to production because a flag was missing is
+#: noticed once" — and meant `crucible experiment.grade --slot r --dry-run`
+#: with no `--store` wrote verdicts, the arm register, the arena cycle and
+#: ledger rows into that bucket. The resolution now falls through to `None`,
+#: and :meth:`Settings.store` refuses with the same message `open_store` uses,
+#: so the two entry points agree.
+DEFAULT_STORE_URI: str | None = None
 
 #: The ArcticDB store is a v1 asset v2 READS and never writes to from a
 #: laptop (the standing in-region rule). Named here so the read path carries
@@ -63,14 +74,31 @@ DEFAULT_ARCTIC_BUCKET = "alpha-engine-data"
 #: the run manifest records that tree's hash as an input.
 STRATEGY_PREFIX = "strategy/current"
 
+#: The CloudFormation stack the tag audit reads (§11 risk 7). One name, here,
+#: so the audit carries no literal and a second account is one variable.
+DEFAULT_STACK_NAME = "crucible-v2"
+
+#: The CloudTrail archive the autonomy gate reads (§11 risk 8). Empty by
+#: default and NOT a guess: the account had no trail at all when this was
+#: written, and a plausible-looking bucket name here would have produced a
+#: `NoSuchBucket` that reads like a permissions problem rather than the honest
+#: answer, which is that the archive does not exist yet. `crucible.autonomy`
+#: raises `ArchiveMissingError` on an empty value.
+DEFAULT_CLOUDTRAIL_ARCHIVE = ""
+
 
 @dataclass(frozen=True)
 class Settings:
     """One resolved configuration, with the provenance of every value."""
 
-    store_uri: str
+    #: `None` when nothing resolved it. Not an error at resolution time — a
+    #: `crucible report --help` or an LLM-cap lookup needs no store — but
+    #: :meth:`store` refuses, so the failure lands where the write would.
+    store_uri: str | None
     arctic_bucket: str
     strategy_dir: Path | None
+    cloudtrail_archive: str = DEFAULT_CLOUDTRAIL_ARCHIVE
+    stack_name: str = DEFAULT_STACK_NAME
     origins: dict[str, str] = field(default_factory=dict)
     #: The per-weekly-run LLM spend ceiling, in USD (plan §2 row 3). Declared
     #: HERE, in config, rather than at a call site: a ceiling that lives beside
@@ -80,25 +108,48 @@ class Settings:
     llm_cap_usd: float = DEFAULT_LLM_CAP_USD
 
     def store(self) -> Store:
+        """The resolved store, or a refusal naming how to resolve one.
+
+        Deliberately the same refusal `crucible.store.open_store` gives. Two
+        entry points into the same decision that disagreed is what let a
+        `--dry-run` reach a production bucket through one of them.
+        """
+        if not self.store_uri:
+            raise ValueError(
+                "no store was resolved. Pass `--store s3://bucket/prefix` or a "
+                "directory path, or set CRUCIBLE_STORE. There is deliberately no "
+                "hardcoded production bucket fallback — a job that wrote to "
+                "production because a flag was missing is noticed once."
+            )
         return store_from_uri(self.store_uri)
+
+    def cloudtrail_bucket_prefix(self) -> tuple[str, str]:
+        """The archive URI split into bucket and prefix, or ("", "") if unset."""
+        if not self.cloudtrail_archive:
+            return "", ""
+        rest = self.cloudtrail_archive.removeprefix("s3://").strip("/")
+        bucket, _, prefix = rest.partition("/")
+        return bucket, prefix
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "store_uri": self.store_uri,
             "arctic_bucket": self.arctic_bucket,
+            "cloudtrail_archive": self.cloudtrail_archive,
+            "stack_name": self.stack_name,
             "strategy_dir": str(self.strategy_dir) if self.strategy_dir else None,
             "llm_cap_usd": self.llm_cap_usd,
             "origins": dict(self.origins),
         }
 
 
-def _resolve(explicit: str | None, variable: str, default: str) -> tuple[str, str]:
+def _resolve(explicit: str | None, variable: str, default: str | None) -> tuple[Any, str]:
     if explicit:
         return explicit, "argument"
     from_environment = os.environ.get(variable)
     if from_environment:
         return from_environment, f"environ:{variable}"
-    return default, "default"
+    return default, "default" if default is not None else "unresolved"
 
 
 def settings(
@@ -107,6 +158,8 @@ def settings(
     arctic_bucket: str | None = None,
     strategy_dir: str | os.PathLike[str] | None = None,
     llm_cap_usd: float | None = None,
+    cloudtrail_archive: str | None = None,
+    stack_name: str | None = None,
 ) -> Settings:
     """Resolve configuration once, and record where each value came from."""
     origins: dict[str, str] = {}
@@ -119,6 +172,12 @@ def settings(
         "CRUCIBLE_LLM_CAP_USD",
         str(DEFAULT_LLM_CAP_USD),
     )
+    resolved_archive, origins["cloudtrail_archive"] = _resolve(
+        cloudtrail_archive, "CRUCIBLE_CLOUDTRAIL_ARCHIVE", DEFAULT_CLOUDTRAIL_ARCHIVE
+    )
+    resolved_stack, origins["stack_name"] = _resolve(
+        stack_name, "CRUCIBLE_STACK", DEFAULT_STACK_NAME
+    )
     raw_dir = strategy_dir or os.environ.get("CRUCIBLE_STRATEGY_DIR")
     if raw_dir:
         origins["strategy_dir"] = "argument" if strategy_dir else "environ:CRUCIBLE_STRATEGY_DIR"
@@ -130,6 +189,8 @@ def settings(
         store_uri=resolved_store,
         arctic_bucket=resolved_arctic,
         strategy_dir=resolved_dir,
+        cloudtrail_archive=resolved_archive,
+        stack_name=resolved_stack,
         llm_cap_usd=_positive_cap(resolved_cap, origins["llm_cap_usd"]),
         origins=origins,
     )

@@ -13,6 +13,12 @@
 # legitimately does not emit is `null` — declared, not omitted, because an
 # omitted class is indistinguishable from a forgotten one.
 #
+# `dispatch` says WHO starts a scheduled row: `arc` (a stage of the weekly
+# driver, `crucible weekly`) or `scheduler` (its own EventBridge schedule).
+# On-demand rows declare `null`. It is a separate field from `schedule`
+# because `schedule` is prose and this is wiring: six rows read
+# "weekly, Saturday" while exactly one of them was dispatched by anything.
+#
 # `deadline` is expressed relative to the TRADING calendar (§4.12): "present
 # by T after the close of trading day d". A Monday holiday therefore raises no
 # page, without anyone muting anything.
@@ -46,6 +52,7 @@ components:
     artifact_retention: forever
     absence_watched_by: alerts.sweep
     schedule: weekdays after close
+    dispatch: scheduler
     deadline:
       anchor: close_plus
       offset_hours: 3
@@ -66,6 +73,7 @@ components:
     artifact_retention: forever
     absence_watched_by: alerts.sweep
     schedule: weekly, Saturday
+    dispatch: arc
     deadline:
       anchor: next_calendar_day_at
       at: "09:00"
@@ -88,6 +96,7 @@ components:
     artifact_retention: forever
     absence_watched_by: alerts.sweep
     schedule: null
+    dispatch: null
     deadline: null
 
   experiment.new:
@@ -106,6 +115,7 @@ components:
     artifact_retention: forever
     absence_watched_by: alerts.sweep
     schedule: null
+    dispatch: null
     deadline: null
 
   experiment.run:
@@ -124,6 +134,7 @@ components:
     artifact_retention: forever
     absence_watched_by: alerts.sweep
     schedule: weekly, Saturday
+    dispatch: arc
     deadline:
       anchor: next_calendar_day_at
       at: "12:00"
@@ -144,6 +155,7 @@ components:
     artifact_retention: forever
     absence_watched_by: alerts.sweep
     schedule: weekly, Saturday
+    dispatch: arc
     deadline:
       anchor: next_calendar_day_at
       at: "14:00"
@@ -164,6 +176,7 @@ components:
     artifact_retention: forever
     absence_watched_by: alerts.sweep
     schedule: null
+    dispatch: null
     deadline: null
 
   report:
@@ -182,6 +195,7 @@ components:
     artifact_retention: forever
     absence_watched_by: alerts.sweep
     schedule: weekly, Saturday
+    dispatch: arc
     deadline:
       anchor: next_calendar_day_at
       at: "16:00"
@@ -203,6 +217,7 @@ components:
     artifact_retention: forever
     absence_watched_by: alerts.sweep
     schedule: null
+    dispatch: null
     deadline: null
 
   migrate.history:
@@ -221,6 +236,7 @@ components:
     artifact_retention: forever
     absence_watched_by: alerts.sweep
     schedule: null
+    dispatch: null
     deadline: null
 
   release.pin:
@@ -239,6 +255,7 @@ components:
     artifact_retention: forever
     absence_watched_by: alerts.sweep
     schedule: null
+    dispatch: null
     deadline: null
 
   smoke:
@@ -259,6 +276,7 @@ components:
     # whose absence is a fact about the system.
     absence_watched_by: alerts.sweep
     schedule: null
+    dispatch: null
     deadline: null
 
   # ── Track C (alpha-engine-config-I9757) ────────────────────────────────
@@ -290,6 +308,7 @@ components:
     # the self-reference is a lag rather than a blind spot.
     absence_watched_by: heartbeat
     schedule: daily 21:00 ET, every calendar day
+    dispatch: scheduler
     deadline:
       anchor: close_plus
       offset_hours: 5.5
@@ -317,6 +336,7 @@ components:
     # is what keeps it from being mistaken for coverage that does not exist.
     absence_watched_by: operator
     schedule: weekly, Saturday
+    dispatch: scheduler
     deadline:
       anchor: next_calendar_day_at
       at: "18:00"
@@ -339,6 +359,7 @@ components:
     artifact_retention: forever
     absence_watched_by: alerts.sweep
     schedule: weekly, Saturday
+    dispatch: arc
     deadline:
       anchor: next_calendar_day_at
       at: "14:00"
@@ -361,6 +382,58 @@ components:
     artifact_retention: forever
     absence_watched_by: alerts.sweep
     schedule: weekly, Saturday
+    dispatch: arc
     deadline:
       anchor: next_calendar_day_at
       at: "17:00"
+
+  # ── Track F (alpha-engine-config-I9757) ────────────────────────────────
+
+  weekly:
+    description: >-
+      Run the declared weekly arc for one trading day, in deadline order,
+      stopping at the first stage that fails.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[runs/**]
+      outcome: run.json:metrics[arc_stages_completed]
+    log_location: /crucible/weekly
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: weekly, Saturday
+    # The one row the arc cannot dispatch: it IS the arc.
+    dispatch: scheduler
+    deadline:
+      # Later than `console`, its own last stage. An arc deadline earlier
+      # than a stage it runs would page for a run that was still working.
+      anchor: next_calendar_day_at
+      at: "17:30"
+
+  gate:
+    description: >-
+      Read the manifests a phase produced and report, clause by clause,
+      whether that phase's exit gate is met.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[runs/**,report/**,arena/**],outputs[gates/**]
+      outcome: run.json:metrics[gate_clauses_met_ratio]
+    log_location: /crucible/gate
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/gates
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    # Run at a phase exit, which is an event and not a cadence. A gate on a
+    # schedule would be a gate whose absence pages between phases.
+    schedule: null
+    dispatch: null
+    deadline: null

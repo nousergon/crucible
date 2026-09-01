@@ -40,6 +40,11 @@ def _minimal_argv(job: str) -> list[str]:
         argv += ["a" * 40]
     if job == "data.heal":
         argv += ["--gap", "missing-panel", "--from", "2026-08-24", "--to", "2026-08-28"]
+    if job == "gate":
+        # track-F: a gate with no name has no clause list, so `--gate` is
+        # required rather than defaulted — a defaulted gate would report a
+        # pass for a phase nobody asked about.
+        argv += ["--gate", "phase1"]
     if job == "smoke":
         # track-C: the pointer flip refuses a smoke manifest belonging to
         # another build, so the sha the smoke is verifying is required.
@@ -80,6 +85,8 @@ class TestJobSurface:
             "migrate.history",
             "release.pin",
             "smoke",
+            "weekly",
+            "gate",
         }
 
     @pytest.mark.parametrize("job", sorted(JOBS))
@@ -101,30 +108,47 @@ class TestJobSurface:
         in JOBS with no handler at all would silently drop out of both."""
         assert set(HANDLERS) == set(JOBS)
 
-    @pytest.mark.parametrize("job", UNIMPLEMENTED)
-    def test_an_unimplemented_job_raises_and_never_returns_zero(self, job: str) -> None:
+    def test_an_unimplemented_job_raises_and_never_returns_zero(self) -> None:
         """A stub that exits 0 is indistinguishable from a job that ran and
         had nothing to do — the exact shape §11 says agent-built systems
         drift toward.
 
-        The parametrisation reads `is_stub` off the handler, so a track
-        landing an implementation flips this by IMPLEMENTING, with no
-        exclusion list for anyone to remember to edit.
+        **A loop, not a parametrisation.** `UNIMPLEMENTED` is derived from
+        `is_stub`, so it legitimately empties as tracks land — and pytest
+        SKIPS a parametrized test whose parameter set is empty, which in a
+        repository declaring zero suppressions (§11.1) is a suppression the
+        `tests/test_no_suppressions.py` grep cannot see: it reports
+        `1 skipped` and reads as green. Looping keeps the assertion real at
+        every size, including zero.
         """
-        with pytest.raises(NotImplementedError, match="I9757"):
-            main(_minimal_argv(job))
+        for job in UNIMPLEMENTED:
+            with pytest.raises(NotImplementedError, match="I9757"):
+                main(_minimal_argv(job))
 
     def test_the_stub_set_shrinks_rather_than_being_declared(self) -> None:
         """The other half of the derivation: an implemented job is NOT here.
 
-        Without this, `UNIMPLEMENTED` going empty would silently turn the
-        test above into zero assertions — a parametrized test over an empty
-        list passes, reports nothing, and looks exactly like a green gate.
+        Without this, `UNIMPLEMENTED` going empty would leave the test above
+        asserting nothing at all — and an empty stub set is exactly the state
+        the repository is trying to reach, so the moment it succeeds is the
+        moment the guard would go dark rather than green.
         """
         assert set(UNIMPLEMENTED) <= set(JOBS)
         assert set(UNIMPLEMENTED).isdisjoint(
             {"data.daily", "data.weekly", "data.heal", "experiment.run", "explain"}
         ), "track A landed these; they are no longer stubs"
+
+    def test_every_job_in_the_table_is_implemented(self) -> None:
+        """The positive form, which is the one that has to hold at the end.
+
+        `UNIMPLEMENTED` shrinking to nothing is the phase-1 goal; stated as an
+        assertion, reaching it is a green test rather than an absence of
+        tests.
+        """
+        assert UNIMPLEMENTED == [], (
+            f"still stubs: {UNIMPLEMENTED}. A stub is a job whose absence from the "
+            "weekly arc nothing else reports."
+        )
 
 
 class TestDateResolution:

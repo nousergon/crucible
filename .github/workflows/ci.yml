@@ -14,8 +14,19 @@ on:
     branches: [main]
     paths-ignore: ['**/*.md', 'docs/**']
   pull_request:
-    branches: [main]
-    paths-ignore: ['**/*.md', 'docs/**']
+    # EVERY base branch, not just `main`. A stacked PR — the shape this
+    # repository uses constantly, because a fix for an open PR's file has to
+    # branch from it — targets the branch it stacks on, so `branches: [main]`
+    # meant `gh pr checks` reported "no checks reported" and the PR merged
+    # unmeasured. A lane where a defect lands with no CI is worse than a slow
+    # lane (measured on crucible-PR8, 2026-09-01).
+    branches: ['**']
+    # No `paths-ignore` on pull_request, deliberately. GitHub records a
+    # workflow skipped by a path filter as never having started, so a
+    # docs-only PR leaves a REQUIRED check pending forever — the check never
+    # goes green and never goes red, and the PR cannot merge. The filter stays
+    # on `push`, where nothing is waiting on the result. These minutes are
+    # free: the repository is public.
 
 # Default-deny at the workflow level; each job re-grants only what it needs.
 # `contents: read` is NOT optional while this repo is private: with no

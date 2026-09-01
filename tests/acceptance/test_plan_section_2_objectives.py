@@ -14,6 +14,7 @@ the test green with no marker to remove.
 
 from __future__ import annotations
 
+import ast
 import datetime as dt
 import inspect
 import json
@@ -69,13 +70,95 @@ class TestAutonomy:
         """§11 risk 8: `lookup-events` truncates its username lookup to ~2
         days, so a gate querying it reads clean because it could not see the
         week. The gate must read the S3 CloudTrail archive over the full
-        window."""
+        window.
+
+        MET by track F, and asserted on all three properties that make the
+        count trustworthy: the module has no path to the forbidden API, an
+        absent archive is UNMEASURABLE rather than zero, and an unrecognised
+        principal counts as human. The last one is the whole control — a
+        classifier defaulting to `probably automation` would read clean on
+        the day a new role appears, which is exactly when it must not.
+        """
+        import ast
+        import gzip
+
+        from crucible import autonomy as autonomy_module
+        from crucible.autonomy import MACHINE_PRINCIPALS, ArchiveMissingError
+
         clause = "plan §2 row 1, closed by §11 risk 8"
         requirement = (
             "The operator-action count is computed from the CloudTrail S3 archive "
             "over the full 4-week window, never from `aws cloudtrail lookup-events`."
         )
-        _unmet(clause, requirement)
+
+        # 1. No path to the truncating API. AST, not a grep: the module's own
+        #    docstring names `lookup-events` in order to explain why it is not
+        #    used, and a text scan needing an exemption for the explanation is
+        #    a scan nobody can keep honest.
+        tree = ast.parse(inspect.getsource(autonomy_module))
+        reached = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)} | {
+            n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
+        }
+        assert not {name for name in reached if "lookup" in name.lower()}, (
+            f"UNMET — {clause}: {requirement}"
+        )
+
+        # 2. No archive is UNMEASURABLE, never zero. A trail that was never
+        #    created and a perfectly autonomous month produce the same
+        #    artifact set, and the two must not be the same answer.
+        with pytest.raises(ArchiveMissingError):
+            autonomy_module.count_operator_actions(
+                object(),
+                bucket="",
+                prefix="",
+                start=dt.date(2026, 8, 1),
+                end=dt.date(2026, 8, 29),
+            )
+
+        # 3. The window is walked day by day out of the archive, and an
+        #    unknown principal counts as human.
+        record = {
+            "eventTime": "2026-08-03T18:00:00Z",
+            "eventName": "PutRolePolicy",
+            "eventSource": "iam.amazonaws.com",
+            "readOnly": False,
+            "requestID": "req-1",
+            "requestParameters": {"roleName": "crucible-v2-runtime"},
+            "userIdentity": {
+                "type": "AssumedRole",
+                "sessionContext": {"sessionIssuer": {"userName": "a-role-nobody-declared"}},
+            },
+        }
+        assert "a-role-nobody-declared" not in MACHINE_PRINCIPALS
+
+        class _Body:
+            def read(self) -> bytes:
+                return gzip.compress(json.dumps({"Records": [record]}).encode("utf-8"))
+
+        class _Paginator:
+            def paginate(self, *, Bucket: str, Prefix: str) -> Any:  # noqa: N803
+                key = "t/2026/08/03/part.json.gz"
+                yield {"Contents": [{"Key": key}] if key.startswith(Prefix) else []}
+
+        class _Client:
+            def get_paginator(self, name: str) -> Any:
+                return _Paginator()
+
+            def get_object(self, *, Bucket: str, Key: str) -> Any:  # noqa: N803
+                return {"Body": _Body()}
+
+        result = autonomy_module.count_operator_actions(
+            _Client(),
+            bucket="trail",
+            prefix="t",
+            start=dt.date(2026, 8, 1),
+            end=dt.date(2026, 8, 29),
+        )
+        assert result.count == 1
+        assert result.actions[0].principal == "a-role-nobody-declared"
+        assert result.start == dt.date(2026, 8, 1) and result.end == dt.date(2026, 8, 29), (
+            "the count must cover the FULL window; a short window is the defect"
+        )
 
 
 class TestOneCommand:
@@ -163,13 +246,41 @@ class TestCost:
         assert manifest["llm_calls"] == []
 
     def test_every_v2_resource_is_tagged_for_cost_attribution(self) -> None:
+        """The one clause in this file that reads LIVE AWS, because the thing
+        it asserts is a property of the account and not of the code.
+
+        It fails until the operator applies the CloudFormation stack, and that
+        is the design: the tag is applied BY the deploy, so a clause that
+        could pass without it would be asserting the template rather than the
+        account. `crucible.tags` raises `StackNotAppliedError` rather than
+        returning an empty difference, because an empty difference over an
+        empty stack is vacuous truth (principle 7).
+        """
+        from crucible.config import settings as load_settings
+        from crucible.tags import StackNotAppliedError, audit_stack_tags
+
         clause = "plan §2 row 3 / §6 phase-0"
         requirement = (
             "Every v2 AWS resource carries tag system=crucible-v2, so the monthly "
             "cost row has a denominator and the <= $40/mo ceiling is measurable "
             "rather than asserted (§11 risk 7)."
         )
-        _unmet(clause, requirement)
+        stack = load_settings().stack_name
+        try:
+            import boto3
+
+            audit = audit_stack_tags(
+                stack=stack,
+                cfn=boto3.client("cloudformation"),
+                tagging=boto3.client("resourcegroupstaggingapi"),
+            )
+        except StackNotAppliedError as exc:
+            _unmet(clause, requirement, exc)
+        except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+            # Credentials, region, permissions: every one of these means the
+            # clause was not measured, and an unmeasured clause is unmet.
+            _unmet(clause, requirement, exc)
+        assert audit.met, f"UNMET — {clause}: {audit.detail()}"
 
 
 class TestNoThirdState:
@@ -267,6 +378,7 @@ class TestAlerting:
         import datetime as dt
 
         from crucible.alerts import evaluate_absence
+        from crucible.calendar import is_trading_day, resolve_trading_day
         from crucible.components import load_registry
         from crucible.store import LocalStore
 
@@ -285,10 +397,20 @@ class TestAlerting:
         # on the holiday binds to the 3rd's close, so the deadline moves with
         # the calendar rather than paging for a day the market never opened.
         holiday = dt.datetime(2026, 7, 4, 12, 0, tzinfo=dt.UTC)
-        assert all(
-            p.trading_day == dt.date(2026, 7, 2) or p.trading_day.weekday() < 5
-            for p in evaluate_absence(store, now=holiday)
+        session = resolve_trading_day(holiday)
+        assert not is_trading_day(holiday.date()), (
+            "this probe is only meaningful on a non-session; a weekday holiday "
+            "that the calendar thinks is open would make every assertion below "
+            "true for the wrong reason"
         )
+        holiday_pages = evaluate_absence(store, now=holiday)
+        assert all(p.trading_day == session for p in holiday_pages), (
+            "every page on a non-session binds to the last SESSION. The earlier "
+            "form of this assertion allowed `weekday() < 5`, which "
+            "`resolve_trading_day` can never violate — a clause that could not "
+            "fail, guarding the one calendar behaviour that matters."
+        )
+        assert all(is_trading_day(p.trading_day) for p in holiday_pages)
 
     def test_the_weekly_alert_count_is_a_metric_with_a_ceiling(self, tmp_path) -> None:
         """MET by track C. Pages per window is a MetricRecord with a declared
@@ -452,6 +574,26 @@ class TestControlArms:
 
         planted = sum(scores[controls["planted"]]) / len(scores[controls["planted"]])
         null = sum(scores[controls["null"]]) / len(scores[controls["null"]])
+        real_ids = [a for a in scores if a not in set(controls.values())]
+        assert real_ids, (
+            "the cycle scored no real arm, so `planted > real > null` degenerates to "
+            "`planted > null` — the two-rung form this clause used to assert while "
+            "carrying a three-rung name"
+        )
+        real = sum(sum(scores[a]) / len(scores[a]) for a in real_ids) / len(real_ids)
+        # §10.1's ordering is `planted > real-or-null > null`, and NULL is the
+        # rung that carries the meaning: the planted control's IC is
+        # calibrated and modest, so a genuinely good real arm outranking it is
+        # the product working, not a broken grader. Asserting `planted > real`
+        # would be a gate that a healthy system fails. What must hold is that
+        # BOTH rungs clear pure noise — a grader that cannot separate a real
+        # arm from noise has measured nothing, which is the audit's central
+        # finding stated as an assertion.
+        assert real > null, (
+            "the real arms did not outrank the null control. A grader that cannot "
+            "separate a real arm from pure noise is the grading loop that ran for "
+            "months while measuring nothing"
+        )
         assert planted > null, (
             "the planted arm's ranking signal is constructed with a known IC against "
             "the realized return; a grader that cannot see it cannot see a real edge"
@@ -507,13 +649,34 @@ class TestFaultInjection:
             f"no scripted injection for {fault!r}. 'Flawless from day 1' is proven on "
             "the failure path, and a fault nobody induces is a claim, not a gate."
         )
-        source = inspect.getsource(cls)
-        for required in ('status"] == "failed"', "_assert_full_telemetry", "_failure_pages"):
-            assert required in source, (
-                f"{cls.__name__} does not assert {required!r}: a fault-injection test "
+        tree = ast.parse(inspect.getsource(cls))
+        called = {
+            n.func.id
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        }
+        called |= {
+            n.func.attr
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        }
+        assert called & {"run_job", "_run_and_capture"}, (
+            f"{cls.__name__} never drives the job. A fault-injection test that does "
+            "not run the job proves nothing about the failure path — and the earlier "
+            "form of this clause was a substring grep over the class's source text, "
+            "which a class whose whole body was three unused string literals passed."
+        )
+        for required in ("_assert_full_telemetry", "_failure_pages"):
+            assert required in called, (
+                f"{cls.__name__} does not call {required!r}: a fault-injection test "
                 "that omits the page count proves the run failed, not that the "
                 "operator was told once."
             )
+        # Recorded, not asserted: faults 2 and 3 raise a message rather than
+        # inducing the condition at the seam that would produce it, so they
+        # cannot fail because of a defect in the data layer or the LLM path.
+        # Tracked as alpha-engine-config-I9782; this clause asserts the shape
+        # every fault must have, and that issue closes the two that fake it.
 
 
 class TestFeatureLayer:
