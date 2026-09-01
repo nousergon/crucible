@@ -40,11 +40,20 @@ from typing import Literal
 from nousergon_lib.arena.engine import ArenaConfig
 
 __all__ = [
+    "ESTIMATOR_KINDS",
+    "EXIT_RULES",
+    "REQUIRED_ARM_FIELDS",
+    "REQUIRED_RECIPE_FIELDS",
     "SLOTS",
+    "UNITS_SUFFIXES",
     "ControlArm",
+    "EstimatorSpec",
     "SlotSpec",
     "arena_config_for",
     "get_slot",
+    "load_arm_specs",
+    "load_model_recipes",
+    "load_strategy_recipes",
     "promotable_arms",
 ]
 
@@ -216,3 +225,30 @@ def promotable_arms(spec: SlotSpec, arm_ids: list[str]) -> list[str]:
     """
     control_ids = {c.arm_id for c in spec.control_arms}
     return [a for a in arm_ids if a not in control_ids]
+
+
+# ---------------------------------------------------------------------------
+# The public surface for consumers who validate strategy content, never
+# re-implement it (`alpha-engine-config-I9766`; plan §4.11, §9.1). Imported
+# down here, after the classes above, because `crucible.slots.arms` imports
+# `ControlArm` and `SlotSpec` back from this package — a top-of-file import
+# would be circular.
+# ---------------------------------------------------------------------------
+
+from crucible.slots.arms import REQUIRED_ARM_FIELDS, load_arm_specs  # noqa: E402
+from crucible.slots.model import _ESTIMATORS as _MODEL_ESTIMATOR_KINDS  # noqa: E402
+from crucible.slots.model import (  # noqa: E402
+    REQUIRED_RECIPE_FIELDS,
+    UNITS_SUFFIXES,
+    EstimatorSpec,
+    load_model_recipes,
+)
+from crucible.slots.strategy import EXIT_RULES, load_strategy_recipes  # noqa: E402
+
+#: The estimator kinds `EstimatorSpec` accepts (`crucible.slots.model._ESTIMATORS`).
+#: Re-exported here, rather than left private, so a consumer validating a
+#: recipe file (`alpha-engine-config-I9766`) has a stable name to import
+#: instead of reaching into a module-private tuple. `test_public_surface.py`
+#: pins this alias to the module's own tuple by identity of *value*, so the
+#: two cannot silently drift apart.
+ESTIMATOR_KINDS: tuple[str, ...] = _MODEL_ESTIMATOR_KINDS
