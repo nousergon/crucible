@@ -35,6 +35,7 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from crucible.keys import champion_key
 from crucible.slots.arms import ArmSpec, read_register, register_arms, write_register
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -236,21 +237,35 @@ def run_migrate_history(
         register = read_register(ctx.store, slot)
         register, _ = register_arms(register, [spec])
         write_register(ctx.store, slot, register)
-        ctx.store.put_bytes(
-            f"champions/{slot}/current.json",
-            json.dumps(
-                {
-                    "schema_version": "champion.v1",
-                    "slot": slot,
-                    "champion": spec.arm_id,
-                    "promoted_at": pointer.get("promoted_at"),
-                    "promotion_source": pointer.get("promotion_source", "unknown"),
-                    "imported_from": next(s.key for s in SOURCES if s.slot == slot),
-                },
-                indent=2,
-                sort_keys=True,
-            ).encode("utf-8"),
-        )
+        key = champion_key(slot)
+        payload = json.dumps(
+            {
+                "schema_version": "champion.v1",
+                "slot": slot,
+                "champion": spec.arm_id,
+                "promoted_at": pointer.get("promoted_at"),
+                "promotion_source": pointer.get("promotion_source", "unknown"),
+                "imported_from": next(s.key for s in SOURCES if s.slot == slot),
+            },
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8")
+        # §4.2's outputs contract and §10.8's lineage walk both need this
+        # pointer, and `store.py` provides exactly one CAS primitive for the
+        # thing this key is: a pointer more than one actor can write.
+        # `ctx.record_output_cas` (not a bare `ctx.store.put_bytes`, and not
+        # a bare `compare_and_swap` either) is the one call that both writes
+        # conditionally AND enters this write into `outputs[]` — a bare PUT
+        # here was last-writer-wins on the one pointer the store has a CAS
+        # primitive for, and it never entered the manifest's lineage, so
+        # `crucible explain champions/{slot}/current.json` raised `KeyError`
+        # for every imported champion (alpha-engine-config-I9757 defect #7).
+        # A migration is one-shot but not guaranteed single-attempt (the
+        # runner retries a transient failure with a fresh context, and the
+        # command itself is documented idempotent), so the expected version
+        # is read fresh immediately before the swap rather than assumed
+        # absent.
+        ctx.record_output_cas(key, ctx.store.etag(key), payload, schema_version="champion.v1")
         imported[slot] = [spec.arm_id]
 
     result = {
@@ -268,7 +283,18 @@ def run_migrate_history(
             "value": float(sum(len(v) for v in imported.values())),
             "unit": "arms",
             "n_floor": 0,
-            "status": "OK" if not missing else "DEGRADED_BY_OPERATOR_CONSENT",
+            # §2 row 4: "No skip flags. No fail-open. No degraded-SUCCEEDED."
+            # `DEGRADED_BY_OPERATOR_CONSENT` was a third state spelled at the
+            # metric level, inside a manifest whose own `status` said `ok` —
+            # the exact shape the top-level status enum exists to forbid,
+            # reintroduced one level down (alpha-engine-config-I9757 defect
+            # #3). `FAIL` is the honest word: the migration did not import
+            # everything it declared as SOURCES, `--allow-missing` is why the
+            # RUN still succeeded rather than raising, and the operator's
+            # consent to that gap is recorded in `status_reason` below, in
+            # prose, where a free-text explanation belongs — not manufactured
+            # as a status token this schema now has to know about.
+            "status": "OK" if not missing else "FAIL",
             "status_reason": (
                 f"{len(found)} of {len(SOURCES)} v1 sources read; "
                 f"{sum(len(v) for v in imported.values())} arm(s) imported with their v1 "

@@ -93,20 +93,6 @@ def validate(manifest: dict[str, Any]) -> None:
     )
 
 
-def new_manifest(*args: Any, **kwargs: Any) -> dict[str, Any]:
-    """Construct a manifest skeleton for a starting run.
-
-    Track A fills this in. It is not a dataclass yet on purpose — the field
-    set is fixed by the schema, and a second declaration of the same fields
-    in Python is a contract restated in two places, which is a documented way
-    to drift.
-    """
-    raise NotImplementedError(
-        "new_manifest is track A's (crucible-v2 phase 1, alpha-engine-config-I9757). "
-        "It must produce a document that passes crucible.manifest.validate."
-    )
-
-
 def manifest_key(job: str, trading_day: str) -> str:
     """The store key a manifest is written under.
 

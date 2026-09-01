@@ -305,6 +305,32 @@ class RunContext:
         value carries a unit and that a horizon is in trading days."""
         self.metrics.append(metric)
 
+    def record_output_cas(
+        self, key: str, expected: str, payload: bytes, schema_version: str = "v1"
+    ) -> str:
+        """Write ``payload`` at ``key`` by compare-and-swap, and record it as
+        an output.
+
+        For a pointer more than one actor can write — a champion pointer, a
+        release pointer — a bare :meth:`record_output` is the wrong tool
+        twice over: it writes last-writer-wins through :meth:`Store.put_bytes`
+        (§4.11's whole reason for :meth:`Store.compare_and_swap` to exist),
+        and a caller that reaches for `store.put_bytes` directly to get the
+        CAS semantics back skips the lineage half, so the pointer never
+        enters `outputs[]` and `crucible explain` cannot name the run that
+        moved it. This method is the one call that gets both: the write is
+        conditional, and win or lose, a successful write is recorded exactly
+        like any other output.
+
+        Raises :class:`~crucible.store.PointerConflictError` on a lost race,
+        same as a bare `compare_and_swap` — never retried here, for the same
+        reason the store itself never retries: the caller re-reads and
+        decides rather than overwriting whatever the winner just published.
+        """
+        digest = self.store.compare_and_swap(key, expected, payload)
+        self.outputs.append({"key": key, "sha256": digest, "schema_version": schema_version})
+        return digest
+
 
 def run_job(
     job: str,
@@ -371,7 +397,19 @@ def run_job(
         reason = ""
         transient: str | None = None
         try:
-            fn(ctx)
+            # The guard is installed HERE, inside the runner, rather than left
+            # to each call site. `spot_interruption_guard` is defined in this
+            # module and only `track_c.py`'s smoke job ever wrapped a call
+            # with it — every other job, including `data.weekly`, the
+            # 1-3 hour job plan §4.7 puts on a spot instance, ran unguarded.
+            # A guard every caller must remember to install is a guard that
+            # is missing from whichever caller was written last; the manifest
+            # guarantee lives in `run_job`, so the guard does too. Nesting is
+            # safe — a caller that also wraps `run_job` itself (as smoke
+            # still does, harmlessly) restores its own handler on exit same
+            # as this one does.
+            with spot_interruption_guard():
+                fn(ctx)
         except BaseException as exc:
             # BaseException, not Exception: a spot reclamation arrives as a
             # signal, so catching only Exception would leave the fleet's single
@@ -447,6 +485,22 @@ def _write_manifest(
         "metrics": ctx.metrics,
         "attempts": ctx.attempts,
     }
+    # cost_usd must be >= the sum of llm_calls[].usd (schemas/run_manifest.v1.json,
+    # `cost_usd` description) — a schema cannot cross-reference two fields of
+    # the same document, so the runner asserts it here, before the write, per
+    # that field's own claim. `record_llm_call` always adds its `usd` to
+    # `cost_usd`, so this can only fail if a job's own bookkeeping (a
+    # negative `record_cost`, most plausibly) pulled the total back below
+    # what the calls themselves report — a defect worth surfacing at write
+    # time, not discovered by a reader doing the arithmetic on a Saturday
+    # morning.
+    llm_usd_total = round(sum(float(call.get("usd", 0.0)) for call in ctx.llm_calls), 6)
+    if manifest["cost_usd"] + 1e-9 < llm_usd_total:
+        raise ValueError(
+            f"cost_usd ({manifest['cost_usd']}) is less than the sum of llm_calls[].usd "
+            f"({llm_usd_total}) for run {ctx.run_id} ({ctx.job}). The schema's own "
+            "description promises the runner asserts this; it must never be false."
+        )
     validate(manifest)
     store.put_bytes(
         manifest_key(ctx.job, ctx.trading_day.isoformat()),

@@ -92,7 +92,7 @@ def _valid_manifest() -> dict:
                 "value": 0.031,
                 "unit": "ratio",
                 "n_floor": 60,
-                "status": "PASS",
+                "status": "OK",
                 "status_reason": "Rank IC over 903 paired names, 21 trading-day horizon.",
                 "source_path": "s3://crucible/signals/2026-08-28/signals.json",
                 "last_updated_utc": "2026-08-29T13:04:11Z",
@@ -108,6 +108,21 @@ def validator() -> Draft202012Validator:
     schema = load_schema()
     Draft202012Validator.check_schema(schema)
     return Draft202012Validator(schema)
+
+
+def test_new_manifest_is_not_a_live_stub() -> None:
+    """alpha-engine-config-I9757 defect #13: `crucible.manifest.new_manifest`
+    was a `NotImplementedError` stub whose message said "is track A's" —
+    track A landed (this module, `crucible.runner._write_manifest`, builds
+    the manifest dict inline) and neither implemented nor removed it, and it
+    had zero callers anywhere in the tree. Dead code claiming outstanding
+    work, in the module that defines the central contract."""
+    import crucible.manifest as manifest_module
+
+    assert not hasattr(manifest_module, "new_manifest"), (
+        "new_manifest must be removed, not merely left unimplemented — its only "
+        "caller was never written, and a stub with none is dead code"
+    )
 
 
 def test_a_complete_manifest_validates(validator: Draft202012Validator) -> None:
@@ -249,6 +264,52 @@ def test_attempts_records_the_declared_transient_retry(
     doc["attempts"] = []
     with pytest.raises(ValidationError):
         validator.validate(doc)
+
+
+@pytest.mark.parametrize(
+    "bad_metric_status",
+    ["DEGRADED_BY_OPERATOR_CONSENT", "DEGRADED", "PARTIAL", "SKIPPED", "UNKNOWN", "ok", ""],
+)
+def test_a_metric_cannot_spell_a_third_state_either(
+    validator: Draft202012Validator, bad_metric_status: str
+) -> None:
+    """alpha-engine-config-I9757 defect #3: the run-level `status` is closed
+    to `ok`/`failed` by schema, but a metric nested inside an `ok` manifest
+    is a level a human reads too — `migrate.history --allow-missing` once
+    wrote `DEGRADED_BY_OPERATOR_CONSENT` there, inside a manifest whose own
+    `status` was `ok`. `metricRecord.status` is now a closed enum for the
+    same reason `status` itself is."""
+    doc = _valid_manifest()
+    doc["metrics"][0]["status"] = bad_metric_status
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+
+@pytest.mark.parametrize(
+    "ok_metric_status",
+    [
+        "OK",
+        "FAIL",
+        "BREACH",
+        "unservable",
+        "bootstrap",
+        "unmeasurable",
+        "measured",
+        "decided",
+        "held",
+    ],
+)
+def test_every_currently_used_metric_status_still_validates(
+    validator: Draft202012Validator, ok_metric_status: str
+) -> None:
+    """Every value a live producer writes today — `crucible.data`/`alerts`/
+    `deploy`/`slots.cycle`/`track_c`'s OK/FAIL/BREACH vocabulary, and
+    `crucible.promote`'s forwarded `nousergon_lib.arena.engine` decision
+    vocabulary — must still be representable; closing the enum must not
+    silently break a producer this PR does not own."""
+    doc = _valid_manifest()
+    doc["metrics"][0]["status"] = ok_metric_status
+    validator.validate(doc)
 
 
 def test_the_valid_fixture_is_not_mutated_between_tests() -> None:

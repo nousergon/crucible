@@ -422,8 +422,19 @@
           "minimum": 0
         },
         "status": {
+          "description": "Closed set (alpha-engine-config-I9757, defect #3): a run's own `status` above is `ok`/`failed` by schema so a third state cannot be spelled there, but §2 row 4 ('no degraded-SUCCEEDED') is a claim about every level a human reads, and a metric nested inside an `ok` manifest is one of them — `migrate.history --allow-missing` once wrote `DEGRADED_BY_OPERATOR_CONSENT` here, inside a manifest whose own `status` said `ok`, which reintroduces exactly the third state the top-level enum exists to forbid. Enumerated rather than left open: `OK`/`FAIL`/`BREACH` are the coverage-and-ceiling vocabulary shared by `crucible.data`, `crucible.alerts`, `crucible.deploy`, `crucible.slots.cycle` and `crucible.track_c`; `unservable`/`bootstrap`/`unmeasurable`/`measured`/`decided`/`held` are `nousergon_lib.arena.engine`'s own champion/challenger decision vocabulary, forwarded verbatim by `crucible.promote`'s `pointer_moved` metric rather than re-encoded into a second vocabulary that could drift from the first. A producer needing a value outside this set grows the enum by PR, with the new state named here, same discipline as `TRANSIENT_CLASSIFIERS` — never by writing a word this schema does not know and letting `additionalProperties` wave it through.",
           "type": "string",
-          "minLength": 1
+          "enum": [
+            "OK",
+            "FAIL",
+            "BREACH",
+            "unservable",
+            "bootstrap",
+            "unmeasurable",
+            "measured",
+            "decided",
+            "held"
+          ]
         },
         "status_reason": {
           "description": "One operator-readable sentence, never generic.",
