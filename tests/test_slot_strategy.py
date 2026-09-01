@@ -13,6 +13,8 @@ over-applied into a second defect.
 
 from __future__ import annotations
 
+import random
+
 import pytest
 
 from crucible.slots import get_slot
@@ -88,20 +90,118 @@ class TestRecipes:
 
 
 class TestWalkForward:
-    def test_folds_purge_and_embargo_around_the_test_block(self) -> None:
-        dates = [f"d{i:03d}" for i in range(300)]
-        folds = build_walk_forward_folds(dates, test_window=21, min_train=100, purge=21, embargo=2)
+    """The fold geometry, asserted as PROPERTIES rather than as arithmetic.
+
+    Both tests in this class previously restated the implementation instead of
+    the invariant, so both were true of the buggy implementation:
+
+    * the purge test asserted ``train_end_idx <= test_start_idx - 21``, which
+      is exactly what ``train_end_idx = fold_start_idx - purge`` produces. It
+      encoded the off-by-one: the last training row's 21-day label lands ON
+      the first test day, and the assertion written to the code could not see
+      it. The invariant is stated below as the leak itself — no training
+      row's label may extend into the test window.
+    * the rolling test asserted ``train_start_idx > 0``, which is true of a
+      bounded window of ANY length, including one bounded by the wrong
+      quantity. It never checked the bound.
+    """
+
+    PURGE = 21
+
+    def _folds(self, **kwargs):
+        dates = [f"d{i:03d}" for i in range(600)]
+        params = {"test_window": 21, "min_train": 100, "purge": self.PURGE, "embargo": 2}
+        params.update(kwargs)
+        return build_walk_forward_folds(dates, **params)
+
+    def test_no_training_rows_label_reaches_into_the_test_window(self) -> None:
+        """`purge` is the LABEL HORIZON, so the last trainable row is the one
+        whose label is fully realized before the test window opens. Stated as
+        the leak rather than as the arithmetic, because the arithmetic is
+        what was wrong: `train_end_idx = fold_start_idx - purge` leaves a row
+        whose label is realized ON `test_start_idx`."""
+        folds = self._folds()
         assert folds
         for fold in folds:
-            assert fold.train_end_idx <= fold.test_start_idx - 21
-            assert fold.train_start_idx == 0  # expanding
+            assert fold.train_end_idx + self.PURGE < fold.test_start_idx, (
+                f"the training block ends at {fold.train_end_idx}, whose {self.PURGE}-day "
+                f"label spans {fold.train_end_idx}..{fold.train_end_idx + self.PURGE} and "
+                f"overlaps a test window opening at {fold.test_start_idx}"
+            )
+            assert fold.test_start_idx - fold.train_end_idx - 1 == self.PURGE, (
+                "the gap must be exactly `purge` excluded rows; a wider one silently "
+                "discards trainable data and a narrower one leaks"
+            )
 
-    def test_a_rolling_window_is_bounded_by_the_test_window(self) -> None:
-        dates = [f"d{i:03d}" for i in range(300)]
-        folds = build_walk_forward_folds(
-            dates, test_window=21, min_train=100, purge=21, embargo=2, train_mode="rolling"
+    def test_the_same_purge_arithmetic_as_the_cpcv_purge(self) -> None:
+        """Two purge implementations in one repository must not differ by a
+        day. `crucible.slots.model.cpcv_oos_ic` excludes `[a - h, a - 1]`,
+        leaving `a - h - 1` as the last trainable row for a test block opening
+        at `a`. The walk-forward folds must agree exactly."""
+        for horizon in (1, 5, 21, 63):
+            folds = build_walk_forward_folds(
+                [f"d{i:03d}" for i in range(600)],
+                test_window=21,
+                min_train=100,
+                purge=horizon,
+                embargo=2,
+            )
+            assert folds
+            for fold in folds:
+                assert fold.train_end_idx == fold.test_start_idx - horizon - 1
+
+    def test_an_expanding_fold_trains_on_at_least_min_train_rows(self) -> None:
+        """`min_train` is a minimum training LENGTH. A fold that cannot reach
+        it is skipped, never emitted short — a spec declaring 100 training
+        rows that trains on 79 of them is a geometry nobody declared."""
+        min_train = 100
+        folds = self._folds(min_train=min_train)
+        assert folds
+        for fold in folds:
+            assert fold.train_start_idx == 0, "expanding"
+            length = fold.train_end_idx - fold.train_start_idx + 1
+            assert length >= min_train, (
+                f"fold trains on {length} rows against a declared min_train={min_train}"
+            )
+
+    def test_a_rolling_window_is_exactly_min_train_rows_long(self) -> None:
+        """The property the previous test NAMED but did not check: the bound.
+        `train_start_idx > 0` holds for a window of any length; it holds just
+        as well for the 21-row window the lifted source produced against a
+        `min_train=504` spec. The bound is asserted as a length, and the
+        window is asserted to actually ROLL rather than expand."""
+        min_train = 100
+        folds = self._folds(min_train=min_train, train_mode="rolling")
+        assert len(folds) > 1
+        for fold in folds:
+            length = fold.train_end_idx - fold.train_start_idx + 1
+            assert length == min_train, (
+                f"rolling window is {length} rows against a declared min_train={min_train}"
+            )
+        starts = [f.train_start_idx for f in folds]
+        assert starts == sorted(starts) and starts[-1] > starts[0], (
+            "a rolling window must move forward; a constant start is an expanding window"
         )
-        assert all(f.train_start_idx > 0 for f in folds[1:])
+
+    def test_an_embargo_wider_than_the_purge_skips_the_next_block(self) -> None:
+        """The second property the fold geometry exists for: when
+        `embargo > purge` the next fold starts later, so the serial
+        correlation immediately after a test block is not scored either."""
+        purge, embargo, test_window = 21, 40, 21
+        folds = build_walk_forward_folds(
+            [f"d{i:03d}" for i in range(900)],
+            test_window=test_window,
+            min_train=100,
+            purge=purge,
+            embargo=embargo,
+        )
+        assert len(folds) > 1
+        for prev, nxt in zip(folds, folds[1:], strict=False):
+            skipped = nxt.test_start_idx - prev.test_end_idx - 1
+            assert skipped >= embargo - purge, (
+                f"only {skipped} day(s) between test blocks for an embargo of {embargo} "
+                f"over a purge of {purge}"
+            )
 
     def test_an_unknown_train_mode_raises(self) -> None:
         with pytest.raises(ValueError, match="train_mode"):
@@ -115,19 +215,31 @@ class TestWalkForward:
             )
 
 
+FULL_COVERAGE = {"coverage_fraction": 1.0, "budget_stopped": False, "measured": True}
+
+
+def _days(n: int) -> list[str]:
+    return [f"d{i:03d}" for i in range(n)]
+
+
+def _series(values: list[float]) -> dict[str, float]:
+    return dict(zip(_days(len(values)), values, strict=True))
+
+
 class TestPitParity:
     def test_a_material_delta_is_a_fail(self) -> None:
         verdict = pit_parity(
-            contaminated=[0.02] * 60,
-            point_in_time=[0.001] * 60,
-            coverage={"coverage_fraction": 1.0, "budget_stopped": False, "measured": True},
+            contaminated=_series([0.02] * 60),
+            point_in_time=_series([0.001] * 60),
+            coverage=FULL_COVERAGE,
         )
         assert verdict.status == "FAIL"
+        assert "MATERIAL contamination" in verdict.reason
 
     def test_no_coverage_is_unknown_never_a_pass(self) -> None:
         verdict = pit_parity(
-            contaminated=[],
-            point_in_time=[],
+            contaminated={},
+            point_in_time={},
             coverage={"coverage_fraction": 0.0, "budget_stopped": False, "measured": False},
         )
         assert verdict.status == "UNKNOWN"
@@ -135,22 +247,105 @@ class TestPitParity:
 
     def test_partial_coverage_is_partial_never_a_pass(self) -> None:
         verdict = pit_parity(
-            contaminated=[0.001] * 60,
-            point_in_time=[0.001] * 60,
+            contaminated=_series([0.001] * 60),
+            point_in_time=_series([0.001] * 60),
             coverage={"coverage_fraction": 0.6, "budget_stopped": True, "measured": True},
         )
         assert verdict.status == "PARTIAL"
 
     def test_an_indistinguishable_delta_over_full_coverage_passes(self) -> None:
         verdict = pit_parity(
-            contaminated=[0.001, 0.0012, 0.0009] * 20,
-            point_in_time=[0.001, 0.0011, 0.001] * 20,
-            coverage={"coverage_fraction": 1.0, "budget_stopped": False, "measured": True},
+            contaminated=_series([0.001, 0.0012, 0.0009] * 20),
+            point_in_time=_series([0.001, 0.0011, 0.001] * 20),
+            coverage=FULL_COVERAGE,
         )
         assert verdict.status == "PASS"
 
     def test_the_status_vocabulary_is_closed(self) -> None:
         assert ATTESTATION_STATUSES == ("PASS", "FAIL", "PARTIAL", "UNKNOWN")
+
+    def test_pairing_is_by_date_so_a_reordered_series_is_the_same_verdict(self) -> None:
+        """Positional pairing makes the ORDER of the two mappings load-bearing.
+        Date-keyed pairing does not, and that is the point."""
+        contaminated = _series([0.02] * 60)
+        point_in_time = _series([0.001] * 60)
+        shuffled = dict(reversed(list(point_in_time.items())))
+        assert (
+            pit_parity(
+                contaminated=contaminated, point_in_time=shuffled, coverage=FULL_COVERAGE
+            ).mean_delta
+            == pit_parity(
+                contaminated=contaminated, point_in_time=point_in_time, coverage=FULL_COVERAGE
+            ).mean_delta
+        )
+
+    def test_one_extra_date_on_one_side_raises_instead_of_pairing_off_by_one(self) -> None:
+        """The demonstrated defect, with the demonstrated numbers.
+
+        `random.seed(2)`, 60 days of N(0, 0.05) point-in-time returns plus a
+        FLAT +150bp/day of real look-ahead alpha, full proven coverage. Paired
+        correctly this renders FAIL (mean delta 0.0150, interval excluding
+        zero). Under the previous positional pairing, prepending ONE element
+        to the contaminated side truncated both sides to 60 and shifted every
+        pair by a day, rendering PASS (mean delta 0.0155, interval straddling
+        zero) with no exception — and `champion._assert_attested` treats that
+        PASS as the sole gate on an S champion.
+
+        There is no verdict to render from two passes that scored different
+        windows, so this raises rather than answering."""
+        random.seed(2)
+        point_in_time = {d: random.gauss(0.0, 0.05) for d in _days(60)}
+        contaminated = {d: v + 0.015 for d, v in point_in_time.items()}
+
+        aligned = pit_parity(
+            contaminated=contaminated, point_in_time=point_in_time, coverage=FULL_COVERAGE
+        )
+        assert aligned.status == "FAIL"
+        assert aligned.mean_delta == pytest.approx(0.015)
+
+        with pytest.raises(ValueError, match="scored different dates"):
+            pit_parity(
+                contaminated={"d999": 0.0, **contaminated},
+                point_in_time=point_in_time,
+                coverage=FULL_COVERAGE,
+            )
+
+    def test_a_missing_date_on_the_contaminated_side_raises(self) -> None:
+        contaminated = _series([0.001] * 60)
+        point_in_time = _series([0.001] * 60)
+        contaminated.pop("d030")
+        with pytest.raises(ValueError, match="scored different dates"):
+            pit_parity(
+                contaminated=contaminated, point_in_time=point_in_time, coverage=FULL_COVERAGE
+            )
+
+    def test_a_positional_sequence_is_refused_outright(self) -> None:
+        """The signature is the fix: positional pairing must be unexpressible,
+        not merely unused."""
+        with pytest.raises(TypeError, match="mapping"):
+            pit_parity(
+                contaminated=[0.02] * 60,  # type: ignore[arg-type]
+                point_in_time=_series([0.001] * 60),
+                coverage=FULL_COVERAGE,
+            )
+
+    def test_an_inverted_delta_fails_and_names_a_broken_harness(self) -> None:
+        """The materiality test is two-sided ON PURPOSE, and that is kept: a
+        point-in-time pass beating its own look-ahead pass is not a clean
+        result, so rendering PASS would be a fail-open on the one gate an S
+        champion has. What was wrong is the MESSAGE — a broken harness
+        reported as "MATERIAL contamination" sends the operator to hunt a leak
+        that is not there."""
+        verdict = pit_parity(
+            contaminated=_series([0.001] * 60),
+            point_in_time=_series([0.02] * 60),
+            coverage=FULL_COVERAGE,
+        )
+        assert verdict.status == "FAIL"
+        assert verdict.mean_delta is not None and verdict.mean_delta < 0
+        assert "INVERTED" in verdict.reason
+        assert "contamination finding" in verdict.reason
+        assert "MATERIAL contamination" not in verdict.reason
 
 
 class TestAttestationGatesTheCard:
