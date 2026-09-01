@@ -34,10 +34,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from crucible.llm import DEFAULT_LLM_CAP_USD
 from crucible.store import LocalStore, S3Store, Store
 
 __all__ = [
     "DEFAULT_ARCTIC_BUCKET",
+    "DEFAULT_LLM_CAP_USD",
     "DEFAULT_STORE_URI",
     "STRATEGY_PREFIX",
     "Settings",
@@ -70,6 +72,12 @@ class Settings:
     arctic_bucket: str
     strategy_dir: Path | None
     origins: dict[str, str] = field(default_factory=dict)
+    #: The per-weekly-run LLM spend ceiling, in USD (plan §2 row 3). Declared
+    #: HERE, in config, rather than at a call site: a ceiling that lives beside
+    #: the code it bounds is one that moves whenever that code is edited.
+    #: `crucible.llm.SpendCap` refuses the call that would cross it, before the
+    #: provider is reached, and the run fails rather than overspending.
+    llm_cap_usd: float = DEFAULT_LLM_CAP_USD
 
     def store(self) -> Store:
         return store_from_uri(self.store_uri)
@@ -79,6 +87,7 @@ class Settings:
             "store_uri": self.store_uri,
             "arctic_bucket": self.arctic_bucket,
             "strategy_dir": str(self.strategy_dir) if self.strategy_dir else None,
+            "llm_cap_usd": self.llm_cap_usd,
             "origins": dict(self.origins),
         }
 
@@ -97,12 +106,18 @@ def settings(
     store_uri: str | None = None,
     arctic_bucket: str | None = None,
     strategy_dir: str | os.PathLike[str] | None = None,
+    llm_cap_usd: float | None = None,
 ) -> Settings:
     """Resolve configuration once, and record where each value came from."""
     origins: dict[str, str] = {}
     resolved_store, origins["store_uri"] = _resolve(store_uri, "CRUCIBLE_STORE", DEFAULT_STORE_URI)
     resolved_arctic, origins["arctic_bucket"] = _resolve(
         arctic_bucket, "CRUCIBLE_ARCTIC_BUCKET", DEFAULT_ARCTIC_BUCKET
+    )
+    resolved_cap, origins["llm_cap_usd"] = _resolve(
+        None if llm_cap_usd is None else str(llm_cap_usd),
+        "CRUCIBLE_LLM_CAP_USD",
+        str(DEFAULT_LLM_CAP_USD),
     )
     raw_dir = strategy_dir or os.environ.get("CRUCIBLE_STRATEGY_DIR")
     if raw_dir:
@@ -115,8 +130,32 @@ def settings(
         store_uri=resolved_store,
         arctic_bucket=resolved_arctic,
         strategy_dir=resolved_dir,
+        llm_cap_usd=_positive_cap(resolved_cap, origins["llm_cap_usd"]),
         origins=origins,
     )
+
+
+def _positive_cap(raw: str, origin: str) -> float:
+    """The cap as a positive float, or a refusal naming where it came from.
+
+    A malformed or non-positive cap RAISES rather than falling back to the
+    default. A ceiling silently replaced by another number is a ceiling nobody
+    is actually running under, and the environment variable is exactly where
+    that typo happens.
+    """
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"the LLM cap {raw!r} (from {origin}) is not a number. It is USD per weekly "
+            "run; a cap that cannot be parsed is not a cap."
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            f"the LLM cap {value} (from {origin}) must be positive. A run budget of zero "
+            "is expressed by registering no call sites, not by a ceiling no call clears."
+        )
+    return value
 
 
 def store_from_uri(uri: str) -> Store:

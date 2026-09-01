@@ -55,9 +55,13 @@ class TestAutonomy:
             "runs/weekly/{trading_day}/run.json, with zero human-originated mutating "
             "calls on v2 resources over the window."
         )
-        from crucible.cli import HANDLERS
-
-        _attempt(clause, requirement, lambda: HANDLERS["report"](_args()))
+        # Deliberately NOT "call the report handler and see whether it raises".
+        # It stopped raising the day track E landed `report`, which would have
+        # turned a phase-2 window clause green on a phase-1 job — a gate
+        # passing because a different feature shipped. The window is read from
+        # four weeks of run manifests in the production store, and that is
+        # phase 2 (alpha-engine-config-I9757).
+        _unmet(clause, requirement)
 
     def test_zero_human_mutating_calls_is_read_from_the_cloudtrail_archive(
         self,
@@ -99,14 +103,64 @@ class TestOneCommand:
 class TestCost:
     """§2 row 3: 'Low API + AWS cost'."""
 
-    def test_the_llm_spend_cap_is_declared_and_enforced(self) -> None:
-        clause = "plan §2 row 3"
-        requirement = (
-            "The per-weekly-run LLM cap is declared in config and enforced through "
-            "krepis.usage_pacing; a run that would exceed it FAILS rather than "
-            "overspending, and run.json.cost_usd carries the spend."
+    def test_the_llm_spend_cap_is_declared_and_enforced(self, tmp_path) -> None:
+        """MET by track E, and asserted on the path that matters: what the run
+        did NOT do. A cap whose test only checks that the number exists would
+        pass against a ceiling nothing consults."""
+        from krepis.usage_pacing import PaceStatus
+
+        from crucible.config import settings
+        from crucible.llm import CallSite, LlmSpendCapExceeded, SpendCap, call, spend_pace
+        from crucible.manifest import manifest_key
+        from crucible.runner import run_job
+        from crucible.store import LocalStore
+
+        # Declared in config, with the provenance of the value it resolved to.
+        resolved = settings()
+        assert resolved.llm_cap_usd > 0
+        assert resolved.origins["llm_cap_usd"]
+        assert resolved.to_dict()["llm_cap_usd"] == resolved.llm_cap_usd
+
+        # Paced through krepis.usage_pacing, not through a local threshold.
+        anchor = dt.datetime(2026, 8, 24, tzinfo=dt.UTC)
+        pace = spend_pace(4.0, cap_usd=5.0, now=anchor + dt.timedelta(days=2), anchor=anchor)
+        assert isinstance(pace, PaceStatus)
+        assert pace.exceeded, "80% of the cap two days into the week is ahead of pace"
+
+        # And a run that would cross the cap FAILS without reaching a provider.
+        store = LocalStore(tmp_path)
+        site = CallSite(
+            callsite_id="acceptance.cap_probe",
+            purpose="prove the refusal precedes the spend",
+            capability_class="reasoning_high",
+            max_usd_per_call=10.0,
+            owner="tests.acceptance",
         )
-        _unmet(clause, requirement)
+
+        def provider(*args: Any, **kwargs: Any) -> NoReturn:
+            raise AssertionError("the provider was reached after the cap refused the call")
+
+        def body(ctx: Any) -> None:
+            call(
+                ctx,
+                callsite_id=site.callsite_id,
+                capability_class="reasoning_high",
+                messages=[{"role": "user", "content": "hello"}],
+                cap=SpendCap(cap_usd=resolved.llm_cap_usd, spent_usd=resolved.llm_cap_usd),
+                estimate_usd=0.01,
+                client_factory=provider,
+                registry={site.callsite_id: site},
+            )
+
+        day = dt.date(2026, 8, 28)
+        with pytest.raises(LlmSpendCapExceeded):
+            run_job("report", body, store=store, trading_day=day, transient_retry=False)
+
+        manifest = json.loads(store.get_bytes(manifest_key("report", day.isoformat())))
+        assert manifest["status"] == "failed"
+        assert "cap" in manifest["reason"]
+        assert manifest["cost_usd"] == 0.0, "a refused call spends nothing"
+        assert manifest["llm_calls"] == []
 
     def test_every_v2_resource_is_tagged_for_cost_attribution(self) -> None:
         clause = "plan §2 row 3 / §6 phase-0"
@@ -152,7 +206,7 @@ class TestNoThirdState:
 class TestAttribution:
     """§2 row 5: 'Pinpoint underperformance'."""
 
-    def test_the_attribution_table_has_five_rows(self) -> None:
+    def test_the_attribution_table_has_five_rows(self, tmp_path) -> None:
         clause = "plan §2 row 5 / §4.5"
         requirement = (
             "`crucible report` writes report/{trading_day}/attribution.json with five "
@@ -161,8 +215,29 @@ class TestAttribution:
             "baseline and status."
         )
         from crucible.cli import HANDLERS
+        from crucible.report import ROWS
+        from crucible.store import LocalStore
 
-        _attempt(clause, requirement, lambda: HANDLERS["report"](_args()))
+        store = LocalStore(tmp_path)
+        day = dt.date(2026, 8, 28)
+        _attempt(
+            clause,
+            requirement,
+            lambda: HANDLERS["report"](_args(trading_day=day, store=str(store.root))),
+        )
+
+        document = json.loads(store.get_bytes(f"report/{day.isoformat()}/attribution.json"))
+        rows = document["rows"]
+        assert len(rows) == 5
+        assert [r["plan_row"] for r in rows] == [spec.plan_row for spec in ROWS]
+        for row in rows:
+            for field in ("value", "ci_low", "ci_high", "n_samples", "baseline", "status"):
+                assert field in row, f"{row['name']} carries no {field}"
+            # A row with nothing behind it declares a not-measured state from
+            # MetricRecord's own vocabulary and names what it is waiting on.
+            # `no data` is never rendered as a number (principle 7).
+            assert row["value"] is not None or row["status"].startswith("N/A")
+            assert row["status_reason"]
 
     def test_alpha_is_factor_neutral_not_raw_excess_return(self) -> None:
         """§10.3: raw 'alpha vs SPY' is mostly beta and sector tilt, and a
@@ -271,13 +346,32 @@ class TestAlerting:
 class TestTransparency:
     """§2 row 7."""
 
-    def test_every_llm_call_site_is_in_the_registry(self) -> None:
-        clause = "plan §2 row 7 / §4.8"
-        requirement = (
-            "LLM_CALLSITE_REGISTRY coverage of v2 call sites is 100%, measured by a "
-            "test that enumerates call sites from the code rather than from a list."
+    def test_every_llm_call_site_is_in_the_registry(self, tmp_path) -> None:
+        """MET by track E. Both halves are asserted, and the second is what
+        makes the first evidence: an enumerator that reports nothing over the
+        package must report something over a tree that has a call site in it,
+        or it is dark rather than green."""
+        import crucible
+        from crucible.llm import LLM_CALLSITE_REGISTRY, audit_call_sites
+
+        package = pathlib.Path(crucible.__file__).parent
+        findings = audit_call_sites(package)
+        assert findings == [], "\n".join(f.describe() for f in findings)
+        assert isinstance(LLM_CALLSITE_REGISTRY, dict)
+
+        # The enumerator reads the AST, so a call site added tomorrow is caught
+        # without anyone remembering to list it — proven here rather than
+        # asserted, against a module the registry has never heard of.
+        (tmp_path / "arm.py").write_text(
+            "from crucible.llm import call\n"
+            "def go(ctx, cap):\n"
+            "    return call(ctx, callsite_id='phase5.unregistered', "
+            "capability_class='reasoning_high', messages=[], cap=cap, estimate_usd=0.1)\n",
+            encoding="utf-8",
         )
-        _unmet(clause, requirement)
+        (tmp_path / "bypass.py").write_text("from krepis.llm import LLMClient\n", encoding="utf-8")
+        kinds = sorted(f.kind for f in audit_call_sites(tmp_path))
+        assert kinds == ["adapter_bypass", "unregistered_callsite"]
 
     def test_explain_walks_a_verdict_back_to_what_produced_it(self, tmp_path) -> None:
         """MET. The chain is recovered from manifests alone — a run's
