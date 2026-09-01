@@ -30,9 +30,11 @@ import datetime as dt
 import json
 import os
 import random
+import signal
 import subprocess
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -45,7 +47,128 @@ from crucible.manifest import (
 )
 from crucible.store import Store, sha256_hex
 
-__all__ = ["RunContext", "run_job"]
+__all__ = [
+    "MAX_ATTEMPTS",
+    "RunContext",
+    "SpotInterruptionError",
+    "TRANSIENT_CLASSIFIERS",
+    "classify_transient",
+    "run_job",
+    "spot_interruption_guard",
+]
+
+#: One retry, never a loop (§11 risk 2). Two attempts is the whole ladder:
+#: a transient fault that survives a fresh instance is not transient, and a
+#: retry budget larger than one is how a job that will never succeed burns
+#: an afternoon of spot time before anyone is told.
+MAX_ATTEMPTS = 2
+
+
+class SpotInterruptionError(BaseException):
+    """The instance is being reclaimed.
+
+    Derives from BaseException, not Exception, deliberately: it is raised
+    from a SIGTERM handler, and a job's own `except Exception` must not be
+    able to swallow the reclamation and carry on writing to a machine that
+    is about to disappear. The runner catches BaseException, so the manifest
+    is still written.
+    """
+
+
+@contextmanager
+def spot_interruption_guard() -> Iterator[None]:
+    """Turn SIGTERM into :class:`SpotInterruptionError` for the duration.
+
+    A spot reclamation arrives as SIGTERM about two minutes before the
+    instance goes away. Without this the process dies with no manifest at
+    all — which surfaces as an ABSENCE page with the cause discarded,
+    rather than as a FAILURE page naming the reclamation and retried once
+    on a fresh instance.
+
+    Restores the previous handler on exit, including on the raise, so a
+    caller that wraps two runs does not leave the second one holding the
+    first one's handler. Signal handlers can only be installed on the main
+    thread; off the main thread this is a documented no-op rather than a
+    crash, because refusing to run a job for want of a signal handler would
+    trade a real failure mode for a certain one.
+    """
+
+    def _handler(signum: int, frame: Any) -> None:
+        raise SpotInterruptionError(
+            f"spot_interruption: received signal {signum}; the instance is being reclaimed"
+        )
+
+    try:
+        previous = signal.signal(signal.SIGTERM, _handler)
+    except ValueError:
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+#: **The declared transient class (§11 risk 2), frozen.** A failure outside
+#: this set pages immediately. Each row is (reason, exception-type names,
+#: message substrings); a match on EITHER the type or a substring claims the
+#: failure. The reasons are exactly the `attempts[].reason` enum in the
+#: manifest schema, so a class that is not in the schema cannot be recorded
+#: and therefore cannot be retried.
+#:
+#: **This tuple grows only by PR, with the failure named.** That is the whole
+#: control: a retry class that can be widened at runtime is a retry class
+#: that eventually swallows a real defect, because the moment a defect looks
+#: transient is the moment someone is under pressure to make it go away.
+TRANSIENT_CLASSIFIERS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        "spot_interruption",
+        ("SpotInterruptionError",),
+        ("spot_interruption", "instance is being reclaimed"),
+    ),
+    (
+        "provider_timeout",
+        ("ReadTimeout", "ConnectTimeout", "ReadTimeoutError", "TimeoutError"),
+        ("provider_timeout", "read timeout", "connection timed out"),
+    ),
+    (
+        "provider_5xx",
+        (),
+        (
+            "provider_5xx",
+            " 500",
+            " 502",
+            " 503",
+            " 504",
+            "internal server error",
+            "bad gateway",
+            "service unavailable",
+        ),
+    ),
+    (
+        "s3_throttling",
+        ("SlowDown",),
+        ("s3_throttling", "slowdown", "requestlimitexceeded", "reduce your request rate"),
+    ),
+)
+
+
+def classify_transient(exc: BaseException) -> str | None:
+    """The declared class of ``exc``, or None if it is not in the class.
+
+    None is the default and the safe answer: an unrecognised failure pages
+    immediately. A classifier whose fall-through was "probably transient"
+    would retry real defects and halve the rate at which they are noticed.
+    """
+    names = {type(exc).__name__, *(b.__name__ for b in type(exc).__mro__)}
+    haystack = f"{type(exc).__name__}: {exc}".lower()
+    for reason, types, needles in TRANSIENT_CLASSIFIERS:
+        if names & set(types):
+            return reason
+        if any(n in haystack for n in needles):
+            return reason
+    return None
+
 
 _ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32
 _UNKNOWN_SHA = "0" * 40
@@ -192,6 +315,7 @@ def run_job(
     now: dt.datetime | None = None,
     seed: int | None = None,
     release_sha: str | None = None,
+    transient_retry: bool = True,
 ) -> RunContext:
     """Run ``fn`` as job ``job`` and write its manifest, whatever happens.
 
@@ -200,6 +324,24 @@ def run_job(
     Saturday has a bug, and quietly resolving it to Friday hides the bug
     while producing plausible output. When it is omitted the day is resolved
     from ``now``.
+
+    **One retry, for one declared class** (§11 risk 2). When the first
+    attempt raises something :func:`classify_transient` recognises — a spot
+    reclamation, a provider 5xx or timeout, an S3 throttle — the job runs once
+    more with a **fresh** :class:`RunContext`, and both attempts appear in
+    ``manifest.attempts[]``. Exactly one manifest is written either way, so a
+    retried success is visibly a retried success rather than a clean first
+    attempt, and a page fires only when the retry also fails.
+
+    The retry rests on jobs being idempotent, which is what content-addressed
+    outputs are for: a rerun producing identical bytes is a no-op. A job that
+    is not idempotent is a defect in that job, not a reason to remove the
+    retry — and the fresh context is what makes the second attempt's lineage
+    its own rather than a merge of two runs.
+
+    ``transient_retry=False`` disables it for a caller that must see the first
+    failure — the fault-injection suite asserts the no-retry path as well as
+    the retry path.
 
     Returns the :class:`RunContext` on success. Re-raises on failure, after
     the manifest is on disk.
@@ -210,69 +352,107 @@ def run_job(
     else:
         assert_trading_day(trading_day, context=manifest_key(job, trading_day.isoformat()))
 
-    calendar_date = started.date()
     resolved_seed = seed if seed is not None else int(trading_day.strftime("%Y%m%d"))
+    attempts: list[dict[str, Any]] = [{"n": 1, "reason": "initial"}]
 
-    ctx = RunContext(
-        run_id=_new_run_id(started),
-        job=job,
-        trading_day=trading_day,
-        calendar_date=calendar_date,
-        store=store,
-        seed=resolved_seed,
-        started=started,
-    )
-
-    status = "ok"
-    reason = ""
-    try:
-        fn(ctx)
-    except BaseException as exc:
-        # BaseException, not Exception: a spot reclamation arrives as a
-        # signal, so catching only Exception would leave the fleet's single
-        # most common real failure with no manifest at all — an ABSENCE page
-        # instead of a FAILURE page, with the cause discarded.
-        status = "failed"
-        reason = _reason_from(exc)
-        raise
-    finally:
-        # `finally`, so the manifest exists on both paths. The exception is
-        # NOT swallowed: the raise above continues after this block runs.
-        finished = dt.datetime.now(dt.UTC) if now is None else now
-        manifest = {
-            "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
-            "run_id": ctx.run_id,
-            "job": ctx.job,
-            "trading_day": ctx.trading_day.isoformat(),
-            "calendar_date": ctx.calendar_date.isoformat(),
-            "status": status,
-            "reason": reason,
-            "started": _utc(started),
-            "finished": _utc(finished),
-            "code_sha": _code_sha(),
-            "release_sha": release_sha or os.environ.get("CRUCIBLE_RELEASE_SHA") or _code_sha(),
-            "seed": ctx.seed,
-            "inputs": ctx.inputs,
-            "outputs": ctx.outputs,
-            "rows_in": ctx.rows_in,
-            "rows_out": ctx.rows_out,
-            "rows_rejected": ctx.rows_rejected,
-            "cost_usd": round(ctx.cost_usd, 6),
-            "llm_calls": ctx.llm_calls,
-            "resource": ctx.resource,
-            "metrics": ctx.metrics,
-            "attempts": ctx.attempts,
-        }
-        # Validated BEFORE the write. A non-conformant manifest is a bug in
-        # the runner, and it must surface here rather than at read time on a
-        # Saturday morning.
-        validate(manifest)
-        store.put_bytes(
-            manifest_key(job, ctx.trading_day.isoformat()),
-            json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"),
+    while True:
+        ctx = RunContext(
+            run_id=_new_run_id(dt.datetime.now(dt.UTC) if now is None else now),
+            job=job,
+            trading_day=trading_day,
+            calendar_date=started.date(),
+            store=store,
+            seed=resolved_seed,
+            started=started,
         )
+        ctx.attempts = [dict(a) for a in attempts]
 
-    return ctx
+        status = "ok"
+        reason = ""
+        transient: str | None = None
+        try:
+            fn(ctx)
+        except BaseException as exc:
+            # BaseException, not Exception: a spot reclamation arrives as a
+            # signal, so catching only Exception would leave the fleet's single
+            # most common real failure with no manifest at all — an ABSENCE page
+            # instead of a FAILURE page, with the cause discarded.
+            status = "failed"
+            reason = _reason_from(exc)
+            if transient_retry and len(attempts) < MAX_ATTEMPTS:
+                transient = classify_transient(exc)
+            if transient is None:
+                raise
+        finally:
+            # `finally`, so the manifest exists on both paths — EXCEPT on the
+            # one path where another attempt is about to run and will write the
+            # manifest itself. Writing a `failed` manifest for attempt 1 and an
+            # `ok` one for attempt 2 at the same key would leave the store's
+            # answer to "did this run work" decided by write ordering, which is
+            # the last-writer-wins shape this system is built to refuse.
+            if transient is None:
+                _write_manifest(
+                    ctx,
+                    store=store,
+                    status=status,
+                    reason=reason,
+                    started=started,
+                    now=now,
+                    release_sha=release_sha,
+                )
+
+        if transient is None:
+            return ctx
+        attempts.append({"n": len(attempts) + 1, "reason": transient})
+
+
+def _write_manifest(
+    ctx: RunContext,
+    *,
+    store: Store,
+    status: str,
+    reason: str,
+    started: dt.datetime,
+    now: dt.datetime | None,
+    release_sha: str | None,
+) -> dict[str, Any]:
+    """Assemble, validate and write one manifest. The single writer.
+
+    Validated BEFORE the write. A non-conformant manifest is a bug in the
+    runner, and it must surface here rather than at read time on a Saturday
+    morning.
+    """
+    finished = dt.datetime.now(dt.UTC) if now is None else now
+    manifest = {
+        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "run_id": ctx.run_id,
+        "job": ctx.job,
+        "trading_day": ctx.trading_day.isoformat(),
+        "calendar_date": ctx.calendar_date.isoformat(),
+        "status": status,
+        "reason": reason,
+        "started": _utc(started),
+        "finished": _utc(finished),
+        "code_sha": _code_sha(),
+        "release_sha": release_sha or os.environ.get("CRUCIBLE_RELEASE_SHA") or _code_sha(),
+        "seed": ctx.seed,
+        "inputs": ctx.inputs,
+        "outputs": ctx.outputs,
+        "rows_in": ctx.rows_in,
+        "rows_out": ctx.rows_out,
+        "rows_rejected": ctx.rows_rejected,
+        "cost_usd": round(ctx.cost_usd, 6),
+        "llm_calls": ctx.llm_calls,
+        "resource": ctx.resource,
+        "metrics": ctx.metrics,
+        "attempts": ctx.attempts,
+    }
+    validate(manifest)
+    store.put_bytes(
+        manifest_key(ctx.job, ctx.trading_day.isoformat()),
+        json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"),
+    )
+    return manifest
 
 
 def _reason_from(exc: BaseException) -> str:

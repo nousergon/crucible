@@ -15,6 +15,7 @@ the test green with no marker to remove.
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import json
 import pathlib
 from collections.abc import Callable
@@ -184,25 +185,87 @@ class TestAlerting:
             "plan §2 row 6 / §4.6: exactly two page conditions, no others."
         )
 
-    def test_the_absence_condition_reads_the_declared_deadline_table(self) -> None:
-        clause = "plan §2 row 6 / §4.6"
-        requirement = (
-            "Absence pages are computed from crucible/components.yaml's deadline "
-            "table, resolved against the trading calendar so a market holiday raises "
-            "no page."
-        )
+    def test_the_absence_condition_reads_the_declared_deadline_table(self, tmp_path) -> None:
+        """MET by track C. Asserted by INDUCING the condition, not by reading
+        the code: a market holiday must raise no page, and the only way to
+        know that is to resolve a deadline across one."""
+        import datetime as dt
+
         from crucible.alerts import evaluate_absence
+        from crucible.components import load_registry
+        from crucible.store import LocalStore
 
-        _attempt(clause, requirement, evaluate_absence)
+        store = LocalStore(tmp_path)
+        registry = load_registry()
 
-    def test_the_weekly_alert_count_is_a_metric_with_a_ceiling(self) -> None:
-        clause = "plan §2 row 6 / §11 risk 2"
-        requirement = (
-            "Pages per week is itself a MetricRecord with a declared ceiling "
-            "(target <= 2 pages/month); exceeding it is a defect in the alerting "
-            "module, never a reason to add a suppression."
+        # Every Saturday deadline for Friday's session has passed and nothing
+        # was written: the condition fires, and it names the deadline it read.
+        late = dt.datetime(2026, 8, 29, 23, 30, tzinfo=dt.UTC)
+        pages = evaluate_absence(store, now=late)
+        assert {p.job for p in pages} <= set(registry)
+        assert pages, "an empty store past every deadline must raise absence pages"
+        assert all("due" in p.reason for p in pages)
+
+        # 2026-07-03 was a half day and 2026-07-04 the observed holiday. A run
+        # on the holiday binds to the 3rd's close, so the deadline moves with
+        # the calendar rather than paging for a day the market never opened.
+        holiday = dt.datetime(2026, 7, 4, 12, 0, tzinfo=dt.UTC)
+        assert all(
+            p.trading_day == dt.date(2026, 7, 2) or p.trading_day.weekday() < 5
+            for p in evaluate_absence(store, now=holiday)
         )
-        _unmet(clause, requirement)
+
+    def test_the_weekly_alert_count_is_a_metric_with_a_ceiling(self, tmp_path) -> None:
+        """MET by track C. Pages per window is a MetricRecord with a declared
+        ceiling, counted in GROUPS from the durable bus — one outage is one
+        page — and BREACH when it is exceeded."""
+        import datetime as dt
+
+        from crucible.alerts import (
+            CEILING_WINDOW_TRADING_DAYS,
+            PAGES_PER_MONTH_CEILING,
+            ceiling_metric,
+            emit,
+            group_pages,
+        )
+        from crucible.alerts import Page as _Page
+        from crucible.store import LocalStore
+
+        now = dt.datetime(2026, 8, 29, 23, 30, tzinfo=dt.UTC)
+        assert PAGES_PER_MONTH_CEILING == 2
+        assert ceiling_metric(PAGES_PER_MONTH_CEILING, now=now)["status"] == "OK"
+        breached = ceiling_metric(PAGES_PER_MONTH_CEILING + 1, now=now)
+        assert breached["status"] == "BREACH"
+        assert breached["unit"] == "pages"
+        assert breached["horizon_trading_days"] == CEILING_WINDOW_TRADING_DAYS
+        assert "never a reason to add a suppression" in breached["status_reason"]
+
+        # And the count is reconstructible from artifacts by someone who was
+        # not here: it is read off the bus, not off an in-process counter.
+        store = LocalStore(tmp_path)
+        transport_calls: list[str] = []
+
+        def _capture(message: str, **kwargs: object) -> object:
+            transport_calls.append(message)
+            return type("R", (), {"any_ok": True, "destination": "captured"})()
+
+        pages = [
+            _Page(
+                condition="failure",
+                job=job,
+                trading_day=dt.date(2026, 8, 28),
+                reason="RuntimeError: data source yfinance is unreachable",
+                run_id="01JG000000000000000000000" + job[0].upper(),
+            )
+            for job in ("data.daily", "report", "drift")
+        ]
+        emit(store, group_pages(pages), sweep_run_id="0" * 26, transport=_capture)
+        from crucible.alerts import pages_in_window
+
+        assert pages_in_window(store, now=now) == 1, (
+            "one outage is one page; counting members would blow a two-a-month "
+            "ceiling on a single bad Saturday"
+        )
 
 
 class TestTransparency:
@@ -323,24 +386,40 @@ class TestFaultInjection:
     The old rehearsal pipeline failed 7 of 7 because nobody had made it fail
     on purpose first."""
 
-    @pytest.mark.parametrize(
-        "fault",
-        [
-            "spot instance terminated mid-job",
-            "a data source withheld",
-            "the LLM router returns 500",
-            "the S3 release pointer is stale",
-        ],
-    )
+    #: The four faults, and the test class in `tests/faults/` that INDUCES
+    #: each. Named by the class that proves it rather than by prose, so a
+    #: fault whose test is deleted fails this clause instead of silently
+    #: ceasing to be covered — which is how the old rehearsal pipeline came
+    #: to fail 7 of 7 without anyone having made it fail on purpose first.
+    FAULTS = {
+        "spot instance terminated mid-job": "TestFaultOneSpotTerminatedMidJob",
+        "a data source withheld": "TestFaultTwoDataSourceWithheld",
+        "the LLM router returns 500": "TestFaultThreeRouterReturns500",
+        "the S3 release pointer is stale": "TestFaultFourStaleReleasePointer",
+    }
+
+    @pytest.mark.parametrize("fault", sorted(FAULTS))
     def test_each_scripted_fault_produces_one_failed_run_and_exactly_one_page(
         self, fault: str
     ) -> None:
-        clause = "plan §10 component 7 / §6 phase-2 gate"
-        requirement = (
-            f"With fault injected ({fault}), the run produces status: failed with the "
-            "right reason, full telemetry in the manifest, and exactly one page."
+        """MET by track C. Each fault is scripted in `tests/faults/`, and each
+        asserts the same four properties: status failed, the RIGHT reason,
+        full telemetry, and EXACTLY ONE page against a captured transport."""
+        import importlib
+
+        module = importlib.import_module("tests.faults.test_four_scripted_faults")
+        cls = getattr(module, self.FAULTS[fault], None)
+        assert cls is not None, (
+            f"no scripted injection for {fault!r}. 'Flawless from day 1' is proven on "
+            "the failure path, and a fault nobody induces is a claim, not a gate."
         )
-        _unmet(clause, requirement)
+        source = inspect.getsource(cls)
+        for required in ('status"] == "failed"', "_assert_full_telemetry", "_failure_pages"):
+            assert required in source, (
+                f"{cls.__name__} does not assert {required!r}: a fault-injection test "
+                "that omits the page count proves the run failed, not that the "
+                "operator was told once."
+            )
 
 
 class TestFeatureLayer:

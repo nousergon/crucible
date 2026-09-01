@@ -44,8 +44,11 @@ components:
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
     artifact_retention: forever
+    absence_watched_by: alerts.sweep
     schedule: weekdays after close
-    deadline: 3h after the close of trading day d
+    deadline:
+      anchor: close_plus
+      offset_hours: 3
 
   data.weekly:
     description: Weekly data refresh and coverage pass.
@@ -61,8 +64,11 @@ components:
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
     artifact_retention: forever
+    absence_watched_by: alerts.sweep
     schedule: weekly, Saturday
-    deadline: 09:00 ET the day after the last trading day of the week
+    deadline:
+      anchor: next_calendar_day_at
+      at: "09:00"
 
   data.heal:
     description: Repair a named gap in the store, idempotently.
@@ -80,6 +86,7 @@ components:
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
     artifact_retention: forever
+    absence_watched_by: alerts.sweep
     schedule: null
     deadline: null
 
@@ -97,6 +104,7 @@ components:
     alert_channel: telegram:crucible-pages
     console_surface: crucible/arms
     artifact_retention: forever
+    absence_watched_by: alerts.sweep
     schedule: null
     deadline: null
 
@@ -114,8 +122,11 @@ components:
     alert_channel: telegram:crucible-pages
     console_surface: crucible/arms
     artifact_retention: forever
+    absence_watched_by: alerts.sweep
     schedule: weekly, Saturday
-    deadline: 12:00 ET the day after the last trading day of the week
+    deadline:
+      anchor: next_calendar_day_at
+      at: "12:00"
 
   experiment.grade:
     description: Run one slot's arena cycle — ladder, pairings, pointer, retirements.
@@ -131,8 +142,11 @@ components:
     alert_channel: telegram:crucible-pages
     console_surface: crucible/slots
     artifact_retention: forever
+    absence_watched_by: alerts.sweep
     schedule: weekly, Saturday
-    deadline: 14:00 ET the day after the last trading day of the week
+    deadline:
+      anchor: next_calendar_day_at
+      at: "14:00"
 
   promote:
     description: Move a slot's champion pointer, evidence-gated.
@@ -148,6 +162,7 @@ components:
     alert_channel: telegram:crucible-pages
     console_surface: crucible/slots
     artifact_retention: forever
+    absence_watched_by: alerts.sweep
     schedule: null
     deadline: null
 
@@ -165,8 +180,11 @@ components:
     alert_channel: telegram:crucible-pages
     console_surface: crucible/report
     artifact_retention: forever
+    absence_watched_by: alerts.sweep
     schedule: weekly, Saturday
-    deadline: 16:00 ET the day after the last trading day of the week
+    deadline:
+      anchor: next_calendar_day_at
+      at: "16:00"
 
   explain:
     description: Walk a run_id or verdict back to everything that produced it.
@@ -183,6 +201,7 @@ components:
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
     artifact_retention: forever
+    absence_watched_by: alerts.sweep
     schedule: null
     deadline: null
 
@@ -200,6 +219,7 @@ components:
     alert_channel: telegram:crucible-pages
     console_surface: crucible/arms
     artifact_retention: forever
+    absence_watched_by: alerts.sweep
     schedule: null
     deadline: null
 
@@ -217,6 +237,7 @@ components:
     alert_channel: telegram:crucible-pages
     console_surface: crucible/releases
     artifact_retention: forever
+    absence_watched_by: alerts.sweep
     schedule: null
     deadline: null
 
@@ -236,5 +257,110 @@ components:
     artifact_retention: forever
     # Runs on every merge to main, which is wall-clock, not scheduled work
     # whose absence is a fact about the system.
+    absence_watched_by: alerts.sweep
     schedule: null
     deadline: null
+
+  # ── Track C (alpha-engine-config-I9757) ────────────────────────────────
+  # The four rows below are the observing surfaces themselves. Two of them
+  # cannot be watched by the sweep — one IS the sweep, and the other is what
+  # stands behind it when the sweep is dead — so both name a different
+  # watcher, and tests/test_components_registry.py refuses any row whose
+  # absence is watched by itself.
+
+  alerts.sweep:
+    description: >-
+      Evaluate the two page conditions over every scheduled row, group by
+      cause, page once per group, and write the alerts bus rows.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[runs/**],outputs[alerts/**]
+      outcome: run.json:metrics[pages_emitted]
+    log_location: /crucible/alerts.sweep
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/alerts
+    artifact_retention: forever
+    # The one row the sweep cannot honestly watch: a sweep that never ran
+    # cannot report itself missing. The weekly heartbeat is what stands
+    # behind it, and a sweep run DOES report the previous day's sweep, so
+    # the self-reference is a lag rather than a blind spot.
+    absence_watched_by: heartbeat
+    schedule: daily 21:00 ET, every calendar day
+    deadline:
+      anchor: close_plus
+      offset_hours: 5.5
+
+  heartbeat:
+    description: >-
+      The weekly proof that the alerting path itself is alive - "v2 alive, N
+      runs ok, $X". Not a third page condition; its ABSENCE is the signal.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[runs/**],outputs[alerts/**]
+      outcome: run.json:metrics[pages_last_28_trading_days]
+    log_location: /crucible/heartbeat
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/alerts
+    artifact_retention: forever
+    # Deliberately a human, and the only row in the file that says so. If
+    # the whole alerting path is dead the sweep is dead too, so a machine
+    # watcher here would be watching from inside the thing that failed. The
+    # operator noticing no Saturday message is the outer loop, and naming it
+    # is what keeps it from being mistaken for coverage that does not exist.
+    absence_watched_by: operator
+    schedule: weekly, Saturday
+    deadline:
+      anchor: next_calendar_day_at
+      at: "18:00"
+
+  drift:
+    description: >-
+      Feature PSI against the training window, prediction-distribution drift,
+      and IC decay by horizon - three MetricRecords with control bands.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[features/**,predictions/**],outputs[drift/**]
+      outcome: run.json:metrics[feature_psi_max_ratio]
+    log_location: /crucible/drift
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/drift
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: weekly, Saturday
+    deadline:
+      anchor: next_calendar_day_at
+      at: "14:00"
+
+  console:
+    description: >-
+      Render the static console page from the manifests - runs with their
+      14-state classification, attribution, champions, week cost, deploys.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[runs/**],outputs[console/index.html]
+      outcome: run.json:metrics[components_unreported]
+    log_location: /crucible/console
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/index
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: weekly, Saturday
+    deadline:
+      anchor: next_calendar_day_at
+      at: "17:00"

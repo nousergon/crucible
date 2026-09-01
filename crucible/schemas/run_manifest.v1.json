@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/nousergon/crucible/schemas/run_manifest.v1.json",
   "title": "Crucible run manifest, v1",
-  "description": "The record every job writes at runs/{job}/{trading_day}/run.json. This schema is the enforcement surface for the plan's central guarantee (§4.2): a run is `ok` or it is `failed`; there is no third state, and it is excluded here rather than by policy. It is also the observability contract (§9.2): one document carries all five signal classes — execution, cost/tokens, resource, data lineage, and outcome vs baseline — under one run_id.",
+  "description": "The record every job writes at runs/{job}/{trading_day}/run.json. This schema is the enforcement surface for the plan's central guarantee (\u00a74.2): a run is `ok` or it is `failed`; there is no third state, and it is excluded here rather than by policy. It is also the observability contract (\u00a79.2): one document carries all five signal classes \u2014 execution, cost/tokens, resource, data lineage, and outcome vs baseline \u2014 under one run_id.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -35,7 +35,7 @@
       "const": "run_manifest.v1"
     },
     "run_id": {
-      "description": "The correlation identity (§9.2). Appears on every log line, alert, cost row and S3 object's metadata for this run. ULID: lexically sortable by creation time.",
+      "description": "The correlation identity (\u00a79.2). Appears on every log line, alert, cost row and S3 object's metadata for this run. ULID: lexically sortable by creation time.",
       "type": "string",
       "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
     },
@@ -55,11 +55,15 @@
         "migrate.history",
         "release.pin",
         "smoke",
+        "alerts.sweep",
+        "heartbeat",
+        "drift",
+        "console",
         "deploy"
       ]
     },
     "trading_day": {
-      "description": "THE KEY (§4.12). An NYSE trading day from krepis.trading_calendar. A run launched on a non-trading day binds to the last completed trading day — a Saturday weekly run is keyed to Friday's close. Never the wall-clock date.",
+      "description": "THE KEY (\u00a74.12). An NYSE trading day from krepis.trading_calendar. A run launched on a non-trading day binds to the last completed trading day \u2014 a Saturday weekly run is keyed to Friday's close. Never the wall-clock date.",
       "$ref": "#/$defs/isoDate"
     },
     "calendar_date": {
@@ -67,16 +71,21 @@
       "$ref": "#/$defs/isoDate"
     },
     "status": {
-      "description": "Exhaustive. `ok` means a complete manifest with every output written; `failed` means the run did not produce its deliverable and pages. There is deliberately no `partial`, `skipped`, `degraded` or `unknown` — the v1 system's `cycle_verdict: unknown` (I9729) and its 32-of-33 no-op skip flags (I9721) are unrepresentable here.",
+      "description": "Exhaustive. `ok` means a complete manifest with every output written; `failed` means the run did not produce its deliverable and pages. There is deliberately no `partial`, `skipped`, `degraded` or `unknown` \u2014 the v1 system's `cycle_verdict: unknown` (I9729) and its 32-of-33 no-op skip flags (I9721) are unrepresentable here.",
       "type": "string",
-      "enum": ["ok", "failed"]
+      "enum": [
+        "ok",
+        "failed"
+      ]
     },
     "reason": {
-      "description": "Mandatory. Empty string when `status` is `ok`; a specific, operator-readable cause when `failed` — the conditional below forbids an empty reason on a failure, because a failure with no cause is indistinguishable from every other failure.",
+      "description": "Mandatory. Empty string when `status` is `ok`; a specific, operator-readable cause when `failed` \u2014 the conditional below forbids an empty reason on a failure, because a failure with no cause is indistinguishable from every other failure.",
       "type": "string",
       "maxLength": 2000
     },
-    "started": { "$ref": "#/$defs/utcTimestamp" },
+    "started": {
+      "$ref": "#/$defs/utcTimestamp"
+    },
     "finished": {
       "description": "Written in the runner's `finally` block, so it is present even when the job raised.",
       "$ref": "#/$defs/utcTimestamp"
@@ -95,27 +104,47 @@
       "minimum": 0
     },
     "inputs": {
-      "description": "§9.2 class 4, upstream half. Every artifact read, content-hashed, with the schema version it was read under. An empty list is legal and means the job read nothing.",
+      "description": "\u00a79.2 class 4, upstream half. Every artifact read, content-hashed, with the schema version it was read under. An empty list is legal and means the job read nothing.",
       "type": "array",
-      "items": { "$ref": "#/$defs/artifactRef" }
+      "items": {
+        "$ref": "#/$defs/artifactRef"
+      }
     },
     "outputs": {
-      "description": "§9.2 class 4, downstream half. Content hashes are what make a rerun idempotent: identical bytes are a no-op.",
+      "description": "\u00a79.2 class 4, downstream half. Content hashes are what make a rerun idempotent: identical bytes are a no-op.",
       "type": "array",
-      "items": { "$ref": "#/$defs/artifactRef" }
+      "items": {
+        "$ref": "#/$defs/artifactRef"
+      }
     },
-    "rows_in": { "type": "integer", "minimum": 0 },
-    "rows_out": { "type": "integer", "minimum": 0 },
+    "rows_in": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rows_out": {
+      "type": "integer",
+      "minimum": 0
+    },
     "rows_rejected": {
       "description": "Rejections WITH REASON, never a bare count. A count with no reason cannot be acted on, and is how 901 of 903 tickers silently failed a liquidity gate for months.",
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["reason", "count"],
+        "required": [
+          "reason",
+          "count"
+        ],
         "properties": {
-          "reason": { "type": "string", "minLength": 1, "maxLength": 200 },
-          "count": { "type": "integer", "minimum": 1 }
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 1
+          }
         }
       }
     },
@@ -125,29 +154,39 @@
       "minimum": 0
     },
     "llm_calls": {
-      "description": "§9.2 class 2. One entry per logical call. Empty for every non-research job — LLM access is confined to research by standing rule, and an empty list is the evidence of that, not an absence of instrumentation.",
+      "description": "\u00a79.2 class 2. One entry per logical call. Empty for every non-research job \u2014 LLM access is confined to research by standing rule, and an empty list is the evidence of that, not an absence of instrumentation.",
       "type": "array",
-      "items": { "$ref": "#/$defs/llmCall" }
+      "items": {
+        "$ref": "#/$defs/llmCall"
+      }
     },
     "resource": {
-      "description": "§9.2 class 3. Present on every manifest including laptop runs, where `spot` is false and the instance type is `local`.",
+      "description": "\u00a79.2 class 3. Present on every manifest including laptop runs, where `spot` is false and the instance type is `local`.",
       "$ref": "#/$defs/resource"
     },
     "metrics": {
-      "description": "§9.2 class 5. MetricRecord-shaped (krepis.metrics.MetricRecord), permissive on extra fields for forward compatibility with a newer producer, but strict about the two that make a number readable: `unit` whenever `value` is set, and `horizon_trading_days` as an integer count of TRADING days.",
+      "description": "\u00a79.2 class 5. MetricRecord-shaped (krepis.metrics.MetricRecord), permissive on extra fields for forward compatibility with a newer producer, but strict about the two that make a number readable: `unit` whenever `value` is set, and `horizon_trading_days` as an integer count of TRADING days.",
       "type": "array",
-      "items": { "$ref": "#/$defs/metricRecord" }
+      "items": {
+        "$ref": "#/$defs/metricRecord"
+      }
     },
     "attempts": {
-      "description": "§11 risk 2. Every attempt this run made, including the transient-class retry. Never empty: a run that executed once records one attempt, so a retried run cannot be mistaken for a clean first-attempt run.",
+      "description": "\u00a711 risk 2. Every attempt this run made, including the transient-class retry. Never empty: a run that executed once records one attempt, so a retried run cannot be mistaken for a clean first-attempt run.",
       "type": "array",
       "minItems": 1,
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["n", "reason"],
+        "required": [
+          "n",
+          "reason"
+        ],
         "properties": {
-          "n": { "type": "integer", "minimum": 1 },
+          "n": {
+            "type": "integer",
+            "minimum": 1
+          },
           "reason": {
             "description": "Why THIS attempt happened. `initial` for the first; otherwise the declared transient class that caused the retry. The class grows only by PR with the failure named.",
             "type": "string",
@@ -166,13 +205,43 @@
   "allOf": [
     {
       "description": "A failed run states why. Enforced in the schema so no writer can omit it.",
-      "if": { "properties": { "status": { "const": "failed" } }, "required": ["status"] },
-      "then": { "properties": { "reason": { "minLength": 1 } } }
+      "if": {
+        "properties": {
+          "status": {
+            "const": "failed"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "reason": {
+            "minLength": 1
+          }
+        }
+      }
     },
     {
       "description": "An ok run has nothing to explain; a non-empty reason on success is a degraded-SUCCEEDED in disguise.",
-      "if": { "properties": { "status": { "const": "ok" } }, "required": ["status"] },
-      "then": { "properties": { "reason": { "const": "" } } }
+      "if": {
+        "properties": {
+          "status": {
+            "const": "ok"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "reason": {
+            "const": ""
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -197,16 +266,22 @@
     "artifactRef": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["key", "sha256", "schema_version"],
+      "required": [
+        "key",
+        "sha256",
+        "schema_version"
+      ],
       "properties": {
         "key": {
           "description": "Store key, not a URI. The store backend (S3 or local dir) resolves it, so the same manifest is portable between them.",
           "type": "string",
           "minLength": 1
         },
-        "sha256": { "$ref": "#/$defs/sha256" },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
         "schema_version": {
-          "description": "The version the artifact was read or written under. Required — an un-versioned cross-module artifact is the M0 contract violation.",
+          "description": "The version the artifact was read or written under. Required \u2014 an un-versioned cross-module artifact is the M0 contract violation.",
           "type": "string",
           "minLength": 1
         }
@@ -232,7 +307,7 @@
           "minLength": 1
         },
         "model_requested": {
-          "description": "What the caller asked the router for — a capability class or registry group, never a provider model id (principle 8).",
+          "description": "What the caller asked the router for \u2014 a capability class or registry group, never a provider model id (principle 8).",
           "type": "string",
           "minLength": 1
         },
@@ -241,11 +316,26 @@
           "type": "string",
           "minLength": 1
         },
-        "tokens_in": { "type": "integer", "minimum": 0 },
-        "tokens_out": { "type": "integer", "minimum": 0 },
-        "cache_read": { "type": "integer", "minimum": 0 },
-        "cache_write": { "type": "integer", "minimum": 0 },
-        "usd": { "type": "number", "minimum": 0 }
+        "tokens_in": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tokens_out": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_read": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_write": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "usd": {
+          "type": "number",
+          "minimum": 0
+        }
       }
     },
     "resource": {
@@ -265,14 +355,25 @@
           "type": "string",
           "minLength": 1
         },
-        "spot": { "type": "boolean" },
+        "spot": {
+          "type": "boolean"
+        },
         "escalated_to_on_demand": {
           "description": "I5727: spot-to-on-demand fallback emits a COUNTABLE metric. Required, so a fleet-wide escalation rate is always computable rather than sampled from whichever runs happened to annotate it.",
           "type": "boolean"
         },
-        "interruptions": { "type": "integer", "minimum": 0 },
-        "mem_peak_mb": { "type": "number", "minimum": 0 },
-        "disk_free_mb": { "type": "number", "minimum": 0 }
+        "interruptions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mem_peak_mb": {
+          "type": "number",
+          "minimum": 0
+        },
+        "disk_free_mb": {
+          "type": "number",
+          "minimum": 0
+        }
       }
     },
     "metricRecord": {
@@ -290,26 +391,54 @@
         "last_updated_utc"
       ],
       "properties": {
-        "name": { "type": "string", "minLength": 1 },
-        "module": { "type": "string", "minLength": 1 },
-        "metric_type": { "type": "string", "minLength": 1 },
-        "value": { "type": ["number", "null"] },
-        "unit": {
-          "description": "Required whenever `value` is set — see the dependency below. A numeric field with no declared unit is the defect that emitted avg_volume_20d as a ratio and consumed it as raw shares.",
-          "type": ["string", "null"],
+        "name": {
+          "type": "string",
           "minLength": 1
         },
-        "n_floor": { "type": "integer", "minimum": 0 },
-        "status": { "type": "string", "minLength": 1 },
+        "module": {
+          "type": "string",
+          "minLength": 1
+        },
+        "metric_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "unit": {
+          "description": "Required whenever `value` is set \u2014 see the dependency below. A numeric field with no declared unit is the defect that emitted avg_volume_20d as a ratio and consumed it as raw shares.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "n_floor": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "status": {
+          "type": "string",
+          "minLength": 1
+        },
         "status_reason": {
           "description": "One operator-readable sentence, never generic.",
           "type": "string",
           "minLength": 1
         },
-        "source_path": { "type": "string", "minLength": 1 },
-        "last_updated_utc": { "$ref": "#/$defs/utcTimestamp" },
+        "source_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "last_updated_utc": {
+          "$ref": "#/$defs/utcTimestamp"
+        },
         "horizon_trading_days": {
-          "description": "§4.12: a horizon is an INTEGER COUNT OF TRADING DAYS — 21 / 63 / 126 / 252. There is no string form, so `1 month` cannot be expressed and fails validation. Absent when the metric has no forward horizon.",
+          "description": "\u00a74.12: a horizon is an INTEGER COUNT OF TRADING DAYS \u2014 21 / 63 / 126 / 252. There is no string form, so `1 month` cannot be expressed and fails validation. Absent when the metric has no forward horizon.",
           "type": "integer",
           "minimum": 1
         }
@@ -318,12 +447,25 @@
         {
           "description": "A number without a unit is refused.",
           "if": {
-            "required": ["value"],
-            "properties": { "value": { "type": "number" } }
+            "required": [
+              "value"
+            ],
+            "properties": {
+              "value": {
+                "type": "number"
+              }
+            }
           },
           "then": {
-            "required": ["unit"],
-            "properties": { "unit": { "type": "string", "minLength": 1 } }
+            "required": [
+              "unit"
+            ],
+            "properties": {
+              "unit": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
           }
         }
       ]

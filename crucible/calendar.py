@@ -29,6 +29,8 @@ import re
 from krepis.trading_calendar import (
     count_trading_days,
     last_closed_trading_day,
+    previous_trading_day,
+    subtract_trading_days,
 )
 from krepis.trading_calendar import (
     is_trading_day as _krepis_is_trading_day,
@@ -40,7 +42,9 @@ __all__ = [
     "TRADING_DAYS_PER_WEEK",
     "assert_trading_day",
     "is_trading_day",
+    "previous_trading_day",
     "resolve_trading_day",
+    "subtract_trading_days",
     "trading_weeks_between",
 ]
 

@@ -40,12 +40,34 @@ def _minimal_argv(job: str) -> list[str]:
         argv += ["a" * 40]
     if job == "data.heal":
         argv += ["--gap", "missing-panel", "--from", "2026-08-24", "--to", "2026-08-28"]
+    if job == "smoke":
+        # track-C: the pointer flip refuses a smoke manifest belonging to
+        # another build, so the sha the smoke is verifying is required.
+        argv += ["--release", "a" * 40]
     return argv
 
 
+#: The jobs track C implemented (alpha-engine-config-I9757). The stub
+#: parametrisation above derives itself from `is_stub`, so this list exists
+#: only to assert the CONVERSE — that these six are implemented. Without it,
+#: track C landing its handlers would simply shrink the stub parametrisation
+#: and nothing would assert they now do something: a gate going dark rather
+#: than green.
+TRACK_C_JOBS = ("alerts.sweep", "console", "drift", "heartbeat", "release.pin", "smoke")
+
+
 class TestJobSurface:
-    def test_the_thirteen_jobs_of_the_plan_are_registered(self) -> None:
+    def test_the_jobs_of_the_plan_are_registered(self) -> None:
+        """The plan's twelve, plus track C's four observing surfaces.
+
+        The four are jobs like any other on purpose: they write manifests on
+        the same terms, so the thing that watches the fleet is watched by the
+        same registry, the same deadline table and the same console."""
         assert set(JOBS) == {
+            "alerts.sweep",
+            "heartbeat",
+            "drift",
+            "console",
             "data.daily",
             "data.weekly",
             "data.heal",
@@ -164,18 +186,75 @@ class TestPageConditions:
         assert a != dedup_key("absence", "data.daily", FRIDAY)
 
 
-class TestUnimplementedAlerting:
-    @pytest.mark.parametrize("name", ["evaluate_absence", "evaluate_failure", "heartbeat"])
-    def test_the_alerting_stubs_refuse_loudly(self, name: str) -> None:
-        import crucible.alerts as alerts
+class TestTrackCJobsAreImplemented:
+    """The converse of `test_an_unimplemented_job_raises_and_never_returns_zero`.
 
-        with pytest.raises(NotImplementedError, match="I9757"):
-            getattr(alerts, name)()
+    Without this, track C landing its handlers would be invisible to the test
+    suite: the stub assertion would simply stop covering those jobs and
+    nothing would assert they now do something. A parametrisation that
+    shrinks silently is a gate going dark rather than green.
+    """
 
-    def test_send_refuses_loudly(self) -> None:
-        """A delivery path that could quietly no-op is an outage nobody
-        hears about."""
-        from crucible.alerts import send
+    @pytest.mark.parametrize("job", sorted(TRACK_C_JOBS))
+    def test_the_handler_is_not_a_stub(self, job: str) -> None:
+        handler = HANDLERS[job]
+        assert not is_stub(handler), (
+            f"{job} still dispatches to a stub. Track C's jobs are implemented; a "
+            "parametrisation that merely stopped covering them would be a gate going "
+            "dark rather than green."
+        )
+        assert handler.__module__ == "crucible.track_c", (
+            f"{job} dispatches to {handler.__module__}.{handler.__name__}; track C's "
+            "handlers live in crucible.track_c."
+        )
+
+
+class TestAlertingSurface:
+    """§4.6's two conditions, exercised against a real store rather than
+    asserted about. The transport is captured, never a live one."""
+
+    def test_an_absence_page_names_its_deadline_and_the_job(self, tmp_path) -> None:
+        from crucible.alerts import evaluate_absence
+        from crucible.store import LocalStore
+
+        store = LocalStore(tmp_path)
+        # Saturday 23:00 UTC — every Saturday deadline for Friday's session
+        # has passed, and nothing has been written.
+        now = dt.datetime(2026, 8, 29, 23, 0, tzinfo=dt.UTC)
+        pages = evaluate_absence(store, now=now)
+        jobs = {p.job for p in pages}
+        assert "data.weekly" in jobs
+        assert all(p.condition == "absence" for p in pages)
+        assert all(p.trading_day == FRIDAY for p in pages)
+        assert all("due" in p.reason for p in pages)
+
+    def test_a_deadline_that_has_not_passed_is_not_an_absence(self, tmp_path) -> None:
+        """A job whose deadline is still in the future is not absent, it is
+        not due. Reporting it would fire the condition every early run."""
+        from crucible.alerts import evaluate_absence
+        from crucible.store import LocalStore
+
+        store = LocalStore(tmp_path)
+        # 16:30 ET on the session itself: the close has passed, so the run
+        # binds to Friday, and every deadline anchored on that close is
+        # still ahead — including data.daily's, at close + 3h.
+        early = dt.datetime(2026, 8, 28, 20, 30, tzinfo=dt.UTC)
+        assert [p.job for p in evaluate_absence(store, now=early)] == []
+
+    def test_the_heartbeat_row_is_never_paged_for_by_the_sweep(self, tmp_path) -> None:
+        """It declares `absence_watched_by: operator`. A machine watcher
+        living inside the alerting path cannot report that path dead."""
+        from crucible.alerts import evaluate_absence
+        from crucible.store import LocalStore
+
+        store = LocalStore(tmp_path)
+        now = dt.datetime(2026, 8, 29, 23, 59, tzinfo=dt.UTC)
+        assert "heartbeat" not in {p.job for p in evaluate_absence(store, now=now)}
+
+    def test_send_raises_when_the_transport_does(self) -> None:
+        """Delivery failure RAISES. An alert that could not be sent and was
+        logged instead is an outage nobody hears about."""
+        from crucible.alerts import PageGroup, send
 
         page = Page(
             condition="absence",
@@ -183,5 +262,9 @@ class TestUnimplementedAlerting:
             trading_day=FRIDAY,
             reason="no manifest by deadline",
         )
-        with pytest.raises(NotImplementedError, match="I9757"):
-            send(page)
+
+        def exploding(*args, **kwargs):
+            raise RuntimeError("telegram unreachable")
+
+        with pytest.raises(RuntimeError, match="telegram unreachable"):
+            send(PageGroup("absence:x", (page,)), alert_id="0" * 26, transport=exploding)
