@@ -28,6 +28,20 @@ caught by the id collision.
 `ranker`, `params`, `registered_at` or `notes` does not register; the metric,
 horizon and benchmark are the SLOT's and are deliberately not settable
 per-arm, because policy §4 requires every arm to be scored on the same axis.
+
+**`registered_at` is a SESSION, asserted on construction** (§4.12). It is the
+start of the arm's out-of-sample clock, and every ladder rung,
+`promote_min_weeks` rung and `grace_weeks` rung is counted from it in
+trading weeks — so a date that is not a session makes the arm's whole
+eligibility clock start on a day the market never traded, and the error
+compounds silently for the arm's entire life. Measured (`I9757`): three
+recipes carrying `registered_at: '2026-08-29'`, a Saturday, loaded and
+registered without complaint, because the §4.12 contract test walks store
+KEYS only while the plan requires it to walk "every artifact key, manifest
+field and `arena_cycle` window" — and this field is a manifest field, not a
+key. The assertion lives on :class:`ArmSpec` rather than in the YAML parser
+so it binds to every construction path, the migration importer's included:
+a spec built in code carries the same contract as one read off disk.
 """
 
 from __future__ import annotations
@@ -40,6 +54,7 @@ from typing import Any
 import yaml
 from nousergon_lib.arena.arms import ArmEvent, ArmRegister, derive_arm_id
 
+from crucible.calendar import assert_trading_day
 from crucible.keys import arm_register_key
 from crucible.slots import ControlArm, SlotSpec
 from crucible.slots.rankers import get_ranker, ranker_identity
@@ -88,6 +103,23 @@ class ArmSpec:
     promotion_source: str = ""
     notes: str = ""
     source_key: str = ""
+
+    def __post_init__(self) -> None:
+        """§4.12: the OOS clock starts on a SESSION, or it starts nowhere.
+
+        Raises :class:`~crucible.calendar.NonTradingDayKeyError`. A raise
+        rather than a resolution to the neighbouring session: a recipe naming
+        a Saturday was written by something that keyed off the wall clock,
+        and quietly moving the date to Friday would hide the writer while
+        producing a plausible arm.
+        """
+        assert_trading_day(
+            self.registered_at,
+            context=(
+                f"arm {self.slot}:{self.name} `registered_at` "
+                f"(source: {self.source_key or 'constructed in code'})"
+            ),
+        )
 
     @property
     def spec(self) -> dict[str, Any]:

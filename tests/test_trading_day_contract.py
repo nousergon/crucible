@@ -103,6 +103,81 @@ class TestKeyEnforcement:
         assert "signals/" in str(exc.value)
 
 
+class TestManifestFieldEnforcement:
+    """The half of the §4.12 walk that is NOT a store key.
+
+    The plan requires the contract test to walk *"every artifact key,
+    manifest field and `arena_cycle` window"*. :class:`TestStoreWalk` below
+    covers the keys; this covers the manifest field whose absence from the
+    walk was measured as `I9757` defect 10 — `registered_at` / `created_date`,
+    which starts an arm's out-of-sample clock and drives `promote_min_weeks`,
+    `grace_weeks` and every ladder rung. It reached the register without ever
+    passing through :func:`assert_trading_day`, so three recipes carrying a
+    Saturday loaded and registered without complaint and every eligibility
+    figure derived from them counted from a day the market never traded.
+    """
+
+    def test_a_recipe_registered_on_a_saturday_is_refused_at_load(self, tmp_path) -> None:
+        """The reproduction, verbatim: `registered_at: '2026-08-29'`."""
+        from crucible.slots.arms import load_arm_specs
+
+        arms = tmp_path / "strategy" / "arms" / "u"
+        arms.mkdir(parents=True)
+        (arms / "momentum_sleeve.yaml").write_text(
+            "name: momentum_sleeve\nslot: u\nranker: momentum_sleeve\n"
+            f"registered_at: '{SATURDAY}'\nparams:\n  top_n: 8\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(NonTradingDayKeyError) as exc:
+            load_arm_specs("u", strategy_dir=tmp_path / "strategy")
+        assert str(SATURDAY) in str(exc.value)
+        assert "registered_at" in str(exc.value), (
+            "the error must name the FIELD, or an operator cannot find the writer"
+        )
+
+    @pytest.mark.parametrize("bad", [SATURDAY, SUNDAY, OBSERVED_HOLIDAY])
+    def test_an_arm_built_in_code_carries_the_same_contract(self, bad) -> None:
+        """The assertion is on the spec, not on the YAML parser, so the
+        migration importer — which takes `registered_at` from a v1 pointer's
+        `promoted_at` — cannot enter a non-session by a different door."""
+        from crucible.slots.arms import ArmSpec
+
+        with pytest.raises(NonTradingDayKeyError):
+            ArmSpec(
+                name="momentum_sleeve",
+                slot="u",
+                ranker="momentum_sleeve",
+                params={"top_n": 8},
+                registered_at=bad.isoformat(),
+            )
+
+    def test_a_session_registration_is_accepted(self) -> None:
+        """The gate must pass what it should pass, or it is a gate nobody can
+        leave switched on. 2026-06-01 is a Monday and a full session."""
+        from crucible.slots.arms import ArmSpec
+
+        spec = ArmSpec(
+            name="momentum_sleeve",
+            slot="u",
+            ranker="momentum_sleeve",
+            params={"top_n": 8},
+            registered_at="2026-06-01",
+        )
+        assert spec.registered_at == "2026-06-01"
+
+    def test_the_generated_control_arms_register_on_a_session(self) -> None:
+        """The controls' registration date is a module constant, so it is
+        exactly the kind of literal nothing checks. It must be early — the
+        library refuses a `created_date` in the future, which would fail every
+        replay of a past Saturday — AND a real session."""
+        from crucible.slots import get_slot
+        from crucible.slots.arms import CONTROL_REGISTERED_AT, control_specs
+
+        assert_trading_day(CONTROL_REGISTERED_AT, context="CONTROL_REGISTERED_AT")
+        for spec in control_specs(get_slot("u")):
+            assert_trading_day(spec.registered_at, context=f"control {spec.name}")
+
+
 class TestStoreWalk:
     """The §4.12 walk itself, over the local backend.
 

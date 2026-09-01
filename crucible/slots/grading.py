@@ -19,15 +19,46 @@ which *those two* produced — so the engine cannot see un-paired data even by
 accident. `tests/test_grading.py` reproduces the I9745 shape and asserts the
 surviving arm keeps its figure.
 
-**Controls are graded beside the arms, every cycle** (§10.1). The planted
-control ranks on the realized forward return plus calibrated noise, so it
-carries a KNOWN edge; the null control ranks on noise alone. If the grader
-does not rank planted above null, the GRADER is broken and the cycle's
-verdicts are void — the cycle fails rather than publishing them. Both
-controls are produced at GRADE time, not at produce time, because a planted
-edge is by construction a look-ahead: it is legal only in a harness device
-that can never be promoted, and generating it in the produce path would put
-a look-ahead artifact on the real-time write path.
+**The grader has two halves, and each needs its own control** (§10.1).
+Half one CONSTRUCTS the label — :func:`forward_returns` turns a price panel
+into a realized forward return per ticker. Half two SCORES a selection
+against that label — :func:`score_selection`. A cycle is only as trustworthy
+as both.
+
+*The scoring half* is checked by the planted/null pair. The planted control
+ranks on the realized forward return plus calibrated noise, so it carries a
+KNOWN edge; the null control ranks on noise alone. If the grader does not
+rank planted above null, the GRADER is broken and the cycle's verdicts are
+void — the cycle fails rather than publishing them. Both controls are
+produced at GRADE time, not at produce time, because a planted edge is by
+construction a look-ahead: it is legal only in a harness device that can
+never be promoted, and generating it in the produce path would put a
+look-ahead artifact on the real-time write path.
+
+*The label half was, until this module carried a second control, invisible
+to the first one.* Both controls are generated from and scored against the
+SAME `returns` mapping the real arms are scored against, so any defect in
+:func:`forward_returns` moves planted and null identically and the
+planted-over-null margin survives it. Measured: forcing the horizon to 5
+sessions published a clean cycle at `control margin=0.025838, n_paired=6`,
+while every `verdict.json` in the run claimed `horizon_trading_days: 21`
+because that number was a separately-passed literal rather than a property
+of what was measured. Two changes close that:
+
+* :func:`forward_returns` returns a :class:`ForwardReturnWindow` whose
+  `horizon_trading_days` is DERIVED from the panel's own session index — the
+  count of sessions between the anchor and the settle date it actually
+  used — and :func:`write_verdict` takes the window rather than an integer.
+  A verdict can no longer claim a horizon nobody measured.
+* :func:`assert_label_control` recomputes the same labels through
+  :func:`reference_forward_returns`, a second implementation that shares no
+  code with the first, and voids the cycle when the two disagree or when the
+  span measured is not the span declared.
+
+:func:`assert_label_control`'s reach and its blind spot are written out on
+the function itself. Read them before trusting a green cycle: a control
+whose blind spot is undocumented is worse than one whose blind spot is
+written down.
 
 **Benchmark: the population the arm drew from, count-matched.** For an
 equal-weight selection of *k* names, the equal-weight mean of the population
@@ -67,11 +98,17 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "CONTROL_PLANTED_IC",
     "DEFAULT_HORIZON_TRADING_DAYS",
+    "LABEL_CONTROL_REL_TOL",
+    "ForwardReturnWindow",
     "GraderControlError",
+    "PopulationIntegrityError",
+    "SelectionMissError",
     "ShadowSelection",
+    "assert_label_control",
     "forward_returns",
     "grade_slot",
     "produce_shadow",
+    "reference_forward_returns",
     "score_selection",
     "series_from_verdicts",
 ]
@@ -87,6 +124,14 @@ DEFAULT_HORIZON_TRADING_DAYS = 21
 #: grader cannot see an edge this large, it cannot see a real one.
 CONTROL_PLANTED_IC = 0.35
 
+#: How far the label control lets the two independent label implementations
+#: drift before it voids the cycle. Relative, and tight: the two paths read
+#: the same two closes and divide them, so anything beyond float
+#: representation error is a real disagreement about WHICH closes. A loose
+#: tolerance here would let a wrong-but-nearby settle date through, which is
+#: exactly the class the control exists for.
+LABEL_CONTROL_REL_TOL = 1e-9
+
 
 class GraderControlError(RuntimeError):
     """The controls did not rank as constructed. The cycle's verdicts are void.
@@ -96,6 +141,71 @@ class GraderControlError(RuntimeError):
     a control that can produce a negative result is the only evidence the
     harness itself works, so a failed control fails the run.
     """
+
+
+class SelectionMissError(ValueError):
+    """This arm had nothing scoreable to say on this date. A MISS, not a failure.
+
+    Plan §4.4 and policy §3: *"a cycle in which an arm legitimately selects
+    nothing is a miss"* — and a miss is data. Every name an arm picked was
+    delisted, halted or otherwise carried no settled close at both ends of
+    the horizon, while the population it drew from is intact and every other
+    arm scores normally. That is a fact about this arm on this date, and
+    recording it is the whole point: policy §3 requires that silent absence
+    and a genuine zero never render identically.
+
+    Deliberately a `ValueError` subclass: the raise it replaces was a bare
+    `ValueError`, and a caller that still catches the general class keeps
+    working rather than losing the refusal.
+
+    The defect this type exists to end (`I9757`): the raise had NO handler at
+    the `run_grade` call site, so one arm whose picks had all delisted took
+    the whole slot down — no arena cycle and no verdict for any healthy arm.
+    That is the `ChallengerShadowGapError` shape v2 claims to have retired,
+    reappearing one step later.
+    """
+
+
+class PopulationIntegrityError(ValueError):
+    """The BENCHMARK could not be formed. Compromised inputs, not a miss.
+
+    The other half of the distinction above, and the half that must still
+    fail the slot. A population with fewer than two settled forward returns
+    is not a population; every arm in the slot is scored against it, so the
+    defect is in the cycle's shared input substrate rather than in one arm's
+    picks (policy §3, Brian's 2026-08-29 ruling). The call site turns this
+    into a :class:`~nousergon_lib.arena.engine.TrainingIntegrityError` and
+    the run FAILS.
+    """
+
+
+@dataclass(frozen=True)
+class ForwardReturnWindow:
+    """The labels for one anchor date, WITH the span they were measured over.
+
+    The horizon is a field of this object rather than an argument travelling
+    beside it, because that is the defect it closes. A verdict used to state
+    `horizon_trading_days` from a literal passed independently of the returns
+    it described, so a run whose labels spanned 5 sessions published verdicts
+    claiming 21 and nothing anywhere disagreed.
+
+    ``horizon_trading_days`` is DERIVED — the number of sessions the panel's
+    own index carries between ``start`` and ``end`` — so it cannot be
+    asserted, only measured.
+    """
+
+    start: str
+    end: str
+    horizon_trading_days: int
+    returns: dict[str, float]
+
+    def __post_init__(self) -> None:
+        if self.horizon_trading_days < 1:
+            raise ValueError(
+                f"a forward-return window spans {self.horizon_trading_days} sessions "
+                f"({self.start} to {self.end}). A horizon of zero or fewer sessions is a "
+                "same-day return wearing a forward return's name."
+            )
 
 
 @dataclass(frozen=True)
@@ -164,23 +274,18 @@ def produce_shadow(
     )
 
 
-def forward_returns(
-    panel: pd.DataFrame,
-    *,
-    start: dt.date,
-    horizon_trading_days: int = DEFAULT_HORIZON_TRADING_DAYS,
-) -> dict[str, float]:
-    """Simple forward return per ticker over ``horizon_trading_days`` SESSIONS.
+def _sessions(panel: pd.DataFrame) -> list[Any]:
+    """The panel's own session index, ascending.
 
-    Sessions are counted from the panel's own date index, which is the set of
-    days the market actually traded — not a calendar offset, which would land
-    on a holiday and silently shorten or lengthen the horizon per ticker.
-
-    A ticker without a settled close at both ends is ABSENT from the result.
-    It is not zero: a delisting is not a flat return, and the arm that picked
-    it records the exclusion rather than banking a 0%.
+    The set of days the market actually traded, taken from the data rather
+    than from a calendar offset: a calendar offset lands on a holiday and
+    silently shortens or lengthens the horizon per ticker.
     """
-    sessions = sorted({d for d in panel["trading_day"].unique()})
+    return sorted({d for d in panel["trading_day"].unique()})
+
+
+def _settle_session(sessions: list[Any], start: dt.date, horizon_trading_days: int) -> Any:
+    """The session ``horizon_trading_days`` after ``start``, or a named refusal."""
     if start not in sessions:
         raise ValueError(
             f"{start} is not a session in the supplied panel (which spans "
@@ -196,7 +301,32 @@ def forward_returns(
             "a return computed over a short window is a different measurement wearing "
             "the same name (policy §7: horizon-vs-retention, asserted not assumed)."
         )
-    end = sessions[end_index]
+    return sessions[end_index]
+
+
+def forward_returns(
+    panel: pd.DataFrame,
+    *,
+    start: dt.date,
+    horizon_trading_days: int = DEFAULT_HORIZON_TRADING_DAYS,
+) -> ForwardReturnWindow:
+    """Simple forward return per ticker over ``horizon_trading_days`` SESSIONS.
+
+    Sessions are counted from the panel's own date index, which is the set of
+    days the market actually traded — not a calendar offset, which would land
+    on a holiday and silently shorten or lengthen the horizon per ticker.
+
+    A ticker without a settled close at both ends is ABSENT from the result.
+    It is not zero: a delisting is not a flat return, and the arm that picked
+    it records the exclusion rather than banking a 0%.
+
+    Returns a :class:`ForwardReturnWindow`, not a bare mapping. The window
+    carries the anchor, the settle session, and the span between them as
+    counted in the panel — so every downstream artifact states the horizon it
+    was measured over rather than one supplied alongside it.
+    """
+    sessions = _sessions(panel)
+    end = _settle_session(sessions, start, horizon_trading_days)
 
     frame = panel[panel["trading_day"].isin({start, end})]
     pivot = frame.pivot_table(index="ticker", columns="trading_day", values="close_raw")
@@ -205,7 +335,160 @@ def forward_returns(
     both = pivot[[start, end]].dropna()
     both = both[both[start] > 0]
     ratio = (both[end] / both[start]) - 1.0
-    return {str(t): float(v) for t, v in ratio.items()}
+    return ForwardReturnWindow(
+        start=str(start),
+        end=str(end),
+        # DERIVED from the index actually walked, never echoed back from the
+        # argument: if this function ever measured a different span than it
+        # was asked for, this is the number that would say so.
+        horizon_trading_days=sessions.index(end) - sessions.index(start),
+        returns={str(t): float(v) for t, v in ratio.items()},
+    )
+
+
+def reference_forward_returns(
+    panel: pd.DataFrame,
+    *,
+    start: dt.date,
+    horizon_trading_days: int,
+) -> dict[str, float]:
+    """The same labels, computed a second time by a different construction.
+
+    The input to the label control (:func:`assert_label_control`). It shares
+    no code with :func:`forward_returns`: where that one reshapes the panel
+    into a `ticker x trading_day` pivot and divides two columns, this one
+    walks the rows into a plain `{ticker: {session: close}}` mapping and
+    divides two scalars per name. Nothing is imported from the other path,
+    so a defect in the pivot — an aggregation over duplicate rows, a column
+    that resolved to the wrong session, a `dropna` that silently kept a
+    misaligned pair — is not shared.
+
+    ``horizon_trading_days`` is the span the CALLER declared, which is the
+    load-bearing asymmetry: the cycle passes the same declared horizon to
+    both paths, so a function that measured something else than it was asked
+    for disagrees with this one rather than agreeing with itself.
+    """
+    sessions = _sessions(panel)
+    end = _settle_session(sessions, start, horizon_trading_days)
+
+    closes: dict[str, dict[Any, float]] = {}
+    for row in panel.itertuples(index=False):
+        day = row.trading_day
+        if day != start and day != end:
+            continue
+        close = float(row.close_raw)
+        if close != close:  # NaN: an unsettled close is absent, never zero
+            continue
+        closes.setdefault(str(row.ticker), {})[day] = close
+
+    out: dict[str, float] = {}
+    for ticker, by_day in closes.items():
+        first = by_day.get(start)
+        last = by_day.get(end)
+        if first is None or last is None or first <= 0:
+            continue
+        out[ticker] = (last / first) - 1.0
+    return out
+
+
+def assert_label_control(
+    window: ForwardReturnWindow,
+    reference: dict[str, float],
+    *,
+    slot: str,
+    declared_horizon_trading_days: int,
+) -> dict[str, Any]:
+    """§10.1's control over the LABEL half of the grader. Voids the cycle when it fails.
+
+    The planted/null pair checks that the grader can SEE an edge. It cannot
+    check that the edge it saw was measured over the right window, because
+    both controls are generated from and scored against the very mapping
+    under test — a wrong label moves planted and null identically and the
+    margin survives it. This is the control for that half, and like the
+    other one its whole value is that it can produce a negative result.
+
+    **What it catches** — every defect that makes the labels under test
+    differ from a correct measurement of the declared horizon:
+
+    * a horizon that is not the one declared, wherever it came from — an
+      argument ignored, a constant edited, an off-by-one on the settle index.
+      This is the reproduced `I9757` defect: forcing a 5-session horizon
+      published a clean cycle at `control margin=0.025838`, and here it
+      raises instead.
+    * an anchor or settle session resolved to a neighbouring day.
+    * a per-ticker misalignment: a close paired with the wrong session, a
+      pivot aggregating duplicate rows, a `dropna` that kept a broken pair.
+    * a name present in one construction and absent from the other — a
+      silently dropped or silently invented ticker.
+
+    **What it CANNOT catch**, because both paths read the same panel through
+    the same contract, and saying so is the point (a control whose blind spot
+    is undocumented is worse than one whose blind spot is written down):
+
+    * a defect in the PANEL itself. If `close_raw` is adjusted wrongly, stale,
+      survivorship-biased, or carries a look-ahead from a restatement, both
+      constructions reproduce it exactly and this control passes. Panel
+      integrity is the data layer's contract, not this one's.
+    * a WRONGLY DECLARED horizon. If the cycle declares 5 sessions, both
+      paths measure 5 and agree; the control passes and every verdict
+      truthfully states 5. That is not a silent failure — the derived
+      `horizon_trading_days` on every artifact is what makes it loud — but it
+      is a configuration question this control does not answer.
+    * whether the panel's session index is the right one. Both paths take the
+      trading-day axis from the data; a panel missing a session shortens the
+      real-world span of a 21-session horizon in both, identically. The
+      §4.12 trading-day contract test owns that.
+    * the SCORING half. Sign, benchmark, count-matching and ranking are the
+      planted/null pair's job, and a grader that scores a correct label
+      backwards passes this control and fails that one.
+    """
+    if window.horizon_trading_days != declared_horizon_trading_days:
+        raise GraderControlError(
+            f"slot {slot!r}: the labels anchored at {window.start} span "
+            f"{window.horizon_trading_days} session(s) to {window.end}, and the cycle "
+            f"declared {declared_horizon_trading_days}. The horizon a verdict claims is "
+            "derived from what was measured, so this is a real disagreement about the "
+            "measurement and not a labelling slip: the cycle's verdicts are void (§10.1)."
+        )
+
+    measured = window.returns
+    only_measured = sorted(set(measured) - set(reference))
+    only_reference = sorted(set(reference) - set(measured))
+    if only_measured or only_reference:
+        raise GraderControlError(
+            f"slot {slot!r}: the two label constructions disagree about WHICH names "
+            f"settled between {window.start} and {window.end}. Present only in the "
+            f"measured labels: {only_measured[:10]}; only in the reference: "
+            f"{only_reference[:10]}. A name that exists in one construction and not the "
+            "other is a selection scored against a benchmark drawn from a different "
+            "cross-section; the cycle's verdicts are void (§10.1)."
+        )
+
+    worst_ticker, worst = "", 0.0
+    for ticker, value in measured.items():
+        other = reference[ticker]
+        delta = abs(value - other)
+        scale = max(abs(value), abs(other), 1.0)
+        if delta / scale > worst:
+            worst_ticker, worst = ticker, delta / scale
+    if worst > LABEL_CONTROL_REL_TOL:
+        raise GraderControlError(
+            f"slot {slot!r}: the two label constructions disagree by {worst:.3e} "
+            f"(relative) on {worst_ticker!r} over {window.start}..{window.end}, which is "
+            f"beyond the {LABEL_CONTROL_REL_TOL:.0e} float tolerance. They read the same "
+            "two closes and divide them, so a disagreement this size is a disagreement "
+            "about WHICH closes. The cycle's verdicts are void (§10.1)."
+        )
+
+    return {
+        "anchor": window.start,
+        "settled_on": window.end,
+        "horizon_trading_days": window.horizon_trading_days,
+        "declared_horizon_trading_days": declared_horizon_trading_days,
+        "n_names": len(measured),
+        "max_relative_disagreement": worst,
+        "tolerance": LABEL_CONTROL_REL_TOL,
+    }
 
 
 def score_selection(
@@ -220,19 +503,40 @@ def score_selection(
     equal-weight mean is compared against exactly what a coin-flip selector
     of the same size would have earned in expectation. No sampling, no seed,
     no Monte-Carlo variance in the benchmark.
+
+    **Two unscoreable cases, and they are not the same event** (plan §4.4).
+    Both used to raise a bare `ValueError`, so the only handler either could
+    ever get was one that treated them alike:
+
+    * every PICK unscoreable while the population is intact —
+      :class:`SelectionMissError`. This arm legitimately has nothing to say
+      on this date; it is a miss, a miss is data, and the other arms in the
+      slot grade normally.
+    * the POPULATION unscoreable — :class:`PopulationIntegrityError`. Every
+      arm in the slot is benchmarked against it, so the cycle's shared inputs
+      are compromised and the whole slot's run fails.
+
+    The population is checked FIRST, deliberately. A cycle whose population
+    has collapsed also has no settled picks, and reporting that as a miss
+    would file a broken input under "this arm had nothing to say" — the
+    precise confusion policy §3 forbids.
     """
     picked = [returns[t] for t in selection if t in returns]
     pool = [returns[t] for t in population if t in returns]
-    if not picked:
-        raise ValueError(
-            f"none of the {len(selection)} selected names has a settled forward return; "
-            "the selection cannot be scored, and scoring it as zero would credit a "
-            "delisting as a flat month"
-        )
     if len(pool) < 2:
-        raise ValueError(
-            f"the population has {len(pool)} settled forward return(s); a benchmark "
-            "drawn from fewer than two names is not a benchmark"
+        raise PopulationIntegrityError(
+            f"the population has {len(pool)} settled forward return(s) out of "
+            f"{len(population)}; a benchmark drawn from fewer than two names is not a "
+            "benchmark. Every arm in this slot is scored against it, so this is a "
+            "compromised input for the whole cycle, not one arm's miss."
+        )
+    if not picked:
+        raise SelectionMissError(
+            f"none of the {len(selection)} selected names has a settled forward return, "
+            f"while {len(pool)} of {len(population)} population names do. The selection "
+            "cannot be scored, and scoring it as zero would credit a delisting as a flat "
+            "month. Recorded as a MISS for this arm on this date (plan §4.4): the arm "
+            "legitimately has nothing to say, and the slot's other arms grade normally."
         )
     selection_mean = sum(picked) / len(picked)
     population_mean = sum(pool) / len(pool)
@@ -434,12 +738,24 @@ def write_verdict(
     trading_day: str,
     slot: str,
     score: float,
-    horizon_trading_days: int,
+    window: ForwardReturnWindow,
     benchmark: str,
     detail: dict[str, Any],
     control: bool,
 ) -> bytes:
-    """One arm's settled score for one decision date."""
+    """One arm's settled score for one decision date.
+
+    Takes the :class:`ForwardReturnWindow` the score was computed from, not
+    a horizon integer. The horizon and the settle session on the artifact are
+    then properties OF THE MEASUREMENT rather than values a caller supplied
+    beside it — which is the whole of the `I9757` fix for this defect: a run
+    whose labels spanned 5 sessions used to write `horizon_trading_days: 21`
+    into every verdict, and no artifact anywhere disagreed.
+
+    ``settled_on`` is additive on `verdict.v1`: the anchor was always on the
+    record as `trading_day`, and the session the return settled at never was,
+    so the artifact could not previously be checked against the panel at all.
+    """
     payload = json.dumps(
         {
             "schema_version": "verdict.v1",
@@ -447,7 +763,8 @@ def write_verdict(
             "slot": slot,
             "trading_day": trading_day,
             "score_ratio": score,
-            "horizon_trading_days": horizon_trading_days,
+            "horizon_trading_days": window.horizon_trading_days,
+            "settled_on": window.end,
             "benchmark": benchmark,
             "control": control,
             "detail": detail,
