@@ -78,7 +78,7 @@ class Clause:
             # the slot, so `experiment.run --slot u` and `--slot r` write the
             # same object — and listing that key four times would present a
             # collision as thoroughness. The collision itself is
-            # alpha-engine-config-I9783.
+            # alpha-engine-config-I9781.
             "evidence": sorted(set(self.evidence)),
         }
 

@@ -675,7 +675,7 @@ class TestFaultInjection:
         # Recorded, not asserted: faults 2 and 3 raise a message rather than
         # inducing the condition at the seam that would produce it, so they
         # cannot fail because of a defect in the data layer or the LLM path.
-        # Tracked as alpha-engine-config-I9782; this clause asserts the shape
+        # Tracked as alpha-engine-config-I9780; this clause asserts the shape
         # every fault must have, and that issue closes the two that fake it.
 
 
