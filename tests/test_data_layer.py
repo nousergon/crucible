@@ -97,9 +97,7 @@ class TestMissingSourceIsFailedNeverZeroFilled:
         def fake_load_universe_ohlcv(bucket, *, symbols, lookback_days, end, region=None):
             return thinned
 
-        monkeypatch.setattr(
-            "nousergon_lib.arcticdb.load_universe_ohlcv", fake_load_universe_ohlcv
-        )
+        monkeypatch.setattr("nousergon_lib.arcticdb.load_universe_ohlcv", fake_load_universe_ohlcv)
         source = ArcticPriceSource("test-bucket")
         with pytest.raises(MissingSourceError, match="dropped"):
             source.load_panel(end=cycle_date, lookback_days=400, symbols=requested)

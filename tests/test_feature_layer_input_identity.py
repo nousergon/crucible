@@ -95,7 +95,7 @@ class TestTheTwoSlotsRecordTheSameInput:
     ) -> None:
         run_job(
             "data.daily",
-            lambda ctx: run_daily(ctx, source=source),
+            lambda ctx: run_daily(ctx, source=source, expected_symbols=source.symbols()),
             store=store,
             trading_day=cycle_date,
         )

@@ -67,7 +67,7 @@ def _seed_cycle(store, source, strategy_dir, cycle_date, tmp_path):
     for day in decision_days + [cycle_date]:
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source),
+            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
             store=store,
             trading_day=day,
         )
@@ -561,7 +561,7 @@ class TestKeysAndRefusals:
         settings = _settings(strategy_dir, tmp_path / "store")
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source),
+            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
             store=store,
             trading_day=cycle_date,
         )

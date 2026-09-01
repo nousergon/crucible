@@ -98,8 +98,6 @@ class UndeclaredUniverseError(RuntimeError):
     """
 
 
-
-
 def write_panel(ctx: RunContext, panel: pd.DataFrame, key: str) -> bytes:
     """Serialize ``panel`` to parquet, write it, and record it as an output."""
     import io

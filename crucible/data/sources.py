@@ -215,6 +215,20 @@ class FramePriceSource(PriceSource):
     def snapshot_id(self) -> str:
         return self._snapshot
 
+    def symbols(self) -> list[str]:
+        """Every ticker this source can serve.
+
+        The coverage DENOMINATOR for a fixture or replay run. `run_daily` now
+        refuses a run with no declared universe — a run with no denominator
+        reports `OK` over a ratio it never computed, which is the
+        901-of-903 bug class — and a caller replaying a fixture has to say what
+        it expected. Reading it off the source is the honest answer for that
+        caller and it is NOT available on the production source by design:
+        asking ArcticDB "what do you have" and then measuring coverage against
+        the reply is a denominator that moves with the outage.
+        """
+        return sorted(self._frames)
+
 
 class ArcticPriceSource(PriceSource):
     """The production source: the ArcticDB universe library, read-only.

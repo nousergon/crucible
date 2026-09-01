@@ -136,7 +136,7 @@ class TestExplain:
     ) -> None:
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source),
+            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
             store=store,
             trading_day=cycle_date,
         )
@@ -166,7 +166,7 @@ class TestExplain:
         day = sessions_ending(cycle_date, 1)[0]
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source),
+            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
             store=store,
             trading_day=day,
         )
@@ -190,7 +190,7 @@ class TestExplain:
     ) -> None:
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source),
+            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
             store=store,
             trading_day=cycle_date,
         )

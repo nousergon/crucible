@@ -197,11 +197,7 @@ def handle_experiment_new(args: argparse.Namespace) -> int:
     register, _ = register_arms(register, specs)
     added = sorted(set(register.all_arms()) - before)
     if args.dry_run:
-        print(
-            json.dumps(
-                {"would_register": added, "already_present": sorted(before)}, indent=2
-            )
-        )
+        print(json.dumps({"would_register": added, "already_present": sorted(before)}, indent=2))
         return 0
 
     def job(ctx: Any) -> None:
