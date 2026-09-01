@@ -25,7 +25,7 @@ from crucible import alerts, release
 from crucible.console.render import build_page, write_page
 from crucible.drift import drift_metrics
 from crucible.runner import RunContext, run_job, spot_interruption_guard
-from crucible.store import Store, open_store
+from crucible.store import Store, open_store, sha256_hex
 
 __all__ = [
     "console_handler",
@@ -36,13 +36,23 @@ __all__ = [
     "sweep_handler",
 ]
 
-#: What `crucible smoke` actually reads. A real end-to-end read against the
-#: live store, not a ping: §4.11 gates the pointer flip on this, and a gate
-#: that only proves the process started would promote a build that cannot
-#: reach its own data. Each entry is (label, key-or-prefix, required).
-SMOKE_READS: tuple[tuple[str, str, bool], ...] = (
-    ("release pointer", release.POINTER_KEY, False),
-    ("components registry", "runs/", False),
+#: The ambient live read paths the smoke exercises **in addition to**
+#: verifying the release under test. A real end-to-end read against the live
+#: store, not a ping: §4.11 gates the pointer flip on this, and a gate that
+#: only proves the process started would promote a build that cannot reach
+#: its own data. Each entry is (label, key-or-prefix).
+#:
+#: Neither is `required`, and there is deliberately no `required` column any
+#: more. A required flag that was False on every row was a column with one
+#: value, and it read as if some read somewhere could fail the smoke while
+#: none could. What actually gates the flip is
+#: :func:`_verify_release_artifacts` below, whose every check raises. These
+#: two are *observations*: on a first-ever deploy the pointer is unset and
+#: `runs/` is empty, and refusing to bootstrap the system is not a gate. They
+#: are counted honestly into `smoke_ok` instead of asserted.
+SMOKE_READS: tuple[tuple[str, str], ...] = (
+    ("release pointer", release.POINTER_KEY),
+    ("run manifests", "runs/"),
 )
 
 
@@ -89,6 +99,65 @@ def release_pin_handler(args: argparse.Namespace) -> int:
 # ── smoke ─────────────────────────────────────────────────────────────────
 
 
+def _verify_release_artifacts(store: Store, sha: str, ctx: RunContext) -> list[str]:
+    """Read and verify the artifacts for ``sha``. Every failure here RAISES.
+
+    This is the part of the smoke that gates the flip. It is not a
+    reachability probe: it reads the two objects that constitute the release
+    `deploy.yml` is about to promote, out of the live store, and checks that
+    what came back is what `release.json` says it is.
+
+    Three failures it is built to catch, none of which a ping would:
+
+    * **the wheel for this sha is not there.** `flip_on_smoke` would happily
+      promote it — the pointer's own guard (`pin` refuses an unpublished
+      sha) fires only on the wheel key, so a prefix missing its
+      `release.json` promotes fine and every consumer of the record breaks
+      later, away from the deploy that caused it.
+    * **the record describes a different build.** A `release.json` for
+      another sha under this prefix makes the rollback target a build it does
+      not describe.
+    * **the bytes in the store are not the bytes that were built.** A
+      truncated or clobbered upload leaves a wheel whose sha256 no longer
+      matches `wheel_sha256`; nothing downstream re-hashes, so the first
+      symptom would be an install failure on a box at 06:30.
+
+    Returns the keys it read, for the manifest's lineage and for the
+    `smoke_ok` count. Raising is the whole design: §4.2 has no status between
+    ok and failed, so a smoke that could not verify its release cannot report
+    anything but `failed`, and the flip refuses on anything but `ok`.
+    """
+    wheel_k = release.wheel_key(sha)
+    meta_k = release.release_json_key(sha)
+    missing = [k for k in (wheel_k, meta_k) if not store.exists(k)]
+    if missing:
+        raise FileNotFoundError(
+            f"smoke: the release under test is not published. {sorted(missing)} absent "
+            f"for {sha}. Promoting a pointer at a prefix whose artifacts are not there "
+            "is a stale pointer written deliberately; the deploy publishes before it "
+            "smokes, so this means the publish did not land."
+        )
+    meta_bytes = store.get_bytes(meta_k)
+    record = release.ReleaseRecord(**json.loads(meta_bytes.decode("utf-8")))
+    if record.sha != sha:
+        raise ValueError(
+            f"smoke: {meta_k} describes {record.sha}, not {sha}. Gating a promotion on "
+            "a record belonging to another build is the gate failing open."
+        )
+    wheel_bytes = store.get_bytes(wheel_k)
+    digest = sha256_hex(wheel_bytes)
+    if digest != record.wheel_sha256:
+        raise ValueError(
+            f"smoke: the wheel at {wheel_k} hashes to {digest}, but {meta_k} claims "
+            f"{record.wheel_sha256}. The stored artifact is not the one that was built "
+            "and tested; promoting it would install unverified bytes on every box that "
+            "follows releases/current."
+        )
+    ctx.record_input(meta_k, meta_bytes, schema_version=release.RELEASE_SCHEMA_VERSION)
+    ctx.record_input(wheel_k, wheel_bytes, schema_version=release.RELEASE_SCHEMA_VERSION)
+    return [meta_k, wheel_k]
+
+
 def smoke_handler(args: argparse.Namespace) -> int:
     """A real run against live S3 read paths. Its manifest gates the flip.
 
@@ -101,37 +170,78 @@ def smoke_handler(args: argparse.Namespace) -> int:
     `release_sha`, because :func:`crucible.release.flip_on_smoke` refuses a
     manifest belonging to another build — promoting on another build's smoke
     is the gate failing open.
+
+    **What makes this a gate rather than a ceremony.** It verifies the
+    artifacts for the sha it is gating (:func:`_verify_release_artifacts`),
+    by reading them out of the live store and re-hashing the wheel against
+    the record — so a smoke against an empty store, or against a sha nothing
+    published, fails instead of reporting `ok` with an empty `inputs[]`. And
+    `smoke_ok` is **counted**, not asserted: its value is the number of read
+    paths that actually returned something and its status is derived from
+    whether every one of them did. A gate whose metric is the literal `"OK"`
+    is a gate that says the same thing on every run it survives, which is
+    indistinguishable from one that did nothing.
     """
     store = _store(args)
 
     def body(ctx: RunContext) -> None:
-        reachable = 0
-        for label, key, required in SMOKE_READS:
+        read: list[str] = []
+        degraded: list[str] = []
+
+        # The gate proper. Raises on every failure; nothing below runs unless
+        # the release under test is present and byte-verified.
+        read += _verify_release_artifacts(store, args.release, ctx)
+
+        for label, key in SMOKE_READS:
             if key.endswith("/"):
                 # A listing, not a get: the paginated list path is the one a
                 # truncation bug hides in, so the smoke exercises it.
                 found = sum(1 for _ in store.list_keys(key))
                 ctx.record_rows(rows_in=ctx.rows_in + found, rows_out=ctx.rows_out)
-                reachable += 1
+                if found:
+                    read.append(key)
+                else:
+                    degraded.append(f"{label} ({key}) listed zero keys")
                 continue
-            if store.exists(key):
-                payload = store.get_bytes(key)
-                ctx.record_input(key, payload, schema_version=release.RELEASE_SCHEMA_VERSION)
-                reachable += 1
-            elif required:
-                raise RuntimeError(f"smoke: required artifact {label} missing at {key}")
+            if not store.exists(key):
+                degraded.append(f"{label} ({key}) is unset")
+                continue
+            payload = store.get_bytes(key)
+            ctx.record_input(key, payload, schema_version=release.RELEASE_SCHEMA_VERSION)
+            read.append(key)
+            if key == release.POINTER_KEY:
+                pointed = json.loads(payload.decode("utf-8"))["sha"]
+                if not store.exists(release.wheel_key(pointed)):
+                    # Recorded, NOT raised, and this is the only deliberate
+                    # non-raise in the job. Failure mode swallowed: a stale
+                    # `releases/current` whose wheel is gone — every job that
+                    # resolves the pointer is already broken. It does not fail
+                    # the smoke because flipping the pointer to this verified
+                    # build is the REMEDY, and refusing to deploy would remove
+                    # the only thing that fixes it. Recording surface: the
+                    # `smoke_ok` MetricRecord below goes BREACH with this
+                    # sentence in `status_reason`, on the manifest §4.5's page
+                    # renders — so it is loud on the console rather than
+                    # silent in a log.
+                    degraded.append(
+                        f"releases/current names {pointed}, whose wheel is absent; every "
+                        "job resolving the pointer is broken until this flip lands"
+                    )
+
+        attempted = 2 + len(SMOKE_READS)  # the two release artifacts, plus the ambient paths
         ctx.record_metric(
             {
                 "name": "smoke_ok",
                 "module": "crucible.track_c",
                 "metric_type": "operational",
-                "value": float(reachable),
+                "value": float(len(read)),
                 "unit": "read_paths",
                 "n_floor": 0,
-                "status": "OK",
+                "status": "OK" if not degraded else "BREACH",
                 "status_reason": (
-                    f"{reachable} of {len(SMOKE_READS)} live read paths reachable from "
-                    f"release {args.release}."
+                    f"{len(read)} of {attempted} live read paths returned data for "
+                    f"release {args.release}; wheel and release.json verified "
+                    f"byte-for-byte." + (f" Degraded: {'; '.join(degraded)}." if degraded else "")
                 ),
                 "source_path": "runs/smoke/{trading_day}/run.json",
                 "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),

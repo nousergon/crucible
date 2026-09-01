@@ -17,19 +17,35 @@ name: Deploy
 # merging" step anywhere in a crucible PR body: hitting merge is Brian's LAST
 # action.
 #
-# ── Why the role check is a job of its own ────────────────────────────────
-# Until the v2 CloudFormation stack is applied, the deploy role does not exist.
-# The failure mode being designed out is NOT "the workflow errors" — it is the
-# workflow quietly falling back to the research role
-# (github-actions-lambda-deploy), which exists and has write access to a
+# ── Why the role check reads the identity back, and is not its own job ────
+# The failure mode being designed out is NOT "the workflow errors" — it is
+# acting as an identity other than the v2 deploy role: notably the research
+# role (github-actions-lambda-deploy), which exists and has write access to a
 # DIFFERENT bucket. Measured 2026-09-01: that role's trust policy lists
-# twenty-three repos and `nousergon/crucible` is not among them, so a fallback
-# would fail at assume time TODAY — but adding one line to that list is a
-# routine change, and after it the fallback would succeed and publish v2
-# releases into v1's prefix. A guard whose correctness depends on a list
-# somebody else maintains is not a guard. So the role ARN is asserted against
-# the one this repository declares, before any credential is configured, and
-# the message names the stack that creates it.
+# twenty-three repos and `nousergon/crucible` is not among them, so it could
+# not be assumed from here today — but adding one line to that list is a
+# routine change, and a guard whose correctness depends on a list somebody
+# else maintains is not a guard.
+#
+# This was previously a standalone `guard` job that compared
+# ${DEPLOY_ROLE_ARN} against the same literal `env` sets it eleven lines
+# above. Nothing in this workflow can make those two differ — there is no
+# input, no override and no dispatch path that sets DEPLOY_ROLE_ARN, and
+# `role-to-assume` is that same variable, so the "silent fallback" it claimed
+# to prevent was not a thing this file could do. A predicate that can only be
+# false if someone edits one of two adjacent lines is not a check; it is a
+# whole runner spent restating a literal.
+#
+# What IS falsifiable is the identity actually obtained. `sts
+# get-caller-identity` is read back AFTER the credential step and BEFORE
+# anything is written, and the run fails unless the assumed role is
+# crucible-v2-github-deploy. That catches an OIDC subject mapped to the wrong
+# role, a role renamed or recreated under the same ARN shape, a
+# pre-existing credential in the runner environment, and a
+# configure-aws-credentials that silently did not assume what was asked —
+# none of which the literal comparison could see. The message still names the
+# stack that creates the role, because "the v2 stack is not applied yet" is
+# the failure an operator will actually hit.
 
 on:
   push:
@@ -59,21 +75,8 @@ env:
   STORE_URI: s3://alpha-engine-crucible-v2/crucible
 
 jobs:
-  guard:
-    name: the v2 deploy role is the only role this may use
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    steps:
-      # No credentials configured in this job, deliberately: the assertion
-      # runs before any identity that could act on it exists.
-      - name: Refuse any role but the v2 deploy role
-        run: |
-          if [ "${DEPLOY_ROLE_ARN}" != "arn:aws:iam::711398986525:role/crucible-v2-github-deploy" ]; then echo "::error::DEPLOY_ROLE_ARN is ${DEPLOY_ROLE_ARN}. This workflow may assume ONLY crucible-v2-github-deploy. The research role (github-actions-lambda-deploy) writes a DIFFERENT bucket; it does not trust this repository today, but one line added to its trust list would make a silent fallback succeed and publish v2 releases into v1 prefix. Apply nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml (stack crucible-v2) to create the v2 roles."; exit 1; fi
-          echo "deploy role: ${DEPLOY_ROLE_ARN}"
-
   build:
     name: build the wheel and record what it is
-    needs: [guard]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -170,15 +173,37 @@ jobs:
           role-to-assume: ${{ env.DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # The role check, read back from AWS rather than restated from `env`.
+      # Runs after the credential step (there is no identity to read before
+      # it) and before anything is written, so a wrong identity fails the
+      # deploy having touched no bucket.
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${DEPLOY_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. It may act ONLY as crucible-v2-github-deploy: the research role (github-actions-lambda-deploy) writes a DIFFERENT bucket, and publishing v2 releases into the v1 prefix is silent until something installs one. If the v2 roles do not exist yet, apply nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml (stack crucible-v2)."; exit 1 ;; esac
+
       # Publish the IMMUTABLE half. Safe and repeatable; it promotes nothing.
       - name: Publish the release artifacts
         run: |
           uv run python -m crucible.deploy publish --sha '${{ needs.build.outputs.sha }}' --wheel 'out/crucible-${{ needs.build.outputs.sha }}-py3-none-any.whl' --release-json out/release.json --store "$STORE_URI"
 
+      # The opening half of the pointer compare-and-swap, taken BEFORE the
+      # smoke so the swap covers the whole verification window. Reading the
+      # token after the smoke — as this workflow used to — leaves an interval
+      # microseconds wide, and an operator rollback (`crucible release.pin`)
+      # landing during the smoke is then silently undone by the flip.
+      - name: Capture the releases/current version token before the smoke
+        run: |
+          uv run python -m crucible.deploy capture --sha '${{ needs.build.outputs.sha }}' --store "$STORE_URI" --out pointer.token
+
       # The gate. A REAL run against live S3 read paths, writing
       # runs/smoke/{trading_day}/run.json through the ordinary runner — so the
       # gate produces the same telemetry every other job does, and a smoke that
-      # "ran and had nothing to do" is not expressible (§4.2).
+      # "ran and had nothing to do" is not expressible (§4.2). It reads the
+      # wheel and release.json for THIS sha out of the store and re-hashes the
+      # wheel against the record, so it cannot pass against a release that was
+      # never published.
       - name: Smoke
         id: smoke
         run: |
@@ -186,10 +211,12 @@ jobs:
 
       # Reads the smoke MANIFEST, not this workflow's exit codes. A
       # caller-supplied "it passed" is the shape that promotes a build whose
-      # smoke quietly did nothing.
+      # smoke quietly did nothing. Swaps against the token captured before the
+      # smoke: if anything moved the pointer in between, this deploy FAILS
+      # rather than overwriting it.
       - name: Flip releases/current on an ok smoke
         run: |
-          uv run python -m crucible.deploy flip --sha '${{ needs.build.outputs.sha }}' --store "$STORE_URI"
+          uv run python -m crucible.deploy flip --sha '${{ needs.build.outputs.sha }}' --store "$STORE_URI" --expect-pointer-file pointer.token
 
       # Written on BOTH paths, in the run-manifest schema, so §4.5's page shows
       # deploys beside runs and a failed deploy is as visible as a failed job.
@@ -203,7 +230,7 @@ jobs:
   # announces it. Measured 2026-08-12: a router config sat undeployed for 16
   # hours behind exactly this gap (alpha-engine-config-I7169).
   notify-main-failure:
-    needs: [guard, build, release]
+    needs: [build, release]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5363e60b9343e270be9a44d41e85516068b4226e
     secrets: inherit
