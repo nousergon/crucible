@@ -757,7 +757,12 @@ def _seeded_slot(tmp_path: Any, cycle_date: dt.date) -> tuple[Any, Any, list[dt.
     horizon = 21
     decisions = 6
     store = LocalStore(tmp_path / "store")
-    source = FramePriceSource(synthetic_frames(end=cycle_date))
+    frames = synthetic_frames(end=cycle_date)
+    source = FramePriceSource(frames)
+    # The coverage DENOMINATOR, passed explicitly. Without it `coverage_ratio`
+    # is None, the metric reports OK, and the 0.90 floor is skipped — which is
+    # the `901 of 903` bug class restored, and is what crucible-PR9 makes a
+    # refusal. Declaring it here is correct on both sides of that merge.
     strategy = tmp_path / "strategy"
     arms = strategy / "arms" / "u"
     arms.mkdir(parents=True)
@@ -781,7 +786,7 @@ def _seeded_slot(tmp_path: Any, cycle_date: dt.date) -> tuple[Any, Any, list[dt.
     for day in decision_days + [cycle_date]:
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source),
+            lambda c: run_daily(c, source=source, expected_symbols=sorted(frames)),
             store=store,
             trading_day=day,
         )
