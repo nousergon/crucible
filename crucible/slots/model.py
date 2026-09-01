@@ -12,7 +12,7 @@ Lifted, not imported, from `crucible-predictor`: the CPCV splitter
 repository — v2 is a separate wheel, and a runtime edge back into v1 would
 make the cutover impossible to finish.
 
-**Four things this module is careful about, each a measured defect:**
+**Seven things this module is careful about, each a measured defect:**
 
 1. **`TrainingIntegrityError` fails the whole slot, never one arm.** Arms in a
    slot share a training substrate, so a defect that spoils one fit is
@@ -29,9 +29,37 @@ make the cutover impossible to finish.
    "you cannot gate on a statistic you did not measure", and an uncomputed
    gate reported as a pass is the defect the gate exists to prevent.
 4. **The benchmark is the scored cross-section, never SPY.** M is graded on
-   CPCV out-of-sample IC against the population it scored (`ArenaConfig`
+   out-of-sample rank IC against the population it scored (`ArenaConfig`
    refuses anything else for a selection-kind slot; M declares `population`
    for the same reason).
+5. **The series the pointer is decided on is OUT-OF-SAMPLE** (plan §9.1, the
+   out-of-sample clock). `grade_arm` used to fit once on every date up to
+   `as_of` and then score those same dates with that fit, so the number the
+   arena paired on was in-sample and the only OOS figure — `ModelGrade.cpcv`
+   — was consumed by nothing on the promotion path. Measured on 40 pure-noise
+   features over a pure-noise label: the in-sample series read +0.0728 mean IC
+   while CPCV OOS read -0.0214, and a 40-feature arm beat a 3-feature arm
+   0.0728 vs 0.0118 on data containing no signal. Overfit was the thing being
+   ranked. :func:`grade_arm` now walks forward — every scored day is predicted
+   by a fit that never saw that day's label — and the window opens no earlier
+   than the recipe's `registered_at`.
+6. **`_rank_ic` averages tied ranks.** The lifted implementation
+   (`training/leakfree_meta_ic.py`) called `scipy.stats.spearmanr`, which
+   assigns mid-ranks to ties; the lift replaced it with an argsort, which
+   assigns ties distinct index-order ranks. Measured: two flat vectors scored
+   +1.0 (the docstring claimed 0.0), a collapsed model emitting one constant
+   `predicted_alpha` scored +1.0 against a flat day, and 45 of 50 names tied
+   scored -0.4558 where the mid-rank Spearman is -0.1043. A collapsed model is
+   the exact condition the behavioural veto exists to catch; the grader was
+   handing it a perfect score. Zero dispersion on either side is now
+   UNMEASURABLE — a miss on the series, never a number.
+7. **A fit dated `as_of` may not consume a label realized after it.** A
+   `label_horizon_trading_days=21` forward return on `as_of` settles on
+   `as_of + 21` sessions, so :func:`train_arm` purges the final horizon from
+   its training rows. Without it every replayed Saturday in the plan's §6.1
+   gate used post-date information, and a panel that leaves the unsettled rows
+   NULL (which `FeatureLayerSource.panel` does) failed the finiteness check
+   instead of naming the real condition.
 """
 
 from __future__ import annotations
@@ -55,6 +83,8 @@ __all__ = [
     "DISPERSION_METRICS",
     "FLOOR_VETO_METRICS",
     "MIN_DISPERSION_RATIO",
+    "OOS_METHOD",
+    "PROPORTION_METRICS",
     "UNITS_SUFFIXES",
     "ZERO_VETO_METRICS",
     "CPCVResult",
@@ -64,6 +94,7 @@ __all__ = [
     "FeatureLayerSource",
     "FeaturePanel",
     "Fit",
+    "MetricScaleError",
     "ModelGrade",
     "ModelRecipe",
     "TrainingWindowSpec",
@@ -74,6 +105,7 @@ __all__ = [
     "evaluate_input_completeness",
     "grade_arm",
     "load_model_recipes",
+    "settled_training_days",
     "train_arm",
 ]
 
@@ -97,10 +129,42 @@ DISPERSION_METRICS: tuple[str, ...] = ("alpha_stdev", "stdev_p_up")
 ZERO_VETO_METRICS: tuple[str, ...] = ("n_high_confidence",)
 
 #: Vetoed on falling below an absolute floor, in the metric's own units. This
-#: is the scale-DEPENDENT part by construction: it asserts the metric is a
-#: 0–1 proportion. A producer emitting a percentage would break it loudly at
-#: the first cycle, which is the correct failure.
+#: is the scale-DEPENDENT part by construction, and the scale is ASSERTED
+#: rather than assumed — see :data:`PROPORTION_METRICS`.
 FLOOR_VETO_METRICS: dict[str, float] = {"model_hit_rate_30d": 0.50}
+
+#: Metrics this module declares to be 0–1 proportions, range-checked on BOTH
+#: sides before any floor is applied.
+#:
+#: The comment that used to sit on :data:`FLOOR_VETO_METRICS` claimed "a
+#: producer emitting a percentage would break it loudly at the first cycle,
+#: which is the correct failure". It did the opposite. Measured: the same
+#: model at two scales — `model_hit_rate_30d=0.4` vetoes on "below the
+#: absolute floor 0.5", and `model_hit_rate_30d=40.0` PASSES, because 40.0 is
+#: comfortably above 0.5. A unit-scale error made the veto fail OPEN, which is
+#: the one direction a veto may never fail. An out-of-range value now raises
+#: :class:`MetricScaleError`: it is not a veto (the model may be fine) and not
+#: a pass (nothing was measured) — it is a producer contract violation, and
+#: the fleet default on those is RAISE.
+#:
+#: Only metrics with a DECLARED unit appear here. `alpha_stdev` and
+#: `stdev_p_up` are compared as ratios against the incumbent's value for the
+#: same metric, which is unit-free by construction, so a scale error on those
+#: cancels rather than misreads and there is nothing to assert.
+PROPORTION_METRICS: tuple[str, ...] = ("model_hit_rate_30d",)
+
+
+class MetricScaleError(ValueError):
+    """A metric declared a 0–1 proportion arrived outside [0, 1].
+
+    Raised rather than vetoed or recorded: a producer emitting a percentage
+    where the contract says proportion has broken the contract, and every
+    downstream comparison against an absolute floor is meaningless in a
+    direction that fails OPEN. `champion-challenger-policy.md` §5.1 — you
+    cannot gate on a statistic you did not measure — and the fleet default on
+    a producer contract violation is to raise, not to degrade.
+    """
+
 
 #: The fleet's units-suffix contract (`AGENTS.md`): `avg_volume_20d` was
 #: emitted as a normalized ratio and consumed as raw shares, silently failing
@@ -163,7 +227,14 @@ def evaluate_behavioural_veto(
     Any ``standardized_*`` key present on the inputs is deliberately IGNORED:
     it is carried by producers for reporting, and reading it here would
     reintroduce the exact normalisation policy §5.3 forbids.
+
+    Every metric in :data:`PROPORTION_METRICS` is range-asserted on BOTH sides
+    first and raises :class:`MetricScaleError` when it is outside [0, 1]. A
+    percentage-scaled hit rate used to sail past its own absolute floor.
     """
+    _assert_proportions(candidate, "candidate")
+    _assert_proportions(incumbent, "incumbent")
+
     reasons: list[str] = []
     uncomputable: list[str] = []
     metrics: dict[str, Any] = {}
@@ -212,6 +283,26 @@ def evaluate_behavioural_veto(
     if uncomputable:
         return VetoResult("insufficient", (), tuple(uncomputable), metrics)
     return VetoResult("pass", (), (), metrics)
+
+
+def _assert_proportions(metrics: dict[str, Any], side: str) -> None:
+    """Raise on any :data:`PROPORTION_METRICS` value outside [0, 1]."""
+    for name in PROPORTION_METRICS:
+        value = metrics.get(name)
+        if value is None:
+            # Absence is already handled by the veto itself, which records it
+            # in `uncomputable` and returns `insufficient` — an absent metric
+            # is never a pass. Nothing is swallowed here.
+            continue
+        numeric = float(value)
+        if not (0.0 <= numeric <= 1.0):
+            raise MetricScaleError(
+                f"{side} {name}={value!r} is outside [0, 1], and this module declares it a "
+                "0–1 proportion. A producer emitting a percentage makes the absolute floor "
+                f"{FLOOR_VETO_METRICS.get(name)} meaningless in the failing-OPEN direction: "
+                "measured, hit rate 0.4 vetoes and the same model at 40.0 passes. Fix the "
+                "producer's units; there is no scale this gate infers."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +749,7 @@ class ModelRecipe:
     training_window: TrainingWindowSpec
     cpcv: CPCVSpec
     feature_version: str
+    registered_at: str
     supersedes: str | None = None
     slot: str = "m"
 
@@ -669,10 +761,24 @@ class ModelRecipe:
             raise ValueError("label_horizon_trading_days must be >= 1 (trading days, §4.12)")
         if self.refit_cadence_trading_days < 1:
             raise ValueError("refit_cadence_trading_days must be >= 1 (trading days, §4.12)")
+        try:
+            dt.date.fromisoformat(self.registered_at)
+        except ValueError as exc:
+            raise ValueError(
+                f"arm {self.name!r}: registered_at={self.registered_at!r} is not an ISO date. "
+                "It is the arm's out-of-sample clock (plan §9.1) — the grader refuses to "
+                "score a date before it — so an unparseable one is not a cosmetic defect."
+            ) from exc
 
     @property
     def spec(self) -> dict[str, Any]:
-        """The canonical spec the arm id hashes. Order-independent by key."""
+        """The canonical spec the arm id hashes. Order-independent by key.
+
+        ``registered_at`` is deliberately NOT hashed, exactly as
+        `crucible.slots.arms.ArmSpec.spec` omits it: it says when the arm
+        started accumulating evidence, not what it computes. Hashing it would
+        make re-registering an arm produce a new id and orphan its series.
+        """
         return {
             "features": list(self.features),
             "estimator": self.estimator.to_dict(),
@@ -714,6 +820,10 @@ def load_model_recipes(directory: Path | str) -> tuple[ModelRecipe, ...]:
         payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         spec = payload.get("spec") or {}
         missing = [f for f in REQUIRED_RECIPE_FIELDS if f not in spec]
+        if "registered_at" not in payload:
+            # Top-level, beside `name` and `slot` and outside the hashed
+            # `spec`, mirroring `crucible.slots.arms`. One shape for one fact.
+            missing = [*missing, "registered_at"]
         if missing:
             raise ValueError(
                 f"{path}: recipe is missing pre-registration field(s) {missing}. Plan §9.1: "
@@ -735,6 +845,7 @@ def load_model_recipes(directory: Path | str) -> tuple[ModelRecipe, ...]:
                 training_window=TrainingWindowSpec(**spec["training_window"]),
                 cpcv=CPCVSpec(**spec["cpcv"]),
                 feature_version=str(spec["feature_version"]),
+                registered_at=str(payload["registered_at"]),
                 supersedes=payload.get("supersedes"),
             )
         )
@@ -800,37 +911,93 @@ def _assert_trainable(recipe: ModelRecipe, matrix: np.ndarray, labels: np.ndarra
         )
 
 
+def settled_training_days(panel: FeaturePanel, *, as_of: str, label_horizon: int) -> list[int]:
+    """Panel row indices whose forward label is REALIZED on or before ``as_of``.
+
+    The purge that was missing (plan §4.12; the §6.1 replay gate). A
+    ``label_horizon`` forward return observed on day ``t`` is not known until
+    ``t + label_horizon`` SESSIONS have passed, so a fit dated ``as_of`` that
+    trains on every date ``<= as_of`` consumes returns from after ``as_of``.
+    Every replayed Saturday would then use post-date information, and the
+    replay would reproduce a verdict that could not have been reached on the
+    day — which is the one property a replay gate exists to establish.
+
+    Measured before the fix: a 160-day panel with a 21-day horizon fitted on
+    all 160 dates. It now fits on 139, and the 21 dates whose labels have not
+    settled are excluded rather than banked.
+
+    Sessions are counted on the PANEL's own date axis, never on a calendar:
+    the axis is exactly the sessions the feature layer was compiled for, and
+    a calendar-derived offset would name days the panel does not carry.
+    """
+    if label_horizon < 1:
+        raise ValueError("label_horizon is a count of SESSIONS and is at least one (§4.12)")
+    dates = panel.dates
+    settled: list[int] = []
+    for i, day in enumerate(dates):
+        if day > as_of:
+            continue
+        realized = i + label_horizon
+        if realized < len(dates) and dates[realized] <= as_of:
+            settled.append(i)
+    return settled
+
+
+def _fit_rows(
+    recipe: ModelRecipe, panel: FeaturePanel, day_indices: list[int]
+) -> tuple[np.ndarray, float, int]:
+    """Fit the recipe on the named panel days. Raises on an unsound fit.
+
+    One implementation, three callers — :func:`train_arm`, :func:`_fold_ic`
+    and the walk-forward grader — because a grading path that fits by
+    slightly different code from the serving path is how "the model changed"
+    and "the measurement changed" become indistinguishable.
+    """
+    n_names = len(panel.names)
+    rows = np.array([d * n_names + n for d in day_indices for n in range(n_names)], dtype=int)
+    matrix = _design(recipe, panel, rows)
+    labels = panel.forward_returns.reshape(-1)[rows]
+    _assert_trainable(recipe, matrix, labels)
+    coefficients, intercept = _fit_linear(recipe.estimator, matrix, labels)
+    return coefficients, intercept, int(matrix.shape[0])
+
+
 def train_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> Fit:
     """Fit ``recipe`` on ``panel`` up to ``as_of``. Raises on an unsound fit.
 
     The refit is the arm executing the cadence its own recipe declares: the
     id and the score series are unchanged across it (policy §3.1), which is
     why `fitted_at` is on the :class:`Fit` and not in the arm id.
+
+    The training rows are the SETTLED ones — see
+    :func:`settled_training_days`. `min_trading_days` is measured against the
+    settled count, not the raw one: a window rule satisfied only by rows whose
+    labels do not exist yet is not satisfied.
     """
-    usable = [i for i, d in enumerate(panel.dates) if d <= as_of]
+    usable = settled_training_days(
+        panel, as_of=as_of, label_horizon=recipe.label_horizon_trading_days
+    )
     if len(usable) < recipe.training_window.min_trading_days:
         raise TrainingIntegrityError(
-            f"arm {recipe.name}: {len(usable)} trading day(s) available up to {as_of}, "
-            f"below the recipe's declared min_trading_days="
+            f"arm {recipe.name}: {len(usable)} trading day(s) with a SETTLED "
+            f"{recipe.label_horizon_trading_days}-session label up to {as_of}, below the "
+            f"recipe's declared min_trading_days="
             f"{recipe.training_window.min_trading_days}. The window rule is part of the "
-            "recipe, so a fit on a shorter one is a different arm's fit."
+            "recipe, so a fit on a shorter one is a different arm's fit — and a fit that "
+            f"reached the count by including dates whose labels settle after {as_of} would "
+            "be trained on post-date information."
         )
     if recipe.training_window.kind == "rolling":
         usable = usable[-recipe.training_window.min_trading_days :]
 
-    rows = np.array([d * len(panel.names) + n for d in usable for n in range(len(panel.names))])
-    matrix = _design(recipe, panel, rows)
-    labels = panel.forward_returns.reshape(-1)[rows]
-    _assert_trainable(recipe, matrix, labels)
-
-    coefficients, intercept = _fit_linear(recipe.estimator, matrix, labels)
+    coefficients, intercept, n_rows = _fit_rows(recipe, panel, usable)
     return Fit(
         arm_id=recipe.arm_id,
         recipe=recipe,
         coefficients=coefficients,
         intercept=intercept,
         fitted_at=as_of,
-        n_rows=int(matrix.shape[0]),
+        n_rows=n_rows,
         training_status=TrainingStatus(arm_id=recipe.arm_id, ok=True),
     )
 
@@ -857,10 +1024,6 @@ def _fit_linear(
     coefficients = np.linalg.solve(gram, centred.T @ (labels - label_mean))
     intercept = label_mean - float(centre @ coefficients)
     return coefficients, intercept
-
-
-def _predict(fit: Fit, panel: FeaturePanel, rows: np.ndarray) -> np.ndarray:
-    return _design(fit.recipe, panel, rows) @ fit.coefficients + fit.intercept
 
 
 # ---------------------------------------------------------------------------
@@ -994,6 +1157,18 @@ def cpcv_oos_ic(
                 tuple(folds),
                 n_paths,
             )
+        if ic is None:
+            return CPCVResult(
+                "unmeasurable",
+                (
+                    f"combination {combo} produced no dispersion on one side of the rank "
+                    "correlation — a collapsed prediction or a flat label block cannot be "
+                    "ranked, and an unrankable fold is not a zero IC"
+                ),
+                (),
+                tuple(folds),
+                n_paths,
+            )
         ics.append(ic)
 
     return CPCVResult("ok", "", tuple(ics), tuple(folds), n_paths)
@@ -1005,37 +1180,85 @@ def _flatten(day_idx: np.ndarray, n_names: int) -> np.ndarray:
 
 def _fold_ic(
     panel: FeaturePanel, recipe: ModelRecipe, train_idx: np.ndarray, test_idx: np.ndarray
-) -> float:
+) -> float | None:
+    """One fold's out-of-sample rank IC, or ``None`` when it cannot be ranked."""
     n_names = len(panel.names)
-    train_rows = _flatten(train_idx, n_names)
+    coefficients, intercept, _ = _fit_rows(recipe, panel, [int(i) for i in train_idx])
     test_rows = _flatten(test_idx, n_names)
-    matrix = _design(recipe, panel, train_rows)
-    labels = panel.forward_returns.reshape(-1)[train_rows]
-    _assert_trainable(recipe, matrix, labels)
-    coefficients, intercept = _fit_linear(recipe.estimator, matrix, labels)
     predicted = _design(recipe, panel, test_rows) @ coefficients + intercept
     actual = panel.forward_returns.reshape(-1)[test_rows]
     return _rank_ic(predicted, actual)
 
 
-def _rank_ic(predicted: np.ndarray, actual: np.ndarray) -> float:
-    """Spearman rank IC. Zero when either side has no dispersion to rank."""
+def _rank_ic(predicted: np.ndarray, actual: np.ndarray) -> float | None:
+    """Spearman rank IC over AVERAGE ranks, or ``None`` when unmeasurable.
+
+    ``None`` is an explicit verdict, not a swallowed failure: it means one
+    side of the comparison has no dispersion, so there is no ordering to
+    correlate. Every call site handles it by name — :func:`cpcv_oos_ic` turns
+    it into an ``unmeasurable`` result and :func:`grade_arm` records the date
+    as a MISS on the arm's series. Neither substitutes a number, because "the
+    cross-section could not be ranked" and "the model ranked it at zero skill"
+    are different facts and only one of them is a grade.
+
+    **Ties are averaged** (mid-ranks), which is what `scipy.stats.spearmanr`
+    does and what the lifted `training/leakfree_meta_ic.py` therefore did.
+    The lift replaced it with an argsort, which hands tied values distinct
+    ranks in index order — an ordering invented by the sort, not present in
+    the data. Measured on the argsort form:
+
+    * two flat vectors scored ``+1.0``, against a docstring claiming ``0.0``;
+    * a collapsed model emitting one constant ``predicted_alpha`` scored
+      ``+1.0`` on a flat day — the grader awarding a perfect score to exactly
+      the condition the behavioural veto exists to refuse;
+    * 45 of 50 names tied scored ``-0.4558`` where the mid-rank Spearman is
+      ``-0.1043``, a sign-preserving but four-fold error driven entirely by
+      ticker order.
+
+    Implemented in numpy rather than by adding `scipy`. The fleet rule is to
+    mirror the SOTA pattern that already exists rather than invent a parallel
+    one, and mid-ranking IS that pattern — but the pattern is the statistic,
+    not the wheel. `scipy` is a large compiled dependency this repository does
+    not otherwise need, on the cold start of every job, for one function of
+    twelve lines whose result is asserted here against hand-computed
+    mid-rank values. Adding it would also make the M slot's grade depend on a
+    transitive numpy ABI pin that `pyproject.toml` deliberately floors.
+    """
+    if predicted.size != actual.size:
+        raise ValueError(
+            f"rank IC needs paired vectors; got {predicted.size} predicted and "
+            f"{actual.size} actual. A length mismatch here is a panel-indexing defect, "
+            "not something to align away."
+        )
     if predicted.size < 2:
-        return 0.0
+        return None
     pr = _ranks(predicted)
     ar = _ranks(actual)
     pr = pr - pr.mean()
     ar = ar - ar.mean()
     denom = float(np.sqrt((pr * pr).sum() * (ar * ar).sum()))
     if denom == 0.0:
-        return 0.0
+        return None
     return float((pr * ar).sum() / denom)
 
 
 def _ranks(values: np.ndarray) -> np.ndarray:
-    order = values.argsort()
-    ranks = np.empty_like(order, dtype=float)
-    ranks[order] = np.arange(values.size, dtype=float)
+    """Average (mid-)ranks: every member of a tied block gets the block mean.
+
+    A group of ``k`` equal values occupying sorted positions ``i .. i+k-1``
+    all receive ``(i + i+k-1) / 2``. With no ties this is identical to the
+    argsort form it replaces, so the untied paths of the grader are
+    unchanged; with ties it is the only form under which a constant vector
+    has zero dispersion and is therefore correctly unrankable.
+    """
+    order = np.argsort(values, kind="stable")
+    ordered = np.asarray(values, dtype="float64")[order]
+    ranks = np.empty(ordered.size, dtype="float64")
+    start = 0
+    for end in range(1, ordered.size + 1):
+        if end == ordered.size or ordered[end] != ordered[start]:
+            ranks[order[start:end]] = 0.5 * (start + end - 1)
+            start = end
     return ranks
 
 
@@ -1044,39 +1267,167 @@ def _ranks(values: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+#: A per-date score is only produced from a fit that never saw that date's
+#: label. This names the mechanism in the artifact so a reader of a verdict
+#: does not have to infer it from the code that produced it.
+OOS_METHOD = "walk_forward_purged"
+
+
 @dataclass(frozen=True)
 class ModelGrade:
-    """One arm's cycle grade: the series, the CPCV battery, the fit."""
+    """One arm's cycle grade: the OOS series, the CPCV battery, the fit.
+
+    ``series`` is the number the arena pairs on and the pointer is therefore
+    decided by, and every date in it is OUT-OF-SAMPLE (see :func:`grade_arm`).
+    ``status`` is ``ok`` or ``unmeasurable``; an arm with too little
+    out-of-sample history carries ``unmeasurable``, an empty series and a
+    ``reason``, and is never handed a backfilled one.
+
+    **There is deliberately no pooled figure on this object** (plan §9.1: "the
+    grader refuses to report a single pooled figure"). ``oos_n`` and
+    ``in_sample_n`` are reported separately, and a caller that wants a summary
+    states which population it is summarising. A single mean across an
+    in-sample warm-up and an out-of-sample window is a number no decision can
+    legitimately be taken on, and the way it gets taken anyway is by existing.
+    """
 
     series: ArmSeries
     cpcv: CPCVResult
     fit: Fit
+    status: str
+    reason: str
+    oos_start: str
+    oos_n: int
+    in_sample_n: int
+    unrankable_dates: tuple[str, ...] = ()
+    oos_method: str = OOS_METHOD
     benchmark: str = "population"
+
+    def __post_init__(self) -> None:
+        if self.status not in ("ok", "unmeasurable"):
+            raise ValueError(f"ModelGrade.status must be ok|unmeasurable; got {self.status!r}")
+        if self.status == "unmeasurable" and not self.reason:
+            raise ValueError(
+                "an unmeasurable grade must carry the reason it could not be measured; "
+                "an unexplained absence is indistinguishable from a producer that never ran"
+            )
 
 
 def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelGrade:
-    """Score ``recipe`` per trading day against the population it scored.
+    """Score ``recipe`` per trading day, OUT-OF-SAMPLE, against the population.
 
     The per-date score is the cross-sectional rank IC of that day's
     predictions against that day's realized forward return — the scored
     cross-section IS the benchmark, which is why M declares `population`
     rather than SPY. The engine then pairs these series across arms; nothing
     here computes a comparison.
+
+    **What changed, and why it had to** (plan §9.1, the out-of-sample clock).
+    This function used to fit ONCE on every date ``<= as_of`` and then score
+    those same dates with that fit. The series the arena paired on — and so
+    the series the champion pointer was decided by — was therefore in-sample,
+    and the only out-of-sample number on this object, ``cpcv``, was consumed
+    by nothing on the promotion path. Measured on 40 pure-noise features over
+    a pure-noise label: the in-sample series read ``+0.0728`` mean IC while
+    CPCV OOS read ``-0.0214``, and a 40-feature arm beat a 3-feature arm
+    ``0.0728`` vs ``0.0118`` on data containing no signal at all. The slot was
+    ranking capacity to overfit and calling it edge. Exposing ``cpcv``
+    alongside the in-sample series would not have fixed it: the number the
+    pointer reads is the one that has to change.
+
+    **The construction.** Walking forward over the panel's own session axis:
+
+    * the window opens at ``max(recipe.registered_at, first date with a full
+      settled training window)`` — an arm accumulates evidence from
+      registration, never before it, so a three-day-old arm cannot be handed a
+      120-date track record;
+    * a day is scored by a fit trained only on days whose labels had SETTLED
+      by that day (:func:`settled_training_days`), which is the purge — the
+      day's own label, and the ``label_horizon`` days before it whose labels
+      overlap it, are outside the fit;
+    * refits happen on the recipe's declared ``refit_cadence_trading_days``,
+      which is the cadence the arm actually runs at; a fit carried forward
+      between refits is older than the day it scores and so still strictly
+      out-of-sample.
+
+    **Nothing is backfilled.** Too little OOS history is ``status ==
+    "unmeasurable"`` with an empty series and a reason. A day whose
+    cross-section cannot be ranked — a collapsed constant prediction, a flat
+    label block — is a MISS on the series (`ArmSeries.misses`), which the
+    engine excludes from every window, because "unrankable" is not "zero
+    skill".
     """
     fit = train_arm(recipe, panel, as_of=as_of)
-    scores: dict[str, float] = {}
+    horizon = recipe.label_horizon_trading_days
+    cadence = recipe.refit_cadence_trading_days
+    minimum = recipe.training_window.min_trading_days
     n_names = len(panel.names)
-    for i, day in enumerate(panel.dates):
-        if day > as_of:
+
+    scorable = [i for i, day in enumerate(panel.dates) if day <= as_of]
+    in_sample_n = 0
+    scores: dict[str, float] = {}
+    unrankable: list[str] = []
+    coefficients: np.ndarray | None = None
+    intercept = 0.0
+    last_refit: int | None = None
+
+    for i in scorable:
+        day = panel.dates[i]
+        train_days = settled_training_days(panel, as_of=day, label_horizon=horizon)
+        if recipe.training_window.kind == "rolling":
+            train_days = train_days[-minimum:]
+        if len(train_days) < minimum:
+            # Warm-up: the arm has no fit that could have existed on this day.
+            # Counted and reported as `in_sample_n`, never scored — the count
+            # is what makes "OOS N = 4" legible beside "panel N = 160".
+            in_sample_n += 1
             continue
+        if day < recipe.registered_at:
+            # Before registration the arm did not exist to be scored. Plan
+            # §9.1: the OOS window BEGINS at registration, so these dates are
+            # training substrate and nothing else.
+            in_sample_n += 1
+            continue
+        if coefficients is None or last_refit is None or (i - last_refit) >= cadence:
+            coefficients, intercept, _ = _fit_rows(recipe, panel, train_days)
+            last_refit = i
         rows = i * n_names + np.arange(n_names)
-        predicted = _predict(fit, panel, rows)
+        predicted = _design(recipe, panel, rows) @ coefficients + intercept
         actual = panel.forward_returns.reshape(-1)[rows]
-        scores[day] = _rank_ic(predicted, actual)
+        ic = _rank_ic(predicted, actual)
+        if ic is None:
+            unrankable.append(day)
+            continue
+        scores[day] = ic
+
     cpcv = cpcv_oos_ic(
         panel,
         recipe=recipe,
         cpcv=recipe.cpcv,
         label_horizon_trading_days=recipe.label_horizon_trading_days,
     )
-    return ModelGrade(series=ArmSeries(arm_id=fit.arm_id, scores=scores), cpcv=cpcv, fit=fit)
+    oos_start = min(scores) if scores else recipe.registered_at
+    if scores:
+        status, reason = "ok", ""
+    else:
+        status = "unmeasurable"
+        reason = (
+            f"arm {recipe.name!r} has no out-of-sample date up to {as_of}: its window opens "
+            f"at registered_at={recipe.registered_at} and needs "
+            f"{minimum} settled training day(s) at a {horizon}-session label horizon before "
+            f"its first score. {in_sample_n} panel date(s) fell in the warm-up and "
+            f"{len(unrankable)} could not be ranked. An arm with no out-of-sample history "
+            "gets no series — a backfilled one is what let a three-day-old arm carry a "
+            "120-date track record past `promote_min_weeks` (plan §9.1)."
+        )
+    return ModelGrade(
+        series=ArmSeries(arm_id=fit.arm_id, scores=scores, misses=frozenset(unrankable)),
+        cpcv=cpcv,
+        fit=fit,
+        status=status,
+        reason=reason,
+        oos_start=oos_start,
+        oos_n=len(scores),
+        in_sample_n=in_sample_n,
+        unrankable_dates=tuple(unrankable),
+    )
