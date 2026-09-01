@@ -14,9 +14,28 @@ Written before `crucible/slots/__init__.py` and seen failing.
 from __future__ import annotations
 
 import pytest
+from nousergon_lib.arena.arms import derive_arm_id
 from nousergon_lib.arena.engine import ArenaConfig, ArenaConfigError
 
-from crucible.slots import SLOTS, SlotSpec, arena_config_for, get_slot, promotable_arms
+from crucible.slots import (
+    SLOTS,
+    SlotSpec,
+    arena_config_for,
+    get_slot,
+    is_control_arm,
+    promotable_arms,
+)
+
+
+def _registered_id(slot: str, name: str) -> str:
+    """The id this arm carries once it is in the register.
+
+    `nousergon_lib.arena.derive_arm_id` is called rather than a hand-written
+    string, so a change to the id format cannot leave these tests asserting
+    against a shape the fleet stopped producing — which is exactly how the
+    control-arm exclusion came to be tested only on inputs it never saw.
+    """
+    return derive_arm_id(slot, name, {"name": name})
 
 
 class TestRegistry:
@@ -94,18 +113,59 @@ class TestControlArms:
     def test_control_arms_are_excluded_from_the_pointer(self) -> None:
         """A control arm scored beside the real arms must never be promoted
         to serve. The planted arm looks at next-period returns; promoting it
-        would be a look-ahead in production."""
+        would be a look-ahead in production.
+
+        **Written against the id form the register actually holds** (plan §11
+        risk 1). This test previously fed BARE names — `control_planted_r`,
+        `arm_real_a` — into `promotable_arms`, and passed for years against a
+        filter that could not match a single registered arm: a registered id
+        is `derive_arm_id`'s `{slot}:{name}:{spec_hash}`, and the exclusion
+        compared it against the bare literal. A test that can only pass on a
+        shape the production path never produces is the shape of a test that
+        cannot fail (`alpha-engine-config-I9757`, F4).
+        """
         spec = get_slot("r")
-        arms = [c.arm_id for c in spec.control_arms] + ["arm_real_a", "arm_real_b"]
-        assert promotable_arms(spec, arms) == ["arm_real_a", "arm_real_b"]
+        controls = [_registered_id("r", c.arm_id) for c in spec.control_arms]
+        real = [_registered_id("r", n) for n in ("arm_real_a", "arm_real_b")]
+        assert all(":" in arm and len(arm.split(":")) == 3 for arm in controls + real)
+
+        assert promotable_arms(spec, controls + real) == real
+
+    def test_the_exclusion_matches_the_real_registered_id_not_the_literal(self) -> None:
+        """The half of F4 that made the filter inert wherever it was called.
+
+        `ControlArm.arm_id` carries the bare NAME, because that is what
+        `crucible.slots.arms.control_specs` hands to `derive_arm_id` as the
+        recipe's name. Everything downstream — the register, the score
+        series, the pointer — speaks the hashed id. The exclusion therefore
+        has to bind on the name COMPONENT.
+        """
+        spec = get_slot("m")
+        literal = spec.control_arms[0].arm_id
+        registered = _registered_id("m", literal)
+
+        assert registered != literal
+        assert registered.split(":")[1] == literal
+        assert is_control_arm(spec, registered)
+        assert is_control_arm(spec, literal)
+        assert promotable_arms(spec, [registered]) == []
+
+    def test_an_unparseable_arm_id_is_refused_not_reported_as_a_non_control(self) -> None:
+        """Fail loud: silently answering "not a control" for an id shape the
+        filter does not understand is F4 inverted — the look-ahead arm
+        reaches the pointer through the case nobody handled."""
+        spec = get_slot("m")
+        for bad in ("m:control_planted_m", "m:control_planted_m:hash:extra", "m::hash"):
+            with pytest.raises(ValueError, match="arm_id"):
+                is_control_arm(spec, bad)
 
     def test_control_arms_do_not_consume_the_cap(self) -> None:
         """The cap of 5 is a RETIREMENT criterion over competing arms. If the
         two controls counted against it, every slot would start two arms into
         its own retirement pressure and the cap would mean 3, not 5."""
         spec = get_slot("r")
-        controls = [c.arm_id for c in spec.control_arms]
-        real = [f"arm_{i}" for i in range(5)]
+        controls = [_registered_id("r", c.arm_id) for c in spec.control_arms]
+        real = [_registered_id("r", f"arm_{i}") for i in range(5)]
         assert len(promotable_arms(spec, controls + real)) == spec.arena.cap
 
     def test_a_control_arm_cannot_be_registered_without_the_flag(self) -> None:

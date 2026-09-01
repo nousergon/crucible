@@ -27,6 +27,13 @@ artifacts every time it is called:
 Both raise :class:`ChampionUnusableError`. Neither returns ``None``: a
 consumer that cannot distinguish "no champion" from "a champion I must not
 serve" would trade the second one.
+
+**And the WRITE is conditional.** One key per slot, several actors that may
+write it (the weekly promote job, an operator revert, a replay), so
+:func:`write_champion` is a compare-and-swap against a version token the
+caller read (:func:`read_champion_etag`) rather than an unconditional PUT.
+A losing writer raises and its run fails; it never retries into a clobber.
+See that function for why a conflict is a failure rather than a retry.
 """
 
 from __future__ import annotations
@@ -49,6 +56,7 @@ __all__ = [
     "ChampionUnusableError",
     "champion_key",
     "read_champion",
+    "read_champion_etag",
     "write_champion",
 ]
 
@@ -192,12 +200,52 @@ class ChampionPointer:
         )
 
 
-def write_champion(store: Store, pointer: ChampionPointer) -> str:
-    """Write ``pointer`` at its slot's key. Returns the content hash.
+def read_champion_etag(store: Store, slot: str) -> str:
+    """The version token to hand :func:`write_champion` as ``expected``.
+
+    Read this **before** the value the decision is taken against, never
+    after. If the pointer changes between the two reads, an etag captured
+    first is older than the bytes in hand and the conditional write fails —
+    which is the safe direction. Captured second, it would be *newer* than
+    the bytes in hand, and the write would sail through and overwrite a
+    pointer this process never looked at.
+
+    Returns :data:`~crucible.store.ETAG_ABSENT` when no pointer exists,
+    which is the create case and goes through the same code path.
+    """
+    return store.etag(champion_key(slot))
+
+
+def write_champion(store: Store, pointer: ChampionPointer, *, expected: str) -> str:
+    """Conditionally write ``pointer`` at its slot's key; return the new version.
 
     Validated on the way out as well as on the way in: a writer that could
     emit a non-conformant pointer would defeat the schema, and the trader
     would discover it at market open.
+
+    **A compare-and-swap, not a put, and ``expected`` is required rather than
+    defaulted.** `champions/{slot}/current.json` is one object per slot
+    written by more than one actor — the weekly promote job, an operator
+    revert, a replay — and an unconditional PUT gives the verdict to whichever
+    writer finished last rather than to the one that checked. That is the
+    fleet's dominant bug class (one key per cycle, several executions,
+    last-writer-wins), and it is silent: the losing decision vanishes with no
+    error and no record. A default of "whatever is there now" would restore
+    exactly that, which is why the caller must produce a token it actually
+    read (:func:`read_champion_etag`).
+
+    **What a conflict MEANS, decided deliberately: the losing writer FAILS.**
+    A pointer decision is computed against a specific incumbent — the arm the
+    key named when the cycle started. If the key moved underneath, the
+    premise of the decision is gone, and the two available alternatives are
+    both wrong: retrying the write would clobber a decision somebody else
+    just published (the very failure the conditional PUT exists to prevent),
+    and re-deciding in place would publish a verdict reached against inputs
+    nobody recorded. So :class:`~crucible.store.PointerConflictError`
+    propagates to the caller, the run fails, its manifest says so, and the
+    next cycle re-reads and decides afresh from a premise that is true.
+    Losing a race is a first-class, reportable outcome here; it is never a
+    reason to write anyway.
     """
     payload = pointer.to_dict()
     errors = sorted(_validator().iter_errors(payload), key=lambda e: list(e.absolute_path))
@@ -207,8 +255,9 @@ def write_champion(store: Store, pointer: ChampionPointer) -> str:
             for e in errors
         )
         raise ValueError(f"refusing to write a non-conformant champion pointer:\n{detail}")
-    return store.put_bytes(
+    return store.compare_and_swap(
         champion_key(pointer.slot),
+        expected,
         json.dumps(payload, indent=2, sort_keys=True).encode("utf-8"),
     )
 

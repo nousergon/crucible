@@ -422,3 +422,501 @@ def _decide(spec, register, ids, dates, *, champ, chal, incumbent="champ"):
             ids["chal"]: series(ids["chal"], dates, chal),
         },
     )
+
+
+# --------------------------------------------------------------------------
+# F3: the retirement reaches the REGISTER, not only the event log.
+# --------------------------------------------------------------------------
+
+
+def seed_register(store: LocalStore, slot: str, register: ArmRegister) -> None:
+    """Put ``register``'s event log where `load_slot_inputs` reads it.
+
+    The retirement is appended to the same document the next cycle folds, so
+    a test that kept the register only in memory would be asserting against
+    a store the production path never has.
+    """
+    from crucible.keys import arm_register_key
+
+    store.put_bytes(
+        arm_register_key(slot),
+        b"".join(json.dumps(e, sort_keys=True).encode() + b"\n" for e in register.to_dicts()),
+    )
+
+
+def seed_series(store: LocalStore, slot: str, series_by_arm: dict) -> None:
+    """Put every arm's score series where `load_slot_inputs` reads it.
+
+    Written for every arm, retired ones included: policy §3 keeps a retired
+    arm scored for its trailing window, and the loader refuses a registered
+    arm with no series rather than silently presenting a smaller cohort.
+    """
+    from crucible.promote import arm_series_key
+
+    for arm_id, arm_series in series_by_arm.items():
+        store.put_bytes(
+            arm_series_key(slot, arm_id),
+            json.dumps({"arm_id": arm_id, "scores": arm_series.scores, "misses": []}).encode(),
+        )
+
+
+def four_arm_slot(store: LocalStore, dates: list[str]):
+    """A cap-2, grace-1 slot where one arm is beaten by three.
+
+    The engine's Condorcet rule (policy §6.1/§6.2) then returns a RETIRE
+    verdict, which is the precondition for the defect: before this fix the
+    verdict was written to `retirements/m/events.jsonl` and to the
+    EXPERIMENTS feed, and to nothing any later cycle reads.
+    """
+    spec = replace(get_slot("m"), cap=2, grace_weeks=1, min_active_arms=2, diff_clip=0.01)
+    names = ["a", "b", "c", "loser"]
+    reg, ids = register_with("m", names, dates[0])
+    seed_register(store, "m", reg)
+    scores = {"a": 0.05, "b": 0.04, "c": 0.03, "loser": -0.05}
+    series_by_arm = {ids[n]: series(ids[n], dates, scores[n]) for n in names}
+    seed_series(store, "m", series_by_arm)
+    return spec, reg, ids, series_by_arm
+
+
+class TestRetirementReachesTheRegister:
+    """F3 (`alpha-engine-config-I9757`).
+
+    Reproduced against the unfixed code with cap=2, grace_weeks=1 and one arm
+    beaten by three: the engine said RETIRE, the keys written were the arena
+    cycle, the retirement event log and the experiments log — and
+    `arms/m/register.jsonl` was not among them. `ArmRegister.retire()` was
+    called nowhere in `crucible/` or `tests/`. Because `load_slot_inputs`
+    rebuilds the register from that log, the retired arm was fully active the
+    next cycle, was re-retired every week forever, `retired_trailing_cycles`
+    never started counting, and `revert_champion`'s `retired_date is not
+    None` guard could never fire.
+    """
+
+    def test_a_retired_arm_is_absent_from_active_arms_next_cycle(self, tmp_path) -> None:
+        from crucible.promote import load_slot_inputs
+
+        store = LocalStore(tmp_path)
+        dates = trading_days(40)
+        spec, reg, ids, series_by_arm = four_arm_slot(store, dates)
+
+        result = run_promotion(
+            spec=spec,
+            as_of=dates[-1],
+            register=reg,
+            series_by_arm=series_by_arm,
+            incumbent=ids["a"],
+            store=store,
+        )
+        retired = {v.arm_id for v in result.cycle.retirements if v.retire}
+        assert retired, "the fixture must actually produce a retirement to be a test of one"
+        assert "arms/m/register.jsonl" in result.keys_written
+
+        next_cycle = load_slot_inputs(store, "m").register
+        for arm in retired:
+            assert arm not in next_cycle.active_arms(), (
+                "policy §6: a retirement the register never records is re-decided "
+                "every cycle forever and removes the arm from nothing"
+            )
+            state = next_cycle.state(arm)
+            assert state.retired_date == dates[-1], "§6.3: retired_date is a queryable fact"
+            assert state.retired_reason
+
+    def test_re_running_the_same_cycle_does_not_double_retire(self, tmp_path) -> None:
+        """The runner retries a transient failure by re-entering the whole
+        job. A second `retired` event for one arm does not merely duplicate a
+        line — `ArmRegister._fold` raises `ImmutableArmError` on it, so the
+        slot would be unloadable from the next cycle onward."""
+        from crucible.promote import load_slot_inputs
+
+        store = LocalStore(tmp_path)
+        dates = trading_days(40)
+        spec, reg, ids, series_by_arm = four_arm_slot(store, dates)
+        args = dict(
+            spec=spec,
+            as_of=dates[-1],
+            register=reg,
+            series_by_arm=series_by_arm,
+            incumbent=ids["a"],
+            store=store,
+        )
+        run_promotion(**args)
+        first = store.get_bytes("arms/m/register.jsonl").decode()
+        run_promotion(**args)  # the re-entered pass, holding the SAME stale register
+        second = store.get_bytes("arms/m/register.jsonl").decode()
+
+        assert second == first, "a re-entered pass appends nothing it already appended"
+        load_slot_inputs(store, "m")  # folds without raising
+
+    def test_a_retired_arm_is_still_scored_for_its_trailing_window(self, tmp_path) -> None:
+        """Policy §3/§6.3: retirement removes an arm from the ACTIVE pool and
+        from the cap; it does not stop it being measured, or "we retired the
+        wrong one" stops being detectable."""
+        from crucible.promote import load_slot_inputs
+
+        store = LocalStore(tmp_path)
+        dates = trading_days(40)
+        spec, reg, ids, series_by_arm = four_arm_slot(store, dates)
+        run_promotion(
+            spec=spec,
+            as_of=dates[-1],
+            register=reg,
+            series_by_arm=series_by_arm,
+            incumbent=ids["a"],
+            store=store,
+        )
+        after = load_slot_inputs(store, "m").register
+        retired = [a for a in after.all_arms() if not after.state(a).active]
+        assert retired
+        scored = after.scored_arms(dates[-1], spec.retired_trailing_cycles)
+        assert set(retired) <= set(scored)
+
+
+# --------------------------------------------------------------------------
+# F4: a control arm never reaches `champions/{slot}/current.json`.
+# --------------------------------------------------------------------------
+
+
+class TestControlArmsNeverServe:
+    """F4 (`alpha-engine-config-I9757`).
+
+    Reproduced against the unfixed code by registering `control_planted_m`
+    with the best series in the slot: the decision came back `decided
+    moved=True`, the champion was the planted control, and the pointer was
+    written as `m:control_planted_m:7e8059f49558`. The planted control reads
+    next-period returns by construction (plan §10.1), so this put a
+    look-ahead arm on the single contract the trader reads.
+
+    Two defects stacked. `_write_pointer_if_moved` never called
+    `promotable_arms` at all — its only call site was a reported field on the
+    cycle artifact, not an exclusion — and `promotable_arms` matched the
+    `ControlArm.arm_id` literal against a registered `derive_arm_id` hash
+    form, so it could not have matched even where it was called.
+    """
+
+    def _slot_with_a_winning_control(self, dates: list[str]):
+        """The planted control OUT-SCORES both real arms, and the better real
+        arm has a supported lead of its own.
+
+        Both halves matter. Without the first, the fixture never puts the
+        control in front and the exclusion is never exercised — measured:
+        with the control on 0.045 and `real_b` on 0.01 the engine held on
+        `real_a` either way, and the test passed against the unfixed code.
+        Without the second, removing the control would leave nothing to
+        promote, and "the pointer is not the control" would be satisfied by a
+        slot that promoted nobody.
+        """
+        spec = get_slot("m")
+        control = spec.control_arms[0].arm_id  # control_planted_m
+        reg, ids = register_with("m", ["real_a", "real_b", control], dates[0])
+        series_by_arm = {
+            ids["real_a"]: series(ids["real_a"], dates, 0.0),
+            ids["real_b"]: series(ids["real_b"], dates, 0.04),
+            ids[control]: series(ids[control], dates, 0.045),
+        }
+        return spec, reg, ids, control, series_by_arm
+
+    def test_the_promotion_path_never_writes_a_control_as_champion(self, tmp_path) -> None:
+        from crucible.champion import champion_key
+
+        store = LocalStore(tmp_path)
+        dates = trading_days(40)
+        spec, reg, ids, control, series_by_arm = self._slot_with_a_winning_control(dates)
+        seed_register(store, "m", reg)
+
+        result = run_promotion(
+            spec=spec,
+            as_of=dates[-1],
+            register=reg,
+            series_by_arm=series_by_arm,
+            incumbent=ids["real_a"],
+            store=store,
+        )
+
+        assert result.decision.champion != ids[control]
+        assert result.decision.champion == ids["real_b"], (
+            "the control is barred from SERVING only; the best real arm still wins"
+        )
+        pointer = json.loads(store.get_bytes(champion_key("m")))
+        assert pointer["arm_id"] == ids["real_b"]
+        assert pointer["arm_id"] != ids[control]
+
+    def test_the_control_is_vetoed_at_the_decision_and_the_reason_is_recorded(
+        self, tmp_path
+    ) -> None:
+        """Excluded at the decision rather than at the write, so the artifact
+        says WHY the control did not serve. A writer that silently declined
+        would leave every artifact recording a promotion that did not
+        happen — policy §7.2's dominant bug class, self-inflicted."""
+        store = LocalStore(tmp_path)
+        dates = trading_days(40)
+        spec, reg, ids, control, series_by_arm = self._slot_with_a_winning_control(dates)
+        seed_register(store, "m", reg)
+
+        cycle = run_promotion(
+            spec=spec,
+            as_of=dates[-1],
+            register=reg,
+            series_by_arm=series_by_arm,
+            incumbent=ids["real_a"],
+            store=store,
+        ).cycle
+
+        assert ids[control] in cycle.decision.ineligible
+        vetoes = cycle.decision.ineligible[ids[control]]
+        assert any(v.name == "not_a_control_arm" and not v.passed for v in vetoes)
+        assert any("next-period returns" in v.reason for v in vetoes)
+
+    def test_the_control_is_still_scored_and_laddered(self, tmp_path) -> None:
+        """§10.1: a control's whole purpose is being graded beside the real
+        arms. Barring it from serving must not bar it from measurement, or
+        the grader-integrity check it exists for stops running."""
+        store = LocalStore(tmp_path)
+        dates = trading_days(40)
+        spec, reg, ids, control, series_by_arm = self._slot_with_a_winning_control(dates)
+        seed_register(store, "m", reg)
+
+        cycle = run_promotion(
+            spec=spec,
+            as_of=dates[-1],
+            register=reg,
+            series_by_arm=series_by_arm,
+            incumbent=ids["real_a"],
+            store=store,
+        ).cycle
+
+        assert ids[control] in cycle.scored_arms
+        assert ids[control] in {ladder.arm_id for ladder in cycle.ladders}
+
+    def test_a_caller_supplied_precondition_is_kept_alongside_the_control_veto(
+        self, tmp_path
+    ) -> None:
+        """An arm can fail more than one gate. Replacing the caller's checks
+        with the control veto would hide a behavioural veto (§5.3) behind a
+        control flag."""
+        store = LocalStore(tmp_path)
+        dates = trading_days(40)
+        spec, reg, ids, control, series_by_arm = self._slot_with_a_winning_control(dates)
+        seed_register(store, "m", reg)
+
+        cycle = run_promotion(
+            spec=spec,
+            as_of=dates[-1],
+            register=reg,
+            series_by_arm=series_by_arm,
+            incumbent=ids["real_a"],
+            store=store,
+            preconditions={
+                ids[control]: (
+                    ServingPrecondition(name="behavioural_veto", passed=False, reason="collapsed"),
+                )
+            },
+        ).cycle
+
+        names = {v.name for v in cycle.decision.ineligible[ids[control]]}
+        assert names == {"behavioural_veto", "not_a_control_arm"}
+
+    def test_the_writer_refuses_a_control_even_if_the_decision_names_one(self, tmp_path) -> None:
+        """The guard on the write itself. It is unreachable while the
+        decision-layer exclusion holds, and it is what makes the failure loud
+        rather than a pointer silently left on the previous arm if that
+        exclusion is ever removed."""
+        from crucible.promote import _write_pointer_if_moved
+        from crucible.store import ETAG_ABSENT
+
+        store = LocalStore(tmp_path)
+        dates = trading_days(40)
+        spec, reg, ids, control, series_by_arm = self._slot_with_a_winning_control(dates)
+        seed_register(store, "m", reg)
+
+        cycle = run_promotion(
+            spec=spec,
+            as_of=dates[-1],
+            register=reg,
+            series_by_arm=series_by_arm,
+            incumbent=ids["real_a"],
+        ).cycle
+        forged = replace(
+            cycle,
+            decision=replace(cycle.decision, champion=ids[control], moved=True, status="decided"),
+        )
+        with pytest.raises(PromotionRefused, match="control arm"):
+            _write_pointer_if_moved(
+                store=store,
+                spec=spec,
+                cycle=forged,
+                expected=ETAG_ABSENT,
+                manifest_key=None,
+                run_id=None,
+                code_sha=None,
+                attestation=None,
+                now=None,
+            )
+
+
+# --------------------------------------------------------------------------
+# F6 on the promotion path, and the re-entrancy of the append helper.
+# --------------------------------------------------------------------------
+
+
+class TestPointerWriteIsConditional:
+    def test_a_cycle_decided_against_a_moved_pointer_fails_loudly(self, tmp_path) -> None:
+        """The pointer moved between the read the decision rests on and the
+        write. Publishing anyway would clobber whatever moved it; retrying
+        would publish a verdict reached against inputs nobody recorded. So
+        the run fails and the next cycle decides from a premise that is
+        true."""
+        from crucible.champion import ChampionPointer, read_champion_etag, write_champion
+        from crucible.store import PointerConflictError
+
+        store = LocalStore(tmp_path)
+        dates = trading_days(40)
+        spec = narrow(get_slot("m"))
+        reg, ids = register_with("m", ["champ", "chal"], dates[0])
+        seed_register(store, "m", reg)
+        stale = read_champion_etag(store, "m")
+
+        # Another writer publishes between our read and our write.
+        write_champion(
+            store,
+            ChampionPointer(
+                slot="m",
+                arm_id=ids["champ"],
+                as_of=dates[-1],
+                decided_at="2026-08-28T12:00:00Z",
+                run_id="0" * 26,
+                code_sha="0" * 40,
+                promotion_source="operator_bootstrap",
+                manifest_key=f"runs/promote/{dates[-1]}/run.json",
+                evidence={"operator": "cipher813", "reason": "concurrent revert"},
+            ),
+            expected=read_champion_etag(store, "m"),
+        )
+
+        with pytest.raises(PointerConflictError):
+            run_promotion(
+                spec=spec,
+                as_of=dates[-1],
+                register=reg,
+                series_by_arm={
+                    ids["champ"]: series(ids["champ"], dates, 0.0),
+                    ids["chal"]: series(ids["chal"], dates, 0.01),
+                },
+                incumbent=ids["champ"],
+                store=store,
+                pointer_etag=stale,
+            )
+
+
+class TestAppendIsIdempotent:
+    """The reviewer's unverified suspicion, confirmed: `_append_events` is a
+    read-modify-write, and `crucible.runner.run_job` retries a declared
+    transient class by re-running the job body from the top. A first pass
+    that wrote the retirement log and then hit an S3 throttle on the
+    experiments write left both to be appended again on the retry, doubling
+    every row of the first. "Single writer per slot per cycle" is a claim
+    about concurrency and says nothing about re-entrancy.
+    """
+
+    def test_re_entering_a_cycle_does_not_duplicate_its_events(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        dates = trading_days(40)
+        spec = narrow(get_slot("m"))
+        names = ["a", "b", "c"]
+        reg, ids = register_with("m", names, dates[0])
+        seed_register(store, "m", reg)
+        args = dict(
+            spec=spec,
+            as_of=dates[-1],
+            register=reg,
+            series_by_arm={
+                ids[n]: series(ids[n], dates, v)
+                for n, v in zip(names, (0.05, 0.0, -0.05), strict=True)
+            },
+            incumbent=ids["a"],
+            store=store,
+        )
+        run_promotion(**args)
+        first_retire = store.get_bytes("retirements/m/events.jsonl").decode().splitlines()
+        first_exp = store.get_bytes(f"experiments/{dates[-1]}/events.jsonl").decode().splitlines()
+
+        run_promotion(**args)  # the retry, same cycle, same as_of
+        assert (
+            store.get_bytes("retirements/m/events.jsonl").decode().splitlines() == first_retire
+        ), "a re-entered pass must not double the retirement verdicts"
+        assert (
+            store.get_bytes(f"experiments/{dates[-1]}/events.jsonl").decode().splitlines()
+            == first_exp
+        ), "a re-entered pass must not double the EXPERIMENTS feed"
+
+    def test_a_later_cycle_still_appends(self, tmp_path) -> None:
+        """Idempotence must not become a write that never happens again: a
+        DIFFERENT cycle's rows differ in `as_of` and are appended."""
+        store = LocalStore(tmp_path)
+        dates = trading_days(40)
+        spec = narrow(get_slot("m"))
+        names = ["a", "b", "c"]
+        reg, ids = register_with("m", names, dates[0])
+        seed_register(store, "m", reg)
+        args = dict(
+            spec=spec,
+            register=reg,
+            series_by_arm={
+                ids[n]: series(ids[n], dates, v)
+                for n, v in zip(names, (0.05, 0.0, -0.05), strict=True)
+            },
+            incumbent=ids["a"],
+            store=store,
+        )
+        run_promotion(as_of=dates[-2], **args)
+        run_promotion(as_of=dates[-1], **args)
+        log = store.get_bytes("retirements/m/events.jsonl").decode().splitlines()
+        assert len(log) == 2 * len(names)
+
+
+class TestOneProducerPerKeyShape:
+    """F11 (`alpha-engine-config-I9757`): `arm_register_key` was DECLARED
+    twice — `crucible/keys.py` and `crucible/promote.py` — both returning
+    `arms/{slot}/register.jsonl`. `arena_io.py`'s own docstring names the
+    pattern: "a second copy of it is how two slots end up writing artifacts
+    the console renders differently". Identity, not string equality: two
+    functions returning the same string today is exactly the state that
+    precedes the drift.
+    """
+
+    def test_the_register_key_has_a_single_producer(self) -> None:
+        import crucible.keys as keys
+        import crucible.promote as promote
+
+        assert promote.arm_register_key is keys.arm_register_key
+        assert promote.arm_register_key.__module__ == "crucible.keys"
+        assert keys.arm_register_key("m") == "arms/m/register.jsonl"
+
+    def test_promote_declares_no_key_shape_keys_already_owns(self) -> None:
+        """The scan, not the instance: a second copy re-added under any name
+        fails here rather than at the console."""
+        import inspect
+
+        import crucible.keys as keys
+        import crucible.promote as promote
+
+        def single_slot_arg(fn) -> bool:
+            """A plain function taking exactly `slot` — the shape of a key
+            producer. Classes and exceptions are excluded before `signature`
+            is asked, because several of them have none."""
+            return inspect.isfunction(fn) and set(inspect.signature(fn).parameters) == {"slot"}
+
+        owned_values = {
+            fn("m")
+            for fn in vars(keys).values()
+            if getattr(fn, "__module__", "") == "crucible.keys" and single_slot_arg(fn)
+        }
+        assert owned_values, "the scan found no slot-keyed producers; it is not reading keys.py"
+        for name, fn in vars(promote).items():
+            if getattr(fn, "__module__", "") != "crucible.promote":
+                continue
+            if not single_slot_arg(fn):
+                continue
+            assert fn("m") not in owned_values, (
+                f"crucible.promote.{name} re-declares a key shape crucible.keys already "
+                "produces; keys.py is the single producer (plan §4.12)"
+            )

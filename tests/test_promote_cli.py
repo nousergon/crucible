@@ -62,7 +62,7 @@ def seat(store, ids, dates, arm: str = "champ") -> None:
     2026-07-13, and starting the tests from it means the first evidence-won
     promotion is exercised as the transition it actually is.
     """
-    from crucible.champion import ChampionPointer, write_champion
+    from crucible.champion import ChampionPointer, read_champion_etag, write_champion
 
     prior = dates[-2]
     manifest_key = f"runs/promote/{prior}/run.json"
@@ -83,6 +83,7 @@ def seat(store, ids, dates, arm: str = "champ") -> None:
             manifest_key=manifest_key,
             evidence={"operator": "cipher813", "reason": "seeded by migrate.history"},
         ),
+        expected=read_champion_etag(store, "m"),
     )
 
 
