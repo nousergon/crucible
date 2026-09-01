@@ -33,6 +33,8 @@ from dataclasses import dataclass
 
 from crucible import __version__
 from crucible.calendar import resolve_trading_day
+from crucible.track_a import HANDLERS as TRACK_A_HANDLERS
+from crucible.track_a import add_track_a_arguments
 
 __all__ = ["HANDLERS", "JOBS", "JobSpec", "build_parser", "is_stub", "main"]
 
@@ -212,11 +214,11 @@ JOBS: dict[str, JobSpec] = {
 }
 
 HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
-    "data.daily": _todo("data.daily", "track B", "Lifts the ingest core from nousergon-data."),
-    "data.weekly": _todo("data.weekly", "track B", "Weekly refresh + coverage MetricRecords."),
+    "data.daily": _todo("data.daily", "track A", "Lifts the ingest core from nousergon-data."),
+    "data.weekly": _todo("data.weekly", "track A", "Weekly refresh + coverage MetricRecords."),
     "data.heal": _todo(
         "data.heal",
-        "track B",
+        "track A",
         "Must record what it repaired in rows_in/rows_out/rows_rejected, not just log it.",
     ),
     "experiment.new": _todo(
@@ -265,6 +267,13 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
         "A REAL run against live S3/ArcticDB. status: ok is what flips releases/current.",
     ),
 }
+
+
+# track-A: the implemented handlers replace their `_todo` placeholders. Done by
+# assignment rather than by editing the table above so each track owns one
+# import line, and so a handler that failed to import is a loud ImportError at
+# start-up rather than a job that is quietly still a stub.
+HANDLERS.update(TRACK_A_HANDLERS)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -326,7 +335,22 @@ def build_parser() -> argparse.ArgumentParser:
                 "override is the one pointer movement nobody can reconstruct later.",
             )
         if spec.name in ("experiment.run", "experiment.new"):
-            sub.add_argument("--arm", metavar="ARM_ID", required=True)
+            # track-A: NOT required for `experiment.run`. Policy §3 scores every
+            # registered arm every cycle, so the default is "all of them"; naming
+            # one narrows the run to it, which is a debugging affordance rather
+            # than the normal path. `experiment.new` still requires it, because
+            # registering "whichever arms happen to be on disk" is not a
+            # deliberate act.
+            sub.add_argument(
+                "--arm",
+                metavar="ARM_ID",
+                required=spec.name == "experiment.new",
+                help=(
+                    "Restrict to one arm by name. Omitted, every registered arm in the "
+                    "slot is produced — an arm that skipped a cycle records a MISS, and "
+                    "a miss is data."
+                ),
+            )
         if spec.name == "explain":
             sub.add_argument("target", metavar="RUN_ID|VERDICT_KEY")
         if spec.name == "release.pin":
@@ -334,6 +358,9 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--target", choices=["current", "trader"], default="current")
         if spec.name == "data.heal":
             sub.add_argument("--gap", required=True, help="The named gap to repair.")
+
+        # track-A: the data, feature, U/R, explain and migrate jobs' own flags.
+        add_track_a_arguments(spec.name, sub)
 
     return parser
 

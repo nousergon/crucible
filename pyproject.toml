@@ -20,11 +20,30 @@ dependencies = [
     # The M slot's linear estimators and the CPCV grader operate on a
     # (trading_day x name) panel. Pure-Python normal equations over ~450k
     # rows is ~20s per fold and 15 folds per cycle, so the arithmetic is
-    # vectorised rather than hand-rolled (principle 4). numpy only: parquet
-    # and the feature layer's I/O are track A's, so nothing here pulls
-    # pandas or pyarrow into a Lambda cold start.
+    # vectorised rather than hand-rolled (principle 4).
+    #
+    # The feature layer (plan §10.4) is a materialized parquet artifact and
+    # the U/R grading path is columnar arithmetic over a price panel, so
+    # pandas and pyarrow join numpy here. Core, not optional: a build that
+    # cannot read `features/{version}/{day}.parquet` cannot run a cycle at
+    # all, and an optional dependency every job needs is a lie about the
+    # install surface. The floor is track B's (>=2.1), not the looser one —
+    # two floors for one package is a lockfile waiting to disagree with a
+    # fresh resolve.
     "numpy>=2.1",
+    "pandas>=2.0",
+    "pyarrow>=14.0",
 ]
+
+[project.optional-dependencies]
+# ArcticDB is the PRODUCTION price source and nothing else. It is a large
+# compiled wheel, and CI grades this repo against synthetic and fixture
+# panels through the same `PriceSource` adapter the live source implements
+# (principle 8), so a CI job that installed it would pay minutes for a code
+# path it never exercises. `crucible data.daily --source arctic` states the
+# missing extra by name when it is absent — it never falls back to a
+# different source, which would silently change what the run measured.
+arcticdb = ["nousergon-lib[arcticdb]==0.124.106"]
 
 [project.scripts]
 crucible = "crucible.cli:main"
