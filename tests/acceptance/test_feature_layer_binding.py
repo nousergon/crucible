@@ -4,12 +4,15 @@ Normative source: plan §10 component 4 — "without it R and M recompute
 features from different code, and 'the signal degraded' cannot be separated
 from 'the feature changed'".
 
-**This test fails until `crucible/features/` lands, and that is the design.**
-The repository carries no suppression collection at all (§11.1): no xfail, no
-skip, no marker. A cross-track dependency is therefore expressed the same way
+**This clause failed until `crucible/features/` landed, and that was the
+design.** The repository carries no suppression collection at all (§11.1): no
+xfail, no skip, no marker. A cross-track dependency is expressed the same way
 every plan clause is — an honest failure naming the requirement and the
-owning track, which goes green the moment both PRs are on `main` with no
-marker for anyone to remember to remove.
+owning track, which went green the moment both producer and consumer were on
+`main`, with no marker for anyone to remember to remove. It went green on
+2026-09-01 with `alpha-engine-config-I9772` / `-I9765`, once the two tracks'
+interfaces were reconciled; the `_unmet` path below stays, because a clause
+that could not report the producer's absence would be dark, not green.
 
 **It lives in `tests/acceptance/` for exactly that reason.** This directory is
 the repository's declared home for clauses written before the code that
@@ -60,8 +63,24 @@ def _features_module() -> Any:
     return features
 
 
+#: The columns the M arm `residual_momentum` declares in
+#: `alpha-engine-config/strategy/arms/m/residual_momentum.yaml`. Named here
+#: rather than a placeholder so the clause asserts the real demand: these are
+#: the columns an M arm will not train without.
+M_ARM_COLUMNS: tuple[str, ...] = (
+    "residual_momentum_252d_skip21d_zscore",
+    "residual_vol_20d_ratio",
+    "momentum_change_21d_zscore",
+    "beta_60d_raw",
+)
+
+
 class TestFeatureLayerBinding:
-    def test_the_m_slot_resolves_its_columns_through_the_registry(self) -> None:
+    def test_the_m_slot_resolves_its_columns_through_the_registry(
+        self, store: Any, source: Any, cycle_date: Any
+    ) -> None:
+        from crucible.data import run_daily
+        from crucible.runner import run_job
         from crucible.slots.model import FeatureLayerSource
 
         features = _features_module()
@@ -69,22 +88,69 @@ class TestFeatureLayerBinding:
         if registry is None:
             _unmet(AttributeError("crucible.features exposes no CATALOG registry"))
 
-        source = FeatureLayerSource(registry=registry, version="v1")
+        # Track A's producer writes the artifact; nothing here recomputes it.
+        run_job(
+            "data.daily",
+            lambda ctx: run_daily(ctx, source=source),
+            store=store,
+            trading_day=cycle_date,
+        )
+
+        # No consumer names a version. It is DERIVED from the catalogue, so an
+        # edited recipe writes to a new prefix instead of overwriting the layer
+        # an earlier verdict was computed from (alpha-engine-config-I9772).
+        layer = FeatureLayerSource(store=store, registry=registry)
         try:
-            panel = source.panel(trading_day="2026-08-28", columns=("mom_21d_ratio",))
+            panel = layer.panel(trading_day=cycle_date.isoformat(), columns=M_ARM_COLUMNS)
         except NotImplementedError as exc:
             _unmet(exc)
-        assert panel.feature_version == "v1"
-        assert "mom_21d_ratio" in panel.features
+
+        assert panel.feature_version == features.DEFAULT_FEATURE_VERSION
+        for column in M_ARM_COLUMNS:
+            assert column in panel.features
+            assert panel.column(column).shape == (len(panel.dates), len(panel.names))
+
+    def test_a_column_the_layer_does_not_produce_raises_at_load(
+        self, store: Any, source: Any, cycle_date: Any
+    ) -> None:
+        """The 2026-08-28 condition, refused rather than trained on.
+
+        Seven features were hard-zeroed that week and every surface said
+        healthy. A recipe naming a column the layer does not produce must fail
+        where it is loaded, never arrive as a silently substituted zero.
+        """
+        from crucible.data import run_daily
+        from crucible.runner import run_job
+        from crucible.slots.model import FeatureLayerSource
+
+        features = _features_module()
+        run_job(
+            "data.daily",
+            lambda ctx: run_daily(ctx, source=source),
+            store=store,
+            trading_day=cycle_date,
+        )
+        layer = FeatureLayerSource(store=store, registry=features.CATALOG)
+        with pytest.raises(KeyError, match="not produced by feature layer version"):
+            layer.panel(
+                trading_day=cycle_date.isoformat(),
+                columns=("a_column_the_layer_never_produced_ratio",),
+            )
 
     def test_every_recipe_column_carries_a_units_suffix(self) -> None:
         """The fleet's units-suffix contract (`AGENTS.md`): a bare column name
         is how `avg_volume_20d` was emitted as a ratio and consumed as raw
-        shares, silently failing 901 of 903 tickers for months."""
+        shares, silently failing 901 of 903 tickers for months.
+
+        The registry is a tuple of `FeatureSpec`s carrying units and lineage,
+        not a tuple of names — so the check reads names through the accessor
+        the producer exposes rather than assuming the element type
+        (alpha-engine-config-I9772).
+        """
         from crucible.slots.model import assert_units_suffixes
 
         features = _features_module()
         registry = getattr(features, "CATALOG", None)
         if registry is None:
             _unmet(AttributeError("crucible.features exposes no CATALOG registry"))
-        assert_units_suffixes(tuple(registry))
+        assert_units_suffixes(features.feature_names(registry))
