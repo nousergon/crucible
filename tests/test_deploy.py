@@ -57,6 +57,7 @@ class _FakeS3Client:
         self.retentions[kw["Key"]] = kw["Retention"]
         return {}
 
+
 SHA = "a" * 40
 OTHER = "b" * 40
 PRIOR = "c" * 40
