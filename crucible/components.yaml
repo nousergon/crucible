@@ -304,8 +304,13 @@ components:
     artifact_retention: forever
     # The one row the sweep cannot honestly watch: a sweep that never ran
     # cannot report itself missing. The weekly heartbeat is what stands
-    # behind it, and a sweep run DOES report the previous day's sweep, so
-    # the self-reference is a lag rather than a blind spot.
+    # behind it.
+    #
+    # An earlier version of this comment added "and a sweep run DOES report
+    # the previous day's sweep, so the self-reference is a lag rather than a
+    # blind spot". That was never true — `heartbeat()` did not read this row's
+    # manifest at all, so the declared watcher watched nothing and the row read
+    # as covered. crucible-PR17 makes the heartbeat actually evaluate it.
     absence_watched_by: heartbeat
     schedule: daily 21:00 ET, every calendar day
     dispatch: scheduler

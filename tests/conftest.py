@@ -178,7 +178,12 @@ class CapturingTransport:
             raise RuntimeError("transport unreachable")
         key = kwargs.get("dedup_key")
         if key is not None and key in self.seen:
-            return _Result(any_ok=True, destination="deduped")
+            # `dedup_skipped=True` alongside `any_ok=True`, because that is
+            # what krepis returns and because `crucible.alerts` now reads it
+            # to decide whether the bus row may claim delivery. A stand-in
+            # that reported a suppressed publish as delivered would make the
+            # honesty test pass against a transport that never sent anything.
+            return _Result(any_ok=True, destination="deduped", dedup_skipped=True)
         if key is not None:
             self.seen.add(key)
         self.calls.append(CapturedPublish(message, kwargs))
@@ -193,6 +198,11 @@ class CapturingTransport:
 class _Result:
     any_ok: bool
     destination: str
+    #: krepis sets this on a publish its own dedup suppressed. `any_ok` stays
+    #: True there — the call did not fail — so `any_ok` alone cannot tell a
+    #: delivery from a suppression, and a bus row built on it claims delivery
+    #: for a page that never left.
+    dedup_skipped: bool = False
 
 
 @pytest.fixture
