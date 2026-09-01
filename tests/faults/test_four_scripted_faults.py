@@ -27,7 +27,8 @@ import pytest
 from crucible.alerts import sweep
 from crucible.data.daily import run_daily
 from crucible.data.sources import FramePriceSource
-from crucible.llm import CallSite, SpendCap, call as llm_call
+from crucible.llm import CallSite, SpendCap
+from crucible.llm import call as llm_call
 from crucible.manifest import manifest_key, validate
 from crucible.release import POINTER_KEY, publish_release, resolve_release, wheel_key
 from crucible.runner import RunContext, SpotInterruptionError, run_job, spot_interruption_guard
@@ -208,10 +209,9 @@ class TestFaultThreeRouterReturns500:
         red — no manifest would carry `status: failed` at all."""
         store = LocalStore(tmp_path)
         # `resolve_model_spec` would otherwise reach SSM/env for a real
-        # deployment spec — irrelevant to what this fault exercises, which is
-        # what `crucible.llm.call` does once the transport fails. Same seam
-        # `tests/test_llm_cap.py::test_a_bill_above_the_admitted_ceiling_fails_the_run_and_is_recorded`
-        # patches.
+        # deployment spec — irrelevant here. Same seam `test_llm_cap.py`'s
+        # overrun test patches, so `crucible.llm.call`'s cap admission runs
+        # for real and only the provider transport is faked.
         monkeypatch.setattr("krepis.llm_config.resolve_model_spec", lambda **_kw: object())
         monkeypatch.setattr("krepis.llm.LLMClient", lambda *a, **k: _Provider5xxClient())
 
@@ -244,10 +244,9 @@ class TestFaultThreeRouterReturns500:
     ) -> None:
         store = LocalStore(tmp_path)
         # `resolve_model_spec` would otherwise reach SSM/env for a real
-        # deployment spec — irrelevant to what this fault exercises, which is
-        # what `crucible.llm.call` does once the transport fails. Same seam
-        # `tests/test_llm_cap.py::test_a_bill_above_the_admitted_ceiling_fails_the_run_and_is_recorded`
-        # patches.
+        # deployment spec — irrelevant here. Same seam `test_llm_cap.py`'s
+        # overrun test patches, so `crucible.llm.call`'s cap admission runs
+        # for real and only the provider transport is faked.
         monkeypatch.setattr("krepis.llm_config.resolve_model_spec", lambda **_kw: object())
         monkeypatch.setattr("krepis.llm.LLMClient", lambda *a, **k: _Provider5xxClient())
 
