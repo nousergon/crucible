@@ -377,6 +377,33 @@ class TestPage:
                             "status": "GREEN",
                             "status_reason": "clean",
                         },
+                        # The three `krepis.metrics.derive_status` states the
+                        # hand-written `ATTRIBUTION_STATUSES` tuple omitted.
+                        # `derive_status` returns all of them and
+                        # `crucible.report` therefore writes them, so before
+                        # the tuple was derived a WATCH row would have raised
+                        # in `_state_class` and taken the console down.
+                        {
+                            "name": "signal_ic",
+                            "value": 0.02,
+                            "unit": "ratio",
+                            "status": "WATCH",
+                            "status_reason": "between the floor and half of it",
+                        },
+                        {
+                            "name": "prediction_ic",
+                            "value": None,
+                            "unit": None,
+                            "status": "N/A-LOW-N",
+                            "status_reason": "2 of 6 sessions settled",
+                        },
+                        {
+                            "name": "universe_coverage",
+                            "value": None,
+                            "unit": None,
+                            "status": "N/A-MISSING-INPUT",
+                            "status_reason": "features/v3/2026-08-28.parquet is absent",
+                        },
                     ]
                 }
             ).encode(),
