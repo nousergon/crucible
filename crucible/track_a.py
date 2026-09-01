@@ -113,7 +113,6 @@ def handle_data_weekly(args: argparse.Namespace) -> int:
             source=source,
             expected_symbols=_symbols(args),
             feature_version=getattr(args, "feature_version", None) or DEFAULT_FEATURE_VERSION,
-            require_full_week=not getattr(args, "allow_week_gap", False),
         ),
         store=store,
         trading_day=args.trading_day,
@@ -172,28 +171,40 @@ def _slot_module(slot: str) -> Any:
 
 
 def handle_experiment_new(args: argparse.Namespace) -> int:
-    """Register the slot's recipes, appending only what is new."""
+    """Register the slot's recipes, appending only what is new.
+
+    ``--dry-run`` resolves the same inputs a real run would (the arm specs
+    and the existing register) and reports what would be added — but
+    computing that diff is read-only until `write_register` runs, so the
+    dry-run path never calls `run_job` and writes nothing: not the register,
+    not a manifest (defect #4b, 2026-09-01 adversarial review — the flag's
+    own help text is "report what would be written; write nothing", and
+    this handler wrote the register regardless of it).
+    """
     config = _settings(args)
     store = config.store()
+    specs = load_arm_specs(args.slot, store=store, strategy_dir=config.strategy_dir)
+    arm = getattr(args, "arm", None)
+    if arm:
+        specs = [s for s in specs if s.name == arm]
+        if not specs:
+            raise KeyError(
+                f"no arm named {arm!r} in slot {args.slot!r}; registering nothing and "
+                "exiting 0 would look exactly like registering it"
+            )
+    register = read_register(store, args.slot)
+    before = set(register.all_arms())
+    register, _ = register_arms(register, specs)
+    added = sorted(set(register.all_arms()) - before)
+    if args.dry_run:
+        print(json.dumps({"would_register": added, "already_present": sorted(before)}, indent=2))
+        return 0
 
     def job(ctx: Any) -> None:
-        specs = load_arm_specs(args.slot, store=store, strategy_dir=config.strategy_dir)
-        arm = getattr(args, "arm", None)
-        if arm:
-            specs = [s for s in specs if s.name == arm]
-            if not specs:
-                raise KeyError(
-                    f"no arm named {arm!r} in slot {args.slot!r}; registering nothing and "
-                    "exiting 0 would look exactly like registering it"
-                )
-        register = read_register(store, args.slot)
-        before = set(register.all_arms())
-        register, _ = register_arms(register, specs)
         payload = write_register(store, args.slot, register)
         ctx.record_output(
             f"arms/{args.slot}/register.jsonl", payload, schema_version="arm_register.v1"
         )
-        added = sorted(set(register.all_arms()) - before)
         ctx.record_rows(rows_in=len(specs), rows_out=len(added))
         print(json.dumps({"registered": added, "already_present": sorted(before)}, indent=2))
 
@@ -205,6 +216,13 @@ def handle_experiment_run(args: argparse.Namespace) -> int:
     config = _settings(args)
     store = config.store()
     module = _slot_module(getattr(args, "slot", None) or "r")
+    if args.dry_run:
+        print(
+            f"experiment.run --slot {args.slot} would call {module.__name__}.produce and "
+            f"write its feed under the store at {config.store_uri}. Resolve inputs and "
+            "report what would be written; write nothing."
+        )
+        return 0
     ctx = run_job(
         "experiment.run",
         lambda c: module.produce(c, settings=config, arm_name=getattr(args, "arm", None)),
@@ -219,6 +237,14 @@ def handle_experiment_grade(args: argparse.Namespace) -> int:
     config = _settings(args)
     store = config.store()
     module = _slot_module(args.slot)
+    if args.dry_run:
+        print(
+            f"experiment.grade --slot {args.slot} would call {module.__name__}.grade, "
+            f"score every settled cut and run the slot's arena cycle against the store at "
+            f"{config.store_uri}. Resolve inputs and report what would be written; write "
+            "nothing."
+        )
+        return 0
     result: dict[str, Any] = {}
 
     def job(ctx: Any) -> None:
@@ -308,21 +334,14 @@ def add_track_a_arguments(name: str, sub: argparse.ArgumentParser) -> None:
         sub.add_argument(
             "--symbols",
             help=(
-                "Comma-separated expected universe. This is the DENOMINATOR of the "
-                "coverage ratio — without it no ratio is reported, because a ratio over "
-                "whatever arrived always reads 1.0."
+                "Comma-separated expected universe. MANDATORY: this is the DENOMINATOR "
+                "of the coverage ratio, and `run_daily`/`run_weekly` refuse to run "
+                "without it — a ratio computed over whatever arrived always reads 1.0, "
+                "and the coverage floor cannot fire with no denominator to measure it "
+                "against (alpha-engine-config-I9757 defect #2)."
             ),
         )
         sub.add_argument("--feature-version", help="Override the derived feature version.")
-    if name == "data.weekly":
-        sub.add_argument(
-            "--allow-week-gap",
-            action="store_true",
-            help=(
-                "Run even though a session in the week has no compiled panel. Records the "
-                "gap in the manifest; use only when the gap is understood."
-            ),
-        )
     if name == "data.heal":
         sub.add_argument("--from", dest="from_date", required=True, metavar="YYYY-MM-DD")
         sub.add_argument("--to", dest="to_date", required=True, metavar="YYYY-MM-DD")

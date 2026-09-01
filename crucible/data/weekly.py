@@ -18,6 +18,15 @@ every detector stayed green" incident in the register. So:
 * a gap FAILS the run with `crucible data.heal --from --to` in the reason,
   because the operator's next action should be in the failure, not in a
   runbook they have to find.
+
+**There is no flag that lets a gap pass.** An earlier `--allow-week-gap`
+recorded the gap as a `FAIL` MetricRecord while still writing an `ok`
+manifest — the excluded third state (§2 row 4: "no skip flags, no
+fail-open, no degraded-SUCCEEDED") reintroduced at the only level a human
+actually reads, since the console pages on absence or `status: failed`
+(§4.6), never on a metric buried inside an `ok` run (defect #3, 2026-09-01
+adversarial review). `run_weekly` now always raises on a gap; there is no
+parameter that suppresses it.
 """
 
 from __future__ import annotations
@@ -70,7 +79,6 @@ def run_weekly(
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     expected_symbols: list[str] | None = None,
     feature_version: str = DEFAULT_FEATURE_VERSION,
-    require_full_week: bool = True,
 ) -> dict[str, Any]:
     """Compile the week's last session, then assert the week has no gap.
 
@@ -114,7 +122,7 @@ def run_weekly(
         }
     )
 
-    if gaps and require_full_week:
+    if gaps:
         first, last = gaps[0].isoformat(), gaps[-1].isoformat()
         raise DataGapError(
             f"the trading week ending {trading_day} has {len(gaps)} session(s) with no "

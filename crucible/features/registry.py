@@ -41,6 +41,32 @@ __all__ = [
 #: so the rule is enforced by the registry rather than by review.
 UNIT_SUFFIXES: tuple[str, ...] = ("_raw", "_ratio", "_pct", "_zscore", "_log_return")
 
+#: The suffix-to-unit contract, exhaustive over `UNIT_SUFFIXES`. A
+#: NORMALIZED suffix (`_ratio`, `_pct`, `_zscore`, `_log_return`) pins the
+#: `unit` field to exactly one string — the suffix names the unit, so there
+#: is nothing else it could legitimately be. `_raw` is the one suffix with
+#: no single unit, because "raw" means "not normalized by this layer", and
+#: an unnormalized column can carry any concrete unit (USD, shares, a beta
+#: coefficient, a 0/1 indicator) — what it may NOT do is claim a normalized
+#: unit while being unnormalized, which is exactly the defect this maps
+#: closes: `avg_volume_20d` was emitted as a ratio and consumed as raw
+#: shares, and a construction-time check that compared only the SUFFIX to
+#: the allowed-suffix list — never the suffix to the declared `unit` — let
+#: `FeatureSpec(name="avg_volume_20d_raw", unit="ratio", ...)` construct
+#: successfully (defect #11, 2026-09-01 adversarial review).
+_NORMALIZED_UNIT_BY_SUFFIX: dict[str, str] = {
+    "_ratio": "ratio",
+    "_pct": "pct",
+    "_zscore": "zscore",
+    "_log_return": "log_return",
+}
+
+#: The unit words `_raw` may never declare — each one is already the exact
+#: unit a normalized suffix owns above. A `_raw` column claiming one of
+#: these is a normalized value wearing the unnormalized suffix, the mirror
+#: image of the bug this registry exists to catch.
+_NORMALIZED_UNIT_WORDS: frozenset[str] = frozenset(_NORMALIZED_UNIT_BY_SUFFIX.values())
+
 
 @dataclass(frozen=True)
 class FeatureSpec:
@@ -59,13 +85,37 @@ class FeatureSpec:
     cross_sectional: bool = False
 
     def __post_init__(self) -> None:
-        if not any(self.name.endswith(s) for s in UNIT_SUFFIXES):
+        matched = [s for s in UNIT_SUFFIXES if self.name.endswith(s)]
+        if not matched:
             raise ValueError(
                 f"feature {self.name!r} carries no units suffix; one of {UNIT_SUFFIXES} "
                 "is mandatory. A bare name is how a ratio gets consumed as raw shares."
             )
         if not self.unit:
             raise ValueError(f"feature {self.name!r} declares no unit")
+        # The longest matching suffix: `_log_return` must not be shadowed by a
+        # coincidental shorter match, though none of `UNIT_SUFFIXES` overlaps
+        # today — this is the check staying correct if one ever does.
+        suffix = max(matched, key=len)
+        if suffix in _NORMALIZED_UNIT_BY_SUFFIX:
+            expected_unit = _NORMALIZED_UNIT_BY_SUFFIX[suffix]
+            if self.unit != expected_unit:
+                raise ValueError(
+                    f"feature {self.name!r} carries suffix {suffix!r} but declares "
+                    f"unit={self.unit!r}; suffix {suffix!r} means unit={expected_unit!r} "
+                    "and nothing else. A suffix that disagrees with the declared unit is "
+                    "the `avg_volume_20d` defect: emitted as a ratio, consumed as raw "
+                    "shares, and 901 of 903 tickers silently failed the liquidity gate "
+                    "for months."
+                )
+        elif self.unit in _NORMALIZED_UNIT_WORDS:
+            raise ValueError(
+                f"feature {self.name!r} carries suffix '_raw' but declares "
+                f"unit={self.unit!r}, which is a NORMALIZED unit. '_raw' means "
+                "unnormalized — a raw column claiming a normalized unit is the same "
+                "defect in the other direction: the name promises the consumer an "
+                "unnormalized value and the declared unit says otherwise."
+            )
         if not self.inputs:
             raise ValueError(
                 f"feature {self.name!r} declares no inputs; a column with no lineage "

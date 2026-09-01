@@ -24,6 +24,15 @@ class 5, so `report` reduces it and the console renders it. A day whose
 coverage falls below the floor FAILS — a panel covering a third of the
 universe is a well-formed artifact containing nothing, and every gate
 downstream passes on it.
+
+**`expected_symbols` is mandatory.** It is the coverage ratio's
+denominator, and a run given none used to write the metric `status: "OK"`
+with `value: None` — the floor above never got a chance to fire, on the
+only path that actually runs in production, since nothing in this repo
+resolves a universe automatically. That is defect #2 of the 2026-09-01
+review: the 901-of-903 bug class the floor exists to catch, restored by a
+default argument. A run with no declared universe now raises
+:class:`UndeclaredUniverseError` before it reads a source.
 """
 
 from __future__ import annotations
@@ -51,6 +60,7 @@ __all__ = [
     "COVERAGE_FLOOR_RATIO",
     "DEFAULT_LOOKBACK_DAYS",
     "CoverageError",
+    "UndeclaredUniverseError",
     "run_daily",
     "write_panel",
 ]
@@ -70,6 +80,22 @@ COVERAGE_FLOOR_RATIO = 0.90
 
 class CoverageError(RuntimeError):
     """The panel was readable but too thin to compute on."""
+
+
+class UndeclaredUniverseError(RuntimeError):
+    """The run declared no expected universe, so the coverage floor could not fire.
+
+    This is defect #2 of the 2026-09-01 adversarial review, restored: with
+    `expected_symbols=None` the ratio has no denominator, the metric used to
+    be written `status: "OK"` with `value: None`, and `COVERAGE_FLOOR_RATIO`
+    never got a chance to raise — on the ONLY path that actually runs in
+    production, since nothing in this repo resolves a universe automatically
+    and `--symbols` is hand-typed. A run that cannot state what it expected
+    to see is not a run whose coverage was "not applicable" — it is a run
+    that cannot detect the 901-of-903 bug class at all, which is exactly the
+    shape that let it run for months. Principle 7: no data is never
+    rendered as green, so this layer refuses to render it as anything.
+    """
 
 
 def write_panel(ctx: RunContext, panel: pd.DataFrame, key: str) -> bytes:
@@ -98,13 +124,29 @@ def run_daily(
 ) -> dict[str, Any]:
     """Compile the day. Called through `crucible.runner.run_job`, never directly.
 
-    ``expected_symbols`` is the denominator of the coverage ratio. When it is
-    absent the ratio has no denominator, and the run says so in the metric's
-    `status_reason` rather than reporting 1.0 — a coverage of 100% computed
-    over whatever arrived is the shape that renders an outage as green.
+    ``expected_symbols`` is the denominator of the coverage ratio, and it is
+    now MANDATORY — a run supplying none raises :class:`UndeclaredUniverseError`
+    before touching the source. There is no code path in this repo that
+    resolves a universe automatically (the U slot's champion feed is
+    downstream of this job, not upstream of it), so the only alternative to
+    requiring it here was letting the floor stay unreachable on the path
+    that actually runs — which is defect #2 of the 2026-09-01 review,
+    restored. A ratio computed over whatever arrived would always read 1.0;
+    a ratio with no declared denominator is not "not applicable", it is a
+    run that cannot detect a partial universe at all.
     """
     trading_day = ctx.trading_day
     assert_trading_day(trading_day, context=f"data.daily --date {trading_day}")
+
+    if not expected_symbols:
+        raise UndeclaredUniverseError(
+            f"data.daily --date {trading_day} was given no --symbols. The coverage "
+            f"floor ({coverage_floor:.2f}) cannot fire without a declared universe to "
+            "measure coverage against, and a run that silently skipped the floor is "
+            "the 901-of-903 bug class COVERAGE_FLOOR_RATIO exists to make loud. Supply "
+            "the expected universe explicitly: `crucible data.daily --symbols "
+            "AAA,BBB,...`."
+        )
 
     panel = source.load_panel(
         end=trading_day,
@@ -122,24 +164,15 @@ def run_daily(
         )
 
     observed = sorted(str(t) for t in day_rows["ticker"].unique())
-    if expected_symbols is None:
-        coverage_ratio: float | None = None
-        coverage_reason = (
-            f"{len(observed)} tickers closed on {trading_day}; no expected-symbol set "
-            "was supplied, so there is no denominator and no ratio is reported. A "
-            "ratio computed over whatever arrived would always read 1.0."
-        )
-    else:
-        expected = sorted(set(expected_symbols))
-        coverage_ratio = len(observed) / len(expected) if expected else 0.0
-        absent = sorted(set(expected) - set(observed))
-        coverage_reason = (
-            f"{len(observed)} of {len(expected)} expected tickers closed on "
-            f"{trading_day}"
-            + (f"; absent: {absent[:20]}{'…' if len(absent) > 20 else ''}" if absent else "")
-        )
-        if absent:
-            ctx.record_rejected("no close on the trading day", len(absent))
+    expected = sorted(set(expected_symbols))
+    coverage_ratio: float = len(observed) / len(expected)
+    absent = sorted(set(expected) - set(observed))
+    coverage_reason = (
+        f"{len(observed)} of {len(expected)} expected tickers closed on {trading_day}"
+        + (f"; absent: {absent[:20]}{'…' if len(absent) > 20 else ''}" if absent else "")
+    )
+    if absent:
+        ctx.record_rejected("no close on the trading day", len(absent))
 
     ctx.record_rows(rows_in=int(len(panel)), rows_out=int(len(panel)))
     ctx.record_metric(
@@ -148,11 +181,9 @@ def run_daily(
             "module": "crucible.data.daily",
             "metric_type": "coverage",
             "value": coverage_ratio,
-            "unit": "ratio" if coverage_ratio is not None else None,
+            "unit": "ratio",
             "n_floor": 1,
-            "status": (
-                "OK" if coverage_ratio is None or coverage_ratio >= coverage_floor else "FAIL"
-            ),
+            "status": "OK" if coverage_ratio >= coverage_floor else "FAIL",
             "status_reason": coverage_reason,
             "source_path": coverage_key(trading_day.isoformat()),
             "last_updated_utc": _utc_now(),
@@ -160,7 +191,7 @@ def run_daily(
         }
     )
 
-    if coverage_ratio is not None and coverage_ratio < coverage_floor:
+    if coverage_ratio < coverage_floor:
         raise CoverageError(
             f"universe coverage {coverage_ratio:.3f} is below the floor {coverage_floor:.2f} "
             f"on {trading_day}: {coverage_reason}. A thin panel is a FAILED day, not a "
@@ -191,7 +222,7 @@ def run_daily(
         "rows_total": int(len(panel)),
         "rows_on_day": int(len(day_rows)),
         "tickers_on_day": observed,
-        "expected_tickers": sorted(set(expected_symbols)) if expected_symbols else None,
+        "expected_tickers": expected,
         "coverage_ratio": coverage_ratio,
         "coverage_floor": coverage_floor,
         "panel_key": panel_key,
