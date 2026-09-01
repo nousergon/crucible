@@ -1,0 +1,132 @@
+"""Track F's handlers: `crucible weekly` and `crucible gate`.
+
+Its own module rather than a branch inside another track's, so tracks land
+code in the same release without editing one another's lines. `cli.py` carries
+one line naming each.
+
+Two jobs, and they are the two halves of one claim. `weekly` RUNS the declared
+arc — the six components `components.yaml` marks `dispatch: arc`, in the order
+their own deadlines imply. `gate` READS what the arc produced and reports,
+clause by clause, whether a phase may exit. Neither does the other's work: a
+gate that ran the thing it grades could not distinguish a run made under gate
+conditions from a run made in production, and a driver that graded itself is
+the shape that closed phase 1 on 2026-09-01 with zero replays performed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+
+from crucible.gate import GATES, GateResult, evaluate, gate_key
+from crucible.runner import RunContext, run_job
+from crucible.store import open_store
+from crucible.weekly import arc_stages, run_arc
+
+__all__ = ["gate_handler", "weekly_handler"]
+
+
+def weekly_handler(args: argparse.Namespace) -> int:
+    """`crucible weekly [--date YYYY-MM-DD]` — run the arc for one trading day.
+
+    The arc's own manifest is written like every other job's, and it records
+    each stage's manifest as an INPUT. That is real lineage rather than a log
+    line: `crucible explain` walks from the arc to the stage that failed, and
+    the arc's `rows_out` is the number of stages that completed — so a run
+    that stopped at stage two is legible as such without opening anything.
+
+    A stage failure propagates. `run_job` writes the arc's `failed` manifest in
+    its `finally`, naming the stage in `reason`, and the process exits
+    non-zero.
+    """
+    store_uri = getattr(args, "store", None)
+    store = open_store(store_uri)
+
+    def body(ctx: RunContext) -> None:
+        planned = arc_stages(ctx.trading_day)
+        ran = run_arc(ctx.trading_day, store=store_uri)
+        for stage in ran:
+            key = f"runs/{stage.job}/{ctx.trading_day.isoformat()}/run.json"
+            ctx.record_input(key, store.get_bytes(key))
+        ctx.record_rows(rows_in=len(planned), rows_out=len(ran))
+        ctx.record_metric(
+            {
+                "name": "arc_stages_completed",
+                "module": "crucible.weekly",
+                "metric_type": "gauge",
+                "value": float(len(ran)),
+                "unit": "count",
+                "n_floor": 1,
+                "status": "OK" if len(ran) == len(planned) else "FAIL",
+                "status_reason": f"{len(ran)} of {len(planned)} declared arc stages completed",
+                "source_path": f"runs/weekly/{ctx.trading_day.isoformat()}/run.json",
+                "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+
+    # `transient_retry=False`, deliberately. Every stage already runs through
+    # its own `run_job` and owns the declared one-retry ladder (§11 risk 2), so
+    # an arc-level retry would re-run `data.weekly` through `report` because
+    # `console` met a 5xx — twelve jobs repeated for one, each rewriting its
+    # own manifest, and the store's answer to "did this week work" decided by
+    # write ordering.
+    run_job("weekly", body, store=store, trading_day=args.trading_day, transient_retry=False)
+    return 0
+
+
+def gate_handler(args: argparse.Namespace) -> int:
+    """`crucible gate --gate phase1 [--weeks N] [--date YYYY-MM-DD]`.
+
+    **The job succeeds when the MEASUREMENT succeeds; the PROCESS exits
+    non-zero when the gate is not met.** The two are different facts and
+    collapsing them would make a store outage look like an unmet phase — or,
+    worse, make an unmet phase look like a broken run that someone reruns
+    until it passes. The manifest records `ok` and the reading; the exit code
+    is what a caller branches on.
+    """
+    store = open_store(getattr(args, "store", None))
+    result: dict[str, GateResult] = {}
+
+    def body(ctx: RunContext) -> None:
+        reading = evaluate(
+            store, gate=args.gate, trading_day=ctx.trading_day, weeks=getattr(args, "weeks", None)
+        )
+        result["reading"] = reading
+        document = reading.to_dict()
+        document["run_id"] = ctx.run_id
+        payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
+        key = gate_key(reading.gate, ctx.trading_day.isoformat())
+        ctx.record_output(key, payload)
+        for clause in reading.clauses:
+            for evidence in clause.evidence:
+                if store.exists(evidence):
+                    ctx.record_input(evidence, store.get_bytes(evidence))
+        ctx.record_rows(rows_in=len(reading.window), rows_out=len(reading.clauses))
+        ctx.record_metric(
+            {
+                "name": "gate_clauses_met_ratio",
+                "module": "crucible.gate",
+                "metric_type": "gauge",
+                "value": reading.met_ratio,
+                "unit": "ratio",
+                "n_floor": 1,
+                "status": "OK" if reading.met else "FAIL",
+                "status_reason": (
+                    f"gate {reading.gate}: "
+                    f"{sum(1 for c in reading.clauses if c.met)}/{len(reading.clauses)} clauses met"
+                ),
+                "source_path": key,
+                "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+
+    run_job("gate", body, store=store, trading_day=args.trading_day)
+    reading = result["reading"]
+    print(reading.render())
+    return 0 if reading.met else 1
+
+
+def gate_names() -> list[str]:
+    """The registered gates, for the CLI's `--gate` choices."""
+    return sorted(GATES)

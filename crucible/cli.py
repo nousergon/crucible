@@ -31,7 +31,7 @@ import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from crucible import __version__, track_c, track_e  # track-C, track-E
+from crucible import __version__, track_c, track_e, track_f  # track-C, track-E, track-F
 from crucible.calendar import resolve_trading_day
 from crucible.track_a import HANDLERS as TRACK_A_HANDLERS
 from crucible.track_a import add_track_a_arguments
@@ -214,6 +214,14 @@ JOBS: dict[str, JobSpec] = {
     "heartbeat": JobSpec("heartbeat", "Weekly proof the alerting path itself is alive", True),
     "drift": JobSpec("drift", "Feature PSI, prediction drift and IC decay", True),
     "console": JobSpec("console", "Render the static console page from the manifests", True),
+    # track-F (alpha-engine-config-I9757). `weekly` is what the Saturday
+    # schedule dispatches: `components.yaml` declares six jobs as weekly and
+    # the scheduler started exactly one of them, so five components were
+    # deadlined, watched for absence, and triggered by nobody. `gate` reads
+    # what a phase produced and says whether it may exit — a phase gate that
+    # is a MEASUREMENT cannot be satisfied by a merge.
+    "weekly": JobSpec("weekly", "Run the declared weekly arc for one trading day", True),
+    "gate": JobSpec("gate", "Read a phase's artifacts and report its exit gate", False),
 }
 
 HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
@@ -262,6 +270,9 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     "heartbeat": track_c.heartbeat_handler,
     "drift": track_c.drift_handler,
     "console": track_c.console_handler,
+    # track-F
+    "weekly": track_f.weekly_handler,
+    "gate": track_f.gate_handler,
 }
 
 
@@ -361,6 +372,27 @@ def build_parser() -> argparse.ArgumentParser:
                     "The release sha this smoke is verifying. Recorded as the "
                     "manifest's release_sha; the pointer flip refuses a smoke "
                     "manifest belonging to another build."
+                ),
+            )
+        if spec.name == "gate":  # track-F
+            sub.add_argument(
+                "--gate",
+                required=True,
+                choices=track_f.gate_names(),
+                help=(
+                    "Which phase gate to read. A gate not registered in "
+                    "`crucible.gate.GATES` has no clause list, and running it would "
+                    "report a pass over nothing."
+                ),
+            )
+            sub.add_argument(
+                "--weeks",
+                type=int,
+                default=None,
+                help=(
+                    "Override the gate's declared window, in weekly trading days. "
+                    "The default is the gate's own width; a narrower window is a "
+                    "debugging affordance and is recorded in the gate artifact."
                 ),
             )
         if spec.name == "data.heal":
