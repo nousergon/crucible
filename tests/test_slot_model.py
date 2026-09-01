@@ -17,19 +17,28 @@ turns them red.
 from __future__ import annotations
 
 import datetime as dt
+import statistics
+from dataclasses import replace
 
+import numpy as np
 import pytest
 from nousergon_lib.arena.engine import TrainingIntegrityError
 
 from crucible.slots.model import (
     MIN_DISPERSION_RATIO,
     CPCVSpec,
+    FeaturePanel,
+    MetricScaleError,
     ModelRecipe,
+    TrainingWindowSpec,
+    _rank_ic,
+    _ranks,
     cpcv_oos_ic,
     evaluate_behavioural_veto,
     evaluate_input_completeness,
     grade_arm,
     load_model_recipes,
+    settled_training_days,
     train_arm,
 )
 from crucible.store import LocalStore
@@ -300,16 +309,333 @@ class TestCPCV:
 
 
 class TestGrade:
-    def test_grade_produces_a_per_date_series_the_arena_can_pair(self, panel) -> None:
-        grade = grade_arm(_recipe(), panel, as_of="2026-08-28")
-        assert grade.series.arm_id == _recipe().arm_id
-        assert grade.series.scores
-        assert all(isinstance(v, float) for v in grade.series.scores.values())
+    """The series the pointer is decided on.
 
-    def test_the_benchmark_is_the_scored_cross_section_never_spy(self) -> None:
+    The two tests that used to live here could not fail. Demonstrated by an
+    adversarial review on 2026-09-01: replacing :func:`grade_arm` with a
+    function returning an all-zero series left both of them GREEN.
+    `test_grade_produces_a_per_date_series_the_arena_can_pair` asserted only
+    that the series was non-empty and float-valued, which is true of any
+    implementation including one that measures nothing;
+    `test_the_benchmark_is_the_scored_cross_section_never_spy` asserted a
+    constant it imported and touched no grading code at all while living in a
+    class named for grading (plan §11 risk 1: "v2 passes its gates because its
+    tests were written to pass").
+
+    What replaces them is the §10.1 control-arm idea applied to the fixtures:
+    a planted edge must be MEASURED, a panel with no signal must not produce
+    one, and a cross-section that cannot be ranked must come back
+    unmeasurable rather than perfect. Each of these turns red when the grader
+    stops measuring.
+    """
+
+    def test_a_planted_edge_is_measured_by_the_out_of_sample_series(self, panel) -> None:
+        """`tests/support/panels.py` plants momentum at ~0.6 of the label's
+        standard deviation. A grader that measures anything at all recovers
+        it; the all-zero stub the reviewer substituted does not."""
+        grade = grade_arm(_recipe(), panel, as_of="2026-08-28")
+        assert grade.status == "ok", grade.reason
+        assert grade.series.arm_id == _recipe().arm_id
+        mean_ic = statistics.fmean(grade.series.scores.values())
+        assert mean_ic > 0.30, (
+            f"the planted edge reads {mean_ic:.4f} out-of-sample; the fixture plants "
+            "momentum at 0.6 of the label's sd and the grader must recover it. A series "
+            "that cannot find a planted edge is not measuring the arm"
+        )
+
+    def test_an_arm_that_only_sees_the_unplanted_feature_scores_near_zero(self, panel) -> None:
+        """`vol_21d_ratio` explains none of the label. The same grader on the
+        same panel must separate it from `mom_21d_ratio` — the §10.1 negative
+        control beside the positive one."""
+        planted = grade_arm(_recipe(features=("mom_21d_ratio",)), panel, as_of="2026-08-28")
+        null = grade_arm(_recipe(features=("vol_21d_ratio",)), panel, as_of="2026-08-28")
+        planted_ic = statistics.fmean(planted.series.scores.values())
+        null_ic = statistics.fmean(null.series.scores.values())
+        assert abs(null_ic) < 0.05, f"the null feature scores {null_ic:.4f}, which is not null"
+        assert planted_ic > null_ic + 0.30
+
+    def test_more_features_do_not_buy_a_better_grade_on_pure_noise(self) -> None:
+        """The F1 reproduction, as a regression test.
+
+        Measured against the in-sample grader this replaces: on 40 pure-noise
+        features over a pure-noise label the series read +0.0728 mean IC while
+        the CPCV out-of-sample figure on the same arm read -0.0214, and the
+        40-feature arm beat a 3-feature arm 0.0728 vs 0.0118 on data
+        containing no signal. The slot was ranking capacity to overfit. A
+        walk-forward series cannot: the fit that scores a day never saw it.
+        """
+        noise = _noise_panel(n_days=160, n_names=25, n_features=40, seed=11)
+        wide = grade_arm(_recipe(features=_noise_features(40)), noise, as_of="2026-08-28")
+        narrow = grade_arm(_recipe(features=_noise_features(3)), noise, as_of="2026-08-28")
+        wide_ic = statistics.fmean(wide.series.scores.values())
+        narrow_ic = statistics.fmean(narrow.series.scores.values())
+        assert abs(wide_ic) < 0.05, (
+            f"40 pure-noise features score {wide_ic:.4f} out-of-sample on a pure-noise "
+            "label; in-sample the same arm read +0.0728"
+        )
+        assert wide_ic < narrow_ic + 0.05, (
+            f"40 features ({wide_ic:.4f}) beat 3 ({narrow_ic:.4f}) on data with no signal, "
+            "which is the in-sample defect: the grader is ranking overfit"
+        )
+
+    def test_a_cross_section_that_cannot_be_ranked_is_a_miss_never_a_score(self, panel) -> None:
+        """A flat label block has no ordering to correlate against. Under the
+        argsort ranks this scored +1.0 — a perfect grade for the collapsed
+        condition the behavioural veto exists to refuse."""
+        flat_day = panel.dates[120]
+        labels = panel.forward_returns.copy()
+        labels[120, :] = 0.004
+        flattened = replace(panel, forward_returns=labels)
+        grade = grade_arm(_recipe(), flattened, as_of="2026-08-28")
+        assert flat_day not in grade.series.scores
+        assert flat_day in grade.series.misses
+        assert flat_day in grade.unrankable_dates
+
+    def test_the_benchmark_is_the_scored_cross_section_never_spy(self, panel) -> None:
+        """The slot's declared benchmark AND the grade that carries it.
+
+        The old version of this test asserted the constant alone and never
+        called the grader, so it passed against a grader that had been deleted.
+        """
         from crucible.slots import get_slot
 
         assert get_slot("m").benchmark == "population"
+        grade = grade_arm(_recipe(), panel, as_of="2026-08-28")
+        assert grade.benchmark == "population"
+        assert grade.oos_method == "walk_forward_purged"
+
+
+class TestOutOfSampleClock:
+    """Plan §9.1: the OOS window begins at registration, and nothing is pooled."""
+
+    def test_no_date_before_registration_is_scored(self, panel) -> None:
+        recipe = _recipe(registered_at="2026-07-01")
+        grade = grade_arm(recipe, panel, as_of="2026-08-28")
+        assert grade.series.scores
+        assert min(grade.series.scores) >= "2026-07-01"
+        assert grade.oos_start >= "2026-07-01"
+
+    def test_a_newly_registered_arm_gets_no_backfilled_series(self, panel) -> None:
+        """The F5 half this file owns.
+
+        `promote.py`'s `promote_min_weeks = 4` measured the paired window, and
+        the grader handed a three-day-old arm a 120-date series to pair over,
+        so the age bar could be cleared by an arm that had existed for days.
+        The grader no longer produces the history — an arm registered two
+        sessions before `as_of` has at most two scores, and one registered
+        after `as_of` has none.
+        """
+        recent = grade_arm(_recipe(registered_at="2026-08-27"), panel, as_of="2026-08-28")
+        assert recent.oos_n <= 2, f"a two-session-old arm was handed {recent.oos_n} dates"
+
+        unborn = grade_arm(_recipe(registered_at="2026-09-30"), panel, as_of="2026-08-28")
+        assert unborn.status == "unmeasurable"
+        assert unborn.oos_n == 0
+        assert not unborn.series.scores
+        assert "registered_at" in unborn.reason
+
+    def test_in_sample_and_out_of_sample_counts_are_reported_separately(self, panel) -> None:
+        """§9.1: 'the grader refuses to report a single pooled figure'."""
+        grade = grade_arm(_recipe(registered_at="2026-07-01"), panel, as_of="2026-08-28")
+        assert grade.in_sample_n > 0
+        assert grade.oos_n > 0
+        assert grade.in_sample_n + grade.oos_n + len(grade.unrankable_dates) == sum(
+            1 for d in panel.dates if d <= "2026-08-28"
+        )
+        assert not hasattr(grade, "mean_ic"), (
+            "a single pooled figure across the warm-up and the OOS window is a number no "
+            "decision can legitimately be taken on, and it gets taken by existing"
+        )
+
+    def test_an_arm_without_a_registration_date_does_not_register(self, tmp_path) -> None:
+        """Plan §9.1 pre-registration: missing fields -> the arm does not register."""
+        (tmp_path / "no_clock.yaml").write_text(
+            "\n".join(
+                [
+                    "slot: m",
+                    "name: no_clock",
+                    "spec:",
+                    "  features: [mom_21d_ratio]",
+                    "  estimator: {kind: ridge, alpha: 1.0}",
+                    "  label_horizon_trading_days: 21",
+                    "  refit_cadence_trading_days: 5",
+                    "  training_window: {kind: expanding, min_trading_days: 504}",
+                    "  cpcv: {n_groups: 6, k_test: 2, embargo_trading_days: 2}",
+                    "  feature_version: v1",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="registered_at"):
+            load_model_recipes(tmp_path)
+
+    def test_registered_at_is_not_part_of_the_arm_id(self) -> None:
+        """A re-registration must not orphan the arm's score series (§3.1)."""
+        assert (
+            _recipe(registered_at="2026-01-02").arm_id == _recipe(registered_at="2026-07-01").arm_id
+        )
+
+
+class TestRankIC:
+    """The tie handling `scipy.stats.spearmanr` gave the lifted original."""
+
+    def test_two_flat_vectors_are_unmeasurable_not_a_perfect_correlation(self) -> None:
+        flat = np.zeros(50)
+        assert _rank_ic(flat, flat.copy()) is None, (
+            "argsort ranks gave 1.0 here — a perfect score for a cross-section with no "
+            "ordering in it"
+        )
+
+    def test_a_collapsed_constant_prediction_is_unmeasurable(self) -> None:
+        collapsed = np.full(50, 0.0031)
+        actual = np.linspace(-0.05, 0.05, 50)
+        assert _rank_ic(collapsed, actual) is None
+
+    def test_ties_take_the_average_rank(self) -> None:
+        """Hand-computed against mid-ranks, which is what `scipy.stats.spearmanr`
+        assigns and what the lifted `leakfree_meta_ic.py` therefore used."""
+        values = np.array([3.0, 1.0, 1.0, 1.0, 5.0])
+        assert list(_ranks(values)) == [3.0, 1.0, 1.0, 1.0, 4.0]
+
+    def test_a_mostly_tied_prediction_does_not_invent_an_ordering(self) -> None:
+        """45 of 50 names tied.
+
+        Measured on a real cross-section, the argsort form read -0.4558 where
+        the mid-rank Spearman is -0.1043. The mechanism is asserted here
+        rather than the two numbers: the index-order form's answer DEPENDS ON
+        THE ORDER THE TICKERS ARRIVED IN, and the mid-rank form's does not.
+        Permuting the tied block alone moves the argsort IC from -0.0372 to
+        +0.2060 on identical data; the mid-rank IC is +0.5206 either way, and
+        matches Spearman's definition.
+        """
+        predicted = np.concatenate([np.arange(5.0), np.full(45, 9.9)])
+        actual = np.arange(50.0)
+        shuffled = np.concatenate([np.arange(5), 5 + np.random.default_rng(9).permutation(45)])
+
+        ic = _rank_ic(predicted, actual)
+        assert ic is not None
+        assert ic == pytest.approx(_spearman_by_definition(predicted, actual), abs=1e-12)
+        assert ic == pytest.approx(_rank_ic(predicted[shuffled], actual[shuffled]), abs=1e-12), (
+            "the grade must be a fact about the cross-section, not about the order the "
+            "tickers were listed in"
+        )
+
+        before = _argsort_rank_ic(predicted, actual)
+        after = _argsort_rank_ic(predicted[shuffled], actual[shuffled])
+        assert abs(before - after) > 0.2, (
+            f"the form this replaced read {before:.4f} and {after:.4f} on the SAME data "
+            "reordered; if that is no longer true the fixture has stopped exercising ties"
+        )
+
+    def test_untied_inputs_are_unchanged_by_the_mid_rank_form(self) -> None:
+        rng = np.random.default_rng(5)
+        predicted = rng.normal(0.0, 1.0, 200)
+        actual = rng.normal(0.0, 1.0, 200)
+        assert _rank_ic(predicted, actual) == pytest.approx(
+            _spearman_by_definition(predicted, actual), abs=1e-12
+        )
+
+    def test_a_length_mismatch_raises_rather_than_aligning(self) -> None:
+        with pytest.raises(ValueError, match="paired vectors"):
+            _rank_ic(np.zeros(5), np.zeros(4))
+
+
+class TestLabelHorizonPurge:
+    """A fit dated `as_of` may not consume a label realized after it."""
+
+    def test_the_final_label_horizon_is_purged_from_the_fit(self, panel) -> None:
+        recipe = _recipe()
+        settled = settled_training_days(panel, as_of="2026-08-28", label_horizon=21)
+        assert len(settled) == len(panel.dates) - 21
+        fit = train_arm(recipe, panel, as_of="2026-08-28")
+        assert fit.n_rows == (len(panel.dates) - 21) * len(panel.names)
+
+    def test_a_label_realized_after_as_of_cannot_move_the_fit(self, panel) -> None:
+        """The defect, stated as an experiment: corrupt only the labels that
+        settle after `as_of` and the fit must be byte-identical. Before the
+        purge it moved, so every replayed Saturday in the §6.1 gate used
+        post-date information."""
+        recipe = _recipe()
+        before = train_arm(recipe, panel, as_of="2026-08-28")
+        tampered = panel.forward_returns.copy()
+        tampered[-21:, :] = tampered[-21:, :] + 5.0
+        after = train_arm(recipe, replace(panel, forward_returns=tampered), as_of="2026-08-28")
+        assert np.array_equal(before.coefficients, after.coefficients), (
+            "a return realized after as_of moved the fit dated as_of"
+        )
+        assert before.intercept == after.intercept
+
+    def test_a_window_reached_only_by_unsettled_dates_is_not_satisfied(self, panel) -> None:
+        """`min_trading_days` counts SETTLED days. 160 panel dates minus a
+        21-session horizon is 139, so a recipe declaring 150 must raise rather
+        than fit on rows whose labels do not exist yet."""
+        with pytest.raises(TrainingIntegrityError, match="SETTLED"):
+            train_arm(
+                _recipe(training_window=TrainingWindowSpec("expanding", 150)),
+                panel,
+                as_of="2026-08-28",
+            )
+
+
+class TestMetricScale:
+    """The behavioural veto may not fail OPEN on a unit-scale error."""
+
+    def test_a_percentage_scaled_hit_rate_raises_rather_than_passing(self) -> None:
+        """The F7 reproduction: the SAME model at two scales. 0.4 vetoes on
+        'below the absolute floor 0.5'; 40.0 used to PASS silently."""
+        candidate = {
+            "alpha_stdev": 0.02,
+            "stdev_p_up": 0.06,
+            "n_high_confidence": 12,
+            "model_hit_rate_30d": 40.0,
+        }
+        incumbent = {
+            "alpha_stdev": 0.02,
+            "stdev_p_up": 0.06,
+            "n_high_confidence": 14,
+            "model_hit_rate_30d": 0.60,
+        }
+        with pytest.raises(MetricScaleError, match="model_hit_rate_30d"):
+            evaluate_behavioural_veto(candidate, incumbent)
+
+        candidate["model_hit_rate_30d"] = 0.40
+        assert evaluate_behavioural_veto(candidate, incumbent).status == "veto"
+
+    def test_an_out_of_range_incumbent_raises_too(self) -> None:
+        """Both sides. A percentage-scaled incumbent makes every ratio and
+        floor on the candidate meaningless in the same direction."""
+        with pytest.raises(MetricScaleError, match="incumbent"):
+            evaluate_behavioural_veto(
+                {
+                    "alpha_stdev": 0.02,
+                    "stdev_p_up": 0.06,
+                    "n_high_confidence": 12,
+                    "model_hit_rate_30d": 0.61,
+                },
+                {
+                    "alpha_stdev": 0.02,
+                    "stdev_p_up": 0.06,
+                    "n_high_confidence": 14,
+                    "model_hit_rate_30d": 60.0,
+                },
+            )
+
+    def test_a_negative_proportion_raises(self) -> None:
+        with pytest.raises(MetricScaleError):
+            evaluate_behavioural_veto(
+                {
+                    "alpha_stdev": 0.02,
+                    "stdev_p_up": 0.06,
+                    "n_high_confidence": 12,
+                    "model_hit_rate_30d": -0.01,
+                },
+                {
+                    "alpha_stdev": 0.02,
+                    "stdev_p_up": 0.06,
+                    "n_high_confidence": 14,
+                    "model_hit_rate_30d": 0.60,
+                },
+            )
 
 
 # --------------------------------------------------------------------------
@@ -332,6 +658,7 @@ class TestRecipeLoading:
                     "  training_window: {kind: expanding, min_trading_days: 504}",
                     "  cpcv: {n_groups: 6, k_test: 2, embargo_trading_days: 2}",
                     "  feature_version: v1",
+                    "registered_at: '2026-06-01'",
                 ]
             ),
             encoding="utf-8",
@@ -354,8 +681,85 @@ class TestRecipeLoading:
 # --------------------------------------------------------------------------
 
 
+def _spearman_by_definition(predicted: np.ndarray, actual: np.ndarray) -> float:
+    """Spearman computed from first principles, independently of the module.
+
+    A test that recomputes the statistic with the same helper it is testing
+    proves only that the helper is self-consistent. This one builds mid-ranks
+    from `sorted()` in plain Python and takes the Pearson correlation of them,
+    so it disagrees with :func:`crucible.slots.model._rank_ic` whenever the
+    module's tie handling is wrong.
+    """
+
+    def midranks(values: np.ndarray) -> list[float]:
+        ordered = sorted(range(len(values)), key=lambda i: values[i])
+        out = [0.0] * len(values)
+        i = 0
+        while i < len(ordered):
+            j = i
+            while j + 1 < len(ordered) and values[ordered[j + 1]] == values[ordered[i]]:
+                j += 1
+            for k in range(i, j + 1):
+                out[ordered[k]] = (i + j) / 2.0
+            i = j + 1
+        return out
+
+    a = midranks(predicted)
+    b = midranks(actual)
+    am = statistics.fmean(a)
+    bm = statistics.fmean(b)
+    num = sum((x - am) * (y - bm) for x, y in zip(a, b, strict=True))
+    den = sum((x - am) ** 2 for x in a) ** 0.5 * sum((y - bm) ** 2 for y in b) ** 0.5
+    return num / den
+
+
+def _argsort_rank_ic(predicted: np.ndarray, actual: np.ndarray) -> float:
+    """The rank IC as the module computed it BEFORE the mid-rank fix.
+
+    Kept so the tie tests can state which of the two answers is correct rather
+    than only that the module changed. Index-order ranks: a tied block is
+    ordered by whatever position its members occupy in the array.
+    """
+
+    def ranks(values: np.ndarray) -> np.ndarray:
+        order = values.argsort()
+        out = np.empty_like(order, dtype=float)
+        out[order] = np.arange(values.size, dtype=float)
+        return out
+
+    pr = ranks(predicted) - ranks(predicted).mean()
+    ar = ranks(actual) - ranks(actual).mean()
+    return float((pr * ar).sum() / np.sqrt((pr * pr).sum() * (ar * ar).sum()))
+
+
+def _noise_features(n: int) -> tuple[str, ...]:
+    return tuple(f"f{i:02d}_zscore" for i in range(n))
+
+
+def _noise_panel(*, n_days: int, n_names: int, n_features: int, seed: int) -> FeaturePanel:
+    """A panel with NO relationship between any feature and the label.
+
+    The §10.1 negative control as a fixture. `tests/support/panels.py` plants
+    an edge on purpose; this one plants nothing, so any grade it produces
+    above sampling noise is the grader measuring itself.
+    """
+    from tests.support.panels import trading_days
+
+    rng = np.random.default_rng(seed)
+    return FeaturePanel(
+        dates=tuple(trading_days(n_days)),
+        names=tuple(f"T{i:03d}" for i in range(n_names)),
+        features={
+            name: rng.normal(0.0, 1.0, size=(n_days, n_names))
+            for name in _noise_features(n_features)
+        },
+        forward_returns=rng.normal(0.0, 1.0, size=(n_days, n_names)),
+        feature_version="v1",
+    )
+
+
 def _recipe(**over) -> ModelRecipe:
-    from crucible.slots.model import EstimatorSpec, TrainingWindowSpec
+    from crucible.slots.model import EstimatorSpec
 
     kwargs = dict(
         name="residual_momentum",
@@ -366,6 +770,10 @@ def _recipe(**over) -> ModelRecipe:
         training_window=TrainingWindowSpec(kind="expanding", min_trading_days=40),
         cpcv=CPCVSpec(n_groups=6, k_test=2, embargo_trading_days=2),
         feature_version="v1",
+        # Earlier than the fixture panel's first session, so a test that does
+        # not care about the out-of-sample clock is not silently gated by it.
+        # The clock's own tests set this explicitly.
+        registered_at="2020-01-02",
     )
     kwargs.update(over)
     return ModelRecipe(**kwargs)
