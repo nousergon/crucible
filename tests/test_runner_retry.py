@@ -168,30 +168,64 @@ class TestRetry:
 
 
 class TestSpotGuard:
-    def test_sigterm_becomes_a_named_failure_with_a_manifest(self, tmp_path) -> None:
-        """Without the guard the process dies with no manifest at all, which
-        surfaces as an ABSENCE page with the cause discarded."""
-        import os
-        import signal
+    def test_sigterm_without_an_external_guard_still_produces_a_manifest(self, tmp_path) -> None:
+        """`run_job` must install `spot_interruption_guard` ITSELF (defect #8,
+        alpha-engine-config-I9757): before the fix, `grep -rn
+        spot_interruption_guard crucible` found only the definition and
+        `track_c.py`'s smoke job — no track-A job installed it, and
+        `data.weekly`, the 1-3 hour job plan §4.7 puts on a spot instance,
+        ran unguarded. A SIGTERM there killed the process with no manifest
+        at all: an ABSENCE page with the cause discarded, which is precisely
+        what the guard's own docstring says it prevents.
 
-        from crucible.runner import spot_interruption_guard
+        A previous version of this test wrapped the `run_job` call in its
+        OWN `with spot_interruption_guard():` — which passes whether or not
+        `run_job` installs the guard internally, because the external guard
+        converts the signal before `run_job` ever sees it. That is a test
+        that cannot fail (§11 risk 1): it asserts a property of the test's
+        own scaffolding, not of `run_job`.
 
-        store = LocalStore(tmp_path)
+        This version calls `run_job` with NO external guard, in a
+        subprocess: the delivered SIGTERM is real, and if `run_job` does not
+        catch it the interpreter dies with the default disposition (process
+        termination) rather than raising anything a `pytest.raises` could
+        observe in this process — which is itself the bug being tested for,
+        so the assertion is on the subprocess's OUTPUT (a manifest file on
+        disk), not on how it exited.
+        """
+        import subprocess
+        import sys
 
-        def reclaimed(ctx: RunContext) -> None:
-            os.kill(os.getpid(), signal.SIGTERM)
-
-        with spot_interruption_guard():
-            with pytest.raises(SpotInterruptionError):
-                run_job(
-                    "data.daily",
-                    reclaimed,
-                    store=store,
-                    trading_day=FRIDAY,
-                    now=NOW,
-                    transient_retry=False,
-                )
-        manifest = _manifest(store)
+        sub_root = tmp_path / "sub"
+        script = (
+            "import datetime as dt, os, signal\n"
+            "from crucible.runner import run_job\n"
+            "from crucible.store import LocalStore\n"
+            f"store = LocalStore({str(sub_root)!r})\n"
+            "def reclaimed(ctx):\n"
+            "    os.kill(os.getpid(), signal.SIGTERM)\n"
+            "try:\n"
+            "    run_job(\n"
+            "        'data.weekly', reclaimed, store=store,\n"
+            f"        trading_day=dt.date({FRIDAY.year}, {FRIDAY.month}, {FRIDAY.day}),\n"
+            f"        now=dt.datetime({NOW.year}, {NOW.month}, {NOW.day}, {NOW.hour}, "
+            f"{NOW.minute}, tzinfo=dt.UTC),\n"
+            "        transient_retry=False,\n"
+            "    )\n"
+            "except BaseException:\n"
+            "    pass\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=30
+        )
+        manifest_path = sub_root / "runs" / "data.weekly" / FRIDAY.isoformat() / "run.json"
+        assert manifest_path.is_file(), (
+            "run_job must install the spot-interruption guard itself, so a caller "
+            "that installs no guard of its own still gets a manifest rather than a "
+            "silent process death. subprocess exit "
+            f"{result.returncode}, stderr:\n{result.stderr[-4000:]}"
+        )
+        manifest = json.loads(manifest_path.read_text())
         assert manifest["status"] == "failed"
         assert "spot_interruption" in manifest["reason"]
 

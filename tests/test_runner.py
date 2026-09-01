@@ -185,6 +185,41 @@ class TestNoThirdState:
             pytest.fail(f"runner wrote a non-conformant manifest: {exc}")
 
 
+class TestCostAssertion:
+    def test_cost_usd_below_the_llm_call_total_is_refused(self, tmp_path) -> None:
+        """schemas/run_manifest.v1.json's `cost_usd` description claims "the
+        runner asserts that, since a schema cannot" (a schema cannot
+        cross-reference two fields of the same document). Before this fix
+        nothing in the runner did — it only accumulated and rounded. A job
+        whose own bookkeeping (a negative `record_cost`, the plausible real
+        case: a refund, a cache-hit credit applied twice) pulls `cost_usd`
+        below what `llm_calls[].usd` itself reports must be refused at write
+        time, not discovered by a reader doing the arithmetic later."""
+        store = LocalStore(tmp_path)
+
+        def job(ctx: RunContext) -> None:
+            ctx.record_llm_call(
+                {
+                    "callsite_id": "research.rank.v1",
+                    "model_requested": "tier:high",
+                    "model_served": "glm-4.6",
+                    "tokens_in": 100,
+                    "tokens_out": 10,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                    "usd": 1.00,
+                }
+            )
+            # bookkeeping bug: pulls cost_usd below the llm total while
+            # staying non-negative, so this exercises the cost_usd-vs-
+            # llm_calls cross-check specifically rather than tripping the
+            # schema's unrelated `cost_usd >= 0` minimum.
+            ctx.record_cost(-0.50)
+
+        with pytest.raises(ValueError, match="less than the sum of llm_calls"):
+            run_job("experiment.run", job, store=store, trading_day=TRADING_DAY)
+
+
 class TestKeyRefusal:
     def test_the_runner_refuses_a_non_trading_day(self, tmp_path) -> None:
         """§4.12: a caller cannot force a Saturday key by passing one. The

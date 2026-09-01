@@ -82,6 +82,53 @@ class TestLedger:
         assert read_trials(store) == []
         assert n_trials(store) == 0
 
+    def test_a_concurrent_writer_between_read_and_write_is_refused(
+        self, store, monkeypatch
+    ) -> None:
+        """alpha-engine-config-I9757 defect #12: `LedgerAppendError`'s old
+        guard (`len(combined) < len(existing)`) can never be true, because
+        `combined` is built by concatenating `existing` with `fresh` two
+        lines above — the comparison tests a property of its own
+        construction, not of the log. The property that matters is that no
+        row this call already read gets dropped or reordered by its own
+        write; the fix re-reads the log immediately before writing and
+        refuses if a concurrent writer got there first."""
+        from crucible import ledger as ledger_module
+
+        append_trials(store, [_row("u", "u:a:1", "2026-08-28")])
+
+        real_read_trials = ledger_module.read_trials
+        calls = {"n": 0}
+
+        def racing_read(store_arg):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                # Simulate a second writer landing between THIS call's first
+                # read and its write: append a row directly, bypassing this
+                # call's own bookkeeping, then return the log AS IT NOW
+                # STANDS — the same as a real re-read would.
+                current = real_read_trials(store_arg)
+                combined = current + [_row("r", "r:z:9", "2026-08-28")]
+                payload = (
+                    "\n".join(__import__("json").dumps(row, sort_keys=True) for row in combined)
+                    + "\n"
+                ).encode("utf-8")
+                store_arg.put_bytes(ledger_module.ledger_key(), payload)
+            return real_read_trials(store_arg)
+
+        monkeypatch.setattr(ledger_module, "read_trials", racing_read)
+        from crucible.ledger import LedgerAppendError
+
+        with pytest.raises(LedgerAppendError, match="changed between read and write"):
+            append_trials(store, [_row("u", "u:b:2", "2026-08-28")])
+
+        # The racing writer's row must survive — the whole point of the guard.
+        monkeypatch.undo()
+        rows = read_trials(store)
+        assert any(r["arm_id"] == "r:z:9" for r in rows), (
+            "the guard exists so a race never silently drops the other writer's row"
+        )
+
 
 class TestExplain:
     def test_the_walk_reaches_the_data_run_from_the_feature_artifact(
@@ -154,23 +201,74 @@ class TestExplain:
         with pytest.raises(FileNotFoundError, match="no run manifests"):
             explain(store, "anything")
 
+    def test_a_collision_keeps_the_later_run_and_names_the_earlier_one(
+        self, store, cycle_date
+    ) -> None:
+        """alpha-engine-config-I9757 defect #9: the module's own docstring
+        claims "the caller sees both `run_id`s in the walk" — `by_output[key]
+        = manifest` alone just overwrites, and the caller sees one. Two runs
+        both claiming `shared/key.json` must render as one winner (the later
+        one, by `finished`) PLUS the earlier run named as a collision, in
+        both the dict form (`Lineage.to_dict()["also_claimed_by"]`) and the
+        rendered text `crucible explain` prints."""
+        import datetime as dt
 
-class _FakeCtx:
-    """The minimum of a RunContext the migration touches."""
+        earlier = dt.datetime(2026, 8, 28, 10, 0, tzinfo=dt.UTC)
+        later = dt.datetime(2026, 8, 28, 14, 0, tzinfo=dt.UTC)
 
-    def __init__(self, store, trading_day):
-        self.store = store
-        self.trading_day = trading_day
-        self.run_id = "01JG0000000000000000000000"
-        self.metrics: list = []
-        self.outputs: list = []
+        first = run_job(
+            "data.heal",
+            lambda c: c.record_output("shared/key.json", b'{"from": "first"}'),
+            store=store,
+            trading_day=cycle_date,
+            now=earlier,
+        )
+        second = run_job(
+            "data.daily",
+            lambda c: c.record_output("shared/key.json", b'{"from": "second"}'),
+            store=store,
+            trading_day=cycle_date,
+            now=later,
+        )
 
-    def record_metric(self, metric):
-        self.metrics.append(metric)
+        node = explain(store, "shared/key.json")
+        assert node.manifest["run_id"] == second.run_id, (
+            "the LATER run (by `finished`) is the winner the walk resolves to"
+        )
+        assert node.collisions == (first.run_id,), (
+            "the earlier claimant must not be silently dropped from the walk"
+        )
+        as_dict = node.to_dict()
+        assert as_dict["also_claimed_by"] == [first.run_id]
 
-    def record_output(self, key, payload, schema_version="v1"):
-        self.store.put_bytes(key, payload)
-        self.outputs.append({"key": key, "schema_version": schema_version})
+        rendered = render(node)
+        assert "ALSO CLAIMED BY" in rendered
+        assert first.run_id in rendered
+        assert second.run_id in rendered
+
+
+def _run_migrate(store, cycle_date, **kwargs):
+    """Run `migrate.history` through the REAL runner, not a hand-rolled ctx.
+
+    alpha-engine-config-I9757 defect #7b: every migrate test used to
+    construct a `_FakeCtx` whose `record_output` fabricated an entry with no
+    `sha256` and never called `compare_and_swap` — migrate was never run
+    through `run_job` in the suite, so its manifest was never schema-
+    validated and the champion-pointer write's CAS/lineage behaviour was
+    never exercised at all. This wrapper is the fix: it returns
+    `(RunContext, result)`, where `result` is `run_migrate_history`'s own
+    return value, captured via the closure since `run_job` does not forward
+    a job callable's return value onto the `RunContext` it returns.
+    """
+    from crucible.runner import run_job
+
+    captured: dict = {}
+
+    def job(ctx):
+        captured["result"] = run_migrate_history(ctx, **kwargs)
+
+    ctx = run_job("migrate.history", job, store=store, trading_day=cycle_date)
+    return ctx, captured.get("result")
 
 
 class TestMigrate:
@@ -181,7 +279,7 @@ class TestMigrate:
 
         v1 = LocalStore(tmp_path / "v1")
         with pytest.raises(MigrationSourceMissing) as excinfo:
-            run_migrate_history(_FakeCtx(store, cycle_date), v1_store=v1)
+            _run_migrate(store, cycle_date, v1_store=v1)
         message = str(excinfo.value)
         for source in SOURCES:
             assert source.key in message, "every absent source must be named by its key"
@@ -205,8 +303,9 @@ class TestMigrate:
             ).encode(),
         )
         recipes = {s.name: s for s in load_arm_specs("u", strategy_dir=strategy_dir)}
-        result = run_migrate_history(
-            _FakeCtx(store, cycle_date),
+        ctx, result = _run_migrate(
+            store,
+            cycle_date,
             v1_store=v1,
             slots=("r",),
             arm_recipes=recipes,
@@ -223,6 +322,65 @@ class TestMigrate:
         assert arm.record.bootstrap is True
         assert arm.record.created_date == "2026-07-13", (
             "the OOS clock starts when the arm actually started, not at cutover"
+        )
+
+        # defect #7: the pointer must be real lineage, not a bare PUT the
+        # manifest never heard about.
+        output_keys = [o["key"] for o in ctx.outputs]
+        assert "champions/r/current.json" in output_keys, (
+            "the champion pointer must be recorded in outputs[], or `crucible "
+            "explain champions/r/current.json` cannot name the run that wrote it"
+        )
+        pointer_output = next(o for o in ctx.outputs if o["key"] == "champions/r/current.json")
+        assert len(pointer_output["sha256"]) == 64, (
+            "a fabricated output entry with no real content hash would defeat both the "
+            "manifest schema's artifactRef contract and idempotency-by-content-hash"
+        )
+
+        node = explain(store, "champions/r/current.json")
+        assert node.manifest["run_id"] == ctx.run_id, "explain must resolve the pointer's lineage"
+
+    def test_allow_missing_records_fail_not_a_third_state(
+        self, store, tmp_path, strategy_dir, cycle_date
+    ) -> None:
+        """alpha-engine-config-I9757 defect #3: `--allow-missing` must not
+        spell a third state (`DEGRADED_BY_OPERATOR_CONSENT`) at the metric
+        level inside a manifest whose own `status` is `ok`. `FAIL` is the
+        honest, schema-legal word; the operator's consent is prose in
+        `status_reason`, not a fabricated status token."""
+        from crucible.slots.arms import load_arm_specs
+        from crucible.store import LocalStore
+
+        v1 = LocalStore(tmp_path / "v1")
+        v1.put_bytes(
+            "config/producer_champion.json",
+            json.dumps(
+                {
+                    "champion": "momentum_sleeve",
+                    "promoted_at": "2026-07-13T22:07:09Z",
+                    "promotion_source": "operator_bootstrap",
+                }
+            ).encode(),
+        )
+        recipes = {s.name: s for s in load_arm_specs("u", strategy_dir=strategy_dir)}
+        ctx, result = _run_migrate(
+            store,
+            cycle_date,
+            v1_store=v1,
+            slots=("r",),
+            arm_recipes=recipes,
+            allow_missing=True,
+        )
+        assert result["sources_missing"], "this fixture leaves sources absent on purpose"
+        migrate_metric = next(m for m in ctx.metrics if m["name"] == "arms_migrated")
+        assert migrate_metric["status"] == "FAIL"
+        assert "ABSENT" in migrate_metric["status_reason"]
+        manifest_key = f"runs/migrate.history/{cycle_date.isoformat()}/run.json"
+        manifest = json.loads(store.get_bytes(manifest_key))
+        assert manifest["status"] == "ok", (
+            "the RUN succeeded (the operator consented to the gap); the schema forbids "
+            "the metric from spelling anything other than ok/failed/OK/FAIL/BREACH/... "
+            "— never a degraded-flavoured word invented for this one caller"
         )
 
     def test_a_champion_with_no_v2_recipe_is_refused_rather_than_guessed(
@@ -242,8 +400,9 @@ class TestMigrate:
             ).encode(),
         )
         with pytest.raises(MigrationSourceMissing, match="launder provenance"):
-            run_migrate_history(
-                _FakeCtx(store, cycle_date),
+            _run_migrate(
+                store,
+                cycle_date,
                 v1_store=v1,
                 slots=("r",),
                 arm_recipes={},
@@ -263,10 +422,46 @@ class TestMigrate:
         )
         recipes = {s.name: s for s in load_arm_specs("u", strategy_dir=strategy_dir)}
         with pytest.raises(MigrationSourceMissing, match="no `promoted_at`"):
-            run_migrate_history(
-                _FakeCtx(store, cycle_date),
+            _run_migrate(
+                store,
+                cycle_date,
                 v1_store=v1,
                 slots=("r",),
                 arm_recipes=recipes,
                 allow_missing=True,
             )
+
+    def test_a_rerun_does_not_lose_the_pointer_to_a_stale_cas_token(
+        self, store, tmp_path, strategy_dir, cycle_date
+    ) -> None:
+        """Migration is documented one-shot and idempotent: `register_arms`
+        already refuses to duplicate an arm. The champion pointer write must
+        be equally safe to repeat — a CAS token captured once and reused on
+        a second run would raise `PointerConflictError` on the exact rerun
+        the module's own docstring promises is safe."""
+        from crucible.store import LocalStore
+
+        v1 = LocalStore(tmp_path / "v1")
+        v1.put_bytes(
+            "config/producer_champion.json",
+            json.dumps(
+                {
+                    "champion": "momentum_sleeve",
+                    "promoted_at": "2026-07-13T22:07:09Z",
+                    "promotion_source": "operator_bootstrap",
+                }
+            ).encode(),
+        )
+        from crucible.slots.arms import load_arm_specs
+
+        recipes = {s.name: s for s in load_arm_specs("u", strategy_dir=strategy_dir)}
+        kwargs = dict(v1_store=v1, slots=("r",), arm_recipes=recipes, allow_missing=True)
+        _run_migrate(store, cycle_date, **kwargs)
+        # A second run reuses the same store; run_job refuses a second
+        # manifest at the same key on the same trading day only if the CALLER
+        # re-derives its own etag each time, which is what `run_migrate_history`
+        # must do internally rather than caching one from an earlier read.
+        pointer_before = json.loads(store.get_bytes("champions/r/current.json"))
+        _run_migrate(store, cycle_date, **kwargs)
+        pointer_after = json.loads(store.get_bytes("champions/r/current.json"))
+        assert pointer_after == pointer_before

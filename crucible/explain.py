@@ -47,12 +47,24 @@ MAX_DEPTH = 12
 
 @dataclass
 class Lineage:
-    """One node of the chain: a run, the key it explains, and what fed it."""
+    """One node of the chain: a run, the key it explains, and what fed it.
+
+    ``collisions`` is the OTHER run ids that also claimed this key as an
+    output, oldest first — empty for the overwhelming majority of keys,
+    which have exactly one producer. It is never used to pick a different
+    winner; :func:`_index` already decided that (the later run, by
+    `finished`). It exists so the caller sees both run_ids rather than one,
+    per this module's own docstring: a shared output key is the
+    last-writer-wins shape that gave a cycle's verdict to its
+    worst-informed author, and a walk that silently kept only the winner
+    would hide the exact defect it is meant to surface.
+    """
 
     key: str
     manifest: dict[str, Any] | None
     depth: int
     parents: list[Lineage] = field(default_factory=list)
+    collisions: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         run = self.manifest or {}
@@ -69,6 +81,7 @@ class Lineage:
             "cost_usd": run.get("cost_usd"),
             "llm_calls": len(run.get("llm_calls") or []),
             "inputs": [i["key"] for i in run.get("inputs") or []],
+            "also_claimed_by": list(self.collisions),
             "parents": [p.to_dict() for p in self.parents],
         }
 
@@ -90,22 +103,31 @@ def load_manifests(store: Store) -> list[dict[str, Any]]:
     return out
 
 
-def _index(manifests: list[dict[str, Any]]) -> tuple[dict[str, dict], dict[str, dict]]:
-    """`{run_id: manifest}` and `{output key: manifest}`.
+def _index(
+    manifests: list[dict[str, Any]],
+) -> tuple[dict[str, dict], dict[str, dict], dict[str, tuple[str, ...]]]:
+    """`{run_id: manifest}`, `{output key: manifest}`, and `{output key: other claimants}`.
 
-    A key claimed as an output by two runs keeps the LATER one, and the
-    collision is not silent: the caller sees both `run_id`s in the walk,
-    because a shared output key written by several executions is exactly
-    the last-writer-wins shape that gave a cycle's verdict to its
-    worst-informed author.
+    A key claimed as an output by two runs keeps the LATER one (by
+    `finished`) as the answer `by_output` gives; that part was already true.
+    What was missing is the third return value: every OTHER run_id that also
+    claimed the key, oldest first, so `explain`/`render` can attach them to
+    the node instead of the collision vanishing when the later manifest
+    overwrites the earlier one in a plain dict.
     """
     by_run: dict[str, dict] = {}
     by_output: dict[str, dict] = {}
+    claimants: dict[str, list[str]] = {}
     for manifest in sorted(manifests, key=lambda m: m["finished"]):
         by_run[manifest["run_id"]] = manifest
         for output in manifest.get("outputs") or []:
-            by_output[output["key"]] = manifest
-    return by_run, by_output
+            key = output["key"]
+            by_output[key] = manifest
+            claimants.setdefault(key, []).append(manifest["run_id"])
+    collisions = {
+        key: tuple(run_ids[:-1]) for key, run_ids in claimants.items() if len(run_ids) > 1
+    }
+    return by_run, by_output, collisions
 
 
 def explain(store: Store, target: str) -> Lineage:
@@ -123,7 +145,7 @@ def explain(store: Store, target: str) -> Lineage:
             "there is no lineage — which is a different answer from 'this verdict has "
             "no explanation'."
         )
-    by_run, by_output = _index(manifests)
+    by_run, by_output, collisions = _index(manifests)
 
     if target in by_run:
         root_manifest: dict[str, Any] | None = by_run[target]
@@ -139,18 +161,19 @@ def explain(store: Store, target: str) -> Lineage:
             "match, because an explanation of the wrong run is worse than none."
         )
 
-    return _walk(root_key, root_manifest, by_output, depth=0, seen=set())
+    return _walk(root_key, root_manifest, by_output, collisions, depth=0, seen=set())
 
 
 def _walk(
     key: str,
     manifest: dict[str, Any] | None,
     by_output: dict[str, dict],
+    collisions: dict[str, tuple[str, ...]],
     *,
     depth: int,
     seen: set[str],
 ) -> Lineage:
-    node = Lineage(key=key, manifest=manifest, depth=depth)
+    node = Lineage(key=key, manifest=manifest, depth=depth, collisions=collisions.get(key, ()))
     if manifest is None or depth >= MAX_DEPTH:
         return node
     for entry in manifest.get("inputs") or []:
@@ -159,7 +182,14 @@ def _walk(
             continue
         seen.add(input_key)
         node.parents.append(
-            _walk(input_key, by_output.get(input_key), by_output, depth=depth + 1, seen=seen)
+            _walk(
+                input_key,
+                by_output.get(input_key),
+                by_output,
+                collisions,
+                depth=depth + 1,
+                seen=seen,
+            )
         )
     return node
 
@@ -186,6 +216,12 @@ def render(node: Lineage) -> str:
                 f"{run['release_sha'][:12]}  seed={run['seed']}  "
                 f"cost_usd={run['cost_usd']}  llm_calls={len(run.get('llm_calls') or [])}"
             )
+            if current.collisions:
+                lines.append(
+                    f"{pad}    ALSO CLAIMED BY: {', '.join(current.collisions)} — "
+                    "this key was written by more than one run; the run above is only "
+                    "the LATEST by `finished`, and the others are not shown in this walk"
+                )
         for parent in current.parents:
             emit(parent)
 

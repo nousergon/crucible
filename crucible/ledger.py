@@ -112,9 +112,27 @@ def append_trials(store: Store, rows: list[dict[str, Any]]) -> int:
     fresh = [row for row in rows if _identity(row) not in seen]
     if not fresh:
         return 0
+    # The guard that matters is NOT `len(combined) < len(existing)` — `combined`
+    # is built by concatenating `existing` with `fresh` two lines below, so
+    # that comparison can never be true for any input; it is a predicate that
+    # tests a property of its own construction, not of the log. The property
+    # that actually matters is append-only in substance: no row `read_trials`
+    # returned above may be dropped, reordered or rewritten by this write. A
+    # concurrent writer that appended between our read and our write is
+    # exactly the case that would violate it — this call would then rewrite
+    # the log from a stale `existing` and silently drop whatever the other
+    # writer just added. Re-reading immediately before the write catches
+    # that race the same way `Store.compare_and_swap` catches it for a
+    # pointer, without needing the store to expose CAS for an append target.
+    current = read_trials(store)
+    if current != existing:
+        raise LedgerAppendError(
+            f"the ledger changed between read and write: {len(current)} row(s) present "
+            f"now, {len(existing)} when this call read it. Writing `existing + fresh` on "
+            "top of that would drop or reorder whatever the concurrent writer just "
+            "appended. Re-read the ledger and retry."
+        )
     combined = existing + fresh
-    if len(combined) < len(existing):  # pragma: no cover - defensive
-        raise LedgerAppendError("a ledger write may only extend the log, never shorten it")
     payload = ("\n".join(json.dumps(row, sort_keys=True) for row in combined) + "\n").encode(
         "utf-8"
     )
