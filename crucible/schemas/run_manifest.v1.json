@@ -59,6 +59,7 @@
         "heartbeat",
         "drift",
         "console",
+        "board",
         "deploy",
         "weekly",
         "gate"

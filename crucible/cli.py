@@ -216,6 +216,12 @@ JOBS: dict[str, JobSpec] = {
     "heartbeat": JobSpec("heartbeat", "Weekly proof the alerting path itself is alive", True),
     "drift": JobSpec("drift", "Feature PSI, prediction drift and IC decay", True),
     "console": JobSpec("console", "Render the static console page from the manifests", True),
+    # alpha-engine-config-I9837. Its own job on its own DAILY schedule, not a
+    # stage of the weekly arc: a board that only refreshes once phase 2 opens
+    # could not have rendered the gap that closed phase 1.
+    "board": JobSpec(
+        "board", "Render the fully-declared board — every objective, gate and component", True
+    ),
     # track-F (alpha-engine-config-I9757). `weekly` is what the Saturday
     # schedule dispatches: `components.yaml` declares six jobs as weekly and
     # the scheduler started exactly one of them, so five components were
@@ -272,6 +278,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     "heartbeat": track_c.heartbeat_handler,
     "drift": track_c.drift_handler,
     "console": track_c.console_handler,
+    "board": track_c.board_handler,
     # track-F
     "weekly": track_f.weekly_handler,
     "gate": track_f.gate_handler,
