@@ -37,7 +37,6 @@ from typing import TYPE_CHECKING, Any
 from crucible.calendar import assert_trading_day, is_trading_day
 from crucible.data.daily import DEFAULT_LOOKBACK_DAYS, run_daily
 from crucible.data.sources import PriceSource
-from crucible.features import DEFAULT_FEATURE_VERSION
 from crucible.keys import data_panel_key
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -78,13 +77,17 @@ def run_weekly(
     source: PriceSource,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     expected_symbols: list[str] | None = None,
-    feature_version: str = DEFAULT_FEATURE_VERSION,
 ) -> dict[str, Any]:
     """Compile the week's last session, then assert the week has no gap.
 
     The order matters: the day is compiled FIRST, so a run whose own session
     is the missing one fails on the source rather than on its own absence,
     which names the actual cause.
+
+    No ``feature_version`` parameter, for the same reason `run_daily` has
+    none (`alpha-engine-config-I9816`): the version is derived inside
+    `run_daily` from the catalogue, and there is nothing here for a caller
+    to override.
     """
     trading_day = ctx.trading_day
     coverage = run_daily(
@@ -92,7 +95,6 @@ def run_weekly(
         source=source,
         lookback_days=lookback_days,
         expected_symbols=expected_symbols,
-        feature_version=feature_version,
     )
 
     sessions = week_sessions(trading_day)

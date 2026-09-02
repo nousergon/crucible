@@ -28,7 +28,6 @@ from crucible.config import settings as resolve_settings
 from crucible.data import ArcticPriceSource, PriceSource, run_daily, run_heal, run_weekly
 from crucible.explain import explain as explain_lineage
 from crucible.explain import render as render_lineage
-from crucible.features import DEFAULT_FEATURE_VERSION
 from crucible.manifest import manifest_key
 from crucible.runner import run_job
 from crucible.slots import research, universe
@@ -154,7 +153,6 @@ def handle_data_daily(args: argparse.Namespace) -> int:
             c,
             source=source,
             expected_symbols=_symbols(args),
-            feature_version=getattr(args, "feature_version", None) or DEFAULT_FEATURE_VERSION,
         ),
         store=store,
         trading_day=args.trading_day,
@@ -179,7 +177,6 @@ def handle_data_weekly(args: argparse.Namespace) -> int:
             c,
             source=source,
             expected_symbols=_symbols(args),
-            feature_version=getattr(args, "feature_version", None) or DEFAULT_FEATURE_VERSION,
         ),
         store=store,
         trading_day=args.trading_day,
@@ -420,7 +417,6 @@ def add_track_a_arguments(name: str, sub: argparse.ArgumentParser) -> None:
                 "against (alpha-engine-config-I9757 defect #2)."
             ),
         )
-        sub.add_argument("--feature-version", help="Override the derived feature version.")
     if name == "data.heal":
         sub.add_argument("--from", dest="from_date", required=True, metavar="YYYY-MM-DD")
         sub.add_argument("--to", dest="to_date", required=True, metavar="YYYY-MM-DD")

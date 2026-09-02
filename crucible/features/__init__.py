@@ -18,11 +18,16 @@ from __future__ import annotations
 from crucible.features.compute import LIQUIDITY_FLOOR_USD, build_features, read_features
 from crucible.features.registry import (
     CATALOG,
+    FEATURE_REGISTRY_SCHEMA_PATH,
+    FEATURE_REGISTRY_SCHEMA_VERSION,
     UNIT_SUFFIXES,
+    FeatureRegistryValidationError,
     FeatureSpec,
     feature_names,
     feature_version,
+    load_registry_schema,
     registry_payload,
+    validate_registry_payload,
 )
 
 #: The version the jobs write to unless told otherwise. Derived from the
@@ -32,12 +37,17 @@ DEFAULT_FEATURE_VERSION = feature_version(CATALOG)
 __all__ = [
     "CATALOG",
     "DEFAULT_FEATURE_VERSION",
+    "FEATURE_REGISTRY_SCHEMA_PATH",
+    "FEATURE_REGISTRY_SCHEMA_VERSION",
     "LIQUIDITY_FLOOR_USD",
     "UNIT_SUFFIXES",
+    "FeatureRegistryValidationError",
     "FeatureSpec",
     "build_features",
     "feature_names",
     "feature_version",
+    "load_registry_schema",
     "read_features",
     "registry_payload",
+    "validate_registry_payload",
 ]
