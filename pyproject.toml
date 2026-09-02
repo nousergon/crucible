@@ -70,7 +70,7 @@ Homepage = "https://github.com/nousergon/crucible"
 [dependency-groups]
 dev = [
     "pytest>=8.3",
-    "ruff>=0.13",
+    "ruff>=0.16.5",
 ]
 
 [build-system]
