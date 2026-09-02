@@ -279,7 +279,7 @@ def resolve_prediction_inputs(recipes: Sequence[Any]) -> dict[str, tuple[str, ..
                     "is registered, scored and promoted like any other — so an input "
                     "naming something that is not one has no producer and the arm does "
                     "not register (plan §9.1). This is the refusal that replaces "
-                    "`registers fine, dies at grading` (alpha-engine-config-I9777)."
+                    "`registers fine, dies at grading`."
                 )
             bases.append(ref.ref)
         edges[recipe.name] = tuple(bases)
@@ -337,7 +337,7 @@ def assert_inputs_producible(recipes: Sequence[Any], *, feature_columns: Sequenc
                     f"`crucible.slots.inputs.INPUT_RESOLVERS` carries "
                     f"{sorted(INPUT_RESOLVERS)}. The arm does NOT register. A kind that is "
                     "declarable but not resolvable is exactly `registers fine, could never "
-                    "be graded` with a new name (alpha-engine-config-I9777)."
+                    "be graded` with a new name."
                 )
         wanted = {c: "spec.features" for c in recipe.features}
         for ref in getattr(recipe, "inputs", ()):
@@ -350,8 +350,8 @@ def assert_inputs_producible(recipes: Sequence[Any], *, feature_columns: Sequenc
                 f"feature layer does not produce; it produces {sorted(produced)}. "
                 "The arm does NOT register. A column that is itself another model's "
                 "output is not a feature — declare it as `predictions[<arm-name>]` "
-                "under `spec.inputs` and register that model as an arm "
-                "(alpha-engine-config-I9777). Registering here and failing later at "
+                "under `spec.inputs` and register that model as an arm. "
+                "Registering here and failing later at "
                 "`FeatureLayerSource.panel()` is the failure mode this refusal replaces: "
                 "an arm nobody can grade is indistinguishable, on every surface, from an "
                 "arm nobody has graded yet."
@@ -631,7 +631,7 @@ if _UNWIRED:  # pragma: no cover - an import-time structural guard
         f"input kind(s) {list(_UNWIRED)} are declarable under `spec.inputs` but have no "
         "entry in INPUT_RESOLVERS, so an arm declaring one would register and then die "
         "when its design matrix was built. Wire the producer or remove the kind from "
-        "INPUT_KINDS; there is no third option (alpha-engine-config-I9777)."
+        "INPUT_KINDS; there is no third option."
     )
 
 

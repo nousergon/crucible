@@ -35,6 +35,15 @@ from typing import Any, NoReturn
 
 import pytest
 
+from crucible.gate import PHASES
+
+#: The producer this clause waits on landed under phase 1
+#: (alpha-engine-config-I9757 per `crucible.gate.PHASES`). Derived rather
+#: than hardcoded so a phase renumbering cannot leave this message stale
+#: (alpha-engine-config-I9839) — this is the same class of defect the
+#: `_unmet` in `test_plan_section_2_objectives.py` was fixed for.
+_PHASE1 = next(p for p in PHASES if p.id == "phase1")
+
 CLAUSE = "plan §10 component 4 (feature layer) × track B M slot"
 REQUIREMENT = (
     "crucible.features exposes a registry interface returning a versioned, hashed "
@@ -63,8 +72,8 @@ def _unmet(exc: BaseException | None = None) -> NoReturn:
     except ImportError:
         status = (
             "the producer is ABSENT — `import crucible.features` fails. This clause is "
-            "waiting on track A (crucible v2 phase 1, alpha-engine-config-I9757), and "
-            "nothing in track B can clear it."
+            f"waiting on track A (crucible v2 phase {_PHASE1.number}, {_PHASE1.tracker}), "
+            "and nothing in track B can clear it."
         )
     else:
         status = (
@@ -73,8 +82,10 @@ def _unmet(exc: BaseException | None = None) -> NoReturn:
             "therefore an INTERFACE MISMATCH between a landed producer and a landed "
             "consumer, NOT an unimplemented producer: read the failure below against "
             "`crucible/schemas/feature_registry.v1.json`, which is the declared "
-            "contract both sides are held to, and fix the side that departs from it "
-            "(alpha-engine-config-I9772)."
+            "contract both sides are held to, and fix the side that departs from it. "
+            f"This clause is tracked under crucible v2 phase {_PHASE1.number}, "
+            f"{_PHASE1.tracker} — see this function's docstring for the specific "
+            "issue that first found this mismatch."
         )
     detail = f"\n  Blocked on: {exc!r}" if exc is not None else ""
     pytest.fail(

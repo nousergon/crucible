@@ -19,7 +19,7 @@ from krepis.metrics import StatusLiteral
 from crucible.calendar import previous_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
 from crucible.console.classify import STATES, Classification, classify
-from crucible.gate import LADDER_KEY, LADDER_STATES, build_ladder
+from crucible.gate import LADDER_KEY, LADDER_STATES, PHASES, build_ladder
 from crucible.gate import validate_ladder_document as _validate_ladder_document
 from crucible.keys import champion_key
 from crucible.manifest import manifest_prefix
@@ -36,6 +36,12 @@ __all__ = [
     "render_html",
     "write_page",
 ]
+
+#: The phase whose track-C work introduced the closed status vocabulary these
+#: two guards defend. Derived rather than hardcoded so a phase renumbering
+#: cannot leave the message pointing at a finished issue
+#: (alpha-engine-config-I9839).
+_C14_PHASE = next(p for p in PHASES if p.id == "phase1")
 
 CONSOLE_KEY = "console/index.html"
 CONSOLE_JSON_KEY = "console/index.json"
@@ -387,7 +393,7 @@ _missing = (set(STATES) | set(ATTRIBUTION_STATUSES) | set(LADDER_STATES)) - set(
 assert not _missing, (
     f"STATUS_COLORS is missing a rule for {sorted(_missing)} — every status in "
     "classify.STATES or ATTRIBUTION_STATUSES must have a color before it can render "
-    "(alpha-engine-config-I9757, C14)."
+    f"({_C14_PHASE.tracker}, C14)."
 )
 
 _STYLE = (
@@ -437,7 +443,7 @@ def _state_class(status: Any) -> str:
         raise KeyError(
             f"status {status!r} has no entry in STATUS_COLORS, so it has no "
             "stylesheet rule — register a color for it before it can render "
-            "(alpha-engine-config-I9757, C14)."
+            f"({_C14_PHASE.tracker}, C14)."
         )
     return f"s-{_e(status)}"
 

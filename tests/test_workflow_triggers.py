@@ -347,7 +347,7 @@ def test_the_job_model_accepts_both_legal_needs_forms() -> None:
     assert Job.model_validate({}).needs == []
 
 
-# alpha-engine-config-I9848 -- round 2. An independent adversarial review of
+# the queue-race defect -- round 2. An independent adversarial review of
 # crucible-PR41 (round 1) found the concurrency/self-heal rework itself was
 # real (each of its four changes was individually reverted and the suite
 # went red every time), but flagged what round 1 did NOT close:
@@ -418,7 +418,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# alpha-engine-config-I9848 round-2 finding 6: mutating calls are routed on
+# the queue-race defect round-2 finding 6: mutating calls are routed on
 # METHOD + URL PREFIX, not on a substring of the whole argv. A prior version
 # of this stub matched on jq-filter text anywhere in argv, which meant a
 # call against a wrong or misspelled endpoint could still be "answered" by

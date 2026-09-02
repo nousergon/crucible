@@ -458,11 +458,13 @@ class TestIdentityProvenanceSplit:
         store = LocalStore(tmp_path)
         _published(store)
         payload = json.loads(store.get_bytes(release_json_key(SHA_A)))
+        # Moved to release_provenance.v1 by alpha-engine-config-I9786 (historical
+        # citation, not a phase pointer — alpha-engine-config-I9839).
         for field_name in ("built_at", "workflow_run_url", "test_summary"):
             assert field_name not in payload, (
-                f"{field_name!r} moved to release_provenance.v1 (I9786) and must not "
-                "reappear in the immutable identity record — its presence is exactly "
-                "what made two builds of the same commit byte-unequal."
+                f"{field_name!r} must not reappear in the immutable identity record "
+                "— its presence is exactly what made two builds of the same commit "
+                "byte-unequal."
             )
         assert payload["schema_version"] == RELEASE_SCHEMA_VERSION == "release.v2"
 

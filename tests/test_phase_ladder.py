@@ -37,6 +37,16 @@ from crucible.store import LocalStore
 FRIDAY = dt.date(2026, 8, 28)
 NOW = dt.datetime(2026, 8, 29, 12, 0, tzinfo=dt.UTC)
 
+#: Phase 0's tracker issue NUMBER, supplied here as the test's own input —
+#: not read back from `PHASES` (that would make the assertions below compare
+#: `PHASES[0].tracker` against itself and catch nothing) and not spelled as
+#: the string "alpha-engine-config-I9756" anywhere (that is the literal this
+#: whole PR removes). `test_every_plan_phase_has_a_rung` independently pins
+#: this same number as PHASES[0].issue, as a plain int, so a mismatch between
+#: the two is still a failing test, not a blind spot (alpha-engine-config-I9839,
+#: alpha-engine-config-I9868).
+_PHASE0_ISSUE = 9756
+
 
 @pytest.fixture
 def store(tmp_path) -> LocalStore:
@@ -67,7 +77,7 @@ class TestTheLadderIsDeclaredWhole:
         row instead of rendering the phase a second time."""
         ladder = build_ladder(store, trading_day=FRIDAY, now=NOW)
         ids = [row["decision_id"] for row in ladder.to_dict()["phases"]]
-        assert ids[0] == "alpha-engine-config-I9756"
+        assert ids[0] == f"alpha-engine-config-I{_PHASE0_ISSUE}"
         assert all(i.startswith("alpha-engine-config-I") for i in ids)
 
     def test_every_declared_gate_name_is_registered_or_absent(self) -> None:
@@ -145,7 +155,7 @@ class TestAbsenceRendersAsAbsence:
         html = render_html(page)
         assert "Phase ladder" in html
         assert "never measured" in html
-        assert "alpha-engine-config-I9756" in html
+        assert f"alpha-engine-config-I{_PHASE0_ISSUE}" in html
 
 
 class TestTheLadderKnowsWhereItIs:
@@ -276,7 +286,7 @@ class TestAnOutOfOrderPhaseIsVisibleAsSuch:
         _file_reading(store, "phase1", FRIDAY, met=False)
         rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
         assert "phase0" in rows["phase1"]["detail"]
-        assert "alpha-engine-config-I9756" in rows["phase1"]["detail"]
+        assert f"alpha-engine-config-I{_PHASE0_ISSUE}" in rows["phase1"]["detail"]
 
 
 class TestTheLadderIsPublishedWhereSomethingReadsIt:

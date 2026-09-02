@@ -207,11 +207,12 @@ class TestI9745NoCrossArmIntersection:
             v for v in verdicts if v["arm_a"] in survivor_ids and v["arm_b"] in survivor_ids
         ]
         assert survivor_pairs, "the surviving arms must still be compared with each other"
+        # If the starved arm nulled them, this is alpha-engine-config-I9745 all over
+        # again: v1 recomputed every figure over the dates on which EVERY registered
+        # arm had scored, so one arm with no shadow emptied the lot. Historical
+        # citation, not a phase pointer (alpha-engine-config-I9839).
         assert all(v["n_dates"] > 0 for v in survivor_pairs), (
-            "every pair between two arms that both produced must keep its own window. "
-            "If the starved arm nulled them, this is I9745 all over again: v1 "
-            "recomputed every figure over the dates on which EVERY registered arm had "
-            "scored, so one arm with no shadow emptied the lot."
+            "every pair between two arms that both produced must keep its own window."
         )
         assert all(v["unmeasurable_reason"] is None for v in survivor_pairs)
 

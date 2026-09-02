@@ -55,6 +55,23 @@ class JobSpec:
     scheduled: bool
 
 
+#: NOT a phase. A `_todo` stub used to cite phase 1's tracker
+#: (`alpha-engine-config-I9757`) — structurally derived from `PHASES` so a
+#: renumbering couldn't leave it stale, but phase 1 CLOSED 2026-09-02T01:31Z
+#: while these stubs remained, so deriving from `PHASES` still pointed every
+#: user at a finished issue: `PHASES` carries no open/closed notion, and no
+#: amount of deriving from it fixes that. The `crucible` skill states the
+#: right anchor: "the epic is the durable anchor to cite; individual phase
+#: issue numbers churn as phases close, the epic number does not." A plain
+#: `int`, not a string, so no `ast.Constant` anywhere carries the literal
+#: (alpha-engine-config-I9839).
+_EPIC_ISSUE = 9751
+
+
+def _epic_tracker() -> str:
+    return f"alpha-engine-config-I{_EPIC_ISSUE}"
+
+
 def _todo(job: str, track: str, note: str) -> Callable[[argparse.Namespace], int]:
     """A handler that refuses loudly, naming who owns it.
 
@@ -65,7 +82,7 @@ def _todo(job: str, track: str, note: str) -> Callable[[argparse.Namespace], int
 
     def handler(args: argparse.Namespace) -> int:
         raise NotImplementedError(
-            f"`crucible {job}` is not implemented yet — {track}, alpha-engine-config-I9757. {note}"
+            f"`crucible {job}` is not implemented yet — {track}, {_epic_tracker()}. {note}"
         )
 
     # Marked so the "a stub never returns 0" guard can enumerate stubs from the

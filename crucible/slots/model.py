@@ -1059,6 +1059,9 @@ def _assert_inputs_resolved(recipe: ModelRecipe, panel: FeaturePanel) -> None:
     unresolved = [r for r in recipe.inputs if r.text not in resolved]
     if not unresolved:
         return
+    # Historical citation, not a phase pointer: alpha-engine-config-I9777 is where
+    # this wiring gap was first found. Kept in this comment rather than the raised
+    # message per alpha-engine-config-I9839.
     raise UnresolvedInputError(
         f"arm {recipe.name!r} declares input(s) {[r.text for r in unresolved]}, which "
         f"contribute design column(s) {[r.column for r in unresolved]}; this panel "
@@ -1068,7 +1071,7 @@ def _assert_inputs_resolved(recipe: ModelRecipe, panel: FeaturePanel) -> None:
         "`crucible.slots.inputs.INPUT_RESOLVERS`; a panel straight from "
         "`FeatureLayerSource.panel()` carries feature columns and nothing else. This "
         "refusal replaces the `KeyError` about a missing parquet column that made the "
-        "wiring gap read as a feature-layer gap (alpha-engine-config-I9777)."
+        "wiring gap read as a feature-layer gap."
     )
 
 

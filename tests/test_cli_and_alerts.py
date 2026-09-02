@@ -133,8 +133,17 @@ class TestJobSurface:
         `1 skipped` and reads as green. Looping keeps the assertion real at
         every size, including zero.
         """
+        # Derived, not hardcoded: a stub's message names the EPIC's tracker
+        # (crucible/cli.py::_EPIC_ISSUE / ::_epic_tracker), not a phase — a
+        # phase closes (phase 1 did, 2026-09-02T01:31Z, while these stubs
+        # remained) and the epic does not. Matching the same int, not the
+        # same string, keeps this in sync with cli.py rather than restating
+        # the number a second time (alpha-engine-config-I9839).
+        from crucible.cli import _EPIC_ISSUE
+
+        expected_tracker = f"alpha-engine-config-I{_EPIC_ISSUE}"
         for job in UNIMPLEMENTED:
-            with pytest.raises(NotImplementedError, match="I9757"):
+            with pytest.raises(NotImplementedError, match=expected_tracker):
                 main(_minimal_argv(job))
 
     def test_the_stub_set_shrinks_rather_than_being_declared(self) -> None:
