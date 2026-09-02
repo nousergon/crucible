@@ -120,6 +120,23 @@ class TestTheSchemaRefuses:
         entry["unit"] = "zscore"
         assert _errors(payload)
 
+    @pytest.mark.parametrize("variant", ["Ratio", "RATIO", "ratio "])
+    def test_a_raw_column_claiming_a_case_or_whitespace_variant_of_a_normalized_unit(
+        self, variant: str
+    ) -> None:
+        """`alpha-engine-config-I9815`: the `_raw`/`not`/`enum` branch used to
+        compare against the exact strings `["ratio", "pct", "zscore",
+        "log_return"]` while `unit` itself was a free string, so any case or
+        whitespace variant of a normalized word walked straight through —
+        `avg_volume_20d_raw` declaring `unit: "Ratio"` validated. `unit` is
+        now a closed enum over the concrete vocabulary the catalogue uses, so
+        a variant spelling is not merely refused by the allOf check, it is
+        not a legal `unit` value at all."""
+        payload = _valid()
+        entry = next(f for f in payload["features"] if f["name"].endswith("_raw"))
+        entry["unit"] = variant
+        assert _errors(payload)
+
     def test_a_column_with_no_lineage(self) -> None:
         payload = _valid()
         payload["features"][0]["inputs"] = []

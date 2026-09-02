@@ -38,7 +38,6 @@ from typing import TYPE_CHECKING, Any
 from crucible.calendar import assert_trading_day, is_trading_day
 from crucible.data.daily import DEFAULT_LOOKBACK_DAYS, run_daily
 from crucible.data.sources import PriceSource
-from crucible.features import DEFAULT_FEATURE_VERSION
 from crucible.keys import data_panel_key
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -131,9 +130,12 @@ def run_heal(
     i_am_in_region: bool = False,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     expected_symbols: list[str] | None = None,
-    feature_version: str = DEFAULT_FEATURE_VERSION,
 ) -> dict[str, Any]:
-    """Recompile every session in ``[start, end]``. Idempotent, and loud."""
+    """Recompile every session in ``[start, end]``. Idempotent, and loud.
+
+    No ``feature_version`` parameter, for the same reason `run_daily` has
+    none (`alpha-engine-config-I9816`).
+    """
     sessions = sessions_in_range(start, end)
     if not sessions:
         raise ValueError(
@@ -169,7 +171,6 @@ def run_heal(
             source=source,
             lookback_days=lookback_days,
             expected_symbols=expected_symbols,
-            feature_version=feature_version,
         )
         (already if present else repaired).append(day.isoformat())
 

@@ -101,7 +101,6 @@ def _wilder_rsi(close: pd.Series, window: int) -> pd.Series:
 def build_features(
     panel: pd.DataFrame,
     *,
-    version: str | None = None,
     catalog: tuple[FeatureSpec, ...] = CATALOG,
     as_of: object = None,
 ) -> tuple[pd.DataFrame, tuple[FeatureSpec, ...]]:
@@ -110,6 +109,13 @@ def build_features(
     Returns the frame and the catalogue it was built from, so the caller
     writes the registry that matches the columns rather than one that
     happens to be importable.
+
+    There is deliberately no ``version`` parameter. The version is a hash of
+    ``catalog`` (`feature_version`, `registry.py`) and nothing else — a
+    caller cannot pass one in, so the frame's own `attrs["feature_version"]`
+    and the registry document `registry_payload(catalog)` writes beside it
+    are computed from the same catalogue by construction, never two values
+    a caller could make disagree (`alpha-engine-config-I9816`).
     """
     import numpy as np
 
@@ -119,7 +125,7 @@ def build_features(
             "it can hand one over, so reaching here means a caller bypassed it"
         )
 
-    resolved_version = version or feature_version(catalog)
+    resolved_version = feature_version(catalog)
     day = as_of if as_of is not None else max(panel["trading_day"])
 
     frame = panel.sort_values(["ticker", "trading_day"]).copy()

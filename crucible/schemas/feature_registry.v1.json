@@ -43,9 +43,8 @@
           "pattern": "^[a-z0-9]+(_[a-z0-9]+)*(_raw|_ratio|_pct|_zscore|_log_return)$"
         },
         "unit": {
-          "description": "The concrete unit. Pinned by the suffix for every NORMALIZED suffix (see the allOf below); free for `_raw`, which means 'not normalized by this layer' and may be USD, shares, a beta coefficient or a 0/1 indicator.",
-          "type": "string",
-          "minLength": 1
+          "description": "The concrete unit, from a CLOSED vocabulary. Pinned by the suffix for every NORMALIZED suffix (see the allOf below: `ratio`, `pct`, `zscore`, `log_return`); the `_raw` set is open in MEANING but still enumerated rather than a free string, so a variant spelling of a normalized word (`Ratio`, `RATIO`, `ratio `) cannot pass the allOf `not`/`enum` check below by evading exact-string matching (alpha-engine-config-I9815 — `avg_volume_20d_raw` declaring `unit: \"Ratio\"` validated before this enum existed, the exact defect the suffix-unit agreement check exists to catch). Extend deliberately, by adding both the enum member here and a `FeatureSpec` in `registry.py::CATALOG` that uses it — never widen this to a free string again.",
+          "enum": ["USD", "beta", "indicator", "log_return", "pct", "ratio", "zscore"]
         },
         "expression": {
           "description": "How the column is computed, as the registry states it. Lineage is a field, not a comment.",

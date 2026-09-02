@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Any
 
 from crucible.calendar import assert_trading_day
 from crucible.data.sources import MissingSourceError, PriceSource
-from crucible.features import DEFAULT_FEATURE_VERSION, build_features, registry_payload
+from crucible.features import build_features, registry_payload
 from crucible.keys import (
     coverage_key,
     data_panel_key,
@@ -119,7 +119,6 @@ def run_daily(
     source: PriceSource,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     expected_symbols: list[str] | None = None,
-    feature_version: str = DEFAULT_FEATURE_VERSION,
     coverage_floor: float = COVERAGE_FLOOR_RATIO,
 ) -> dict[str, Any]:
     """Compile the day. Called through `crucible.runner.run_job`, never directly.
@@ -134,6 +133,19 @@ def run_daily(
     restored. A ratio computed over whatever arrived would always read 1.0;
     a ratio with no declared denominator is not "not applicable", it is a
     run that cannot detect a partial universe at all.
+
+    There is deliberately no ``feature_version`` parameter. `crucible-PR27`
+    added a `--feature-version` override that flowed only into the S3 KEY
+    (`features_key`, `feature_registry_key`) while `registry_payload()`
+    always recomputed the version from the catalogue for the document BODY
+    — so `--feature-version v1` wrote `features/v1/registry.json` whose own
+    `feature_version` field read the derived hash, silently reachable
+    through the override the schema was added to close
+    (`alpha-engine-config-I9816`). The fix removes the parameter rather than
+    reconciling the two: the version is `feature_version(catalog)` and
+    nothing else, computed once below and used for the key, the registry
+    body and the parquet's own `attrs["feature_version"]` — one value, three
+    places it appears, structurally unable to disagree.
     """
     trading_day = ctx.trading_day
     assert_trading_day(trading_day, context=f"data.daily --date {trading_day}")
@@ -202,14 +214,21 @@ def run_daily(
     panel_key = data_panel_key(trading_day.isoformat())
     write_panel(ctx, panel, panel_key)
 
-    features, registry = build_features(panel, version=feature_version)
+    # One derivation, three consumers: `registry` is the exact document
+    # written to `feature_registry_key`, and `registry["feature_version"]`
+    # is the exact string used to build BOTH keys below. There is no second
+    # source that could name a different version — see the docstring above.
+    features, catalog = build_features(panel)
+    registry = registry_payload(catalog)
+    feature_version = registry["feature_version"]
+
     feature_key = features_key(feature_version, trading_day.isoformat())
     write_panel(ctx, features, feature_key)
 
     registry_key = feature_registry_key(feature_version)
     ctx.record_output(
         registry_key,
-        json.dumps(registry_payload(registry), indent=2, sort_keys=True).encode("utf-8"),
+        json.dumps(registry, indent=2, sort_keys=True).encode("utf-8"),
         schema_version="feature_registry.v1",
     )
 

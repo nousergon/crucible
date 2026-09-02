@@ -20,7 +20,7 @@ from crucible.data import (
 )
 from crucible.data.daily import UndeclaredUniverseError
 from crucible.data.heal import LAPTOP_SESSION_ALLOWANCE
-from crucible.keys import coverage_key, data_panel_key, features_key
+from crucible.keys import coverage_key, data_panel_key, feature_registry_key, features_key
 from crucible.manifest import read_manifest
 from crucible.runner import run_job
 
@@ -201,6 +201,93 @@ class TestArtifacts:
             trading_day=cycle_date,
         )
         store.assert_keys_bind_to_trading_days()
+
+
+class TestFeatureVersionIsDerivedNeverCallerSupplied:
+    """`alpha-engine-config-I9816`: `--feature-version` set the layer PREFIX
+    while `registry_payload()` always recomputed the body's own
+    `feature_version` from the catalogue, so `data.daily --feature-version
+    v1` wrote `features/v1/registry.json` whose declared version was the
+    unrelated derived hash — key and content disagreed, and the overwrite
+    hazard the derived version exists to close was still reachable through
+    the flag.
+
+    The fix removes the parameter rather than reconciling the two values:
+    there is no longer anywhere in `run_daily`, `run_weekly`, `run_heal` or
+    `build_features` for a caller to hand in a version, so key and content
+    are both derived from the same `feature_version(catalog)` call inside
+    `run_daily` and cannot name two different things.
+    """
+
+    def test_run_daily_accepts_no_feature_version_override(self) -> None:
+        import inspect
+
+        assert "feature_version" not in inspect.signature(run_daily).parameters, (
+            "a `feature_version` parameter on `run_daily` is exactly the reintroduced "
+            "write-prefix override I9816 closed; the version is derived inside the "
+            "function and there is nothing for a caller to pass in"
+        )
+
+    def test_run_weekly_accepts_no_feature_version_override(self) -> None:
+        import inspect
+
+        assert "feature_version" not in inspect.signature(run_weekly).parameters
+
+    def test_run_heal_accepts_no_feature_version_override(self) -> None:
+        import inspect
+
+        assert "feature_version" not in inspect.signature(run_heal).parameters
+
+    def test_build_features_accepts_no_version_override(self) -> None:
+        import inspect
+
+        from crucible.features import build_features
+
+        assert "version" not in inspect.signature(build_features).parameters, (
+            "the frame's own attrs['feature_version'] must be `feature_version(catalog)` "
+            "and nothing else, or `run_daily` could receive one string from a caller and "
+            "compute a second, different one for the registry body"
+        )
+
+    def test_cli_no_longer_declares_feature_version_for_any_data_job(self) -> None:
+        """The write-side half of the flag's removal: no subcommand can even
+        construct a namespace carrying `feature_version` for `run_daily` to
+        (no longer can) receive."""
+        from crucible.cli import build_parser
+
+        for job in ("data.daily", "data.weekly", "data.heal"):
+            with pytest.raises(SystemExit):
+                build_parser().parse_args([job, "--date", "2026-08-28", "--feature-version", "v1"])
+
+    def test_a_real_run_writes_the_same_version_in_the_key_and_the_registry_body(
+        self, store, source, frames, cycle_date
+    ) -> None:
+        """Not merely a unit assertion that the two calls take one value —
+        an end-to-end run, reading the artifact the write path actually
+        produced, the way the reviewer demonstrated the original defect."""
+        ctx = run_job(
+            "data.daily",
+            lambda c: run_daily(c, source=source, expected_symbols=sorted(frames)),
+            store=store,
+            trading_day=cycle_date,
+        )
+        coverage = json.loads(store.get_bytes(coverage_key(cycle_date.isoformat())))
+        written_version = coverage["feature_version"]
+
+        assert store.exists(features_key(written_version, cycle_date.isoformat())), (
+            "the coverage record's declared feature_version must be the SAME string "
+            "the parquet was actually keyed under"
+        )
+        registry = json.loads(store.get_bytes(feature_registry_key(written_version)))
+        assert registry["feature_version"] == written_version, (
+            "the registry document living under features/{written_version}/registry.json "
+            "must itself declare written_version — a document whose body names a "
+            "different version than its own key is the exact contradiction I9816 found"
+        )
+        feature_output = next(
+            o for o in ctx.outputs if o["key"].endswith(".parquet") and "features/" in o["key"]
+        )
+        assert feature_output["key"] == features_key(written_version, cycle_date.isoformat())
 
 
 class TestWeekly:
