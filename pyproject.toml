@@ -41,7 +41,7 @@ dependencies = [
     # install surface. The floor is track B's (>=2.1), not the looser one —
     # two floors for one package is a lockfile waiting to disagree with a
     # fresh resolve.
-    "numpy>=2.1",
+    "numpy>=2.5.2",
     "pandas>=2.0",
     "pyarrow>=14.0",
     # The store's S3 backend and the conditional PUT the release pointer
