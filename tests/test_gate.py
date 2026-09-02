@@ -13,7 +13,21 @@ import json
 
 import pytest
 
-from crucible.gate import GATES, evaluate, gate_key
+from crucible.gate import (
+    ACCEPTANCE_RATCHET_PATH,
+    GATE_DELIVERABLES,
+    GATES,
+    PHASE0_DELIVERABLES,
+    PHASES,
+    SOURCE_SCAN_SCOPE,
+    Deliverable,
+    build_ladder,
+    coverage_note,
+    evaluate,
+    gate_key,
+    legacy_weekly_executions_key,
+    weekly_anchor,
+)
 from crucible.keys import arena_cycle_key, arm_register_key
 from crucible.manifest import manifest_key
 from crucible.report import attribution_key
@@ -307,3 +321,616 @@ class TestTheGateJobPublishesAnHonestMetric:
         (metric,) = [m for m in manifest["metrics"] if m["name"] == "gate_clauses_met_ratio"]
         assert metric["value"] == 0.0
         assert not metric["status"].startswith("N/A")
+
+
+PHASE0_WINDOW = [FRIDAY - dt.timedelta(weeks=n) for n in reversed(range(2))]
+
+
+def _seed_phase0_met(tmp_path, starts: int = 1) -> LocalStore:
+    """A store in which the v1 weekly cadence clause is satisfied.
+
+    The acceptance clause reads the committed ratchet, not the store, so a
+    seeded store plus the real repository is the whole met state.
+    """
+    store = LocalStore(tmp_path)
+    for day in PHASE0_WINDOW:
+        _put(
+            store,
+            legacy_weekly_executions_key(weekly_anchor(day).isoformat()),
+            {"executions_started": starts, "source": "a filed count, not a live API call"},
+        )
+    return store
+
+
+def _clause(result, name: str):
+    return next(c for c in result.clauses if c.name == name)
+
+
+class TestPhaseZeroIsRegisteredAtAll:
+    """`alpha-engine-config-I9804`. The ladder read `phase0 UNMEASURED` while
+    phase 0 was the phase in flight, which made phase 1 render OUT_OF_ORDER for
+    a reason nothing in the harness could ever clear."""
+
+    def test_phase0_has_a_clause_list_and_the_ladder_rung_names_it(self) -> None:
+        assert "phase0" in GATES
+        assert PHASES[0].id == "phase0"
+        assert PHASES[0].gate == "phase0"
+
+    def test_the_window_is_the_two_consecutive_weeks_the_issue_asks_for(self, tmp_path) -> None:
+        """I9756's closes-when is "<= 1 start per calendar week for two
+        consecutive weeks". One quiet week is a gap between reruns."""
+        assert GATES["phase0"][0] == 2
+        result = evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY)
+        assert result.window == PHASE0_WINDOW
+
+
+class TestPhaseZeroOldWeeklyCadence:
+    def test_an_unfiled_count_is_unmet_with_the_missing_key_named(self, tmp_path) -> None:
+        """The count is not filed anywhere today. That reads UNMET naming the
+        key — never unmeasurable-as-pass, and never a live
+        `states:ListExecutions` call, which no replay and no test could make."""
+        result = evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY)
+        clause = _clause(result, "old_weekly_within_cadence")
+        assert not clause.met
+        assert legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat()) in clause.detail
+        assert not result.met
+
+    def test_two_quiet_weeks_meet_the_clause_and_the_gate(self, tmp_path) -> None:
+        result = evaluate(_seed_phase0_met(tmp_path), gate="phase0", trading_day=FRIDAY)
+        assert _clause(result, "old_weekly_within_cadence").met
+        assert result.met, result.render()
+
+    def test_a_week_over_the_cadence_fails_the_gate(self, tmp_path) -> None:
+        """19 executions since 2026-08-26 was the live reading on 2026-09-02
+        (`alpha-engine-config-I9831`); a gate that called that met would be
+        measuring nothing."""
+        store = _seed_phase0_met(tmp_path)
+        _put(
+            store,
+            legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat()),
+            {"executions_started": 19},
+        )
+        result = evaluate(store, gate="phase0", trading_day=FRIDAY)
+        clause = _clause(result, "old_weekly_within_cadence")
+        assert not clause.met
+        assert "19 starts" in clause.detail
+        assert not result.met
+
+    def test_one_quiet_week_is_not_a_cadence(self, tmp_path) -> None:
+        """A single filed week may not carry the clause: two consecutive weeks
+        is the requirement, and an absent second week is an absence."""
+        store = LocalStore(tmp_path)
+        _put(
+            store,
+            legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat()),
+            {"executions_started": 1},
+        )
+        result = evaluate(store, gate="phase0", trading_day=FRIDAY)
+        clause = _clause(result, "old_weekly_within_cadence")
+        assert not clause.met
+        assert (
+            legacy_weekly_executions_key(weekly_anchor(PHASE0_WINDOW[0]).isoformat())
+            in clause.detail
+        )
+
+    def test_every_week_of_the_window_is_named_as_evidence(self, tmp_path) -> None:
+        result = evaluate(_seed_phase0_met(tmp_path), gate="phase0", trading_day=FRIDAY)
+        clause = _clause(result, "old_weekly_within_cadence")
+        assert set(clause.evidence) == {
+            legacy_weekly_executions_key(weekly_anchor(d).isoformat()) for d in PHASE0_WINDOW
+        }
+
+    def test_the_evidence_key_is_the_same_whatever_day_the_gate_is_read_on(self, tmp_path) -> None:
+        """The defect an adversarial review found on this branch: `_window`
+        steps back in raw calendar weeks from whatever day the caller passed,
+        and the ladder is rendered DAILY, so a raw-day key sent Monday's read
+        and Tuesday's read to two different objects. A producer filing one
+        document per week would have made phase 0 read MET on one weekday and
+        UNMET on the other four, forever."""
+        store = LocalStore(tmp_path)
+        readings = {
+            day: _clause(
+                evaluate(store, gate="phase0", trading_day=dt.date.fromisoformat(day)),
+                "old_weekly_within_cadence",
+            ).evidence
+            for day in ("2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04")
+        }
+        assert len(set(readings.values())) == 1, readings
+
+    def test_the_week_that_has_not_closed_yet_is_not_asked_for(self) -> None:
+        """Strictly BEFORE, not on-or-before. The week ending this Friday is
+        not counted until its close has passed and the weekly producer has
+        run, so anchoring to it would make the newest week absent for a day
+        and flap once a week instead of four times a week."""
+        assert weekly_anchor(dt.date(2026, 9, 4)) == dt.date(2026, 8, 28)
+        assert weekly_anchor(dt.date(2026, 9, 5)) == dt.date(2026, 9, 4)
+
+    def test_two_window_weeks_collapsing_onto_one_anchor_is_unmet(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Two anchors 7 days apart cannot normally collide, but a future
+        change to the anchor could make them. One document graded twice is a
+        cadence claim backed by half the evidence it names, so the collapse is
+        a red reading rather than a silently shorter window."""
+        monkeypatch.setattr("crucible.gate.weekly_anchor", lambda day: FRIDAY)
+        clause = _clause(
+            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
+            "old_weekly_within_cadence",
+        )
+        assert not clause.met
+        assert "collapsed" in clause.detail
+
+    def test_a_malformed_filed_count_is_a_red_reading_not_an_exception(self, tmp_path) -> None:
+        """This document is written by a producer outside this repository. A
+        bare `document["executions_started"]` would raise out of `evaluate`
+        and take `crucible gate`, `build_ladder` AND the board render down
+        together — so one malformed upstream file would publish NOTHING
+        rather than a red reading."""
+        store = _seed_phase0_met(tmp_path)
+        key = legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat())
+        _put(store, key, {"count": 1})
+        clause = _clause(
+            evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
+        )
+        assert not clause.met
+        assert key in clause.detail
+        assert "executions_started" in clause.detail
+
+    def test_a_count_that_is_not_a_whole_number_of_starts_is_malformed(self, tmp_path) -> None:
+        """`True` is an `int` in Python and a boolean is not a count. A
+        document filing `executions_started: true` would otherwise read as
+        one start and satisfy the cadence."""
+        store = _seed_phase0_met(tmp_path)
+        key = legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat())
+        _put(store, key, {"executions_started": True})
+        clause = _clause(
+            evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
+        )
+        assert not clause.met
+
+    @pytest.mark.parametrize(
+        ("body", "expected"),
+        [
+            (b"{not json", "not readable JSON"),
+            (b"[1, 2]", "parsed to list"),
+            (b"null", "literal `null`"),
+            (b'"1"', "parsed to str"),
+        ],
+        ids=["truncated json", "a list", "literal null", "a bare string"],
+    )
+    def test_every_malformed_body_is_a_red_reading_not_an_exception(
+        self, tmp_path, body: bytes, expected: str
+    ) -> None:
+        """Round-2 covered exactly ONE malformed shape — a well-formed object
+        with the wrong field — and the invariant was asserted for all of them.
+        Every other shape raised out of `evaluate` and took `crucible gate`,
+        `build_ladder` and the board render down together, publishing nothing
+        where a red reading belongs."""
+        store = _seed_phase0_met(tmp_path)
+        key = legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat())
+        store.put_bytes(key, body)
+        clause = _clause(
+            evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
+        )
+        assert not clause.met
+        assert key in clause.detail
+        assert expected in clause.detail
+
+    def test_present_but_null_is_unreadable_not_absent(self, tmp_path) -> None:
+        """The key EXISTS. Reporting it as "no filed count" names the wrong
+        remedy: the operator would go and write a producer that is already
+        running."""
+        store = _seed_phase0_met(tmp_path)
+        key = legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat())
+        store.put_bytes(key, b"null")
+        clause = _clause(
+            evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
+        )
+        assert "no filed count" not in clause.detail
+        assert "unreadable, not absent" in clause.detail
+
+    def test_a_malformed_document_does_not_take_the_ladder_down_with_it(self, tmp_path) -> None:
+        """The doctrine both modules state: an unreadable input is a red
+        READING on the surface, never absence from it."""
+        store = _seed_phase0_met(tmp_path)
+        # Unparseable BYTES, not a well-formed object with the wrong field:
+        # the field check was already guarded, and `json.loads` was not.
+        store.put_bytes(
+            legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat()), b"{not json"
+        )
+        rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
+        assert rows["phase0"]["state"] == "UNMET"
+        assert rows["phase0"]["clauses_total"] == 2
+
+
+def _fake_acceptance_tree(
+    tmp_path, monkeypatch, *, met: list[str], unmet: dict[str, str], define: list[str] | None = None
+) -> None:
+    """A ratchet and the suite it claims to describe, both under `tmp_path`.
+
+    Both globals are redirected: the clause reads the ratchet AND parses the
+    suite beside it, and a test that moved only one of them would be grading
+    this repository's real suite against a synthetic ratchet.
+    """
+    suite = tmp_path / "acceptance"
+    suite.mkdir(exist_ok=True)
+    defined = [*met, *unmet] if define is None else define
+    body: list[str] = []
+    for cid in defined:
+        cls, method = cid.split("[", 1)[0].split("::")
+        body.append(f"class {cls}:\n    def {method}(self):\n        raise AssertionError")
+    (suite / "test_generated.py").write_text("\n\n".join(body) + "\n", encoding="utf-8")
+    ratchet = suite / "ratchet.json"
+    ratchet.write_text(json.dumps({"met": met, "unmet": unmet}), encoding="utf-8")
+    monkeypatch.setattr("crucible.gate.ACCEPTANCE_RATCHET_PATH", ratchet)
+    monkeypatch.setattr("crucible.gate.ACCEPTANCE_SUITE_DIR", suite)
+
+
+class TestPhaseZeroAcceptanceSuite:
+    def test_the_clause_reads_the_committed_ratchet_of_this_repository(self, tmp_path) -> None:
+        """`tests/acceptance/ratchet.json` is the durable reading: it commits
+        the exact id sets, `tests/test_acceptance_reading.py` fails when they
+        drift from what the suite collects, and CI fails a push to main on any
+        movement."""
+        clause = _clause(
+            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
+            "acceptance_suite_committed",
+        )
+        assert clause.met, clause.detail
+        assert str(ACCEPTANCE_RATCHET_PATH) in clause.evidence
+        committed = json.loads(ACCEPTANCE_RATCHET_PATH.read_text(encoding="utf-8"))
+        assert f"{len(committed['met']) + len(committed['unmet'])} §2 clauses" in clause.detail
+
+    def test_an_absent_ratchet_is_unmet_with_the_path_named(self, tmp_path, monkeypatch) -> None:
+        """A wheel install ships no `tests/`. That is an absence, and an
+        absence is never a pass."""
+        missing = tmp_path / "nowhere" / "ratchet.json"
+        monkeypatch.setattr("crucible.gate.ACCEPTANCE_RATCHET_PATH", missing)
+        clause = _clause(
+            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
+            "acceptance_suite_committed",
+        )
+        assert not clause.met
+        assert str(missing) in clause.detail
+
+    def test_a_ratchet_naming_no_clauses_is_dark_not_green(self, tmp_path, monkeypatch) -> None:
+        """`all([])` again: an empty clause set would otherwise satisfy every
+        assertion about the clauses it contains."""
+        _fake_acceptance_tree(tmp_path, monkeypatch, met=[], unmet={})
+        clause = _clause(
+            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
+            "acceptance_suite_committed",
+        )
+        assert not clause.met
+        assert "no clauses" in clause.detail
+
+    def test_an_unmet_clause_with_no_stated_reason_fails(self, tmp_path, monkeypatch) -> None:
+        """ "Failing honestly" is the requirement. A red board whose rows say
+        nothing about why is the same absence as no board."""
+        _fake_acceptance_tree(
+            tmp_path, monkeypatch, met=["TestX::test_a"], unmet={"TestX::test_b": "   "}
+        )
+        clause = _clause(
+            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
+            "acceptance_suite_committed",
+        )
+        assert not clause.met
+        assert "TestX::test_b" in clause.detail
+
+    def test_a_suite_that_went_fully_green_still_meets_the_clause(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The clause asks that the clauses were WRITTEN, not that they fail.
+        Keying it on redness would make it go unmet the day the system
+        satisfied it — a gate that inverts."""
+        _fake_acceptance_tree(tmp_path, monkeypatch, met=["TestX::test_a"], unmet={})
+        clause = _clause(
+            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
+            "acceptance_suite_committed",
+        )
+        assert clause.met, clause.detail
+
+    def test_a_ratchet_beside_a_DELETED_suite_is_unmet(self, tmp_path, monkeypatch) -> None:
+        """The defect an adversarial review found: `rm tests/acceptance/*.py`
+        left the ratchet parsing perfectly and the clause reading MET over 24
+        clauses that existed nowhere. The requirement says the suite EXISTS,
+        so existence is read from source rather than assumed."""
+        _fake_acceptance_tree(
+            tmp_path, monkeypatch, met=["TestX::test_a"], unmet={"TestX::test_b": "phase 3"}
+        )
+        for module in (tmp_path / "acceptance").glob("test_*.py"):
+            module.unlink()
+        clause = _clause(
+            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
+            "acceptance_suite_committed",
+        )
+        assert not clause.met
+        assert "defined nowhere" in clause.detail
+        assert "TestX::test_a" in clause.detail
+
+    def test_a_clause_the_suite_defines_but_the_ratchet_omits_is_unmet(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The other direction, and the quieter one: a clause added to the
+        suite and never recorded is a clause no reading is held to."""
+        _fake_acceptance_tree(
+            tmp_path,
+            monkeypatch,
+            met=["TestX::test_a"],
+            unmet={},
+            define=["TestX::test_a", "TestX::test_unrecorded"],
+        )
+        clause = _clause(
+            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
+            "acceptance_suite_committed",
+        )
+        assert not clause.met
+        assert "TestX::test_unrecorded" in clause.detail
+
+    def test_an_absent_suite_directory_is_unmet(self, tmp_path, monkeypatch) -> None:
+        _fake_acceptance_tree(tmp_path, monkeypatch, met=["TestX::test_a"], unmet={})
+        monkeypatch.setattr("crucible.gate.ACCEPTANCE_SUITE_DIR", tmp_path / "gone")
+        clause = _clause(
+            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
+            "acceptance_suite_committed",
+        )
+        assert not clause.met
+        assert "not here" in clause.detail
+
+    def test_a_parametrised_clause_id_matches_the_method_that_defines_it(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A source parse cannot see `[case]`; the ratchet's real ids carry
+        it. Comparing the raw strings would report every parametrised clause
+        as defined nowhere."""
+        _fake_acceptance_tree(
+            tmp_path,
+            monkeypatch,
+            met=["TestFault::test_each[a data source withheld]"],
+            unmet={},
+            define=["TestFault::test_each"],
+        )
+        clause = _clause(
+            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
+            "acceptance_suite_committed",
+        )
+        assert clause.met, clause.detail
+
+
+class TestPhaseZeroSaysWhatItDoesNotGrade:
+    """Partial coverage reported as complete is the defect this repo keeps
+    finding. Phase 0 carries five deliverables and plan §6 makes two of them
+    the gate, so the subset has to reach every surface the reading reaches —
+    not only the clause list of a dated artifact somebody has to open."""
+
+    def test_the_coverage_line_is_on_the_reading_and_on_the_durable_artifact(
+        self, tmp_path
+    ) -> None:
+        result = evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY)
+        assert "2 of 5" in result.coverage
+        assert result.to_dict()["coverage"] == result.coverage
+        assert result.coverage in result.render()
+        for deliverable in PHASE0_DELIVERABLES:
+            if deliverable.graded_by is None:
+                assert deliverable.id in result.coverage
+
+    def test_the_ladder_row_detail_carries_it_so_a_MET_phase_still_says_so(self, tmp_path) -> None:
+        """A phase whose gate grades a SUBSET renders MET on the ladder and on
+        the board with nothing saying so unless the row itself carries it."""
+        store = _seed_phase0_met(tmp_path)
+        rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
+        assert rows["phase0"]["state"] == "MET"
+        assert "not gate-readable" in rows["phase0"]["detail"]
+        assert "dead_lambdas_deleted" in rows["phase0"]["detail"]
+
+    def test_a_gate_with_no_declared_deliverables_gets_no_coverage_line(self, tmp_path) -> None:
+        """Silence is "not declared", never "grades everything". Phase 1
+        declares no deliverable table, so it publishes no claim about one."""
+        result = evaluate(LocalStore(tmp_path), gate="phase1", trading_day=FRIDAY)
+        assert result.coverage is None
+        assert result.to_dict()["coverage"] is None
+
+    def test_a_deliverable_naming_a_clause_the_reading_lacks_RAISES(self) -> None:
+        """The edit that would quietly shrink what "phase 0 is met" means: a
+        clause renamed or dropped while the deliverable still claims it. Rule
+        5's default is raise — a reading published from an inconsistent table
+        grades less than it says it does."""
+        with pytest.raises(ValueError, match="old_weekly_once_per_week"):
+            coverage_note("phase0", [])
+
+    def test_a_deliverable_added_with_no_decision_RAISES(self, monkeypatch) -> None:
+        monkeypatch.setitem(
+            GATE_DELIVERABLES,
+            "phase0",
+            (*PHASE0_DELIVERABLES, Deliverable("a_sixth_thing", "unruled", None, "")),
+        )
+        with pytest.raises(ValueError, match="a_sixth_thing"):
+            evaluate(LocalStore("/tmp"), gate="phase0", trading_day=FRIDAY)
+
+    def test_every_ungraded_deliverable_carries_a_written_reason(self) -> None:
+        for deliverable in PHASE0_DELIVERABLES:
+            if deliverable.graded_by is None:
+                assert deliverable.reason.strip(), deliverable.id
+            else:
+                assert not deliverable.reason
+
+
+class TestTheAcceptanceReadIsAlsoGuarded:
+    """Same class of defect, second and third site. The ratchet and the suite
+    are checked-in files a person edits by hand, so a malformed one is routine
+    — and an exception raised while reading one takes `crucible gate`,
+    `build_ladder` and the board render down together."""
+
+    @pytest.mark.parametrize(
+        ("body", "expected"),
+        [
+            (b"{not json", "not readable JSON"),
+            (b"[1, 2]", "parsed to list"),
+            (b"null", "literal `null`"),
+            (b'{"met": []}', "`unmet` is NoneType"),
+            (b'{"met": [], "unmet": ["A::test_a"]}', "`unmet` is list"),
+            (b'{"met": "A::test_a", "unmet": {}}', "`met` is str"),
+        ],
+        ids=[
+            "truncated json",
+            "a list",
+            "literal null",
+            "no unmet field",
+            "unmet is a list",
+            "met is a string",
+        ],
+    )
+    def test_a_malformed_ratchet_is_a_red_clause_not_an_exception(
+        self, tmp_path, monkeypatch, body: bytes, expected: str
+    ) -> None:
+        ratchet = tmp_path / "ratchet.json"
+        ratchet.write_bytes(body)
+        monkeypatch.setattr("crucible.gate.ACCEPTANCE_RATCHET_PATH", ratchet)
+        monkeypatch.setattr("crucible.gate.ACCEPTANCE_SUITE_DIR", tmp_path)
+        clause = _clause(
+            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
+            "acceptance_suite_committed",
+        )
+        assert not clause.met
+        assert expected in clause.detail
+
+    def test_a_malformed_ratchet_does_not_take_the_ladder_down_with_it(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        ratchet = tmp_path / "ratchet.json"
+        ratchet.write_bytes(b"{not json")
+        monkeypatch.setattr("crucible.gate.ACCEPTANCE_RATCHET_PATH", ratchet)
+        monkeypatch.setattr("crucible.gate.ACCEPTANCE_SUITE_DIR", tmp_path)
+        rows = {
+            r["phase"]: r
+            for r in build_ladder(LocalStore(tmp_path), trading_day=FRIDAY).to_dict()["phases"]
+        }
+        assert rows["phase0"]["state"] == "UNMET"
+        assert rows["phase0"]["clauses_total"] == 2
+
+    def test_a_suite_module_that_does_not_parse_is_a_red_clause(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A `SyntaxError` out of the source walk is the same crash by another
+        route, and "the suite does not parse" is an UNKNOWN clause set, never
+        an empty one."""
+        _fake_acceptance_tree(tmp_path, monkeypatch, met=["TestX::test_a"], unmet={})
+        (tmp_path / "acceptance" / "test_broken.py").write_text("class Test(:\n", encoding="utf-8")
+        clause = _clause(
+            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
+            "acceptance_suite_committed",
+        )
+        assert not clause.met
+        assert "test_broken.py could not be parsed" in clause.detail
+        assert "SyntaxError" in clause.detail
+
+
+class TestTheSourceScanSeesWhatPytestCollects:
+    """A latent false UNMET on a clause that GATES THE PHASE is worse than one
+    on a test: nobody is holding the gate wrong, and the phase simply stops
+    exiting. Reproduced during review on a probe file."""
+
+    def test_an_inherited_test_is_collected_under_the_CHILDS_name(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """pytest collects `TestChild::test_inherited`. A scan reporting only
+        `TestBase::test_inherited` flips the clause to UNMET against a
+        perfectly correct ratchet."""
+        suite = tmp_path / "acceptance"
+        suite.mkdir()
+        (suite / "test_inherit.py").write_text(
+            "class TestBase:\n"
+            "    def test_inherited(self):\n"
+            "        raise AssertionError\n"
+            "\n"
+            "\n"
+            "class TestChild(TestBase):\n"
+            "    def test_own(self):\n"
+            "        raise AssertionError\n",
+            encoding="utf-8",
+        )
+        ratchet = suite / "ratchet.json"
+        ratchet.write_text(
+            json.dumps(
+                {
+                    "met": [
+                        "TestBase::test_inherited",
+                        "TestChild::test_inherited",
+                        "TestChild::test_own",
+                    ],
+                    "unmet": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("crucible.gate.ACCEPTANCE_RATCHET_PATH", ratchet)
+        monkeypatch.setattr("crucible.gate.ACCEPTANCE_SUITE_DIR", suite)
+        clause = _clause(
+            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
+            "acceptance_suite_committed",
+        )
+        assert clause.met, clause.detail
+
+    def test_a_base_class_in_another_module_of_the_suite_is_resolved(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        suite = tmp_path / "acceptance"
+        suite.mkdir()
+        (suite / "test_base.py").write_text(
+            "class TestShared:\n    def test_shared(self):\n        raise AssertionError\n",
+            encoding="utf-8",
+        )
+        (suite / "test_child.py").write_text(
+            "class TestUser(TestShared):\n    def test_own(self):\n        raise AssertionError\n",
+            encoding="utf-8",
+        )
+        ratchet = suite / "ratchet.json"
+        ratchet.write_text(
+            json.dumps(
+                {
+                    "met": [
+                        "TestShared::test_shared",
+                        "TestUser::test_shared",
+                        "TestUser::test_own",
+                    ],
+                    "unmet": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("crucible.gate.ACCEPTANCE_RATCHET_PATH", ratchet)
+        monkeypatch.setattr("crucible.gate.ACCEPTANCE_SUITE_DIR", suite)
+        clause = _clause(
+            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
+            "acceptance_suite_committed",
+        )
+        assert clause.met, clause.detail
+
+    def test_a_module_level_test_function_is_NAMED_not_invisible(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """pytest collects it; the ratchet's `Class::method` grammar cannot
+        record it. Invisible would mean a clause nothing is ever held to, so
+        the clause reads UNMET and names the function."""
+        _fake_acceptance_tree(tmp_path, monkeypatch, met=["TestX::test_a"], unmet={})
+        (tmp_path / "acceptance" / "test_loose.py").write_text(
+            "def test_loose():\n    raise AssertionError\n", encoding="utf-8"
+        )
+        clause = _clause(
+            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
+            "acceptance_suite_committed",
+        )
+        assert not clause.met
+        assert "test_loose.py::test_loose" in clause.detail
+
+    def test_the_requirement_states_exactly_what_the_scan_can_see(self, tmp_path) -> None:
+        """A future clause author reads the requirement, not this module. The
+        one shape no static parse can see is named there rather than left to
+        be discovered as a red gate."""
+        clause = _clause(
+            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
+            "acceptance_suite_committed",
+        )
+        assert SOURCE_SCAN_SCOPE in clause.requirement
+        assert "inherit" in clause.requirement
+        assert "setattr" in clause.requirement

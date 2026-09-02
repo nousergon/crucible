@@ -112,10 +112,12 @@ class TestTheLadderIsDeclaredWhole:
 
 class TestAbsenceRendersAsAbsence:
     def test_an_unwritten_gate_is_UNMEASURED_not_MET(self, store: LocalStore) -> None:
-        """Principle 7. Phases 0 and 2-5 have no clause list today; not one of
-        them may render as a phase that passed."""
+        """Principle 7. Phases 2-5 have no clause list today; not one of them
+        may render as a phase that passed. Phase 0 is no longer among them —
+        its clause list was written for `alpha-engine-config-I9804`, which is
+        the only legitimate way a phase leaves this list."""
         rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
-        for phase_id in ("phase0", "phase2", "phase3", "phase4", "phase5"):
+        for phase_id in ("phase2", "phase3", "phase4", "phase5"):
             assert rows[phase_id]["state"] == "UNMEASURED"
             assert rows[phase_id]["console_state"] == "UNREPORTED"
 
@@ -124,9 +126,9 @@ class TestAbsenceRendersAsAbsence:
         `met_ratio: 0.0` for a phase nobody has ever graded is publishing a
         figure it did not measure."""
         rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
-        assert rows["phase0"]["met_ratio"] is None
-        assert rows["phase0"]["clauses_total"] is None
-        assert rows["phase0"]["clauses_met"] is None
+        assert rows["phase2"]["met_ratio"] is None
+        assert rows["phase2"]["clauses_total"] is None
+        assert rows["phase2"]["clauses_met"] is None
 
     def test_a_row_says_when_it_was_last_read_and_null_when_never(self, store: LocalStore) -> None:
         rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
@@ -145,7 +147,7 @@ class TestAbsenceRendersAsAbsence:
         """Same reasoning as the transparency gap: a number nobody publishes
         is a number nobody is held to."""
         document = build_ladder(store, trading_day=FRIDAY).to_dict()
-        assert document["unmeasured"] == 5
+        assert document["unmeasured"] == 4
         assert document["phases_met"] == 0
 
     def test_the_html_renders_never_measured_not_a_blank_or_a_zero(self, store: LocalStore) -> None:
@@ -220,19 +222,24 @@ class TestTheLadderKnowsWhereItIs:
         be evaluated a second time."""
         from crucible.gate import GateResult, evaluate
 
-        calls = {"n": 0}
+        evaluated: list[str] = []
         real_evaluate = evaluate
 
         def counting_evaluate(*args, **kwargs):
-            calls["n"] += 1
+            evaluated.append(kwargs["gate"])
             return real_evaluate(*args, **kwargs)
 
         monkeypatch.setattr("crucible.gate.evaluate", counting_evaluate)
         reading = real_evaluate(store, gate="phase1", trading_day=FRIDAY)
-        calls["n"] = 0  # only count calls made during build_ladder below
+        evaluated.clear()  # only count calls made during build_ladder below
 
         ladder = build_ladder(store, trading_day=FRIDAY, readings={"phase1": reading})
-        assert calls["n"] == 0
+        # Counted PER GATE, not in total: every other registered gate is still
+        # evaluated normally, so a bare call count would go green again the
+        # moment one more phase gained a clause list — which is exactly what
+        # happened when phase 0 gained one (`alpha-engine-config-I9804`).
+        assert "phase1" not in evaluated
+        assert "phase0" in evaluated
 
         rows = {r["phase"]: r for r in ladder.to_dict()["phases"]}
         assert rows["phase1"]["clauses_met"] == sum(1 for c in reading.clauses if c.met)
