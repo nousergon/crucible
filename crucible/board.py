@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -75,10 +75,13 @@ __all__ = [
     "board_key",
     "board_html_key",
     "board_payload",
+    "pointer_may_move",
     "render_board_html",
     "build_board",
     "load_declarations",
-    "read_verdict",
+    "READERS",
+    "READER_ARTIFACTS",
+    "read_declaration",
 ]
 
 BOARD_SCHEMA_VERSION = "board.v1"
@@ -162,7 +165,13 @@ BOARD_CONSOLE_STATE: dict[str, str] = {
     "MET": "HEALTHY",
     "UNMET": "DEGRADED",
     "UNMEASURED": "UNREPORTED",
-    "UNMEASURABLE": "UNREPORTED",
+    # FAILED, not UNREPORTED. `UNMEASURED` and `UNMEASURABLE` are different
+    # facts and this board argues that harder than it argues anything else —
+    # so collapsing them onto one console state would lose the distinction on
+    # the FLEET surface, which is the surface actually opened. `UNREPORTED` is
+    # "nobody has read this"; a read that was ATTEMPTED and could not complete
+    # is a fault in our access, and §8.3's word for a fault is FAILED.
+    "UNMEASURABLE": "FAILED",
     "OUT_OF_ORDER": "FAILED",
     "PLANNED": "ARMED",
     "DECLARED_OFF": "DISABLED",
@@ -186,6 +195,10 @@ LADDER_BOARD_STATE: dict[str, str] = {
 #:
 #: Two mappings are worth arguing rather than reading past:
 #:
+#: * `MISSED` maps to `UNMEASURED`, not `UNMET`: a schedule that fired with
+#:   no run produced no reading, and "we did not measure" is not "we measured
+#:   and it fell short". `ABSENT` stays `UNMET` because it IS a reading — a
+#:   declared component established as not present.
 #: * `ARMED` (on-demand, silence carries no claim of a recent run) maps to
 #:   `UNMEASURED`, not to a grey state. Silence carrying no claim IS the
 #:   definition of unmeasured; treating "we never ask" as acceptable is how a
@@ -199,7 +212,12 @@ COMPONENT_BOARD_STATE: dict[str, str] = {
     "DEGRADED": "UNMET",
     "FAILED": "UNMET",
     "STALLED": "UNMET",
-    "MISSED": "UNMET",
+    # `MISSED` is "its schedule fired and no run started" — no reading was
+    # taken at all, which is this board's definition of UNMEASURED, not of a
+    # measured shortfall. `ABSENT` below stays UNMET on purpose and the
+    # difference is worth stating: ABSENT is a positive finding that a
+    # DECLARED thing is not there, which is itself a reading.
+    "MISSED": "UNMEASURED",
     "NEVER_RAN": "UNMEASURED",
     "DISABLED": "DECLARED_OFF",
     "DEPRECATED": "DECLARED_OFF",
@@ -217,27 +235,51 @@ def _check_total(
     mapping: dict[str, str],
     codomain: Iterable[str],
 ) -> None:
-    """Refuse a source state with no declared board rendering.
+    """Refuse a mapping that is not total, in EITHER direction, over a non-empty domain.
 
     A plain function rather than a module-level `assert`, for the reason
     `crucible.gate._check_ladder_console_coverage` gives: `assert` is compiled
     out under `python -O`, which makes it the one guard construct guaranteed
-    absent in an optimized interpreter — and this is the guard that stops a
+    absent in an optimized interpreter, and this is the guard that stops a
     state reaching a surface with no declared rendering
     (`alpha-engine-config-I9826`).
+
+    Three checks, and the first two were each missing once:
+
+    * **non-empty domain** — an empty domain makes every other assertion
+      vacuously true. A guard that passes over nothing is the failure this
+      repository grades other systems on, so it is refused rather than trusted
+      to be impossible.
+    * **domain ⊆ keys** — every source state has a rendering.
+    * **keys ⊆ domain** — no rendering exists for a state that no longer
+      exists. Dead data today; a renamed state tomorrow, still mapped under
+      its old name, silently unrendered under the new one.
+    * **values ⊆ codomain** — a mapping total over its inputs can still land
+      on a state nothing renders.
     """
-    gap = set(domain) - set(mapping)
-    if gap:
+    states, targets = set(domain), set(codomain)
+    if not states:
         raise ValueError(
-            f"{name} is missing {sorted(gap)} — every source state must declare how "
+            f"{name} was checked against an EMPTY domain, which makes every assertion "
+            "about it vacuously true. A guard that passes over nothing is not a guard."
+        )
+    missing = states - set(mapping)
+    if missing:
+        raise ValueError(
+            f"{name} is missing {sorted(missing)} — every source state must declare how "
             "it renders on the board before it can reach a surface."
         )
-    stray = set(mapping.values()) - set(codomain)
+    orphaned = set(mapping) - states
+    if orphaned:
+        raise ValueError(
+            f"{name} maps {sorted(orphaned)}, which are not source states. A rendering "
+            "for a state that no longer exists is how a renamed state ends up unrendered."
+        )
+    stray = set(mapping.values()) - targets
     if stray:
         raise ValueError(
             f"{name} maps to {sorted(stray)}, which are outside its declared codomain "
-            f"{sorted(codomain)}. Both directions are checked: a mapping that is total "
-            "over its inputs can still land on a state nothing renders."
+            f"{sorted(targets)}."
         )
 
 
@@ -259,18 +301,24 @@ if RED_STATES | GREY_STATES | {"MET"} != set(BOARD_STATES):  # pragma: no cover 
 class Declaration:
     """One declared row, before anything has been read for it.
 
-    ``reads`` is `None` exactly when the row is `PLANNED`. That is the whole
+    ``reader`` is `None` exactly when the row is `PLANNED`. That is the whole
     encoding of "declared, not built", and it is a declaration rather than an
     inference on purpose: an absent artifact would otherwise be
     indistinguishable from a producer that broke.
+
+    ``artifact`` names the key a reader resolves, for the READER OF THE BOARD.
+    It is asserted equal to the key the registered reader actually derives, so
+    it cannot drift into decoration — and it is stated even for a `PLANNED`
+    row, because "here is the objective and here is the artifact nobody writes
+    yet" is actionable and a bare grey dot is not.
     """
 
     id: str
     source: str
     title: str
     surface: str
-    reads: str | None
-    verdict: str | None
+    reader: str | None
+    artifact: str
     means_when_red: str
     section: str = ""
     clause_class: str = ""
@@ -279,29 +327,32 @@ class Declaration:
     def __post_init__(self) -> None:
         if self.source not in SOURCES:
             raise ValueError(f"{self.id}: source {self.source!r} not in {SOURCES}")
-        if (self.reads is None) != (self.verdict is None):
+        if not self.artifact.strip():
             raise ValueError(
-                f"{self.id}: `reads` and `verdict` must be set together. A key with no "
-                "field to read cannot produce a state, and a field with no key has "
-                "nowhere to come from."
+                f"{self.id} names no artifact. Every row names the thing it reads or is "
+                "waiting for — a red row a reader has to ask an agent about is not "
+                "actionable, which is the whole objection to the surface this replaces."
             )
-        if self.reads is None and not self.planned_because.strip():
+        if self.reader is not None and self.reader not in READERS:
+            raise ValueError(
+                f"{self.id}: reader {self.reader!r} is not registered in board.READERS "
+                f"({sorted(READERS)}). A declaration naming a reader that does not exist "
+                "would render UNMEASURABLE forever for a reason about US, not about the "
+                "objective."
+            )
+        if self.reader is None and not self.planned_because.strip():
             raise ValueError(
                 f"{self.id} is PLANNED with no `planned_because`. A grey row with no "
                 "stated reason is indistinguishable from one somebody forgot to wire, "
                 "and grey rows are the ones nobody chases."
             )
-        if self.reads is not None and self.planned_because.strip():
+        if self.reader is not None and self.planned_because.strip():
             raise ValueError(
-                f"{self.id} declares both `reads` and `planned_because` — it cannot be "
+                f"{self.id} declares both a reader and `planned_because` — it cannot be "
                 "both measured and not built."
             )
         if not self.means_when_red.strip():
-            raise ValueError(
-                f"{self.id} declares no `means_when_red`. A red row a reader has to ask "
-                "an agent about is not actionable, which is the whole objection to the "
-                "board this one replaces."
-            )
+            raise ValueError(f"{self.id} declares no `means_when_red`")
 
 
 @dataclass(frozen=True)
@@ -322,8 +373,8 @@ def _declaration(row_id: str, source: str, body: dict[str, Any]) -> Declaration:
         "statement",
         "clause_class",
         "surface",
-        "reads",
-        "verdict",
+        "reader",
+        "artifact",
         "planned_because",
         "means_when_red",
     }
@@ -334,7 +385,7 @@ def _declaration(row_id: str, source: str, body: dict[str, Any]) -> Declaration:
             "closed — a typo'd key would otherwise be silently ignored, which on a "
             "board means a row measuring nothing while looking configured."
         )
-    missing = {"statement", "surface", "means_when_red"} - set(body)
+    missing = {"statement", "surface", "artifact", "means_when_red"} - set(body)
     if missing:
         raise ValueError(f"{row_id}: missing required field(s) {sorted(missing)}")
     return Declaration(
@@ -342,8 +393,8 @@ def _declaration(row_id: str, source: str, body: dict[str, Any]) -> Declaration:
         source=source,
         title=str(body["statement"]).strip(),
         surface=str(body["surface"]),
-        reads=body.get("reads"),
-        verdict=body.get("verdict"),
+        reader=body.get("reader"),
+        artifact=str(body["artifact"]).strip(),
         means_when_red=str(body.get("means_when_red", "")),
         section=str(body.get("section", "")),
         clause_class=str(body.get("clause_class", "")),
@@ -395,73 +446,150 @@ class Reading:
     last_read: str | None = None
 
 
-def read_verdict(store: Store, declaration: Declaration) -> Reading:
-    """Resolve one declared row against the store. Reads; never runs.
+def _fetch(
+    store: Store, key: str, trading_day: str
+) -> tuple[dict[str, Any] | None, Reading | None]:
+    """Read one day-keyed JSON document. Returns `(document, None)` or `(None, reading)`.
 
-    The four outcomes are deliberately distinct, and three of them are red:
+    Every failure mode is a DIFFERENT red, and three of them are about us
+    rather than about the system:
 
-    * key absent            -> `UNMEASURED`, key named.
-    * key unreadable        -> `UNMEASURABLE`, error named. A credential
-      failure and an unmet objective are different facts, and reporting them
-      identically is `alpha-engine-config-I9828`.
-    * field absent          -> `UNMEASURABLE`, field named.
-    * field present         -> `MET` / `UNMET`.
+    * key absent           -> `UNMEASURED`, key named.
+    * key unreadable       -> `UNMEASURABLE`, error named. A credential failure
+      and an unmet objective reported identically is
+      `alpha-engine-config-I9828`, whose cost clause has been unreadable in CI
+      for its whole life for exactly this reason.
+    * not a JSON object    -> `UNMEASURABLE`, type named.
+    * document's own day disagrees with the board's -> `UNMEASURED`, both days
+      named. The key is day-scoped so this should be impossible; it is checked
+      anyway, because "the artifact says it is about a different day" is the
+      one thing that would make a stale document read as a current reading,
+      and `crucible.gate.last_read` already records that a freshly written
+      artifact full of never-measured content otherwise looks entirely fresh.
     """
-    if declaration.reads is None:
-        return Reading("PLANNED", declaration.planned_because.strip())
-
-    key = declaration.reads
     try:
         present = store.exists(key)
     except Exception as exc:  # noqa: BLE001 - the error IS the reading
-        return Reading(
+        return None, Reading(
             "UNMEASURABLE",
-            f"could not establish whether {key} exists: {type(exc).__name__}: {exc}. "
-            "This is not the same as the objective being unmet — it is a statement "
-            "about our access, and it must never be counted as one about the system.",
+            f"could not establish whether {key} exists: {type(exc).__name__}: {exc}. This "
+            "is not the same as the objective being unmet — it is a statement about our "
+            "access, and it must never be counted as one about the system.",
         )
     if not present:
-        return Reading("UNMEASURED", f"no artifact at {key} — nothing has filed a reading yet")
-
+        return None, Reading(
+            "UNMEASURED", f"no artifact at {key} — nothing has filed a reading for this day"
+        )
     try:
         document = json.loads(store.get_bytes(key))
     except Exception as exc:  # noqa: BLE001 - the error IS the reading
-        return Reading(
-            "UNMEASURABLE",
-            f"{key} is present but could not be read: {type(exc).__name__}: {exc}",
+        return None, Reading(
+            "UNMEASURABLE", f"{key} is present but could not be read: {type(exc).__name__}: {exc}"
         )
     if not isinstance(document, dict):
-        return Reading(
-            "UNMEASURABLE",
-            f"{key} parsed to {type(document).__name__}, not an object with fields",
+        return None, Reading(
+            "UNMEASURABLE", f"{key} parsed to {type(document).__name__}, not an object with fields"
         )
+    stamped = document.get("trading_day")
+    if stamped is not None and stamped != trading_day:
+        return None, Reading(
+            "UNMEASURED",
+            f"{key} carries trading_day {stamped!r}, not {trading_day!r}. A document about "
+            "another day is not a reading for this one, however recently it was written.",
+            last_read=str(stamped),
+        )
+    return document, None
 
-    field_name = declaration.verdict
-    assert field_name is not None  # Declaration.__post_init__ guarantees the pair
-    if field_name not in document:
+
+def _provenance(document: dict[str, Any]) -> str | None:
+    for field_name in ("generated_utc", "generated_at", "trading_day"):
+        value = document.get(field_name)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _read_attribution(store: Store, trading_day: str) -> Reading:
+    """Plan §2 row 5 — the five-row attribution table, read from the report card.
+
+    Key from `crucible.report.attribution_key`, which is the module that
+    WRITES it. Not restated here: a key format restated at a call site is a
+    contract restated twice, and this board's first draft restated fourteen of
+    them wrongly.
+
+    MET requires the declared number of rows AND that no row reports
+    `UNREPORTED`. A table that grades fewer layers than it declares is the
+    shape `build_attribution` already refuses to produce; a table whose rows
+    are all present and all blank is the one it cannot refuse, and it is the
+    one that reads green if you only count rows.
+    """
+    from crucible.report import ROWS, attribution_key  # noqa: PLC0415 - avoids a cycle
+
+    key = attribution_key(trading_day)
+    document, failure = _fetch(store, key, trading_day)
+    if failure is not None:
+        return failure
+    assert document is not None
+    rows = document.get("rows")
+    if not isinstance(rows, list):
         return Reading(
             "UNMEASURABLE",
-            f"{key} carries no field {field_name!r}. The document exists and does not "
-            "answer the question, which is not the same as answering it 'no'.",
-            last_read=_as_text(document.get("generated_at")),
+            f"{key} carries no `rows` list — the document exists and does not answer the "
+            "question, which is not the same as answering it 'no'.",
+            last_read=_provenance(document),
         )
-    value = document[field_name]
-    if not isinstance(value, bool):
+    blind = [
+        r.get("name", "?") for r in rows if isinstance(r, dict) and r.get("status") == "UNREPORTED"
+    ]
+    provenance = _provenance(document)
+    if len(rows) != len(ROWS):
         return Reading(
-            "UNMEASURABLE",
-            f"{key}:{field_name} is {type(value).__name__} {value!r}, not a boolean. A "
-            "verdict field that is not a verdict cannot be rendered either way.",
-            last_read=_as_text(document.get("generated_at")),
+            "UNMET",
+            f"{key} grades {len(rows)} of {len(ROWS)} declared layer(s)",
+            last_read=provenance,
+        )
+    if blind:
+        return Reading(
+            "UNMET",
+            f"{key} grades all {len(rows)} layers and {len(blind)} of them report no value "
+            f"({', '.join(blind)}). A row that measured nothing is not evidence of health.",
+            last_read=provenance,
         )
     return Reading(
-        "MET" if value else "UNMET",
-        f"{key}:{field_name} is {value}",
-        last_read=_as_text(document.get("generated_at")),
+        "MET", f"{key} grades all {len(rows)} declared layers with a value each", provenance
     )
 
 
-def _as_text(value: Any) -> str | None:
-    return str(value) if isinstance(value, str) and value.strip() else None
+#: The registered readers, by the name a declaration uses.
+#:
+#: A reader takes `(store, trading_day)` and returns a `Reading`. It derives
+#: its own key from the module that OWNS the artifact — never from a literal
+#: in `board.yaml`, which is what the first draft of this board did for
+#: fourteen keys, eight of them wrong.
+#:
+#: The registry is deliberately small. Most §2 objectives have no producer at
+#: all yet, and those rows are `PLANNED` with the artifact they are waiting for
+#: named. Inventing a reader for an artifact nobody writes would produce a red
+#: about the KEY rather than about the objective, indistinguishable from the
+#: gap this board exists to show.
+READERS: dict[str, Callable[[Store, str], Reading]] = {
+    "attribution_table_is_complete": _read_attribution,
+}
+
+#: What key each reader resolves, as a template, for the board's reader.
+#: `test_every_declared_artifact_matches_the_key_its_reader_uses` asserts each
+#: entry against the key the reader really derives for a sample trading day,
+#: so the human-facing string cannot drift away from the code.
+READER_ARTIFACTS: dict[str, str] = {
+    "attribution_table_is_complete": "report/{trading_day}/attribution.json",
+}
+
+
+def read_declaration(store: Store, declaration: Declaration, trading_day: str) -> Reading:
+    """Resolve one declared row against the store. Reads; never runs."""
+    if declaration.reader is None:
+        return Reading("PLANNED", declaration.planned_because.strip())
+    return READERS[declaration.reader](store, trading_day)
 
 
 # ── Rows and the board ────────────────────────────────────────────────────
@@ -599,15 +727,15 @@ def build_board(
     rows: list[BoardRow] = []
 
     for row_id, declaration in decl.objectives.items():
-        rows.append(_declared_row(store, f"objective:{row_id}", declaration))
+        rows.append(_declared_row(store, f"objective:{row_id}", declaration, day))
 
-    rows.extend(_phase_rows(ladder))
+    rows.extend(_phase_rows(ladder, day))
 
     for name in sorted(reg):
         rows.append(_component_row(reg[name], (classifications or {}).get(name)))
 
     for row_id, declaration in decl.cutover.items():
-        rows.append(_declared_row(store, f"cutover:{row_id}", declaration))
+        rows.append(_declared_row(store, f"cutover:{row_id}", declaration, day))
 
     return Board(
         trading_day=day,
@@ -616,8 +744,10 @@ def build_board(
     )
 
 
-def _declared_row(store: Store, row_id: str, declaration: Declaration) -> BoardRow:
-    reading = read_verdict(store, declaration)
+def _declared_row(
+    store: Store, row_id: str, declaration: Declaration, trading_day: str
+) -> BoardRow:
+    reading = read_declaration(store, declaration, trading_day)
     return BoardRow(
         id=row_id,
         source=declaration.source,
@@ -626,15 +756,41 @@ def _declared_row(store: Store, row_id: str, declaration: Declaration) -> BoardR
         state=reading.state,
         detail=reading.detail,
         surface=declaration.surface,
-        artifact=declaration.reads or "(no producer yet)",
+        # The template with the day substituted where there is one to
+        # substitute. A literal `{trading_day}` left on the surface is the
+        # fleet's documented placeholder gotcha: a key nobody can copy, and
+        # indistinguishable from one that was never written.
+        artifact=declaration.artifact.replace("{trading_day}", trading_day),
         means_when_red=declaration.means_when_red,
         last_read=reading.last_read,
     )
 
 
-def _phase_rows(ladder: Ladder | None) -> list[BoardRow]:
+def _phase_rows(ladder: Ladder | None, trading_day: str) -> list[BoardRow]:
     """One row per §6 phase, from `gate.PHASES` — never from a second list."""
-    from crucible.gate import PHASES  # noqa: PLC0415 - avoids a module import cycle
+    from crucible.gate import PHASES, gate_key  # noqa: PLC0415 - avoids a module import cycle
+
+    def artifact(phase: Any) -> str:
+        # `phase.gate or phase.id` FABRICATES a key for every unregistered
+        # phase: `gate_key` is keyed by the REGISTERED gate name, so
+        # `gates/phase2/…` is a path no producer will ever write. Copying it
+        # yields nothing, which is indistinguishable from a gate that ran and
+        # produced nothing — the exact confusion this board exists to remove.
+        if phase.gate is None:
+            return "(no gate is registered for this phase)"
+        return gate_key(phase.gate, trading_day)
+
+    def means_when_red(phase: Any) -> str:
+        if phase.gate is None:
+            return (
+                f"no clause list is registered for phase {phase.number}, so its gate "
+                f"cannot be read at all — it is not unmet, it does not exist. Tracker: "
+                f"{phase.tracker} ({phase.tracker_url})."
+            )
+        return (
+            f"phase {phase.number}'s exit gate is not met. Tracker: "
+            f"{phase.tracker} ({phase.tracker_url})."
+        )
 
     if ladder is None:
         return [
@@ -649,11 +805,8 @@ def _phase_rows(ladder: Ladder | None) -> list[BoardRow]:
                     "is a statement about the producer, not about the phase."
                 ),
                 surface="crucible/board",
-                artifact=f"gates/{phase.gate or phase.id}/{{trading_day}}/gate.json",
-                means_when_red=(
-                    f"phase {phase.number}'s exit gate is not met. Tracker: "
-                    f"{phase.tracker} ({phase.tracker_url})."
-                ),
+                artifact=artifact(phase),
+                means_when_red=means_when_red(phase),
             )
             for phase in PHASES
         ]
@@ -678,11 +831,8 @@ def _phase_rows(ladder: Ladder | None) -> list[BoardRow]:
                 state=LADDER_BOARD_STATE[ladder_row.state],
                 detail=_ladder_detail(ladder_row),
                 surface="crucible/board",
-                artifact=f"gates/{phase.gate or phase.id}/{{trading_day}}/gate.json",
-                means_when_red=(
-                    f"phase {phase.number}'s exit gate is not met. Tracker: "
-                    f"{phase.tracker} ({phase.tracker_url})."
-                ),
+                artifact=artifact(phase),
+                means_when_red=means_when_red(phase),
                 last_read=ladder_row.read_on,
             )
         )
@@ -895,3 +1045,37 @@ def _esc(value: Any) -> str:
     import html  # noqa: PLC0415 - one call site, kept local to the renderer
 
     return html.escape("" if value is None else str(value))
+
+
+def pointer_may_move(previous: dict[str, Any] | None, board: Board) -> tuple[bool, str]:
+    """Whether `board/current.json` may be repointed at this board.
+
+    **A replay must not clobber the pointer with an older board.** Measured on
+    this branch before the guard existed: `crucible board --date 2026-09-01`
+    then `--date 2026-08-28` left `current.json` reading 2026-08-28, and that
+    key is what the fleet-console adapter reads
+    (`alpha-engine-config-I9800`) and what the workflow's summary step
+    downloads. The dated key is always written; only the POINTER is guarded,
+    for the same reason `crucible.release` guards its release pointer rather
+    than its releases.
+
+    An unreadable incumbent does NOT license a move. "I could not read what is
+    there" is not "what is there is older", and on a pointer those two want
+    opposite actions.
+    """
+    if previous is None:
+        return True, "no incumbent pointer"
+    incumbent = previous.get("trading_day")
+    if not isinstance(incumbent, str) or not incumbent:
+        return False, (
+            "the incumbent board/current.json carries no trading_day, so this board "
+            "cannot be shown to be newer. Refusing to move the pointer: an unreadable "
+            "incumbent is not evidence that it is stale."
+        )
+    if incumbent > board.trading_day:
+        return False, (
+            f"the incumbent board/current.json is for {incumbent}, which is later than "
+            f"this board's {board.trading_day}. A replay does not repoint the pointer — "
+            "the dated board was still written."
+        )
+    return True, f"incumbent is {incumbent}, this board is {board.trading_day}"

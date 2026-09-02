@@ -30,6 +30,7 @@ from crucible.board import (
     board_key,
     board_payload,
     build_board,
+    pointer_may_move,
     render_board_html,
 )
 from crucible.calendar import resolve_trading_day
@@ -454,20 +455,29 @@ def board_handler(args: argparse.Namespace) -> int:
             ladder=ladder,
         )
 
-        previous = _read_previous_board(store)
+        previous, previous_unreadable = _read_previous_board(store)
         deltas = board_delta(previous, board)
 
         payload = board_payload(board)
-        for key in (board_key(board.trading_day), BOARD_CURRENT_KEY):
+        may_move, pointer_reason = pointer_may_move(previous, board)
+        # The dated board is ALWAYS written; the pointer is conditional. A
+        # replay must not clobber `board/current.json` with an older board —
+        # that key is what the fleet console reads.
+        written = [board_key(board.trading_day)]
+        if may_move:
+            written.append(BOARD_CURRENT_KEY)
+        for key in written:
             store.put_bytes(key, payload)
             ctx.record_output(key, payload, schema_version=BOARD_SCHEMA_VERSION)
         # The page and the JSON, always together: `console-policy` requires
         # every view to serve the JSON an agent reads, because a page whose
         # numbers can only be scraped out of HTML is a page the next automated
-        # reader re-derives incorrectly.
-        page = render_board_html(board, deltas).encode("utf-8")
-        store.put_bytes(BOARD_HTML_KEY, page)
-        ctx.record_output(BOARD_HTML_KEY, page, schema_version=BOARD_SCHEMA_VERSION)
+        # reader re-derives incorrectly. It moves with the pointer, for the
+        # same reason and under the same condition.
+        if may_move:
+            page = render_board_html(board, deltas).encode("utf-8")
+            store.put_bytes(BOARD_HTML_KEY, page)
+            ctx.record_output(BOARD_HTML_KEY, page, schema_version=BOARD_SCHEMA_VERSION)
 
         counts = board.counts()
         ctx.record_metric(
@@ -502,13 +512,21 @@ def board_handler(args: argparse.Namespace) -> int:
                 "value": float(len(deltas)),
                 "unit": "rows",
                 "n_floor": 0,
-                "status": "OK",
+                # BREACH when the previous board could not be read. Reporting
+                # "0 rows moved" over a failed comparison is a POSITIVE claim
+                # asserted on no evidence — and this is the only surface that
+                # reports a VANISHED declaration, so a silent zero here hides
+                # exactly the event the board exists to catch.
+                "status": "OK" if previous_unreadable is None else "BREACH",
                 # The digest reports DELTAS, not absolute state. A board
                 # reading almost entirely PLANNED for weeks is correct and is
                 # also the thing people stop opening; the delta is the part
                 # that stays worth reading.
                 "status_reason": (
-                    "; ".join(d.describe() for d in deltas)
+                    f"the previous board could not be read ({previous_unreadable}), so no "
+                    "comparison was possible. This is NOT a claim that nothing moved."
+                    if previous_unreadable is not None
+                    else "; ".join(d.describe() for d in deltas)
                     if deltas
                     else "no row changed state since the last board"
                 ),
@@ -543,21 +561,30 @@ def board_handler(args: argparse.Namespace) -> int:
     return 0
 
 
-def _read_previous_board(store: Store) -> dict[str, Any] | None:
-    """The last board filed, or None on the first ever run.
+def _read_previous_board(store: Store) -> tuple[dict[str, Any] | None, str | None]:
+    """The last board filed. Returns `(document, unreadable_reason)`.
 
-    A read failure here returns None rather than raising: the delta is a
-    convenience layered on top of the board, and losing yesterday's copy must
-    not stop today's from being written. The board itself never degrades this
-    way -- an unreadable ROW is UNMEASURABLE and loud.
+    **A failed read is not "no change".** The earlier version of this returned
+    `None` on any exception, which fed `board_delta(None, …) -> []` and made
+    the digest publish `board_rows_moved = 0, "no row changed state"` — a
+    POSITIVE claim of no movement, asserted over a read that failed. That is
+    the one thing this module's whole argument forbids, and it happened to be
+    on the only surface that reports a VANISHED declaration.
+
+    So the two cases are separated and the second is surfaced by the caller:
+    "there is no previous board" (the first ever run) and "there is one and I
+    could not read it" want opposite responses, and the second is
+    `UNMEASURABLE` in this board's own vocabulary.
     """
     try:
         if not store.exists(BOARD_CURRENT_KEY):
-            return None
+            return None, None
         document = json.loads(store.get_bytes(BOARD_CURRENT_KEY))
-    except Exception:  # noqa: BLE001 - see the docstring; the board still writes
-        return None
-    return document if isinstance(document, dict) else None
+    except Exception as exc:  # noqa: BLE001 - reported, never swallowed; see the docstring
+        return None, f"{type(exc).__name__}: {exc}"
+    if not isinstance(document, dict):
+        return None, f"{BOARD_CURRENT_KEY} parsed to {type(document).__name__}, not an object"
+    return document, None
 
 
 def console_handler(args: argparse.Namespace) -> int:

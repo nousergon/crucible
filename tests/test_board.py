@@ -32,6 +32,8 @@ from crucible.board import (
     COMPONENT_BOARD_STATE,
     GREY_STATES,
     LADDER_BOARD_STATE,
+    READER_ARTIFACTS,
+    READERS,
     RED_STATES,
     SOURCES,
     Board,
@@ -41,7 +43,8 @@ from crucible.board import (
     board_payload,
     build_board,
     load_declarations,
-    read_verdict,
+    pointer_may_move,
+    read_declaration,
 )
 from crucible.components import load_registry
 from crucible.console.classify import STATES as COMPONENT_STATES
@@ -222,23 +225,45 @@ class TestTheObjectivesMatchTheAcceptanceSuite:
 
 
 class TestReadingIsHonestAboutWhatItCouldNotDo:
+    """The four ways a read can end, and the three that are red.
+
+    `attribution_table_is_complete` is the one registered reader, so it is the
+    one exercised here. What is asserted is the SHAPE every reader must share,
+    not one reader's arithmetic.
+    """
+
     @staticmethod
-    def _measured(**overrides) -> Declaration:
+    def _declaration(**overrides) -> Declaration:
         base = {
-            "id": "probe",
+            "id": "attribution",
             "source": "objective",
             "title": "a probe",
             "surface": "crucible/board",
-            "reads": "probe/current.json",
-            "verdict": "ok",
-            "means_when_red": "the probe says no",
+            "reader": "attribution_table_is_complete",
+            "artifact": "report/{trading_day}/attribution.json",
+            "means_when_red": "the table is incomplete",
         }
         return Declaration(**{**base, **overrides})
 
+    @staticmethod
+    def _table(rows: int, *, blind: int = 0, day: str = "2026-08-28") -> bytes:
+        from crucible.report import ROWS
+
+        body = [
+            {"name": f"row{i}", "status": "UNREPORTED" if i < blind else "OK"} for i in range(rows)
+        ]
+        assert len(ROWS) >= 1
+        return json.dumps(
+            {"trading_day": day, "generated_utc": "2026-08-28T00:00:00Z", "rows": body}
+        ).encode()
+
+    def _read(self, store, day="2026-08-28"):
+        return read_declaration(store, self._declaration(), day)
+
     def test_an_absent_artifact_is_unmeasured_and_names_the_key(self, store) -> None:
-        reading = read_verdict(store, self._measured())
+        reading = self._read(store)
         assert reading.state == "UNMEASURED"
-        assert "probe/current.json" in reading.detail
+        assert "report/2026-08-28/attribution.json" in reading.detail
 
     def test_a_read_failure_is_unmeasurable_not_unmet(self, store, monkeypatch) -> None:
         """The `alpha-engine-config-I9828` case, as a property.
@@ -251,99 +276,175 @@ class TestReadingIsHonestAboutWhatItCouldNotDo:
             raise PermissionError("AccessDenied")
 
         monkeypatch.setattr(store, "exists", _denied)
-        reading = read_verdict(store, self._measured())
+        reading = self._read(store)
         assert reading.state == "UNMEASURABLE"
         assert "AccessDenied" in reading.detail
 
-    def test_a_document_missing_the_field_is_unmeasurable(self, store) -> None:
-        store.put_bytes("probe/current.json", json.dumps({"something_else": True}).encode())
-        reading = read_verdict(store, self._measured())
+    def test_a_document_that_does_not_answer_the_question_is_unmeasurable(self, store) -> None:
+        store.put_bytes(
+            "report/2026-08-28/attribution.json",
+            json.dumps({"trading_day": "2026-08-28", "something_else": True}).encode(),
+        )
+        reading = self._read(store)
         assert reading.state == "UNMEASURABLE"
-        assert "'ok'" in reading.detail
+        assert "rows" in reading.detail
 
-    def test_a_non_boolean_verdict_is_unmeasurable(self, store) -> None:
-        store.put_bytes("probe/current.json", json.dumps({"ok": "yes"}).encode())
-        assert read_verdict(store, self._measured()).state == "UNMEASURABLE"
+    def test_a_document_for_another_day_is_unmeasured_not_met(self, store) -> None:
+        """The staleness case, and the reason it is UNMEASURED rather than MET.
 
-    def test_a_true_verdict_is_met_and_a_false_one_is_unmet(self, store) -> None:
-        store.put_bytes("probe/current.json", json.dumps({"ok": True}).encode())
-        assert read_verdict(store, self._measured()).state == "MET"
-        store.put_bytes("probe/current.json", json.dumps({"ok": False}).encode())
-        assert read_verdict(store, self._measured()).state == "UNMET"
+        Every readable artifact here is keyed by trading day, so a document
+        stamped with a different day can only mean the key was resolved for
+        one day and filled by another. `crucible.gate.last_read` already
+        records what happens without this check: a freshly written artifact
+        full of never-measured content looks entirely fresh.
+        """
+        store.put_bytes(
+            "report/2026-08-28/attribution.json",
+            self._table(len(_attribution_rows()), day="2019-01-04"),
+        )
+        reading = self._read(store)
+        assert reading.state == "UNMEASURED"
+        assert "2019-01-04" in reading.detail
+
+    def test_a_complete_table_is_met_and_carries_its_provenance(self, store) -> None:
+        store.put_bytes("report/2026-08-28/attribution.json", self._table(len(_attribution_rows())))
+        reading = self._read(store)
+        assert reading.state == "MET"
+        assert reading.last_read == "2026-08-28T00:00:00Z", (
+            "a MET row with no provenance is a green dot that cannot say when it was "
+            "last true, which is the state I9837 deliverable 3 exists to forbid"
+        )
+
+    def test_a_short_table_is_unmet(self, store) -> None:
+        store.put_bytes(
+            "report/2026-08-28/attribution.json", self._table(len(_attribution_rows()) - 1)
+        )
+        assert self._read(store).state == "UNMET"
+
+    def test_a_full_table_of_blank_rows_is_unmet_not_met(self, store) -> None:
+        """Counting rows is not reading them.
+
+        A table with every declared row present and every one of them
+        reporting no value is the case `build_attribution` cannot refuse, and
+        it is the one that reads green if the check is a row count.
+        """
+        n = len(_attribution_rows())
+        store.put_bytes("report/2026-08-28/attribution.json", self._table(n, blind=n))
+        reading = self._read(store)
+        assert reading.state == "UNMET"
+        assert "report no value" in reading.detail
 
     def test_planned_is_declared_never_inferred_from_absence(self, store) -> None:
         """The distinction the board turns on.
 
-        An absent artifact under a declared producer is UNMEASURED (red). The
-        SAME absence under `reads: null` is PLANNED (grey). Nothing about the
+        An absent artifact under a registered reader is UNMEASURED (red). The
+        SAME absence with `reader: null` is PLANNED (grey). Nothing about the
         store separates those two; only the declaration does.
         """
-        planned = self._measured(reads=None, verdict=None, planned_because="no producer yet")
-        assert read_verdict(store, planned).state == "PLANNED"
-        assert read_verdict(store, self._measured()).state == "UNMEASURED"
+        planned = self._declaration(reader=None, planned_because="no producer yet")
+        assert read_declaration(store, planned, "2026-08-28").state == "PLANNED"
+        assert self._read(store).state == "UNMEASURED"
+
+
+def _attribution_rows():
+    from crucible.report import ROWS
+
+    return ROWS
+
+
+class TestNoDeclarationInventsAKey:
+    """`crucible/keys.py` exists so a key shape is written once.
+
+    The first draft of `board.yaml` carried a literal S3 key per row and
+    invented EIGHT OF TEN of them — `ledger/cost/current.json` against the
+    real `ledger/trials.jsonl`, `features/current.json` against a
+    `features/{version}/{day}.parquet`, `arms/controls/current.json` against
+    an `arms/{slot}/register.jsonl`. Those rows would have read UNMEASURED
+    forever, and the red would have been about the KEY rather than about the
+    objective — indistinguishable from the gap the board exists to show.
+    """
+
+    def test_every_reader_declares_the_artifact_it_resolves(self) -> None:
+        assert set(READERS) == set(READER_ARTIFACTS), (
+            "a reader with no declared artifact template cannot be checked against the "
+            "key it really derives, which is how the human-facing string drifts"
+        )
+
+    def test_every_declared_artifact_matches_the_key_its_reader_uses(self, declarations) -> None:
+        """The board.yaml string equals what the reader actually resolves.
+
+        Asserted against the REAL key for a sample day, so the template on the
+        surface cannot become decoration.
+        """
+        day = "2026-08-28"
+        for declaration in declarations.all.values():
+            if declaration.reader is None:
+                continue
+            expected = READER_ARTIFACTS[declaration.reader].replace("{trading_day}", day)
+            assert declaration.artifact.replace("{trading_day}", day) == expected, (
+                f"{declaration.id} declares artifact {declaration.artifact!r}, but its "
+                f"reader resolves {READER_ARTIFACTS[declaration.reader]!r}"
+            )
+
+    def test_the_attribution_reader_uses_the_owning_modules_key_function(self) -> None:
+        from crucible.report import attribution_key
+
+        assert READER_ARTIFACTS["attribution_table_is_complete"].replace(
+            "{trading_day}", "2026-08-28"
+        ) == attribution_key("2026-08-28")
+
+    def test_a_declaration_naming_an_unregistered_reader_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="not registered"):
+            Declaration(
+                id="x",
+                source="objective",
+                title="t",
+                surface="s",
+                reader="no_such_reader",
+                artifact="k",
+                means_when_red="r",
+            )
 
 
 class TestTheDeclarationSchemaIsClosed:
-    def test_reads_and_verdict_must_be_set_together(self) -> None:
-        with pytest.raises(ValueError, match="must be set together"):
-            Declaration(
-                id="x",
-                source="objective",
-                title="t",
-                surface="s",
-                reads="k",
-                verdict=None,
-                means_when_red="r",
-            )
+    @staticmethod
+    def _declaration(**overrides) -> Declaration:
+        base = {
+            "id": "x",
+            "source": "objective",
+            "title": "t",
+            "surface": "s",
+            "reader": "attribution_table_is_complete",
+            "artifact": "report/{trading_day}/attribution.json",
+            "means_when_red": "r",
+        }
+        return Declaration(**{**base, **overrides})
 
     def test_a_planned_row_must_say_why(self) -> None:
         with pytest.raises(ValueError, match="planned_because"):
-            Declaration(
-                id="x",
-                source="objective",
-                title="t",
-                surface="s",
-                reads=None,
-                verdict=None,
-                means_when_red="r",
-            )
+            self._declaration(reader=None)
 
     def test_a_row_cannot_be_both_measured_and_not_built(self) -> None:
-        with pytest.raises(ValueError, match="both"):
-            Declaration(
-                id="x",
-                source="objective",
-                title="t",
-                surface="s",
-                reads="k",
-                verdict="v",
-                means_when_red="r",
-                planned_because="also planned",
-            )
+        with pytest.raises(ValueError, match="both measured and not built"):
+            self._declaration(planned_because="also planned")
 
     def test_every_row_must_say_what_red_means(self) -> None:
         with pytest.raises(ValueError, match="means_when_red"):
-            Declaration(
-                id="x",
-                source="objective",
-                title="t",
-                surface="s",
-                reads="k",
-                verdict="v",
-                means_when_red="   ",
-            )
+            self._declaration(means_when_red="   ")
+
+    def test_every_row_must_name_an_artifact_even_when_planned(self) -> None:
+        """A grey dot with no key is not actionable.
+
+        `PLANNED` still names the thing nobody writes yet — that is the
+        difference between "declared and waiting on X" and "somebody forgot
+        this row".
+        """
+        with pytest.raises(ValueError, match="names no artifact"):
+            self._declaration(reader=None, planned_because="p", artifact="  ")
 
     def test_an_unknown_source_is_refused(self) -> None:
         with pytest.raises(ValueError, match="source"):
-            Declaration(
-                id="x",
-                source="invented",
-                title="t",
-                surface="s",
-                reads="k",
-                verdict="v",
-                means_when_red="r",
-            )
+            self._declaration(source="invented")
 
     def test_an_unknown_yaml_field_is_refused(self, tmp_path) -> None:
         """A typo'd key must not be silently ignored.
@@ -358,14 +459,17 @@ class TestTheDeclarationSchemaIsClosed:
             "  a:\n"
             "    statement: s\n"
             "    surface: crucible/board\n"
+            "    reader: null\n"
+            "    artifact: k\n"
+            "    planned_because: p\n"
             "    read: k\n"
             "    means_when_red: r\n"
             "cutover:\n"
             "  b:\n"
             "    statement: s\n"
             "    surface: crucible/board\n"
-            "    reads: null\n"
-            "    verdict: null\n"
+            "    reader: null\n"
+            "    artifact: k\n"
             "    planned_because: p\n"
             "    means_when_red: r\n"
         )
@@ -525,8 +629,27 @@ class TestTheDigestReportsDeltas:
         assert {d.id for d in deltas} == {"a", "b"}
 
 
+class _WriteRefusingStore(LocalStore):
+    """A store whose EVERY mutator raises.
+
+    The earlier version of this guard monkeypatched `put_bytes` alone, and was
+    beatable: `LocalStore.compare_and_swap` writes via `open(tmp, "xb")` plus
+    `os.replace` and never touches `put_bytes`, so inserting a
+    `compare_and_swap` call into `build_board` wrote an object with the whole
+    suite green. Patching one method names the writes someone thought of,
+    which is the denylist shape this repository forbids. Subclassing and
+    refusing every mutator on `Store`'s interface is the allowlist.
+    """
+
+    def put_bytes(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
+        raise AssertionError("build_board wrote via put_bytes")
+
+    def compare_and_swap(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
+        raise AssertionError("build_board wrote via compare_and_swap")
+
+
 class TestTheProducerNeverRunsWhatItGrades:
-    def test_build_board_only_reads_the_store(self, store, monkeypatch) -> None:
+    def test_build_board_only_reads_the_store(self, tmp_path) -> None:
         """`a gate reads; it never runs`, asserted rather than intended.
 
         The board is a grading surface. A producer that could write while
@@ -534,10 +657,83 @@ class TestTheProducerNeverRunsWhatItGrades:
         the second half of this guard, not the first — a role is a deployment
         fact and this is a code fact.
         """
-        writes: list[str] = []
-        monkeypatch.setattr(store, "put_bytes", lambda key, *a, **k: writes.append(key))
-        build_board(store)
-        assert writes == [], f"build_board wrote {writes}"
+        build_board(_WriteRefusingStore(tmp_path))
+
+    def test_the_refusing_store_actually_refuses(self, tmp_path) -> None:
+        """The guard's own guard.
+
+        A `_WriteRefusingStore` that silently permitted a write would make the
+        test above pass over nothing — the vacuous-guard shape this board
+        argues against everywhere else.
+        """
+        refusing = _WriteRefusingStore(tmp_path)
+        with pytest.raises(AssertionError, match="put_bytes"):
+            refusing.put_bytes("k", b"{}")
+        with pytest.raises(AssertionError, match="compare_and_swap"):
+            refusing.compare_and_swap("k", "etag", b"{}")
+
+    def test_every_store_mutator_is_refused_by_the_double(self) -> None:
+        """Derived from `Store`, so a new mutator cannot slip past.
+
+        If `Store` gains a third write method, this fails until the double
+        refuses it too — otherwise the guard above would keep passing while
+        being blind to the new path, exactly as it was blind to
+        `compare_and_swap`.
+        """
+        from crucible.store import Store as _Store
+
+        mutators = {"put_bytes", "compare_and_swap"}
+        declared = {
+            name
+            for name in dir(_Store)
+            if not name.startswith("_") and name in {"put_bytes", "compare_and_swap"}
+        }
+        assert declared == mutators, (
+            f"Store's mutator set is {sorted(declared)}; _WriteRefusingStore refuses "
+            f"{sorted(mutators)}. Teach the double the new one."
+        )
+
+
+class TestAReplayDoesNotClobberThePointer:
+    """`board/current.json` is what the fleet console reads.
+
+    Measured before the guard existed: `crucible board --date 2026-09-01` then
+    `--date 2026-08-28` left the pointer reading 2026-08-28. The dated board
+    is always written; only the pointer is guarded, the same way
+    `crucible.release` guards its release pointer rather than its releases.
+    """
+
+    @staticmethod
+    def _board(day: str) -> Board:
+        return Board(trading_day=day, generated_at="2026-09-02T00:00:00Z", rows=[])
+
+    def test_the_first_board_may_move_the_pointer(self) -> None:
+        may, _ = pointer_may_move(None, self._board("2026-08-28"))
+        assert may
+
+    def test_a_newer_board_may_move_the_pointer(self) -> None:
+        may, _ = pointer_may_move({"trading_day": "2026-08-28"}, self._board("2026-09-01"))
+        assert may
+
+    def test_the_same_day_may_move_the_pointer(self) -> None:
+        """A same-day re-render is a refresh, not a regression."""
+        may, _ = pointer_may_move({"trading_day": "2026-09-01"}, self._board("2026-09-01"))
+        assert may
+
+    def test_a_replay_may_not_move_the_pointer_backwards(self) -> None:
+        may, reason = pointer_may_move({"trading_day": "2026-09-01"}, self._board("2026-08-28"))
+        assert not may
+        assert "2026-09-01" in reason and "2026-08-28" in reason
+
+    def test_an_unreadable_incumbent_does_not_license_a_move(self) -> None:
+        """ "I could not read what is there" is not "what is there is older".
+
+        On a pointer those two want opposite actions, and defaulting to move
+        would let one corrupt read overwrite a good pointer with a replay.
+        """
+        may, reason = pointer_may_move({"generated_at": "x"}, self._board("2026-08-28"))
+        assert not may
+        assert "no trading_day" in reason
 
 
 class TestTheDeclarationsFileItself:
@@ -549,7 +745,7 @@ class TestTheDeclarationsFileItself:
         """
         assert len(declarations.cutover) == 4
         for declaration in declarations.cutover.values():
-            assert declaration.reads, (
+            assert declaration.artifact.strip(), (
                 f"{declaration.id} names no artifact. A cutover predicate with nowhere "
                 "to read from can never become true except by someone asserting it."
             )
@@ -562,8 +758,8 @@ class TestTheDeclarationsFileItself:
                 source="objective",
                 title="t",
                 surface="s",
-                reads=None,
-                verdict=None,
+                reader=None,
+                artifact="k",
                 means_when_red="r",
                 planned_because="p",
             )
@@ -707,3 +903,69 @@ class TestTheProducerRunsWithoutTheWeeklyArc:
         page = self._run(tmp_path).get_bytes("board/index.html").decode()
         assert "UNMEASURABLE" in page
         assert _SWATCH["UNMEASURABLE"] != _SWATCH["UNMET"]
+
+
+class TestTheDigestNeverClaimsNothingMovedOverAFailedRead:
+    """A positive claim asserted on no evidence is the one thing forbidden here.
+
+    The earlier `_read_previous_board` swallowed any exception into `None`,
+    which fed `board_delta(None, …) -> []` and made the digest publish
+    `board_rows_moved = 0, "no row changed state"` over a read that had
+    FAILED — on the only surface that reports a VANISHED declaration.
+    """
+
+    @staticmethod
+    def _run(tmp_path, day):
+        import argparse
+
+        from crucible.track_c import board_handler
+
+        board_handler(argparse.Namespace(trading_day=day, store=str(tmp_path)))
+        return LocalStore(tmp_path)
+
+    def test_an_unreadable_previous_board_is_a_breach_not_a_quiet_zero(self, tmp_path) -> None:
+        self._run(tmp_path, dt.date(2026, 9, 1))
+        LocalStore(tmp_path).put_bytes("board/current.json", b"{not json")
+        written = self._run(tmp_path, dt.date(2026, 9, 2))
+        manifest = json.loads(written.get_bytes("runs/board/2026-09-02/run.json"))
+        moved = next(m for m in manifest["metrics"] if m["name"] == "board_rows_moved")
+        assert moved["status"] == "BREACH"
+        assert "NOT a claim that nothing moved" in moved["status_reason"]
+
+    def test_a_replay_leaves_the_pointer_alone_and_still_writes_its_dated_board(
+        self, tmp_path
+    ) -> None:
+        self._run(tmp_path, dt.date(2026, 9, 1))
+        written = self._run(tmp_path, dt.date(2026, 8, 28))
+        pointer = json.loads(written.get_bytes("board/current.json"))
+        assert pointer["trading_day"] == "2026-09-01", (
+            "a replay repointed board/current.json backwards — that key is what the "
+            "fleet-console adapter reads"
+        )
+        assert written.exists("board/2026-08-28/board.json")
+
+
+class TestThePhaseRowsAreActionable:
+    def test_no_row_leaves_an_unsubstituted_placeholder(self, store) -> None:
+        """The fleet's documented `{date}`-placeholder gotcha.
+
+        A literal `{trading_day}` on the surface is a key nobody can copy, and
+        it is indistinguishable from one that was never written.
+        """
+        for row in build_board(store).rows:
+            assert "{trading_day}" not in row.artifact, row.id
+
+    def test_an_unregistered_phase_says_so_rather_than_naming_a_fabricated_key(self, store) -> None:
+        """`phase.gate or phase.id` invented a key for five of six phases.
+
+        `gate_key` is keyed by the REGISTERED gate name, so `gates/phase2/…` is
+        a path no producer will ever write. Naming it would send a reader to
+        an empty key and tell them nothing about why it is empty.
+        """
+        rows = {r.id: r for r in build_board(store).rows if r.source == "phase"}
+        unregistered = [p for p in PHASES if p.gate is None]
+        assert unregistered, "this test is vacuous if every phase has a gate"
+        for phase in unregistered:
+            row = rows[f"phase:{phase.id}"]
+            assert "no gate is registered" in row.artifact
+            assert "it does not exist" in row.means_when_red
