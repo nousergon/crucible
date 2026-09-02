@@ -1,8 +1,11 @@
 name: CI
 
 # Plan §4.11. Target: <= 5 min per PR, <= 300 GHA minutes/month, CodeBuild $0,
-# ECR $0, Inspector $0. This repository is public, so those minutes are free
-# and unmetered — zero private minutes for the harness.
+# ECR $0, Inspector $0. This repository is PRIVATE today, so these minutes are
+# metered; the budget above is what keeps that immaterial. It goes public at
+# phase-1 exit (alpha-engine-config-I9775), and only then are they free. The
+# earlier version of this comment asserted "public, so those minutes are free"
+# in the present tense, which was wrong on the day it was written.
 #
 # Three workflows in this repo and no others (revised 2026-09-02 — plan §11
 # risk 1 added `adversarial-review-gate.yml` after this comment was written;
@@ -29,8 +32,9 @@ on:
     # workflow skipped by a path filter as never having started, so a
     # docs-only PR leaves a REQUIRED check pending forever — the check never
     # goes green and never goes red, and the PR cannot merge. The filter stays
-    # on `push`, where nothing is waiting on the result. These minutes are
-    # free: the repository is public.
+    # on `push`, where nothing is waiting on the result. The extra runs are
+    # metered while the repo is private, and cost a few minutes a month
+    # against the §4.11 budget.
   # The acceptance gate's second arm. `push: [main]` grades the reading minutes
   # after a merge; this catches what no merge can see — a clause whose subject
   # is live infrastructure changing out of band. Both arms exclude the PR path.
@@ -45,7 +49,12 @@ on:
 permissions: {}
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # The event name is part of the group. With `ci-${{ github.ref }}` alone, a
+  # scheduled run and a push to main share one group on `refs/heads/main`, so a
+  # merge landing inside the daily window CANCELS the scheduled reading — and a
+  # cancelled run is neither green nor red, which is the one outcome nothing
+  # notices.
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -82,6 +91,20 @@ jobs:
       - name: Foundation tests
         run: uv run pytest -q --ignore=tests/acceptance
 
+      # Collection, not execution — and it belongs HERE, on the PR path.
+      # Importing a test module grades the TREE: it proves every symbol
+      # tests/acceptance references still exists. Running the clauses grades
+      # the SYSTEM, which is why that half moved off the PR path.
+      #
+      # Without this, renaming a `crucible/` symbol an acceptance test imports
+      # passes ruff, passes the foundation suite (which --ignores that
+      # directory) and passes every other PR check, then breaks the acceptance
+      # job on main at collection time. `--collect-only` executes no test body,
+      # so it touches no live AWS and stays on the correct side of
+      # scm-platform-policy.md §3.1.
+      - name: Acceptance clauses still import
+        run: uv run pytest tests/acceptance --collect-only -q
+
   acceptance:
     name: acceptance gate (RED until the phase exits — reporting only)
     runs-on: ubuntu-latest
@@ -106,18 +129,28 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-    # NOT a blocking check, and deliberately so. tests/acceptance holds the
-    # plan §2 clauses written BEFORE the code that satisfies them (plan §6
-    # phase-0 exit: "acceptance tests written as failing pytest"). They fail
-    # today by design and go green one at a time as tracks A, B and C land.
+    # tests/acceptance holds the plan §2 clauses written BEFORE the code that
+    # satisfies them (plan §6 phase-0 exit: "acceptance tests written as
+    # failing pytest"). They fail today by design and go green one at a time
+    # as the tracks land.
     #
     # This is not a suppression: the tests are not skipped, not xfailed and
     # not marked — nothing in the tree hides them, and
-    # tests/test_no_suppressions.py enforces that. They are RUN, in full, and
-    # their pass count is published on every commit as the phase gate's
-    # reading. A gate that reads is the point; a gate wired to block the
-    # branch it is measuring would simply be turned off.
-    continue-on-error: true
+    # tests/test_no_suppressions.py enforces that. They are RUN, in full.
+    #
+    # NO `continue-on-error`, and that is the point. The job does not grade
+    # pass/fail on the suite — a suite red by design would page forever, which
+    # is the desensitisation this whole PR removes. It grades the READING
+    # against `tests/acceptance/ratchet.json` and fails the RUN on any
+    # movement: fewer clauses met is a regression, more is progress that was
+    # not recorded, and a different collected count is a clause added, removed
+    # or failing to import.
+    #
+    # Without this the arm was structurally incapable of signalling: a
+    # job-level `continue-on-error` reports the RUN as success, so GitHub's
+    # scheduled-failure mail never fires, and the reading existed only in a
+    # step summary nobody opens. A component emitting nothing is not healthy,
+    # it is unobserved (principle 7).
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -129,23 +162,30 @@ jobs:
       - name: Install
         run: uv sync --frozen
 
+      # JUnit XML, not the terminal summary line. `pyproject.toml` sets
+      # `addopts = "-q"`, so a command-line `-q` makes `-qq` and pytest prints
+      # no summary at all — parsing stdout is how a wrong count goes unnoticed.
       - name: Acceptance clauses (plan §2)
         run: |
           set +e
-          uv run pytest tests/acceptance -q -p no:cacheprovider > acceptance.txt 2>&1
-          code=$?
+          uv run pytest tests/acceptance -p no:cacheprovider --tb=no \
+            --junitxml=acceptance.xml > acceptance.txt 2>&1
           set -e
           tail -40 acceptance.txt
-          summary=$(tail -1 acceptance.txt)
-          # A run that collected NOTHING is an unobserved gate, not a pass:
-          # 'no data' never renders as green (principle 7).
-          if grep -q "no tests ran" acceptance.txt; then
-            echo "::error::the acceptance suite collected no tests — the gate is dark, not green"
-            exit 1
-          fi
-          echo "### Acceptance gate (plan §2)" >> "$GITHUB_STEP_SUMMARY"
-          echo '' >> "$GITHUB_STEP_SUMMARY"
-          echo "\`$summary\`" >> "$GITHUB_STEP_SUMMARY"
-          echo '' >> "$GITHUB_STEP_SUMMARY"
-          echo "Passing clauses are satisfied objectives. Failing clauses are the phase-1/2 definition of done — see tests/acceptance/README.md." >> "$GITHUB_STEP_SUMMARY"
-          exit $code
+
+      - name: The reading has not moved
+        run: uv run python tests/acceptance/check_reading.py acceptance.xml
+
+  # A moved reading on main or on the daily sweep blocks nothing and is green
+  # to the next author, so without this nothing announces it — the same gap
+  # that left a router config undeployed for 16 hours
+  # (alpha-engine-config-I7169), which is why deploy.yml already carries this
+  # job. Mirrored here rather than reinvented.
+  #
+  # It fires only on the arms that grade the system. A red `test` job on a PR
+  # already blocks that PR and is the author's to see.
+  notify-main-failure:
+    needs: [acceptance]
+    if: ${{ failure() && github.event_name != 'pull_request' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5363e60b9343e270be9a44d41e85516068b4226e
+    secrets: inherit

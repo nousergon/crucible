@@ -1,0 +1,11 @@
+{
+  "note": "The acceptance gate's reading, committed. `met` is how many plan §2 clauses pass today; `collected` is how many exist. CI compares every push:[main] and scheduled run against these numbers and FAILS on any difference — a drop is a regression, a rise is progress that must be recorded here in the same PR that earns it, and a change in `collected` is a clause added, removed, or failing to import. The suite being red by design is therefore not the same thing as the run being red: the run is green while the reading is exactly what this file says.",
+  "met": 21,
+  "collected": 24,
+  "last_moved": "2026-09-02",
+  "unmet": [
+    "TestAutonomy::test_the_ruled_live_gate_two_live_saturdays_plus_five_replayed — phase 2",
+    "TestCost::test_every_v2_resource_is_tagged_for_cost_attribution — phase 0, currently UNMEASURABLE in CI (no credentials); alpha-engine-config-I9828",
+    "TestAttribution::test_alpha_is_factor_neutral_not_raw_excess_return — phase 3"
+  ]
+}
