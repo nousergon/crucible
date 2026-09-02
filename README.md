@@ -1,5 +1,7 @@
 # crucible
 
+[![CI](https://github.com/nousergon/crucible/actions/workflows/ci.yml/badge.svg)](https://github.com/nousergon/crucible/actions/workflows/ci.yml)
+
 An experiment harness for systematic strategies. It runs champion/challenger
 experiments on a trading-day axis, writes one machine-readable manifest per
 run, and grades every arm every cycle against a control it can fail.
@@ -99,6 +101,17 @@ purpose.** They are the definition of done for phases 1 and 2, written before
 the code that satisfies them. They are not skipped, not xfailed and not
 marked — this repository carries no suppression collections at all, and
 `tests/test_no_suppressions.py` enforces that.
+
+## Documentation
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) — how to propose a change, run the suite, what review to expect
+- [SECURITY.md](SECURITY.md) — how to report a vulnerability
+- `crucible/components.yaml` — the observability registry: every job's signals, log location, alert channel and deadline
+- `tests/acceptance/README.md` — the phase-1/2 acceptance clauses, and what "done" means for this harness
+
+Design rationale, the rebuild plan and strategy configuration are maintained
+in the operating org's private repositories; this repository is the harness
+itself.
 
 ## Licence
 
