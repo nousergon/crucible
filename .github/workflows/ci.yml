@@ -195,5 +195,5 @@ jobs:
   notify-main-failure:
     needs: [acceptance]
     if: ${{ failure() && github.event_name != 'pull_request' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5363e60b9343e270be9a44d41e85516068b4226e
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@619de3f32aef2e63329e7270afb87ec6b1e381e3
     secrets: inherit
