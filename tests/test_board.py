@@ -707,27 +707,42 @@ class TestTheProducerNeverRunsWhatItGrades:
         with pytest.raises(AssertionError, match=name):
             getattr(refusing, name)("k", "etag", b"{}")
 
-    def test_the_mutator_declaration_covers_every_abstract_write(self) -> None:
-        """`Store.MUTATORS` names every method on the interface that writes.
+    def test_the_mutator_declaration_partitions_the_interface(self) -> None:
+        """`MUTATORS` and `READERS` together cover every public method on `Store`.
 
-        Derived from the abstract method set and the signatures, not from a
-        literal compared against itself. A new abstract method taking a
-        `payload` is a write, and it must be declared before this passes —
-        which is what makes `_refusing_store` a real allowlist.
+        A PARTITION, not a signature heuristic. The previous version derived
+        the write set from `"payload" in signature.parameters` — a guess at a
+        parameter NAME — and adding `delete(self, key)` (no payload by
+        definition) or `append_bytes(self, key, data)` left it returning the
+        same two names, the guard green, and `_refusing_store` installing no
+        refusal for either. `test_build_board_only_reads_the_store` would then
+        have passed over a board that deletes from the store.
+
+        Under a partition a new method cannot be missed: it belongs to one
+        list or the other, and belonging to neither fails here. Classifying it
+        wrongly is a deliberate act visible in a diff, which is the most any
+        declaration can promise.
         """
-        import inspect
-
-        writes = {
+        public = {
             name
-            for name in getattr(Store, "__abstractmethods__", frozenset())
-            if "payload" in inspect.signature(getattr(Store, name)).parameters
+            for name in vars(Store)
+            if not name.startswith("_") and callable(getattr(Store, name, None))
         }
-        assert writes, "no abstract method takes a payload — this derivation has gone blind"
-        assert writes <= set(Store.MUTATORS), (
-            f"{sorted(writes - set(Store.MUTATORS))} write to the store and are not in "
-            "Store.MUTATORS, so _refusing_store does not refuse them and every "
-            "read-only assertion above is blind to them."
+        declared = set(Store.MUTATORS) | set(Store.READERS)
+        assert public, "no public methods found on Store — this derivation has gone blind"
+        unclassified = public - declared
+        assert not unclassified, (
+            f"{sorted(unclassified)} are on Store and in neither MUTATORS nor READERS. "
+            "Every method must be declared one or the other: an unclassified method is "
+            "one `_refusing_store` will not refuse, which makes every read-only "
+            "assertion in this class blind to it."
         )
+        phantom = declared - public
+        assert not phantom, (
+            f"{sorted(phantom)} are declared on Store and do not exist — a stale entry "
+            "makes the partition look complete while covering nothing."
+        )
+        assert not (set(Store.MUTATORS) & set(Store.READERS))
 
 
 class TestAReplayDoesNotClobberThePointer:
@@ -1057,3 +1072,134 @@ class TestADryRunDoesNotTouchThePointer:
             "a replay is a deliberate operator action; grading it BREACH would teach the "
             "reader to discount the one status that means something"
         )
+
+
+class TestBothHalvesOfTheBlindnessCheckAreTested:
+    """`_row_measured_nothing` has two conditions and only one had a test.
+
+    Round 2 added the null-value case and left the `N/A-*` case with no test
+    that could fail — deleting the status check left the entire blocking suite
+    green. That is the exact half round 1 got wrong, and the repo's binding
+    rule is that a detector nobody has made fail is a detector nobody knows
+    works.
+
+    The two are not redundant. `crucible/report.py` describes `N/A-LOW-N` as a
+    row whose *value may read 1.0* while `n_samples = 1` — a real emission
+    carrying a non-null value under a not-measured status. Either condition
+    alone lets that row through.
+    """
+
+    @staticmethod
+    def _row(**overrides):
+        from crucible.board import _row_measured_nothing
+
+        base = {"name": "r", "status": "OK", "value": 0.5}
+        return _row_measured_nothing({**base, **overrides})
+
+    def test_a_measured_row_is_not_blind(self) -> None:
+        assert not self._row()
+
+    def test_a_null_value_is_blind_whatever_the_status_says(self) -> None:
+        assert self._row(value=None)
+
+    @pytest.mark.parametrize(
+        "status", ["N/A-NOT-RUN", "N/A-NOT-IMPL", "N/A-MISSING-INPUT", "N/A-LOW-N"]
+    )
+    def test_an_n_a_status_is_blind_even_carrying_a_value(self, status) -> None:
+        """The half that had no test.
+
+        `N/A-LOW-N` with `value: 1.0` is the documented real case: the number
+        is there and it is not evidence. A check on the value alone passes it.
+        """
+        assert self._row(status=status, value=1.0)
+
+    def test_a_row_that_is_not_a_dict_is_blind(self) -> None:
+        from crucible.board import _row_measured_nothing
+
+        assert _row_measured_nothing("not a row")
+
+    def test_the_two_conditions_are_independently_load_bearing(self) -> None:
+        """Neither condition is redundant, asserted rather than argued.
+
+        One case that only the status check catches, one that only the value
+        check catches. Delete either condition and one of these goes green.
+        """
+        assert self._row(status="N/A-LOW-N", value=1.0)
+        assert self._row(status="OK", value=None)
+
+
+class TestTheHeldPointerDeltaGuardIsTested:
+    """The delta-on-held-pointer fix shipped with no test that could fail.
+
+    Replacing `board_delta(previous, board) if may_move else []` with the
+    unconditional call left the entire blocking suite green, and
+    `grep -rn "may_move" tests/` returned nothing. One of the four fixes the
+    round-2 body named was asserted only by the body.
+    """
+
+    @staticmethod
+    def _run(tmp_path, day, **kwargs):
+        import argparse
+
+        from crucible.track_c import board_handler
+
+        board_handler(argparse.Namespace(trading_day=day, store=str(tmp_path), **kwargs))
+        return LocalStore(tmp_path)
+
+    def test_a_replay_publishes_no_phantom_regressions(self, tmp_path) -> None:
+        """The concrete failure the guard prevents.
+
+        The incumbent is doctored so that an UNCONDITIONAL delta would be
+        non-zero — one row's state is flipped in `board/current.json`. A
+        replay of an older day then compares forward in time and would publish
+        that row as a regression, which is an artefact of the comparison
+        direction and not of anything that moved.
+
+        Doctoring is necessary: with a real ladder, two boards a few days
+        apart over the same store happen to agree, so a test that merely runs
+        two days cannot tell the guarded case from the unguarded one. That is
+        why the round-2 fix shipped with no test that could fail.
+        """
+        self._run(tmp_path, dt.date(2026, 9, 1))
+        store = LocalStore(tmp_path)
+        incumbent = json.loads(store.get_bytes("board/current.json"))
+        flipped = next(r for r in incumbent["rows"] if r["state"] == "UNMEASURED")
+        flipped["state"] = "MET"
+        store.put_bytes("board/current.json", json.dumps(incumbent).encode())
+
+        written = self._run(tmp_path, dt.date(2026, 8, 28))
+        manifest = json.loads(written.get_bytes("runs/board/2026-08-28/run.json"))
+        moved = next(m for m in manifest["metrics"] if m["name"] == "board_rows_moved")
+        assert moved["value"] == 0, (
+            f"the replay published {moved['value']} phantom delta(s) — {moved['status_reason']}"
+        )
+        assert "no comparison was made" in moved["status_reason"]
+
+    def test_a_forward_step_still_reports_its_deltas(self, tmp_path) -> None:
+        """The guard must not silence a REAL move.
+
+        A same-day or later board moves the pointer, so the comparison is in
+        the right direction and the delta is published. Asserted so the fix
+        cannot be "never report anything".
+        """
+        self._run(tmp_path, dt.date(2026, 8, 28))
+        written = self._run(tmp_path, dt.date(2026, 9, 1))
+        manifest = json.loads(written.get_bytes("runs/board/2026-09-01/run.json"))
+        moved = next(m for m in manifest["metrics"] if m["name"] == "board_rows_moved")
+        assert "no comparison was made" not in moved["status_reason"], (
+            "a forward step must still diff — a guard that silences every delta is "
+            "not a guard, it is a mute button"
+        )
+
+    def test_a_replay_does_not_leave_the_next_day_blind(self, tmp_path) -> None:
+        """The two fixes compose.
+
+        Because the replay did not clobber the pointer, the next forward board
+        still diffs against the newest real board rather than against the
+        replayed one — so a regression that happened while a replay ran is
+        still reported the next day.
+        """
+        self._run(tmp_path, dt.date(2026, 9, 1))
+        self._run(tmp_path, dt.date(2026, 8, 28))
+        written = LocalStore(tmp_path)
+        assert json.loads(written.get_bytes("board/current.json"))["trading_day"] == "2026-09-01"

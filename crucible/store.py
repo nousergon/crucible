@@ -90,6 +90,26 @@ class Store(ABC):
     #: alone was beaten by inserting one call.
     MUTATORS: tuple[str, ...] = ("put_bytes", "compare_and_swap")
 
+    #: Every method on this interface that only READS. Declared as the
+    #: complement so the two together must PARTITION the interface, which is
+    #: what makes `MUTATORS` checkable without guessing from a signature.
+    #:
+    #: An earlier guard derived the write set from `"payload" in
+    #: signature.parameters`. That is a heuristic on a parameter NAME: adding
+    #: `delete(self, key)` — which takes no payload by definition — or
+    #: `append_bytes(self, key, data)` left the derivation returning the same
+    #: two names, the guard green, and `_refusing_store` installing no refusal
+    #: for either. A partition cannot miss a method that way: a new abstract
+    #: method belongs to one list or the other, and belonging to neither is
+    #: the failure.
+    READERS: tuple[str, ...] = (
+        "get_bytes",
+        "exists",
+        "list_keys",
+        "etag",
+        "assert_keys_bind_to_trading_days",
+    )
+
     @abstractmethod
     def put_bytes(
         self,
