@@ -83,12 +83,25 @@ permissions: {}
 # same sha can cancel a `post-pending-check` run of that sha; keying
 # `resolve` on its own `resolve-<pr_number>` group means a push can never
 # cancel a verdict-recording dispatch.
+#
+# `cancel-in-progress` is an expression, not a flat `true`: a
+# `pull_request` run may still be cancelled by a same-sha re-run (harmless —
+# nothing wasted, one gh api call), but a `resolve` dispatch never is. A
+# durable verdict write should queue behind another verdict write, never be
+# discarded mid-flight.
+#
+# Known cosmetic residual (round-2 review, note 8): keying `pull_request`
+# runs on head sha means a superseded sha's `post-pending-check` run is left
+# with its `in_progress` check-run un-cancelled and un-resolved forever —
+# only the HEAD sha's check-runs count toward merge state, so this is
+# harmless to merging, just confusing if someone reads the Checks tab on an
+# old sha. Not worth the complexity of hunting down and closing orphans.
 concurrency:
   group: >-
     ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' &&
     format('resolve-{0}', inputs.pr_number) ||
     format('pr-{0}', github.event.pull_request.head.sha) }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   post-pending-check:
@@ -140,11 +153,40 @@ jobs:
           # check-run by this name already exists on the sha (self-healed
           # or otherwise), do not post a duplicate.
           existing="$(gh api "/repos/$REPO/commits/$SHA/check-runs" -q '[.check_runs[] | select(.name=="adversarial-review-gate")] | length')"
+
+          # alpha-engine-config-I9848 round-2 finding 3: `existing` MUST be
+          # validated as a non-negative integer before it drives a decision.
+          # A malformed or empty read fed straight into `[ "$existing" -gt 0
+          # ]` prints a stderr line ("integer expression expected") but
+          # `set -e` does not fire inside an `if` condition — the test
+          # silently evaluates false and the script falls through to POST a
+          # duplicate. AGENTS.md rule 5 (fail loud, default RAISE): treat an
+          # unparseable read as unknown and refuse to proceed, rather than
+          # betting the empty case is "no existing check-run".
+          case "$existing" in
+            ''|*[!0-9]*)
+              echo "::error::adversarial-review-gate existing-check-run count came back non-numeric ('$existing') for $SHA — cannot tell whether a check-run already exists. Refusing to post rather than risk a duplicate. Re-run this job."
+              exit 1
+              ;;
+          esac
+
           if [ "$existing" -gt 0 ]; then
             echo "adversarial-review-gate check-run already exists on $SHA (resolve self-healed while this job was queued, or it was posted already) — not posting a duplicate."
             exit 0
           fi
 
+          # alpha-engine-config-I9848 round-2 finding 4: this is
+          # check-THEN-post, not atomic — the Checks API has no conditional
+          # create. There is a real window between the read above and the
+          # POST below: if `resolve` self-heals inside it, this job's
+          # `in_progress` POST lands AFTER the self-healed `completed` run
+          # and becomes the current reading, pending forever. The guard
+          # above narrows the race from ~3 minutes (the measured PR38 queue
+          # delay) to roughly the few hundred milliseconds this step takes —
+          # it does not close it. Stated plainly rather than presented as an
+          # absolute invariant: closing it fully would need a re-read/
+          # reconcile after this POST, deferred as a follow-up rather than
+          # risking an untested reconciliation path in this fix.
           echo "Posting pending adversarial-review-gate check-run for PR #$PR_NUM @ $SHA"
 
           # `output` is a nested OBJECT in the check-runs API, not a string —
@@ -211,30 +253,61 @@ jobs:
             exit 1
           fi
 
+          # alpha-engine-config-I9848 round-2 finding 5: `resolve` never
+          # checked draft state. Dispatching it against a draft let the
+          # self-heal POST a completed, green check-run before
+          # post-pending-check ever ran; marking the PR ready then skipped
+          # posting entirely (the collision guard above sees the self-healed
+          # run and backs off) — the PR reaches ready-for-review with a
+          # green required check and no pending stage was ever posted. Same
+          # content, same sha, so this is ordering laxity rather than a
+          # content bypass, but it is still not the intended sequence.
+          # Refuse while the PR is a draft, same as post-pending-check does.
+          is_draft="$(gh api "/repos/$REPO/pulls/$PR_NUM" -q '.draft')"
+          if [ "$is_draft" = "true" ]; then
+            echo "::error::PR #$PR_NUM is a draft. Mark it ready for review first — resolve must run against a reviewable PR, not one that hasn't posted its pending check yet."
+            exit 1
+          fi
+
           # Complete the SAME check-run post-pending-check created rather
           # than posting a second one — a second POST left the original
           # 'in_progress' run pending forever (finding 4 on this PR's
           # review). Look it up by name ("adversarial-review-gate", the
           # gate's check identity — see the no-`name:` note on the
-          # post-pending-check job above) and status on the head sha.
+          # post-pending-check job above) on the head sha.
+          #
+          # alpha-engine-config-I9848 round-2 finding 1: the ORIGINAL query
+          # here filtered `.status=="in_progress"`, so a check-run that had
+          # ALREADY been completed (by an earlier `resolve` dispatch — a
+          # verdict correction, a re-review, or a retried dispatch) was
+          # invisible to the lookup. That made the empty-run_id branch take
+          # the self-heal path and POST a SECOND check-run of the same name,
+          # so two coexisted on one sha — one of the most ordinary operator
+          # actions there is (re-dispatching `resolve`), not an edge case.
+          # The fix: select the NEWEST check-run of this name regardless of
+          # status (`max_by(.id)` — check-run ids are assigned in creation
+          # order, so the highest id is the newest) and PATCH it either way.
+          # There is only ever one code path now: PATCH if a check-run of
+          # this name exists in ANY state, self-heal (create-and-complete)
+          # only if none exists at all.
           #
           # alpha-engine-config-I9848 (corrected root cause): if
           # `post-pending-check` hasn't run yet — measured on crucible-PR38
           # as a QUEUE RACE, not a cancellation: `resolve` was dispatched
           # ~3 minutes before a busy runner started the queued job — no
-          # in_progress check-run exists to find. That used to be a hard
-          # failure with no path forward — the required check could never
-          # be satisfied because the object the verdict attaches to was
-          # never created. The pending post is a visibility convenience;
-          # the verdict is the durable thing and must be recordable
-          # regardless. run_id is left empty here (never exit 1) and the
-          # next step creates-and-completes the check-run directly when
-          # that happens. post-pending-check's own collision guard (above)
-          # keeps it from then posting a second, stale check-run once it
-          # wakes.
-          run_id="$(gh api "/repos/$REPO/commits/$sha/check-runs" -q '[.check_runs[] | select(.name=="adversarial-review-gate" and .status=="in_progress")][0].id // empty')"
+          # check-run exists to find at all. That used to be a hard failure
+          # with no path forward — the required check could never be
+          # satisfied because the object the verdict attaches to was never
+          # created. The pending post is a visibility convenience; the
+          # verdict is the durable thing and must be recordable regardless.
+          # run_id is left empty here (never exit 1) and the next step
+          # creates-and-completes the check-run directly when that happens.
+          # post-pending-check's own collision guard (above) keeps it from
+          # then posting a second, stale check-run once it wakes — subject
+          # to the residual race documented there (finding 4).
+          run_id="$(gh api "/repos/$REPO/commits/$sha/check-runs" -q '[.check_runs[] | select(.name=="adversarial-review-gate")] | max_by(.id).id // empty')"
           if [ -z "$run_id" ]; then
-            echo "No in_progress 'adversarial-review-gate' check-run found on $sha — post-pending-check hasn't recorded one yet (queue race) or never will. Creating and completing the check-run directly (self-healing, alpha-engine-config-I9848)."
+            echo "No 'adversarial-review-gate' check-run found on $sha — post-pending-check hasn't recorded one yet (queue race) or never will. Creating and completing the check-run directly (self-healing, alpha-engine-config-I9848)."
           fi
 
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
@@ -262,8 +335,11 @@ jobs:
           # `-f output[key]=value` field-path syntax, not a literal JSON
           # string (same gotcha as post-pending-check's POST).
           if [ -n "$RUN_ID" ]; then
-            # PATCH the existing pending run — see the note above finding
-            # this run_id.
+            # PATCH the existing run — see the note above finding this
+            # run_id. It may already be `completed` (a re-dispatch, a
+            # verdict correction) rather than `in_progress`; PATCH
+            # overwrites it either way rather than creating a duplicate
+            # (round-2 finding 1).
             gh api "/repos/$REPO/check-runs/$RUN_ID" \
               -X PATCH \
               -f status="completed" \
