@@ -39,6 +39,7 @@ from crucible.keys import (
     arena_cycle_key,
     champion_key,
     data_panel_key,
+    experiments_prefix,
     features_key,
     shadow_key,
     verdict_key,
@@ -136,9 +137,7 @@ def _shadow_dates(store: Store, arm_id: str) -> list[str]:
     registered mid-window has no shadow before its registration, and
     inventing the dates would turn its absence into a run of misses.
     """
-    from crucible.keys import arm_key_segment
-
-    prefix = f"experiments/{arm_key_segment(arm_id)}/"
+    prefix = experiments_prefix(arm_id)
     days = []
     for key in store.list_keys(prefix):
         if key.endswith("/shadow.json"):
@@ -256,6 +255,11 @@ def run_produce(
                 f"slot {slot}: {len(produced)} registered arm(s) produced a shadow for "
                 f"{trading_day}; population {len(features)} names"
             ),
+            # Not `experiments_prefix(arm_id)`: this metric is about every arm
+            # PRODUCED this cycle, not one arm — the `*` stands in for "any of
+            # them", and `crucible.keys` has no per-arm-set wildcard shape to
+            # call (alpha-engine-config-I9852). Display-only source_path, not
+            # a key any store call reads.
             "source_path": f"experiments/*/{trading_day.isoformat()}/shadow.json",
             "last_updated_utc": _utc_now(),
         }

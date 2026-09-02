@@ -66,7 +66,7 @@ from krepis.metrics import MetricRecord, derive_status
 
 from crucible.calendar import previous_trading_day
 from crucible.data.daily import COVERAGE_FLOOR_RATIO
-from crucible.keys import arm_key_segment, attribution_key, champion_key
+from crucible.keys import attribution_key, champion_key, experiments_prefix
 from crucible.manifest import manifest_key
 from crucible.slots.grading import CROSS_SECTION_MIN_NAMES, RankICSkip, spearman_ic
 from crucible.store import Store
@@ -460,7 +460,7 @@ def _slot_row(
     arm_id = pointer["arm_id"]
 
     first, last = window[0], window[-1]
-    prefix = f"experiments/{arm_key_segment(arm_id)}/"
+    prefix = experiments_prefix(arm_id)
     scores: list[float] = []
     horizons: set[int] = set()
     outside = 0
@@ -597,7 +597,7 @@ def _rank_ic_row(
     arm_id = pointer["arm_id"]
 
     first, last = window[0], window[-1]
-    prefix = f"experiments/{arm_key_segment(arm_id)}/"
+    prefix = experiments_prefix(arm_id)
     ics: list[float] = []
     horizons: set[int] = set()
     outside = 0

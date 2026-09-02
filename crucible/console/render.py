@@ -21,7 +21,7 @@ from crucible.components import Component, load_registry
 from crucible.console.classify import STATES, Classification, classify
 from crucible.gate import LADDER_KEY, LADDER_STATES, PHASES, build_ladder
 from crucible.gate import validate_ladder_document as _validate_ladder_document
-from crucible.keys import champion_key
+from crucible.keys import attribution_key, champion_key
 from crucible.manifest import manifest_prefix
 from crucible.store import Store
 
@@ -130,6 +130,11 @@ def _has_history(store: Store, job: str) -> bool:
     listing rather than an assumption. Short-circuits on the first hit — the
     question is existential, not a count.
     """
+    # Not `manifest_prefix(job, trading_day)`: this checks whether the
+    # component has EVER produced a manifest, across every trading day, and
+    # `crucible.keys` deliberately keys every function to a trading day
+    # (§4.12) — there is no bare per-job prefix function to call
+    # (alpha-engine-config-I9852).
     prefix = f"runs/{job}/"
     for key in store.list_keys(prefix):
         if key.endswith("/run.json"):
@@ -236,7 +241,7 @@ def build_page(
                 }
             )
 
-    attribution = _read_json(store, f"report/{trading_day.isoformat()}/attribution.json")
+    attribution = _read_json(store, attribution_key(trading_day.isoformat()))
     champions = _champions(store)
     ladder = build_ladder(store, trading_day=trading_day, registry=reg, now=moment)
 

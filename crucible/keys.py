@@ -43,9 +43,13 @@ __all__ = [
     "cross_section_key",
     "cross_section_settled_key",
     "data_panel_key",
+    "drift_input_key",
+    "drift_metrics_key",
     "experiments_key",
+    "experiments_prefix",
     "feature_registry_key",
     "features_key",
+    "features_prefix",
     "gate_key",
     "ledger_key",
     "manifest_key",
@@ -54,6 +58,7 @@ __all__ = [
     "shadow_key",
     "signals_key",
     "strategy_arm_key",
+    "strategy_arms_prefix",
     "universe_members_key",
     "verdict_key",
 ]
@@ -120,6 +125,19 @@ def feature_registry_key(version: str) -> str:
     return f"features/{version}/registry.json"
 
 
+def features_prefix(version: str) -> str:
+    """The prefix under which every trading day's compiled feature layer for
+    ``version`` lives.
+
+    `features_key(version, trading_day)` for any ``trading_day`` starts with
+    this prefix — a reader that needs to know which days a version has been
+    compiled for (`crucible.slots.model.FeatureLayer._sessions`, listing the
+    store rather than deriving a date range) lists this prefix instead of
+    restating its shape.
+    """
+    return f"features/{version}/"
+
+
 # -- arms and slots ---------------------------------------------------------
 
 
@@ -131,6 +149,18 @@ def strategy_arm_key(slot: str, name: str) -> str:
 def arm_register_key(slot: str) -> str:
     """The append-only arm event log for one slot, folded to state on read."""
     return f"arms/{slot}/register.jsonl"
+
+
+def strategy_arms_prefix(slot: str) -> str:
+    """The prefix under which every arm recipe for ``slot`` lives, synced
+    into the store.
+
+    `strategy_arm_key(slot, name)` for any ``name`` starts with this prefix —
+    `crucible.slots.arms.load_arm_specs` lists it (rather than restating the
+    shape) when reading from the spot-box synced tree instead of a local
+    `CRUCIBLE_STRATEGY_DIR` checkout.
+    """
+    return f"strategy/current/arms/{slot}/"
 
 
 #: A discriminator is a path segment, not free text: it must round-trip
@@ -232,6 +262,19 @@ def cross_section_settled_key(arm_id: str, trading_day: str) -> str:
     return f"experiments/{arm_key_segment(arm_id)}/{trading_day}/cross_section_settled.json"
 
 
+def experiments_prefix(arm_id: str) -> str:
+    """The prefix under which every dated artifact for ``arm_id`` lives —
+    `shadow_key`, `verdict_key`, `cross_section_key` and
+    `cross_section_settled_key` all start with it.
+
+    A reader that walks every trading day an arm has an artifact for
+    (`crucible.report`'s slot-alpha and rank-IC rows, `crucible.slots.cycle`'s
+    grader and `_shadow_dates`) lists this prefix rather than restating the
+    shape those four key functions already own.
+    """
+    return f"experiments/{arm_key_segment(arm_id)}/"
+
+
 def retirement_log_key(slot: str) -> str:
     """The append-only retirement event log for ``slot``.
 
@@ -307,6 +350,31 @@ def universe_members_key(trading_day: str) -> str:
 def signals_key(trading_day: str) -> str:
     """The R champion's feed: how names were scored."""
     return f"signals/{trading_day}/signals.json"
+
+
+# -- drift --------------------------------------------------------------
+
+
+_DRIFT_INPUTS = ("features", "predictions", "ic")
+
+
+def drift_input_key(name: str, trading_day: str) -> str:
+    """One of the three artifacts `crucible.track_c.drift_handler` reads
+    before it will compute a drift metric at all — track A/B's features,
+    predictions and realized IC for the cycle.
+
+    ``name`` is one of :data:`_DRIFT_INPUTS`; anything else raises rather
+    than silently producing a fourth input key nothing writes.
+    """
+    if name not in _DRIFT_INPUTS:
+        raise ValueError(f"unknown drift input {name!r}; the three inputs are {_DRIFT_INPUTS}")
+    return f"drift/{trading_day}/input_{name}.json"
+
+
+def drift_metrics_key(trading_day: str) -> str:
+    """Where `crucible.track_c.drift_handler` files the cycle's three
+    drift `MetricRecord`s, alongside the run manifest's own copy."""
+    return f"drift/{trading_day}/metrics.json"
 
 
 # -- fleet ledger -----------------------------------------------------------
