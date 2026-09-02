@@ -78,6 +78,7 @@ from nousergon_lib.arena.engine import TrainingIntegrityError, TrainingStatus
 
 from crucible.features.registry import UNIT_SUFFIXES
 from crucible.keys import features_key
+from crucible.slots.inputs import InputRef, assert_inputs_producible, parse_input_ref
 
 __all__ = [
     "DISPERSION_METRICS",
@@ -96,6 +97,7 @@ __all__ = [
     "Fit",
     "MetricScaleError",
     "ModelGrade",
+    "InputRef",
     "ModelRecipe",
     "TrainingWindowSpec",
     "VetoResult",
@@ -750,6 +752,10 @@ class ModelRecipe:
     cpcv: CPCVSpec
     feature_version: str
     registered_at: str
+    #: Typed input references (`alpha-engine-config-I9777`). Empty for every
+    #: arm whose whole design matrix comes from the feature layer, which is
+    #: why it is absent from :attr:`spec` when empty — see that property.
+    inputs: tuple[InputRef, ...] = ()
     supersedes: str | None = None
     slot: str = "m"
 
@@ -757,6 +763,15 @@ class ModelRecipe:
         if not self.features:
             raise ValueError(f"arm {self.name!r} declares no features")
         assert_units_suffixes(self.features)
+        assert_units_suffixes(tuple(r.column for r in self.inputs))
+        duplicates = sorted({c for c in self.design_columns if self.design_columns.count(c) > 1})
+        if duplicates:
+            raise ValueError(
+                f"arm {self.name!r} declares column(s) {duplicates} more than once across "
+                "`features` and `inputs`. A design matrix with a column twice is exactly "
+                "collinear, and the normal equations answer it with an arbitrary split of "
+                "one coefficient across two."
+            )
         if self.label_horizon_trading_days < 1:
             raise ValueError("label_horizon_trading_days must be >= 1 (trading days, §4.12)")
         if self.refit_cadence_trading_days < 1:
@@ -771,6 +786,16 @@ class ModelRecipe:
             ) from exc
 
     @property
+    def design_columns(self) -> tuple[str, ...]:
+        """Every column of this arm's design matrix, in fit order.
+
+        `spec.features` first, then one column per `predictions[...]` input.
+        One accessor, so the fitter, the trainability check and the panel
+        builder cannot disagree about what the arm actually reads.
+        """
+        return tuple(self.features) + tuple(r.column for r in self.inputs)
+
+    @property
     def spec(self) -> dict[str, Any]:
         """The canonical spec the arm id hashes. Order-independent by key.
 
@@ -779,7 +804,7 @@ class ModelRecipe:
         started accumulating evidence, not what it computes. Hashing it would
         make re-registering an arm produce a new id and orphan its series.
         """
-        return {
+        payload: dict[str, Any] = {
             "features": list(self.features),
             "estimator": self.estimator.to_dict(),
             "label_horizon_trading_days": self.label_horizon_trading_days,
@@ -788,6 +813,12 @@ class ModelRecipe:
             "cpcv": self.cpcv.to_dict(),
             "feature_version": self.feature_version,
         }
+        if self.inputs:
+            # Emitted ONLY when declared. A key that always appeared would
+            # re-hash every arm already registered and orphan its score
+            # series the moment this field shipped (policy §3.1).
+            payload["inputs"] = [r.text for r in self.inputs]
+        return payload
 
     @property
     def arm_id(self) -> str:
@@ -807,12 +838,29 @@ REQUIRED_RECIPE_FIELDS: tuple[str, ...] = (
 )
 
 
-def load_model_recipes(directory: Path | str) -> tuple[ModelRecipe, ...]:
+def load_model_recipes(
+    directory: Path | str, *, feature_columns: tuple[str, ...] | None = None
+) -> tuple[ModelRecipe, ...]:
     """Load every `*.yaml` M recipe under ``directory``, sorted by name.
 
     The directory is `alpha-engine-config/strategy/arms/m/` in production —
     recipes are strategy content and live in the private repository
     (`repository-tiering-policy` test 2). This repository holds the shape.
+
+    **Loading is registration, and registration validates PRODUCIBILITY**
+    (`alpha-engine-config-I9777`). Until this check existed the loader
+    validated shape alone, so `sota_directional_combine` — which declared two
+    columns that are another model's output and have no feature-layer
+    producer — registered cleanly and then failed deep inside
+    `FeatureLayerSource.panel()` at grading time. An arm nobody can grade is
+    indistinguishable, on every surface, from an arm nobody has graded yet;
+    that is the failure mode this refusal makes structurally impossible.
+
+    ``feature_columns`` defaults to the live catalogue, exactly as
+    :class:`FeatureLayerSource` resolves its version rather than taking one
+    from a consumer. It is a parameter only so a test can state a small
+    catalogue explicitly — never so a caller can opt out, which is why there
+    is no value of it that disables the check.
     """
     root = Path(directory)
     recipes: list[ModelRecipe] = []
@@ -846,9 +894,16 @@ def load_model_recipes(directory: Path | str) -> tuple[ModelRecipe, ...]:
                 cpcv=CPCVSpec(**spec["cpcv"]),
                 feature_version=str(spec["feature_version"]),
                 registered_at=str(payload["registered_at"]),
+                inputs=tuple(parse_input_ref(t) for t in (spec.get("inputs") or ())),
                 supersedes=payload.get("supersedes"),
             )
         )
+
+    if feature_columns is None:
+        from crucible.features import CATALOG  # noqa: PLC0415
+
+        feature_columns = tuple(f.name for f in CATALOG)
+    assert_inputs_producible(recipes, feature_columns=feature_columns)
     return tuple(recipes)
 
 
@@ -877,7 +932,7 @@ class Fit:
 
 
 def _design(recipe: ModelRecipe, panel: FeaturePanel, rows: np.ndarray) -> np.ndarray:
-    return np.column_stack([panel.column(f).reshape(-1)[rows] for f in recipe.features])
+    return np.column_stack([panel.column(f).reshape(-1)[rows] for f in recipe.design_columns])
 
 
 def _assert_trainable(recipe: ModelRecipe, matrix: np.ndarray, labels: np.ndarray) -> None:
@@ -901,7 +956,7 @@ def _assert_trainable(recipe: ModelRecipe, matrix: np.ndarray, labels: np.ndarra
             "not run on inputs nobody vouched for (Brian ruling 2026-08-29)."
         )
     stds = matrix.std(axis=0)
-    dead = [recipe.features[i] for i, s in enumerate(stds) if float(s) < DEGENERATE_STD]
+    dead = [recipe.design_columns[i] for i, s in enumerate(stds) if float(s) < DEGENERATE_STD]
     if dead:
         raise TrainingIntegrityError(
             f"arm {recipe.name}: feature(s) {dead} are constant across the training "
