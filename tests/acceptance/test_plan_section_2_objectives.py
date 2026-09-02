@@ -24,26 +24,47 @@ from typing import Any, NoReturn
 
 import pytest
 
+from crucible.gate import PHASES
 from crucible.slots import SLOTS, get_slot
 
+#: Looked up by `phase` id (`"phase0"`, `"phase2"`, …) rather than restated —
+#: `crucible.gate.PHASES` is the single source of truth for which tracker
+#: issue owns which phase (alpha-engine-config-I9839). A clause names its own
+#: phase; `_unmet`/`_attempt` derive the tracker pointer from it, so a phase
+#: renumbering — or a phase closing, as phase 1 did on 2026-09-02 while every
+#: clause here still pointed at it — cannot leave a failure message stale.
+_PHASES_BY_ID = {phase.id: phase for phase in PHASES}
 
-def _unmet(clause: str, requirement: str, exc: BaseException | None = None) -> NoReturn:
-    """Fail this acceptance clause with everything needed to act on it."""
+
+def _unmet(
+    clause: str, requirement: str, exc: BaseException | None = None, *, phase: str
+) -> NoReturn:
+    """Fail this acceptance clause with everything needed to act on it.
+
+    `phase` is a `crucible.gate.PHASES` id (e.g. `"phase2"`) naming the phase
+    whose exit gate this clause belongs to — never a literal issue number.
+    """
+    try:
+        owning_phase = _PHASES_BY_ID[phase]
+    except KeyError:
+        raise ValueError(
+            f"{clause!r} names unknown phase {phase!r}; must be one of {sorted(_PHASES_BY_ID)}"
+        ) from None
     detail = f" Blocked on: {exc}" if exc is not None else ""
     pytest.fail(
         f"UNMET — {clause}\n"
         f"  Required: {requirement}\n"
-        f"  Status:   not yet satisfied (crucible v2 phase 1, "
-        f"alpha-engine-config-I9757).{detail}",
+        f"  Status:   not yet satisfied (crucible v2 phase {owning_phase.number}, "
+        f"{owning_phase.tracker}).{detail}",
         pytrace=False,
     )
 
 
-def _attempt(clause: str, requirement: str, fn: Callable[[], Any]) -> Any:
+def _attempt(clause: str, requirement: str, fn: Callable[[], Any], *, phase: str) -> Any:
     try:
         return fn()
     except NotImplementedError as exc:
-        _unmet(clause, requirement, exc)
+        _unmet(clause, requirement, exc, phase=phase)
 
 
 class TestAutonomy:
@@ -83,8 +104,8 @@ class TestAutonomy:
         # turned a phase-2 window clause green on a phase-1 job — a gate
         # passing because a different feature shipped. The window is read from
         # the run manifests of the two live plus five replayed Saturdays in
-        # the production store, and that is phase 2 (alpha-engine-config-I9757).
-        _unmet(clause, requirement)
+        # the production store, and that is phase 2 (alpha-engine-config-I9758).
+        _unmet(clause, requirement, phase="phase2")
 
     def test_zero_human_mutating_calls_is_read_from_the_cloudtrail_archive(
         self,
@@ -302,11 +323,11 @@ class TestCost:
                 iam=boto3.client("iam"),
             )
         except StackNotAppliedError as exc:
-            _unmet(clause, requirement, exc)
+            _unmet(clause, requirement, exc, phase="phase0")
         except Exception as exc:  # noqa: BLE001 - reported, never swallowed
             # Credentials, region, permissions: every one of these means the
             # clause was not measured, and an unmeasured clause is unmet.
-            _unmet(clause, requirement, exc)
+            _unmet(clause, requirement, exc, phase="phase0")
         assert audit.met, f"UNMET — {clause}: {audit.detail()}"
 
 
@@ -364,6 +385,7 @@ class TestAttribution:
             clause,
             requirement,
             lambda: HANDLERS["report"](_args(trading_day=day, store=str(store.root))),
+            phase="phase3",
         )
 
         document = json.loads(store.get_bytes(f"report/{day.isoformat()}/attribution.json"))
@@ -388,7 +410,7 @@ class TestAttribution:
             "Each slot's return is decomposed into market beta, sector, size and "
             "residual; the attribution table reports RESIDUAL alpha."
         )
-        _unmet(clause, requirement)
+        _unmet(clause, requirement, phase="phase3")
 
 
 class TestAlerting:
