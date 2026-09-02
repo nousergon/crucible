@@ -13,11 +13,17 @@ name: Adversarial Review Gate
 # run: the workflow's own GITHUB_TOKEN is granted `checks: write` directly
 # (no App dependency), and a second job — invoked by hand or by a separate
 # Claude session running the adversarial pass — RESOLVES the same check to
-# success/failure. Independence is enforced structurally: `resolve` reads the
-# PR's author back from the API and refuses to complete the check if the
-# actor resolving it is the same login, so "reviewed by an independent
-# adversarial agent, not by its author" cannot be satisfied by the author
-# self-approving.
+# success/failure. Independence is enforced structurally: `resolve` takes
+# `reviewer` and `author` as explicit workflow_dispatch inputs — session/agent
+# identifiers, not GitHub logins — and refuses to complete the check if they
+# are the same identity. This repo has exactly one GitHub collaborator and it
+# has authored every PR ever opened here, so comparing `github.actor` to the
+# PR's `.user.login` (the original design) is equal on every dispatch and can
+# never be satisfied; recording the reviewer as data, supplied by the
+# dispatching session rather than inferred from the dispatching account, is
+# the only comparison that can actually distinguish an independent review
+# from a self-review in this fleet. See the adversarial review on this PR
+# (finding 2) for the full argument.
 #
 # Cost: `post-pending-check` runs on every pull_request open/sync/reopen/
 # ready-for-review event — one `gh api` call, no checkout, no `uv sync`, no
@@ -44,6 +50,12 @@ on:
       pr_number:
         description: 'PR number the adversarial review was run against'
         required: true
+      reviewer:
+        description: 'Session/agent identifier of the reviewing session (NOT a GitHub login — every agent in this fleet dispatches as the same collaborator account, so a login can never prove independence)'
+        required: true
+      author:
+        description: 'Session/agent identifier of the authoring session, recorded independently of GitHub identity, per the same reason as reviewer'
+        required: true
       conclusion:
         description: 'Review verdict'
         required: true
@@ -62,7 +74,14 @@ concurrency:
 jobs:
   post-pending-check:
     if: github.event_name == 'pull_request'
-    name: adversarial-review-gate
+    # No `name:` here on purpose — the job's DISPLAYED check-run name must
+    # not collide with the gate's own check-run name ("adversarial-review-
+    # gate", posted below via the API). A collision means two check-runs
+    # share that name on every head sha, and the job's own always-green run
+    # satisfies "adversarial-review-gate" in required-checks without any
+    # review having happened. Measured on 129a34b — see the adversarial
+    # review on this PR, finding 1. Left unset, the check-run defaults to
+    # the job id, "post-pending-check".
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -107,65 +126,88 @@ jobs:
       checks: write
       pull-requests: read
     steps:
-      - name: Look up the PR and refuse a self-review
+      - name: Look up the pending check-run and refuse a same-identity review
         id: pr
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUM: ${{ inputs.pr_number }}
-          ACTOR: ${{ github.actor }}
+          REVIEWER: ${{ inputs.reviewer }}
+          AUTHOR: ${{ inputs.author }}
         run: |
           set -euo pipefail
 
-          info="$(gh api "/repos/$REPO/pulls/$PR_NUM" -q '{sha: .head.sha, author: .user.login}')"
-          sha="$(printf '%s' "$info" | jq -r '.sha')"
-          author="$(printf '%s' "$info" | jq -r '.author')"
+          # Independence is recorded as DATA, never inferred from the
+          # dispatching GitHub account. This repo has exactly one
+          # collaborator identity and it has authored every PR ever opened
+          # here (measured on the adversarial review of this PR, finding
+          # 2) — so `github.actor` vs `.user.login` is equal on every
+          # dispatch and the check could never be completed. `reviewer`
+          # and `author` are session/agent identifiers supplied explicitly
+          # by the dispatching session; independence is exactly that they
+          # differ. The PR's actual GitHub author login is fetched below
+          # only for the audit trail in the check-run summary, never for
+          # the refusal decision.
+          reviewer_lc="$(printf '%s' "$REVIEWER" | tr '[:upper:]' '[:lower:]')"
+          author_lc="$(printf '%s' "$AUTHOR" | tr '[:upper:]' '[:lower:]')"
 
+          if [ -z "$reviewer_lc" ] || [ -z "$author_lc" ]; then
+            echo "::error::Both 'reviewer' and 'author' inputs are required session/agent identifiers (not GitHub logins)."
+            exit 1
+          fi
+
+          if [ "$reviewer_lc" = "$author_lc" ]; then
+            echo "::error::reviewer ('$REVIEWER') and author ('$AUTHOR') are the same identity. An adversarial review must be independent of the author (plan §11 risk 1) — dispatch this from a different reviewing session."
+            exit 1
+          fi
+
+          gh_author="$(gh api "/repos/$REPO/pulls/$PR_NUM" -q '.user.login')"
+          sha="$(gh api "/repos/$REPO/pulls/$PR_NUM" -q '.head.sha')"
           if [ -z "$sha" ] || [ "$sha" = "null" ]; then
             echo "::error::PR #$PR_NUM not found or has no head sha."
             exit 1
           fi
 
-          # Plan §11 risk 1: "reviewed by an independent adversarial agent
-          # against §2's acceptance tests, not by its author." Enforced here,
-          # not left to reviewer discipline — the actor resolving this check
-          # (the identity that ran workflow_dispatch) may not be the PR's
-          # own author.
-          actor_lc="$(printf '%s' "$ACTOR" | tr '[:upper:]' '[:lower:]')"
-          author_lc="$(printf '%s' "$author" | tr '[:upper:]' '[:lower:]')"
-          if [ "$actor_lc" = "$author_lc" ]; then
-            echo "::error::PR #$PR_NUM was authored by '$author' and this review was run by the same identity ('$ACTOR'). An adversarial review must be independent of the author (plan §11 risk 1) — have a different reviewer run this."
+          # Complete the SAME check-run post-pending-check created rather
+          # than posting a second one — a second POST left the original
+          # 'in_progress' run pending forever (finding 4 on this PR's
+          # review). Look it up by name ("adversarial-review-gate", the
+          # gate's check identity — see the no-`name:` note on the
+          # post-pending-check job above) and status on the head sha.
+          run_id="$(gh api "/repos/$REPO/commits/$sha/check-runs" -q '[.check_runs[] | select(.name=="adversarial-review-gate" and .status=="in_progress")][0].id // empty')"
+          if [ -z "$run_id" ]; then
+            echo "::error::No in_progress 'adversarial-review-gate' check-run found on $sha — nothing to resolve. Has post-pending-check run for this PR (it is skipped while the PR is a draft)?"
             exit 1
           fi
 
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "author=$author" >> "$GITHUB_OUTPUT"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "gh_author=$gh_author" >> "$GITHUB_OUTPUT"
 
-      - name: Post completed adversarial-review-gate check-run
+      - name: Complete the pending adversarial-review-gate check-run
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          SHA: ${{ steps.pr.outputs.sha }}
-          AUTHOR: ${{ steps.pr.outputs.author }}
-          ACTOR: ${{ github.actor }}
+          RUN_ID: ${{ steps.pr.outputs.run_id }}
+          GH_AUTHOR: ${{ steps.pr.outputs.gh_author }}
+          REVIEWER: ${{ inputs.reviewer }}
+          AUTHOR: ${{ inputs.author }}
           CONCLUSION: ${{ inputs.conclusion }}
           SUMMARY: ${{ inputs.summary }}
         run: |
           set -euo pipefail
 
           title="Adversarial review: ${CONCLUSION}"
-          full_summary="$(printf '%s\n\nReviewed by: %s (independent of author %s)' "$SUMMARY" "$ACTOR" "$AUTHOR")"
+          full_summary="$(printf '%s\n\nReviewed by: %s (independent of author: %s) — PR opened by GitHub account: %s' "$SUMMARY" "$REVIEWER" "$AUTHOR" "$GH_AUTHOR")"
 
-          # See the note in post-pending-check: `output` is a nested object,
-          # built here via gh api's `-f output[key]=value` field-path syntax
-          # rather than a literal JSON string.
-          gh api "/repos/$REPO/check-runs" \
-            -X POST \
-            -f name="adversarial-review-gate" \
-            -f head_sha="$SHA" \
+          # PATCH the existing pending run — see the note above finding
+          # this run_id. `output` is a nested object, built via gh api's
+          # `-f output[key]=value` field-path syntax, not a literal JSON
+          # string (same gotcha as post-pending-check's POST).
+          gh api "/repos/$REPO/check-runs/$RUN_ID" \
+            -X PATCH \
             -f status="completed" \
             -f conclusion="$CONCLUSION" \
             -f output[title]="$title" \
             -f output[summary]="$full_summary"
 
-          echo "Recorded adversarial-review-gate=$CONCLUSION for $SHA (reviewer: $ACTOR, author: $AUTHOR)"
+          echo "Recorded adversarial-review-gate=$CONCLUSION on check-run $RUN_ID (reviewer: $REVIEWER, author: $AUTHOR, GitHub author: $GH_AUTHOR)"
