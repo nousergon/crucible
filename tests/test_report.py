@@ -482,6 +482,54 @@ class TestRankICRow:
         with pytest.raises(ValueError, match="horizons"):
             build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
 
+    def test_a_constant_ranker_date_does_not_clear_the_floor_it_carries_no_information(
+        self, tmp_path
+    ) -> None:
+        """`alpha-engine-config-I9778` review, finding 1, reproduced and closed.
+
+        Five genuine dates alone sit below `RANK_IC_N_FLOOR` (6) and read
+        `WATCH`. Before the fix, adding a SIXTH date whose ranker emitted a
+        constant score — carrying zero information — was scored as a real
+        `ic=0.0` observation, pushed `n_samples` to 6, and cleared the floor
+        into `GREEN`. That is principle 7 inverted: a date with no data was
+        the thing that turned the row green. After the fix the degenerate
+        date contributes neither a value nor a count: `n_samples` stays 5
+        and the row stays out of GREEN.
+        """
+        store = _store(tmp_path)
+        _write_champion(store, "r", ARM)
+        genuine_days = [
+            "2026-07-01",
+            "2026-07-02",
+            "2026-07-06",
+            "2026-07-07",
+            "2026-07-08",
+        ]
+        _write_cross_sections_settled(store, ARM, genuine_days)
+
+        # Five genuine dates alone: below the floor, WATCH.
+        document, _ = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
+        row = next(r for r in document["rows"] if r["name"] == "signal_rank_ic_r")
+        assert row["n_samples"] == 5
+        assert row["status"] == "WATCH"
+
+        # Add a sixth date with a constant ranker score across every name —
+        # the "hard-zeroed feature column" shape the review demonstrated.
+        constant_section = tuple(
+            (ticker, 1.0, realized) for ticker, _score, realized in _PERFECT_RANK_SECTION
+        )
+        _write_cross_sections_settled(
+            store, ARM, ["2026-07-09"], ranks=constant_section
+        )
+        document, _ = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
+        row = next(r for r in document["rows"] if r["name"] == "signal_rank_ic_r")
+        assert row["n_samples"] == 5, "the degenerate date must not increment n"
+        assert row["status"] != "GREEN", "no data must never render as GREEN"
+        assert row["status"] == "WATCH"
+        assert "degenerate" in row["status_reason"] or "undefined correlation" in (
+            row["status_reason"]
+        )
+
 
 class TestTheJob:
     def _run(self, tmp_path) -> tuple[LocalStore, dict]:
@@ -522,6 +570,11 @@ class TestTheJob:
         assert spend["unit"] == "usd"
         assert spend["baseline"] == 5.00
         assert spend["status"] == "OK"
+        # `alpha-engine-config-I9823`: the manifest is where `Settings
+        # .llm_cap_usd_measured` now reaches a consumer — it was previously
+        # written only to `Settings.to_dict()`, which nothing in this
+        # package read.
+        assert spend["cap_usd_measured"] is False
         pace = next(m for m in manifest["metrics"] if m["name"] == "llm_spend_pace_overrun_ratio")
         assert pace["value"] <= 0.0
 

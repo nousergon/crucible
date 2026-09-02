@@ -107,15 +107,21 @@ class Settings:
     #: `crucible.llm.SpendCap` refuses the call that would cross it, before the
     #: provider is reached, and the run fails rather than overspending.
     llm_cap_usd: float = DEFAULT_LLM_CAP_USD
-    #: `alpha-engine-config-I9778`: whether the resolved ``llm_cap_usd`` traces
-    #: back to a measured cycle rather than :data:`DEFAULT_LLM_CAP_USD`'s
-    #: declared-not-measured value. False whenever the origin is the default
-    #: AND that default has not yet been re-set from a phase-5 cost sink
-    #: (`crucible.llm.DEFAULT_LLM_CAP_USD_MEASURED`); an operator override
-    #: (argument or `CRUCIBLE_LLM_CAP_USD`) is read as measured because a
-    #: human placing a number there is asserting it, the same way an operator
-    #: bootstrap on a champion pointer is a promotion source rather than a
-    #: refusal.
+    #: `alpha-engine-config-I9778`/`alpha-engine-config-I9823`: whether
+    #: :data:`~crucible.llm.DEFAULT_LLM_CAP_USD` traces back to a phase-5
+    #: cost-sink measurement — nothing else. Tracks
+    #: `crucible.llm.DEFAULT_LLM_CAP_USD_MEASURED` exactly, and ONLY that: an
+    #: operator override (`--llm-cap-usd` or `CRUCIBLE_LLM_CAP_USD`) does not
+    #: flip it, on either value. The review that opened I9823 found the prior
+    #: shape — `origins["llm_cap_usd"] != "default" or
+    #: DEFAULT_LLM_CAP_USD_MEASURED` — let a caller re-declare the identical
+    #: $5.00 default through the env var and have it read back as "measured";
+    #: an assertion is not a measurement, and conflating the two made the
+    #: flag flippable by anyone who could set an env var. Provenance of an
+    #: operator override is already recorded, verbatim, in
+    #: ``origins["llm_cap_usd"]`` (``"argument"`` / ``"environ:..."`` /
+    #: ``"default"``) — nothing here needed a second, weaker channel to carry
+    #: the same fact.
     llm_cap_usd_measured: bool = False
 
     def store(self) -> Store:
@@ -197,12 +203,15 @@ def settings(
     else:
         origins["strategy_dir"] = f"store:{STRATEGY_PREFIX}"
         resolved_dir = None
-    # A resolved cap counts as MEASURED when an operator placed it (argument
-    # or CRUCIBLE_LLM_CAP_USD — a human asserting a number, not this module
-    # guessing at one) or when DEFAULT_LLM_CAP_USD_MEASURED itself has been
-    # flipped True by a phase-5 re-set. It is False only for the untouched
-    # $5.00 declared ceiling — alpha-engine-config-I9778's whole point.
-    cap_measured = origins["llm_cap_usd"] != "default" or DEFAULT_LLM_CAP_USD_MEASURED
+    # `alpha-engine-config-I9823`: MEASURED tracks DEFAULT_LLM_CAP_USD_MEASURED
+    # ONLY — a code-level fact nothing at runtime can flip. An operator
+    # override (argument or CRUCIBLE_LLM_CAP_USD) is an assertion, not a
+    # measurement, and asserting the identical $5.00 default through the env
+    # var must not read back as "measured" — that was exactly the tamper
+    # vector the prior `origins[...] != "default" or ...` shape left open.
+    # The override's own provenance is still recorded, verbatim, in
+    # origins["llm_cap_usd"].
+    cap_measured = DEFAULT_LLM_CAP_USD_MEASURED
     return Settings(
         store_uri=resolved_store,
         arctic_bucket=resolved_arctic,

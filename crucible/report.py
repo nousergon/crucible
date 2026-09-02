@@ -68,7 +68,7 @@ from crucible.calendar import previous_trading_day
 from crucible.data.daily import COVERAGE_FLOOR_RATIO
 from crucible.keys import arm_key_segment, champion_key
 from crucible.manifest import manifest_key
-from crucible.slots.grading import CROSS_SECTION_MIN_NAMES, spearman_ic
+from crucible.slots.grading import CROSS_SECTION_MIN_NAMES, RankICSkip, spearman_ic
 from crucible.store import Store
 
 __all__ = [
@@ -558,9 +558,19 @@ def _rank_ic_row(
     produced an IC, against :data:`RANK_IC_N_FLOOR` — a separate axis from
     :data:`~crucible.slots.grading.CROSS_SECTION_MIN_NAMES`, the floor on
     names WITHIN one date's cross-section below which that date contributes
-    no IC at all (`crucible.slots.grading.spearman_ic` enforces it and
-    returns ``None``; this function counts and reports how many dates were
-    skipped that way, so a low n is legible rather than merely low).
+    no IC at all. `crucible.slots.grading.spearman_ic` enforces two distinct
+    skip conditions (:class:`~crucible.slots.grading.RankICSkip`) rather than
+    one: too few paired names, or a paired-but-DEGENERATE cross-section — a
+    constant score or a constant realized return, whose correlation is
+    undefined rather than zero. Neither skip contributes a value OR
+    increments ``n_samples``: a date that carries no information does not
+    count as an observation, even when it clears
+    :data:`~crucible.slots.grading.CROSS_SECTION_MIN_NAMES`
+    (`alpha-engine-config-I9778` review, finding 1 — a constant-ranker date
+    was previously scored as a real ``ic=0.0`` and could clear
+    :data:`RANK_IC_N_FLOOR` on its own, turning a `WATCH` row `GREEN`). This
+    function counts and reports both skip reasons separately in
+    ``status_reason``, so a low n is legible rather than merely low.
 
     **No backfill was performed** (plan §4.5's explicit instruction on this
     clause): `cross_section_settled.json` exists only for cycles run after
@@ -597,6 +607,7 @@ def _rank_ic_row(
     horizons: set[int] = set()
     outside = 0
     skipped_low_names = 0
+    skipped_degenerate = 0
     for key in sorted(store.list_keys(prefix)):
         if not key.endswith("/cross_section_settled.json"):
             continue
@@ -612,8 +623,18 @@ def _rank_ic_row(
             if row["realized_forward_return_ratio"] is not None
         }
         result = spearman_ic(score_by_ticker, return_by_ticker)
-        if result is None:
+        if result is RankICSkip.TOO_FEW_NAMES:
             skipped_low_names += 1
+            continue
+        if result is RankICSkip.DEGENERATE:
+            # Undefined correlation (constant score or constant realized
+            # return): this date carries NO information and must not be
+            # counted toward n_samples, even though it cleared
+            # CROSS_SECTION_MIN_NAMES. Reported separately from
+            # skipped_low_names so a status_reason never conflates "too
+            # little data to pair" with "paired, but the pairing measured
+            # nothing" (alpha-engine-config-I9778 review, finding 1).
+            skipped_degenerate += 1
             continue
         sources.append(key)
         ic, _n_names = result
@@ -637,8 +658,10 @@ def _rank_ic_row(
                 f"{CROSS_SECTION_MIN_NAMES} paired names in the {len(window)}-session window "
                 f"{first}..{last} under {prefix} ({outside} settled cross-section(s) exist "
                 f"outside it, {skipped_low_names} inside it were skipped for too few paired "
-                "names). No backfill was performed for shadow.v2, so this is expected in the "
-                "weeks immediately after rollout, not an arm with no edge"
+                f"names, {skipped_degenerate} inside it were skipped for an undefined "
+                "correlation — a constant score or a constant realized return). No backfill "
+                "was performed for shadow.v2, so this is expected in the weeks immediately "
+                "after rollout, not an arm with no edge"
             ),
         )
     if len(horizons) != 1:
@@ -666,9 +689,11 @@ def _rank_ic_row(
             f"forward return over {len(ics)} settled decision date(s) (each clearing "
             f"{CROSS_SECTION_MIN_NAMES}+ paired names) in the {len(window)}-session window "
             f"{first}..{last}, {_ci_phrase(low, high)}; {skipped_low_names} date(s) inside the "
-            f"window were skipped for too few paired names and {outside} settled "
-            "cross-section(s) exist outside it; the baseline is 0.0 because that is the "
-            "expectation of a random ranking's correlation with the realized return"
+            f"window were skipped for too few paired names, {skipped_degenerate} were skipped "
+            "for an undefined correlation (a constant score or a constant realized return — "
+            f"not counted as an observation), and {outside} settled cross-section(s) exist "
+            "outside it; the baseline is 0.0 because that is the expectation of a random "
+            "ranking's correlation with the realized return"
         ),
         target=0.0,
         red_line=0.0,

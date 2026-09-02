@@ -70,6 +70,7 @@ exact without sampling. Never SPY for a selection slot — the library's
 from __future__ import annotations
 
 import datetime as dt
+import enum
 import json
 import math
 import random
@@ -105,6 +106,7 @@ __all__ = [
     "ForwardReturnWindow",
     "GraderControlError",
     "PopulationIntegrityError",
+    "RankICSkip",
     "ScoredCrossSection",
     "SelectionMissError",
     "ShadowSelection",
@@ -450,16 +452,41 @@ def write_cross_section_settled(
     return payload
 
 
+class RankICSkip(enum.Enum):
+    """Why one date contributed no rank IC — the two reasons are not the same
+    fact and must not collapse into one signal.
+
+    ``TOO_FEW_NAMES``: fewer than :data:`CROSS_SECTION_MIN_NAMES` paired
+    tickers. ``DEGENERATE``: enough paired names, but the score or the
+    realized-return side of the pairing carried zero variance (every score
+    tied, or every realized return tied) — a constant ranker, or a
+    hard-zeroed feature column. A Spearman correlation is undefined there,
+    not zero: `alpha-engine-config-I9778`'s review demonstrated that
+    reporting ``0.0`` for this case let a date carrying NO information clear
+    :data:`~crucible.report.RANK_IC_N_FLOOR` and turn a `WATCH` row `GREEN`
+    (principle 7 — *"no data is never rendered as green"*). Kept distinct
+    from ``TOO_FEW_NAMES`` so a caller can name each reason separately
+    (`crucible.report._rank_ic_row`'s ``skipped_low_names`` vs.
+    ``skipped_degenerate``) rather than reporting one combined "skipped"
+    count that hides which failure mode actually happened.
+    """
+
+    TOO_FEW_NAMES = "too_few_names"
+    DEGENERATE = "degenerate"
+
+
 def spearman_ic(
     score_by_ticker: dict[str, float], return_by_ticker: dict[str, float]
-) -> tuple[float, int] | None:
+) -> tuple[float, int] | RankICSkip:
     """One date's rank IC: the Spearman correlation of score against realized
     forward return, paired by ticker.
 
-    Returns ``None`` below :data:`CROSS_SECTION_MIN_NAMES` paired names
-    rather than a correlation computed on too little to mean anything — the
-    caller (`crucible.report`) then excludes that date from the series
-    entirely, the same way an unsettled date excludes itself from a slot
+    Returns a :class:`RankICSkip` rather than a numeric result when this
+    date contributes no observation — either too few paired names, or an
+    undefined correlation (see :class:`RankICSkip`). The caller
+    (`crucible.report`) excludes that date from the series entirely AND
+    from ``n_samples``: a date that carries no information must not count
+    as one, the same way an unsettled date excludes itself from a slot
     row's `n_samples`.
 
     Implemented with average (mid-rank) ties and a plain Pearson correlation
@@ -470,10 +497,12 @@ def spearman_ic(
     """
     tickers = sorted(set(score_by_ticker) & set(return_by_ticker))
     if len(tickers) < CROSS_SECTION_MIN_NAMES:
-        return None
+        return RankICSkip.TOO_FEW_NAMES
     scores = [score_by_ticker[t] for t in tickers]
     realized = [return_by_ticker[t] for t in tickers]
     ic = _pearson(_fractional_ranks(scores), _fractional_ranks(realized))
+    if ic is None:
+        return RankICSkip.DEGENERATE
     return ic, len(tickers)
 
 
@@ -493,7 +522,22 @@ def _fractional_ranks(values: list[float]) -> list[float]:
     return ranks
 
 
-def _pearson(a: list[float], b: list[float]) -> float:
+def _pearson(a: list[float], b: list[float]) -> float | None:
+    """Pearson correlation of two equal-length vectors, or ``None`` when it is
+    undefined.
+
+    Returns ``None`` — never ``0.0`` — when either vector has zero variance
+    (every rank tied: every score, or every realized return, identical). Zero
+    is a real, meaningful correlation; undefined is not, and the two must be
+    distinguishable at the type level rather than by convention. Prior to
+    `alpha-engine-config-I9778`'s review this returned ``0.0`` for the
+    degenerate case, which let a constant ranker's date be counted as a real
+    ``ic=0.0`` observation and increment ``n`` — the mechanism by which one
+    date carrying NO information moved a row from `WATCH` to `GREEN`. The
+    caller (:func:`spearman_ic`) turns this ``None`` into
+    :attr:`RankICSkip.DEGENERATE`, which `crucible.report._rank_ic_row`
+    excludes from both the IC series and ``n_samples``.
+    """
     n = len(a)
     mean_a = sum(a) / n
     mean_b = sum(b) / n
@@ -501,12 +545,7 @@ def _pearson(a: list[float], b: list[float]) -> float:
     variance_a = sum((x - mean_a) ** 2 for x in a)
     variance_b = sum((x - mean_b) ** 2 for x in b)
     if variance_a == 0.0 or variance_b == 0.0:
-        # Every rank tied (every score, or every realized return, identical).
-        # A correlation is undefined, not zero: reported as 0.0 with the
-        # degenerate input rather than raised, since a control or a quiet
-        # cross-section can legitimately land here and the caller treats a
-        # date contributing nothing differently from a date that failed.
-        return 0.0
+        return None
     return covariance / math.sqrt(variance_a * variance_b)
 
 

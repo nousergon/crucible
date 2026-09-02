@@ -333,6 +333,15 @@ class SpendCap:
     cap_usd: float
     spent_usd: float = 0.0
     anchor: dt.datetime | None = None
+    #: `alpha-engine-config-I9823`: whether ``cap_usd`` traces to a phase-5
+    #: cost-sink measurement (`crucible.config.Settings.llm_cap_usd_measured`,
+    #: itself only ever :data:`DEFAULT_LLM_CAP_USD_MEASURED`). Carried on the
+    #: cap the caller constructs rather than re-derived here, so this module
+    #: never re-implements config's resolution — but it now RIDES somewhere:
+    #: :func:`cap_metric` publishes it on every run's `llm_spend_usd` metric,
+    #: closing the half of I9823 where the flag was written only to
+    #: `Settings.to_dict()`, which no caller in this package read.
+    cap_usd_measured: bool = False
 
     def headroom_usd(self) -> float:
         return self.cap_usd - self.spent_usd
@@ -408,9 +417,21 @@ def cap_metric(cap: SpendCap, *, now: dt.datetime, source_path: str) -> dict[str
     Emitted on EVERY run that holds a cap, including the ones that spend
     nothing: a cap nobody publishes a figure against is a cap nobody is held
     to, and zero spend is a measurement.
+
+    Carries ``cap_usd_measured`` (`alpha-engine-config-I9823`): whether
+    ``cap.cap_usd_measured`` traces to a phase-5 cost-sink cycle rather than
+    the declared-not-measured default. Before this, a manifest or a report
+    generated under the default looked identical to one generated under a
+    cap someone had actually re-set — the flag existed in
+    `crucible.config.Settings` but reached no consumer. This is that
+    consumer: the field is on `metricRecord`, which is
+    ``additionalProperties: true`` in the run-manifest schema, so it needs no
+    schema change to become machine-checkable off the manifest a run already
+    writes.
     """
     fraction = cap.spent_usd / cap.cap_usd if cap.cap_usd else 0.0
     status = "BREACH" if cap.spent_usd > cap.cap_usd else "OK"
+    measured_phrase = "measured" if cap.cap_usd_measured else "declared, not measured"
     return {
         "name": "llm_spend_usd",
         "module": "crucible.llm",
@@ -420,13 +441,14 @@ def cap_metric(cap: SpendCap, *, now: dt.datetime, source_path: str) -> dict[str
         "n_floor": 0,
         "status": status,
         "status_reason": (
-            f"${cap.spent_usd:.4f} of a declared ${cap.cap_usd:.2f} per-weekly-run cap "
-            f"({fraction:.1%}); a call that would exceed it is refused before the provider "
-            "is reached, so the run fails rather than overspending"
+            f"${cap.spent_usd:.4f} of a {measured_phrase} ${cap.cap_usd:.2f} per-weekly-run "
+            f"cap ({fraction:.1%}); a call that would exceed it is refused before the "
+            "provider is reached, so the run fails rather than overspending"
         ),
         "source_path": source_path,
         "last_updated_utc": now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "baseline": cap.cap_usd,
+        "cap_usd_measured": cap.cap_usd_measured,
     }
 
 

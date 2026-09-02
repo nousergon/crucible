@@ -27,6 +27,7 @@ from crucible.slots.grading import (
     ForwardReturnWindow,
     GraderControlError,
     PopulationIntegrityError,
+    RankICSkip,
     ScoredCrossSection,
     SelectionMissError,
     assert_controls_ordered,
@@ -638,11 +639,11 @@ class TestSpearmanIC:
         assert ic == pytest.approx(-1.0)
         assert n == len(names)
 
-    def test_below_the_names_floor_returns_none(self) -> None:
+    def test_below_the_names_floor_returns_too_few_names(self) -> None:
         names = self._names(CROSS_SECTION_MIN_NAMES - 1)
         score = {t: float(i) for i, t in enumerate(names)}
         realized = {t: float(i) for i, t in enumerate(names)}
-        assert spearman_ic(score, realized) is None
+        assert spearman_ic(score, realized) is RankICSkip.TOO_FEW_NAMES
 
     def test_only_the_paired_intersection_counts_toward_the_floor(self) -> None:
         """A ticker scored but never settled (or vice versa) is unpaired and
@@ -651,18 +652,26 @@ class TestSpearmanIC:
         names = self._names(CROSS_SECTION_MIN_NAMES)
         score = {t: float(i) for i, t in enumerate(names)}
         realized = {t: float(i) for i, t in enumerate(names[:-1])}  # one short
-        assert spearman_ic(score, realized) is None
+        assert spearman_ic(score, realized) is RankICSkip.TOO_FEW_NAMES
 
-    def test_tied_scores_use_average_ranks(self) -> None:
+    def test_tied_scores_are_degenerate_not_a_measured_zero(self) -> None:
+        """`alpha-engine-config-I9778` review, finding 1: every score tied (a
+        constant ranker) makes the correlation UNDEFINED, not `0.0`. Prior to
+        the fix this returned `(0.0, n)` and was counted as a real
+        observation — the exact mechanism the review used to turn a `WATCH`
+        row `GREEN` on a date that carried no information at all."""
         names = self._names(CROSS_SECTION_MIN_NAMES)
         score = dict.fromkeys(names, 1.0)
         realized = {t: float(i) for i, t in enumerate(names)}
-        ic, n = spearman_ic(score, realized)
-        # Every score identical: the score side of the rank correlation has
-        # zero variance, which is the degenerate case a real cross-section
-        # can legitimately hit (a control, or a quiet day).
-        assert ic == pytest.approx(0.0)
-        assert n == len(names)
+        assert spearman_ic(score, realized) is RankICSkip.DEGENERATE
+
+    def test_tied_realized_returns_are_also_degenerate(self) -> None:
+        """The other side of the pairing: every realized return identical
+        (e.g. a quiet cross-section) is equally undefined, not `0.0`."""
+        names = self._names(CROSS_SECTION_MIN_NAMES)
+        score = {t: float(i) for i, t in enumerate(names)}
+        realized = dict.fromkeys(names, 0.01)
+        assert spearman_ic(score, realized) is RankICSkip.DEGENERATE
 
     def test_a_random_shuffle_is_not_perfectly_correlated(self) -> None:
         names = self._names(8)
