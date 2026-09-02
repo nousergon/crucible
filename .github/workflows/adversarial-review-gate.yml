@@ -67,8 +67,27 @@ on:
 
 permissions: {}
 
+# alpha-engine-config-I9848 correction: an independent adversarial review of
+# crucible-PR41 measured, against the Actions API, that no Adversarial
+# Review Gate run has EVER been cancelled in this repo — the run named as
+# root cause (33657407462) completed successfully. The real defect on
+# crucible-PR38 was a QUEUE RACE: `resolve` was dispatched ~3 minutes before
+# a busy runner started the queued `post-pending-check` job, so the lookup
+# found nothing. The self-heal below (in `resolve`) is the actual fix for
+# that. This workflow-level group is defence in depth, not the I9848 fix:
+# the ORIGINAL group keyed on PR number, which means two DIFFERENT-sha
+# pull_request runs for the same PR shared a group and could cancel each
+# other, and a `resolve` dispatch shared that same group and could be
+# cancelled by an in-flight push. Neither has an observed instance. Keying
+# `pull_request` runs on head sha means only a genuine re-run of the exact
+# same sha can cancel a `post-pending-check` run of that sha; keying
+# `resolve` on its own `resolve-<pr_number>` group means a push can never
+# cancel a verdict-recording dispatch.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' &&
+    format('resolve-{0}', inputs.pr_number) ||
+    format('pr-{0}', github.event.pull_request.head.sha) }}
   cancel-in-progress: true
 
 jobs:
@@ -83,23 +102,12 @@ jobs:
     # review on this PR, finding 1. Left unset, the check-run defaults to
     # the job id, "post-pending-check".
     #
-    # alpha-engine-config-I9848: this job gets its OWN concurrency group,
-    # scoped to the head SHA, and cancel-in-progress: false. The workflow-
-    # level group above is keyed on PR number, so two pushes in quick
-    # succession cancel the OLDER run in favor of the newer one — correct
-    # for a build (nothing wasted by killing stale work), wrong here: this
-    # job does one `gh api` call with no checkout, and its whole purpose is
-    # to CREATE a durable check-run object that `resolve` later completes.
-    # Cancelling it doesn't save anything and leaves the newer SHA with no
-    # check-run to resolve, which is exactly what made crucible-PR38
-    # unrecoverable from the workflow (2026-09-02, runs 33657407462,
-    # 33657408674, 33657583001). A per-SHA group means this job can never
-    # collide with a run for a different SHA in the first place;
-    # cancel-in-progress: false is belt-and-braces for the case where the
-    # SAME SHA is somehow re-dispatched (e.g. a manual re-run).
-    concurrency:
-      group: ${{ github.workflow }}-post-pending-check-${{ github.event.pull_request.head.sha }}
-      cancel-in-progress: false
+    # alpha-engine-config-I9848 correction: a job-level `concurrency:`
+    # block here is VOID — GitHub Actions has no such mechanism. The
+    # workflow-level `cancel-in-progress: true` cancels the RUN (and every
+    # job in it) as a unit; a job cannot opt itself out. The real defence
+    # against cross-sha collision is the workflow-level group above, keyed
+    # on head sha.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -117,6 +125,23 @@ jobs:
 
           if [ "$IS_DRAFT" = "true" ]; then
             echo "PR #$PR_NUM is a draft — no adversarial-review-gate check posted until it is ready for review."
+            exit 0
+          fi
+
+          # alpha-engine-config-I9848 correction, finding 2: `resolve` can
+          # now self-heal by creating a `completed` check-run when this job
+          # hasn't run yet (queue race — measured on crucible-PR38: resolve
+          # was dispatched ~3 minutes before this job left the queue). If
+          # this job then wakes and POSTs unconditionally, it creates a
+          # SECOND check-run named "adversarial-review-gate" on the same
+          # sha, `in_progress`, which becomes the current reading and blocks
+          # the PR forever — the exact collision the no-`name:` note above
+          # warns about, from the other direction. Check first: if a
+          # check-run by this name already exists on the sha (self-healed
+          # or otherwise), do not post a duplicate.
+          existing="$(gh api "/repos/$REPO/commits/$SHA/check-runs" -q '[.check_runs[] | select(.name=="adversarial-review-gate")] | length')"
+          if [ "$existing" -gt 0 ]; then
+            echo "adversarial-review-gate check-run already exists on $SHA (resolve self-healed while this job was queued, or it was posted already) — not posting a duplicate."
             exit 0
           fi
 
@@ -193,20 +218,23 @@ jobs:
           # gate's check identity — see the no-`name:` note on the
           # post-pending-check job above) and status on the head sha.
           #
-          # alpha-engine-config-I9848: if `post-pending-check` was itself
-          # cancelled (its run superseded by a later push before the
-          # concurrency-group fix above took effect on THIS sha, or any
-          # other reason it never ran), no in_progress check-run exists to
-          # find. That used to be a hard failure with no path forward — the
-          # required check could never be satisfied because the object the
-          # verdict attaches to was never created. The pending post is a
-          # visibility convenience; the verdict is the durable thing and
-          # must be recordable regardless. run_id is left empty here (never
-          # exit 1) and the next step creates-and-completes the check-run
-          # directly when that happens.
+          # alpha-engine-config-I9848 (corrected root cause): if
+          # `post-pending-check` hasn't run yet — measured on crucible-PR38
+          # as a QUEUE RACE, not a cancellation: `resolve` was dispatched
+          # ~3 minutes before a busy runner started the queued job — no
+          # in_progress check-run exists to find. That used to be a hard
+          # failure with no path forward — the required check could never
+          # be satisfied because the object the verdict attaches to was
+          # never created. The pending post is a visibility convenience;
+          # the verdict is the durable thing and must be recordable
+          # regardless. run_id is left empty here (never exit 1) and the
+          # next step creates-and-completes the check-run directly when
+          # that happens. post-pending-check's own collision guard (above)
+          # keeps it from then posting a second, stale check-run once it
+          # wakes.
           run_id="$(gh api "/repos/$REPO/commits/$sha/check-runs" -q '[.check_runs[] | select(.name=="adversarial-review-gate" and .status=="in_progress")][0].id // empty')"
           if [ -z "$run_id" ]; then
-            echo "No in_progress 'adversarial-review-gate' check-run found on $sha — post-pending-check likely never ran or was cancelled by a later push. Creating and completing the check-run directly (self-healing, alpha-engine-config-I9848)."
+            echo "No in_progress 'adversarial-review-gate' check-run found on $sha — post-pending-check hasn't recorded one yet (queue race) or never will. Creating and completing the check-run directly (self-healing, alpha-engine-config-I9848)."
           fi
 
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
@@ -244,11 +272,12 @@ jobs:
               -f output[summary]="$full_summary"
             echo "Recorded adversarial-review-gate=$CONCLUSION on existing check-run $RUN_ID (reviewer: $REVIEWER, author: $AUTHOR, GitHub author: $GH_AUTHOR)"
           else
-            # Self-heal: no pending check-run existed on this sha (it was
-            # never posted, or its posting run was cancelled). Create the
-            # check-run and complete it in the same call — the verdict must
-            # be recordable even when the earlier convenience job didn't
-            # survive.
+            # Self-heal: no pending check-run existed on this sha yet — the
+            # measured cause is a queue race (resolve dispatched before
+            # post-pending-check left the queue), not a cancellation. Create
+            # the check-run and complete it in the same call — the verdict
+            # must be recordable even when the earlier convenience job
+            # hasn't run yet.
             new_run_id="$(gh api "/repos/$REPO/check-runs" \
               -X POST \
               -f name="adversarial-review-gate" \

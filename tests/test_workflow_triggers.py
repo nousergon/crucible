@@ -57,6 +57,7 @@ from __future__ import annotations
 import inspect
 import pathlib
 import re
+import subprocess
 
 import pytest
 import yaml
@@ -343,115 +344,355 @@ def test_the_job_model_accepts_both_legal_needs_forms() -> None:
     assert Job.model_validate({}).needs == []
 
 
-# alpha-engine-config-I9848: `post-pending-check` does one `gh api` call with
-# no checkout — nothing is saved by cancelling it, and cancelling it left the
-# newer head with no check-run for `resolve` to complete, making the
-# required `adversarial-review-gate` check permanently unsatisfiable on that
-# sha (measured on crucible-PR38 head 7ac3cb6: runs 33657407462 cancelled,
-# 33657408674 and 33657583001 failed with no path forward).
-def test_post_pending_check_is_not_cancellable_by_a_later_push() -> None:
-    """The workflow-level concurrency group is keyed on PR number, so a
-    second push cancels the first push's `post-pending-check` run under the
-    top-level `cancel-in-progress: true`. The job needs its OWN concurrency
-    block — scoped to the head sha, so it can never collide with a run for a
-    different sha — with `cancel-in-progress: false`, so even a same-sha
-    re-run doesn't cancel it.
+# alpha-engine-config-I9848 -- these tests were reworked after an independent
+# adversarial review of crucible-PR41 measured (against the Actions API) that
+# the workflow's `cancel-in-progress` concurrency group had NEVER cancelled a
+# run in this repo; the run named as root cause (33657407462) completed
+# successfully. The actual crucible-PR38 failure was a queue race: `resolve`
+# was dispatched ~3 minutes before a busy runner started the queued
+# `post-pending-check` job. The tests below assert the corrected shape:
+#
+# 1. `post-pending-check` carries no job-level `concurrency:` (GitHub Actions
+#    has no such per-job override -- a job-level block there is silently
+#    void, which the earlier version of this file did not know and asserted
+#    on anyway); the real defence against cross-run collision lives at the
+#    WORKFLOW level, keyed so a `pull_request` run and a `resolve` dispatch
+#    can never share a group.
+# 2. `resolve` self-heals a missing check-run by EXECUTING the actual step
+#    scripts under a stubbed `gh`, not by pattern-matching the shell text --
+#    a predicate over a shell command string is a partial shell parser and
+#    therefore a denylist, the exact lesson from PR38's own adversarial
+#    review rounds (this file's module docstring). Running the real script
+#    means a regression that reintroduces a non-zero exit on this path
+#    (`exit 1`, or `false` under `set -e` -- both were tried against an
+#    earlier, text-matching version of this test and both slipped through)
+#    is caught because the subprocess genuinely fails, not because a string
+#    is absent.
+# 3. `post-pending-check`'s new collision guard (skip posting if a
+#    check-run by this name already exists on the sha) is exercised the
+#    same way, both branches.
+
+
+_FAKE_GH = """#!/usr/bin/env bash
+set -euo pipefail
+argv="$*"
+# Mutating calls (-X POST / -X PATCH) are checked FIRST and unconditionally
+# logged: a read-only lookup query can legitimately contain the substrings
+# "in_progress" or "length" as query text, but a POST that sets
+# `status=in_progress` also contains the literal substring "in_progress" in
+# ITS argv (`-f status="in_progress"`) — matching that against the read-only
+# case below is exactly the mismatch this ordering avoids (measured: an
+# earlier version of this stub matched the POST call against the
+# in_progress-lookup case and never logged the call at all). Each call is
+# logged NUL-separated, not newline-separated — the real `full_summary`
+# payload embeds literal newlines, which would otherwise fragment one call
+# into several log lines.
+case "$argv" in
+  *"-X POST"*)
+    printf 'POST %s\\0' "$argv" >> "$CALL_LOG"
+    if [[ "$argv" == *"-q .id"* ]]; then echo "999"; fi ;;
+  *"-X PATCH"*)
+    printf 'PATCH %s\\0' "$argv" >> "$CALL_LOG" ;;
+  *"/pulls/"*"-q .user.login"*)
+    echo "gh-author" ;;
+  *"/pulls/"*"-q .head.sha"*)
+    echo "$FAKE_SHA" ;;
+  *"check-runs"*"in_progress"*)
+    echo "$FAKE_RUN_ID" ;;
+  *"check-runs"*"| length"*)
+    echo "$FAKE_EXISTING_COUNT" ;;
+  *)
+    echo "unhandled fake gh invocation: $argv" >&2
+    exit 99 ;;
+esac
+"""
+
+
+def _run_step(
+    tmp_path: pathlib.Path,
+    script: str,
+    step_env: dict[str, str],
+    fake_sha: str = "deadbeef",
+    fake_run_id: str = "",
+    fake_existing_count: str = "0",
+) -> tuple[subprocess.CompletedProcess, dict[str, str], list[str]]:
+    """Execute an extracted workflow step's real `run:` script under bash,
+    with `gh` stubbed out, and return (result, GITHUB_OUTPUT as a dict, the
+    list of gh invocations that mutated state via POST/PATCH).
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_gh = bin_dir / "gh"
+    fake_gh.write_text(_FAKE_GH)
+    fake_gh.chmod(0o755)
+
+    github_output = tmp_path / "github_output"
+    github_output.write_text("")
+    call_log = tmp_path / "call_log"
+    call_log.write_text("")
+
+    step_process_env = {
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "GITHUB_OUTPUT": str(github_output),
+        "CALL_LOG": str(call_log),
+        "FAKE_SHA": fake_sha,
+        "FAKE_RUN_ID": fake_run_id,
+        "FAKE_EXISTING_COUNT": fake_existing_count,
+        "GH_TOKEN": "fake-token",
+        "REPO": "nousergon/crucible",
+    }
+    step_process_env.update(step_env)
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env=step_process_env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    output_lines = [line for line in github_output.read_text().splitlines() if "=" in line]
+    outputs = dict(line.split("=", 1) for line in output_lines)
+    # NUL-separated, not newline-separated — see _FAKE_GH's comment on why.
+    calls = [call for call in call_log.read_text().split("\0") if call]
+    return result, outputs, calls
+
+
+def test_post_pending_check_has_no_job_level_concurrency() -> None:
+    """A job-level `concurrency:` block is void in GitHub Actions -- the
+    workflow-level group and `cancel-in-progress` apply to the whole run,
+    and a job cannot opt itself out. Asserting one here would assert a
+    no-op; the real defence is the workflow-level group's shape, checked by
+    `test_workflow_level_concurrency_group_separates_resolve_from_pull_request_runs`.
     """
     workflow = Workflow.load(WORKFLOW_DIR / "adversarial-review-gate.yml")
     job = workflow.jobs["post-pending-check"]
-    job_concurrency = (job.model_extra or {}).get("concurrency")
-    assert isinstance(job_concurrency, dict), (
-        "post-pending-check has no job-level `concurrency:` override, so it "
-        "inherits the workflow-level group (keyed on PR number) and "
-        "`cancel-in-progress: true` — a later push on the same PR cancels "
-        "it, exactly the alpha-engine-config-I9848 defect."
-    )
-    assert job_concurrency.get("cancel-in-progress") is False, (
-        "post-pending-check's concurrency block must set "
-        "`cancel-in-progress: false` — it does one `gh api` call with no "
-        "checkout, so nothing is saved by cancelling it, and cancelling it "
-        "is what made crucible-PR38 unrecoverable."
-    )
-    group = job_concurrency.get("group", "")
-    assert "head.sha" in group or "head_sha" in group, (
-        "post-pending-check's concurrency group must be scoped to the head "
-        "sha (not the PR number), or a same-PR, different-sha run can still "
-        f"collide with it. Got group={group!r}."
+    assert "concurrency" not in (job.model_extra or {}), (
+        "post-pending-check carries a job-level `concurrency:` block. "
+        "GitHub Actions has no such per-job override -- it is silently "
+        "void -- so this either does nothing (misleading) or, if GitHub "
+        "ever rejects it, breaks the workflow outright. The fix belongs at "
+        "the workflow level."
     )
 
 
-def test_resolve_self_heals_instead_of_exiting_when_no_pending_check_run_exists() -> None:
-    """`resolve` must not give up when `post-pending-check` never created (or
-    lost) the check-run it expects to complete — that path used to be a bare
-    `exit 1` with a rhetorical question, leaving the required check
-    permanently absent on that sha with no remedy from the workflow itself.
+def test_workflow_level_concurrency_group_separates_resolve_from_pull_request_runs() -> None:
+    """The workflow-level group must key `resolve` (workflow_dispatch)
+    separately from `pull_request` runs of the same PR, so a push cannot
+    cancel an in-flight verdict-recording dispatch -- and must key
+    `pull_request` runs on the head SHA, so two different pushes to the same
+    PR cannot cancel each other's `post-pending-check` run. Neither
+    collision has an observed instance (an independent review measured,
+    against the Actions API, that no run in this repo has ever been
+    cancelled) -- this is defence in depth, not the I9848 root-cause fix.
+    """
+    workflow = Workflow.load(WORKFLOW_DIR / "adversarial-review-gate.yml")
+    group = workflow.model_extra["concurrency"]["group"]
+    assert "workflow_dispatch" in group and "resolve" in group, (
+        "the workflow-level concurrency group no longer branches on "
+        "`workflow_dispatch` to give `resolve` its own key -- a push to the "
+        "PR can cancel an in-flight resolve dispatch again."
+    )
+    assert "pull_request.head.sha" in group, (
+        "the workflow-level concurrency group is no longer keyed on the "
+        "pull_request head sha -- two different pushes to the same PR "
+        "number can collide again."
+    )
 
-    This asserts two properties on the actual step scripts rather than a
-    predicate over shell text (a predicate over a shell command string is a
-    partial shell parser and therefore a denylist — the exact lesson from
-    PR38's own adversarial review rounds):
 
-    1. The specific `if [ -z "$run_id" ]; then ... fi` block (the one guard
-       that fires when no in_progress check-run was found) contains no
-       `exit` at all — extracted by name, not inferred from surrounding
-       text.
-    2. The completion step's script contains the exact, pinned `gh api`
-       POST call that creates-and-completes a check-run directly, inside an
-       `else` branch keyed on the same `$RUN_ID` the lookup step produces.
+def test_resolve_self_heals_a_missing_check_run_instead_of_exiting(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Execute the real `resolve` lookup step with a stubbed `gh` reporting
+    no in_progress check-run on the sha (the queue-race condition measured
+    on crucible-PR38). The step must exit 0 and record an empty `run_id`
+    output -- not fail. Running the actual script (rather than pattern-
+    matching its text) means a regression that swaps `exit 1` for `false`
+    (both non-zero under `set -e`, and both were shown to defeat an earlier
+    text-matching version of this test) is still caught, because the
+    subprocess genuinely exits non-zero either way.
     """
     workflow = Workflow.load(WORKFLOW_DIR / "adversarial-review-gate.yml")
     resolve = workflow.jobs["resolve"]
     lookup_script = resolve.steps[0]["run"]
+
+    result, outputs, _calls = _run_step(
+        tmp_path,
+        lookup_script,
+        step_env={
+            "PR_NUM": "41",
+            "REVIEWER": "session-a",
+            "AUTHOR": "session-b",
+        },
+        fake_sha="7ac3cb6",
+        fake_run_id="",
+    )
+    assert result.returncode == 0, (
+        "the check-run lookup step exited non-zero when no in_progress "
+        "check-run was found on the sha -- resolve fails hard again instead "
+        f"of self-healing. stderr:\n{result.stderr}"
+    )
+    assert outputs.get("run_id", "") == "", (
+        f"expected an empty run_id output when no in_progress check-run "
+        f"exists; got outputs={outputs!r}"
+    )
+    assert outputs.get("sha") == "7ac3cb6", (
+        f"expected the resolved sha to be forwarded as an output; got outputs={outputs!r}"
+    )
+
+
+def test_resolve_completion_step_creates_a_completed_check_run_when_run_id_is_empty(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With no existing check-run to PATCH (`run_id` empty, the self-heal
+    condition), the completion step must POST a new, already-`completed`
+    check-run rather than doing nothing or failing. Verified by executing
+    the real script and inspecting the actual `gh api` call it made, not by
+    matching its text.
+    """
+    workflow = Workflow.load(WORKFLOW_DIR / "adversarial-review-gate.yml")
+    resolve = workflow.jobs["resolve"]
     complete_script = resolve.steps[1]["run"]
 
-    block_match = re.search(r'if \[ -z "\$run_id" \]; then\n(.*?)\nfi\n', lookup_script, re.DOTALL)
-    assert block_match is not None, (
-        'expected an `if [ -z "$run_id" ]; then ... fi` block in the '
-        "check-run lookup step — its absence means the script structure "
-        "changed under this test; update the test to match the new shape "
-        "and re-verify the no-exit property by hand."
+    result, _outputs, calls = _run_step(
+        tmp_path,
+        complete_script,
+        step_env={
+            "RUN_ID": "",
+            "SHA": "7ac3cb6",
+            "GH_AUTHOR": "cipher813",
+            "REVIEWER": "session-a",
+            "AUTHOR": "session-b",
+            "CONCLUSION": "success",
+            "SUMMARY": "no findings",
+        },
     )
-    assert "exit" not in block_match.group(1), (
-        "the empty-run_id branch still calls `exit`, so `resolve` fails "
-        "hard again instead of self-healing when post-pending-check's "
-        "check-run is missing on the head sha."
+    assert result.returncode == 0, f"self-heal completion step failed: {result.stderr}"
+    assert len(calls) == 1, (
+        f"expected exactly one mutating gh api call (the self-heal POST); got {calls!r}"
+    )
+    (call,) = calls
+    assert call.startswith("POST"), f"expected a POST (create), got: {call!r}"
+    assert "-f status=completed" in call, (
+        f"the self-heal call must create the check-run already completed, not pending: {call!r}"
+    )
+    assert "-f head_sha=7ac3cb6" in call, f"the self-heal call is not scoped to the sha: {call!r}"
+
+
+def test_resolve_completion_step_patches_the_existing_run_when_run_id_is_present(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The normal path -- a pending check-run exists -- must still PATCH it
+    rather than creating a second one (a second POST left the original
+    check-run pending forever; this is the finding-4-on-this-PR regression
+    the workflow's own comments already document).
+    """
+    workflow = Workflow.load(WORKFLOW_DIR / "adversarial-review-gate.yml")
+    resolve = workflow.jobs["resolve"]
+    complete_script = resolve.steps[1]["run"]
+
+    result, _outputs, calls = _run_step(
+        tmp_path,
+        complete_script,
+        step_env={
+            "RUN_ID": "123456",
+            "SHA": "7ac3cb6",
+            "GH_AUTHOR": "cipher813",
+            "REVIEWER": "session-a",
+            "AUTHOR": "session-b",
+            "CONCLUSION": "success",
+            "SUMMARY": "no findings",
+        },
+    )
+    assert result.returncode == 0, f"the PATCH-existing-run step failed: {result.stderr}"
+    assert len(calls) == 1, f"expected exactly one gh api call; got {calls!r}"
+    (call,) = calls
+    assert call.startswith("PATCH"), f"expected a PATCH of the existing run, got: {call!r}"
+    assert "check-runs/123456" in call, f"the PATCH did not target the existing run id: {call!r}"
+
+
+def test_post_pending_check_skips_posting_when_a_check_run_already_exists(
+    tmp_path: pathlib.Path,
+) -> None:
+    """If `resolve` self-healed while this job was still queued (the
+    measured PR38 ordering -- `resolve` dispatched ~3 minutes before this
+    job started), a check-run named `adversarial-review-gate` already
+    exists on the sha when this job finally runs. It must NOT post a
+    second, `in_progress` one -- that would become the current reading and
+    block the PR forever, the collision finding 2 named. Verified by
+    executing the real step script with a stubbed `gh` reporting an
+    existing check-run, and asserting no POST happened.
+    """
+    workflow = Workflow.load(WORKFLOW_DIR / "adversarial-review-gate.yml")
+    post_pending = workflow.jobs["post-pending-check"]
+    script = post_pending.steps[0]["run"]
+
+    result, _outputs, calls = _run_step(
+        tmp_path,
+        script,
+        step_env={
+            "PR_NUM": "41",
+            "SHA": "7ac3cb6",
+            "IS_DRAFT": "false",
+        },
+        fake_existing_count="1",
+    )
+    assert result.returncode == 0, f"expected a clean skip, got: {result.stderr}"
+    assert calls == [], (
+        "post-pending-check posted a check-run even though one already "
+        f"existed on the sha -- this is the collision finding 2 named. calls={calls!r}"
     )
 
-    # Pin the exact recovery call — a POST that creates the check-run
-    # already completed, guarded by the `else` of the same `$RUN_ID` check
-    # the PATCH branch uses.
-    expected_self_heal_call = (
-        'if [ -n "$RUN_ID" ]; then\n'
-        "  # PATCH the existing pending run — see the note above finding\n"
-        "  # this run_id.\n"
-        '  gh api "/repos/$REPO/check-runs/$RUN_ID" \\\n'
-        "    -X PATCH \\\n"
-        '    -f status="completed" \\\n'
-        '    -f conclusion="$CONCLUSION" \\\n'
-        '    -f output[title]="$title" \\\n'
-        '    -f output[summary]="$full_summary"\n'
+
+def test_post_pending_check_posts_when_no_check_run_exists_yet(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The normal path -- nothing has self-healed yet -- must still post
+    the pending check-run. Guards against a collision fix that
+    over-corrects into never posting.
+    """
+    workflow = Workflow.load(WORKFLOW_DIR / "adversarial-review-gate.yml")
+    post_pending = workflow.jobs["post-pending-check"]
+    script = post_pending.steps[0]["run"]
+
+    result, _outputs, calls = _run_step(
+        tmp_path,
+        script,
+        step_env={
+            "PR_NUM": "41",
+            "SHA": "7ac3cb6",
+            "IS_DRAFT": "false",
+        },
+        fake_existing_count="0",
     )
-    assert expected_self_heal_call in complete_script, (
-        "the PATCH-if-present branch text has changed from what this test "
-        "pins — re-verify the else branch below still creates-and-completes "
-        "a new check-run when $RUN_ID is empty, then update this literal."
+    assert result.returncode == 0, f"expected a clean post, got: {result.stderr}"
+    assert len(calls) == 1, f"expected exactly one gh api call (the pending POST); got {calls!r}"
+    (call,) = calls
+    assert call.startswith("POST"), f"expected a POST, got: {call!r}"
+    assert "-f status=in_progress" in call, (
+        f"post-pending-check must still post the check-run as in_progress: {call!r}"
     )
-    else_index = complete_script.index(expected_self_heal_call) + len(expected_self_heal_call)
-    else_branch = complete_script[else_index:]
-    assert "else" in else_branch, (
-        "no `else` branch follows the PATCH-if-present block — self-healing "
-        "when $RUN_ID is empty has been removed."
+
+
+def test_post_pending_check_skips_entirely_while_the_pr_is_a_draft(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Unrelated to the collision fix, but a regression here would be silent
+    without a real execution test: a draft PR must not get any check-run at
+    all, self-heal or otherwise.
+    """
+    workflow = Workflow.load(WORKFLOW_DIR / "adversarial-review-gate.yml")
+    post_pending = workflow.jobs["post-pending-check"]
+    script = post_pending.steps[0]["run"]
+
+    result, _outputs, calls = _run_step(
+        tmp_path,
+        script,
+        step_env={
+            "PR_NUM": "41",
+            "SHA": "7ac3cb6",
+            "IS_DRAFT": "true",
+        },
+        fake_existing_count="0",
     )
-    expected_create_call = (
-        'gh api "/repos/$REPO/check-runs" \\\n'
-        "    -X POST \\\n"
-        '    -f name="adversarial-review-gate" \\\n'
-        '    -f head_sha="$SHA" \\\n'
-        '    -f status="completed" \\\n'
-        '    -f conclusion="$CONCLUSION" \\\n'
-    )
-    assert expected_create_call in else_branch, (
-        "the self-heal `else` branch must POST a new check-run with "
-        '`status="completed"` set directly (create-and-complete in one '
-        "call), scoped to $SHA — this exact call is missing or changed."
-    )
+    assert result.returncode == 0, f"draft skip should exit 0, got: {result.stderr}"
+    assert calls == [], f"a draft PR must not get any check-run posted; calls={calls!r}"
