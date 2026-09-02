@@ -17,18 +17,50 @@ naming the clause and the owning track. When a track lands the code, the test
 goes green on its own — nothing has to be un-marked, and nobody has to
 remember that a gate was waiting.
 
-## How to read the count
+## How to read the count — it is progress, not the gate
 
-`uv run pytest -q tests/acceptance` prints the phase gate:
+`uv run pytest -q tests/acceptance` prints how much of the plan is satisfied:
 
 ```
 N failed, M passed  →  M of N+M plan clauses currently satisfied
 ```
 
-That number is the gate. It is expected to be `0 passed` at the end of the
-foundation commit and to climb as tracks A, B and C land. A run of this
-directory that reports **no tests at all** is not a pass — it is an
-unobserved gate, and CI treats it as a failure.
+**That number is progress. It is not a phase gate, and quoting it as one is a
+known defect.** Phase 1 (`alpha-engine-config-I9757`) was closed
+**2026-09-02T01:31:16Z**, the moment its build PRs merged, with its exit gate
+never measured. Four readings had circulated beforehand — from three surfaces,
+over two totals, and not all of them measurements:
+
+| Reading | Where it came from |
+|---|---|
+| 9 of 23 clauses failing (14 met) | `I9757` comment, 2026-09-01T20:23Z, on `6eb52f0` |
+| 18 met / 6 unmet | same issue — a **prediction** of what two unmerged PRs would produce |
+| 19 met / 4 unmet | same issue — measured on a **local** merge of three PRs, not on `main` |
+| "21 of 23" | carried in conversation; **no artifact** |
+
+Measured 2026-09-02 on `main`, the disagreement resolved into **two
+instruments**: this suite read **21 of 24**, while the phase-1 gate read
+**NOT MET, 1 of 5 clauses** — `pointer_flipped_on_smoke` only — against the
+store `s3://alpha-engine-crucible-v2/crucible`
+(`gates/phase1/2026-09-01/gate.json`, `met_ratio: 0.2`). Zero replay Saturdays
+had run. The issue was reopened.
+
+Note the store: the gate reads **1 of 5** against the production store and
+**0 of 5** against an empty one. A gate reading without its store named is not
+a reading — that is the same defect one level down.
+
+**The gate is `crucible gate --gate <phase> --store <store>`**, which reads the
+artifacts the phase actually produced and never runs the thing it grades
+(`crucible/gate.py`). A phase exits on that command's output, pasted; nothing
+here can substitute for it, because every clause in this directory is
+satisfiable by code alone, and a gate that code alone can satisfy is not
+measuring the system.
+
+What this count is good for: it is the red board. It is expected to read
+`0 passed` at the end of the foundation commit and to climb as tracks land,
+and it is the only progress figure worth quoting in a report — not merged PRs,
+not findings, not commits. A run of this directory that reports **no tests at
+all** is not a pass; it is an unobserved board, and CI treats it as a failure.
 
 ## Cross-track clauses belong here too
 
