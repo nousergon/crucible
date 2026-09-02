@@ -47,22 +47,29 @@ contains. Both classes of text are unreachable from a raised message or a
 test failure, so a citation living there costs nothing and gains nothing by
 being derived.
 
-**Two files this scan intentionally does not fix, and does not silently
-skip either — it reports them as findings like any other.** `crucible/gate.py`
-is explicitly out of this PR's authority (a concurrent session owns it), and
-`tests/test_phase_ladder.py`'s hardcoded `alpha-engine-config-I9756` literals
-are the TEST ORACLE for `crucible.gate`'s own derivation (`Phase.tracker`
-computing the right string for phase 0) — replacing them with a derived
-lookup would make that test compare `PHASES[0].tracker` against itself and
-prove nothing. There is no way to express "this literal is the oracle, not
-a leak" as a general rule without a per-file exemption list, which is the
-suppression-collection shape this repository forbids outright (`AGENTS.md`
-rule 4). So this scan does not special-case them: if they still contain a
-hardcoded literal, this test is red, and stays red, until the file's actual
-owner resolves it — the same posture applied to any other file this PR did
-not touch because a concurrent session owns it (`crucible/console/`,
-`crucible/slots/inputs.py`, and their paired tests). This is a KNOWN,
-reported, currently-red state, not a bug in the scan.
+**A test asserting a derivation's output is not exempt from this — the
+oracle's expectation is built from the test's own INPUT instead.**
+`tests/test_phase_ladder.py` asserts `crucible.gate`'s ladder output names
+phase 0's tracker; the naive fix (comparing against `PHASES[0].tracker`)
+would make the assertion compare `PHASES[0].tracker` against itself and
+prove nothing. The actual fix is smaller: the test already supplies phase
+0's issue NUMBER as its own input (`_PHASE0_ISSUE = 9756`, a plain `int`,
+independently cross-checked against `PHASES[0].issue` by
+`test_every_plan_phase_has_a_rung`), and builds the expected string from
+that input with an f-string (`f"alpha-engine-config-I{_PHASE0_ISSUE}"`) —
+non-circular, and no `ast.Constant` string anywhere carries the literal.
+
+**This scan does not carry a per-file exemption list, and does not need
+one.** `crucible/console/render.py` and `crucible/slots/inputs.py` (plus
+its paired test) are, as of this PR, still red — both are owned by
+concurrent sessions (`i9837-red-board` and `crucible-PR43` respectively)
+this PR is not authorized to edit. That is a KNOWN, reported (
+`alpha-engine-config-I9868`), currently-red state, not a bug in the scan:
+merging past it would be exactly the "a red check the author decided
+doesn't count" anti-pattern `crucible-PR38` existed to close (Brian's
+2026-08-10 ruling). It is expected to clear on its own, with nothing
+further to do here, once those two branches land and this PR is rebased
+onto `main`.
 
 **Fail closed.** A file this scan cannot parse is a finding, not a skip: a
 scanner that goes quiet on the one file it cannot read is indistinguishable
