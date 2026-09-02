@@ -31,6 +31,11 @@ on:
     # goes green and never goes red, and the PR cannot merge. The filter stays
     # on `push`, where nothing is waiting on the result. These minutes are
     # free: the repository is public.
+  # The acceptance gate's second arm. `push: [main]` grades the reading minutes
+  # after a merge; this catches what no merge can see — a clause whose subject
+  # is live infrastructure changing out of band. Both arms exclude the PR path.
+  schedule:
+    - cron: '17 13 * * *'
 
 # Default-deny at the workflow level; each job re-grants only what it needs.
 # `contents: read` is NOT optional while this repo is private: with no
@@ -47,6 +52,8 @@ jobs:
   test:
     name: lint + foundation tests
     runs-on: ubuntu-latest
+    # Grades the tree, so it has nothing to say on the schedule arm.
+    if: github.event_name != 'schedule'
     timeout-minutes: 10
     permissions:
       contents: read
@@ -78,6 +85,24 @@ jobs:
   acceptance:
     name: acceptance gate (RED until the phase exits — reporting only)
     runs-on: ubuntu-latest
+    # NOT on the pull_request path — not required, not advisory, not present.
+    # `scm-platform-policy.md` §3.1 (Brian ruling 2026-08-10): a check grades
+    # the diff; a check whose subject is live infrastructure does not belong on
+    # a PR at all. These clauses grade the SYSTEM at a phase boundary — live
+    # AWS among them (`TestCost` calls cloudformation:ListStackResources) — so
+    # their answer is a property of the account and the phase, never of the
+    # branch under review. An author cannot clear them and is not meant to.
+    #
+    # Leaving them here made every PR in this repo read red, which trains the
+    # operator to merge past red and destroys the value of every other check:
+    # measured 2026-09-02, all seven open Dependabot PRs sat UNSTABLE on this
+    # single failure, and merging any of them required a human to decide, per
+    # PR, that a red check did not count.
+    #
+    # The reading is not lost — it moves to `push: [main]` plus the daily
+    # schedule above, which is where a phase gate belongs: graded minutes after
+    # each merge, and swept daily for the clauses only live state can answer.
+    if: github.event_name != 'pull_request'
     timeout-minutes: 10
     permissions:
       contents: read
