@@ -98,21 +98,33 @@ def test_ci_runs_uv_lock_check(workflow) -> None:
     )
 
 
-def test_the_lock_check_runs_before_anything_installs(workflow) -> None:
-    """Order is load-bearing.
+def test_every_job_that_installs_also_checks_the_lockfile_first(workflow) -> None:
+    """Per job, and it FAILS rather than skipping when the check is absent.
 
-    `uv sync --frozen` installs from the lockfile. Checking the lockfile
-    afterwards would grade a file the job has already acted on, and any step
-    between the two runs against dependencies nobody verified were the
-    declared ones.
+    The earlier version `continue`d when a job had an install and no check —
+    which made the live state pass: `uv lock --check` was in the `test` job
+    only, while the `acceptance` job (the phase gate, on `push: [main]`)
+    installed from an unverified lockfile. A guard that skips the case it
+    exists to catch is the vacuous-guard shape this repository keeps finding
+    elsewhere.
+
+    Repeated per job rather than inherited on purpose: GitHub jobs share
+    nothing, so "the other job checked it" is not a property of this runner.
     """
     for job_name, job in (workflow.get("jobs") or {}).items():
+        if not isinstance(job, dict):
+            continue
         steps = [s for s in (job.get("steps") or []) if isinstance(s, dict)]
         commands = [s.get("run") or "" for s in steps]
-        check_at = next((i for i, c in enumerate(commands) if LOCK_CHECK_COMMAND in c), None)
         install_at = next((i for i, c in enumerate(commands) if FROZEN_INSTALL_COMMAND in c), None)
-        if check_at is None or install_at is None:
+        if install_at is None:
             continue
+        check_at = next((i for i, c in enumerate(commands) if LOCK_CHECK_COMMAND in c), None)
+        assert check_at is not None, (
+            f"job {job_name!r} installs from the lockfile and never runs "
+            f"`{LOCK_CHECK_COMMAND}`. It would install from a lockfile nothing verified "
+            "against pyproject.toml."
+        )
         assert check_at < install_at, (
             f"in job {job_name!r}, `{LOCK_CHECK_COMMAND}` runs at step {check_at} and "
             f"`{FROZEN_INSTALL_COMMAND}` at step {install_at}. The check must come "
@@ -121,13 +133,12 @@ def test_the_lock_check_runs_before_anything_installs(workflow) -> None:
 
 
 def test_every_install_is_frozen(workflow) -> None:
-    """No job may re-resolve.
+    """No job may re-resolve at install time.
 
     The lockfile is the supply chain. A job that resolves its own
     dependencies has not tested what ships, and a bare `uv sync` would
-    additionally REWRITE the lockfile in the runner — which would make
-    `uv lock --check` in a later job pass over a file CI had just fixed for
-    itself.
+    additionally REWRITE the lockfile in the runner — which would let CI
+    quietly repair the very drift `uv lock --check` had just refused.
     """
     for job_name, step in _steps(workflow):
         command = step.get("run") or ""
@@ -136,3 +147,31 @@ def test_every_install_is_frozen(workflow) -> None:
         assert FROZEN_INSTALL_COMMAND in command, (
             f"job {job_name!r} runs `uv sync` without `--frozen`: {command.strip()!r}"
         )
+
+
+def test_every_uv_run_is_frozen(workflow) -> None:
+    """`uv run` re-locks too, and that is the harder half.
+
+    Measured 2026-09-02: rolling `uv.lock` back to `main`'s stale version and
+    running `uv run pytest` changed the file's md5 and made a subsequent
+    `uv lock --check` exit 0. So an unfrozen `uv run` anywhere after the
+    install silently re-resolves against a different set than the one
+    `uv sync --frozen` installed, and repairs the drift in the runner while it
+    is at it.
+
+    The install-side assertion above does not cover this: its predicate is
+    `uv sync`, so every `uv run` step was uncovered. Both halves of "a CI run
+    that resolves its own dependencies has not tested what ships" are now
+    enforced.
+    """
+    for job_name, step in _steps(workflow):
+        command = step.get("run") or ""
+        if "uv run" not in command:
+            continue
+        for line in command.splitlines():
+            if "uv run" not in line:
+                continue
+            assert "uv run --frozen" in line, (
+                f"job {job_name!r} runs `uv run` without `--frozen`: {line.strip()!r}. "
+                "It would re-resolve, and rewrite uv.lock in the runner."
+            )
