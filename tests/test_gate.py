@@ -117,15 +117,19 @@ class TestVacuity:
         assert all(not c.met for c in result.clauses)
         assert all(c.detail for c in result.clauses)
 
-    def test_a_gate_with_no_clauses_is_zero_not_one(self) -> None:
+    def test_a_gate_with_no_clauses_is_unmeasured_not_zero(self) -> None:
         """`all([])` is True, and a gate whose clause list emptied would read
         as a pass over nothing — the vacuous truth that let a phase close
-        unmeasured."""
+        unmeasured. `met_ratio` must be `None`, not `0.0`: `0.0` says "we
+        measured, and nothing passed", which is a different, false, claim
+        from "we never measured" (alpha-engine-config-I9824)."""
         from crucible.gate import GateResult
 
         empty = GateResult(gate="phase1", trading_day=FRIDAY, window=WINDOW)
-        assert empty.met_ratio == 0.0
+        assert empty.met_ratio is None
+        assert empty.to_dict()["met_ratio"] is None
         assert not empty.met
+        assert empty.to_dict()["met"] is False
 
     def test_an_unregistered_gate_raises_rather_than_passing(self) -> None:
         with pytest.raises(KeyError, match="phase1"):
@@ -246,3 +250,60 @@ class TestArtifact:
         text = evaluate(LocalStore(tmp_path), gate="phase1", trading_day=FRIDAY).render()
         assert "NOT MET" in text
         assert "arc_runs_ok" in text
+
+
+class TestTheGateJobPublishesAnHonestMetric:
+    """`alpha-engine-config-I9824`, deliverable #3: an unmeasured gate must
+    publish `gate_clauses_met_ratio` as an explicit N/A-shaped status with a
+    reason, never as a numeric `0.0` that reads as "measured, none passed"."""
+
+    def test_an_empty_clause_list_publishes_NA_not_0_0(self, tmp_path, monkeypatch) -> None:
+        import argparse
+
+        from crucible.gate import GATES
+        from crucible.store import LocalStore
+        from crucible.track_f import gate_handler
+
+        monkeypatch.setitem(GATES, "phase1", (5, lambda *_a, **_k: []))
+        store_uri = str(tmp_path)
+        args = argparse.Namespace(gate="phase1", trading_day=FRIDAY, weeks=None, store=store_uri)
+        exit_code = gate_handler(args)
+        assert exit_code == 1  # unmet, per the fail-loud-on-exit-code invariant
+
+        store = LocalStore(tmp_path)
+        manifest = json.loads(store.get_bytes(f"runs/gate/{FRIDAY.isoformat()}/run.json"))
+        (metric,) = [m for m in manifest["metrics"] if m["name"] == "gate_clauses_met_ratio"]
+        assert metric["value"] is None
+        assert metric["status"].startswith("N/A")
+        assert metric["status_reason"]
+        assert metric["status"] != "0.0"
+
+        gate_artifact = json.loads(store.get_bytes(gate_key("phase1", FRIDAY.isoformat())))
+        assert gate_artifact["met_ratio"] is None
+
+    def test_a_real_measurement_still_publishes_its_ratio_as_a_number(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The N/A branch must not swallow a real reading — a gate that
+        measured something and met none of it still reports `0.0`, and it is
+        a numeric OK/FAIL status, not N/A."""
+        import argparse
+
+        from crucible.gate import GATES, Clause
+        from crucible.store import LocalStore
+        from crucible.track_f import gate_handler
+
+        monkeypatch.setitem(
+            GATES,
+            "phase1",
+            (5, lambda *_a, **_k: [Clause("c", "req", False, "unmet", ())]),
+        )
+        store_uri = str(tmp_path)
+        args = argparse.Namespace(gate="phase1", trading_day=FRIDAY, weeks=None, store=store_uri)
+        gate_handler(args)
+
+        store = LocalStore(tmp_path)
+        manifest = json.loads(store.get_bytes(f"runs/gate/{FRIDAY.isoformat()}/run.json"))
+        (metric,) = [m for m in manifest["metrics"] if m["name"] == "gate_clauses_met_ratio"]
+        assert metric["value"] == 0.0
+        assert not metric["status"].startswith("N/A")

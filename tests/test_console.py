@@ -290,8 +290,12 @@ class TestPage:
         whose numbers can only be scraped out of HTML is re-derived
         incorrectly by the next automated reader."""
         store = LocalStore(tmp_path)
-        html_key, json_key = write_page(store, build_page(store, now=SATURDAY_NIGHT))
-        assert store.exists(html_key) and store.exists(json_key)
+        # Every key `write_page` writes, not the first two: the phase-ladder
+        # artifact joined the page and its JSON, and a two-name unpack is how
+        # a third output turns a passing test into a ValueError.
+        keys = write_page(store, build_page(store, now=SATURDAY_NIGHT))
+        json_key = keys[1]
+        assert all(store.exists(k) for k in keys)
         assert json.loads(store.get_bytes(json_key))["population"] == len(load_registry())
 
     def test_the_transparency_gap_count_sees_metric_statuses_not_only_component_states(

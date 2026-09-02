@@ -18,8 +18,19 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+from typing import Any
 
-from crucible.gate import GATES, GateResult, evaluate, gate_key
+from krepis.metrics import derive_status
+
+from crucible.gate import (
+    GATES,
+    LADDER_KEY,
+    LADDER_SCHEMA_VERSION,
+    build_ladder,
+    evaluate,
+    gate_key,
+    ladder_payload,
+)
 from crucible.runner import RunContext, run_job
 from crucible.store import open_store
 from crucible.weekly import arc_stages, run_arc
@@ -86,7 +97,7 @@ def gate_handler(args: argparse.Namespace) -> int:
     is what a caller branches on.
     """
     store = open_store(getattr(args, "store", None))
-    result: dict[str, GateResult] = {}
+    result: dict[str, Any] = {}
 
     def body(ctx: RunContext) -> None:
         reading = evaluate(
@@ -102,7 +113,40 @@ def gate_handler(args: argparse.Namespace) -> int:
             for evidence in clause.evidence:
                 if store.exists(evidence):
                     ctx.record_input(evidence, store.get_bytes(evidence))
+        # The phase LADDER, republished on every gate read. The gate above
+        # answers "is phase N met"; the ladder answers "which phase is the
+        # rebuild on, and is any phase being graded ahead of an earlier one" —
+        # the question that lived only in `alpha-engine-config-I9757`'s issue
+        # comments, was written by hand, and was wrong twice. Written here
+        # rather than by a second command because a surface refreshed by a
+        # step somebody has to remember is the defect one layer along; the
+        # weekly `console` arc stage republishes it on a cadence as well.
+        ladder = build_ladder(
+            store,
+            trading_day=ctx.trading_day,
+            now=ctx.started,
+            readings={reading.gate: reading},
+        )
+        ctx.record_output(LADDER_KEY, ladder_payload(ladder), schema_version=LADDER_SCHEMA_VERSION)
+        result["ladder"] = ladder
         ctx.record_rows(rows_in=len(reading.window), rows_out=len(reading.clauses))
+        n_clauses = len(reading.clauses)
+        met_count = sum(1 for c in reading.clauses if c.met)
+        # `reading.met_ratio` is `None` for an unmeasured (empty-clause) gate
+        # (`crucible.gate.GateResult.met_ratio`, alpha-engine-config-I9824).
+        # `derive_status` turns that absence into an explicit N/A-shaped
+        # status rather than a bare 0.0 that would read as "measured, none
+        # passed" — the same vocabulary `crucible/report.py::_row` publishes
+        # through, not a second one invented here. The measured branch keeps
+        # this job's own OK/FAIL vocabulary (met vs not met), unchanged from
+        # before this fix — only the previously-impossible-to-express
+        # "nothing was measured" case is new.
+        if reading.met_ratio is None:
+            status = derive_status(value=None, n_samples=n_clauses, n_floor=1)
+            status_reason = f"gate {reading.gate}: no clauses registered, nothing measured"
+        else:
+            status = "OK" if reading.met else "FAIL"
+            status_reason = f"gate {reading.gate}: {met_count}/{n_clauses} clauses met"
         ctx.record_metric(
             {
                 "name": "gate_clauses_met_ratio",
@@ -111,11 +155,9 @@ def gate_handler(args: argparse.Namespace) -> int:
                 "value": reading.met_ratio,
                 "unit": "ratio",
                 "n_floor": 1,
-                "status": "OK" if reading.met else "FAIL",
-                "status_reason": (
-                    f"gate {reading.gate}: "
-                    f"{sum(1 for c in reading.clauses if c.met)}/{len(reading.clauses)} clauses met"
-                ),
+                "n_samples": n_clauses,
+                "status": status,
+                "status_reason": status_reason,
                 "source_path": key,
                 "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
@@ -124,6 +166,7 @@ def gate_handler(args: argparse.Namespace) -> int:
     run_job("gate", body, store=store, trading_day=args.trading_day)
     reading = result["reading"]
     print(reading.render())
+    print(result["ladder"].render())
     return 0 if reading.met else 1
 
 
