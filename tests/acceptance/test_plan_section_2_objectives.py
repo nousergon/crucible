@@ -49,19 +49,41 @@ def _attempt(clause: str, requirement: str, fn: Callable[[], Any]) -> Any:
 class TestAutonomy:
     """§2 row 1: 'Runs autonomously, minimal input'."""
 
-    def test_four_consecutive_saturdays_first_attempt_ok(self) -> None:
-        clause = "plan §2 row 1 / §6 phase-2 exit gate"
+    def test_the_ruled_live_gate_two_live_saturdays_plus_five_replayed(self) -> None:
+        """The gate is **2 live + 5 replayed**, not 4 live.
+
+        Plan §2 row 1 and the §6 phase table both still read "4 consecutive
+        Saturdays". §6.1 supersedes them and says so in terms: "Minimum live
+        gate: 2 consecutive first-attempt `ok` Saturdays, **not 4**" — the
+        four-Saturday soak becomes two live plus five replayed, on a path
+        whose inputs are point-in-time addressable, "stated here so the
+        shortcut is a ruling, not a drift". Adopted under the stated
+        assumption recorded on alpha-engine-config-I9751 at
+        2026-09-01T18:16Z — Brian's instruction was "begin work on crucible v2
+        per the plan", and §6.1 is the plan's own text on this gate. The phase-2
+        execution issue, alpha-engine-config-I9758, already carries it as its
+        closes-when: five unattended scheduler runs plus live Saturdays
+        2026-09-12 and 2026-09-19 first-attempt ok, then cutover.
+
+        This clause asserted 4 live Saturdays — two calendar weeks of soak
+        that was never required, and a calendar gate is the one cost no
+        amount of build speed can compress. An acceptance clause overstating
+        the ruled requirement is the same defect as one understating it: it
+        is not measuring what was decided.
+        """
+        clause = "plan §2 row 1 as superseded by §6.1 / §6 phase-2 exit gate"
         requirement = (
-            "4 consecutive weekly runs, first attempt, status: ok, each writing "
-            "runs/weekly/{trading_day}/run.json, with zero human-originated mutating "
-            "calls on v2 resources over the window."
+            "2 consecutive LIVE weekly runs, first attempt, status: ok, plus 5 "
+            "REPLAYED historical Saturdays (2026-08-01 … 08-29) also first-attempt "
+            "ok, each writing runs/weekly/{trading_day}/run.json, with zero "
+            "human-originated mutating calls on v2 resources over the window."
         )
         # Deliberately NOT "call the report handler and see whether it raises".
         # It stopped raising the day track E landed `report`, which would have
         # turned a phase-2 window clause green on a phase-1 job — a gate
         # passing because a different feature shipped. The window is read from
-        # four weeks of run manifests in the production store, and that is
-        # phase 2 (alpha-engine-config-I9757).
+        # the run manifests of the two live plus five replayed Saturdays in
+        # the production store, and that is phase 2 (alpha-engine-config-I9757).
         _unmet(clause, requirement)
 
     def test_zero_human_mutating_calls_is_read_from_the_cloudtrail_archive(
@@ -88,7 +110,7 @@ class TestAutonomy:
         clause = "plan §2 row 1, closed by §11 risk 8"
         requirement = (
             "The operator-action count is computed from the CloudTrail S3 archive "
-            "over the full 4-week window, never from `aws cloudtrail lookup-events`."
+            "over the full live-gate window, never from `aws cloudtrail lookup-events`."
         )
 
         # 1. No path to the truncating API. AST, not a grep: the module's own

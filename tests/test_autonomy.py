@@ -94,7 +94,7 @@ class TestTheForbiddenApi:
     def test_the_module_never_reaches_for_lookup_events(self) -> None:
         """§11 risk 8: `lookup-events` truncates its username lookup to about
         two days and returns a plausible short answer rather than erroring, so
-        a four-week gate built on it reports zero because it looked at two
+        a multi-week gate built on it reports zero because it looked at two
         days. The module is asserted to contain no path to it at all."""
         tree = ast.parse(inspect.getsource(autonomy))
         # The AST, not a grep over the text: the module's own docstring names
