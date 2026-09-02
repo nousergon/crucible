@@ -85,12 +85,18 @@ jobs:
 
           echo "Posting pending adversarial-review-gate check-run for PR #$PR_NUM @ $SHA"
 
+          # `output` is a nested OBJECT in the check-runs API, not a string —
+          # `-f output='{"title":...}'` sends the literal string and 422s
+          # ("not an object or null"), measured 2026-09-02 on this exact
+          # workflow. `-f output[title]=... -f output[summary]=...` is gh
+          # api's field-path syntax for building the nested object.
           gh api "/repos/$REPO/check-runs" \
             -X POST \
             -f name="adversarial-review-gate" \
             -f head_sha="$SHA" \
             -f status="in_progress" \
-            -f output="{\"title\":\"Adversarial review gate: pending\",\"summary\":\"Waiting on an independent adversarial review against plan section 2 acceptance tests (plan section 11 risk 1). Resolved by the 'resolve' job in this workflow (workflow_dispatch), run by a reviewer who is not this PR's author.\"}"
+            -f output[title]="Adversarial review gate: pending" \
+            -f output[summary]="Waiting on an independent adversarial review against plan section 2 acceptance tests (plan section 11 risk 1). Resolved by the 'resolve' job in this workflow (workflow_dispatch), run by a reviewer who is not this PR's author."
 
   resolve:
     if: github.event_name == 'workflow_dispatch'
@@ -148,19 +154,18 @@ jobs:
           set -euo pipefail
 
           title="Adversarial review: ${CONCLUSION}"
-          body=$(jq -n \
-            --arg title "$title" \
-            --arg summary "$SUMMARY" \
-            --arg reviewer "$ACTOR" \
-            --arg author "$AUTHOR" \
-            '{title: $title, summary: ($summary + "\n\nReviewed by: " + $reviewer + " (independent of author " + $author + ")")}')
+          full_summary="$(printf '%s\n\nReviewed by: %s (independent of author %s)' "$SUMMARY" "$ACTOR" "$AUTHOR")"
 
+          # See the note in post-pending-check: `output` is a nested object,
+          # built here via gh api's `-f output[key]=value` field-path syntax
+          # rather than a literal JSON string.
           gh api "/repos/$REPO/check-runs" \
             -X POST \
             -f name="adversarial-review-gate" \
             -f head_sha="$SHA" \
             -f status="completed" \
             -f conclusion="$CONCLUSION" \
-            -f output="$body"
+            -f output[title]="$title" \
+            -f output[summary]="$full_summary"
 
           echo "Recorded adversarial-review-gate=$CONCLUSION for $SHA (reviewer: $ACTOR, author: $AUTHOR)"
