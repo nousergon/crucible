@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nousergon.dev/crucible/schemas/arm_predictions.v1.json",
+  "title": "arm_predictions.v1",
+  "description": "One M arm's cross-section of predicted alpha for ONE trading day. The producer/consumer contract a stacked arm reads through (alpha-engine-config-I9777). The trading day is carried IN the document as well as in the key so a consumer can refuse a payload written for another day rather than train on it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "arm_id",
+    "trading_day",
+    "feature_version",
+    "predicted_alpha"
+  ],
+  "properties": {
+    "schema_version": {"const": "arm_predictions.v1"},
+    "arm_id": {
+      "type": "string",
+      "pattern": "^[a-z]:[A-Za-z0-9_.-]+:[0-9a-f]+$",
+      "description": "The producing arm's full `{slot}:{name}:{spec_hash}` identity. The spec hash is what makes a stacked arm's lineage name the exact base recipe that fed it."
+    },
+    "trading_day": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+    "feature_version": {"type": "string", "minLength": 1},
+    "predicted_alpha": {
+      "type": "object",
+      "description": "ticker -> predicted alpha, in the arm's own units (raw). Never standardized here: a transform applied by the producer is a transform no consumer declared.",
+      "minProperties": 1,
+      "additionalProperties": {"type": "number"},
+      "propertyNames": {"pattern": "^[A-Za-z0-9.-]+$"}
+    }
+  }
+}

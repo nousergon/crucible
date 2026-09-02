@@ -663,7 +663,7 @@ class TestRecipeLoading:
             ),
             encoding="utf-8",
         )
-        recipes = load_model_recipes(tmp_path)
+        recipes = load_model_recipes(tmp_path, feature_columns=("mom_21d_ratio",))
         assert len(recipes) == 1
         assert recipes[0].arm_id.startswith("m:residual_momentum:")
 
