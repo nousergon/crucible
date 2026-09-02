@@ -49,11 +49,28 @@ from. A base arm's opinion about a later session is therefore unreachable
 rather than merely unused.
 
 **Identity.** The stacked recipe hashes the base arm's *name*, not its id —
-the id is not knowable from one file. The binding to the exact base *recipe*
-is made where it can be verified: the resolved key carries the base arm's
-spec hash in its segment, and every read is recorded as a manifest input, so
-`crucible explain` walks a stacked verdict back to the precise base vintage
-that produced each column (plan §10.8).
+the id is not knowable from one file. The binding from that name to the arm
+actually read is made twice, and both times by code rather than by a caller:
+:func:`crucible.slots.model.design_panel` resolves every base id from the
+loaded recipe set, and :func:`stack_prediction_columns` asserts that the id
+it was handed carries the name that asked for it
+(:func:`arm_name_from_id`). Before that assertion existed, a caller-supplied
+`base_arm_ids` could stack any arm's cross-section under any declared base's
+column; the lineage recorded the key honestly and the design matrix was
+still wrong. The resolved key then carries the base arm's spec hash in its
+segment, and every read is recorded as a manifest input, so `crucible
+explain` walks a stacked verdict back to the precise base vintage that
+produced each column (plan §10.8).
+
+**Wiring is a table, not a call site.** :data:`INPUT_RESOLVERS` maps every
+kind in :data:`INPUT_KINDS` to the function that materialises it onto a
+panel. :func:`assert_inputs_producible` refuses at registration any declared
+kind with no row, importing this module fails outright if the grammar admits
+a kind nothing resolves, and :func:`resolve_declared_inputs` — reached from
+the M slot's one panel-building seam — iterates the table rather than naming
+kinds. A producer declared and never wired is the defect this module was
+written to remove and then reproduced once; the table is what stops a third
+occurrence, because there is no longer a call site to forget.
 """
 
 from __future__ import annotations
@@ -77,15 +94,20 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "ARM_PREDICTIONS_SCHEMA_VERSION",
     "INPUT_KINDS",
+    "INPUT_RESOLVERS",
     "ArmPredictionsContractError",
+    "BasePredictionsUnavailableError",
     "InputCycleError",
     "InputRef",
     "UnproducibleInputError",
+    "UnresolvedInputError",
+    "arm_name_from_id",
     "arm_predictions_key",
     "assert_inputs_producible",
     "parse_input_ref",
     "prediction_column",
     "read_arm_predictions",
+    "resolve_declared_inputs",
     "resolve_prediction_inputs",
     "stack_prediction_columns",
     "write_arm_predictions",
@@ -126,6 +148,27 @@ class ArmPredictionsContractError(ValueError):
     """A predictions artifact that does not conform, or is not the one asked for."""
 
 
+class BasePredictionsUnavailableError(ArmPredictionsContractError):
+    """A base arm's predictions do not exist for every session the panel carries.
+
+    Separate from a malformed document because the remedy is different and
+    mechanical: run the base arm's producer over the named sessions. The
+    message carries the count and the command, because a stacked arm on a
+    504-session window needs 504 base-arm artifacts and "KeyError" repeated
+    once per missing day is not an operator instruction.
+    """
+
+
+class UnresolvedInputError(UnproducibleInputError):
+    """A declared input was never materialised onto the panel being trained on.
+
+    The refusal that replaces `KeyError: feature 'predicted_alpha_x_raw' is
+    not in this panel`. That message blamed the parquet layer for a column
+    the parquet layer was never asked to produce; this one names the seam
+    that was skipped and the producer that fills it.
+    """
+
+
 @dataclass(frozen=True)
 class InputRef:
     """One typed input reference: a kind and the thing it names."""
@@ -156,6 +199,24 @@ class InputRef:
 def prediction_column(arm_name: str) -> str:
     """The design column a `predictions[<arm-name>]` input contributes."""
     return _PREDICTION_COLUMN_TEMPLATE.format(name=arm_name)
+
+
+def arm_name_from_id(arm_id: str) -> str:
+    """`m:gbm_directional:ab12cd` -> `gbm_directional`.
+
+    The declared name and the artifact actually read are bound here. Without
+    it, `base_arm_ids` was a caller-supplied lookup nothing checked, so any
+    arm's cross-section could be stacked under any declared base's column
+    and the design matrix would be wrong while every surface stayed quiet.
+    """
+    parts = str(arm_id).split(":")
+    if len(parts) != 3 or not all(parts):
+        raise UnproducibleInputError(
+            f"arm id {arm_id!r} is not `{{slot}}:{{name}}:{{spec_hash}}`. A stacked arm "
+            "binds a declared base NAME to a resolved arm ID; an id whose name cannot be "
+            "read is an id that cannot be checked against the name that asked for it."
+        )
+    return parts[1]
 
 
 def parse_input_ref(text: str) -> InputRef:
@@ -268,6 +329,16 @@ def assert_inputs_producible(recipes: Sequence[Any], *, feature_columns: Sequenc
     """
     produced = set(feature_columns)
     for recipe in recipes:
+        for ref in getattr(recipe, "inputs", ()):
+            if ref.kind not in INPUT_RESOLVERS:
+                raise UnproducibleInputError(
+                    f"arm {recipe.name!r} declares input {ref.text!r}, but the harness has "
+                    f"no producer wired for kind {ref.kind!r}: "
+                    f"`crucible.slots.inputs.INPUT_RESOLVERS` carries "
+                    f"{sorted(INPUT_RESOLVERS)}. The arm does NOT register. A kind that is "
+                    "declarable but not resolvable is exactly `registers fine, could never "
+                    "be graded` with a new name (alpha-engine-config-I9777)."
+                )
         wanted = {c: "spec.features" for c in recipe.features}
         for ref in getattr(recipe, "inputs", ()):
             if ref.kind == "features":
@@ -422,6 +493,16 @@ def stack_prediction_columns(
     whole training axis rather than only at its anchor — a base arm's
     prediction for session *t* is the one that lands in row *t*.
 
+    **The declared name is checked against the id it resolved to.**
+    ``base_arm_ids`` is a lookup, and a lookup nothing verifies is a lookup
+    that can be wrong: before this check, `base_arm_ids={"base":
+    "m:totally_different_arm:deadbe"}` stacked an unrelated arm's opinion
+    under the column `predicted_alpha_base_raw` without complaint. The
+    lineage recorded the key honestly and the design matrix was still wrong.
+    :func:`crucible.slots.model.design_panel` resolves the mapping from the
+    loaded recipe set so a caller cannot supply one at all; this assertion is
+    what makes that the only reachable outcome rather than the usual one.
+
     A base arm that did not score every name the panel carries is a refusal,
     not a hole: a stacked arm's design row is only meaningful when every base
     model expressed an opinion about that name, and a substituted zero is the
@@ -435,7 +516,8 @@ def stack_prediction_columns(
 
     blocks = dict(panel.features)
     for ref in refs:
-        arm_id = base_arm_ids[ref.ref]
+        arm_id = _resolved_base_arm_id(recipe, ref, base_arm_ids)
+        _assert_base_predictions_present(store, arm_id=arm_id, ref=ref, dates=panel.dates)
         block = np.full((len(panel.dates), len(panel.names)), np.nan, dtype="float64")
         for row, day in enumerate(panel.dates):
             scores = read_arm_predictions(store, arm_id=arm_id, trading_day=day, ctx=ctx)
@@ -452,6 +534,139 @@ def stack_prediction_columns(
             block[row, :] = np.array([scores[n] for n in panel.names], dtype="float64")
         blocks[ref.column] = block
 
+    return _with_resolved(panel, features=blocks, refs=refs)
+
+
+def _resolved_base_arm_id(recipe: Any, ref: InputRef, base_arm_ids: Mapping[str, str]) -> str:
+    """The arm id for ``ref``, verified to belong to the name ``ref`` declares."""
+    try:
+        arm_id = base_arm_ids[ref.ref]
+    except KeyError as exc:
+        raise UnproducibleInputError(
+            f"arm {getattr(recipe, 'name', '<unnamed>')!r} declares input {ref.text!r} but "
+            f"no arm id was resolved for {ref.ref!r}; ids were resolved for "
+            f"{sorted(base_arm_ids)}. Build the panel with "
+            "`crucible.slots.model.design_panel`, which resolves every base id from the "
+            "loaded recipe set."
+        ) from exc
+    actual = arm_name_from_id(arm_id)
+    if actual != ref.ref:
+        raise UnproducibleInputError(
+            f"input {ref.text!r} resolved to arm id {arm_id!r}, whose name is {actual!r}. "
+            f"The design column {ref.column!r} would then carry {actual!r}'s opinion under "
+            f"{ref.ref!r}'s name — a wrong design matrix that every surface renders as a "
+            "healthy one, because the lineage honestly records the key that was read."
+        )
+    return arm_id
+
+
+def _assert_base_predictions_present(
+    store: Store, *, arm_id: str, ref: InputRef, dates: Sequence[str]
+) -> None:
+    """Every session the panel carries has a base-arm artifact, or one refusal.
+
+    Checked ahead of the read loop and reported as a COUNT with the command
+    that fills it. Registration can establish that a base arm exists; only
+    the store can say whether it has run, and a stacked arm on a 504-session
+    window needs 504 artifacts. One `KeyError` per missing day, discovered
+    one day at a time, is not an operator instruction.
+    """
+    missing = [d for d in dates if not store.exists(arm_predictions_key(arm_id, d))]
+    if not missing:
+        return
+    raise BasePredictionsUnavailableError(
+        f"base arm {arm_id!r} has no predictions artifact for {len(missing)} of "
+        f"{len(dates)} panel session(s) (first {missing[0]}, last {missing[-1]}). A "
+        f"stacked arm reads {ref.text!r} on every row of its training window, so a gap is "
+        "a refusal rather than a hole — a substituted zero is the 2026-08-28 hard-zeroed "
+        "condition by another door. Produce them with:\n"
+        f"    crucible experiment.run --slot m --arm {ref.ref} --trading-day <session>"
+    )
+
+
+def _resolve_feature_inputs(
+    panel: FeaturePanel,
+    *,
+    store: Store,  # noqa: ARG001 - resolver signature; features come from the layer
+    recipe: Any,
+    base_arm_ids: Mapping[str, str],  # noqa: ARG001 - resolver signature
+    ctx: Any = None,  # noqa: ARG001 - resolver signature
+) -> FeaturePanel:
+    """`features[...]` inputs: already produced by the layer, asserted here.
+
+    A resolver rather than a no-op so the table below is total over
+    :data:`INPUT_KINDS`. A kind present in the grammar and absent from the
+    table is what `predictions` was before this change — declarable,
+    registerable, and resolved by nothing.
+    """
+    refs = [r for r in getattr(recipe, "inputs", ()) if r.kind == "features"]
+    if not refs:
+        return panel
+    missing = sorted(r.column for r in refs if r.column not in panel.features)
+    if missing:
+        raise UnresolvedInputError(
+            f"arm {getattr(recipe, 'name', '<unnamed>')!r} declares feature input(s) "
+            f"{missing} which this panel does not carry; it carries "
+            f"{sorted(panel.features)}. The feature layer produces these columns — the "
+            "panel was built without asking for them."
+        )
+    return _with_resolved(panel, features=dict(panel.features), refs=refs)
+
+
+def _with_resolved(
+    panel: FeaturePanel, *, features: dict[str, Any], refs: Sequence[InputRef]
+) -> FeaturePanel:
+    """``panel`` with ``features``, and the resolved refs recorded on it.
+
+    The provenance is what lets :func:`crucible.slots.model._design` tell
+    "this panel was never built through the seam" from "the layer is missing
+    a column", and report the first as the wiring defect it is.
+    """
     from dataclasses import replace  # noqa: PLC0415
 
-    return replace(panel, features=blocks)
+    resolved = tuple(getattr(panel, "resolved_inputs", ())) + tuple(r.text for r in refs)
+    return replace(panel, features=features, resolved_inputs=resolved)
+
+
+#: kind -> the function that materialises that kind's columns onto a panel.
+#:
+#: The table is the wiring. :func:`assert_inputs_producible` refuses at
+#: REGISTRATION any declared kind absent from it, and the import-time check
+#: below refuses to load a module whose grammar admits a kind nothing
+#: resolves — so the shape of `alpha-engine-config-I9777` (a producer
+#: declared and never wired, an arm registering fine and dying at training)
+#: cannot reopen for a third kind without the process failing to start.
+INPUT_RESOLVERS: dict[str, Any] = {
+    "features": _resolve_feature_inputs,
+    "predictions": stack_prediction_columns,
+}
+
+_UNWIRED = tuple(k for k in INPUT_KINDS if k not in INPUT_RESOLVERS)
+if _UNWIRED:  # pragma: no cover - an import-time structural guard
+    raise RuntimeError(
+        f"input kind(s) {list(_UNWIRED)} are declarable under `spec.inputs` but have no "
+        "entry in INPUT_RESOLVERS, so an arm declaring one would register and then die "
+        "when its design matrix was built. Wire the producer or remove the kind from "
+        "INPUT_KINDS; there is no third option (alpha-engine-config-I9777)."
+    )
+
+
+def resolve_declared_inputs(
+    panel: FeaturePanel,
+    *,
+    store: Store,
+    recipe: Any,
+    base_arm_ids: Mapping[str, str],
+    ctx: Any = None,
+) -> FeaturePanel:
+    """Materialise EVERY declared input onto ``panel``, one resolver per kind.
+
+    Iterates :data:`INPUT_RESOLVERS` rather than naming kinds, so a fourth
+    kind is wired by adding a row to the table and nothing else — the seam
+    picks it up, and a row that is missing is refused at registration.
+    """
+    for kind in INPUT_KINDS:
+        panel = INPUT_RESOLVERS[kind](
+            panel, store=store, recipe=recipe, base_arm_ids=base_arm_ids, ctx=ctx
+        )
+    return panel

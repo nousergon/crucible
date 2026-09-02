@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from itertools import combinations
 from pathlib import Path
@@ -78,7 +79,14 @@ from nousergon_lib.arena.engine import TrainingIntegrityError, TrainingStatus
 
 from crucible.features.registry import UNIT_SUFFIXES
 from crucible.keys import features_key
-from crucible.slots.inputs import InputRef, assert_inputs_producible, parse_input_ref
+from crucible.slots.inputs import (
+    InputRef,
+    UnresolvedInputError,
+    assert_inputs_producible,
+    parse_input_ref,
+    resolve_declared_inputs,
+    write_arm_predictions,
+)
 
 __all__ = [
     "DISPERSION_METRICS",
@@ -99,6 +107,10 @@ __all__ = [
     "ModelGrade",
     "InputRef",
     "ModelRecipe",
+    "UnresolvedInputError",
+    "design_panel",
+    "predict_cross_section",
+    "produce_arm_predictions",
     "TrainingWindowSpec",
     "VetoResult",
     "assert_units_suffixes",
@@ -424,6 +436,14 @@ class FeaturePanel:
     features: dict[str, np.ndarray]
     forward_returns: np.ndarray
     feature_version: str
+    #: The `spec.inputs` references materialised onto this panel, in the
+    #: text form the recipe declared them (`predictions[base]`). Empty on a
+    #: panel straight from :meth:`FeatureLayerSource.panel`, which produces
+    #: feature columns and nothing else. :func:`_design` reads it to tell a
+    #: skipped seam from a missing parquet column — two defects whose
+    #: remedies have nothing in common and which used to raise the same
+    #: `KeyError` (`alpha-engine-config-I9777`).
+    resolved_inputs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         shape = (len(self.dates), len(self.names))
@@ -453,6 +473,7 @@ class FeaturePanel:
             features={k: v[:n] for k, v in self.features.items()},
             forward_returns=self.forward_returns[:n],
             feature_version=self.feature_version,
+            resolved_inputs=self.resolved_inputs,
         )
 
     def with_zeroed(self, columns: tuple[str, ...]) -> FeaturePanel:
@@ -918,6 +939,87 @@ def load_model_recipes(
 DEGENERATE_STD = 1e-9
 
 
+def design_panel(
+    recipe: ModelRecipe,
+    *,
+    source: FeatureLayerSource,
+    trading_day: str,
+    recipes: Sequence[ModelRecipe] = (),
+    store: Any = None,
+    lookback_trading_days: int = 0,
+    ctx: Any = None,
+) -> FeaturePanel:
+    """The ONE way to obtain a panel an M arm can be fitted on.
+
+    `alpha-engine-config-I9777` was filed because a stacked arm registered
+    and could never be graded. The first fix moved the refusal from
+    `FeatureLayerSource.panel()` to `FeaturePanel.column()` and declared a
+    producer and a stacker that no production code called — the same defect,
+    one frame later. This function is the seam that was missing: it reads the
+    feature layer for the arm's `spec.features` and then materialises every
+    `spec.inputs` reference through
+    :func:`crucible.slots.inputs.resolve_declared_inputs`, so a panel handed
+    to :func:`train_arm` or :func:`grade_arm` carries the arm's WHOLE design
+    matrix or the call already failed.
+
+    **Base ids are resolved here, from the loaded recipe set.** The caller
+    never supplies them, so the mapping cannot name an arm other than the one
+    the recipe declared; :func:`crucible.slots.inputs.stack_prediction_columns`
+    asserts the same property again on the value it receives, because a check
+    that only holds when one caller behaves is not a property of the code.
+
+    ``recipes`` is the slot's loaded set — what
+    :func:`load_model_recipes` returned. It is required only when the arm
+    declares prediction inputs; an arm whose design matrix is entirely the
+    feature layer needs no graph and passes none.
+    """
+    columns = tuple(recipe.features)
+    panel = source.panel(
+        trading_day=trading_day,
+        columns=columns,
+        lookback_trading_days=lookback_trading_days,
+        label_horizon_trading_days=recipe.label_horizon_trading_days,
+        ctx=ctx,
+    )
+    if not recipe.inputs:
+        return panel
+    if store is None:
+        store = source.store
+    return resolve_declared_inputs(
+        panel,
+        store=store,
+        recipe=recipe,
+        base_arm_ids=_base_arm_ids(recipe, recipes),
+        ctx=ctx,
+    )
+
+
+def _base_arm_ids(recipe: ModelRecipe, recipes: Sequence[ModelRecipe]) -> dict[str, str]:
+    """`{base name: base arm id}` for this recipe, from the loaded slot set.
+
+    Registration already refused an input naming an arm the slot does not
+    declare (`assert_inputs_producible`), so reaching this raise means the
+    panel is being built from a different recipe set than the one that
+    registered — which is a caller defect and not a data condition.
+    """
+    by_name = {r.name: r for r in recipes}
+    resolved: dict[str, str] = {}
+    for ref in recipe.inputs:
+        if ref.kind != "predictions":
+            continue
+        base = by_name.get(ref.ref)
+        if base is None:
+            raise UnresolvedInputError(
+                f"arm {recipe.name!r} declares input {ref.text!r}, but the recipe set "
+                f"passed to `design_panel` declares {sorted(by_name)}. Pass the set "
+                "`load_model_recipes` returned: the base arm's ID is derived from its "
+                "recipe and is never supplied by a caller, so an absent recipe means the "
+                "id cannot be derived rather than that it is unknown."
+            )
+        resolved[ref.ref] = base.arm_id
+    return resolved
+
+
 @dataclass(frozen=True)
 class Fit:
     """One fitted arm. The weights are the refit; the recipe is the arm."""
@@ -932,7 +1034,42 @@ class Fit:
 
 
 def _design(recipe: ModelRecipe, panel: FeaturePanel, rows: np.ndarray) -> np.ndarray:
+    _assert_inputs_resolved(recipe, panel)
     return np.column_stack([panel.column(f).reshape(-1)[rows] for f in recipe.design_columns])
+
+
+def _assert_inputs_resolved(recipe: ModelRecipe, panel: FeaturePanel) -> None:
+    """Refuse a panel that never had this arm's declared inputs materialised.
+
+    The `alpha-engine-config-I9777` defect in its second form. A stacked arm
+    registers, and then `panel.column()` raises `KeyError: feature
+    'predicted_alpha_base_raw' is not in this panel` — a message about a
+    missing parquet column, for a column the parquet layer was never asked
+    to produce and never could. The remedy is not "compile the feature
+    layer"; it is "build the panel through :func:`design_panel`", and a
+    refusal that does not say so sends an operator to the wrong file.
+
+    Reads the panel's own provenance rather than re-deriving anything, so it
+    is total over :data:`crucible.slots.inputs.INPUT_KINDS` — a fourth kind
+    needs no line here.
+    """
+    if not recipe.inputs:
+        return
+    resolved = set(panel.resolved_inputs)
+    unresolved = [r for r in recipe.inputs if r.text not in resolved]
+    if not unresolved:
+        return
+    raise UnresolvedInputError(
+        f"arm {recipe.name!r} declares input(s) {[r.text for r in unresolved]}, which "
+        f"contribute design column(s) {[r.column for r in unresolved]}; this panel "
+        f"resolved {sorted(resolved)} and carries columns {sorted(panel.features)}. A "
+        "panel for an arm with declared inputs is built by "
+        "`crucible.slots.model.design_panel`, which resolves every input through "
+        "`crucible.slots.inputs.INPUT_RESOLVERS`; a panel straight from "
+        "`FeatureLayerSource.panel()` carries feature columns and nothing else. This "
+        "refusal replaces the `KeyError` about a missing parquet column that made the "
+        "wiring gap read as a feature-layer gap (alpha-engine-config-I9777)."
+    )
 
 
 def _assert_trainable(recipe: ModelRecipe, matrix: np.ndarray, labels: np.ndarray) -> None:
@@ -1054,6 +1191,54 @@ def train_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> Fit:
         fitted_at=as_of,
         n_rows=n_rows,
         training_status=TrainingStatus(arm_id=recipe.arm_id, ok=True),
+    )
+
+
+def predict_cross_section(fit: Fit, panel: FeaturePanel, *, trading_day: str) -> dict[str, float]:
+    """``fit``'s predicted alpha per name for ONE session of ``panel``.
+
+    The same `_design` the fit was trained through, so a stacked arm's
+    serving row is assembled by the code that assembled its training rows —
+    a serving path that built its design matrix separately is how "the model
+    changed" and "the input changed" stop being distinguishable.
+    """
+    try:
+        row = panel.dates.index(trading_day)
+    except ValueError as exc:
+        raise KeyError(
+            f"{trading_day} is not on this panel's session axis "
+            f"({panel.dates[0]}..{panel.dates[-1]}, {len(panel.dates)} session(s)). A "
+            "prediction for a session the panel does not carry would be computed from "
+            "some other session's features."
+        ) from exc
+    rows = row * len(panel.names) + np.arange(len(panel.names))
+    values = _design(fit.recipe, panel, rows) @ fit.coefficients + fit.intercept
+    unscored = [n for n, v in zip(panel.names, values, strict=True) if not np.isfinite(float(v))]
+    if unscored:
+        raise TrainingIntegrityError(
+            f"arm {fit.recipe.name}: {len(unscored)} name(s) produced a non-finite "
+            f"prediction on {trading_day}, first five {unscored[:5]}. A NaN written into "
+            "the predictions artifact is a hole a downstream stacked arm would either "
+            "train on or refuse a whole session for; it fails here instead."
+        )
+    return {n: float(v) for n, v in zip(panel.names, values, strict=True)}
+
+
+def produce_arm_predictions(ctx: Any, *, fit: Fit, panel: FeaturePanel, trading_day: str) -> str:
+    """Write ONE arm's cross-section for ONE session. The M produce path.
+
+    The producer half of the `arm_predictions.v1` contract, called from the
+    module that owns fitting rather than from the module that defines the
+    schema — so the artifact a stacked arm consumes is written by the same
+    code that trains the arm which consumes it, and neither half of the
+    contract is reachable only from a test.
+    """
+    return write_arm_predictions(
+        ctx,
+        arm_id=fit.arm_id,
+        trading_day=trading_day,
+        feature_version=panel.feature_version,
+        predicted_alpha=predict_cross_section(fit, panel, trading_day=trading_day),
     )
 
 
