@@ -80,6 +80,31 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      # The lockfile agrees with pyproject.toml. FIRST, before anything
+      # installs or runs.
+      #
+      # Measured 2026-09-02: seven Dependabot PRs (#31-#37) raised dependency
+      # floors in pyproject.toml -- numpy >=2.1 to >=2.5.2, pyarrow >=14.0 to
+      # >=25.0.1, jsonschema, PyYAML, ruff -- and none regenerated uv.lock.
+      # All seven merged with fully green CI, and main then carried a lockfile
+      # whose recorded requirements named the OLD floors.
+      #
+      # `uv sync --frozen` does not catch this: verified against main at
+      # 44d00a5, it exits 0. `--frozen` installs the locked versions without
+      # re-checking them against pyproject.toml, so the drift is invisible to
+      # the one command every job here runs.
+      #
+      # `uv lock --check` is uv's own contract check and is the thing that
+      # cannot be fooled: exit 1 on main's stale lockfile, exit 0 once
+      # regenerated, both measured. A pytest guard was written first and
+      # DISCARDED, because `uv run pytest` implicitly re-locks before running
+      # -- so the test would have rewritten the very file it was grading and
+      # reported green. A guard that reads as coverage while being blind is
+      # worse than none, and that is the class this repository keeps finding
+      # in other people's systems.
+      - name: The lockfile agrees with pyproject.toml
+        run: uv lock --check
+
       # --frozen, never a re-resolve. The lockfile is the supply chain: a CI
       # run that resolves its own dependencies has not tested what ships.
       - name: Install
