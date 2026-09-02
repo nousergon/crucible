@@ -41,8 +41,8 @@ the key only when the arm declares one, and a test pins an existing arm's id
 across this change.
 
 **Point-in-time by construction.** A prediction input resolves to
-``predictions/{arm}/{trading_day}.json`` — the *same* trading day as the row
-being built, on the panel's own date axis. There is no code path that reads
+:func:`crucible.keys.arm_predictions_key` for the *same* trading day as the
+row being built, on the panel's own date axis. There is no code path that reads
 a later day: the key names the day, and :func:`read_arm_predictions` refuses
 a payload whose own ``trading_day`` field disagrees with the key it was read
 from. A base arm's opinion about a later session is therefore unreachable
@@ -85,7 +85,7 @@ from typing import TYPE_CHECKING, Any
 
 from jsonschema import Draft202012Validator
 
-from crucible.keys import arm_key_segment
+from crucible.keys import arm_predictions_key
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from crucible.slots.model import FeaturePanel
@@ -363,23 +363,7 @@ def assert_inputs_producible(recipes: Sequence[Any], *, feature_columns: Sequenc
 # The predictions artifact — the versioned producer/consumer contract.
 # ---------------------------------------------------------------------------
 
-#: `predictions/{arm}/{trading_day}.json`. Declared here rather than in
-#: `crucible.keys` only because that module is being edited concurrently for
-#: `alpha-engine-config-I9772`; it belongs there, and moving it is tracked.
-_ARM_PREDICTIONS_PREFIX = "predictions"
-
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "arm_predictions.v1.json"
-
-
-def arm_predictions_key(arm_id: str, trading_day: str) -> str:
-    """What ONE arm predicted on ONE trading day.
-
-    Per-arm, not per-slot: `predictions/{trading_day}.json` is the *champion's*
-    serving feed, and a stacked arm reading that would depend on whichever arm
-    holds the pointer — a base model that silently changes identity between
-    two cycles, and a self-reference the moment the stacked arm won the slot.
-    """
-    return f"{_ARM_PREDICTIONS_PREFIX}/{arm_key_segment(arm_id)}/{trading_day}.json"
 
 
 @lru_cache(maxsize=1)

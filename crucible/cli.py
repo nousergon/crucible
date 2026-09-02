@@ -33,6 +33,8 @@ from dataclasses import dataclass
 
 from crucible import __version__, track_c, track_e, track_f  # track-C, track-E, track-F
 from crucible.calendar import resolve_trading_day
+from crucible.keys import arena_cycle_key, champion_key
+from crucible.keys import manifest_key as _promote_manifest_key
 from crucible.track_a import HANDLERS as TRACK_A_HANDLERS
 from crucible.track_a import add_track_a_arguments
 
@@ -139,10 +141,10 @@ def _promote(args: argparse.Namespace) -> int:
                 as_of=as_of,
                 operator=getattr(args, "operator", None) or os.environ.get("USER", "unknown"),
                 reason=args.reason,
-                manifest_key=f"runs/promote/{as_of}/run.json",
+                manifest_key=_promote_manifest_key("promote", as_of),
                 run_id=ctx.run_id,
             )
-            _record_written(ctx, store, (f"champions/{pointer.slot}/current.json",))
+            _record_written(ctx, store, (champion_key(pointer.slot),))
             return
 
         inputs = load_slot_inputs(store, args.slot)
@@ -153,7 +155,7 @@ def _promote(args: argparse.Namespace) -> int:
             series_by_arm=inputs.series_by_arm,
             incumbent=inputs.incumbent,
             store=None if args.dry_run else store,
-            manifest_key=f"runs/promote/{as_of}/run.json",
+            manifest_key=_promote_manifest_key("promote", as_of),
             run_id=ctx.run_id,
         )
         _record_written(ctx, store, result.keys_written)
@@ -170,7 +172,7 @@ def _promote(args: argparse.Namespace) -> int:
                 "n_floor": 1,
                 "status": result.decision.status,
                 "status_reason": result.decision.reason or "pointer held",
-                "source_path": f"arena/{args.slot}/{as_of}/arena_cycle.json",
+                "source_path": arena_cycle_key(args.slot, as_of),
                 "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
         )

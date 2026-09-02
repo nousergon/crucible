@@ -25,7 +25,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 from nousergon_lib.arena import ArenaCycle
 
-from crucible.calendar import assert_trading_day
+from crucible.keys import arena_cycle_key
 from crucible.store import Store
 
 __all__ = [
@@ -40,19 +40,6 @@ __all__ = [
 
 class ArenaCycleValidationError(ValueError):
     """An `arena_cycle` document that does not conform to the library contract."""
-
-
-def arena_cycle_key(slot: str, trading_day: str) -> str:
-    """The store key for one slot's cycle artifact.
-
-    The trading day is the key (§4.12); the slot is above it so that a
-    slot's whole history lists under one prefix, which is what the console's
-    "cycles since the pointer last moved" panel walks.
-    """
-    if not slot:
-        raise ValueError("slot must be non-empty")
-    assert_trading_day(trading_day, context=f"arena_cycle key for slot {slot!r}")
-    return f"arena/{slot}/{trading_day}/arena_cycle.json"
 
 
 @lru_cache(maxsize=1)

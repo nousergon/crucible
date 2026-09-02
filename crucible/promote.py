@@ -62,7 +62,14 @@ from crucible.champion import (
     read_champion_etag,
     write_champion,
 )
-from crucible.keys import arm_register_key, arm_series_key
+from crucible.keys import (
+    arm_register_key,
+    arm_series_key,
+    champion_key,
+    experiments_key,
+    retirement_log_key,
+)
+from crucible.keys import manifest_key as _promote_manifest_key
 from crucible.slots import SlotSpec, is_control_arm
 from crucible.store import ETAG_ABSENT, Store
 
@@ -106,26 +113,6 @@ def paired_days_required(spec: SlotSpec) -> int:
     window — an eligibility clock nobody declared.
     """
     return spec.promote_min_weeks * TRADING_DAYS_PER_WEEK
-
-
-def retirement_log_key(slot: str) -> str:
-    """The append-only retirement event log for ``slot``.
-
-    Dateless by design: it is the log, not a per-cycle artifact, and the §4.12
-    key walk skips keys with no date component rather than requiring a
-    trading day of something that spans all of them.
-    """
-    return f"retirements/{slot}/events.jsonl"
-
-
-def experiments_key(trading_day: str) -> str:
-    """The generated `EXPERIMENTS` feed for one trading day.
-
-    Plan §9.1: "`EXPERIMENTS.md` entry is generated from the register event,
-    never hand-written." A negative result that only ever existed in a
-    private doc someone remembered to update is not a record.
-    """
-    return f"experiments/{trading_day}/events.jsonl"
 
 
 @dataclass(frozen=True)
@@ -357,7 +344,7 @@ def run_promotion(
             now=now,
         )
         if pointer is not None:
-            written.append(f"champions/{spec.slot}/current.json")
+            written.append(champion_key(spec.slot))
 
     return PromotionResult(
         cycle=cycle,
@@ -429,7 +416,7 @@ def revert_champion(
         run_id=run_id or _placeholder_run_id(),
         code_sha=code_sha or "0" * 40,
         promotion_source="operator_bootstrap",
-        manifest_key=manifest_key or f"runs/promote/{as_of}/run.json",
+        manifest_key=manifest_key or _promote_manifest_key("promote", as_of),
         evidence={
             "operator": operator,
             "reason": reason,
@@ -581,7 +568,7 @@ def _write_pointer_if_moved(
         run_id=run_id or _placeholder_run_id(),
         code_sha=code_sha or "0" * 40,
         promotion_source="evidence" if decision.status == "decided" else "bootstrap",
-        manifest_key=manifest_key or f"runs/promote/{decision.as_of}/run.json",
+        manifest_key=manifest_key or _promote_manifest_key("promote", decision.as_of),
         evidence=evidence,
         attestation=attestation,
     )
@@ -885,7 +872,7 @@ def _current_arm(store: Store, slot: str) -> str | None:
     except ChampionUnusableError:
         # Refused by the reader, but its arm_id is still the honest answer to
         # "what was this pointing at before the revert".
-        payload = json.loads(store.get_bytes(f"champions/{slot}/current.json"))
+        payload = json.loads(store.get_bytes(champion_key(slot)))
         arm_id = payload.get("arm_id")
         return str(arm_id) if arm_id is not None else None
 
