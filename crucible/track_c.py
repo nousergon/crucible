@@ -22,9 +22,27 @@ import json
 from typing import Any
 
 from crucible import alerts, release
-from crucible.console.render import CONSOLE_JSON_KEY, CONSOLE_KEY, build_page, write_page
+from crucible.board import (
+    BOARD_CURRENT_KEY,
+    BOARD_HTML_KEY,
+    BOARD_SCHEMA_VERSION,
+    board_delta,
+    board_key,
+    board_payload,
+    build_board,
+    render_board_html,
+)
+from crucible.calendar import resolve_trading_day
+from crucible.components import load_registry
+from crucible.console.render import (
+    CONSOLE_JSON_KEY,
+    CONSOLE_KEY,
+    build_page,
+    classify_registry,
+    write_page,
+)
 from crucible.drift import drift_metrics
-from crucible.gate import LADDER_KEY, LADDER_SCHEMA_VERSION
+from crucible.gate import LADDER_KEY, LADDER_SCHEMA_VERSION, build_ladder
 from crucible.runner import RunContext, run_job, spot_interruption_guard
 from crucible.store import Store, open_store, sha256_hex
 
@@ -398,6 +416,148 @@ def drift_handler(args: argparse.Namespace) -> int:
 
 
 # ── console ───────────────────────────────────────────────────────────────
+
+
+def board_handler(args: argparse.Namespace) -> int:
+    """Render the fully-declared board and file it. Reads; never runs.
+
+    `alpha-engine-config-I9837`. Deliberately its OWN job on its OWN daily
+    schedule rather than a stage of `console`: `console` is `dispatch: arc`,
+    dispatched by the weekly driver, and the weekly driver is phase-2 work.
+    A board that only refreshes once phase 2 opens could not have rendered
+    the gap that closed phase 1 — which is the entire reason it exists.
+
+    The board's own red is NOT this job's exit status. Almost every row is
+    red on day one and that is the correct reading, so a non-zero exit here
+    would be a daily failure alert on a working producer, and a daily failure
+    alert nobody can act on is how a channel gets muted. The job fails when
+    the MEASUREMENT fails; the reading lives in the artifact.
+    """
+    store = _store(args)
+
+    def body(ctx: RunContext) -> None:
+        moment = dt.datetime.now(dt.UTC)
+        registry = load_registry()
+        # `args.trading_day` when the caller named one — the same day the run
+        # manifest is keyed by. Resolving the wall clock here instead would
+        # file a replayed board under today's key while its manifest sat
+        # under the replayed day (§4.12).
+        trading_day = args.trading_day or resolve_trading_day(moment)
+        classifications, _ = classify_registry(store, registry, now=moment, trading_day=trading_day)
+        ladder = build_ladder(store, trading_day=trading_day, registry=registry, now=moment)
+        board = build_board(
+            store,
+            now=moment,
+            trading_day=trading_day,
+            registry=registry,
+            classifications=classifications,
+            ladder=ladder,
+        )
+
+        previous = _read_previous_board(store)
+        deltas = board_delta(previous, board)
+
+        payload = board_payload(board)
+        for key in (board_key(board.trading_day), BOARD_CURRENT_KEY):
+            store.put_bytes(key, payload)
+            ctx.record_output(key, payload, schema_version=BOARD_SCHEMA_VERSION)
+        # The page and the JSON, always together: `console-policy` requires
+        # every view to serve the JSON an agent reads, because a page whose
+        # numbers can only be scraped out of HTML is a page the next automated
+        # reader re-derives incorrectly.
+        page = render_board_html(board, deltas).encode("utf-8")
+        store.put_bytes(BOARD_HTML_KEY, page)
+        ctx.record_output(BOARD_HTML_KEY, page, schema_version=BOARD_SCHEMA_VERSION)
+
+        counts = board.counts()
+        ctx.record_metric(
+            {
+                "name": "board_rows_red",
+                "module": "crucible.board",
+                "metric_type": "operational",
+                "value": float(len(board.red)),
+                "unit": "rows",
+                "n_floor": 0,
+                # OK, not BREACH. Red is the DECLARED starting state of this
+                # instrument -- every row exists before the thing it measures
+                # -- so a non-zero count is the expected reading and grading it
+                # as a breach would page every day of the build. What is
+                # graded instead is whether the board could be RENDERED, and
+                # that is this job's own status.
+                "status": "OK",
+                "status_reason": (
+                    f"{len(board.red)} of {len(board.rows)} row(s) red; "
+                    f"{len(board.grey)} declared-not-built; {len(board.met)} met. "
+                    "Red is the declared day-one state of a fully-declared board."
+                ),
+                "source_path": BOARD_CURRENT_KEY,
+                "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+        ctx.record_metric(
+            {
+                "name": "board_rows_moved",
+                "module": "crucible.board",
+                "metric_type": "operational",
+                "value": float(len(deltas)),
+                "unit": "rows",
+                "n_floor": 0,
+                "status": "OK",
+                # The digest reports DELTAS, not absolute state. A board
+                # reading almost entirely PLANNED for weeks is correct and is
+                # also the thing people stop opening; the delta is the part
+                # that stays worth reading.
+                "status_reason": (
+                    "; ".join(d.describe() for d in deltas)
+                    if deltas
+                    else "no row changed state since the last board"
+                ),
+                "source_path": BOARD_CURRENT_KEY,
+                "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+        # UNMEASURABLE is visibly distinct from UNMET in the digest as well as
+        # on the surface: a row we could not READ is a statement about our
+        # access, and folding it into "unmet" reports our own outage as the
+        # system's result.
+        ctx.record_metric(
+            {
+                "name": "board_rows_unmeasurable",
+                "module": "crucible.board",
+                "metric_type": "operational",
+                "value": float(counts["UNMEASURABLE"]),
+                "unit": "rows",
+                "n_floor": 0,
+                "status": "OK" if counts["UNMEASURABLE"] == 0 else "BREACH",
+                "status_reason": (
+                    f"{counts['UNMEASURABLE']} row(s) could not be read at all. Unlike "
+                    "UNMET, this is a statement about our access rather than about the "
+                    "system, and its objective is zero."
+                ),
+                "source_path": BOARD_CURRENT_KEY,
+                "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+
+    run_job("board", body, store=store, trading_day=args.trading_day)
+    return 0
+
+
+def _read_previous_board(store: Store) -> dict[str, Any] | None:
+    """The last board filed, or None on the first ever run.
+
+    A read failure here returns None rather than raising: the delta is a
+    convenience layered on top of the board, and losing yesterday's copy must
+    not stop today's from being written. The board itself never degrades this
+    way -- an unreadable ROW is UNMEASURABLE and loud.
+    """
+    try:
+        if not store.exists(BOARD_CURRENT_KEY):
+            return None
+        document = json.loads(store.get_bytes(BOARD_CURRENT_KEY))
+    except Exception:  # noqa: BLE001 - see the docstring; the board still writes
+        return None
+    return document if isinstance(document, dict) else None
 
 
 def console_handler(args: argparse.Namespace) -> int:

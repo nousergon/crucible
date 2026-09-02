@@ -1,0 +1,232 @@
+# The board's declarations (alpha-engine-config-I9837).
+#
+# Every row of the v2 board is declared BEFORE the thing it measures exists.
+# That is the whole instrument: a board assembled from what already reports
+# can only ever show you the parts that report, and the failure this exists to
+# prevent is the one that closed `alpha-engine-config-I9757` on 2026-09-02 —
+# a phase issue closed the moment its PRs merged, with zero replay Saturdays
+# run and its gate reading 1 of 5, because nothing rendered the gap. A row
+# reading `UNMEASURED — 0 of 5 replay Saturdays` since day one could not have
+# been closed by accident.
+#
+# THIS FILE IS NOT THE WHOLE ROW SET. The board draws from four declarations
+# and this file carries two of them; the other two are read from code that
+# already exists, because a second copy of a declaration is a contract
+# restated in two places and this repository has already watched one drift:
+#
+#   objectives  -> here            (plan §2 table, plan §10 components)
+#   cutover     -> here            (the v1 -> v2 predicates, plan §6 phase 4)
+#   phases      -> crucible/gate.py `PHASES` + `GATES`
+#   components  -> crucible/components.yaml
+#
+# `tests/test_board.py` asserts the derivation in BOTH directions for all
+# four. A row whose source declaration disappears is an error, never a
+# silently smaller board — a board that shrinks quietly is the same defect as
+# a green row over no data, wearing a different face.
+#
+# ── The fields, and why each is required ──────────────────────────────────
+#
+# `reads` is the store key the row's state is read from, or `null` when no
+# producer exists yet. `null` is what makes a row PLANNED, and PLANNED is
+# DECLARED — never inferred from an absent artifact, because "nobody built it"
+# and "it broke" want opposite responses and render identically if you infer.
+#
+# `verdict` names the field inside that document holding the row's answer.
+# Required whenever `reads` is set. A document that is present but does not
+# carry the field is UNMEASURABLE with the field named — not UNMET, because
+# "read it and it says no" and "could not read it" are different facts and the
+# second one is about us, not about the system.
+#
+# `surface` is where the row is rendered. `artifact` prose says what a red row
+# means in one sentence, so a red row is actionable without asking an agent.
+
+version: 1
+
+# ── Plan §2: "Objectives, made testable" ──────────────────────────────────
+#
+# One row per §2 objective, plus the §10 components whose absence makes a
+# verdict wrong. `clause_class` is the acceptance-suite class that tests this
+# objective; the bijection between these rows and those classes is asserted,
+# so an objective cannot be declared without a test and a test class cannot
+# exist without a board row.
+
+objectives:
+  autonomy:
+    section: "§2 row 1"
+    statement: Runs autonomously, minimal input.
+    clause_class: TestAutonomy
+    surface: crucible/board
+    reads: null
+    verdict: null
+    planned_because: >-
+      The window is read from the run manifests of 2 live plus 5 replayed
+      Saturdays in the production store, and no run has been made under phase-2
+      conditions yet. Phase 2 is alpha-engine-config-I9758; the gate is §6.1's
+      2 live + 5 replayed, NOT §2's stale "4 consecutive Saturdays".
+    means_when_red: >-
+      The weekly arc has not yet completed the ruled live window unattended.
+
+  one_command:
+    section: "§2 row 2"
+    statement: Easy to run experiments — one command returns a verdict.
+    clause_class: TestOneCommand
+    surface: crucible/board
+    reads: experiments/latest/verdict.json
+    verdict: returned_a_verdict
+    means_when_red: >-
+      `crucible experiment run` did not produce a verdict document on its last
+      invocation, or has never been invoked against the production store.
+
+  cost:
+    section: "§2 row 3"
+    statement: Low API and AWS cost, with the spend cap declared and enforced.
+    clause_class: TestCost
+    surface: crucible/board
+    reads: ledger/cost/current.json
+    verdict: within_cap
+    means_when_red: >-
+      Either the monthly figure is over its ceiling, or — the case that has
+      actually bitten — the reading could not be taken at all. A cost clause
+      that fails on a CREDENTIAL error reports identically to an unmet
+      objective unless the board separates them, which is why UNMEASURABLE is
+      a state here (alpha-engine-config-I9828).
+
+  no_third_state:
+    section: "§2 row 4"
+    statement: Works flawlessly from day 1 — two statuses, never a third.
+    clause_class: TestNoThirdState
+    surface: crucible/board
+    reads: null
+    verdict: null
+    planned_because: >-
+      This objective is enforced by the manifest SCHEMA rather than by a
+      produced artifact, so its reading is a schema property and the producer
+      that files it does not exist yet. It is PLANNED rather than MET on
+      purpose: the schema passing in CI is not a reading of production.
+    means_when_red: >-
+      Some job in the production store declared a status outside {ok, failed}.
+
+  attribution:
+    section: "§2 row 5"
+    statement: Pinpoint underperformance — the five-row attribution table.
+    clause_class: TestAttribution
+    surface: crucible/board
+    reads: report/attribution/current.json
+    verdict: rows_complete
+    means_when_red: >-
+      The attribution table is missing rows, or its alpha leg is still raw
+      excess return rather than factor-neutral (plan §10 component 3).
+
+  alerting:
+    section: "§2 row 6"
+    statement: Alerts only when wrong — exactly two page conditions.
+    clause_class: TestAlerting
+    surface: crucible/board
+    reads: alerts/weekly/current.json
+    verdict: within_ceiling
+    means_when_red: >-
+      The week's alert count is over its ceiling, or the absence condition did
+      not evaluate against the declared deadline table.
+
+  transparency:
+    section: "§2 row 7"
+    statement: Transparency — every LLM call site registered, every verdict explainable.
+    clause_class: TestTransparency
+    surface: crucible/board
+    reads: null
+    verdict: null
+    planned_because: >-
+      `crucible explain` walks a verdict back to what produced it, and there is
+      no production verdict to walk back yet. The registry half is a repository
+      property; the explain half needs a real run.
+    means_when_red: >-
+      A call site is unregistered, or a verdict cannot be walked back to its
+      inputs.
+
+  control_arms:
+    section: "§10 component 1"
+    statement: Every slot declares a planted and a null control, scored every cycle.
+    clause_class: TestControlArms
+    surface: crucible/board
+    reads: arms/controls/current.json
+    verdict: every_slot_has_both
+    means_when_red: >-
+      A slot is missing a control arm, so no replay run in that slot counts —
+      this is a hard precondition, not a nice-to-have.
+
+  fault_injection:
+    section: "§10 component 7"
+    statement: Each scripted fault produces one failed run and exactly one page.
+    clause_class: TestFaultInjection
+    surface: crucible/board
+    reads: null
+    verdict: null
+    planned_because: >-
+      "Flawless from day 1" is proven on the FAILURE path, and the fault
+      harness has not been run against the production store. Nothing about the
+      happy path can substitute for this reading.
+    means_when_red: >-
+      A scripted fault did not produce exactly one failed run and one page.
+
+  feature_layer:
+    section: "§10 component 4"
+    statement: R and M read the same materialized, hashed, versioned feature artifact.
+    clause_class: TestFeatureLayer
+    surface: crucible/board
+    reads: features/current.json
+    verdict: r_and_m_agree
+    means_when_red: >-
+      The R and M slots are reading different feature artifacts or different
+      versions of one, which makes every comparison between them meaningless.
+
+# ── The v1 -> v2 cutover, as four individually readable predicates ─────────
+#
+# Deliberately NOT "phase 4 is MET". Inferring the cutover from a phase state
+# is how a milestone gets declared from a merge: the four things below are
+# separately observable, separately reversible, and three of them are about
+# resources that no longer existing is the evidence. A single rolled-up row
+# would let one of them be quietly outstanding.
+#
+# Every one of these reads an artifact this repository does not write yet, so
+# every one is UNMEASURED from day one WITH ITS KEY NAMED. That is the correct
+# reading and the intended one — the alternative is a board that says nothing
+# about the cutover until the day it happens.
+
+cutover:
+  old_step_functions_disabled:
+    statement: The three v1 Step Functions are disabled.
+    surface: crucible/board
+    reads: cutover/step_functions.json
+    verdict: all_disabled
+    means_when_red: >-
+      At least one v1 Step Function can still fire. Until this is green the two
+      systems can both act on the same trading day.
+
+  v1_resources_deleted:
+    statement: The 66 v1 Lambdas and 153 v1 alarms are deleted.
+    surface: crucible/board
+    reads: cutover/v1_resources.json
+    verdict: none_remain
+    means_when_red: >-
+      v1 compute or alarms still exist. Alarms outliving their producer is the
+      shape that pages on a system nobody operates.
+
+  trader_on_the_v2_contract:
+    statement: >-
+      The trader reads champions/{slot}/current.json produced by v2, not by v1.
+    surface: crucible/board
+    reads: cutover/trader_contract.json
+    verdict: producer_is_v2
+    means_when_red: >-
+      The trader is still consuming a v1-produced champion pointer, so v2 is
+      running beside production rather than as production.
+
+  aws_cost_under_ceiling:
+    statement: AWS spend is at or under $70/month.
+    surface: crucible/board
+    reads: cutover/aws_cost.json
+    verdict: within_ceiling
+    means_when_red: >-
+      The v1 teardown has not produced its saving, or v2 costs more than
+      planned. Read alongside v1_resources_deleted — cost not falling while
+      resources are gone means the saving was somewhere else.

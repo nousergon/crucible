@@ -26,6 +26,7 @@ from crucible.store import Store
 
 __all__ = [
     "ATTRIBUTION_STATUSES",
+    "classify_registry",
     "CONSOLE_KEY",
     "LADDER_KEY",
     "ConsolePage",
@@ -129,6 +130,43 @@ def _has_history(store: Store, job: str) -> bool:
     return False
 
 
+def classify_registry(
+    store: Store,
+    registry: dict[str, Component],
+    *,
+    now: dt.datetime,
+    trading_day: dt.date,
+) -> tuple[dict[str, Classification], dict[str, dict[str, Any] | None]]:
+    """Classify every registry row once, and hand back the manifests too.
+
+    Extracted so the console page and the declared board
+    (`alpha-engine-config-I9837`) read the SAME classification rather than
+    each computing its own. Two surfaces classifying the same components
+    independently is a contract restated in two places, and this repository
+    has already watched one of those drift — the board's whole argument is
+    that a second copy of a declaration is the defect, so it would be an odd
+    thing for the board itself to introduce.
+
+    Returns `(classifications, manifests)` keyed by component name, both
+    covering every registry row. A component with no manifest is present in
+    both maps with a `None` manifest, never absent — an absent key would make
+    a caller's `.get()` return `None` for "no such component" and "no run
+    today" alike.
+    """
+    classifications: dict[str, Classification] = {}
+    manifests: dict[str, dict[str, Any] | None] = {}
+    for name, component in sorted(registry.items()):
+        manifest = _read_representative_manifest(store, name, trading_day.isoformat())
+        manifests[name] = manifest
+        classifications[name] = classify(
+            component,
+            manifest,
+            now=now,
+            history=manifest is not None or _has_history(store, name),
+        )
+    return classifications, manifests
+
+
 def build_page(
     store: Store,
     *,
@@ -152,14 +190,10 @@ def build_page(
 
     rows: list[dict[str, Any]] = []
     metric_gap = 0
+    classifications, manifests = classify_registry(store, reg, now=moment, trading_day=trading_day)
     for name, component in sorted(reg.items()):
-        manifest = _read_representative_manifest(store, name, trading_day.isoformat())
-        classification = classify(
-            component,
-            manifest,
-            now=moment,
-            history=manifest is not None or _has_history(store, name),
-        )
+        manifest = manifests[name]
+        classification = classifications[name]
         rows.append(_row(component, classification, manifest))
         # alpha-engine-config-I9757 (C5): the transparency-gap count read
         # only component STATES, never the metric statuses inside a

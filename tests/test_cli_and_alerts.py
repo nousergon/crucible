@@ -58,18 +58,30 @@ def _minimal_argv(job: str) -> list[str]:
 #: track C landing its handlers would simply shrink the stub parametrisation
 #: and nothing would assert they now do something: a gate going dark rather
 #: than green.
-TRACK_C_JOBS = ("alerts.sweep", "console", "drift", "heartbeat", "release.pin", "smoke")
+TRACK_C_JOBS = (
+    "alerts.sweep",
+    "board",
+    "console",
+    "drift",
+    "heartbeat",
+    "release.pin",
+    "smoke",
+)
 
 
 class TestJobSurface:
     def test_the_jobs_of_the_plan_are_registered(self) -> None:
-        """The plan's twelve, plus track C's four observing surfaces.
+        """The plan's twelve, plus the observing surfaces.
 
-        The four are jobs like any other on purpose: they write manifests on
-        the same terms, so the thing that watches the fleet is watched by the
-        same registry, the same deadline table and the same console."""
+        The observing surfaces are jobs like any other on purpose: they write
+        manifests on the same terms, so the thing that watches the fleet is
+        watched by the same registry, the same deadline table and the same
+        console."""
         assert set(JOBS) == {
             "alerts.sweep",
+            # alpha-engine-config-I9837: the fully-declared board. Its own job
+            # on its own DAILY schedule, not a stage of the weekly arc.
+            "board",
             "heartbeat",
             "drift",
             "console",
