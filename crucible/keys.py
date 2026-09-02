@@ -25,6 +25,7 @@ import re
 from crucible.calendar import assert_trading_day
 
 __all__ = [
+    "legacy_weekly_executions_key",
     "board_html_key",
     "board_key",
     "BOARD_HTML_KEY",
@@ -343,3 +344,26 @@ def board_key(trading_day: str) -> str:
 
 def board_html_key() -> str:
     return BOARD_HTML_KEY
+
+
+# -- the v1 weekly pipeline, read by phase 0's exit gate --------------------
+
+
+def legacy_weekly_executions_key(week_anchor: str) -> str:
+    """Where the v1 weekly state machine's start count for one week is filed.
+
+    ``week_anchor`` is a :func:`weekly_anchor` session, never a raw render day.
+
+    **The gate reads this; it never counts.** A clause that called
+    `states:ListExecutions` would reach live AWS, which makes the reading
+    unreplayable, untestable without credentials, and impossible to grade at a
+    past date — and phase 0's whole claim is about a cadence sustained over
+    two consecutive weeks, which is a claim about the past.
+
+    Nothing files this key yet, and that is the honest state of the
+    measurement rather than a reason to relax the clause: the clause reads
+    UNMET and names the key, so the operator's next action is in the output
+    (`alpha-engine-config-I9860`). The shape belongs in `crucible.keys` and
+    moves there once the branch that owns that file lands.
+    """
+    return f"legacy/weekly/{week_anchor}/executions.json"
