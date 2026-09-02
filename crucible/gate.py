@@ -379,7 +379,9 @@ def _phase1(store: Store, window: list[dt.date], registry: dict[str, Component])
 
 
 #: The gates this command can read, and how wide a window each needs. Phase 1
-#: is five replay Saturdays; the phase-2 gate is four consecutive LIVE ones and
+#: is five replay Saturdays; the phase-2 gate is two consecutive LIVE ones
+#: (§6.1's ruled minimum — "2 consecutive first-attempt `ok` Saturdays, not 4",
+#: the other two soak weeks traded for the five replays) and
 #: is not registered here, because it is measured over production manifests
 #: that do not exist yet and a clause list without them would be a gate that
 #: could go green on replays (`alpha-engine-config-I9757`).
