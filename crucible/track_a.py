@@ -28,6 +28,7 @@ from crucible.config import settings as resolve_settings
 from crucible.data import ArcticPriceSource, PriceSource, run_daily, run_heal, run_weekly
 from crucible.explain import explain as explain_lineage
 from crucible.explain import render as render_lineage
+from crucible.keys import arm_register_key
 from crucible.manifest import manifest_key
 from crucible.runner import run_job
 from crucible.slots import research, universe
@@ -266,9 +267,7 @@ def handle_experiment_new(args: argparse.Namespace) -> int:
 
     def job(ctx: Any) -> None:
         payload = write_register(store, args.slot, register)
-        ctx.record_output(
-            f"arms/{args.slot}/register.jsonl", payload, schema_version="arm_register.v1"
-        )
+        ctx.record_output(arm_register_key(args.slot), payload, schema_version="arm_register.v1")
         ctx.record_rows(rows_in=len(specs), rows_out=len(added))
         print(json.dumps({"registered": added, "already_present": sorted(before)}, indent=2))
 

@@ -39,6 +39,26 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: class, and the first entry added beside this one is how it starts.
 SELF = Path(__file__).resolve()
 
+#: A second, deliberate exemption — reviewed 2026-09-02 on
+#: alpha-engine-config-I9807's PR, and it is exactly one entry, not a list:
+#: `tests/test_key_construction_placement.py` names its own two
+#: `_KNOWN_ARCHITECTURAL_EXCEPTIONS` / `_KNOWN_TRACKED_DEBT` registries with
+#: a `_KNOWN_` prefix ON PURPOSE, so THIS scanner sees them rather than
+#: being blind to an unnamed collection — the exact defect a hidden
+#: allowlist (originally just `_ALLOWED`, matching no `FORBIDDEN` pattern
+#: here) turned out to BE. `_KNOWN_ARCHITECTURAL_EXCEPTIONS` is a reviewed,
+#: permanent registry (every entry is a case where a function correctly
+#: lives outside `crucible/keys.py`, not a debt list — see its own
+#: docstring); `_KNOWN_TRACKED_DEBT` is a debt list, OPENLY named as one,
+#: each entry naming the issue that clears it. Sanctioning them here, by
+#: name, is what makes them visible exceptions rather than a silent one —
+#: a THIRD `_KNOWN_*`/`_GRANDFATHERED_*` collection added anywhere else in
+#: the tree, including a third one in this same file, still fails, because
+#: nothing else is named. Only the `_KNOWN_` pattern is exempted for this
+#: one file — `xfail`, `pytest.skip` and the rest are still scanned there
+#: like everywhere else.
+_SANCTIONED_KNOWN_REGISTRY_FILE = REPO_ROOT / "tests" / "test_key_construction_placement.py"
+
 # Directories that are not source: caches, the virtualenv, git internals.
 _IGNORED_DIRS = {
     ".git",
@@ -162,10 +182,18 @@ def test_no_suppression_collections_anywhere_in_the_tree() -> None:
                 # how a guard reports green over code it never read.
                 findings.append(f"{path.relative_to(REPO_ROOT)}: does not parse ({exc})")
                 continue
+        is_sanctioned_registry_file = path.resolve() == _SANCTIONED_KNOWN_REGISTRY_FILE
         for lineno, line in enumerate(text.splitlines(), start=1):
             if lineno in exempt:
                 continue
             for pattern, compiled in _PATTERNS.items():
+                if pattern == r"_KNOWN_" and is_sanctioned_registry_file:
+                    # The one deliberate exemption declared beside
+                    # `_SANCTIONED_KNOWN_REGISTRY_FILE` above — reviewed,
+                    # named, and limited to this single pattern in this
+                    # single file. Every other FORBIDDEN pattern is still
+                    # scanned here.
+                    continue
                 if compiled.search(line):
                     rel = path.relative_to(REPO_ROOT)
                     findings.append(
