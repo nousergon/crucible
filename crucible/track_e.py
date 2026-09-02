@@ -70,6 +70,10 @@ def report_handler(args: argparse.Namespace) -> int:
             spent_usd=week_to_date_llm_spend(
                 store, window_start=window_start, trading_day=ctx.trading_day
             ),
+            # `alpha-engine-config-I9823`: the run manifest is where this
+            # traces to a measured cap or a declared one, not only config's
+            # own `to_dict()` (which nothing here read until this line).
+            cap_usd_measured=config.llm_cap_usd_measured,
         )
         ctx.record_metric(
             cap_metric(cap, now=now, source_path=f"runs/*/{ctx.trading_day}/run.json")

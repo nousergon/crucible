@@ -23,16 +23,26 @@ from crucible.slots import universe
 from crucible.slots.cycle import MissingArtifactError
 from crucible.slots.grading import (
     CONTROL_PLANTED_IC,
+    CROSS_SECTION_MIN_NAMES,
     ForwardReturnWindow,
     GraderControlError,
     PopulationIntegrityError,
+    RankICSkip,
+    ScoredCrossSection,
     SelectionMissError,
     assert_controls_ordered,
     assert_label_control,
     control_selection,
+    cross_section_key,
+    cross_section_settled_key,
     forward_returns,
+    produce_cross_section,
     reference_forward_returns,
     score_selection,
+    settle_cross_section,
+    spearman_ic,
+    write_cross_section,
+    write_cross_section_settled,
 )
 
 #: Enough decision dates that a 21-session horizon has settled for several of
@@ -604,3 +614,205 @@ class TestVerdictArtifacts:
         assert verdict["benchmark"] == "population", "never SPY for a selection slot"
         assert isinstance(verdict["score_ratio"], float)
         assert dt.date.fromisoformat(verdict["trading_day"]) == decision_days[0]
+
+
+class TestSpearmanIC:
+    """`spearman_ic` — the formula `crucible.report`'s rank-IC rows reduce
+    over settled dates (alpha-engine-config-I9778)."""
+
+    def _names(self, n: int) -> list[str]:
+        return [f"T{i:02d}" for i in range(n)]
+
+    def test_a_perfectly_agreeing_ranking_scores_plus_one(self) -> None:
+        names = self._names(CROSS_SECTION_MIN_NAMES)
+        score = {t: float(i) for i, t in enumerate(names)}
+        realized = {t: float(i) * 0.01 for i, t in enumerate(names)}
+        ic, n = spearman_ic(score, realized)
+        assert ic == pytest.approx(1.0)
+        assert n == len(names)
+
+    def test_a_perfectly_inverted_ranking_scores_minus_one(self) -> None:
+        names = self._names(CROSS_SECTION_MIN_NAMES)
+        score = {t: float(i) for i, t in enumerate(names)}
+        realized = {t: -float(i) * 0.01 for i, t in enumerate(names)}
+        ic, n = spearman_ic(score, realized)
+        assert ic == pytest.approx(-1.0)
+        assert n == len(names)
+
+    def test_below_the_names_floor_returns_too_few_names(self) -> None:
+        names = self._names(CROSS_SECTION_MIN_NAMES - 1)
+        score = {t: float(i) for i, t in enumerate(names)}
+        realized = {t: float(i) for i, t in enumerate(names)}
+        assert spearman_ic(score, realized) is RankICSkip.TOO_FEW_NAMES
+
+    def test_only_the_paired_intersection_counts_toward_the_floor(self) -> None:
+        """A ticker scored but never settled (or vice versa) is unpaired and
+        does not count toward `CROSS_SECTION_MIN_NAMES` — the same "absent is
+        absent" rule the rest of this module holds."""
+        names = self._names(CROSS_SECTION_MIN_NAMES)
+        score = {t: float(i) for i, t in enumerate(names)}
+        realized = {t: float(i) for i, t in enumerate(names[:-1])}  # one short
+        assert spearman_ic(score, realized) is RankICSkip.TOO_FEW_NAMES
+
+    def test_tied_scores_are_degenerate_not_a_measured_zero(self) -> None:
+        """`alpha-engine-config-I9778` review, finding 1: every score tied (a
+        constant ranker) makes the correlation UNDEFINED, not `0.0`. Prior to
+        the fix this returned `(0.0, n)` and was counted as a real
+        observation — the exact mechanism the review used to turn a `WATCH`
+        row `GREEN` on a date that carried no information at all."""
+        names = self._names(CROSS_SECTION_MIN_NAMES)
+        score = dict.fromkeys(names, 1.0)
+        realized = {t: float(i) for i, t in enumerate(names)}
+        assert spearman_ic(score, realized) is RankICSkip.DEGENERATE
+
+    def test_tied_realized_returns_are_also_degenerate(self) -> None:
+        """The other side of the pairing: every realized return identical
+        (e.g. a quiet cross-section) is equally undefined, not `0.0`."""
+        names = self._names(CROSS_SECTION_MIN_NAMES)
+        score = {t: float(i) for i, t in enumerate(names)}
+        realized = dict.fromkeys(names, 0.01)
+        assert spearman_ic(score, realized) is RankICSkip.DEGENERATE
+
+    def test_a_random_shuffle_is_not_perfectly_correlated(self) -> None:
+        names = self._names(8)
+        score = {t: float(i) for i, t in enumerate(names)}
+        shuffled_realized = list(range(8))
+        shuffled_realized[0], shuffled_realized[-1] = (
+            shuffled_realized[-1],
+            shuffled_realized[0],
+        )
+        realized = {t: float(shuffled_realized[i]) for i, t in enumerate(names)}
+        ic, _n = spearman_ic(score, realized)
+        assert -1.0 < ic < 1.0
+
+
+class TestScoredCrossSection:
+    """`produce_cross_section`/`write_cross_section` — the produce-time half
+    of `shadow.v2` (alpha-engine-config-I9778)."""
+
+    def test_produce_ranks_the_whole_population_not_only_top_n(
+        self, store, source, strategy_dir, cycle_date, tmp_path
+    ) -> None:
+        from crucible.features import DEFAULT_FEATURE_VERSION, read_features
+        from crucible.keys import features_key
+        from crucible.slots.arms import load_arm_specs
+
+        settings, decision_days = _seed_cycle(store, source, strategy_dir, cycle_date, tmp_path)
+        day = decision_days[0]
+        features = read_features(
+            store.get_bytes(features_key(DEFAULT_FEATURE_VERSION, day.isoformat()))
+        )
+        arm = load_arm_specs("u", strategy_dir=strategy_dir)[0]
+        top_n = int(arm.params.get("top_n", 10))
+
+        cross_section = produce_cross_section(arm, features, day)
+
+        assert len(cross_section.ranks) > top_n, (
+            "shadow.v1's whole reason for existing was that the top-N selection is "
+            "not enough to compute a rank correlation from"
+        )
+        assert cross_section.ranks[0][2] == 1, "rank 1 is the highest score"
+        scores_desc = [score for _ticker, score, _rank in cross_section.ranks]
+        assert scores_desc == sorted(scores_desc, reverse=True)
+
+    def test_write_then_read_round_trips(self, store) -> None:
+        cross_section = ScoredCrossSection(
+            arm_id="r:x:1", trading_day="2026-08-28", ranks=(("AAA", 3.0, 1), ("BBB", 1.0, 2))
+        )
+        write_cross_section(store, cross_section)
+        key = cross_section_key("r:x:1", "2026-08-28")
+        assert store.exists(key)
+        document = json.loads(store.get_bytes(key).decode("utf-8"))
+        assert document["population_size"] == 2
+        assert document["ranks"][0]["ticker"] == "AAA"
+
+
+class TestSettleCrossSection:
+    def test_settlement_joins_by_ticker_and_leaves_unsettled_names_null(self) -> None:
+        document = ScoredCrossSection(
+            arm_id="r:x:1",
+            trading_day="2026-08-28",
+            ranks=(("AAA", 3.0, 1), ("BBB", 2.0, 2), ("CCC", 1.0, 3)),
+        ).to_dict()
+        settled = settle_cross_section(
+            document,
+            returns={"AAA": 0.05, "CCC": -0.01},
+            horizon_trading_days=21,
+            settled_on="2026-09-28",
+        )
+        by_ticker = {r["ticker"]: r["realized_forward_return_ratio"] for r in settled["ranks"]}
+        assert by_ticker == {"AAA": 0.05, "BBB": None, "CCC": -0.01}
+        assert settled["n_settled"] == 2
+        assert settled["population_size"] == 3
+        assert settled["horizon_trading_days"] == 21
+        assert settled["settled_on"] == "2026-09-28"
+
+    def test_write_then_read_round_trips(self, store) -> None:
+        document = settle_cross_section(
+            ScoredCrossSection(
+                arm_id="r:x:1", trading_day="2026-08-28", ranks=(("AAA", 3.0, 1),)
+            ).to_dict(),
+            returns={"AAA": 0.05},
+            horizon_trading_days=21,
+            settled_on="2026-09-28",
+        )
+        write_cross_section_settled(
+            store, arm_id="r:x:1", trading_day="2026-08-28", document=document
+        )
+        key = cross_section_settled_key("r:x:1", "2026-08-28")
+        assert store.exists(key)
+
+
+class TestCycleWritesShadowV2:
+    """The wiring inside `crucible.slots.cycle`: `run_produce` writes
+    `cross_section.json` beside `shadow.json`, and `run_grade` settles it
+    beside `verdict.json`, once its horizon settles."""
+
+    def test_produce_writes_a_cross_section_for_every_shadow(
+        self, store, source, strategy_dir, cycle_date, tmp_path
+    ) -> None:
+        settings, decision_days = _seed_cycle(store, source, strategy_dir, cycle_date, tmp_path)
+        from crucible.slots.arms import load_arm_specs
+
+        for arm in load_arm_specs("u", strategy_dir=strategy_dir):
+            for day in decision_days:
+                assert store.exists(shadow_key(arm.arm_id, day.isoformat()))
+                assert store.exists(cross_section_key(arm.arm_id, day.isoformat())), (
+                    f"shadow.json exists for {arm.arm_id}/{day} with no cross_section.json "
+                    "beside it — shadow.v2 is not actually being produced"
+                )
+
+    def test_grade_settles_the_cross_section_alongside_the_verdict(
+        self, store, source, strategy_dir, cycle_date, tmp_path
+    ) -> None:
+        settings, decision_days = _seed_cycle(store, source, strategy_dir, cycle_date, tmp_path)
+        run_job(
+            "experiment.grade",
+            lambda c: universe.grade(c, settings=settings),
+            store=store,
+            trading_day=cycle_date,
+        )
+        from crucible.slots.arms import load_arm_specs
+
+        arm = load_arm_specs("u", strategy_dir=strategy_dir)[0]
+        settled_anything = False
+        for day in decision_days:
+            verdict_exists = store.exists(verdict_key(arm.arm_id, day.isoformat()))
+            settled_exists = store.exists(cross_section_settled_key(arm.arm_id, day.isoformat()))
+            assert verdict_exists == settled_exists, (
+                f"{day}: verdict.json and cross_section_settled.json must appear together — "
+                "one settling without the other is exactly the drift shadow.v2 exists to "
+                "prevent between what the row grades and what it reduces"
+            )
+            settled_anything = settled_anything or settled_exists
+        assert settled_anything, "at least one decision date must have settled by cycle_date"
+
+        settled_key = next(
+            cross_section_settled_key(arm.arm_id, day.isoformat())
+            for day in decision_days
+            if store.exists(cross_section_settled_key(arm.arm_id, day.isoformat()))
+        )
+        document = json.loads(store.get_bytes(settled_key).decode("utf-8"))
+        assert document["schema_version"] == "cross_section_settled.v2"
+        assert document["n_settled"] >= 1
+        assert document["population_size"] >= document["n_settled"]

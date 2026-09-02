@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from crucible.llm import DEFAULT_LLM_CAP_USD
+from crucible.llm import DEFAULT_LLM_CAP_USD, DEFAULT_LLM_CAP_USD_MEASURED
 from crucible.store import LocalStore, S3Store, Store
 
 __all__ = [
@@ -47,6 +47,7 @@ __all__ = [
     "DEFAULT_CLOUDTRAIL_ARCHIVE",
     "DEFAULT_STACK_NAME",
     "DEFAULT_LLM_CAP_USD",
+    "DEFAULT_LLM_CAP_USD_MEASURED",
     "DEFAULT_STORE_URI",
     "STRATEGY_PREFIX",
     "Settings",
@@ -106,6 +107,22 @@ class Settings:
     #: `crucible.llm.SpendCap` refuses the call that would cross it, before the
     #: provider is reached, and the run fails rather than overspending.
     llm_cap_usd: float = DEFAULT_LLM_CAP_USD
+    #: `alpha-engine-config-I9778`/`alpha-engine-config-I9823`: whether
+    #: :data:`~crucible.llm.DEFAULT_LLM_CAP_USD` traces back to a phase-5
+    #: cost-sink measurement — nothing else. Tracks
+    #: `crucible.llm.DEFAULT_LLM_CAP_USD_MEASURED` exactly, and ONLY that: an
+    #: operator override (`--llm-cap-usd` or `CRUCIBLE_LLM_CAP_USD`) does not
+    #: flip it, on either value. The review that opened I9823 found the prior
+    #: shape — `origins["llm_cap_usd"] != "default" or
+    #: DEFAULT_LLM_CAP_USD_MEASURED` — let a caller re-declare the identical
+    #: $5.00 default through the env var and have it read back as "measured";
+    #: an assertion is not a measurement, and conflating the two made the
+    #: flag flippable by anyone who could set an env var. Provenance of an
+    #: operator override is already recorded, verbatim, in
+    #: ``origins["llm_cap_usd"]`` (``"argument"`` / ``"environ:..."`` /
+    #: ``"default"``) — nothing here needed a second, weaker channel to carry
+    #: the same fact.
+    llm_cap_usd_measured: bool = False
 
     def store(self) -> Store:
         """The resolved store, or a refusal naming how to resolve one.
@@ -139,6 +156,7 @@ class Settings:
             "stack_name": self.stack_name,
             "strategy_dir": str(self.strategy_dir) if self.strategy_dir else None,
             "llm_cap_usd": self.llm_cap_usd,
+            "llm_cap_usd_measured": self.llm_cap_usd_measured,
             "origins": dict(self.origins),
         }
 
@@ -185,6 +203,15 @@ def settings(
     else:
         origins["strategy_dir"] = f"store:{STRATEGY_PREFIX}"
         resolved_dir = None
+    # `alpha-engine-config-I9823`: MEASURED tracks DEFAULT_LLM_CAP_USD_MEASURED
+    # ONLY — a code-level fact nothing at runtime can flip. An operator
+    # override (argument or CRUCIBLE_LLM_CAP_USD) is an assertion, not a
+    # measurement, and asserting the identical $5.00 default through the env
+    # var must not read back as "measured" — that was exactly the tamper
+    # vector the prior `origins[...] != "default" or ...` shape left open.
+    # The override's own provenance is still recorded, verbatim, in
+    # origins["llm_cap_usd"].
+    cap_measured = DEFAULT_LLM_CAP_USD_MEASURED
     return Settings(
         store_uri=resolved_store,
         arctic_bucket=resolved_arctic,
@@ -192,6 +219,7 @@ def settings(
         cloudtrail_archive=resolved_archive,
         stack_name=resolved_stack,
         llm_cap_usd=_positive_cap(resolved_cap, origins["llm_cap_usd"]),
+        llm_cap_usd_measured=cap_measured,
         origins=origins,
     )
 

@@ -328,7 +328,9 @@ class TestAttribution:
             "`crucible report` writes report/{trading_day}/attribution.json with five "
             "MetricRecord rows — data freshness/coverage, signal IC (R), prediction IC "
             "(M), portfolio alpha (S), execution shortfall — each with value, ci, n, "
-            "baseline and status."
+            "baseline and status. R and M are a TRUE rank IC reduced from shadow.v2's "
+            "settled cross-sections (alpha-engine-config-I9778), not a plan_row-annotated "
+            "excess-return stand-in — plan_row no longer exists."
         )
         from crucible.cli import HANDLERS
         from crucible.report import ROWS
@@ -345,7 +347,8 @@ class TestAttribution:
         document = json.loads(store.get_bytes(f"report/{day.isoformat()}/attribution.json"))
         rows = document["rows"]
         assert len(rows) == 5
-        assert [r["plan_row"] for r in rows] == [spec.plan_row for spec in ROWS]
+        assert [r["name"] for r in rows] == [spec.name for spec in ROWS]
+        assert not any("plan_row" in row for row in rows)
         for row in rows:
             for field in ("value", "ci_low", "ci_high", "n_samples", "baseline", "status"):
                 assert field in row, f"{row['name']} carries no {field}"

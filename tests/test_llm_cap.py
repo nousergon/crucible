@@ -66,6 +66,48 @@ class TestDeclaration:
         assert resolved.llm_cap_usd == 1.25
         assert resolved.origins["llm_cap_usd"] == "environ:CRUCIBLE_LLM_CAP_USD"
 
+    def test_the_untouched_default_is_machine_checkably_unmeasured(self) -> None:
+        """alpha-engine-config-I9778: the docstring beside `DEFAULT_LLM_CAP_USD`
+        already said this in prose ("A declared ceiling, not a measurement");
+        this is the field a manifest or a report can be compared against
+        instead of trusting the comment."""
+        from crucible.llm import DEFAULT_LLM_CAP_USD_MEASURED
+
+        assert DEFAULT_LLM_CAP_USD_MEASURED is False, (
+            "no phase-5 LLM arm has run a full cycle yet — flipping this without one "
+            "would be exactly the unmeasured-number-presented-as-measured defect this "
+            "flag exists to make impossible"
+        )
+        resolved = settings()
+        assert resolved.llm_cap_usd_measured is False
+        assert resolved.to_dict()["llm_cap_usd_measured"] is False
+
+    def test_an_operator_override_does_not_read_as_measured(self, monkeypatch) -> None:
+        """`alpha-engine-config-I9823` review: an operator ASSERTING a number
+        is not the same fact as the number having been MEASURED from a
+        phase-5 cost-sink cycle, and conflating them let an operator flip
+        `llm_cap_usd_measured` at will — including by re-declaring the
+        identical $5.00 default through the env var. `llm_cap_usd_measured`
+        now tracks `DEFAULT_LLM_CAP_USD_MEASURED` only; the override's own
+        provenance is still recorded, verbatim, in `origins["llm_cap_usd"]`."""
+        monkeypatch.setenv("CRUCIBLE_LLM_CAP_USD", "1.25")
+        resolved = settings()
+        assert resolved.llm_cap_usd_measured is False
+        assert resolved.origins["llm_cap_usd"] == "environ:CRUCIBLE_LLM_CAP_USD"
+
+    def test_declaring_the_identical_default_through_the_env_var_stays_unmeasured(
+        self, monkeypatch
+    ) -> None:
+        """The exact scenario the review demonstrated: re-asserting the same
+        $5.00 number via `CRUCIBLE_LLM_CAP_USD` must not make the flag say
+        `True` — an identical number is still not a measurement."""
+        from crucible.llm import DEFAULT_LLM_CAP_USD
+
+        monkeypatch.setenv("CRUCIBLE_LLM_CAP_USD", f"{DEFAULT_LLM_CAP_USD:.2f}")
+        resolved = settings()
+        assert resolved.llm_cap_usd == DEFAULT_LLM_CAP_USD
+        assert resolved.llm_cap_usd_measured is False
+
     @pytest.mark.parametrize("bad", ["", "0", "-3", "five dollars"])
     def test_a_malformed_cap_raises_rather_than_falling_back(self, monkeypatch, bad) -> None:
         """A ceiling silently replaced by the default is a ceiling nobody is
@@ -420,3 +462,17 @@ class TestWindow:
         assert over["unit"] == "usd" and over["baseline"] == 1.0
         ok = cap_metric(SpendCap(cap_usd=1.0), now=NOW, source_path="runs/")
         assert ok["status"] == "OK" and ok["value"] == 0.0
+
+    def test_the_cap_metric_publishes_whether_the_cap_was_measured(self) -> None:
+        """`alpha-engine-config-I9823`: the flag reaches an artifact now —
+        the run's own `llm_spend_usd` metric — rather than only
+        `Settings.to_dict()`, which nothing in this package read."""
+        declared = cap_metric(SpendCap(cap_usd=5.0), now=NOW, source_path="runs/")
+        assert declared["cap_usd_measured"] is False
+        assert "declared, not measured" in declared["status_reason"]
+
+        measured = cap_metric(
+            SpendCap(cap_usd=5.0, cap_usd_measured=True), now=NOW, source_path="runs/"
+        )
+        assert measured["cap_usd_measured"] is True
+        assert "declared, not measured" not in measured["status_reason"]
