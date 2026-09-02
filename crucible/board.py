@@ -512,16 +512,20 @@ def _provenance(document: dict[str, Any]) -> str | None:
 def _read_attribution(store: Store, trading_day: str) -> Reading:
     """Plan §2 row 5 — the five-row attribution table, read from the report card.
 
-    Key from `crucible.report.attribution_key`, which is the module that
-    WRITES it. Not restated here: a key format restated at a call site is a
-    contract restated twice, and this board's first draft restated fourteen of
-    them wrongly.
+    Key AND vocabulary from `crucible.report`, which is the module that WRITES
+    it. Not restated here — the first version of this reader filtered on
+    ``status == "UNREPORTED"``, a token `report.py` never emits: attribution
+    rows are statused by `krepis.metrics.derive_status`, whose
+    not-measured vocabulary is the `N/A-*` family, and `report.py:278` itself
+    filters on ``startswith("N/A")``. So a table of five blank rows read MET,
+    with a detail asserting "with a value each" over five nulls — the exact
+    failure the previous paragraph of this docstring claimed to prevent, and
+    the exact bug class of a test that fabricates the keys its code invented.
 
-    MET requires the declared number of rows AND that no row reports
-    `UNREPORTED`. A table that grades fewer layers than it declares is the
-    shape `build_attribution` already refuses to produce; a table whose rows
-    are all present and all blank is the one it cannot refuse, and it is the
-    one that reads green if you only count rows.
+    MET therefore requires all three: the declared number of rows, no row in
+    the `N/A-*` family, and no row whose `value` is null. A row count is not a
+    reading, and `build_attribution` already refuses to emit the wrong number
+    of rows — so counting them grades the one thing that cannot go wrong.
     """
     from crucible.report import ROWS, attribution_key  # noqa: PLC0415 - avoids a cycle
 
@@ -538,9 +542,6 @@ def _read_attribution(store: Store, trading_day: str) -> Reading:
             "question, which is not the same as answering it 'no'.",
             last_read=_provenance(document),
         )
-    blind = [
-        r.get("name", "?") for r in rows if isinstance(r, dict) and r.get("status") == "UNREPORTED"
-    ]
     provenance = _provenance(document)
     if len(rows) != len(ROWS):
         return Reading(
@@ -548,16 +549,41 @@ def _read_attribution(store: Store, trading_day: str) -> Reading:
             f"{key} grades {len(rows)} of {len(ROWS)} declared layer(s)",
             last_read=provenance,
         )
+    blind = [_row_name(r) for r in rows if _row_measured_nothing(r)]
     if blind:
         return Reading(
             "UNMET",
-            f"{key} grades all {len(rows)} layers and {len(blind)} of them report no value "
-            f"({', '.join(blind)}). A row that measured nothing is not evidence of health.",
+            f"{key} grades all {len(rows)} layers and {len(blind)} of them measured "
+            f"nothing ({', '.join(blind)}). A row that measured nothing is not evidence "
+            "of health, whatever the table's own row count says.",
             last_read=provenance,
         )
     return Reading(
-        "MET", f"{key} grades all {len(rows)} declared layers with a value each", provenance
+        "MET",
+        f"{key} grades all {len(rows)} declared layers, each with a measured value",
+        provenance,
     )
+
+
+def _row_name(row: Any) -> str:
+    return str(row.get("name", "?")) if isinstance(row, dict) else "?"
+
+
+def _row_measured_nothing(row: Any) -> bool:
+    """Whether one attribution row carries no measurement.
+
+    Two conditions, because either alone is beatable. `report.py` writes the
+    `N/A-*` status family through `krepis.metrics.derive_status` for a row it
+    could not measure — but a row can also carry a measured-looking status and
+    a null value, and a null value is not a measurement whatever the status
+    says. A malformed row (not a dict at all) counts as blind: a row this
+    reader cannot parse has not been shown to measure anything.
+    """
+    if not isinstance(row, dict):
+        return True
+    if str(row.get("status", "")).startswith("N/A"):
+        return True
+    return row.get("value") is None
 
 
 #: The registered readers, by the name a declaration uses.

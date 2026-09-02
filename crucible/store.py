@@ -78,6 +78,18 @@ class Store(ABC):
     leaking into the callers and pinning us to one provider (principle 8).
     """
 
+    #: Every method on this interface that WRITES. Declared, so a guard can be
+    #: derived from it rather than from a literal list kept in step by hand —
+    #: `tests/test_board.py::_refusing_store` installs a refusal per entry, and
+    #: a third mutator added without a line here would leave that guard
+    #: silently blind to it.
+    #:
+    #: `compare_and_swap` is the reason this exists: it writes WITHOUT going
+    #: through `put_bytes` (a temp file plus `os.replace` locally, a
+    #: conditional PUT on S3), so a "did it write?" check patching `put_bytes`
+    #: alone was beaten by inserting one call.
+    MUTATORS: tuple[str, ...] = ("put_bytes", "compare_and_swap")
+
     @abstractmethod
     def put_bytes(
         self,

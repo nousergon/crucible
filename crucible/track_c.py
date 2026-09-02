@@ -456,14 +456,29 @@ def board_handler(args: argparse.Namespace) -> int:
         )
 
         previous, previous_unreadable = _read_previous_board(store)
-        deltas = board_delta(previous, board)
 
         payload = board_payload(board)
         may_move, pointer_reason = pointer_may_move(previous, board)
+        # `--dry-run` must not touch the pointer. The flag is ignored by all
+        # five track-C handlers (alpha-engine-config-I9863, which owns the
+        # repo-wide fix), and honouring it for `board` alone would normally be
+        # the wrong shape — but this is the one job whose `--dry-run` clobbers
+        # `board/current.json`, the key the fleet-console adapter reads. One
+        # narrow guard here, the class fix in I9863.
+        dry_run = bool(getattr(args, "dry_run", False))
+        if dry_run:
+            may_move = False
+            pointer_reason = "--dry-run: the pointer and the page are not written"
+        # The delta is computed against the incumbent only when this board is
+        # the one that supersedes it. When the pointer is HELD -- a replay, or
+        # a dry run -- comparing forward in time would publish a set of
+        # "regressions" that are an artefact of reading an older board against
+        # a newer one, which is a false reading on every replay.
+        deltas = board_delta(previous, board) if may_move else []
         # The dated board is ALWAYS written; the pointer is conditional. A
         # replay must not clobber `board/current.json` with an older board —
         # that key is what the fleet console reads.
-        written = [board_key(board.trading_day)]
+        written = [] if dry_run else [board_key(board.trading_day)]
         if may_move:
             written.append(BOARD_CURRENT_KEY)
         for key in written:
@@ -517,6 +532,12 @@ def board_handler(args: argparse.Namespace) -> int:
                 # asserted on no evidence — and this is the only surface that
                 # reports a VANISHED declaration, so a silent zero here hides
                 # exactly the event the board exists to catch.
+                # BREACH only when the previous board could not be READ.
+                # A held pointer -- a replay, a dry run -- is a deliberate
+                # operator action and reporting it as a breach would teach the
+                # reader to discount the one status that means something.
+                # Either way the reason states plainly that no comparison was
+                # made, so the zero is never a claim that nothing moved.
                 "status": "OK" if previous_unreadable is None else "BREACH",
                 # The digest reports DELTAS, not absolute state. A board
                 # reading almost entirely PLANNED for weeks is correct and is
@@ -526,6 +547,9 @@ def board_handler(args: argparse.Namespace) -> int:
                     f"the previous board could not be read ({previous_unreadable}), so no "
                     "comparison was possible. This is NOT a claim that nothing moved."
                     if previous_unreadable is not None
+                    else f"no comparison was made: {pointer_reason}. This is NOT a claim "
+                    "that nothing moved."
+                    if not may_move
                     else "; ".join(d.describe() for d in deltas)
                     if deltas
                     else "no row changed state since the last board"

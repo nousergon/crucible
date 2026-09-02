@@ -50,7 +50,7 @@ from crucible.components import load_registry
 from crucible.console.classify import STATES as COMPONENT_STATES
 from crucible.console.classify import Classification
 from crucible.gate import LADDER_STATES, PHASES
-from crucible.store import LocalStore
+from crucible.store import LocalStore, Store
 
 ACCEPTANCE_SUITE = (
     pathlib.Path(__file__).parent / "acceptance" / "test_plan_section_2_objectives.py"
@@ -247,12 +247,23 @@ class TestReadingIsHonestAboutWhatItCouldNotDo:
 
     @staticmethod
     def _table(rows: int, *, blind: int = 0, day: str = "2026-08-28") -> bytes:
-        from crucible.report import ROWS
+        """A table in the shape the REAL producer writes.
 
+        The first version of this helper emitted `"UNREPORTED"` and `"OK"` —
+        neither of which `crucible.report` ever writes — and no `value` field
+        at all. So the blindness check was asserted against a vocabulary the
+        producer does not use, and the MET case was asserted over rows
+        `build_attribution` would never produce. The statuses below come from
+        `krepis.metrics.derive_status`'s real `N/A-*` family, and
+        `TestTheAttributionReaderMatchesItsRealProducer` pins that against the
+        producer's actual output rather than against this fixture.
+        """
         body = [
-            {"name": f"row{i}", "status": "UNREPORTED" if i < blind else "OK"} for i in range(rows)
+            {"name": f"row{i}", "status": "N/A-NOT-RUN", "value": None}
+            if i < blind
+            else {"name": f"row{i}", "status": "OK", "value": 0.5}
+            for i in range(rows)
         ]
-        assert len(ROWS) >= 1
         return json.dumps(
             {"trading_day": day, "generated_utc": "2026-08-28T00:00:00Z", "rows": body}
         ).encode()
@@ -325,14 +336,27 @@ class TestReadingIsHonestAboutWhatItCouldNotDo:
         """Counting rows is not reading them.
 
         A table with every declared row present and every one of them
-        reporting no value is the case `build_attribution` cannot refuse, and
-        it is the one that reads green if the check is a row count.
+        measuring nothing is the case `build_attribution` cannot refuse — it
+        refuses the wrong ROW COUNT — and it is the one that reads green if
+        the check is a row count.
         """
         n = len(_attribution_rows())
         store.put_bytes("report/2026-08-28/attribution.json", self._table(n, blind=n))
         reading = self._read(store)
         assert reading.state == "UNMET"
-        assert "report no value" in reading.detail
+        assert "measured nothing" in reading.detail
+
+    def test_a_row_with_a_measured_status_but_a_null_value_is_not_met(self, store) -> None:
+        """Either condition alone is beatable.
+
+        A row can carry a measured-looking status and a null value, and a null
+        value is not a measurement whatever the status says.
+        """
+        n = len(_attribution_rows())
+        document = json.loads(self._table(n))
+        document["rows"][0]["value"] = None
+        store.put_bytes("report/2026-08-28/attribution.json", json.dumps(document).encode())
+        assert self._read(store).state == "UNMET"
 
     def test_planned_is_declared_never_inferred_from_absence(self, store) -> None:
         """The distinction the board turns on.
@@ -629,23 +653,35 @@ class TestTheDigestReportsDeltas:
         assert {d.id for d in deltas} == {"a", "b"}
 
 
-class _WriteRefusingStore(LocalStore):
-    """A store whose EVERY mutator raises.
+def _refusing_store(tmp_path) -> LocalStore:
+    """A store whose every declared mutator raises, installed FROM the declaration.
 
-    The earlier version of this guard monkeypatched `put_bytes` alone, and was
-    beatable: `LocalStore.compare_and_swap` writes via `open(tmp, "xb")` plus
-    `os.replace` and never touches `put_bytes`, so inserting a
-    `compare_and_swap` call into `build_board` wrote an object with the whole
-    suite green. Patching one method names the writes someone thought of,
-    which is the denylist shape this repository forbids. Subclassing and
-    refusing every mutator on `Store`'s interface is the allowlist.
+    Two earlier versions of this guard were wrong in the same direction. The
+    first monkeypatched `put_bytes` alone and was beaten by
+    `compare_and_swap`, which writes via `open(tmp,"xb")` plus `os.replace`
+    and never touches it. The second hand-listed both names and then compared
+    that list against `dir(Store)` FILTERED BY MEMBERSHIP IN THE SAME LIST —
+    so it computed `mutators ∩ dir(Store)` and asserted only that those two
+    names still exist. Adding a third abstract mutator to `Store` left it
+    green: a denylist wearing an allowlist's docstring, reintroduced inside
+    the fix for exactly that.
+
+    The refusals are now installed by iterating `Store.MUTATORS`, which is the
+    interface's own declaration. A mutator added there is refused here without
+    anyone editing this file; a mutator added WITHOUT a line there fails
+    `test_the_mutator_declaration_covers_every_abstract_write`.
     """
 
-    def put_bytes(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
-        raise AssertionError("build_board wrote via put_bytes")
+    class _Refusing(LocalStore):
+        pass
 
-    def compare_and_swap(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
-        raise AssertionError("build_board wrote via compare_and_swap")
+    for name in Store.MUTATORS:
+
+        def _refuse(*_args, _name: str = name, **_kwargs):
+            raise AssertionError(f"build_board wrote via {_name}")
+
+        setattr(_Refusing, name, _refuse)
+    return _Refusing(tmp_path)
 
 
 class TestTheProducerNeverRunsWhatItGrades:
@@ -657,40 +693,40 @@ class TestTheProducerNeverRunsWhatItGrades:
         the second half of this guard, not the first — a role is a deployment
         fact and this is a code fact.
         """
-        build_board(_WriteRefusingStore(tmp_path))
+        build_board(_refusing_store(tmp_path))
 
-    def test_the_refusing_store_actually_refuses(self, tmp_path) -> None:
-        """The guard's own guard.
+    @pytest.mark.parametrize("name", Store.MUTATORS)
+    def test_the_double_really_refuses_each_declared_mutator(self, tmp_path, name) -> None:
+        """The guard's own guard, one case per mutator.
 
-        A `_WriteRefusingStore` that silently permitted a write would make the
-        test above pass over nothing — the vacuous-guard shape this board
-        argues against everywhere else.
+        A double that silently permitted a write would make the test above
+        pass over nothing — the vacuous-guard shape this board argues against
+        everywhere else.
         """
-        refusing = _WriteRefusingStore(tmp_path)
-        with pytest.raises(AssertionError, match="put_bytes"):
-            refusing.put_bytes("k", b"{}")
-        with pytest.raises(AssertionError, match="compare_and_swap"):
-            refusing.compare_and_swap("k", "etag", b"{}")
+        refusing = _refusing_store(tmp_path)
+        with pytest.raises(AssertionError, match=name):
+            getattr(refusing, name)("k", "etag", b"{}")
 
-    def test_every_store_mutator_is_refused_by_the_double(self) -> None:
-        """Derived from `Store`, so a new mutator cannot slip past.
+    def test_the_mutator_declaration_covers_every_abstract_write(self) -> None:
+        """`Store.MUTATORS` names every method on the interface that writes.
 
-        If `Store` gains a third write method, this fails until the double
-        refuses it too — otherwise the guard above would keep passing while
-        being blind to the new path, exactly as it was blind to
-        `compare_and_swap`.
+        Derived from the abstract method set and the signatures, not from a
+        literal compared against itself. A new abstract method taking a
+        `payload` is a write, and it must be declared before this passes —
+        which is what makes `_refusing_store` a real allowlist.
         """
-        from crucible.store import Store as _Store
+        import inspect
 
-        mutators = {"put_bytes", "compare_and_swap"}
-        declared = {
+        writes = {
             name
-            for name in dir(_Store)
-            if not name.startswith("_") and name in {"put_bytes", "compare_and_swap"}
+            for name in getattr(Store, "__abstractmethods__", frozenset())
+            if "payload" in inspect.signature(getattr(Store, name)).parameters
         }
-        assert declared == mutators, (
-            f"Store's mutator set is {sorted(declared)}; _WriteRefusingStore refuses "
-            f"{sorted(mutators)}. Teach the double the new one."
+        assert writes, "no abstract method takes a payload — this derivation has gone blind"
+        assert writes <= set(Store.MUTATORS), (
+            f"{sorted(writes - set(Store.MUTATORS))} write to the store and are not in "
+            "Store.MUTATORS, so _refusing_store does not refuse them and every "
+            "read-only assertion above is blind to them."
         )
 
 
@@ -969,3 +1005,55 @@ class TestThePhaseRowsAreActionable:
             row = rows[f"phase:{phase.id}"]
             assert "no gate is registered" in row.artifact
             assert "it does not exist" in row.means_when_red
+
+
+class TestADryRunDoesNotTouchThePointer:
+    """`--dry-run` is ignored by all five track-C handlers.
+
+    `alpha-engine-config-I9863` owns the repo-wide fix, and honouring the flag
+    for `board` alone would normally be the wrong shape — one handler behaving
+    differently from the four beside it. The exception is narrow and specific:
+    this is the one job whose `--dry-run` clobbers `board/current.json`, the
+    key the fleet-console adapter reads.
+    """
+
+    @staticmethod
+    def _run(tmp_path, day, *, dry_run=False):
+        import argparse
+
+        from crucible.track_c import board_handler
+
+        board_handler(argparse.Namespace(trading_day=day, store=str(tmp_path), dry_run=dry_run))
+        return LocalStore(tmp_path)
+
+    def test_a_dry_run_writes_neither_the_pointer_nor_the_page(self, tmp_path) -> None:
+        written = self._run(tmp_path, dt.date(2026, 9, 1), dry_run=True)
+        assert not written.exists("board/current.json")
+        assert not written.exists("board/index.html")
+        assert not written.exists("board/2026-09-01/board.json")
+
+    def test_a_dry_run_does_not_overwrite_a_good_pointer(self, tmp_path) -> None:
+        self._run(tmp_path, dt.date(2026, 9, 1))
+        written = self._run(tmp_path, dt.date(2026, 8, 28), dry_run=True)
+        assert json.loads(written.get_bytes("board/current.json"))["trading_day"] == "2026-09-01"
+
+    def test_a_held_pointer_reports_no_comparison_rather_than_phantom_regressions(
+        self, tmp_path
+    ) -> None:
+        """A replay must not publish deltas computed forward in time.
+
+        `board_delta` against a NEWER incumbent yields a set of "regressions"
+        that are an artefact of the comparison direction, not of anything that
+        moved. The digest says no comparison was made and why.
+        """
+        self._run(tmp_path, dt.date(2026, 9, 1))
+        written = self._run(tmp_path, dt.date(2026, 8, 28))
+        manifest = json.loads(written.get_bytes("runs/board/2026-08-28/run.json"))
+        moved = next(m for m in manifest["metrics"] if m["name"] == "board_rows_moved")
+        assert moved["value"] == 0
+        assert "no comparison was made" in moved["status_reason"]
+        assert "NOT a claim that nothing moved" in moved["status_reason"]
+        assert moved["status"] == "OK", (
+            "a replay is a deliberate operator action; grading it BREACH would teach the "
+            "reader to discount the one status that means something"
+        )
