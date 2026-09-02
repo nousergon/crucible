@@ -220,6 +220,74 @@ class TestCostAssertion:
             run_job("experiment.run", job, store=store, trading_day=TRADING_DAY)
 
 
+class TestDiscriminator:
+    """alpha-engine-config-I9781: a discriminator keeps concurrent or
+    repeated writers of the same job+trading_day from colliding."""
+
+    def test_two_slots_on_the_same_trading_day_write_two_manifests(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+
+        run_job(
+            "experiment.run",
+            lambda ctx: ctx.record_output("u.json", b"{}"),
+            store=store,
+            trading_day=TRADING_DAY,
+            discriminator="u",
+        )
+        run_job(
+            "experiment.run",
+            lambda ctx: ctx.record_output("r.json", b"{}"),
+            store=store,
+            trading_day=TRADING_DAY,
+            discriminator="r",
+        )
+
+        iso = TRADING_DAY.isoformat()
+        u_doc = json.loads(store.get_bytes(manifest_key("experiment.run", iso, discriminator="u")))
+        r_doc = json.loads(store.get_bytes(manifest_key("experiment.run", iso, discriminator="r")))
+        assert u_doc["discriminator"] == "u"
+        assert r_doc["discriminator"] == "r"
+        assert u_doc["outputs"][0]["key"] == "u.json"
+        assert r_doc["outputs"][0]["key"] == "r.json"
+        assert not store.exists(manifest_key("experiment.run", TRADING_DAY.isoformat()))
+
+    def test_no_discriminator_writes_the_undiscriminated_key_with_no_field(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        run_job("data.daily", lambda ctx: None, store=store, trading_day=TRADING_DAY)
+        doc = _read_manifest(store, "data.daily")
+        assert "discriminator" not in doc
+        validate(doc)
+
+    def test_a_callable_discriminator_resolves_against_the_built_context(self, tmp_path) -> None:
+        """`alerts.sweep`'s shape: the discriminator (`calendar_date`) is
+        only known once the runner has resolved it, not at the call site."""
+        store = LocalStore(tmp_path)
+        friday_evening = dt.datetime(2026, 8, 28, 21, 0)
+        saturday_evening = dt.datetime(2026, 8, 29, 21, 0)
+        sunday_evening = dt.datetime(2026, 8, 30, 21, 0)
+
+        for moment in (friday_evening, saturday_evening, sunday_evening):
+            run_job(
+                "alerts.sweep",
+                lambda ctx: None,
+                store=store,
+                now=moment,
+                discriminator=lambda ctx: ctx.calendar_date.isoformat(),
+            )
+
+        # All three resolve to Friday's trading day, and each firing left its
+        # own manifest rather than the last one overwriting the first two.
+        for calendar_date in ("2026-08-28", "2026-08-29", "2026-08-30"):
+            doc = json.loads(
+                store.get_bytes(
+                    manifest_key("alerts.sweep", "2026-08-28", discriminator=calendar_date)
+                )
+            )
+            assert doc["trading_day"] == "2026-08-28"
+            assert doc["calendar_date"] == calendar_date
+            assert doc["discriminator"] == calendar_date
+
+
 class TestKeyRefusal:
     def test_the_runner_refuses_a_non_trading_day(self, tmp_path) -> None:
         """§4.12: a caller cannot force a Saturday key by passing one. The

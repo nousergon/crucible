@@ -21,6 +21,7 @@ emit an invalid manifest would defeat the schema entirely.
 from __future__ import annotations
 
 import json
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -93,21 +94,78 @@ def validate(manifest: dict[str, Any]) -> None:
     )
 
 
-def manifest_key(job: str, trading_day: str) -> str:
+#: A discriminator is a path segment, not free text: it must round-trip
+#: through every path-shaped tool a key passes through (a `LocalStore` path,
+#: `aws s3 cp`, a URL) the same way `crucible.keys.arm_key_segment` protects
+#: arm ids. Slot letters (`u`/`r`/`m`/`s`) and ISO calendar dates both already
+#: satisfy this, so no translation table is needed — only a refusal of
+#: anything that would not.
+_DISCRIMINATOR_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def manifest_key(job: str, trading_day: str, *, discriminator: str | None = None) -> str:
     """The store key a manifest is written under.
 
     The trading day is the key (§4.12). This function is the single place
     that shape is expressed, so the trading-day contract test has one thing
     to walk.
+
+    ``discriminator`` distinguishes multiple manifests a single job
+    legitimately writes for one trading day — the slot letter for
+    `experiment.run`/`experiment.grade` (four slots, one job name, one
+    trading day, four writers), or a firing's own `calendar_date` for a job
+    like `alerts.sweep` that runs more than once between two trading-day
+    rollovers. Omitted (the default) for every job that writes at most one
+    manifest per trading day, which keeps the key shape unchanged for every
+    existing caller (alpha-engine-config-I9781).
+
+    The alternative weighed in I9781 — folding the slot into the job name
+    itself (`experiment.run:r`) — was rejected: `job` is a closed enum the
+    schema validates and `components.yaml` keys its one-row-per-job registry
+    off it, so multiplying it by slot would multiply the registry too. A
+    discriminator is an orthogonal path segment instead, so `job` keeps
+    meaning "which of the thirteen CLI jobs wrote this" and nothing else.
+
+    ``discriminator`` is never an arm id, so it does not go through
+    `crucible.keys.arm_key_segment` — it is validated directly against a
+    plain path-segment charset instead.
     """
     if not job:
         raise ValueError("job must be non-empty")
     if not trading_day:
         raise ValueError("trading_day must be non-empty")
-    return f"runs/{job}/{trading_day}/run.json"
+    if discriminator is None:
+        return f"runs/{job}/{trading_day}/run.json"
+    if not _DISCRIMINATOR_RE.match(discriminator):
+        raise ValueError(
+            f"discriminator {discriminator!r} must be 1-64 characters of "
+            "[A-Za-z0-9_.-] — it is a path segment, and this is the one place "
+            "that is enforced so a future writer cannot orphan a manifest under "
+            "a key no path-shaped tool can address."
+        )
+    return f"runs/{job}/{trading_day}/{discriminator}/run.json"
 
 
-def read_manifest(store: Any, job: str, trading_day: str) -> dict[str, Any]:
+def manifest_prefix(job: str, trading_day: str) -> str:
+    """The prefix under which every manifest for ``job`` on ``trading_day``
+    lives, discriminated or not.
+
+    `manifest_key(job, trading_day)` (bare) and
+    `manifest_key(job, trading_day, discriminator=d)` (any ``d``) both start
+    with this prefix, so a reader that does not know in advance whether a
+    job writes one manifest or several per trading day — `crucible.alerts`,
+    chiefly — lists this prefix rather than guessing a discriminator.
+    """
+    if not job:
+        raise ValueError("job must be non-empty")
+    if not trading_day:
+        raise ValueError("trading_day must be non-empty")
+    return f"runs/{job}/{trading_day}/"
+
+
+def read_manifest(
+    store: Any, job: str, trading_day: str, *, discriminator: str | None = None
+) -> dict[str, Any]:
     """Read and validate one manifest from ``store``.
 
     Validated on READ as well as on write. A manifest written by an older
@@ -119,7 +177,7 @@ def read_manifest(store: Any, job: str, trading_day: str) -> dict[str, Any]:
     ``None``, because absence is one of the two page conditions (§4.6) and a
     caller that cannot tell "absent" from "empty" cannot raise it.
     """
-    payload = store.get_bytes(manifest_key(job, trading_day))
+    payload = store.get_bytes(manifest_key(job, trading_day, discriminator=discriminator))
     document = json.loads(payload.decode("utf-8"))
     validate(document)
     return document

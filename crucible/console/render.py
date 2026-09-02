@@ -19,7 +19,7 @@ from krepis.metrics import StatusLiteral
 from crucible.calendar import previous_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
 from crucible.console.classify import STATES, Classification, classify
-from crucible.manifest import manifest_key
+from crucible.manifest import manifest_prefix
 from crucible.store import Store
 
 __all__ = [
@@ -75,6 +75,37 @@ def _read_json(store: Store, key: str) -> dict[str, Any] | None:
     return json.loads(store.get_bytes(key).decode("utf-8"))
 
 
+def _read_representative_manifest(
+    store: Store, job: str, trading_day: str
+) -> dict[str, Any] | None:
+    """One manifest to classify ``job`` for ``trading_day`` by, from however
+    many its writers produced.
+
+    A job that carries a discriminator (`experiment.run`/`experiment.grade`
+    by slot, `alerts.sweep` by `calendar_date`) can have written several
+    manifests here since I9781 fixed the collision that used to leave
+    exactly one, last-writer-wins. This row still renders one classification,
+    so a `failed` manifest wins over an `ok` one — a component is DEGRADED
+    the moment any one of its writers failed, never masked by a healthier
+    sibling — and otherwise the lexicographically-last manifest is used, on
+    the same principle `Store.list_keys` orders by: deterministic, not a
+    claim about recency.
+
+    Per-writer rows (one per slot) are a console redesign this fix does not
+    make — tracked as a follow-up in the PR body.
+    """
+    candidates: list[dict[str, Any]] = []
+    for key in sorted(store.list_keys(manifest_prefix(job, trading_day))):
+        payload = json.loads(store.get_bytes(key).decode("utf-8"))
+        candidates.append(payload)
+    if not candidates:
+        return None
+    for manifest in candidates:
+        if manifest.get("status") == "failed":
+            return manifest
+    return candidates[-1]
+
+
 def _has_history(store: Store, job: str) -> bool:
     """Whether this component has ever produced a manifest.
 
@@ -113,7 +144,7 @@ def build_page(
     rows: list[dict[str, Any]] = []
     metric_gap = 0
     for name, component in sorted(reg.items()):
-        manifest = _read_json(store, manifest_key(name, trading_day.isoformat()))
+        manifest = _read_representative_manifest(store, name, trading_day.isoformat())
         classification = classify(
             component,
             manifest,

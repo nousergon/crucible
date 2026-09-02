@@ -23,6 +23,7 @@ import json
 from typing import Any
 
 from crucible import migrate as migrate_module
+from crucible.calendar import is_trading_day
 from crucible.config import settings as resolve_settings
 from crucible.data import ArcticPriceSource, PriceSource, run_daily, run_heal, run_weekly
 from crucible.explain import explain as explain_lineage
@@ -35,6 +36,13 @@ from crucible.slots.arms import load_arm_specs, read_register, register_arms, wr
 __all__ = ["HANDLERS", "add_track_a_arguments"]
 
 _SLOT_MODULES = {"u": universe, "r": research}
+
+
+def _today() -> dt.date:
+    """The wall-clock calendar date. A thin, monkeypatchable seam —
+    `dt.date.today` is a built-in classmethod tests cannot patch directly —
+    used only by the `data.daily` holiday guard below (alpha-engine-config-I9781)."""
+    return dt.date.today()
 
 
 def _settings(args: argparse.Namespace) -> Any:
@@ -72,6 +80,24 @@ def _symbols(args: argparse.Namespace) -> list[str] | None:
 
 
 def handle_data_daily(args: argparse.Namespace) -> int:
+    # `data.daily`'s EventBridge schedule fires every weekday close, and a
+    # market holiday (Thanksgiving, Independence Day observed, ...) is still
+    # a weekday: without this guard the job resolves `trading_day` back to
+    # the last real session (rule 3 — that resolution is legitimate) and
+    # reruns the whole compile for it, overwriting that session's already-
+    # good manifest with a second, unrelated writer's output — the same
+    # last-writer-wins shape as the slot collision this fix addresses
+    # (alpha-engine-config-I9781). Refused only when `--date` was NOT given:
+    # an explicit `--date` is a deliberate backfill/replay and is honoured
+    # even on a holiday, same as everywhere else in this repo (rule 3).
+    today = _today()
+    if getattr(args, "date", None) is None and not is_trading_day(today):
+        print(
+            f"data.daily: {today.isoformat()} is not an NYSE trading day; "
+            "the schedule fired on a holiday. Nothing to compile — exiting without "
+            f"touching {args.trading_day.isoformat()}'s existing manifest."
+        )
+        return 0
     config = _settings(args)
     store = config.store()
     source = _source(args, config)
@@ -228,6 +254,10 @@ def handle_experiment_run(args: argparse.Namespace) -> int:
         lambda c: module.produce(c, settings=config, arm_name=getattr(args, "arm", None)),
         store=store,
         trading_day=args.trading_day,
+        # Four slots share one job name and one trading day; the slot is the
+        # discriminator that keeps `--slot u` and `--slot r` from writing the
+        # same manifest (alpha-engine-config-I9781).
+        discriminator=args.slot,
     )
     print(json.dumps({"run_id": ctx.run_id, "outputs": [o["key"] for o in ctx.outputs]}, indent=2))
     return 0
@@ -250,7 +280,15 @@ def handle_experiment_grade(args: argparse.Namespace) -> int:
     def job(ctx: Any) -> None:
         result.update(module.grade(ctx, settings=config))
 
-    ctx = run_job("experiment.grade", job, store=store, trading_day=args.trading_day)
+    ctx = run_job(
+        "experiment.grade",
+        job,
+        store=store,
+        trading_day=args.trading_day,
+        # Same shape as `experiment.run` above: one job name, four slots
+        # (alpha-engine-config-I9781).
+        discriminator=args.slot,
+    )
     print(
         json.dumps(
             {

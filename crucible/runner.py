@@ -236,6 +236,12 @@ class RunContext:
     seed: int
     started: dt.datetime
 
+    #: Set by `run_job` from its own `discriminator` argument, once
+    #: `calendar_date` is known — never by the job body. Mirrors
+    #: `crucible.manifest.manifest_key`'s `discriminator`: absent for a job
+    #: that writes at most one manifest per trading day (alpha-engine-config-I9781).
+    discriminator: str | None = None
+
     inputs: list[dict[str, Any]] = field(default_factory=list)
     outputs: list[dict[str, Any]] = field(default_factory=list)
     rows_in: int = 0
@@ -342,8 +348,20 @@ def run_job(
     seed: int | None = None,
     release_sha: str | None = None,
     transient_retry: bool = True,
+    discriminator: str | Callable[[RunContext], str] | None = None,
 ) -> RunContext:
     """Run ``fn`` as job ``job`` and write its manifest, whatever happens.
+
+    ``discriminator`` distinguishes concurrent or repeated writers of the
+    same `job`+`trading_day` (alpha-engine-config-I9781) — see
+    `crucible.manifest.manifest_key`. Pass a plain string when the value is
+    known before the run starts (a `--slot`); pass a callable taking the
+    freshly-built :class:`RunContext` when it can only be derived after
+    `trading_day`/`calendar_date` resolve (`alerts.sweep`'s own
+    `calendar_date`, so Friday/Saturday/Sunday firings that all resolve to
+    Friday's trading day still write three distinct manifests). Omitted for
+    every job that writes at most one manifest per trading day, which is
+    every job but those two today.
 
     ``trading_day`` may be passed explicitly (a backfill, a replay); it is
     then *asserted*, never silently corrected. A caller that asked for a
@@ -392,6 +410,7 @@ def run_job(
             started=started,
         )
         ctx.attempts = [dict(a) for a in attempts]
+        ctx.discriminator = discriminator(ctx) if callable(discriminator) else discriminator
 
         status = "ok"
         reason = ""
@@ -485,6 +504,11 @@ def _write_manifest(
         "metrics": ctx.metrics,
         "attempts": ctx.attempts,
     }
+    if ctx.discriminator is not None:
+        # Omitted entirely rather than written as null: the schema declares
+        # it optional, not nullable, so a job with one writer per trading day
+        # produces a manifest byte-identical to one from before I9781.
+        manifest["discriminator"] = ctx.discriminator
     # cost_usd must be >= the sum of llm_calls[].usd (schemas/run_manifest.v1.json,
     # `cost_usd` description) — a schema cannot cross-reference two fields of
     # the same document, so the runner asserts it here, before the write, per
@@ -503,7 +527,7 @@ def _write_manifest(
         )
     validate(manifest)
     store.put_bytes(
-        manifest_key(ctx.job, ctx.trading_day.isoformat()),
+        manifest_key(ctx.job, ctx.trading_day.isoformat(), discriminator=ctx.discriminator),
         json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"),
     )
     return manifest

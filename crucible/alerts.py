@@ -43,7 +43,7 @@ from crucible.calendar import (
     resolve_trading_day,
 )
 from crucible.components import Component, load_registry, scheduled_components
-from crucible.manifest import manifest_key
+from crucible.manifest import manifest_prefix
 from crucible.store import Store
 
 __all__ = [
@@ -352,7 +352,11 @@ def days_to_evaluate(
     for _ in range(window_trading_days):
         day = previous_trading_day(day)
         candidates.append(day)
-    ran = {d for d in candidates if store.exists(manifest_key(SWEEP_JOB, d.isoformat()))}
+    # `alerts.sweep` now discriminates its own manifest by `calendar_date`
+    # (alpha-engine-config-I9781), so a trading day can carry several — this
+    # only needs to know whether ANY exist, hence a prefix listing rather
+    # than an exact-key check.
+    ran = {d for d in candidates if any(store.list_keys(manifest_prefix(SWEEP_JOB, d.isoformat())))}
     if not ran:
         # No evidence the sweep ran on any day in the window: either it is a
         # cold start or the sweep has been down for longer than the window,
@@ -408,7 +412,12 @@ def evaluate_absence(
             due = component.deadline.due_at(trading_day)
             if moment < due:
                 continue
-            if store.exists(manifest_key(name, trading_day.isoformat())):
+            # A prefix listing, not an exact-key check: a job that carries a
+            # discriminator (experiment.run/grade by slot, alerts.sweep by
+            # calendar_date) writes ANY number of manifests under this
+            # trading day, and absence means none of them exist — not that
+            # the one bare key is missing (alpha-engine-config-I9781).
+            if any(store.list_keys(manifest_prefix(name, trading_day.isoformat()))):
                 continue
             pages.append(
                 Page(
@@ -416,7 +425,7 @@ def evaluate_absence(
                     job=name,
                     trading_day=trading_day,
                     reason=(
-                        f"no manifest at {manifest_key(name, trading_day.isoformat())}; due "
+                        f"no manifest under {manifest_prefix(name, trading_day.isoformat())}; due "
                         f"{component.deadline.describe(trading_day)} "
                         f"({due.strftime('%Y-%m-%dT%H:%M:%SZ')}), now "
                         f"{moment.strftime('%Y-%m-%dT%H:%M:%SZ')}"
@@ -455,32 +464,36 @@ def evaluate_failure(
         for name, component in sorted(reg.items()):
             if component.lifecycle != "ACTIVE":
                 continue
-            key = manifest_key(name, trading_day.isoformat())
-            if not store.exists(key):
-                continue
-            try:
-                manifest = json.loads(store.get_bytes(key).decode("utf-8"))
-            except (ValueError, UnicodeDecodeError) as exc:
-                pages.append(
-                    Page(
-                        condition="failure",
-                        job=name,
-                        trading_day=trading_day,
-                        reason=f"manifest at {key} is unreadable: {type(exc).__name__}: {exc}",
-                        run_id=_UNPARSEABLE_RUN_ID,
+            # A job that carries a discriminator (experiment.run/grade by
+            # slot, alerts.sweep by calendar_date) can have written several
+            # manifests under this trading day; each is its own writer and
+            # each is checked, rather than the single bare key that used to
+            # be the only place a failure could be recorded — and the only
+            # one four colliding writers could share (alpha-engine-config-I9781).
+            for key in sorted(store.list_keys(manifest_prefix(name, trading_day.isoformat()))):
+                try:
+                    manifest = json.loads(store.get_bytes(key).decode("utf-8"))
+                except (ValueError, UnicodeDecodeError) as exc:
+                    pages.append(
+                        Page(
+                            condition="failure",
+                            job=name,
+                            trading_day=trading_day,
+                            reason=f"manifest at {key} is unreadable: {type(exc).__name__}: {exc}",
+                            run_id=_UNPARSEABLE_RUN_ID,
+                        )
                     )
-                )
-                continue
-            if manifest.get("status") == "failed":
-                pages.append(
-                    Page(
-                        condition="failure",
-                        job=name,
-                        trading_day=trading_day,
-                        reason=manifest.get("reason") or "(the manifest recorded no reason)",
-                        run_id=manifest.get("run_id") or _UNPARSEABLE_RUN_ID,
+                    continue
+                if manifest.get("status") == "failed":
+                    pages.append(
+                        Page(
+                            condition="failure",
+                            job=name,
+                            trading_day=trading_day,
+                            reason=manifest.get("reason") or "(the manifest recorded no reason)",
+                            run_id=manifest.get("run_id") or _UNPARSEABLE_RUN_ID,
+                        )
                     )
-                )
     return pages
 
 

@@ -63,19 +63,26 @@ def _write_manifest(
     reason: str = "",
     cost: float = 0.0,
     trading_day: dt.date = FRIDAY,
+    calendar_date: dt.date | None = None,
+    discriminator: str | None = None,
 ):
     payload = {
         "schema_version": "run_manifest.v1",
         "run_id": "01JG000000000000000000000" + job[0].upper(),
         "job": job,
         "trading_day": trading_day.isoformat(),
-        "calendar_date": trading_day.isoformat(),
+        "calendar_date": (calendar_date or trading_day).isoformat(),
         "status": status,
         "reason": reason,
         "cost_usd": cost,
         "attempts": [{"n": 1, "reason": "initial"}],
     }
-    store.put_bytes(manifest_key(job, trading_day.isoformat()), json.dumps(payload).encode())
+    if discriminator is not None:
+        payload["discriminator"] = discriminator
+    store.put_bytes(
+        manifest_key(job, trading_day.isoformat(), discriminator=discriminator),
+        json.dumps(payload).encode(),
+    )
     return payload
 
 
@@ -149,6 +156,70 @@ class TestFailureCondition:
         pages = evaluate_failure(store, now=SATURDAY_NIGHT)
         assert len(pages) == 1
         assert "unreadable" in pages[0].reason
+
+
+class TestDiscriminatedManifests:
+    """alpha-engine-config-I9781: `alerts.sweep` fires every calendar day, and
+    Friday/Saturday/Sunday all resolve to Friday's trading day. Each firing
+    now writes its own manifest (discriminated by `calendar_date`) instead of
+    the last one silently overwriting the first two; the sweep's own reader
+    logic has to see all of them, not just whichever key it used to guess."""
+
+    def test_evaluate_failure_sees_every_discriminated_manifest_not_just_one(
+        self, tmp_path
+    ) -> None:
+        store = LocalStore(tmp_path)
+        _write_manifest(
+            store,
+            "alerts.sweep",
+            status="ok",
+            trading_day=FRIDAY,
+            calendar_date=FRIDAY,
+            discriminator="2026-08-28",
+        )
+        _write_manifest(
+            store,
+            "alerts.sweep",
+            status="failed",
+            reason="RuntimeError: SNS publish timed out",
+            trading_day=FRIDAY,
+            calendar_date=dt.date(2026, 8, 29),
+            discriminator="2026-08-29",
+        )
+        _write_manifest(
+            store,
+            "alerts.sweep",
+            status="ok",
+            trading_day=FRIDAY,
+            calendar_date=dt.date(2026, 8, 30),
+            discriminator="2026-08-30",
+        )
+        pages = evaluate_failure(store, now=SATURDAY_NIGHT)
+        assert [p.reason for p in pages] == ["RuntimeError: SNS publish timed out"]
+
+    def test_days_to_evaluate_treats_any_discriminated_firing_as_the_sweep_having_run(
+        self, tmp_path
+    ) -> None:
+        store = LocalStore(tmp_path)
+        _write_manifest(
+            store,
+            "alerts.sweep",
+            status="ok",
+            trading_day=FRIDAY,
+            calendar_date=dt.date(2026, 8, 30),
+            discriminator="2026-08-30",
+        )
+        # Only the Sunday firing's manifest exists; the sweep still counts
+        # as having run for FRIDAY, not as three consecutive absences.
+        assert days_to_evaluate(store, SATURDAY_NIGHT) == [FRIDAY]
+
+    def test_a_bare_and_a_discriminated_manifest_for_the_same_job_both_read(self, tmp_path) -> None:
+        """Backward compatibility: a job with no discriminator (every job but
+        the two I9781 gave one to) still pages exactly as it always did."""
+        store = LocalStore(tmp_path)
+        _write_manifest(store, "data.daily", status="failed", reason="boom")
+        pages = evaluate_failure(store, now=SATURDAY_NIGHT)
+        assert [p.reason for p in pages] == ["boom"]
 
 
 class TestBus:

@@ -297,7 +297,18 @@ def sweep_handler(args: argparse.Namespace) -> int:
             }
         )
 
-    run_job("alerts.sweep", body, store=store, trading_day=args.trading_day)
+    run_job(
+        "alerts.sweep",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        # The sweep fires every calendar day at 21:00 ET, and Friday,
+        # Saturday and Sunday all resolve to Friday's trading day — three
+        # writers, one key, without this. `calendar_date` is only known once
+        # the runner resolves `trading_day`/`started`, so it is a callable
+        # rather than a value computed here (alpha-engine-config-I9781).
+        discriminator=lambda ctx: ctx.calendar_date.isoformat(),
+    )
     print(json.dumps({k: v for k, v in result.items() if k != "metric"}, indent=2))
     return 0
 
