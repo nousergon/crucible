@@ -46,7 +46,8 @@ to be invented and nothing is hidden.
 
 ## What is deliberately not here
 
-Anything measured against live AWS: the four-consecutive-Saturday window, the
+Anything measured against live AWS: the live-gate window (2 live Saturdays plus
+5 replayed, per plan §6.1 — not the 4 that §2 row 1 still names), the
 CloudTrail human-mutating-call count and the monthly bill are read from
 artifacts and from the CloudTrail S3 archive, not from a unit test. Their
 clauses appear below as assertions over the artifacts those measurements

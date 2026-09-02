@@ -57,9 +57,13 @@ class TestAutonomy:
         gate: 2 consecutive first-attempt `ok` Saturdays, **not 4**" — the
         four-Saturday soak becomes two live plus five replayed, on a path
         whose inputs are point-in-time addressable, "stated here so the
-        shortcut is a ruling, not a drift". Brian ruled (a) on every §7 item
-        including the §6.1 gate, recorded on alpha-engine-config-I9751 at
-        2026-09-01T18:16Z.
+        shortcut is a ruling, not a drift". Adopted under the stated
+        assumption recorded on alpha-engine-config-I9751 at
+        2026-09-01T18:16Z — Brian's instruction was "begin work on crucible v2
+        per the plan", and §6.1 is the plan's own text on this gate. The phase-2
+        execution issue, alpha-engine-config-I9758, already carries it as its
+        closes-when: five unattended scheduler runs plus live Saturdays
+        2026-09-12 and 2026-09-19 first-attempt ok, then cutover.
 
         This clause asserted 4 live Saturdays — two calendar weeks of soak
         that was never required, and a calendar gate is the one cost no

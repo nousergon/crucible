@@ -9,7 +9,7 @@ Normative source: plan §2 row 1 ("runs autonomously, minimal input") and
     because the query could not see the week.
 
 `lookup-events` returns a plausible short answer instead of an error, so a
-four-week gate built on it reports zero because it looked at two days. This
+multi-week gate built on it reports zero because it looked at two days. This
 module reads the **CloudTrail S3 archive** — the gzipped JSON objects a trail
 delivers — over the whole window, and `tests/test_autonomy.py` asserts the
 module never imports or calls the lookup API at all. That assertion is the
@@ -163,7 +163,7 @@ def iter_archive_records(
     so the window is walked one calendar day at a time and each day's objects
     are listed under their own prefix. Listing the whole trail and filtering
     client-side would work and would also read years of objects to answer a
-    question about four weeks.
+    question about a handful of weeks.
 
     Calendar days, not trading days — one of §4.12's exhaustive exceptions.
     CloudTrail delivers on wall-clock time, and a gate that skipped weekends
