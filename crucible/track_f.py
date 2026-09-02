@@ -31,6 +31,7 @@ from crucible.gate import (
     gate_key,
     ladder_payload,
 )
+from crucible.keys import manifest_key
 from crucible.runner import RunContext, run_job
 from crucible.store import open_store
 from crucible.weekly import arc_stages, run_arc
@@ -58,7 +59,7 @@ def weekly_handler(args: argparse.Namespace) -> int:
         planned = arc_stages(ctx.trading_day)
         ran = run_arc(ctx.trading_day, store=store_uri)
         for stage in ran:
-            key = f"runs/{stage.job}/{ctx.trading_day.isoformat()}/run.json"
+            key = manifest_key(stage.job, ctx.trading_day.isoformat(), discriminator=stage.slot)
             ctx.record_input(key, store.get_bytes(key))
         ctx.record_rows(rows_in=len(planned), rows_out=len(ran))
         ctx.record_metric(
@@ -71,7 +72,7 @@ def weekly_handler(args: argparse.Namespace) -> int:
                 "n_floor": 1,
                 "status": "OK" if len(ran) == len(planned) else "FAIL",
                 "status_reason": f"{len(ran)} of {len(planned)} declared arc stages completed",
-                "source_path": f"runs/weekly/{ctx.trading_day.isoformat()}/run.json",
+                "source_path": manifest_key("weekly", ctx.trading_day.isoformat()),
                 "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
         )

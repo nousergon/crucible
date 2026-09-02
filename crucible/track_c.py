@@ -22,9 +22,26 @@ import json
 from typing import Any
 
 from crucible import alerts, release
-from crucible.console.render import CONSOLE_JSON_KEY, CONSOLE_KEY, build_page, write_page
+from crucible.board import (
+    BOARD_SCHEMA_VERSION,
+    board_delta,
+    board_payload,
+    build_board,
+    pointer_may_move,
+    render_board_html,
+)
+from crucible.calendar import resolve_trading_day
+from crucible.components import load_registry
+from crucible.console.render import (
+    CONSOLE_JSON_KEY,
+    CONSOLE_KEY,
+    build_page,
+    classify_registry,
+    write_page,
+)
 from crucible.drift import drift_metrics
-from crucible.gate import LADDER_KEY, LADDER_SCHEMA_VERSION
+from crucible.gate import LADDER_KEY, LADDER_SCHEMA_VERSION, build_ladder
+from crucible.keys import BOARD_CURRENT_KEY, BOARD_HTML_KEY, board_key
 from crucible.runner import RunContext, run_job, spot_interruption_guard
 from crucible.store import Store, open_store, sha256_hex
 
@@ -398,6 +415,198 @@ def drift_handler(args: argparse.Namespace) -> int:
 
 
 # ── console ───────────────────────────────────────────────────────────────
+
+
+def board_handler(args: argparse.Namespace) -> int:
+    """Render the fully-declared board and file it. Reads; never runs.
+
+    `alpha-engine-config-I9837`. Deliberately its OWN job on its OWN daily
+    schedule rather than a stage of `console`: `console` is `dispatch: arc`,
+    dispatched by the weekly driver, and the weekly driver is phase-2 work.
+    A board that only refreshes once phase 2 opens could not have rendered
+    the gap that closed phase 1 — which is the entire reason it exists.
+
+    The board's own red is NOT this job's exit status. Almost every row is
+    red on day one and that is the correct reading, so a non-zero exit here
+    would be a daily failure alert on a working producer, and a daily failure
+    alert nobody can act on is how a channel gets muted. The job fails when
+    the MEASUREMENT fails; the reading lives in the artifact.
+    """
+    store = _store(args)
+
+    def body(ctx: RunContext) -> None:
+        moment = dt.datetime.now(dt.UTC)
+        registry = load_registry()
+        # `args.trading_day` when the caller named one — the same day the run
+        # manifest is keyed by. Resolving the wall clock here instead would
+        # file a replayed board under today's key while its manifest sat
+        # under the replayed day (§4.12).
+        trading_day = args.trading_day or resolve_trading_day(moment)
+        classifications, _ = classify_registry(store, registry, now=moment, trading_day=trading_day)
+        ladder = build_ladder(store, trading_day=trading_day, registry=registry, now=moment)
+        board = build_board(
+            store,
+            now=moment,
+            trading_day=trading_day,
+            registry=registry,
+            classifications=classifications,
+            ladder=ladder,
+        )
+
+        previous, previous_unreadable = _read_previous_board(store)
+
+        payload = board_payload(board)
+        may_move, pointer_reason = pointer_may_move(previous, board)
+        # `--dry-run` must not touch the pointer. The flag is ignored by all
+        # five track-C handlers (alpha-engine-config-I9863, which owns the
+        # repo-wide fix), and honouring it for `board` alone would normally be
+        # the wrong shape — but this is the one job whose `--dry-run` clobbers
+        # `board/current.json`, the key the fleet-console adapter reads. One
+        # narrow guard here, the class fix in I9863.
+        dry_run = bool(getattr(args, "dry_run", False))
+        if dry_run:
+            may_move = False
+            pointer_reason = "--dry-run: the pointer and the page are not written"
+        # The delta is computed against the incumbent only when this board is
+        # the one that supersedes it. When the pointer is HELD -- a replay, or
+        # a dry run -- comparing forward in time would publish a set of
+        # "regressions" that are an artefact of reading an older board against
+        # a newer one, which is a false reading on every replay.
+        deltas = board_delta(previous, board) if may_move else []
+        # The dated board is ALWAYS written; the pointer is conditional. A
+        # replay must not clobber `board/current.json` with an older board —
+        # that key is what the fleet console reads.
+        written = [] if dry_run else [board_key(board.trading_day)]
+        if may_move:
+            written.append(BOARD_CURRENT_KEY)
+        for key in written:
+            store.put_bytes(key, payload)
+            ctx.record_output(key, payload, schema_version=BOARD_SCHEMA_VERSION)
+        # The page and the JSON, always together: `console-policy` requires
+        # every view to serve the JSON an agent reads, because a page whose
+        # numbers can only be scraped out of HTML is a page the next automated
+        # reader re-derives incorrectly. It moves with the pointer, for the
+        # same reason and under the same condition.
+        if may_move:
+            page = render_board_html(board, deltas).encode("utf-8")
+            store.put_bytes(BOARD_HTML_KEY, page)
+            ctx.record_output(BOARD_HTML_KEY, page, schema_version=BOARD_SCHEMA_VERSION)
+
+        counts = board.counts()
+        ctx.record_metric(
+            {
+                "name": "board_rows_red",
+                "module": "crucible.board",
+                "metric_type": "operational",
+                "value": float(len(board.red)),
+                "unit": "rows",
+                "n_floor": 0,
+                # OK, not BREACH. Red is the DECLARED starting state of this
+                # instrument -- every row exists before the thing it measures
+                # -- so a non-zero count is the expected reading and grading it
+                # as a breach would page every day of the build. What is
+                # graded instead is whether the board could be RENDERED, and
+                # that is this job's own status.
+                "status": "OK",
+                "status_reason": (
+                    f"{len(board.red)} of {len(board.rows)} row(s) red; "
+                    f"{len(board.grey)} declared-not-built; {len(board.met)} met. "
+                    "Red is the declared day-one state of a fully-declared board."
+                ),
+                "source_path": BOARD_CURRENT_KEY,
+                "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+        ctx.record_metric(
+            {
+                "name": "board_rows_moved",
+                "module": "crucible.board",
+                "metric_type": "operational",
+                "value": float(len(deltas)),
+                "unit": "rows",
+                "n_floor": 0,
+                # BREACH when the previous board could not be read. Reporting
+                # "0 rows moved" over a failed comparison is a POSITIVE claim
+                # asserted on no evidence — and this is the only surface that
+                # reports a VANISHED declaration, so a silent zero here hides
+                # exactly the event the board exists to catch.
+                # BREACH only when the previous board could not be READ.
+                # A held pointer -- a replay, a dry run -- is a deliberate
+                # operator action and reporting it as a breach would teach the
+                # reader to discount the one status that means something.
+                # Either way the reason states plainly that no comparison was
+                # made, so the zero is never a claim that nothing moved.
+                "status": "OK" if previous_unreadable is None else "BREACH",
+                # The digest reports DELTAS, not absolute state. A board
+                # reading almost entirely PLANNED for weeks is correct and is
+                # also the thing people stop opening; the delta is the part
+                # that stays worth reading.
+                "status_reason": (
+                    f"the previous board could not be read ({previous_unreadable}), so no "
+                    "comparison was possible. This is NOT a claim that nothing moved."
+                    if previous_unreadable is not None
+                    else f"no comparison was made: {pointer_reason}. This is NOT a claim "
+                    "that nothing moved."
+                    if not may_move
+                    else "; ".join(d.describe() for d in deltas)
+                    if deltas
+                    else "no row changed state since the last board"
+                ),
+                "source_path": BOARD_CURRENT_KEY,
+                "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+        # UNMEASURABLE is visibly distinct from UNMET in the digest as well as
+        # on the surface: a row we could not READ is a statement about our
+        # access, and folding it into "unmet" reports our own outage as the
+        # system's result.
+        ctx.record_metric(
+            {
+                "name": "board_rows_unmeasurable",
+                "module": "crucible.board",
+                "metric_type": "operational",
+                "value": float(counts["UNMEASURABLE"]),
+                "unit": "rows",
+                "n_floor": 0,
+                "status": "OK" if counts["UNMEASURABLE"] == 0 else "BREACH",
+                "status_reason": (
+                    f"{counts['UNMEASURABLE']} row(s) could not be read at all. Unlike "
+                    "UNMET, this is a statement about our access rather than about the "
+                    "system, and its objective is zero."
+                ),
+                "source_path": BOARD_CURRENT_KEY,
+                "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+
+    run_job("board", body, store=store, trading_day=args.trading_day)
+    return 0
+
+
+def _read_previous_board(store: Store) -> tuple[dict[str, Any] | None, str | None]:
+    """The last board filed. Returns `(document, unreadable_reason)`.
+
+    **A failed read is not "no change".** The earlier version of this returned
+    `None` on any exception, which fed `board_delta(None, …) -> []` and made
+    the digest publish `board_rows_moved = 0, "no row changed state"` — a
+    POSITIVE claim of no movement, asserted over a read that failed. That is
+    the one thing this module's whole argument forbids, and it happened to be
+    on the only surface that reports a VANISHED declaration.
+
+    So the two cases are separated and the second is surfaced by the caller:
+    "there is no previous board" (the first ever run) and "there is one and I
+    could not read it" want opposite responses, and the second is
+    `UNMEASURABLE` in this board's own vocabulary.
+    """
+    try:
+        if not store.exists(BOARD_CURRENT_KEY):
+            return None, None
+        document = json.loads(store.get_bytes(BOARD_CURRENT_KEY))
+    except Exception as exc:  # noqa: BLE001 - reported, never swallowed; see the docstring
+        return None, f"{type(exc).__name__}: {exc}"
+    if not isinstance(document, dict):
+        return None, f"{BOARD_CURRENT_KEY} parsed to {type(document).__name__}, not an object"
+    return document, None
 
 
 def console_handler(args: argparse.Namespace) -> int:

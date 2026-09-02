@@ -510,6 +510,12 @@ _UNPARSEABLE_RUN_ID = "0" * 26
 def bus_key(group: PageGroup) -> str:
     """`alerts/{trading_day}/{incident_id}.json` (§9.3).
 
+    Stays here rather than in `crucible.keys` (alpha-engine-config-I9807
+    class sweep): the key is a function of `incident_id(group)`, this
+    module's own derived identity for a `PageGroup` — moving `bus_key` alone
+    would either duplicate that derivation in `crucible.keys` or make the
+    generic key module import alert-domain logic, which is backwards.
+
     **One row per INCIDENT, not per observation.** §9.3 writes the shape as
     `alerts/{date}/{run_id}.json`; keying on the observation's id meant the
     nightly sweep wrote a fresh row for the same unchanged absence every

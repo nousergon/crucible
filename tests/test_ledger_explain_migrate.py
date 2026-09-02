@@ -185,6 +185,37 @@ class TestExplain:
             p.manifest is not None and p.manifest["job"] == "data.daily" for p in node.parents
         )
 
+    def test_a_run_id_resolves_to_its_discriminated_key_not_the_bare_shape(
+        self, store, cycle_date
+    ) -> None:
+        """alpha-engine-config-I9807 review: `explain.py` reconstructed the root
+        key as the bare `runs/{job}/{day}/run.json` shape, ignoring the
+        `discriminator` `crucible.keys.manifest_key` has supported since
+        I9781 — wrong for every `experiment.run`/`experiment.grade`/
+        `alerts.sweep` manifest, which is every job that ever legitimately
+        writes more than one manifest per trading day. This pins the fix:
+        the resolved node's identifier must be the key the manifest was
+        actually written under, discriminator included.
+        """
+        import crucible.keys as store_keys
+
+        ctx = run_job(
+            "experiment.run",
+            lambda c: None,
+            store=store,
+            trading_day=cycle_date,
+            discriminator="u",
+        )
+        expected = store_keys.manifest_key(
+            "experiment.run", cycle_date.isoformat(), discriminator="u"
+        )
+        node = explain(store, ctx.run_id)
+        assert node.key == expected
+        assert store.exists(node.key), (
+            "the identifier explain() names for this run must be the one it was "
+            "actually written under, not a reconstruction that happens to look plausible"
+        )
+
     def test_an_unclaimed_key_renders_as_unknown_rather_than_being_elided(
         self, store, source, cycle_date
     ) -> None:
