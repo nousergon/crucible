@@ -19,12 +19,14 @@ from krepis.metrics import StatusLiteral
 from crucible.calendar import previous_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
 from crucible.console.classify import STATES, Classification, classify
+from crucible.gate import LADDER_KEY, LADDER_STATES, build_ladder
 from crucible.manifest import manifest_prefix
 from crucible.store import Store
 
 __all__ = [
     "ATTRIBUTION_STATUSES",
     "CONSOLE_KEY",
+    "LADDER_KEY",
     "ConsolePage",
     "STATUS_COLORS",
     "build_page",
@@ -52,6 +54,12 @@ class ConsolePage:
     trading_day: str
     generated_utc: str
     rows: list[dict[str, Any]] = field(default_factory=list)
+    #: The plan §6 phase ladder — one row per phase, as `crucible.gate`
+    #: measures it. Carried on the page rather than left to a second command
+    #: so the ladder refreshes on the `console` job's weekly cadence as well
+    #: as on every `crucible gate` read: a surface only ever refreshed by hand
+    #: is the defect `alpha-engine-config-I9757` published three times.
+    phase_ladder: dict[str, Any] = field(default_factory=dict)
     attribution: list[dict[str, Any]] = field(default_factory=list)
     champions: dict[str, Any] = field(default_factory=dict)
     deploys: list[dict[str, Any]] = field(default_factory=list)
@@ -188,6 +196,7 @@ def build_page(
 
     attribution = _read_json(store, f"report/{trading_day.isoformat()}/attribution.json")
     champions = _champions(store)
+    ladder = build_ladder(store, trading_day=trading_day, registry=reg, now=moment)
 
     return ConsolePage(
         trading_day=trading_day.isoformat(),
@@ -200,6 +209,7 @@ def build_page(
         champions=champions,
         deploys=sorted(deploys, key=lambda d: str(d.get("trading_day"))),
         week_cost_usd=round(week_cost, 4),
+        phase_ladder=ladder.to_dict(),
         unreported=sum(1 for r in rows if r["state"] == "UNREPORTED") + metric_gap,
         population=len(rows),
     )
@@ -297,6 +307,15 @@ STATUS_COLORS: dict[str, str] = {
     # `crucible.drift.Band.status()` — not yet rendered through a dedicated
     # Metrics section, colored here so that day does not repeat C14.
     "WATCH": _AMBER,
+    # The phase ladder's own four states (`crucible.gate.LADDER_STATES`).
+    # `UNMEASURED` is RED, not gray: a phase whose gate has never been read is
+    # unobserved, not "fine so far" (principle 7). `OUT_OF_ORDER` is PURPLE —
+    # it is not a phase running badly, it is the ladder itself being violated,
+    # and giving it FAILED's red would hide it among ordinary unmet clauses.
+    "MET": _GREEN,
+    "UNMET": _AMBER,
+    "UNMEASURED": _RED,
+    "OUT_OF_ORDER": _PURPLE,
     # The attribution table's own vocabulary (`ATTRIBUTION_STATUSES`). `OK`
     # and `GREEN` alias `HEALTHY`'s color, `BREACH`/`RED` alias `FAILED`'s,
     # and the two `N/A-*` statuses are red rather than a neutral gray:
@@ -322,7 +341,7 @@ STATUS_COLORS: dict[str, str] = {
 # under `console-policy`'s add-by-PR-only closed vocabulary, but checked
 # anyway) or a new attribution status added to `ATTRIBUTION_STATUSES`
 # without a matching entry here fails the import, not a rendered page.
-_missing = (set(STATES) | set(ATTRIBUTION_STATUSES)) - set(STATUS_COLORS)
+_missing = (set(STATES) | set(ATTRIBUTION_STATUSES) | set(LADDER_STATES)) - set(STATUS_COLORS)
 assert not _missing, (
     f"STATUS_COLORS is missing a rule for {sorted(_missing)} — every status in "
     "classify.STATES or ATTRIBUTION_STATUSES must have a color before it can render "
@@ -399,6 +418,7 @@ def render_html(page: ConsolePage) -> str:
         f"<code>${page.week_cost_usd:.2f}</code> · population {page.population} · "
         f'transparency gap <span class="gap {gap_class}">{page.unreported}</span> '
         "(objective 0)</p>",
+        *_ladder_section(page),
         "<h2>Components</h2>",
         '<div class="wrap"><table><thead><tr>'
         "<th>Component</th><th>State</th><th>Schedule</th><th>Deadline</th>"
@@ -485,13 +505,71 @@ def render_html(page: ConsolePage) -> str:
     return "\n".join(parts)
 
 
-def write_page(store: Store, page: ConsolePage) -> tuple[str, str]:
-    """Write the HTML and the JSON. Returns both keys.
+def _ladder_section(page: ConsolePage) -> list[str]:
+    """The phase ladder, rendered at the TOP of the page.
+
+    Above Components deliberately: "which phase is this rebuild on, and is
+    anything being graded out of order" is the question the whole surface
+    exists to answer, and it is the one that was previously answerable only by
+    reading three GitHub issue comments and knowing which of them superseded
+    the others.
+    """
+    ladder = page.phase_ladder
+    if not ladder:
+        return [
+            "<h2>Phase ladder</h2>",
+            '<p class="empty">No ladder was built for this page. That is an absence, '
+            "not a complete ladder — <code>crucible.gate.build_ladder</code> did not "
+            "run.</p>",
+        ]
+    out_of_order = ladder.get("out_of_order") or []
+    parts = [
+        "<h2>Phase ladder</h2>",
+        f'<p class="sub">At <code>{_e(ladder.get("current_phase"))}</code> · '
+        f"{_e(ladder.get('phases_met'))}/{_e(ladder.get('phases_total'))} gates met · "
+        f'<span class="gap {"gap-zero" if not ladder.get("unmeasured") else "gap-nonzero"}">'
+        f"{_e(ladder.get('unmeasured'))} unmeasured</span> · "
+        f'<span class="gap {"gap-zero" if not out_of_order else "gap-nonzero"}">'
+        f"{len(out_of_order)} out of order</span></p>",
+        '<div class="wrap"><table><thead><tr><th>Phase</th><th>State</th>'
+        "<th>Clauses</th><th>Last read</th><th>Tracker</th><th>Why</th>"
+        "</tr></thead><tbody>",
+    ]
+    for row in ladder.get("phases", []):
+        met, total = row.get("clauses_met"), row.get("clauses_total")
+        # `never measured`, never `0/0` and never a blank cell: an unread gate
+        # and a gate that read zero met clauses are different facts.
+        clauses = "never measured" if total is None else f"{met}/{total}"
+        read_on = row.get("read_on") or "never"
+        parts.append(
+            "<tr>"
+            f"<td><code>{_e(row.get('phase'))}</code> {_e(row.get('title'))}</td>"
+            f'<td class="state {_state_class(row.get("state"))}">{_e(row.get("state"))}</td>'
+            f"<td>{_e(clauses)}</td>"
+            f"<td>{_e(read_on)}</td>"
+            f'<td><a href="{_e(row.get("tracker_url"))}"><code>'
+            f"{_e(row.get('tracker'))}</code></a></td>"
+            f'<td class="reason">{_e(row.get("detail"))}</td>'
+            "</tr>"
+        )
+    parts.append("</tbody></table></div>")
+    return parts
+
+
+def write_page(store: Store, page: ConsolePage) -> tuple[str, ...]:
+    """Write the HTML, the JSON and the phase-ladder artifact. Returns the keys.
 
     The JSON is not an extra: `console-policy` requires every view to serve
     the JSON an agent reads, and a page whose numbers can only be scraped out
     of HTML is a page the next automated reader re-derives incorrectly.
+
+    The ladder is written to its own well-known key as well as being embedded
+    here, because the FLEET console reads it as a source (an `s3-records`
+    adapter over `gates/ladder.json`) and an adapter that had to parse this
+    page's JSON would be coupled to the page's shape rather than to the
+    measurement.
     """
     store.put_bytes(CONSOLE_KEY, render_html(page).encode("utf-8"))
     store.put_bytes(CONSOLE_JSON_KEY, page.to_json())
-    return CONSOLE_KEY, CONSOLE_JSON_KEY
+    store.put_bytes(LADDER_KEY, json.dumps(page.phase_ladder, indent=2, sort_keys=True).encode())
+    return CONSOLE_KEY, CONSOLE_JSON_KEY, LADDER_KEY

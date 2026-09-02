@@ -405,8 +405,10 @@ def console_handler(args: argparse.Namespace) -> int:
 
     def body(ctx: RunContext) -> None:
         page = build_page(store, now=dt.datetime.now(dt.UTC))
-        html_key, json_key = write_page(store, page)
-        for key in (html_key, json_key):
+        # Every key `write_page` wrote, unpacked positionally by nobody: the
+        # ladder artifact joined the page and its JSON, and a two-name unpack
+        # would have failed the console job the moment it did.
+        for key in write_page(store, page):
             ctx.record_output(key, store.get_bytes(key), schema_version="console_page.v1")
         ctx.record_metric(
             {

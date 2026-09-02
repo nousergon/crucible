@@ -18,8 +18,16 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+from typing import Any
 
-from crucible.gate import GATES, GateResult, evaluate, gate_key
+from crucible.gate import (
+    GATES,
+    LADDER_KEY,
+    build_ladder,
+    evaluate,
+    gate_key,
+    ladder_payload,
+)
 from crucible.runner import RunContext, run_job
 from crucible.store import open_store
 from crucible.weekly import arc_stages, run_arc
@@ -86,7 +94,7 @@ def gate_handler(args: argparse.Namespace) -> int:
     is what a caller branches on.
     """
     store = open_store(getattr(args, "store", None))
-    result: dict[str, GateResult] = {}
+    result: dict[str, Any] = {}
 
     def body(ctx: RunContext) -> None:
         reading = evaluate(
@@ -102,6 +110,17 @@ def gate_handler(args: argparse.Namespace) -> int:
             for evidence in clause.evidence:
                 if store.exists(evidence):
                     ctx.record_input(evidence, store.get_bytes(evidence))
+        # The phase LADDER, republished on every gate read. The gate above
+        # answers "is phase N met"; the ladder answers "which phase is the
+        # rebuild on, and is any phase being graded ahead of an earlier one" —
+        # the question that lived only in `alpha-engine-config-I9757`'s issue
+        # comments, was written by hand, and was wrong twice. Written here
+        # rather than by a second command because a surface refreshed by a
+        # step somebody has to remember is the defect one layer along; the
+        # weekly `console` arc stage republishes it on a cadence as well.
+        ladder = build_ladder(store, trading_day=ctx.trading_day, now=ctx.started)
+        ctx.record_output(LADDER_KEY, ladder_payload(ladder))
+        result["ladder"] = ladder
         ctx.record_rows(rows_in=len(reading.window), rows_out=len(reading.clauses))
         ctx.record_metric(
             {
@@ -124,6 +143,7 @@ def gate_handler(args: argparse.Namespace) -> int:
     run_job("gate", body, store=store, trading_day=args.trading_day)
     reading = result["reading"]
     print(reading.render())
+    print(result["ladder"].render())
     return 0 if reading.met else 1
 
 

@@ -371,14 +371,15 @@ components:
 
   console:
     description: >-
-      Render the static console page from the manifests - runs with their
-      14-state classification, attribution, champions, week cost, deploys.
+      Render the static console page from the manifests - the plan §6 phase
+      ladder, runs with their 14-state classification, attribution,
+      champions, week cost, deploys.
     lifecycle: ACTIVE
     signals:
       execution: run.json
       cost: run.json:cost_usd
       resource: run.json:resource
-      lineage: run.json:inputs[runs/**],outputs[console/index.html]
+      lineage: run.json:inputs[runs/**,gates/**],outputs[console/index.html,gates/ladder.json]
       outcome: run.json:metrics[components_unreported]
     log_location: /crucible/console
     log_retention_days: 90
