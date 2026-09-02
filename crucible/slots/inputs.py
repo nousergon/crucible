@@ -41,8 +41,8 @@ the key only when the arm declares one, and a test pins an existing arm's id
 across this change.
 
 **Point-in-time by construction.** A prediction input resolves to
-``predictions/{arm}/{trading_day}.json`` — the *same* trading day as the row
-being built, on the panel's own date axis. There is no code path that reads
+:func:`crucible.keys.arm_predictions_key` for the *same* trading day as the
+row being built, on the panel's own date axis. There is no code path that reads
 a later day: the key names the day, and :func:`read_arm_predictions` refuses
 a payload whose own ``trading_day`` field disagrees with the key it was read
 from. A base arm's opinion about a later session is therefore unreachable
@@ -85,7 +85,7 @@ from typing import TYPE_CHECKING, Any
 
 from jsonschema import Draft202012Validator
 
-from crucible.keys import arm_key_segment
+from crucible.keys import arm_predictions_key
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from crucible.slots.model import FeaturePanel
@@ -279,7 +279,7 @@ def resolve_prediction_inputs(recipes: Sequence[Any]) -> dict[str, tuple[str, ..
                     "is registered, scored and promoted like any other — so an input "
                     "naming something that is not one has no producer and the arm does "
                     "not register (plan §9.1). This is the refusal that replaces "
-                    "`registers fine, dies at grading` (alpha-engine-config-I9777)."
+                    "`registers fine, dies at grading`."
                 )
             bases.append(ref.ref)
         edges[recipe.name] = tuple(bases)
@@ -337,7 +337,7 @@ def assert_inputs_producible(recipes: Sequence[Any], *, feature_columns: Sequenc
                     f"`crucible.slots.inputs.INPUT_RESOLVERS` carries "
                     f"{sorted(INPUT_RESOLVERS)}. The arm does NOT register. A kind that is "
                     "declarable but not resolvable is exactly `registers fine, could never "
-                    "be graded` with a new name (alpha-engine-config-I9777)."
+                    "be graded` with a new name."
                 )
         wanted = {c: "spec.features" for c in recipe.features}
         for ref in getattr(recipe, "inputs", ()):
@@ -350,8 +350,8 @@ def assert_inputs_producible(recipes: Sequence[Any], *, feature_columns: Sequenc
                 f"feature layer does not produce; it produces {sorted(produced)}. "
                 "The arm does NOT register. A column that is itself another model's "
                 "output is not a feature — declare it as `predictions[<arm-name>]` "
-                "under `spec.inputs` and register that model as an arm "
-                "(alpha-engine-config-I9777). Registering here and failing later at "
+                "under `spec.inputs` and register that model as an arm. "
+                "Registering here and failing later at "
                 "`FeatureLayerSource.panel()` is the failure mode this refusal replaces: "
                 "an arm nobody can grade is indistinguishable, on every surface, from an "
                 "arm nobody has graded yet."
@@ -363,23 +363,7 @@ def assert_inputs_producible(recipes: Sequence[Any], *, feature_columns: Sequenc
 # The predictions artifact — the versioned producer/consumer contract.
 # ---------------------------------------------------------------------------
 
-#: `predictions/{arm}/{trading_day}.json`. Declared here rather than in
-#: `crucible.keys` only because that module is being edited concurrently for
-#: `alpha-engine-config-I9772`; it belongs there, and moving it is tracked.
-_ARM_PREDICTIONS_PREFIX = "predictions"
-
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "arm_predictions.v1.json"
-
-
-def arm_predictions_key(arm_id: str, trading_day: str) -> str:
-    """What ONE arm predicted on ONE trading day.
-
-    Per-arm, not per-slot: `predictions/{trading_day}.json` is the *champion's*
-    serving feed, and a stacked arm reading that would depend on whichever arm
-    holds the pointer — a base model that silently changes identity between
-    two cycles, and a self-reference the moment the stacked arm won the slot.
-    """
-    return f"{_ARM_PREDICTIONS_PREFIX}/{arm_key_segment(arm_id)}/{trading_day}.json"
 
 
 @lru_cache(maxsize=1)
@@ -647,7 +631,7 @@ if _UNWIRED:  # pragma: no cover - an import-time structural guard
         f"input kind(s) {list(_UNWIRED)} are declarable under `spec.inputs` but have no "
         "entry in INPUT_RESOLVERS, so an arm declaring one would register and then die "
         "when its design matrix was built. Wire the producer or remove the kind from "
-        "INPUT_KINDS; there is no third option (alpha-engine-config-I9777)."
+        "INPUT_KINDS; there is no third option."
     )
 
 

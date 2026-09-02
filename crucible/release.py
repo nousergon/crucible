@@ -45,6 +45,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from crucible.keys import manifest_key
 from crucible.store import ETAG_ABSENT, PointerConflictError, S3Store, Store, sha256_hex
 
 _SCHEMA_DIR = Path(__file__).parent / "schemas"
@@ -262,6 +263,15 @@ def _assert_sha(sha: str) -> str:
 
 
 def release_prefix(sha: str) -> str:
+    """Stays here rather than in `crucible.keys` (alpha-engine-config-I9807
+    class sweep): `_assert_sha` is release-domain validation reused directly
+    by callers elsewhere in this module (`_assert_sha` at lines ~416, ~523),
+    not a key-only helper like `crucible.keys.arm_key_segment`. Moving just
+    the three key functions below would either duplicate `_assert_sha` in
+    `crucible.keys` — a second source of truth for sha validation — or make
+    the generic key module import a release-specific validator, which is
+    backwards: nothing in `crucible.keys` depends on a domain module today.
+    """
     return f"releases/{_assert_sha(sha)}"
 
 
@@ -557,7 +567,7 @@ def write_deploy_manifest(
     because a deploy that reported itself in a bespoke place is a deploy the
     console has to be taught about separately, and would not be.
     """
-    from crucible.manifest import manifest_key, validate  # noqa: PLC0415 - cycle
+    from crucible.manifest import validate  # noqa: PLC0415 - cycle
 
     validate(manifest)
     key = manifest_key("deploy", manifest["trading_day"])

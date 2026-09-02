@@ -132,7 +132,7 @@ class TestNothingIsDeclaredAndLeftUnwired:
         assert orphans == [], (
             f"{orphans} are exported by `crucible.slots.inputs` and are not reachable "
             "from anything `crucible/` references. A producer with no production caller "
-            "is the shape of alpha-engine-config-I9777: an arm registers against "
+            "is the shape of the stacked-arm defect: an arm registers against "
             "machinery that never runs, and the failure surfaces at training as somebody "
             "else's KeyError."
         )

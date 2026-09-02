@@ -369,6 +369,36 @@ components:
       anchor: next_calendar_day_at
       at: "14:00"
 
+  board:
+    description: >-
+      Render the fully-declared board - every plan §2 objective, every §6 phase
+      gate, every registry component and the four cutover predicates, each in
+      one of seven typed states.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[runs/**,gates/**,report/**,arms/**],outputs[board/index.html,board/current.json]
+      outcome: run.json:metrics[board_rows_unmeasurable]
+    log_location: /crucible/board
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/board
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    # DAILY, and `scheduler`, not `arc`. The weekly driver is phase-2 work
+    # (alpha-engine-config-I9758); a board dispatched by it would go dark for
+    # the whole of phase 0 and phase 1 - which are exactly the phases whose
+    # gaps this instrument exists to render. It is also why `dispatch: arc`
+    # would be wrong even though `console` is: six rows in this file once read
+    # "weekly, Saturday" while exactly one of them was dispatched by anything.
+    schedule: daily
+    dispatch: scheduler
+    deadline:
+      anchor: close_plus
+      offset_hours: 6
+
   console:
     description: >-
       Render the static console page from the manifests - the plan §6 phase

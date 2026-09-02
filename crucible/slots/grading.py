@@ -88,7 +88,7 @@ from nousergon_lib.arena.engine import (
 )
 from nousergon_lib.arena.window import ArmSeries, pair_on_common_window
 
-from crucible.keys import arm_key_segment, shadow_key, verdict_key
+from crucible.keys import cross_section_key, cross_section_settled_key, shadow_key, verdict_key
 from crucible.slots import SlotSpec
 from crucible.slots.arms import ArmSpec
 from crucible.slots.rankers import MissingFeatureError, rank_with
@@ -349,22 +349,6 @@ def _validate_cross_section_document(schema_filename: str, payload: dict[str, An
 #: the aggregate. A row can fail either: too few names on enough dates, or
 #: too few dates with enough names.
 CROSS_SECTION_MIN_NAMES = 5
-
-
-def cross_section_key(arm_id: str, trading_day: str) -> str:
-    """The full scored cross-section an arm produced on ``trading_day``.
-
-    Lives beside `shadow.json` under the same `experiments/{arm}/{day}/`
-    prefix (`crucible.keys` is another agent's file this session; the shape
-    matches its convention rather than restating it there).
-    """
-    return f"experiments/{arm_key_segment(arm_id)}/{trading_day}/cross_section.json"
-
-
-def cross_section_settled_key(arm_id: str, trading_day: str) -> str:
-    """The same cross-section, joined against the realized forward return
-    once ``trading_day``'s horizon has settled. Never written before then."""
-    return f"experiments/{arm_key_segment(arm_id)}/{trading_day}/cross_section_settled.json"
 
 
 @dataclass(frozen=True)

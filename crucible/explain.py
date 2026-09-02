@@ -31,6 +31,7 @@ import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from crucible.keys import manifest_key
 from crucible.manifest import validate
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -149,7 +150,11 @@ def explain(store: Store, target: str) -> Lineage:
 
     if target in by_run:
         root_manifest: dict[str, Any] | None = by_run[target]
-        root_key = f"runs/{root_manifest['job']}/{root_manifest['trading_day']}/run.json"
+        root_key = manifest_key(
+            root_manifest["job"],
+            root_manifest["trading_day"],
+            discriminator=root_manifest.get("discriminator"),
+        )
     elif target in by_output:
         root_manifest = by_output[target]
         root_key = target

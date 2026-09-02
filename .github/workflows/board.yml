@@ -1,0 +1,135 @@
+name: Board
+
+# The fully-declared board's producer — `alpha-engine-config-I9837`.
+#
+# It runs DAILY, on its own schedule, and deliberately not as a stage of the
+# weekly arc. `crucible weekly` is phase-2 work (alpha-engine-config-I9758);
+# a board dispatched by it would go dark for the whole of phase 0 and phase 1,
+# which are exactly the phases whose gaps this instrument exists to render.
+# The board that could have stopped `alpha-engine-config-I9757` closing on
+# 2026-09-02 with zero replay Saturdays run had to exist BEFORE phase 2, not
+# after it.
+#
+# ── Why this workflow can hold credentials when ci.yml cannot ─────────────
+#
+# `ci.yml` has `permissions: {contents: read}`, no OIDC and no credentials,
+# which is why its acceptance job carries no `schedule:` — a cron there could
+# not signal anything, because the clauses it would run read live AWS. This
+# workflow is the opposite shape on purpose: it exists to read live AWS, so it
+# has `id-token: write` and one narrowly-scoped role.
+#
+# ── What the role may and may not do ──────────────────────────────────────
+#
+# `crucible-v2-github-board` (nous-ergon-ops/infrastructure/cloudformation/
+# crucible-v2.yaml) reads `crucible/*` and writes exactly `crucible/board/*`
+# and `crucible/console/*`.
+#
+# That role is created by an OPERATOR-GATED apply, not by merging the ops PR:
+# the crucible-v2 stack is deliberately applied by a human with operator
+# credentials because a named-IAM apply is a security boundary
+# (`pull-request-policy` §4.2 form 3 — the merge emits the exact command AND a
+# detector stays red until it runs). Until the apply happens this workflow
+# fails daily on the identity check below, naming the exact command. That is
+# the detector working, not a defect: an operator step recorded in an issue
+# and nowhere else is `alpha-engine-config-I1906`, closed as *fixed* on a PR
+# whose `aws iam put-role-policy` was never performed.
+#
+# It is NOT the deploy role and NOT the runtime role. `crucible/gate.py`'s
+# binding rule is "a gate reads; it never runs", and this is that rule
+# expressed as an identity rather than as a convention: an identity that
+# cannot write a run manifest cannot be used to satisfy a clause it is
+# grading, whatever the code does.
+#
+# ── Why a red board is not a failed run ───────────────────────────────────
+#
+# Almost every row is red on day one and that is the correct reading. A
+# non-zero exit here would be a daily failure alert on a working producer, and
+# a daily failure alert nobody can act on is how a channel gets muted — which
+# is the state the acceptance gate had reached on every PR in this repository
+# before 2026-09-02. This job fails when the MEASUREMENT fails. The reading
+# lives in `board/current.json` and on `board/index.html`.
+
+on:
+  schedule:
+    # 21:30 UTC — after the US close plus the registry's declared 6h deadline
+    # window for the `board` row, and on CALENDAR time. §4.12's first
+    # exhaustive exception: the SCHEDULER runs on calendar time and the JOB
+    # resolves the trading day. A cron that tried to skip holidays would
+    # diverge from the calendar the artifacts are keyed by, and nothing would
+    # say so.
+    - cron: '30 21 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+# Serialised, and a superseded run is NOT cancelled. `post-pending-check` in
+# adversarial-review-gate.yml was cancelled by exactly this setting on
+# 2026-09-02 and left `crucible-PR38` unmergeable with no in-workflow remedy
+# (alpha-engine-config-I9848). Here the cost of cancelling is smaller but the
+# shape is the same: this job's whole purpose is to CREATE a durable artifact
+# other things read.
+concurrency:
+  group: board
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  # Declared here, read back from AWS below, and created by
+  # nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml. One
+  # literal, one place.
+  BOARD_ROLE_ARN: arn:aws:iam::711398986525:role/crucible-v2-github-board
+  STORE_URI: s3://alpha-engine-crucible-v2/crucible
+
+jobs:
+  board:
+    name: render the declared board
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          role-to-assume: ${{ env.BOARD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The identity actually obtained, read back from AWS rather than
+      # restated from `env`. Same argument deploy.yml makes: what is
+      # falsifiable is the identity, not the literal. A board rendered by the
+      # DEPLOY role would be a grading surface produced by an identity that
+      # can write the artifacts it grades, which is the one property this
+      # separation exists to guarantee.
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${BOARD_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. The board must render as a READ-ONLY identity; rendering it as a writer would let a grading surface satisfy the clauses it grades. If the role does not exist yet the crucible-v2 stack has not been applied since nous-ergon-ops-PR990 merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until that happens is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+
+      - name: Render the board
+        run: uv run crucible board --store "$STORE_URI"
+
+      # The one line a human reads if they open the run. Deltas, not absolute
+      # state: a board reading almost entirely PLANNED for weeks is correct,
+      # and is also the thing people stop opening.
+      - name: What moved
+        run: |
+          aws s3 cp "s3://alpha-engine-crucible-v2/crucible/board/current.json" board.json --only-show-errors
+          uv run python -c "import json,sys; d=json.load(open('board.json')); print(f\"{d['red_count']} of {d['row_count']} rows red\"); print(json.dumps(d['counts'], indent=2))"
+
+  notify-failure:
+    needs: [board]
+    if: ${{ failure() }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@619de3f32aef2e63329e7270afb87ec6b1e381e3
+    secrets: inherit
