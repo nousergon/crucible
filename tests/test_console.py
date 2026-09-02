@@ -16,7 +16,13 @@ import pytest
 
 from crucible.components import Component, Deadline, load_registry
 from crucible.console import STATES, build_page, classify, render_html
-from crucible.console.render import ATTRIBUTION_STATUSES, STATUS_COLORS, _state_class, write_page
+from crucible.console.render import (
+    ATTRIBUTION_STATUSES,
+    STATUS_COLORS,
+    _read_representative_manifest,
+    _state_class,
+    write_page,
+)
 from crucible.manifest import manifest_key
 from crucible.store import LocalStore
 
@@ -210,6 +216,31 @@ class TestPage:
         page = build_page(LocalStore(tmp_path), now=SATURDAY_NIGHT)
         assert page.unreported == 0
         assert "transparency gap" in render_html(page)
+
+    def test_a_failed_slot_manifest_is_not_masked_by_a_healthy_sibling(self, tmp_path) -> None:
+        """alpha-engine-config-I9781: `experiment.run` now writes one
+        manifest per slot. A row still renders one classification per job,
+        so the console reads the failed slot's manifest rather than
+        whichever discriminated key sorts last."""
+        store = LocalStore(tmp_path)
+        for slot, status, reason in (("u", "ok", ""), ("r", "failed", "boom"), ("s", "ok", "")):
+            store.put_bytes(
+                manifest_key("experiment.run", FRIDAY.isoformat(), discriminator=slot),
+                json.dumps(
+                    {
+                        "job": "experiment.run",
+                        "trading_day": FRIDAY.isoformat(),
+                        "status": status,
+                        "reason": reason,
+                        "cost_usd": 0.0,
+                        "run_id": "01JG0000000000000000000001",
+                        "discriminator": slot,
+                    }
+                ).encode(),
+            )
+        manifest = _read_representative_manifest(store, "experiment.run", FRIDAY.isoformat())
+        assert manifest["status"] == "failed"
+        assert manifest["discriminator"] == "r"
 
     def test_deploys_appear_beside_runs(self, tmp_path) -> None:
         store = LocalStore(tmp_path)

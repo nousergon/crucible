@@ -67,7 +67,11 @@ def _seed_met(tmp_path) -> LocalStore:
     store = LocalStore(tmp_path)
     for day in WINDOW:
         for stage in arc_stages(day):
-            _put(store, manifest_key(stage.job, day.isoformat()), _manifest())
+            _put(
+                store,
+                manifest_key(stage.job, day.isoformat(), discriminator=stage.slot),
+                _manifest(),
+            )
         for slot, spec in SLOTS.items():
             # The REGISTERED id form, `{slot}:{name}:{hash}` — the form the
             # §10.1 control filter has to match, and the one two reviews found

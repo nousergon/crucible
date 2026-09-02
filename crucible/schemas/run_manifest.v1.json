@@ -68,6 +68,13 @@
       "description": "THE KEY (\u00a74.12). An NYSE trading day from krepis.trading_calendar. A run launched on a non-trading day binds to the last completed trading day \u2014 a Saturday weekly run is keyed to Friday's close. Never the wall-clock date.",
       "$ref": "#/$defs/isoDate"
     },
+    "discriminator": {
+      "description": "Present only for a job that legitimately writes more than one manifest for the same `job`+`trading_day` \u2014 the slot letter (u/r/m/s) for `experiment.run`/`experiment.grade`, or the firing's own `calendar_date` for `alerts.sweep`, which runs every calendar day and can therefore fire more than once against one trading day. Absent for every other job. Never encodes a fact `job` or `trading_day` already carries (alpha-engine-config-I9781); see `crucible.manifest.manifest_key`.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_.-]{1,64}$"
+    },
     "calendar_date": {
       "description": "Wall-clock date the run actually executed on, recorded for provenance ONLY. Never used as a key, never an input to a promotion, retirement, freshness or grading decision.",
       "$ref": "#/$defs/isoDate"
