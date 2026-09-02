@@ -27,7 +27,7 @@ dependencies = [
     # Python import to read. Pydantic is the in-process reader, not a
     # replacement for them.
     "pydantic>=2.9",
-    "PyYAML>=6.0",
+    "PyYAML>=6.0.3",
     # The M slot's linear estimators and the CPCV grader operate on a
     # (trading_day x name) panel. Pure-Python normal equations over ~450k
     # rows is ~20s per fold and 15 folds per cycle, so the arithmetic is
