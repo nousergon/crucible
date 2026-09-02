@@ -39,7 +39,7 @@ import datetime as dt
 import json
 import re
 from dataclasses import asdict, dataclass, field
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +50,7 @@ from crucible.store import ETAG_ABSENT, PointerConflictError, S3Store, Store, sh
 _SCHEMA_DIR = Path(__file__).parent / "schemas"
 
 
-@lru_cache(maxsize=None)
+@cache
 def _validator_for(schema_filename: str) -> Draft202012Validator:
     """A cached validator for one of this module's own schema files.
 
@@ -83,6 +83,7 @@ def _validate_release_artifact(schema_filename: str, payload: dict[str, Any]) ->
         f"  - {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors
     )
     raise ValueError(f"{schema_filename}: document does not conform:\n{detail}")
+
 
 __all__ = [
     "POINTER_KEY",

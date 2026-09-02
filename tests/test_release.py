@@ -487,9 +487,7 @@ class TestIdentityProvenanceSplit:
         with pytest.raises(ValueError, match="run_attempt"):
             provenance_key(SHA_A, "9", "")
 
-    def test_publish_validates_the_identity_record_against_its_own_schema(
-        self, tmp_path
-    ) -> None:
+    def test_publish_validates_the_identity_record_against_its_own_schema(self, tmp_path) -> None:
         """M0 discipline: a writer that could emit a non-conformant document
         would defeat the schema this module ships alongside it — the same
         contract test crucible.champion and crucible.manifest carry for
@@ -505,14 +503,17 @@ class TestIdentityProvenanceSplit:
         with pytest.raises(ValueError, match="does not conform"):
             _validate_release_artifact("release.v2.json", bad)
 
-    def test_publish_validates_the_provenance_record_against_its_own_schema(
-        self, tmp_path
-    ) -> None:
+    def test_publish_validates_the_provenance_record_against_its_own_schema(self, tmp_path) -> None:
         from crucible.release import _validate_release_artifact
 
         store = LocalStore(tmp_path)
         publish_release(
-            store, sha=SHA_A, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url="",
+            store,
+            sha=SHA_A,
+            wheel=b"w",
+            lockfile=b"l",
+            test_summary="",
+            workflow_run_url="",
             run_id="1",
         )
         payload = json.loads(store.get_bytes(provenance_key(SHA_A, "1", "1")))
