@@ -29,6 +29,7 @@ regenerates cannot live inside that runner.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,15 @@ LOCK_CHECK_COMMAND = "uv lock --check"
 #: re-resolve is visible: a CI run that resolves its own dependencies has not
 #: tested what ships.
 FROZEN_INSTALL_COMMAND = "uv sync --frozen"
+
+#: Anything that can materialise the environment. `uv run` installs from the
+#: lockfile on first use just as `uv sync` does, so a job carrying only
+#: `uv run` steps still installs and still needs the lockfile checked first.
+_INSTALLS = re.compile(r"\buv (?:sync|run)\b")
+
+#: Every `uv run` occurrence, so the `--frozen` assertion is per invocation
+#: rather than per line.
+_UV_RUN = re.compile(r"\buv run\b")
 
 
 @pytest.fixture(scope="module")
@@ -116,7 +126,14 @@ def test_every_job_that_installs_also_checks_the_lockfile_first(workflow) -> Non
             continue
         steps = [s for s in (job.get("steps") or []) if isinstance(s, dict)]
         commands = [s.get("run") or "" for s in steps]
-        install_at = next((i for i, c in enumerate(commands) if FROZEN_INSTALL_COMMAND in c), None)
+        # Any uv invocation that can materialise the environment counts as an
+        # install, not just the literal `uv sync --frozen`. `uv run` creates
+        # the venv and installs from the lockfile on first use, so a job whose
+        # only uv step is `uv run` installs too — and detecting installs by the
+        # `uv sync --frozen` literal alone skipped exactly that job. Measured:
+        # a job with one `uv run --frozen pytest` step and no lock check passed
+        # every assertion in this file. The hole had moved, not closed.
+        install_at = next((i for i, c in enumerate(commands) if _INSTALLS.search(c)), None)
         if install_at is None:
             continue
         check_at = next((i for i, c in enumerate(commands) if LOCK_CHECK_COMMAND in c), None)
@@ -166,12 +183,15 @@ def test_every_uv_run_is_frozen(workflow) -> None:
     """
     for job_name, step in _steps(workflow):
         command = step.get("run") or ""
-        if "uv run" not in command:
-            continue
-        for line in command.splitlines():
-            if "uv run" not in line:
-                continue
-            assert "uv run --frozen" in line, (
-                f"job {job_name!r} runs `uv run` without `--frozen`: {line.strip()!r}. "
-                "It would re-resolve, and rewrite uv.lock in the runner."
+        for match in _UV_RUN.finditer(command):
+            # Per OCCURRENCE, not per line. `in line` was satisfied by the
+            # first `uv run --frozen` on a line and passed over a second,
+            # unfrozen one after `&&` — measured: `uv run --frozen ruff check
+            # && uv run ruff format --check` passed all five tests while the
+            # second invocation re-resolved and rewrote uv.lock in the runner.
+            following = command[match.end() : match.end() + 16]
+            assert following.lstrip().startswith("--frozen"), (
+                f"job {job_name!r} has a `uv run` that is not `uv run --frozen`: "
+                f"{command[match.start() : match.start() + 60].strip()!r}. It would "
+                "re-resolve, and rewrite uv.lock in the runner."
             )
