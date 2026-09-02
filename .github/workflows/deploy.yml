@@ -107,6 +107,15 @@ jobs:
       - name: Build
         run: uv build --wheel
 
+      # release.json (identity) and provenance.json (this attempt) are two
+      # separate files, per alpha-engine-config-I9786: release.json is a
+      # DETERMINISTIC function of the commit — nothing in it can differ
+      # between two builds of the same sha — so a workflow_dispatch re-run
+      # of an unchanged main is a clean `crucible.deploy publish` no-op
+      # instead of a guaranteed ReleaseImmutabilityError. built_at,
+      # workflow_run_url and test_summary move on every rebuild and go to
+      # provenance.json instead, which is written unconditionally and never
+      # immutable-checked.
       - name: Name the artifact by its commit
         id: meta
         run: |
@@ -120,19 +129,30 @@ jobs:
           wheel = pathlib.Path(f"out/crucible-{sha}-py3-none-any.whl").read_bytes()
           lock = pathlib.Path("uv.lock").read_bytes()
           print(json.dumps({
-              "schema_version": "release.v1",
+              "schema_version": "release.v2",
               "sha": sha,
-              "built_at": os.environ["BUILT_AT"],
               "lockfile_sha256": hashlib.sha256(lock).hexdigest(),
               "wheel_sha256": hashlib.sha256(wheel).hexdigest(),
-              "test_summary": os.environ["TEST_SUMMARY"],
-              "workflow_run_url": os.environ["RUN_URL"],
               "python_requires": ">=3.12,<3.13",
               "extra": {},
           }, indent=2, sort_keys=True))
           PY
+          python3 - <<'PY' > "out/provenance.json"
+          import json, os
+          print(json.dumps({
+              "schema_version": "release_provenance.v1",
+              "sha": os.environ["SHA"],
+              "run_id": os.environ["RUN_ID"],
+              "run_attempt": os.environ["RUN_ATTEMPT"],
+              "built_at": os.environ["BUILT_AT"],
+              "workflow_run_url": os.environ["RUN_URL"],
+              "test_summary": os.environ["TEST_SUMMARY"],
+          }, indent=2, sort_keys=True))
+          PY
         env:
           SHA: ${{ inputs.sha || github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           BUILT_AT: ${{ github.event.repository.updated_at }}
           TEST_SUMMARY: ${{ steps.tests.outputs.summary }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -186,7 +206,7 @@ jobs:
       # Publish the IMMUTABLE half. Safe and repeatable; it promotes nothing.
       - name: Publish the release artifacts
         run: |
-          uv run python -m crucible.deploy publish --sha '${{ needs.build.outputs.sha }}' --wheel 'out/crucible-${{ needs.build.outputs.sha }}-py3-none-any.whl' --release-json out/release.json --store "$STORE_URI"
+          uv run python -m crucible.deploy publish --sha '${{ needs.build.outputs.sha }}' --wheel 'out/crucible-${{ needs.build.outputs.sha }}-py3-none-any.whl' --release-json out/release.json --provenance-json out/provenance.json --store "$STORE_URI"
 
       # The opening half of the pointer compare-and-swap, taken BEFORE the
       # smoke so the swap covers the whole verification window. Reading the

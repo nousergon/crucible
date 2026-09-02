@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nousergon/crucible/schemas/release.v2.json",
+  "title": "Crucible release identity, v2",
+  "description": "What release.json carries at releases/{sha}/release.json. Deterministic across every rebuild of the same commit (alpha-engine-config-I9786) — nothing in this document can differ between two builds of the same sha, which is what makes assert_immutable_write's byte comparison a correctness check rather than a false-alarm generator. v2 replaces v1, which also carried built_at/workflow_run_url/test_summary; those move to release_provenance.v1, one instance per publish attempt, because they moved on every rebuild and made a re-run of an unchanged commit an unconditional immutability failure. additionalProperties: false because a field a reader does not understand is a field the producer expected it to act on.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sha",
+    "lockfile_sha256",
+    "wheel_sha256",
+    "python_requires",
+    "extra"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
+      "const": "release.v2"
+    },
+    "sha": {
+      "description": "The commit this release is built from. Content-addresses the release prefix.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "lockfile_sha256": {
+      "description": "The resolved dependency tree's hash. The wheel does not pin its own transitive tree, so two wheels from one commit against two lockfiles are two different artifacts, and only this says which.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "wheel_sha256": {
+      "description": "The wheel's own hash, checked against the bytes actually uploaded by both the publisher and the smoke.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "python_requires": {
+      "description": "The interpreter constraint this wheel was built against.",
+      "type": "string",
+      "minLength": 1
+    },
+    "extra": {
+      "description": "Reserved for future identity-bearing fields. Empty on every release today — anything that would vary per run belongs in release_provenance.v1, not here.",
+      "type": "object"
+    }
+  }
+}

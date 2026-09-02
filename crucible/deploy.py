@@ -47,13 +47,15 @@ from crucible.calendar import resolve_trading_day
 from crucible.manifest import RUN_MANIFEST_SCHEMA_VERSION, manifest_key
 from crucible.release import (
     POINTER_KEY,
+    ReleaseProvenance,
     ReleaseRecord,
-    _lock_release_object,
     assert_immutable_write,
     current_release,
     flip_on_smoke,
+    provenance_key,
     read_pointer,
     release_json_key,
+    release_object_lock_params,
     wheel_key,
     write_deploy_manifest,
 )
@@ -67,10 +69,16 @@ _UNKNOWN_SHA = "0" * 40
 def _publish(args: argparse.Namespace, store: Store) -> int:
     """Upload the immutable half. Promotes nothing.
 
-    `release.json` is built in the workflow (where the lockfile and the test
-    summary are) and validated here against :class:`ReleaseRecord`, so a
-    malformed record is refused before it is durable rather than discovered
-    by whatever reads it next.
+    `release.json` is the DETERMINISTIC identity half — built in the
+    workflow from the lockfile and wheel, and validated here against
+    :class:`ReleaseRecord` — so a malformed record is refused before it is
+    durable rather than discovered by whatever reads it next.
+    `provenance.json` is this attempt's :class:`ReleaseProvenance` (the
+    fields that move on every rebuild: `built_at`, `workflow_run_url`,
+    `test_summary`) and is written unconditionally, never immutable-checked
+    (alpha-engine-config-I9786): a re-run for an unchanged commit produces
+    identity bytes the store already holds and a NEW provenance record,
+    never a `ReleaseImmutabilityError`.
 
     Two things are checked that validating the dataclass does not:
 
@@ -81,21 +89,36 @@ def _publish(args: argparse.Namespace, store: Store) -> int:
       the smoke against what actually landed in the store (§4.11), so a
       corruption in the upload is caught by the gate rather than by whatever
       installs the wheel next week.
-    * **the prefix is not already occupied by different bytes.** See
-      :class:`crucible.release.ReleaseImmutabilityError`.
+    * **the prefix is not already occupied by different IDENTITY bytes.**
+      See :class:`crucible.release.ReleaseImmutabilityError`. This is the
+      whole fix for I9786: `release.json` no longer carries the three fields
+      that moved on every run, so two builds of the same commit really are
+      byte-identical and a re-run is a clean no-op instead of a guaranteed
+      failure.
 
-    On S3, each key actually written is also locked under S3 Object Lock
-    GOVERNANCE mode (`crucible.release.RELEASE_OBJECT_LOCK_RETENTION`) — see
-    `crucible.release._lock_release_object`. `assert_immutable_write` defends
-    at this writer only; the lock defends against a writer that skips it
-    (a hand-rolled `aws s3 cp`, a second `workflow_dispatch`).
+    On S3, each identity key actually written is locked under S3 Object Lock
+    GOVERNANCE mode (`crucible.release.RELEASE_OBJECT_LOCK_RETENTION`) on the
+    SAME `put_bytes` call that writes it (alpha-engine-config-I9787) — see
+    `crucible.release.release_object_lock_params`. `assert_immutable_write`
+    defends at this writer only; the lock defends against a writer that skips
+    it (a hand-rolled `aws s3 cp`, a second `workflow_dispatch` running code
+    that predates this fix).
     """
     wheel = Path(args.wheel).read_bytes()
     record = ReleaseRecord(**json.loads(Path(args.release_json).read_text(encoding="utf-8")))
+    provenance = ReleaseProvenance(
+        **json.loads(Path(args.provenance_json).read_text(encoding="utf-8"))
+    )
     if record.sha != args.sha:
         raise SystemExit(
             f"release.json is for {record.sha}, not {args.sha}. Publishing it under the "
             "wrong prefix would make the rollback target a build it does not describe."
+        )
+    if provenance.sha != args.sha:
+        raise SystemExit(
+            f"provenance.json is for {provenance.sha}, not {args.sha}. Recording it "
+            "under the wrong prefix would attribute this attempt to a build it did not "
+            "produce."
         )
     digest = sha256_hex(wheel)
     if digest != record.wheel_sha256:
@@ -105,8 +128,9 @@ def _publish(args: argparse.Namespace, store: Store) -> int:
             "thing anyone downstream has about these bytes; publishing a record that "
             "does not describe its own artifact makes every later verification vacuous."
         )
-    # Both keys are checked before either is written: a refusal must not be
-    # able to leave a wheel from one build beside a release.json from another.
+    # Both identity keys are checked before either is written: a refusal
+    # must not be able to leave a wheel from one build beside a release.json
+    # from another.
     writes = [
         (key, payload)
         for key, payload in (
@@ -115,11 +139,24 @@ def _publish(args: argparse.Namespace, store: Store) -> int:
         )
         if assert_immutable_write(store, key, payload)
     ]
+    lock_mode, retain_until = release_object_lock_params(store)
     for key, payload in writes:
-        store.put_bytes(key, payload)
-        _lock_release_object(store, key)
+        store.put_bytes(
+            key, payload, object_lock_mode=lock_mode, object_lock_retain_until=retain_until
+        )
+    # Unconditional and unlocked: keyed per attempt, so it never contends
+    # with itself, and it is the durable trace that THIS attempt happened
+    # even when the identity keys needed no write at all — which is exactly
+    # the re-run-of-an-unchanged-commit case I9786 asks to be a no-op.
+    store.put_bytes(
+        provenance_key(args.sha, provenance.run_id, provenance.run_attempt), provenance.to_json()
+    )
     if not writes:
-        print(f"releases/{args.sha}/ already holds exactly these bytes; nothing to publish")
+        print(
+            f"releases/{args.sha}/ already holds exactly this identity; nothing to "
+            f"publish. Recorded this attempt's provenance at "
+            f"{provenance_key(args.sha, provenance.run_id, provenance.run_attempt)}."
+        )
         return 0
     print(f"published releases/{args.sha}/ ({len(wheel)} bytes)")
     return 0
@@ -312,6 +349,7 @@ def main(argv: list[str] | None = None) -> int:
         if name == "publish":
             p.add_argument("--wheel", required=True)
             p.add_argument("--release-json", required=True)
+            p.add_argument("--provenance-json", required=True)
         if name == "capture":
             p.add_argument("--out", required=True)
         if name == "flip":

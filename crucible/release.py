@@ -39,32 +39,96 @@ import datetime as dt
 import json
 import re
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
+from jsonschema import Draft202012Validator
+
 from crucible.store import ETAG_ABSENT, PointerConflictError, S3Store, Store, sha256_hex
+
+_SCHEMA_DIR = Path(__file__).parent / "schemas"
+
+
+@lru_cache(maxsize=None)
+def _validator_for(schema_filename: str) -> Draft202012Validator:
+    """A cached validator for one of this module's own schema files.
+
+    Mirrors `crucible.manifest.load_schema` / `crucible.champion.load_schema`:
+    the schema ships inside the package, so a missing file means a broken
+    build, not a degraded write.
+    """
+    path = _SCHEMA_DIR / schema_filename
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{schema_filename} missing at {path}. It ships inside the package; a "
+            "missing schema means a broken build, not a degraded write."
+        )
+    schema = json.loads(path.read_text(encoding="utf-8"))
+    Draft202012Validator.check_schema(schema)
+    return Draft202012Validator(schema)
+
+
+def _validate_release_artifact(schema_filename: str, payload: dict[str, Any]) -> None:
+    """Raise with every error, never just the first, against one of this
+    module's own artifact schemas. A writer that could emit a non-conformant
+    document would defeat the schema entirely — validated on the way OUT,
+    not only wherever something later reads it back."""
+    errors = sorted(
+        _validator_for(schema_filename).iter_errors(payload), key=lambda e: list(e.absolute_path)
+    )
+    if not errors:
+        return
+    detail = "\n".join(
+        f"  - {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors
+    )
+    raise ValueError(f"{schema_filename}: document does not conform:\n{detail}")
 
 __all__ = [
     "POINTER_KEY",
     "PointerConflictError",
+    "RELEASE_PROVENANCE_SCHEMA_VERSION",
     "ReleaseImmutabilityError",
     "assert_immutable_write",
     "flip_on_smoke",
     "RELEASE_SCHEMA_VERSION",
+    "ReleaseProvenance",
     "ReleaseRecord",
     "StaleReleasePointerError",
     "TRADER_PIN_KEY",
     "current_release",
     "pin",
+    "provenance_key",
     "publish_release",
     "read_pointer",
     "release_json_key",
+    "release_object_lock_params",
     "release_prefix",
     "resolve_release",
     "wheel_key",
     "write_deploy_manifest",
 ]
 
-RELEASE_SCHEMA_VERSION = "release.v1"
+#: `release.json`'s schema. Bumped to v2 by alpha-engine-config-I9786: v1
+#: carried `built_at` / `workflow_run_url` / `test_summary`, three fields
+#: that move on every rebuild of the same commit, which made a
+#: `workflow_dispatch` re-run of an unchanged `main` an UNCONDITIONAL
+#: `ReleaseImmutabilityError` — `release.json` could never be byte-identical
+#: across two runs even though the wheel it described was. v2 carries only
+#: what is a deterministic function of the commit; the per-run facts moved to
+#: :class:`ReleaseProvenance`. A v1 object already published under an older
+#: build stays exactly as published — it is never rewritten — so the one
+#: live transitional effect is that the FIRST re-run of a sha published
+#: before this shipped still raises (the v1 and v2 bytes genuinely differ);
+#: every rebuild after that is the clean no-op the issue asks for.
+RELEASE_SCHEMA_VERSION = "release.v2"
+
+#: `releases/{sha}/provenance/{run_id}-{run_attempt}.json`'s schema. One
+#: instance per publish ATTEMPT, never immutable-checked (I9786): a second
+#: attempt for an already-published sha is expected to differ in exactly
+#: these fields, and each attempt is a durable record, not a contender for
+#: the one slot `release.json` occupies.
+RELEASE_PROVENANCE_SCHEMA_VERSION = "release_provenance.v1"
 
 #: The single mutable object in the whole release layout. Everything else is
 #: immutable and content-addressed by the sha in its own prefix.
@@ -97,40 +161,33 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RELEASE_OBJECT_LOCK_RETENTION = dt.timedelta(days=3650)
 
 
-def _lock_release_object(store: Store, key: str, *, now: dt.datetime | None = None) -> None:
-    """Apply GOVERNANCE-mode Object Lock retention to a just-written object.
+def release_object_lock_params(
+    store: Store, *, now: dt.datetime | None = None
+) -> tuple[str | None, dt.datetime | None]:
+    """The ``(object_lock_mode, object_lock_retain_until)`` to pass on the
+    write itself, or ``(None, None)`` off S3.
+
+    Resolved by the caller of :meth:`crucible.store.Store.put_bytes.
+    put_bytes` and passed on the SAME call that writes the bytes
+    (alpha-engine-config-I9787) — never as a separate ``PutObjectRetention``
+    call afterward, which left a window, bounded only by that one extra
+    round trip, in which a published release object existed unlocked. A
+    process dying in that window left a published, unprotected artifact and
+    nothing detected it.
 
     A no-op off S3 — :class:`crucible.store.LocalStore` (the laptop and test
     backend) has no Object Lock concept, and the bucket-level
     ``ObjectLockEnabled`` flag this defends against being inert without it is
-    an S3-only condition (issue's "Gotcha").
+    an S3-only condition (I9787's "Gotcha").
 
     Called only for the wheel and ``release.json`` keys, never for
-    :data:`POINTER_KEY` — the caller decides which keys pass through here,
-    and the pointer flip goes through :func:`pin` / ``compare_and_swap``,
-    a different code path that never reaches this function.
-
-    ``crucible.store.Store.put_bytes`` — the single write path shared by
-    every backend — has no retention parameters, and ``crucible/store.py``
-    is not owned by this change. Retention is therefore applied as a
-    **separate** ``PutObjectRetention`` call immediately after the write,
-    rather than as ``ObjectLockMode`` / ``ObjectLockRetainUntilDate`` on the
-    PUT itself. That leaves a window, bounded by this one extra round trip,
-    in which the object exists unlocked. The correct fix is for
-    ``Store.put_bytes`` (and its `S3Store` implementation) to accept the
-    retention parameters so the lock is set atomically on the PUT; that
-    signature change is out of scope here (see the PR description).
+    :data:`POINTER_KEY` — the pointer flip goes through :func:`pin` /
+    ``compare_and_swap``, a different code path that never reaches this.
     """
     if not isinstance(store, S3Store):
-        return
+        return None, None
     stamp = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
-    retain_until = stamp + RELEASE_OBJECT_LOCK_RETENTION
-    s3_key = f"{store.prefix}/{key}" if store.prefix else key
-    store.client.put_object_retention(
-        Bucket=store.bucket,
-        Key=s3_key,
-        Retention={"Mode": "GOVERNANCE", "RetainUntilDate": retain_until},
-    )
+    return "GOVERNANCE", stamp + RELEASE_OBJECT_LOCK_RETENTION
 
 
 class StaleReleasePointerError(RuntimeError):
@@ -221,25 +278,77 @@ def release_json_key(sha: str) -> str:
     return f"{release_prefix(sha)}/release.json"
 
 
+def provenance_key(sha: str, run_id: str, run_attempt: str = "1") -> str:
+    """One key per publish attempt. Never contended for, unlike `release.json`.
+
+    ``run_id`` is the CI run that produced this attempt (GitHub's
+    ``GITHUB_RUN_ID``, or a local caller's own identifier); ``run_attempt``
+    distinguishes a "re-run failed jobs" retry that reuses the same run id.
+    Both are required to be non-empty: an empty component would let two
+    unrelated attempts collide on `releases/{sha}/provenance/-1.json` (or
+    worse, on the same key), silently discarding one attempt's record.
+    """
+    if not run_id:
+        raise ValueError(
+            "run_id must be non-empty: provenance is keyed per attempt, and an empty "
+            "run_id would collide across every re-run that also omitted one."
+        )
+    if not run_attempt:
+        raise ValueError("run_attempt must be non-empty, for the same reason as run_id.")
+    return f"{release_prefix(sha)}/provenance/{run_id}-{run_attempt}.json"
+
+
 @dataclass(frozen=True)
 class ReleaseRecord:
-    """What `release.json` carries. Everything needed to answer "what is this".
+    """What `release.json` carries: what a rollback needs to know **what**
+    this release is — deterministic across every rebuild of the same commit.
 
     `lockfile_sha256` is here because the wheel does not pin its own
     transitive tree: two wheels built from one commit against two resolved
     dependency sets are two different artifacts, and only the lockfile hash
     says which one this is.
+
+    **Nothing here can differ between two builds of the same commit**
+    (alpha-engine-config-I9786) — that is what makes `assert_immutable_write`
+    a correctness check rather than a false-alarm generator: a second
+    `workflow_dispatch` for an unchanged commit produces these same bytes,
+    and the write becomes a no-op instead of a `ReleaseImmutabilityError`.
+    Per-run facts — when this build ran, which workflow run produced it,
+    what the tests printed — belong to :class:`ReleaseProvenance`, one
+    instance per attempt, never here.
     """
 
     schema_version: str
     sha: str
-    built_at: str
     lockfile_sha256: str
     wheel_sha256: str
-    test_summary: str
-    workflow_run_url: str
     python_requires: str = ">=3.12,<3.13"
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def to_json(self) -> bytes:
+        return json.dumps(asdict(self), indent=2, sort_keys=True).encode("utf-8")
+
+
+@dataclass(frozen=True)
+class ReleaseProvenance:
+    """One publish ATTEMPT for `sha`, at `provenance_key(sha, run_id, run_attempt)`.
+
+    Exactly the three fields that used to live in `release.json` and made it
+    unreproducible (I9786's Gotcha: `built_at` is repository metadata, not
+    the build instant — carried here unexamined is still more honest than
+    dropping it, since a wrong-but-named field is better than an absent one,
+    and it is never used for anything but display). Never immutable-checked:
+    a second attempt for an already-published sha is EXPECTED to differ here,
+    and each attempt adds a record rather than contending for one slot.
+    """
+
+    schema_version: str
+    sha: str
+    run_id: str
+    run_attempt: str
+    built_at: str
+    workflow_run_url: str
+    test_summary: str
 
     def to_json(self) -> bytes:
         return json.dumps(asdict(self), indent=2, sort_keys=True).encode("utf-8")
@@ -253,6 +362,8 @@ def publish_release(
     lockfile: bytes,
     test_summary: str,
     workflow_run_url: str,
+    run_id: str = "0",
+    run_attempt: str = "1",
     now: dt.datetime | None = None,
 ) -> ReleaseRecord:
     """Write the immutable half of a release. Does NOT touch the pointer.
@@ -263,15 +374,28 @@ def publish_release(
     impossible to express, and the smoke gate sits precisely in between.
 
     "Repeatable" means **byte-identical**, not "overwrites whatever is
-    there": re-publishing a sha whose prefix already holds different bytes
-    raises :class:`ReleaseImmutabilityError`. See that class for why.
+    there": re-publishing a sha whose `release.json`/wheel prefix already
+    holds different IDENTITY bytes raises :class:`ReleaseImmutabilityError`.
+    A re-publish whose identity matches — including one with a different
+    `run_id`, `built_at` or `test_summary`, which the identity record does
+    not even carry (alpha-engine-config-I9786) — is a clean no-op: neither
+    key is rewritten. See :class:`ReleaseRecord` for why nothing in it can
+    differ between two builds of the same commit, and :class:`ReleaseImmutabilityError`
+    for why a genuinely differing rebuild still raises.
 
-    When ``store`` is an :class:`~crucible.store.S3Store`, each key actually
-    written here is also locked under S3 Object Lock GOVERNANCE mode for
-    :data:`RELEASE_OBJECT_LOCK_RETENTION` — see :func:`_lock_release_object`.
-    `assert_immutable_write` refuses a differing overwrite at THIS writer;
-    the lock is the defense against a writer that skips this function
-    entirely (a hand-rolled `aws s3 cp`, a second `workflow_dispatch`).
+    A :class:`ReleaseProvenance` record for THIS attempt is always written,
+    at `provenance_key(sha, run_id, run_attempt)`, whether or not the
+    identity keys needed writing — so a re-run that changed nothing is still
+    a reconstructible event, not a silent no-op with no trace.
+
+    When ``store`` is an :class:`~crucible.store.S3Store`, each identity key
+    actually written here is locked under S3 Object Lock GOVERNANCE mode for
+    :data:`RELEASE_OBJECT_LOCK_RETENTION`, on the SAME `put_bytes` call that
+    writes it (alpha-engine-config-I9787) — see
+    :func:`release_object_lock_params`. `assert_immutable_write` refuses a
+    differing overwrite at THIS writer; the lock is the defense against a
+    writer that skips this function entirely (a hand-rolled `aws s3 cp`, a
+    second `workflow_dispatch` running code that predates this fix).
     """
     _assert_sha(sha)
     if not wheel:
@@ -280,22 +404,40 @@ def publish_release(
     record = ReleaseRecord(
         schema_version=RELEASE_SCHEMA_VERSION,
         sha=sha,
-        built_at=stamp,
         lockfile_sha256=sha256_hex(lockfile),
         wheel_sha256=sha256_hex(wheel),
-        test_summary=test_summary,
-        workflow_run_url=workflow_run_url,
     )
-    # Immutability is enforced BEFORE the first of the two writes, so a
-    # refusal cannot leave a prefix half-overwritten: a wheel from one build
-    # beside a release.json from another is worse than either.
+    provenance = ReleaseProvenance(
+        schema_version=RELEASE_PROVENANCE_SCHEMA_VERSION,
+        sha=sha,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        built_at=stamp,
+        workflow_run_url=workflow_run_url,
+        test_summary=test_summary,
+    )
+    # Contract-tested at birth (M0 discipline): a writer that could emit a
+    # non-conformant identity or provenance document would defeat the schema
+    # this module ships alongside it.
+    _validate_release_artifact("release.v2.json", asdict(record))
+    _validate_release_artifact("release_provenance.v1.json", asdict(provenance))
+    # Immutability is enforced BEFORE the first of the two identity writes,
+    # so a refusal cannot leave a prefix half-overwritten: a wheel from one
+    # build beside a release.json from another is worse than either.
     payloads = ((wheel_key(sha), wheel), (release_json_key(sha), record.to_json()))
     needed = [
         (key, payload) for key, payload in payloads if assert_immutable_write(store, key, payload)
     ]
+    lock_mode, retain_until = release_object_lock_params(store, now=now)
     for key, payload in needed:
-        store.put_bytes(key, payload)
-        _lock_release_object(store, key, now=now)
+        store.put_bytes(
+            key, payload, object_lock_mode=lock_mode, object_lock_retain_until=retain_until
+        )
+    # Unconditional and unlocked: it is per-attempt by construction (the key
+    # already carries run_id/run_attempt) so it never contends with itself,
+    # and it is the durable trace that this attempt happened even when the
+    # identity keys needed no write at all.
+    store.put_bytes(provenance_key(sha, run_id, run_attempt), provenance.to_json())
     return record
 
 
