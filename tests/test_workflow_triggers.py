@@ -92,7 +92,16 @@ LIVE_STATE_MARKERS = ("aws", "boto3", "cloudformation", "tests/acceptance")
 # `--collect-only` imports the acceptance modules without executing a clause
 # body, which is why it is allowed on the PR path at all. It is the one way
 # `tests/acceptance` may be RUN in a step there.
+#
+# Applied PER COMMAND, never per step. A step-wide carve-out was demonstrated
+# to permit
+#     uv run pytest tests/acceptance --collect-only -q
+#     uv run pytest tests/acceptance
+# in one `run:` body — the full plan §2 suite, live AWS included, running on
+# every PR from inside an allowlisted job, with this guard green. The carve-out
+# sat one line above the violation it was licensing.
 ACCEPTANCE_CARVE_OUT = "--collect-only"
+COMMAND_SEPARATORS = re.compile(r"\n|&&|\|\||;")
 
 # `--ignore=tests/acceptance` is the opposite of running it, and the foundation
 # suite carries it on every PR. Stripped before scanning so an exclusion is not
@@ -132,18 +141,17 @@ PR_REACHABLE_JOBS: dict[str, str] = {
 
 
 #: Allowlisted jobs that are legitimately a job-level `uses:` and so have no
-#: steps for the second layer to scan. Each needs its safety argued somewhere
-#: this file asserts, because a called workflow declares `workflow_call` rather
-#: than a PR event and is therefore never reached by the scan below.
-REUSABLE_WORKFLOW_JOBS = frozenset(
-    {
-        # Pinned by SHA to a nousergon-lib workflow that posts a notification
-        # and nothing else, and unreachable on a PR because it needs the
-        # excluded `acceptance` job — both asserted by
-        # `test_the_notify_job_still_depends_on_the_excluded_job`.
-        "ci.yml:notify-main-failure",
-    }
-)
+#: steps for the second layer to scan, mapped to the test that argues each
+#: one's safety. A named-member exemption set with no forcing function is the
+#: shape AGENTS.md rule 4 forbids, so membership REQUIRES the named test to
+#: exist — `test_every_reusable_workflow_exemption_has_a_property_test`
+#: enforces it, and a second member cannot be added by editing this set alone.
+REUSABLE_WORKFLOW_JOBS: dict[str, str] = {
+    # Pinned by SHA to a nousergon-lib workflow that posts a notification and
+    # nothing else, and unreachable on a PR because it needs the excluded
+    # `acceptance` job.
+    "ci.yml:notify-main-failure": "test_the_notify_job_still_depends_on_the_excluded_job",
+}
 
 
 def _events(workflow: dict) -> set[str]:
@@ -167,35 +175,71 @@ def _excluded(job: dict, pr_events: frozenset[str]) -> bool:
     return str(job.get("if", "")).strip() in _exclusions_for(pr_events)
 
 
+def _mentions(text: str, marker: str) -> bool:
+    """`marker` appears in `text` bounded by non-identifier characters.
+
+    Substring-with-boundary, not whole-word: whole-word matching was
+    demonstrated to miss `/usr/bin/aws`, `$(echo aws)` and
+    `python -c '__import__("boto3")...'`. `awslogs` still does not match.
+    """
+    for match in re.finditer(re.escape(marker), text):
+        before = text[match.start() - 1] if match.start() else " "
+        after = text[match.end()] if match.end() < len(text) else " "
+        if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+            return True
+    return False
+
+
 def _live_state_steps(job: dict) -> list[str]:
+    """EVERY step in `job` that reads state outside the tree under review.
+
+    Every one, not the first: naming one and stopping tells the reader to fix
+    it and re-run to discover the next.
+
+    The whole step is scanned, not just its `run:` body. `uses:`, `with:`,
+    `env:`, `container:` and `services:` reach live state just as well, and
+    moving a marker from `$(echo aws)` into `env: {TOOL: /usr/bin/aws}` was
+    demonstrated to walk straight past a run-only scan — the same evasion
+    class, one field along.
+    """
     hits = []
     for step in job.get("steps") or []:
         if not isinstance(step, dict):
             continue
         run = IGNORE_TOKEN.sub("", (step.get("run") or "").lower())
+        rest = yaml.safe_dump({k: v for k, v in step.items() if k != "run"}).lower()
+        label = step.get("name") or step.get("uses") or "<unnamed step>"
         for marker in LIVE_STATE_MARKERS:
-            if marker == "tests/acceptance" and ACCEPTANCE_CARVE_OUT in run:
-                continue
-            for match in re.finditer(re.escape(marker), run):
-                before = run[match.start() - 1] if match.start() else " "
-                after = run[match.end()] if match.end() < len(run) else " "
-                # Bounded by non-identifier characters on both sides, so
-                # `/usr/bin/aws`, `$(echo aws)` and `"boto3"` all match while
-                # `awslogs` and `bawsic` do not.
-                if not (before.isalnum() or before == "_") and not (
-                    after.isalnum() or after == "_"
-                ):
-                    hits.append(f"{step.get('name', '<unnamed step>')}: mentions `{marker}`")
-                    break
-            else:
-                continue
-            break
+            commands = [c for c in COMMAND_SEPARATORS.split(run) if c.strip()]
+            if marker == "tests/acceptance":
+                # Per COMMAND, never per step: a carve-out on one line does not
+                # license the next one down.
+                commands = [c for c in commands if ACCEPTANCE_CARVE_OUT not in c]
+            if any(_mentions(c, marker) for c in commands) or _mentions(rest, marker):
+                hits.append(f"{label}: mentions `{marker}`")
+                break
     return hits
 
 
 def test_at_least_one_workflow_is_scanned() -> None:
     # A guard that scanned nothing is dark, not green (principle 7).
     assert WORKFLOWS, "no workflows found — this guard is not measuring anything"
+
+
+def test_every_reusable_workflow_exemption_has_a_property_test() -> None:
+    """An exemption set with no forcing function grows by editing one line.
+
+    `REUSABLE_WORKFLOW_JOBS` exempts a job from the step scan entirely, because
+    a called workflow declares `workflow_call` and is never reached from here.
+    That is the strongest exemption this file grants, so each member names the
+    test that argues its safety, and that test must exist.
+    """
+    for key, test_name in REUSABLE_WORKFLOW_JOBS.items():
+        assert test_name in globals(), (
+            f"{key} is exempt from the step scan on the strength of "
+            f"`{test_name}`, which does not exist in this module. Write it, or "
+            "remove the exemption — an exemption nothing argues is a hole."
+        )
 
 
 def test_every_allowlisted_job_still_exists() -> None:
@@ -234,12 +278,15 @@ def test_the_notify_job_still_depends_on_the_excluded_job() -> None:
     # It is in REUSABLE_WORKFLOW_JOBS, so the step scan cannot see what it
     # calls. Pin the target: repointing it at another workflow is exactly the
     # repurposing this entry exists to prevent.
-    assert str(job.get("uses", "")).startswith(
-        "nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@"
+    assert re.fullmatch(
+        r"nousergon/nousergon-lib/\.github/workflows/notify-ci-failure\.yml@[0-9a-f]{40}",
+        str(job.get("uses", "")),
     ), (
-        "notify-main-failure calls something other than the pinned nousergon-lib "
-        "notification workflow; its allowlist entry assumes that target, and "
-        "nothing here can scan a called workflow."
+        "notify-main-failure must call the nousergon-lib notification workflow "
+        "pinned to a 40-character SHA. Its allowlist entry assumes that target, "
+        "nothing here can scan a called workflow, and the job carries "
+        "`secrets: inherit` — a moving ref like `@main` is a supply-chain hole, "
+        "and a prefix check accepted one."
     )
 
 

@@ -19,9 +19,12 @@ So the comparison is set-shaped:
   this file moves with it, in the PR that earns it;
 * a clause not in `unmet` that now fails — a REGRESSION, and the only event on
   this arm that is genuinely someone's fault;
-* a different collected count — a clause was added, removed, or is failing to
-  import. A collection error surfaces as an `error` case, not as "no tests
-  ran", which is the shape the old grep-based guard could not see.
+* a clause that vanished or appeared — added, renamed, removed, or failing to
+  import. This is compared against the union of `met` and `unmet`, not against
+  a count: a count let any of the 21 MET clauses be renamed or deleted with a
+  one-digit edit to `ratchet.json` while every check read green, which is the
+  same defect one level along. A collection error surfaces as an `error` case,
+  not as "no tests ran", which is the shape the old grep-based guard missed.
 
 Exit 0 means the reading is exactly what the repository claims it is. That is
 the state in which this job is green while the suite is red, and it is the
@@ -69,8 +72,8 @@ def clause_id(classname: str, name: str) -> str:
     return f"{classname.rsplit('.', 1)[-1]}::{name}"
 
 
-def read_report(report: pathlib.Path) -> tuple[int, set[str]]:
-    """Return (collected, set of unmet clause ids) from a JUnit XML report."""
+def read_report(report: pathlib.Path) -> tuple[set[str], set[str]]:
+    """Return (every collected clause id, the unmet ones) from a JUnit report."""
     if not report.exists():
         raise SystemExit(_fail(f"no acceptance report at {report} — the gate is dark, not green"))
     try:
@@ -78,18 +81,16 @@ def read_report(report: pathlib.Path) -> tuple[int, set[str]]:
     except ET.ParseError as exc:
         raise SystemExit(_fail(f"acceptance report {report} does not parse: {exc}")) from exc
 
-    collected = 0
+    collected: set[str] = set()
     unmet: set[str] = set()
-    seen: set[str] = set()
     for case in tree.getroot().iter("testcase"):
-        collected += 1
         cid = clause_id(case.get("classname", "?"), case.get("name", "?"))
         # Two same-named classes in different modules collapse to one id, and
         # then one of them can regress while the other stays unmet: the set is
         # unchanged, the count is unchanged, and the run is green while the
         # true reading dropped. Refuse the ambiguity rather than resolve it —
         # a clause id that is not unique is not an identifier.
-        if cid in seen:
+        if cid in collected:
             raise SystemExit(
                 _fail(
                     f"two acceptance clauses share the id {cid!r}. Clause ids are "
@@ -97,10 +98,10 @@ def read_report(report: pathlib.Path) -> tuple[int, set[str]]:
                     "this grader — rename one of the classes."
                 )
             )
-        seen.add(cid)
+        collected.add(cid)
         if any(child.tag in {"failure", "error", "skipped"} for child in case):
             unmet.add(cid)
-    if collected == 0:
+    if not collected:
         raise SystemExit(
             _fail("the acceptance suite collected no tests — the gate is dark, not green")
         )
@@ -110,28 +111,48 @@ def read_report(report: pathlib.Path) -> tuple[int, set[str]]:
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         return _fail(f"usage: {argv[0]} <junit-xml>")
-    collected, unmet = read_report(pathlib.Path(argv[1]))
+    collected_ids, unmet = read_report(pathlib.Path(argv[1]))
     ratchet = json.loads(RATCHET.read_text())
-    want_collected = int(ratchet["collected"])
+    # A malformed ratchet must fail the way everything else here does — with a
+    # sentence naming the fix — rather than as a KeyError traceback, which is
+    # both unreadable in an Actions log and indistinguishable from the grader
+    # itself being broken.
+    for field, kind in (("unmet", dict), ("met", list)):
+        if not isinstance(ratchet.get(field), kind):
+            return _fail(
+                f"ratchet.json has no `{field}` of type {kind.__name__}. It carries "
+                "two clause-id collections: `unmet` (id -> reason) and `met` (ids)."
+            )
     want_unmet = set(ratchet["unmet"])
+    want_all = set(ratchet["met"]) | want_unmet
+    if len(want_all) != len(ratchet["met"]) + len(want_unmet):
+        return _fail("ratchet.json lists a clause in both `met` and `unmet`")
 
     _summary(
         [
             "### Acceptance gate (plan §2)",
             "",
-            f"`{collected - len(unmet)} of {collected} clauses met` — "
-            f"ratchet says `{want_collected - len(want_unmet)} of {want_collected}`",
+            f"`{len(collected_ids) - len(unmet)} of {len(collected_ids)} clauses met` — "
+            f"ratchet says `{len(want_all) - len(want_unmet)} of {len(want_all)}`",
             "",
             *(f"- unmet: `{name}`" for name in sorted(unmet)),
         ]
     )
 
-    if collected != want_collected:
+    # The clause SET, not how many there are. A count lets a met clause be
+    # renamed or deleted with a one-digit edit to this file while every check
+    # reads green — plan §2 objectives are not deletable, and a grader that
+    # cannot see one disappear is not grading them.
+    vanished = sorted(want_all - collected_ids)
+    appeared = sorted(collected_ids - want_all)
+    if vanished or appeared:
         return _fail(
-            f"the acceptance suite collected {collected} clauses, ratchet.json says "
-            f"{want_collected}. A clause was added, removed, or failed to import "
-            f"(a collection error reports as an error case, not as 'no tests ran'). "
-            f"Update tests/acceptance/ratchet.json in the PR that changes the suite."
+            "the acceptance suite no longer collects what ratchet.json describes."
+            + (f" Gone: {', '.join(vanished)}." if vanished else "")
+            + (f" New: {', '.join(appeared)}." if appeared else "")
+            + " A clause was added, renamed, removed, or failed to import (a"
+            " collection error reports as an error case, not as 'no tests ran')."
+            " Update tests/acceptance/ratchet.json in the PR that changes the suite."
         )
 
     regressed = sorted(unmet - want_unmet)
@@ -149,7 +170,10 @@ def main(argv: list[str]) -> int:
             + ". Progress is not recorded until the ratchet moves with it — drop "
             "them from `unmet` (and bump `last_moved`) in the PR that earns them."
         )
-    print(f"the reading is unchanged: {collected - len(unmet)} of {collected} clauses met")
+    print(
+        f"the reading is unchanged: {len(collected_ids) - len(unmet)} "
+        f"of {len(collected_ids)} clauses met"
+    )
     return 0
 
 

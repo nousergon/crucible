@@ -53,18 +53,20 @@ def _run(report: Path, ratchet: Path) -> subprocess.CompletedProcess[str]:
 @pytest.fixture
 def ratchet(tmp_path: Path) -> Path:
     path = tmp_path / "ratchet.json"
-    path.write_text(json.dumps({"collected": 3, "unmet": {"T::a": "phase 2"}}))
+    path.write_text(json.dumps({"unmet": {"T::a": "phase 2"}, "met": ["T::b", "T::c"]}))
     return path
 
 
 def test_the_committed_ratchet_is_wellformed() -> None:
     """The file CI grades against must parse and carry both fields."""
     data = json.loads(RATCHET.read_text())
-    assert isinstance(data["collected"], int)
     assert isinstance(data["unmet"], dict)
-    assert len(data["unmet"]) <= data["collected"]
-    for clause, reason in data["unmet"].items():
+    assert isinstance(data["met"], list)
+    assert not set(data["met"]) & set(data["unmet"]), "a clause is both met and unmet"
+    assert len(set(data["met"])) == len(data["met"]), "duplicate id in `met`"
+    for clause in list(data["unmet"]) + data["met"]:
         assert "::" in clause, f"{clause!r} is not a `Class::method` clause id"
+    for clause, reason in data["unmet"].items():
         assert reason.strip(), f"{clause} carries no reason"
 
 
@@ -124,15 +126,17 @@ def test_the_committed_ratchet_matches_the_real_suite() -> None:
         "Two same-named classes in different modules collapse to one id, and one "
         "can then regress invisibly."
     )
-    assert len(ids) == ratchet["collected"], (
-        f"tests/acceptance collects {len(ids)} clauses; ratchet.json says "
-        f"{ratchet['collected']}. Update the ratchet in the PR that changes the suite."
-    )
-    missing = sorted(set(ratchet["unmet"]) - set(ids))
-    assert not missing, (
-        f"ratchet.json lists clauses that no longer exist: {missing}. A renamed or "
-        "deleted clause must be renamed or dropped here in the same PR, or the "
-        "first push to main fails claiming they started passing."
+    want = set(ratchet["met"]) | set(ratchet["unmet"])
+    vanished = sorted(want - set(ids))
+    appeared = sorted(set(ids) - want)
+    assert not vanished and not appeared, (
+        "tests/acceptance no longer collects what ratchet.json describes."
+        + (f" Gone: {vanished}." if vanished else "")
+        + (f" New: {appeared}." if appeared else "")
+        + " Every clause is compared by ID, met ones included: comparing counts "
+        "let any of the passing plan §2 objectives be renamed or deleted with a "
+        "one-digit edit while every check read green. Update the ratchet in the "
+        "PR that changes the suite."
     )
 
 
@@ -179,12 +183,36 @@ def test_unrecorded_progress_is_red(tmp_path: Path, ratchet: Path) -> None:
     assert "T::a" in result.stderr
 
 
-def test_a_changed_collected_count_is_red(tmp_path: Path, ratchet: Path) -> None:
-    """A clause added, removed, or failing to import."""
+def test_a_removed_clause_is_red(tmp_path: Path, ratchet: Path) -> None:
+    """A clause added, removed, renamed, or failing to import."""
     report = _report(tmp_path / "r.xml", met=["T::b"], unmet=["T::a"])
     result = _run(report, ratchet)
     assert result.returncode == 1
-    assert "collected" in result.stderr
+    assert "Gone: T::c" in result.stderr
+
+
+def test_a_renamed_met_clause_is_red(tmp_path: Path, ratchet: Path) -> None:
+    """The count is unchanged and a plan §2 objective has silently moved.
+
+    Comparing counts made every MET clause deletable with a one-digit edit —
+    the 21 passing objectives were the unprotected majority.
+    """
+    report = _report(tmp_path / "r.xml", met=["T::b", "T::renamed"], unmet=["T::a"])
+    result = _run(report, ratchet)
+    assert result.returncode == 1
+    assert "Gone: T::c" in result.stderr
+    assert "New: T::renamed" in result.stderr
+
+
+def test_a_malformed_ratchet_is_red_not_a_traceback(tmp_path: Path) -> None:
+    """A ratchet missing a field must fail loudly and legibly, not crash."""
+    ratchet = tmp_path / "ratchet.json"
+    ratchet.write_text(json.dumps({"unmet": {"T::a": "phase 2"}}))
+    report = _report(tmp_path / "r.xml", met=["T::b"], unmet=["T::a"])
+    result = _run(report, ratchet)
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert "met" in result.stderr
 
 
 def test_a_missing_report_is_red_not_green(tmp_path: Path, ratchet: Path) -> None:
@@ -229,7 +257,7 @@ def test_a_collection_error_is_red(tmp_path: Path, ratchet: Path) -> None:
     )
     result = _run(report, ratchet)
     assert result.returncode == 1
-    assert "collected" in result.stderr
+    assert "Gone:" in result.stderr or "New:" in result.stderr
 
 
 def test_the_module_path_is_not_part_of_a_clause_id() -> None:
