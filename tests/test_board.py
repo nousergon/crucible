@@ -23,6 +23,7 @@ import dataclasses
 import datetime as dt
 import json
 import pathlib
+from abc import ABC
 
 import pytest
 
@@ -723,10 +724,19 @@ class TestTheProducerNeverRunsWhatItGrades:
         wrongly is a deliberate act visible in a diff, which is the most any
         declaration can promise.
         """
+        # The whole MRO, not `vars(Store)`. `vars` sees only what is defined
+        # ON the class, so a public write inherited from a base or a mixin was
+        # invisible: adding `class Store(_LegacyMixin, ABC)` with a `purge`
+        # method left this green and `_refusing_store` installing no refusal
+        # for it. `ABC` and `object` are excluded because their members are
+        # not this interface's surface.
+        inherited = set(dir(ABC)) | set(dir(object))
         public = {
             name
-            for name in vars(Store)
-            if not name.startswith("_") and callable(getattr(Store, name, None))
+            for name in dir(Store)
+            if not name.startswith("_")
+            and name not in inherited
+            and callable(getattr(Store, name, None))
         }
         declared = set(Store.MUTATORS) | set(Store.READERS)
         assert public, "no public methods found on Store — this derivation has gone blind"
@@ -1178,18 +1188,33 @@ class TestTheHeldPointerDeltaGuardIsTested:
     def test_a_forward_step_still_reports_its_deltas(self, tmp_path) -> None:
         """The guard must not silence a REAL move.
 
-        A same-day or later board moves the pointer, so the comparison is in
-        the right direction and the delta is published. Asserted so the fix
-        cannot be "never report anything".
+        The incumbent is doctored for the same reason the replay test doctors
+        it: two real boards a few days apart AGREE, so a forward step over an
+        undoctored store can never observe a non-zero delta, and an assertion
+        over it proves nothing.
+
+        The earlier version asserted only that the status_reason lacked "no
+        comparison was made" — a string selected by `may_move`, a different
+        variable, never by the delta content. Replacing the delta with a
+        literal `[]` (the mute button this test claims to prevent) left it
+        passing. It now asserts the COUNT.
         """
         self._run(tmp_path, dt.date(2026, 8, 28))
+        store = LocalStore(tmp_path)
+        incumbent = json.loads(store.get_bytes("board/current.json"))
+        flipped = next(r for r in incumbent["rows"] if r["state"] == "UNMEASURED")
+        flipped["state"] = "MET"
+        store.put_bytes("board/current.json", json.dumps(incumbent).encode())
+
         written = self._run(tmp_path, dt.date(2026, 9, 1))
         manifest = json.loads(written.get_bytes("runs/board/2026-09-01/run.json"))
         moved = next(m for m in manifest["metrics"] if m["name"] == "board_rows_moved")
-        assert "no comparison was made" not in moved["status_reason"], (
+        assert moved["value"] > 0, (
             "a forward step must still diff — a guard that silences every delta is "
             "not a guard, it is a mute button"
         )
+        assert flipped["id"] in moved["status_reason"]
+        assert "no comparison was made" not in moved["status_reason"]
 
     def test_a_replay_does_not_leave_the_next_day_blind(self, tmp_path) -> None:
         """The two fixes compose.
