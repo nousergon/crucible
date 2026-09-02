@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nousergon/crucible/schemas/cross_section.v2.json",
+  "title": "Crucible shadow.v2 — produce-time scored cross-section",
+  "description": "The whole ranked cross-section an arm produced on one trading day, written at experiments/{arm}/{trading_day}/cross_section.json. `shadow.v1` (shadow.json, unchanged) persists only the top-N selection, which is enough to score a pick but not enough to compute a rank correlation. This document exists to make `crucible report`'s R/M attribution rows a true rank IC rather than the realized-excess-return stand-in named plan_row (alpha-engine-config-I9778). additionalProperties: false because a field this reader does not understand is a field the producer expected it to act on.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "arm_id", "trading_day", "population_size", "ranks"],
+  "properties": {
+    "schema_version": {
+      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
+      "const": "cross_section.v2"
+    },
+    "arm_id": {
+      "description": "`{slot}:{name}:{spec_hash}` — the same identity every other artifact in this tree addresses an arm by.",
+      "type": "string",
+      "minLength": 1
+    },
+    "trading_day": {
+      "description": "The NYSE session the cross-section was scored on (§4.12).",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "population_size": {
+      "description": "len(ranks). Redundant with the array length by construction, and required anyway so a truncated array is a schema failure rather than a silently smaller population.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "ranks": {
+      "description": "Every ticker the arm's ranker scored, ordered by DESCENDING score. Not necessarily sorted in the array — `rank` is the authoritative order.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ticker", "score", "rank"],
+        "properties": {
+          "ticker": {"type": "string", "minLength": 1},
+          "score": {"type": "number"},
+          "rank": {
+            "description": "1-based, dense: rank 1 is the highest score.",
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    }
+  }
+}

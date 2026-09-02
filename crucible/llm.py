@@ -62,6 +62,7 @@ __all__ = [
     "CALLSITE_REGISTRY_PATH",
     "CallSite",
     "DEFAULT_LLM_CAP_USD",
+    "DEFAULT_LLM_CAP_USD_MEASURED",
     "Finding",
     "LLM_CALLSITE_REGISTRY",
     "LlmCallCeilingExceeded",
@@ -90,6 +91,23 @@ __all__ = [
 #: It is re-set from the cost sink once an LLM arm has run a full cycle —
 #: that is a measurement, and it belongs to phase 5.
 DEFAULT_LLM_CAP_USD = 5.00
+
+#: **Machine-checkable, not only prose.** `alpha-engine-config-I9778`: the
+#: paragraph above already SAID the cap is unmeasured, but nothing in the
+#: artifacts a run writes could be compared against that claim — a manifest
+#: or a report generated under the default looked identical to one generated
+#: under a cap someone had actually re-set. This flag is that comparison
+#: point: :func:`~crucible.config.settings` cannot set it (there is no
+#: `CRUCIBLE_LLM_CAP_MEASURED` env var — measurement is a fact about how the
+#: number was chosen, not a runtime knob), so it flips to `True` only when a
+#: future edit HERE, beside the value it describes, records that a phase-5
+#: cost-sink cycle re-set :data:`DEFAULT_LLM_CAP_USD`. Track: a phase-5
+#: follow-up files "re-set `DEFAULT_LLM_CAP_USD` from the first LLM arm's
+#: first full weekly cycle's `llm_spend_usd` metric, then flip this to
+#: `True` in the same PR that changes the value" — the two edits belong in
+#: one PR precisely so this flag can never say `True` beside a number nobody
+#: measured.
+DEFAULT_LLM_CAP_USD_MEASURED = False
 
 #: The window the cap is paced across. The cap is per WEEKLY RUN and the
 #: weekly cycle is the window, so `krepis.usage_pacing` compares spend against

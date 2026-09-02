@@ -20,6 +20,7 @@ from crucible.data.daily import COVERAGE_FLOOR_RATIO
 from crucible.keys import champion_key, verdict_key
 from crucible.manifest import manifest_key
 from crucible.report import (
+    RANK_IC_N_FLOOR,
     REPORT_WINDOW_TRADING_DAYS,
     ROWS,
     SLOT_WINDOW_TRADING_DAYS,
@@ -27,12 +28,14 @@ from crucible.report import (
     build_attribution,
 )
 from crucible.runner import run_job
+from crucible.slots.grading import CROSS_SECTION_MIN_NAMES, cross_section_settled_key
 from crucible.store import LocalStore
 from crucible.track_e import report_handler
 
 DAY = dt.date(2026, 8, 28)
 NOW = dt.datetime(2026, 8, 29, 12, 0, tzinfo=dt.UTC)
 ARM = "r:momentum_sleeve:ab12cd"
+S_ARM = "s:momentum_sleeve:ab12cd"
 
 
 def _store(tmp_path) -> LocalStore:
@@ -102,12 +105,63 @@ def _write_verdicts(
         )
 
 
+#: A perfectly rank-correlated cross-section (score and realized return agree
+#: on every ordering), sized above :data:`CROSS_SECTION_MIN_NAMES` so a date
+#: built from it always contributes an IC of ``+1.0``.
+_PERFECT_RANK_SECTION: tuple[tuple[str, float, float], ...] = (
+    ("AAA", 6.0, 0.060),
+    ("BBB", 5.0, 0.050),
+    ("CCC", 4.0, 0.040),
+    ("DDD", 3.0, 0.030),
+    ("EEE", 2.0, 0.020),
+    ("FFF", 1.0, 0.010),
+)
+
+
+def _write_cross_sections_settled(
+    store: LocalStore,
+    arm_id: str,
+    days: list[str],
+    *,
+    ranks: tuple[tuple[str, float, float | None], ...] = _PERFECT_RANK_SECTION,
+    horizon: int = 21,
+) -> None:
+    """One `cross_section_settled.json` per day — the shape `experiment.grade`
+    writes via `crucible.slots.grading.settle_cross_section`."""
+    for day in days:
+        document = {
+            "schema_version": "cross_section_settled.v2",
+            "arm_id": arm_id,
+            "trading_day": day,
+            "horizon_trading_days": horizon,
+            "settled_on": day,
+            "population_size": len(ranks),
+            "n_settled": sum(1 for _, _, r in ranks if r is not None),
+            "ranks": [
+                {"ticker": t, "score": s, "rank": i + 1, "realized_forward_return_ratio": r}
+                for i, (t, s, r) in enumerate(ranks)
+            ],
+        }
+        store.put_bytes(
+            cross_section_settled_key(arm_id, day),
+            json.dumps(document, sort_keys=True).encode("utf-8"),
+        )
+
+
 class TestShape:
     def test_the_table_always_has_the_five_declared_rows_in_order(self, tmp_path) -> None:
         document, _ = build_attribution(_store(tmp_path), trading_day=DAY, now=NOW, run_id="R" * 26)
         assert [r["name"] for r in document["rows"]] == [s.name for s in ROWS]
-        assert [r["plan_row"] for r in document["rows"]] == [s.plan_row for s in ROWS]
         assert document["schema_version"] == "attribution.v1"
+
+    def test_plan_row_is_gone(self, tmp_path) -> None:
+        """alpha-engine-config-I9778: the indirection existed only because the
+        R/M rows disagreed with §4.5's wording. They no longer do — the row
+        name IS the wording now — so there is nothing left for the field to
+        carry."""
+        document, _ = build_attribution(_store(tmp_path), trading_day=DAY, now=NOW, run_id="R" * 26)
+        for row in document["rows"]:
+            assert "plan_row" not in row
 
     def test_every_row_carries_value_ci_n_baseline_and_status(self, tmp_path) -> None:
         document, _ = build_attribution(_store(tmp_path), trading_day=DAY, now=NOW, run_id="R" * 26)
@@ -128,7 +182,7 @@ class TestShape:
             assert row["unit"] is None, "a row with no value declares no unit"
         reasons = {r["name"]: r["status_reason"] for r in document["rows"]}
         assert "data.daily" in reasons["data_coverage_ratio"]
-        assert "champions/r/current.json" in reasons["signal_excess_return_r_ratio"]
+        assert "champions/r/current.json" in reasons["signal_rank_ic_r"]
         assert "trader" in reasons["execution_shortfall_bps"]
 
     def test_the_execution_row_is_not_implemented_rather_than_absent(self, tmp_path) -> None:
@@ -226,13 +280,17 @@ class TestCoverageRow:
         assert row["n_samples"] == 1
 
 
-class TestSlotRows:
+class TestPortfolioAlphaRow:
+    """S: unchanged by I9778 — still `_slot_row`'s realized excess return,
+    reduced from `verdict.json`, because portfolio alpha is a claim about
+    what was actually earned, not a ranking to correlate."""
+
     def test_the_champions_settled_verdicts_become_the_row(self, tmp_path) -> None:
         store = _store(tmp_path)
-        _write_champion(store, "r", ARM)
+        _write_champion(store, "s", S_ARM)
         _write_verdicts(
             store,
-            ARM,
+            S_ARM,
             {
                 "2026-07-01": 0.02,
                 "2026-07-02": 0.01,
@@ -243,75 +301,126 @@ class TestSlotRows:
             },
         )
         document, sources = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
-        row = next(r for r in document["rows"] if r["name"] == "signal_excess_return_r_ratio")
+        row = next(r for r in document["rows"] if r["name"] == "portfolio_excess_return_s_ratio")
         assert row["value"] == pytest.approx(0.02, abs=1e-9)
         assert row["n_samples"] == 6
         assert row["baseline"] == 0.0
         assert row["horizon_trading_days"] == 21
         assert row["status"] == "GREEN"
         assert row["ci_low"] > 0.0
-        assert verdict_key(ARM, "2026-07-01") in sources
-        assert champion_key("r") in sources
+        assert verdict_key(S_ARM, "2026-07-01") in sources
+        assert champion_key("s") in sources
 
-    def test_a_verdict_after_the_report_day_is_not_read(self, tmp_path) -> None:
+    def test_too_few_settled_dates_is_low_n_not_a_number(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        _write_champion(store, "s", S_ARM)
+        _write_verdicts(store, S_ARM, {"2026-07-01": 0.9})
+        document, _ = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
+        row = next(r for r in document["rows"] if r["name"] == "portfolio_excess_return_s_ratio")
+        assert row["status"] == "N/A-LOW-N"
+
+    def test_a_champion_with_no_settled_verdict_is_missing_input(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        _write_champion(store, "s", S_ARM)
+        document, _ = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
+        row = next(r for r in document["rows"] if r["name"] == "portfolio_excess_return_s_ratio")
+        assert row["status"] == "N/A-MISSING-INPUT"
+
+    def test_verdicts_at_two_horizons_are_refused_rather_than_averaged(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        _write_champion(store, "s", S_ARM)
+        _write_verdicts(store, S_ARM, {"2026-07-01": 0.02}, horizon=21)
+        _write_verdicts(store, S_ARM, {"2026-07-02": 0.02}, horizon=63)
+        with pytest.raises(ValueError, match="horizons"):
+            build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
+
+
+class TestRankICRow:
+    """R and M: reduced from `shadow.v2` settled cross-sections into a true
+    Spearman rank IC (alpha-engine-config-I9778), not the realized excess
+    return `signal_excess_return_r_ratio` used to carry under a `plan_row`
+    admitting the mismatch."""
+
+    def test_the_champions_settled_cross_sections_become_the_row(self, tmp_path) -> None:
         store = _store(tmp_path)
         _write_champion(store, "r", ARM)
-        _write_verdicts(store, ARM, {"2026-07-01": 0.02, "2026-09-01": 9.0})
+        days = [
+            "2026-07-01",
+            "2026-07-02",
+            "2026-07-06",
+            "2026-07-07",
+            "2026-07-08",
+            "2026-07-09",
+        ]
+        _write_cross_sections_settled(store, ARM, days)
+        document, sources = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
+        row = next(r for r in document["rows"] if r["name"] == "signal_rank_ic_r")
+        assert row["value"] == pytest.approx(1.0, abs=1e-9)
+        assert row["n_samples"] == len(days)
+        assert row["n_floor"] == RANK_IC_N_FLOOR
+        assert row["baseline"] == 0.0
+        assert row["horizon_trading_days"] == 21
+        assert row["unit"] == "ic"
+        assert row["status"] == "GREEN"
+        assert cross_section_settled_key(ARM, days[0]) in sources
+        assert champion_key("r") in sources
+
+    def test_a_cross_section_after_the_report_day_is_not_read(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        _write_champion(store, "r", ARM)
+        _write_cross_sections_settled(store, ARM, ["2026-07-01", "2026-09-01"])
         document, _ = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
-        row = next(r for r in document["rows"] if r["name"] == "signal_excess_return_r_ratio")
+        row = next(r for r in document["rows"] if r["name"] == "signal_rank_ic_r")
         assert row["n_samples"] == 1
 
     def test_too_few_settled_dates_is_low_n_not_a_number(self, tmp_path) -> None:
         store = _store(tmp_path)
         _write_champion(store, "r", ARM)
-        _write_verdicts(store, ARM, {"2026-07-01": 0.9})
+        _write_cross_sections_settled(store, ARM, ["2026-07-01"])
         document, _ = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
-        row = next(r for r in document["rows"] if r["name"] == "signal_excess_return_r_ratio")
+        row = next(r for r in document["rows"] if r["name"] == "signal_rank_ic_r")
         assert row["status"] == "N/A-LOW-N"
 
-    def test_a_champion_with_no_settled_verdict_is_missing_input(self, tmp_path) -> None:
+    def test_a_champion_with_no_settled_cross_section_is_missing_input(self, tmp_path) -> None:
         store = _store(tmp_path)
         _write_champion(store, "r", ARM)
         document, _ = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
-        row = next(r for r in document["rows"] if r["name"] == "signal_excess_return_r_ratio")
+        row = next(r for r in document["rows"] if r["name"] == "signal_rank_ic_r")
         assert row["status"] == "N/A-MISSING-INPUT"
-        assert "horizon" in row["status_reason"]
+        assert "shadow.v2" in row["status_reason"]
 
-    def test_a_verdict_outside_the_declared_window_is_not_read(self, tmp_path) -> None:
-        """The E2 reproduction, as a test.
-
-        The shape this replaces read EVERY verdict the champion had ever
-        produced on or before the trading day, while the document header
-        declared a five-session week. Reproduced 2026-09-01: header
-        ``2026-08-24..2026-08-28``, R row ``n_samples = 8`` spanning January
-        to August. Here five of the eight verdicts predate the row's own
-        twelve-trading-week window; under the old shape ``n_samples`` reads 8
-        and the mean is 0.5, both of which the assertions below refuse.
-        """
+    def test_a_date_below_the_names_floor_is_skipped_not_counted(self, tmp_path) -> None:
+        """§4.12/`CROSS_SECTION_MIN_NAMES`: a cross-section with too few
+        paired names contributes NO observation — it does not get counted as
+        a zero, and it does not get counted as a date at all."""
         store = _store(tmp_path)
         _write_champion(store, "r", ARM)
-        inside = {"2026-06-08": 0.01, "2026-07-06": 0.01, "2026-08-28": 0.01}
-        outside = {
-            "2026-01-05": 1.0,
-            "2026-02-05": 1.0,
-            "2026-03-05": 1.0,
-            "2026-04-06": 1.0,
-            "2026-05-05": 1.0,
-        }
-        _write_verdicts(store, ARM, {**inside, **outside})
+        thin = tuple(_PERFECT_RANK_SECTION[: CROSS_SECTION_MIN_NAMES - 1])
+        _write_cross_sections_settled(store, ARM, ["2026-07-01"], ranks=thin)
+        document, _ = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
+        row = next(r for r in document["rows"] if r["name"] == "signal_rank_ic_r")
+        assert row["n_samples"] == 0
+        assert row["status"].startswith("N/A")
+        assert str(CROSS_SECTION_MIN_NAMES) in row["status_reason"]
+
+    def test_a_cross_section_outside_the_declared_window_is_not_read(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        _write_champion(store, "r", ARM)
+        inside = ["2026-06-08", "2026-07-06", "2026-08-28"]
+        outside = ["2026-01-05", "2026-02-05", "2026-03-05", "2026-04-06", "2026-05-05"]
+        _write_cross_sections_settled(store, ARM, inside + outside)
         document, sources = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
-        row = next(r for r in document["rows"] if r["name"] == "signal_excess_return_r_ratio")
+        row = next(r for r in document["rows"] if r["name"] == "signal_rank_ic_r")
         assert row["n_samples"] == len(inside)
-        assert row["value"] == pytest.approx(0.01)
-        assert verdict_key(ARM, "2026-01-05") not in sources
-        assert verdict_key(ARM, "2026-08-28") in sources
+        assert cross_section_settled_key(ARM, "2026-01-05") not in sources
+        assert cross_section_settled_key(ARM, "2026-08-28") in sources
 
     def test_every_row_declares_the_window_it_was_reduced_over(self, tmp_path) -> None:
-        """A window stated only in the header is a window three rows can be
-        read against without being measured over it."""
         store = _store(tmp_path)
         _write_champion(store, "r", ARM)
-        _write_verdicts(store, ARM, {"2026-07-01": 0.02})
+        _write_cross_sections_settled(
+            store, ARM, ["2026-07-01", "2026-07-02", "2026-07-06", "2026-07-07", "2026-07-08"]
+        )
         document, _ = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
         assert document["window_scope"] == "per-row"
         by_name = {r["name"]: r for r in document["rows"]}
@@ -322,8 +431,8 @@ class TestSlotRows:
         assert coverage["window_end"] == document["window_sessions"][-1]
 
         for name in (
-            "signal_excess_return_r_ratio",
-            "prediction_excess_return_m_ratio",
+            "signal_rank_ic_r",
+            "prediction_rank_ic_m",
             "portfolio_excess_return_s_ratio",
         ):
             row = by_name[name]
@@ -335,48 +444,41 @@ class TestSlotRows:
             )
 
         assert (
-            by_name["signal_excess_return_r_ratio"]["window_start"]
-            in (by_name["signal_excess_return_r_ratio"]["status_reason"])
+            by_name["signal_rank_ic_r"]["window_start"]
+            in (by_name["signal_rank_ic_r"]["status_reason"])
         ), "the row that HAS a champion names its window in words too"
 
         execution = by_name["execution_shortfall_bps"]
         assert execution["window_trading_days"] is None, "an unimplemented row grades no window"
 
-    def test_identical_scores_do_not_buy_a_zero_width_interval(self, tmp_path) -> None:
-        """`_bootstrap_ci`'s own docstring warns against the certainty a
-        zero-width interval reads as; it used to emit one anyway, and
-        `derive_status` then returned GREEN off it."""
+    def test_identical_ics_do_not_buy_a_zero_width_interval(self, tmp_path) -> None:
         store = _store(tmp_path)
         _write_champion(store, "r", ARM)
-        _write_verdicts(
-            store,
-            ARM,
-            dict.fromkeys(
-                [
-                    "2026-07-01",
-                    "2026-07-02",
-                    "2026-07-06",
-                    "2026-07-07",
-                    "2026-07-08",
-                    "2026-07-09",
-                ],
-                0.02,
-            ),
-        )
+        days = [
+            "2026-07-01",
+            "2026-07-02",
+            "2026-07-06",
+            "2026-07-07",
+            "2026-07-08",
+            "2026-07-09",
+        ]
+        _write_cross_sections_settled(store, ARM, days)
         document, _ = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
-        row = next(r for r in document["rows"] if r["name"] == "signal_excess_return_r_ratio")
-        assert row["n_samples"] == 6
+        row = next(r for r in document["rows"] if r["name"] == "signal_rank_ic_r")
+        assert row["n_samples"] == len(days)
         assert row["ci_low"] is None and row["ci_high"] is None
         assert row["ci_method"] is None, (
             "a zero-width interval is a bootstrap with nothing to resample, not a method"
         )
         assert "identical observations" in row["status_reason"]
 
-    def test_verdicts_at_two_horizons_are_refused_rather_than_averaged(self, tmp_path) -> None:
+    def test_cross_sections_at_two_horizons_are_refused_rather_than_averaged(
+        self, tmp_path
+    ) -> None:
         store = _store(tmp_path)
         _write_champion(store, "r", ARM)
-        _write_verdicts(store, ARM, {"2026-07-01": 0.02}, horizon=21)
-        _write_verdicts(store, ARM, {"2026-07-02": 0.02}, horizon=63)
+        _write_cross_sections_settled(store, ARM, ["2026-07-01"], horizon=21)
+        _write_cross_sections_settled(store, ARM, ["2026-07-02"], horizon=63)
         with pytest.raises(ValueError, match="horizons"):
             build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
 

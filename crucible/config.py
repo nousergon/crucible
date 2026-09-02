@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from crucible.llm import DEFAULT_LLM_CAP_USD
+from crucible.llm import DEFAULT_LLM_CAP_USD, DEFAULT_LLM_CAP_USD_MEASURED
 from crucible.store import LocalStore, S3Store, Store
 
 __all__ = [
@@ -47,6 +47,7 @@ __all__ = [
     "DEFAULT_CLOUDTRAIL_ARCHIVE",
     "DEFAULT_STACK_NAME",
     "DEFAULT_LLM_CAP_USD",
+    "DEFAULT_LLM_CAP_USD_MEASURED",
     "DEFAULT_STORE_URI",
     "STRATEGY_PREFIX",
     "Settings",
@@ -106,6 +107,16 @@ class Settings:
     #: `crucible.llm.SpendCap` refuses the call that would cross it, before the
     #: provider is reached, and the run fails rather than overspending.
     llm_cap_usd: float = DEFAULT_LLM_CAP_USD
+    #: `alpha-engine-config-I9778`: whether the resolved ``llm_cap_usd`` traces
+    #: back to a measured cycle rather than :data:`DEFAULT_LLM_CAP_USD`'s
+    #: declared-not-measured value. False whenever the origin is the default
+    #: AND that default has not yet been re-set from a phase-5 cost sink
+    #: (`crucible.llm.DEFAULT_LLM_CAP_USD_MEASURED`); an operator override
+    #: (argument or `CRUCIBLE_LLM_CAP_USD`) is read as measured because a
+    #: human placing a number there is asserting it, the same way an operator
+    #: bootstrap on a champion pointer is a promotion source rather than a
+    #: refusal.
+    llm_cap_usd_measured: bool = False
 
     def store(self) -> Store:
         """The resolved store, or a refusal naming how to resolve one.
@@ -139,6 +150,7 @@ class Settings:
             "stack_name": self.stack_name,
             "strategy_dir": str(self.strategy_dir) if self.strategy_dir else None,
             "llm_cap_usd": self.llm_cap_usd,
+            "llm_cap_usd_measured": self.llm_cap_usd_measured,
             "origins": dict(self.origins),
         }
 
@@ -185,6 +197,12 @@ def settings(
     else:
         origins["strategy_dir"] = f"store:{STRATEGY_PREFIX}"
         resolved_dir = None
+    # A resolved cap counts as MEASURED when an operator placed it (argument
+    # or CRUCIBLE_LLM_CAP_USD — a human asserting a number, not this module
+    # guessing at one) or when DEFAULT_LLM_CAP_USD_MEASURED itself has been
+    # flipped True by a phase-5 re-set. It is False only for the untouched
+    # $5.00 declared ceiling — alpha-engine-config-I9778's whole point.
+    cap_measured = origins["llm_cap_usd"] != "default" or DEFAULT_LLM_CAP_USD_MEASURED
     return Settings(
         store_uri=resolved_store,
         arctic_bucket=resolved_arctic,
@@ -192,6 +210,7 @@ def settings(
         cloudtrail_archive=resolved_archive,
         stack_name=resolved_stack,
         llm_cap_usd=_positive_cap(resolved_cap, origins["llm_cap_usd"]),
+        llm_cap_usd_measured=cap_measured,
         origins=origins,
     )
 

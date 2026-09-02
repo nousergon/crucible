@@ -36,16 +36,22 @@ already emits; the slot rows are reduced from the verdict artifacts the arena
 already writes. A second implementation of a number is a second answer to the
 same question.
 
-**Units are declared, and they are not the plan's shorthand.** §4.5 calls rows
-two and three "signal IC" and "prediction IC". What the durable artifacts
-identify is the champion's realized excess return against the population it
-drew from — `shadow.v1` records the selected names, not the ranked
-cross-section, so a rank correlation is not reconstructible from what is
-stored. The rows are therefore named and united as what they are, and each
-carries ``plan_row`` naming the §4.5 row it answers, so the mapping is
-machine-checkable rather than a matter of reading two documents side by side.
-Emitting an excess return under the name of a correlation is the
-``avg_volume_20d`` defect with a report card around it.
+**Rows two and three are the true rank IC §4.5 asks for.** They used to be
+named as realized excess return, carrying a ``plan_row`` field naming the
+§4.5 wording as an admission that the two disagreed: `shadow.v1` recorded
+only the selected names, not the ranked cross-section, so a rank correlation
+was not reconstructible from what was stored, and emitting an excess return
+under the name of a correlation would have been the ``avg_volume_20d``
+defect with a report card around it. `shadow.v2`
+(`crucible.slots.grading.ScoredCrossSection`, `cross_section.json` +
+`cross_section_settled.json`) persists the whole scored cross-section, so
+the R and M rows now reduce a per-date Spearman rank IC
+(`crucible.slots.grading.spearman_ic`) — the champion's score against the
+realized forward return, paired by ticker, over every settled decision date
+in the window — and ``plan_row`` is gone: the row's own name is the §4.5
+wording (`alpha-engine-config-I9778`). The S row is unchanged — portfolio
+alpha is a claim about realized return, not a ranking, so it stays
+`_slot_row`'s realized-excess-return reduction.
 """
 
 from __future__ import annotations
@@ -62,6 +68,7 @@ from crucible.calendar import previous_trading_day
 from crucible.data.daily import COVERAGE_FLOOR_RATIO
 from crucible.keys import arm_key_segment, champion_key
 from crucible.manifest import manifest_key
+from crucible.slots.grading import CROSS_SECTION_MIN_NAMES, spearman_ic
 from crucible.store import Store
 
 __all__ = [
@@ -124,14 +131,21 @@ SLOT_N_FLOOR = 6
 BOOTSTRAP_RESAMPLES = 2000
 BOOTSTRAP_SEED = 20260901
 
+#: Settled decision DATES a rank-IC row needs before its value is read as a
+#: measurement rather than as noise. Same number as :data:`SLOT_N_FLOOR` and
+#: for the same reason — both floor a count of settled dates in the same
+#: :data:`SLOT_WINDOW_TRADING_DAYS` window — kept as a separate name because
+#: the two rows floor DIFFERENT things (one arm-dates of excess return, one
+#: dates that cleared :data:`~crucible.slots.grading.CROSS_SECTION_MIN_NAMES`
+#: names each) and a shared constant would make that an accident rather than
+#: a fact.
+RANK_IC_N_FLOOR = SLOT_N_FLOOR
+
 
 @dataclass(frozen=True)
 class RowSpec:
     """One row of the §4.5 table: what it answers, and where it reads."""
 
-    #: The §4.5 wording, carried into the artifact so the mapping from this
-    #: table to the plan is a field rather than an act of interpretation.
-    plan_row: str
     name: str
     module: str
     unit: str
@@ -139,6 +153,11 @@ class RowSpec:
     #: The arena slot whose champion this row grades, or None when the row is
     #: reduced from the data layer or from the trader.
     slot: str | None
+    #: True for R and M: the row is a Spearman rank IC reduced from
+    #: `shadow.v2`'s settled cross-sections, not a realized excess return.
+    #: S stays excess return — portfolio alpha is a claim about what was
+    #: actually earned, not a ranking, so there is no rank to correlate.
+    rank_ic: bool = False
 
 
 #: The five rows. Frozen and ordered: the table's shape is the clause, so a
@@ -146,7 +165,6 @@ class RowSpec:
 #: reason for each row is written down.
 ROWS: tuple[RowSpec, ...] = (
     RowSpec(
-        plan_row="data freshness/coverage",
         name="data_coverage_ratio",
         module="crucible.data",
         unit="ratio",
@@ -154,23 +172,22 @@ ROWS: tuple[RowSpec, ...] = (
         slot=None,
     ),
     RowSpec(
-        plan_row="signal IC (R)",
-        name="signal_excess_return_r_ratio",
+        name="signal_rank_ic_r",
         module="crucible.slots.research",
-        unit="ratio",
-        metric_type="ratio",
+        unit="ic",
+        metric_type="ic",
         slot="r",
+        rank_ic=True,
     ),
     RowSpec(
-        plan_row="prediction IC (M)",
-        name="prediction_excess_return_m_ratio",
+        name="prediction_rank_ic_m",
         module="crucible.slots.model",
-        unit="ratio",
-        metric_type="ratio",
+        unit="ic",
+        metric_type="ic",
         slot="m",
+        rank_ic=True,
     ),
     RowSpec(
-        plan_row="portfolio alpha (S)",
         name="portfolio_excess_return_s_ratio",
         module="crucible.slots.strategy",
         unit="ratio",
@@ -178,7 +195,6 @@ ROWS: tuple[RowSpec, ...] = (
         slot="s",
     ),
     RowSpec(
-        plan_row="execution shortfall",
         name="execution_shortfall_bps",
         module="crucible.executor",
         unit="bps",
@@ -213,6 +229,8 @@ def build_attribution(
     for spec in ROWS:
         if spec.slot is None and spec.name == "data_coverage_ratio":
             row = _coverage_row(store, spec, sessions=sessions, now=now, sources=sources)
+        elif spec.rank_ic:
+            row = _rank_ic_row(store, spec, trading_day=trading_day, now=now, sources=sources)
         elif spec.slot is not None:
             row = _slot_row(store, spec, trading_day=trading_day, now=now, sources=sources)
         else:
@@ -513,6 +531,150 @@ def _slot_row(
     )
 
 
+def _rank_ic_row(
+    store: Store,
+    spec: RowSpec,
+    *,
+    trading_day: dt.date,
+    now: dt.datetime,
+    sources: list[str],
+) -> dict[str, Any]:
+    """R and M: the champion's TRUE rank IC, reduced from `shadow.v2`.
+
+    Replaces the realized-excess-return stand-in this row used to carry
+    under a ``plan_row`` of "signal IC (R)" / "prediction IC (M)"
+    (`alpha-engine-config-I9778`). `shadow.v1` recorded only the top-N
+    selection, so a rank correlation was not reconstructible from what was
+    stored; `crucible.slots.grading.ScoredCrossSection` now persists the
+    whole scored cross-section, settled once each decision date's horizon
+    passes, at ``experiments/{arm}/{day}/cross_section_settled.json``.
+
+    **One IC per settled date, then aggregated across the window** — the
+    same two-stage shape :func:`_slot_row` uses for excess return, for the
+    same reason: a rank IC is a per-date measurement (score vs. realized
+    return, paired by ticker, within one cross-section) and averaging raw
+    ticker pairs across dates would let a date with an unusually large
+    population dominate the mean. ``n_samples`` is the count of DATES that
+    produced an IC, against :data:`RANK_IC_N_FLOOR` — a separate axis from
+    :data:`~crucible.slots.grading.CROSS_SECTION_MIN_NAMES`, the floor on
+    names WITHIN one date's cross-section below which that date contributes
+    no IC at all (`crucible.slots.grading.spearman_ic` enforces it and
+    returns ``None``; this function counts and reports how many dates were
+    skipped that way, so a low n is legible rather than merely low).
+
+    **No backfill was performed** (plan §4.5's explicit instruction on this
+    clause): `cross_section_settled.json` exists only for cycles run after
+    `shadow.v2` shipped, so the first weeks after rollout show climbing n
+    against the floor rather than a false GREEN or a fabricated history —
+    that IS the honest first true-IC week, not a defect in it.
+    """
+    pointer_key = champion_key(spec.slot or "")
+    window = _window(trading_day, SLOT_WINDOW_TRADING_DAYS)
+    pointer = _read_json(store, pointer_key)
+    if pointer is None:
+        return _row(
+            spec,
+            value=None,
+            ci=(None, None),
+            n_samples=0,
+            baseline=0.0,
+            now=now,
+            source_path=pointer_key,
+            ran=False,
+            window=window,
+            reason=(
+                f"slot {spec.slot!r} has no champion pointer at {pointer_key}; the slot has "
+                "not run an arena cycle, so there is no champion whose rank IC this row "
+                "could report"
+            ),
+        )
+    sources.append(pointer_key)
+    arm_id = pointer["arm_id"]
+
+    first, last = window[0], window[-1]
+    prefix = f"experiments/{arm_key_segment(arm_id)}/"
+    ics: list[float] = []
+    horizons: set[int] = set()
+    outside = 0
+    skipped_low_names = 0
+    for key in sorted(store.list_keys(prefix)):
+        if not key.endswith("/cross_section_settled.json"):
+            continue
+        document = json.loads(store.get_bytes(key).decode("utf-8"))
+        day = dt.date.fromisoformat(document["trading_day"])
+        if not first <= day <= last:
+            outside += 1
+            continue
+        score_by_ticker = {row["ticker"]: row["score"] for row in document["ranks"]}
+        return_by_ticker = {
+            row["ticker"]: row["realized_forward_return_ratio"]
+            for row in document["ranks"]
+            if row["realized_forward_return_ratio"] is not None
+        }
+        result = spearman_ic(score_by_ticker, return_by_ticker)
+        if result is None:
+            skipped_low_names += 1
+            continue
+        sources.append(key)
+        ic, _n_names = result
+        ics.append(ic)
+        horizons.add(int(document["horizon_trading_days"]))
+
+    if not ics:
+        return _row(
+            spec,
+            value=None,
+            ci=(None, None),
+            n_samples=0,
+            baseline=0.0,
+            now=now,
+            source_path=prefix,
+            input_present=False,
+            window=window,
+            n_floor=RANK_IC_N_FLOOR,
+            reason=(
+                f"champion {arm_id} holds no settled cross-section with at least "
+                f"{CROSS_SECTION_MIN_NAMES} paired names in the {len(window)}-session window "
+                f"{first}..{last} under {prefix} ({outside} settled cross-section(s) exist "
+                f"outside it, {skipped_low_names} inside it were skipped for too few paired "
+                "names). No backfill was performed for shadow.v2, so this is expected in the "
+                "weeks immediately after rollout, not an arm with no edge"
+            ),
+        )
+    if len(horizons) != 1:
+        raise ValueError(
+            f"champion {arm_id} carries settled cross-sections at {sorted(horizons)} "
+            "horizons. Averaging rank ICs measured over different horizons produces a "
+            "number that is not a measurement of anything (§4.12)."
+        )
+
+    mean = sum(ics) / len(ics)
+    low, high = _bootstrap_ci(ics)
+    return _row(
+        spec,
+        value=mean,
+        ci=(low, high),
+        n_samples=len(ics),
+        baseline=0.0,
+        now=now,
+        source_path=prefix,
+        horizon_trading_days=next(iter(horizons)),
+        window=window,
+        n_floor=RANK_IC_N_FLOOR,
+        reason=(
+            f"champion {arm_id}: mean Spearman rank IC {mean:+.5f} of score against realized "
+            f"forward return over {len(ics)} settled decision date(s) (each clearing "
+            f"{CROSS_SECTION_MIN_NAMES}+ paired names) in the {len(window)}-session window "
+            f"{first}..{last}, {_ci_phrase(low, high)}; {skipped_low_names} date(s) inside the "
+            f"window were skipped for too few paired names and {outside} settled "
+            "cross-section(s) exist outside it; the baseline is 0.0 because that is the "
+            "expectation of a random ranking's correlation with the realized return"
+        ),
+        target=0.0,
+        red_line=0.0,
+    )
+
+
 def _execution_row(spec: RowSpec, *, now: dt.datetime) -> dict[str, Any]:
     """Execution shortfall — the trader's row, and the trader is not v2 phase 1.
 
@@ -603,7 +765,6 @@ def _row(
         last_updated_utc=now.astimezone(dt.UTC),
     )
     row = json.loads(record.model_dump_json())
-    row["plan_row"] = spec.plan_row
     row["baseline"] = baseline
     # Every row declares the span it was reduced over. A row whose window is
     # only stated in the document header is a row that can silently be read

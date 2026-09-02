@@ -66,6 +66,30 @@ class TestDeclaration:
         assert resolved.llm_cap_usd == 1.25
         assert resolved.origins["llm_cap_usd"] == "environ:CRUCIBLE_LLM_CAP_USD"
 
+    def test_the_untouched_default_is_machine_checkably_unmeasured(self) -> None:
+        """alpha-engine-config-I9778: the docstring beside `DEFAULT_LLM_CAP_USD`
+        already said this in prose ("A declared ceiling, not a measurement");
+        this is the field a manifest or a report can be compared against
+        instead of trusting the comment."""
+        from crucible.llm import DEFAULT_LLM_CAP_USD_MEASURED
+
+        assert DEFAULT_LLM_CAP_USD_MEASURED is False, (
+            "no phase-5 LLM arm has run a full cycle yet — flipping this without one "
+            "would be exactly the unmeasured-number-presented-as-measured defect this "
+            "flag exists to make impossible"
+        )
+        resolved = settings()
+        assert resolved.llm_cap_usd_measured is False
+        assert resolved.to_dict()["llm_cap_usd_measured"] is False
+
+    def test_an_operator_override_reads_as_measured(self, monkeypatch) -> None:
+        """A human placing a number is asserting it — the same distinction
+        `promotion_source` draws between `bootstrap` and `operator_bootstrap`
+        on a champion pointer."""
+        monkeypatch.setenv("CRUCIBLE_LLM_CAP_USD", "1.25")
+        resolved = settings()
+        assert resolved.llm_cap_usd_measured is True
+
     @pytest.mark.parametrize("bad", ["", "0", "-3", "five dollars"])
     def test_a_malformed_cap_raises_rather_than_falling_back(self, monkeypatch, bad) -> None:
         """A ceiling silently replaced by the default is a ceiling nobody is

@@ -85,7 +85,7 @@ from nousergon_lib.arena.engine import (
 )
 from nousergon_lib.arena.window import ArmSeries, pair_on_common_window
 
-from crucible.keys import shadow_key, verdict_key
+from crucible.keys import arm_key_segment, shadow_key, verdict_key
 from crucible.slots import SlotSpec
 from crucible.slots.arms import ArmSpec
 from crucible.slots.rankers import MissingFeatureError, rank_with
@@ -97,20 +97,31 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 __all__ = [
     "CONTROL_PLANTED_IC",
+    "CROSS_SECTION_MIN_NAMES",
+    "CROSS_SECTION_SCHEMA_VERSION",
+    "CROSS_SECTION_SETTLED_SCHEMA_VERSION",
     "DEFAULT_HORIZON_TRADING_DAYS",
     "LABEL_CONTROL_REL_TOL",
     "ForwardReturnWindow",
     "GraderControlError",
     "PopulationIntegrityError",
+    "ScoredCrossSection",
     "SelectionMissError",
     "ShadowSelection",
     "assert_label_control",
+    "cross_section_key",
+    "cross_section_settled_key",
     "forward_returns",
     "grade_slot",
+    "produce_cross_section",
     "produce_shadow",
     "reference_forward_returns",
     "score_selection",
     "series_from_verdicts",
+    "settle_cross_section",
+    "spearman_ic",
+    "write_cross_section",
+    "write_cross_section_settled",
 ]
 
 #: §4.12: a horizon is a count of SESSIONS. 21 is the canonical one-month
@@ -272,6 +283,231 @@ def produce_shadow(
         ranker=spec.ranker,
         params=dict(spec.params),
     )
+
+
+#: `shadow.v2` (`alpha-engine-config-I9778`): the full scored cross-section,
+#: not `shadow.v1`'s top-N selection. Two artifacts, produce/grade-separated
+#: exactly like `shadow.json`/`verdict.json` above, because the same defect
+#: this module already guards against — a look-ahead written into a
+#: produce-time artifact — applies to a return value too: the PRODUCE-time
+#: document (`cross_section.json`) carries only what `rank_with` computed
+#: from that day's features, and the realized forward return is filled in
+#: ONLY once the horizon settles, into a SEPARATE, later-written document
+#: (`cross_section_settled.json`). Overwriting `cross_section.json` in place
+#: once the outcome is known was considered and rejected: it would make the
+#: same key mean two different things depending on when it was read, which
+#: is the ambiguity `shadow.json` vs `verdict.json` exists to avoid.
+CROSS_SECTION_SCHEMA_VERSION = "cross_section.v2"
+CROSS_SECTION_SETTLED_SCHEMA_VERSION = "cross_section_settled.v2"
+
+#: The floor below which a single date's rank correlation is not computed at
+#: all — the date contributes no observation to the IC series rather than a
+#: noisy one. A Spearman correlation over 2-4 paired names is dominated by
+#: which two or three names happened to settle; five is the smallest count at
+#: which a rank swap changes the statistic by less than a full step, and it
+#: is a floor on EVIDENCE PER DATE, deliberately distinct from
+#: `crucible.report.SLOT_N_FLOOR`, which floors the number of DATES behind
+#: the aggregate. A row can fail either: too few names on enough dates, or
+#: too few dates with enough names.
+CROSS_SECTION_MIN_NAMES = 5
+
+
+def cross_section_key(arm_id: str, trading_day: str) -> str:
+    """The full scored cross-section an arm produced on ``trading_day``.
+
+    Lives beside `shadow.json` under the same `experiments/{arm}/{day}/`
+    prefix (`crucible.keys` is another agent's file this session; the shape
+    matches its convention rather than restating it there).
+    """
+    return f"experiments/{arm_key_segment(arm_id)}/{trading_day}/cross_section.json"
+
+
+def cross_section_settled_key(arm_id: str, trading_day: str) -> str:
+    """The same cross-section, joined against the realized forward return
+    once ``trading_day``'s horizon has settled. Never written before then."""
+    return f"experiments/{arm_key_segment(arm_id)}/{trading_day}/cross_section_settled.json"
+
+
+@dataclass(frozen=True)
+class ScoredCrossSection:
+    """Every name an arm ranked on one trading day, not only its top-N pick.
+
+    `shadow.v1` (:class:`ShadowSelection`) persists only ``selection`` —
+    the top N tickers — because that is all `experiment.grade` needs to
+    score a pick against the population mean. A rank correlation needs the
+    WHOLE ranked cross-section, which `shadow.v1` never wrote and
+    `crucible.report` could not reconstruct: the reason the R and M
+    attribution rows were named as realized excess return instead of the
+    signal/prediction IC §4.5 calls for (`alpha-engine-config-I9778`).
+
+    ``ranks`` is 1-based and dense: rank 1 is the highest score. It is a
+    tuple of ``(ticker, score, rank)`` rather than three parallel lists so a
+    row can never desync from the others under an edit.
+    """
+
+    arm_id: str
+    trading_day: str
+    ranks: tuple[tuple[str, float, int], ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": CROSS_SECTION_SCHEMA_VERSION,
+            "arm_id": self.arm_id,
+            "trading_day": self.trading_day,
+            "population_size": len(self.ranks),
+            "ranks": [
+                {"ticker": ticker, "score": score, "rank": rank}
+                for ticker, score, rank in self.ranks
+            ],
+        }
+
+
+def produce_cross_section(
+    spec: ArmSpec,
+    features: pd.DataFrame,
+    trading_day: dt.date,
+) -> ScoredCrossSection:
+    """Rank the WHOLE cross-section, not only the top-N `produce_shadow` picks.
+
+    Shares `rank_with` with :func:`produce_shadow` deliberately: two
+    functions computing two different rankings from the same recipe would be
+    a second implementation of the ranker, and a report that graded a
+    different ranking than production selected on would not be grading
+    production. `scores` is already ordered descending by `rank_with`'s own
+    contract (`produce_shadow` reads `scores.head(top_n)`), so the position
+    in that order IS the rank — nothing here re-sorts.
+    """
+    scores = rank_with(spec.ranker, features, spec.params)
+    ranks = tuple(
+        (str(ticker), float(score), position)
+        for position, (ticker, score) in enumerate(scores.items(), start=1)
+    )
+    if not ranks:
+        raise MissingFeatureError(
+            f"arm {spec.name!r} ranked zero names on {trading_day} from a population of "
+            f"{len(features)}. Every feature its ranker reads was null across the whole "
+            "cross-section, which is a broken feature layer, not an arm with nothing to "
+            "say."
+        )
+    return ScoredCrossSection(arm_id=spec.arm_id, trading_day=trading_day.isoformat(), ranks=ranks)
+
+
+def write_cross_section(store: Store, cross_section: ScoredCrossSection) -> bytes:
+    payload = json.dumps(cross_section.to_dict(), indent=2, sort_keys=True).encode("utf-8")
+    store.put_bytes(cross_section_key(cross_section.arm_id, cross_section.trading_day), payload)
+    return payload
+
+
+def settle_cross_section(
+    document: dict[str, Any],
+    *,
+    returns: dict[str, float],
+    horizon_trading_days: int,
+    settled_on: str,
+) -> dict[str, Any]:
+    """Join a produce-time cross-section against the realized forward return.
+
+    ``returns`` is exactly the mapping :func:`forward_returns` already
+    computed for the grading cycle — never recomputed here, so this can only
+    ever agree with what the verdict for the same date was scored against.
+    A ticker absent from ``returns`` (delisted, halted, no settled close at
+    both ends) carries ``realized_forward_return_ratio: null`` rather than
+    being dropped or zero-filled: the same "absent is absent, never zero"
+    rule `crucible.slots.grading.forward_returns` and `crucible.report`
+    already hold elsewhere in this tree.
+    """
+    settled_ranks = []
+    n_settled = 0
+    for row in document["ranks"]:
+        realized = returns.get(row["ticker"])
+        if realized is not None:
+            n_settled += 1
+        settled_ranks.append(
+            {
+                "ticker": row["ticker"],
+                "score": row["score"],
+                "rank": row["rank"],
+                "realized_forward_return_ratio": realized,
+            }
+        )
+    return {
+        "schema_version": CROSS_SECTION_SETTLED_SCHEMA_VERSION,
+        "arm_id": document["arm_id"],
+        "trading_day": document["trading_day"],
+        "horizon_trading_days": horizon_trading_days,
+        "settled_on": settled_on,
+        "population_size": document["population_size"],
+        "n_settled": n_settled,
+        "ranks": settled_ranks,
+    }
+
+
+def write_cross_section_settled(
+    store: Store, *, arm_id: str, trading_day: str, document: dict[str, Any]
+) -> bytes:
+    payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
+    store.put_bytes(cross_section_settled_key(arm_id, trading_day), payload)
+    return payload
+
+
+def spearman_ic(
+    score_by_ticker: dict[str, float], return_by_ticker: dict[str, float]
+) -> tuple[float, int] | None:
+    """One date's rank IC: the Spearman correlation of score against realized
+    forward return, paired by ticker.
+
+    Returns ``None`` below :data:`CROSS_SECTION_MIN_NAMES` paired names
+    rather than a correlation computed on too little to mean anything — the
+    caller (`crucible.report`) then excludes that date from the series
+    entirely, the same way an unsettled date excludes itself from a slot
+    row's `n_samples`.
+
+    Implemented with average (mid-rank) ties and a plain Pearson correlation
+    of the two rank vectors, which is the standard equivalence for Spearman's
+    rho — no `scipy` dependency for one formula this module already needs a
+    second reference implementation of, in the same spirit as
+    :func:`reference_forward_returns`.
+    """
+    tickers = sorted(set(score_by_ticker) & set(return_by_ticker))
+    if len(tickers) < CROSS_SECTION_MIN_NAMES:
+        return None
+    scores = [score_by_ticker[t] for t in tickers]
+    realized = [return_by_ticker[t] for t in tickers]
+    ic = _pearson(_fractional_ranks(scores), _fractional_ranks(realized))
+    return ic, len(tickers)
+
+
+def _fractional_ranks(values: list[float]) -> list[float]:
+    """1-based ranks, tied values sharing the AVERAGE of their positions."""
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        average_rank = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = average_rank
+        i = j + 1
+    return ranks
+
+
+def _pearson(a: list[float], b: list[float]) -> float:
+    n = len(a)
+    mean_a = sum(a) / n
+    mean_b = sum(b) / n
+    covariance = sum((a[i] - mean_a) * (b[i] - mean_b) for i in range(n))
+    variance_a = sum((x - mean_a) ** 2 for x in a)
+    variance_b = sum((x - mean_b) ** 2 for x in b)
+    if variance_a == 0.0 or variance_b == 0.0:
+        # Every rank tied (every score, or every realized return, identical).
+        # A correlation is undefined, not zero: reported as 0.0 with the
+        # degenerate input rather than raised, since a control or a quiet
+        # cross-section can legitimately land here and the caller treats a
+        # date contributing nothing differently from a date that failed.
+        return 0.0
+    return covariance / math.sqrt(variance_a * variance_b)
 
 
 def _sessions(panel: pd.DataFrame) -> list[Any]:

@@ -57,17 +57,23 @@ from crucible.slots.grading import (
     ForwardReturnWindow,
     GraderControlError,
     PopulationIntegrityError,
+    ScoredCrossSection,
     SelectionMissError,
     ShadowSelection,
     assert_label_control,
     control_selection,
+    cross_section_key,
     forward_returns,
     grade_slot,
+    produce_cross_section,
     produce_shadow,
     raise_training_integrity,
     reference_forward_returns,
     score_selection,
+    settle_cross_section,
     training_ok,
+    write_cross_section,
+    write_cross_section_settled,
     write_shadow,
     write_verdict,
 )
@@ -179,6 +185,15 @@ def run_produce(
     for spec in specs:
         try:
             shadow = produce_shadow(spec, features, trading_day)
+            # shadow.v2 (alpha-engine-config-I9778): the WHOLE ranked
+            # cross-section, not only the top-N `shadow.v1` selection above.
+            # Produced from the same `features` frame and the same recipe as
+            # the selection it sits beside, so a rank IC computed from it
+            # later is a rank IC over what this arm actually saw on this
+            # day — never a second, drifted ranking.
+            cross_section: ScoredCrossSection | None = produce_cross_section(
+                spec, features, trading_day
+            )
         except MissingFeatureError as exc:
             # plan §4.4: a defective input fails the whole slot's run. It is
             # never a miss — "this arm had nothing to say" and "this arm's
@@ -190,6 +205,12 @@ def run_produce(
                 shadow_key(shadow.arm_id, shadow.trading_day),
                 json.dumps(shadow.to_dict(), indent=2, sort_keys=True).encode("utf-8"),
                 schema_version="shadow.v1",
+            )
+            write_cross_section(ctx.store, cross_section)
+            ctx.record_output(
+                cross_section_key(cross_section.arm_id, cross_section.trading_day),
+                json.dumps(cross_section.to_dict(), indent=2, sort_keys=True).encode("utf-8"),
+                schema_version="cross_section.v2",
             )
             produced.append(shadow)
 
@@ -389,6 +410,27 @@ def run_grade(
                     detail=detail,
                     control=False,
                 )
+                # shadow.v2 settlement (alpha-engine-config-I9778): join the
+                # produce-time cross-section against the SAME `window.returns`
+                # the verdict above was scored against, so the rank IC
+                # `crucible.report` later reduces this into can only ever
+                # agree with what the verdict for this date says settled.
+                # Guarded rather than required: a shadow produced before this
+                # artifact existed has no cross_section.json, and that is a
+                # migration date, not a defect — `crucible report`'s rank IC
+                # row reads n_samples off what settlement actually wrote.
+                cs_key = cross_section_key(arm_id, day)
+                if ctx.store.exists(cs_key):
+                    cross_section_doc = json.loads(ctx.store.get_bytes(cs_key).decode("utf-8"))
+                    settled = settle_cross_section(
+                        cross_section_doc,
+                        returns=window.returns,
+                        horizon_trading_days=window.horizon_trading_days,
+                        settled_on=window.end,
+                    )
+                    write_cross_section_settled(
+                        ctx.store, arm_id=arm_id, trading_day=day, document=settled
+                    )
 
     settled_days = sorted(d for d, w in returns_cache.items() if w.returns)
     if not settled_days:
