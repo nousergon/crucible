@@ -26,10 +26,19 @@ N failed, M passed  →  M of N+M plan clauses currently satisfied
 ```
 
 **That number is progress. It is not a phase gate, and quoting it as one is a
-known defect.** On 2026-09-01 this suite read 21 of 24 while the phase-1 gate
-read 1 of 5 clauses met, and the phase issue was closed anyway — zero replays
-run, nine clauses failing (`alpha-engine-config-I9757`, reopened). Two numbers
-both called "the gate" is how that happened, and this file said so.
+known defect.** Phase 1 (`alpha-engine-config-I9757`) was closed
+**2026-09-02T01:31Z**, the moment its build PRs merged, with its exit gate never
+measured. Four different figures had been quoted for that gate — 15/9, 18/6,
+19/4, "21 of 23" — none agreeing, all hand-typed into issue comments. Measured
+2026-09-02 on `main` at `794a1b0`, the disagreement resolved into **two
+instruments**: this suite read **21 of 24**, while the phase-1 gate read **NOT
+MET, 1 of 5 clauses** (`pointer_flipped_on_smoke` only) against the real store
+`s3://alpha-engine-crucible-v2/crucible`. Zero replay Saturdays had run. The
+issue was reopened.
+
+Note the store: the gate reads **1 of 5** against the production store and
+**0 of 5** against an empty one. A gate reading without its store named is not
+a reading — that is the same defect one level down.
 
 **The gate is `crucible gate --gate <phase> --store <store>`**, which reads the
 artifacts the phase actually produced and never runs the thing it grades
