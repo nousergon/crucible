@@ -35,7 +35,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from crucible.components import Component, load_registry
-from crucible.keys import arena_cycle_key, arm_register_key
+from crucible.keys import arena_cycle_key, arm_register_key, gate_key  # noqa: F401 - re-exported
 from crucible.manifest import manifest_key
 from crucible.release import POINTER_KEY
 from crucible.report import attribution_key
@@ -67,11 +67,6 @@ __all__ = [
 ]
 
 GATE_SCHEMA_VERSION = "gate.v1"
-
-
-def gate_key(gate: str, trading_day: str) -> str:
-    """Where a gate reading is filed. Keyed by trading day like everything else."""
-    return f"gates/{gate}/{trading_day}/gate.json"
 
 
 @dataclass(frozen=True)

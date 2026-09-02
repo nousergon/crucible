@@ -66,7 +66,7 @@ from krepis.metrics import MetricRecord, derive_status
 
 from crucible.calendar import previous_trading_day
 from crucible.data.daily import COVERAGE_FLOOR_RATIO
-from crucible.keys import arm_key_segment, champion_key
+from crucible.keys import arm_key_segment, attribution_key, champion_key
 from crucible.manifest import manifest_key
 from crucible.slots.grading import CROSS_SECTION_MIN_NAMES, RankICSkip, spearman_ic
 from crucible.store import Store
@@ -202,11 +202,6 @@ ROWS: tuple[RowSpec, ...] = (
         slot=None,
     ),
 )
-
-
-def attribution_key(trading_day: str) -> str:
-    """The week's report card. Keyed by trading day like everything else."""
-    return f"report/{trading_day}/attribution.json"
 
 
 def build_attribution(

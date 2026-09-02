@@ -46,6 +46,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from crucible.keys import champion_key
 from crucible.store import Store
 
 __all__ = [
@@ -93,13 +94,6 @@ class ChampionUnusableError(RuntimeError):
     collapsed them would fall back to trading nothing in a case that should
     page.
     """
-
-
-def champion_key(slot: str) -> str:
-    """The store key for ``slot``'s pointer. The trader's whole read surface."""
-    if slot not in ("u", "r", "m", "s"):
-        raise KeyError(f"unknown slot {slot!r}; the four slots are ['m', 'r', 's', 'u']")
-    return f"champions/{slot}/current.json"
 
 
 @lru_cache(maxsize=1)
