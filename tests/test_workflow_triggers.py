@@ -45,6 +45,7 @@ actually declares.
 from __future__ import annotations
 
 import pathlib
+import re
 
 import pytest
 import yaml
@@ -75,12 +76,28 @@ def _exclusions_for(events: frozenset[str]) -> set[str]:
     return accepted | {"${{ " + form + " }}" for form in accepted}
 
 
-# A step whose `run:` body matches any of these is reading state that lives
-# outside the tree under review. Second layer only: the allowlist above is what
+# A step whose `run:` body mentions any of these is reading state that lives
+# outside the tree under review. Second layer only: the allowlist below is what
 # actually decides reachability. `gh api` is deliberately absent — the
 # adversarial-review gate reads the state of the pull request it runs on, which
 # IS the subject under review.
-LIVE_STATE_MARKERS = ("aws", "boto3", "cloudformation")
+#
+# Matched as a substring bounded by non-identifier characters, NOT as a whole
+# shell word. Whole-word matching was demonstrated to miss `/usr/bin/aws`,
+# `$(echo aws)`, and `python -c '__import__("boto3")...'` — every one of which
+# reaches live AWS from inside an allowlisted job. `awslogs` still does not
+# match, which is the only thing word matching was buying.
+LIVE_STATE_MARKERS = ("aws", "boto3", "cloudformation", "tests/acceptance")
+
+# `--collect-only` imports the acceptance modules without executing a clause
+# body, which is why it is allowed on the PR path at all. It is the one way
+# `tests/acceptance` may be RUN in a step there.
+ACCEPTANCE_CARVE_OUT = "--collect-only"
+
+# `--ignore=tests/acceptance` is the opposite of running it, and the foundation
+# suite carries it on every PR. Stripped before scanning so an exclusion is not
+# read as an execution.
+IGNORE_TOKEN = re.compile(r"--ignore=\S+")
 
 #: `<workflow>:<job>` pairs that may run on a PR because their subject is the
 #: tree, or the pull request itself. Every entry names why.
@@ -114,6 +131,21 @@ PR_REACHABLE_JOBS: dict[str, str] = {
 }
 
 
+#: Allowlisted jobs that are legitimately a job-level `uses:` and so have no
+#: steps for the second layer to scan. Each needs its safety argued somewhere
+#: this file asserts, because a called workflow declares `workflow_call` rather
+#: than a PR event and is therefore never reached by the scan below.
+REUSABLE_WORKFLOW_JOBS = frozenset(
+    {
+        # Pinned by SHA to a nousergon-lib workflow that posts a notification
+        # and nothing else, and unreachable on a PR because it needs the
+        # excluded `acceptance` job — both asserted by
+        # `test_the_notify_job_still_depends_on_the_excluded_job`.
+        "ci.yml:notify-main-failure",
+    }
+)
+
+
 def _events(workflow: dict) -> set[str]:
     # PyYAML resolves the bare key `on` to the boolean True (YAML 1.1), so
     # reading workflow["on"] finds nothing and passes on every file — a dark
@@ -140,14 +172,24 @@ def _live_state_steps(job: dict) -> list[str]:
     for step in job.get("steps") or []:
         if not isinstance(step, dict):
             continue
-        run = (step.get("run") or "").lower()
-        # Word-boundary-ish: split on shell punctuation so `aws\tfoo`, `aws;`
-        # and `aws` alone all match while `awslogs` does not.
-        words = set(run.replace("\t", " ").replace(";", " ").replace("|", " ").split())
+        run = IGNORE_TOKEN.sub("", (step.get("run") or "").lower())
         for marker in LIVE_STATE_MARKERS:
-            if any(word == marker or word.startswith(f"{marker}.") for word in words):
-                hits.append(f"{step.get('name', '<unnamed step>')}: runs `{marker}`")
-                break
+            if marker == "tests/acceptance" and ACCEPTANCE_CARVE_OUT in run:
+                continue
+            for match in re.finditer(re.escape(marker), run):
+                before = run[match.start() - 1] if match.start() else " "
+                after = run[match.end()] if match.end() < len(run) else " "
+                # Bounded by non-identifier characters on both sides, so
+                # `/usr/bin/aws`, `$(echo aws)` and `"boto3"` all match while
+                # `awslogs` and `bawsic` do not.
+                if not (before.isalnum() or before == "_") and not (
+                    after.isalnum() or after == "_"
+                ):
+                    hits.append(f"{step.get('name', '<unnamed step>')}: mentions `{marker}`")
+                    break
+            else:
+                continue
+            break
     return hits
 
 
@@ -189,6 +231,16 @@ def test_the_notify_job_still_depends_on_the_excluded_job() -> None:
     assert "failure()" in condition, (
         "notify-main-failure no longer runs only on failure; its allowlist entry claims it does."
     )
+    # It is in REUSABLE_WORKFLOW_JOBS, so the step scan cannot see what it
+    # calls. Pin the target: repointing it at another workflow is exactly the
+    # repurposing this entry exists to prevent.
+    assert str(job.get("uses", "")).startswith(
+        "nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@"
+    ), (
+        "notify-main-failure calls something other than the pinned nousergon-lib "
+        "notification workflow; its allowlist entry assumes that target, and "
+        "nothing here can scan a called workflow."
+    )
 
 
 @pytest.mark.parametrize("path", WORKFLOWS, ids=lambda p: p.name)
@@ -203,6 +255,22 @@ def test_no_live_state_job_runs_on_the_pull_request_path(path: pathlib.Path) -> 
         if _excluded(job, pr_events):
             continue
         if key in PR_REACHABLE_JOBS:
+            # A job-level `uses:` has no steps to scan and delegates to a
+            # workflow this guard never reaches, because that workflow declares
+            # `workflow_call` rather than a PR event. Repointing an allowlisted
+            # job at one turned the entire guard green with live AWS running on
+            # every PR — demonstrated. An allowlist entry describes what a job
+            # DOES, so a job that no longer does its own work forfeits it.
+            assert "uses" not in job or key in REUSABLE_WORKFLOW_JOBS, (
+                f"{key} is allowlisted but is now a job-level `uses:` calling "
+                f"{job['uses']!r}. The called workflow declares workflow_call, not "
+                "a PR event, so nothing here scans it. Inline the steps, or remove "
+                "the allowlist entry and take the job off the PR path."
+            )
+            assert job.get("steps") or key in REUSABLE_WORKFLOW_JOBS, (
+                f"{key} is allowlisted and has no steps. An allowlist entry names "
+                "what a job does; a job that does nothing scannable cannot keep one."
+            )
             # Second layer: allowlisted for its subject, still not licensed to
             # reach live AWS in a step someone adds later.
             hits = _live_state_steps(job)

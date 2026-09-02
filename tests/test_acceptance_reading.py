@@ -68,12 +68,13 @@ def test_the_committed_ratchet_is_wellformed() -> None:
         assert reason.strip(), f"{clause} carries no reason"
 
 
-def test_the_committed_ratchet_matches_the_real_suite() -> None:
-    """`collected` is checkable on the PR path, so check it.
+def _collected_clause_ids() -> list[str]:
+    """The `Class::method` id of every acceptance clause, by collection.
 
-    Otherwise deleting a clause and editing `collected` to match is green on
-    the PR and green on main — the ratchet grading itself. Collection imports
-    the modules and executes no test body, so this touches no live AWS.
+    `-o addopts=` clears `pyproject.toml`'s `-q`, which would otherwise combine
+    with the `-q` below into `-qq` and print per-file counts instead of ids.
+    Collection imports the modules and executes no test body, so this touches
+    no live AWS and belongs on the PR path.
     """
     result = subprocess.run(
         [
@@ -83,6 +84,8 @@ def test_the_committed_ratchet_matches_the_real_suite() -> None:
             "tests/acceptance",
             "--collect-only",
             "-q",
+            "-o",
+            "addopts=",
             "-p",
             "no:cacheprovider",
         ],
@@ -92,15 +95,44 @@ def test_the_committed_ratchet_matches_the_real_suite() -> None:
         cwd=ROOT,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    collected = sum(
-        int(line.rsplit(":", 1)[1])
+    ids = [
+        "::".join(line.strip().split("::")[-2:])
         for line in result.stdout.splitlines()
-        if line.startswith("tests/acceptance/") and line.rsplit(":", 1)[-1].strip().isdigit()
+        if line.startswith("tests/acceptance/") and line.count("::") >= 2
+    ]
+    # A parser that silently yields nothing would make every assertion below
+    # vacuously true — the dark-gate shape, one level up.
+    assert ids, f"collected no clause ids from:\n{result.stdout}"
+    return ids
+
+
+def test_the_committed_ratchet_matches_the_real_suite() -> None:
+    """The ratchet is verified by ID SET on the PR path, not by count.
+
+    Counting was the round-two defect one level up: `check_reading.py`
+    compares a set, so verifying the committed file by count alone let a
+    RENAMED clause pass every PR check and then fail the first `push: [main]`
+    run with the actively misleading "clauses now pass that ratchet.json still
+    lists as unmet". Deleting a clause and editing `collected` to match had
+    the same shape — the ratchet grading itself.
+    """
+    ids = _collected_clause_ids()
+    ratchet = json.loads(RATCHET.read_text())
+
+    assert len(ids) == len(set(ids)), (
+        f"duplicate clause ids collected: {sorted({i for i in ids if ids.count(i) > 1})}. "
+        "Two same-named classes in different modules collapse to one id, and one "
+        "can then regress invisibly."
     )
-    want = json.loads(RATCHET.read_text())["collected"]
-    assert collected == want, (
-        f"tests/acceptance collects {collected} clauses; ratchet.json says {want}. "
-        "Update the ratchet in the PR that changes the suite."
+    assert len(ids) == ratchet["collected"], (
+        f"tests/acceptance collects {len(ids)} clauses; ratchet.json says "
+        f"{ratchet['collected']}. Update the ratchet in the PR that changes the suite."
+    )
+    missing = sorted(set(ratchet["unmet"]) - set(ids))
+    assert not missing, (
+        f"ratchet.json lists clauses that no longer exist: {missing}. A renamed or "
+        "deleted clause must be renamed or dropped here in the same PR, or the "
+        "first push to main fails claiming they started passing."
     )
 
 

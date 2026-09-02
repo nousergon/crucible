@@ -184,7 +184,7 @@ jobs:
       - name: The reading has not moved
         run: uv run python tests/acceptance/check_reading.py acceptance.xml
 
-  # A moved reading on main or on the daily sweep blocks nothing and is green
+  # A moved reading on main blocks nothing and is green
   # to the next author, so without this nothing announces it — the same gap
   # that left a router config undeployed for 16 hours
   # (alpha-engine-config-I7169), which is why deploy.yml already carries this

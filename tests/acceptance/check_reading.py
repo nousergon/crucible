@@ -80,10 +80,26 @@ def read_report(report: pathlib.Path) -> tuple[int, set[str]]:
 
     collected = 0
     unmet: set[str] = set()
+    seen: set[str] = set()
     for case in tree.getroot().iter("testcase"):
         collected += 1
+        cid = clause_id(case.get("classname", "?"), case.get("name", "?"))
+        # Two same-named classes in different modules collapse to one id, and
+        # then one of them can regress while the other stays unmet: the set is
+        # unchanged, the count is unchanged, and the run is green while the
+        # true reading dropped. Refuse the ambiguity rather than resolve it —
+        # a clause id that is not unique is not an identifier.
+        if cid in seen:
+            raise SystemExit(
+                _fail(
+                    f"two acceptance clauses share the id {cid!r}. Clause ids are "
+                    "Class::method, so a duplicate makes one clause invisible to "
+                    "this grader — rename one of the classes."
+                )
+            )
+        seen.add(cid)
         if any(child.tag in {"failure", "error", "skipped"} for child in case):
-            unmet.add(clause_id(case.get("classname", "?"), case.get("name", "?")))
+            unmet.add(cid)
     if collected == 0:
         raise SystemExit(
             _fail("the acceptance suite collected no tests — the gate is dark, not green")
