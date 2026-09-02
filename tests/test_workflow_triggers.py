@@ -60,7 +60,7 @@ import re
 
 import pytest
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 WORKFLOW_DIR = pathlib.Path(__file__).resolve().parents[1] / ".github" / "workflows"
 # GitHub accepts both suffixes; `test_no_suppressions.py` already scans both.
@@ -143,6 +143,18 @@ class Job(BaseModel):
     needs: list[str] = Field(default_factory=list)
     uses: str = ""
     steps: list[dict] = Field(default_factory=list)
+
+    @field_validator("needs", mode="before")
+    @classmethod
+    def _needs_accepts_the_scalar_form(cls, value: object) -> object:
+        """`needs: build` is legal GitHub syntax, as is `needs: [build]`.
+
+        Modelling only the list form makes a legal edit error the whole guard
+        rather than evaluate it. That fails closed, so it is not a hole — but
+        a guard that refuses to run is a guard nobody keeps, which is how the
+        rule it enforces gets removed instead of fixed.
+        """
+        return [value] if isinstance(value, str) else value
 
 
 class Workflow(BaseModel):
@@ -322,3 +334,10 @@ def test_no_live_state_job_runs_on_the_pull_request_path(path: pathlib.Path) -> 
             f"or, if its subject genuinely is the diff, add `{key}` to "
             "PR_REACHABLE_JOBS in this file with the reason."
         )
+
+
+def test_the_job_model_accepts_both_legal_needs_forms() -> None:
+    """`needs: build` and `needs: [build]` are both legal GitHub syntax."""
+    assert Job.model_validate({"needs": "build"}).needs == ["build"]
+    assert Job.model_validate({"needs": ["build", "test"]}).needs == ["build", "test"]
+    assert Job.model_validate({}).needs == []
