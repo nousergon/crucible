@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nousergon/crucible/schemas/feature_registry.v1.json",
+  "title": "Crucible feature registry, v1",
+  "description": "The document written to features/{version}/registry.json beside every day's feature parquet (plan §10 component 4). It is the PRODUCER/CONSUMER CONTRACT of the feature layer: the producer (crucible.features) may not emit a payload this schema refuses, and the consumer (crucible.slots.model.FeatureLayerSource) resolves a recipe's declared columns against exactly the names listed here. Interfaces reconciled by alpha-engine-config-I9772 / -I9765; the schema exists so the next disagreement between the two tracks is a validation failure rather than two correct readings of an undeclared interface.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "feature_version", "features"],
+  "properties": {
+    "schema_version": {
+      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
+      "const": "feature_registry.v1"
+    },
+    "feature_version": {
+      "description": "The layer version, DERIVED by hashing this catalogue (crucible.features.feature_version) and never hand-written. A hand-written string lets an edited recipe overwrite the layer an earlier verdict was computed from, and nothing would show it; the pattern makes a hand-written 'v1' a validation failure rather than a convention someone remembers (alpha-engine-config-I9772, disagreement 2).",
+      "type": "string",
+      "pattern": "^v[0-9a-f]{12}$"
+    },
+    "features": {
+      "description": "Every column this version produces, in catalogue order. A consumer naming a column absent from this list must fail at load, never train on a silently substituted zero (the 2026-08-28 seven-hard-zeroed-features condition).",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/feature" }
+    }
+  },
+  "$defs": {
+    "feature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "unit",
+        "expression",
+        "description",
+        "inputs",
+        "window_trading_days",
+        "cross_sectional"
+      ],
+      "properties": {
+        "name": {
+          "description": "The column name. The units suffix is MANDATORY and is enforced by the pattern: `avg_volume_20d` was emitted as a normalized ratio and consumed as raw shares, and 901 of 903 tickers silently failed the scanner liquidity gate for months. There is no grandfather list — this layer has no history to grandfather.",
+          "type": "string",
+          "pattern": "^[a-z0-9]+(_[a-z0-9]+)*(_raw|_ratio|_pct|_zscore|_log_return)$"
+        },
+        "unit": {
+          "description": "The concrete unit. Pinned by the suffix for every NORMALIZED suffix (see the allOf below); free for `_raw`, which means 'not normalized by this layer' and may be USD, shares, a beta coefficient or a 0/1 indicator.",
+          "type": "string",
+          "minLength": 1
+        },
+        "expression": {
+          "description": "How the column is computed, as the registry states it. Lineage is a field, not a comment.",
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "description": "What the column means and why it is shaped that way. Empty is refused: a column nobody can read the intent of rots without anyone noticing it stopped being computed correctly.",
+          "type": "string",
+          "minLength": 1
+        },
+        "inputs": {
+          "description": "The panel or feature columns this feature reads. At least one, always: a column with no lineage cannot be traced back to the data that produced it (principle 1), which is what `explain` answers 'the signal degraded or the feature changed' from.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "window_trading_days": {
+          "description": "A count of SESSIONS (§4.12), never calendar days. Null for a point-in-time column reading only the current row. Zero and negative are refused — a window is at least one session.",
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "cross_sectional": {
+          "description": "True when the column is computed across one day's cross-section (a z-score or a rank) rather than along one ticker's history.",
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "name": { "pattern": "_ratio$" } }, "required": ["name"] },
+          "then": { "properties": { "unit": { "const": "ratio" } } }
+        },
+        {
+          "if": { "properties": { "name": { "pattern": "_pct$" } }, "required": ["name"] },
+          "then": { "properties": { "unit": { "const": "pct" } } }
+        },
+        {
+          "if": { "properties": { "name": { "pattern": "_zscore$" } }, "required": ["name"] },
+          "then": { "properties": { "unit": { "const": "zscore" } } }
+        },
+        {
+          "if": { "properties": { "name": { "pattern": "_log_return$" } }, "required": ["name"] },
+          "then": { "properties": { "unit": { "const": "log_return" } } }
+        },
+        {
+          "if": { "properties": { "name": { "pattern": "_raw$" } }, "required": ["name"] },
+          "then": {
+            "properties": {
+              "unit": {
+                "description": "A `_raw` column may not claim a NORMALIZED unit: the name promises the consumer an unnormalized value and the declared unit would say otherwise. That is the avg_volume_20d defect in the other direction.",
+                "not": { "enum": ["ratio", "pct", "zscore", "log_return"] }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

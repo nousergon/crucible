@@ -26,16 +26,46 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 __all__ = [
     "CATALOG",
+    "FEATURE_REGISTRY_SCHEMA_PATH",
+    "FEATURE_REGISTRY_SCHEMA_VERSION",
     "UNIT_SUFFIXES",
+    "FeatureRegistryValidationError",
     "FeatureSpec",
     "feature_names",
     "feature_version",
+    "load_registry_schema",
     "registry_payload",
+    "render_catalog_markdown",
+    "validate_registry_payload",
 ]
+
+#: The versioned producer/consumer contract of the feature layer, and the
+#: `schema_version` the artifact at `features/{version}/registry.json`
+#: carries. Written at BIRTH of the interface rather than lifted out of it
+#: later (M0 contract discipline): the two tracks that build the producer and
+#: the consumer read the same declared document instead of each holding a
+#: defensible reading of an undeclared one, which is how
+#: `alpha-engine-config-I9772`'s three disagreements happened.
+FEATURE_REGISTRY_SCHEMA_VERSION = "feature_registry.v1"
+FEATURE_REGISTRY_SCHEMA_PATH = (
+    Path(__file__).resolve().parent.parent / "schemas" / "feature_registry.v1.json"
+)
+
+
+class FeatureRegistryValidationError(ValueError):
+    """A registry payload that does not conform to its own schema.
+
+    Always raised, never logged and swallowed. The layer's whole claim is
+    that R and M read the same declared columns; a registry document nobody
+    validated, read as valid, is worse than none.
+    """
+
 
 #: The exhaustive suffix set. A column outside it is refused at construction,
 #: so the rule is enforced by the registry rather than by review.
@@ -416,13 +446,58 @@ def feature_names(catalog: tuple[FeatureSpec, ...] = CATALOG) -> tuple[str, ...]
     return tuple(spec.name for spec in catalog)
 
 
+@lru_cache(maxsize=1)
+def load_registry_schema() -> dict[str, Any]:
+    """The v1 feature-registry schema, as a dict.
+
+    Cached: the validator is constructed per process and the file never
+    changes under a running one.
+    """
+    return json.loads(FEATURE_REGISTRY_SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def validate_registry_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Refuse a registry document that does not conform. Returns it on success.
+
+    Raises rather than warning: this is the producer side of the contract,
+    and a producer that emits a document its own consumer will refuse has
+    failed, not degraded (`AGENTS.md`, fail loud).
+    """
+    from jsonschema import Draft202012Validator  # noqa: PLC0415
+
+    errors = sorted(
+        Draft202012Validator(load_registry_schema()).iter_errors(payload),
+        key=lambda e: list(e.absolute_path),
+    )
+    if errors:
+        detail = "; ".join(
+            f"{'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors
+        )
+        raise FeatureRegistryValidationError(
+            f"the feature registry does not conform to {FEATURE_REGISTRY_SCHEMA_VERSION}: "
+            f"{detail}. The registry is the producer/consumer contract of the feature "
+            "layer — a document the consumer would refuse must never be written beside a "
+            "day's parquet, because the parquet would then be read against a registry "
+            "nothing validated."
+        )
+    return payload
+
+
 def registry_payload(catalog: tuple[FeatureSpec, ...] = CATALOG) -> dict[str, Any]:
-    """The registry as it is written to `features/{version}/registry.json`."""
-    return {
-        "schema_version": "feature_registry.v1",
-        "feature_version": feature_version(catalog),
-        "features": [spec.to_dict() for spec in catalog],
-    }
+    """The registry as it is written to `features/{version}/registry.json`.
+
+    Validated against `schemas/feature_registry.v1.json` on the way out, so
+    the producer structurally cannot emit a payload the consumer's contract
+    refuses — no caller has to remember to validate, and `crucible/data/`'s
+    write path inherits the check without naming it.
+    """
+    return validate_registry_payload(
+        {
+            "schema_version": FEATURE_REGISTRY_SCHEMA_VERSION,
+            "feature_version": feature_version(catalog),
+            "features": [spec.to_dict() for spec in catalog],
+        }
+    )
 
 
 def feature_version(catalog: tuple[FeatureSpec, ...] = CATALOG) -> str:
@@ -436,3 +511,36 @@ def feature_version(catalog: tuple[FeatureSpec, ...] = CATALOG) -> str:
         [spec.to_dict() for spec in catalog], sort_keys=True, separators=(",", ":")
     )
     return "v" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+
+
+#: The markers `docs/FEATURE_CATALOG.md` carries around its generated table.
+#: The prose outside them is written by hand; the rows between them are
+#: rendered from `CATALOG` and asserted equal by
+#: `tests/test_feature_registry_contract.py`, so a column added without its
+#: documentation row is a test failure rather than a doc that quietly stops
+#: describing the layer.
+CATALOG_TABLE_BEGIN = "<!-- BEGIN GENERATED CATALOG TABLE -->"
+CATALOG_TABLE_END = "<!-- END GENERATED CATALOG TABLE -->"
+
+
+def render_catalog_markdown(catalog: tuple[FeatureSpec, ...] = CATALOG) -> str:
+    """The catalogue as the documentation table, one row per column.
+
+    Rendered rather than hand-maintained: the fleet rule asks for a
+    documentation row per feature column, and a hand-written table is a
+    contract restated in a second place, which has already drifted once in
+    this fleet.
+    """
+    header = (
+        "| Column | Unit | Window (sessions) | Cross-sectional | Expression | Inputs |\n"
+        "|---|---|---|---|---|---|"
+    )
+    rows = []
+    for spec in catalog:
+        window = "—" if spec.window_trading_days is None else str(spec.window_trading_days)
+        rows.append(
+            f"| `{spec.name}` | {spec.unit} | {window} | "
+            f"{'yes' if spec.cross_sectional else 'no'} | "
+            f"`{spec.expression}` | {', '.join(f'`{i}`' for i in spec.inputs)} |"
+        )
+    return "\n".join([header, *rows])

@@ -45,12 +45,40 @@ REQUIREMENT = (
 
 
 def _unmet(exc: BaseException | None = None) -> NoReturn:
-    detail = f" Blocked on: {exc}" if exc is not None else ""
+    """Fail naming WHICH of the two conditions holds, not one of them.
+
+    The message this replaced said "track A has not landed
+    `crucible/features` yet" unconditionally — and the first real failure of
+    this clause was not that at all: the producer had landed, and the two
+    tracks had reconciled nothing (`alpha-engine-config-I9772`). An interface
+    MISMATCH wearing an unimplemented-producer message sends the reader to
+    the wrong track's backlog, which is how three disagreements sat on `main`
+    reading as one unstarted dependency.
+
+    So the status is MEASURED here rather than asserted: the module either
+    imports or it does not, and the message says which, with what it found.
+    """
+    try:  # noqa: SIM105 - the import IS the measurement
+        import crucible.features as _features
+    except ImportError:
+        status = (
+            "the producer is ABSENT — `import crucible.features` fails. This clause is "
+            "waiting on track A (crucible v2 phase 1, alpha-engine-config-I9757), and "
+            "nothing in track B can clear it."
+        )
+    else:
+        status = (
+            "the producer is PRESENT — `crucible.features` imports and exposes "
+            f"{sorted(n for n in dir(_features) if not n.startswith('_'))}. This is "
+            "therefore an INTERFACE MISMATCH between a landed producer and a landed "
+            "consumer, NOT an unimplemented producer: read the failure below against "
+            "`crucible/schemas/feature_registry.v1.json`, which is the declared "
+            "contract both sides are held to, and fix the side that departs from it "
+            "(alpha-engine-config-I9772)."
+        )
+    detail = f"\n  Blocked on: {exc!r}" if exc is not None else ""
     pytest.fail(
-        f"UNMET — {CLAUSE}\n"
-        f"  Required: {REQUIREMENT}\n"
-        f"  Status:   track A has not landed crucible/features yet "
-        f"(crucible v2 phase 1, alpha-engine-config-I9757).{detail}",
+        f"UNMET — {CLAUSE}\n  Required: {REQUIREMENT}\n  Status:   {status}{detail}",
         pytrace=False,
     )
 
