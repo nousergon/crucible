@@ -1,0 +1,30 @@
+# Standard fleet Dependabot config (weekly, grouped minor+patch) —
+# repository-baseline-policy.md §4.3. Version-update PRs merge under
+# auto-merge-policy.md's Dependabot lane, not by hand.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+      majors:
+        update-types:
+          - major
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+      majors:
+        update-types:
+          - major

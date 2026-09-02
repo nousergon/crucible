@@ -13,6 +13,9 @@ dist/
 .ruff_cache/
 .venv/
 venv/
+.coverage
+.coverage.*
+htmlcov/
 
 # Secrets — never committed (fleet root AGENTS.md, Security section).
 # Config files with real values use the .example pattern.
