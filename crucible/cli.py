@@ -33,7 +33,6 @@ from dataclasses import dataclass
 
 from crucible import __version__, track_c, track_e, track_f  # track-C, track-E, track-F
 from crucible.calendar import resolve_trading_day
-from crucible.gate import PHASES
 from crucible.track_a import HANDLERS as TRACK_A_HANDLERS
 from crucible.track_a import add_track_a_arguments
 
@@ -54,14 +53,21 @@ class JobSpec:
     scheduled: bool
 
 
-#: The wiring gap every `_todo` stub below reports lives under phase 1
-#: ("One command, locally" — plan §6): the underlying capability may already
-#: exist (`run_daily`, `crucible.explain`, ... are real), but the CLI is not
-#: yet wired to call it. Derived rather than hardcoded so a phase
-#: renumbering cannot leave a stub's message stale (alpha-engine-config-I9839)
-#: — this is the same fix `tests/acceptance/test_plan_section_2_objectives.py`
-#: got for the same reason.
-_WIRING_PHASE = next(p for p in PHASES if p.id == "phase1")
+#: NOT a phase. A `_todo` stub used to cite phase 1's tracker
+#: (`alpha-engine-config-I9757`) — structurally derived from `PHASES` so a
+#: renumbering couldn't leave it stale, but phase 1 CLOSED 2026-09-02T01:31Z
+#: while these stubs remained, so deriving from `PHASES` still pointed every
+#: user at a finished issue: `PHASES` carries no open/closed notion, and no
+#: amount of deriving from it fixes that. The `crucible` skill states the
+#: right anchor: "the epic is the durable anchor to cite; individual phase
+#: issue numbers churn as phases close, the epic number does not." A plain
+#: `int`, not a string, so no `ast.Constant` anywhere carries the literal
+#: (alpha-engine-config-I9839).
+_EPIC_ISSUE = 9751
+
+
+def _epic_tracker() -> str:
+    return f"alpha-engine-config-I{_EPIC_ISSUE}"
 
 
 def _todo(job: str, track: str, note: str) -> Callable[[argparse.Namespace], int]:
@@ -74,7 +80,7 @@ def _todo(job: str, track: str, note: str) -> Callable[[argparse.Namespace], int
 
     def handler(args: argparse.Namespace) -> int:
         raise NotImplementedError(
-            f"`crucible {job}` is not implemented yet — {track}, {_WIRING_PHASE.tracker}. {note}"
+            f"`crucible {job}` is not implemented yet — {track}, {_epic_tracker()}. {note}"
         )
 
     # Marked so the "a stub never returns 0" guard can enumerate stubs from the

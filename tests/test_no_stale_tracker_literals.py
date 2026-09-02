@@ -110,10 +110,13 @@ SELF = Path(__file__).resolve()
 
 _IGNORED_DIRS = {".git", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache"}
 
-#: An issue number as it appears in `alpha-engine-config-I9757`: `I` followed
-#: by four-or-more digits. Four, not `\d+`, so this does not fire on an
-#: unrelated single- or double-digit `I` token elsewhere in the tree.
-_ISSUE_LITERAL = re.compile(r"\bI\d{4,}\b")
+#: The full `alpha-engine-config-I9757` shape, not a bare `I\d{4,}` — the
+#: prefix is required so a future `I` plus four digits that is not this
+#: tracker's shape (an S3 key fragment, an unrelated identifier) cannot
+#: false-positive. Four digits, not `\d+`, so a real citation is still
+#: caught regardless of how many digits the issue number reaches; the
+#: prefix is what does the real narrowing here.
+_ISSUE_LITERAL = re.compile(r"alpha-engine-config-(I\d{4,})")
 
 
 def _scanned_py_files() -> list[Path]:
