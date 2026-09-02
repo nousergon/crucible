@@ -298,3 +298,76 @@ def test_the_module_path_is_not_part_of_a_clause_id() -> None:
     spec.loader.exec_module(module)
     assert module.clause_id("tests.acceptance.old_name.TestX", "test_y") == "TestX::test_y"
     assert module.clause_id("tests.acceptance.new_name.TestX", "test_y") == "TestX::test_y"
+
+
+def test_ratchets_unmet_phase_agrees_with_the_clauses_own_phase_kwarg() -> None:
+    """`ratchet.json`'s `unmet` reasons and `_unmet`'s `phase=` kwarg are two
+    restatements of the same fact — the ratchet says "phase 2 — ..." in
+    prose, the code passes `phase="phase2"` — and nothing compared them
+    (alpha-engine-config-I9839, round-2 review note 2). This closes that:
+    for every `unmet` clause in the committed ratchet, the phase number its
+    reason names must match the phase number `crucible.gate.PHASES` resolves
+    the clause's own `phase=` kwarg to, so the two can no longer drift apart
+    silently.
+
+    AST-based, not an import-and-run: two of these clauses read live AWS or
+    require production stores, and this file's own docstring is explicit
+    that collection — never execution — is what belongs on the PR path.
+    """
+    import ast
+    import re
+
+    from crucible.gate import PHASES
+
+    phase_number = {phase.id: phase.number for phase in PHASES}
+
+    ratchet = json.loads(RATCHET.read_text())
+    unmet: dict[str, str] = ratchet["unmet"]
+    assert unmet, "the committed ratchet names no unmet clauses — nothing to check"
+
+    source_path = ROOT / "tests" / "acceptance" / "test_plan_section_2_objectives.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+
+    # method name -> {phase kwargs it passes to _unmet/_attempt}
+    phases_by_method: dict[str, set[str]] = {}
+    for cls in ast.walk(tree):
+        if not isinstance(cls, ast.ClassDef):
+            continue
+        for func in cls.body:
+            if not isinstance(func, ast.FunctionDef):
+                continue
+            found: set[str] = set()
+            for node in ast.walk(func):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in {"_unmet", "_attempt"}
+                ):
+                    for kw in node.keywords:
+                        if kw.arg == "phase" and isinstance(kw.value, ast.Constant):
+                            found.add(kw.value.value)
+            if found:
+                phases_by_method[f"{cls.name}::{func.name}"] = found
+
+    mismatches: list[str] = []
+    for clause_id, reason in unmet.items():
+        match = re.match(r"phase (\d+) —", reason)
+        assert match, f"{clause_id!r}'s ratchet reason does not start 'phase N — ': {reason!r}"
+        ratchet_phase_number = int(match.group(1))
+
+        code_phases = phases_by_method.get(clause_id)
+        assert code_phases, (
+            f"{clause_id!r} is unmet in the ratchet but calls no `_unmet`/`_attempt` "
+            "with a `phase=` kwarg in test_plan_section_2_objectives.py — either the "
+            "clause moved, or it no longer names its phase"
+        )
+        code_numbers = {phase_number[p] for p in code_phases}
+        if code_numbers != {ratchet_phase_number}:
+            mismatches.append(
+                f"{clause_id}: ratchet says phase {ratchet_phase_number}, code passes "
+                f"phase={sorted(code_phases)} (phase {sorted(code_numbers)})"
+            )
+    assert not mismatches, (
+        "ratchet.json's unmet reason and the clause's own phase= kwarg disagree — "
+        "one of the two restatements drifted:\n" + "\n".join(f"  - {m}" for m in mismatches)
+    )

@@ -204,12 +204,15 @@ class LocalStore(Store):
         object_lock_retain_until: dt.datetime | None = None,
     ) -> str:
         if object_lock_mode is not None or object_lock_retain_until is not None:
+            # Historical citation, not a phase pointer: alpha-engine-config-I9787 is
+            # where this gap was first found. Kept in this comment rather than the
+            # raised message per alpha-engine-config-I9839.
             raise NotImplementedError(
                 f"LocalStore has no Object Lock concept and cannot honour "
                 f"object_lock_mode={object_lock_mode!r} for {key!r}. Accepting and "
                 "silently discarding it would make the test suite green over a "
-                "guarantee the local backend does not provide (alpha-engine-config-"
-                "I9787). Use S3Store for a release publish that needs retention."
+                "guarantee the local backend does not provide. Use S3Store for a "
+                "release publish that needs retention."
             )
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)

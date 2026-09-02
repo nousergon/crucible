@@ -28,6 +28,7 @@ from crucible.config import settings as resolve_settings
 from crucible.data import ArcticPriceSource, PriceSource, run_daily, run_heal, run_weekly
 from crucible.explain import explain as explain_lineage
 from crucible.explain import render as render_lineage
+from crucible.gate import PHASES
 from crucible.manifest import manifest_key
 from crucible.runner import run_job
 from crucible.slots import research, universe
@@ -36,6 +37,11 @@ from crucible.slots.arms import load_arm_specs, read_register, register_arms, wr
 __all__ = ["HANDLERS", "add_track_a_arguments"]
 
 _SLOT_MODULES = {"u": universe, "r": research}
+
+#: "M and S arrive with track B" names phase 3 ("All three slots" — plan
+#: §6). Derived rather than hardcoded so a phase renumbering cannot leave
+#: `_slot_module`'s message stale (alpha-engine-config-I9839).
+_ALL_SLOTS_PHASE = next(p for p in PHASES if p.id == "phase3")
 
 
 def _today() -> dt.date:
@@ -228,7 +234,7 @@ def _slot_module(slot: str) -> Any:
     except KeyError as exc:
         raise SystemExit(
             f"slot {slot!r} is not implemented in track A. U and R are here; M and S "
-            "arrive with track B (alpha-engine-config-I9757). A handler that returned "
+            f"arrive with track B ({_ALL_SLOTS_PHASE.tracker}). A handler that returned "
             "0 for an unimplemented slot would be indistinguishable from a cycle that "
             "ran and had nothing to do."
         ) from exc
@@ -414,7 +420,10 @@ def add_track_a_arguments(name: str, sub: argparse.ArgumentParser) -> None:
                 "of the coverage ratio, and `run_daily`/`run_weekly` refuse to run "
                 "without it — a ratio computed over whatever arrived always reads 1.0, "
                 "and the coverage floor cannot fire with no denominator to measure it "
-                "against (alpha-engine-config-I9757 defect #2)."
+                # Historical citation, not a phase pointer: alpha-engine-config-I9757
+                # defect #2 is where this specific gap was first found. Kept in this
+                # comment rather than the --help text per alpha-engine-config-I9839.
+                "against."
             ),
         )
     if name == "data.heal":

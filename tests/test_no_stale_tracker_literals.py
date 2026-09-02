@@ -1,42 +1,68 @@
-"""No acceptance clause hardcodes a tracker issue number, anywhere.
+"""No hardcoded tracker issue number, anywhere in the package.
 
-Normative source: alpha-engine-config-I9839. Every clause under
+Normative source: alpha-engine-config-I9839. Every acceptance clause under
 `tests/acceptance/` used to fail with a literal `alpha-engine-config-I9757`
 baked into `_unmet`, regardless of which phase the clause actually belonged
 to — so a phase-2 clause and a phase-3 clause both pointed a reader at
 phase 1, and stayed pointed at it after phase 1 closed (2026-09-02T01:31Z).
-`crucible.gate.PHASES` is the single source of truth for which tracker issue
-owns which phase; the fix derives the pointer from it, at the two places
-(`_unmet` in `test_plan_section_2_objectives.py` and
-`test_feature_layer_binding.py`) that build an UNMET status line.
+The same shape turned out to live in PRODUCTION code too, not just tests:
+`crucible/cli.py`'s `_todo` stub and `crucible/track_a.py`'s `_slot_module`
+both handed a live user the same closed `I9757` (round 2 of this PR's own
+review). `crucible.gate.PHASES` is the single source of truth for which
+tracker issue owns which phase; every one of those sites now derives its
+pointer from it instead of restating a literal.
+
+**Scope is the whole package, not one directory.** The class is "a hardcoded
+tracker literal that can go stale", and nothing about that class is specific
+to `tests/acceptance/` — it happened there first only because that is where
+this issue started. This scan walks `crucible/` and `tests/` both.
 
 **Not a text grep, and not gated on "does this call `pytest.fail` directly".**
-The first version of this guard was gated that way and missed the actual
-attack: `TestAutonomy.test_the_ruled_live_gate_...` never calls `pytest.fail`
-itself — it calls `_unmet(clause, requirement, phase="phase2")` — so a
-literal appended to `requirement` in THAT function's own body reaches the
-failure text without the guard's scanned function ever containing a
-`pytest.fail` call. Tracing the real call graph (`_unmet`/`_attempt` call
-`pytest.fail`; test methods call `_unmet`/`_attempt`; either could be
-reached through an alias, `assert`, string concatenation, an f-string over a
-local, or a module-level constant) is the harder-to-keep-honest half of that
-problem. So this scan does not try to trace it: it treats every function in
-every file under `tests/acceptance/` as reachable, and every non-docstring
-string literal in the whole tree as a potential failure-message fragment —
-the same posture `tests/test_no_suppressions.py` already takes for its own,
-differently-shaped scan. A hardcoded `alpha-engine-config-I<N>` reference has
-exactly one legitimate home in this tree: prose (a docstring, or a comment,
-neither of which reaches a test failure — see "What's exempt" below).
-Anywhere else, it is written to be replaced by a derived lookup.
+An earlier version of this guard was gated that way and missed the actual
+attack: a test method that never calls `pytest.fail` itself — it calls
+`_unmet(clause, requirement, phase="phase2")` — can still leak a literal
+into the eventual failure text by building `requirement` with one appended
+locally. Tracing the real call graph (`_unmet`/`_attempt` call `pytest.fail`;
+callers reach either through an alias, `assert`, string concatenation, an
+f-string over a local, or a module-level constant) is the harder-to-keep-
+honest half of that problem. So this scan does not try to trace it: it
+treats every function in every scanned file as reachable, and every
+non-docstring string literal in the whole tree as a potential
+message fragment — the same posture `tests/test_no_suppressions.py` already
+takes for its own, differently-shaped scan. A hardcoded
+`alpha-engine-config-I<N>` reference has exactly one legitimate home:
+prose (a docstring, or a comment, neither of which reaches a raised message
+or a test failure — see "What's exempt" below). Anywhere else, it is written
+to be replaced by a derived lookup, or — when it cites a historical, non-phase
+issue that can never be derived from `PHASES` (the `I9772`/`I9777`/`I9778`/
+`I9780`/`I9786`/`I9787`/`I9816`/`I9745` shape) — moved into a comment.
 
 **What's exempt, and why it is only these two things.** A docstring, because
-a clause has to be able to narrate its own history in prose — this test
-excludes exactly the same node shape `test_no_suppressions.py` does: the
-first statement of a module, class, or function body when it is a bare
-string expression. A `#` comment, because `ast.parse` never sees one — it is
-not a carve-out this file grants, it is a fact about what the AST contains.
-Both classes of text style are unreachable from a pytest failure line, so a
-citation living there costs nothing and gains nothing by being derived.
+code has to be able to narrate its own history in prose — this scan excludes
+exactly the same node shape `test_no_suppressions.py` does: the first
+statement of a module, class, function or async-function body when it is a
+bare string expression. A `#` comment, because `ast.parse` never sees one —
+it is not a carve-out this file grants, it is a fact about what the AST
+contains. Both classes of text are unreachable from a raised message or a
+test failure, so a citation living there costs nothing and gains nothing by
+being derived.
+
+**Two files this scan intentionally does not fix, and does not silently
+skip either — it reports them as findings like any other.** `crucible/gate.py`
+is explicitly out of this PR's authority (a concurrent session owns it), and
+`tests/test_phase_ladder.py`'s hardcoded `alpha-engine-config-I9756` literals
+are the TEST ORACLE for `crucible.gate`'s own derivation (`Phase.tracker`
+computing the right string for phase 0) — replacing them with a derived
+lookup would make that test compare `PHASES[0].tracker` against itself and
+prove nothing. There is no way to express "this literal is the oracle, not
+a leak" as a general rule without a per-file exemption list, which is the
+suppression-collection shape this repository forbids outright (`AGENTS.md`
+rule 4). So this scan does not special-case them: if they still contain a
+hardcoded literal, this test is red, and stays red, until the file's actual
+owner resolves it — the same posture applied to any other file this PR did
+not touch because a concurrent session owns it (`crucible/console/`,
+`crucible/slots/inputs.py`, and their paired tests). This is a KNOWN,
+reported, currently-red state, not a bug in the scan.
 
 **Fail closed.** A file this scan cannot parse is a finding, not a skip: a
 scanner that goes quiet on the one file it cannot read is indistinguishable
@@ -49,11 +75,11 @@ from a clean tree.
 `tests/acceptance/` could therefore never block a PR, only mail a failure
 after something had already merged to `main` — and a second-order defect:
 `check_reading.py`/`ratchet.json` compare the acceptance suite's collected
-`Class::method` ids against a committed set, and a plain function here would
-collect as an ID neither file describes, red-ing the `acceptance` job on
-every `push: [main]` for a reason unrelated to any plan clause. Living beside
-`tests/test_no_suppressions.py` makes this a blocking PR check and keeps it
-out of the acceptance ratchet's id set entirely.
+`Class::method` ids against a committed set, and a plain function there
+would collect as an id neither file describes, red-ing the `acceptance` job
+on every `push: [main]` for a reason unrelated to any plan clause. Living
+beside `tests/test_no_suppressions.py` makes this a blocking PR check and
+keeps it out of the acceptance ratchet's id set entirely.
 """
 
 from __future__ import annotations
@@ -63,7 +89,19 @@ import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-ACCEPTANCE_DIR = REPO_ROOT / "tests" / "acceptance"
+
+#: The whole package: production code plus every test. `tests/acceptance/`
+#: is included (it is already clean) rather than special-cased back out.
+SCAN_ROOTS = (REPO_ROOT / "crucible", REPO_ROOT / "tests")
+
+#: This file, and nothing else — it must contain the pattern it searches for
+#: in order to document and self-test it. Same exemption shape as
+#: `tests/test_no_suppressions.py::SELF`: a single path compared by equality,
+#: never a collection, because an exemption LIST is itself the bug class this
+#: repository forbids.
+SELF = Path(__file__).resolve()
+
+_IGNORED_DIRS = {".git", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache"}
 
 #: An issue number as it appears in `alpha-engine-config-I9757`: `I` followed
 #: by four-or-more digits. Four, not `\d+`, so this does not fire on an
@@ -71,17 +109,28 @@ ACCEPTANCE_DIR = REPO_ROOT / "tests" / "acceptance"
 _ISSUE_LITERAL = re.compile(r"\bI\d{4,}\b")
 
 
-def _acceptance_py_files() -> list[Path]:
-    return sorted(ACCEPTANCE_DIR.rglob("*.py"))
+def _scanned_py_files() -> list[Path]:
+    files: list[Path] = []
+    for root in SCAN_ROOTS:
+        for path in root.rglob("*.py"):
+            if any(part in _IGNORED_DIRS for part in path.parts):
+                continue
+            if path.resolve() == SELF:
+                continue
+            files.append(path)
+    return sorted(set(files))
 
 
 def test_the_scan_actually_reads_files() -> None:
     """A guard that walks nothing reports clean — assert it walked something."""
-    files = _acceptance_py_files()
-    assert len(files) >= 2, (
+    files = _scanned_py_files()
+    assert len(files) >= 50, (
         f"the tracker-literal scan walked only {len(files)} files under "
-        f"{ACCEPTANCE_DIR} — it is not reading the acceptance tree, so a "
-        "clean result means nothing."
+        f"{SCAN_ROOTS} — it is not reading the package, so a clean result "
+        "means nothing."
+    )
+    assert any(f.parent.name == "crucible" for f in files), (
+        "the scan did not reach the package source under crucible/"
     )
 
 
@@ -106,6 +155,15 @@ def _docstring_node_ids(tree: ast.AST) -> set[int]:
     return ids
 
 
+def _display(path: Path) -> str:
+    """A path relative to the repo root, or absolute for one outside it
+    (a scan target constructed in a test's own `tmp_path`)."""
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
 def _findings_in_file(path: Path) -> list[str]:
     text = path.read_text(encoding="utf-8")
     try:
@@ -119,11 +177,11 @@ def _findings_in_file(path: Path) -> list[str]:
     exempt = _docstring_node_ids(tree)
     findings: list[str] = []
     # Every Constant string in the WHOLE module — not gated on which function
-    # it sits in, or on what that function calls. A `pytest.fail(...)`
-    # literal, a `MSG = "..."` module constant, an `assert x, "..."` message,
-    # implicit string concatenation, and a literal chunk of an f-string are
-    # all just `ast.Constant` nodes at this level, so all five are caught by
-    # the same check.
+    # it sits in, or on what that function calls. A `pytest.fail(...)`/
+    # `raise ...(...)` literal, a `MSG = "..."` module constant, an
+    # `assert x, "..."` message, implicit string concatenation, and a
+    # literal chunk of an f-string are all just `ast.Constant` nodes at this
+    # level, so all five are caught by the same check.
     for node in ast.walk(tree):
         if id(node) in exempt:
             continue
@@ -140,22 +198,13 @@ def _findings_in_file(path: Path) -> list[str]:
     return findings
 
 
-def _display(path: Path) -> str:
-    """A path relative to the repo root, or absolute for one outside it
-    (a scan target constructed in a test's own `tmp_path`)."""
-    try:
-        return str(path.relative_to(REPO_ROOT))
-    except ValueError:
-        return str(path)
-
-
-def test_no_hardcoded_tracker_literal_anywhere_in_the_acceptance_tree() -> None:
+def test_no_hardcoded_tracker_literal_anywhere_in_the_package() -> None:
     findings: list[str] = []
-    for path in _acceptance_py_files():
+    for path in _scanned_py_files():
         findings.extend(_findings_in_file(path))
     assert not findings, (
-        "an acceptance-tree file names a hardcoded tracker issue number instead "
-        "of deriving it from crucible.gate.PHASES, or citing it only in prose "
+        "the package names a hardcoded tracker issue number instead of deriving "
+        "it from crucible.gate.PHASES, or citing it only in prose "
         f"(alpha-engine-config-I9839). {len(findings)} finding(s):\n"
         + "\n".join(f"  - {f}" for f in findings)
     )
@@ -163,9 +212,9 @@ def test_no_hardcoded_tracker_literal_anywhere_in_the_acceptance_tree() -> None:
 
 # ---------------------------------------------------------------------------
 # The detector is shown firing — and shown firing on every shape that was
-# proposed against the first version of this guard and found it blind:
-# a call site building `requirement`/message text with no `pytest.fail` in
-# its own body, an aliased `from pytest import fail`, an `assert` message, a
+# proposed against earlier versions of this guard and found them blind:
+# a call site building message text with no `pytest.fail`/`raise` in its own
+# body, an aliased `from pytest import fail`, an `assert` message, a
 # module-level constant, a nested `def`, and implicit string concatenation.
 # A guard nobody has made fail is a guard nobody knows works.
 # ---------------------------------------------------------------------------
@@ -174,8 +223,8 @@ def test_no_hardcoded_tracker_literal_anywhere_in_the_acceptance_tree() -> None:
 def test_the_scan_fires_on_a_literal_in_a_function_with_no_direct_pytest_fail_call(
     tmp_path: Path,
 ) -> None:
-    """The exact miss reported against the previous version of this guard:
-    appending a literal to `requirement` in the CALLING test method, which
+    """The exact miss reported against an earlier version of this guard:
+    appending a literal to `requirement` in the CALLING function, which
     itself never calls `pytest.fail` — only `_unmet` does, in another
     function entirely."""
     sample = tmp_path / "test_sample.py"
@@ -192,6 +241,19 @@ def test_the_scan_fires_on_a_literal_in_a_function_with_no_direct_pytest_fail_ca
     findings = _findings_in_file(sample)
     assert findings, "did not catch a literal appended in the CALLING function, not _unmet itself"
     assert "I9757" in findings[0]
+
+
+def test_the_scan_fires_on_a_hardcoded_literal_in_production_code(tmp_path: Path) -> None:
+    """The round-2 miss: a hardcoded tracker literal reaching a live user
+    through a raised exception in production code, not a test failure."""
+    sample = tmp_path / "cli.py"
+    sample.write_text(
+        "def handler() -> None:\n"
+        '    raise NotImplementedError("not implemented yet (alpha-engine-config-I9757)")\n',
+        encoding="utf-8",
+    )
+    findings = _findings_in_file(sample)
+    assert findings, "did not catch a hardcoded literal in a production `raise`, no test involved"
 
 
 def test_the_scan_fires_on_an_aliased_fail_import(tmp_path: Path) -> None:
@@ -255,6 +317,14 @@ def test_the_scan_fires_inside_a_nested_def(tmp_path: Path) -> None:
     assert findings, "did not catch a literal inside a nested function"
 
 
+def test_the_scan_fails_closed_on_an_unparseable_file(tmp_path: Path) -> None:
+    sample = tmp_path / "test_broken.py"
+    sample.write_text("def test_x(:\n    this is not python\n", encoding="utf-8")
+    findings = _findings_in_file(sample)
+    assert findings, "an unparseable file must be a finding, never a quiet skip"
+    assert "does not parse" in findings[0]
+
+
 def test_the_scan_permits_a_derived_pointer(tmp_path: Path) -> None:
     """The positive case, in the same shape `crucible.gate.Phase.tracker`
     actually uses: the issue NUMBER is an int, and the `alpha-engine-config-I`
@@ -284,7 +354,8 @@ def test_the_scan_permits_a_derived_pointer(tmp_path: Path) -> None:
 
 def test_the_scan_permits_a_docstring_citation(tmp_path: Path) -> None:
     """The other positive case: prose. A docstring narrating history is not
-    reachable from a test failure and costs nothing left as-is."""
+    reachable from a raised message or a test failure and costs nothing left
+    as-is."""
     sample = tmp_path / "test_sample_ok2.py"
     sample.write_text(
         "def test_x() -> None:\n"
@@ -294,3 +365,19 @@ def test_the_scan_permits_a_docstring_citation(tmp_path: Path) -> None:
     )
     findings = _findings_in_file(sample)
     assert not findings, f"a docstring citation was wrongly flagged: {findings}"
+
+
+def test_the_scan_permits_a_comment_citation(tmp_path: Path) -> None:
+    """A `#` comment is not part of the AST at all — this is a fact about
+    the parser, not an exemption this file grants, and it is worth proving:
+    a comment sitting on the same line pattern that would be flagged as a
+    string must not be."""
+    sample = tmp_path / "test_sample_ok3.py"
+    sample.write_text(
+        "def test_x() -> None:\n"
+        "    # Historical citation: alpha-engine-config-I9772.\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+    findings = _findings_in_file(sample)
+    assert not findings, f"a comment citation was wrongly flagged: {findings}"

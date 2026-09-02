@@ -33,6 +33,7 @@ from dataclasses import dataclass
 
 from crucible import __version__, track_c, track_e, track_f  # track-C, track-E, track-F
 from crucible.calendar import resolve_trading_day
+from crucible.gate import PHASES
 from crucible.track_a import HANDLERS as TRACK_A_HANDLERS
 from crucible.track_a import add_track_a_arguments
 
@@ -53,6 +54,16 @@ class JobSpec:
     scheduled: bool
 
 
+#: The wiring gap every `_todo` stub below reports lives under phase 1
+#: ("One command, locally" — plan §6): the underlying capability may already
+#: exist (`run_daily`, `crucible.explain`, ... are real), but the CLI is not
+#: yet wired to call it. Derived rather than hardcoded so a phase
+#: renumbering cannot leave a stub's message stale (alpha-engine-config-I9839)
+#: — this is the same fix `tests/acceptance/test_plan_section_2_objectives.py`
+#: got for the same reason.
+_WIRING_PHASE = next(p for p in PHASES if p.id == "phase1")
+
+
 def _todo(job: str, track: str, note: str) -> Callable[[argparse.Namespace], int]:
     """A handler that refuses loudly, naming who owns it.
 
@@ -63,7 +74,7 @@ def _todo(job: str, track: str, note: str) -> Callable[[argparse.Namespace], int
 
     def handler(args: argparse.Namespace) -> int:
         raise NotImplementedError(
-            f"`crucible {job}` is not implemented yet — {track}, alpha-engine-config-I9757. {note}"
+            f"`crucible {job}` is not implemented yet — {track}, {_WIRING_PHASE.tracker}. {note}"
         )
 
     # Marked so the "a stub never returns 0" guard can enumerate stubs from the

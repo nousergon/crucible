@@ -222,10 +222,12 @@ class TestFeatureVersionIsDerivedNeverCallerSupplied:
     def test_run_daily_accepts_no_feature_version_override(self) -> None:
         import inspect
 
+        # A `feature_version` parameter on `run_daily` is exactly the reintroduced
+        # write-prefix override alpha-engine-config-I9816 closed (historical
+        # citation, not a phase pointer — alpha-engine-config-I9839).
         assert "feature_version" not in inspect.signature(run_daily).parameters, (
-            "a `feature_version` parameter on `run_daily` is exactly the reintroduced "
-            "write-prefix override I9816 closed; the version is derived inside the "
-            "function and there is nothing for a caller to pass in"
+            "the version is derived inside the function and there is nothing for a "
+            "caller to pass in"
         )
 
     def test_run_weekly_accepts_no_feature_version_override(self) -> None:
@@ -279,10 +281,12 @@ class TestFeatureVersionIsDerivedNeverCallerSupplied:
             "the parquet was actually keyed under"
         )
         registry = json.loads(store.get_bytes(feature_registry_key(written_version)))
+        # A document whose body names a different version than its own key is the
+        # exact contradiction alpha-engine-config-I9816 found (historical citation,
+        # not a phase pointer — alpha-engine-config-I9839).
         assert registry["feature_version"] == written_version, (
             "the registry document living under features/{written_version}/registry.json "
-            "must itself declare written_version — a document whose body names a "
-            "different version than its own key is the exact contradiction I9816 found"
+            "must itself declare written_version"
         )
         feature_output = next(
             o for o in ctx.outputs if o["key"].endswith(".parquet") and "features/" in o["key"]

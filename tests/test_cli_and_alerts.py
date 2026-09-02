@@ -17,6 +17,7 @@ import pytest
 
 from crucible.alerts import PAGE_CONDITIONS, Page, dedup_key
 from crucible.cli import HANDLERS, JOBS, build_parser, is_stub, main, resolve_date
+from crucible.gate import PHASES
 
 FRIDAY = dt.date(2026, 8, 28)
 
@@ -121,8 +122,12 @@ class TestJobSurface:
         `1 skipped` and reads as green. Looping keeps the assertion real at
         every size, including zero.
         """
+        # Derived, not hardcoded: a stub's message names phase 1's tracker
+        # (crucible/cli.py::_WIRING_PHASE), so this stays in sync with it rather
+        # than restating the number a second time (alpha-engine-config-I9839).
+        wiring_phase = next(p for p in PHASES if p.id == "phase1")
         for job in UNIMPLEMENTED:
-            with pytest.raises(NotImplementedError, match="I9757"):
+            with pytest.raises(NotImplementedError, match=wiring_phase.tracker):
                 main(_minimal_argv(job))
 
     def test_the_stub_set_shrinks_rather_than_being_declared(self) -> None:
