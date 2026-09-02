@@ -23,11 +23,8 @@ from typing import Any
 
 from crucible import alerts, release
 from crucible.board import (
-    BOARD_CURRENT_KEY,
-    BOARD_HTML_KEY,
     BOARD_SCHEMA_VERSION,
     board_delta,
-    board_key,
     board_payload,
     build_board,
     pointer_may_move,
@@ -44,6 +41,7 @@ from crucible.console.render import (
 )
 from crucible.drift import drift_metrics
 from crucible.gate import LADDER_KEY, LADDER_SCHEMA_VERSION, build_ladder
+from crucible.keys import BOARD_CURRENT_KEY, BOARD_HTML_KEY, board_key
 from crucible.runner import RunContext, run_job, spot_interruption_guard
 from crucible.store import Store, open_store, sha256_hex
 

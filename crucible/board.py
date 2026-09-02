@@ -57,7 +57,6 @@ from crucible.store import Store
 
 __all__ = [
     "BOARD_CONSOLE_STATE",
-    "BOARD_CURRENT_KEY",
     "BOARD_SCHEMA_VERSION",
     "BOARD_STATES",
     "COMPONENT_BOARD_STATE",
@@ -72,8 +71,6 @@ __all__ = [
     "Declarations",
     "RowDelta",
     "board_delta",
-    "board_key",
-    "board_html_key",
     "board_payload",
     "pointer_may_move",
     "render_board_html",
@@ -90,23 +87,6 @@ DECLARATION_PATH = Path(__file__).parent / "board.yaml"
 
 #: Where a day's board is filed, and the pointer the console reads. Keyed by
 #: trading day like everything else (§4.12).
-BOARD_CURRENT_KEY = "board/current.json"
-
-
-#: The served page. `console-policy` requires every view to also serve the
-#: JSON an agent reads, which is `BOARD_CURRENT_KEY` — a page whose numbers can
-#: only be scraped out of HTML is a page the next automated reader re-derives
-#: incorrectly.
-BOARD_HTML_KEY = "board/index.html"
-
-
-def board_key(trading_day: str) -> str:
-    return f"board/{trading_day}/board.json"
-
-
-def board_html_key() -> str:
-    return BOARD_HTML_KEY
-
 
 #: The four declarations a row can come from. Closed: a fifth source is a
 #: design change visible in a diff, not a new dict key someone adds.

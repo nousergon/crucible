@@ -25,6 +25,10 @@ import re
 from crucible.calendar import assert_trading_day
 
 __all__ = [
+    "board_html_key",
+    "board_key",
+    "BOARD_HTML_KEY",
+    "BOARD_CURRENT_KEY",
     "ARM_SEGMENT_SEPARATOR",
     "arena_cycle_key",
     "arm_id_from_segment",
@@ -314,3 +318,28 @@ def ledger_key() -> str:
     and a per-date ledger would make "everything ever tried" a join.
     """
     return "ledger/trials.jsonl"
+
+
+# -- the declared board (alpha-engine-config-I9837) --------------------------
+
+
+#: The pointer the fleet-console adapter reads, and the served page. Here
+#: rather than in `crucible/board.py` because this module's rule admits no
+#: exception: every store key shape, in one place. `tests/test_key_construction_placement.py`
+#: caught these two the moment it landed, and its message is the right one —
+#: there is no "not moved yet" registry, because that is a suppression list.
+BOARD_CURRENT_KEY = "board/current.json"
+
+#: `console-policy` requires every view to serve the JSON an agent reads
+#: alongside its HTML: a page whose numbers can only be scraped out of markup
+#: is a page the next automated reader re-derives incorrectly.
+BOARD_HTML_KEY = "board/index.html"
+
+
+def board_key(trading_day: str) -> str:
+    """Where one day's board is filed. Keyed by trading day like everything else."""
+    return f"board/{trading_day}/board.json"
+
+
+def board_html_key() -> str:
+    return BOARD_HTML_KEY
