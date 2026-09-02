@@ -62,7 +62,14 @@ from crucible.champion import (
     read_champion_etag,
     write_champion,
 )
-from crucible.keys import arm_register_key, arm_series_key, experiments_key, retirement_log_key
+from crucible.keys import (
+    arm_register_key,
+    arm_series_key,
+    champion_key,
+    experiments_key,
+    retirement_log_key,
+)
+from crucible.keys import manifest_key as _promote_manifest_key
 from crucible.slots import SlotSpec, is_control_arm
 from crucible.store import ETAG_ABSENT, Store
 
@@ -337,7 +344,7 @@ def run_promotion(
             now=now,
         )
         if pointer is not None:
-            written.append(f"champions/{spec.slot}/current.json")
+            written.append(champion_key(spec.slot))
 
     return PromotionResult(
         cycle=cycle,
@@ -409,7 +416,7 @@ def revert_champion(
         run_id=run_id or _placeholder_run_id(),
         code_sha=code_sha or "0" * 40,
         promotion_source="operator_bootstrap",
-        manifest_key=manifest_key or f"runs/promote/{as_of}/run.json",
+        manifest_key=manifest_key or _promote_manifest_key("promote", as_of),
         evidence={
             "operator": operator,
             "reason": reason,
@@ -561,7 +568,7 @@ def _write_pointer_if_moved(
         run_id=run_id or _placeholder_run_id(),
         code_sha=code_sha or "0" * 40,
         promotion_source="evidence" if decision.status == "decided" else "bootstrap",
-        manifest_key=manifest_key or f"runs/promote/{decision.as_of}/run.json",
+        manifest_key=manifest_key or _promote_manifest_key("promote", decision.as_of),
         evidence=evidence,
         attestation=attestation,
     )
@@ -865,7 +872,7 @@ def _current_arm(store: Store, slot: str) -> str | None:
     except ChampionUnusableError:
         # Refused by the reader, but its arm_id is still the honest answer to
         # "what was this pointing at before the revert".
-        payload = json.loads(store.get_bytes(f"champions/{slot}/current.json"))
+        payload = json.loads(store.get_bytes(champion_key(slot)))
         arm_id = payload.get("arm_id")
         return str(arm_id) if arm_id is not None else None
 

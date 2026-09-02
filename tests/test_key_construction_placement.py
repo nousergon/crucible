@@ -26,9 +26,20 @@ they are built from a private validator reused elsewhere in their own module
 (moving just the key function would either duplicate that validator in
 `crucible.keys` or make the generic key module import domain logic — see
 each entry's reason below). Every hit is therefore required to be named,
-with a reason, in `_ALLOWED`. An unlisted module fails CLOSED: a new
-`*_key`/`*_prefix` function anywhere else in the package fails this test
-until it is either moved into `crucible.keys` or added here with a reason.
+with a reason, in `_ALLOWED`. An unlisted module fails the test: a new
+`*_key`/`*_prefix` function found by the walk below fails until it is
+either moved into `crucible.keys` or added here with a reason.
+
+**What the walk does NOT see — narrower than "fails closed" would imply.**
+`_module_level_key_functions` matches only `ast.FunctionDef` nodes in a
+module's top-level `tree.body`. It does not see: `async def foo_key(...)`,
+a `def foo_key` nested inside a class, an `if`, or another function, or an
+assignment-defined callable (`foo_key = _make_key_fn(...)`). Given every
+real key function in this package today is a plain top-level `def`, this is
+low practical risk, not zero — a future key function written in one of
+those shapes would not be caught here. Narrow this comment before trusting
+it as a hard guarantee; widening the walk (`ast.walk` plus `AsyncFunctionDef`
+and an assignment check) is the fix if that gap is ever exercised.
 """
 
 from __future__ import annotations
