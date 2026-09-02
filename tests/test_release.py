@@ -16,6 +16,8 @@ from crucible.release import (
     RELEASE_SCHEMA_VERSION,
     TRADER_PIN_KEY,
     ReleaseImmutabilityError,
+    ReleaseProvenance,
+    ReleaseRecord,
     StaleReleasePointerError,
     assert_immutable_write,
     current_release,
@@ -522,3 +524,67 @@ class TestIdentityProvenanceSplit:
         del bad["run_id"]
         with pytest.raises(ValueError, match="does not conform"):
             _validate_release_artifact("release_provenance.v1.json", bad)
+
+
+class TestValidationIsStructuralNotPerCaller:
+    """alpha-engine-config-I9814's blocking finding: the two schemas were
+    enforced only inside `publish_release`, a function with zero non-test
+    callers — `crucible.deploy._publish`, the writer `deploy.yml` actually
+    invokes, built both records by dataclass kwargs and never validated.
+
+    The fix moves validation onto the dataclasses themselves
+    (`ReleaseRecord.__post_init__` / `ReleaseProvenance.__post_init__`), so
+    the property to assert is not "the writers I know about validate" —
+    that was already true of `publish_release` and the finding still landed
+    — it is "constructing either dataclass validates, independent of the
+    call site". These tests construct the dataclasses DIRECTLY, the way a
+    future third writer nobody has reviewed yet would, without going
+    through `publish_release` or `crucible.deploy` at all. If a future
+    change moves validation back onto a specific function instead of the
+    type, these fail — which is the point: the type is the only call site
+    that cannot be skipped by writing a new one.
+    """
+
+    def test_constructing_a_release_record_directly_validates(self) -> None:
+        with pytest.raises(ValueError, match="does not conform"):
+            ReleaseRecord(
+                schema_version="release.v99",
+                sha=SHA_A,
+                lockfile_sha256="z" * 64,
+                wheel_sha256="a" * 64,
+                python_requires="",
+            )
+
+    def test_constructing_a_release_provenance_directly_validates(self) -> None:
+        with pytest.raises(ValueError, match="does not conform"):
+            ReleaseProvenance(
+                schema_version="nonsense.v0",
+                sha=SHA_A,
+                run_id="1",
+                run_attempt="1",
+                built_at="not-a-timestamp",
+                workflow_run_url="",
+                test_summary="",
+            )
+
+    def test_a_conformant_construction_of_both_still_succeeds(self) -> None:
+        """The structural guard must not become a suppression collection of
+        its own — a correct document still constructs cleanly."""
+        record = ReleaseRecord(
+            schema_version=RELEASE_SCHEMA_VERSION,
+            sha=SHA_A,
+            lockfile_sha256="0" * 64,
+            wheel_sha256="1" * 64,
+            python_requires=">=3.12,<3.13",
+        )
+        assert record.sha == SHA_A
+        provenance = ReleaseProvenance(
+            schema_version=RELEASE_PROVENANCE_SCHEMA_VERSION,
+            sha=SHA_A,
+            run_id="1",
+            run_attempt="1",
+            built_at="2026-08-28T21:00:00Z",
+            workflow_run_url="https://…/runs/1",
+            test_summary="42 passed",
+        )
+        assert provenance.sha == SHA_A

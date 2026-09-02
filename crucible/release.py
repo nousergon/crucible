@@ -326,6 +326,15 @@ class ReleaseRecord:
     python_requires: str = ">=3.12,<3.13"
     extra: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # Validated on CONSTRUCTION, not only inside `publish_release`
+        # (alpha-engine-config-I9814): a document that fails the schema
+        # cannot exist as a `ReleaseRecord` at all, so every writer —
+        # `publish_release`, `crucible.deploy._publish`, or one that does not
+        # exist yet — is refused the moment it builds one, with no second
+        # call site to remember or forget.
+        _validate_release_artifact("release.v2.json", asdict(self))
+
     def to_json(self) -> bytes:
         return json.dumps(asdict(self), indent=2, sort_keys=True).encode("utf-8")
 
@@ -350,6 +359,12 @@ class ReleaseProvenance:
     built_at: str
     workflow_run_url: str
     test_summary: str
+
+    def __post_init__(self) -> None:
+        # Same reasoning as `ReleaseRecord.__post_init__`: the schema is
+        # enforced by the type, not by whichever function happens to call
+        # `_validate_release_artifact` on it afterward.
+        _validate_release_artifact("release_provenance.v1.json", asdict(self))
 
     def to_json(self) -> bytes:
         return json.dumps(asdict(self), indent=2, sort_keys=True).encode("utf-8")
@@ -417,11 +432,15 @@ def publish_release(
         workflow_run_url=workflow_run_url,
         test_summary=test_summary,
     )
-    # Contract-tested at birth (M0 discipline): a writer that could emit a
-    # non-conformant identity or provenance document would defeat the schema
-    # this module ships alongside it.
-    _validate_release_artifact("release.v2.json", asdict(record))
-    _validate_release_artifact("release_provenance.v1.json", asdict(provenance))
+    # Contract-tested at birth (M0 discipline): both dataclasses validate
+    # themselves against their own schema in `__post_init__`, so the
+    # `ReleaseRecord(...)` / `ReleaseProvenance(...)` calls above already
+    # raised if either document were non-conformant — there is nothing left
+    # to check here, on purpose (alpha-engine-config-I9814): a second,
+    # separate validation call at this call site is exactly the "two
+    # readings of the same contract" shape that let the CLI's own
+    # construction skip validation entirely.
+    #
     # Immutability is enforced BEFORE the first of the two identity writes,
     # so a refusal cannot leave a prefix half-overwritten: a wheel from one
     # build beside a release.json from another is worse than either.

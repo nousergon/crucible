@@ -272,6 +272,82 @@ class TestPublish:
             self._publish(tmp_path, store_dir, wheel=b"PK different")
         assert LocalStore(store_dir).get_bytes(release_json_key(SHA)) == before
 
+    def test_the_reviewers_falsification_now_fails_loud(self, tmp_path) -> None:
+        """alpha-engine-config-I9814: the independent adversarial review on
+        PR25 published a `release.json` the module's own `release.v2.json`
+        schema refuses — `schema_version: "release.v99"`,
+        `lockfile_sha256: "zzzz..."` (fails `^[0-9a-f]{64}$`), an empty
+        `python_requires` — plus a `provenance.json` with
+        `schema_version: "nonsense.v0"` and `built_at: "not-a-timestamp"` —
+        through `python -m crucible.deploy publish`, the exact CLI
+        `deploy.yml` runs, and it exited 0 with both documents durable. This
+        is that same publish, byte-for-byte, re-run against the fix: it must
+        now fail loud, name both schema violations, and leave the store
+        empty rather than half- or fully-written."""
+        store_dir = tmp_path / "store"
+        bad_release_json = json.dumps(
+            {
+                "schema_version": "release.v99",
+                "sha": SHA,
+                "lockfile_sha256": "z" * 64,
+                "wheel_sha256": sha256_hex(WHEEL_BYTES),
+                "python_requires": "",
+                "extra": {},
+            }
+        )
+        bad_provenance_json = json.dumps(
+            {
+                "schema_version": "nonsense.v0",
+                "sha": SHA,
+                "run_id": "1",
+                "run_attempt": "1",
+                "built_at": "not-a-timestamp",
+                "workflow_run_url": "https://github.com/nousergon/crucible/actions/runs/1",
+                "test_summary": "42 passed",
+            }
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            self._publish(
+                tmp_path,
+                store_dir,
+                release_json=bad_release_json,
+                provenance_json=bad_provenance_json,
+            )
+        message = str(excinfo.value)
+        assert "release.v2.json" in message
+        assert "lockfile_sha256" in message
+        assert "python_requires" in message
+        # The store must be untouched: the CLI's own construction of
+        # `ReleaseRecord` is what raises, before `provenance.json` is even
+        # parsed and before either identity key is written.
+        store = LocalStore(store_dir)
+        assert not store.exists(wheel_key(SHA))
+        assert not store.exists(release_json_key(SHA))
+        assert not store.exists(provenance_key(SHA, "1", "1"))
+
+    def test_a_schema_refused_provenance_also_fails_loud_before_any_write(self, tmp_path) -> None:
+        """Finding 2 in `alpha-engine-config-I9814`'s non-inferable gotcha:
+        `_publish` writes `provenance.json` unconditionally and unlocked,
+        AFTER the identity writes — so a malformed provenance record must be
+        refused before either identity key lands too, not only after."""
+        store_dir = tmp_path / "store"
+        bad_provenance_json = json.dumps(
+            {
+                "schema_version": "nonsense.v0",
+                "sha": SHA,
+                "run_id": "1",
+                "run_attempt": "1",
+                "built_at": "not-a-timestamp",
+                "workflow_run_url": "https://github.com/nousergon/crucible/actions/runs/1",
+                "test_summary": "42 passed",
+            }
+        )
+        with pytest.raises(SystemExit, match="release_provenance.v1.json"):
+            self._publish(tmp_path, store_dir, provenance_json=bad_provenance_json)
+        store = LocalStore(store_dir)
+        assert not store.exists(wheel_key(SHA))
+        assert not store.exists(release_json_key(SHA))
+
 
 class TestFlip:
     def _published(self, tmp_path, sha=SHA):

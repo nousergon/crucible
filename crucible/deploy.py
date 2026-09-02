@@ -105,10 +105,31 @@ def _publish(args: argparse.Namespace, store: Store) -> int:
     that predates this fix).
     """
     wheel = Path(args.wheel).read_bytes()
-    record = ReleaseRecord(**json.loads(Path(args.release_json).read_text(encoding="utf-8")))
-    provenance = ReleaseProvenance(
-        **json.loads(Path(args.provenance_json).read_text(encoding="utf-8"))
-    )
+    # `ReleaseRecord.__post_init__` / `ReleaseProvenance.__post_init__`
+    # validate against their own schema on construction (alpha-engine-config
+    # I9814) — the two calls below are the ONLY code path in this module
+    # that turns the files on disk into these dataclasses, so a
+    # schema-refused `release.json`/`provenance.json` fails HERE, before a
+    # single byte reaches the store, rather than shipping through the CLI
+    # the deploy workflow actually runs. `TypeError` covers a document
+    # missing a required field or carrying one the dataclass does not
+    # declare; `ValueError` covers the schema violations `__post_init__`
+    # raises for a field present but non-conformant (bad pattern, empty
+    # string, unknown `schema_version`). Both are re-raised as `SystemExit`
+    # so the failure reads like every other refusal in this function rather
+    # than as an uncaught traceback.
+    try:
+        record = ReleaseRecord(**json.loads(Path(args.release_json).read_text(encoding="utf-8")))
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"{args.release_json} does not conform to release.v2.json: {exc}") from exc
+    try:
+        provenance = ReleaseProvenance(
+            **json.loads(Path(args.provenance_json).read_text(encoding="utf-8"))
+        )
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(
+            f"{args.provenance_json} does not conform to release_provenance.v1.json: {exc}"
+        ) from exc
     if record.sha != args.sha:
         raise SystemExit(
             f"release.json is for {record.sha}, not {args.sha}. Publishing it under the "
