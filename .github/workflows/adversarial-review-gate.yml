@@ -82,6 +82,24 @@ jobs:
     # review having happened. Measured on 129a34b — see the adversarial
     # review on this PR, finding 1. Left unset, the check-run defaults to
     # the job id, "post-pending-check".
+    #
+    # alpha-engine-config-I9848: this job gets its OWN concurrency group,
+    # scoped to the head SHA, and cancel-in-progress: false. The workflow-
+    # level group above is keyed on PR number, so two pushes in quick
+    # succession cancel the OLDER run in favor of the newer one — correct
+    # for a build (nothing wasted by killing stale work), wrong here: this
+    # job does one `gh api` call with no checkout, and its whole purpose is
+    # to CREATE a durable check-run object that `resolve` later completes.
+    # Cancelling it doesn't save anything and leaves the newer SHA with no
+    # check-run to resolve, which is exactly what made crucible-PR38
+    # unrecoverable from the workflow (2026-09-02, runs 33657407462,
+    # 33657408674, 33657583001). A per-SHA group means this job can never
+    # collide with a run for a different SHA in the first place;
+    # cancel-in-progress: false is belt-and-braces for the case where the
+    # SAME SHA is somehow re-dispatched (e.g. a manual re-run).
+    concurrency:
+      group: ${{ github.workflow }}-post-pending-check-${{ github.event.pull_request.head.sha }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -174,20 +192,33 @@ jobs:
           # review). Look it up by name ("adversarial-review-gate", the
           # gate's check identity — see the no-`name:` note on the
           # post-pending-check job above) and status on the head sha.
+          #
+          # alpha-engine-config-I9848: if `post-pending-check` was itself
+          # cancelled (its run superseded by a later push before the
+          # concurrency-group fix above took effect on THIS sha, or any
+          # other reason it never ran), no in_progress check-run exists to
+          # find. That used to be a hard failure with no path forward — the
+          # required check could never be satisfied because the object the
+          # verdict attaches to was never created. The pending post is a
+          # visibility convenience; the verdict is the durable thing and
+          # must be recordable regardless. run_id is left empty here (never
+          # exit 1) and the next step creates-and-completes the check-run
+          # directly when that happens.
           run_id="$(gh api "/repos/$REPO/commits/$sha/check-runs" -q '[.check_runs[] | select(.name=="adversarial-review-gate" and .status=="in_progress")][0].id // empty')"
           if [ -z "$run_id" ]; then
-            echo "::error::No in_progress 'adversarial-review-gate' check-run found on $sha — nothing to resolve. Has post-pending-check run for this PR (it is skipped while the PR is a draft)?"
-            exit 1
+            echo "No in_progress 'adversarial-review-gate' check-run found on $sha — post-pending-check likely never ran or was cancelled by a later push. Creating and completing the check-run directly (self-healing, alpha-engine-config-I9848)."
           fi
 
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "gh_author=$gh_author" >> "$GITHUB_OUTPUT"
 
-      - name: Complete the pending adversarial-review-gate check-run
+      - name: Complete (or self-heal and complete) the adversarial-review-gate check-run
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ steps.pr.outputs.run_id }}
+          SHA: ${{ steps.pr.outputs.sha }}
           GH_AUTHOR: ${{ steps.pr.outputs.gh_author }}
           REVIEWER: ${{ inputs.reviewer }}
           AUTHOR: ${{ inputs.author }}
@@ -199,15 +230,33 @@ jobs:
           title="Adversarial review: ${CONCLUSION}"
           full_summary="$(printf '%s\n\nReviewed by: %s (independent of author: %s) — PR opened by GitHub account: %s' "$SUMMARY" "$REVIEWER" "$AUTHOR" "$GH_AUTHOR")"
 
-          # PATCH the existing pending run — see the note above finding
-          # this run_id. `output` is a nested object, built via gh api's
+          # `output` is a nested object, built via gh api's
           # `-f output[key]=value` field-path syntax, not a literal JSON
           # string (same gotcha as post-pending-check's POST).
-          gh api "/repos/$REPO/check-runs/$RUN_ID" \
-            -X PATCH \
-            -f status="completed" \
-            -f conclusion="$CONCLUSION" \
-            -f output[title]="$title" \
-            -f output[summary]="$full_summary"
-
-          echo "Recorded adversarial-review-gate=$CONCLUSION on check-run $RUN_ID (reviewer: $REVIEWER, author: $AUTHOR, GitHub author: $GH_AUTHOR)"
+          if [ -n "$RUN_ID" ]; then
+            # PATCH the existing pending run — see the note above finding
+            # this run_id.
+            gh api "/repos/$REPO/check-runs/$RUN_ID" \
+              -X PATCH \
+              -f status="completed" \
+              -f conclusion="$CONCLUSION" \
+              -f output[title]="$title" \
+              -f output[summary]="$full_summary"
+            echo "Recorded adversarial-review-gate=$CONCLUSION on existing check-run $RUN_ID (reviewer: $REVIEWER, author: $AUTHOR, GitHub author: $GH_AUTHOR)"
+          else
+            # Self-heal: no pending check-run existed on this sha (it was
+            # never posted, or its posting run was cancelled). Create the
+            # check-run and complete it in the same call — the verdict must
+            # be recordable even when the earlier convenience job didn't
+            # survive.
+            new_run_id="$(gh api "/repos/$REPO/check-runs" \
+              -X POST \
+              -f name="adversarial-review-gate" \
+              -f head_sha="$SHA" \
+              -f status="completed" \
+              -f conclusion="$CONCLUSION" \
+              -f output[title]="$title" \
+              -f output[summary]="$full_summary" \
+              -q '.id')"
+            echo "Recorded adversarial-review-gate=$CONCLUSION on newly created check-run $new_run_id (self-healed — no pending check-run existed on $SHA; reviewer: $REVIEWER, author: $AUTHOR, GitHub author: $GH_AUTHOR)"
+          fi

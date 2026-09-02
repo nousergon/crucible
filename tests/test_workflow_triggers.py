@@ -341,3 +341,117 @@ def test_the_job_model_accepts_both_legal_needs_forms() -> None:
     assert Job.model_validate({"needs": "build"}).needs == ["build"]
     assert Job.model_validate({"needs": ["build", "test"]}).needs == ["build", "test"]
     assert Job.model_validate({}).needs == []
+
+
+# alpha-engine-config-I9848: `post-pending-check` does one `gh api` call with
+# no checkout — nothing is saved by cancelling it, and cancelling it left the
+# newer head with no check-run for `resolve` to complete, making the
+# required `adversarial-review-gate` check permanently unsatisfiable on that
+# sha (measured on crucible-PR38 head 7ac3cb6: runs 33657407462 cancelled,
+# 33657408674 and 33657583001 failed with no path forward).
+def test_post_pending_check_is_not_cancellable_by_a_later_push() -> None:
+    """The workflow-level concurrency group is keyed on PR number, so a
+    second push cancels the first push's `post-pending-check` run under the
+    top-level `cancel-in-progress: true`. The job needs its OWN concurrency
+    block — scoped to the head sha, so it can never collide with a run for a
+    different sha — with `cancel-in-progress: false`, so even a same-sha
+    re-run doesn't cancel it.
+    """
+    workflow = Workflow.load(WORKFLOW_DIR / "adversarial-review-gate.yml")
+    job = workflow.jobs["post-pending-check"]
+    job_concurrency = (job.model_extra or {}).get("concurrency")
+    assert isinstance(job_concurrency, dict), (
+        "post-pending-check has no job-level `concurrency:` override, so it "
+        "inherits the workflow-level group (keyed on PR number) and "
+        "`cancel-in-progress: true` — a later push on the same PR cancels "
+        "it, exactly the alpha-engine-config-I9848 defect."
+    )
+    assert job_concurrency.get("cancel-in-progress") is False, (
+        "post-pending-check's concurrency block must set "
+        "`cancel-in-progress: false` — it does one `gh api` call with no "
+        "checkout, so nothing is saved by cancelling it, and cancelling it "
+        "is what made crucible-PR38 unrecoverable."
+    )
+    group = job_concurrency.get("group", "")
+    assert "head.sha" in group or "head_sha" in group, (
+        "post-pending-check's concurrency group must be scoped to the head "
+        "sha (not the PR number), or a same-PR, different-sha run can still "
+        f"collide with it. Got group={group!r}."
+    )
+
+
+def test_resolve_self_heals_instead_of_exiting_when_no_pending_check_run_exists() -> None:
+    """`resolve` must not give up when `post-pending-check` never created (or
+    lost) the check-run it expects to complete — that path used to be a bare
+    `exit 1` with a rhetorical question, leaving the required check
+    permanently absent on that sha with no remedy from the workflow itself.
+
+    This asserts two properties on the actual step scripts rather than a
+    predicate over shell text (a predicate over a shell command string is a
+    partial shell parser and therefore a denylist — the exact lesson from
+    PR38's own adversarial review rounds):
+
+    1. The specific `if [ -z "$run_id" ]; then ... fi` block (the one guard
+       that fires when no in_progress check-run was found) contains no
+       `exit` at all — extracted by name, not inferred from surrounding
+       text.
+    2. The completion step's script contains the exact, pinned `gh api`
+       POST call that creates-and-completes a check-run directly, inside an
+       `else` branch keyed on the same `$RUN_ID` the lookup step produces.
+    """
+    workflow = Workflow.load(WORKFLOW_DIR / "adversarial-review-gate.yml")
+    resolve = workflow.jobs["resolve"]
+    lookup_script = resolve.steps[0]["run"]
+    complete_script = resolve.steps[1]["run"]
+
+    block_match = re.search(r'if \[ -z "\$run_id" \]; then\n(.*?)\nfi\n', lookup_script, re.DOTALL)
+    assert block_match is not None, (
+        'expected an `if [ -z "$run_id" ]; then ... fi` block in the '
+        "check-run lookup step — its absence means the script structure "
+        "changed under this test; update the test to match the new shape "
+        "and re-verify the no-exit property by hand."
+    )
+    assert "exit" not in block_match.group(1), (
+        "the empty-run_id branch still calls `exit`, so `resolve` fails "
+        "hard again instead of self-healing when post-pending-check's "
+        "check-run is missing on the head sha."
+    )
+
+    # Pin the exact recovery call — a POST that creates the check-run
+    # already completed, guarded by the `else` of the same `$RUN_ID` check
+    # the PATCH branch uses.
+    expected_self_heal_call = (
+        'if [ -n "$RUN_ID" ]; then\n'
+        "  # PATCH the existing pending run — see the note above finding\n"
+        "  # this run_id.\n"
+        '  gh api "/repos/$REPO/check-runs/$RUN_ID" \\\n'
+        "    -X PATCH \\\n"
+        '    -f status="completed" \\\n'
+        '    -f conclusion="$CONCLUSION" \\\n'
+        '    -f output[title]="$title" \\\n'
+        '    -f output[summary]="$full_summary"\n'
+    )
+    assert expected_self_heal_call in complete_script, (
+        "the PATCH-if-present branch text has changed from what this test "
+        "pins — re-verify the else branch below still creates-and-completes "
+        "a new check-run when $RUN_ID is empty, then update this literal."
+    )
+    else_index = complete_script.index(expected_self_heal_call) + len(expected_self_heal_call)
+    else_branch = complete_script[else_index:]
+    assert "else" in else_branch, (
+        "no `else` branch follows the PATCH-if-present block — self-healing "
+        "when $RUN_ID is empty has been removed."
+    )
+    expected_create_call = (
+        'gh api "/repos/$REPO/check-runs" \\\n'
+        "    -X POST \\\n"
+        '    -f name="adversarial-review-gate" \\\n'
+        '    -f head_sha="$SHA" \\\n'
+        '    -f status="completed" \\\n'
+        '    -f conclusion="$CONCLUSION" \\\n'
+    )
+    assert expected_create_call in else_branch, (
+        "the self-heal `else` branch must POST a new check-run with "
+        '`status="completed"` set directly (create-and-complete in one '
+        "call), scoped to $SHA — this exact call is missing or changed."
+    )
