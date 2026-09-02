@@ -73,13 +73,12 @@ class Clause:
             "requirement": self.requirement,
             "met": self.met,
             "detail": self.detail,
-            # De-duplicated and ordered. Several arc stages share one manifest
-            # key — `manifest_key` carries the job and the trading day but not
-            # the slot, so `experiment.run --slot u` and `--slot r` write the
-            # same object — and listing that key four times would present a
-            # collision as thoroughness. The collision itself is
-            # alpha-engine-config-I9781.
-            "evidence": sorted(set(self.evidence)),
+            # Ordered, not de-duplicated. Each arc stage now reads its own
+            # discriminated manifest key (alpha-engine-config-I9781), so a
+            # repeated key in this list is evidence of a real collision
+            # rather than an artifact of a bare, undiscriminated read that
+            # de-duplication would otherwise mask.
+            "evidence": sorted(self.evidence),
         }
 
 
@@ -189,7 +188,7 @@ def _clause_arc_runs_ok(
     evidence: list[str] = []
     for day in window:
         for stage in arc_stages(day, registry):
-            key = manifest_key(stage.job, day.isoformat())
+            key = manifest_key(stage.job, day.isoformat(), discriminator=stage.slot)
             evidence.append(key)
             document = _read_json(store, key)
             if document is None:

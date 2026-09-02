@@ -29,6 +29,7 @@ from crucible.data import ArcticPriceSource, PriceSource, run_daily, run_heal, r
 from crucible.explain import explain as explain_lineage
 from crucible.explain import render as render_lineage
 from crucible.features import DEFAULT_FEATURE_VERSION
+from crucible.manifest import manifest_key
 from crucible.runner import run_job
 from crucible.slots import research, universe
 from crucible.slots.arms import load_arm_specs, read_register, register_arms, write_register
@@ -87,19 +88,59 @@ def handle_data_daily(args: argparse.Namespace) -> int:
     # reruns the whole compile for it, overwriting that session's already-
     # good manifest with a second, unrelated writer's output — the same
     # last-writer-wins shape as the slot collision this fix addresses
-    # (alpha-engine-config-I9781). Refused only when `--date` was NOT given:
+    # (alpha-engine-config-I9781). Guarded only when `--date` was NOT given:
     # an explicit `--date` is a deliberate backfill/replay and is honoured
     # even on a holiday, same as everywhere else in this repo (rule 3).
+    #
+    # The guard does not skip the job. Rule 2: "if a job had nothing to do,
+    # it produced a complete correct result — that is `ok`." A holiday
+    # firing goes through `run_job` like any other invocation and writes a
+    # real `ok` manifest, discriminated by the wall-clock calendar date it
+    # actually fired on so it cannot collide with — or be mistaken for — the
+    # prior session's real manifest at the same `trading_day`. A silent
+    # `return 0` with no manifest is rule 1's and rule 2's exact shape: no
+    # record exists to distinguish a holiday no-op from a `data.daily` that
+    # has stopped working, and the alerting absence check has nothing to see
+    # either way.
     today = _today()
-    if getattr(args, "date", None) is None and not is_trading_day(today):
-        print(
-            f"data.daily: {today.isoformat()} is not an NYSE trading day; "
-            "the schedule fired on a holiday. Nothing to compile — exiting without "
-            f"touching {args.trading_day.isoformat()}'s existing manifest."
-        )
-        return 0
     config = _settings(args)
     store = config.store()
+    if getattr(args, "date", None) is None and not is_trading_day(today):
+        detail = (
+            f"{today.isoformat()} is not an NYSE trading day; the schedule fired on a "
+            f"holiday. Nothing to compile for trading_day {args.trading_day.isoformat()}."
+        )
+        if args.dry_run:
+            print(f"data.daily --date {args.trading_day} would record a holiday no-op: {detail}")
+            return 0
+
+        def _holiday_noop(ctx: Any) -> None:
+            ctx.record_metric(
+                {
+                    "name": "data.daily.holiday_noop",
+                    "module": "crucible.track_a",
+                    "metric_type": "gauge",
+                    "value": 1.0,
+                    "unit": "count",
+                    "n_floor": 0,
+                    "status": "OK",
+                    "status_reason": detail,
+                    "source_path": manifest_key("data.daily", args.trading_day.isoformat()),
+                    "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                }
+            )
+
+        ctx = run_job(
+            "data.daily",
+            _holiday_noop,
+            store=store,
+            trading_day=args.trading_day,
+            discriminator=today.isoformat(),
+        )
+        print(json.dumps({"run_id": ctx.run_id, "outputs": [], "detail": detail}, indent=2))
+        return 0
     source = _source(args, config)
     if args.dry_run:
         print(

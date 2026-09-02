@@ -4,15 +4,21 @@ The EventBridge schedule fires every weekday close, and a market holiday is
 still a weekday: without a guard, `data.daily` resolves `trading_day` back to
 the last real session (legitimate — rule 3) and reruns the whole compile for
 it, overwriting that session's already-good manifest with a second, unrelated
-writer's output. `crucible.track_a.handle_data_daily` refuses to run at all
-when the schedule fires on a day that is not itself an NYSE session and no
-explicit `--date` was given.
+writer's output. `crucible.track_a.handle_data_daily` never re-compiles on a
+day that is not itself an NYSE session with no explicit `--date` given — but
+per rule 2 ("a job that had nothing to do produced a complete correct
+result — that is `ok`"), it still runs the job and writes a real `ok`
+manifest, discriminated by the wall-clock firing date so it cannot collide
+with the prior session's real manifest. A silent `return 0` with no manifest
+at all was the shape rules 1 and 2 forbid: it left a holiday no-op and a
+`data.daily` that had stopped working indistinguishable.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 
 import pytest
 
@@ -43,7 +49,7 @@ def _args(**over) -> argparse.Namespace:
 
 
 class TestHolidayGuard:
-    def test_a_holiday_firing_with_no_explicit_date_is_a_clean_no_op(
+    def test_a_holiday_firing_with_no_explicit_date_does_not_touch_the_real_manifest(
         self, tmp_path, monkeypatch, capsys
     ) -> None:
         monkeypatch.setattr(track_a, "_today", lambda: LABOR_DAY)
@@ -64,6 +70,31 @@ class TestHolidayGuard:
             == b'{"status": "ok", "sentinel": "friday-was-here"}'
         )
         assert "not an NYSE trading day" in capsys.readouterr().out
+
+    def test_a_holiday_firing_still_writes_a_real_ok_manifest_of_its_own(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Rules 1 and 2: a holiday no-op is a run that happened, not a
+        vanished third status wearing exit 0 — it goes through `run_job` and
+        writes its own `ok` manifest, discriminated so it cannot collide
+        with the real session's manifest at the same `trading_day`."""
+        monkeypatch.setattr(track_a, "_today", lambda: LABOR_DAY)
+        store = LocalStore(tmp_path)
+        args = _args(store=str(tmp_path))
+
+        code = track_a.handle_data_daily(args)
+
+        assert code == 0
+        holiday_key = manifest_key(
+            "data.daily", PRIOR_FRIDAY.isoformat(), discriminator=LABOR_DAY.isoformat()
+        )
+        assert store.exists(holiday_key)
+        manifest = json.loads(store.get_bytes(holiday_key))
+        assert manifest["status"] == "ok"
+        assert manifest["reason"] == ""
+        assert manifest["discriminator"] == LABOR_DAY.isoformat()
+        # And the bare (undiscriminated) key is still untouched.
+        assert not store.exists(manifest_key("data.daily", PRIOR_FRIDAY.isoformat()))
 
     def test_an_explicit_date_on_a_holiday_is_still_honoured(self, monkeypatch) -> None:
         """Rule 3: an explicit `--date` is a deliberate backfill/replay and
