@@ -41,6 +41,7 @@ __all__ = [
     "experiments_key",
     "feature_registry_key",
     "features_key",
+    "gate_key",
     "ledger_key",
     "manifest_key",
     "manifest_prefix",
@@ -286,6 +287,11 @@ def champion_key(slot: str) -> str:
 def attribution_key(trading_day: str) -> str:
     """The week's report card. Keyed by trading day like everything else."""
     return f"report/{trading_day}/attribution.json"
+
+
+def gate_key(gate: str, trading_day: str) -> str:
+    """Where a gate reading is filed. Keyed by trading day like everything else."""
+    return f"gates/{gate}/{trading_day}/gate.json"
 
 
 def universe_members_key(trading_day: str) -> str:

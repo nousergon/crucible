@@ -41,23 +41,47 @@ SELF = Path(__file__).resolve()
 
 #: A second, deliberate exemption — reviewed 2026-09-02 on
 #: alpha-engine-config-I9807's PR, and it is exactly one entry, not a list:
-#: `tests/test_key_construction_placement.py` names its own two
-#: `_KNOWN_ARCHITECTURAL_EXCEPTIONS` / `_KNOWN_TRACKED_DEBT` registries with
-#: a `_KNOWN_` prefix ON PURPOSE, so THIS scanner sees them rather than
-#: being blind to an unnamed collection — the exact defect a hidden
-#: allowlist (originally just `_ALLOWED`, matching no `FORBIDDEN` pattern
-#: here) turned out to BE. `_KNOWN_ARCHITECTURAL_EXCEPTIONS` is a reviewed,
-#: permanent registry (every entry is a case where a function correctly
-#: lives outside `crucible/keys.py`, not a debt list — see its own
-#: docstring); `_KNOWN_TRACKED_DEBT` is a debt list, OPENLY named as one,
-#: each entry naming the issue that clears it. Sanctioning them here, by
-#: name, is what makes them visible exceptions rather than a silent one —
-#: a THIRD `_KNOWN_*`/`_GRANDFATHERED_*` collection added anywhere else in
-#: the tree, including a third one in this same file, still fails, because
-#: nothing else is named. Only the `_KNOWN_` pattern is exempted for this
-#: one file — `xfail`, `pytest.skip` and the rest are still scanned there
-#: like everywhere else.
+#: `tests/test_key_construction_placement.py` names its own
+#: `_KNOWN_ARCHITECTURAL_EXCEPTIONS` registry with a `_KNOWN_` prefix ON
+#: PURPOSE, so THIS scanner sees it rather than being blind to an unnamed
+#: collection — the exact defect a hidden allowlist (originally just
+#: `_ALLOWED`, matching no `FORBIDDEN` pattern here) turned out to BE.
+#: It is a reviewed, architectural registry: every entry is a case where a
+#: function correctly lives outside `crucible/keys.py` today, never a "not
+#: moved yet" debt list — a debt list would itself be a suppression
+#: collection, and shipping one is a rule change (`AGENTS.md` rule 4)
+#: outside a single review's authority, so that file carries none (round 3
+#: of I9807's review: `_KNOWN_TRACKED_DEBT` was removed by moving its one
+#: entry, `gate_key`, into `crucible/keys.py` instead of listing it here).
+#:
+#: **Gated on the exact IDENTIFIER, not the file.** An earlier version of
+#: this exemption skipped the whole `_KNOWN_` PATTERN for the sanctioned
+#: file, which admitted any number of arbitrarily-named `_KNOWN_*`
+#: collections there undetected (measured: appending
+#: `_KNOWN_ANYTHING_GOES: dict[str, str] = {"a": "b"}` to that file still
+#: passed clean) — a hole in the scanner, and the file-path exemption's own
+#: comment asserted the opposite. `_SANCTIONED_KNOWN_IDENTIFIERS` names
+#: exactly the identifier(s) this exemption covers; `_line_is_exempt`
+#: below only skips a `_KNOWN_` match when removing every occurrence of a
+#: sanctioned identifier from the line leaves no `_KNOWN_` text behind — a
+#: third, unsanctioned `_KNOWN_*` collection in the SAME file, on the SAME
+#: or a different line, still fails. Only the `_KNOWN_` pattern is exempted
+#: this way, and only for the one file — `xfail`, `pytest.skip` and the
+#: rest are still scanned there like everywhere else.
 _SANCTIONED_KNOWN_REGISTRY_FILE = REPO_ROOT / "tests" / "test_key_construction_placement.py"
+_SANCTIONED_KNOWN_IDENTIFIERS = ("_KNOWN_ARCHITECTURAL_EXCEPTIONS",)
+
+
+def _line_is_exempt_known_pattern(line: str) -> bool:
+    """True only if every `_KNOWN_` occurrence on ``line`` is accounted for
+    by a sanctioned identifier substring. An unsanctioned `_KNOWN_*` name on
+    the same line — even one that also contains a sanctioned identifier —
+    still leaves `_KNOWN_` text behind and is reported."""
+    stripped = line
+    for name in _SANCTIONED_KNOWN_IDENTIFIERS:
+        stripped = stripped.replace(name, "")
+    return "_KNOWN_" not in stripped
+
 
 # Directories that are not source: caches, the virtualenv, git internals.
 _IGNORED_DIRS = {
@@ -165,6 +189,48 @@ def test_the_scan_actually_reads_files() -> None:
     )
 
 
+def _findings_for_file(path: Path, text: str) -> list[str]:
+    """Every FORBIDDEN-pattern match in ``text``, as if read from ``path``.
+
+    Extracted from the tree-wide scan so the sanctioned-exemption's exact
+    boundary can be exercised directly, against a real path comparison,
+    rather than only observed indirectly through the whole-tree result.
+    """
+    findings: list[str] = []
+    exempt: set[int] = set()
+    if path.suffix == ".py":
+        try:
+            exempt = _docstring_lines(text)
+        except SyntaxError as exc:
+            # A source file that does not parse is a finding in itself,
+            # never a quiet skip: an unparseable file scanned as clean is
+            # how a guard reports green over code it never read.
+            findings.append(f"{path}: does not parse ({exc})")
+            return findings
+    is_sanctioned_registry_file = path.resolve() == _SANCTIONED_KNOWN_REGISTRY_FILE
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if lineno in exempt:
+            continue
+        for pattern, compiled in _PATTERNS.items():
+            if (
+                pattern == r"_KNOWN_"
+                and is_sanctioned_registry_file
+                and _line_is_exempt_known_pattern(line)
+            ):
+                # The one deliberate exemption declared beside
+                # `_SANCTIONED_KNOWN_REGISTRY_FILE` above — gated on the
+                # exact identifier via `_line_is_exempt_known_pattern`,
+                # not the whole `_KNOWN_` pattern for the file. Every
+                # other FORBIDDEN pattern is still scanned here.
+                continue
+            if compiled.search(line):
+                findings.append(
+                    f"{path}:{lineno}: matches {pattern!r} — {FORBIDDEN[pattern]}\n"
+                    f"      {line.strip()[:120]}"
+                )
+    return findings
+
+
 def test_no_suppression_collections_anywhere_in_the_tree() -> None:
     findings: list[str] = []
     for path in _scanned_files():
@@ -172,34 +238,10 @@ def test_no_suppression_collections_anywhere_in_the_tree() -> None:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        exempt: set[int] = set()
-        if path.suffix == ".py":
-            try:
-                exempt = _docstring_lines(text)
-            except SyntaxError as exc:
-                # A source file that does not parse is a finding in itself,
-                # never a quiet skip: an unparseable file scanned as clean is
-                # how a guard reports green over code it never read.
-                findings.append(f"{path.relative_to(REPO_ROOT)}: does not parse ({exc})")
-                continue
-        is_sanctioned_registry_file = path.resolve() == _SANCTIONED_KNOWN_REGISTRY_FILE
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            if lineno in exempt:
-                continue
-            for pattern, compiled in _PATTERNS.items():
-                if pattern == r"_KNOWN_" and is_sanctioned_registry_file:
-                    # The one deliberate exemption declared beside
-                    # `_SANCTIONED_KNOWN_REGISTRY_FILE` above — reviewed,
-                    # named, and limited to this single pattern in this
-                    # single file. Every other FORBIDDEN pattern is still
-                    # scanned here.
-                    continue
-                if compiled.search(line):
-                    rel = path.relative_to(REPO_ROOT)
-                    findings.append(
-                        f"{rel}:{lineno}: matches {pattern!r} — {FORBIDDEN[pattern]}\n"
-                        f"      {line.strip()[:120]}"
-                    )
+        findings.extend(
+            f.replace(str(path), str(path.relative_to(REPO_ROOT)), 1)
+            for f in _findings_for_file(path, text)
+        )
     assert not findings, (
         "this repository carries no suppression collections (plan §11.1). "
         f"{len(findings)} finding(s):\n" + "\n".join(f"  - {f}" for f in findings)
@@ -231,4 +273,66 @@ def test_the_scan_can_actually_find_something(tmp_path: Path) -> None:
         assert _PATTERNS[pattern].search(sample), (
             f"pattern {pattern!r} no longer matches its own sample {sample!r} — the "
             "detector is broken and would report a clean tree."
+        )
+
+
+class TestTheSanctionedKnownRegistryExemptionIsExactlyAsNarrowAsClaimed:
+    """Self-tests for `_SANCTIONED_KNOWN_REGISTRY_FILE` / `_line_is_exempt_known_pattern`.
+
+    A guard that weakens `test_no_suppression_collections_anywhere_in_the_tree`
+    is the one change in alpha-engine-config-I9807 with no self-test proving
+    what it does and does not admit — caught on that PR's round-3 review,
+    after a file-path-only exemption was measured to admit an arbitrarily
+    named `_KNOWN_*` collection undetected. These four cases are exactly the
+    axes that mattered: the sanctioned identifier itself, an unsanctioned
+    identifier in the same file, a different FORBIDDEN pattern in the same
+    file, and the sanctioned identifier's own pattern in a different file.
+    """
+
+    def test_the_sanctioned_identifier_itself_is_exempt(self) -> None:
+        text = '_KNOWN_ARCHITECTURAL_EXCEPTIONS: dict[str, dict[str, str]] = {"x": {}}'
+        assert _findings_for_file(_SANCTIONED_KNOWN_REGISTRY_FILE, text) == []
+
+    def test_an_unsanctioned_known_collection_in_the_sanctioned_file_is_still_reported(
+        self,
+    ) -> None:
+        """The exact mutation the review measured passing clean: appending an
+        arbitrarily named `_KNOWN_*` collection to the sanctioned file."""
+        text = '_KNOWN_ANYTHING_GOES: dict[str, str] = {"a": "b"}'
+        findings = _findings_for_file(_SANCTIONED_KNOWN_REGISTRY_FILE, text)
+        assert findings, (
+            "an unsanctioned _KNOWN_* collection in the sanctioned file must still be "
+            "reported — the exemption is gated on the identifier, not the file."
+        )
+
+    def test_a_line_naming_both_a_sanctioned_and_unsanctioned_identifier_is_reported(
+        self,
+    ) -> None:
+        """A sanctioned identifier's presence on a line must not launder an
+        unsanctioned one riding along on the same line."""
+        text = "_KNOWN_ANYTHING_GOES = _KNOWN_ARCHITECTURAL_EXCEPTIONS"
+        findings = _findings_for_file(_SANCTIONED_KNOWN_REGISTRY_FILE, text)
+        assert findings, (
+            "a line naming an unsanctioned _KNOWN_* identifier is reported even when a "
+            "sanctioned identifier also appears on it."
+        )
+
+    def test_a_different_forbidden_pattern_in_the_sanctioned_file_is_still_reported(
+        self,
+    ) -> None:
+        text = "_GRANDFATHERED_THING = 1"
+        findings = _findings_for_file(_SANCTIONED_KNOWN_REGISTRY_FILE, text)
+        assert findings, (
+            "the sanctioned file's exemption covers only the _KNOWN_ pattern; "
+            "_GRANDFATHERED_ (and every other FORBIDDEN pattern) is still scanned there."
+        )
+
+    def test_a_known_collection_in_an_unsanctioned_file_is_still_reported(self) -> None:
+        text = "_KNOWN_ARCHITECTURAL_EXCEPTIONS = {}"
+        other_path = _SANCTIONED_KNOWN_REGISTRY_FILE.parent / "test_some_other_module.py"
+        assert other_path.resolve() != _SANCTIONED_KNOWN_REGISTRY_FILE
+        findings = _findings_for_file(other_path, text)
+        assert findings, (
+            "the exemption is scoped to one specific file; the same sanctioned "
+            "identifier text in any other file is still reported."
         )

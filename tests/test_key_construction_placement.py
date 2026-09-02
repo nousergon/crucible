@@ -30,15 +30,25 @@ few are store keys that are *legitimately* not in `crucible.keys` because
 they are built from a private validator reused elsewhere in their own
 module (moving just the key function would either duplicate that validator
 in `crucible.keys` or make the generic key module import domain logic).
-Those go in `_KNOWN_ARCHITECTURAL_EXCEPTIONS` below. A hit that is a real
-key function simply not moved YET — because the file it lives in is out of
-scope for the PR that would move it — goes in `_KNOWN_TRACKED_DEBT`
-instead, naming the issue that clears it. **Both registries are named
-`_KNOWN_*` on purpose**, so `tests/test_no_suppressions.py`'s own scan sees
-and sanctions them explicitly (AGENTS.md rule 4: no suppression collection
-the scanner is blind to — see each collection's docstring for the full
-argument). An unlisted hit fails this test until it is moved into
-`crucible.keys`, or added to one of the two registries with a reason.
+Those, and only those, go in `_KNOWN_ARCHITECTURAL_EXCEPTIONS` below —
+there is deliberately no companion "not moved yet" debt registry: a
+suppression list is a rule change (`AGENTS.md` rule 4, "no suppression
+collections, at all," names exactly two exemptions and neither is a file
+list) and shipping one inside this test would make that call by default
+instead of putting it to Brian. So a hit that is a real key function
+simply not moved yet is not accounted for here — it fails this test, and
+the fix is to move it into `crucible.keys` in the same change (see
+`crucible.gate.gate_key`, which alpha-engine-config-I9807's review moved
+this way rather than leaving as debt).
+
+`_KNOWN_ARCHITECTURAL_EXCEPTIONS` is named `_KNOWN_*` **on purpose**,
+deliberately matching `tests/test_no_suppressions.py::FORBIDDEN`'s
+`_KNOWN_` pattern, so that scanner sees this one collection and sanctions
+it explicitly by NAME (not by file, and not the whole `_KNOWN_` pattern in
+this file — see that test's own exemption and its self-test) rather than
+being blind to it because its name never matched anything checked for,
+which is exactly the defect this collection would otherwise be: a
+suppression list evading the suppression scanner.
 """
 
 from __future__ import annotations
@@ -54,21 +64,25 @@ _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*_(key|prefix)$")
 _CRUCIBLE_ROOT = Path(__file__).resolve().parent.parent / "crucible"
 
 #: module (dotted, relative to `crucible/`) -> {function name: reason it
-#: CORRECTLY lives outside `crucible.keys`, permanently}. This is an
-#: architectural registry, not a debt list: every entry here is expected to
-#: still be here in a year, because the function genuinely does not belong
-#: in the generic key module (it is not a store key at all, or it is built
-#: from a private validator this module owns and reuses elsewhere). A case
-#: that is merely UNFIXED YET belongs in `_KNOWN_TRACKED_DEBT` below, not
-#: here — see that collection's own docstring for why the distinction
-#: matters and is enforced, not just asserted.
+#: CORRECTLY lives outside `crucible.keys` today}. This is an architectural
+#: registry, not a debt list — deliberately the ONLY registry in this file
+#: (see the module docstring: a companion "not moved yet" debt collection
+#: would be a suppression list, and shipping one is a rule change that
+#: belongs to Brian, not a review call). Every entry names a real reason a
+#: function is built from something local to its own module, not merely
+#: that nobody has moved it yet; each is expected to hold, though a future
+#: refactor could still dissolve one (a `crucible.keys` that took a
+#: validator callback would fold the `release.py` cluster in, for
+#: instance) — "correct today" is checked, not "permanent by decree".
 #:
-#: Named `_KNOWN_*` ON PURPOSE, deliberately matching
-#: `tests/test_no_suppressions.py::FORBIDDEN`'s `_KNOWN_` pattern, so that
-#: scanner sees this collection and sanctions it explicitly (a named,
-#: reviewed exception it knows about) rather than being blind to it because
-#: the name never matched anything it checks for — which is exactly the
-#: defect this collection would otherwise BE: a suppression list evading the
+#: This identifier — `_KNOWN_ARCHITECTURAL_EXCEPTIONS` — is spelled with
+#: that specific leading prefix ON PURPOSE, deliberately matching
+#: `tests/test_no_suppressions.py::FORBIDDEN`'s suppression-collection
+#: pattern, so that scanner sees this collection and sanctions it
+#: explicitly, BY THIS EXACT NAME (not by file — see that test's own
+#: exemption and its self-test) rather than being blind to it because its
+#: name never matched anything it checks for, which is exactly the defect
+#: this collection would otherwise BE: a suppression list evading the
 #: suppression scanner (AGENTS.md rule 4; caught on review of
 #: alpha-engine-config-I9807, 2026-09-02).
 _KNOWN_ARCHITECTURAL_EXCEPTIONS: dict[str, dict[str, str]] = {
@@ -102,25 +116,6 @@ _KNOWN_ARCHITECTURAL_EXCEPTIONS: dict[str, dict[str, str]] = {
     },
 }
 
-#: module -> {function name: reason it has NOT moved yet, and what clears
-#: the entry}. Unlike `_KNOWN_ARCHITECTURAL_EXCEPTIONS`, every entry here is
-#: expected to be REMOVED — this collection's target size is zero, not a
-#: fact about where the function belongs. Also named `_KNOWN_*` on purpose,
-#: for the same reason as above: a debt list the suppression scanner cannot
-#: see is worse than no list, because it looks like every entry was reviewed
-#: when only its EXISTENCE was.
-_KNOWN_TRACKED_DEBT: dict[str, dict[str, str]] = {
-    "gate": {
-        "gate_key": (
-            "gate.py was being edited concurrently by another session when I9807 "
-            "landed, the same reason arm_predictions_key was originally placed "
-            "outside crucible.keys — not touched here for the same reason. Moving "
-            "it is alpha-engine-config-I9852's own tracked deliverable, which also "
-            "removes this entry as part of closing that issue."
-        ),
-    },
-}
-
 
 def _module_level_key_functions() -> list[tuple[str, str]]:
     """(module, function name) for every `*_key`/`*_prefix` def under
@@ -149,9 +144,7 @@ def _module_level_key_functions() -> list[tuple[str, str]]:
 
 
 def _accounted_for(module: str, name: str) -> bool:
-    return name in _KNOWN_ARCHITECTURAL_EXCEPTIONS.get(
-        module, {}
-    ) or name in _KNOWN_TRACKED_DEBT.get(module, {})
+    return name in _KNOWN_ARCHITECTURAL_EXCEPTIONS.get(module, {})
 
 
 class TestEveryKeyShapedFunctionIsAccountedFor:
@@ -159,19 +152,20 @@ class TestEveryKeyShapedFunctionIsAccountedFor:
         hits = _module_level_key_functions()
         assert hits, (
             "the AST walk found zero *_key/*_prefix functions outside crucible/keys.py, "
-            "which is suspicious given known ones (crucible.gate.gate_key at least) — the "
-            "walk itself is probably broken, not the codebase."
+            "which is suspicious given known ones (crucible.release.wheel_key at least) — "
+            "the walk itself is probably broken, not the codebase."
         )
         unaccounted = [
             f"{module}::{name}" for module, name in hits if not _accounted_for(module, name)
         ]
         assert not unaccounted, (
             "a *_key/*_prefix function was added outside crucible/keys.py with no "
-            "registry entry: " + ", ".join(unaccounted) + ". Either move it into "
+            "registry entry: " + ", ".join(unaccounted) + ". Move it into "
             "crucible/keys.py (crucible/keys.py's own rule: every store key shape, in "
-            "one place), add it to _KNOWN_ARCHITECTURAL_EXCEPTIONS if it genuinely "
-            "belongs outside crucible.keys permanently, or to _KNOWN_TRACKED_DEBT with "
-            "the issue that will clear it if it does not."
+            "one place) in the same change, or add it to _KNOWN_ARCHITECTURAL_EXCEPTIONS "
+            "if it genuinely, permanently belongs outside crucible.keys — there is no "
+            "'not moved yet' registry; that would be a suppression list (AGENTS.md rule 4) "
+            "and shipping one is Brian's call, not this test's."
         )
 
     @pytest.mark.parametrize(
@@ -179,11 +173,6 @@ class TestEveryKeyShapedFunctionIsAccountedFor:
         [
             ("_KNOWN_ARCHITECTURAL_EXCEPTIONS", m, n)
             for m, entries in _KNOWN_ARCHITECTURAL_EXCEPTIONS.items()
-            for n in entries
-        ]
-        + [
-            ("_KNOWN_TRACKED_DEBT", m, n)
-            for m, entries in _KNOWN_TRACKED_DEBT.items()
             for n in entries
         ],
     )
