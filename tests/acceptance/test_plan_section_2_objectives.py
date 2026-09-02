@@ -367,13 +367,19 @@ class TestAttribution:
 
     def test_the_attribution_table_has_five_rows(self, tmp_path) -> None:
         clause = "plan §2 row 5 / §4.5"
+        # R and M's TRUE rank IC, reduced from shadow.v2's settled cross-sections
+        # rather than a plan_row-annotated excess-return stand-in, is what
+        # alpha-engine-config-I9778 landed — a historical citation, not a phase
+        # pointer, so it stays in this comment rather than in the requirement
+        # text below (alpha-engine-config-I9839 forbids a hardcoded tracker
+        # literal in a clause's live failure-message text).
         requirement = (
             "`crucible report` writes report/{trading_day}/attribution.json with five "
             "MetricRecord rows — data freshness/coverage, signal IC (R), prediction IC "
             "(M), portfolio alpha (S), execution shortfall — each with value, ci, n, "
             "baseline and status. R and M are a TRUE rank IC reduced from shadow.v2's "
-            "settled cross-sections (alpha-engine-config-I9778), not a plan_row-annotated "
-            "excess-return stand-in — plan_row no longer exists."
+            "settled cross-sections, not a plan_row-annotated excess-return stand-in "
+            "— plan_row no longer exists."
         )
         from crucible.cli import HANDLERS
         from crucible.report import ROWS
@@ -740,11 +746,14 @@ class TestFaultInjection:
                 "operator was told once."
             )
         seam = self.SEAMS[fault]
+        # The historical issue this shape of defect was found under is cited
+        # on the `SEAMS` comment above and this method's own docstring — not
+        # restated in this assert message, per alpha-engine-config-I9839.
         assert called & seam, (
             f"{cls.__name__} never calls into {sorted(seam)}. A fault raised "
             "directly inside the test body — `raise RuntimeError('...')` — cannot "
             "fail because of a defect in the production module it claims to "
-            "exercise; alpha-engine-config-I9780 is exactly that shape, twice."
+            "exercise; SEAMS names exactly that shape, twice."
         )
 
 

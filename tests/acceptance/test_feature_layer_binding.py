@@ -82,8 +82,10 @@ def _unmet(exc: BaseException | None = None) -> NoReturn:
             "therefore an INTERFACE MISMATCH between a landed producer and a landed "
             "consumer, NOT an unimplemented producer: read the failure below against "
             "`crucible/schemas/feature_registry.v1.json`, which is the declared "
-            "contract both sides are held to, and fix the side that departs from it "
-            "(see this function's docstring for the issue that first found this)."
+            "contract both sides are held to, and fix the side that departs from it. "
+            f"This clause is tracked under crucible v2 phase {_PHASE1.number}, "
+            f"{_PHASE1.tracker} — see this function's docstring for the specific "
+            "issue that first found this mismatch."
         )
     detail = f"\n  Blocked on: {exc!r}" if exc is not None else ""
     pytest.fail(
