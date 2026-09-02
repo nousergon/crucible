@@ -35,11 +35,20 @@ on:
     # on `push`, where nothing is waiting on the result. The extra runs are
     # metered while the repo is private, and cost a few minutes a month
     # against the §4.11 budget.
-  # The acceptance gate's second arm. `push: [main]` grades the reading minutes
-  # after a merge; this catches what no merge can see — a clause whose subject
-  # is live infrastructure changing out of band. Both arms exclude the PR path.
-  schedule:
-    - cron: '17 13 * * *'
+  # NO `schedule:`, deliberately, and this is worth reading before adding one.
+  #
+  # A daily arm is the right shape for a gate with a live-state clause: it
+  # catches what no merge can see, an account changing out of band. But the
+  # `acceptance` job below holds `permissions: {contents: read}` — no OIDC, no
+  # AWS credentials — so its one live-state clause (`TestCost`) cannot reach
+  # the account at all and lands in the same UNMET branch a genuine failure
+  # would. A cron here would regrade an unchanged tree against an unchanged
+  # lockfile and return the same reading every day, forever: metered minutes
+  # on a private repo buying a signal it is not able to produce.
+  #
+  # `alpha-engine-config-I9828` gives the job read-only OIDC and makes
+  # UNMEASURABLE a distinct outcome from UNMET. The cron belongs in that
+  # change, where it starts measuring something, not in this one.
 
 # Default-deny at the workflow level; each job re-grants only what it needs.
 # `contents: read` is NOT optional while this repo is private: with no
@@ -49,11 +58,10 @@ on:
 permissions: {}
 
 concurrency:
-  # The event name is part of the group. With `ci-${{ github.ref }}` alone, a
-  # scheduled run and a push to main share one group on `refs/heads/main`, so a
-  # merge landing inside the daily window CANCELS the scheduled reading — and a
-  # cancelled run is neither green nor red, which is the one outcome nothing
-  # notices.
+  # The event name is part of the group so that two arms sharing a ref never
+  # cancel each other — a cancelled run is neither green nor red, which is the
+  # one outcome nothing notices. There is no scheduled arm today (see above),
+  # but the group is written so adding one does not silently reintroduce that.
   group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
@@ -61,8 +69,6 @@ jobs:
   test:
     name: lint + foundation tests
     runs-on: ubuntu-latest
-    # Grades the tree, so it has nothing to say on the schedule arm.
-    if: github.event_name != 'schedule'
     timeout-minutes: 10
     permissions:
       contents: read
@@ -122,9 +128,9 @@ jobs:
     # single failure, and merging any of them required a human to decide, per
     # PR, that a red check did not count.
     #
-    # The reading is not lost — it moves to `push: [main]` plus the daily
-    # schedule above, which is where a phase gate belongs: graded minutes after
-    # each merge, and swept daily for the clauses only live state can answer.
+    # The reading is not lost — it moves to `push: [main]`, which is where a
+    # phase gate belongs: graded minutes after each merge, with a deploy behind
+    # it, rather than attributed to an author who cannot change the answer.
     if: github.event_name != 'pull_request'
     timeout-minutes: 10
     permissions:
@@ -142,15 +148,17 @@ jobs:
     # pass/fail on the suite — a suite red by design would page forever, which
     # is the desensitisation this whole PR removes. It grades the READING
     # against `tests/acceptance/ratchet.json` and fails the RUN on any
-    # movement: fewer clauses met is a regression, more is progress that was
-    # not recorded, and a different collected count is a clause added, removed
-    # or failing to import.
+    # movement of the SET of unmet clauses — a clause that regressed, a clause
+    # that started passing without the ratchet moving with it, or a change in
+    # how many clauses exist. The set, not a count: one clause going green
+    # while another regresses leaves a count unchanged, and a scalar
+    # comparison then reports "unchanged" on the day something broke.
     #
     # Without this the arm was structurally incapable of signalling: a
-    # job-level `continue-on-error` reports the RUN as success, so GitHub's
-    # scheduled-failure mail never fires, and the reading existed only in a
-    # step summary nobody opens. A component emitting nothing is not healthy,
-    # it is unobserved (principle 7).
+    # job-level `continue-on-error` reports the RUN as success while the job
+    # is red, so nothing downstream — mail, notify job, or a human reading the
+    # runs list — can tell. A component emitting nothing is not healthy, it is
+    # unobserved (principle 7).
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 

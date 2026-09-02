@@ -14,23 +14,32 @@ those landed and did not carry one, so the acceptance gate — which calls
 life and made every one of them read red (measured 2026-09-02: seven open
 Dependabot PRs, all UNSTABLE on that single check).
 
-**This guard is an ALLOWLIST, and that is load-bearing.** The first version
-matched a list of live-state markers (`aws `, `boto3`, `tests/acceptance`) in
-each step's `run:` body. Six shapes walked straight past it, all demonstrated:
-a job-level `uses:` reusable workflow (no `steps` to scan at all), a marker
-passed in `with:` instead of `run:`, a marker behind a called shell script, a
-tab instead of the space in `"aws "`, an `aws-actions/configure-aws-credentials`
-step followed by a `crucible` command that reaches S3, and `pull_request_target`
-(which the trigger check missed entirely, and which is *more* dangerous because
-it runs with base-repo secrets).
+**The allowlist is the primary control, and it is load-bearing.** The first
+version of this guard matched live-state markers (`aws `, `boto3`,
+`tests/acceptance`) in each step's `run:` body. Six shapes walked straight past
+it, all demonstrated: a job-level `uses:` reusable workflow with no steps to
+scan, a marker in `with:` rather than `run:`, a marker behind a called script, a
+tab instead of the space in `"aws "`, configure-aws-credentials plus a
+`crucible` command reaching S3, and `pull_request_target`. A marker list is a
+list of the known-bad that only ever grows — the structure `AGENTS.md` rule 4
+and plan §11.1 forbid for suppression collections. So the question is inverted:
+every job reachable on a PR event is live-state UNTIL it is named in
+`PR_REACHABLE_JOBS` with a reason.
 
-A marker list is a list of the known-bad that only ever grows — the exact
-structure `AGENTS.md` rule 4 and plan §11.1 forbid for suppression collections.
-Shipping one as the enforcement mechanism for a policy rule is that defect
-wearing a different hat. So the question is inverted: every job reachable on a
-PR is live-state UNTIL it is named here as grading the tree. Adding a job means
-adding a line to `PR_REACHABLE_JOBS` and saying why, which is a decision someone
-makes deliberately rather than a filter someone slips past.
+**The marker scan is kept as a second layer INSIDE allowlisted jobs.** The
+allowlist says a job may run on a PR; it cannot say that every step someone
+adds to that job later still grades the tree. An allowlist alone let a
+`run: aws s3 ls` inserted into `ci.yml:test` pass, which the old denylist
+caught. Neither layer is sufficient; both are cheap.
+
+**`pull_request_target` is held to the same rule, and needs its own exclusion
+string.** On a `pull_request_target` event `github.event_name` is
+`'pull_request_target'`, so `github.event_name != 'pull_request'` evaluates
+TRUE and the job runs. An earlier version of this file accepted that expression
+as an exclusion on any workflow, which meant the guard failed open on the one
+trigger it claims to hold most tightly — the one that runs with base-repo
+write-scoped secrets. The exclusion must cover every PR event the workflow
+actually declares.
 """
 
 from __future__ import annotations
@@ -45,17 +54,36 @@ WORKFLOW_DIR = pathlib.Path(__file__).resolve().parents[1] / ".github" / "workfl
 WORKFLOWS = sorted(p for p in WORKFLOW_DIR.glob("*.y*ml") if p.suffix in {".yml", ".yaml"})
 
 # `pull_request_target` runs with base-repo write-scoped secrets, so it is the
-# trigger someone reaches for when they want AWS credentials on a PR. It is
-# held to the same rule, not a laxer one.
+# trigger someone reaches for when they want AWS credentials on a PR.
 PR_EVENTS = frozenset({"pull_request", "pull_request_target"})
 
-# The exact `if:` expression that takes a job off the PR path. Compared as a
-# whole string, not as a substring: `... != 'pull_request' || <anything>` is a
-# disjunction that runs on PRs, and a substring test passes it.
-PR_EXCLUSION = "github.event_name != 'pull_request'"
+_BOTH = '!contains(fromJSON(\'["pull_request","pull_request_target"]\'), github.event_name)'
+
+
+def _exclusions_for(events: frozenset[str]) -> set[str]:
+    """`if:` expressions that provably keep a job off every PR event present.
+
+    An expression naming one event does not exclude the other, which is the
+    hole this function exists to close.
+    """
+    single = {event: f"github.event_name != '{event}'" for event in sorted(events)}
+    accepted = {_BOTH}
+    if len(events) == 1:
+        accepted.add(next(iter(single.values())))
+    else:
+        accepted.add(" && ".join(single[event] for event in sorted(events)))
+    return accepted | {"${{ " + form + " }}" for form in accepted}
+
+
+# A step whose `run:` body matches any of these is reading state that lives
+# outside the tree under review. Second layer only: the allowlist above is what
+# actually decides reachability. `gh api` is deliberately absent — the
+# adversarial-review gate reads the state of the pull request it runs on, which
+# IS the subject under review.
+LIVE_STATE_MARKERS = ("aws", "boto3", "cloudformation")
 
 #: `<workflow>:<job>` pairs that may run on a PR because their subject is the
-#: tree under review. Every entry names why. Nothing else may run on a PR.
+#: tree, or the pull request itself. Every entry names why.
 PR_REACHABLE_JOBS: dict[str, str] = {
     "ci.yml:test": (
         "lint, format, the foundation suite, and `--collect-only` over "
@@ -77,8 +105,11 @@ PR_REACHABLE_JOBS: dict[str, str] = {
         "cannot run on a PR: it `needs: [acceptance]`, and that job is excluded "
         "from the PR path, so it is skipped. Its `if:` is a compound "
         "`failure() && ...` expression, which this guard deliberately refuses "
-        "to read as an exclusion — a disjunction there would run on PRs and a "
-        "substring test would wave it through — so it is named here instead."
+        "to read as an exclusion, so it is named here instead. The two "
+        "properties that make it safe are asserted by "
+        "`test_the_notify_job_still_depends_on_the_excluded_job`, because an "
+        "allowlist keyed on a job NAME otherwise lets that job be repurposed "
+        "into something else entirely."
     ),
 }
 
@@ -97,11 +128,27 @@ def _events(workflow: dict) -> set[str]:
     raise AssertionError(f"unparseable `on:` block: {on!r}")
 
 
-def _excluded_from_pull_request(job: dict) -> bool:
-    condition = str(job.get("if", "")).strip()
-    # Accept the bare expression and the `${{ ... }}` wrapping of it, and
-    # nothing else. A compound condition is not an exclusion.
-    return condition in {PR_EXCLUSION, "${{ " + PR_EXCLUSION + " }}"}
+def _excluded(job: dict, pr_events: frozenset[str]) -> bool:
+    # Whole-string comparison, not a substring test: `... != 'pull_request' ||
+    # <anything>` is a disjunction that runs on PRs, and a substring test waves
+    # it through.
+    return str(job.get("if", "")).strip() in _exclusions_for(pr_events)
+
+
+def _live_state_steps(job: dict) -> list[str]:
+    hits = []
+    for step in job.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        run = (step.get("run") or "").lower()
+        # Word-boundary-ish: split on shell punctuation so `aws\tfoo`, `aws;`
+        # and `aws` alone all match while `awslogs` does not.
+        words = set(run.replace("\t", " ").replace(";", " ").replace("|", " ").split())
+        for marker in LIVE_STATE_MARKERS:
+            if any(word == marker or word.startswith(f"{marker}.") for word in words):
+                hits.append(f"{step.get('name', '<unnamed step>')}: runs `{marker}`")
+                break
+    return hits
 
 
 def test_at_least_one_workflow_is_scanned() -> None:
@@ -124,22 +171,55 @@ def test_every_allowlisted_job_still_exists() -> None:
     )
 
 
+def test_the_notify_job_still_depends_on_the_excluded_job() -> None:
+    """The allowlist is keyed on a job NAME, so the name can be repurposed.
+
+    `ci.yml:notify-main-failure` is allowlisted on the strength of two
+    properties: it depends on a job that is excluded from the PR path, and it
+    only runs on failure. Rewriting the job body while keeping the name would
+    inherit the exemption. Assert the properties, not the name.
+    """
+    workflow = yaml.safe_load((WORKFLOW_DIR / "ci.yml").read_text())
+    job = workflow["jobs"]["notify-main-failure"]
+    assert "acceptance" in (job.get("needs") or []), (
+        "notify-main-failure no longer depends on `acceptance`, which is what "
+        "keeps it off the PR path. Re-derive its allowlist entry."
+    )
+    condition = str(job.get("if", ""))
+    assert "failure()" in condition, (
+        "notify-main-failure no longer runs only on failure; its allowlist entry claims it does."
+    )
+
+
 @pytest.mark.parametrize("path", WORKFLOWS, ids=lambda p: p.name)
 def test_no_live_state_job_runs_on_the_pull_request_path(path: pathlib.Path) -> None:
     workflow = yaml.safe_load(path.read_text())
-    if not (_events(workflow) & PR_EVENTS):
+    pr_events = frozenset(_events(workflow) & PR_EVENTS)
+    if not pr_events:
         return
 
     for name, job in (workflow.get("jobs") or {}).items():
         key = f"{path.name}:{name}"
-        if key in PR_REACHABLE_JOBS or _excluded_from_pull_request(job):
+        if _excluded(job, pr_events):
+            continue
+        if key in PR_REACHABLE_JOBS:
+            # Second layer: allowlisted for its subject, still not licensed to
+            # reach live AWS in a step someone adds later.
+            hits = _live_state_steps(job)
+            assert not hits, (
+                f"{key} is allowlisted as grading the tree, but a step reads live "
+                f"state:\n  " + "\n  ".join(hits) + "\n"
+                "Move that step to a job off the PR path — the allowlist entry "
+                "covers the job's stated subject, not anything later added to it."
+            )
             continue
         pytest.fail(
-            f"{key} can run on a pull request and is not declared as grading the "
-            "tree.\nscm-platform-policy.md §3.1 (Brian ruling 2026-08-10): a check "
-            "grades the diff; a check whose subject is live infrastructure does not "
-            "belong on the pull_request path at all.\n"
-            "Either move it to `push: [main]` plus a schedule, give the job "
-            f"`if: {PR_EXCLUSION}` exactly, or — if its subject genuinely is the "
-            f"diff — add `{key}` to PR_REACHABLE_JOBS in this file with the reason."
+            f"{key} can run on {sorted(pr_events)} and is not declared as grading "
+            "the tree.\nscm-platform-policy.md §3.1 (Brian ruling 2026-08-10): a "
+            "check grades the diff; a check whose subject is live infrastructure "
+            "does not belong on the pull_request path at all.\n"
+            "Either move it to `push: [main]` plus a schedule, give the job one of "
+            f"these exact `if:` expressions — {sorted(_exclusions_for(pr_events))} — "
+            f"or, if its subject genuinely is the diff, add `{key}` to "
+            "PR_REACHABLE_JOBS in this file with the reason."
         )
