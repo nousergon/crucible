@@ -75,8 +75,10 @@ import json
 import math
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from jsonschema import Draft202012Validator
 from nousergon_lib.arena.engine import (
     ArenaCycle,
     ServingPrecondition,
@@ -302,6 +304,41 @@ def produce_shadow(
 CROSS_SECTION_SCHEMA_VERSION = "cross_section.v2"
 CROSS_SECTION_SETTLED_SCHEMA_VERSION = "cross_section_settled.v2"
 
+_SCHEMA_DIR = Path(__file__).parent.parent / "schemas"
+
+
+def _validator_for(schema_filename: str) -> Draft202012Validator:
+    path = _SCHEMA_DIR / schema_filename
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{schema_filename} missing at {path}. It ships inside the package; a "
+            "missing schema means a broken build, not a degraded write."
+        )
+    schema = json.loads(path.read_text(encoding="utf-8"))
+    Draft202012Validator.check_schema(schema)
+    return Draft202012Validator(schema)
+
+
+def _validate_cross_section_document(schema_filename: str, payload: dict[str, Any]) -> None:
+    """Raise with every error, never just the first — same shape as
+    `crucible.release._validate_release_artifact`, the house pattern for "a
+    writer must not be able to emit a non-conformant document"
+    (`alpha-engine-config-I9814`). A schema checked only inside a test is a
+    schema one future producer can silently drift from; validated here, on
+    the way OUT of :meth:`ScoredCrossSection.__post_init__` and
+    :func:`write_cross_section_settled`, a non-conformant `shadow.v2`
+    document cannot exist as either artifact at all."""
+    errors = sorted(
+        _validator_for(schema_filename).iter_errors(payload), key=lambda e: list(e.absolute_path)
+    )
+    if not errors:
+        return
+    detail = "\n".join(
+        f"  - {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors
+    )
+    raise ValueError(f"{schema_filename}: document does not conform:\n{detail}")
+
+
 #: The floor below which a single date's rank correlation is not computed at
 #: all — the date contributes no observation to the IC series rather than a
 #: noisy one. A Spearman correlation over 2-4 paired names is dominated by
@@ -350,6 +387,16 @@ class ScoredCrossSection:
     arm_id: str
     trading_day: str
     ranks: tuple[tuple[str, float, int], ...]
+
+    def __post_init__(self) -> None:
+        # Validated on CONSTRUCTION, the same shape `crucible.release`
+        # adopted for `ReleaseRecord`/`ReleaseProvenance`
+        # (`alpha-engine-config-I9814`): a document that fails
+        # `cross_section.v2.json` cannot exist as a `ScoredCrossSection` at
+        # all, so `produce_cross_section` — or any future producer — is
+        # refused at the moment it builds one rather than at whichever call
+        # site later happens to validate it.
+        _validate_cross_section_document(f"{CROSS_SECTION_SCHEMA_VERSION}.json", self.to_dict())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -447,6 +494,19 @@ def settle_cross_section(
 def write_cross_section_settled(
     store: Store, *, arm_id: str, trading_day: str, document: dict[str, Any]
 ) -> bytes:
+    """Write `cross_section_settled.json`, validated against its schema first.
+
+    `settle_cross_section` returns a plain dict rather than a dataclass —
+    the join is a per-call reduction, not a value with an identity worth
+    naming — so there is no `__post_init__` to hook the way
+    :class:`ScoredCrossSection` does. The check moves here instead, on the
+    WRITE path, so it still runs whether ``document`` came from
+    :func:`settle_cross_section` or from a future producer that never calls
+    it: the same "a writer must not emit a non-conformant document" rule
+    (`alpha-engine-config-I9814`), applied at the one place every settled
+    cross-section must pass through before it becomes durable.
+    """
+    _validate_cross_section_document(f"{CROSS_SECTION_SETTLED_SCHEMA_VERSION}.json", document)
     payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
     store.put_bytes(cross_section_settled_key(arm_id, trading_day), payload)
     return payload

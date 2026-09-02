@@ -518,16 +518,15 @@ class TestRankICRow:
         constant_section = tuple(
             (ticker, 1.0, realized) for ticker, _score, realized in _PERFECT_RANK_SECTION
         )
-        _write_cross_sections_settled(
-            store, ARM, ["2026-07-09"], ranks=constant_section
-        )
+        _write_cross_sections_settled(store, ARM, ["2026-07-09"], ranks=constant_section)
         document, _ = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
         row = next(r for r in document["rows"] if r["name"] == "signal_rank_ic_r")
         assert row["n_samples"] == 5, "the degenerate date must not increment n"
         assert row["status"] != "GREEN", "no data must never render as GREEN"
         assert row["status"] == "WATCH"
-        assert "degenerate" in row["status_reason"] or "undefined correlation" in (
-            row["status_reason"]
+        assert (
+            "degenerate" in row["status_reason"]
+            or "undefined correlation" in (row["status_reason"])
         )
 
 
