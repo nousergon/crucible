@@ -21,6 +21,7 @@ from crucible.components import Component, load_registry
 from crucible.console.classify import STATES, Classification, classify
 from crucible.gate import LADDER_KEY, LADDER_STATES, build_ladder
 from crucible.gate import validate_ladder_document as _validate_ladder_document
+from crucible.keys import champion_key
 from crucible.manifest import manifest_prefix
 from crucible.store import Store
 
@@ -280,7 +281,13 @@ def _champions(store: Store) -> dict[str, Any]:
     """
     out: dict[str, Any] = {}
     for slot in ("u", "r", "m", "s"):
-        key = f"champions/{slot}/current.json"
+        # `keys.champion_key`, not a restatement of its shape. Handed over
+        # from the I9807 sweep, which fixed the other five instances and could
+        # not touch this file while this branch owned it. The module's own
+        # docstring is the argument: "a key format restated at each call site
+        # is a contract restated fifty times, and one of them has already
+        # drifted" — and one of them had, in `explain.py`.
+        key = champion_key(slot)
         payload = _read_json(store, key)
         out[slot] = payload if payload else None
     return out
