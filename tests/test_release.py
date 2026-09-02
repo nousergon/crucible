@@ -12,13 +12,18 @@ import pytest
 
 from crucible.release import (
     POINTER_KEY,
+    RELEASE_PROVENANCE_SCHEMA_VERSION,
+    RELEASE_SCHEMA_VERSION,
     TRADER_PIN_KEY,
     ReleaseImmutabilityError,
+    ReleaseProvenance,
+    ReleaseRecord,
     StaleReleasePointerError,
     assert_immutable_write,
     current_release,
     flip_on_smoke,
     pin,
+    provenance_key,
     publish_release,
     read_pointer,
     release_json_key,
@@ -35,12 +40,14 @@ class _FakeS3Client:
     """Just enough of the boto3 S3 surface for the Object Lock test below.
 
     Deliberately NOT `tests/conftest.py`'s `FakeS3` fixture: this module owns
-    only `crucible/release.py`'s tests, and `put_object_retention` is not
-    part of that shared fake's boto3 surface (its owner is a sibling change
-    in this same issue's session) — adding it there would edit a fixture
-    other tests in this suite depend on. This fake exists to prove one
-    thing: that `PutObjectRetention` is actually requested on the object,
-    not merely that the bucket-level flag exists (the issue's Gotcha).
+    only `crucible/release.py`'s tests, and Object Lock kwargs on `put_object`
+    are not part of that shared fake's boto3 surface — adding them there
+    would edit a fixture other tests in this suite depend on. This fake
+    exists to prove one thing: that `ObjectLockMode` / `ObjectLockRetainUntilDate`
+    are requested ON THE SAME `put_object` call that writes the bytes
+    (alpha-engine-config-I9787), not via a separate follow-up call — there is
+    no `put_object_retention` method here at all, so a source path that still
+    called it would fail with an `AttributeError`, not silently no-op.
     """
 
     def __init__(self) -> None:
@@ -49,6 +56,15 @@ class _FakeS3Client:
 
     def put_object(self, **kw) -> dict:
         self.objects[kw["Key"]] = kw["Body"]
+        # The I9787 fix: the lock rides ON the PUT itself. There is no
+        # `put_object_retention` method on this fake any more — a call to it
+        # would be an AttributeError, which is a stronger proof that nothing
+        # in the source calls it than merely asserting it was not invoked.
+        if "ObjectLockMode" in kw or "ObjectLockRetainUntilDate" in kw:
+            self.retentions[kw["Key"]] = {
+                "Mode": kw.get("ObjectLockMode"),
+                "RetainUntilDate": kw.get("ObjectLockRetainUntilDate"),
+            }
         return {"ETag": '"fake"'}
 
     def get_object(self, **kw) -> dict:
@@ -67,10 +83,6 @@ class _FakeS3Client:
 
             raise ClientError({"Error": {"Code": "404"}}, "head_object")
         return {"ETag": '"fake"'}
-
-    def put_object_retention(self, **kw) -> dict:
-        self.retentions[kw["Key"]] = kw["Retention"]
-        return {}
 
 
 def _published(store, sha=SHA_A):
@@ -148,7 +160,7 @@ class TestObjectLock:
         _published(store)
         for key in (wheel_key(SHA_A), release_json_key(SHA_A)):
             s3_key = f"crucible/{key}"
-            assert s3_key in client.retentions, f"no PutObjectRetention requested for {key}"
+            assert s3_key in client.retentions, f"no Object Lock requested on the PUT for {key}"
             retention = client.retentions[s3_key]
             assert retention["Mode"] == "GOVERNANCE"
             assert retention["RetainUntilDate"] > dt.datetime(2026, 8, 28, 21, 0, tzinfo=dt.UTC)
@@ -350,6 +362,80 @@ class TestImmutability:
         _published(store)  # same bytes, same `now` — must not raise
         assert store.exists(wheel_key(SHA_A))
 
+    def test_a_republish_with_different_provenance_is_still_a_no_op(self, tmp_path) -> None:
+        """alpha-engine-config-I9786, reproduced exactly. Live evidence: run
+        33572214728 published, smoked and flipped; the immediate re-run of
+        the SAME commit failed with a `ReleaseImmutabilityError` even though
+        the wheel was byte-identical, because `release.json` carried
+        `built_at`, `workflow_run_url` and `test_summary` — three fields
+        that move on every run. A `workflow_dispatch` re-run never repeats
+        `now`, the run id or the test line; this asserts a re-run that
+        varies exactly those three (and nothing else) is a clean no-op, not
+        the guaranteed failure that was measured live."""
+        store = LocalStore(tmp_path)
+        publish_release(
+            store,
+            sha=SHA_A,
+            wheel=b"PK\x03\x04 wheel bytes",
+            lockfile=b"# uv.lock",
+            test_summary="42 passed",
+            workflow_run_url="https://github.com/nousergon/crucible/actions/runs/33572214728",
+            run_id="33572214728",
+            run_attempt="1",
+            now=dt.datetime(2026, 9, 1, 23, 4, 28, tzinfo=dt.UTC),
+        )
+        original_release_json = store.get_bytes(release_json_key(SHA_A))
+        original_wheel = store.get_bytes(wheel_key(SHA_A))
+        # A second, immediate `workflow_dispatch`: same commit, same wheel
+        # bytes, but a different run id, a different instant and a different
+        # (still-passing) test line — must NOT raise.
+        publish_release(
+            store,
+            sha=SHA_A,
+            wheel=b"PK\x03\x04 wheel bytes",
+            lockfile=b"# uv.lock",
+            test_summary="42 passed   [100%]",
+            workflow_run_url="https://github.com/nousergon/crucible/actions/runs/33572299999",
+            run_id="33572299999",
+            run_attempt="1",
+            now=dt.datetime(2026, 9, 1, 23, 6, 0, tzinfo=dt.UTC),
+        )
+        assert store.get_bytes(release_json_key(SHA_A)) == original_release_json
+        assert store.get_bytes(wheel_key(SHA_A)) == original_wheel
+        # Both attempts are reconstructible: two provenance records, not one
+        # overwriting the other.
+        first = json.loads(store.get_bytes(provenance_key(SHA_A, "33572214728", "1")))
+        second = json.loads(store.get_bytes(provenance_key(SHA_A, "33572299999", "1")))
+        assert first["workflow_run_url"].endswith("33572214728")
+        assert second["workflow_run_url"].endswith("33572299999")
+        assert first["test_summary"] != second["test_summary"]
+
+    def test_a_republish_with_genuinely_different_bytes_still_raises(self, tmp_path) -> None:
+        """The other half of I9786: the guard is correct and must not be
+        weakened. Two different run ids AND a rebuilt wheel — this is the
+        "differing wheel for a published sha" case the issue says stays the
+        hard error it is today."""
+        store = LocalStore(tmp_path)
+        publish_release(
+            store,
+            sha=SHA_A,
+            wheel=b"wheel one",
+            lockfile=b"lock",
+            test_summary="ok",
+            workflow_run_url="https://…/runs/1",
+            run_id="1",
+        )
+        with pytest.raises(ReleaseImmutabilityError):
+            publish_release(
+                store,
+                sha=SHA_A,
+                wheel=b"wheel TWO, genuinely different",
+                lockfile=b"lock",
+                test_summary="ok",
+                workflow_run_url="https://…/runs/2",
+                run_id="2",
+            )
+
     def test_the_comparison_is_on_the_bytes_not_on_a_recorded_digest(self, tmp_path) -> None:
         """The thing being protected is precisely the case where a recorded
         claim and the object have diverged, so a digest the writer supplies
@@ -360,3 +446,145 @@ class TestImmutability:
         assert assert_immutable_write(store, "releases/absent", b"one") is True
         with pytest.raises(ReleaseImmutabilityError):
             assert_immutable_write(store, "releases/x", b"two")
+
+
+class TestIdentityProvenanceSplit:
+    """alpha-engine-config-I9786's shape, asserted directly: `release.json`
+    carries only what is a deterministic function of the commit; the fields
+    that move on every run live in a separate, per-attempt provenance
+    record that is never immutable-checked."""
+
+    def test_release_json_carries_no_provenance_field(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _published(store)
+        payload = json.loads(store.get_bytes(release_json_key(SHA_A)))
+        for field_name in ("built_at", "workflow_run_url", "test_summary"):
+            assert field_name not in payload, (
+                f"{field_name!r} moved to release_provenance.v1 (I9786) and must not "
+                "reappear in the immutable identity record — its presence is exactly "
+                "what made two builds of the same commit byte-unequal."
+            )
+        assert payload["schema_version"] == RELEASE_SCHEMA_VERSION == "release.v2"
+
+    def test_provenance_carries_the_three_fields_that_moved(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        publish_release(
+            store,
+            sha=SHA_A,
+            wheel=b"w",
+            lockfile=b"l",
+            test_summary="42 passed",
+            workflow_run_url="https://…/runs/9",
+            run_id="9",
+        )
+        payload = json.loads(store.get_bytes(provenance_key(SHA_A, "9", "1")))
+        assert payload["built_at"]
+        assert payload["workflow_run_url"] == "https://…/runs/9"
+        assert payload["test_summary"] == "42 passed"
+        assert payload["schema_version"] == RELEASE_PROVENANCE_SCHEMA_VERSION
+
+    def test_a_provenance_key_requires_a_non_empty_run_id_and_attempt(self) -> None:
+        with pytest.raises(ValueError, match="run_id"):
+            provenance_key(SHA_A, "", "1")
+        with pytest.raises(ValueError, match="run_attempt"):
+            provenance_key(SHA_A, "9", "")
+
+    def test_publish_validates_the_identity_record_against_its_own_schema(self, tmp_path) -> None:
+        """M0 discipline: a writer that could emit a non-conformant document
+        would defeat the schema this module ships alongside it — the same
+        contract test crucible.champion and crucible.manifest carry for
+        their own artifact shapes."""
+        from crucible.release import _validate_release_artifact
+
+        store = LocalStore(tmp_path)
+        _published(store)
+        payload = json.loads(store.get_bytes(release_json_key(SHA_A)))
+        _validate_release_artifact("release.v2.json", payload)  # must not raise
+        bad = dict(payload)
+        bad["sha"] = "not-a-sha"
+        with pytest.raises(ValueError, match="does not conform"):
+            _validate_release_artifact("release.v2.json", bad)
+
+    def test_publish_validates_the_provenance_record_against_its_own_schema(self, tmp_path) -> None:
+        from crucible.release import _validate_release_artifact
+
+        store = LocalStore(tmp_path)
+        publish_release(
+            store,
+            sha=SHA_A,
+            wheel=b"w",
+            lockfile=b"l",
+            test_summary="",
+            workflow_run_url="",
+            run_id="1",
+        )
+        payload = json.loads(store.get_bytes(provenance_key(SHA_A, "1", "1")))
+        _validate_release_artifact("release_provenance.v1.json", payload)  # must not raise
+        bad = dict(payload)
+        del bad["run_id"]
+        with pytest.raises(ValueError, match="does not conform"):
+            _validate_release_artifact("release_provenance.v1.json", bad)
+
+
+class TestValidationIsStructuralNotPerCaller:
+    """alpha-engine-config-I9814's blocking finding: the two schemas were
+    enforced only inside `publish_release`, a function with zero non-test
+    callers — `crucible.deploy._publish`, the writer `deploy.yml` actually
+    invokes, built both records by dataclass kwargs and never validated.
+
+    The fix moves validation onto the dataclasses themselves
+    (`ReleaseRecord.__post_init__` / `ReleaseProvenance.__post_init__`), so
+    the property to assert is not "the writers I know about validate" —
+    that was already true of `publish_release` and the finding still landed
+    — it is "constructing either dataclass validates, independent of the
+    call site". These tests construct the dataclasses DIRECTLY, the way a
+    future third writer nobody has reviewed yet would, without going
+    through `publish_release` or `crucible.deploy` at all. If a future
+    change moves validation back onto a specific function instead of the
+    type, these fail — which is the point: the type is the only call site
+    that cannot be skipped by writing a new one.
+    """
+
+    def test_constructing_a_release_record_directly_validates(self) -> None:
+        with pytest.raises(ValueError, match="does not conform"):
+            ReleaseRecord(
+                schema_version="release.v99",
+                sha=SHA_A,
+                lockfile_sha256="z" * 64,
+                wheel_sha256="a" * 64,
+                python_requires="",
+            )
+
+    def test_constructing_a_release_provenance_directly_validates(self) -> None:
+        with pytest.raises(ValueError, match="does not conform"):
+            ReleaseProvenance(
+                schema_version="nonsense.v0",
+                sha=SHA_A,
+                run_id="1",
+                run_attempt="1",
+                built_at="not-a-timestamp",
+                workflow_run_url="",
+                test_summary="",
+            )
+
+    def test_a_conformant_construction_of_both_still_succeeds(self) -> None:
+        """The structural guard must not become a suppression collection of
+        its own — a correct document still constructs cleanly."""
+        record = ReleaseRecord(
+            schema_version=RELEASE_SCHEMA_VERSION,
+            sha=SHA_A,
+            lockfile_sha256="0" * 64,
+            wheel_sha256="1" * 64,
+            python_requires=">=3.12,<3.13",
+        )
+        assert record.sha == SHA_A
+        provenance = ReleaseProvenance(
+            schema_version=RELEASE_PROVENANCE_SCHEMA_VERSION,
+            sha=SHA_A,
+            run_id="1",
+            run_attempt="1",
+            built_at="2026-08-28T21:00:00Z",
+            workflow_run_url="https://…/runs/1",
+            test_summary="42 passed",
+        )
+        assert provenance.sha == SHA_A

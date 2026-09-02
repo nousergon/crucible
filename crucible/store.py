@@ -79,8 +79,28 @@ class Store(ABC):
     """
 
     @abstractmethod
-    def put_bytes(self, key: str, payload: bytes) -> str:
-        """Write ``payload`` at ``key``; return its sha256 hex digest."""
+    def put_bytes(
+        self,
+        key: str,
+        payload: bytes,
+        *,
+        object_lock_mode: str | None = None,
+        object_lock_retain_until: dt.datetime | None = None,
+    ) -> str:
+        """Write ``payload`` at ``key``; return its sha256 hex digest.
+
+        ``object_lock_mode`` / ``object_lock_retain_until`` request S3 Object
+        Lock retention on THIS write, atomically with the bytes
+        (alpha-engine-config-I9787) — never as a follow-up call, which leaves
+        a window in which the object exists published and unlocked. Omitted
+        (both ``None``) means "no retention requested", the ordinary case for
+        every key that is not a locked release artifact.
+
+        A backend that cannot honour a real request refuses rather than
+        silently accepting and discarding it: see :class:`LocalStore`, which
+        has no Object Lock concept and would otherwise make the test suite
+        green over a guarantee the local backend does not provide.
+        """
 
     @abstractmethod
     def get_bytes(self, key: str) -> bytes:
@@ -175,7 +195,22 @@ class LocalStore(Store):
             )
         return self.root / key
 
-    def put_bytes(self, key: str, payload: bytes) -> str:
+    def put_bytes(
+        self,
+        key: str,
+        payload: bytes,
+        *,
+        object_lock_mode: str | None = None,
+        object_lock_retain_until: dt.datetime | None = None,
+    ) -> str:
+        if object_lock_mode is not None or object_lock_retain_until is not None:
+            raise NotImplementedError(
+                f"LocalStore has no Object Lock concept and cannot honour "
+                f"object_lock_mode={object_lock_mode!r} for {key!r}. Accepting and "
+                "silently discarding it would make the test suite green over a "
+                "guarantee the local backend does not provide (alpha-engine-config-"
+                "I9787). Use S3Store for a release publish that needs retention."
+            )
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(payload)
@@ -290,7 +325,19 @@ class S3Store(Store):
     def _error_code(exc: Any) -> str:
         return str(exc.response.get("Error", {}).get("Code", ""))
 
-    def put_bytes(self, key: str, payload: bytes) -> str:
+    def put_bytes(
+        self,
+        key: str,
+        payload: bytes,
+        *,
+        object_lock_mode: str | None = None,
+        object_lock_retain_until: dt.datetime | None = None,
+    ) -> str:
+        lock_kwargs: dict[str, Any] = {}
+        if object_lock_mode is not None:
+            lock_kwargs["ObjectLockMode"] = object_lock_mode
+        if object_lock_retain_until is not None:
+            lock_kwargs["ObjectLockRetainUntilDate"] = object_lock_retain_until
         self.client.put_object(
             Bucket=self.bucket,
             Key=self._s3_key(key),
@@ -299,6 +346,7 @@ class S3Store(Store):
                 "application/json" if key.endswith(".json") else "application/octet-stream"
             ),
             Metadata={"sha256": sha256_hex(payload)},
+            **lock_kwargs,
         )
         return sha256_hex(payload)
 

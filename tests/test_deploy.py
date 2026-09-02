@@ -25,6 +25,7 @@ from crucible.release import (
     ReleaseImmutabilityError,
     current_release,
     pin,
+    provenance_key,
     publish_release,
     read_pointer,
     release_json_key,
@@ -35,7 +36,7 @@ from crucible.store import LocalStore, S3Store, sha256_hex
 
 class _FakeS3Client:
     """Just enough of the boto3 S3 surface to prove `deploy._publish` asks
-    S3 to lock what it writes, per I9782. See `test_release._FakeS3Client`
+    S3 to lock what it writes, per I9782/I9787. See `test_release._FakeS3Client`
     for why this is not `tests/conftest.py`'s shared `FakeS3`."""
 
     def __init__(self) -> None:
@@ -44,6 +45,14 @@ class _FakeS3Client:
 
     def put_object(self, **kw) -> dict:
         self.objects[kw["Key"]] = kw["Body"]
+        # I9787: the lock rides ON the PUT. No `put_object_retention` method
+        # exists on this fake — a source path that still called it separately
+        # would fail with an AttributeError, not silently no-op.
+        if "ObjectLockMode" in kw or "ObjectLockRetainUntilDate" in kw:
+            self.retentions[kw["Key"]] = {
+                "Mode": kw.get("ObjectLockMode"),
+                "RetainUntilDate": kw.get("ObjectLockRetainUntilDate"),
+            }
         return {"ETag": '"fake"'}
 
     def head_object(self, **kw) -> dict:
@@ -52,10 +61,6 @@ class _FakeS3Client:
 
             raise ClientError({"Error": {"Code": "404"}}, "head_object")
         return {"ETag": '"fake"'}
-
-    def put_object_retention(self, **kw) -> dict:
-        self.retentions[kw["Key"]] = kw["Retention"]
-        return {}
 
 
 SHA = "a" * 40
@@ -69,7 +74,8 @@ WHEEL_BYTES = b"PK\x03\x04 a wheel"
 
 
 def _release_json(sha=SHA, *, wheel: bytes = WHEEL_BYTES, wheel_sha256: str | None = None) -> str:
-    """A record that DESCRIBES its wheel.
+    """The DETERMINISTIC identity record (alpha-engine-config-I9786) that
+    DESCRIBES its wheel.
 
     `wheel_sha256` is derived from the bytes rather than stubbed, because a
     fixture that pre-supplies a placeholder digest is a fixture in which the
@@ -79,15 +85,28 @@ def _release_json(sha=SHA, *, wheel: bytes = WHEEL_BYTES, wheel_sha256: str | No
     """
     return json.dumps(
         {
-            "schema_version": "release.v1",
+            "schema_version": "release.v2",
             "sha": sha,
-            "built_at": "2026-08-28T21:00:00Z",
             "lockfile_sha256": "0" * 64,
             "wheel_sha256": wheel_sha256 or sha256_hex(wheel),
-            "test_summary": "42 passed",
-            "workflow_run_url": "https://github.com/nousergon/crucible/actions/runs/1",
             "python_requires": ">=3.12,<3.13",
             "extra": {},
+        }
+    )
+
+
+def _provenance_json(sha=SHA, *, run_id: str = "1", run_attempt: str = "1") -> str:
+    """This attempt's provenance — the three fields that moved out of
+    `release.json` because they change on every rebuild of the same commit."""
+    return json.dumps(
+        {
+            "schema_version": "release_provenance.v1",
+            "sha": sha,
+            "run_id": run_id,
+            "run_attempt": run_attempt,
+            "built_at": "2026-08-28T21:00:00Z",
+            "workflow_run_url": f"https://github.com/nousergon/crucible/actions/runs/{run_id}",
+            "test_summary": "42 passed",
         }
     )
 
@@ -120,12 +139,27 @@ def _write_smoke(store, sha=SHA, status="ok", *, trading_day=None):
 
 
 class TestPublish:
-    def _publish(self, tmp_path, store_dir, *, sha=SHA, wheel=WHEEL_BYTES, release_json=None):
-        wheel_path = tmp_path / f"{sha[:6]}.whl"
+    def _publish(
+        self,
+        tmp_path,
+        store_dir,
+        *,
+        sha=SHA,
+        wheel=WHEEL_BYTES,
+        release_json=None,
+        provenance_json=None,
+        run_id="1",
+        suffix="",
+    ):
+        wheel_path = tmp_path / f"{sha[:6]}{suffix}.whl"
         wheel_path.write_bytes(wheel)
-        meta = tmp_path / f"{sha[:6]}-release.json"
+        meta = tmp_path / f"{sha[:6]}{suffix}-release.json"
         meta.write_text(
             release_json if release_json is not None else _release_json(sha, wheel=wheel)
+        )
+        prov = tmp_path / f"{sha[:6]}{suffix}-provenance.json"
+        prov.write_text(
+            provenance_json if provenance_json is not None else _provenance_json(sha, run_id=run_id)
         )
         return deploy_main(
             [
@@ -138,6 +172,8 @@ class TestPublish:
                 str(wheel_path),
                 "--release-json",
                 str(meta),
+                "--provenance-json",
+                str(prov),
             ]
         )
 
@@ -186,25 +222,45 @@ class TestPublish:
         self._publish(tmp_path, store_dir)
         assert self._publish(tmp_path, store_dir) == 0
 
+    def test_a_workflow_dispatch_rerun_with_a_new_run_id_is_still_a_no_op(self, tmp_path) -> None:
+        """alpha-engine-config-I9786, at the `deploy._publish` layer: a second
+        `workflow_dispatch` for an unchanged commit gets a NEW `run_id` (and a
+        new `built_at`, a new `workflow_run_url`) but the same identity
+        record — that must stay a no-op, and both attempts must be
+        reconstructible from their own provenance record."""
+        store_dir = tmp_path / "store"
+        assert self._publish(tmp_path, store_dir, run_id="33572214728") == 0
+        assert self._publish(tmp_path, store_dir, run_id="33572299999") == 0
+        store = LocalStore(store_dir)
+        assert store.exists(provenance_key(SHA, "33572214728", "1"))
+        assert store.exists(provenance_key(SHA, "33572299999", "1"))
+
     def test_publish_locks_the_wheel_and_release_json_on_s3_but_not_the_pointer(
         self, tmp_path
     ) -> None:
-        """The `deploy._publish` half of I9782: the same Object Lock request
-        `crucible.release.publish_release` makes, made here too, since this
-        is the code path `deploy.yml` actually drives in CI."""
+        """The `deploy._publish` half of I9782/I9787: the same Object Lock
+        request `crucible.release.publish_release` makes, requested ON THE
+        PUT itself, made here too, since this is the code path `deploy.yml`
+        actually drives in CI."""
         wheel_path = tmp_path / "a.whl"
         wheel_path.write_bytes(WHEEL_BYTES)
         meta = tmp_path / "a-release.json"
         meta.write_text(_release_json(SHA, wheel=WHEEL_BYTES))
+        prov = tmp_path / "a-provenance.json"
+        prov.write_text(_provenance_json(SHA))
         client = _FakeS3Client()
         store = S3Store("bucket", "crucible", client=client)
-        args = argparse.Namespace(sha=SHA, wheel=str(wheel_path), release_json=str(meta))
+        args = argparse.Namespace(
+            sha=SHA, wheel=str(wheel_path), release_json=str(meta), provenance_json=str(prov)
+        )
         assert _publish(args, store) == 0
         for key in (wheel_key(SHA), release_json_key(SHA)):
             s3_key = f"crucible/{key}"
             assert s3_key in client.retentions
             assert client.retentions[s3_key]["Mode"] == "GOVERNANCE"
         assert f"crucible/{POINTER_KEY}" not in client.retentions
+        # The provenance object was written too, but never asked to be locked.
+        assert f"crucible/{provenance_key(SHA, '1', '1')}" not in client.retentions
 
     def test_a_refused_overwrite_leaves_neither_key_half_written(self, tmp_path) -> None:
         """A wheel from one build beside a release.json from another is worse
@@ -215,6 +271,82 @@ class TestPublish:
         with pytest.raises(ReleaseImmutabilityError):
             self._publish(tmp_path, store_dir, wheel=b"PK different")
         assert LocalStore(store_dir).get_bytes(release_json_key(SHA)) == before
+
+    def test_the_reviewers_falsification_now_fails_loud(self, tmp_path) -> None:
+        """alpha-engine-config-I9814: the independent adversarial review on
+        PR25 published a `release.json` the module's own `release.v2.json`
+        schema refuses — `schema_version: "release.v99"`,
+        `lockfile_sha256: "zzzz..."` (fails `^[0-9a-f]{64}$`), an empty
+        `python_requires` — plus a `provenance.json` with
+        `schema_version: "nonsense.v0"` and `built_at: "not-a-timestamp"` —
+        through `python -m crucible.deploy publish`, the exact CLI
+        `deploy.yml` runs, and it exited 0 with both documents durable. This
+        is that same publish, byte-for-byte, re-run against the fix: it must
+        now fail loud, name both schema violations, and leave the store
+        empty rather than half- or fully-written."""
+        store_dir = tmp_path / "store"
+        bad_release_json = json.dumps(
+            {
+                "schema_version": "release.v99",
+                "sha": SHA,
+                "lockfile_sha256": "z" * 64,
+                "wheel_sha256": sha256_hex(WHEEL_BYTES),
+                "python_requires": "",
+                "extra": {},
+            }
+        )
+        bad_provenance_json = json.dumps(
+            {
+                "schema_version": "nonsense.v0",
+                "sha": SHA,
+                "run_id": "1",
+                "run_attempt": "1",
+                "built_at": "not-a-timestamp",
+                "workflow_run_url": "https://github.com/nousergon/crucible/actions/runs/1",
+                "test_summary": "42 passed",
+            }
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            self._publish(
+                tmp_path,
+                store_dir,
+                release_json=bad_release_json,
+                provenance_json=bad_provenance_json,
+            )
+        message = str(excinfo.value)
+        assert "release.v2.json" in message
+        assert "lockfile_sha256" in message
+        assert "python_requires" in message
+        # The store must be untouched: the CLI's own construction of
+        # `ReleaseRecord` is what raises, before `provenance.json` is even
+        # parsed and before either identity key is written.
+        store = LocalStore(store_dir)
+        assert not store.exists(wheel_key(SHA))
+        assert not store.exists(release_json_key(SHA))
+        assert not store.exists(provenance_key(SHA, "1", "1"))
+
+    def test_a_schema_refused_provenance_also_fails_loud_before_any_write(self, tmp_path) -> None:
+        """Finding 2 in `alpha-engine-config-I9814`'s non-inferable gotcha:
+        `_publish` writes `provenance.json` unconditionally and unlocked,
+        AFTER the identity writes — so a malformed provenance record must be
+        refused before either identity key lands too, not only after."""
+        store_dir = tmp_path / "store"
+        bad_provenance_json = json.dumps(
+            {
+                "schema_version": "nonsense.v0",
+                "sha": SHA,
+                "run_id": "1",
+                "run_attempt": "1",
+                "built_at": "not-a-timestamp",
+                "workflow_run_url": "https://github.com/nousergon/crucible/actions/runs/1",
+                "test_summary": "42 passed",
+            }
+        )
+        with pytest.raises(SystemExit, match="release_provenance.v1.json"):
+            self._publish(tmp_path, store_dir, provenance_json=bad_provenance_json)
+        store = LocalStore(store_dir)
+        assert not store.exists(wheel_key(SHA))
+        assert not store.exists(release_json_key(SHA))
 
 
 class TestFlip:
