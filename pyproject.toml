@@ -15,7 +15,7 @@ dependencies = [
     # Run-manifest schema validation. The schema is the enforcement surface
     # for `status in {ok, failed}` (plan §4.2), so validation is a runtime
     # dependency, not a test-only one.
-    "jsonschema>=4.23",
+    "jsonschema>=4.26.0",
     # Every document this repo READS is parsed into a validated model, never
     # into dict indexing over `json.loads` output. The difference is where a
     # malformed document surfaces: as a named field error at the boundary, or
