@@ -44,6 +44,7 @@ actually declares.
 
 from __future__ import annotations
 
+import inspect
 import pathlib
 import re
 
@@ -89,19 +90,27 @@ def _exclusions_for(events: frozenset[str]) -> set[str]:
 # match, which is the only thing word matching was buying.
 LIVE_STATE_MARKERS = ("aws", "boto3", "cloudformation", "tests/acceptance")
 
-# `--collect-only` imports the acceptance modules without executing a clause
-# body, which is why it is allowed on the PR path at all. It is the one way
-# `tests/acceptance` may be RUN in a step there.
-#
-# Applied PER COMMAND, never per step. A step-wide carve-out was demonstrated
-# to permit
-#     uv run pytest tests/acceptance --collect-only -q
-#     uv run pytest tests/acceptance
-# in one `run:` body — the full plan §2 suite, live AWS included, running on
-# every PR from inside an allowlisted job, with this guard green. The carve-out
-# sat one line above the violation it was licensing.
-ACCEPTANCE_CARVE_OUT = "--collect-only"
-COMMAND_SEPARATORS = re.compile(r"\n|&&|\|\||;")
+#: The exact `run:` bodies that may mention `tests/acceptance` on the PR path,
+#: keyed `<workflow>:<job>:<step name>`. Compared verbatim.
+#:
+#: Three carve-outs have now been tried and defeated, each by ordinary shell
+#: syntax: a `--collect-only` substring anywhere in the step (which licensed
+#: `pytest tests/acceptance` on the next line), then the same test applied per
+#: command with a naive splitter — beaten by a single `&` instead of `&&`, and
+#: by `# --collect-only` in a trailing comment. The class is not "the splitter
+#: is incomplete". The class is TEXT MATCHING OVER SHELL: any predicate over a
+#: command string is a partial shell parser, and a partial shell parser is a
+#: denylist of the syntax someone thought of.
+#:
+#: So there is no predicate. There is exactly one legitimate command, and it is
+#: pinned. Editing it means editing this file, which is the point — the whole
+#: reason `tests/acceptance` may appear on the PR path at all is that this
+#: precise invocation collects without executing a clause body.
+PINNED_ACCEPTANCE_COMMANDS: dict[str, str] = {
+    "ci.yml:test:Acceptance clauses still import": (
+        "uv run pytest tests/acceptance --collect-only -q"
+    ),
+}
 
 # `--ignore=tests/acceptance` is the opposite of running it, and the foundation
 # suite carries it on every PR. Stripped before scanning so an exclusion is not
@@ -185,12 +194,18 @@ def _mentions(text: str, marker: str) -> bool:
     for match in re.finditer(re.escape(marker), text):
         before = text[match.start() - 1] if match.start() else " "
         after = text[match.end()] if match.end() < len(text) else " "
-        if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+        # An underscore AFTER the marker is a separator, not a continuation:
+        # `aws_access_key_id`, `aws_secret_access_key` and `$aws_profile` are
+        # the single most common way live AWS reaches a workflow, and treating
+        # `_` as an identifier character rejected every one of them while
+        # accepting `/usr/bin/aws`. `awslogs` still does not match, because
+        # `l` is not a separator.
+        if not (before.isalnum() or before == "_") and not after.isalnum():
             return True
     return False
 
 
-def _live_state_steps(job: dict) -> list[str]:
+def _live_state_steps(job: dict, workflow_job: str = "") -> list[str]:
     """EVERY step in `job` that reads state outside the tree under review.
 
     Every one, not the first: naming one and stopping tells the reader to fix
@@ -210,12 +225,13 @@ def _live_state_steps(job: dict) -> list[str]:
         rest = yaml.safe_dump({k: v for k, v in step.items() if k != "run"}).lower()
         label = step.get("name") or step.get("uses") or "<unnamed step>"
         for marker in LIVE_STATE_MARKERS:
-            commands = [c for c in COMMAND_SEPARATORS.split(run) if c.strip()]
             if marker == "tests/acceptance":
-                # Per COMMAND, never per step: a carve-out on one line does not
-                # license the next one down.
-                commands = [c for c in commands if ACCEPTANCE_CARVE_OUT not in c]
-            if any(_mentions(c, marker) for c in commands) or _mentions(rest, marker):
+                # No predicate over the command text — the pinned command, or
+                # a hit. See PINNED_ACCEPTANCE_COMMANDS for why.
+                pinned = PINNED_ACCEPTANCE_COMMANDS.get(f"{workflow_job}:{step.get('name')}")
+                if pinned is not None and (step.get("run") or "").strip() == pinned:
+                    continue
+            if _mentions(run, marker) or _mentions(rest, marker):
                 hits.append(f"{label}: mentions `{marker}`")
                 break
     return hits
@@ -234,11 +250,26 @@ def test_every_reusable_workflow_exemption_has_a_property_test() -> None:
     That is the strongest exemption this file grants, so each member names the
     test that argues its safety, and that test must exist.
     """
+    named = list(REUSABLE_WORKFLOW_JOBS.values())
+    assert len(named) == len(set(named)), (
+        "two members of REUSABLE_WORKFLOW_JOBS name the same test. Pointing a "
+        "new member at an existing member's test is how the set grows without "
+        "anything new being argued."
+    )
     for key, test_name in REUSABLE_WORKFLOW_JOBS.items():
-        assert test_name in globals(), (
+        test = globals().get(test_name)
+        assert test is not None, (
             f"{key} is exempt from the step scan on the strength of "
             f"`{test_name}`, which does not exist in this module. Write it, or "
             "remove the exemption — an exemption nothing argues is a hole."
+        )
+        # The test must actually be about this job. Naming any existing test
+        # satisfied the earlier version of this check.
+        job = key.split(":", 1)[1]
+        assert job in inspect.getsource(test), (
+            f"`{test_name}` never mentions `{job}`, so it does not argue "
+            f"{key}'s safety. An exemption is only as good as the property "
+            "someone asserted about the thing exempted."
         )
 
 
@@ -320,7 +351,7 @@ def test_no_live_state_job_runs_on_the_pull_request_path(path: pathlib.Path) -> 
             )
             # Second layer: allowlisted for its subject, still not licensed to
             # reach live AWS in a step someone adds later.
-            hits = _live_state_steps(job)
+            hits = _live_state_steps(job, key)
             assert not hits, (
                 f"{key} is allowlisted as grading the tree, but a step reads live "
                 f"state:\n  " + "\n  ".join(hits) + "\n"
@@ -337,4 +368,29 @@ def test_no_live_state_job_runs_on_the_pull_request_path(path: pathlib.Path) -> 
             f"these exact `if:` expressions — {sorted(_exclusions_for(pr_events))} — "
             f"or, if its subject genuinely is the diff, add `{key}` to "
             "PR_REACHABLE_JOBS in this file with the reason."
+        )
+
+
+def test_every_pinned_acceptance_command_is_the_step_that_is_there() -> None:
+    """A pin that no longer matches the workflow silently permits nothing.
+
+    Worse, an entry left behind after a step is renamed becomes a licence
+    waiting for the next step to take that name.
+    """
+    for key, command in PINNED_ACCEPTANCE_COMMANDS.items():
+        workflow_name, job_name, step_name = key.split(":", 2)
+        workflow = yaml.safe_load((WORKFLOW_DIR / workflow_name).read_text())
+        job = (workflow.get("jobs") or {}).get(job_name)
+        assert job, f"{key} pins a command in a job that does not exist"
+        steps = [s for s in (job.get("steps") or []) if s.get("name") == step_name]
+        assert len(steps) == 1, (
+            f"{key} pins a command to a step named {step_name!r}, and the job has "
+            f"{len(steps)} of them. Two steps with one name make the pin ambiguous."
+        )
+        assert (steps[0].get("run") or "").strip() == command, (
+            f"{key} no longer runs the pinned command.\n  pinned: {command!r}\n"
+            f"  actual: {(steps[0].get('run') or '').strip()!r}\n"
+            "tests/acceptance may appear on the PR path only as this exact "
+            "invocation, which collects without executing a clause body. Change "
+            "both together, deliberately, or not at all."
         )
