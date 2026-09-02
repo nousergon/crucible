@@ -43,7 +43,7 @@ dependencies = [
     # fresh resolve.
     "numpy>=2.5.2",
     "pandas>=2.0",
-    "pyarrow>=14.0",
+    "pyarrow>=25.0.1",
     # The store's S3 backend and the conditional PUT the release pointer
     # flips on. Floored, not pinned: boto3 ships daily and the API surface
     # used here (put_object/head_object/get_paginator, IfMatch/IfNoneMatch)
