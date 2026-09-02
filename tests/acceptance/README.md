@@ -27,14 +27,23 @@ N failed, M passed  →  M of N+M plan clauses currently satisfied
 
 **That number is progress. It is not a phase gate, and quoting it as one is a
 known defect.** Phase 1 (`alpha-engine-config-I9757`) was closed
-**2026-09-02T01:31Z**, the moment its build PRs merged, with its exit gate never
-measured. Four different figures had been quoted for that gate — 15/9, 18/6,
-19/4, "21 of 23" — none agreeing, all hand-typed into issue comments. Measured
-2026-09-02 on `main` at `794a1b0`, the disagreement resolved into **two
-instruments**: this suite read **21 of 24**, while the phase-1 gate read **NOT
-MET, 1 of 5 clauses** (`pointer_flipped_on_smoke` only) against the real store
-`s3://alpha-engine-crucible-v2/crucible`. Zero replay Saturdays had run. The
-issue was reopened.
+**2026-09-02T01:31:16Z**, the moment its build PRs merged, with its exit gate
+never measured. Four readings had circulated beforehand — from three surfaces,
+over two totals, and not all of them measurements:
+
+| Reading | Where it came from |
+|---|---|
+| 9 of 23 clauses failing (14 met) | `I9757` comment, 2026-09-01T20:23Z, on `6eb52f0` |
+| 18 met / 6 unmet | same issue — a **prediction** of what two unmerged PRs would produce |
+| 19 met / 4 unmet | same issue — measured on a **local** merge of three PRs, not on `main` |
+| "21 of 23" | carried in conversation; **no artifact** |
+
+Measured 2026-09-02 on `main`, the disagreement resolved into **two
+instruments**: this suite read **21 of 24**, while the phase-1 gate read
+**NOT MET, 1 of 5 clauses** — `pointer_flipped_on_smoke` only — against the
+store `s3://alpha-engine-crucible-v2/crucible`
+(`gates/phase1/2026-09-01/gate.json`, `met_ratio: 0.2`). Zero replay Saturdays
+had run. The issue was reopened.
 
 Note the store: the gate reads **1 of 5** against the production store and
 **0 of 5** against an empty one. A gate reading without its store named is not
