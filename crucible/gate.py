@@ -37,7 +37,12 @@ from jsonschema import Draft202012Validator
 
 from crucible.calendar import resolve_trading_day
 from crucible.components import Component, load_registry
-from crucible.keys import arena_cycle_key, arm_register_key, gate_key  # noqa: F401 - re-exported
+from crucible.keys import (
+    arena_cycle_key,
+    arm_register_key,
+    gate_key,
+    legacy_weekly_executions_key,
+)  # noqa: F401 - re-exported
 from crucible.manifest import manifest_key
 from crucible.release import POINTER_KEY
 from crucible.report import attribution_key
@@ -541,26 +546,6 @@ def weekly_anchor(day: dt.date) -> dt.date:
     days_back = ((day.weekday() - 4) % 7) or 7
     friday = day - dt.timedelta(days=days_back)
     return resolve_trading_day(dt.datetime.combine(friday, dt.time(23, 59)))
-
-
-def legacy_weekly_executions_key(week_anchor: str) -> str:
-    """Where the v1 weekly state machine's start count for one week is filed.
-
-    ``week_anchor`` is a :func:`weekly_anchor` session, never a raw render day.
-
-    **The gate reads this; it never counts.** A clause that called
-    `states:ListExecutions` would reach live AWS, which makes the reading
-    unreplayable, untestable without credentials, and impossible to grade at a
-    past date — and phase 0's whole claim is about a cadence sustained over
-    two consecutive weeks, which is a claim about the past.
-
-    Nothing files this key yet, and that is the honest state of the
-    measurement rather than a reason to relax the clause: the clause reads
-    UNMET and names the key, so the operator's next action is in the output
-    (`alpha-engine-config-I9860`). The shape belongs in `crucible.keys` and
-    moves there once the branch that owns that file lands.
-    """
-    return f"legacy/weekly/{week_anchor}/executions.json"
 
 
 #: The committed reading of the plan §2 acceptance suite. Not a store artifact:
