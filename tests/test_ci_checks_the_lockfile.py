@@ -55,11 +55,11 @@ FROZEN_INSTALL_COMMAND = "uv sync --frozen"
 #: Anything that can materialise the environment. `uv run` installs from the
 #: lockfile on first use just as `uv sync` does, so a job carrying only
 #: `uv run` steps still installs and still needs the lockfile checked first.
-_INSTALLS = re.compile(r"\buv (?:sync|run)\b")
+_INSTALLS = re.compile(r"\buv\s+(?:sync|run)\b")
 
 #: Every `uv run` occurrence, so the `--frozen` assertion is per invocation
 #: rather than per line.
-_UV_RUN = re.compile(r"\buv run\b")
+_UV_RUN = re.compile(r"\buv\s+run\b")
 
 
 @pytest.fixture(scope="module")
