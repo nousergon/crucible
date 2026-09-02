@@ -80,22 +80,47 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      # The lockfile agrees with pyproject.toml. FIRST, before anything
+      # installs or runs.
+      #
+      # Measured 2026-09-02: seven Dependabot PRs (#31-#37) raised dependency
+      # floors in pyproject.toml -- numpy >=2.1 to >=2.5.2, pyarrow >=14.0 to
+      # >=25.0.1, jsonschema, PyYAML, ruff -- and none regenerated uv.lock.
+      # All seven merged with fully green CI, and main then carried a lockfile
+      # whose recorded requirements named the OLD floors.
+      #
+      # `uv sync --frozen` does not catch this: verified against main at
+      # 44d00a5, it exits 0. `--frozen` installs the locked versions without
+      # re-checking them against pyproject.toml, so the drift is invisible to
+      # the one command every job here runs.
+      #
+      # `uv lock --check` is uv's own contract check and is the thing that
+      # cannot be fooled: exit 1 on main's stale lockfile, exit 0 once
+      # regenerated, both measured. A pytest guard was written first and
+      # DISCARDED, because `uv run --frozen pytest` implicitly re-locks before running
+      # -- so the test would have rewritten the very file it was grading and
+      # reported green. A guard that reads as coverage while being blind is
+      # worse than none, and that is the class this repository keeps finding
+      # in other people's systems.
+      - name: The lockfile agrees with pyproject.toml
+        run: uv lock --check
+
       # --frozen, never a re-resolve. The lockfile is the supply chain: a CI
       # run that resolves its own dependencies has not tested what ships.
       - name: Install
         run: uv sync --frozen
 
       - name: Lint
-        run: uv run ruff check
+        run: uv run --frozen ruff check
 
       - name: Format check
-        run: uv run ruff format --check
+        run: uv run --frozen ruff format --check
 
       # The blocking gate. tests/acceptance is excluded here and run as its
       # own reporting job below — see the comment there for why that is not a
       # suppression.
       - name: Foundation tests
-        run: uv run pytest -q --ignore=tests/acceptance
+        run: uv run --frozen pytest -q --ignore=tests/acceptance
 
       # Collection, not execution — and it belongs HERE, on the PR path.
       # Importing a test module grades the TREE: it proves every symbol
@@ -109,7 +134,7 @@ jobs:
       # so it touches no live AWS and stays on the correct side of
       # scm-platform-policy.md §3.1.
       - name: Acceptance clauses still import
-        run: uv run pytest tests/acceptance --collect-only -q
+        run: uv run --frozen pytest tests/acceptance --collect-only -q
 
   acceptance:
     name: acceptance gate (RED until the phase exits — reporting only)
@@ -167,6 +192,14 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      # The same check the `test` job runs, and for the same reason: this job
+      # installs too, and a job that installs from an unverified lockfile is
+      # exactly what `uv lock --check` exists to stop. Repeated rather than
+      # inherited -- GitHub jobs share nothing, so "the other job checked it"
+      # is not a property of this runner.
+      - name: The lockfile agrees with pyproject.toml
+        run: uv lock --check
+
       - name: Install
         run: uv sync --frozen
 
@@ -176,13 +209,13 @@ jobs:
       - name: Acceptance clauses (plan §2)
         run: |
           set +e
-          uv run pytest tests/acceptance -p no:cacheprovider --tb=no \
+          uv run --frozen pytest tests/acceptance -p no:cacheprovider --tb=no \
             --junitxml=acceptance.xml > acceptance.txt 2>&1
           set -e
           tail -40 acceptance.txt
 
       - name: The reading has not moved
-        run: uv run python tests/acceptance/check_reading.py acceptance.xml
+        run: uv run --frozen python tests/acceptance/check_reading.py acceptance.xml
 
   # A moved reading on main blocks nothing and is green
   # to the next author, so without this nothing announces it — the same gap
