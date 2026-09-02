@@ -4,10 +4,14 @@ name: CI
 # ECR $0, Inspector $0. This repository is public, so those minutes are free
 # and unmetered — zero private minutes for the harness.
 #
-# Two workflows in this repo and no others. Every guard the v1 repos carry as
-# a per-repo workflow is a pytest in `tests/` here, or it is not carried:
-# sixteen workflows per repo is how a fleet spends 66% of its metered CI
-# minutes on one private repo. deploy.yml is track C's.
+# Three workflows in this repo and no others (revised 2026-09-02 — plan §11
+# risk 1 added `adversarial-review-gate.yml` after this comment was written;
+# see that file for why it does not repeat the sixteen-workflows-per-repo
+# mistake: it is two thin `gh api` calls, no checkout, no `uv sync`). Every
+# guard the v1 repos carry as a per-repo workflow is a pytest in `tests/`
+# here, or it is not carried: sixteen workflows per repo is how a fleet
+# spends 66% of its metered CI minutes on one private repo. deploy.yml is
+# track C's.
 
 on:
   push:

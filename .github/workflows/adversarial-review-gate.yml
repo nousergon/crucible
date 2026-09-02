@@ -1,0 +1,166 @@
+name: Adversarial Review Gate
+
+# Plan §11 risk 1: "every track's exit is reviewed by an independent
+# adversarial agent against §2's acceptance tests, not by its author." This
+# workflow is the structural enforcement of that clause — not a convention,
+# not a PR-body checkbox.
+#
+# Ported from alpha-engine-config/.github/workflows/adversarial-review-gate.yml
+# and adapted: that reference posts only a PENDING check, relying on an
+# external async groom sweep (this repo has none) to resolve it, and its
+# check-run POST is 403-inert until the ne-groomer GitHub App gets
+# checks:write. This version is self-contained and functional from the first
+# run: the workflow's own GITHUB_TOKEN is granted `checks: write` directly
+# (no App dependency), and a second job — invoked by hand or by a separate
+# Claude session running the adversarial pass — RESOLVES the same check to
+# success/failure. Independence is enforced structurally: `resolve` reads the
+# PR's author back from the API and refuses to complete the check if the
+# actor resolving it is the same login, so "reviewed by an independent
+# adversarial agent, not by its author" cannot be satisfied by the author
+# self-approving.
+#
+# Cost: `post-pending-check` runs on every pull_request open/sync/reopen/
+# ready-for-review event — one `gh api` call, no checkout, no `uv sync`, no
+# runner minutes beyond the job's own startup (~5-10s on ubuntu-latest).
+# `resolve` is workflow_dispatch-only, invoked once per track exit, same
+# shape (~5-10s). This repo is PRIVATE and CI minutes are metered
+# (crucible AGENTS.md "Visibility"); at this cost, ~100 PR events/month is
+# well under a minute of billed compute.
+#
+# What this workflow does NOT do: it does not run the acceptance suite
+# itself and does not grade anything. The adversarial review — reading the
+# diff, running `uv run pytest tests/acceptance`, checking the change against
+# plan §2 — happens in the reviewing session; this workflow only records the
+# verdict as a structural, non-bypassable gate and enforces who may record
+# it. See the PR body for the follow-up `crucible/gate.py` wiring so a
+# phase's exit gate (`crucible gate`) can read this verdict as a clause,
+# consistent with gate.py's "a gate reads; it never runs" design.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number the adversarial review was run against'
+        required: true
+      conclusion:
+        description: 'Review verdict'
+        required: true
+        type: choice
+        options: [success, failure]
+      summary:
+        description: 'One-line verdict summary (e.g. "no findings against plan §2" or "3 findings, see review comment")'
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  post-pending-check:
+    if: github.event_name == 'pull_request'
+    name: adversarial-review-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      checks: write
+    steps:
+      - name: Post pending adversarial-review-gate check-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -euo pipefail
+
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo "PR #$PR_NUM is a draft — no adversarial-review-gate check posted until it is ready for review."
+            exit 0
+          fi
+
+          echo "Posting pending adversarial-review-gate check-run for PR #$PR_NUM @ $SHA"
+
+          gh api "/repos/$REPO/check-runs" \
+            -X POST \
+            -f name="adversarial-review-gate" \
+            -f head_sha="$SHA" \
+            -f status="in_progress" \
+            -f output="{\"title\":\"Adversarial review gate: pending\",\"summary\":\"Waiting on an independent adversarial review against plan section 2 acceptance tests (plan section 11 risk 1). Resolved by the 'resolve' job in this workflow (workflow_dispatch), run by a reviewer who is not this PR's author.\"}"
+
+  resolve:
+    if: github.event_name == 'workflow_dispatch'
+    name: resolve adversarial-review-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      checks: write
+      pull-requests: read
+    steps:
+      - name: Look up the PR and refuse a self-review
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUM: ${{ inputs.pr_number }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+
+          info="$(gh api "/repos/$REPO/pulls/$PR_NUM" -q '{sha: .head.sha, author: .user.login}')"
+          sha="$(printf '%s' "$info" | jq -r '.sha')"
+          author="$(printf '%s' "$info" | jq -r '.author')"
+
+          if [ -z "$sha" ] || [ "$sha" = "null" ]; then
+            echo "::error::PR #$PR_NUM not found or has no head sha."
+            exit 1
+          fi
+
+          # Plan §11 risk 1: "reviewed by an independent adversarial agent
+          # against §2's acceptance tests, not by its author." Enforced here,
+          # not left to reviewer discipline — the actor resolving this check
+          # (the identity that ran workflow_dispatch) may not be the PR's
+          # own author.
+          actor_lc="$(printf '%s' "$ACTOR" | tr '[:upper:]' '[:lower:]')"
+          author_lc="$(printf '%s' "$author" | tr '[:upper:]' '[:lower:]')"
+          if [ "$actor_lc" = "$author_lc" ]; then
+            echo "::error::PR #$PR_NUM was authored by '$author' and this review was run by the same identity ('$ACTOR'). An adversarial review must be independent of the author (plan §11 risk 1) — have a different reviewer run this."
+            exit 1
+          fi
+
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "author=$author" >> "$GITHUB_OUTPUT"
+
+      - name: Post completed adversarial-review-gate check-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.pr.outputs.sha }}
+          AUTHOR: ${{ steps.pr.outputs.author }}
+          ACTOR: ${{ github.actor }}
+          CONCLUSION: ${{ inputs.conclusion }}
+          SUMMARY: ${{ inputs.summary }}
+        run: |
+          set -euo pipefail
+
+          title="Adversarial review: ${CONCLUSION}"
+          body=$(jq -n \
+            --arg title "$title" \
+            --arg summary "$SUMMARY" \
+            --arg reviewer "$ACTOR" \
+            --arg author "$AUTHOR" \
+            '{title: $title, summary: ($summary + "\n\nReviewed by: " + $reviewer + " (independent of author " + $author + ")")}')
+
+          gh api "/repos/$REPO/check-runs" \
+            -X POST \
+            -f name="adversarial-review-gate" \
+            -f head_sha="$SHA" \
+            -f status="completed" \
+            -f conclusion="$CONCLUSION" \
+            -f output="$body"
+
+          echo "Recorded adversarial-review-gate=$CONCLUSION for $SHA (reviewer: $ACTOR, author: $AUTHOR)"
