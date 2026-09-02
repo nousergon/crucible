@@ -57,17 +57,25 @@ def ratchet(tmp_path: Path) -> Path:
     return path
 
 
+def _checker():
+    """Import `check_reading` as a module, for the model-level assertions."""
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    spec = spec_from_file_location("check_reading", CHECKER)
+    assert spec and spec.loader
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_the_committed_ratchet_is_wellformed() -> None:
     """The file CI grades against must parse and carry both fields."""
-    data = json.loads(RATCHET.read_text())
-    assert isinstance(data["unmet"], dict)
-    assert isinstance(data["met"], list)
-    assert not set(data["met"]) & set(data["unmet"]), "a clause is both met and unmet"
-    assert len(set(data["met"])) == len(data["met"]), "duplicate id in `met`"
-    for clause in list(data["unmet"]) + data["met"]:
-        assert "::" in clause, f"{clause!r} is not a `Class::method` clause id"
-    for clause, reason in data["unmet"].items():
-        assert reason.strip(), f"{clause} carries no reason"
+    # The model IS the validation — id shape, disjointness, duplicate ids and
+    # empty reasons are all field-level rules on `Ratchet`, so loading it is
+    # the assertion. Hand-rolled type checks here would be the contract
+    # restated in a second place, which is how a contract drifts.
+    ratchet = _checker().load_ratchet(RATCHET)
+    assert ratchet.clauses, "the committed ratchet describes no clauses"
 
 
 def _collected_clause_ids() -> list[str]:
@@ -204,15 +212,35 @@ def test_a_renamed_met_clause_is_red(tmp_path: Path, ratchet: Path) -> None:
     assert "New: T::renamed" in result.stderr
 
 
-def test_a_malformed_ratchet_is_red_not_a_traceback(tmp_path: Path) -> None:
-    """A ratchet missing a field must fail loudly and legibly, not crash."""
+@pytest.mark.parametrize(
+    ("document", "expected"),
+    [
+        ({"unmet": {"T::a": "phase 2"}}, "met"),
+        ({"met": ["T::b"]}, "unmet"),
+        ({"unmet": {"T::a": "why"}, "met": ["T::a"]}, "both met and unmet"),
+        ({"unmet": {"T::a": "why"}, "met": ["T::b", "T::b"]}, "same clause twice"),
+        ({"unmet": {"not-an-id": "why"}, "met": []}, "clause id"),
+        ({"unmet": {"T::a": "   "}, "met": []}, "no reason"),
+        ({"unmet": {}, "met": [], "surprise": 1}, "surprise"),
+    ],
+)
+def test_a_malformed_ratchet_is_red_and_names_the_field(
+    tmp_path: Path, document: dict, expected: str
+) -> None:
+    """Every malformed shape fails at the boundary, naming the field.
+
+    Before the model, a missing key surfaced as a KeyError traceback three
+    functions in — unreadable in an Actions log and indistinguishable from the
+    grader itself being broken. `extra="forbid"` is in the list because a typo
+    in a key name is otherwise a silently ignored edit.
+    """
     ratchet = tmp_path / "ratchet.json"
-    ratchet.write_text(json.dumps({"unmet": {"T::a": "phase 2"}}))
+    ratchet.write_text(json.dumps(document))
     report = _report(tmp_path / "r.xml", met=["T::b"], unmet=["T::a"])
     result = _run(report, ratchet)
     assert result.returncode == 1
     assert "Traceback" not in result.stderr
-    assert "met" in result.stderr
+    assert expected in result.stderr
 
 
 def test_a_missing_report_is_red_not_green(tmp_path: Path, ratchet: Path) -> None:

@@ -26,11 +26,21 @@ and plan §11.1 forbid for suppression collections. So the question is inverted:
 every job reachable on a PR event is live-state UNTIL it is named in
 `PR_REACHABLE_JOBS` with a reason.
 
-**The marker scan is kept as a second layer INSIDE allowlisted jobs.** The
-allowlist says a job may run on a PR; it cannot say that every step someone
-adds to that job later still grades the tree. An allowlist alone let a
-`run: aws s3 ls` inserted into `ci.yml:test` pass, which the old denylist
-caught. Neither layer is sufficient; both are cheap.
+**There is deliberately no second layer here scanning step bodies.** Five
+independent adversarial reviews attacked one, and each fix opened the next
+round's hole — a `--collect-only` substring licensing the next line, then a
+per-command splitter beaten by a single `&` and by a trailing `# comment`,
+then a boundary rule that rejected `AWS_ACCESS_KEY_ID`. The class is that any
+predicate over a `run:` body is a partial shell parser, and a partial shell
+parser is a denylist of the syntax someone thought of — the structure
+`AGENTS.md` rule 4 forbids.
+
+That scan is defence in depth, not the §3.1 requirement, and it belongs where
+it will be reused: `alpha-engine-config-I9830` lifts this guard into
+`nousergon-lib` for the whole fleet, built on a typed workflow model rather
+than text. Hardening it once there beats hardening it five times here. The
+gap until then is narrower than what this file already closes: a live-AWS
+step added INSIDE the already-allowlisted `ci.yml:test` job.
 
 **`pull_request_target` is held to the same rule, and needs its own exclusion
 string.** On a `pull_request_target` event `github.event_name` is
@@ -50,6 +60,7 @@ import re
 
 import pytest
 import yaml
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 WORKFLOW_DIR = pathlib.Path(__file__).resolve().parents[1] / ".github" / "workflows"
 # GitHub accepts both suffixes; `test_no_suppressions.py` already scans both.
@@ -76,46 +87,6 @@ def _exclusions_for(events: frozenset[str]) -> set[str]:
         accepted.add(" && ".join(single[event] for event in sorted(events)))
     return accepted | {"${{ " + form + " }}" for form in accepted}
 
-
-# A step whose `run:` body mentions any of these is reading state that lives
-# outside the tree under review. Second layer only: the allowlist below is what
-# actually decides reachability. `gh api` is deliberately absent — the
-# adversarial-review gate reads the state of the pull request it runs on, which
-# IS the subject under review.
-#
-# Matched as a substring bounded by non-identifier characters, NOT as a whole
-# shell word. Whole-word matching was demonstrated to miss `/usr/bin/aws`,
-# `$(echo aws)`, and `python -c '__import__("boto3")...'` — every one of which
-# reaches live AWS from inside an allowlisted job. `awslogs` still does not
-# match, which is the only thing word matching was buying.
-LIVE_STATE_MARKERS = ("aws", "boto3", "cloudformation", "tests/acceptance")
-
-#: The exact `run:` bodies that may mention `tests/acceptance` on the PR path,
-#: keyed `<workflow>:<job>:<step name>`. Compared verbatim.
-#:
-#: Three carve-outs have now been tried and defeated, each by ordinary shell
-#: syntax: a `--collect-only` substring anywhere in the step (which licensed
-#: `pytest tests/acceptance` on the next line), then the same test applied per
-#: command with a naive splitter — beaten by a single `&` instead of `&&`, and
-#: by `# --collect-only` in a trailing comment. The class is not "the splitter
-#: is incomplete". The class is TEXT MATCHING OVER SHELL: any predicate over a
-#: command string is a partial shell parser, and a partial shell parser is a
-#: denylist of the syntax someone thought of.
-#:
-#: So there is no predicate. There is exactly one legitimate command, and it is
-#: pinned. Editing it means editing this file, which is the point — the whole
-#: reason `tests/acceptance` may appear on the PR path at all is that this
-#: precise invocation collects without executing a clause body.
-PINNED_ACCEPTANCE_COMMANDS: dict[str, str] = {
-    "ci.yml:test:Acceptance clauses still import": (
-        "uv run pytest tests/acceptance --collect-only -q"
-    ),
-}
-
-# `--ignore=tests/acceptance` is the opposite of running it, and the foundation
-# suite carries it on every PR. Stripped before scanning so an exclusion is not
-# read as an execution.
-IGNORE_TOKEN = re.compile(r"--ignore=\S+")
 
 #: `<workflow>:<job>` pairs that may run on a PR because their subject is the
 #: tree, or the pull request itself. Every entry names why.
@@ -163,78 +134,71 @@ REUSABLE_WORKFLOW_JOBS: dict[str, str] = {
 }
 
 
-def _events(workflow: dict) -> set[str]:
-    # PyYAML resolves the bare key `on` to the boolean True (YAML 1.1), so
-    # reading workflow["on"] finds nothing and passes on every file — a dark
-    # guard, which is the failure mode this file exists to prevent.
-    on = workflow.get("on", workflow.get(True))
-    if isinstance(on, str):
-        return {on}
-    if isinstance(on, list):
-        return set(on)
-    if isinstance(on, dict):
-        return set(on)
-    raise AssertionError(f"unparseable `on:` block: {on!r}")
+class Job(BaseModel):
+    """One job, as much of it as this guard reasons about."""
+
+    model_config = ConfigDict(extra="allow")
+
+    condition: str = Field(default="", alias="if")
+    needs: list[str] = Field(default_factory=list)
+    uses: str = ""
+    steps: list[dict] = Field(default_factory=list)
 
 
-def _excluded(job: dict, pr_events: frozenset[str]) -> bool:
+class Workflow(BaseModel):
+    """A GitHub Actions workflow, parsed rather than indexed.
+
+    The `on:` key is why this is a model and not `dict.get`. PyYAML resolves a
+    bare `on` to the BOOLEAN True under YAML 1.1, so `workflow["on"]` finds
+    nothing, every workflow reads as having no triggers, and the guard passes
+    on all of them — dark, which is the exact failure this file exists to
+    prevent. An alias states that once; the alternative is remembering it at
+    every call site, which is how it gets forgotten.
+    """
+
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    triggers: dict | list | str = Field(default_factory=dict)
+    jobs: dict[str, Job] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalise_the_on_key(cls, data: object) -> object:
+        """`on:` arrives as the boolean True, or as the string, or not at all.
+
+        A pydantic alias cannot name a non-string key, so the normalisation is
+        explicit — and it RAISES when neither form is present, because a
+        workflow with no triggers is a document this guard did not understand,
+        not a workflow with nothing to check.
+        """
+        if not isinstance(data, dict):
+            return data
+        payload = dict(data)
+        for key in (True, "on"):
+            if key in payload:
+                payload["triggers"] = payload.pop(key)
+                return payload
+        if "triggers" in payload:
+            return payload
+        raise ValueError("workflow has no `on:` block — unparseable, not trigger-free")
+
+    @property
+    def events(self) -> set[str]:
+        on = self.triggers
+        if isinstance(on, str):
+            return {on}
+        return set(on)
+
+    @classmethod
+    def load(cls, path: pathlib.Path) -> Workflow:
+        return cls.model_validate(yaml.safe_load(path.read_text()))
+
+
+def _excluded(job: Job, pr_events: frozenset[str]) -> bool:
     # Whole-string comparison, not a substring test: `... != 'pull_request' ||
     # <anything>` is a disjunction that runs on PRs, and a substring test waves
     # it through.
-    return str(job.get("if", "")).strip() in _exclusions_for(pr_events)
-
-
-def _mentions(text: str, marker: str) -> bool:
-    """`marker` appears in `text` bounded by non-identifier characters.
-
-    Substring-with-boundary, not whole-word: whole-word matching was
-    demonstrated to miss `/usr/bin/aws`, `$(echo aws)` and
-    `python -c '__import__("boto3")...'`. `awslogs` still does not match.
-    """
-    for match in re.finditer(re.escape(marker), text):
-        before = text[match.start() - 1] if match.start() else " "
-        after = text[match.end()] if match.end() < len(text) else " "
-        # An underscore AFTER the marker is a separator, not a continuation:
-        # `aws_access_key_id`, `aws_secret_access_key` and `$aws_profile` are
-        # the single most common way live AWS reaches a workflow, and treating
-        # `_` as an identifier character rejected every one of them while
-        # accepting `/usr/bin/aws`. `awslogs` still does not match, because
-        # `l` is not a separator.
-        if not (before.isalnum() or before == "_") and not after.isalnum():
-            return True
-    return False
-
-
-def _live_state_steps(job: dict, workflow_job: str = "") -> list[str]:
-    """EVERY step in `job` that reads state outside the tree under review.
-
-    Every one, not the first: naming one and stopping tells the reader to fix
-    it and re-run to discover the next.
-
-    The whole step is scanned, not just its `run:` body. `uses:`, `with:`,
-    `env:`, `container:` and `services:` reach live state just as well, and
-    moving a marker from `$(echo aws)` into `env: {TOOL: /usr/bin/aws}` was
-    demonstrated to walk straight past a run-only scan — the same evasion
-    class, one field along.
-    """
-    hits = []
-    for step in job.get("steps") or []:
-        if not isinstance(step, dict):
-            continue
-        run = IGNORE_TOKEN.sub("", (step.get("run") or "").lower())
-        rest = yaml.safe_dump({k: v for k, v in step.items() if k != "run"}).lower()
-        label = step.get("name") or step.get("uses") or "<unnamed step>"
-        for marker in LIVE_STATE_MARKERS:
-            if marker == "tests/acceptance":
-                # No predicate over the command text — the pinned command, or
-                # a hit. See PINNED_ACCEPTANCE_COMMANDS for why.
-                pinned = PINNED_ACCEPTANCE_COMMANDS.get(f"{workflow_job}:{step.get('name')}")
-                if pinned is not None and (step.get("run") or "").strip() == pinned:
-                    continue
-            if _mentions(run, marker) or _mentions(rest, marker):
-                hits.append(f"{label}: mentions `{marker}`")
-                break
-    return hits
+    return job.condition.strip() in _exclusions_for(pr_events)
 
 
 def test_at_least_one_workflow_is_scanned() -> None:
@@ -277,8 +241,7 @@ def test_every_allowlisted_job_still_exists() -> None:
     """An allowlist entry for a deleted job is a hole waiting for a name collision."""
     present = set()
     for path in WORKFLOWS:
-        workflow = yaml.safe_load(path.read_text())
-        for name in workflow.get("jobs") or {}:
+        for name in Workflow.load(path).jobs:
             present.add(f"{path.name}:{name}")
     stale = sorted(set(PR_REACHABLE_JOBS) - present)
     assert not stale, (
@@ -296,13 +259,12 @@ def test_the_notify_job_still_depends_on_the_excluded_job() -> None:
     only runs on failure. Rewriting the job body while keeping the name would
     inherit the exemption. Assert the properties, not the name.
     """
-    workflow = yaml.safe_load((WORKFLOW_DIR / "ci.yml").read_text())
-    job = workflow["jobs"]["notify-main-failure"]
-    assert "acceptance" in (job.get("needs") or []), (
+    job = Workflow.load(WORKFLOW_DIR / "ci.yml").jobs["notify-main-failure"]
+    assert "acceptance" in job.needs, (
         "notify-main-failure no longer depends on `acceptance`, which is what "
         "keeps it off the PR path. Re-derive its allowlist entry."
     )
-    condition = str(job.get("if", ""))
+    condition = job.condition
     assert "failure()" in condition, (
         "notify-main-failure no longer runs only on failure; its allowlist entry claims it does."
     )
@@ -311,7 +273,7 @@ def test_the_notify_job_still_depends_on_the_excluded_job() -> None:
     # repurposing this entry exists to prevent.
     assert re.fullmatch(
         r"nousergon/nousergon-lib/\.github/workflows/notify-ci-failure\.yml@[0-9a-f]{40}",
-        str(job.get("uses", "")),
+        job.uses,
     ), (
         "notify-main-failure must call the nousergon-lib notification workflow "
         "pinned to a 40-character SHA. Its allowlist entry assumes that target, "
@@ -323,12 +285,12 @@ def test_the_notify_job_still_depends_on_the_excluded_job() -> None:
 
 @pytest.mark.parametrize("path", WORKFLOWS, ids=lambda p: p.name)
 def test_no_live_state_job_runs_on_the_pull_request_path(path: pathlib.Path) -> None:
-    workflow = yaml.safe_load(path.read_text())
-    pr_events = frozenset(_events(workflow) & PR_EVENTS)
+    workflow = Workflow.load(path)
+    pr_events = frozenset(workflow.events & PR_EVENTS)
     if not pr_events:
         return
 
-    for name, job in (workflow.get("jobs") or {}).items():
+    for name, job in workflow.jobs.items():
         key = f"{path.name}:{name}"
         if _excluded(job, pr_events):
             continue
@@ -339,24 +301,15 @@ def test_no_live_state_job_runs_on_the_pull_request_path(path: pathlib.Path) -> 
             # job at one turned the entire guard green with live AWS running on
             # every PR — demonstrated. An allowlist entry describes what a job
             # DOES, so a job that no longer does its own work forfeits it.
-            assert "uses" not in job or key in REUSABLE_WORKFLOW_JOBS, (
+            assert not job.uses or key in REUSABLE_WORKFLOW_JOBS, (
                 f"{key} is allowlisted but is now a job-level `uses:` calling "
-                f"{job['uses']!r}. The called workflow declares workflow_call, not "
+                f"{job.uses!r}. The called workflow declares workflow_call, not "
                 "a PR event, so nothing here scans it. Inline the steps, or remove "
                 "the allowlist entry and take the job off the PR path."
             )
-            assert job.get("steps") or key in REUSABLE_WORKFLOW_JOBS, (
+            assert job.steps or key in REUSABLE_WORKFLOW_JOBS, (
                 f"{key} is allowlisted and has no steps. An allowlist entry names "
                 "what a job does; a job that does nothing scannable cannot keep one."
-            )
-            # Second layer: allowlisted for its subject, still not licensed to
-            # reach live AWS in a step someone adds later.
-            hits = _live_state_steps(job, key)
-            assert not hits, (
-                f"{key} is allowlisted as grading the tree, but a step reads live "
-                f"state:\n  " + "\n  ".join(hits) + "\n"
-                "Move that step to a job off the PR path — the allowlist entry "
-                "covers the job's stated subject, not anything later added to it."
             )
             continue
         pytest.fail(
@@ -368,29 +321,4 @@ def test_no_live_state_job_runs_on_the_pull_request_path(path: pathlib.Path) -> 
             f"these exact `if:` expressions — {sorted(_exclusions_for(pr_events))} — "
             f"or, if its subject genuinely is the diff, add `{key}` to "
             "PR_REACHABLE_JOBS in this file with the reason."
-        )
-
-
-def test_every_pinned_acceptance_command_is_the_step_that_is_there() -> None:
-    """A pin that no longer matches the workflow silently permits nothing.
-
-    Worse, an entry left behind after a step is renamed becomes a licence
-    waiting for the next step to take that name.
-    """
-    for key, command in PINNED_ACCEPTANCE_COMMANDS.items():
-        workflow_name, job_name, step_name = key.split(":", 2)
-        workflow = yaml.safe_load((WORKFLOW_DIR / workflow_name).read_text())
-        job = (workflow.get("jobs") or {}).get(job_name)
-        assert job, f"{key} pins a command in a job that does not exist"
-        steps = [s for s in (job.get("steps") or []) if s.get("name") == step_name]
-        assert len(steps) == 1, (
-            f"{key} pins a command to a step named {step_name!r}, and the job has "
-            f"{len(steps)} of them. Two steps with one name make the pin ambiguous."
-        )
-        assert (steps[0].get("run") or "").strip() == command, (
-            f"{key} no longer runs the pinned command.\n  pinned: {command!r}\n"
-            f"  actual: {(steps[0].get('run') or '').strip()!r}\n"
-            "tests/acceptance may appear on the PR path only as this exact "
-            "invocation, which collects without executing a clause body. Change "
-            "both together, deliberately, or not at all."
         )

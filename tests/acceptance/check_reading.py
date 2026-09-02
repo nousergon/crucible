@@ -4,46 +4,102 @@
 The acceptance suite is red by design — plan §6 phase-0 exit requires the §2
 clauses written as failing pytest, and they go green one at a time as the
 phases land. So "did the suite pass?" is the wrong question to page on: the
-answer is no for months, and a check that is red whenever it is working
-trains the operator to ignore it.
+answer is no for months, and a check that is red whenever it is working trains
+the operator to ignore it.
 
-The right question is whether the READING MOVED, and the reading is the SET of
-unmet clauses, never a count of them. Counting is how a regression hides: one
-clause going green while another regresses leaves `met` unchanged, and a
-scalar comparison reports "unchanged" on the day something broke. Demonstrated
-against an earlier version of this file, which did exactly that.
+The right question is whether the READING MOVED, and the reading is two SETS of
+clause ids, never counts. Counting failed twice, at two different levels: a
+regression offset by a gain leaves a count unchanged, and committing `collected`
+as a number let any of the met clauses be renamed or deleted with a one-digit
+edit while every check read green.
 
 So the comparison is set-shaped:
 
-* a clause in `unmet` that now passes — progress, and it is not recorded until
-  this file moves with it, in the PR that earns it;
-* a clause not in `unmet` that now fails — a REGRESSION, and the only event on
-  this arm that is genuinely someone's fault;
 * a clause that vanished or appeared — added, renamed, removed, or failing to
-  import. This is compared against the union of `met` and `unmet`, not against
-  a count: a count let any of the 21 MET clauses be renamed or deleted with a
-  one-digit edit to `ratchet.json` while every check read green, which is the
-  same defect one level along. A collection error surfaces as an `error` case,
-  not as "no tests ran", which is the shape the old grep-based guard missed.
+  import. A collection error surfaces as an `error` case, not as "no tests ran",
+  which is the shape the old grep-based guard could not see;
+* a clause in `unmet` that now passes — progress, and it is not recorded until
+  the ratchet moves with it, in the PR that earns it;
+* a clause not in `unmet` that now fails — a REGRESSION, and the only event on
+  this arm that is genuinely someone's fault.
 
 Exit 0 means the reading is exactly what the repository claims it is. That is
 the state in which this job is green while the suite is red, and it is the
 distinction the arm exists to make.
 
-Absence is never a pass (principle 7): a missing, unparseable or empty report
-is an error, not a silent success.
+**Both documents are parsed into validated models, not dict indexing.** An
+earlier version read `ratchet["met"]` straight off `json.loads` and a missing
+field surfaced as a KeyError traceback in the Actions log — indistinguishable
+from the grader itself being broken. Absence is never a pass (principle 7), and
+a malformed input is an absence: it fails here with the field named.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import pathlib
 import sys
 import xml.etree.ElementTree as ET
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
 HERE = pathlib.Path(__file__).resolve().parent
 RATCHET = HERE / "ratchet.json"
+
+#: `Class::method`. The module path is deliberately absent: renaming a file is
+#: not a moved reading, and JUnit's `classname` carries the dotted module path
+#: in front of the class.
+CLAUSE_ID = r"^[A-Za-z_][\w]*::[A-Za-z_][\w]*(\[.*\])?$"
+
+
+class Ratchet(BaseModel):
+    """The committed reading: which clauses exist, and which are unmet."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    unmet: dict[str, str] = Field(description="clause id -> why it is unmet, with its phase")
+    met: list[str] = Field(description="clause ids that pass today")
+    note: str = ""
+    last_moved: str = ""
+
+    @model_validator(mode="after")
+    def _ids_are_well_formed_and_disjoint(self) -> Ratchet:
+        import re
+
+        for cid in [*self.unmet, *self.met]:
+            if not re.match(CLAUSE_ID, cid):
+                raise ValueError(f"{cid!r} is not a `Class::method` clause id")
+        if len(set(self.met)) != len(self.met):
+            raise ValueError("`met` lists the same clause twice")
+        both = set(self.met) & set(self.unmet)
+        if both:
+            raise ValueError(f"listed as both met and unmet: {sorted(both)}")
+        for cid, reason in self.unmet.items():
+            if not reason.strip():
+                raise ValueError(f"{cid} carries no reason")
+        return self
+
+    @property
+    def clauses(self) -> set[str]:
+        return set(self.met) | set(self.unmet)
+
+
+class Reading(BaseModel):
+    """What the suite actually reported, parsed out of the JUnit report."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    collected: set[str]
+    unmet: set[str]
+
+    @model_validator(mode="after")
+    def _unmet_is_a_subset(self) -> Reading:
+        if not self.collected:
+            raise ValueError("the acceptance suite collected no tests — dark, not green")
+        stray = self.unmet - self.collected
+        if stray:
+            raise ValueError(f"unmet clauses that were never collected: {sorted(stray)}")
+        return self
 
 
 def _fail(message: str) -> int:
@@ -63,17 +119,12 @@ def _summary(lines: list[str]) -> None:
 
 
 def clause_id(classname: str, name: str) -> str:
-    """`TestAutonomy::test_x` — the class and method, without the module path.
-
-    JUnit's `classname` is the dotted module path plus the class. The module
-    path moves when a file is renamed, and a renamed file is not a moved
-    reading, so it is dropped.
-    """
+    """`TestAutonomy::test_x` — the class and method, without the module path."""
     return f"{classname.rsplit('.', 1)[-1]}::{name}"
 
 
-def read_report(report: pathlib.Path) -> tuple[set[str], set[str]]:
-    """Return (every collected clause id, the unmet ones) from a JUnit report."""
+def read_report(report: pathlib.Path) -> Reading:
+    """Parse a JUnit XML report into a `Reading`."""
     if not report.exists():
         raise SystemExit(_fail(f"no acceptance report at {report} — the gate is dark, not green"))
     try:
@@ -86,10 +137,9 @@ def read_report(report: pathlib.Path) -> tuple[set[str], set[str]]:
     for case in tree.getroot().iter("testcase"):
         cid = clause_id(case.get("classname", "?"), case.get("name", "?"))
         # Two same-named classes in different modules collapse to one id, and
-        # then one of them can regress while the other stays unmet: the set is
-        # unchanged, the count is unchanged, and the run is green while the
-        # true reading dropped. Refuse the ambiguity rather than resolve it —
-        # a clause id that is not unique is not an identifier.
+        # one can then regress while the other stays unmet — set unchanged,
+        # count unchanged, run green, reading wrong. An id that is not unique
+        # is not an identifier, so refuse the ambiguity rather than resolve it.
         if cid in collected:
             raise SystemExit(
                 _fail(
@@ -101,62 +151,50 @@ def read_report(report: pathlib.Path) -> tuple[set[str], set[str]]:
         collected.add(cid)
         if any(child.tag in {"failure", "error", "skipped"} for child in case):
             unmet.add(cid)
-    if not collected:
-        raise SystemExit(
-            _fail("the acceptance suite collected no tests — the gate is dark, not green")
-        )
-    return collected, unmet
+    try:
+        return Reading(collected=collected, unmet=unmet)
+    except ValidationError as exc:
+        raise SystemExit(_fail(f"the acceptance report is not a usable reading: {exc}")) from exc
+
+
+def load_ratchet(path: pathlib.Path = RATCHET) -> Ratchet:
+    try:
+        return Ratchet.model_validate_json(path.read_text())
+    except ValidationError as exc:
+        raise SystemExit(_fail(f"{path.name} is not a valid ratchet: {exc}")) from exc
 
 
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         return _fail(f"usage: {argv[0]} <junit-xml>")
-    collected_ids, unmet = read_report(pathlib.Path(argv[1]))
-    ratchet = json.loads(RATCHET.read_text())
-    # A malformed ratchet must fail the way everything else here does — with a
-    # sentence naming the fix — rather than as a KeyError traceback, which is
-    # both unreadable in an Actions log and indistinguishable from the grader
-    # itself being broken.
-    for field, kind in (("unmet", dict), ("met", list)):
-        if not isinstance(ratchet.get(field), kind):
-            return _fail(
-                f"ratchet.json has no `{field}` of type {kind.__name__}. It carries "
-                "two clause-id collections: `unmet` (id -> reason) and `met` (ids)."
-            )
-    want_unmet = set(ratchet["unmet"])
-    want_all = set(ratchet["met"]) | want_unmet
-    if len(want_all) != len(ratchet["met"]) + len(want_unmet):
-        return _fail("ratchet.json lists a clause in both `met` and `unmet`")
+    reading = read_report(pathlib.Path(argv[1]))
+    ratchet = load_ratchet()
 
     _summary(
         [
             "### Acceptance gate (plan §2)",
             "",
-            f"`{len(collected_ids) - len(unmet)} of {len(collected_ids)} clauses met` — "
-            f"ratchet says `{len(want_all) - len(want_unmet)} of {len(want_all)}`",
+            f"`{len(reading.collected) - len(reading.unmet)} of "
+            f"{len(reading.collected)} clauses met` — ratchet says "
+            f"`{len(ratchet.met)} of {len(ratchet.clauses)}`",
             "",
-            *(f"- unmet: `{name}`" for name in sorted(unmet)),
+            *(f"- unmet: `{name}`" for name in sorted(reading.unmet)),
         ]
     )
 
-    # The clause SET, not how many there are. A count lets a met clause be
-    # renamed or deleted with a one-digit edit to this file while every check
-    # reads green — plan §2 objectives are not deletable, and a grader that
-    # cannot see one disappear is not grading them.
-    vanished = sorted(want_all - collected_ids)
-    appeared = sorted(collected_ids - want_all)
+    vanished = sorted(ratchet.clauses - reading.collected)
+    appeared = sorted(reading.collected - ratchet.clauses)
     if vanished or appeared:
         return _fail(
             "the acceptance suite no longer collects what ratchet.json describes."
             + (f" Gone: {', '.join(vanished)}." if vanished else "")
             + (f" New: {', '.join(appeared)}." if appeared else "")
-            + " A clause was added, renamed, removed, or failed to import (a"
-            " collection error reports as an error case, not as 'no tests ran')."
+            + " A clause was added, renamed, removed, or failed to import."
             " Update tests/acceptance/ratchet.json in the PR that changes the suite."
         )
 
-    regressed = sorted(unmet - want_unmet)
-    earned = sorted(want_unmet - unmet)
+    regressed = sorted(reading.unmet - set(ratchet.unmet))
+    earned = sorted(set(ratchet.unmet) - reading.unmet)
     if regressed:
         return _fail(
             "REGRESSION: a plan §2 objective that was satisfied no longer is: "
@@ -171,8 +209,8 @@ def main(argv: list[str]) -> int:
             "them from `unmet` (and bump `last_moved`) in the PR that earns them."
         )
     print(
-        f"the reading is unchanged: {len(collected_ids) - len(unmet)} "
-        f"of {len(collected_ids)} clauses met"
+        f"the reading is unchanged: {len(reading.collected) - len(reading.unmet)} "
+        f"of {len(reading.collected)} clauses met"
     )
     return 0
 
