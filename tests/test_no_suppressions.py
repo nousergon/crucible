@@ -54,33 +54,56 @@ SELF = Path(__file__).resolve()
 #: of I9807's review: `_KNOWN_TRACKED_DEBT` was removed by moving its one
 #: entry, `gate_key`, into `crucible/keys.py` instead of listing it here).
 #:
-#: **Gated on the exact IDENTIFIER, not the file.** An earlier version of
-#: this exemption skipped the whole `_KNOWN_` PATTERN for the sanctioned
-#: file, which admitted any number of arbitrarily-named `_KNOWN_*`
-#: collections there undetected (measured: appending
-#: `_KNOWN_ANYTHING_GOES: dict[str, str] = {"a": "b"}` to that file still
-#: passed clean) — a hole in the scanner, and the file-path exemption's own
-#: comment asserted the opposite. `_SANCTIONED_KNOWN_IDENTIFIERS` names
-#: exactly the identifier(s) this exemption covers; `_line_is_exempt`
-#: below only skips a `_KNOWN_` match when removing every occurrence of a
-#: sanctioned identifier from the line leaves no `_KNOWN_` text behind — a
-#: third, unsanctioned `_KNOWN_*` collection in the SAME file, on the SAME
-#: or a different line, still fails. Only the `_KNOWN_` pattern is exempted
-#: this way, and only for the one file — `xfail`, `pytest.skip` and the
-#: rest are still scanned there like everywhere else.
+#: **Gated on the exact IDENTIFIER, not the file, not a substring.** Two
+#: prior holes, both measured, both closed:
+#:
+#: Round 2: an earlier version skipped the whole `_KNOWN_` PATTERN for the
+#: sanctioned file, admitting any arbitrarily-named `_KNOWN_*` collection
+#: there undetected (`_KNOWN_ANYTHING_GOES: dict[str, str] = {"a": "b"}`
+#: passed clean).
+#:
+#: Round 3: the fix for that used `str.replace` to strip the sanctioned
+#: name as a SUBSTRING, so any identifier merely CONTAINING the sanctioned
+#: name was exempt too — `_KNOWN_ARCHITECTURAL_EXCEPTIONS_2` (the
+#: sanctioned name plus a suffix) and
+#: `X_KNOWN_ARCHITECTURAL_EXCEPTIONS_EXTRA` (the sanctioned name inside a
+#: longer identifier) both passed clean under that version: a debt list —
+#: the exact thing this file must never carry — landing under a
+#: two-character rename.
+#:
+#: Fixed by matching WHOLE IDENTIFIER TOKENS: `_line_is_exempt_known_pattern`
+#: extracts every identifier-shaped token on the line and requires every
+#: token that CONTAINS `_KNOWN_` to EXACTLY equal a name in
+#: `_SANCTIONED_KNOWN_IDENTIFIERS` — not merely contain one, and not merely
+#: be contained by one. A third, unsanctioned `_KNOWN_*` identifier in the
+#: SAME file, on the SAME or a different line, still fails, whether it
+#: extends the sanctioned name, is extended BY it, or shares none of it.
+#: Only the `_KNOWN_` pattern is exempted this way, and only for the one
+#: file — `xfail`, `pytest.skip` and the rest are still scanned there like
+#: everywhere else.
 _SANCTIONED_KNOWN_REGISTRY_FILE = REPO_ROOT / "tests" / "test_key_construction_placement.py"
-_SANCTIONED_KNOWN_IDENTIFIERS = ("_KNOWN_ARCHITECTURAL_EXCEPTIONS",)
+_SANCTIONED_KNOWN_IDENTIFIERS = frozenset({"_KNOWN_ARCHITECTURAL_EXCEPTIONS"})
+
+_IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _line_is_exempt_known_pattern(line: str) -> bool:
-    """True only if every `_KNOWN_` occurrence on ``line`` is accounted for
-    by a sanctioned identifier substring. An unsanctioned `_KNOWN_*` name on
-    the same line — even one that also contains a sanctioned identifier —
-    still leaves `_KNOWN_` text behind and is reported."""
-    stripped = line
-    for name in _SANCTIONED_KNOWN_IDENTIFIERS:
-        stripped = stripped.replace(name, "")
-    return "_KNOWN_" not in stripped
+    """True only if every identifier TOKEN on ``line`` that contains
+    `_KNOWN_` is EXACTLY one of `_SANCTIONED_KNOWN_IDENTIFIERS` — not a
+    token that merely contains a sanctioned name as a substring
+    (`_KNOWN_ARCHITECTURAL_EXCEPTIONS_2`) or that a sanctioned name is a
+    substring of (`X_KNOWN_ARCHITECTURAL_EXCEPTIONS_EXTRA`, one token,
+    since `X` and `_` are both word characters with no boundary between
+    them). A line with no `_KNOWN_`-containing token at all is vacuously
+    exempt from THIS pattern (there is nothing on it to sanction), which is
+    safe: the caller only reaches this function when deciding whether to
+    skip a `_KNOWN_` match, and a line with no such token cannot produce
+    one.
+    """
+    tokens_containing_known = [t for t in _IDENTIFIER_TOKEN_RE.findall(line) if "_KNOWN_" in t]
+    if not tokens_containing_known:
+        return True
+    return all(token in _SANCTIONED_KNOWN_IDENTIFIERS for token in tokens_containing_known)
 
 
 # Directories that are not source: caches, the virtualenv, git internals.
@@ -281,12 +304,17 @@ class TestTheSanctionedKnownRegistryExemptionIsExactlyAsNarrowAsClaimed:
 
     A guard that weakens `test_no_suppression_collections_anywhere_in_the_tree`
     is the one change in alpha-engine-config-I9807 with no self-test proving
-    what it does and does not admit — caught on that PR's round-3 review,
-    after a file-path-only exemption was measured to admit an arbitrarily
-    named `_KNOWN_*` collection undetected. These four cases are exactly the
-    axes that mattered: the sanctioned identifier itself, an unsanctioned
-    identifier in the same file, a different FORBIDDEN pattern in the same
-    file, and the sanctioned identifier's own pattern in a different file.
+    what it does and does not admit. Two rounds of review found two holes,
+    both measured, both closed, both pinned here:
+
+    Round 3: a file-path-only exemption admitted an arbitrarily named
+    `_KNOWN_*` collection anywhere in the sanctioned file, undetected.
+
+    Round 4: the round-3 fix matched the sanctioned name as a SUBSTRING,
+    so `_KNOWN_ARCHITECTURAL_EXCEPTIONS_2` (sanctioned name plus a suffix)
+    and `X_KNOWN_ARCHITECTURAL_EXCEPTIONS_EXTRA` (sanctioned name inside a
+    longer identifier) both passed clean — a debt list landing under a
+    two-character rename. Fixed by requiring a WHOLE-TOKEN match.
     """
 
     def test_the_sanctioned_identifier_itself_is_exempt(self) -> None:
@@ -335,4 +363,30 @@ class TestTheSanctionedKnownRegistryExemptionIsExactlyAsNarrowAsClaimed:
         assert findings, (
             "the exemption is scoped to one specific file; the same sanctioned "
             "identifier text in any other file is still reported."
+        )
+
+    def test_a_sanctioned_name_plus_a_suffix_is_still_reported(self) -> None:
+        """Round-4 finding: the round-3 fix stripped the sanctioned name as a
+        SUBSTRING, so an identifier merely CONTAINING it (the sanctioned name
+        plus a two-character suffix) was exempt too — a debt list landing
+        under a rename. `_KNOWN_ARCHITECTURAL_EXCEPTIONS_2` is a distinct
+        identifier from `_KNOWN_ARCHITECTURAL_EXCEPTIONS` and must not be
+        exempt merely because it starts with it."""
+        text = '_KNOWN_ARCHITECTURAL_EXCEPTIONS_2: dict[str, str] = {"track_a": "not moved yet"}'
+        findings = _findings_for_file(_SANCTIONED_KNOWN_REGISTRY_FILE, text)
+        assert findings, (
+            "_KNOWN_ARCHITECTURAL_EXCEPTIONS_2 CONTAINS the sanctioned identifier as a "
+            "prefix but is not equal to it, and must still be reported."
+        )
+
+    def test_a_sanctioned_name_embedded_in_a_longer_identifier_is_still_reported(self) -> None:
+        """Round-4 finding, the other direction: the sanctioned name as a
+        substring INSIDE a longer identifier, rather than the sanctioned
+        name extended by a suffix."""
+        text = "X_KNOWN_ARCHITECTURAL_EXCEPTIONS_EXTRA = {}"
+        findings = _findings_for_file(_SANCTIONED_KNOWN_REGISTRY_FILE, text)
+        assert findings, (
+            "X_KNOWN_ARCHITECTURAL_EXCEPTIONS_EXTRA is one identifier token containing "
+            "the sanctioned name as a substring, not equal to it, and must still be "
+            "reported."
         )
