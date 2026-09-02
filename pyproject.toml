@@ -16,6 +16,17 @@ dependencies = [
     # for `status in {ok, failed}` (plan §4.2), so validation is a runtime
     # dependency, not a test-only one.
     "jsonschema>=4.23",
+    # Every document this repo READS is parsed into a validated model, never
+    # into dict indexing over `json.loads` output. The difference is where a
+    # malformed document surfaces: as a named field error at the boundary, or
+    # as a KeyError traceback three functions in — which is what the acceptance
+    # ratchet did until an adversarial review hit it (2026-09-02).
+    #
+    # JSON Schema stays the CROSS-REPO contract surface (`schemas/*.json`,
+    # plan §4.2): those are consumed by other repos and must not require a
+    # Python import to read. Pydantic is the in-process reader, not a
+    # replacement for them.
+    "pydantic>=2.9",
     "PyYAML>=6.0",
     # The M slot's linear estimators and the CPCV grader operate on a
     # (trading_day x name) panel. Pure-Python normal equations over ~450k
