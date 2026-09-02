@@ -28,7 +28,11 @@ import datetime as dt
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
+
+from jsonschema import Draft202012Validator
 
 from crucible.components import Component, load_registry
 from crucible.keys import arena_cycle_key, arm_register_key
@@ -58,6 +62,8 @@ __all__ = [
     "gate_key",
     "ladder_payload",
     "last_read",
+    "ladder_schema",
+    "validate_ladder_document",
 ]
 
 GATE_SCHEMA_VERSION = "gate.v1"
@@ -107,22 +113,31 @@ class GateResult:
         return bool(self.clauses) and all(c.met for c in self.clauses)
 
     @property
-    def met_ratio(self) -> float:
-        """Met clauses over total. Zero clauses is 0.0, never 1.0 — an empty
-        gate is a gate that measured nothing, and vacuous truth is exactly the
-        shape that let a phase close unmeasured."""
+    def met_ratio(self) -> float | None:
+        """Met clauses over total, or `None` when nothing was measured.
+
+        Zero clauses is `None`, never `0.0` and never `1.0` — an empty gate
+        measured nothing, and `0.0` there is a false measurement: it reads as
+        "measured, and none passed" when the truth is "never measured"
+        (principle 7, `alpha-engine-config-I9824`). This is the ONE place the
+        ratio is computed; `build_ladder` and `PhaseRow` both read it from
+        here rather than re-deriving it, so the durable gate artifact and the
+        overwritten ladder cannot disagree about the same reading.
+        """
         if not self.clauses:
-            return 0.0
+            return None
         return sum(1 for c in self.clauses if c.met) / len(self.clauses)
 
     def to_dict(self) -> dict[str, Any]:
+        ratio = self.met_ratio
         return {
             "schema_version": GATE_SCHEMA_VERSION,
             "gate": self.gate,
             "trading_day": self.trading_day.isoformat(),
             "window": [d.isoformat() for d in self.window],
             "met": self.met,
-            "met_ratio": round(self.met_ratio, 6),
+            # `null`, never 0.0, when nothing was measured — see `met_ratio`.
+            "met_ratio": None if ratio is None else round(ratio, 6),
             "clauses": [c.to_dict() for c in self.clauses],
         }
 
@@ -505,11 +520,26 @@ LADDER_CONSOLE_STATE: dict[str, str] = {
     "OUT_OF_ORDER": "FAILED",
 }
 
-_ladder_state_gap = set(LADDER_STATES) - set(LADDER_CONSOLE_STATE)
-assert not _ladder_state_gap, (
-    f"LADDER_CONSOLE_STATE is missing {sorted(_ladder_state_gap)} — every ladder "
-    "state must declare how it renders before it can reach a surface."
-)
+
+def _check_ladder_console_coverage(states: Iterable[str], console_map: dict[str, str]) -> None:
+    """Refuse a ladder state with no declared console rendering.
+
+    A plain function, not a module-level `assert`: `assert` is compiled out
+    under `python -O`/`PYTHONOPTIMIZE` — the one guard construct guaranteed
+    absent in an optimized interpreter, and this is the guard that stops a
+    ladder state reaching a console surface with no declared rendering
+    (`alpha-engine-config-I9826`). Called once at import time below, so the
+    failure is still caught at import, not deferred to the first render.
+    """
+    gap = set(states) - set(console_map)
+    if gap:
+        raise ValueError(
+            f"LADDER_CONSOLE_STATE is missing {sorted(gap)} — every ladder "
+            "state must declare how it renders before it can reach a surface."
+        )
+
+
+_check_ladder_console_coverage(LADDER_STATES, LADDER_CONSOLE_STATE)
 
 
 def last_read(store: Store, gate: str) -> str | None:
@@ -632,15 +662,23 @@ def build_ladder(
     trading_day: dt.date,
     registry: dict[str, Component] | None = None,
     now: dt.datetime | None = None,
+    readings: dict[str, GateResult] | None = None,
 ) -> Ladder:
     """Read every phase's gate out of ``store`` and assemble the ladder.
 
     Reads only. Each registered gate is evaluated against the artifacts already
     filed — the same measurement `crucible gate` publishes — so the ladder can
     never disagree with the per-gate reading beside it.
+
+    ``readings`` lets a caller that already evaluated a gate this run (`crucible
+    gate`'s own handler) hand that reading in rather than have it re-evaluated
+    here — `gate_handler` used to read the same gate twice in one job, doubling
+    every store read the clause set makes (`alpha-engine-config-I9826`). Any
+    gate not present in ``readings`` is still evaluated normally.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     reg = registry if registry is not None else load_registry()
+    supplied = readings or {}
 
     gate_states: list[tuple[Phase, str, str, int | None, int | None, float | None, str | None]] = []
     for phase in PHASES:
@@ -658,16 +696,31 @@ def build_ladder(
                 )
             )
             continue
-        reading = evaluate(store, gate=phase.gate, trading_day=trading_day, registry=reg)
+        reading = supplied.get(phase.gate) or evaluate(
+            store, gate=phase.gate, trading_day=trading_day, registry=reg
+        )
         met = sum(1 for c in reading.clauses if c.met)
         total = len(reading.clauses)
         read_on = last_read(store, phase.gate)
         if total == 0:
-            # A gate with no clauses measured nothing. `met` would be vacuously
-            # true and `met_ratio` 0.0; both are the shape that lets a phase
-            # close unmeasured, so the ladder refuses to call it a reading.
+            # A gate with no clauses measured nothing. `met` would be
+            # vacuously true, and `reading.met_ratio` is already `None` here
+            # (GateResult.met_ratio, not re-derived) — both are the shape
+            # that lets a phase close unmeasured, so the ladder refuses to
+            # call it a reading. Passing `reading.met_ratio` through, rather
+            # than constructing a second `None` here, is what makes the
+            # ladder row and the dated gate artifact agree by construction:
+            # there is exactly one place this ratio is computed.
             gate_states.append(
-                (phase, "UNMEASURED", f"gate {phase.gate} has no clauses", 0, 0, None, read_on)
+                (
+                    phase,
+                    "UNMEASURED",
+                    f"gate {phase.gate} has no clauses",
+                    0,
+                    0,
+                    reading.met_ratio,
+                    read_on,
+                )
             )
             continue
         unmet = [c.name for c in reading.clauses if not c.met]
@@ -726,6 +779,55 @@ def build_ladder(
     )
 
 
+LADDER_SCHEMA_PATH = Path(__file__).parent / "schemas" / "phase_ladder.v1.json"
+
+
+@lru_cache(maxsize=1)
+def ladder_schema() -> dict[str, Any]:
+    """The `phase_ladder.v1` JSON Schema, loaded once (`alpha-engine-config-I9825`).
+
+    A missing schema is a broken build, not a degraded read — same posture as
+    `crucible.champion.load_schema`.
+    """
+    if not LADDER_SCHEMA_PATH.is_file():
+        raise FileNotFoundError(
+            f"phase ladder schema missing at {LADDER_SCHEMA_PATH}. It ships inside "
+            "the package; a missing schema means a broken build."
+        )
+    return json.loads(LADDER_SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+@lru_cache(maxsize=1)
+def _ladder_validator() -> Draft202012Validator:
+    schema = ladder_schema()
+    Draft202012Validator.check_schema(schema)
+    return Draft202012Validator(schema)
+
+
+def validate_ladder_document(document: dict[str, Any]) -> None:
+    """Refuse a ladder document that does not conform to `phase_ladder.v1`.
+
+    Producer-side validation, the shape `crucible/slots/inputs.py::write_arm_
+    predictions` uses — a malformed ladder is refused before it reaches the
+    store, not discovered by whatever reads it next.
+    """
+    errors = sorted(_ladder_validator().iter_errors(document), key=lambda e: list(e.absolute_path))
+    if errors:
+        detail = "\n".join(
+            f"  - {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}"
+            for e in errors
+        )
+        raise ValueError(f"ladder document does not conform to {LADDER_SCHEMA_VERSION}:\n{detail}")
+
+
 def ladder_payload(ladder: Ladder) -> bytes:
-    """The ladder artifact's bytes, as every publisher writes them."""
-    return json.dumps(ladder.to_dict(), indent=2, sort_keys=True).encode("utf-8")
+    """The ladder artifact's bytes, as every publisher writes them.
+
+    Validated against `phase_ladder.v1` before being returned — both
+    publishers (`crucible gate` and `crucible console`) call this rather than
+    re-serializing `ladder.to_dict()` by hand, so there is exactly one place
+    the bytes on the wire are produced and checked (`alpha-engine-config-I9825`).
+    """
+    document = ladder.to_dict()
+    validate_ladder_document(document)
+    return json.dumps(document, indent=2, sort_keys=True).encode("utf-8")

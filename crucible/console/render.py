@@ -20,6 +20,7 @@ from crucible.calendar import previous_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
 from crucible.console.classify import STATES, Classification, classify
 from crucible.gate import LADDER_KEY, LADDER_STATES, build_ladder
+from crucible.gate import validate_ladder_document as _validate_ladder_document
 from crucible.manifest import manifest_prefix
 from crucible.store import Store
 
@@ -571,5 +572,11 @@ def write_page(store: Store, page: ConsolePage) -> tuple[str, ...]:
     """
     store.put_bytes(CONSOLE_KEY, render_html(page).encode("utf-8"))
     store.put_bytes(CONSOLE_JSON_KEY, page.to_json())
+    # Validated against `phase_ladder.v1` here too — `write_page` is the
+    # SECOND producer of `gates/ladder.json` (`crucible gate` is the first,
+    # via `crucible.gate.ladder_payload`), and this is the one place its
+    # bytes are formed, so a malformed ladder is refused before either
+    # publisher's write lands (alpha-engine-config-I9825).
+    _validate_ladder_document(page.phase_ladder)
     store.put_bytes(LADDER_KEY, json.dumps(page.phase_ladder, indent=2, sort_keys=True).encode())
     return CONSOLE_KEY, CONSOLE_JSON_KEY, LADDER_KEY

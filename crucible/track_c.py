@@ -22,8 +22,9 @@ import json
 from typing import Any
 
 from crucible import alerts, release
-from crucible.console.render import build_page, write_page
+from crucible.console.render import CONSOLE_JSON_KEY, CONSOLE_KEY, build_page, write_page
 from crucible.drift import drift_metrics
+from crucible.gate import LADDER_KEY, LADDER_SCHEMA_VERSION
 from crucible.runner import RunContext, run_job, spot_interruption_guard
 from crucible.store import Store, open_store, sha256_hex
 
@@ -408,8 +409,19 @@ def console_handler(args: argparse.Namespace) -> int:
         # Every key `write_page` wrote, unpacked positionally by nobody: the
         # ladder artifact joined the page and its JSON, and a two-name unpack
         # would have failed the console job the moment it did.
+        #
+        # Each key gets ITS OWN schema version rather than one blanket stamp —
+        # `gates/ladder.json` speaks `phase_ladder.v1`, not `console_page.v1`;
+        # stamping every `write_page` key the same version is what let the
+        # manifest lineage entry for the ladder disagree with the bytes it
+        # described (`alpha-engine-config-I9825`).
+        key_schema_versions = {
+            CONSOLE_KEY: "console_page.v1",
+            CONSOLE_JSON_KEY: "console_page.v1",
+            LADDER_KEY: LADDER_SCHEMA_VERSION,
+        }
         for key in write_page(store, page):
-            ctx.record_output(key, store.get_bytes(key), schema_version="console_page.v1")
+            ctx.record_output(key, store.get_bytes(key), schema_version=key_schema_versions[key])
         ctx.record_metric(
             {
                 "name": "components_unreported",

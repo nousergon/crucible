@@ -81,6 +81,24 @@ class TestTheLadderIsDeclaredWhole:
         assert set(LADDER_STATES) == set(LADDER_CONSOLE_STATE)
         assert set(LADDER_STATES) <= set(STATUS_COLORS)
 
+    def test_a_ladder_state_with_no_console_mapping_raises_ValueError_not_AssertionError(
+        self,
+    ) -> None:
+        """`alpha-engine-config-I9826`. `assert` is compiled out under
+        `python -O`/`PYTHONOPTIMIZE` — the guard that stops an undeclared
+        ladder state reaching a console surface must not be the one construct
+        guaranteed absent in an optimized interpreter. This is the exact
+        function the module calls at import time, so a real gap fails the
+        same way whether or not the interpreter is optimized."""
+        from crucible.gate import _check_ladder_console_coverage
+
+        with pytest.raises(ValueError, match="A_NEW_STATE"):
+            _check_ladder_console_coverage(
+                (*LADDER_STATES, "A_NEW_STATE"), dict(LADDER_CONSOLE_STATE)
+            )
+        # No gap: the real, current vocabulary passes without raising.
+        _check_ladder_console_coverage(LADDER_STATES, dict(LADDER_CONSOLE_STATE))
+
 
 class TestAbsenceRendersAsAbsence:
     def test_an_unwritten_gate_is_UNMEASURED_not_MET(self, store: LocalStore) -> None:
@@ -143,6 +161,73 @@ class TestTheLadderKnowsWhereItIs:
         rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
         assert rows["phase1"]["state"] == "UNMEASURED"
         assert rows["phase1"]["met_ratio"] is None
+
+    def test_the_ladder_row_and_the_dated_gate_artifact_cannot_disagree(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`alpha-engine-config-I9824`. The durable, dated artifact at
+        `gates/{gate}/{trading_day}/gate.json` (`GateResult.to_dict`) and the
+        overwritten `gates/ladder.json` row (`PhaseRow.to_dict`) must publish
+        the identical `met_ratio` for the same reading — by construction,
+        because `build_ladder` reads `GateResult.met_ratio` rather than
+        re-deriving it, not merely by two authors agreeing.
+
+        Checked at both ends of the vocabulary: an emptied clause list
+        (`None` on both surfaces) and a real 0/5 measurement (`0.0` on both
+        surfaces, which is the correct, MEASURED zero — not the false one
+        this issue is about).
+        """
+        from crucible.gate import Clause, evaluate
+
+        monkeypatch.setitem(GATES, "phase1", (5, lambda *_a, **_k: []))
+        gate_reading = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        ladder_rows = {
+            r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]
+        }
+        assert gate_reading.to_dict()["met_ratio"] is None
+        assert ladder_rows["phase1"]["met_ratio"] is None
+        assert gate_reading.to_dict()["met_ratio"] == ladder_rows["phase1"]["met_ratio"]
+
+        monkeypatch.setitem(
+            GATES,
+            "phase1",
+            (5, lambda *_a, **_k: [Clause("c", "req", False, "unmet", ())]),
+        )
+        gate_reading = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        ladder_rows = {
+            r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]
+        }
+        assert gate_reading.to_dict()["met_ratio"] == 0.0
+        assert ladder_rows["phase1"]["met_ratio"] == 0.0
+
+    def test_a_supplied_reading_is_reused_not_re_evaluated(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`alpha-engine-config-I9826` finding 2: `gate_handler` used to call
+        `evaluate` for `phase1` once itself and again inside `build_ladder`,
+        doubling every store read the clause set makes. `readings` lets the
+        caller hand in what it already computed; the supplied gate must not
+        be evaluated a second time."""
+        from crucible.gate import GateResult, evaluate
+
+        calls = {"n": 0}
+        real_evaluate = evaluate
+
+        def counting_evaluate(*args, **kwargs):
+            calls["n"] += 1
+            return real_evaluate(*args, **kwargs)
+
+        monkeypatch.setattr("crucible.gate.evaluate", counting_evaluate)
+        reading = real_evaluate(store, gate="phase1", trading_day=FRIDAY)
+        calls["n"] = 0  # only count calls made during build_ladder below
+
+        ladder = build_ladder(store, trading_day=FRIDAY, readings={"phase1": reading})
+        assert calls["n"] == 0
+
+        rows = {r["phase"]: r for r in ladder.to_dict()["phases"]}
+        assert rows["phase1"]["clauses_met"] == sum(1 for c in reading.clauses if c.met)
+        assert rows["phase1"]["clauses_total"] == len(reading.clauses)
+        assert isinstance(reading, GateResult)
 
 
 class TestAnOutOfOrderPhaseIsVisibleAsSuch:
@@ -219,6 +304,83 @@ class TestTheLadderIsPublishedWhereSomethingReadsIt:
 
         html = render_html(ConsolePage(trading_day="2026-08-28", generated_utc="x"))
         assert "No ladder was built" in html
+
+
+class TestThePhaseLadderSchemaContract:
+    """`alpha-engine-config-I9825`. `gates/ladder.json` has two producers and
+    a declared version; this class is the producer/consumer contract test
+    the M0 rule (`~/Development/CLAUDE.md`) requires at its birth."""
+
+    def test_the_schema_file_exists_and_is_a_valid_schema(self) -> None:
+        from jsonschema import Draft202012Validator
+
+        from crucible.gate import ladder_schema
+
+        Draft202012Validator.check_schema(ladder_schema())
+
+    def test_bytes_from_both_producers_validate_against_the_schema(self, store: LocalStore) -> None:
+        from crucible.gate import validate_ladder_document
+
+        ladder = build_ladder(store, trading_day=FRIDAY, now=NOW)
+        validate_ladder_document(json.loads(ladder_payload(ladder).decode("utf-8")))
+
+        page = build_page(store, now=NOW)
+        write_page(store, page)
+        validate_ladder_document(json.loads(store.get_bytes(LADDER_KEY).decode("utf-8")))
+
+    def test_the_gate_jobs_manifest_records_the_ladders_own_schema_version(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Measured on `crucible-PR30` head `a124381`: `gate_handler` recorded
+        `record_output`'s bare default (`v1`), not `phase_ladder.v1`, for
+        `gates/ladder.json`."""
+        import argparse
+
+        from crucible.gate import GATES, Clause
+        from crucible.store import LocalStore
+        from crucible.track_f import gate_handler
+
+        monkeypatch.setitem(
+            GATES, "phase1", (5, lambda *_a, **_k: [Clause("c", "req", True, "met", ())])
+        )
+        args = argparse.Namespace(
+            gate="phase1", trading_day=FRIDAY, weeks=None, store=str(tmp_path)
+        )
+        gate_handler(args)
+
+        store = LocalStore(tmp_path)
+        manifest = json.loads(store.get_bytes(f"runs/gate/{FRIDAY.isoformat()}/run.json"))
+        (ladder_output,) = [o for o in manifest["outputs"] if o["key"] == LADDER_KEY]
+        assert ladder_output["schema_version"] == "phase_ladder.v1"
+
+    def test_the_console_jobs_manifest_also_records_the_ladders_own_schema_version(
+        self, tmp_path
+    ) -> None:
+        """Measured on `crucible-PR30` head `a124381`: `console_handler`
+        stamped every `write_page` key, ladder included, with the single
+        literal `console_page.v1`."""
+        import argparse
+
+        from crucible.store import LocalStore
+        from crucible.track_c import console_handler
+
+        args = argparse.Namespace(trading_day=FRIDAY, store=str(tmp_path))
+        console_handler(args)
+
+        store = LocalStore(tmp_path)
+        manifest = json.loads(store.get_bytes(f"runs/console/{FRIDAY.isoformat()}/run.json"))
+        (ladder_output,) = [o for o in manifest["outputs"] if o["key"] == LADDER_KEY]
+        assert ladder_output["schema_version"] == "phase_ladder.v1"
+
+    def test_an_out_of_vocabulary_state_is_refused_by_the_schema(self, store: LocalStore) -> None:
+        ladder = build_ladder(store, trading_day=FRIDAY, now=NOW)
+        document = ladder.to_dict()
+        document["phases"][0]["state"] = "PENDING"
+
+        from crucible.gate import validate_ladder_document
+
+        with pytest.raises(ValueError, match="does not conform"):
+            validate_ladder_document(document)
 
 
 class TestTheLadderRendersForAHuman:
