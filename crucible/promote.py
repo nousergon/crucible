@@ -62,7 +62,7 @@ from crucible.champion import (
     read_champion_etag,
     write_champion,
 )
-from crucible.keys import arm_register_key, arm_series_key
+from crucible.keys import arm_register_key, arm_series_key, experiments_key, retirement_log_key
 from crucible.slots import SlotSpec, is_control_arm
 from crucible.store import ETAG_ABSENT, Store
 
@@ -106,26 +106,6 @@ def paired_days_required(spec: SlotSpec) -> int:
     window — an eligibility clock nobody declared.
     """
     return spec.promote_min_weeks * TRADING_DAYS_PER_WEEK
-
-
-def retirement_log_key(slot: str) -> str:
-    """The append-only retirement event log for ``slot``.
-
-    Dateless by design: it is the log, not a per-cycle artifact, and the §4.12
-    key walk skips keys with no date component rather than requiring a
-    trading day of something that spans all of them.
-    """
-    return f"retirements/{slot}/events.jsonl"
-
-
-def experiments_key(trading_day: str) -> str:
-    """The generated `EXPERIMENTS` feed for one trading day.
-
-    Plan §9.1: "`EXPERIMENTS.md` entry is generated from the register event,
-    never hand-written." A negative result that only ever existed in a
-    private doc someone remembered to update is not a record.
-    """
-    return f"experiments/{trading_day}/events.jsonl"
 
 
 @dataclass(frozen=True)

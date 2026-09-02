@@ -262,6 +262,15 @@ def _assert_sha(sha: str) -> str:
 
 
 def release_prefix(sha: str) -> str:
+    """Stays here rather than in `crucible.keys` (alpha-engine-config-I9807
+    class sweep): `_assert_sha` is release-domain validation reused directly
+    by callers elsewhere in this module (`_assert_sha` at lines ~416, ~523),
+    not a key-only helper like `crucible.keys.arm_key_segment`. Moving just
+    the three key functions below would either duplicate `_assert_sha` in
+    `crucible.keys` — a second source of truth for sha validation — or make
+    the generic key module import a release-specific validator, which is
+    backwards: nothing in `crucible.keys` depends on a domain module today.
+    """
     return f"releases/{_assert_sha(sha)}"
 
 
