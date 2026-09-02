@@ -22,11 +22,23 @@ name: Board
 #
 # `crucible-v2-github-board` (nous-ergon-ops/infrastructure/cloudformation/
 # crucible-v2.yaml) reads `crucible/*` and writes exactly `crucible/board/*`
-# and `crucible/console/*`. It is NOT the deploy role and NOT the runtime
-# role. `crucible/gate.py`'s binding rule is "a gate reads; it never runs",
-# and this is that rule expressed as an identity rather than as a convention:
-# an identity that cannot write a run manifest cannot be used to satisfy a
-# clause it is grading, whatever the code does.
+# and `crucible/console/*`.
+#
+# That role is created by an OPERATOR-GATED apply, not by merging the ops PR:
+# the crucible-v2 stack is deliberately applied by a human with operator
+# credentials because a named-IAM apply is a security boundary
+# (`pull-request-policy` §4.2 form 3 — the merge emits the exact command AND a
+# detector stays red until it runs). Until the apply happens this workflow
+# fails daily on the identity check below, naming the exact command. That is
+# the detector working, not a defect: an operator step recorded in an issue
+# and nowhere else is `alpha-engine-config-I1906`, closed as *fixed* on a PR
+# whose `aws iam put-role-policy` was never performed.
+#
+# It is NOT the deploy role and NOT the runtime role. `crucible/gate.py`'s
+# binding rule is "a gate reads; it never runs", and this is that rule
+# expressed as an identity rather than as a convention: an identity that
+# cannot write a run manifest cannot be used to satisfy a clause it is
+# grading, whatever the code does.
 #
 # ── Why a red board is not a failed run ───────────────────────────────────
 #
@@ -103,7 +115,7 @@ jobs:
         run: |
           assumed="$(aws sts get-caller-identity --query Arn --output text)"
           expected="${BOARD_ROLE_ARN##*/}"
-          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. The board must render as a READ-ONLY identity; rendering it as a writer would let a grading surface satisfy the clauses it grades. If the role does not exist yet, merge the crucible-v2 stack change in nous-ergon-ops (it applies on merge) before this workflow can run."; exit 1 ;; esac
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. The board must render as a READ-ONLY identity; rendering it as a writer would let a grading surface satisfy the clauses it grades. If the role does not exist yet the crucible-v2 stack has not been applied since nous-ergon-ops-PR990 merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until that happens is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
 
       - name: Render the board
         run: uv run crucible board --store "$STORE_URI"
