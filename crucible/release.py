@@ -101,6 +101,7 @@ __all__ = [
     "ReleaseRecordMismatchError",
     "StaleReleasePointerError",
     "TRADER_PIN_KEY",
+    "assert_sha",
     "current_release",
     "parse_release_record",
     "pin",
@@ -342,6 +343,20 @@ def assert_immutable_write(store: Store, key: str, payload: bytes) -> bool:
         "To re-promote this build use `crucible release.pin <sha>` (no rebuild); to "
         "publish different bytes, publish them under their own commit."
     )
+
+
+def assert_sha(sha: str) -> str:
+    """Refuse anything but a 40-character lowercase git sha; return it.
+
+    Public so a caller that reads a sha out of a document it does not own —
+    `track_c`'s smoke reading `releases/current` — can validate it BEFORE
+    entering a block that swallows record-shaped failures. Measured on the
+    review of alpha-engine-config-I9932: with the check only inside
+    :func:`resolve_published_wheel`, a corrupt pointer (`"sha":
+    "NOT-A-VALID-SHA"`) was swallowed with the record conditions and the
+    smoke reported `ok` over it.
+    """
+    return _assert_sha(sha)
 
 
 def _assert_sha(sha: str) -> str:

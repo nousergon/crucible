@@ -828,6 +828,29 @@ class TestTheSmokeGate:
         with pytest.raises(ValueError, match="describes"):
             self._run(tmp_path)
 
+    def test_a_corrupt_pointer_fails_the_smoke_rather_than_reading_as_a_broken_build(
+        self, tmp_path
+    ) -> None:
+        """Review of alpha-engine-config-I9932 (crucible-PR83 round 1): with
+        the sha check only inside `resolve_published_wheel`, a
+        `releases/current` naming `NOT-A-VALID-SHA` fell into the pointed-
+        release branch's swallow beside the three record conditions, and the
+        smoke exited 0 / `ok` — the flip would have proceeded over a corrupt
+        pointer. On `main` before PR83 the same store raised. The pointer's
+        shape is now validated BEFORE the swallow: a raise, a `failed`
+        manifest, no flip."""
+        store = LocalStore(tmp_path)
+        publish_release(
+            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
+        )
+        store.put_bytes(
+            POINTER_KEY,
+            json.dumps({"sha": "NOT-A-VALID-SHA", "target": "current"}).encode("utf-8"),
+        )
+        with pytest.raises(ValueError, match="not a 40-character lowercase git sha"):
+            self._run(tmp_path)
+        assert self._manifest(tmp_path)["status"] == "failed"
+
     def test_a_passing_smoke_records_the_artifacts_it_actually_read(self, tmp_path) -> None:
         """`inputs: []` on a gate is the signature of a gate that read
         nothing."""

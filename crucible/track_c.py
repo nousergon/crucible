@@ -296,6 +296,13 @@ def smoke_handler(args: argparse.Namespace) -> int:
                 # v2 path, so `wheel_key(pointed)` alone cannot answer this.
                 # A missing or unreadable release.json here means the same
                 # thing as a missing wheel: the pointed build is broken.
+                # The POINTER's own shape is checked OUTSIDE the swallow
+                # below: a `releases/current` that does not even name a sha
+                # is a corrupt pointer, not a broken pointed build, and it
+                # raises — review of alpha-engine-config-I9932 measured that
+                # with the check inside the resolver it was swallowed with
+                # the record conditions and the smoke read `ok` over it.
+                release.assert_sha(pointed)
                 pointed_wheel_present = False
                 try:
                     pointed_wheel_present = store.exists(
@@ -308,7 +315,9 @@ def smoke_handler(args: argparse.Namespace) -> int:
                     # POINTED release (`ReleaseRecordMismatchError` is a
                     # `ValueError`) is itself evidence the pointed build is
                     # broken, which is exactly what this branch already
-                    # records as `degraded`, never as a raise.
+                    # records as `degraded`, never as a raise. Exactly those
+                    # three record conditions; the pointer itself was
+                    # validated above.
                     pointed_wheel_present = False
                 if not pointed_wheel_present:
                     # Recorded, NOT raised, and this is the only deliberate
