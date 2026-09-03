@@ -43,7 +43,7 @@ from crucible.calendar import (
     resolve_trading_day,
 )
 from crucible.components import Component, load_registry, scheduled_components
-from crucible.keys import ALERTS_ROOT, RUNS_ROOT, parse_manifest_key
+from crucible.keys import ALERTS_ROOT, RUNS_ROOT, is_manifest_key, parse_manifest_key
 from crucible.manifest import manifest_prefix
 from crucible.store import Store
 
@@ -357,7 +357,18 @@ def days_to_evaluate(
     # (alpha-engine-config-I9781), so a trading day can carry several — this
     # only needs to know whether ANY exist, hence a prefix listing rather
     # than an exact-key check.
-    ran = {d for d in candidates if any(store.list_keys(manifest_prefix(SWEEP_JOB, d.isoformat())))}
+    # `is_manifest_key`, not `any(...)` over the raw listing: a manifest prefix
+    # is a namespace and a job may file its own evidence beside its manifest
+    # (`report.morning` writes `message.txt` there). Counting a non-manifest
+    # object as "the sweep ran" would delete a real missed day from the backlog
+    # (alpha-engine-config-I9900).
+    ran = {
+        d
+        for d in candidates
+        if any(
+            is_manifest_key(k) for k in store.list_keys(manifest_prefix(SWEEP_JOB, d.isoformat()))
+        )
+    }
     if not ran:
         # No evidence the sweep ran on any day in the window: either it is a
         # cold start or the sweep has been down for longer than the window,
@@ -418,7 +429,14 @@ def evaluate_absence(
             # calendar_date) writes ANY number of manifests under this
             # trading day, and absence means none of them exist — not that
             # the one bare key is missing (alpha-engine-config-I9781).
-            if any(store.list_keys(manifest_prefix(name, trading_day.isoformat()))):
+            # Narrowed to MANIFEST keys: a job's own evidence filed beside its
+            # manifest (`report.morning`'s `message.txt`) is not a manifest,
+            # and letting it satisfy this check would suppress a real absence
+            # page for the one job that files evidence (alpha-engine-config-I9900).
+            if any(
+                is_manifest_key(k)
+                for k in store.list_keys(manifest_prefix(name, trading_day.isoformat()))
+            ):
                 continue
             pages.append(
                 Page(
@@ -472,6 +490,12 @@ def evaluate_failure(
             # be the only place a failure could be recorded — and the only
             # one four colliding writers could share (alpha-engine-config-I9781).
             for key in sorted(store.list_keys(manifest_prefix(name, trading_day.isoformat()))):
+                # Only manifests. Without this, `report.morning`'s delivered
+                # `message.txt` — filed under its own manifest prefix by
+                # design — fails `json.loads` below and pages a FAILURE for a
+                # job that succeeded, every night (alpha-engine-config-I9900).
+                if not is_manifest_key(key):
+                    continue
                 try:
                     manifest = json.loads(store.get_bytes(key).decode("utf-8"))
                 except (ValueError, UnicodeDecodeError) as exc:

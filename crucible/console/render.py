@@ -19,12 +19,14 @@ from krepis.metrics import StatusLiteral
 from crucible.calendar import previous_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
 from crucible.console.classify import STATES, Classification, classify
+from crucible.documents import DocumentRead, read_store_document
 from crucible.gate import LADDER_KEY, LADDER_STATES, PHASES, build_ladder
 from crucible.gate import validate_ladder_document as _validate_ladder_document
 from crucible.keys import (
     RUNS_ROOT,
     attribution_key,
     champion_key,
+    is_manifest_key,
     parse_manifest_key,
     runs_prefix,
 )
@@ -69,6 +71,14 @@ class ConsolePage:
     trading_day: str
     generated_utc: str
     rows: list[dict[str, Any]] = field(default_factory=list)
+    #: Every artifact this page tried to read and could not, as
+    #: `{"key": ..., "fault": ...}`. A first-class published field rather than
+    #: a log line: `alpha-engine-config-I9900` is the case where ONE
+    #: unreadable artifact raised out of the builder and published no page at
+    #: all, and the remedy is not a quieter failure but a page that renders
+    #: every other row and says, on its own surface, exactly which key it
+    #: could not read and why.
+    unreadable: list[dict[str, str]] = field(default_factory=list)
     #: The plan §6 phase ladder — one row per phase, as `crucible.gate`
     #: measures it. Carried on the page rather than left to a second command
     #: so the ladder refreshes on the `console` job's weekly cadence as well
@@ -86,21 +96,51 @@ class ConsolePage:
         return json.dumps(self.__dict__, indent=2, sort_keys=True).encode("utf-8")
 
 
-def _read_json(store: Store, key: str) -> dict[str, Any] | None:
-    """Read one JSON artifact, or None when it is absent.
+#: The ONE guarded reader this module parses stored JSON with — imported, not
+#: redefined. Every JSON read below goes through it: the representative
+#: manifest, the week-cost roll-up, the attribution artifact and each champion
+#: pointer. `alpha-engine-config-I9900` is what an unguarded read costs — a
+#: `json.loads` on a `message.txt` sitting beside a run manifest raised
+#: `JSONDecodeError` out of `_read_representative_manifest`, out of
+#: `classify_registry`, out of `crucible board`, and published no board and no
+#: ladder for seven hours.
+_read = read_store_document
 
-    An UNREADABLE artifact raises. Absence and corruption are different facts,
-    and returning None for both would let a corrupt manifest render as a
-    component that simply had not run.
+
+def _fault(read: DocumentRead, key: str) -> str | None:
+    """``read``'s fault as a sentence naming ``key``, or None when it read.
+
+    An ABSENT artifact is not a fault: absence is an answer this page renders
+    (`no pointer written`, `no attribution artifact`). Present-and-unreadable
+    is, and it names the key, because a detail that says only "unreadable" is
+    a detail nobody can act on.
     """
-    if not store.exists(key):
+    if read.problem is None:
         return None
-    return json.loads(store.get_bytes(key).decode("utf-8"))
+    return f"{read.problem}" if key in read.problem else f"{key}: {read.problem}"
 
 
-def _read_representative_manifest(
-    store: Store, job: str, trading_day: str
-) -> dict[str, Any] | None:
+@dataclass(frozen=True)
+class ManifestRead:
+    """The representative manifest for one component, or why there is none.
+
+    ``manifest`` and ``problem`` are never both set, and both being None means
+    the component filed nothing for this trading day — the ordinary absence
+    the classifier's four absence branches already answer. ``problem`` set is
+    the third outcome `classify` grew an argument for: something WAS filed and
+    we could not read it.
+    """
+
+    manifest: dict[str, Any] | None
+    problem: str | None
+    #: `{key: fault}` for every key under the prefix that could not be read.
+    #: Keyed by STORE KEY rather than by component so the page's unreadable
+    #: section can deduplicate against the week-cost roll-up, which lists
+    #: `RUNS_ROOT` and reaches the same objects by a different route.
+    faults: dict[str, str] = field(default_factory=dict)
+
+
+def _read_representative_manifest(store: Store, job: str, trading_day: str) -> ManifestRead:
     """One manifest to classify ``job`` for ``trading_day`` by, from however
     many its writers produced.
 
@@ -114,19 +154,46 @@ def _read_representative_manifest(
     the same principle `Store.list_keys` orders by: deterministic, not a
     claim about recency.
 
+    **A manifest prefix is a namespace, not a manifest list.** The listing is
+    narrowed by :func:`crucible.keys.is_manifest_key` before anything is read,
+    because a job may legitimately file its own evidence beside its manifest
+    and `report.morning` does exactly that — `runs/report.morning/{day}/
+    {calendar_date}/message.txt`, the delivered text, under the job's own
+    prefix so the delivery needs no second IAM grant. Parsing that as a
+    manifest is `alpha-engine-config-I9900`, and it is why the board published
+    nothing between 14:26Z and this fix.
+
+    An unreadable manifest is reported, never skipped and never raised: it
+    becomes this row's `problem`, which `classify` renders UNREPORTED with the
+    key and the fault in the detail.
+
     Per-writer rows (one per slot) are a console redesign this fix does not
     make — tracked as a follow-up in the PR body.
     """
     candidates: list[dict[str, Any]] = []
+    faults: dict[str, str] = {}
     for key in sorted(store.list_keys(manifest_prefix(job, trading_day))):
-        payload = json.loads(store.get_bytes(key).decode("utf-8"))
-        candidates.append(payload)
+        if not is_manifest_key(key):
+            continue
+        read = _read(store, key)
+        fault = _fault(read, key)
+        if fault is not None:
+            faults[key] = fault
+            continue
+        if read.document is not None:
+            candidates.append(read.document)
+    if faults:
+        # Reported even when a readable sibling exists. A component with one
+        # corrupt writer and one healthy one is not healthy — the same rule
+        # the `failed`-wins branch below states, applied to the manifest we
+        # could not read at all rather than to the one that said it failed.
+        return ManifestRead(None, "; ".join(faults[k] for k in sorted(faults)), faults)
     if not candidates:
-        return None
+        return ManifestRead(None, None)
     for manifest in candidates:
         if manifest.get("status") == "failed":
-            return manifest
-    return candidates[-1]
+            return ManifestRead(manifest, None)
+    return ManifestRead(candidates[-1], None)
 
 
 def _has_history(store: Store, job: str) -> bool:
@@ -140,7 +207,10 @@ def _has_history(store: Store, job: str) -> bool:
     # component has EVER produced a manifest, across every trading day.
     prefix = runs_prefix(job)
     for key in store.list_keys(prefix):
-        if key.endswith("/run.json"):
+        # `is_manifest_key`, not a `"/run.json"` suffix literal: the basename
+        # is `crucible.keys`' to own, and the predicate checks the root and
+        # the arity too (alpha-engine-config-I9900).
+        if is_manifest_key(key):
             return True
     return False
 
@@ -151,6 +221,7 @@ def classify_registry(
     *,
     now: dt.datetime,
     trading_day: dt.date,
+    faults: dict[str, str] | None = None,
 ) -> tuple[dict[str, Classification], dict[str, dict[str, Any] | None]]:
     """Classify every registry row once, and hand back the manifests too.
 
@@ -167,17 +238,31 @@ def classify_registry(
     both maps with a `None` manifest, never absent — an absent key would make
     a caller's `.get()` return `None` for "no such component" and "no run
     today" alike.
+
+    ``faults`` is an optional mapping this fills with `{store key: fault}` for
+    every manifest that existed and could not be read. An
+    out-parameter rather than a third return value because
+    `crucible.track_c.board_handler` unpacks the pair and the board does not
+    render an unreadable-artifact section — the console does, and it is the
+    only caller that asks. The classification itself already carries the fault
+    in its reason for every caller, so nothing is lost by not asking.
     """
     classifications: dict[str, Classification] = {}
     manifests: dict[str, dict[str, Any] | None] = {}
     for name, component in sorted(registry.items()):
-        manifest = _read_representative_manifest(store, name, trading_day.isoformat())
-        manifests[name] = manifest
+        read = _read_representative_manifest(store, name, trading_day.isoformat())
+        manifests[name] = read.manifest
+        if faults is not None:
+            faults.update(read.faults)
         classifications[name] = classify(
             component,
-            manifest,
+            read.manifest,
             now=now,
-            history=manifest is not None or _has_history(store, name),
+            # An unreadable manifest still counts as history: something ran.
+            history=read.manifest is not None
+            or read.problem is not None
+            or _has_history(store, name),
+            unreadable=read.problem,
         )
     return classifications, manifests
 
@@ -205,7 +290,14 @@ def build_page(
 
     rows: list[dict[str, Any]] = []
     metric_gap = 0
-    classifications, manifests = classify_registry(store, reg, now=moment, trading_day=trading_day)
+    unreadable: list[dict[str, str]] = []
+    manifest_faults: dict[str, str] = {}
+    classifications, manifests = classify_registry(
+        store, reg, now=moment, trading_day=trading_day, faults=manifest_faults
+    )
+    unreadable.extend(
+        {"key": key, "fault": fault} for key, fault in sorted(manifest_faults.items())
+    )
     for name, component in sorted(reg.items()):
         manifest = manifests[name]
         classification = classifications[name]
@@ -232,8 +324,30 @@ def build_page(
         job, trading_day_str, _discriminator = parsed
         if trading_day_str not in day_set:
             continue
-        manifest = json.loads(store.get_bytes(key).decode("utf-8"))
-        week_cost += float(manifest.get("cost_usd", 0.0))
+        read = _read(store, key)
+        fault = _fault(read, key)
+        if fault is not None or read.document is None:
+            # A manifest in the window we cannot read is a hole in the week's
+            # cost, and a hole nobody publishes reads as $0 spent. Named on
+            # the page instead, and the row it belongs to is already
+            # UNREPORTED above (alpha-engine-config-I9900).
+            # Deduplicated against the per-component pass above: the same
+            # object is reachable by two routes (a manifest prefix and
+            # `RUNS_ROOT`) and listing it twice would make the page's own
+            # unreadable count depend on how many readers happened to touch it.
+            if key not in manifest_faults:
+                unreadable.append(
+                    {"key": key, "fault": fault or "present but read as absent mid-listing"}
+                )
+            continue
+        manifest = read.document
+        cost = manifest.get("cost_usd", 0.0)
+        if isinstance(cost, bool) or not isinstance(cost, int | float):
+            unreadable.append(
+                {"key": key, "fault": f"cost_usd is {type(cost).__name__}, not a number ({cost!r})"}
+            )
+        else:
+            week_cost += float(cost)
         if job == "deploy":
             deploys.append(
                 {
@@ -245,8 +359,13 @@ def build_page(
                 }
             )
 
-    attribution = _read_json(store, attribution_key(trading_day.isoformat()))
-    champions = _champions(store)
+    attribution_key_ = attribution_key(trading_day.isoformat())
+    attribution_read = _read(store, attribution_key_)
+    attribution_fault = _fault(attribution_read, attribution_key_)
+    if attribution_fault is not None:
+        unreadable.append({"key": attribution_key_, "fault": attribution_fault})
+    attribution_rows = _attribution_rows(attribution_read, attribution_key_, unreadable)
+    champions = _champions(store, unreadable)
     ladder = build_ladder(store, trading_day=trading_day, registry=reg, now=moment)
 
     return ConsolePage(
@@ -256,11 +375,12 @@ def build_page(
         # Track A owns `report`; until it lands there is no attribution
         # artifact, and the page says so rather than showing an empty table
         # that reads like five rows of zero.
-        attribution=attribution.get("rows", []) if attribution else [],
+        attribution=attribution_rows,
         champions=champions,
         deploys=sorted(deploys, key=lambda d: str(d.get("trading_day"))),
         week_cost_usd=round(week_cost, 4),
         phase_ladder=ladder.to_dict(),
+        unreadable=unreadable,
         unreported=sum(1 for r in rows if r["state"] == "UNREPORTED") + metric_gap,
         population=len(rows),
     )
@@ -288,11 +408,39 @@ def _row(
     }
 
 
-def _champions(store: Store) -> dict[str, Any]:
+def _attribution_rows(
+    read: DocumentRead, key: str, unreadable: list[dict[str, str]]
+) -> list[dict[str, Any]]:
+    """The attribution table's rows, or an empty table plus a named fault.
+
+    `rows` is the one required field of this artifact, and it must be a list.
+    A document that parses to an object and then carries `rows` as a string or
+    a mapping used to reach the renderer and raise there instead — one line
+    further down, with a less obvious traceback and the same outcome: no page
+    at all.
+    """
+    if read.absent:
+        return []
+    problem = read.require("rows", list)
+    if problem is not None:
+        if not any(entry["key"] == key for entry in unreadable):
+            unreadable.append({"key": key, "fault": problem})
+        return []
+    assert read.document is not None  # `require` returned None, so it read
+    return list(read.document["rows"])
+
+
+def _champions(store: Store, unreadable: list[dict[str, str]]) -> dict[str, Any]:
     """The champion pointer per slot, or an honest absence.
 
     Track B owns `promote` and therefore the pointers. Reading them here is a
     one-way dependency on an artifact contract, not on their code.
+
+    A pointer that is present and unreadable is neither a champion nor "no
+    pointer written": it is recorded in ``unreadable`` and the slot renders as
+    an unreadable pointer, because a corrupt pointer rendered as an absent one
+    says the slot has never promoted when in fact the trader's whole read
+    surface is broken.
     """
     out: dict[str, Any] = {}
     for slot in ("u", "r", "m", "s"):
@@ -303,8 +451,13 @@ def _champions(store: Store) -> dict[str, Any]:
         # is a contract restated fifty times, and one of them has already
         # drifted" — and one of them had, in `explain.py`.
         key = champion_key(slot)
-        payload = _read_json(store, key)
-        out[slot] = payload if payload else None
+        read = _read(store, key)
+        fault = _fault(read, key)
+        if fault is not None:
+            unreadable.append({"key": key, "fault": fault})
+            out[slot] = {"unreadable": fault}
+            continue
+        out[slot] = read.document if read.document else None
     return out
 
 
@@ -471,6 +624,7 @@ def render_html(page: ConsolePage) -> str:
     calmly is a count nobody acts on.
     """
     gap_class = "gap-zero" if page.unreported == 0 else "gap-nonzero"
+    unreadable_class = "gap-zero" if not page.unreadable else "gap-nonzero"
     parts = [
         "<title>Crucible v2</title>",
         f"<style>{_STYLE}</style>",
@@ -479,7 +633,9 @@ def render_html(page: ConsolePage) -> str:
         f"<code>{_e(page.generated_utc)}</code> · week cost "
         f"<code>${page.week_cost_usd:.2f}</code> · population {page.population} · "
         f'transparency gap <span class="gap {gap_class}">{page.unreported}</span> '
-        "(objective 0)</p>",
+        f'(objective 0) · unreadable artifacts <span class="gap {unreadable_class}">'
+        f"{len(page.unreadable)}</span></p>",
+        *_unreadable_section(page),
         *_ladder_section(page),
         "<h2>Components</h2>",
         '<div class="wrap"><table><thead><tr>'
@@ -521,11 +677,24 @@ def render_html(page: ConsolePage) -> str:
             )
         parts.append("</tbody></table></div>")
     else:
-        parts.append(
-            '<p class="empty">No attribution artifact for this trading day. This is an '
-            "absence, not five rows of zero — <code>crucible report</code> has not "
-            "written <code>report/{trading_day}/attribution.json</code>.</p>"
+        # An unreadable attribution artifact is NOT an absent one, and saying
+        # "crucible report has not written it" when it did and the bytes are
+        # corrupt names the wrong remedy (alpha-engine-config-I9900).
+        fault = next(
+            (e for e in page.unreadable if str(e.get("key", "")).startswith("report/")), None
         )
+        if fault is not None:
+            parts.append(
+                f'<p class="reason {_state_class("UNREPORTED")}">The attribution artifact '
+                f"<code>{_e(fault.get('key'))}</code> exists and could not be read: "
+                f"{_e(fault.get('fault'))}. This is a corrupt artifact, not an absent one.</p>"
+            )
+        else:
+            parts.append(
+                '<p class="empty">No attribution artifact for this trading day. This is an '
+                "absence, not five rows of zero — <code>crucible report</code> has not "
+                "written <code>report/{trading_day}/attribution.json</code>.</p>"
+            )
 
     parts.append("<h2>Champions</h2>")
     parts.append(
@@ -533,7 +702,13 @@ def render_html(page: ConsolePage) -> str:
         "<th>Since</th></tr></thead><tbody>"
     )
     for slot, champ in sorted(page.champions.items()):
-        if champ:
+        if champ and champ.get("unreadable"):
+            parts.append(
+                f"<tr><td><code>{_e(slot)}</code></td>"
+                f'<td class="state {_state_class("UNREPORTED")}" colspan="2">unreadable: '
+                f"{_e(champ['unreadable'])}</td></tr>"
+            )
+        elif champ:
             parts.append(
                 f"<tr><td><code>{_e(slot)}</code></td>"
                 f"<td><code>{_e(champ.get('arm_id'))}</code></td>"
@@ -565,6 +740,36 @@ def render_html(page: ConsolePage) -> str:
         parts.append('<p class="empty">No deploy manifests in the window.</p>')
 
     return "\n".join(parts)
+
+
+def _unreadable_section(page: ConsolePage) -> list[str]:
+    """Every artifact this page could not read, at the TOP of the page.
+
+    Rendered above the ladder and the component table because it is the
+    section that says how much of everything below it is trustworthy. It is
+    omitted entirely when it is empty — the header already publishes the count
+    as a zero, so an empty table here would be a second rendering of the same
+    zero rather than a fact.
+    """
+    if not page.unreadable:
+        return []
+    parts = [
+        "<h2>Unreadable artifacts</h2>",
+        '<p class="sub">Read and could not be parsed. Every row below that depends on one '
+        "of these keys is UNREPORTED, not green, and the page renders regardless — one "
+        "unreadable artifact publishing no page at all is the defect this section "
+        "exists to have prevented.</p>",
+        '<div class="wrap"><table><thead><tr><th>Key</th><th>Fault</th></tr></thead><tbody>',
+    ]
+    for entry in page.unreadable:
+        parts.append(
+            "<tr>"
+            f"<td><code>{_e(entry.get('key'))}</code></td>"
+            f'<td class="reason {_state_class("UNREPORTED")}">{_e(entry.get("fault"))}</td>'
+            "</tr>"
+        )
+    parts.append("</tbody></table></div>")
+    return parts
 
 
 def _ladder_section(page: ConsolePage) -> list[str]:

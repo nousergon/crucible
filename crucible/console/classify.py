@@ -80,11 +80,17 @@ def classify(
     *,
     now: dt.datetime,
     history: bool = True,
+    unreadable: str | None = None,
 ) -> Classification:
     """Place one component in exactly one state.
 
     ``manifest`` is the component's manifest for the current trading day, or
-    None when there is none. ``history`` says whether the component has ever
+    None when there is none. ``unreadable`` is set instead when a manifest for
+    this component EXISTS and could not be read — the fault, naming the key.
+    That is a third input, not a variant of ``manifest=None``: an unreadable
+    manifest is a producer we cannot trust, and rendering it as "no run today"
+    would send an operator to the trigger when the artifact is the problem
+    (`alpha-engine-config-I9900`). ``history`` says whether the component has ever
     produced a manifest — that is the whole difference between `MISSED` (its
     schedule fired and no run started) and `NEVER_RAN` (registered, in
     service, never executed, so its first failure is still ahead of it), and
@@ -92,7 +98,10 @@ def classify(
 
     The branch order is load-bearing. Declared lifecycle first, because a
     DISABLED component must not be evaluated against a deadline it was
-    deliberately taken off. Then evidence, then the absence branches, then
+    deliberately taken off. Then the unreadable branch, because a fault we
+    cannot read past outranks both the evidence we do not have and the
+    absence we would otherwise infer. Then evidence, then the absence
+    branches, then
     `UNREPORTED` as the resolved placement for everything left — never as a
     default that means "probably fine".
     """
@@ -112,7 +121,22 @@ def classify(
             "so the absence is stated rather than silent.",
         )
 
-    # 2. Evidence. A manifest exists, so the run's own record decides.
+    # 2. An artifact exists and we could not read it. Ahead of every evidence
+    #    and absence branch because it is the one case where we know something
+    #    was filed and know nothing about what it says. UNREPORTED, which is
+    #    red and counts toward the §8.4 transparency gap: principle 7 — a
+    #    component whose record we cannot parse is unobserved, never healthy,
+    #    and never quietly reported as not having run.
+    if unreadable:
+        return Classification(
+            component.name,
+            "UNREPORTED",
+            f"a manifest for this trading day exists and could not be read: {unreadable}. "
+            "Distinct from MISSED: something was filed, so the failure is in the "
+            "artifact or in our access to it, not in the trigger.",
+        )
+
+    # 3. Evidence. A manifest exists, so the run's own record decides.
     if manifest is not None:
         status = manifest.get("status")
         run_id = manifest.get("run_id")
@@ -217,7 +241,7 @@ def classify(
             run_id=run_id,
         )
 
-    # 3. No manifest. The four absence branches, each distinct on the surface.
+    # 4. No manifest. The four absence branches, each distinct on the surface.
     if not component.scheduled:
         # An on-demand job's silence is not a fact about the system. It is
         # ARMED when something still triggers it, and that trigger is the CLI,
