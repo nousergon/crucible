@@ -2,7 +2,7 @@
 
 Normative source: plan §4.11.
 
-    releases/{sha}/crucible-{sha}-py3-none-any.whl
+    releases/{sha}/crucible-{version}-py3-none-any.whl   (PEP-440-legal; see wheel_filename_for)
     releases/{sha}/release.json
     releases/current            -> {"sha": ...}   (conditional PUT)
     runs/deploy/{trading_day}/run.json            (run-manifest schema)
@@ -99,6 +99,7 @@ __all__ = [
     "StaleReleasePointerError",
     "TRADER_PIN_KEY",
     "current_release",
+    "parse_release_record",
     "pin",
     "provenance_key",
     "publish_release",
@@ -107,7 +108,9 @@ __all__ = [
     "release_object_lock_params",
     "release_prefix",
     "resolve_release",
+    "wheel_filename_for",
     "wheel_key",
+    "wheel_key_for",
     "write_deploy_manifest",
 ]
 
@@ -123,7 +126,45 @@ __all__ = [
 #: live transitional effect is that the FIRST re-run of a sha published
 #: before this shipped still raises (the v1 and v2 bytes genuinely differ);
 #: every rebuild after that is the clean no-op the issue asks for.
-RELEASE_SCHEMA_VERSION = "release.v2"
+#:
+#: Bumped to v3 by alpha-engine-config-I9908: adds `wheel_filename`. Every
+#: wheel this pipeline had ever published was unpip-installable — the
+#: workflow renamed it to `crucible-{sha}-py3-none-any.whl`, and a 40-hex
+#: git sha is not a PEP 440 version, so pip refused the filename under
+#: either name it was ever given. v3 publishes the wheel under the filename
+#: `uv build` itself produced (PEP-440-legal, carrying the sha as a local
+#: version segment — see `wheel_filename_for`) and records that filename so
+#: a bash bootstrap on a spot box can download it by name without
+#: reimplementing the version derivation in shell.
+RELEASE_SCHEMA_VERSION = "release.v3"
+
+#: The base PEP 440 version `pyproject.toml` declares. `deploy.yml` appends
+#: `+g<sha12>` at BUILD time (a local version segment, never committed —
+#: crucible_v2_rebuild_plan §4.11 / alpha-engine-config-I9908: "no committed
+#: pyproject change per release"); this constant is the same literal so a
+#: reader that never ran the build can still name the wheel a given sha
+#: produced. Asserted equal to `pyproject.toml`'s own `version` by
+#: `tests/test_release.py::test_base_version_matches_pyproject`, so the two
+#: cannot drift silently.
+_BASE_VERSION = "0.1.0"
+
+
+def wheel_filename_for(sha: str) -> str:
+    """The wheel's own PEP 440 filename for ``sha`` — deterministic, no I/O.
+
+    `crucible-{version}-py3-none-any.whl` where `version` is
+    `{_BASE_VERSION}+g{sha[:12]}`: a 40-hex git sha is not a PEP 440
+    version and pip refuses it outright (`ERROR: crucible.whl is not a
+    valid wheel filename`, alpha-engine-config-I9908's console evidence);
+    the `+g<sha12>` local-version-segment form is PEP-440-legal while still
+    recovering the commit from the filename (`g` for "git", following the
+    convention `setuptools_scm`/`hatch-vcs` use for a dev build). `sha[:12]`
+    and `_BASE_VERSION` both match `deploy.yml`'s own derivation —
+    `tests/test_release.py::test_base_version_matches_pyproject` is the
+    assertion that keeps the two from drifting apart.
+    """
+    return f"crucible-{_BASE_VERSION}+g{_assert_sha(sha)[:12]}-py3-none-any.whl"
+
 
 #: `releases/{sha}/provenance/{run_id}-{run_attempt}.json`'s schema. One
 #: instance per publish ATTEMPT, never immutable-checked (I9786): a second
@@ -276,13 +317,30 @@ def release_prefix(sha: str) -> str:
 
 
 def wheel_key(sha: str) -> str:
-    """The wheel's key. Named by sha, not by version.
+    """The key THIS pipeline publishes ``sha``'s wheel under (release.v3+).
 
-    `pyproject`'s version moves rarely and a build is identified by its
-    commit; two builds sharing a version string in one prefix would be
-    indistinguishable in a rollback.
+    Prefixed by the sha for rollback addressing, per :func:`release_prefix`
+    (a build is identified by its commit); the object name under it is
+    `wheel_filename_for(sha)` — pip-installable, per alpha-engine-config-I9908.
+    Callers holding a `ReleaseRecord` already parsed from a possibly older
+    `release.json` should use :func:`wheel_key_for` with `record.wheel_filename`
+    instead: a v2 record's wheel is not at this path (see `parse_release_record`).
     """
-    return f"{release_prefix(sha)}/crucible-{sha}-py3-none-any.whl"
+    return wheel_key_for(sha, wheel_filename_for(sha))
+
+
+def wheel_key_for(sha: str, wheel_filename: str) -> str:
+    """The key a specific wheel FILENAME lives at, for ``sha``.
+
+    Distinct from :func:`wheel_key`, which derives the filename this
+    release.v3 pipeline publishes under. This one takes the filename as
+    given — from a parsed :class:`ReleaseRecord`, v2 or v3 — because a v2
+    record's wheel was published under a different (unpip-installable)
+    name than v3 derives, and a reader that already knows the real filename
+    must not re-derive a v3-shaped guess for an object that was never
+    written under it.
+    """
+    return f"{release_prefix(sha)}/{wheel_filename}"
 
 
 def release_json_key(sha: str) -> str:
@@ -333,6 +391,13 @@ class ReleaseRecord:
     sha: str
     lockfile_sha256: str
     wheel_sha256: str
+    #: The wheel's own filename, added in release.v3 (alpha-engine-config-
+    #: I9908). Required, no default: a record built without it is exactly
+    #: the shape that made every prior wheel unpip-installable, so there is
+    #: no safe value to default to. `parse_release_record` synthesizes it
+    #: for a legacy v2 document being read back; nothing WRITES a v2 record
+    #: any more.
+    wheel_filename: str
     python_requires: str = ">=3.12,<3.13"
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -343,10 +408,68 @@ class ReleaseRecord:
         # `publish_release`, `crucible.deploy._publish`, or one that does not
         # exist yet — is refused the moment it builds one, with no second
         # call site to remember or forget.
-        _validate_release_artifact("release.v2.json", asdict(self))
+        _validate_release_artifact("release.v3.json", asdict(self))
 
     def to_json(self) -> bytes:
         return json.dumps(asdict(self), indent=2, sort_keys=True).encode("utf-8")
+
+
+#: `release.json`'s retired schema. Predates `wheel_sha256` integrity
+#: checking; a document at this version carries no verified relationship to
+#: any wheel bytes at all, so there is no correct way to synthesize a
+#: `ReleaseRecord` from one. `parse_release_record` refuses it by name
+#: (alpha-engine-config-I9908) rather than raising a bare `KeyError` three
+#: frames into a dataclass construction.
+_RETIRED_SCHEMA_VERSION_V1 = "release.v1"
+
+#: The schema `release.json` carried before I9908 — no `wheel_filename`,
+#: and every object actually published under it lives at the LEGACY,
+#: unpip-installable key `crucible-{sha}-py3-none-any.whl`
+#: (`deploy.yml`'s pre-fix rename; alpha-engine-config-I9908's console
+#: evidence). `parse_release_record` synthesizes that exact legacy name for
+#: a v2 document, never `wheel_filename_for(sha)` — a v2 release was never
+#: published at the v3 path, and guessing one would be would send a caller
+#: to a key nothing wrote.
+_PREDECESSOR_SCHEMA_VERSION_V2 = "release.v2"
+
+
+def parse_release_record(payload: dict[str, Any]) -> ReleaseRecord:
+    """Parse a `release.json` payload into a :class:`ReleaseRecord`.
+
+    Accepts `release.v2` (this schema's predecessor) and `release.v3` (this
+    module's current :data:`RELEASE_SCHEMA_VERSION`); refuses `release.v1`
+    by name. alpha-engine-config-I9908: every reader of a possibly-old
+    `release.json` — `crucible.deploy._publish`'s idempotent-republish
+    check, `crucible.track_c._verify_release_artifacts`'s smoke gate — goes
+    through here rather than constructing `ReleaseRecord` directly, so a
+    release published before this fix landed is still readable instead of
+    raising a `TypeError` for a missing `wheel_filename` nothing wrote at
+    the time.
+    """
+    version = payload.get("schema_version")
+    if version == RELEASE_SCHEMA_VERSION:
+        return ReleaseRecord(**payload)
+    if version == _PREDECESSOR_SCHEMA_VERSION_V2:
+        normalized = dict(payload)
+        sha = normalized.get("sha", "")
+        normalized["wheel_filename"] = f"crucible-{sha}-py3-none-any.whl"
+        normalized["schema_version"] = RELEASE_SCHEMA_VERSION
+        return ReleaseRecord(**normalized)
+    if version == _RETIRED_SCHEMA_VERSION_V1:
+        # Retired by the issue named in this module's RELEASE_SCHEMA_VERSION
+        # docstring above: v1 predates wheel_sha256 integrity checking, so
+        # there is no verified relationship between a v1 document and any
+        # wheel bytes to read it back into.
+        raise ValueError(
+            "release.json is release.v1, retired: v1 predates wheel_sha256 integrity "
+            "checking, so there is no verified relationship between a v1 document and "
+            "any wheel bytes to read it back into. No v1 release is a valid smoke or "
+            "install target."
+        )
+    raise ValueError(
+        f"release.json schema_version {version!r} is not recognized; expected "
+        f"{_PREDECESSOR_SCHEMA_VERSION_V2!r} or {RELEASE_SCHEMA_VERSION!r}."
+    )
 
 
 @dataclass(frozen=True)
@@ -432,6 +555,7 @@ def publish_release(
         sha=sha,
         lockfile_sha256=sha256_hex(lockfile),
         wheel_sha256=sha256_hex(wheel),
+        wheel_filename=wheel_filename_for(sha),
     )
     provenance = ReleaseProvenance(
         schema_version=RELEASE_PROVENANCE_SCHEMA_VERSION,

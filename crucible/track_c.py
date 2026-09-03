@@ -153,22 +153,32 @@ def _verify_release_artifacts(store: Store, sha: str, ctx: RunContext) -> list[s
     ok and failed, so a smoke that could not verify its release cannot report
     anything but `failed`, and the flip refuses on anything but `ok`.
     """
-    wheel_k = release.wheel_key(sha)
+    # `release.json` is read (and parsed) BEFORE the wheel key can even be
+    # computed: `wheel_key_for` needs `record.wheel_filename`, and a v2
+    # record's wheel is not at the v3-derived `wheel_key(sha)` path
+    # (alpha-engine-config-I9908 — see `crucible.release.parse_release_record`).
     meta_k = release.release_json_key(sha)
-    missing = [k for k in (wheel_k, meta_k) if not store.exists(k)]
-    if missing:
+    if not store.exists(meta_k):
         raise FileNotFoundError(
-            f"smoke: the release under test is not published. {sorted(missing)} absent "
+            f"smoke: the release under test is not published. [{meta_k!r}] absent "
             f"for {sha}. Promoting a pointer at a prefix whose artifacts are not there "
             "is a stale pointer written deliberately; the deploy publishes before it "
             "smokes, so this means the publish did not land."
         )
     meta_bytes = store.get_bytes(meta_k)
-    record = release.ReleaseRecord(**json.loads(meta_bytes.decode("utf-8")))
+    record = release.parse_release_record(json.loads(meta_bytes.decode("utf-8")))
     if record.sha != sha:
         raise ValueError(
             f"smoke: {meta_k} describes {record.sha}, not {sha}. Gating a promotion on "
             "a record belonging to another build is the gate failing open."
+        )
+    wheel_k = release.wheel_key_for(sha, record.wheel_filename)
+    if not store.exists(wheel_k):
+        raise FileNotFoundError(
+            f"smoke: the release under test is not published. [{wheel_k!r}] absent "
+            f"for {sha}. Promoting a pointer at a prefix whose artifacts are not there "
+            "is a stale pointer written deliberately; the deploy publishes before it "
+            "smokes, so this means the publish did not land."
         )
     wheel_bytes = store.get_bytes(wheel_k)
     digest = sha256_hex(wheel_bytes)
@@ -237,7 +247,31 @@ def smoke_handler(args: argparse.Namespace) -> int:
             read.append(key)
             if key == release.POINTER_KEY:
                 pointed = json.loads(payload.decode("utf-8"))["sha"]
-                if not store.exists(release.wheel_key(pointed)):
+                # A v2-or-v3 record for the POINTED sha, not `sha` under
+                # test — its wheel may live at the legacy (unpip-installable)
+                # v2 path, so `wheel_key(pointed)` alone cannot answer this.
+                # A missing or unreadable release.json here means the same
+                # thing as a missing wheel: the pointed build is broken.
+                pointed_meta_k = release.release_json_key(pointed)
+                pointed_wheel_present = False
+                if store.exists(pointed_meta_k):
+                    try:
+                        pointed_record = release.parse_release_record(
+                            json.loads(store.get_bytes(pointed_meta_k).decode("utf-8"))
+                        )
+                    except (ValueError, TypeError):
+                        # Swallowed here only: this whole branch is the
+                        # documented single non-raise in the job (see below)
+                        # — a malformed record for the POINTED release is
+                        # itself evidence the pointed build is broken, which
+                        # is exactly what this branch already records as
+                        # `degraded`, never as a raise.
+                        pointed_wheel_present = False
+                    else:
+                        pointed_wheel_present = store.exists(
+                            release.wheel_key_for(pointed, pointed_record.wheel_filename)
+                        )
+                if not pointed_wheel_present:
                     # Recorded, NOT raised, and this is the only deliberate
                     # non-raise in the job. Failure mode swallowed: a stale
                     # `releases/current` whose wheel is gone — every job that
