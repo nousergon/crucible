@@ -11,7 +11,7 @@ dependencies = [
     # re-implemented (crucible_v2_rebuild_plan §4.4).
     "nousergon-lib==0.124.106",
     # Trading calendar, dual-date resolution, structured logging, alerts.
-    "krepis==0.59.44",
+    "krepis==0.59.45",
     # Run-manifest schema validation. The schema is the enforcement surface
     # for `status in {ok, failed}` (plan §4.2), so validation is a runtime
     # dependency, not a test-only one.

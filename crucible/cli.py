@@ -35,6 +35,7 @@ from crucible import __version__, morning, track_c, track_e, track_f  # track-C,
 from crucible.calendar import resolve_trading_day
 from crucible.keys import arena_cycle_key, champion_key
 from crucible.keys import manifest_key as _promote_manifest_key
+from crucible.release_retention import RELEASE_LOCK_JOB, release_lock_handler
 from crucible.track_a import HANDLERS as TRACK_A_HANDLERS
 from crucible.track_a import add_track_a_arguments
 
@@ -225,6 +226,12 @@ JOBS: dict[str, JobSpec] = {
         "migrate.history", "Import v1 arm history with its provenance", False
     ),
     "release.pin": JobSpec("release.pin", "Repoint a release, or pin the trader to one", False),
+    # alpha-engine-config-I9898: the repair for a release published before
+    # I9787's write-time Object Lock fix. On-demand, like release.pin — an
+    # operator runs it against a named sha, never a schedule.
+    RELEASE_LOCK_JOB: JobSpec(
+        RELEASE_LOCK_JOB, "Apply Object Lock retention to a published release", False
+    ),
     "smoke": JobSpec("smoke", "A real end-to-end run that gates a release flip", False),
     # track-C (alpha-engine-config-I9757): the observing surfaces themselves.
     # They are jobs like any other, so they write manifests like any other and
@@ -300,6 +307,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     # track-C handlers live in crucible/track_c.py so three tracks can land
     # code in parallel without editing one another's lines.
     "release.pin": track_c.release_pin_handler,
+    RELEASE_LOCK_JOB: release_lock_handler,
     "smoke": track_c.smoke_handler,
     "alerts.sweep": track_c.sweep_handler,
     "heartbeat": track_c.heartbeat_handler,
@@ -400,6 +408,8 @@ def build_parser() -> argparse.ArgumentParser:
         if spec.name == "release.pin":
             sub.add_argument("sha", metavar="RELEASE_SHA")
             sub.add_argument("--target", choices=["current", "trader"], default="current")
+        if spec.name == RELEASE_LOCK_JOB:
+            sub.add_argument("sha", metavar="RELEASE_SHA")
         if spec.name == "smoke":  # track-C
             sub.add_argument(
                 "--release",

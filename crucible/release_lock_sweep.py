@@ -52,7 +52,12 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from crucible.release import POINTER_KEY, RELEASE_OBJECT_LOCK_RETENTION
+from crucible.release import (
+    POINTER_KEY,
+    RELEASE_OBJECT_LOCK_RETENTION,
+    RETENTION_CLOCK_SKEW_SLACK,
+    retention_meets_target,
+)
 from crucible.store import S3Store, Store
 
 __all__ = [
@@ -87,17 +92,6 @@ ReleaseLockState = Literal["MET", "UNMET", "UNMEASURABLE"]
 _RELEASE_OBJECT_RE = re.compile(
     r"^releases/(?P<sha>[0-9a-f]{40})/(?:release\.json|crucible-.+\.whl)$"
 )
-
-#: Slack subtracted from the declared minimum retain-until before comparing
-#: it against `GetObjectRetention`'s `RetainUntilDate`. `release.py` stamps
-#: `retain_until` as `now() + RELEASE_OBJECT_LOCK_RETENTION` at publish time,
-#: and `HeadObject`'s `LastModified` is that same publish instant as S3
-#: recorded it — the two should agree exactly, but a reading that failed on
-#: sub-second clock skew between the SDK call and S3's own stamp would be a
-#: false UNMET about US, not about the retention. A day is generous against
-#: a single request round trip and costs nothing: a retention genuinely short
-#: by a day is still short against the plan's ten-year horizon.
-_CLOCK_SKEW_SLACK = dt.timedelta(days=1)
 
 #: `GetObjectRetention`'s error code for "this object has no Object Lock
 #: retention set" — the genuinely-unlocked case, distinct from every other
@@ -236,14 +230,20 @@ def _read_one(store: S3Store, key: str) -> ReleaseLockReading:
             "confirmed absence of retention.",
         )
     if last_modified is not None:
-        floor = last_modified.astimezone(dt.UTC) + RELEASE_OBJECT_LOCK_RETENTION - _CLOCK_SKEW_SLACK
-        if retain_until.astimezone(dt.UTC) < floor:
+        target_retain_until = last_modified.astimezone(dt.UTC) + RELEASE_OBJECT_LOCK_RETENTION
+        # `retention_meets_target` (`crucible.release`) — the SAME
+        # comparison, with the SAME `RETENTION_CLOCK_SKEW_SLACK`,
+        # `crucible.release_retention`'s repair now uses (I9898 round 2):
+        # this sweep and that repair can no longer disagree about whether a
+        # given object is already compliant.
+        if not retention_meets_target(retain_until, target_retain_until):
             return ReleaseLockReading(
                 key,
                 "UNMET",
                 f"{key}: retained until {retain_until.isoformat()}, short of the "
                 f"declared {RELEASE_OBJECT_LOCK_RETENTION.days}-day policy "
-                f"(published {last_modified.isoformat()})",
+                f"(published {last_modified.isoformat()}), beyond the "
+                f"{RETENTION_CLOCK_SKEW_SLACK.days}-day clock-skew slack.",
             )
     return ReleaseLockReading(key, "MET", f"{key}: {mode} until {retain_until.isoformat()}")
 
