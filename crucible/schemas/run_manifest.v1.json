@@ -54,6 +54,7 @@
         "explain",
         "migrate.history",
         "release.pin",
+        "release.lock",
         "smoke",
         "alerts.sweep",
         "heartbeat",

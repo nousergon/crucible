@@ -277,6 +277,28 @@ components:
     dispatch: null
     deadline: null
 
+  release.lock:
+    description: >-
+      Apply Object Lock retention to a published release's identity objects
+      (alpha-engine-config-I9898) — the repair for a release published before
+      the write-time fix (I9787).
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:metrics[release_object_retention]
+      outcome: run.json:metrics[release_objects_locked]
+    log_location: /crucible/release.lock
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/releases
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
   smoke:
     description: A real end-to-end run against live data that gates a release flip.
     lifecycle: ACTIVE

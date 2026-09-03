@@ -38,6 +38,10 @@ def _minimal_argv(job: str) -> list[str]:
         argv += ["01JG0000000000000000000000"]
     if job == "release.pin":
         argv += ["a" * 40]
+    if job == "release.lock":
+        # alpha-engine-config-I9898: repair job, takes the release sha
+        # positionally same as release.pin.
+        argv += ["a" * 40]
     if job == "data.heal":
         argv += ["--gap", "missing-panel", "--from", "2026-08-24", "--to", "2026-08-28"]
     if job == "gate":
@@ -96,6 +100,9 @@ class TestJobSurface:
             "explain",
             "migrate.history",
             "release.pin",
+            # alpha-engine-config-I9898: the repair for a release published
+            # before I9787's write-time Object Lock fix.
+            "release.lock",
             "smoke",
             "weekly",
             "gate",
