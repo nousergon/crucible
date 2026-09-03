@@ -74,11 +74,16 @@ concurrency:
 
 env:
   AWS_REGION: us-east-1
-  # Declared here, read back from AWS below, and created by
-  # nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml. One
-  # literal, one place.
-  BOARD_ROLE_ARN: arn:aws:iam::711398986525:role/crucible-v2-github-board
-  STORE_URI: s3://alpha-engine-crucible-v2/crucible
+  # AWS_ACCOUNT_ID and STORE_URI come from repository variables
+  # (alpha-engine-config-I9906) — this repo goes PUBLIC at phase-1 exit
+  # (I9775) and `AGENTS.md` forbids infrastructure identifiers, bucket names
+  # and account numbers in the tree. The role NAME stays a literal below: it
+  # carries no secret on its own, and the account id is the sensitive half.
+  # Read back from AWS below, and created by
+  # nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml.
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  BOARD_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/crucible-v2-github-board
+  STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
 
 jobs:
   board:
@@ -89,6 +94,23 @@ jobs:
       contents: read
       id-token: write   # OIDC only; no long-lived AWS keys in this repository
     steps:
+      # First step, before checkout: neither identity nor the store are
+      # reachable without these, and failing here names the exact operator
+      # command rather than dying deep inside `configure-aws-credentials`
+      # with an opaque OIDC/ARN error.
+      - name: Repository variables are set
+        run: |
+          missing=0
+          if [ -z "$AWS_ACCOUNT_ID" ]; then
+            echo "::error::repository variable AWS_ACCOUNT_ID is not set — set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/crucible --body '<12-digit-account-id>'"
+            missing=1
+          fi
+          if [ -z "$STORE_URI" ]; then
+            echo "::error::repository variable CRUCIBLE_STORE_URI is not set — set it with: gh variable set CRUCIBLE_STORE_URI --repo nousergon/crucible --body '<s3-uri-of-the-crucible-v2-store>'"
+            missing=1
+          fi
+          exit "$missing"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
@@ -125,7 +147,7 @@ jobs:
       # and is also the thing people stop opening.
       - name: What moved
         run: |
-          aws s3 cp "s3://alpha-engine-crucible-v2/crucible/board/current.json" board.json --only-show-errors
+          aws s3 cp "${STORE_URI}/board/current.json" board.json --only-show-errors
           uv run python -c "import json,sys; d=json.load(open('board.json')); print(f\"{d['red_count']} of {d['row_count']} rows red\"); print(json.dumps(d['counts'], indent=2))"
 
   notify-failure:
