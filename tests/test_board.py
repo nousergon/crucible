@@ -24,6 +24,7 @@ import datetime as dt
 import json
 import pathlib
 from abc import ABC
+from typing import Any
 
 import pytest
 
@@ -50,7 +51,8 @@ from crucible.board import (
 from crucible.components import load_registry
 from crucible.console.classify import STATES as COMPONENT_STATES
 from crucible.console.classify import Classification
-from crucible.gate import LADDER_STATES, PHASES
+from crucible.gate import LADDER_STATES, PHASES, evaluate
+from crucible.keys import acceptance_reading_key
 from crucible.store import LocalStore, Store
 
 ACCEPTANCE_SUITE = (
@@ -1423,3 +1425,147 @@ class TestScheduleRows:
 
         (row,) = [r for r in _schedule_rows(None, "2026-09-14") if r.id == "schedule:live1"]
         assert row.state == "UNMEASURED"
+
+
+# ── the page is the detailed artifact (alpha-engine-config-I9921) ──────────
+
+
+class TestThePageIsTheDetailedArtifact:
+    """Brian, 2026-09-03: *"I don't find the report detailed enough."*
+
+    The Telegram message is capped at 4096 characters and must truncate; this
+    page is where the detail lives, so what is asserted here is that each
+    thing the message drops is actually PRESENT — and that an absence is
+    stated rather than rendered as a gap.
+    """
+
+    DAY = dt.date(2026, 8, 28)
+
+    @staticmethod
+    def _page(tmp_path, *, acceptance: dict[str, Any] | None = None) -> str:
+        import argparse
+
+        from crucible.track_c import board_handler
+
+        store = LocalStore(tmp_path)
+        if acceptance is not None:
+            store.put_bytes(
+                acceptance_reading_key(TestThePageIsTheDetailedArtifact.DAY.isoformat()),
+                json.dumps(acceptance).encode(),
+            )
+        board_handler(
+            argparse.Namespace(
+                trading_day=TestThePageIsTheDetailedArtifact.DAY, store=str(tmp_path)
+            )
+        )
+        return store.get_bytes("board/index.html").decode()
+
+    def test_every_source_kind_is_grouped_onto_the_page(self, tmp_path) -> None:
+        page = self._page(tmp_path)
+        for source in SOURCES:
+            assert f"<h2>{source} (" in page, f"the {source} rows are not grouped on the page"
+
+    def test_every_row_carries_its_store_key_and_its_generated_at(self, tmp_path) -> None:
+        """A row with no key is a red dot a reader has to ask an agent about,
+        and a reading with no stamp cannot be told from one taken in March."""
+        page = self._page(tmp_path)
+        assert "<th>store key</th>" in page
+        assert "<th>generated at</th>" in page
+        # Every row renders a stamp cell; the unread ones say so in words
+        # rather than leaving a cell that reads as a formatting gap.
+        assert "never read" in page
+
+    def test_a_phase_row_carries_every_clause_with_its_own_state_and_reason(self, tmp_path) -> None:
+        page = self._page(tmp_path)
+        reading = evaluate(LocalStore(tmp_path), gate="phase0", trading_day=self.DAY)
+        clauses = [c.name for c in reading.clauses]
+        assert clauses, "the fixture must exercise a gate that declares clauses"
+        for name in clauses:
+            assert name in page, f"clause {name} is not on the page"
+        assert "requires:" in page, "a clause with no requirement stated is not actionable"
+
+    def test_a_phase_row_with_no_reading_says_so_rather_than_showing_no_clauses(self) -> None:
+        """`None` and `()` are different facts. A page that rendered them
+        identically would make an unread gate look like a gate with no
+        conditions — 0 of 0, which reads as complete."""
+        from crucible.board import _clause_list_html
+
+        unread = _row_fixture(clauses=None)
+        empty = _row_fixture(clauses=())
+        assert "no gate reading was supplied" in _clause_list_html(unread)
+        assert "declares no clauses" in _clause_list_html(empty)
+        assert _clause_list_html(unread) != _clause_list_html(empty)
+
+    def test_a_non_phase_row_with_no_clause_list_renders_nothing_extra(self) -> None:
+        """Only phase rows have gates. Printing "no reading" under every
+        objective and component row would be noise wearing honesty's clothes."""
+        from crucible.board import _clause_list_html
+
+        assert _clause_list_html(_row_fixture(source="objective", clauses=None)) == ""
+
+    def test_the_acceptance_section_is_present_even_when_the_artifact_is_absent(
+        self, tmp_path
+    ) -> None:
+        """§12 rule 3's only progress figure is the last number this page may
+        go quiet about: an omitted section and a broken producer look the same."""
+        page = self._page(tmp_path)
+        assert "acceptance (plan §2" in page
+        assert "No acceptance reading on this store" in page
+
+    def test_a_filed_acceptance_reading_is_rendered_with_its_clause_ids(self, tmp_path) -> None:
+        page = self._page(
+            tmp_path,
+            acceptance={
+                "met": 3,
+                "unmet": 2,
+                "unmeasurable": 1,
+                "commit": "abc123",
+                "measured_at": "2026-08-28T12:00:00Z",
+                "unmet_clauses": ["clause_replays_run", "clause_cost_measured"],
+                "unmeasurable_clauses": ["clause_cost_reachable"],
+            },
+        )
+        assert "3 met / 2 unmet / 1 unmeasurable</strong> of 6 clauses" in page
+        assert "clause_replays_run" in page
+        assert "clause_cost_reachable" in page
+
+    def test_a_partial_acceptance_reading_is_refused_rather_than_half_rendered(
+        self, tmp_path
+    ) -> None:
+        """Three of four fields of the only number the plan calls progress is
+        a fabrication that looks exactly like a measurement."""
+        page = self._page(tmp_path, acceptance={"met": 3, "commit": "abc123"})
+        assert "answers a different question" in page
+        assert "3 met" not in page
+
+    def test_an_acceptance_reading_with_no_clause_ids_says_so(self, tmp_path) -> None:
+        """The counts alone are honest; claiming to list clauses that are not
+        on the artifact would not be."""
+        page = self._page(
+            tmp_path,
+            acceptance={"met": 3, "unmet": 2, "unmeasurable": 1, "commit": "abc123"},
+        )
+        assert "names no unmet clause ids" in page
+
+    def test_the_clause_states_on_the_page_are_the_ladders_own_reading(self, tmp_path) -> None:
+        """One evaluation, two surfaces. A page that re-evaluated the gate
+        could disagree with the row it sits inside."""
+        self._page(tmp_path)
+        board = json.loads(LocalStore(tmp_path).get_bytes("board/current.json"))
+        phase = next(r for r in board["rows"] if r["id"] == "phase:phase0")
+        met = sum(1 for c in phase["clauses"] if c["met"])
+        assert f"{met}/{len(phase['clauses'])} clauses met" in phase["detail"]
+
+
+def _row_fixture(*, source: str = "phase", clauses: Any = None) -> BoardRow:
+    return BoardRow(
+        id=f"{source}:x",
+        source=source,
+        title="x",
+        state="UNMET",
+        detail="d",
+        surface="crucible/board",
+        artifact="k.json",
+        means_when_red="r",
+        clauses=clauses,
+    )

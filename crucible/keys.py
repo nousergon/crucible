@@ -699,7 +699,16 @@ def acceptance_reading_key(trading_day: str) -> str:
     **The producer contract**, and the document `crucible.morning` parses::
 
         {"met": int, "unmet": int, "unmeasurable": int,
-         "commit": str, "measured_at": str}
+         "commit": str, "measured_at": str,
+         "unmet_clauses": [str], "unmeasurable_clauses": [str]}
+
+    The two clause-id lists are OPTIONAL and are the only optional fields
+    here (`alpha-engine-config-I9921`): the report and the board page name the
+    failing clauses when the producer files them, and say "the artifact names
+    no unmet clause ids" when it does not. Optional rather than required so a
+    producer shipping the counts first is a partial producer rather than a
+    broken one — but never inferred: an absent list means "not filed", never
+    "there are none", and the consumers render those differently.
 
     `unmeasurable` is its own integer and is never folded into `unmet`: "the
     clause says no" and "we could not ask" are different facts and the second

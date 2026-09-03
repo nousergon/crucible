@@ -81,6 +81,7 @@ __all__ = [
     "render_board_html",
     "build_board",
     "load_declarations",
+    "read_acceptance",
     "READERS",
     "READER_ARTIFACTS",
     "read_declaration",
@@ -561,6 +562,24 @@ def _read_attribution(store: Store, trading_day: str) -> Reading:
     )
 
 
+def read_acceptance(store: Store, trading_day: str) -> tuple[dict[str, Any] | None, str]:
+    """The §2 acceptance reading for ``trading_day``, or `None` and why not.
+
+    Routed through :func:`_fetch` so an absent artifact, an unreadable one and
+    a credential failure are three different sentences on the page rather
+    than one silent gap — the same distinction `crucible.morning` makes for
+    the same artifact, made once here so the page and the message cannot
+    disagree about what they could read.
+    """
+    from crucible.keys import acceptance_reading_key  # noqa: PLC0415 - avoids a cycle
+
+    key = acceptance_reading_key(trading_day)
+    document, failure = _fetch(store, key, trading_day)
+    if failure is not None:
+        return None, failure.detail
+    return document, ""
+
+
 def _row_name(row: Any) -> str:
     return str(row.get("name", "?")) if isinstance(row, dict) else "?"
 
@@ -637,6 +656,23 @@ class BoardRow:
     means_when_red: str
     section: str = ""
     last_read: str | None = None
+    #: The gate clauses behind this row, each `{name, met, requirement,
+    #: detail}` — or `None` when this row has no clause list to show.
+    #:
+    #: `None` and `()` are DIFFERENT facts and are kept apart deliberately.
+    #: `None` is "this render was given no gate reading for this row", which
+    #: is a statement about the producer; `()` is "the gate was read and
+    #: declares no clauses", which is `crucible.gate`'s own UNMEASURED case.
+    #: A consumer that could not tell them apart would render "0/0 clauses
+    #: met" over a render that never took a reading — the fabricated
+    #: measurement this whole board exists to make impossible.
+    #:
+    #: Carried on the ROW rather than left in the free-text `detail` because
+    #: `crucible.morning` has to print the unmet clause NAMES
+    #: (`alpha-engine-config-I9921`), and the alternative is parsing them back
+    #: out of an English sentence — a contract restated as a regex, which is
+    #: the bug class this repository has already paid for twice.
+    clauses: tuple[dict[str, Any], ...] | None = None
 
     def __post_init__(self) -> None:
         if self.state not in BOARD_STATES:
@@ -671,6 +707,10 @@ class BoardRow:
             "artifact": self.artifact,
             "means_when_red": self.means_when_red,
             "last_read": self.last_read,
+            # `null` for "no reading was taken", `[]` for "read, no clauses".
+            # See the field's own comment: collapsing the two would let a
+            # consumer print 0/0 over a render that measured nothing.
+            "clauses": None if self.clauses is None else [dict(c) for c in self.clauses],
         }
 
 
@@ -726,6 +766,7 @@ def build_board(
     classifications: dict[str, Classification] | None = None,
     ladder: Ladder | None = None,
     declarations: Declarations | None = None,
+    readings: dict[str, Any] | None = None,
 ) -> Board:
     """Assemble every declared row and read each one. Reads; never runs.
 
@@ -735,6 +776,17 @@ def build_board(
     computation of either would put two surfaces out of step. Passing `None`
     for either is not "skip it": those rows still appear, `UNMEASURED`, with
     the reason stated.
+
+    ``readings`` is the same argument one level further in: the
+    `{gate: GateResult}` the caller ALREADY evaluated for `build_ladder`,
+    handed on so each phase row can carry its clause list
+    (:attr:`BoardRow.clauses`, `alpha-engine-config-I9921`) without this
+    function evaluating a single gate itself. Re-reading them here would
+    double every store read the clause set makes — the defect
+    `alpha-engine-config-I9826` fixed in `gate_handler` — and would break
+    "a gate reads; it never runs" the moment the two evaluations disagreed.
+    `None` leaves every phase row's `clauses` `None`, which renders as "this
+    build took no reading" rather than as an empty clause list.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     # The RUN's trading day when the caller has one, never the wall clock.
@@ -751,7 +803,7 @@ def build_board(
     for row_id, declaration in decl.objectives.items():
         rows.append(_declared_row(store, f"objective:{row_id}", declaration, day))
 
-    rows.extend(_phase_rows(ladder, day))
+    rows.extend(_phase_rows(ladder, day, readings or {}))
     rows.extend(_schedule_rows(ladder, day))
 
     for name in sorted(reg):
@@ -789,9 +841,36 @@ def _declared_row(
     )
 
 
-def _phase_rows(ladder: Ladder | None, trading_day: str) -> list[BoardRow]:
+def _clause_views(reading: Any | None) -> tuple[dict[str, Any], ...] | None:
+    """One gate's clauses as plain dicts, or `None` when nothing was read.
+
+    Plain dicts rather than `Clause` objects because this travels onto
+    `board/{day}/board.json` and out to two consumers — the page and the
+    morning report — and a surface that could only be read by importing
+    `crucible.gate` is a contract only this repository can consume.
+    """
+    if reading is None:
+        return None
+    return tuple(
+        {
+            "name": clause.name,
+            "met": bool(clause.met),
+            "requirement": clause.requirement,
+            "detail": clause.detail,
+        }
+        for clause in reading.clauses
+    )
+
+
+def _phase_rows(
+    ladder: Ladder | None,
+    trading_day: str,
+    readings: dict[str, Any] | None = None,
+) -> list[BoardRow]:
     """One row per §6 phase, from `gate.PHASES` — never from a second list."""
     from crucible.gate import PHASES, gate_key  # noqa: PLC0415 - avoids a module import cycle
+
+    supplied = readings or {}
 
     def artifact(phase: Any) -> str:
         # `phase.gate or phase.id` FABRICATES a key for every unregistered
@@ -857,6 +936,7 @@ def _phase_rows(ladder: Ladder | None, trading_day: str) -> list[BoardRow]:
                 artifact=artifact(phase),
                 means_when_red=means_when_red(phase),
                 last_read=ladder_row.read_on,
+                clauses=_clause_views(supplied.get(phase.gate) if phase.gate else None),
             )
         )
     return rows
@@ -1095,13 +1175,33 @@ _SWATCH: dict[str, str] = {
 _check_total("_SWATCH", BOARD_STATES, {k: k for k in _SWATCH}, BOARD_STATES)
 
 
-def render_board_html(board: Board, deltas: list[RowDelta] | None = None) -> str:
+def render_board_html(
+    board: Board,
+    deltas: list[RowDelta] | None = None,
+    *,
+    acceptance: dict[str, Any] | None = None,
+    acceptance_note: str = "",
+) -> str:
     """One page, every declared row, grouped by source.
 
     The headline is the RED count, not the green one. A board that leads with
     "3 of 40 met" on day one leads with a number that looks like failure and
     is in fact the plan; a board that leads with what is not yet measurable
     leads with the thing that can be acted on.
+
+    **This page is the detailed artifact; the Telegram report is a pointer to
+    it** (`alpha-engine-config-I9921`, Brian 2026-09-03: *"I don't find the
+    report detailed enough"*). Everything the message has to truncate to fit
+    4096 characters is here in full — every row's store key and last-read
+    stamp, every phase's per-clause state and reason, the acceptance clause
+    list, and the §6.1 schedule.
+
+    ``acceptance`` is the `report/acceptance/{day}.json` document
+    (`crucible.keys.acceptance_reading_key`) when one could be read, and
+    ``acceptance_note`` says why not when it could not. Both, never one: a
+    page that simply omitted the section when the artifact was missing would
+    render identically to one whose producer broke, and §12 rule 3's only
+    progress figure is the last number this page may go quiet about.
     """
     counts = board.counts()
     parts = [
@@ -1116,6 +1216,10 @@ def render_board_html(board: Board, deltas: list[RowDelta] | None = None) -> str
         ".s{font-weight:700;white-space:nowrap}",
         ".k{font-family:ui-monospace,monospace;font-size:12px;color:#57606a}",
         ".d{color:#57606a}",
+        "ul.c{margin:.4rem 0 0;padding-left:1.1rem}",
+        "ul.c li{margin:.15rem 0}",
+        ".met{color:#1a7f37;font-weight:700}",
+        ".unmet{color:#cf222e;font-weight:700}",
         "</style></head><body>",
         "<h1>crucible v2 — the declared board</h1>",
         f"<p><strong>{len(board.red)} of {len(board.rows)} rows red.</strong> "
@@ -1141,6 +1245,8 @@ def render_board_html(board: Board, deltas: list[RowDelta] | None = None) -> str
     elif deltas is not None:
         parts.append("<h2>Since the last board</h2><p class='d'>No row changed state.</p>")
 
+    parts.extend(_acceptance_section(acceptance, acceptance_note))
+
     for source in SOURCES:
         rows = [r for r in board.rows if r.source == source]
         if not rows:
@@ -1148,20 +1254,102 @@ def render_board_html(board: Board, deltas: list[RowDelta] | None = None) -> str
         parts.append(f"<h2>{_esc(source)} ({len(rows)})</h2>")
         parts.append(
             "<table><tr><th>state</th><th>row</th><th>how it knows</th>"
-            "<th>artifact</th><th>what red means</th></tr>"
+            "<th>store key</th><th>generated at</th><th>what red means</th></tr>"
         )
         for row in rows:
             parts.append(
                 f"<tr><td class='s' style='color:{_SWATCH[row.state]}'>{row.state}</td>"
                 f"<td>{_esc(row.title)}<br><span class='k'>{_esc(row.id)}</span></td>"
-                f"<td class='d'>{_esc(row.detail)}</td>"
+                f"<td class='d'>{_esc(row.detail)}{_clause_list_html(row)}</td>"
                 f"<td class='k'>{_esc(row.artifact)}</td>"
+                # `last_read` is the row's OWN provenance stamp and is
+                # rendered as "never read" rather than blank when absent: an
+                # empty cell reads as a formatting gap, and this is the field
+                # that says whether the reading beside it is from today.
+                f"<td class='k'>{_esc(row.last_read) if row.last_read else 'never read'}</td>"
                 f"<td class='d'>{_esc(row.means_when_red)}</td></tr>"
             )
         parts.append("</table>")
 
     parts.append("</body></html>")
     return "".join(parts)
+
+
+def _clause_list_html(row: BoardRow) -> str:
+    """One row's gate clauses, each with its own state and reason.
+
+    Three renderings, because `None`, `()` and a populated list are three
+    different facts (:attr:`BoardRow.clauses`) and a page that showed nothing
+    for the first two would make an unread gate look like a gate with no
+    conditions.
+    """
+    if row.clauses is None:
+        # Only phase rows ever carry a clause list; saying "no reading" under
+        # every objective and component row would be noise, not honesty.
+        if row.source != "phase":
+            return ""
+        return (
+            "<br><span class='d'>no gate reading was supplied to this render, so no "
+            "clause states are shown — a statement about the producer, not the phase.</span>"
+        )
+    if not row.clauses:
+        return "<br><span class='d'>this gate declares no clauses, so it measured nothing.</span>"
+    met = sum(1 for c in row.clauses if c["met"])
+    items = "".join(
+        f"<li><span class='{'met' if c['met'] else 'unmet'}'>"
+        f"{'MET' if c['met'] else 'UNMET'}</span> <span class='k'>{_esc(c['name'])}</span> — "
+        f"{_esc(c['detail'])}<br><span class='d'>requires: {_esc(c['requirement'])}</span></li>"
+        for c in row.clauses
+    )
+    return (
+        f"<br><span class='d'>{met}/{len(row.clauses)} clauses met</span><ul class='c'>{items}</ul>"
+    )
+
+
+def _acceptance_section(acceptance: dict[str, Any] | None, note: str) -> list[str]:
+    """§12 rule 3's one progress figure, and the clauses behind it.
+
+    Never omitted. When the artifact cannot be read the section states that
+    in the words the reader needs — an absent section and a broken producer
+    look identical, and this is the one number the plan calls progress.
+    """
+    parts = ["<h2>acceptance (plan §2 — the only progress figure, §12 rule 3)</h2>"]
+    if acceptance is None:
+        parts.append(
+            f"<p class='d'>No acceptance reading on this store: {_esc(note)}. "
+            "The count is a property of the repository (<span class='k'>"
+            "tests/acceptance/ratchet.json</span>) until a producer republishes it; "
+            "reading it out of whichever checkout rendered this page would be a "
+            "fabricated provenance rather than a missing one.</p>"
+        )
+        return parts
+    fields = ("met", "unmet", "unmeasurable")
+    if not all(isinstance(acceptance.get(f), int) for f in fields):
+        parts.append(
+            "<p class='d'>The acceptance artifact is present and does not carry "
+            f"{' / '.join(fields)} as integers, so it answers a different question than "
+            "the one asked. Rendering part of it would look exactly like a measurement.</p>"
+        )
+        return parts
+    total = sum(int(acceptance[f]) for f in fields)
+    parts.append(
+        f"<p><strong>{acceptance['met']} met / {acceptance['unmet']} unmet / "
+        f"{acceptance['unmeasurable']} unmeasurable</strong> of {total} clauses, at commit "
+        f"<span class='k'>{_esc(acceptance.get('commit', 'UNKNOWN'))}</span>, measured "
+        f"{_esc(acceptance.get('measured_at', 'at an unrecorded time'))}.</p>"
+    )
+    for field_name, label in (("unmet_clauses", "unmet"), ("unmeasurable_clauses", "unmeasurable")):
+        named = acceptance.get(field_name)
+        if not isinstance(named, list) or not named:
+            parts.append(
+                f"<p class='d'>The artifact names no {label} clause ids, so this page "
+                f"cannot list which {label} clauses they are — only how many.</p>"
+            )
+            continue
+        parts.append(f"<p class='d'>{label} clauses:</p><ul class='c'>")
+        parts.extend(f"<li><span class='k'>{_esc(cid)}</span></li>" for cid in named)
+        parts.append("</ul>")
+    return parts
 
 
 def _esc(value: Any) -> str:
