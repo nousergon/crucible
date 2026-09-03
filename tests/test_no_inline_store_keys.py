@@ -15,30 +15,44 @@ caller from hardcoding `f"drift/{day}/input_features.json"` inline instead
 of calling `crucible.keys.drift_input_key`, and I9852 fixed nine call sites
 that were doing exactly that with zero detector catching any of them.
 
-**What this checks, precisely.** A `Store.get_bytes`/`put_bytes`/`list_keys`/
-`exists` or `RunContext.record_output`/`record_input` call whose FIRST
-positional argument is a string constant or an f-string (`ast.Constant` or
-`ast.JoinedStr`) is a key or prefix built inline at the call site rather than
-by a `crucible.keys` function or constant. A call passing a `Name`,
-`Attribute` or another `Call` as that argument — `drift_input_key(...)`,
-`RUNS_ROOT`, a local variable already built from one of those — passes,
-because the shape is owned somewhere else and this call is only using it.
+**What this checks, precisely.** A call to one of `crucible.store.Store`'s
+declared mutating or reading methods, or one of `RunContext`'s key-writing
+methods, whose FIRST positional argument is a string constant or an f-string
+(`ast.Constant` or `ast.JoinedStr`) is a key or prefix built inline at the
+call site rather than by a `crucible.keys` function or constant. A call
+passing a `Name`, `Attribute` or another `Call` as that argument —
+`drift_input_key(...)`, `RUNS_ROOT`, a local variable already built from one
+of those — passes, because the shape is owned somewhere else and this call
+is only using it.
+
+**The method set is DERIVED, not a hand-kept literal.** An earlier version
+of this file hardcoded `{"get_bytes", "put_bytes", "list_keys", "exists"}`
+and called it "exhaustive" — false the moment it shipped:
+`crucible.store.Store.compare_and_swap` (the champion pointer's own write
+path), `etag` and `assert_keys_bind_to_trading_days` were all invisible to
+it, and so was `RunContext.record_output_cas`. `crucible/store.py` already
+solves exactly this problem for exactly this reason — `Store.MUTATORS` /
+`Store.READERS` are declared there, with the comment: "a guard can be
+derived from it rather than from a literal list kept in step by hand — a
+third mutator added without a line here would leave that guard silently
+blind to it." This module reuses that declaration instead of re-inventing a
+second hand-kept list beside it. `RunContext` carries no equivalent declared
+constant, so `_CONTEXT_METHODS` below is read directly off the class by a
+human rather than derived — named as a limitation, not claimed as
+exhaustive.
 
 **Scope, stated rather than suppressed.** This walks every `.py` file under
 `crucible/` EXCEPT `crucible/keys.py` itself (the producer, not a call site)
 and `crucible/gate.py`. `gate.py` is excluded by IDENTITY, not by a growing
 allowlist: it is a single, named, structural boundary tied to a live,
-concurrent PR under `alpha-engine-config-I9852` that owns moving `gate_key`
-into `crucible.keys` (this PR's own part of I9852 is scoped away from
-`gate.py` for the same reason — two PRs editing the same file). `gate.py`
-carries two known hits today — `gate.py:470` (`store.list_keys("runs/smoke/")`,
-which `crucible.keys.runs_prefix("smoke")` already covers) and `gate.py:1124`
-(`store.list_keys(f"gates/{gate}/")`, which wants a `gate_prefix(gate)`
-function alongside `gate_key`'s move) — both reported in this PR's body
-rather than fixed here, and both will still be reachable by anyone who reads
-this module's own exclusion list: `self_test_gate_py_hits_are_real` proves
-they exist, so an accidental widening of the exclusion (or a stale one, once
-`gate.py`'s PR lands) is caught rather than silently made permanent.
+concurrent PR under `alpha-engine-config-I9875` that owns adding
+`gate_prefix(gate)` for the one remaining hit inside it —
+`gate.py`'s OTHER hit (`store.list_keys("runs/smoke/")`) was fixed directly
+in this PR (`runs_prefix("smoke")` already existed), leaving exactly one:
+`store.list_keys(f"gates/{gate}/")`. `self_test_gate_py_hits_are_real`
+proves that hit still exists, so an accidental widening of the exclusion (or
+a stale one, once I9875 lands) is caught rather than silently made
+permanent.
 """
 
 from __future__ import annotations
@@ -46,19 +60,32 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from crucible.store import Store
+
 _CRUCIBLE_ROOT = Path(__file__).resolve().parent.parent / "crucible"
 
-#: The store/context methods this test polices. Exhaustive: these five are
-#: every method through which a key or prefix reaches the store layer.
-_STORE_METHODS = frozenset({"get_bytes", "put_bytes", "list_keys", "exists"})
-_CONTEXT_METHODS = frozenset({"record_output", "record_input"})
+#: Derived from `Store`'s own declared partition (`crucible/store.py`'s
+#: `MUTATORS`/`READERS`), not a second hand-kept list beside it — see the
+#: module docstring for why a hand-kept version already missed
+#: `compare_and_swap`, `etag` and `assert_keys_bind_to_trading_days`.
+_STORE_METHODS = frozenset(Store.MUTATORS) | frozenset(Store.READERS)
+
+#: `RunContext` (`crucible/runner.py`) has no `Store`-style declared
+#: partition to derive this from, so these three are read directly off the
+#: class: every method whose first parameter after `self` is a store key —
+#: `record_input`, `record_output`, `record_output_cas`. NOT claimed
+#: exhaustive the way `_STORE_METHODS` now is; a fourth key-writing method
+#: added to `RunContext` without a line here is exactly the blind spot this
+#: file exists to avoid reintroducing, and there is no declared constant on
+#: `RunContext` yet to derive it from instead.
+_CONTEXT_METHODS = frozenset({"record_input", "record_output", "record_output_cas"})
 
 #: `crucible/keys.py` is the producer, not a call site — excluded by path
 #: identity, exactly like `test_key_construction_placement.py` excludes it.
 #: `crucible/gate.py` is excluded for the reason the module docstring gives:
-#: a live, concurrent, same-issue PR owns that file today. ONE path, by
-#: identity, not a pattern and not a name that could silently match a second
-#: file later.
+#: a live, concurrent PR under `alpha-engine-config-I9875` owns its one
+#: remaining hit. ONE path, by identity, not a pattern and not a name that
+#: could silently match a second file later.
 _SELF_EXCLUDED = {_CRUCIBLE_ROOT / "keys.py"}
 _GATE_PY = _CRUCIBLE_ROOT / "gate.py"
 
@@ -111,47 +138,51 @@ class TestNoInlineStoreKeyLiterals:
             + ". Move the literal into crucible/keys.py (a *_key/*_prefix function or a "
             "ROOT constant) and call it from here — or, if it is genuinely not a store "
             "key (a dedup identity, human-readable message text, unresolved template "
-            "prose), it should not be arg0 to one of these five methods at all."
+            "prose), it should not be arg0 to one of these methods at all."
         )
 
-    def test_the_detector_actually_fires_the_self_test_that_shows_it_working(self) -> None:
-        """§ Test discipline: "give every guard a self-test that shows it
-        firing." A tiny synthetic AST, not a real file, so this cannot be
-        made to pass by fixing the codebase out from under it."""
+    def test_the_detector_fires_on_an_fstring_and_a_literal_but_not_a_name(
+        self, tmp_path: Path
+    ) -> None:
+        """Calls the REAL `_hits_in` against a real file on disk — not a
+        second, hand-copied reimplementation of its walk — so a future edit
+        that breaks `_hits_in`, or removes the `ast.JoinedStr` arm (the exact
+        shape I9852 fixed nine instances of), fails THIS test directly.
+        Measured: a prior version of this test re-implemented the walk
+        inline, and neutering `_hits_in` to `return []`, or deleting its
+        `ast.JoinedStr` branch outright, left it — and the other two tests in
+        this file — green.
+        """
         source = (
             "def f(store):\n"
             "    day = '2026-08-28'\n"
             "    store.get_bytes(f'drift/{day}/input_features.json')\n"
             "    store.exists('champions/current.json')\n"
-            "    store.list_keys(RUNS_ROOT)\n"  # a Name — must NOT fire
+            "    store.list_keys(RUNS_ROOT)\n"
         )
-        tree = ast.parse(source)
-        hits = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-                continue
-            if node.func.attr not in _STORE_METHODS or not node.args:
-                continue
-            arg0 = node.args[0]
-            if isinstance(arg0, ast.JoinedStr) or (
-                isinstance(arg0, ast.Constant) and isinstance(arg0.value, str)
-            ):
-                hits.append(node.func.attr)
-        assert hits == ["get_bytes", "exists"], (
-            f"expected the f-string and the literal to fire and the Name (RUNS_ROOT) not "
-            f"to, got {hits}"
+        path = tmp_path / "synthetic_module.py"
+        path.write_text(source, encoding="utf-8")
+
+        hits = _hits_in(path)
+
+        methods = [method for _, method, _ in hits]
+        assert methods == ["get_bytes", "exists"], (
+            "expected the f-string arg to get_bytes and the literal arg to exists to "
+            f"fire, and the Name RUNS_ROOT passed to list_keys not to; got {methods}"
         )
+        shapes = [shape for _, _, shape in hits]
+        assert shapes == ["f-string", "literal 'champions/current.json'"]
 
     def test_gate_py_hits_are_real_not_a_stale_exclusion(self) -> None:
         """`gate.py` is excluded above by identity, with a stated reason:
-        a live, concurrent PR under the same issue owns that file. This
-        proves the exclusion is still covering REAL hits rather than having
-        gone stale once that PR lands — if `gate.py` stops carrying these,
-        remove it from `_SELF_EXCLUDED`'s sibling check above instead of
-        leaving a boundary that no longer excludes anything real."""
+        a live, concurrent PR (`alpha-engine-config-I9875`) owns its one
+        remaining hit. This proves the exclusion is still covering a REAL
+        hit rather than having gone stale once that PR lands — if `gate.py`
+        stops carrying it, remove the exclusion from `_walk()` above instead
+        of leaving a boundary that no longer excludes anything real."""
         hits = _hits_in(_GATE_PY)
         assert hits, (
             "crucible/gate.py carries no inline store-key literals any more — the "
-            "concurrent PR that owns it must have landed. Remove the gate.py exclusion "
-            "from this test's _walk() and let the main test cover it."
+            "concurrent PR named in this test's docstring must have landed. Remove the "
+            "gate.py exclusion from this test's _walk() and let the main test cover it."
         )
