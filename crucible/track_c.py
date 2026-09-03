@@ -28,6 +28,7 @@ from crucible.board import (
     board_payload,
     build_board,
     pointer_may_move,
+    read_acceptance,
     render_board_html,
 )
 from crucible.calendar import resolve_trading_day
@@ -40,7 +41,14 @@ from crucible.console.render import (
     write_page,
 )
 from crucible.drift import drift_metrics
-from crucible.gate import LADDER_KEY, LADDER_SCHEMA_VERSION, build_ladder
+from crucible.gate import (
+    GATES,
+    LADDER_KEY,
+    LADDER_SCHEMA_VERSION,
+    PHASES,
+    build_ladder,
+    evaluate,
+)
 from crucible.keys import (
     BOARD_CURRENT_KEY,
     BOARD_HTML_KEY,
@@ -498,7 +506,24 @@ def board_handler(args: argparse.Namespace) -> int:
         # under the replayed day (§4.12).
         trading_day = args.trading_day or resolve_trading_day(moment)
         classifications, _ = classify_registry(store, registry, now=moment, trading_day=trading_day)
-        ladder = build_ladder(store, trading_day=trading_day, registry=registry, now=moment)
+        # Evaluated ONCE, here, and handed to both consumers. `build_ladder`
+        # would otherwise evaluate each gate itself and `build_board` would
+        # have to evaluate them a second time to obtain the clause lists the
+        # page renders — doubling every store read the clause set makes
+        # (`alpha-engine-config-I9826`) and, worse, giving one page two
+        # readings of the same gate that are free to disagree.
+        readings = {
+            phase.gate: evaluate(store, gate=phase.gate, trading_day=trading_day, registry=registry)
+            for phase in PHASES
+            if phase.gate is not None and phase.gate in GATES
+        }
+        ladder = build_ladder(
+            store,
+            trading_day=trading_day,
+            registry=registry,
+            now=moment,
+            readings=readings,
+        )
         board = build_board(
             store,
             now=moment,
@@ -506,7 +531,9 @@ def board_handler(args: argparse.Namespace) -> int:
             registry=registry,
             classifications=classifications,
             ladder=ladder,
+            readings=readings,
         )
+        acceptance, acceptance_note = read_acceptance(store, trading_day.isoformat())
 
         previous, previous_unreadable = _read_previous_board(store)
 
@@ -543,7 +570,12 @@ def board_handler(args: argparse.Namespace) -> int:
         # reader re-derives incorrectly. It moves with the pointer, for the
         # same reason and under the same condition.
         if may_move:
-            page = render_board_html(board, deltas).encode("utf-8")
+            page = render_board_html(
+                board,
+                deltas,
+                acceptance=acceptance,
+                acceptance_note=acceptance_note,
+            ).encode("utf-8")
             store.put_bytes(BOARD_HTML_KEY, page)
             ctx.record_output(BOARD_HTML_KEY, page, schema_version=BOARD_SCHEMA_VERSION)
 

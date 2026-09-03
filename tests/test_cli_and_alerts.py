@@ -308,6 +308,26 @@ class TestAlertingSurface:
         now = dt.datetime(2026, 8, 29, 23, 59, tzinfo=dt.UTC)
         assert "heartbeat" not in {p.job for p in evaluate_absence(store, now=now)}
 
+    def test_evidence_beside_a_manifest_is_neither_a_run_nor_a_failure(self, tmp_path) -> None:
+        """alpha-engine-config-I9900, the same false assumption one module
+        over: `report.morning` files its delivered `message.txt` under its OWN
+        manifest prefix. `evaluate_failure` used to `json.loads` it and page a
+        FAILURE every night for a job that succeeded, and `evaluate_absence`
+        used to count it as "a manifest exists" and suppress a real absence.
+        Both narrow the listing to manifest keys now."""
+        from crucible.alerts import evaluate_absence, evaluate_failure
+        from crucible.keys import morning_report_key
+        from crucible.store import LocalStore
+
+        store = LocalStore(tmp_path)
+        store.put_bytes(
+            morning_report_key(FRIDAY.isoformat(), "2026-08-29"),
+            b"Good morning. Board: 14 of 23 clauses met.\n",
+        )
+        now = dt.datetime(2026, 8, 29, 23, 0, tzinfo=dt.UTC)
+        assert evaluate_failure(store, now=now) == []
+        assert "report.morning" in {p.job for p in evaluate_absence(store, now=now)}
+
     def test_send_raises_when_the_transport_does(self) -> None:
         """Delivery failure RAISES. An alert that could not be sent and was
         logged instead is an outage nobody hears about."""

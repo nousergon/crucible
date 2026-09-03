@@ -89,8 +89,18 @@ ReleaseLockState = Literal["MET", "UNMET", "UNMEASURABLE"]
 #: still starts with `crucible-` and ends in `.whl`), so this sweep keeps
 #: covering every release object ever published, old naming and new, with
 #: one pattern rather than two.
+#:
+#: The filename half is `[^/]+`, never `.+` (alpha-engine-config-I9917 item
+#: 2): `.` matches `/`, so `.+` made the pattern match at ANY depth below the
+#: sha prefix as long as the first segment started with `crucible-` — e.g.
+#: `releases/{sha}/crucible-staging/inner/build.whl`. That contradicted this
+#: docstring's own "directly under the sha prefix" invariant, and
+#: `publish_release` writes exactly two keys there, so anything deeper is not
+#: a published release object: reporting a lock finding against one would
+#: grade something the release contract does not own and inflate the sweep's
+#: denominator with it.
 _RELEASE_OBJECT_RE = re.compile(
-    r"^releases/(?P<sha>[0-9a-f]{40})/(?:release\.json|crucible-.+\.whl)$"
+    r"^releases/(?P<sha>[0-9a-f]{40})/(?:release\.json|crucible-[^/]+\.whl)$"
 )
 
 #: `GetObjectRetention`'s error code for "this object has no Object Lock
