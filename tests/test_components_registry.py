@@ -133,7 +133,21 @@ class TestVocabulary:
         naming it here is what keeps it from becoming a general exemption."""
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
         enum = set(schema["properties"]["job"]["enum"])
-        assert enum - set(components["components"]) == {"deploy"}
+        registry = set(components["components"])
+        assert enum - registry == {"deploy"}
+        # The other direction (alpha-engine-config-I9907). Measured before
+        # this assertion existed: deleting one job from the schema enum left
+        # this file at 18 passed, 0 failed — the "three files, any two
+        # disagreeing is caught" claim in AGENTS.md rule 1 held for two of the
+        # three pairs. A job present in the CLI table and the registry but
+        # absent from the enum ships fine and fails at runtime on its first
+        # manifest, with schema validation as the only (indirect) catch.
+        assert set(JOBS) - enum == set(), (
+            f"CLI jobs missing from the manifest schema's job enum: {sorted(set(JOBS) - enum)}"
+        )
+        assert registry - enum == set(), (
+            f"registry rows missing from the manifest schema's job enum: {sorted(registry - enum)}"
+        )
 
 
 class TestDeadlinesAreMachineReadable:
