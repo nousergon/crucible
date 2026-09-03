@@ -62,6 +62,87 @@ and it is the only progress figure worth quoting in a report — not merged PRs,
 not findings, not commits. A run of this directory that reports **no tests at
 all** is not a pass; it is an unobserved board, and CI treats it as a failure.
 
+## Three outcomes, not two
+
+A clause has one of three outcomes, never a fourth: **MET**, **UNMET** (the
+clause read fine and the property does not hold), and **UNMEASURABLE** (the
+read itself failed — no credentials, no region, `AccessDenied`, an
+unreachable endpoint). Only a handful of clauses read live infrastructure at
+all, and only those can ever be unmeasurable; every other clause is MET or
+UNMET, same as before.
+
+**UNMEASURABLE is never a pass** (principle 7 — "no data is never rendered
+as green"), and it fails the run exactly like UNMET does. It is reported
+separately because it is not a statement about the system: rendering it
+identically to UNMET made a permanently-uncredentialed CI job
+indistinguishable from a real, closeable plan-clause gap, and inflated the
+gate's own denominator with something no amount of application code could
+ever fix (alpha-engine-config-I9828).
+
+A clause raises `_unmeasurable(...)` (defined beside `_unmet` in
+`test_plan_section_2_objectives.py`) rather than `_unmet(...)` when the
+failure is in the READ, not the property — structurally, that means the
+`try` block around the live call, never the `assert` that follows it once
+the read succeeded. **Only from an allowed `except` handler**: `_unmeasurable`
+may be reached only from a handler whose caught type(s) are in
+`_UNMEASURABLE_ALLOWED_EXCEPTIONS` (`StackNotAppliedError`,
+`NoCredentialsError`, `NoRegionError`, `EndpointConnectionError`,
+`ClientError` — the last further gated on its AWS error code, at the call
+site, to an access/auth allowlist). This is round-2 hardening
+(alpha-engine-config-I9828): the round-1 version caught a bare `except
+Exception`, and an independent adversarial review reproduced turning an
+injected `TypeError` into a false UNMEASURABLE reading with it. A PR-blocking
+AST test (`tests/test_acceptance_reading.py::test_unmeasurable_is_only_called_from_an_allowed_except_handler`,
+part of the FOUNDATION suite, so it runs on every `pull_request`) enforces
+this; a self-test shows it firing on a bare except and on `except Exception`.
+
+**Classification is by JUnit `<properties>`, never by message text.**
+`_unmeasurable` calls the pytest-core `record_property` fixture (no plugin)
+to write `outcome=unmeasurable` and `blocked_on_class=<exception type name>`;
+`check_reading.py` reads only those two properties. Round 1 classified on a
+substring search over the failure message and traceback body — the same
+review reproduced two ways past that (an `AssertionError` quoting the marker
+word, and the marker surviving inside an unrelated traceback) — so the
+`UNMEASURABLE — ` message prefix survives for terminal legibility only and is
+read by nothing.
+
+`ratchet.json`'s `unmeasurable` map is a **subset of `unmet`'s keys**, not a
+fourth top-level bucket — `crucible/gate.py`'s phase-0 clause reads this same
+file and requires `met | unmet` to equal every clause the suite defines (that
+two-bucket contract predates this issue; the gate-side UNMEASURABLE `Clause`
+state is a separate track, crucible-PR53 / alpha-engine-config-I9869 round 2),
+so an unmeasurable clause id is listed in both `unmet` (for that coarse view)
+and `unmeasurable` (naming why the read failed, for the finer one). Each
+`unmeasurable` VALUE is an object — `reason`, `blocked_on_class`, `last_moved`
+— not a bare string, so moving a clause into this bucket is a reviewable
+diff (a new key appearing, never a string relocating silently between two
+JSON values), and a later drift in WHICH exception is actually observed
+fails the run until the ratchet is updated to match.
+
+`push: [main]`'s step summary reports `N met / M unmet / K unmeasurable`,
+with `M` counting only the plain-unmet remainder (`unmet` minus
+`unmeasurable`); a clause moving between met, plain-unmet and unmeasurable,
+or whose `blocked_on_class` drifts from what the ratchet commits, without the
+ratchet moving with it, fails the run.
+
+**Why the suite mirrors `crucible/board.py`'s UNMEASURABLE/UNMEASURED
+vocabulary instead of importing it:** the acceptance suite grades the system
+from outside it, and a suite that imports the code it grades can be broken by
+the exact code change it exists to catch.
+
+**Currently unmeasurable, and why:**
+
+| Clause | Why | Tracked |
+|---|---|---|
+| `TestCost::test_every_v2_resource_is_tagged_for_cost_attribution` | Reads live AWS (`cloudformation:ListStackResources`, `resourcegroupstaggingapi`, `iam:ListRoleTags`) to audit the `system=crucible-v2` tag. The `acceptance` CI job carries no AWS credentials at all (`permissions: {contents: read}`, no OIDC); `ne-laptop-agent` lacks the three read actions on the `crucible-v2` stack (`AccessDenied`). Neither environment can read it. | alpha-engine-config-I9895 |
+
+Every other clause in this directory either performs no live-infrastructure
+read (it constructs its own fakes, as `TestAutonomy`'s CloudTrail clause
+does) or is not yet built (`NotImplementedError` via `_unmet`/`_attempt`),
+and neither of those is unmeasurable — a clause that has not been written
+yet is UNMET, not UNMEASURABLE: the code, not the caller's credentials, is
+what is missing.
+
 ## Cross-track clauses belong here too
 
 A clause one track can only satisfy with another track's code is the same

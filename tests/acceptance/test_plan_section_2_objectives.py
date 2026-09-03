@@ -67,6 +67,110 @@ def _attempt(clause: str, requirement: str, fn: Callable[[], Any], *, phase: str
         _unmet(clause, requirement, exc, phase=phase)
 
 
+#: The ONLY exception types `_unmeasurable` may be called for — round-2 review
+#: finding 1/2 (alpha-engine-config-I9828): without this, an author can turn
+#: any code bug into a "read failure" by wrapping the call in `except
+#: Exception` and swapping `_unmet` for `_unmeasurable`, and `check_reading.py`
+#: cannot tell the difference from its two inputs alone. `test_acceptance_reading.py`'s
+#: `test_unmeasurable_is_only_called_from_an_allowed_except_handler` enforces
+#: this on every PR (it is in the FOUNDATION suite, which — unlike the
+#: acceptance job — runs on `pull_request`), and
+#: `test_the_except_handler_scanner_fires_on_a_bare_except_and_a_disallowed_type`
+#: is its self-test: it feeds synthetic modules reaching `_unmeasurable` from
+#: a bare `except` and from `except Exception`, and asserts the scanner
+#: reports both as violations. `ClientError` is further gated at the call
+#: site (see `_CLIENT_ERROR_UNMEASURABLE_CODES`) — being in this set only
+#: means the type itself is eligible, not that every instance of it is.
+_UNMEASURABLE_ALLOWED_EXCEPTIONS = frozenset(
+    {
+        "StackNotAppliedError",
+        "NoCredentialsError",
+        "NoRegionError",
+        "EndpointConnectionError",
+        "ClientError",
+    }
+)
+
+#: `ClientError` error codes that mean "the caller could not authenticate or
+#: is not authorized" — an environment problem, not a system property. Any
+#: other `ClientError` code (a real API contract violation, a malformed
+#: request, a throttle) re-raises as an uncaught error: round-2 review finding
+#: 2 named an injected `TypeError` from `audit_stack_tags` reading as
+#: UNMEASURABLE under the old bare `except Exception`, which this closes.
+_CLIENT_ERROR_UNMEASURABLE_CODES = frozenset(
+    {
+        "AccessDenied",
+        "AccessDeniedException",
+        "UnauthorizedOperation",
+        "ExpiredToken",
+        "InvalidClientTokenId",
+    }
+)
+
+
+def _unmeasurable(
+    clause: str,
+    requirement: str,
+    exc: BaseException,
+    *,
+    phase: str,
+    record_property: Callable[[str, object], None],
+) -> NoReturn:
+    """Fail this clause because the READ failed, not because the property was
+    read and found false.
+
+    Normative source: alpha-engine-config-I9828, round 2. A clause that reads
+    live infrastructure can fail two ways that must never render the same:
+    UNMET (the read succeeded and the property does not hold — call `_unmet`
+    or assert directly) and UNMEASURABLE (no credentials, no region,
+    AccessDenied, an unreachable endpoint — the caller could not read at
+    all). Both fail the job, but only UNMET is a statement about the system.
+    Rendering them identically is the exact defect this function exists to
+    end: it made a permanently-uncredentialed CI job indistinguishable from
+    three real plan-clause gaps, forever, with no artifact showing which was
+    which.
+
+    `record_property` (a pytest-core fixture, no plugin needed) writes
+    `outcome=unmeasurable` and `blocked_on_class=<type(exc).__name__>` into
+    the JUnit `<properties>` — `check_reading.py` classifies on THAT, never on
+    message text, because a substring search over `message` and the traceback
+    body is spoofable: round-2 review reproduced both an `AssertionError`
+    quoting the marker word and the marker surviving inside a traceback body,
+    each reclassified as unmeasurable by the round-1 version of this function.
+    The `UNMEASURABLE — ` prefix stays in the `pytest.fail` message for
+    terminal legibility only — a human reading raw `pytest -q` output — and is
+    read by nothing.
+
+    Only callable from an `except` handler whose caught type(s) are in
+    `_UNMEASURABLE_ALLOWED_EXCEPTIONS` — enforced by an AST guard in
+    `tests/test_acceptance_reading.py`, not by anything in this function
+    (there is no reflection trick that makes a call site police its own
+    caller reliably); the type is checked here only as a second, redundant
+    guard against `exc` itself lying about what raised it.
+    """
+    if type(exc).__name__ not in _UNMEASURABLE_ALLOWED_EXCEPTIONS:
+        raise TypeError(
+            f"_unmeasurable called for {type(exc).__name__}, not in the declared "
+            f"allowlist {sorted(_UNMEASURABLE_ALLOWED_EXCEPTIONS)} — this is a code "
+            "bug, not a read failure, and must not be reported as one"
+        )
+    try:
+        owning_phase = _PHASES_BY_ID[phase]
+    except KeyError:
+        raise ValueError(
+            f"{clause!r} names unknown phase {phase!r}; must be one of {sorted(_PHASES_BY_ID)}"
+        ) from None
+    record_property("outcome", "unmeasurable")
+    record_property("blocked_on_class", type(exc).__name__)
+    pytest.fail(
+        f"UNMEASURABLE — {clause}\n"
+        f"  Required: {requirement}\n"
+        f"  Status:   could not be read (crucible v2 phase {owning_phase.number}, "
+        f"{owning_phase.tracker}). Blocked on: {exc}",
+        pytrace=False,
+    )
+
+
 class TestAutonomy:
     """§2 row 1: 'Runs autonomously, minimal input'."""
 
@@ -288,7 +392,7 @@ class TestCost:
         assert manifest["cost_usd"] == 0.0, "a refused call spends nothing"
         assert manifest["llm_calls"] == []
 
-    def test_every_v2_resource_is_tagged_for_cost_attribution(self) -> None:
+    def test_every_v2_resource_is_tagged_for_cost_attribution(self, record_property) -> None:
         """The one clause in this file that reads LIVE AWS, because the thing
         it asserts is a property of the account and not of the code.
 
@@ -298,7 +402,26 @@ class TestCost:
         account. `crucible.tags` raises `StackNotAppliedError` rather than
         returning an empty difference, because an empty difference over an
         empty stack is vacuous truth (principle 7).
+
+        Round 2 (alpha-engine-config-I9828 review finding 2): the exception
+        handling is a NAMED allowlist, not `except Exception`. A bare
+        `except Exception` sent a code bug — an injected `TypeError` from
+        `audit_stack_tags` was the reviewer's reproduction — into
+        `_unmeasurable` exactly like a genuine credential failure would, and
+        nothing here could then tell the two apart. Only the exception types
+        that mean "the read itself could not happen" are caught; a
+        `ClientError` is further gated on its AWS error code, since most
+        `ClientError` codes are not credential/access problems at all. Every
+        other exception — the `TypeError` included — is not caught here and
+        surfaces as a pytest ERROR, not a classified outcome.
         """
+        from botocore.exceptions import (
+            ClientError,
+            EndpointConnectionError,
+            NoCredentialsError,
+            NoRegionError,
+        )
+
         from crucible.config import settings as load_settings
         from crucible.tags import StackNotAppliedError, audit_stack_tags
 
@@ -323,11 +446,23 @@ class TestCost:
                 iam=boto3.client("iam"),
             )
         except StackNotAppliedError as exc:
-            _unmet(clause, requirement, exc, phase="phase0")
-        except Exception as exc:  # noqa: BLE001 - reported, never swallowed
-            # Credentials, region, permissions: every one of these means the
-            # clause was not measured, and an unmeasured clause is unmet.
-            _unmet(clause, requirement, exc, phase="phase0")
+            # crucible.tags's own docstring: an absent stack is UNMEASURABLE,
+            # never a pass — there is nothing to tag yet.
+            _unmeasurable(clause, requirement, exc, phase="phase0", record_property=record_property)
+        except (NoCredentialsError, NoRegionError, EndpointConnectionError) as exc:
+            # No credentials at all, no region configured, or the endpoint
+            # could not be reached — all three are the READ failing, not the
+            # property being read and found false.
+            _unmeasurable(clause, requirement, exc, phase="phase0", record_property=record_property)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code not in _CLIENT_ERROR_UNMEASURABLE_CODES:
+                # A real API error — a malformed request, a throttle, a
+                # not-found — is a code bug or a genuine contract violation,
+                # never a read-failure disguise. Re-raise: this is a pytest
+                # ERROR, not UNMEASURABLE and not UNMET.
+                raise
+            _unmeasurable(clause, requirement, exc, phase="phase0", record_property=record_property)
         assert audit.met, f"UNMET — {clause}: {audit.detail()}"
 
 
