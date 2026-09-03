@@ -69,11 +69,22 @@ LIFECYCLES: tuple[str, ...] = ("ACTIVE", "DISABLED", "RETIRED")
 #: WHO starts a scheduled job. Exhaustive, and declared per row rather than
 #: inferred from the schedule string: `arc` means the weekly driver runs it as
 #: a stage (`crucible.weekly`), `scheduler` means it has an EventBridge
-#: schedule of its own. Before this field existed, six rows said "weekly,
-#: Saturday" and exactly one of them was dispatched by anything — the other
-#: five were declared, deadlined, watched for absence, and started by nobody.
-#: A schedule string is a description; this is the wiring.
-DISPATCHES: tuple[str, ...] = ("arc", "scheduler")
+#: schedule of its own, `github-actions` means a cron in this repository's own
+#: `.github/workflows/` starts it. Before this field existed, six rows said
+#: "weekly, Saturday" and exactly one of them was dispatched by anything — the
+#: other five were declared, deadlined, watched for absence, and started by
+#: nobody. A schedule string is a description; this is the wiring.
+#:
+#: `github-actions` was added 2026-09-02 (alpha-engine-config-I9878) because
+#: `board` declared `scheduler` while a GitHub Actions cron actually started
+#: it — a value that named the wrong starter, which is the same blindness one
+#: layer up. It is a real value and not a hole: every `github-actions` row
+#: must have a matching cron in `.github/workflows/`, and every scheduled
+#: workflow must map to such a row, asserted in BOTH directions by
+#: `nous-ergon-ops/tests/crossrepo/test_crucible_dispatch_lockstep.py`. A
+#: value verified in only one direction would be a suppression wearing a
+#: field name.
+DISPATCHES: tuple[str, ...] = ("arc", "scheduler", "github-actions")
 
 
 @dataclass(frozen=True)
@@ -172,9 +183,11 @@ class Component:
     #: declaration surface and the dataclass is a value object a test may
     #: construct for one narrow purpose.
     #: The cross-repo half of this contract — that every `scheduler` row has a
-    #: real `AWS::Scheduler::Schedule` and no `arc` row has one — is asserted
-    #: in `nous-ergon-ops` against the CloudFormation template, because that is
-    #: where the other half of the pair lives.
+    #: real `AWS::Scheduler::Schedule`, no `arc` row has one, and every
+    #: `github-actions` row has a real cron in `.github/workflows/` (and every
+    #: scheduled workflow has such a row) — is asserted in `nous-ergon-ops`
+    #: against the CloudFormation template and this repo's workflows, because
+    #: that is where the other half of each pair lives.
     dispatch: str | None = None
     #: WHO would notice this row's absence. Almost always `alerts.sweep`.
     #: The two exceptions are the sweep itself (a sweep that never ran
@@ -263,7 +276,8 @@ def _assert_dispatch_declared(name: str, row: dict[str, Any]) -> None:
         raise ValueError(
             f"{name} declares no `dispatch`. Every row states who starts it — `arc` "
             "(a stage of `crucible weekly`), `scheduler` (its own EventBridge "
-            "schedule), or `null` for on-demand."
+            "schedule), `github-actions` (a cron in this repo's .github/workflows/), "
+            "or `null` for on-demand."
         )
     dispatch = row["dispatch"]
     scheduled = row["schedule"] is not None

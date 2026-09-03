@@ -886,10 +886,44 @@ class TestTheProducerRunsWithoutTheWeeklyArc:
     def test_the_job_is_registered_as_its_own_daily_scheduled_component(self) -> None:
         component = load_registry()["board"]
         assert component.schedule == "daily"
-        assert component.dispatch == "scheduler", (
+        # `scheduler` is what this row said from 2026-09-02T21:47Z until
+        # alpha-engine-config-I9878, and it was false: there is no
+        # AWS::Scheduler::Schedule for this job anywhere in crucible-v2.yaml.
+        assert component.dispatch == "github-actions", (
             "`arc` would put the board behind the weekly driver, which is phase-2 "
             "work — six rows in components.yaml once read 'weekly, Saturday' while "
-            "exactly one of them was dispatched by anything"
+            "exactly one of them was dispatched by anything. The starter here is "
+            "the `on.schedule` cron in .github/workflows/board.yml"
+        )
+
+    def test_the_workflow_named_by_the_row_is_the_one_that_actually_crons_it(self) -> None:
+        """The half of the claim this repository can check on its own.
+
+        The cross-repo lockstep guard
+        (`nous-ergon-ops/tests/crossrepo/test_crucible_dispatch_lockstep.py`)
+        asserts the `github-actions` vocabulary in both directions over every
+        row and every workflow. This asserts the one instance here too,
+        because a guard living only in the repository that cannot break it is
+        the exact defect I9878 was filed for.
+        """
+        import yaml
+
+        workflow = yaml.safe_load(
+            (
+                pathlib.Path(__file__).resolve().parent.parent
+                / ".github"
+                / "workflows"
+                / "board.yml"
+            ).read_text(encoding="utf-8")
+        )
+        # `on` parses as the boolean True under YAML 1.1 — the key is not the
+        # string "on" here, which is the single most common way a workflow
+        # trigger assertion passes vacuously.
+        triggers = workflow[True]
+        crons = [entry["cron"] for entry in triggers["schedule"]]
+        assert crons == ["30 21 * * *"], (
+            "the `board` row declares `dispatch: github-actions`; board.yml is "
+            f"the workflow that has to carry the cron, and it has {crons}"
         )
 
     def test_a_red_board_is_not_a_failed_run(self, tmp_path) -> None:
