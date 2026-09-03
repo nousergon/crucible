@@ -276,7 +276,13 @@ def apply_release_retention(
 
 
 def _store(args: argparse.Namespace) -> Store:
-    return open_store(getattr(args, "store", None))
+    # alpha-engine-config-I9922 N1, defense-in-depth: `release_lock_handler`'s
+    # `--dry-run` branch below never reaches `run_job` and already avoids
+    # `apply_release_retention`'s `PutObjectRetention` call, so wrapping here
+    # changes nothing on the real path — `isinstance(store, S3Store)`
+    # (`apply_release_retention`'s own guard) still holds through the wrap,
+    # since `read_only` subclasses rather than delegates (`crucible.store`).
+    return open_store(getattr(args, "store", None), dry_run=bool(getattr(args, "dry_run", False)))
 
 
 def release_lock_handler(args: argparse.Namespace) -> int:

@@ -53,9 +53,15 @@ def _today() -> dt.date:
 
 
 def _settings(args: argparse.Namespace) -> Any:
+    # `dry_run` threaded here, once, rather than at each of this module's
+    # eight `config.store()` call sites (alpha-engine-config-I9922 N1): every
+    # track-A handler that reaches `config.store()` gets a read-only store
+    # under `--dry-run` regardless of whether that handler's own body checks
+    # the flag.
     return resolve_settings(
         store_uri=getattr(args, "store", None),
         strategy_dir=getattr(args, "strategy_dir", None),
+        dry_run=bool(getattr(args, "dry_run", False)),
     )
 
 
@@ -388,7 +394,19 @@ def handle_migrate_history(args: argparse.Namespace) -> int:
         )
         print(json.dumps(result, indent=2, sort_keys=True))
 
-    run_job("migrate.history", job, store=store, trading_day=args.trading_day)
+    # `migrate.history` never checked `--dry-run` at all (alpha-engine-config-
+    # I9922 N1): `store` is read-only under `dry_run` (via `_settings` above),
+    # so `job`'s writes now raise `DryRunWriteRefusedError` rather than
+    # landing for real, and `dry_run=` here means that raise replaces the
+    # write attempt cleanly rather than also failing the manifest write in
+    # `run_job`'s own `finally`.
+    run_job(
+        "migrate.history",
+        job,
+        store=store,
+        trading_day=args.trading_day,
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
     return 0
 
 

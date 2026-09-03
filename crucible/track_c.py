@@ -91,7 +91,11 @@ SMOKE_READS: tuple[tuple[str, str], ...] = (
 
 
 def _store(args: argparse.Namespace) -> Store:
-    return open_store(getattr(args, "store", None))
+    # alpha-engine-config-I9922 N1: read-only under `--dry-run` regardless of
+    # whether the calling handler's own body checks the flag — this is the
+    # single point every one of this module's six handlers resolves a store
+    # through.
+    return open_store(getattr(args, "store", None), dry_run=bool(getattr(args, "dry_run", False)))
 
 
 # ── release.pin ───────────────────────────────────────────────────────────
@@ -126,7 +130,13 @@ def release_pin_handler(args: argparse.Namespace) -> int:
             }
         )
 
-    run_job("release.pin", body, store=store, trading_day=args.trading_day)
+    run_job(
+        "release.pin",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
     return 0
 
 
@@ -329,6 +339,7 @@ def smoke_handler(args: argparse.Namespace) -> int:
             # Retrying it would promote a build whose first attempt failed,
             # and the deploy would read a green manifest over an amber fact.
             transient_retry=False,
+            dry_run=bool(getattr(args, "dry_run", False)),
         )
     return 0
 
@@ -393,6 +404,7 @@ def sweep_handler(args: argparse.Namespace) -> int:
         # the runner resolves `trading_day`/`started`, so it is a callable
         # rather than a value computed here (alpha-engine-config-I9781).
         discriminator=lambda ctx: ctx.calendar_date.isoformat(),
+        dry_run=bool(getattr(args, "dry_run", False)),
     )
     print(json.dumps({k: v for k, v in result.items() if k != "metric"}, indent=2))
     return 0
@@ -424,7 +436,13 @@ def heartbeat_handler(args: argparse.Namespace) -> int:
             }
         )
 
-    run_job("heartbeat", body, store=store, trading_day=args.trading_day)
+    run_job(
+        "heartbeat",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
     return 0
 
 
@@ -473,7 +491,13 @@ def drift_handler(args: argparse.Namespace) -> int:
             schema_version="metric_record.v1",
         )
 
-    run_job("drift", body, store=store, trading_day=args.trading_day)
+    run_job(
+        "drift",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
     return 0
 
 
@@ -778,5 +802,11 @@ def console_handler(args: argparse.Namespace) -> int:
             }
         )
 
-    run_job("console", body, store=store, trading_day=args.trading_day)
+    run_job(
+        "console",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
     return 0

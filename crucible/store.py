@@ -36,11 +36,13 @@ from crucible.calendar import (
 __all__ = [
     "ETAG_ABSENT",
     "PRESIGN_MAX_S",
+    "DryRunWriteRefusedError",
     "LocalStore",
     "PointerConflictError",
     "S3Store",
     "Store",
     "open_store",
+    "read_only",
     "sha256_hex",
 ]
 
@@ -65,6 +67,75 @@ class PointerConflictError(RuntimeError):
     would overwrite whatever the winner just published, which is exactly
     the last-writer-wins failure the conditional PUT exists to prevent.
     """
+
+
+class DryRunWriteRefusedError(RuntimeError):
+    """A :data:`Store.MUTATORS` method was called on a store resolved with
+    ``dry_run=True`` (alpha-engine-config-I9922, finding N1).
+
+    `run_job(dry_run=True)` alone only stops `run_job` from writing its OWN
+    manifest — it hands `fn` the same store either way, so a job body that
+    calls `ctx.record_output`, `ctx.record_output_cas`, or `store.put_bytes`
+    directly still reached the real backend under `--dry-run` (reproduced:
+    a body calling `record_output("board/current.json", ...)` under
+    `dry_run=True` left the artifact in the store with no manifest, while
+    the runner printed "no outputs recorded"). `open_store(..., dry_run=True)`
+    and `Settings.store(dry_run=True)` are the two places every handler
+    resolves a store, and both now return a :func:`read_only` wrapper: every
+    read behaves identically, and every write raises this, loudly, before it
+    reaches the backend — a job whose body never checked `args.dry_run` at
+    all (`gate`, `report`, `weekly`, `smoke`, `release.pin`, `alerts.sweep`,
+    `heartbeat`, `drift`, `console`) now fails loudly on the write it
+    attempts rather than silently succeeding.
+    """
+
+
+_READ_ONLY_CLASS_CACHE: dict[type, type] = {}
+
+
+def _read_only_class(base: type) -> type:
+    """A subclass of ``base`` whose every :data:`Store.MUTATORS` method
+    refuses. Built once per concrete backend class and cached.
+
+    A dynamic **subclass**, not a composition wrapper, deliberately:
+    `release_retention.py`, `release.py` and `release_lock_sweep.py` each do
+    `isinstance(store, S3Store)` to refuse a laptop-directory store outright,
+    and a wrapper that only delegated to an inner store would fail every one
+    of those checks under `--dry-run` — trading the write-leak bug this class
+    fixes for a silent wrong-backend-type bug instead. A real subclass keeps
+    `isinstance` (and every other attribute — `.bucket`, `.client`, `.root`)
+    true and working; only the two declared `MUTATORS` are overridden.
+    """
+    cached = _READ_ONLY_CLASS_CACHE.get(base)
+    if cached is not None:
+        return cached
+
+    def _refuse(self: Any, key: str = "<unknown key>", *args: Any, **kwargs: Any) -> Any:
+        raise DryRunWriteRefusedError(
+            f"--dry-run: refusing to write {key!r} — this store was resolved read-only "
+            "(crucible.store.open_store(..., dry_run=True) / "
+            "crucible.config.Settings.store(dry_run=True)). A dry run must not reach "
+            "the backend; see DryRunWriteRefusedError's own docstring."
+        )
+
+    namespace = {name: _refuse for name in Store.MUTATORS}
+    cls = type(f"ReadOnly{base.__name__}", (base,), namespace)
+    _READ_ONLY_CLASS_CACHE[base] = cls
+    return cls
+
+
+def read_only(store: Store) -> Store:
+    """``store``, wrapped so every :data:`Store.MUTATORS` call raises
+    :class:`DryRunWriteRefusedError` instead of reaching the backend.
+
+    Every :data:`Store.READERS` method, and every other attribute, behaves
+    exactly as it does on ``store`` — this IS that object's state, under a
+    subclass with two methods overridden, not a copy or a second connection.
+    """
+    cls = _read_only_class(type(store))
+    wrapped = object.__new__(cls)
+    wrapped.__dict__.update(store.__dict__)
+    return wrapped
 
 
 def sha256_hex(payload: bytes) -> str:
@@ -565,7 +636,7 @@ class S3Store(Store):
         return str(resp.get("ETag", "")).strip('"')
 
 
-def open_store(uri: str | None) -> Store:
+def open_store(uri: str | None, *, dry_run: bool = False) -> Store:
     """`s3://bucket/prefix` or a directory path, resolved to a backend.
 
     One factory so `--store` means the same thing to every job, and so the
@@ -573,6 +644,13 @@ def open_store(uri: str | None) -> Store:
     `CRUCIBLE_STORE`; there is deliberately no hardcoded production bucket
     fallback — a job that silently wrote to production because a flag was
     missing is the kind of default that is only noticed once.
+
+    ``dry_run=True`` returns the backend wrapped by :func:`read_only`
+    (alpha-engine-config-I9922) — every CLI handler resolves its store
+    through this function (or `crucible.config.Settings.store`, which wraps
+    the same way) with `dry_run=bool(args.dry_run)`, so `--dry-run` is now
+    true of every job regardless of whether that job's own handler body
+    checks the flag.
     """
     target = uri or os.environ.get("CRUCIBLE_STORE")
     if not target:
@@ -584,5 +662,7 @@ def open_store(uri: str | None) -> Store:
     if target.startswith("s3://"):
         rest = target[len("s3://") :]
         bucket, _, prefix = rest.partition("/")
-        return S3Store(bucket, prefix)
-    return LocalStore(target)
+        store: Store = S3Store(bucket, prefix)
+    else:
+        store = LocalStore(target)
+    return read_only(store) if dry_run else store

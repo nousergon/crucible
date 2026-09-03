@@ -366,3 +366,52 @@ class TestDryRun:
             run_job("report", job, store=store, trading_day=TRADING_DAY, dry_run=True)
 
         assert list(store.list_keys()) == []
+
+    def test_dry_run_alone_does_not_stop_fn_writing_through_a_real_store(self, tmp_path) -> None:
+        """BLOCKING F1 (independent review of crucible-PR74, 2026-09-03),
+        turned into a passing regression test. `run_job(dry_run=True)` skips
+        `run_job`'s OWN manifest write — it does not, and was never meant to,
+        stop `fn` writing through whatever `store` it was handed. Reproduced
+        exactly as the reviewer measured: a body calling
+        `ctx.record_output("board/current.json", ...)` under `dry_run=True`
+        against a REAL `LocalStore` lands the artifact in the store with no
+        manifest.
+
+        This is not a defect in `run_job` — the fix is that no caller ever
+        hands a job body a real, writable store under `--dry-run` in the
+        first place (`crucible.store.read_only`, wired in at every CLI
+        store-construction point; see `tests/test_cli_and_alerts.py::
+        TestDryRunNeverWrites` for the store-wrapped, CLI-level guarantee).
+        This test documents and pins the boundary: `run_job` itself does not
+        and must not try to guess whether `store` is real or wrapped."""
+        store = LocalStore(tmp_path)
+
+        def job(ctx: RunContext) -> None:
+            ctx.record_output("board/current.json", b"{}")
+
+        run_job("board", job, store=store, trading_day=TRADING_DAY, dry_run=True)
+
+        # The artifact landed for real — `run_job` alone cannot and does not
+        # prevent this — while no manifest exists, exactly the split the
+        # reviewer's probe demonstrated.
+        assert store.exists("board/current.json")
+        assert list(store.list_keys("runs/")) == []
+
+    def test_dry_run_against_a_read_only_store_refuses_the_write_loudly(self, tmp_path) -> None:
+        """The actual fix, exercised at the `run_job` boundary: when the
+        store IS wrapped (`crucible.store.read_only`, as every CLI handler
+        now resolves its store under `--dry-run`), the same body from the
+        test above raises instead of writing — `run_job` needed no changes
+        of its own to get this; it is a property of the store it was
+        handed."""
+        from crucible.store import DryRunWriteRefusedError, read_only
+
+        store = read_only(LocalStore(tmp_path))
+
+        def job(ctx: RunContext) -> None:
+            ctx.record_output("board/current.json", b"{}")
+
+        with pytest.raises(DryRunWriteRefusedError, match="board/current.json"):
+            run_job("board", job, store=store, trading_day=TRADING_DAY, dry_run=True)
+
+        assert list(store.list_keys()) == []

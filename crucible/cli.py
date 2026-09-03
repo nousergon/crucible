@@ -117,11 +117,18 @@ def _resolve_store(args: argparse.Namespace):
     `python -m crucible.deploy`, which does not go through this CLI. All this
     adds is the CLI's exit convention: a missing store is a usage error, and
     a traceback for one is noise in front of a one-line fix.
+
+    Read-only when `--dry-run` is set (alpha-engine-config-I9922 N1) — the
+    store this returns is the one every handler writes through, so this is
+    where `--dry-run`'s own CLI help ("write nothing") becomes true for every
+    job rather than only the ones whose handler body happened to check it.
     """
     from crucible.store import open_store
 
     try:
-        return open_store(getattr(args, "store", None))
+        return open_store(
+            getattr(args, "store", None), dry_run=bool(getattr(args, "dry_run", False))
+        )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -380,6 +387,13 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument(
             "--dry-run",
             action="store_true",
+            # Enforced at the store (`crucible.store.open_store`,
+            # `crucible.config.Settings.store` — see `read_only`), not in this
+            # help text or in each handler: a job whose own body does not
+            # check this flag now reports and writes nothing where it can, or
+            # raises loudly on the first write it attempts otherwise, rather
+            # than the silent real write this closed (alpha-engine-config-
+            # I9922 N1, independent review of crucible-PR74, 2026-09-03).
             help="Resolve inputs and report what would be written; write nothing.",
         )
         sub.add_argument(

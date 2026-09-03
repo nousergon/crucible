@@ -54,11 +54,16 @@ def weekly_handler(args: argparse.Namespace) -> int:
     non-zero.
     """
     store_uri = getattr(args, "store", None)
-    store = open_store(store_uri)
+    dry_run = bool(getattr(args, "dry_run", False))
+    store = open_store(store_uri, dry_run=dry_run)
 
     def body(ctx: RunContext) -> None:
         planned = arc_stages(ctx.trading_day)
-        ran = run_arc(ctx.trading_day, store=store_uri)
+        # `dry_run` is passed to `run_arc` so every stage's own argv carries
+        # `--dry-run` too (alpha-engine-config-I9922 N1) — each stage is a
+        # fresh `crucible.cli.main` invocation with no shared `args`, so
+        # `weekly --dry-run` previously ran every stage for real.
+        ran = run_arc(ctx.trading_day, store=store_uri, dry_run=dry_run)
         for stage in ran:
             key = manifest_key(stage.job, ctx.trading_day.isoformat(), discriminator=stage.slot)
             ctx.record_input(key, store.get_bytes(key))
@@ -84,7 +89,14 @@ def weekly_handler(args: argparse.Namespace) -> int:
     # `console` met a 5xx — twelve jobs repeated for one, each rewriting its
     # own manifest, and the store's answer to "did this week work" decided by
     # write ordering.
-    run_job("weekly", body, store=store, trading_day=args.trading_day, transient_retry=False)
+    run_job(
+        "weekly",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        transient_retry=False,
+        dry_run=dry_run,
+    )
     return 0
 
 
@@ -98,7 +110,8 @@ def gate_handler(args: argparse.Namespace) -> int:
     until it passes. The manifest records `ok` and the reading; the exit code
     is what a caller branches on.
     """
-    store = open_store(getattr(args, "store", None))
+    dry_run = bool(getattr(args, "dry_run", False))
+    store = open_store(getattr(args, "store", None), dry_run=dry_run)
     result: dict[str, Any] = {}
 
     def body(ctx: RunContext) -> None:
@@ -192,7 +205,12 @@ def gate_handler(args: argparse.Namespace) -> int:
             }
         )
 
-    run_job("gate", body, store=store, trading_day=args.trading_day)
+    # `gate` never checked `--dry-run` (alpha-engine-config-I9922 N1 — measured
+    # writing `gates/ladder.json` and `gates/phase1/<day>/gate.json`). The
+    # read-only `store` above turns those `ctx.record_output` calls into a
+    # loud `DryRunWriteRefusedError`; `dry_run=` here keeps `run_job` from
+    # also attempting its own manifest write on top of that.
+    run_job("gate", body, store=store, trading_day=args.trading_day, dry_run=dry_run)
     reading = result["reading"]
     print(reading.render())
     print(result["ladder"].render())

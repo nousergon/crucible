@@ -345,3 +345,51 @@ class TestAlertingSurface:
 
         with pytest.raises(RuntimeError, match="telegram unreachable"):
             send(PageGroup("absence:x", (page,)), alert_id="0" * 26, transport=exploding)
+
+
+class TestDryRunNeverWrites:
+    """alpha-engine-config-I9922 N1 (independent-review finding, 2026-09-03).
+
+    `--dry-run`'s own CLI help ("write nothing") was true only of the jobs
+    whose handler body happened to check `args.dry_run` before touching the
+    store. `run_job(dry_run=True)` alone did not fix this: it only stops
+    `run_job` from writing ITS OWN manifest — a job body that calls
+    `ctx.record_output` (or `store.put_bytes` / `compare_and_swap` directly)
+    still reached the real backend, reproduced live: a body calling
+    `record_output("board/current.json", ...)` under `dry_run=True` left the
+    artifact in the store with no manifest, while the runner printed "no
+    outputs recorded".
+
+    The fix is enforced at store construction (`open_store(..., dry_run=)`,
+    `Settings.store(dry_run=)`) rather than in each handler body, so this is
+    parametrized over every entry in `JOBS` — a job added later is covered
+    automatically, with no new test to remember to write for it.
+    """
+
+    @pytest.mark.parametrize("job", sorted(JOBS))
+    def test_dry_run_leaves_a_fresh_store_empty(self, job: str, tmp_path, monkeypatch) -> None:
+        """A job with nothing to read (a fresh store, no prior runs) is
+        expected to RAISE under `--dry-run` for many jobs here — `gate`,
+        `report`, `weekly`, `smoke`, `release.pin`, `alerts.sweep`,
+        `heartbeat`, `drift`, `console` never learned to check the flag, so
+        their body's first write attempt is refused loudly rather than
+        succeeding. That raise is the CORRECT outcome (the class docstring
+        above), not a test failure — the one fact that must hold regardless
+        of whether the job reported cleanly or raised is the assertion
+        below: nothing landed in the store."""
+        from crucible.store import LocalStore
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        argv = [
+            *_minimal_argv(job),
+            "--date",
+            FRIDAY.isoformat(),
+            "--store",
+            str(tmp_path),
+            "--dry-run",
+        ]
+        try:
+            main(argv)
+        except BaseException:  # noqa: BLE001 - deliberately unconditional; see docstring
+            pass
+        assert list(LocalStore(tmp_path).list_keys()) == []

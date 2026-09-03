@@ -372,7 +372,10 @@ class TestTheMessage:
             manifest_key("board", DAY.isoformat()),
             json.dumps({"status": "ok", "code_sha": SHA, "reason": ""}).encode(),
         )
-        monkeypatch.setattr("crucible.morning.open_store", lambda uri: denied)
+        # `dry_run=` accepted and ignored: this test exercises the real
+        # (`dry_run=False`) path — `morning.py`'s `open_store` call now
+        # passes the kwarg unconditionally (alpha-engine-config-I9922 N1).
+        monkeypatch.setattr("crucible.morning.open_store", lambda uri, dry_run=False: denied)
         monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
 
         assert morning_handler(_args(tmp_path, dry_run=False)) == 0

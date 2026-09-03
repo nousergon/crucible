@@ -1207,8 +1207,13 @@ def morning_handler(args: argparse.Namespace) -> int:
     """
     from crucible.runner import RunContext, run_job  # noqa: PLC0415 - lazy; see cli.py
 
-    store = open_store(getattr(args, "store", None))
     dry_run = bool(getattr(args, "dry_run", False))
+    # Wrapped read-only under `--dry-run` (alpha-engine-config-I9922 N1),
+    # defense-in-depth: `body` below already skips `ctx.record_output` when
+    # `dry_run`, so nothing here should ever reach a MUTATOR, but a store that
+    # refuses on its own is what makes that true structurally rather than by
+    # this function remembering to check the flag correctly forever.
+    store = open_store(getattr(args, "store", None), dry_run=dry_run)
     rendered: list[str] = []
 
     def body(ctx: RunContext) -> None:
@@ -1216,9 +1221,12 @@ def morning_handler(args: argparse.Namespace) -> int:
         message = run_report(store, trading_day=ctx.trading_day, now=now)
         rendered.append(message)
         if dry_run:
-            # No output, no delivery, and the manifest that `run_job` writes
-            # regardless says `outputs: []` -- so a dry run is visibly a dry
-            # run rather than one that claims a delivery it did not make.
+            # No output, no delivery, and (as of alpha-engine-config-I9922)
+            # no manifest either: `run_job(dry_run=True)` below skips its own
+            # write, and `store` above is read-only regardless -- a dry run
+            # is visibly a dry run because nothing under `runs/` or
+            # `reports/` changes at all, not because the manifest it used to
+            # write happened to say `outputs: []`.
             print(message)
             return
         destination = deliver(message)
