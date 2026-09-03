@@ -46,11 +46,11 @@ from crucible.gate import (
     weekly_anchor,
 )
 from crucible.keys import (
-    arm_register_key,
     champion_key,
     manifest_key,
     parse_bus_key,
     runs_prefix,
+    strategy_arm_key,
     verdict_key,
 )
 from crucible.manifest import PREDECESSOR_SCHEMA_VERSION, RUN_MANIFEST_SCHEMA_VERSION
@@ -730,11 +730,21 @@ class TestAnEmptyArmSetIsNeverAPass:
     ) -> None:
         """The second precondition, named separately so the reason is
         actionable: call sites exist, but the register cannot say which arms
-        use one."""
+        use one. The field exists on `main` since alpha-engine-config-I9920,
+        so this is the reading a build that LOST it would give — forced by
+        setting the constant back to `None`."""
         monkeypatch.setattr(llm_module, "LLM_CALLSITE_REGISTRY", {"research.rank": _CallSite()})
+        monkeypatch.setattr(gate_module, "LLM_ARM_CALLSITE_FIELD", None)
         clause = gate_module._clause_every_llm_arm_has_a_verdict(store, _window(1))
         assert clause.unmeasurable and not clause.met
         assert "not " in clause.detail
+
+    def test_the_gate_reads_the_same_params_key_the_loader_validates(self) -> None:
+        """One key, two modules: the gate restates it by value so it never
+        imports the slot machinery; this is what keeps the two from drifting."""
+        from crucible.slots.arms import LLM_CALLSITE_PARAM
+
+        assert gate_module.LLM_ARM_CALLSITE_FIELD == LLM_CALLSITE_PARAM == "llm_callsite"
 
     def test_unmeasurable_when_no_active_arm_declares_one(
         self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
@@ -765,40 +775,89 @@ class TestAnEmptyArmSetIsNeverAPass:
         clause = gate_module._clause_every_llm_arm_has_a_verdict(store, _window(1))
         assert clause.met and not clause.unmeasurable
 
-    @staticmethod
-    def _register(store: LocalStore, slot: str, arms: list[tuple[str, dict]]) -> str:
-        """One `registered` event per arm, carrying the recipe `spec`.
+    def test_an_active_arm_with_no_synced_recipe_is_unmet_not_skipped(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The register says an arm is active; the strategy tree cannot say
+        what it is. Silently treating it as a non-LLM arm is how the set this
+        property quantifies over would lose exactly the arms it is for."""
+        monkeypatch.setattr(llm_module, "LLM_CALLSITE_REGISTRY", {"research.rank": _CallSite()})
+        self._register(store, "r", [("llm", {"callsite_id": "research.rank"})], sync=False)
+        clause = gate_module._clause_every_llm_arm_has_a_verdict(store, _window(1))
+        assert not clause.met and not clause.unmeasurable
+        assert "no arm recipes" in clause.detail or "no recipe" in clause.detail
 
-        The `spec.params` carrier is the shape the call-site field WILL take
-        once the arm-recipe gap is closed; the register does not emit it
-        today, which is why the two clauses above read unmeasurable. Writing
-        the fixture in that shape is what makes the met and unmet branches
-        tested before they first run rather than after.
+    def test_the_m_recipe_has_no_place_for_a_call_site(self) -> None:
+        """What justifies `LLM_ARM_RECIPE_SLOTS` omitting the M slot: the
+        `ModelRecipe` contract carries no `params` and no call-site field, so
+        no M arm can be an LLM arm by declaration. If either appears, this
+        fails and the tuple is widened deliberately."""
+        import dataclasses
+
+        from crucible.slots.model import ModelRecipe
+
+        names = {f.name for f in dataclasses.fields(ModelRecipe)}
+        assert "params" not in names
+        assert gate_module.LLM_ARM_CALLSITE_FIELD not in names
+        assert set(gate_module.LLM_ARM_RECIPE_SLOTS) == {"u", "r"}
+
+    @staticmethod
+    def _register(
+        store: LocalStore, slot: str, arms: list[tuple[str, dict]], *, sync: bool = True
+    ) -> str:
+        """Register each arm the way production does — a REAL `ArmSpec`, its
+        id the hash of its spec, folded into the register (which carries only
+        the `spec_hash`) — and sync its recipe into the store's strategy tree,
+        which is where the gate reads `params.llm_callsite` from.
+
+        The call-site field is `LLM_ARM_CALLSITE_FIELD` on the spec's params;
+        a fixture key of `callsite_id` is rewritten to it so the cases above
+        read as "this arm names that site".
         """
-        lines = []
+        from nousergon_lib.arena.arms import ArmRegister
+
+        from crucible.slots import get_slot
+        from crucible.slots.arms import ArmSpec, control_specs, write_register
+
+        register = ArmRegister()
+        # Production registers the slot's two controls beside every filed arm
+        # (`crucible.slots.cycle`, both call sites), and controls are never in
+        # the strategy tree — so the fixture carries them too, or the join
+        # below is proven only on a register production never writes.
+        for control in control_specs(get_slot(slot)):
+            register, _ = register.register(
+                slot=slot,
+                name=control.name,
+                spec=control.spec,
+                created_date=control.registered_at,
+            )
         arm_id = ""
         for name, params in arms:
-            arm_id = f"{slot}:{name}:ab12cd"
-            lines.append(
-                json.dumps(
-                    {
-                        "kind": "registered",
-                        "arm_id": arm_id,
-                        "date": "2026-01-02",
-                        "reason": "",
-                        "spec": {"name": name, "slot": slot, "params": params},
-                        "record": {
-                            "arm_id": arm_id,
-                            "slot": slot,
-                            "name": name,
-                            "spec_hash": "ab12cd",
-                            "created_date": "2026-01-02",
-                        },
-                    },
-                    sort_keys=True,
-                )
+            field = gate_module.LLM_ARM_CALLSITE_FIELD
+            params = {(field if k == "callsite_id" and field else k): v for k, v in params.items()}
+            spec = ArmSpec(
+                name=name,
+                slot=slot,
+                ranker="momentum_sleeve",
+                params={"top_n": 8, **params},
+                registered_at="2026-01-02",
             )
-        store.put_bytes(arm_register_key(slot), ("\n".join(lines) + "\n").encode("utf-8"))
+            register, _ = register.register(
+                slot=slot, name=name, spec=spec.spec, created_date=spec.registered_at
+            )
+            arm_id = spec.arm_id
+            if sync:
+                lines = [
+                    f"name: {name}",
+                    f"slot: {slot}",
+                    "ranker: momentum_sleeve",
+                    "registered_at: '2026-01-02'",
+                    "params:",
+                ] + [f"  {k}: {json.dumps(v)}" for k, v in spec.params.items()]
+                store.put_bytes(
+                    strategy_arm_key(slot, name), ("\n".join(lines) + "\n").encode("utf-8")
+                )
+        write_register(store, slot, register)
         return arm_id
 
 

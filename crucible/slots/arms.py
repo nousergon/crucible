@@ -62,6 +62,7 @@ from crucible.store import Store
 
 __all__ = [
     "CONTROL_REGISTERED_AT",
+    "LLM_CALLSITE_PARAM",
     "REQUIRED_ARM_FIELDS",
     "ArmSpec",
     "InapplicableArmError",
@@ -81,6 +82,20 @@ CONTROL_REGISTERED_AT = "2026-01-02"
 #: question a verdict must be able to answer, and a recipe that leaves one
 #: blank produces a verdict that cannot.
 REQUIRED_ARM_FIELDS: tuple[str, ...] = ("name", "slot", "ranker", "params", "registered_at")
+
+#: The `params` key through which an arm declares WHICH registered LLM call
+#: site it reaches a model through (`alpha-engine-config-I9920`, plan §6 row 5).
+#:
+#: It lives inside `params` on purpose: `params` is already part of the
+#: id-hashed :attr:`ArmSpec.spec`, so two arms differing only in the model they
+#: call are two arms — without adding a second hashing rule — and every arm
+#: registered before this key existed keeps its id, because a key that is
+#: absent from `params` was never in the hash. Its value must be a key of
+#: `crucible.llm.LLM_CALLSITE_REGISTRY`; :func:`_parse` REFUSES an unregistered
+#: one rather than accepting and ignoring it, so "which arms are LLM arms" is
+#: answerable from the register alone and is never a string heuristic over
+#: ranker names. `crucible.gate.LLM_ARM_CALLSITE_FIELD` names the same key.
+LLM_CALLSITE_PARAM = "llm_callsite"
 
 
 class InapplicableArmError(ValueError):
@@ -181,6 +196,8 @@ def _parse(payload: bytes, origin: str) -> ArmSpec:
     if not isinstance(params, dict):
         raise ValueError(f"{origin}: `params` must be a mapping; got {type(params).__name__}")
     get_ranker(str(document["ranker"]))  # raises by name on an unknown ranker
+    if LLM_CALLSITE_PARAM in params:
+        _require_registered_callsite(params[LLM_CALLSITE_PARAM], origin=origin)
     return ArmSpec(
         name=str(document["name"]),
         slot=str(document["slot"]),
@@ -195,6 +212,35 @@ def _parse(payload: bytes, origin: str) -> ArmSpec:
         notes=str(document.get("notes", "")),
         source_key=origin,
     )
+
+
+def _require_registered_callsite(value: Any, *, origin: str) -> None:
+    """Refuse an arm that names a call site the registry does not carry.
+
+    Accepting-and-ignoring is the defect: the arm would register, the gate
+    would count it as a non-LLM arm, and phase 5's "every LLM arm has a
+    verdict" would quantify over a set missing exactly the arm that most
+    needed grading. The registry is imported here, lazily, because it is a
+    heavy module with one consumer in this file.
+    """
+    from crucible.llm import (  # noqa: PLC0415 - one call site, heavy import
+        CALLSITE_REGISTRY_PATH,
+        LLM_CALLSITE_REGISTRY,
+    )
+
+    if not isinstance(value, str) or not value:
+        raise ValueError(
+            f"{origin}: `params.{LLM_CALLSITE_PARAM}` must be the id of a registered LLM "
+            f"call site (a non-empty string); got {value!r}"
+        )
+    if value not in LLM_CALLSITE_REGISTRY:
+        registered = ", ".join(sorted(LLM_CALLSITE_REGISTRY)) or "(none registered)"
+        raise ValueError(
+            f"{origin}: `params.{LLM_CALLSITE_PARAM}` names {value!r}, which is not a key "
+            f"of LLM_CALLSITE_REGISTRY ({CALLSITE_REGISTRY_PATH.name}: {registered}). An "
+            "arm reaches a model only through a registered call site — register the "
+            "site first, in the same change as the code that calls it."
+        )
 
 
 def load_arm_specs(
