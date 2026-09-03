@@ -103,6 +103,7 @@ __all__ = [
     "pin",
     "provenance_key",
     "publish_release",
+    "published_wheel_key",
     "read_pointer",
     "RETENTION_CLOCK_SKEW_SLACK",
     "release_json_key",
@@ -660,6 +661,40 @@ def current_release(store: Store) -> str | None:
     return read_pointer(store)[0]
 
 
+def published_wheel_key(store: Store, sha: str) -> str:
+    """The key ``sha``'s wheel was ACTUALLY published at.
+
+    Read out of that release's own `release.json`
+    (:attr:`ReleaseRecord.wheel_filename`, synthesized for a `release.v2`
+    document by :func:`parse_release_record`) rather than derived from the sha
+    — which is the same lookup `crucible.track_c._verify_release_artifacts`
+    already performs, for the same reason.
+
+    alpha-engine-config-I9917 item 1: :func:`wheel_key` derives the CURRENT
+    (v3, PEP 440) name unconditionally, and every release published before
+    alpha-engine-config-I9908's fix is stored under the legacy
+    `crucible-{sha40}-py3-none-any.whl` name. Deriving the name therefore
+    refused every prior release — the exact set a rollback reaches for — with
+    a message naming a key nothing ever wrote, which reads as "the object was
+    deleted" rather than "this release predates the naming fix".
+
+    Raises :class:`StaleReleasePointerError` for a sha with no `release.json`,
+    naming THAT absence: a sha with no release record was never published at
+    all, and the two conditions want different operator responses.
+    """
+    _assert_sha(sha)
+    meta_key = release_json_key(sha)
+    if not store.exists(meta_key):
+        raise StaleReleasePointerError(
+            f"{sha} was never published: no release record at {meta_key}. A release's "
+            "wheel filename is read from its own release.json, so a sha without one "
+            "has no addressable wheel — this is not the same condition as a published "
+            "release whose wheel was deleted, which names the wheel key instead."
+        )
+    record = parse_release_record(json.loads(store.get_bytes(meta_key).decode("utf-8")))
+    return wheel_key_for(sha, record.wheel_filename)
+
+
 def resolve_release(store: Store, key: str = POINTER_KEY) -> str:
     """The sha a job should install, verified to actually be there.
 
@@ -668,6 +703,10 @@ def resolve_release(store: Store, key: str = POINTER_KEY) -> str:
     run whatever was already on the box — which is the silent version of
     every deploy bug, and the reason this is checked at read time rather than
     trusted from the pointer.
+
+    The wheel key comes from :func:`published_wheel_key`, so a pointer at a
+    pre-alpha-engine-config-I9908 release resolves instead of being refused
+    against a v3-shaped path that release never occupied.
     """
     sha, _ = read_pointer(store, key)
     if sha is None:
@@ -675,9 +714,10 @@ def resolve_release(store: Store, key: str = POINTER_KEY) -> str:
             f"{key} is unset: no release has ever been promoted. A job cannot choose "
             "a release for itself."
         )
-    if not store.exists(wheel_key(sha)):
+    wheel = published_wheel_key(store, sha)
+    if not store.exists(wheel):
         raise StaleReleasePointerError(
-            f"{key} names {sha}, whose wheel is not at {wheel_key(sha)}. Restore the "
+            f"{key} names {sha}, whose wheel is not at {wheel}. Restore the "
             f"release prefix or `crucible release.pin <prior-sha>`; a job must never "
             "fall back to whatever is already installed."
         )
@@ -699,13 +739,20 @@ def pin(
     rollback — the operator has just looked — and wrong for an automated
     deploy, which passes the token it read before running the smoke. The
     deploy path always passes it.
+
+    The wheel key comes from :func:`published_wheel_key`, so a rollback to a
+    pre-alpha-engine-config-I9908 release is accepted rather than refused
+    against a v3-shaped path that release never occupied. This is the call
+    site the bug actually bit: `release.pin <prior-sha>` IS the rollback
+    command, and prior shas are precisely the ones with legacy wheel names.
     """
     _assert_sha(sha)
     if target not in PIN_TARGETS:
         raise ValueError(f"pin target {target!r} not in {PIN_TARGETS}")
-    if not store.exists(wheel_key(sha)):
+    wheel = published_wheel_key(store, sha)
+    if not store.exists(wheel):
         raise StaleReleasePointerError(
-            f"refusing to pin {target} to {sha}: no wheel at {wheel_key(sha)}. A "
+            f"refusing to pin {target} to {sha}: no wheel at {wheel}. A "
             "pointer to an artifact that is not there is a stale pointer the moment "
             "it is written."
         )

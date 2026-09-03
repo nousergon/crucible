@@ -26,6 +26,7 @@ from crucible.release import (
     pin,
     provenance_key,
     publish_release,
+    published_wheel_key,
     read_pointer,
     release_json_key,
     resolve_release,
@@ -317,8 +318,13 @@ class TestObjectLock:
 class TestPointer:
     def test_pinning_to_an_unpublished_sha_is_refused(self, tmp_path) -> None:
         """A pointer to an artifact that is not there is stale the moment it
-        is written."""
-        with pytest.raises(StaleReleasePointerError, match="no wheel at"):
+        is written.
+
+        The message names the ABSENT `release.json`, not a derived wheel path:
+        a sha with no release record was never published at all, and quoting a
+        v3-shaped wheel key for it would send an operator hunting for an object
+        that never existed (alpha-engine-config-I9917 item 1)."""
+        with pytest.raises(StaleReleasePointerError, match="was never published"):
             pin(LocalStore(tmp_path), SHA_A)
 
     def test_pin_then_read_round_trips(self, tmp_path) -> None:
@@ -367,6 +373,93 @@ class TestStalePointer:
         (tmp_path / wheel_key(SHA_A)).unlink()
         with pytest.raises(StaleReleasePointerError, match="whose wheel is not at"):
             resolve_release(store)
+
+
+class TestAPriorReleaseIsStillAddressable:
+    """alpha-engine-config-I9917 item 1. `resolve_release` and `pin` derived
+    the wheel name from the sha (`wheel_key`), which is the v3 name only.
+
+    Every release published before alpha-engine-config-I9908's fix is stored
+    under the legacy `crucible-{sha40}-py3-none-any.whl` name, so a rollback
+    to one was refused with "no wheel at
+    releases/{sha}/crucible-0.1.0+g{sha12}-py3-none-any.whl" — which reads to
+    an operator mid-rollback as "somebody deleted the object", not "this
+    release predates the naming fix". The rollback target is exactly the
+    releases that predate the fix, so this was wrong in the only case it was
+    reached for.
+
+    The real filename is recorded in that release's own `release.json`
+    (`ReleaseRecord.wheel_filename`, synthesized for a v2 document by
+    `parse_release_record`), which is what `track_c._verify_release_artifacts`
+    already reads. Both call sites now resolve through it.
+    """
+
+    def _publish_a_v2_release(self, store, tmp_path, sha: str = SHA_B) -> str:
+        """Lay down a pre-I9908 release by hand: a `release.v2` document and a
+        wheel at the LEGACY key. `publish_release` cannot write one — it emits
+        the current schema — and a fixture that wrote the v3 shape would not
+        reproduce the bug at all."""
+        legacy_name = f"crucible-{sha}-py3-none-any.whl"
+        legacy_key = f"releases/{sha}/{legacy_name}"
+        wheel = b"PK\x03\x04 legacy wheel bytes"
+        store.put_bytes(legacy_key, wheel)
+        store.put_bytes(
+            release_json_key(sha),
+            json.dumps(
+                {
+                    "schema_version": "release.v2",
+                    "sha": sha,
+                    "lockfile_sha256": "0" * 64,
+                    "wheel_sha256": "1" * 64,
+                    "python_requires": ">=3.12,<3.13",
+                    "extra": {},
+                }
+            ).encode("utf-8"),
+        )
+        return legacy_key
+
+    def test_pinning_to_a_pre_fix_release_is_accepted(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        legacy_key = self._publish_a_v2_release(store, tmp_path)
+        # The bug: this key does not exist and never did for a v2 release.
+        assert not store.exists(wheel_key(SHA_B))
+        assert store.exists(legacy_key)
+        pin(store, SHA_B)
+        assert current_release(store) == SHA_B
+
+    def test_resolving_a_pre_fix_release_is_accepted(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        self._publish_a_v2_release(store, tmp_path)
+        pin(store, SHA_B)
+        assert resolve_release(store) == SHA_B
+
+    def test_a_sha_that_was_never_published_is_refused_by_that_name(self, tmp_path) -> None:
+        """The honest message for the genuinely-absent case, and the one the
+        derived-name version could never distinguish from a deleted wheel."""
+        store = LocalStore(tmp_path)
+        with pytest.raises(StaleReleasePointerError, match="was never published"):
+            published_wheel_key(store, SHA_A)
+
+    def test_a_published_release_whose_wheel_was_deleted_names_the_real_key(self, tmp_path) -> None:
+        """`release.json` survives, the wheel does not: the refusal quotes the
+        LEGACY key the object actually occupied, so the operator looks in the
+        right place."""
+        store = LocalStore(tmp_path)
+        legacy_key = self._publish_a_v2_release(store, tmp_path)
+        (tmp_path / legacy_key).unlink()
+        with pytest.raises(StaleReleasePointerError) as excinfo:
+            pin(store, SHA_B)
+        assert legacy_key in str(excinfo.value)
+        assert wheel_key(SHA_B) not in str(excinfo.value)
+
+    def test_a_current_release_still_resolves_through_its_own_record(self, tmp_path) -> None:
+        """The v3 path is not special-cased — it goes through the same lookup,
+        so there is one resolution rule rather than a fast path and a fallback
+        that can disagree."""
+        store = LocalStore(tmp_path)
+        record = _published(store)
+        assert published_wheel_key(store, SHA_A) == wheel_key_for(SHA_A, record.wheel_filename)
+        assert published_wheel_key(store, SHA_A) == wheel_key(SHA_A)
 
 
 class TestSmokeGate:
