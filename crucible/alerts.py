@@ -43,7 +43,7 @@ from crucible.calendar import (
     resolve_trading_day,
 )
 from crucible.components import Component, load_registry, scheduled_components
-from crucible.keys import ALERTS_ROOT, RUNS_ROOT
+from crucible.keys import ALERTS_ROOT, RUNS_ROOT, parse_manifest_key
 from crucible.manifest import manifest_prefix
 from crucible.store import Store
 
@@ -1091,15 +1091,22 @@ def _week_summary(store: Store, trading_day: dt.date) -> tuple[int, int, float]:
     ok = failed = 0
     spend = 0.0
     for key in store.list_keys(RUNS_ROOT):
-        if not key.endswith("/run.json"):
+        parsed = parse_manifest_key(key)
+        if parsed is None:
             continue
-        parts = key.split("/")
-        if len(parts) != 4:
-            continue
+        _job, trading_day_str, _discriminator = parsed
         try:
-            if dt.date.fromisoformat(parts[2]) not in days:
+            if dt.date.fromisoformat(trading_day_str) not in days:
                 continue
         except ValueError:
+            # A trading-day segment that fails ISO parsing means this key
+            # was never written by crucible.keys.manifest_key — but it still
+            # sits under a real job/day prefix and still cost something, so
+            # counting it failed (matching the manifest-read failure below)
+            # keeps this summary from reading healthier than reality the
+            # worse the store gets; a silent `continue` here would have done
+            # exactly that.
+            failed += 1
             continue
         try:
             manifest = json.loads(store.get_bytes(key).decode("utf-8"))
