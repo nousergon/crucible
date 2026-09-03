@@ -1247,6 +1247,7 @@ def morning_handler(args: argparse.Namespace) -> int:
         body,
         store=store,
         trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
         # The FIRING, not the trading day. A 13:00 UTC cron fires every
         # calendar day and `resolve_trading_day` collapses Saturday, Sunday
         # and Monday onto Friday's close (§4.12), so without this the weekend

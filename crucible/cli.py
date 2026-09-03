@@ -36,6 +36,7 @@ from crucible.calendar import resolve_trading_day
 from crucible.keys import arena_cycle_key, champion_key
 from crucible.keys import manifest_key as _promote_manifest_key
 from crucible.release_retention import RELEASE_LOCK_JOB, release_lock_handler
+from crucible.runmode import RUN_MODES, resolve_run_mode
 from crucible.track_a import HANDLERS as TRACK_A_HANDLERS
 from crucible.track_a import add_track_a_arguments
 
@@ -195,7 +196,13 @@ def _promote(args: argparse.Namespace) -> int:
             }
         )
 
-    run_job("promote", job, store=store, trading_day=args.trading_day)
+    run_job(
+        "promote",
+        job,
+        store=store,
+        trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
+    )
     return 0
 
 
@@ -352,6 +359,18 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         sub.add_argument(
+            "--run-mode",
+            choices=list(RUN_MODES),
+            default=None,
+            help=(
+                "Whether this invocation is a LIVE run or a REPLAY of a historical "
+                "trading day. Recorded in the manifest and read by phase 2's exit "
+                "gate. No default: omitted, $CRUCIBLE_RUN_MODE is consulted, and an "
+                "invocation that declares neither is REFUSED. The date cannot answer "
+                "this — a replay replays a real past Saturday."
+            ),
+        )
+        sub.add_argument(
             "--dry-run",
             action="store_true",
             help="Resolve inputs and report what would be written; write nothing.",
@@ -475,6 +494,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     args = build_parser().parse_args(argv)
     args.trading_day = resolve_date(getattr(args, "date", None))
+    # Resolved once, here, so every handler passes the SAME value to `run_job`
+    # and a `--run-mode` typo is a usage error before any job starts. Resolved
+    # even for the handlers that never write a manifest: an invocation is
+    # live or a replay regardless of what it happens to produce.
+    args.run_mode = resolve_run_mode(getattr(args, "run_mode", None))
     return HANDLERS[args.job](args)
 
 

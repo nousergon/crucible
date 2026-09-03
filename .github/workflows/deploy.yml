@@ -311,7 +311,7 @@ jobs:
       - name: Smoke
         id: smoke
         run: |
-          uv run crucible smoke --release '${{ needs.build.outputs.sha }}' --store "$STORE_URI"
+          uv run crucible smoke --run-mode live --release '${{ needs.build.outputs.sha }}' --store "$STORE_URI"
 
       # Reads the smoke MANIFEST, not this workflow's exit codes. A
       # caller-supplied "it passed" is the shape that promotes a build whose
@@ -327,7 +327,7 @@ jobs:
       - name: Record the deploy manifest
         if: always()
         run: |
-          uv run python -m crucible.deploy record --sha '${{ needs.build.outputs.sha }}' --store "$STORE_URI" --outcome '${{ job.status }}' --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          uv run python -m crucible.deploy record --run-mode live --sha '${{ needs.build.outputs.sha }}' --store "$STORE_URI" --outcome '${{ job.status }}' --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
   # A failed DEPLOY on main means live no longer matches main — and unlike a
   # failed test it blocks nothing and is green to the next author, so nothing

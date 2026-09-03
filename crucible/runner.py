@@ -45,6 +45,7 @@ from crucible.manifest import (
     manifest_key,
     validate,
 )
+from crucible.runmode import resolve_run_mode
 from crucible.store import Store, sha256_hex
 
 __all__ = [
@@ -236,6 +237,18 @@ class RunContext:
     seed: int
     started: dt.datetime
 
+    #: `live` or `replay`, resolved by `run_job` from the INVOCATION before
+    #: the job body runs — never from `trading_day` or `calendar_date`, which
+    #: are identical for a live Saturday and for a replay of one. A job body
+    #: may read it (a replay legitimately behaves differently) but never
+    #: assigns it: the mode is a property of how the process was launched.
+    #:
+    #: The empty default is not a value — `run_manifest.v2` has no empty
+    #: member in its `run_mode` enum, so a context that reached the write path
+    #: without `run_job` setting it fails validation loudly instead of filing
+    #: a run under a mode nobody declared.
+    run_mode: str = ""
+
     #: Set by `run_job` from its own `discriminator` argument, once
     #: `calendar_date` is known — never by the job body. Mirrors
     #: `crucible.manifest.manifest_key`'s `discriminator`: absent for a job
@@ -349,6 +362,7 @@ def run_job(
     release_sha: str | None = None,
     transient_retry: bool = True,
     discriminator: str | Callable[[RunContext], str] | None = None,
+    run_mode: str | None = None,
 ) -> RunContext:
     """Run ``fn`` as job ``job`` and write its manifest, whatever happens.
 
@@ -387,10 +401,24 @@ def run_job(
     failure — the fault-injection suite asserts the no-retry path as well as
     the retry path.
 
+    ``run_mode`` is `live` or `replay` and is REQUIRED, in the sense that
+    omitting it here falls through to ``$CRUCIBLE_RUN_MODE`` and then to a
+    refusal (:class:`crucible.runmode.RunModeError`) — there is no default at
+    any layer, and the resolution never looks at the date. A replay of a past
+    Saturday is indistinguishable from a live one by `trading_day`, and phase
+    2's exit gate counts live Saturdays from this field, so a guessed value
+    would be a false claim about production in the one place that matters
+    (alpha-engine-config-I9918). Resolved BEFORE the job body runs, so an
+    undeclared invocation costs nothing.
+
     Returns the :class:`RunContext` on success. Re-raises on failure, after
     the manifest is on disk.
     """
     started = now or dt.datetime.now(dt.UTC)
+    # Resolved first, before the trading day and before any work: an
+    # invocation that never said whether it was live or a replay is refused
+    # while refusing is still free.
+    resolved_run_mode = resolve_run_mode(run_mode)
     if trading_day is None:
         trading_day = resolve_trading_day(started)
     else:
@@ -408,6 +436,7 @@ def run_job(
             store=store,
             seed=resolved_seed,
             started=started,
+            run_mode=resolved_run_mode,
         )
         ctx.attempts = [dict(a) for a in attempts]
         ctx.discriminator = discriminator(ctx) if callable(discriminator) else discriminator
@@ -484,6 +513,10 @@ def _write_manifest(
         "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
         "run_id": ctx.run_id,
         "job": ctx.job,
+        # From the invocation, carried on the context since before the job
+        # body ran. Never recomputed here, and never derived from either date
+        # field below.
+        "run_mode": ctx.run_mode,
         "trading_day": ctx.trading_day.isoformat(),
         "calendar_date": ctx.calendar_date.isoformat(),
         "status": status,

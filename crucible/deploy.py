@@ -59,6 +59,7 @@ from crucible.release import (
     wheel_key_for,
     write_deploy_manifest,
 )
+from crucible.runmode import RUN_MODES, resolve_run_mode
 from crucible.store import PointerConflictError, Store, open_store, sha256_hex
 
 __all__ = ["main"]
@@ -297,6 +298,10 @@ def _record(args: argparse.Namespace, store: Store) -> int:
         "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
         "run_id": _run_id_from(args.sha, now),
         "job": "deploy",
+        # From the invocation, never from the date: `deploy.yml` declares it,
+        # and a deploy replayed against a historical day must not read as a
+        # live one. Resolved before any of the work above is recorded.
+        "run_mode": resolve_run_mode(getattr(args, "run_mode", None)),
         "trading_day": trading_day.isoformat(),
         "calendar_date": now.date().isoformat(),
         "status": "ok" if ok else "failed",
@@ -394,6 +399,11 @@ def main(argv: list[str] | None = None) -> int:
         if name == "record":
             p.add_argument("--outcome", required=True)
             p.add_argument("--run-url", default="")
+            # Same surface, same rules, same resolver as `crucible --run-mode`
+            # (`crucible.runmode`): this step writes a run manifest, and
+            # `run_manifest.v2` requires the field with no default. Omitted,
+            # $CRUCIBLE_RUN_MODE decides; neither, and the step refuses.
+            p.add_argument("--run-mode", choices=list(RUN_MODES), default=None)
 
     args = parser.parse_args(argv)
     store = open_store(args.store)

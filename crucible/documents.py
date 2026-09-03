@@ -56,7 +56,8 @@ class DocumentRead:
 
     This is the ONE reader for external documents (artifacts written by
     producers outside this repository) and first-party ones alike
-    (`run_manifest.v1` and the arena artifacts `crucible.runner` writes and
+    (the run manifest, at whichever version wrote it, and the arena artifacts
+    `crucible.runner` writes and
     validates at write time). A validated-at-write-time schema is not a
     validated-at-READ-time guarantee — a truncated `run.json` (an interrupted
     write, a partial multipart upload, a hand-edited artifact) is unreadable

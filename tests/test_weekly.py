@@ -13,6 +13,7 @@ import datetime as dt
 import pytest
 
 from crucible.components import DISPATCHES, Component, Deadline, load_registry
+from crucible.runmode import RUN_MODE_ENV, RUN_MODE_LIVE, RUN_MODE_REPLAY
 from crucible.slots import SLOTS
 from crucible.weekly import ARC_SLOT_JOBS, ArcStageFailed, arc_stages, run_arc
 
@@ -123,11 +124,51 @@ class TestRunsTheRealCommand:
             seen.append(argv)
             return 0
 
-        run_arc(FRIDAY, store="/tmp/store", main=fake_main)
-        assert seen[0][:5] == ["data.weekly", "--date", FRIDAY.isoformat(), "--store", "/tmp/store"]
+        run_arc(FRIDAY, store="/tmp/store", run_mode=RUN_MODE_LIVE, main=fake_main)
+        assert seen[0][:7] == [
+            "data.weekly",
+            "--date",
+            FRIDAY.isoformat(),
+            "--run-mode",
+            RUN_MODE_LIVE,
+            "--store",
+            "/tmp/store",
+        ]
         assert all("--date" in argv and FRIDAY.isoformat() in argv for argv in seen)
+        # Every stage, not just the first: each one re-enters `crucible.cli.main`
+        # and resolves its own mode, so a stage missing the flag falls back to
+        # the environment and can disagree with the arc that launched it.
+        for argv in seen:
+            assert "--run-mode" in argv, argv
+            assert argv[argv.index("--run-mode") + 1] == RUN_MODE_LIVE, argv
         slot_calls = [a for a in seen if a[0] in ARC_SLOT_JOBS]
         assert all("--slot" in a for a in slot_calls)
+
+    def test_a_replay_arc_names_no_stage_live_even_when_the_environment_does(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The class, not the instance.
+
+        A replay arc launched on a box whose environment declares `live` — the
+        production shape, since the dispatcher exports `CRUCIBLE_RUN_MODE=live`
+        — must not put `live` on any stage argv. Every stage would otherwise
+        resolve `live` from that environment and file twelve LIVE manifests
+        under an arc manifest saying `replay`, and `_clause_replays_ok` reads
+        the STAGE manifests: §6.1's five replayed Saturdays would each file
+        twelve false-live runs.
+        """
+        monkeypatch.setenv(RUN_MODE_ENV, RUN_MODE_LIVE)
+        seen: list[list[str]] = []
+
+        def fake_main(argv: list[str]) -> int:
+            seen.append(argv)
+            return 0
+
+        run_arc(FRIDAY, store=None, run_mode=RUN_MODE_REPLAY, main=fake_main)
+        assert seen, "the arc ran no stages, so this asserts nothing"
+        for argv in seen:
+            assert RUN_MODE_LIVE not in argv, argv
+            assert argv[argv.index("--run-mode") + 1] == RUN_MODE_REPLAY, argv
 
     def test_a_failed_stage_stops_the_arc_and_names_itself(self) -> None:
         """No `continue`, no partial success. The stages after a failure read
@@ -140,7 +181,7 @@ class TestRunsTheRealCommand:
             return 0 if argv[0] == "data.weekly" else 3
 
         with pytest.raises(ArcStageFailed, match="experiment.run"):
-            run_arc(FRIDAY, store=None, main=fake_main)
+            run_arc(FRIDAY, store=None, run_mode=RUN_MODE_LIVE, main=fake_main)
         assert "report" not in seen, "the arc must not continue past a failed stage"
 
     def test_a_stage_raising_propagates_rather_than_being_swallowed(self) -> None:
@@ -148,7 +189,7 @@ class TestRunsTheRealCommand:
             raise RuntimeError("provider_5xx: the source is down")
 
         with pytest.raises(RuntimeError, match="provider_5xx"):
-            run_arc(FRIDAY, store=None, main=fake_main)
+            run_arc(FRIDAY, store=None, run_mode=RUN_MODE_LIVE, main=fake_main)
 
 
 class TestDeadlineOfTheArcItself:
