@@ -287,7 +287,7 @@ def release_lock_metric(findings: list[ReleaseLockReading], *, now: dt.datetime)
 
     BREACH beats `unmeasurable` beats OK — a single unlocked object must
     never be masked by nine unreadable ones. Status values are drawn from
-    `run_manifest.v1.json`'s closed `metricRecord.status` enum: `BREACH`/
+    the run manifest schema's closed `metricRecord.status` enum: `BREACH`/
     `OK` are the coverage-and-ceiling vocabulary `crucible.alerts` and
     `crucible.track_c` already use; `unmeasurable` (lowercase) is the arena's
     own not-measured spelling forwarded verbatim by that same enum — this

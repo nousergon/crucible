@@ -124,9 +124,16 @@ def load_schema_for(version: str) -> dict[str, Any]:
 
 @lru_cache(maxsize=len(SCHEMA_PATHS))
 def _validator(version: str) -> Draft202012Validator:
-    """A checked validator per version. A test that mutates a schema must
-    clear `load_schema`, `load_schema_for` AND this cache, or it will grade
-    its mutation against the validator built from the file on disk."""
+    """A checked validator per version.
+
+    FIVE caches sit over these schema files, and a test that mutates one must
+    clear every cache that could still be holding the unmutated copy: this
+    one, :func:`load_schema`, :func:`load_schema_for`, and — over the same
+    documents, in another module — `crucible.gate._manifest_property_names`
+    and `crucible.gate._manifest_status_values`. Clearing three of the five
+    grades a mutation against the file on disk and passes for the wrong
+    reason.
+    """
     schema = load_schema_for(version)
     Draft202012Validator.check_schema(schema)
     return Draft202012Validator(schema)

@@ -58,7 +58,11 @@ def weekly_handler(args: argparse.Namespace) -> int:
 
     def body(ctx: RunContext) -> None:
         planned = arc_stages(ctx.trading_day)
-        ran = run_arc(ctx.trading_day, store=store_uri)
+        # `ctx.run_mode`, not `args` and not the environment: the arc's mode is
+        # whatever `run_job` resolved for THIS invocation, and every stage is
+        # run under that one answer. A stage left to re-resolve would let the
+        # arc manifest and its stage manifests disagree about the same week.
+        ran = run_arc(ctx.trading_day, store=store_uri, run_mode=ctx.run_mode)
         for stage in ran:
             key = manifest_key(stage.job, ctx.trading_day.isoformat(), discriminator=stage.slot)
             ctx.record_input(key, store.get_bytes(key))

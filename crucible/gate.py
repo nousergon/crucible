@@ -473,8 +473,8 @@ def _field(key: str, document: dict[str, Any], field_name: str, expected_type: t
 
 @lru_cache(maxsize=1)
 def _manifest_status_values() -> frozenset[str]:
-    """The exhaustive `run_manifest.v1` `status` vocabulary, derived from the
-    SCHEMA every manifest is validated against at write time — never a
+    """The exhaustive run-manifest `status` vocabulary, derived from the
+    CURRENT schema every manifest is validated against at write time — never a
     restated literal, so a schema change is picked up here without a second
     edit that could drift from it. `alpha-engine-config-I9869` round 2: a
     manifest carrying `status: "degraded"` or `status: 3` was re-rendered as
@@ -491,7 +491,7 @@ def _status(key: str, document: dict[str, Any]) -> tuple[str | None, str | None]
     Three checks, in order: `status` is present and a string; it is one of
     the schema's exhaustive values (never `!= "ok"`, which lets anything
     through); and `status: "ok"` implies `reason == ""` — the same
-    implication `run_manifest.v1`'s own conditional schema enforces at write
+    implication the run manifest's own conditional schema enforces at write
     time, so a manifest that satisfied it when written and was since
     hand-edited is exactly the malformed input this clause exists to catch.
     """
