@@ -31,7 +31,7 @@ import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from crucible.keys import RUNS_ROOT, manifest_key
+from crucible.keys import RUNS_ROOT, is_manifest_key, manifest_key
 from crucible.manifest import validate
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -96,7 +96,10 @@ def load_manifests(store: Store) -> list[dict[str, Any]]:
     """
     out: list[dict[str, Any]] = []
     for key in store.list_keys(RUNS_ROOT):
-        if not key.endswith("/run.json"):
+        # `is_manifest_key`, not a `"/run.json"` suffix literal: the basename
+        # is `crucible.keys`' to own, and the predicate checks the root and the
+        # arity too (alpha-engine-config-I9900).
+        if not is_manifest_key(key):
             continue
         document = json.loads(store.get_bytes(key).decode("utf-8"))
         validate(document)

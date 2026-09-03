@@ -28,7 +28,7 @@ import ast
 import datetime as dt
 import json
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -38,6 +38,9 @@ from jsonschema import Draft202012Validator
 
 from crucible.calendar import resolve_trading_day
 from crucible.components import Component, load_registry
+from crucible.documents import DocumentRead
+from crucible.documents import read_path_document as _read_path_document
+from crucible.documents import read_store_document as _read_store_document
 from crucible.keys import (
     arena_cycle_key,
     arm_register_key,
@@ -218,110 +221,14 @@ class GateResult:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class DocumentRead:
-    """One document this gate reads, or the reason it could not be read.
-
-    Three outcomes, never two: present-and-readable, ABSENT, and
-    UNREADABLE. Collapsing the last two is the defect this exists to prevent
-    — "no filed count" and "the file is corrupt" call for different actions,
-    and only one of them is about the system rather than about us.
-
-    This is the ONE reader in `gate.py`, for external documents (phase-0
-    clauses, over artifacts written by producers outside this repository) and
-    first-party ones alike (phase-1 clauses, over `run_manifest.v1` and arena
-    artifacts `crucible.runner` writes and validates at write time). A
-    validated-at-write-time schema is not a validated-at-READ-time guarantee
-    — a truncated `run.json` (an interrupted write, a partial multipart
-    upload, a hand-edited artifact) is unreadable regardless of who wrote it,
-    and reading it unguarded was exactly the gap `alpha-engine-config-I9869`
-    closed: `json.loads` plus direct field indexing, raising the same way an
-    external read used to.
-    """
-
-    document: dict[str, Any] | None
-    absent: bool
-    problem: str | None
-    #: True when ``problem`` is a statement about OUR ACCESS (the reader
-    #: raised: PermissionError, AccessDenied) rather than about the content
-    #: (unparseable JSON, wrong shape). The distinction is what lets a caller
-    #: report UNMEASURABLE instead of UNMET — round 2 of
-    #: `alpha-engine-config-I9869`: the two were collapsed, so a store outage
-    #: read identically to a broken build.
-    access_problem: bool = False
-
-
-def _read_document(source: str, reader: Callable[[], bytes | None]) -> DocumentRead:
-    """Read one document — first-party or written by a producer outside this
-    repository, this module makes no distinction.
-
-    ``reader`` returns the raw bytes, or ``None`` when the source is absent.
-
-    The shape of `crucible.board._fetch`, and here for the same reason: this
-    is the only place in `gate.py` where a document is parsed, and **an
-    exception raised here does not fail one clause — it propagates out of
-    `evaluate` and takes `crucible gate`, `build_ladder` and the board render
-    down together.** One malformed file — upstream or first-party — would
-    then publish NOTHING where a red reading belongs, which is precisely the
-    absence-instead-of-red failure the whole gate exists to refuse. So every
-    failure mode below becomes a clause detail naming the source and the
-    fault.
-
-    The broad `except` is deliberate and is not a swallow: the failure mode
-    caught is "a document cannot be parsed", and the recording surface is the
-    returned :class:`DocumentRead`, which every caller renders into an unmet
-    clause. Nothing is discarded and nothing degrades silently.
-    """
-    try:
-        raw = reader()
-    except Exception as exc:
-        return DocumentRead(
-            None,
-            False,
-            f"{source} could not be read: {type(exc).__name__}: {exc}. That is a "
-            "statement about our access, not about the system being measured",
-            access_problem=True,
-        )
-    if raw is None:
-        return DocumentRead(None, True, None)
-    try:
-        document = json.loads(raw)
-    except Exception as exc:
-        return DocumentRead(
-            None,
-            False,
-            f"{source} is present but is not readable JSON: {type(exc).__name__}: {exc}",
-        )
-    if document is None:
-        return DocumentRead(
-            None,
-            False,
-            f"{source} is present and its body is literal `null` — present-but-null is "
-            "unreadable, not absent, and reporting it as absent names the wrong remedy",
-        )
-    if not isinstance(document, dict):
-        return DocumentRead(
-            None, False, f"{source} parsed to {type(document).__name__}, not an object with fields"
-        )
-    return DocumentRead(document, False, None)
-
-
-def _read_store_document(store: Store, key: str) -> DocumentRead:
-    """:func:`_read_document` over a store key."""
-
-    def reader() -> bytes | None:
-        return store.get_bytes(key) if store.exists(key) else None
-
-    return _read_document(key, reader)
-
-
-def _read_path_document(path: Path) -> DocumentRead:
-    """:func:`_read_document` over a file in the checkout."""
-
-    def reader() -> bytes | None:
-        return path.read_bytes() if path.is_file() else None
-
-    return _read_document(str(path), reader)
+# `DocumentRead` and its two readers used to be DEFINED here. They moved to
+# `crucible.documents` under `alpha-engine-config-I9900`, unchanged, because
+# the console needed exactly this guard and a second copy of it would be the
+# third reader in the tree — the defect `crucible.keys`' own docstring names
+# ("a contract restated at each call site is a contract restated fifty times,
+# and one of them has already drifted"). Imported under the private names the
+# clauses below already call, so this file's call sites are untouched and the
+# move is provably behaviour-preserving.
 
 
 @dataclass(frozen=True)
