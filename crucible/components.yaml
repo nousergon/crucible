@@ -28,6 +28,16 @@
 # does not exist — which is exactly what `board` did between
 # 2026-09-02T21:47Z and alpha-engine-config-I9878.
 #
+# A `github-actions` row also carries `dispatch_workflow`: the basename of
+# the workflow that crons it. The link has to be something the workflow
+# DECLARES. The first version of that guard matched `crucible <job>` in each
+# step's `run:` body, and an adversarial review defeated it by commenting the
+# command out - the board rendered nothing and the guard read green. See
+# tests/test_workflow_triggers.py for the general result, from five rounds
+# against a different guard: any predicate over a `run:` body is a partial
+# shell parser, and a partial shell parser is a denylist of the syntax
+# someone thought of, which rule 4 forbids.
+#
 # `deadline` is expressed relative to the TRADING calendar (§4.12): "present
 # by T after the close of trading day d". A Monday holiday therefore raises no
 # page, without anyone muting anything.
@@ -418,6 +428,7 @@ components:
     # never on trusting the cron.
     schedule: daily
     dispatch: github-actions
+    dispatch_workflow: board.yml
     deadline:
       anchor: close_plus
       offset_hours: 6
