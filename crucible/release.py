@@ -104,10 +104,12 @@ __all__ = [
     "provenance_key",
     "publish_release",
     "read_pointer",
+    "RETENTION_CLOCK_SKEW_SLACK",
     "release_json_key",
     "release_object_lock_params",
     "release_prefix",
     "resolve_release",
+    "retention_meets_target",
     "wheel_filename_for",
     "wheel_key",
     "wheel_key_for",
@@ -231,6 +233,50 @@ def release_object_lock_params(
         return None, None
     stamp = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     return "GOVERNANCE", stamp + RELEASE_OBJECT_LOCK_RETENTION
+
+
+#: Slack allowed when comparing a stored `RetainUntilDate` against a target
+#: recomputed from `HeadObject`'s `LastModified` (alpha-engine-config-I9898
+#: round-2 adversarial review, finding 1). `release.py` stamps
+#: `retain_until` at publish time from `dt.datetime.now(dt.UTC)`, which S3
+#: then stores at MILLISECOND precision; `HeadObject`'s `LastModified` comes
+#: back at SECOND precision (S3's own truncation, not this codebase's), so
+#: recomputing the target from `LastModified` and comparing it exactly
+#: against the stored value is always a few hundred milliseconds short for
+#: an object that is genuinely, fully compliant. A day is generous against a
+#: single request round trip and costs nothing: a retention genuinely short
+#: by a day is still short against the plan's ten-year horizon.
+#: `crucible.release_lock_sweep` carried this same slack as a private
+#: `_CLOCK_SKEW_SLACK` before I9898 round 2 — the two now share one
+#: constant and one comparison (:func:`retention_meets_target`) so a sweep
+#: reading MET and a repair reading `extended` for the same object can no
+#: longer happen.
+RETENTION_CLOCK_SKEW_SLACK = dt.timedelta(days=1)
+
+
+def retention_meets_target(
+    current_retain_until: dt.datetime,
+    target_retain_until: dt.datetime,
+    *,
+    slack: dt.timedelta = RETENTION_CLOCK_SKEW_SLACK,
+) -> bool:
+    """Whether a stored ``current_retain_until`` already satisfies
+    ``target_retain_until``, allowing ``slack`` for the millisecond-vs-second
+    precision mismatch between what S3 stores and what `HeadObject` reports.
+
+    The ONE comparison both `crucible.release_retention` (the repair) and
+    `crucible.release_lock_sweep` (the read-only detector) use — living here
+    rather than in either of those two modules because `release_retention`
+    already imports from `release_lock_sweep` (`_RELEASE_OBJECT_RE`), so
+    putting it in either of those two would make the other import back into
+    it, a cycle. `crucible.release` is a dependency both already have.
+
+    Never reversed to "target - slack <= current": written as
+    "current + slack >= target" so a caller passing a genuinely-shorter
+    retention (not a clock-skew artifact, but a real gap) is still correctly
+    read as not meeting the target once the gap exceeds ``slack``.
+    """
+    return current_retain_until.astimezone(dt.UTC) + slack >= target_retain_until.astimezone(dt.UTC)
 
 
 class StaleReleasePointerError(RuntimeError):

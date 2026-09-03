@@ -67,6 +67,7 @@ from crucible.release import (
     release_json_key,
     release_object_lock_params,
     release_prefix,
+    retention_meets_target,
 )
 from crucible.release_lock_sweep import _RELEASE_OBJECT_RE
 from crucible.runner import RunContext, run_job
@@ -179,7 +180,7 @@ def _plan_one(store: S3Store, key: str) -> tuple[RetentionApplyResult, dict[str,
     current_mode, current_retain_until = _current_retention(store, s3_key)
 
     if current_mode is not None and current_retain_until is not None:
-        if current_retain_until >= target_retain_until:
+        if retention_meets_target(current_retain_until, target_retain_until):
             return (
                 RetentionApplyResult(
                     key,
@@ -356,5 +357,19 @@ def release_lock_handler(args: argparse.Namespace) -> int:
         )
         print(json.dumps({"sha": sha, "objects": [asdict(r) for r in results]}, indent=2))
 
-    run_job(RELEASE_LOCK_JOB, body, store=store, trading_day=args.trading_day, release_sha=sha)
+    run_job(
+        RELEASE_LOCK_JOB,
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        release_sha=sha,
+        # `discriminator=sha` (alpha-engine-config-I9781's parameter,
+        # already used by `crucible.track_c`): without it, two repairs on
+        # one trading day overwrite one another's
+        # `runs/release.lock/{trading_day}/run.json` — rule 1, manifest or
+        # it did not happen, defeated at the second invocation. A repair
+        # session over `crucible/releases/`'s five unprovenanced shas is the
+        # expected multi-sha use, not a hypothetical.
+        discriminator=sha,
+    )
     return 0

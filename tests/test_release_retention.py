@@ -215,6 +215,42 @@ class TestApplyReleaseRetention:
         assert {r.action for r in results} == {RETENTION_UNCHANGED}
         assert client.put_object_retention_calls == []
 
+    def test_a_target_500ms_short_from_second_precision_skew_is_unchanged(self) -> None:
+        """alpha-engine-config-I9898 round-2 finding 1, reproduced: S3 stores
+        `RetainUntilDate` at millisecond precision, but the target this job
+        recomputes comes from `HeadObject`'s `LastModified`, which S3
+        truncates to the SECOND. A correctly-locked object is therefore
+        always a few hundred milliseconds "short" of a target recomputed
+        this way — `retention_meets_target`'s clock-skew slack must absorb
+        that, or every already-compliant release is read as `extended` and
+        gets a redundant `PutObjectRetention` forever."""
+        client = _FakeS3Client()
+        store = _store(client)
+        target = _PUBLISHED_AT + RELEASE_OBJECT_LOCK_RETENTION
+        stored = target - dt.timedelta(milliseconds=500)
+        _publish(client, SHA, locked=True, retain_until=stored, last_modified=_PUBLISHED_AT)
+
+        results = apply_release_retention(store, SHA)
+
+        assert {r.action for r in results} == {RETENTION_UNCHANGED}
+        assert client.put_object_retention_calls == []
+
+    def test_a_target_2_days_short_is_extended_despite_the_skew_slack(self) -> None:
+        """A gap larger than the clock-skew slack is a real shortfall, not
+        skew — it must still extend."""
+        client = _FakeS3Client()
+        store = _store(client)
+        target = _PUBLISHED_AT + RELEASE_OBJECT_LOCK_RETENTION
+        stored = target - dt.timedelta(days=2)
+        _publish(client, SHA, locked=True, retain_until=stored, last_modified=_PUBLISHED_AT)
+
+        results = apply_release_retention(store, SHA)
+
+        assert {r.action for r in results} == {RETENTION_EXTENDED}
+        assert len(client.put_object_retention_calls) == 2
+        for call in client.put_object_retention_calls:
+            assert call["Retention"]["RetainUntilDate"] == target
+
     def test_a_sha_with_no_release_json_is_refused(self) -> None:
         client = _FakeS3Client()
         store = _store(client)
@@ -291,14 +327,47 @@ class TestReleaseLockHandler:
             rc = release_lock_handler(self._args(sha=SHA, store=store))
 
         assert rc == 0
-        # The manifest landed at runs/release.lock/2026-08-28/run.json.
-        manifest_bytes = client.blobs["crucible/runs/release.lock/2026-08-28/run.json"]
+        # The manifest landed at runs/release.lock/{trading_day}/{sha}/run.json
+        # — discriminated by sha (finding 2), not a bare
+        # runs/release.lock/{trading_day}/run.json.
+        manifest_bytes = client.blobs[f"crucible/runs/release.lock/2026-08-28/{SHA}/run.json"]
         manifest = json.loads(manifest_bytes)
         assert manifest["status"] == "ok"
         assert manifest["job"] == "release.lock"
         names = {m["name"] for m in manifest["metrics"]}
         assert "release_objects_locked" in names
         assert "release_object_retention" in names
+
+    def test_two_shas_repaired_on_one_trading_day_write_two_manifests(self) -> None:
+        """alpha-engine-config-I9898 round-2 finding 2: without
+        `discriminator=sha`, two repairs on the same trading day both write
+        `runs/release.lock/{trading_day}/run.json` and the second silently
+        overwrites the first — rule 1, manifest or it did not happen,
+        defeated at the second invocation."""
+        client = _FakeS3Client()
+        store = _store(client)
+        sha_a = "a" * 40
+        sha_b = "b" * 40
+        _publish(client, sha_a, locked=False, last_modified=_PUBLISHED_AT)
+        _publish(client, sha_b, locked=False, last_modified=_PUBLISHED_AT)
+
+        from unittest.mock import patch
+
+        with patch("crucible.release_retention.open_store", return_value=store):
+            rc_a = release_lock_handler(self._args(sha=sha_a, store=store))
+            rc_b = release_lock_handler(self._args(sha=sha_b, store=store))
+
+        assert rc_a == 0
+        assert rc_b == 0
+        key_a = f"crucible/runs/release.lock/2026-08-28/{sha_a}/run.json"
+        key_b = f"crucible/runs/release.lock/2026-08-28/{sha_b}/run.json"
+        assert key_a != key_b
+        assert key_a in client.blobs
+        assert key_b in client.blobs
+        manifest_a = json.loads(client.blobs[key_a])
+        manifest_b = json.loads(client.blobs[key_b])
+        assert manifest_a["status"] == "ok"
+        assert manifest_b["status"] == "ok"
 
     def test_access_denied_fails_the_job_with_the_reason_named(self) -> None:
         client = _FakeS3Client()
@@ -312,7 +381,7 @@ class TestReleaseLockHandler:
             with pytest.raises(ClientError):
                 release_lock_handler(self._args(sha=SHA, store=store))
 
-        manifest_bytes = client.blobs["crucible/runs/release.lock/2026-08-28/run.json"]
+        manifest_bytes = client.blobs[f"crucible/runs/release.lock/2026-08-28/{SHA}/run.json"]
         manifest = json.loads(manifest_bytes)
         assert manifest["status"] == "failed"
         assert "AccessDenied" in manifest["reason"]
@@ -329,4 +398,4 @@ class TestReleaseLockHandler:
 
         assert rc == 0
         assert client.put_object_retention_calls == []
-        assert "crucible/runs/release.lock/2026-08-28/run.json" not in client.blobs
+        assert f"crucible/runs/release.lock/2026-08-28/{SHA}/run.json" not in client.blobs
