@@ -30,6 +30,7 @@ __all__ = [
     "BOARD_CURRENT_KEY",
     "BOARD_HTML_KEY",
     "DRIFT_INPUTS",
+    "MANIFEST_BASENAME",
     "REVIEWER_PATTERN",
     "RUNS_ROOT",
     "acceptance_reading_key",
@@ -57,6 +58,7 @@ __all__ = [
     "gate_key",
     "gate_prefix",
     "heal_key",
+    "is_manifest_key",
     "ledger_key",
     "legacy_weekly_executions_key",
     "manifest_key",
@@ -88,6 +90,25 @@ ARM_SEGMENT_SEPARATOR = "~"
 #: week-cost/deploys loop, `crucible.alerts._week_summary`) — lists this
 #: constant directly rather than hardcoding `"runs/"` at the call site.
 RUNS_ROOT = "runs/"
+
+#: The basename EVERY run manifest is written under, and the only object under
+#: a manifest prefix that is a manifest.
+#:
+#: A manifest prefix is a namespace, not a manifest list: a job may legitimately
+#: file its own evidence beside its manifest, and `report.morning` does exactly
+#: that (`morning_report_key` -> `{manifest_prefix}/{calendar_date}/message.txt`,
+#: deliberately under the job's own prefix so the delivery needs no second IAM
+#: grant). A reader that `json.loads` every key it lists under a manifest prefix
+#: therefore parses a plain-text message as a manifest and raises — which is
+#: `alpha-engine-config-I9900`, observed live on 2026-09-03: one `message.txt`
+#: took `crucible board` down for seven hours, publishing no board and no
+#: ladder at all.
+#:
+#: Named here rather than as a `"run.json"` literal at each filter so
+#: `manifest_key`, `parse_manifest_key` and every consumer that narrows a
+#: listing agree by construction. Consumers should prefer
+#: :func:`is_manifest_key`, which additionally checks the root and the arity.
+MANIFEST_BASENAME = "run.json"
 
 #: The root namespace segment every alert bus row lives under, narrowed by
 #: `crucible.alerts.bus_key` (an architectural exception — see
@@ -245,7 +266,7 @@ def manifest_key(job: str, trading_day: str, *, discriminator: str | None = None
     if not trading_day:
         raise ValueError("trading_day must be non-empty")
     if discriminator is None:
-        return f"runs/{job}/{trading_day}/run.json"
+        return f"runs/{job}/{trading_day}/{MANIFEST_BASENAME}"
     if not _DISCRIMINATOR_RE.match(discriminator):
         raise ValueError(
             f"discriminator {discriminator!r} must be 1-64 characters of "
@@ -253,7 +274,7 @@ def manifest_key(job: str, trading_day: str, *, discriminator: str | None = None
             "that is enforced so a future writer cannot orphan a manifest under "
             "a key no path-shaped tool can address."
         )
-    return f"runs/{job}/{trading_day}/{discriminator}/run.json"
+    return f"runs/{job}/{trading_day}/{discriminator}/{MANIFEST_BASENAME}"
 
 
 def manifest_prefix(job: str, trading_day: str) -> str:
@@ -293,7 +314,7 @@ def parse_manifest_key(key: str) -> tuple[str, str, str | None] | None:
     or simply not of interest, this function only decides what it does not
     understand.
     """
-    if not key.startswith(RUNS_ROOT) or not key.endswith("/run.json"):
+    if not key.startswith(RUNS_ROOT) or not key.endswith(f"/{MANIFEST_BASENAME}"):
         return None
     parts = key.split("/")
     if len(parts) == 4:
@@ -303,6 +324,25 @@ def parse_manifest_key(key: str) -> tuple[str, str, str | None] | None:
         _, job, trading_day, discriminator, _ = parts
         return job, trading_day, discriminator
     return None
+
+
+def is_manifest_key(key: str) -> bool:
+    """Whether ``key`` names a run manifest this module could have written.
+
+    The predicate every consumer that LISTS a manifest prefix — or
+    :data:`RUNS_ROOT`, or :func:`runs_prefix` — narrows the listing with
+    before it reads anything. A manifest prefix is a namespace and not a
+    manifest list (see :data:`MANIFEST_BASENAME`), so "every key under this
+    prefix is a manifest" is a false assumption that reads as true for as long
+    as no job files evidence beside its own manifest — and one now does.
+
+    Expressed as :func:`parse_manifest_key` rather than as a suffix test, so a
+    consumer gets the root and the arity checked too: `runs/x/run.json` ends
+    with the right basename and is not a manifest key, and a suffix test at
+    the call site is the shape that let `len(parts) != 4` drop every
+    discriminated manifest (`alpha-engine-config-I9879`).
+    """
+    return parse_manifest_key(key) is not None
 
 
 def runs_prefix(job: str) -> str:

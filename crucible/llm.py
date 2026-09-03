@@ -56,7 +56,7 @@ from typing import Any
 import yaml
 from krepis.usage_pacing import PaceStatus, pace_check
 
-from crucible.keys import RUNS_ROOT
+from crucible.keys import RUNS_ROOT, is_manifest_key
 from crucible.store import Store
 
 __all__ = [
@@ -293,7 +293,10 @@ def week_to_date_llm_spend(store: Store, *, window_start: dt.date, trading_day: 
     """
     total = 0.0
     for key in store.list_keys(RUNS_ROOT):
-        if not key.endswith("/run.json"):
+        # `is_manifest_key`, not a `"/run.json"` suffix literal: the basename
+        # is `crucible.keys`' to own, and the predicate checks the root and the
+        # arity too (alpha-engine-config-I9900).
+        if not is_manifest_key(key):
             continue
         manifest = json.loads(store.get_bytes(key).decode("utf-8"))
         day = dt.date.fromisoformat(manifest["trading_day"])
