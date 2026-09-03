@@ -827,14 +827,24 @@ class ModelRecipe:
         **There is no ``feature_version`` key here** (`alpha-engine-config-
         I9801`). The recipe's inputs are already pinned by `features` and
         `inputs`, which ARE hashed; which feature-layer artifact a run
-        actually reads is resolved by `FeatureLayerSource` at grading time,
-        not declared by the recipe, and is recorded as the run's lineage —
-        `FeaturePanel.feature_version` flows into
-        :func:`produce_arm_predictions` and every layer read is logged via
-        `ctx.record_input`. Hashing a catalogue version here would mean an
-        unrelated feature added to the catalogue re-ids every M arm and
-        orphans its score series — worse than the stale-and-unread field it
-        would replace.
+        actually reads is resolved at produce time, not declared by the
+        recipe, and is recorded as the run's lineage — `crucible.slots.
+        cycle.run_produce` (the production path for every slot, M included)
+        calls ``ctx.record_input(features_key(feature_version, day), ...)``,
+        so the layer's resolved version is embedded in the recorded key
+        (``features/<version>/<day>.parquet``) inside ``inputs[]`` on the
+        run's own manifest (``runs/{job}/{day}/run.json``). R and M are
+        asserted to record the SAME entry, byte-for-byte, by
+        `tests/test_feature_layer_input_identity.py`. (`FeatureLayerSource`
+        /`FeaturePanel.feature_version` resolve and carry the same version
+        through :func:`design_panel` and :func:`grade_arm` for training and
+        grading; :func:`produce_arm_predictions` also threads it into the
+        `arm_predictions.v1` artifact, but that function has no production
+        caller today — `cycle.run_produce`'s `ctx.record_input` is the
+        lineage that is actually live.) Hashing a catalogue version into this
+        spec instead would mean an unrelated feature added to the catalogue
+        re-ids every M arm and orphans its score series — worse than the
+        stale-and-unread field it would replace.
         """
         payload: dict[str, Any] = {
             "features": list(self.features),

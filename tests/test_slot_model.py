@@ -28,6 +28,7 @@ from crucible.slots.model import (
     MIN_DISPERSION_RATIO,
     REQUIRED_RECIPE_FIELDS,
     CPCVSpec,
+    FeatureLayerSource,
     FeaturePanel,
     MetricScaleError,
     ModelRecipe,
@@ -707,17 +708,24 @@ class TestRecipeLoading:
         assert len(loaded) == 1
         assert "feature_version" not in loaded[0].spec
 
-    def test_arm_id_is_stable_across_two_loads_and_independent_of_feature_layer_version(
+    def test_arm_id_is_independent_of_which_feature_layer_version_is_resolved(
         self, tmp_path
     ) -> None:
-        """Deliverable 4 (`alpha-engine-config-I9801`): the arm id no longer
+        """Deliverable 4 (`alpha-engine-config-I9801`), the actual claim.
 
-        depends on a declared `feature_version`, so a catalogue change — the
-        thing the removed field would otherwise have needed re-declaring for
-        — cannot silently re-id or silently NOT re-id an arm depending on
-        whether someone remembered to bump it. There is nothing left that
-        could diverge silently: the field the issue's `closes-when` asks be
-        either gone or checked is gone.
+        The arm id no longer depends on a declared `feature_version`, so a
+        catalogue change — the thing the removed field would otherwise have
+        needed re-declaring for — cannot silently re-id or silently NOT re-id
+        an arm depending on whether someone remembered to bump it. Proved
+        against a real feature-layer symbol: two `FeatureLayerSource`
+        instances resolve two DIFFERENT versions, and the recipe's `arm_id`
+        — computed from `ModelRecipe.spec` alone, which `FeatureLayerSource`
+        never enters — is identical regardless, and identical across two
+        loads of the same file. (A prior version of this test loaded the
+        file twice with nothing about the feature layer varied at all, which
+        passed for the uninteresting reason that `load_model_recipes` is a
+        pure hash of file bytes — it named no feature-layer symbol despite
+        its name.)
         """
         (tmp_path / "residual_momentum.yaml").write_text(
             "\n".join(
@@ -736,9 +744,14 @@ class TestRecipeLoading:
             ),
             encoding="utf-8",
         )
+        source_a = FeatureLayerSource(store=None, version="vaaaaaaaaaaaa")
+        source_b = FeatureLayerSource(store=None, version="vbbbbbbbbbbbb")
+        assert source_a.version != source_b.version
+
         first = load_model_recipes(tmp_path, feature_columns=("mom_21d_ratio",))
         second = load_model_recipes(tmp_path, feature_columns=("mom_21d_ratio",))
         assert first[0].arm_id == second[0].arm_id
+        assert "feature_version" not in first[0].spec
 
     def test_a_recipe_missing_a_pre_registration_field_does_not_register(self, tmp_path) -> None:
         """Plan §9.1: 'Missing fields -> the arm does not register.'"""
