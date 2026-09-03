@@ -364,14 +364,19 @@ STATUS_COLORS: dict[str, str] = {
     # `crucible.drift.Band.status()` — not yet rendered through a dedicated
     # Metrics section, colored here so that day does not repeat C14.
     "WATCH": _AMBER,
-    # The phase ladder's own four states (`crucible.gate.LADDER_STATES`).
+    # The phase ladder's own state vocabulary (`crucible.gate.LADDER_STATES`).
     # `UNMEASURED` is RED, not gray: a phase whose gate has never been read is
     # unobserved, not "fine so far" (principle 7). `OUT_OF_ORDER` is PURPLE —
     # it is not a phase running badly, it is the ladder itself being violated,
     # and giving it FAILED's red would hide it among ordinary unmet clauses.
+    # `UNMEASURABLE` aliases `UNMEASURED`'s red — both are "we have nothing
+    # trustworthy to show", the same posture `board.BOARD_CONSOLE_STATE`
+    # takes mapping it to FAILED rather than a third color
+    # (`alpha-engine-config-I9869` round 3, finding 4).
     "MET": _GREEN,
     "UNMET": _AMBER,
     "UNMEASURED": _RED,
+    "UNMEASURABLE": _RED,
     "OUT_OF_ORDER": _PURPLE,
     # The attribution table's own vocabulary (`ATTRIBUTION_STATUSES`). `OK`
     # and `GREEN` alias `HEALTHY`'s color, `BREACH`/`RED` alias `FAILED`'s,
