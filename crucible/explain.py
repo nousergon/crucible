@@ -31,7 +31,7 @@ import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from crucible.keys import manifest_key
+from crucible.keys import RUNS_ROOT, manifest_key
 from crucible.manifest import validate
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -95,7 +95,7 @@ def load_manifests(store: Store) -> list[dict[str, Any]]:
     document nobody checked is an explanation nobody should act on.
     """
     out: list[dict[str, Any]] = []
-    for key in store.list_keys("runs/"):
+    for key in store.list_keys(RUNS_ROOT):
         if not key.endswith("/run.json"):
             continue
         document = json.loads(store.get_bytes(key).decode("utf-8"))

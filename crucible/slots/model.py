@@ -78,7 +78,7 @@ from nousergon_lib.arena import ArmSeries, ServingPrecondition, derive_arm_id
 from nousergon_lib.arena.engine import TrainingIntegrityError, TrainingStatus
 
 from crucible.features.registry import UNIT_SUFFIXES
-from crucible.keys import features_key
+from crucible.keys import features_key, features_prefix
 from crucible.slots.inputs import (
     InputRef,
     UnresolvedInputError,
@@ -573,7 +573,7 @@ class FeatureLayerSource:
         never compiled for and turn a producer gap into a run of nulls. The
         store knows which days exist; a gap therefore raises by name below.
         """
-        prefix = f"features/{self.version}/"
+        prefix = features_prefix(self.version)
         available = sorted(
             key[len(prefix) : -len(".parquet")]
             for key in self.store.list_keys(prefix)

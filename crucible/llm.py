@@ -56,6 +56,7 @@ from typing import Any
 import yaml
 from krepis.usage_pacing import PaceStatus, pace_check
 
+from crucible.keys import RUNS_ROOT
 from crucible.store import Store
 
 __all__ = [
@@ -291,7 +292,7 @@ def week_to_date_llm_spend(store: Store, *, window_start: dt.date, trading_day: 
     happened rather than against what this process remembers.
     """
     total = 0.0
-    for key in store.list_keys("runs/"):
+    for key in store.list_keys(RUNS_ROOT):
         if not key.endswith("/run.json"):
             continue
         manifest = json.loads(store.get_bytes(key).decode("utf-8"))

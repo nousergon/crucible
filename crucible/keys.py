@@ -25,12 +25,12 @@ import re
 from crucible.calendar import assert_trading_day
 
 __all__ = [
-    "legacy_weekly_executions_key",
-    "board_html_key",
-    "board_key",
-    "BOARD_HTML_KEY",
-    "BOARD_CURRENT_KEY",
+    "ALERTS_ROOT",
     "ARM_SEGMENT_SEPARATOR",
+    "BOARD_CURRENT_KEY",
+    "BOARD_HTML_KEY",
+    "DRIFT_INPUTS",
+    "RUNS_ROOT",
     "arena_cycle_key",
     "arm_id_from_segment",
     "arm_key_segment",
@@ -38,22 +38,33 @@ __all__ = [
     "arm_register_key",
     "arm_series_key",
     "attribution_key",
+    "board_html_key",
+    "board_key",
     "champion_key",
     "coverage_key",
     "cross_section_key",
     "cross_section_settled_key",
     "data_panel_key",
+    "drift_input_key",
+    "drift_metrics_key",
     "experiments_key",
+    "experiments_prefix",
     "feature_registry_key",
     "features_key",
+    "features_prefix",
     "gate_key",
+    "heal_key",
     "ledger_key",
+    "legacy_weekly_executions_key",
     "manifest_key",
     "manifest_prefix",
+    "migration_key",
     "retirement_log_key",
+    "runs_prefix",
     "shadow_key",
     "signals_key",
     "strategy_arm_key",
+    "strategy_arms_prefix",
     "universe_members_key",
     "verdict_key",
 ]
@@ -61,6 +72,22 @@ __all__ = [
 #: `:` is legal in an S3 key and hostile in every path-shaped tool that
 #: reads one. `~` is legal in both and appears in no arm name.
 ARM_SEGMENT_SEPARATOR = "~"
+
+#: The root namespace segment every run manifest lives under — the prefix
+#: `manifest_key`, `manifest_prefix` and `runs_prefix` all in turn narrow. A
+#: caller with no job and no trading day at all — an existential "has
+#: ANYTHING ever run" scan (`crucible.explain.load_manifests`,
+#: `crucible.llm.week_to_date_llm_spend`, `crucible.console.render.build_page`'s
+#: week-cost/deploys loop, `crucible.alerts._week_summary`) — lists this
+#: constant directly rather than hardcoding `"runs/"` at the call site.
+RUNS_ROOT = "runs/"
+
+#: The root namespace segment every alert bus row lives under, narrowed by
+#: `crucible.alerts.bus_key` (an architectural exception — see
+#: `tests/test_key_construction_placement.py`). `crucible.alerts.pages_in_window`
+#: lists this constant rather than hardcoding `"alerts/"` when it counts every
+#: incident across the whole trailing window, not one group.
+ALERTS_ROOT = "alerts/"
 
 
 def arm_key_segment(arm_id: str) -> str:
@@ -120,6 +147,25 @@ def feature_registry_key(version: str) -> str:
     return f"features/{version}/registry.json"
 
 
+def features_prefix(version: str) -> str:
+    """The prefix under which every trading day's compiled feature layer for
+    ``version`` lives.
+
+    `features_key(version, trading_day)` for any ``trading_day`` starts with
+    this prefix — a reader that needs to know which days a version has been
+    compiled for (`crucible.slots.model.FeatureLayer._sessions`, listing the
+    store rather than deriving a date range) lists this prefix instead of
+    restating its shape.
+    """
+    if not version:
+        raise ValueError(
+            "version must be non-empty — a blank version would list every version's "
+            "features under one empty-segment prefix, and `store.list_keys('features//')` "
+            "returning nothing reads as 'no data' rather than the caller's own bug."
+        )
+    return f"features/{version}/"
+
+
 # -- arms and slots ---------------------------------------------------------
 
 
@@ -131,6 +177,24 @@ def strategy_arm_key(slot: str, name: str) -> str:
 def arm_register_key(slot: str) -> str:
     """The append-only arm event log for one slot, folded to state on read."""
     return f"arms/{slot}/register.jsonl"
+
+
+def strategy_arms_prefix(slot: str) -> str:
+    """The prefix under which every arm recipe for ``slot`` lives, synced
+    into the store.
+
+    `strategy_arm_key(slot, name)` for any ``name`` starts with this prefix —
+    `crucible.slots.arms.load_arm_specs` lists it (rather than restating the
+    shape) when reading from the spot-box synced tree instead of a local
+    `CRUCIBLE_STRATEGY_DIR` checkout.
+    """
+    if not slot:
+        raise ValueError(
+            "slot must be non-empty — a blank slot would list every slot's arms under "
+            "one empty-segment prefix, and `store.list_keys('strategy/current/arms//')` "
+            "returning nothing reads as 'no data' rather than the caller's own bug."
+        )
+    return f"strategy/current/arms/{slot}/"
 
 
 #: A discriminator is a path segment, not free text: it must round-trip
@@ -202,6 +266,21 @@ def manifest_prefix(job: str, trading_day: str) -> str:
     return f"runs/{job}/{trading_day}/"
 
 
+def runs_prefix(job: str) -> str:
+    """The prefix under which EVERY trading day's manifest for ``job`` lives —
+    coarser than :func:`manifest_prefix`, which additionally fixes the day.
+
+    `manifest_prefix(job, trading_day)` for any ``trading_day`` starts with
+    this prefix. A reader asking an existential question across every day a
+    job has ever run (`crucible.console.render._has_history`: "has this
+    component EVER produced a manifest?") lists this prefix instead of
+    restating `runs/{job}/` inline.
+    """
+    if not job:
+        raise ValueError("job must be non-empty")
+    return f"runs/{job}/"
+
+
 def shadow_key(arm_id: str, trading_day: str) -> str:
     """What an arm SELECTED on a trading day, before any outcome is known.
 
@@ -230,6 +309,19 @@ def cross_section_settled_key(arm_id: str, trading_day: str) -> str:
     """The same cross-section, joined against the realized forward return
     once ``trading_day``'s horizon has settled. Never written before then."""
     return f"experiments/{arm_key_segment(arm_id)}/{trading_day}/cross_section_settled.json"
+
+
+def experiments_prefix(arm_id: str) -> str:
+    """The prefix under which every dated artifact for ``arm_id`` lives —
+    `shadow_key`, `verdict_key`, `cross_section_key` and
+    `cross_section_settled_key` all start with it.
+
+    A reader that walks every trading day an arm has an artifact for
+    (`crucible.report`'s slot-alpha and rank-IC rows, `crucible.slots.cycle`'s
+    grader and `_shadow_dates`) lists this prefix rather than restating the
+    shape those four key functions already own.
+    """
+    return f"experiments/{arm_key_segment(arm_id)}/"
 
 
 def retirement_log_key(slot: str) -> str:
@@ -307,6 +399,61 @@ def universe_members_key(trading_day: str) -> str:
 def signals_key(trading_day: str) -> str:
     """The R champion's feed: how names were scored."""
     return f"signals/{trading_day}/signals.json"
+
+
+# -- drift ------------------------------------------------------------------
+
+
+DRIFT_INPUTS = ("features", "predictions", "ic")
+
+
+def drift_input_key(name: str, trading_day: str) -> str:
+    """One of the three artifacts `crucible.track_c.drift_handler` reads
+    before it will compute a drift metric at all — track A/B's features,
+    predictions and realized IC for the cycle.
+
+    ``name`` is one of :data:`DRIFT_INPUTS`; anything else raises rather
+    than silently producing a fourth input key nothing writes.
+    """
+    if name not in DRIFT_INPUTS:
+        raise ValueError(f"unknown drift input {name!r}; the three inputs are {DRIFT_INPUTS}")
+    return f"drift/{trading_day}/input_{name}.json"
+
+
+def drift_metrics_key(trading_day: str) -> str:
+    """Where `crucible.track_c.drift_handler` files the cycle's three
+    drift `MetricRecord`s, alongside the run manifest's own copy."""
+    return f"drift/{trading_day}/metrics.json"
+
+
+# -- one-shot / repair jobs --------------------------------------------------
+
+
+def migration_key(trading_day: str, run_id: str) -> str:
+    """Where `crucible migrate.history` files its own result, per attempt.
+
+    Keyed by `run_id`, not by trading day alone: the migration is a one-shot
+    the runbook says is safe to rerun (`--allow-missing` recovery), and a
+    bare `{trading_day}/migration.json` would let a second attempt on the
+    same day overwrite the first attempt's record of what it actually
+    imported.
+    """
+    if not run_id:
+        raise ValueError("run_id must be non-empty — see manifest_key's discriminator for why.")
+    return f"migrations/{trading_day}/{run_id}.json"
+
+
+def heal_key(trading_day: str, run_id: str) -> str:
+    """Where `crucible data.heal` files its own result, per attempt.
+
+    Keyed by `run_id` for the same reason as :func:`migration_key`: a heal is
+    rerun idempotently, and each attempt's own record — which sessions were
+    repaired versus already present — is worth keeping distinct from the
+    attempt before it.
+    """
+    if not run_id:
+        raise ValueError("run_id must be non-empty — see manifest_key's discriminator for why.")
+    return f"heals/{trading_day}/{run_id}.json"
 
 
 # -- fleet ledger -----------------------------------------------------------

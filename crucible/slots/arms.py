@@ -55,7 +55,7 @@ import yaml
 from nousergon_lib.arena.arms import ArmEvent, ArmRegister, derive_arm_id
 
 from crucible.calendar import assert_trading_day
-from crucible.keys import arm_register_key
+from crucible.keys import arm_register_key, strategy_arms_prefix
 from crucible.slots import ControlArm, SlotSpec
 from crucible.slots.rankers import get_ranker, ranker_identity
 from crucible.store import Store
@@ -224,7 +224,7 @@ def load_arm_specs(
     else:
         if store is None:
             raise ValueError("load_arm_specs needs either a store or a strategy_dir")
-        prefix = f"strategy/current/arms/{slot}/"
+        prefix = strategy_arms_prefix(slot)
         for key in sorted(store.list_keys(prefix)):
             if key.endswith(".yaml"):
                 specs.append(_parse(store.get_bytes(key), key))

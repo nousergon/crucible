@@ -41,7 +41,14 @@ from crucible.console.render import (
 )
 from crucible.drift import drift_metrics
 from crucible.gate import LADDER_KEY, LADDER_SCHEMA_VERSION, build_ladder
-from crucible.keys import BOARD_CURRENT_KEY, BOARD_HTML_KEY, board_key
+from crucible.keys import (
+    BOARD_CURRENT_KEY,
+    BOARD_HTML_KEY,
+    DRIFT_INPUTS,
+    board_key,
+    drift_input_key,
+    drift_metrics_key,
+)
 from crucible.runner import RunContext, run_job, spot_interruption_guard
 from crucible.store import Store, open_store, sha256_hex
 
@@ -241,6 +248,8 @@ def smoke_handler(args: argparse.Namespace) -> int:
                     # sentence in `status_reason`, on the manifest §4.5's page
                     # renders — so it is loud on the console rather than
                     # silent in a log.
+                    # Human-readable diagnostic text, not a store key — no
+                    # store call reads this string (alpha-engine-config-I9852).
                     degraded.append(
                         f"releases/current names {pointed}, whose wheel is absent; every "
                         "job resolving the pointer is broken until this flip lands"
@@ -378,11 +387,7 @@ def drift_handler(args: argparse.Namespace) -> int:
 
     def body(ctx: RunContext) -> None:
         day = ctx.trading_day.isoformat()
-        inputs = {
-            "features": f"drift/{day}/input_features.json",
-            "predictions": f"drift/{day}/input_predictions.json",
-            "ic": f"drift/{day}/input_ic.json",
-        }
+        inputs = {name: drift_input_key(name, day) for name in DRIFT_INPUTS}
         missing = [k for k, key in inputs.items() if not store.exists(key)]
         if missing:
             raise FileNotFoundError(
@@ -405,7 +410,7 @@ def drift_handler(args: argparse.Namespace) -> int:
         for record in records:
             ctx.record_metric(record)
         ctx.record_output(
-            f"drift/{day}/metrics.json",
+            drift_metrics_key(day),
             json.dumps(records, indent=2, sort_keys=True).encode("utf-8"),
             schema_version="metric_record.v1",
         )

@@ -75,6 +75,11 @@ def report_handler(args: argparse.Namespace) -> int:
             # own `to_dict()` (which nothing here read until this line).
             cap_usd_measured=config.llm_cap_usd_measured,
         )
+        # Not `manifest_key(job, trading_day)`: the spend is aggregated across
+        # every job that ran this trading day, so the `*` stands in for "any
+        # job", and this is display-only source_path metadata on a
+        # MetricRecord, never a key a store call reads
+        # (alpha-engine-config-I9852).
         ctx.record_metric(
             cap_metric(cap, now=now, source_path=f"runs/*/{ctx.trading_day}/run.json")
         )
@@ -99,6 +104,8 @@ def report_handler(args: argparse.Namespace) -> int:
                     "overrun is ahead of a straight-line pace, which is visible here days "
                     "before a fixed threshold on the cap itself would fire"
                 ),
+                # Same reasoning as the source_path above: cross-job, display
+                # only.
                 "source_path": f"runs/*/{ctx.trading_day}/run.json",
                 "last_updated_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "baseline": 0.0,

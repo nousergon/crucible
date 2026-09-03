@@ -42,6 +42,7 @@ from crucible.keys import (
     arm_register_key,
     gate_key,
     legacy_weekly_executions_key,
+    runs_prefix,
 )  # noqa: F401 - re-exported
 from crucible.manifest import manifest_key
 from crucible.release import POINTER_KEY
@@ -467,7 +468,7 @@ def _clause_pointer_flipped_on_smoke(store: Store, window: list[dt.date]) -> Cla
         )
     sha = pointer.get("sha", "")
     evidence = [POINTER_KEY]
-    for key in store.list_keys("runs/smoke/"):
+    for key in store.list_keys(runs_prefix("smoke")):
         if not key.endswith("run.json"):
             continue
         evidence.append(key)
