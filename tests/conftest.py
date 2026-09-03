@@ -252,6 +252,21 @@ class FakeS3:
         assert name == "list_objects_v2"
         return _Paginator(self)
 
+    def generate_presigned_url(self, operation: str, **kw: Any) -> str:
+        """A URL shaped like a real presign, without a real signature.
+
+        boto3 computes this offline from the credential it already holds, so
+        the fake does the same: no object lookup, no network. The parameters
+        are echoed into the query string so a test can assert WHICH key and
+        WHICH lifetime were signed — a fake returning a constant would pass
+        for a store that presigned the wrong object.
+        """
+        params = kw["Params"]
+        return (
+            f"https://{params['Bucket']}.s3.amazonaws.com/{params['Key']}"
+            f"?op={operation}&X-Amz-Expires={kw['ExpiresIn']}&X-Amz-Signature=fake"
+        )
+
     # -- helpers --------------------------------------------------------
     def _guard(self, key: str) -> None:
         if key in self.denied:

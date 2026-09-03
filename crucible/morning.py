@@ -26,7 +26,19 @@ cannot buzz a phone at 6am for a board that is red by design. `crucible.alerts`
 is deliberately NOT imported: routing a digest through the page path is how a
 page channel becomes the channel someone mutes.
 
-**What it says, exhaustively.** Five things, and no sixth:
+**It is a POINTER, and the board page is the artifact.** Brian, 2026-09-03,
+on the first delivered report: *"I don't find the report detailed enough. It
+should at a minimum be formatted well, so if we need another way to deliver
+this report (email, url, etc) let's do so."* Telegram caps a message at 4096
+characters, so a message that tried to carry the detail would be truncated by
+the transport from the TAIL — losing the link to everything it had left out.
+The six sections below are the summary, each under a heading; the presigned
+link in the last one opens `board/index.html`, which carries every row's
+store key and stamp, every phase's per-clause state and reason, the
+acceptance clause list and the §6.1 schedule (`alpha-engine-config-I9921`).
+
+**What it says, exhaustively.** Six headed sections (:data:`SECTIONS`), and
+no seventh:
 
 1. Every phase gate's reading, quoted with the store it came from, the
    board's `generated_at`, and the crucible commit the board was rendered
@@ -89,32 +101,45 @@ from zoneinfo import ZoneInfo
 from crucible.calendar import previous_trading_day
 from crucible.keys import (
     BOARD_CURRENT_KEY,
+    BOARD_HTML_KEY,
     acceptance_reading_key,
     board_key,
     manifest_key,
     morning_report_key,
+    parse_acceptance_reading,
 )
-from crucible.store import LocalStore, S3Store, Store, open_store
+from crucible.store import PRESIGN_MAX_S, LocalStore, S3Store, Store, open_store
 
 __all__ = [
     "ACCEPTANCE_NOT_ON_ANY_ARTIFACT",
     "ACCEPTANCE_UNREADABLE",
+    "BOARD_URL_CAVEAT",
+    "BOARD_URL_EXPIRES_S",
+    "BOARD_URL_UNAVAILABLE",
+    "BOARD_URL_UNREADABLE",
     "CLAUSE_SEPARATOR",
     "FORBIDDEN_PROGRESS_TOKENS",
     "BOARD_JOB",
+    "DELIVERY_SEVERITY",
+    "DELIVERY_SOURCE",
     "DELIVERY_TZ",
+    "MESSAGE_MAX_CHARS",
     "MORNING_JOB",
     "MorningInputs",
+    "SECTIONS",
     "SILENT_STATES",
     "NO_OPERATOR_ACTION",
     "STALE_AFTER",
+    "TRUNCATION_MARKER",
     "UndeliveredError",
+    "TRANSPORT_PREFIX",
     "deliver",
     "morning_handler",
     "read_inputs",
     "render_message",
     "run_report",
     "store_uri",
+    "wire_length",
 ]
 
 #: The CLI job name. One string, used by the handler, the registry row, the
@@ -125,6 +150,15 @@ MORNING_JOB = "report.morning"
 #: The job whose artifact this one reports. Named rather than inlined so the
 #: manifest lookup and the prose cannot drift apart.
 BOARD_JOB = "board"
+
+#: The severity and source :func:`deliver` publishes under. Named constants
+#: rather than literals at the call site because they are not only routing —
+#: `krepis.alerts.publish` renders BOTH into the prefix it prepends to the
+#: body, so they are also two of the terms in this message's character budget
+#: (:func:`transport_prefix`). A source string edited at the call site alone
+#: would silently move the budget and the message would start being refused.
+DELIVERY_SEVERITY = "info"
+DELIVERY_SOURCE = f"crucible-v2/{MORNING_JOB}"
 
 #: The board states that mean "nobody can read this", as opposed to "this
 #: reads no". Reported as their own figure: a board where half the rows
@@ -221,6 +255,135 @@ FORBIDDEN_PROGRESS_TOKENS: tuple[str, ...] = (
 #: assertion unfalsifiable.
 WITHHELD_MARKER = "[{n} clause{s} withheld — plan §12 rule 3]"
 
+#: The six headed sections, in the order `alpha-engine-config-I9921` states
+#: them. Declared as a tuple rather than written out once in the renderer so
+#: `tests/test_morning.py` can assert the ORDER against this list instead of
+#: against a copy of it — a test that restates the order it grades passes
+#: whichever way the renderer drifts.
+#:
+#: **CAPS, not bold.** The issue asks for a bold heading per section, and
+#: `krepis.telegram.send_message` (0.124.x) exposes no `parse_mode` argument:
+#: it always sends Markdown v1 and escapes the body itself. Emitting `*bold*`
+#: would work until a board detail interpolated an odd asterisk, at which
+#: point Telegram drops the whole message and krepis retries it as plain text
+#: with the asterisks visible. A heading that is legible in BOTH renderings is
+#: worth more than one that is bold in the common case, so the headings are
+#: capitalised and the formatting request is filed as
+#: `alpha-engine-config-I9925` (add `parse_mode` to krepis' transport).
+SECTIONS: tuple[str, ...] = (
+    "LADDER",
+    "SCHEDULE (PLAN §6.1)",
+    "ACCEPTANCE",
+    "MOVED SINCE {previous_day}",
+    "SILENCE",
+    "FULL BOARD",
+)
+
+#: Telegram's hard limit on one message. The renderer fits the message to
+#: this itself rather than letting `krepis.telegram._truncate_for_telegram`
+#: tail-trim it: that transport cuts the TAIL, and the tail of this message is
+#: the link to everything it had to leave out.
+MESSAGE_MAX_CHARS = 4096
+
+#: Appended when anything was dropped to fit. Stated, never silent — a
+#: message that quietly shortened itself is indistinguishable from a board
+#: that had less to say.
+TRUNCATION_MARKER = "(truncated — see full board)"
+
+#: The presigned lifetime asked for: the SigV4 maximum, seven days
+#: (`crucible.store.PRESIGN_MAX_S`). A link that outlives the weekend is the
+#: whole point — a report read on Monday whose link died on Saturday is a
+#: report with no board.
+BOARD_URL_EXPIRES_S = PRESIGN_MAX_S
+
+#: Rendered beside the URL, every time. **A presigned URL signed with
+#: temporary credentials dies with the credential**, and every crucible job
+#: runs as an assumed role, so the seven days above is an upper bound the
+#: signing session may not reach. Quoting "expires in 7 days" without this
+#: would be a promise the credential cannot keep — and a reader who finds a
+#: dead link and was told it had days left concludes the board is broken.
+#: The durable fix is a page on the fleet console (`policy-console`), filed
+#: as `alpha-engine-config-I9926`; a presigned URL is the surface that needs
+#: no new identity, not the one that should exist forever.
+BOARD_URL_CAVEAT = (
+    "presigned GET, expires {expires} or when the signing role's session ends, whichever is first"
+)
+
+#: The line emitted when there is no page to link to. FAILURE MODE SWALLOWED:
+#: `board/index.html` absent — the board render never published a page, or
+#: published one under a held pointer. RECORDING SURFACE: this line, in the
+#: delivered message, on the operator's phone. Raising instead would trade a
+#: report with a missing link for no report at all, and the report is the
+#: surface that would tell anybody the page is missing.
+BOARD_URL_UNAVAILABLE = (
+    f"no page at {BOARD_HTML_KEY} — the board render published none, so there is "
+    "nothing to link to. That is a defect in the board job, not in this report."
+)
+
+#: The line emitted when the page could not be REACHED, as opposed to being
+#: absent. `S3Store.presigned_url` reaches absence through `exists()` →
+#: `head_object`, which re-raises every non-404 `ClientError` — and
+#: `alpha-engine-config-I9896` measured the shape that matters: S3 answers 403
+#: for a MISSING key when the caller also lacks `s3:ListBucket` on the prefix,
+#: which is precisely the case `board/index.html` sits in, since the page is
+#: written only under `if may_move:` in `board_handler`. Rendering that as
+#: :data:`BOARD_URL_UNAVAILABLE` would blame the board job for an IAM gap;
+#: raising it would trade the whole report for a missing optional link. So it
+#: is the third fact, named, exactly as `ACCEPTANCE_UNREADABLE` is.
+#: FAILURE MODE SWALLOWED: a botocore read failure on `board/index.html`.
+#: RECORDING SURFACE: this line, in the delivered message.
+BOARD_URL_UNREADABLE = (
+    f"the page at {BOARD_HTML_KEY} could not be read ({{code}}) — this is an access failure, "
+    "not a missing page, so it is a gap in this job's permissions rather than a defect in "
+    "the board job."
+)
+
+#: The characters `krepis.telegram._escape_markdown` doubles on the wire.
+#: Counted, not guessed: the renderer's 4096-character budget is spent on the
+#: ESCAPED body, and a message that fits before escaping and not after is
+#: tail-trimmed by the transport — losing the link this whole change adds.
+_ESCAPED_CHARS = "\\_`[]"
+
+
+def wire_length(text: str) -> int:
+    """How many characters ``text`` occupies after krepis escapes it.
+
+    `krepis.telegram.send_message` escapes the body for Markdown v1 AFTER the
+    caller hands it over, so `len(message)` is not what Telegram measures.
+    Computed from :data:`_ESCAPED_CHARS` rather than by calling krepis'
+    private `_escape_markdown`: importing a private function would make this
+    module's budget silently wrong the day krepis renames it, whereas a
+    disagreement about WHICH characters are escaped shows up as a slightly
+    conservative budget rather than a dropped message.
+    """
+    return len(text) + sum(text.count(c) for c in _ESCAPED_CHARS)
+
+
+#: What `krepis.alerts.publish` puts in FRONT of this body, unescaped.
+#:
+#: **The budget is spent on the wire body, and the body is not what this
+#: module hands over.** `krepis.alerts.publish` calls its own
+#: `_format_message(message, severity, source, state)` and passes the RESULT
+#: to the Telegram transport, which truncates on `len()` and only then
+#: escapes. So the message this module renders reaches Telegram with
+#: ``[INFO] crucible-v2/report.morning: `` in front of it, and a budget
+#: computed on the body alone is short by that much — measured on the
+#: adversarial review's 60-phase fixture, a body of wire length 4117 plus a
+#: 37-character escaped prefix was POSTed at 4152 and refused 400 *message is
+#: too long*, which is not an entity-parse error, so krepis' plain-text retry
+#: never fired and the report was not delivered at all.
+#:
+#: Composed from :data:`DELIVERY_SEVERITY` and :data:`DELIVERY_SOURCE` — the
+#: same two values :func:`deliver` publishes under — rather than restated as a
+#: 35-character literal, so the two cannot drift. krepis exposes no public
+#: formatter (`_format_message` is private, and importing a private symbol
+#: would make this budget silently wrong the day it is renamed), so
+#: `tests/test_morning.py::TestTheWireBodyFitsTheCap::
+#: test_the_prefix_matches_the_one_krepis_actually_prepends` PINS this against
+#: krepis' real output by calling that formatter from the test — a
+#: disagreement fails a test instead of dropping a report.
+TRANSPORT_PREFIX = f"[{DELIVERY_SEVERITY.upper()}] {DELIVERY_SOURCE}: "
+
 
 def _withhold_progress(detail: str) -> str:
     """Drop the clauses of ``detail`` that state a forbidden progress figure.
@@ -299,6 +462,18 @@ class MorningInputs:
     #: were `main`'s reading (`alpha-engine-config-I9902` builds the
     #: producer).
     acceptance: dict[str, Any] | None
+    #: A presigned GET on `board/index.html`, or `None` when there is no page
+    #: to link to (`BOARD_URL_UNAVAILABLE` says so in the message). The
+    #: message is a POINTER; this is what it points at.
+    board_url: str | None
+    #: When the link above stops working, as an upper bound — see
+    #: :data:`BOARD_URL_CAVEAT` for why it is a bound and not a promise.
+    board_url_expires: str
+    #: The botocore failure code when the PAGE read failed because it could
+    #: not be reached, or `None` when the page was simply absent or present.
+    #: The same three-way distinction `acceptance_denied_code` carries, for
+    #: the same measured reason (`alpha-engine-config-I9896`).
+    board_url_denied_code: str | None
     #: The botocore failure code (`AccessDenied`, ...) when the acceptance
     #: read failed because it could not be REACHED, or `None` when it was
     #: simply absent/corrupt/present. `alpha-engine-config-I9896`: an
@@ -385,14 +560,62 @@ def _read_json(store: Store, key: str) -> _Read:
         return _Read(None, f"unreadable at {key}: {exc}", None)
 
 
-def read_inputs(store: Store, *, trading_day: dt.date) -> MorningInputs:
+def _board_url(store: Store, *, now: dt.datetime) -> tuple[str | None, str, str | None]:
+    """A presigned GET on the board page, when it expires, and why not.
+
+    Three outcomes, like :func:`_read_json`, and for the same reason: the page
+    is an OPTIONAL artifact this job does not write, and "it is not there" and
+    "we are not permitted to look" want different responses from a reader.
+
+    FAILURE MODE SWALLOWED: `board/index.html` absent — `Store.presigned_url`
+    raises `KeyError` rather than handing back a link to nothing — AND a
+    botocore read failure that is not a not-found, which
+    `S3Store.presigned_url` reaches through `exists()` → `head_object` and
+    re-raises. `alpha-engine-config-I9896` measured the second shape live: S3
+    returns 403 for a missing key when the caller also lacks `s3:ListBucket`
+    on the prefix. The report must still go out either way, because it is the
+    surface that would tell anybody the page is missing. RECORDING SURFACE:
+    :data:`BOARD_URL_UNAVAILABLE` and :data:`BOARD_URL_UNREADABLE`, rendered
+    into the delivered message — and only ONE of them, so the reader is told
+    which of the two facts happened.
+
+    Nothing else is swallowed. A malformed store URI or an out-of-range
+    lifetime raise `ValueError`/`TypeError` and propagate: those are defects
+    in this job's own configuration, not in its access to somebody else's
+    artifact, and a report that silently dropped its link over one would hide
+    the defect behind a slightly shorter message.
+    """
+    expires = (now + dt.timedelta(seconds=BOARD_URL_EXPIRES_S)).astimezone(dt.UTC)
+    stamp = expires.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        return store.presigned_url(BOARD_HTML_KEY, BOARD_URL_EXPIRES_S), stamp, None
+    except KeyError:
+        return None, stamp, None
+    except Exception as exc:  # reclassified below; re-raised unless it's a named botocore code
+        code = _client_error_code(exc)
+        if code is None:
+            raise
+        if code in ("NoSuchKey", "404"):
+            return None, stamp, None
+        return None, stamp, code
+
+
+def read_inputs(
+    store: Store, *, trading_day: dt.date, now: dt.datetime | None = None
+) -> MorningInputs:
     """Read every artifact the message quotes. Reads; never runs.
 
     `board/current.json` is read WITHOUT a fallback: a report that could not
     read the board has nothing to say, and rendering a message about an
     absent board would be a surface reporting its own outage as the system's
     state.
+
+    ``now`` dates the presigned link's expiry. Defaulted rather than required
+    so an existing caller cannot silently get a WRONG expiry from a forgotten
+    argument; `run_report` passes the run's own instant, which is what makes
+    the rendered message deterministic in its inputs.
     """
+    moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     board = json.loads(store.get_bytes(BOARD_CURRENT_KEY))
     board_day = str(board.get("trading_day") or trading_day.isoformat())
 
@@ -433,10 +656,14 @@ def read_inputs(store: Store, *, trading_day: dt.date) -> MorningInputs:
             )
 
     acceptance_read = _read_json(store, acceptance_reading_key(board_day))
+    board_url, board_url_expires, board_url_denied_code = _board_url(store, now=moment)
 
     return MorningInputs(
         board=board,
         board_uri=store_uri(store),
+        board_url=board_url,
+        board_url_expires=board_url_expires,
+        board_url_denied_code=board_url_denied_code,
         previous=previous,
         previous_reason=previous_reason,
         previous_day=previous_day,
@@ -469,25 +696,102 @@ def _staleness(generated_at: str, now: dt.datetime) -> str | None:
     )
 
 
-def _phase_lines(board: dict[str, Any]) -> list[str]:
-    """One line per phase gate, in the board's own order.
+#: One rendered line, and whether it may be dropped to fit Telegram's 4096.
+#:
+#: The tier is the whole truncation rule (`alpha-engine-config-I9921`): the
+#: LADDER lines are tier 0 and are dropped last, clause-name detail is tier 2
+#: and is dropped first. A single boolean would have made "drop the clause
+#: names before the schedule" unexpressible, and the issue states that order.
+_Line = tuple[str, int]
 
-    A phase row that vanished from the board is NOT silently absent: the
-    section header carries the count, so six phases becoming five is visible
-    without the reader knowing there should be six.
+#: **Tier -1 — never dropped, at any size.** The FULL BOARD heading, the URL,
+#: and the caveat beside it. The URL is the pointer to everything truncation
+#: removed, so a message that dropped it says "see full board" and carries no
+#: board — measured on the adversarial review's 200-line fixture, where the
+#: link went first because it is last in the list and the inner loop deletes
+#: from the end. :data:`MESSAGE_MAX_CHARS`'s own docstring gives that outcome
+#: as the reason not to let the transport tail-trim; the fitter must not
+#: reproduce it. This tier never appears in :data:`_DROP_ORDER`, which is what
+#: makes "never the URL" a property of the algorithm rather than of the input.
+_URL = -1
+#: Tier 0 — dropped LAST, and only once every tier below is exhausted.
+#: Headings, the header block, the ladder's own lines, the acceptance count.
+_KEEP = 0
+#: Tier 1 — the acceptance clause IDS.
+_ACCEPTANCE_IDS = 1
+#: Tier 2 — the silence counts and the pending-operator-action line.
+_SILENCE = 2
+#: Tier 3 — the moved-since rows.
+_MOVED = 3
+#: Tier 4 — the schedule detail.
+_SCHEDULE = 4
+#: Tier 5 — dropped FIRST: clause NAMES. The count above them survives and the
+#: names are exactly what the full board exists to carry.
+_NAMES = 5
+
+#: The order of sacrifice, stated once (`alpha-engine-config-I9921`
+#: adversarial review F3): clause-name lines, then schedule detail, then
+#: moved-since rows, then silence, then acceptance ids, and only then anything
+#: in :data:`_KEEP`. :data:`_URL` is absent by construction.
+_DROP_ORDER: tuple[int, ...] = (_NAMES, _SCHEDULE, _MOVED, _SILENCE, _ACCEPTANCE_IDS, _KEEP)
+
+
+def _phase_lines(board: dict[str, Any]) -> list[_Line]:
+    """The ladder: one line per phase gate, in the board's own order.
+
+    A phase row that vanished from the board is NOT silently absent: an empty
+    ladder is a named defect rather than a blank section, so six phases
+    becoming zero is visible without the reader knowing there should be six.
+
+    `alpha-engine-config-I9921` asks for `phase0  UNMET  1/2` with the unmet
+    clause NAMES beneath it. The fraction is computed from the row's own
+    `clauses` list (`crucible.board.BoardRow.clauses`), never parsed back out
+    of the English `detail` — a contract restated as a regex is the bug class
+    this repository has already paid for twice. A board rendered by a producer
+    that carried no clause list falls back to the detail sentence and says
+    nothing it cannot show.
     """
     rows = [row for row in board.get("rows", []) if row.get("source") == "phase"]
     if not rows:
         return [
-            "  no phase row on the board — the ladder is not being rendered, which is a "
-            "defect in the board, not a phase that has no gate"
+            (
+                "  no phase row on the board — the ladder is not being rendered, which is a "
+                "defect in the board, not a phase that has no gate",
+                _KEEP,
+            )
         ]
-    return [f"  {row['id']}  {row['state']}  {_withhold_progress(row['detail'])}" for row in rows]
+    lines: list[_Line] = []
+    for row in rows:
+        clauses = row.get("clauses")
+        if isinstance(clauses, list) and clauses:
+            met = sum(1 for c in clauses if c.get("met"))
+            lines.append((f"  {row['id']}  {row['state']}  {met}/{len(clauses)}", _KEEP))
+            unmet = [str(c.get("name", "?")) for c in clauses if not c.get("met")]
+            if unmet:
+                lines.append((f"    holding: {_withhold_progress(', '.join(unmet))}", _NAMES))
+        elif isinstance(clauses, list):
+            # Read, and it declares nothing. `0/0` would read as a measurement.
+            lines.append(
+                (
+                    f"  {row['id']}  {row['state']}  no clauses — this gate measured nothing",
+                    _KEEP,
+                )
+            )
+        else:
+            # No clause list on this board at all: a producer that took no
+            # gate reading. The detail sentence is what there is, and
+            # inventing a fraction from it would be the fabrication the
+            # structured field exists to remove.
+            lines.append(
+                (f"  {row['id']}  {row['state']}  {_withhold_progress(row['detail'])}", _KEEP)
+            )
+        if row["state"] == "OUT_OF_ORDER":
+            lines.append((f"    out of order: {_withhold_progress(row['detail'])}", _NAMES))
+    return lines
 
 
-def _schedule_lines(board: dict[str, Any]) -> list[str]:
-    """One line per plan §6.1 milestone (`alpha-engine-config-I9914`), in the
-    board's own order.
+def _schedule_lines(board: dict[str, Any]) -> list[_Line]:
+    """One line per plan §6.1 milestone (`alpha-engine-config-I9914`).
 
     Reads `schedule:*` board rows exactly the way :func:`_phase_lines` reads
     `phase:*` rows — this function computes nothing; it quotes what
@@ -497,21 +801,34 @@ def _schedule_lines(board: dict[str, Any]) -> list[str]:
     board's own vocabulary has no `OVERDUE` state (`crucible.board.
     BOARD_STATES`), so this is the one place that word is rendered, and it is
     rendered from `UNMET`, never invented on a second condition.
+
+    OVERDUE FIRST (`alpha-engine-config-I9921`): a milestone that has passed
+    its date is the only line in this section anybody has to act on, and a
+    section ordered by the board's declaration order buries it under the ones
+    that are still ahead. The sort is STABLE, so within each group the
+    board's own order survives — the plan's sequence is still readable.
     """
     rows = [row for row in board.get("rows", []) if row.get("source") == "schedule"]
     if not rows:
         return [
-            "  no schedule row on the board — the plan §6.1 milestones are not being "
-            "rendered, which is a defect in the board, not an absent plan"
+            (
+                "  no schedule row on the board — the plan §6.1 milestones are not being "
+                "rendered, which is a defect in the board, not an absent plan",
+                _KEEP,
+            )
         ]
+    ordered = sorted(rows, key=lambda row: 0 if row["state"] == "UNMET" else 1)
     return [
-        f"  {'OVERDUE ' if row['state'] == 'UNMET' else ''}{row['id']}  {row['state']}  "
-        f"{_withhold_progress(row['detail'])}"
-        for row in rows
+        (
+            f"  {'OVERDUE ' if row['state'] == 'UNMET' else ''}{row['id']}  {row['state']}  "
+            f"{_withhold_progress(row['detail'])}",
+            _SCHEDULE,
+        )
+        for row in ordered
     ]
 
 
-def _moved_lines(inputs: MorningInputs) -> list[str]:
+def _moved_lines(inputs: MorningInputs) -> list[_Line]:
     """What changed, old -> new. Never an absolute-state retelling.
 
     A previous board that could not be read yields the READ FAILURE, never
@@ -520,15 +837,17 @@ def _moved_lines(inputs: MorningInputs) -> list[str]:
     `crucible.board._read_previous_board` exists to refuse one layer down.
     """
     if inputs.previous is None:
-        return [f"  cannot say — the {inputs.previous_day} board is {inputs.previous_reason}"]
+        return [
+            (f"  cannot say — the {inputs.previous_day} board is {inputs.previous_reason}", _KEEP)
+        ]
     before = {row["id"]: row["state"] for row in inputs.previous.get("rows", [])}
     after = {row["id"]: row["state"] for row in inputs.board.get("rows", [])}
     moved = [
-        f"  {row_id}: {before.get(row_id, 'ABSENT')} -> {after.get(row_id, 'VANISHED')}"
+        (f"  {row_id}: {before.get(row_id, 'ABSENT')} -> {after.get(row_id, 'VANISHED')}", _MOVED)
         for row_id in sorted(set(before) | set(after))
         if before.get(row_id) != after.get(row_id)
     ]
-    return moved or ["  nothing moved"]
+    return moved or [("  nothing moved", _KEEP)]
 
 
 def _acceptance_line(reading: dict[str, Any] | None, *, denied_code: str | None) -> str:
@@ -543,22 +862,55 @@ def _acceptance_line(reading: dict[str, Any] | None, *, denied_code: str | None)
     ``denied_code`` takes priority over both: an access failure is a THIRD
     fact, never routed through the absent literal (`alpha-engine-config-I9896`
     measured `AccessDenied` on the first live run — see `ACCEPTANCE_UNREADABLE`).
+
+    The completeness rule itself is NOT stated here. It lives in
+    `crucible.keys.parse_acceptance_reading`, which the board page reads the
+    same artifact through, so the two surfaces cannot disagree about whether
+    a document is a reading — they did, on one document, before this review.
     """
     if denied_code is not None:
         return ACCEPTANCE_UNREADABLE.format(code=denied_code)
-    if reading is None:
-        return ACCEPTANCE_NOT_ON_ANY_ARTIFACT
-    try:
-        met = int(reading["met"])
-        unmet = int(reading["unmet"])
-        unmeasurable = int(reading["unmeasurable"])
-        commit = str(reading["commit"])
-    except (KeyError, TypeError, ValueError):
+    parsed = parse_acceptance_reading(reading)
+    if parsed is None:
         return ACCEPTANCE_NOT_ON_ANY_ARTIFACT
     return (
-        f"acceptance count: {met} met / {unmet} unmet / {unmeasurable} unmeasurable "
-        f"(commit {commit})"
+        f"acceptance count: {parsed.met} met / {parsed.unmet} unmet / "
+        f"{parsed.unmeasurable} unmeasurable of {parsed.total} (commit {parsed.commit})"
     )
+
+
+def _acceptance_lines(reading: dict[str, Any] | None, *, denied_code: str | None) -> list[_Line]:
+    """The acceptance count, then the clause ids behind it.
+
+    The COUNT is tier 0 — §12 rule 3 makes it the only progress figure, and
+    it is the last thing this message gives up short of the link. The clause
+    IDS are :data:`_ACCEPTANCE_IDS`, dropped only after the schedule, the
+    moved-since rows and the silence counts have gone, because the full board
+    carries them and the count above them stays true either way.
+
+    The ids come from the SAME parse the count does
+    (`crucible.keys.parse_acceptance_reading`), so a document complete enough
+    to state a figure is the only kind that gets ids listed under it. When the
+    producer filed no list this says so rather than going quiet: "the producer
+    files no names" and "there are no unmet clauses" are different facts, and
+    an empty section renders them identically.
+    """
+    lines: list[_Line] = [(f"  {_acceptance_line(reading, denied_code=denied_code)}", _KEEP)]
+    if denied_code is not None:
+        return lines
+    parsed = parse_acceptance_reading(reading)
+    if parsed is None:
+        return lines
+    for named, label in (
+        (parsed.unmet_clauses, "unmet"),
+        (parsed.unmeasurable_clauses, "unmeasurable"),
+    ):
+        if named:
+            joined = ", ".join(named)
+            lines.append((f"    {label}: {_withhold_progress(joined)}", _ACCEPTANCE_IDS))
+        else:
+            lines.append((f"    the artifact names no {label} clause ids", _ACCEPTANCE_IDS))
+    return lines
 
 
 def _silence_line(board: dict[str, Any]) -> str:
@@ -567,46 +919,164 @@ def _silence_line(board: dict[str, Any]) -> str:
     return f"silence: {parts} of {board.get('row_count', 0)} rows"
 
 
+def _truncation_suffix(dropped: int) -> str:
+    """Exactly what :func:`_fit` appends when it dropped anything.
+
+    One definition, because the budget has to RESERVE this and the body has to
+    END with it. The adversarial review's F1 was precisely these two drifting:
+    the budget reserved `"\\n\\n(truncated — see full board)"` and the emitted
+    string was that plus ` — N line(s) withheld`, so every truncated message
+    was 22–25 characters longer than the budget it was fitted to.
+    """
+    return f"\n\n{TRUNCATION_MARKER} — {dropped} line(s) withheld"
+
+
+def _join(lines: list[_Line]) -> str:
+    return "\n".join(text for text, _ in lines)
+
+
+def _fit(lines: list[_Line]) -> str:
+    """Join ``lines``, dropping the least important until Telegram will take it.
+
+    **The postcondition is about the WIRE BODY, not about this return value.**
+    ``wire_length(TRANSPORT_PREFIX + result) <= MESSAGE_MAX_CHARS`` — the
+    prefix krepis prepends and the suffix this function appends are both
+    subtracted from the budget before a single line is dropped, because a
+    fitter measuring something other than what is POSTed is a fitter that
+    reports success on a message Telegram refuses (400 *message is too long*,
+    which krepis' plain-text retry does not cover, so the report is not
+    delivered and the job pages).
+
+    **Truncation is a stated fact, never a silent shortening.** A message that
+    quietly dropped half its content is indistinguishable from a board that
+    had half as much to say, which is the same defect as a green row over no
+    data one surface down.
+
+    Dropped in :data:`_DROP_ORDER` — clause names, schedule detail,
+    moved-since rows, silence, acceptance ids, and only then tier
+    :data:`_KEEP` — and always from the END of the tier, so the earliest lines
+    of each section survive and the ladder, which is near the front of
+    ``_KEEP``, is the last thing to go. :data:`_URL` is not in the order at
+    all, so the link to the full board survives every size of input.
+
+    RESIDUAL, stated rather than hidden: if the :data:`_URL` lines ALONE
+    exceeded the budget nothing here could drop them, and the returned body
+    would be over the cap. That block is one heading, one presigned URL and
+    one fixed caveat — bounded, and
+    `tests/test_morning.py::TestTheWireBodyFitsTheCap::
+    test_the_url_block_alone_fits_the_cap` asserts the bound, so the case is
+    measured rather than assumed away.
+    """
+    prefix_cost = wire_length(TRANSPORT_PREFIX)
+    if prefix_cost + wire_length(_join(lines)) <= MESSAGE_MAX_CHARS:
+        return _join(lines)
+
+    kept = list(lines)
+    dropped = 0
+    # Reserved against the WIDEST suffix this call could emit: the count is
+    # not known until the loop finishes, and reserving for the count it turns
+    # out to be would need the loop to have run. `len(lines)` is an upper
+    # bound on how many can be dropped, so the reservation can only ever be a
+    # character or two generous — never short, which is the direction that
+    # loses the message.
+    budget = MESSAGE_MAX_CHARS - prefix_cost - wire_length(_truncation_suffix(len(lines)))
+    for tier in _DROP_ORDER:
+        for index in range(len(kept) - 1, -1, -1):
+            if wire_length(_join(kept)) <= budget:
+                break
+            if kept[index][1] == tier:
+                del kept[index]
+                dropped += 1
+    # The count is stated. "Something was cut" tells a reader to open the
+    # board; "17 lines were cut" tells them how much of it they are missing.
+    return f"{_join(kept)}{_truncation_suffix(dropped)}"
+
+
 def render_message(inputs: MorningInputs, *, now: dt.datetime) -> str:
-    """The exact bytes delivered. Five sections, and no sixth.
+    """The exact bytes delivered: a header, then :data:`SECTIONS`, in order.
 
     Deterministic in ``now`` and ``inputs`` alone, so the message a test
     asserts is the message an operator receives — a renderer that reached the
     clock or the store would be tested against something other than what
     ships.
+
+    **The message is a POINTER; the board page is the artifact**
+    (`alpha-engine-config-I9921`). Everything that will not fit in 4096
+    characters is on the page, and the last section is the link to it.
+
+    The `pending operator action` line is rendered under SILENCE rather than
+    as a seventh section. It is not one of the six the issue lists and it was
+    not there to be dropped: `alpha-engine-config-I9896` added it deliberately
+    and it is the one line in this message naming something a human must do.
+    Silence and an unactioned operator step are the same subject — nobody is
+    looking — so it sits with the silence counts.
     """
     board = inputs.board
     local = now.astimezone(DELIVERY_TZ)
     commit = inputs.board_code_sha or f"UNKNOWN ({inputs.board_run_note})"
-    lines: list[str] = []
+    lines: list[_Line] = []
 
     headline = _staleness(str(board.get("generated_at", "")), now)
     if headline:
-        lines.append(headline)
-        lines.append("")
+        lines.append((headline, _KEEP))
+        lines.append(("", _KEEP))
 
-    lines.append(f"crucible v2 — board for trading day {board.get('trading_day')}")
-    lines.append(f"store: {inputs.board_uri}/{BOARD_CURRENT_KEY}")
-    lines.append(f"generated: {board.get('generated_at')}  commit: {commit}")
-    lines.append(f"delivered: {local:%Y-%m-%d %H:%M %Z}")
-    lines.append("")
-    lines.append("phase gates")
-    lines.extend(_phase_lines(board))
-    lines.append("")
-    lines.append("schedule (plan §6.1)")
-    lines.extend(_schedule_lines(board))
-    lines.append("")
-    lines.append(f"moved since {inputs.previous_day}")
-    lines.extend(_moved_lines(inputs))
-    lines.append("")
-    lines.append(_acceptance_line(inputs.acceptance, denied_code=inputs.acceptance_denied_code))
-    lines.append(_silence_line(board))
-    lines.append(
-        f"pending operator action: {inputs.operator_action}"
-        if inputs.operator_action
-        else NO_OPERATOR_ACTION
-    )
-    return "\n".join(lines)
+    lines.append((f"CRUCIBLE V2 — BOARD FOR TRADING DAY {board.get('trading_day')}", _KEEP))
+    lines.append((f"store: {inputs.board_uri}/{BOARD_CURRENT_KEY}", _KEEP))
+    lines.append((f"generated: {board.get('generated_at')}  commit: {commit}", _KEEP))
+    lines.append((f"delivered: {local:%Y-%m-%d %H:%M %Z}", _KEEP))
+
+    sections: list[list[_Line]] = [
+        _phase_lines(board),
+        _schedule_lines(board),
+        _acceptance_lines(inputs.acceptance, denied_code=inputs.acceptance_denied_code),
+        _moved_lines(inputs),
+        [
+            (f"  {_silence_line(board)}", _SILENCE),
+            (
+                f"  pending operator action: {inputs.operator_action}"
+                if inputs.operator_action
+                else f"  {NO_OPERATOR_ACTION}",
+                _SILENCE,
+            ),
+        ],
+        _board_lines(inputs),
+    ]
+    for heading, body in zip(SECTIONS, sections, strict=True):
+        # A heading is never more droppable than the section under it — a bare
+        # URL with no `FULL BOARD` over it is a naked link in a status report.
+        # The FULL BOARD heading and its blank separator therefore ride the
+        # `_URL` tier with the link itself.
+        tier = min((line_tier for _, line_tier in body), default=_KEEP)
+        lines.append(("", tier))
+        lines.append((heading.format(previous_day=inputs.previous_day), tier))
+        lines.extend(body)
+    return _fit(lines)
+
+
+def _board_lines(inputs: MorningInputs) -> list[_Line]:
+    """The link, and the honest bound on how long it lives.
+
+    Every line here is :data:`_URL` — never dropped, at any size. This section
+    is the pointer to everything the fitter removed, and the fixture that
+    proved it needed a tier of its own is
+    `tests/test_morning.py::TestTheLinkOutlivesEveryTruncation`.
+
+    A read that FAILED is distinguished from a page that is ABSENT, the same
+    way :func:`_read_json` does it for the acceptance artifact: an
+    `AccessDenied` rendered as "the board render published none" would report
+    an IAM gap as a defect in another job (`alpha-engine-config-I9896`
+    measured exactly that shape — S3 returns 403 for a missing key when the
+    caller also lacks `s3:ListBucket` on the prefix).
+    """
+    if inputs.board_url_denied_code is not None:
+        return [(f"  {BOARD_URL_UNREADABLE.format(code=inputs.board_url_denied_code)}", _URL)]
+    if inputs.board_url is None:
+        return [(f"  {BOARD_URL_UNAVAILABLE}", _URL)]
+    return [
+        (f"  {inputs.board_url}", _URL),
+        (f"  {BOARD_URL_CAVEAT.format(expires=inputs.board_url_expires)}", _URL),
+    ]
 
 
 def _krepis_publish(*args: Any, **kwargs: Any) -> Any:
@@ -688,8 +1158,8 @@ def deliver(message: str, *, transport: Callable[..., Any] | None = None) -> str
     publish = transport if transport is not None else _krepis_publish
     result = publish(
         message,
-        severity="info",
-        source=f"crucible-v2/{MORNING_JOB}",
+        severity=DELIVERY_SEVERITY,
+        source=DELIVERY_SOURCE,
         sns=False,
         telegram=True,
         silent=False,
@@ -796,4 +1266,4 @@ def run_report(store: Store, *, trading_day: dt.date, now: dt.datetime) -> str:
     run in exactly one branch of the handler rather than in a code path the
     tests cannot reach.
     """
-    return render_message(read_inputs(store, trading_day=trading_day), now=now)
+    return render_message(read_inputs(store, trading_day=trading_day, now=now), now=now)

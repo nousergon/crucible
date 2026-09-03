@@ -35,6 +35,7 @@ from crucible.calendar import (
 
 __all__ = [
     "ETAG_ABSENT",
+    "PRESIGN_MAX_S",
     "LocalStore",
     "PointerConflictError",
     "S3Store",
@@ -42,6 +43,12 @@ __all__ = [
     "open_store",
     "sha256_hex",
 ]
+
+#: The longest lifetime an S3 SigV4 presigned GET may declare: seven days.
+#: A larger ``ExpiresIn`` is not clamped by S3 — the URL is simply rejected on
+#: use, which turns a caller's arithmetic error into a link that looks right
+#: and 403s, so :meth:`Store.presigned_url` refuses it at construction instead.
+PRESIGN_MAX_S = 7 * 24 * 3600
 
 #: The version token that means "this key does not exist yet". Passed as
 #: ``expected`` to :meth:`Store.compare_and_swap` to express "create it,
@@ -107,6 +114,7 @@ class Store(ABC):
         "exists",
         "list_keys",
         "etag",
+        "presigned_url",
         "assert_keys_bind_to_trading_days",
     )
 
@@ -171,6 +179,45 @@ class Store(ABC):
         by more than one actor, and last-writer-wins gives the verdict to
         whichever writer finished last rather than to the one that checked.
         """
+
+    @abstractmethod
+    def presigned_url(self, key: str, expires_s: int) -> str:
+        """A URL that reads ``key`` without the reader holding a credential.
+
+        The one reason this exists: `alpha-engine-config-I9921`. The morning
+        report is a Telegram message, and a message that says "the board is
+        red" without a way to open the board makes the reader ask an agent —
+        which is the same defect the board's `means_when_red` column exists to
+        remove one layer down.
+
+        **A missing key raises `KeyError`.** S3 will happily presign a key
+        that does not exist and hand back a URL that 403s on use, which puts a
+        broken link on the operator's phone under a report claiming the render
+        succeeded. Absence is a first-class fact in this interface everywhere
+        else (:meth:`get_bytes`, :meth:`exists`); it is one here too.
+
+        **``expires_s`` is validated, never clamped** — see
+        :data:`PRESIGN_MAX_S`. Silently shortening a caller's requested
+        lifetime would produce a link that expires at a time nobody stated.
+
+        This is a READER: it takes no lock, writes nothing and is declared in
+        :data:`READERS` accordingly.
+        """
+
+    @staticmethod
+    def _validated_expiry(expires_s: int) -> int:
+        """``expires_s``, or a refusal naming the bound it broke."""
+        if not isinstance(expires_s, int) or isinstance(expires_s, bool):
+            raise TypeError(
+                f"expires_s must be an int number of seconds, not {type(expires_s).__name__}"
+            )
+        if expires_s < 1 or expires_s > PRESIGN_MAX_S:
+            raise ValueError(
+                f"expires_s={expires_s} is outside 1..{PRESIGN_MAX_S} seconds. S3 does not "
+                "clamp an over-long lifetime — it rejects the URL on use, so a link built "
+                "from it looks correct and 403s."
+            )
+        return expires_s
 
     def assert_keys_bind_to_trading_days(self, prefix: str = "") -> None:
         """Walk the store and refuse any key whose date is not a session.
@@ -299,6 +346,29 @@ class LocalStore(Store):
         os.replace(tmp, path)
         return sha256_hex(payload)
 
+    def presigned_url(self, key: str, expires_s: int) -> str:
+        """A `file://` URL for the object on disk.
+
+        There is no signature and nothing expires — a local directory has no
+        credential to sign with — so ``expires_s`` is validated and then
+        discarded. Validated rather than ignored: a caller whose arithmetic
+        would be refused by the S3 backend must be refused by this one too,
+        or the whole test suite passes over a bound production enforces.
+
+        Deliberately NOT a rendered fake signature. A local URL that looked
+        presigned would make a test asserting "the message carries a
+        presigned URL" pass against a string nobody can use, which is the
+        shape of a green test over an absent capability.
+        """
+        self._validated_expiry(expires_s)
+        path = self._path(key)
+        if not path.is_file():
+            raise KeyError(
+                f"{key!r} is not present in {self.root}, so a URL to it would be a link "
+                "to nothing on the operator's phone."
+            )
+        return path.resolve().as_uri()
+
     def list_keys(self, prefix: str = "") -> Iterator[str]:
         for path in sorted(self.root.rglob("*")):
             if not path.is_file():
@@ -420,6 +490,37 @@ class S3Store(Store):
         for page in paginator.paginate(Bucket=self.bucket, Prefix=scope):
             for obj in page.get("Contents", []):
                 yield self._strip(obj["Key"])
+
+    def presigned_url(self, key: str, expires_s: int) -> str:
+        """A SigV4 presigned GET, signed with whatever credential this process holds.
+
+        **The stated lifetime is an upper bound, not a guarantee.** A URL
+        signed with TEMPORARY credentials — every assumed role, which is what
+        every crucible job runs as — stops working when the underlying session
+        token expires, whichever comes first. So a 7-day presign taken by a
+        GitHub Actions OIDC role survives that role's session and no longer;
+        the caller renders that caveat beside the link
+        (`crucible.morning.BOARD_URL_CAVEAT`) rather than quoting an expiry
+        the credential cannot honour. The durable fix is a page on the fleet
+        console, filed separately — a presigned URL is the surface that needs
+        no new identity, not the surface that should exist forever.
+
+        No bucket, account or ARN literal reaches this file: the bucket comes
+        from the store URI the job was given (`crucible/AGENTS.md`).
+        """
+        self._validated_expiry(expires_s)
+        if not self.exists(key):
+            raise KeyError(
+                f"{key!r} is not present in s3://{self.bucket}/{self.prefix}, so a URL to "
+                "it would be a link that 403s under a report claiming a successful render."
+            )
+        return str(
+            self.client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": self.bucket, "Key": self._s3_key(key)},
+                ExpiresIn=expires_s,
+            )
+        )
 
     def etag(self, key: str) -> str:
         from botocore.exceptions import ClientError  # noqa: PLC0415
