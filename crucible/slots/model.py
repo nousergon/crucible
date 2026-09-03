@@ -771,7 +771,6 @@ class ModelRecipe:
     refit_cadence_trading_days: int
     training_window: TrainingWindowSpec
     cpcv: CPCVSpec
-    feature_version: str
     registered_at: str
     #: Typed input references (`alpha-engine-config-I9777`). Empty for every
     #: arm whose whole design matrix comes from the feature layer, which is
@@ -824,6 +823,18 @@ class ModelRecipe:
         `crucible.slots.arms.ArmSpec.spec` omits it: it says when the arm
         started accumulating evidence, not what it computes. Hashing it would
         make re-registering an arm produce a new id and orphan its series.
+
+        **There is no ``feature_version`` key here** (`alpha-engine-config-
+        I9801`). The recipe's inputs are already pinned by `features` and
+        `inputs`, which ARE hashed; which feature-layer artifact a run
+        actually reads is resolved by `FeatureLayerSource` at grading time,
+        not declared by the recipe, and is recorded as the run's lineage —
+        `FeaturePanel.feature_version` flows into
+        :func:`produce_arm_predictions` and every layer read is logged via
+        `ctx.record_input`. Hashing a catalogue version here would mean an
+        unrelated feature added to the catalogue re-ids every M arm and
+        orphans its score series — worse than the stale-and-unread field it
+        would replace.
         """
         payload: dict[str, Any] = {
             "features": list(self.features),
@@ -832,7 +843,6 @@ class ModelRecipe:
             "refit_cadence_trading_days": self.refit_cadence_trading_days,
             "training_window": self.training_window.to_dict(),
             "cpcv": self.cpcv.to_dict(),
-            "feature_version": self.feature_version,
         }
         if self.inputs:
             # Emitted ONLY when declared. A key that always appeared would
@@ -855,7 +865,6 @@ REQUIRED_RECIPE_FIELDS: tuple[str, ...] = (
     "refit_cadence_trading_days",
     "training_window",
     "cpcv",
-    "feature_version",
 )
 
 
@@ -913,7 +922,6 @@ def load_model_recipes(
                 refit_cadence_trading_days=int(spec["refit_cadence_trading_days"]),
                 training_window=TrainingWindowSpec(**spec["training_window"]),
                 cpcv=CPCVSpec(**spec["cpcv"]),
-                feature_version=str(spec["feature_version"]),
                 registered_at=str(payload["registered_at"]),
                 inputs=tuple(parse_input_ref(t) for t in (spec.get("inputs") or ())),
                 supersedes=payload.get("supersedes"),

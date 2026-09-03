@@ -186,7 +186,6 @@ class TestEveryDeclarableKindResolves:
                     "  refit_cadence_trading_days: 5",
                     "  training_window: {kind: expanding, min_trading_days: 504}",
                     "  cpcv: {n_groups: 6, k_test: 2, embargo_trading_days: 2}",
-                    "  feature_version: v1",
                     "registered_at: '2026-06-01'",
                 ]
             ),
