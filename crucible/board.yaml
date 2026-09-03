@@ -128,7 +128,7 @@ objectives:
     clause_class: TestNoThirdState
     surface: crucible/board
     reader: null
-    artifact: crucible/schemas/run_manifest.v1.json
+    artifact: crucible/schemas/run_manifest.v2.json
     planned_because: >-
       This objective is enforced by the manifest SCHEMA, which is a repository
       property rather than a store artifact. The schema passing in CI is not a

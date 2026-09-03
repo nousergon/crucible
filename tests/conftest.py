@@ -20,6 +20,7 @@ import random
 import pytest
 
 from crucible.calendar import is_trading_day
+from crucible.runmode import RUN_MODE_ENV, RUN_MODE_LIVE
 from crucible.store import LocalStore
 
 #: Enough sessions for the 252-session feature window plus a 21-session
@@ -81,6 +82,23 @@ def synthetic_frames(
             )
         frames[ticker] = pd.DataFrame(rows).set_index("trading_day")
     return frames
+
+
+@pytest.fixture(autouse=True)
+def declared_run_mode(monkeypatch):
+    """Every test invocation declares itself LIVE, in one place.
+
+    `run_manifest.v2` requires `run_mode` and `crucible.runmode` refuses to
+    guess it, so a job invoked by a test has to declare one exactly as a
+    workflow or an operator does. Declaring it here rather than at ~60 call
+    sites keeps the requirement in a single readable statement — and it is a
+    DECLARATION, not a default: `crucible.runmode.resolve_run_mode` still has
+    none, and `tests/test_run_mode_contract.py` clears this variable to show
+    the refusal firing, which is what proves the requirement is real.
+
+    `monkeypatch.setenv` unwinds per test, so nothing leaks between them.
+    """
+    monkeypatch.setenv(RUN_MODE_ENV, RUN_MODE_LIVE)
 
 
 @pytest.fixture

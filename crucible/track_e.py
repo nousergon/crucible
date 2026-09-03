@@ -125,5 +125,12 @@ def report_handler(args: argparse.Namespace) -> int:
     # `DryRunWriteRefusedError` instead of a real `attribution.json`, and
     # `dry_run=` here means `run_job` reports that rather than also failing
     # to write its own manifest afterward.
-    run_job("report", body, store=store, trading_day=args.trading_day, dry_run=dry_run)
+    run_job(
+        "report",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        dry_run=dry_run,
+        run_mode=getattr(args, "run_mode", None),
+    )
     return 0

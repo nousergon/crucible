@@ -149,6 +149,7 @@ def handle_data_daily(args: argparse.Namespace) -> int:
             _holiday_noop,
             store=store,
             trading_day=args.trading_day,
+            run_mode=getattr(args, "run_mode", None),
             discriminator=today.isoformat(),
         )
         print(json.dumps({"run_id": ctx.run_id, "outputs": [], "detail": detail}, indent=2))
@@ -169,6 +170,7 @@ def handle_data_daily(args: argparse.Namespace) -> int:
         ),
         store=store,
         trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
     )
     print(json.dumps({"run_id": ctx.run_id, "outputs": [o["key"] for o in ctx.outputs]}, indent=2))
     return 0
@@ -193,6 +195,7 @@ def handle_data_weekly(args: argparse.Namespace) -> int:
         ),
         store=store,
         trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
     )
     print(json.dumps({"run_id": ctx.run_id, "outputs": [o["key"] for o in ctx.outputs]}, indent=2))
     return 0
@@ -283,7 +286,13 @@ def handle_experiment_new(args: argparse.Namespace) -> int:
         ctx.record_rows(rows_in=len(specs), rows_out=len(added))
         print(json.dumps({"registered": added, "already_present": sorted(before)}, indent=2))
 
-    ctx = run_job("experiment.new", job, store=store, trading_day=args.trading_day)
+    ctx = run_job(
+        "experiment.new",
+        job,
+        store=store,
+        trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
+    )
     return 0 if ctx else 0
 
 
@@ -303,6 +312,7 @@ def handle_experiment_run(args: argparse.Namespace) -> int:
         lambda c: module.produce(c, settings=config, arm_name=getattr(args, "arm", None)),
         store=store,
         trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
         # Four slots share one job name and one trading day; the slot is the
         # discriminator that keeps `--slot u` and `--slot r` from writing the
         # same manifest (alpha-engine-config-I9781).
@@ -334,6 +344,7 @@ def handle_experiment_grade(args: argparse.Namespace) -> int:
         job,
         store=store,
         trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
         # Same shape as `experiment.run` above: one job name, four slots
         # (alpha-engine-config-I9781).
         discriminator=args.slot,
@@ -406,6 +417,7 @@ def handle_migrate_history(args: argparse.Namespace) -> int:
         store=store,
         trading_day=args.trading_day,
         dry_run=bool(getattr(args, "dry_run", False)),
+        run_mode=getattr(args, "run_mode", None),
     )
     return 0
 

@@ -368,6 +368,7 @@ def release_lock_handler(args: argparse.Namespace) -> int:
         body,
         store=store,
         trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
         release_sha=sha,
         # `discriminator=sha` (alpha-engine-config-I9781's parameter,
         # already used by `crucible.track_c`): without it, two repairs on

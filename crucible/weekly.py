@@ -50,8 +50,33 @@ class Stage:
     slot: str | None
     due_at: dt.datetime
 
-    def argv(self, *, trading_day: dt.date, store: str | None, dry_run: bool = False) -> list[str]:
-        argv = [self.job, "--date", trading_day.isoformat()]
+    def argv(
+        self,
+        *,
+        trading_day: dt.date,
+        store: str | None,
+        run_mode: str,
+        dry_run: bool = False,
+    ) -> list[str]:
+        """The exact argv an operator would type for this stage.
+
+        ``run_mode`` is required and always emitted. Each stage re-enters
+        `crucible.cli.main` as its own process-equivalent invocation and
+        therefore resolves the mode independently: without it on the argv, a
+        stage falls back to `$CRUCIBLE_RUN_MODE`, which means a replay arc
+        (`crucible weekly --run-mode replay`) launched on a box whose
+        environment declares `live` would file twelve LIVE stage manifests
+        under an arc manifest that says `replay` — the false-liveness claim
+        the field exists to prevent, and `_clause_replays_ok` reads the STAGE
+        manifests. With the environment unset it is worse and better at once:
+        every stage refuses, so the arc fails loudly at stage one.
+
+        ``dry_run=True`` appends `--dry-run` for the same reason
+        (alpha-engine-config-I9922 N1): the arc's own `--dry-run` reaches a
+        stage ONLY via that stage's own argv, since there is no `args` object
+        shared between this call and the stage's.
+        """
+        argv = [self.job, "--date", trading_day.isoformat(), "--run-mode", run_mode]
         if store:
             argv += ["--store", store]
         if self.slot:
@@ -118,11 +143,18 @@ def run_arc(
     trading_day: dt.date,
     *,
     store: str | None,
+    run_mode: str,
     registry: dict[str, Component] | None = None,
     main: object | None = None,
     dry_run: bool = False,
 ) -> list[Stage]:
     """Run every stage for ``trading_day``. Raises on the first failure.
+
+    ``run_mode`` is required and threaded onto every stage's argv. It is the
+    ARC's own resolved mode, passed down rather than re-resolved per stage:
+    an arc and its stages are one invocation, and letting twelve stages each
+    consult the environment is how an arc's manifest and its stages' manifests
+    end up disagreeing about whether the week was live.
 
     ``main`` is injectable for tests only; it defaults to `crucible.cli.main`,
     imported lazily because `cli` imports this module's handler. A test that
@@ -141,7 +173,7 @@ def run_arc(
     for stage in arc_stages(trading_day, registry):
         try:
             code = main(  # type: ignore[operator]
-                stage.argv(trading_day=trading_day, store=store, dry_run=dry_run)
+                stage.argv(trading_day=trading_day, store=store, run_mode=run_mode, dry_run=dry_run)
             )
         except BaseException as exc:  # noqa: BLE001 - re-raised on the next line
             # NOT a swallow: re-raised immediately, chained to the original.

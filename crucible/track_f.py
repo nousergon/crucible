@@ -63,7 +63,13 @@ def weekly_handler(args: argparse.Namespace) -> int:
         # `--dry-run` too (alpha-engine-config-I9922 N1) — each stage is a
         # fresh `crucible.cli.main` invocation with no shared `args`, so
         # `weekly --dry-run` previously ran every stage for real.
-        ran = run_arc(ctx.trading_day, store=store_uri, dry_run=dry_run)
+        #
+        # `run_mode=ctx.run_mode`, not `args` and not the environment: the
+        # arc's mode is whatever `run_job` resolved for THIS invocation, and
+        # every stage is run under that one answer. A stage left to
+        # re-resolve would let the arc manifest and its stage manifests
+        # disagree about the same week.
+        ran = run_arc(ctx.trading_day, store=store_uri, dry_run=dry_run, run_mode=ctx.run_mode)
         for stage in ran:
             key = manifest_key(stage.job, ctx.trading_day.isoformat(), discriminator=stage.slot)
             ctx.record_input(key, store.get_bytes(key))
@@ -96,6 +102,7 @@ def weekly_handler(args: argparse.Namespace) -> int:
         trading_day=args.trading_day,
         transient_retry=False,
         dry_run=dry_run,
+        run_mode=getattr(args, "run_mode", None),
     )
     return 0
 
@@ -219,7 +226,14 @@ def gate_handler(args: argparse.Namespace) -> int:
     # read-only `store` above turns those `ctx.record_output` calls into a
     # loud `DryRunWriteRefusedError`; `dry_run=` here keeps `run_job` from
     # also attempting its own manifest write on top of that.
-    run_job("gate", body, store=store, trading_day=args.trading_day, dry_run=dry_run)
+    run_job(
+        "gate",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        dry_run=dry_run,
+        run_mode=getattr(args, "run_mode", None),
+    )
     reading = result["reading"]
     print(reading.render())
     print(result["ladder"].render())
