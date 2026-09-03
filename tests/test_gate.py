@@ -461,6 +461,255 @@ class TestPhaseOneGuardedReads:
         assert not hasattr(gate_module, "_read_json")
 
 
+class _AccessDenied(LocalStore):
+    """A store whose `get_bytes` raises for one key — a permission denial /
+    AccessDenied, not a content problem. `exists` still answers normally, the
+    same asymmetry a real S3 401/403 exhibits."""
+
+    def __init__(self, root, denied_key: str) -> None:
+        super().__init__(root)
+        self._denied_key = denied_key
+
+    def get_bytes(self, key: str) -> bytes:
+        if key == self._denied_key:
+            raise PermissionError(f"access denied: {key}")
+        return super().get_bytes(key)
+
+
+class TestPhaseOneGuardedReadsRound2:
+    """`alpha-engine-config-I9869` round 2, findings from independent
+    adversarial review of round 1's PR: the register was still unguarded, the
+    guard checked container type but not field type, the status vocabulary
+    was compared with `!= "ok"` instead of against the schema, and a store
+    access failure read identically to a broken build."""
+
+    # -- finding 1: BLOCKING — `_register_arms` was a bare `json.loads` per
+    # line, unguarded. ------------------------------------------------------
+
+    def test_a_malformed_register_line_is_a_red_reading_not_an_exception(self, tmp_path) -> None:
+        store = _seed_met(tmp_path)
+        key = arm_register_key("m")
+        store.put_bytes(key, b"{not json\n")
+        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        clause = next(c for c in result.clauses if c.name == "arms_all_scored")
+        assert not clause.met
+        assert key in clause.detail
+        rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
+        assert rows["phase1"]["clauses_total"] == 6
+
+    def test_a_malformed_register_line_names_the_line_number(self, tmp_path) -> None:
+        store = _seed_met(tmp_path)
+        key = arm_register_key("m")
+        store.put_bytes(key, b'{"kind": "registered"}\n[1, 2]\n')
+        clause = next(
+            c
+            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "arms_all_scored"
+        )
+        assert not clause.met
+        assert f"{key}:2" in clause.detail
+
+    def test_the_register_can_still_be_read_via_the_cli_dry_run_path(self, tmp_path) -> None:
+        """The reproduction named in the review: `crucible gate ... --dry-run`
+        over a store seeded with a malformed register must not raise."""
+        store = _seed_met(tmp_path)
+        store.put_bytes(arm_register_key("m"), b"{not json\n")
+        # `evaluate` is exactly what the CLI's gate command calls; asserting
+        # it returns (rather than raises) is the same guarantee the CLI
+        # reproduction depends on, without shelling out to a second process.
+        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        assert not result.met
+
+    # -- finding 2: BLOCKING — the guard checked container type only; a
+    # wrong-typed FIELD still crashed a downstream index. -------------------
+
+    def test_attribution_rows_field_wrong_type_is_a_red_reading(self, tmp_path) -> None:
+        store = _seed_met(tmp_path)
+        key = attribution_key(FRIDAY.isoformat())
+        _put(store, key, {"rows": 5})
+        clause = next(
+            c
+            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "attribution_renders"
+        )
+        assert not clause.met
+        assert "rows" in clause.detail
+
+    def test_attribution_row_element_wrong_type_is_a_red_reading(self, tmp_path) -> None:
+        store = _seed_met(tmp_path)
+        key = attribution_key(FRIDAY.isoformat())
+        _put(store, key, {"rows": ["a", "b", "c", "d", "e"]})
+        clause = next(
+            c
+            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "attribution_renders"
+        )
+        assert not clause.met
+
+    def test_arena_cycle_scored_arms_element_wrong_type_is_a_red_reading(self, tmp_path) -> None:
+        store = _seed_met(tmp_path)
+        key = arena_cycle_key("m", FRIDAY.isoformat())
+        _put(store, key, {"scored_arms": [{"a": 1}], "active_arms": []})
+        clause = next(
+            c
+            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "arms_all_scored"
+        )
+        assert not clause.met
+        assert "scored_arms" in clause.detail
+
+    def test_pointer_sha_wrong_type_is_a_red_reading(self, tmp_path) -> None:
+        store = _seed_met(tmp_path)
+        _put(store, "releases/current", {"sha": 12345})
+        clause = next(
+            c
+            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "pointer_flipped_on_smoke"
+        )
+        assert not clause.met
+        assert "sha" in clause.detail
+
+    # -- finding 3: SHOULD-FIX — status vocabulary compared with `!= "ok"`
+    # instead of against the schema's exhaustive enum. ----------------------
+
+    def test_a_status_outside_the_schema_vocabulary_is_malformed_not_failed(self, tmp_path) -> None:
+        store = _seed_met(tmp_path)
+        key = manifest_key("report", WINDOW[2].isoformat())
+        _put(store, key, {"status": "degraded", "reason": ""})
+        clause = next(
+            c
+            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "arc_runs_ok"
+        )
+        assert not clause.met
+        assert "degraded" in clause.detail
+        assert "failed" not in clause.detail.split(":")[0]
+
+    def test_a_non_string_status_is_malformed(self, tmp_path) -> None:
+        store = _seed_met(tmp_path)
+        key = manifest_key("report", WINDOW[2].isoformat())
+        _put(store, key, {"status": 3, "reason": ""})
+        clause = next(
+            c
+            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "arc_runs_ok"
+        )
+        assert not clause.met
+        assert key in clause.detail
+
+    def test_status_ok_with_a_non_empty_reason_is_malformed(self, tmp_path) -> None:
+        store = _seed_met(tmp_path)
+        key = manifest_key("report", WINDOW[2].isoformat())
+        _put(store, key, {"status": "ok", "reason": "x"})
+        clause = next(
+            c
+            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "arc_runs_ok"
+        )
+        assert not clause.met, "status `ok` with a non-empty reason read MET"
+
+    def test_a_null_status_is_malformed_not_failed_with_an_empty_cause(self, tmp_path) -> None:
+        store = _seed_met(tmp_path)
+        key = manifest_key("report", WINDOW[2].isoformat())
+        _put(store, key, {"status": None, "reason": ""})
+        clause = next(
+            c
+            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "arc_runs_ok"
+        )
+        assert not clause.met
+        assert key in clause.detail
+
+    def test_the_status_vocabulary_check_applies_to_explain_too(self, tmp_path) -> None:
+        """`!= "ok"` alone would already read this unmet (for the wrong
+        reason — a vacuous `continue`, same as an absent manifest); the
+        assertion that actually distinguishes the vocabulary check is that
+        `degraded` is NAMED, not silently folded into "no ok manifest"."""
+        store = _seed_met(tmp_path)
+        key = manifest_key("explain", FRIDAY.isoformat())
+        for day in WINDOW:
+            _put(
+                store,
+                manifest_key("explain", day.isoformat()),
+                {"status": "degraded", "reason": ""},
+            )
+        clause = next(
+            c
+            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "explain_walks_a_verdict"
+        )
+        assert not clause.met
+        assert key in clause.detail
+        assert "degraded" in clause.detail
+
+    def test_the_status_vocabulary_check_applies_to_smoke_too(self, tmp_path) -> None:
+        store = _seed_met(tmp_path)
+        key = manifest_key("smoke", FRIDAY.isoformat())
+        _put(store, key, {"status": "degraded", "reason": ""})
+        clause = next(
+            c
+            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "pointer_flipped_on_smoke"
+        )
+        assert not clause.met
+        assert key in clause.detail
+        assert "degraded" in clause.detail
+
+    # -- finding 4: SHOULD-FIX — a store read that raises (access, not
+    # content) must read UNMEASURABLE, never folded into UNMET-malformed. ---
+
+    def test_an_access_failure_reads_unmeasurable_not_malformed(self, tmp_path) -> None:
+        key = manifest_key("report", WINDOW[2].isoformat())
+        _seed_met(tmp_path)
+        denied = _AccessDenied(tmp_path, denied_key=key)
+        result = evaluate(denied, gate="phase1", trading_day=FRIDAY)
+        clause = next(c for c in result.clauses if c.name == "arc_runs_ok")
+        assert not clause.met
+        assert clause.unmeasurable
+        assert "access" in clause.detail
+        # An unmeasurable clause is never met, and it is never silently
+        # dropped from the reading either.
+        assert not result.met
+
+    def test_an_access_failure_does_not_take_the_ladder_down_with_it(self, tmp_path) -> None:
+        key = manifest_key("report", WINDOW[2].isoformat())
+        _seed_met(tmp_path)
+        denied = _AccessDenied(tmp_path, denied_key=key)
+        result = evaluate(denied, gate="phase1", trading_day=FRIDAY)
+        clause = next(c for c in result.clauses if c.name == "arc_runs_ok")
+        assert clause.unmeasurable
+        rows = {r["phase"]: r for r in build_ladder(denied, trading_day=FRIDAY).to_dict()["phases"]}
+        assert rows["phase1"]["state"] == "UNMET"
+        assert rows["phase1"]["clauses_total"] == 6
+
+    def test_an_access_failure_on_the_register_reads_unmeasurable(self, tmp_path) -> None:
+        key = arm_register_key("m")
+        _seed_met(tmp_path)
+        denied = _AccessDenied(tmp_path, denied_key=key)
+        clause = next(
+            c
+            for c in evaluate(denied, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "arms_all_scored"
+        )
+        assert not clause.met
+        assert clause.unmeasurable
+
+    def test_clause_to_dict_carries_the_unmeasurable_flag(self, tmp_path) -> None:
+        key = manifest_key("report", WINDOW[2].isoformat())
+        _seed_met(tmp_path)
+        denied = _AccessDenied(tmp_path, denied_key=key)
+        clause = next(
+            c
+            for c in evaluate(denied, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "arc_runs_ok"
+        )
+        assert clause.to_dict()["unmeasurable"] is True
+
+    def test_a_met_clause_defaults_unmeasurable_false(self, tmp_path) -> None:
+        result = evaluate(_seed_met(tmp_path), gate="phase1", trading_day=FRIDAY)
+        assert all(not c.unmeasurable for c in result.clauses)
+
+
 class TestArtifact:
     def test_the_reading_serializes_with_its_window_and_every_clause(self, tmp_path) -> None:
         document = evaluate(_seed_met(tmp_path), gate="phase1", trading_day=FRIDAY).to_dict()

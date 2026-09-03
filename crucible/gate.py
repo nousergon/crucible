@@ -48,7 +48,7 @@ from crucible.keys import (
     review_prefix,
     runs_prefix,
 )  # noqa: F401 - re-exported
-from crucible.manifest import manifest_key
+from crucible.manifest import load_schema, manifest_key
 from crucible.release import POINTER_KEY
 from crucible.report import attribution_key
 from crucible.slots import SLOTS
@@ -98,19 +98,30 @@ GATE_SCHEMA_VERSION = "gate.v1"
 
 @dataclass(frozen=True)
 class Clause:
-    """One gate condition and what the store said about it."""
+    """One gate condition and what the store said about it.
+
+    A clause is met, unmet, or UNMEASURABLE, and unmeasurable is never met
+    (module docstring; `alpha-engine-config-I9869` round 2). ``unmeasurable``
+    is a fact about OUR access — a store read that raised (a permission
+    denial, a transient AccessDenied) — never a fact about the system being
+    graded, and it renders distinctly rather than being folded into "unmet"
+    so an operator does not go fix a producer when the real fault is our own
+    credentials.
+    """
 
     name: str
     requirement: str
     met: bool
     detail: str
     evidence: tuple[str, ...] = ()
+    unmeasurable: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "requirement": self.requirement,
             "met": self.met,
+            "unmeasurable": self.unmeasurable,
             "detail": self.detail,
             # Ordered, not de-duplicated. Each arc stage now reads its own
             # discriminated manifest key (alpha-engine-config-I9781), so a
@@ -183,7 +194,8 @@ class GateResult:
         if self.coverage:
             lines.append(f"coverage: {self.coverage}")
         for clause in self.clauses:
-            lines.append(f"  [{'x' if clause.met else ' '}] {clause.name}: {clause.detail}")
+            marker = "x" if clause.met else ("?" if clause.unmeasurable else " ")
+            lines.append(f"  [{marker}] {clause.name}: {clause.detail}")
         return "\n".join(lines)
 
 
@@ -217,6 +229,13 @@ class DocumentRead:
     document: dict[str, Any] | None
     absent: bool
     problem: str | None
+    #: True when ``problem`` is a statement about OUR ACCESS (the reader
+    #: raised: PermissionError, AccessDenied) rather than about the content
+    #: (unparseable JSON, wrong shape). The distinction is what lets a caller
+    #: report UNMEASURABLE instead of UNMET — round 2 of
+    #: `alpha-engine-config-I9869`: the two were collapsed, so a store outage
+    #: read identically to a broken build.
+    access_problem: bool = False
 
 
 def _read_document(source: str, reader: Callable[[], bytes | None]) -> DocumentRead:
@@ -248,6 +267,7 @@ def _read_document(source: str, reader: Callable[[], bytes | None]) -> DocumentR
             False,
             f"{source} could not be read: {type(exc).__name__}: {exc}. That is a "
             "statement about our access, not about the system being measured",
+            access_problem=True,
         )
     if raw is None:
         return DocumentRead(None, True, None)
@@ -291,6 +311,80 @@ def _read_path_document(path: Path) -> DocumentRead:
     return _read_document(str(path), reader)
 
 
+@dataclass(frozen=True)
+class LinesRead:
+    """One newline-delimited JSON event log, or the reason it could not be
+    read.
+
+    :class:`DocumentRead`'s shape does not fit an arm register: it is a JSONL
+    event log, not one JSON object, and reporting the first bad line as "the
+    whole key is unreadable" would lose which line. Same three outcomes —
+    present-and-readable, absent, unreadable — and the same access-vs-content
+    distinction as :class:`DocumentRead`, for the same reason.
+    """
+
+    lines: list[dict[str, Any]] | None
+    absent: bool
+    problem: str | None
+    access_problem: bool = False
+
+
+def _read_store_lines(store: Store, key: str) -> LinesRead:
+    """Read one JSONL event log, guarded the same way :func:`_read_document`
+    guards a single document.
+
+    `_register_arms` used to do a bare `json.loads` per line with no guard at
+    all: one malformed line (`arms/{slot}/register.jsonl` = `{not json`)
+    raised `JSONDecodeError` out of `_clause_arms_all_scored`, out of
+    `_phase1`, out of `evaluate` — no ladder, no artifact
+    (`alpha-engine-config-I9869` round 2).
+    """
+    try:
+        present = store.exists(key)
+    except Exception as exc:
+        return LinesRead(
+            None,
+            False,
+            f"{key} could not be read: {type(exc).__name__}: {exc}. That is a statement "
+            "about our access, not about the system being measured",
+            access_problem=True,
+        )
+    if not present:
+        return LinesRead(None, True, None)
+    try:
+        raw = store.get_bytes(key)
+    except Exception as exc:
+        return LinesRead(
+            None,
+            False,
+            f"{key} could not be read: {type(exc).__name__}: {exc}. That is a statement "
+            "about our access, not about the system being measured",
+            access_problem=True,
+        )
+    try:
+        text = raw.decode("utf-8")
+    except Exception as exc:
+        return LinesRead(None, False, f"{key} is not readable UTF-8: {type(exc).__name__}: {exc}")
+    lines: list[dict[str, Any]] = []
+    for lineno, entry in enumerate(text.splitlines(), start=1):
+        if not entry.strip():
+            continue
+        try:
+            parsed = json.loads(entry)
+        except Exception as exc:
+            return LinesRead(
+                None, False, f"{key}:{lineno} is not readable JSON: {type(exc).__name__}: {exc}"
+            )
+        if not isinstance(parsed, dict):
+            return LinesRead(
+                None,
+                False,
+                f"{key}:{lineno} parsed to {type(parsed).__name__}, not an object with fields",
+            )
+        lines.append(parsed)
+    return LinesRead(lines, False, None)
+
+
 def arm_name(arm_id: str) -> str:
     """The NAME component of a registered arm id.
 
@@ -307,19 +401,24 @@ def arm_name(arm_id: str) -> str:
     return parts[1] if len(parts) == 3 else arm_id
 
 
-def _register_arms(store: Store, slot: str) -> tuple[set[str], str | None]:
-    """The slot's ACTIVE registered arm ids, and the key they came from."""
+def _register_arms(store: Store, slot: str) -> tuple[set[str], str, str | None, bool]:
+    """The slot's ACTIVE registered arm ids, the key, and the reason if the
+    register could not be read (``problem``, ``access_problem``).
+
+    Guarded through :func:`_read_store_lines` rather than the bare
+    `json.loads` per line this used to run: an unreadable register is a red
+    `arms_all_scored` reading naming the key, never an exception out of
+    `evaluate` (`alpha-engine-config-I9869` round 2).
+    """
     key = arm_register_key(slot)
-    if not store.exists(key):
-        return set(), None
+    read = _read_store_lines(store, key)
+    if read.problem is not None:
+        return set(), key, read.problem, read.access_problem
+    if read.absent:
+        return set(), key, None, False
     from nousergon_lib.arena import ArmRegister  # noqa: PLC0415 - heavy import, one call site
 
-    events = [
-        json.loads(line)
-        for line in store.get_bytes(key).decode("utf-8").splitlines()
-        if line.strip()
-    ]
-    return set(ArmRegister.from_dicts(events).active_arms()), key
+    return set(ArmRegister.from_dicts(read.lines or []).active_arms()), key, None, False
 
 
 # ---------------------------------------------------------------------------
@@ -327,18 +426,75 @@ def _register_arms(store: Store, slot: str) -> tuple[set[str], str | None]:
 # ---------------------------------------------------------------------------
 
 
-def _missing_field(key: str, document: dict[str, Any], field: str) -> str | None:
-    """``None`` when ``field`` is present on ``document``, else the malformed
-    detail naming it.
+def _field(key: str, document: dict[str, Any], field_name: str, expected_type: type) -> str | None:
+    """``None`` when ``field_name`` is present on ``document`` AND of
+    ``expected_type``, else the malformed detail naming the key, the field,
+    and what is wrong.
 
-    A missing REQUIRED field is malformed, not absent: the document exists
-    and is readable JSON, it just does not carry the shape the schema
-    promises. Reporting it as "absent" would send the operator looking for a
-    producer that already ran (`alpha-engine-config-I9869`).
+    A missing REQUIRED field and a present-but-wrong-typed one are both
+    malformed, not absent: the document exists and is readable JSON, it just
+    does not carry the shape the schema promises. Reporting either as
+    "absent" would send the operator looking for a producer that already
+    ran. Round 1 of `alpha-engine-config-I9869` guarded presence only —
+    `{"rows": 5}`, `{"scored_arms": [{"a": 1}]}` and `{"sha": 12345}` each
+    still crashed a downstream index (`len()`, `set()`, a slice) on a
+    present-but-wrong-typed value; round 2 closes that.
+
+    ``bool`` is a `Python` subclass of `int`, so a caller checking `int`
+    would otherwise accept `True`/`False` — no phase-1 field is typed `int`
+    today, so this is not yet exercised, but the exclusion is written down
+    rather than left to be found the way `alpha-engine-config-I9870`'s
+    `executions_started` check found it.
     """
-    if field not in document:
-        return f"{key}: missing required field `{field}`"
+    if field_name not in document:
+        return f"{key}: missing required field `{field_name}`"
+    value = document[field_name]
+    if isinstance(value, bool) and expected_type is not bool:
+        return f"{key}: `{field_name}` is {value!r}, not {expected_type.__name__}"
+    if not isinstance(value, expected_type):
+        return f"{key}: `{field_name}` is {value!r}, not {expected_type.__name__}"
     return None
+
+
+@lru_cache(maxsize=1)
+def _manifest_status_values() -> frozenset[str]:
+    """The exhaustive `run_manifest.v1` `status` vocabulary, derived from the
+    SCHEMA every manifest is validated against at write time — never a
+    restated literal, so a schema change is picked up here without a second
+    edit that could drift from it. `alpha-engine-config-I9869` round 2: a
+    manifest carrying `status: "degraded"` or `status: 3` was re-rendered as
+    `failed` by the `!= "ok"` comparison every phase-1 clause used, silently
+    accepting any value the schema itself forbids.
+    """
+    return frozenset(load_schema()["properties"]["status"]["enum"])
+
+
+def _status(key: str, document: dict[str, Any]) -> tuple[str | None, str | None]:
+    """The document's validated `status`, or the malformed detail naming why
+    it is not one.
+
+    Three checks, in order: `status` is present and a string; it is one of
+    the schema's exhaustive values (never `!= "ok"`, which lets anything
+    through); and `status: "ok"` implies `reason == ""` — the same
+    implication `run_manifest.v1`'s own conditional schema enforces at write
+    time, so a manifest that satisfied it when written and was since
+    hand-edited is exactly the malformed input this clause exists to catch.
+    """
+    problem = _field(key, document, "status", str)
+    if problem is not None:
+        return None, problem
+    status = document["status"]
+    if status not in _manifest_status_values():
+        return None, (
+            f"{key}: `status` is {status!r}, not one of {sorted(_manifest_status_values())}"
+        )
+    problem = _field(key, document, "reason", str)
+    if problem is not None:
+        return None, problem
+    reason = document["reason"]
+    if status == "ok" and reason != "":
+        return None, f"{key}: status `ok` but `reason` is {reason!r}, not empty"
+    return status, None
 
 
 def _clause_arc_runs_ok(
@@ -350,6 +506,7 @@ def _clause_arc_runs_ok(
     )
     missing: list[str] = []
     malformed: list[str] = []
+    unmeasurable: list[str] = []
     failed: list[str] = []
     evidence: list[str] = []
     for day in window:
@@ -358,31 +515,36 @@ def _clause_arc_runs_ok(
             evidence.append(key)
             read = _read_store_document(store, key)
             if read.problem is not None:
-                malformed.append(read.problem)
+                (unmeasurable if read.access_problem else malformed).append(read.problem)
                 continue
             if read.absent:
                 missing.append(f"{stage.label}@{day.isoformat()}")
                 continue
             document = read.document or {}
-            problem = _missing_field(key, document, "status")
+            status, problem = _status(key, document)
             if problem is not None:
                 malformed.append(problem)
                 continue
-            if document["status"] != "ok":
-                problem = _missing_field(key, document, "reason")
-                if problem is not None:
-                    malformed.append(problem)
-                    continue
+            if status != "ok":
                 failed.append(f"{stage.label}@{day.isoformat()}: {document['reason']}")
-    if missing or malformed or failed:
+    if missing or malformed or unmeasurable or failed:
         parts = []
+        if unmeasurable:
+            parts.append(f"{len(unmeasurable)} could not be read: {'; '.join(unmeasurable[:2])}")
         if missing:
             parts.append(f"{len(missing)} never ran ({', '.join(missing[:4])}...)")
         if malformed:
             parts.append(f"{len(malformed)} malformed: {'; '.join(malformed[:4])}")
         if failed:
             parts.append(f"{len(failed)} failed ({'; '.join(failed[:2])})")
-        return Clause("arc_runs_ok", requirement, False, "; ".join(parts), tuple(evidence))
+        return Clause(
+            "arc_runs_ok",
+            requirement,
+            False,
+            "; ".join(parts),
+            tuple(evidence),
+            unmeasurable=bool(unmeasurable),
+        )
     return Clause(
         "arc_runs_ok",
         requirement,
@@ -398,6 +560,7 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
         "arms, on every trading day in the window"
     )
     gaps: list[str] = []
+    unmeasurable: list[str] = []
     evidence: list[str] = []
     for day in window:
         for slot, spec in SLOTS.items():
@@ -405,18 +568,27 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
             evidence.append(key)
             read = _read_store_document(store, key)
             if read.problem is not None:
-                gaps.append(read.problem)
+                (unmeasurable if read.access_problem else gaps).append(read.problem)
                 continue
             if read.absent:
                 gaps.append(f"{slot}@{day.isoformat()}: no arena_cycle artifact")
                 continue
             cycle = read.document or {}
-            problem = _missing_field(key, cycle, "scored_arms")
-            if problem is not None or not isinstance(cycle["scored_arms"], list):
-                gaps.append(problem or f"{key}: `scored_arms` is not a list")
+            problem = _field(key, cycle, "scored_arms", list)
+            if problem is not None:
+                gaps.append(problem)
+                continue
+            non_str = [a for a in cycle["scored_arms"] if not isinstance(a, str)]
+            if non_str:
+                gaps.append(f"{key}: `scored_arms` contains non-string element(s): {non_str[:2]!r}")
                 continue
             scored = set(cycle["scored_arms"])
-            registered, _ = _register_arms(store, slot)
+            registered, register_key, register_problem, register_access = _register_arms(
+                store, slot
+            )
+            if register_problem is not None:
+                (unmeasurable if register_access else gaps).append(register_problem)
+                continue
             unscored = registered - scored
             if unscored:
                 gaps.append(f"{slot}@{day.isoformat()}: {sorted(unscored)} registered but unscored")
@@ -426,8 +598,22 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
                     f"{slot}@{day.isoformat()}: no control arm was scored — an unscored "
                     "control is an unverified grader (§10.1)"
                 )
-    if gaps:
-        return Clause("arms_all_scored", requirement, False, "; ".join(gaps[:4]), tuple(evidence))
+            if register_key is not None:
+                evidence.append(register_key)
+    if gaps or unmeasurable:
+        parts = []
+        if unmeasurable:
+            parts.append(f"{len(unmeasurable)} could not be read: {'; '.join(unmeasurable[:2])}")
+        if gaps:
+            parts.append("; ".join(gaps[:4]))
+        return Clause(
+            "arms_all_scored",
+            requirement,
+            False,
+            "; ".join(parts),
+            tuple(evidence),
+            unmeasurable=bool(unmeasurable),
+        )
     return Clause(
         "arms_all_scored",
         requirement,
@@ -446,22 +632,45 @@ def _clause_attribution_renders(store: Store, window: list[dt.date]) -> Clause:
     key = attribution_key(day.isoformat())
     read = _read_store_document(store, key)
     if read.problem is not None:
-        return Clause("attribution_renders", requirement, False, read.problem, (key,))
+        return Clause(
+            "attribution_renders",
+            requirement,
+            False,
+            read.problem,
+            (key,),
+            unmeasurable=read.access_problem,
+        )
     if read.absent:
         return Clause("attribution_renders", requirement, False, f"{key} is absent", (key,))
     document = read.document or {}
-    rows = document.get("rows", [])
+    rows_problem = _field(key, document, "rows", list)
+    if rows_problem is not None:
+        return Clause("attribution_renders", requirement, False, rows_problem, (key,))
+    rows = document["rows"]
     if len(rows) != 5:
         return Clause(
             "attribution_renders", requirement, False, f"{len(rows)} rows, expected 5", (key,)
         )
-    silent = [
-        r["name"]
-        for r in rows
-        if r.get("value") is None
-        and not str(r.get("status", "")).startswith("N/A")
-        or not r.get("status_reason")
-    ]
+    silent: list[str] = []
+    for idx, r in enumerate(rows):
+        row_key = f"{key}[{idx}]"
+        if not isinstance(r, dict):
+            return Clause(
+                "attribution_renders",
+                requirement,
+                False,
+                f"{row_key}: row is {type(r).__name__}, not an object with fields",
+                (key,),
+            )
+        name_problem = _field(row_key, r, "name", str)
+        if name_problem is not None:
+            return Clause("attribution_renders", requirement, False, name_problem, (key,))
+        if (
+            r.get("value") is None
+            and not str(r.get("status", "")).startswith("N/A")
+            or not r.get("status_reason")
+        ):
+            silent.append(r["name"])
     if silent:
         return Clause(
             "attribution_renders",
@@ -482,23 +691,34 @@ def _clause_explain_walks_a_verdict(store: Store, window: list[dt.date]) -> Clau
     )
     evidence = [manifest_key("explain", d.isoformat()) for d in window]
     malformed: list[str] = []
+    unmeasurable: list[str] = []
     for key in evidence:
         read = _read_store_document(store, key)
         if read.problem is not None:
-            malformed.append(read.problem)
+            (unmeasurable if read.access_problem else malformed).append(read.problem)
             continue
         if read.absent:
             continue
         document = read.document or {}
-        problem = _missing_field(key, document, "status")
+        status, problem = _status(key, document)
         if problem is not None:
             malformed.append(problem)
             continue
-        if document["status"] != "ok":
+        if status != "ok":
             continue
         inputs = document.get("inputs", [])
         if any(isinstance(i, dict) and "verdict.json" in str(i.get("key", "")) for i in inputs):
             return Clause("explain_walks_a_verdict", requirement, True, f"walked at {key}", (key,))
+    if unmeasurable:
+        return Clause(
+            "explain_walks_a_verdict",
+            requirement,
+            False,
+            f"{len(unmeasurable)} could not be read: {'; '.join(unmeasurable[:2])}"
+            + ("; " + "; ".join(malformed) if malformed else ""),
+            tuple(evidence),
+            unmeasurable=True,
+        )
     if malformed:
         return Clause(
             "explain_walks_a_verdict", requirement, False, "; ".join(malformed), tuple(evidence)
@@ -520,7 +740,12 @@ def _clause_pointer_flipped_on_smoke(store: Store, window: list[dt.date]) -> Cla
     pointer_read = _read_store_document(store, POINTER_KEY)
     if pointer_read.problem is not None:
         return Clause(
-            "pointer_flipped_on_smoke", requirement, False, pointer_read.problem, (POINTER_KEY,)
+            "pointer_flipped_on_smoke",
+            requirement,
+            False,
+            pointer_read.problem,
+            (POINTER_KEY,),
+            unmeasurable=pointer_read.access_problem,
         )
     if pointer_read.absent:
         return Clause(
@@ -532,24 +757,33 @@ def _clause_pointer_flipped_on_smoke(store: Store, window: list[dt.date]) -> Cla
         )
     pointer = pointer_read.document or {}
     sha = pointer.get("sha", "")
+    if not isinstance(sha, str):
+        return Clause(
+            "pointer_flipped_on_smoke",
+            requirement,
+            False,
+            f"{POINTER_KEY}: `sha` is {sha!r}, not str",
+            (POINTER_KEY,),
+        )
     evidence = [POINTER_KEY]
     malformed: list[str] = []
+    unmeasurable: list[str] = []
     for key in store.list_keys(runs_prefix("smoke")):
         if not key.endswith("run.json"):
             continue
         evidence.append(key)
         read = _read_store_document(store, key)
         if read.problem is not None:
-            malformed.append(read.problem)
+            (unmeasurable if read.access_problem else malformed).append(read.problem)
             continue
         if read.absent:
             continue
         document = read.document or {}
-        problem = _missing_field(key, document, "status")
+        status, problem = _status(key, document)
         if problem is not None:
             malformed.append(problem)
             continue
-        if document["status"] == "ok" and document.get("release_sha") == sha:
+        if status == "ok" and document.get("release_sha") == sha:
             return Clause(
                 "pointer_flipped_on_smoke",
                 requirement,
@@ -557,6 +791,18 @@ def _clause_pointer_flipped_on_smoke(store: Store, window: list[dt.date]) -> Cla
                 f"{POINTER_KEY} -> {sha[:12]}, smoked at {key}",
                 tuple(evidence),
             )
+    if unmeasurable:
+        detail = f"{len(unmeasurable)} could not be read: {'; '.join(unmeasurable[:2])}"
+        if malformed:
+            detail += "; " + "; ".join(malformed)
+        return Clause(
+            "pointer_flipped_on_smoke",
+            requirement,
+            False,
+            detail,
+            tuple(evidence),
+            unmeasurable=True,
+        )
     if malformed:
         return Clause(
             "pointer_flipped_on_smoke", requirement, False, "; ".join(malformed), tuple(evidence)
