@@ -99,6 +99,11 @@ class TestJobSurface:
             "smoke",
             "weekly",
             "gate",
+            # alpha-engine-config-I9896: the 6am PT accountability delivery.
+            # A reporting surface, so it READS the board and never renders
+            # one -- the same separation `board` keeps from the artifacts it
+            # grades, one layer further out.
+            "report.morning",
         }
 
     @pytest.mark.parametrize("job", sorted(JOBS))
