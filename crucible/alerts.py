@@ -43,6 +43,7 @@ from crucible.calendar import (
     resolve_trading_day,
 )
 from crucible.components import Component, load_registry, scheduled_components
+from crucible.documents import load_store_document, read_listed_document, read_manifests_under
 from crucible.keys import (
     ALERTS_ROOT,
     RUNS_ROOT,
@@ -496,26 +497,25 @@ def evaluate_failure(
             # each is checked, rather than the single bare key that used to
             # be the only place a failure could be recorded — and the only
             # one four colliding writers could share (alpha-engine-config-I9781).
-            for key in sorted(store.list_keys(manifest_prefix(name, trading_day.isoformat()))):
-                # Only manifests. Without this, `report.morning`'s delivered
-                # `message.txt` — filed under its own manifest prefix by
-                # design — fails `json.loads` below and pages a FAILURE for a
-                # job that succeeded, every night (alpha-engine-config-I9900).
-                if not is_manifest_key(key):
-                    continue
-                try:
-                    manifest = json.loads(store.get_bytes(key).decode("utf-8"))
-                except (ValueError, UnicodeDecodeError) as exc:
-                    pages.append(
-                        Page(
-                            condition="failure",
-                            job=name,
-                            trading_day=trading_day,
-                            reason=f"manifest at {key} is unreadable: {type(exc).__name__}: {exc}",
-                            run_id=_UNPARSEABLE_RUN_ID,
-                        )
+            # One guarded prefix reader (`crucible.documents`), never a listing
+            # parsed key by key: it keeps manifests only — `report.morning`'s
+            # delivered `message.txt` is filed under its own manifest prefix
+            # by design and used to page a FAILURE for a job that succeeded,
+            # every night (alpha-engine-config-I9900) — and it turns a manifest
+            # whose body is an array or a string into a fault instead of an
+            # `AttributeError` out of the sweep (alpha-engine-config-I9931).
+            listed = read_manifests_under(store, manifest_prefix(name, trading_day.isoformat()))
+            for key, problem in sorted(listed.faults.items()):
+                pages.append(
+                    Page(
+                        condition="failure",
+                        job=name,
+                        trading_day=trading_day,
+                        reason=f"manifest at {key} is unreadable: {problem}",
+                        run_id=_UNPARSEABLE_RUN_ID,
                     )
-                    continue
+                )
+            for _key, manifest in listed.documents:
                 if manifest.get("status") == "failed":
                     pages.append(
                         Page(
@@ -935,7 +935,10 @@ def _record_reobservation(store: Store, key: str, group: PageGroup, stamp: str) 
     an operator should see.
     """
     expected = store.etag(key)
-    row = json.loads(store.get_bytes(key).decode("utf-8"))
+    # The STRICT face of the one reader: this is a writer about to swap a row
+    # it has just read, and a bus row that is not an object is a reason to
+    # stop the sweep with the cause named, never a fault row to publish.
+    row = load_store_document(store, key)
     row["observations"] = int(row["observations"]) + 1
     row["last_observed_utc"] = stamp
     row["members_now"] = _members(group)
@@ -1185,14 +1188,17 @@ def _week_summary(store: Store, trading_day: dt.date) -> tuple[int, int, float]:
             # exactly that.
             failed += 1
             continue
-        try:
-            manifest = json.loads(store.get_bytes(key).decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
+        read = read_listed_document(store, key)
+        if read.problem is not None or read.document is None:
             # Counted as failed, never skipped: an unreadable manifest is the
             # run most likely to be broken, and dropping it from the summary
             # would make the heartbeat read healthier the worse things got.
+            # Through the one guarded reader, so an array-bodied manifest is
+            # counted here rather than raising `AttributeError` two lines
+            # down (alpha-engine-config-I9931).
             failed += 1
             continue
+        manifest = read.document
         if manifest.get("status") == "ok":
             ok += 1
         else:

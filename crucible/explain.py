@@ -27,10 +27,10 @@ quietly dropped its unexplained hops would read as complete.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from crucible.documents import load_store_document
 from crucible.keys import RUNS_ROOT, is_manifest_key, manifest_key
 from crucible.manifest import validate
 
@@ -101,7 +101,10 @@ def load_manifests(store: Store) -> list[dict[str, Any]]:
         # arity too (alpha-engine-config-I9900).
         if not is_manifest_key(key):
             continue
-        document = json.loads(store.get_bytes(key).decode("utf-8"))
+        # STRICT face of the one reader (`crucible.documents`): an explanation
+        # is refused over a corrupt manifest, with the key named, the same way
+        # `validate` refuses a non-conforming one.
+        document = load_store_document(store, key)
         validate(document)
         out.append(document)
     return out

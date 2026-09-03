@@ -62,6 +62,7 @@ from crucible.champion import (
     read_champion_etag,
     write_champion,
 )
+from crucible.documents import load_document_bytes, load_store_document
 from crucible.keys import (
     arm_register_key,
     arm_series_key,
@@ -148,7 +149,7 @@ def load_slot_inputs(store: Store, slot: str) -> SlotInputs:
     series_by_arm: dict[str, ArmSeries] = {}
     for arm_id in register.all_arms():
         try:
-            payload = json.loads(store.get_bytes(arm_series_key(slot, arm_id)))
+            payload = load_store_document(store, arm_series_key(slot, arm_id))
         except KeyError as exc:
             raise KeyError(
                 f"arm {arm_id!r} is registered in slot {slot!r} but has no series at "
@@ -872,7 +873,13 @@ def _current_arm(store: Store, slot: str) -> str | None:
     except ChampionUnusableError:
         # Refused by the reader, but its arm_id is still the honest answer to
         # "what was this pointing at before the revert".
-        payload = json.loads(store.get_bytes(champion_key(slot)))
+        # The reader refused the pointer for a REASON other than parse (a
+        # failed producing run, a missing attestation); a pointer that does
+        # not even parse to an object re-raises here as UnreadableDocumentError
+        # from the strict face, which is the honest answer — there is no arm_id
+        # to report.
+        key = champion_key(slot)
+        payload = load_document_bytes(key, store.get_bytes(key))
         arm_id = payload.get("arm_id")
         return str(arm_id) if arm_id is not None else None
 

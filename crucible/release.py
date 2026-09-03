@@ -45,6 +45,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from crucible.documents import load_store_document
 from crucible.keys import manifest_key
 from crucible.store import ETAG_ABSENT, PointerConflictError, S3Store, Store, sha256_hex
 
@@ -653,7 +654,7 @@ def read_pointer(store: Store, key: str = POINTER_KEY) -> tuple[str | None, str]
     version = store.etag(key)
     if version == ETAG_ABSENT:
         return None, ETAG_ABSENT
-    payload = json.loads(store.get_bytes(key).decode("utf-8"))
+    payload = load_store_document(store, key)
     return payload["sha"], version
 
 
@@ -691,7 +692,7 @@ def published_wheel_key(store: Store, sha: str) -> str:
             "has no addressable wheel — this is not the same condition as a published "
             "release whose wheel was deleted, which names the wheel key instead."
         )
-    record = parse_release_record(json.loads(store.get_bytes(meta_key).decode("utf-8")))
+    record = parse_release_record(load_store_document(store, meta_key))
     return wheel_key_for(sha, record.wheel_filename)
 
 

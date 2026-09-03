@@ -27,6 +27,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from crucible.documents import load_store_document
 from crucible.keys import manifest_key, manifest_prefix  # noqa: F401 - re-exported
 
 #: The version every producer writes TODAY. Bumped to v2 by
@@ -184,7 +185,8 @@ def read_manifest(
     ``None``, because absence is one of the two page conditions (§4.6) and a
     caller that cannot tell "absent" from "empty" cannot raise it.
     """
-    payload = store.get_bytes(manifest_key(job, trading_day, discriminator=discriminator))
-    document = json.loads(payload.decode("utf-8"))
+    document = load_store_document(
+        store, manifest_key(job, trading_day, discriminator=discriminator)
+    )
     validate(document)
     return document

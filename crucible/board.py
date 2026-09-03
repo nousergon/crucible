@@ -57,6 +57,7 @@ from crucible.calendar import resolve_trading_day
 from crucible.components import Component, load_registry
 from crucible.console.classify import STATES as COMPONENT_STATES
 from crucible.console.classify import Classification
+from crucible.documents import read_store_document
 from crucible.gate import LADDER_STATES, Ladder, PhaseRow
 from crucible.store import Store
 
@@ -477,16 +478,13 @@ def _fetch(
         return None, Reading(
             "UNMEASURED", f"no artifact at {key} — nothing has filed a reading for this day"
         )
-    try:
-        document = json.loads(store.get_bytes(key))
-    except Exception as exc:  # noqa: BLE001 - the error IS the reading
-        return None, Reading(
-            "UNMEASURABLE", f"{key} is present but could not be read: {type(exc).__name__}: {exc}"
-        )
-    if not isinstance(document, dict):
-        return None, Reading(
-            "UNMEASURABLE", f"{key} parsed to {type(document).__name__}, not an object with fields"
-        )
+    # The one guarded reader: present-and-unreadable (corrupt, wrong shape,
+    # denied) is UNMEASURABLE with the reason named, never an exception out of
+    # the board (alpha-engine-config-I9900, -I9931).
+    read = read_store_document(store, key)
+    if read.problem is not None or read.document is None:
+        return None, Reading("UNMEASURABLE", read.problem or f"{key} read as absent mid-read")
+    document = read.document
     stamped = document.get("trading_day")
     if stamped is not None and stamped != trading_day:
         return None, Reading(

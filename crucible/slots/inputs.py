@@ -85,6 +85,7 @@ from typing import TYPE_CHECKING, Any
 
 from jsonschema import Draft202012Validator
 
+from crucible.documents import load_document_bytes
 from crucible.keys import arm_predictions_key
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -443,7 +444,7 @@ def read_arm_predictions(
     """
     key = arm_predictions_key(arm_id, trading_day)
     payload = store.get_bytes(key)  # raises KeyError when absent; never None
-    document = json.loads(payload.decode("utf-8"))
+    document = load_document_bytes(key, payload)  # the bytes recorded below decide
     _validate(document)
     if document["arm_id"] != arm_id:
         raise ArmPredictionsContractError(
