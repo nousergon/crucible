@@ -26,7 +26,9 @@ from nousergon_lib.arena.engine import TrainingIntegrityError
 
 from crucible.slots.model import (
     MIN_DISPERSION_RATIO,
+    REQUIRED_RECIPE_FIELDS,
     CPCVSpec,
+    FeatureLayerSource,
     FeaturePanel,
     MetricScaleError,
     ModelRecipe,
@@ -461,7 +463,6 @@ class TestOutOfSampleClock:
                     "  refit_cadence_trading_days: 5",
                     "  training_window: {kind: expanding, min_trading_days: 504}",
                     "  cpcv: {n_groups: 6, k_test: 2, embargo_trading_days: 2}",
-                    "  feature_version: v1",
                 ]
             ),
             encoding="utf-8",
@@ -657,7 +658,6 @@ class TestRecipeLoading:
                     "  refit_cadence_trading_days: 5",
                     "  training_window: {kind: expanding, min_trading_days: 504}",
                     "  cpcv: {n_groups: 6, k_test: 2, embargo_trading_days: 2}",
-                    "  feature_version: v1",
                     "registered_at: '2026-06-01'",
                 ]
             ),
@@ -666,6 +666,92 @@ class TestRecipeLoading:
         recipes = load_model_recipes(tmp_path, feature_columns=("mom_21d_ratio",))
         assert len(recipes) == 1
         assert recipes[0].arm_id.startswith("m:residual_momentum:")
+
+    def test_feature_version_is_not_a_recipe_field(self, tmp_path) -> None:
+        """`alpha-engine-config-I9801`: a hand-written `feature_version` inside
+
+        `spec` was hashed into the arm id and read by nothing — the same bug
+        class as `avg_volume_20d` (AGENTS.md), a hand-maintained value
+        standing where a derived one belongs. It is now gone from the recipe
+        entirely: `REQUIRED_RECIPE_FIELDS` does not name it, a recipe that
+        still declares it under `spec` registers with the key silently
+        ignored (a private-repo recipe transitioning off the old field is not
+        refused mid-migration), and it is absent from the hashed `spec` —
+        which feature-layer artifact a run actually reads is resolved by
+        `FeatureLayerSource` and recorded as lineage
+        (`FeaturePanel.feature_version`), never declared by the recipe.
+        """
+        assert "feature_version" not in REQUIRED_RECIPE_FIELDS
+        recipe = _recipe()
+        assert "feature_version" not in recipe.spec
+        assert not hasattr(recipe, "feature_version")
+
+        (tmp_path / "legacy.yaml").write_text(
+            "\n".join(
+                [
+                    "slot: m",
+                    "name: legacy",
+                    "spec:",
+                    "  features: [mom_21d_ratio]",
+                    "  estimator: {kind: ridge, alpha: 1.0}",
+                    "  label_horizon_trading_days: 21",
+                    "  refit_cadence_trading_days: 5",
+                    "  training_window: {kind: expanding, min_trading_days: 504}",
+                    "  cpcv: {n_groups: 6, k_test: 2, embargo_trading_days: 2}",
+                    "  feature_version: v1",
+                    "registered_at: '2026-06-01'",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        loaded = load_model_recipes(tmp_path, feature_columns=("mom_21d_ratio",))
+        assert len(loaded) == 1
+        assert "feature_version" not in loaded[0].spec
+
+    def test_arm_id_is_independent_of_which_feature_layer_version_is_resolved(
+        self, tmp_path
+    ) -> None:
+        """Deliverable 4 (`alpha-engine-config-I9801`), the actual claim.
+
+        The arm id no longer depends on a declared `feature_version`, so a
+        catalogue change — the thing the removed field would otherwise have
+        needed re-declaring for — cannot silently re-id or silently NOT re-id
+        an arm depending on whether someone remembered to bump it. Proved
+        against a real feature-layer symbol: two `FeatureLayerSource`
+        instances resolve two DIFFERENT versions, and the recipe's `arm_id`
+        — computed from `ModelRecipe.spec` alone, which `FeatureLayerSource`
+        never enters — is identical regardless, and identical across two
+        loads of the same file. (A prior version of this test loaded the
+        file twice with nothing about the feature layer varied at all, which
+        passed for the uninteresting reason that `load_model_recipes` is a
+        pure hash of file bytes — it named no feature-layer symbol despite
+        its name.)
+        """
+        (tmp_path / "residual_momentum.yaml").write_text(
+            "\n".join(
+                [
+                    "slot: m",
+                    "name: residual_momentum",
+                    "spec:",
+                    "  features: [mom_21d_ratio]",
+                    "  estimator: {kind: ridge, alpha: 1.0}",
+                    "  label_horizon_trading_days: 21",
+                    "  refit_cadence_trading_days: 5",
+                    "  training_window: {kind: expanding, min_trading_days: 504}",
+                    "  cpcv: {n_groups: 6, k_test: 2, embargo_trading_days: 2}",
+                    "registered_at: '2026-06-01'",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        source_a = FeatureLayerSource(store=None, version="vaaaaaaaaaaaa")
+        source_b = FeatureLayerSource(store=None, version="vbbbbbbbbbbbb")
+        assert source_a.version != source_b.version
+
+        first = load_model_recipes(tmp_path, feature_columns=("mom_21d_ratio",))
+        second = load_model_recipes(tmp_path, feature_columns=("mom_21d_ratio",))
+        assert first[0].arm_id == second[0].arm_id
+        assert "feature_version" not in first[0].spec
 
     def test_a_recipe_missing_a_pre_registration_field_does_not_register(self, tmp_path) -> None:
         """Plan §9.1: 'Missing fields -> the arm does not register.'"""
@@ -769,7 +855,6 @@ def _recipe(**over) -> ModelRecipe:
         refit_cadence_trading_days=5,
         training_window=TrainingWindowSpec(kind="expanding", min_trading_days=40),
         cpcv=CPCVSpec(n_groups=6, k_test=2, embargo_trading_days=2),
-        feature_version="v1",
         # Earlier than the fixture panel's first session, so a test that does
         # not care about the out-of-sample clock is not silently gated by it.
         # The clock's own tests set this explicitly.

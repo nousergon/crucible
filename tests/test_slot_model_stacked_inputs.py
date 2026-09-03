@@ -63,7 +63,6 @@ def _write(directory: Path, name: str, *, features: str, inputs: tuple[str, ...]
         "  refit_cadence_trading_days: 5",
         "  training_window: {kind: expanding, min_trading_days: 504}",
         "  cpcv: {n_groups: 6, k_test: 2, embargo_trading_days: 2}",
-        "  feature_version: v1",
         "registered_at: '2026-06-01'",
     ]
     (directory / f"{name}.yaml").write_text("\n".join(lines), encoding="utf-8")
@@ -192,15 +191,18 @@ class TestTheArmIdDoesNotMoveForArmsWithNoInputs:
     def test_an_existing_recipes_id_is_unchanged_by_this_field_existing(self) -> None:
         """A key that always appeared would orphan every registered series.
 
-        The literal is the id `main` derived before `inputs` existed
-        (measured 2026-09-01). It is pinned rather than recomputed: a test
-        that recomputes the hash with the code under test proves only that
-        the code agrees with itself.
+        The literal is the id derived before `inputs` existed (measured
+        2026-09-01), and re-pinned 2026-09-02 (`alpha-engine-config-I9801`)
+        when `feature_version` left the hashed spec — an intentional, one-time
+        move since it changes what the id is a hash OF, not the presence of
+        `inputs`, which is what this test actually pins. It is pinned rather
+        than recomputed: a test that recomputes the hash with the code under
+        test proves only that the code agrees with itself.
         """
         from tests.test_slot_model import _recipe
 
         recipe = _recipe()
-        assert recipe.arm_id == "m:residual_momentum:108ce944bb02"
+        assert recipe.arm_id == "m:residual_momentum:ab013b0f2225"
         assert "inputs" not in recipe.spec
 
     def test_declaring_an_input_produces_a_different_arm(self) -> None:

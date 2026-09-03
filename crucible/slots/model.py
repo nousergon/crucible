@@ -771,7 +771,6 @@ class ModelRecipe:
     refit_cadence_trading_days: int
     training_window: TrainingWindowSpec
     cpcv: CPCVSpec
-    feature_version: str
     registered_at: str
     #: Typed input references (`alpha-engine-config-I9777`). Empty for every
     #: arm whose whole design matrix comes from the feature layer, which is
@@ -824,6 +823,28 @@ class ModelRecipe:
         `crucible.slots.arms.ArmSpec.spec` omits it: it says when the arm
         started accumulating evidence, not what it computes. Hashing it would
         make re-registering an arm produce a new id and orphan its series.
+
+        **There is no ``feature_version`` key here** (`alpha-engine-config-
+        I9801`). The recipe's inputs are already pinned by `features` and
+        `inputs`, which ARE hashed; which feature-layer artifact a run
+        actually reads is resolved at produce time, not declared by the
+        recipe, and is recorded as the run's lineage — `crucible.slots.
+        cycle.run_produce` (the production path for every slot, M included)
+        calls ``ctx.record_input(features_key(feature_version, day), ...)``,
+        so the layer's resolved version is embedded in the recorded key
+        (``features/<version>/<day>.parquet``) inside ``inputs[]`` on the
+        run's own manifest (``runs/{job}/{day}/run.json``). R and M are
+        asserted to record the SAME entry, byte-for-byte, by
+        `tests/test_feature_layer_input_identity.py`. (`FeatureLayerSource`
+        /`FeaturePanel.feature_version` resolve and carry the same version
+        through :func:`design_panel` and :func:`grade_arm` for training and
+        grading; :func:`produce_arm_predictions` also threads it into the
+        `arm_predictions.v1` artifact, but that function has no production
+        caller today — `cycle.run_produce`'s `ctx.record_input` is the
+        lineage that is actually live.) Hashing a catalogue version into this
+        spec instead would mean an unrelated feature added to the catalogue
+        re-ids every M arm and orphans its score series — worse than the
+        stale-and-unread field it would replace.
         """
         payload: dict[str, Any] = {
             "features": list(self.features),
@@ -832,7 +853,6 @@ class ModelRecipe:
             "refit_cadence_trading_days": self.refit_cadence_trading_days,
             "training_window": self.training_window.to_dict(),
             "cpcv": self.cpcv.to_dict(),
-            "feature_version": self.feature_version,
         }
         if self.inputs:
             # Emitted ONLY when declared. A key that always appeared would
@@ -855,7 +875,6 @@ REQUIRED_RECIPE_FIELDS: tuple[str, ...] = (
     "refit_cadence_trading_days",
     "training_window",
     "cpcv",
-    "feature_version",
 )
 
 
@@ -913,7 +932,6 @@ def load_model_recipes(
                 refit_cadence_trading_days=int(spec["refit_cadence_trading_days"]),
                 training_window=TrainingWindowSpec(**spec["training_window"]),
                 cpcv=CPCVSpec(**spec["cpcv"]),
-                feature_version=str(spec["feature_version"]),
                 registered_at=str(payload["registered_at"]),
                 inputs=tuple(parse_input_ref(t) for t in (spec.get("inputs") or ())),
                 supersedes=payload.get("supersedes"),
