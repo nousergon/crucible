@@ -54,6 +54,7 @@ __all__ = [
     "features_key",
     "features_prefix",
     "gate_key",
+    "gate_prefix",
     "heal_key",
     "ledger_key",
     "legacy_weekly_executions_key",
@@ -509,6 +510,23 @@ def attribution_key(trading_day: str) -> str:
 def gate_key(gate: str, trading_day: str) -> str:
     """Where a gate reading is filed. Keyed by trading day like everything else."""
     return f"gates/{gate}/{trading_day}/gate.json"
+
+
+def gate_prefix(gate: str) -> str:
+    """The prefix under which every trading day's reading of ``gate`` lives.
+
+    `gate_key(gate, trading_day)` for any ``trading_day`` starts with this
+    prefix — `crucible.gate.last_read`, which lists the store to find the
+    most recent trading day a gate was read for, lists this prefix instead
+    of restating its shape.
+    """
+    if not gate:
+        raise ValueError(
+            "gate must be non-empty — a blank gate would list every gate's readings "
+            "under one empty-segment prefix, and `store.list_keys('gates//')` "
+            "returning nothing reads as 'no data' rather than the caller's own bug."
+        )
+    return f"gates/{gate}/"
 
 
 def universe_members_key(trading_day: str) -> str:
