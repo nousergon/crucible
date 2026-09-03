@@ -13,12 +13,71 @@ import pytest
 
 from crucible.store import (
     ETAG_ABSENT,
+    PRESIGN_MAX_S,
     LocalStore,
     PointerConflictError,
     S3Store,
     open_store,
     sha256_hex,
 )
+
+
+class TestPresignedUrl:
+    """`alpha-engine-config-I9921` — the link the morning report carries.
+
+    Every assertion here is a REFUSAL or a provenance check. A test that only
+    showed the method returning a string would pass over a URL pointing at
+    the wrong object, at nothing at all, or with a lifetime S3 rejects on use.
+    """
+
+    def test_an_s3_presign_names_the_prefixed_key_and_the_lifetime(self, fake_s3) -> None:
+        store = S3Store("bucket", "crucible", client=fake_s3)
+        store.put_bytes("board/index.html", b"<html></html>")
+        url = store.presigned_url("board/index.html", 3600)
+        assert "crucible/board/index.html" in url, "the store prefix must be signed, not dropped"
+        assert "X-Amz-Expires=3600" in url
+
+    def test_an_s3_presign_of_a_missing_key_raises_rather_than_linking_to_nothing(
+        self, fake_s3
+    ) -> None:
+        """S3 signs a key that does not exist and the URL 403s on use — a
+        broken link on the operator's phone under a report claiming the
+        render succeeded."""
+        store = S3Store("bucket", "crucible", client=fake_s3)
+        with pytest.raises(KeyError):
+            store.presigned_url("board/index.html", 3600)
+
+    def test_a_local_presign_is_a_file_uri_for_the_object_on_disk(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        store.put_bytes("board/index.html", b"<html></html>")
+        url = store.presigned_url("board/index.html", 60)
+        assert url.startswith("file://")
+        assert url.endswith("/board/index.html")
+
+    def test_a_local_presign_of_a_missing_key_raises(self, tmp_path) -> None:
+        with pytest.raises(KeyError):
+            LocalStore(tmp_path).presigned_url("board/index.html", 60)
+
+    @pytest.mark.parametrize("expires", [0, -1, PRESIGN_MAX_S + 1])
+    def test_a_lifetime_outside_the_sigv4_bound_is_refused_by_both_backends(
+        self, tmp_path, fake_s3, expires
+    ) -> None:
+        """Refused, never clamped. S3 does not shorten an over-long
+        `ExpiresIn`; it rejects the URL on use, so a clamp here would hand
+        back a link that expires at a time nobody stated."""
+        local = LocalStore(tmp_path)
+        local.put_bytes("board/index.html", b"x")
+        s3 = S3Store("bucket", "crucible", client=fake_s3)
+        s3.put_bytes("board/index.html", b"x")
+        for store in (local, s3):
+            with pytest.raises(ValueError, match="outside 1.."):
+                store.presigned_url("board/index.html", expires)
+
+    def test_the_seven_day_maximum_is_itself_accepted(self, tmp_path) -> None:
+        """The bound is inclusive — the report asks for exactly this."""
+        store = LocalStore(tmp_path)
+        store.put_bytes("board/index.html", b"x")
+        assert store.presigned_url("board/index.html", PRESIGN_MAX_S).startswith("file://")
 
 
 class TestPagination:

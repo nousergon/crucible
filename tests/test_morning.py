@@ -39,13 +39,27 @@ from botocore.exceptions import ClientError
 
 from crucible.cli import HANDLERS, JOBS
 from crucible.components import load_registry
-from crucible.keys import BOARD_CURRENT_KEY, board_key, manifest_key, morning_report_key
+from crucible.keys import (
+    BOARD_CURRENT_KEY,
+    BOARD_HTML_KEY,
+    board_key,
+    manifest_key,
+    morning_report_key,
+)
 from crucible.morning import (
     ACCEPTANCE_NOT_ON_ANY_ARTIFACT,
     ACCEPTANCE_UNREADABLE,
+    BOARD_URL_EXPIRES_S,
+    BOARD_URL_UNAVAILABLE,
+    DELIVERY_SEVERITY,
+    DELIVERY_SOURCE,
     DELIVERY_TZ,
+    MESSAGE_MAX_CHARS,
     MORNING_JOB,
     NO_OPERATOR_ACTION,
+    SECTIONS,
+    TRANSPORT_PREFIX,
+    TRUNCATION_MARKER,
     MorningInputs,
     UndeliveredError,
     deliver,
@@ -54,6 +68,7 @@ from crucible.morning import (
     render_message,
     run_report,
     store_uri,
+    wire_length,
 )
 from crucible.store import LocalStore
 
@@ -69,7 +84,17 @@ GENERATED = "2026-09-02T21:35:04Z"
 SHA = "8fc58b6c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a"
 
 
-def _row(row_id: str, source: str, state: str, detail: str) -> dict[str, Any]:
+def _clause(name: str, met: bool) -> dict[str, Any]:
+    return {"name": name, "met": met, "requirement": f"{name} holds", "detail": f"{name} detail"}
+
+
+def _row(
+    row_id: str,
+    source: str,
+    state: str,
+    detail: str,
+    clauses: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     return {
         "id": row_id,
         "source": source,
@@ -82,6 +107,10 @@ def _row(row_id: str, source: str, state: str, detail: str) -> dict[str, Any]:
         "artifact": f"{row_id}.json",
         "means_when_red": "x",
         "last_read": None,
+        # `None` — no reading was taken — is the default, because that is what
+        # a board rendered before `alpha-engine-config-I9921` carries, and the
+        # report has to stay honest against one.
+        "clauses": clauses,
     }
 
 
@@ -94,8 +123,20 @@ def _board(
         rows
         if rows is not None
         else [
-            _row("phase0", "phase", "UNMET", "1 of 2 clauses — old_weekly_within_cadence"),
-            _row("phase1", "phase", "OUT_OF_ORDER", "1 of 5 clauses — phase0's gate is not met"),
+            _row(
+                "phase0",
+                "phase",
+                "UNMET",
+                "1 of 2 clauses — old_weekly_within_cadence",
+                [_clause("a_met", True), _clause("b_unmet", False)],
+            ),
+            _row(
+                "phase1",
+                "phase",
+                "OUT_OF_ORDER",
+                "1 of 5 clauses — phase0's gate is not met",
+                [_clause("c_unmet", False)],
+            ),
             _row("obj:cost", "objective", "UNMEASURED", "no artifact"),
             _row("obj:alpha", "objective", "MET", "read"),
         ]
@@ -121,9 +162,16 @@ def _seed(
     board: dict[str, Any] | None = None,
     previous: dict[str, Any] | None = None,
     board_run: dict[str, Any] | None | str = "default",
+    page: bool = True,
 ) -> LocalStore:
     store = LocalStore(tmp_path)
     store.put_bytes(BOARD_CURRENT_KEY, json.dumps(board or _board()).encode())
+    if page:
+        # The page the message links to. Seeded by default because the real
+        # `board` job writes it in the same run as `board/current.json`; the
+        # `page=False` case is a board render that published one and not the
+        # other, which the report must survive rather than die on.
+        store.put_bytes(BOARD_HTML_KEY, b"<html></html>")
     if previous is not None:
         store.put_bytes(board_key(PREVIOUS.isoformat()), json.dumps(previous).encode())
     if board_run == "default":
@@ -198,25 +246,36 @@ class TestTheMessage:
         message = run_report(store, trading_day=DAY, now=FIRED_AT)
         assert message == "\n".join(
             [
-                "crucible v2 — board for trading day 2026-09-02",
+                "CRUCIBLE V2 — BOARD FOR TRADING DAY 2026-09-02",
                 f"store: {tmp_path}/board/current.json",
                 f"generated: {GENERATED}  commit: {SHA}",
                 "delivered: 2026-09-03 06:00 PDT",
                 "",
-                "phase gates",
-                "  phase0  UNMET  1 of 2 clauses — old_weekly_within_cadence",
-                "  phase1  OUT_OF_ORDER  1 of 5 clauses — phase0's gate is not met",
+                "LADDER",
+                "  phase0  UNMET  1/2",
+                "    holding: b_unmet",
+                "  phase1  OUT_OF_ORDER  0/1",
+                "    holding: c_unmet",
+                "    out of order: 1 of 5 clauses — phase0's gate is not met",
                 "",
-                "schedule (plan §6.1)",
+                "SCHEDULE (PLAN §6.1)",
                 "  no schedule row on the board — the plan §6.1 milestones are not being "
                 "rendered, which is a defect in the board, not an absent plan",
                 "",
-                "moved since 2026-09-01",
+                "ACCEPTANCE",
+                f"  {ACCEPTANCE_NOT_ON_ANY_ARTIFACT}",
+                "",
+                "MOVED SINCE 2026-09-01",
                 "  obj:cost: PLANNED -> UNMEASURED",
                 "",
-                ACCEPTANCE_NOT_ON_ANY_ARTIFACT,
-                "silence: 1 UNMEASURED, 0 UNMEASURABLE of 4 rows",
-                NO_OPERATOR_ACTION,
+                "SILENCE",
+                "  silence: 1 UNMEASURED, 0 UNMEASURABLE of 4 rows",
+                f"  {NO_OPERATOR_ACTION}",
+                "",
+                "FULL BOARD",
+                f"  {(tmp_path / 'board' / 'index.html').resolve().as_uri()}",
+                "  presigned GET, expires 2026-09-10T13:00:00Z or when the signing role's "
+                "session ends, whichever is first",
             ]
         )
 
@@ -280,7 +339,9 @@ class TestTheMessage:
             ).encode(),
         )
         message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert f"acceptance count: 21 met / 3 unmet / 0 unmeasurable (commit {SHA})" in message
+        assert (
+            f"acceptance count: 21 met / 3 unmet / 0 unmeasurable of 24 (commit {SHA})" in message
+        )
         assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT not in message
 
     def test_a_corrupt_acceptance_reading_is_absent_rather_than_guessed(self, tmp_path):
@@ -384,9 +445,9 @@ class TestTheMessage:
         line = [
             ln
             for ln in run_report(store, trading_day=DAY, now=FIRED_AT).splitlines()
-            if ln.startswith("silence:")
+            if ln.strip().startswith("silence:")
         ]
-        assert line == ["silence: 1 UNMEASURED, 1 UNMEASURABLE of 3 rows"]
+        assert line == ["  silence: 1 UNMEASURED, 1 UNMEASURABLE of 3 rows"]
 
     def test_a_failed_board_render_becomes_the_pending_operator_action(self, tmp_path):
         store = _seed(
@@ -552,9 +613,9 @@ class TestSchedule:
         store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
         message = run_report(store, trading_day=DAY, now=FIRED_AT)
         lines = message.splitlines()
-        phase_at = lines.index("phase gates")
-        schedule_at = lines.index("schedule (plan §6.1)")
-        moved_at = next(i for i, ln in enumerate(lines) if ln.startswith("moved since"))
+        phase_at = lines.index("LADDER")
+        schedule_at = lines.index("SCHEDULE (PLAN §6.1)")
+        moved_at = next(i for i, ln in enumerate(lines) if ln.startswith("MOVED SINCE"))
         assert phase_at < schedule_at < moved_at
 
 
@@ -666,7 +727,7 @@ class TestTheJob:
         assert manifest["status"] == "ok"
         (output,) = manifest["outputs"]
         message = store.get_bytes(output["key"]).decode()
-        assert message.startswith("crucible v2 — board for trading day")
+        assert message.startswith("CRUCIBLE V2 — BOARD FOR TRADING DAY")
         assert output["key"] == morning_report_key(DAY.isoformat(), manifest["calendar_date"])
 
     def test_the_manifest_key_is_discriminated_by_the_firing(self, tmp_path, monkeypatch):
@@ -777,10 +838,552 @@ class TestDeclarations:
         assert set(SILENT_STATES).isdisjoint(BOARD_GREY)
 
 
+class TestTheSixHeadedSections:
+    """`alpha-engine-config-I9921` — Brian: *"I don't find the report detailed
+    enough. It should at a minimum be formatted well."*
+
+    Asserted here: the six headings exist and are in the issue's order, the
+    ladder carries the clause NAMES rather than a sentence about them, and
+    the message points at a page rather than trying to be one.
+    """
+
+    def test_the_six_headings_appear_in_the_order_the_issue_states(self, tmp_path):
+        rows = [
+            *_board()["rows"],
+            _row("schedule:day5", "schedule", "MET", "met — due 2026-09-04"),
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        lines = run_report(store, trading_day=DAY, now=FIRED_AT).splitlines()
+        expected = [s.format(previous_day=PREVIOUS) for s in SECTIONS]
+        at = [lines.index(heading) for heading in expected]
+        assert at == sorted(at), (
+            f"the sections are out of order: {list(zip(expected, at, strict=True))}"
+        )
+
+    def test_the_ladder_names_the_unmet_clauses_rather_than_summarising_them(self, tmp_path):
+        """A fraction with no names is a number the reader cannot act on, and
+        the names are the thing the previous report left out entirely."""
+        store = _seed(tmp_path, previous=_board())
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "  phase0  UNMET  1/2" in message
+        assert "    holding: b_unmet" in message
+        assert "a_met" not in message, "a MET clause is not what is holding the phase"
+
+    def test_a_row_whose_board_carried_no_clause_list_invents_no_fraction(self, tmp_path):
+        """A board rendered before this change carries `clauses: null`.
+        Printing `0/0` over it would be a measurement nobody took."""
+        rows = [_row("phase0", "phase", "UNMET", "1 of 2 clauses — a sentence, not a list")]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "  phase0  UNMET  1 of 2 clauses — a sentence, not a list" in message
+        assert "0/0" not in message
+
+    def test_a_gate_that_declares_no_clauses_is_not_rendered_as_zero_of_zero(self, tmp_path):
+        rows = [_row("phase0", "phase", "UNMEASURED", "gate phase0 has no clauses", [])]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "no clauses — this gate measured nothing" in message
+        assert "0/0" not in message
+
+    def test_the_out_of_order_reason_is_rendered_when_set(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "    out of order: 1 of 5 clauses — phase0's gate is not met" in message
+
+    def test_overdue_schedule_rows_sort_ahead_of_the_rest(self, tmp_path):
+        """The only line in that section anybody has to act on."""
+        rows = [
+            *_board()["rows"],
+            _row("schedule:ahead", "schedule", "PLANNED", "due 2026-10-01, waiting"),
+            _row("schedule:late", "schedule", "UNMET", "OVERDUE since 2026-08-01"),
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        lines = run_report(store, trading_day=DAY, now=FIRED_AT).splitlines()
+        late = lines.index("  OVERDUE schedule:late  UNMET  OVERDUE since 2026-08-01")
+        ahead = lines.index("  schedule:ahead  PLANNED  due 2026-10-01, waiting")
+        assert late < ahead
+
+    def test_the_acceptance_section_names_the_unmet_clause_ids(self, tmp_path):
+        from crucible.keys import acceptance_reading_key
+
+        store = _seed(tmp_path, previous=_board())
+        store.put_bytes(
+            acceptance_reading_key(DAY.isoformat()),
+            json.dumps(
+                {
+                    "met": 21,
+                    "unmet": 2,
+                    "unmeasurable": 1,
+                    "commit": SHA,
+                    "measured_at": "2026-09-02T22:00:00Z",
+                    "unmet_clauses": ["c_replays", "c_cost"],
+                    "unmeasurable_clauses": ["c_spend"],
+                }
+            ).encode(),
+        )
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "    unmet: c_replays, c_cost" in message
+        assert "    unmeasurable: c_spend" in message
+
+    def test_an_acceptance_artifact_with_no_clause_ids_says_so_rather_than_nothing(self, tmp_path):
+        """ "the producer files no names" and "there are no unmet clauses" are
+        different facts; an omitted line renders them identically."""
+        from crucible.keys import acceptance_reading_key
+
+        store = _seed(tmp_path, previous=_board())
+        store.put_bytes(
+            acceptance_reading_key(DAY.isoformat()),
+            json.dumps(
+                {"met": 21, "unmet": 2, "unmeasurable": 1, "commit": SHA, "measured_at": "x"}
+            ).encode(),
+        )
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "    the artifact names no unmet clause ids" in message
+
+
+class TestTheLinkToTheFullBoard:
+    def test_the_message_carries_a_url_for_the_board_page(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert (tmp_path / "board" / "index.html").resolve().as_uri() in message
+
+    def test_the_expiry_is_quoted_as_a_bound_and_not_as_a_promise(self, tmp_path):
+        """A presigned URL signed with temporary credentials dies with the
+        credential. Quoting seven days flat would be a promise the signing
+        role cannot keep, and a reader who finds a dead link having been told
+        it had days left concludes the board is broken."""
+        store = _seed(tmp_path, previous=_board())
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "when the signing role's session ends, whichever is first" in message
+        assert BOARD_URL_EXPIRES_S == 7 * 24 * 3600
+
+    def test_a_missing_page_is_stated_rather_than_killing_the_whole_report(self, tmp_path):
+        """The report is the surface that would tell anybody the page is
+        missing, so it must survive the page being missing."""
+        store = _seed(tmp_path, previous=_board(), page=False)
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert BOARD_URL_UNAVAILABLE in message
+        assert "LADDER" in message, "the rest of the report must still be there"
+
+
+class TestTheTruncationRule:
+    """Telegram takes 4096 characters. What gets dropped is a decision, and
+    dropping it silently is the same defect as a green row over no data.
+    """
+
+    @staticmethod
+    def _huge(tmp_path) -> str:
+        # 60 phases, each holding 12 clauses with long names — far past the cap.
+        rows = [
+            _row(
+                f"phase{i}",
+                "phase",
+                "UNMET",
+                "d",
+                [_clause(f"clause_number_{i}_{j}_with_a_long_name", False) for j in range(12)],
+            )
+            for i in range(60)
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        return run_report(store, trading_day=DAY, now=FIRED_AT)
+
+    def test_a_message_over_the_cap_is_cut_to_fit(self, tmp_path):
+        assert wire_length(self._huge(tmp_path)) <= MESSAGE_MAX_CHARS
+
+    def test_the_cut_is_declared_with_a_count(self, tmp_path):
+        message = self._huge(tmp_path)
+        assert TRUNCATION_MARKER in message
+        assert "line(s) withheld" in message
+
+    def test_every_ladder_line_survives_while_clause_names_are_dropped(self, tmp_path):
+        """The issue's rule, and the one that decides what a reader is left
+        with: every phase's fraction survives; the names go to the page.
+
+        Dropped from the END of the tier, so the earliest phases keep their
+        names — a truncation that cut from the front would leave a reader
+        with the tail of a ladder and no idea where it started.
+        """
+        message = self._huge(tmp_path)
+        for i in range(60):
+            assert f"  phase{i}  UNMET  0/12" in message, f"phase{i}'s ladder line was dropped"
+        holding = [ln for ln in message.splitlines() if ln.startswith("    holding:")]
+        assert holding, "dropping every name when only some were needed is over-truncation"
+        assert len(holding) < 60, "no clause-name line was dropped, so nothing was truncated"
+        assert message.splitlines().index(f"    holding: {holding[0].split(': ')[1]}") < 10
+
+    def test_a_message_under_the_cap_is_untouched(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert TRUNCATION_MARKER not in message
+        assert "    holding: b_unmet" in message
+
+    def test_the_budget_is_measured_on_the_escaped_body(self, tmp_path):
+        """krepis escapes the body AFTER this module hands it over, so a
+        message that fits before escaping and not after is tail-trimmed by the
+        transport — losing the link, which is the last thing in it."""
+        assert wire_length("a_b") == 4
+        assert wire_length("[x]") == 5
+        assert wire_length("plain") == 5
+
+
+# ── the POSTed body, not the rendered one, is what has to fit (review F1) ──
+
+
+class TestTheWireBodyFitsTheCap:
+    """`_fit`'s ONE postcondition, asserted on what Telegram actually receives.
+
+    The adversarial review on `alpha-engine-config-I9921` measured the gap:
+    the 60-phase fixture rendered a body of wire length **4117** against a
+    budget that reserved only `"\\n\\n(truncated — see full board)"` — not the
+    ` — N line(s) withheld` it also emits, and not the 35-character
+    `[INFO] crucible-v2/report.morning: ` prefix `krepis.alerts.publish`
+    prepends. 4117 + 35 = 4152 was POSTed; Telegram returned 400 *message is
+    too long*, which is not an entity-parse error, so krepis' plain-text retry
+    never fired, `send_message` returned False, `deliver` raised
+    `UndeliveredError`, the manifest read `failed` and `alerts.sweep` paged.
+
+    `TestTheTruncationRule` above asserted the ladder survived and that
+    `wire_length` was the unit of measure. It never asserted the result was
+    under the cap — the one property the whole function exists to deliver.
+    This class asserts exactly that, at the cap and over it.
+    """
+
+    @staticmethod
+    def _wire(message: str) -> int:
+        """What krepis escapes and POSTs: the prefix plus this body."""
+        return wire_length(TRANSPORT_PREFIX + message)
+
+    def test_the_prefix_matches_the_one_krepis_actually_prepends(self):
+        """PINNED against krepis' own formatter, not restated from its source.
+
+        `TRANSPORT_PREFIX` is composed here from `DELIVERY_SEVERITY` and
+        `DELIVERY_SOURCE` because krepis exposes no public formatter. That is
+        a budget term derived from another package's behaviour, so it is
+        pinned by CALLING that behaviour: the day krepis changes its envelope
+        this fails, instead of the report silently going over the cap.
+        """
+        from krepis.alerts import _format_message
+
+        formatted = _format_message("BODY", DELIVERY_SEVERITY, DELIVERY_SOURCE)
+        assert formatted == f"{TRANSPORT_PREFIX}BODY"
+        assert TRANSPORT_PREFIX.endswith(": ")
+
+    def test_the_reviews_own_fixture_now_fits_the_wire(self, tmp_path):
+        """The exact fixture that measured 4117 and was refused."""
+        message = TestTheTruncationRule._huge(tmp_path)
+        assert self._wire(message) <= MESSAGE_MAX_CHARS
+        assert TRUNCATION_MARKER in message
+
+    def test_a_body_at_exactly_the_cap_is_not_truncated(self):
+        """The boundary is inclusive: 4096 is a message Telegram takes."""
+        from crucible.morning import _KEEP, _fit
+
+        lines = self._lines_of_wire_length(MESSAGE_MAX_CHARS - wire_length(TRANSPORT_PREFIX))
+        rendered = _fit(lines)
+        assert self._wire(rendered) == MESSAGE_MAX_CHARS
+        assert TRUNCATION_MARKER not in rendered
+        assert rendered == "\n".join(text for text, _ in lines)
+        assert all(tier == _KEEP for _, tier in lines)
+
+    def test_a_body_one_character_over_the_cap_is_truncated_and_fits(self):
+        """One character over, and the result is under — including the suffix
+        the truncation itself adds, which is what F1 was."""
+        from crucible.morning import _fit
+
+        lines = self._lines_of_wire_length(MESSAGE_MAX_CHARS - wire_length(TRANSPORT_PREFIX) + 1)
+        rendered = _fit(lines)
+        assert TRUNCATION_MARKER in rendered
+        assert self._wire(rendered) <= MESSAGE_MAX_CHARS
+
+    def test_the_suffix_the_budget_reserved_is_the_suffix_emitted(self):
+        """F1 restated as a property: the reserved string and the emitted
+        string are one function, so they cannot drift again."""
+        from crucible.morning import _fit, _truncation_suffix
+
+        lines = self._lines_of_wire_length(MESSAGE_MAX_CHARS * 2)
+        rendered = _fit(lines)
+        dropped = len(lines) - len(rendered.split(TRUNCATION_MARKER)[0].rstrip("\n").splitlines())
+        assert rendered.endswith(_truncation_suffix(dropped))
+        assert self._wire(rendered) <= MESSAGE_MAX_CHARS
+
+    @pytest.mark.parametrize("phases", [1, 6, 60, 400])
+    def test_the_wire_fits_at_every_board_size(self, tmp_path, phases):
+        """The postcondition is not a property of one fixture."""
+        rows = [
+            _row(
+                f"phase{i}",
+                "phase",
+                "UNMET",
+                "d",
+                [_clause(f"clause_number_{i}_{j}_with_a_long_name", False) for j in range(12)],
+            )
+            for i in range(phases)
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert self._wire(message) <= MESSAGE_MAX_CHARS
+
+    def test_the_url_block_alone_fits_the_cap(self, tmp_path):
+        """`_fit`'s stated residual, measured rather than assumed away.
+
+        The `_URL` tier is never dropped, so if it alone exceeded the budget
+        nothing could bring the message under the cap. It is one heading, one
+        presigned URL and one fixed caveat — this asserts that bound holds on
+        a real render rather than trusting that it is obviously small.
+        """
+        from crucible.morning import _URL, _board_lines
+
+        inputs = read_inputs(_seed(tmp_path, previous=_board()), trading_day=DAY, now=FIRED_AT)
+        block = _board_lines(inputs)
+        assert block and all(tier == _URL for _, tier in block)
+        heading = SECTIONS[-1]
+        pinned = "\n".join(["", heading, *(text for text, _ in block)])
+        assert wire_length(TRANSPORT_PREFIX + pinned) < MESSAGE_MAX_CHARS
+
+    @staticmethod
+    def _lines_of_wire_length(target: int) -> list[tuple[str, int]]:
+        """`_KEEP` lines of plain text joining to exactly ``target`` wire chars.
+
+        Plain `a`s, so `wire_length` is `len` and the arithmetic under test is
+        the fitter's rather than the escaper's.
+        """
+        from crucible.morning import _KEEP
+
+        lines = [("a" * 100, _KEEP) for _ in range(target // 101)]
+        remainder = target - (len(lines) * 101 - 1) - 1
+        if remainder > 0:
+            lines.append(("a" * remainder, _KEEP))
+        built = "\n".join(text for text, _ in lines)
+        assert wire_length(built) == target, "the fixture does not hit its own target length"
+        return lines
+
+
+# ── the link is the pointer to everything cut, so it is never cut (F3) ─────
+
+
+class TestTheLinkOutlivesEveryTruncation:
+    """`alpha-engine-config-I9921`: "never the ladder lines", and the review's
+    corollary — never the URL either.
+
+    Measured before this fix, on a 200-line `_KEEP` ladder: the FULL BOARD
+    heading, the URL and the caveat were the first three lines dropped, purely
+    because the inner loop deletes from the END of the list and they are last.
+    The message then said "(truncated — see full board)" and carried no board,
+    which is the outcome `MESSAGE_MAX_CHARS`'s own docstring names as the
+    reason not to let the transport tail-trim.
+
+    The fixture is a board whose phase rows carry NO clause list, so
+    `_phase_lines` falls back to the board's unbounded free text at `_KEEP` —
+    the path the review named as unbounded, reached without inventing a
+    private call.
+    """
+
+    @staticmethod
+    def _message(tmp_path, *, phases: int) -> str:
+        rows = [
+            _row(f"phase{i}", "phase", "UNMET", "unbounded board free text " * 12)
+            for i in range(phases)
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        return run_report(store, trading_day=DAY, now=FIRED_AT)
+
+    @pytest.mark.parametrize("phases", [200, 2000])
+    def test_the_url_survives_a_keep_tier_body_far_over_budget(self, tmp_path, phases):
+        message = self._message(tmp_path, phases=phases)
+        assert TRUNCATION_MARKER in message, "the fixture must actually truncate"
+        assert "file://" in message, "the link to the full board was dropped"
+        assert SECTIONS[-1] in message, "the FULL BOARD heading was dropped"
+
+    def test_the_caveat_stays_with_the_url(self, tmp_path):
+        """A presigned link with no expiry beside it is a promise the
+        credential cannot keep — the caveat is part of the pointer."""
+        message = self._message(tmp_path, phases=200)
+        assert "presigned GET, expires" in message
+
+    def test_the_ladder_is_sacrificed_before_the_link(self, tmp_path):
+        """The inverse of the defect: at extreme sizes ladder lines go and the
+        link stays, never the other way round."""
+        message = self._message(tmp_path, phases=2000)
+        ladder = [ln for ln in message.splitlines() if ln.startswith("  phase")]
+        assert len(ladder) < 2000, "nothing was dropped, so the fixture proves nothing"
+        assert "file://" in message
+
+    def test_the_order_of_sacrifice_is_the_one_the_issue_states(self):
+        """Clause names, schedule, moved-since, silence, acceptance ids, then
+        whatever is left — and the URL is not in the order at all."""
+        from crucible.morning import (
+            _ACCEPTANCE_IDS,
+            _DROP_ORDER,
+            _KEEP,
+            _MOVED,
+            _NAMES,
+            _SCHEDULE,
+            _SILENCE,
+            _URL,
+        )
+
+        assert _DROP_ORDER == (_NAMES, _SCHEDULE, _MOVED, _SILENCE, _ACCEPTANCE_IDS, _KEEP)
+        assert _URL not in _DROP_ORDER
+
+
+# ── one artifact, one parse, two surfaces (review F2) ─────────────────────
+
+
+class TestOneAcceptanceReaderForBothSurfaces:
+    """The message and the page it links to read the SAME document with the
+    SAME rule, or one of them is lying about the other.
+
+    Measured before this fix, on one document missing only `commit`: the
+    message rendered `acceptance count: not on any artifact` while the page it
+    pointed at rendered `21 met / 2 unmet / 1 unmeasurable ... at commit
+    UNKNOWN`. `board.py`'s own docstring claimed the distinction was "made
+    once here so the page and the message cannot disagree". It was made twice.
+    """
+
+    COMPLETE: dict[str, Any] = {
+        "met": 21,
+        "unmet": 2,
+        "unmeasurable": 1,
+        "commit": SHA,
+        "measured_at": "2026-09-02T22:00:00Z",
+    }
+    #: The review's own document: three counts, no commit.
+    NO_COMMIT: dict[str, Any] = {"met": 21, "unmet": 2, "unmeasurable": 1}
+
+    @staticmethod
+    def _both(tmp_path, document: dict[str, Any]) -> tuple[str, str]:
+        """One document, rendered by both surfaces from one store."""
+        import argparse
+
+        from crucible.keys import acceptance_reading_key
+        from crucible.track_c import board_handler
+
+        store = _seed(tmp_path, previous=_board())
+        store.put_bytes(acceptance_reading_key(DAY.isoformat()), json.dumps(document).encode())
+        board_handler(argparse.Namespace(trading_day=DAY, store=str(tmp_path)))
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        return message, store.get_bytes(BOARD_HTML_KEY).decode()
+
+    def test_a_document_with_no_commit_is_refused_by_both(self, tmp_path):
+        """The exact disagreement the review measured, as one assertion."""
+        message, page = self._both(tmp_path, self.NO_COMMIT)
+        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT in message
+        assert "answers a different question" in page
+        assert "21 met" not in page, "the page quotes a figure the message says does not exist"
+        assert "UNKNOWN" not in page.split("<h2>objective")[0]
+
+    def test_a_complete_document_renders_the_same_figures_on_both(self, tmp_path):
+        message, page = self._both(tmp_path, self.COMPLETE)
+        assert "acceptance count: 21 met / 2 unmet / 1 unmeasurable of 24" in message
+        assert "21 met / 2 unmet / 1 unmeasurable</strong> of 24 clauses" in page
+        assert SHA in message
+        assert SHA in page
+        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT not in message
+
+    @pytest.mark.parametrize(
+        "document",
+        [
+            {"met": 21, "unmet": 2, "unmeasurable": 1},
+            {"met": 21, "unmet": 2, "commit": SHA},
+            {"met": "21", "unmet": 2, "unmeasurable": 1, "commit": SHA},
+            {"met": True, "unmet": 2, "unmeasurable": 1, "commit": SHA},
+            {"met": 21, "unmet": 2, "unmeasurable": 1, "commit": ""},
+        ],
+    )
+    def test_every_incomplete_shape_is_refused_by_both(self, tmp_path, document):
+        """One completeness rule, exercised on every way a document can miss
+        it — including `True`, which Python calls an `int` and no reader
+        should call a count."""
+        message, page = self._both(tmp_path, document)
+        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT in message
+        assert "answers a different question" in page
+
+    def test_the_shared_parser_is_the_only_completeness_rule(self):
+        """Neither renderer restates it. A rule stated in two places has
+        already drifted; this one had."""
+        from crucible.keys import ACCEPTANCE_REQUIRED_FIELDS, parse_acceptance_reading
+
+        assert ACCEPTANCE_REQUIRED_FIELDS == ("met", "unmet", "unmeasurable", "commit")
+        assert parse_acceptance_reading(self.NO_COMMIT) is None
+        parsed = parse_acceptance_reading(self.COMPLETE)
+        assert parsed is not None
+        assert parsed.total == 24
+        assert parsed.unmet_clauses is None, "an absent list is 'not filed', never 'there are none'"
+
+
+# ── the page link: denied is not absent (review F4) ───────────────────────
+
+
+class TestAReadThatFailedIsNotAPageThatIsAbsent:
+    """`_board_url` swallowed only `KeyError`, but `S3Store.presigned_url`
+    reaches absence through `exists()` → `head_object`, which re-raises every
+    non-404 `ClientError`. `alpha-engine-config-I9896` measured the shape live:
+    S3 answers **403 for a missing key** when the caller also lacks
+    `s3:ListBucket` on the prefix — and `board/index.html` is written only
+    under `if may_move:`, so its absence is a live possibility. The whole
+    report would have died over a missing optional link.
+    """
+
+    class _Store(LocalStore):
+        def __init__(self, root, *, code: str) -> None:
+            super().__init__(root)
+            self._code = code
+
+        def presigned_url(self, key: str, expires_s: int) -> str:
+            if key == BOARD_HTML_KEY:
+                raise ClientError(
+                    {"Error": {"Code": self._code, "Message": "s3:ListBucket denied"}},
+                    "HeadObject",
+                )
+            return super().presigned_url(key, expires_s)
+
+    def _message(self, tmp_path, code: str) -> str:
+        _seed(tmp_path, previous=_board())
+        store = self._Store(tmp_path, code=code)
+        return run_report(store, trading_day=DAY, now=FIRED_AT)
+
+    def test_an_access_denied_page_read_does_not_kill_the_report(self, tmp_path):
+        message = self._message(tmp_path, "AccessDenied")
+        assert message.startswith("CRUCIBLE V2 —")
+
+    def test_an_access_denied_page_read_is_named_as_an_access_failure(self, tmp_path):
+        message = self._message(tmp_path, "AccessDenied")
+        assert "AccessDenied" in message
+        assert "access failure" in message
+        assert BOARD_URL_UNAVAILABLE not in message, (
+            "a denied read reported as 'the board render published none' blames the wrong job"
+        )
+
+    def test_a_not_found_page_read_is_still_absent_not_denied(self, tmp_path):
+        """A `ClientError` carrying a 404 code is the ABSENT case, matched for
+        the same reason `_read_json` matches it: a mock or a future backend
+        that raises it directly must degrade to the honest answer."""
+        message = self._message(tmp_path, "NoSuchKey")
+        assert BOARD_URL_UNAVAILABLE in message
+        assert "access failure" not in message
+
+    def test_an_absent_page_is_still_the_unavailable_line(self, tmp_path):
+        store = _seed(tmp_path, previous=_board(), page=False)
+        assert BOARD_URL_UNAVAILABLE in run_report(store, trading_day=DAY, now=FIRED_AT)
+
+    def test_a_configuration_failure_still_raises(self, tmp_path):
+        """Nothing widened. A `ValueError` from an out-of-range lifetime is a
+        defect in this job's own configuration and must not be swallowed into
+        a slightly shorter message."""
+
+        class _Broken(LocalStore):
+            def presigned_url(self, key: str, expires_s: int) -> str:
+                raise ValueError("expires_s out of range")
+
+        _seed(tmp_path, previous=_board())
+        with pytest.raises(ValueError):
+            run_report(_Broken(tmp_path), trading_day=DAY, now=FIRED_AT)
+
+
 def test_read_inputs_returns_the_declared_shape(tmp_path):
     store = _seed(tmp_path, previous=_board())
     inputs = read_inputs(store, trading_day=DAY)
     assert isinstance(inputs, MorningInputs)
     assert inputs.previous_day == PREVIOUS
     assert inputs.board_code_sha == SHA
-    assert render_message(inputs, now=FIRED_AT).startswith("crucible v2 —")
+    assert render_message(inputs, now=FIRED_AT).startswith("CRUCIBLE V2 —")

@@ -21,12 +21,16 @@ under the old one without failing.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from typing import Any
 
 from crucible.calendar import assert_trading_day
 
 __all__ = [
+    "ACCEPTANCE_REQUIRED_FIELDS",
     "ALERTS_ROOT",
     "ARM_SEGMENT_SEPARATOR",
+    "AcceptanceReading",
     "BOARD_CURRENT_KEY",
     "BOARD_HTML_KEY",
     "DRIFT_INPUTS",
@@ -65,6 +69,7 @@ __all__ = [
     "manifest_prefix",
     "migration_key",
     "morning_report_key",
+    "parse_acceptance_reading",
     "parse_manifest_key",
     "retirement_log_key",
     "review_key",
@@ -739,7 +744,16 @@ def acceptance_reading_key(trading_day: str) -> str:
     **The producer contract**, and the document `crucible.morning` parses::
 
         {"met": int, "unmet": int, "unmeasurable": int,
-         "commit": str, "measured_at": str}
+         "commit": str, "measured_at": str,
+         "unmet_clauses": [str], "unmeasurable_clauses": [str]}
+
+    The two clause-id lists are OPTIONAL and are the only optional fields
+    here (`alpha-engine-config-I9921`): the report and the board page name the
+    failing clauses when the producer files them, and say "the artifact names
+    no unmet clause ids" when it does not. Optional rather than required so a
+    producer shipping the counts first is a partial producer rather than a
+    broken one — but never inferred: an absent list means "not filed", never
+    "there are none", and the consumers render those differently.
 
     `unmeasurable` is its own integer and is never folded into `unmet`: "the
     clause says no" and "we could not ask" are different facts and the second
@@ -751,3 +765,88 @@ def acceptance_reading_key(trading_day: str) -> str:
     if not trading_day:
         raise ValueError("trading_day must be non-empty")
     return f"report/acceptance/{trading_day}.json"
+
+
+#: The fields a reading must carry before either surface will quote a figure
+#: from it. Declared once, here, beside the key whose contract they are —
+#: :func:`parse_acceptance_reading` is the only reader, and both consumers go
+#: through it.
+ACCEPTANCE_REQUIRED_FIELDS: tuple[str, ...] = ("met", "unmet", "unmeasurable", "commit")
+
+
+@dataclass(frozen=True)
+class AcceptanceReading:
+    """One parsed §2 acceptance reading. Complete by construction.
+
+    There is no partial instance of this type: :func:`parse_acceptance_reading`
+    returns `None` rather than an object with a missing field, so no consumer
+    can render three quarters of the only number the plan calls progress and
+    have it look exactly like a measurement.
+    """
+
+    met: int
+    unmet: int
+    unmeasurable: int
+    commit: str
+    measured_at: str | None
+    #: `None` means the producer filed no list — never "there are none". The
+    #: two render differently on both surfaces.
+    unmet_clauses: tuple[str, ...] | None
+    unmeasurable_clauses: tuple[str, ...] | None
+
+    @property
+    def total(self) -> int:
+        return self.met + self.unmet + self.unmeasurable
+
+
+def _clause_ids(document: dict[str, Any], field_name: str) -> tuple[str, ...] | None:
+    named = document.get(field_name)
+    if not isinstance(named, list) or not named:
+        return None
+    return tuple(str(cid) for cid in named)
+
+
+def parse_acceptance_reading(document: Any) -> AcceptanceReading | None:
+    """The ONE reader of an acceptance artifact. `None` when it is not one.
+
+    **One parse, two consumers** (`alpha-engine-config-I9921` adversarial
+    review F2). `crucible.morning` renders this reading into the Telegram
+    message and `crucible.board` renders it onto the page the message links
+    to. Before this function existed each had its own completeness rule — the
+    message required all four of :data:`ACCEPTANCE_REQUIRED_FIELDS` and the
+    page required only the three integers, rendering a missing `commit` as
+    the literal `UNKNOWN`. Measured on ONE document: the message said
+    `acceptance count: not on any artifact` while the page it pointed at
+    printed `21 met / 2 unmet / 1 unmeasurable ... at commit UNKNOWN`. A
+    surface that says a number does not exist, linking to a surface printing
+    it, is worse than either alone.
+
+    The rule, stated once: all four required fields present, the three counts
+    real `int`s (a `bool` is not a count, however much Python agrees it is an
+    `int`), `commit` a non-empty string. Anything else is not a reading —
+    `None`, and each surface says so in its own words. Absence and denial are
+    NOT this function's business: the caller already told them apart when it
+    read the key, and folding them in here would put plan §6 rule 1's
+    forbidden conflation inside the shared parser.
+    """
+    if not isinstance(document, dict):
+        return None
+    counts: list[int] = []
+    for field_name in ("met", "unmet", "unmeasurable"):
+        value = document.get(field_name)
+        if not isinstance(value, int) or isinstance(value, bool):
+            return None
+        counts.append(value)
+    commit = document.get("commit")
+    if not isinstance(commit, str) or not commit:
+        return None
+    measured_at = document.get("measured_at")
+    return AcceptanceReading(
+        met=counts[0],
+        unmet=counts[1],
+        unmeasurable=counts[2],
+        commit=commit,
+        measured_at=measured_at if isinstance(measured_at, str) and measured_at else None,
+        unmet_clauses=_clause_ids(document, "unmet_clauses"),
+        unmeasurable_clauses=_clause_ids(document, "unmeasurable_clauses"),
+    )
