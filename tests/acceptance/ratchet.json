@@ -7,9 +7,9 @@
   },
   "unmeasurable": {
     "TestCost::test_every_v2_resource_is_tagged_for_cost_attribution": {
-      "reason": "phase 0 — the read fails in both environments the suite runs in: GitHub Actions grants the acceptance job no AWS credentials at all (Blocked on: You must specify a region), and ne-laptop-agent's assumed role lacks cloudformation:ListStackResources on the crucible-v2 stack (ClientError, code AccessDenied). Neither is a statement about whether resources are tagged. Follow-up to grant read-only access in at least one environment: alpha-engine-config-I9895",
-      "blocked_on_class": "ClientError",
-      "last_moved": "2026-09-02"
+      "reason": "phase 0 — the read fails in the environment the checker runs in: GitHub Actions grants the acceptance job no AWS credentials and no region (botocore NoRegionError). On the laptop the same clause reads ClientError/AccessDenied on cloudformation:ListStackResources, but the ratchet commits what CI observes, not what an author's shell observes — crucible-PR55 committed the laptop's class and turned main red on its own merge (2026-09-03T14:40Z). Neither exception is a statement about whether resources are tagged. Becomes measurable when alpha-engine-config-I9895 (read-only role) and I9902 (crucible-PR61) land; that is a further ratchet move in its own PR.",
+      "blocked_on_class": "NoRegionError",
+      "last_moved": "2026-09-03"
     }
   },
   "met": [
