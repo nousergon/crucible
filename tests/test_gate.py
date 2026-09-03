@@ -19,7 +19,6 @@ from crucible.gate import (
     GATES,
     PHASE0_DELIVERABLES,
     PHASES,
-    REVIEW_SCHEMA_VERSION,
     SOURCE_SCAN_SCOPE,
     Deliverable,
     build_ladder,
@@ -32,6 +31,7 @@ from crucible.gate import (
 from crucible.keys import arena_cycle_key, arm_register_key, review_key
 from crucible.manifest import manifest_key
 from crucible.report import attribution_key
+from crucible.review import review_document
 from crucible.slots import SLOTS
 from crucible.store import LocalStore
 from crucible.weekly import arc_stages
@@ -43,20 +43,37 @@ REVIEWER = "session_01ReviewerBBBBB"
 
 
 def _review() -> dict:
-    """One independent adversarial review, in the shape the clause reads."""
-    return {
-        "schema_version": REVIEW_SCHEMA_VERSION,
-        "phase": "phase1",
-        "verdict": "pass",
-        "reviewer": REVIEWER,
-        # Derived from the commits under review by the recording job — never
-        # supplied by the session asking to be passed.
-        "authors": ["session_01AuthorAAAAAAAA", "cipher813"],
-        "pr_number": 46,
-        "head_sha": SHA,
-        "summary": "no findings against plan §2",
-        "reviewed_at": "2026-08-28T18:00:00Z",
-    }
+    """One independent adversarial review, built by the REAL producer.
+
+    `crucible.review.review_document`, not a hand-written dict: a fixture that
+    restates the shape is a second contract, and this repository has already
+    found one of those drifting inside the change that introduced it.
+    """
+    return review_document(
+        phase="phase1",
+        verdict="pass",
+        reviewer=REVIEWER,
+        # The author set is read out of the commits, never supplied by the
+        # session asking to be passed.
+        commits=[
+            {
+                "commit": {
+                    "message": (
+                        "fix: a thing\n\nClaude-Session: "
+                        "https://claude.ai/code/session_01AuthorAAAAAAAA\n"
+                    ),
+                    "author": {"email": "someone@example.invalid"},
+                    "committer": {"email": "someone@example.invalid"},
+                },
+                "author": {"login": "cipher813"},
+                "committer": {"login": "cipher813"},
+            }
+        ],
+        head_sha=SHA,
+        pr_number=46,
+        summary="no findings against plan section 2",
+        reviewed_at=dt.datetime(2026, 8, 28, 18, 0, tzinfo=dt.UTC),
+    )
 
 
 def _put(store: LocalStore, key: str, document: dict) -> None:
@@ -141,7 +158,12 @@ def _seed_met(tmp_path) -> LocalStore:
     # `tests/test_gate_independent_review.py`; here it only has to be present
     # and independent, so `_seed_met` still means "every phase-1 clause is
     # satisfied" rather than "every clause except the newest one".
-    _put(store, review_key("phase1", FRIDAY.isoformat(), REVIEWER), _review())
+    _review_document = _review()
+    _put(
+        store,
+        review_key("phase1", FRIDAY.isoformat(), REVIEWER, "pass"),
+        _review_document,
+    )
     return store
 
 

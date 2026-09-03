@@ -60,11 +60,14 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
 from typing import NamedTuple
 
 import pytest
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from crucible.store import LocalStore
 
 WORKFLOW_DIR = pathlib.Path(__file__).resolve().parents[1] / ".github" / "workflows"
 # GitHub accepts both suffixes; `test_no_suppressions.py` already scans both.
@@ -100,18 +103,6 @@ PR_REACHABLE_JOBS: dict[str, str] = {
         "tests/acceptance. Every step reads the checkout and nothing else; "
         "--collect-only imports the clause modules without executing a body, "
         "so it touches no live AWS."
-    ),
-    "adversarial-review-gate.yml:adversarial-review-gate": (
-        "the required status check. Its subject IS the pull request — it reads "
-        "the commits under review and the commit statuses on their head sha, "
-        "both properties of the diff, and the author clears it by getting an "
-        "independent review done. It reaches no live AWS and holds no OIDC "
-        "token: it could not, since every crucible role's trust condition pins "
-        "`ref:refs/heads/main` and a pull_request job runs on refs/pull/N/merge."
-    ),
-    "adversarial-review-gate.yml:record-verdict": (
-        "workflow_dispatch-only; gated on the dispatch inputs and records one "
-        "named PR's review verdict as a commit status."
     ),
     "ci.yml:notify-main-failure": (
         "sends a notification; it grades nothing and posts no check. It also "
@@ -351,124 +342,164 @@ def test_the_job_model_accepts_both_legal_needs_forms() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The adversarial review gate, after the redesign.
+# The adversarial review recording workflow.
 #
 # What was deleted here, and why: this file used to carry ~700 lines executing
-# the `post-pending-check` and `resolve` shell scripts under a stubbed `gh` —
-# their collision guard, their self-heal, their duplicate-check-run handling.
+# the `post-pending-check` and `resolve` shell scripts under a stubbed `gh`.
 # Every one of them graded the management of a check-run created through
 # `POST /check-runs`, and a repository-ruleset required status check is NOT
-# satisfied by one of those. Measured by removal on 2026-09-02: dropping the
-# context from `required_status_checks` and changing nothing else merged
-# instantly; restoring it re-blocked, on a head whose check-run read
-# `completed/success`. So the whole mechanism those tests protected could
-# never satisfy the rule it existed for, and the tests were a detailed,
-# well-argued grading of a control that did not work. The required context is
-# a real job now, and the comparison it makes lives in
-# `.github/scripts/adversarial_review.py`, whose refusals are exercised
-# directly in `tests/test_adversarial_review.py`.
+# satisfied by one of those (measured 2026-09-02 by removal, on a head whose
+# check-run read `completed/success`). Then Brian ruled on 2026-09-03 that the
+# required-check FORM is abandoned permanently — an `if:`-skipped job still
+# posts a check-run under its own name and a `skipped` conclusion counts as
+# success, so the graded party could green the gate by pressing a dispatch
+# button. So the tests went with the mechanism, twice over.
+#
+# Two properties of that block were real and are rebuilt below rather than
+# lost: the `gh` stub's own self-test (a harness that silently answers an
+# unhandled endpoint proves nothing about the script it runs), and the
+# draft-PR refusal. The harness executes EVERY `run:` body in the surviving
+# job — an earlier version ran one step of one job, which is precisely why a
+# timeout-budget defect and a missing verification step were invisible to it.
+#
+# The independence comparison itself is NOT graded here: it lives in
+# `crucible/review.py` and is exercised as ordinary Python in
+# `tests/test_review.py`. This file grades the workflow's shape, its ordering,
+# and the fact that its shell actually reaches that module.
 # ---------------------------------------------------------------------------
 
-REVIEW_WORKFLOW = WORKFLOW_DIR / "adversarial-review-gate.yml"
-
-#: The context named in the `main-protection` ruleset's `required_status_checks`.
-#: A required context naming a job that does not exist is a check that never
-#: reports, which blocks every PR in the repository with no red anywhere to
-#: explain why — so this string is asserted against the workflow, not trusted.
-REQUIRED_CONTEXT = "adversarial-review-gate"
+RECORD_WORKFLOW = WORKFLOW_DIR / "adversarial-review-record.yml"
 
 
-def _review_workflow() -> Workflow:
-    return Workflow.load(REVIEW_WORKFLOW)
+def _record() -> Workflow:
+    return Workflow.load(RECORD_WORKFLOW)
 
 
-def test_the_required_context_is_emitted_by_a_real_job() -> None:
-    """The whole repair. A job whose rendered check-run name IS the required
-    context, running on `pull_request` — not an API-created check-run, which a
-    ruleset does not accept."""
-    job = _review_workflow().jobs[REQUIRED_CONTEXT]
-    assert job.model_extra["name"] == REQUIRED_CONTEXT, (
-        "the job's `name:` is what GitHub renders as the check-run name. If it "
-        f"is not exactly {REQUIRED_CONTEXT!r}, the required context is never "
-        "reported and every PR blocks forever."
-    )
-    assert "pull_request" in _review_workflow().events
+def _record_job() -> Job:
+    return _record().jobs["record-verdict"]
 
 
-def test_nothing_in_this_workflow_creates_its_own_check_run() -> None:
-    """The measured defect, held closed. A check-run POSTed through the REST
-    API cannot satisfy a ruleset required check, so a step that posts one is
-    either dead weight or a second check-run colliding with the real job's."""
-    workflow = _review_workflow()
-    # The EXECUTABLE surface only. The file's header comment explains at
-    # length why `POST /check-runs` cannot satisfy a ruleset required check,
-    # and a scan over raw text would refuse the explanation along with the
-    # thing it explains.
-    for name, job in workflow.jobs.items():
-        assert "checks" not in (job.model_extra.get("permissions") or {}), name
-        for step in job.steps:
-            assert "/check-runs" not in step.get("run", ""), name
+def _record_steps() -> list[str]:
+    return [step["run"] for step in _record_job().steps if "run" in step]
 
 
-def test_the_gate_job_holds_no_write_permission_of_any_kind() -> None:
-    """It reads a verdict; it never records one. A gate that could write its
-    own input is the shape `crucible/gate.py` exists to refuse."""
-    permissions = _review_workflow().jobs[REQUIRED_CONTEXT].model_extra["permissions"]
-    assert set(permissions.values()) == {"read"}, permissions
+def _record_step(name_fragment: str) -> str:
+    """One step's `run:` body, selected by NAME rather than by index.
+
+    An index moves the moment a step is inserted, and a harness that then runs
+    the wrong body still passes — which is how an earlier version of this file
+    executed one step of one job while reading as if it covered both.
+    """
+    matches = [
+        step["run"]
+        for step in _record_job().steps
+        if name_fragment.lower() in step.get("name", "").lower() and "run" in step
+    ]
+    assert len(matches) == 1, f"{name_fragment!r} matched {len(matches)} steps, expected 1"
+    return matches[0]
+
+
+def test_no_workflow_posts_a_check_run_or_a_commit_status() -> None:
+    """The review is a practice that is RUN, not a check that BLOCKS (Brian
+    ruling 2026-09-03).
+
+    Two measured properties made a required check worse than none, because
+    each converts an unexamined PR into a green one: an `if:`-skipped job
+    still posts a check-run under its own name and a `skipped` conclusion
+    counts as successful, so any workflow with a gate job plus a second
+    trigger let the graded party green it by pressing a button; and the author
+    side of the comparison is read out of a commit message the author writes.
+
+    This is asserted over EVERY workflow, not just the review one: the failure
+    mode is somebody re-adding the blocking half somewhere else because the
+    reason it went away was not written down where they would look.
+    """
+    for path in WORKFLOWS:
+        workflow = Workflow.load(path)
+        for name, job in workflow.jobs.items():
+            granted = job.model_extra.get("permissions") or {}
+            assert "checks" not in granted, f"{path.name}:{name}"
+            assert "statuses" not in granted, f"{path.name}:{name}"
+            for step in job.steps:
+                body = step.get("run", "")
+                assert "/check-runs" not in body, f"{path.name}:{name}"
+                assert "/statuses/" not in body, f"{path.name}:{name}"
+
+
+def test_the_recording_workflow_never_runs_on_a_pull_request() -> None:
+    """A `pull_request` trigger here would put a `record-verdict` check-run on
+    every PR head — a red check on an unreviewed PR, which is exactly the
+    noise the ruling removed. An unreviewed PR is a normal state now."""
+    assert _record().events == {"workflow_dispatch"}
+
+
+def test_the_recording_job_carries_no_if_condition() -> None:
+    """A single trigger makes an `if:` unnecessary, and an `if:` reappearing
+    here is the tell that a second trigger was added — the shape in which a
+    skipped job's check-run became satisfiable by a button press."""
+    assert _record_job().condition == ""
 
 
 def test_the_dispatch_has_no_author_input() -> None:
-    """The second defect. `author` was a free-text input supplied by the very
-    session asking to be passed — a gate whose input is supplied by the thing
-    it grades measures nothing. The author set is derived from the commits
-    now, so there is nothing for a dispatcher to assert."""
-    inputs = _review_workflow().triggers["workflow_dispatch"]["inputs"]
+    """`author` was a free-text input supplied by the very session asking to be
+    passed — a gate whose input is supplied by the thing it grades measures
+    nothing. The author set is read out of the commits now, so there is
+    nothing for a dispatcher to assert."""
+    inputs = _record().triggers["workflow_dispatch"]["inputs"]
     assert "author" not in inputs
     assert "reviewer" in inputs
 
 
-def test_both_jobs_call_the_one_shared_implementation() -> None:
-    """One independence comparison, not two. Two shell reimplementations of
-    "is this reviewer an author" is a contract restated twice, and one of them
-    drifts."""
-    jobs = _review_workflow().jobs
-    gate_script = "\n".join(step.get("run", "") for step in jobs[REQUIRED_CONTEXT].steps)
-    record_script = "\n".join(step.get("run", "") for step in jobs["record-verdict"].steps)
-    assert "adversarial_review.py gate" in gate_script
-    assert "adversarial_review.py context" in record_script
-    assert (
-        (pathlib.Path(__file__).resolve().parents[1] / ".github" / "scripts")
-        .joinpath("adversarial_review.py")
-        .is_file()
+def test_the_workflow_calls_crucible_review_rather_than_reimplementing_it() -> None:
+    """One independence comparison and one key shape, not a shell copy of
+    each. The module is imported by the gate clause too, so a drift between
+    producer and consumer is impossible rather than merely unlikely."""
+    script = "\n".join(_record_steps())
+    assert "python -m crucible.review check" in script
+    assert "python -m crucible.review record" in script
+
+
+def test_the_self_review_refusal_runs_before_any_credential_is_issued() -> None:
+    """A session that may not record a verdict has no business holding a token
+    that could write one. Ordering asserted against the step list, not
+    assumed."""
+    steps = _record_job().steps
+    checked = next(i for i, s in enumerate(steps) if "crucible.review check" in s.get("run", ""))
+    credentials = next(
+        i for i, s in enumerate(steps) if "configure-aws-credentials" in s.get("uses", "")
     )
+    assert checked < credentials
 
 
-def test_the_verdict_is_never_written_before_the_independence_check() -> None:
-    """Ordering, asserted rather than assumed: the refusal must sit between the
-    dispatch inputs and the status API, or a self-review reaches the record."""
-    script = "\n".join(
-        step.get("run", "") for step in _review_workflow().jobs["record-verdict"].steps
-    )
-    assert script.index("adversarial_review.py context") < script.index("/statuses/")
+def test_the_dispatch_is_refused_off_main() -> None:
+    """`alpha-engine-config-I9882`: the review role's OIDC trust pins
+    `ref:refs/heads/main` while `workflow_dispatch` accepts any ref, so a
+    dispatch off a branch failed at the assume — after the independence check
+    had passed, with an error STS gives no useful text for. The guard is the
+    FIRST step, so it costs nothing and its message carries the remedy."""
+    first = _record_job().steps[0]
+    assert "github.ref != 'refs/heads/main'" in first.get("if", "")
+    assert "--ref main" in first.get("run", "")
 
 
-def test_the_record_job_refreshes_the_gate_it_just_satisfied() -> None:
-    """Detect -> act -> VERIFY -> close, without a human. A recorded verdict
-    that leaves the required check red until someone re-runs a job by hand is
-    an operator step, and an operator step an agent could have run itself is a
-    defect (principle 3)."""
-    script = "\n".join(
-        step.get("run", "") for step in _review_workflow().jobs["record-verdict"].steps
-    )
-    assert "/rerun" in script
+def test_the_job_holds_no_write_permission_beyond_the_oidc_token() -> None:
+    granted = _record_job().model_extra["permissions"]
+    assert granted == {"contents": "read", "pull-requests": "read", "id-token": "write"}
 
 
-def test_a_verdict_write_is_never_cancelled_by_an_in_flight_push() -> None:
-    """`cancel-in-progress` must be an expression that reads FALSE for a
-    workflow_dispatch event: a durable verdict write should queue behind
-    another verdict write, never be discarded mid-flight."""
-    cancel_in_progress = _review_workflow().model_extra["concurrency"]["cancel-in-progress"]
-    assert isinstance(cancel_in_progress, str) and "workflow_dispatch" in cancel_in_progress
+def test_the_job_verifies_the_lockfile_before_installing() -> None:
+    """`uv sync --frozen` installs the locked versions without re-checking
+    them against pyproject.toml, so lockfile drift is invisible to it. Seven
+    Dependabot PRs merged green over exactly that."""
+    script = "\n".join(_record_steps())
+    assert "uv lock --check" in script
+    assert script.index("uv lock --check") < script.index("uv sync --frozen")
+
+
+def test_a_verdict_write_is_never_cancelled_by_an_in_flight_dispatch() -> None:
+    """A durable verdict write should queue behind another verdict write,
+    never be discarded mid-flight."""
+    assert _record().model_extra["concurrency"]["cancel-in-progress"] is False
 
 
 _FAKE_GH = """#!/usr/bin/env bash
@@ -480,84 +511,33 @@ if [ "$1" != "api" ]; then
 fi
 shift
 url=""
-method="GET"
-jq=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --paginate) shift ;;
-    -X) method="$2"; shift 2 ;;
-    --jq|-q) jq="$2"; shift 2 ;;
-    -f) shift 2 ;;
+    -X|--jq|-q|-f) shift 2 ;;
     *) if [ -z "$url" ]; then url="$1"; fi; shift ;;
   esac
 done
-case "$method:$url" in
-  POST:*/statuses/*) exit 0 ;;
-  GET:*/pulls/*/commits) cat "$FAKE_COMMITS" ;;
-  GET:*/pulls/*) echo "$FAKE_SHA" ;;
-  *) echo "unhandled fake gh endpoint: $method $url" >&2; exit 99 ;;
+# Routed on the URL, and anything unrecognised exits 99 rather than being
+# answered by whichever branch happens to match. A stub that quietly answers an
+# endpoint the script never really called proves nothing about the script;
+# `test_the_fake_gh_stub_rejects_an_unrecognised_endpoint` holds that property.
+case "$url" in
+  */pulls/*/commits) cat "$FAKE_COMMITS" ;;
+  */pulls/*) cat "$FAKE_PR" ;;
+  *) echo "unhandled fake gh endpoint: $url" >&2; exit 99 ;;
 esac
 """
 
-
-class _StepResult(NamedTuple):
-    result: subprocess.CompletedProcess
-    calls: list[str]
-
-
-def _run_record_step(tmp_path: pathlib.Path, commits: list[dict], reviewer: str) -> _StepResult:
-    """Execute the record-verdict job's REAL `run:` script under bash.
-
-    The script is extracted from the workflow rather than restated, so a step
-    that stops calling the independence check fails this harness rather than
-    passing a copy of itself.
-    """
-    root = pathlib.Path(__file__).resolve().parents[1]
-    (tmp_path / ".github" / "scripts").mkdir(parents=True)
-    shutil.copy(
-        root / ".github" / "scripts" / "adversarial_review.py",
-        tmp_path / ".github" / "scripts" / "adversarial_review.py",
-    )
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    (bin_dir / "gh").write_text(_FAKE_GH)
-    (bin_dir / "gh").chmod(0o755)
-    commits_path = tmp_path / "fake_commits.json"
-    commits_path.write_text(json.dumps(commits), encoding="utf-8")
-    call_log = tmp_path / "call_log"
-    call_log.write_text("")
-    github_env = tmp_path / "github_env"
-    github_env.write_text("")
-
-    script = _review_workflow().jobs["record-verdict"].steps[1]["run"]
-    result = subprocess.run(
-        ["bash", "-c", script],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        env={
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "CALL_LOG": str(call_log),
-            "GITHUB_ENV": str(github_env),
-            "FAKE_SHA": "c" * 40,
-            "FAKE_COMMITS": str(commits_path),
-            "GH_TOKEN": "fake-token",
-            "REPO": "nousergon/crucible",
-            "PR_NUM": "46",
-            "REVIEWER": reviewer,
-            "CONCLUSION": "success",
-            "SUMMARY": "no findings against plan section 2",
-            "RUN_URL": "https://example.invalid/run/1",
-        },
-    )
-    return _StepResult(result, [c for c in call_log.read_text().split("\0") if c])
-
-
 _AUTHOR_SESSION = "session_01AuthorAAAAAAAA"
+_REVIEWER_SESSION = "session_01ReviewerBBBBB"
+_HEAD_SHA = "c" * 40
 _COMMITS = [
     {
         "commit": {
-            "message": f"fix: a thing\n\nClaude-Session: https://claude.ai/code/{_AUTHOR_SESSION}\n",
+            "message": (
+                f"fix: a thing\n\nClaude-Session: https://claude.ai/code/{_AUTHOR_SESSION}\n"
+            ),
             "author": {"email": "someone@example.invalid"},
             "committer": {"email": "someone@example.invalid"},
         },
@@ -567,30 +547,180 @@ _COMMITS = [
 ]
 
 
+class _StepResult(NamedTuple):
+    result: subprocess.CompletedProcess
+    calls: list[str]
+    exported: str
+
+
+def _run_step(
+    tmp_path: pathlib.Path,
+    script: str | list[str],
+    overrides: dict[str, str],
+    *,
+    draft: bool = False,
+) -> _StepResult:
+    """Execute workflow steps' REAL `run:` bodies under bash, with `gh` stubbed.
+
+    The scripts are extracted from the workflow rather than restated, so a step
+    that stops calling the independence check fails this harness rather than
+    passing a copy of itself. `uv` is stubbed to exec its argument, which runs
+    the genuine `crucible.review` out of this checkout — the module is the
+    thing under test, and mocking it would leave the shell grading nothing.
+
+    Several steps may be passed, and they run in order in ONE working
+    directory with `GITHUB_ENV` carried forward — so the handoffs between them
+    (`commits.json` on disk, `REVIEW_SHA` exported) are exercised rather than
+    faked. A harness that fabricated those inputs would grade each step against
+    a world the previous step does not actually produce. The result is the LAST
+    step's, and the run stops at the first non-zero exit, exactly as GitHub
+    would.
+    """
+    scripts = [script] if isinstance(script, str) else script
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gh").write_text(_FAKE_GH)
+    (bin_dir / "gh").chmod(0o755)
+    (bin_dir / "uv").write_text(
+        '#!/usr/bin/env bash\nset -euo pipefail\n[ "$1" = "run" ] || exit 0\nshift\nexec "$@"\n'
+    )
+    (bin_dir / "uv").chmod(0o755)
+
+    def _dump(name: str, payload: object) -> str:
+        path = tmp_path / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    call_log = tmp_path / "call_log"
+    call_log.write_text("")
+    github_env = tmp_path / "github_env"
+    github_env.write_text("")
+    step_summary = tmp_path / "step_summary"
+    step_summary.write_text("")
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    variables = {
+        "PATH": f"{bin_dir}:{pathlib.Path(sys.executable).parent}:/usr/bin:/bin",
+        "PYTHONPATH": str(root),
+        "CALL_LOG": str(call_log),
+        "GITHUB_ENV": str(github_env),
+        "GITHUB_STEP_SUMMARY": str(step_summary),
+        "FAKE_PR": _dump("pr.json.fixture", {"head": {"sha": _HEAD_SHA}, "draft": draft}),
+        "FAKE_COMMITS": _dump("commits.json.fixture", _COMMITS),
+        "GH_TOKEN": "fake-token",
+        "REPO": "nousergon/crucible",
+        "PR_NUM": "48",
+        "REVIEWER": _REVIEWER_SESSION,
+        "PHASE": "phase1",
+        "VERDICT": "pass",
+        "SUMMARY": "no findings against plan section 2",
+        "STORE_URI": str(tmp_path / "store"),
+    }
+    variables.update(overrides)
+    for body in scripts:
+        result = subprocess.run(
+            ["bash", "-c", body],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            env=variables,
+        )
+        # `GITHUB_ENV` is how a step hands a value to the next one. Replayed
+        # here rather than assumed, so a step that stops exporting what the
+        # next one reads fails this harness.
+        for line in github_env.read_text().splitlines():
+            if "=" in line:
+                name, _, value = line.partition("=")
+                variables[name] = value
+        if result.returncode != 0:
+            break
+    return _StepResult(
+        result,
+        [c for c in call_log.read_text().split("\0") if c],
+        github_env.read_text(),
+    )
+
+
+def _python_is_available_as_python() -> bool:
+    return shutil.which("python") is not None or shutil.which("python3") is not None
+
+
+def test_the_fake_gh_stub_rejects_an_unrecognised_endpoint(tmp_path: pathlib.Path) -> None:
+    """This harness is only as real as its stub's routing. A stub that answers
+    a wrong path by coincidence is how a step's real endpoint goes unexercised
+    while the test reads green — which is what happened to the predecessor of
+    this file."""
+    step = _run_step(tmp_path, 'gh api "/repos/$REPO/bogus-endpoint"', {})
+    assert step.result.returncode == 99, step.result.stdout
+
+
 def test_the_authoring_session_cannot_record_a_verdict_on_its_own_change(
     tmp_path: pathlib.Path,
 ) -> None:
-    """The one structural control this workflow exists for, executed rather
-    than read: the refusal must happen, and it must happen BEFORE anything is
-    written."""
-    step = _run_record_step(tmp_path, _COMMITS, reviewer=_AUTHOR_SESSION)
+    """The one structural control this workflow exists for, executed through
+    the real shell and the real module rather than read off the file."""
+    step = _run_step(tmp_path, _record_step("refuse a self-review"), {"REVIEWER": _AUTHOR_SESSION})
     assert step.result.returncode != 0, step.result.stdout
     assert "independent of the author" in step.result.stderr
-    assert not [call for call in step.calls if "/statuses/" in call], step.calls
 
 
 def test_free_text_is_not_accepted_as_a_reviewer_identity(tmp_path: pathlib.Path) -> None:
-    step = _run_record_step(tmp_path, _COMMITS, reviewer="the reviewing agent")
+    step = _run_step(
+        tmp_path, _record_step("refuse a self-review"), {"REVIEWER": "the reviewing agent"}
+    )
     assert step.result.returncode != 0
-    assert not [call for call in step.calls if "/statuses/" in call]
+    assert "not a Claude session id" in step.result.stderr
 
 
-def test_an_independent_session_records_the_verdict(tmp_path: pathlib.Path) -> None:
+def test_a_verdict_is_refused_against_a_draft_pr(tmp_path: pathlib.Path) -> None:
+    """A verdict recorded against a draft sits on a sha the author is still
+    editing, and is honoured the moment the PR is marked ready — no further
+    push, no re-review."""
+    step = _run_step(tmp_path, _record_step("refuse a self-review"), {}, draft=True)
+    assert step.result.returncode != 0
+    assert "draft" in step.result.stdout.lower() + step.result.stderr.lower()
+
+
+def test_an_independent_session_passes_the_check_and_exports_the_sha(
+    tmp_path: pathlib.Path,
+) -> None:
     """Guards against a refusal that over-corrects into refusing everything —
     the shape that made the previous design's independence check unsatisfiable
-    on every dispatch."""
-    step = _run_record_step(tmp_path, _COMMITS, reviewer="session_01ReviewerBBBBB")
+    on every dispatch. Also pins the step's one output: the filing step reads
+    `REVIEW_SHA`, and a step that stopped exporting it would file a review of
+    nothing."""
+    step = _run_step(tmp_path, _record_step("refuse a self-review"), {})
     assert step.result.returncode == 0, step.result.stderr
-    posted = [call for call in step.calls if "/statuses/" in call]
-    assert posted, step.calls
-    assert "adversarial-review/session_01reviewerbbbbb" in posted[0]
+    assert f"REVIEW_SHA={_HEAD_SHA}" in step.exported
+
+
+def test_the_filing_step_writes_the_artifact_the_gate_clause_reads(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The second `run:` body, executed end to end into a real store — the
+    step that actually produces the deliverable. An earlier version of this
+    harness ran one step only, which is why two defects in the other one were
+    invisible."""
+    step = _run_step(
+        tmp_path,
+        [_record_step("refuse a self-review"), _record_step("File the review artifact")],
+        {},
+    )
+    assert step.result.returncode == 0, step.result.stdout + step.result.stderr
+    filed = sorted(LocalStore(tmp_path / "store").list_keys("reviews/"))
+    assert len(filed) == 1, filed
+    assert filed[0].startswith("reviews/phase1/")
+    assert filed[0].endswith(f"/{_REVIEWER_SESSION.lower()}/pass.json")
+
+
+def test_the_filing_step_records_a_fail_under_its_own_key(tmp_path: pathlib.Path) -> None:
+    """The durability guarantee, end to end: a `fail` and a `pass` from one
+    reviewer on one session are different objects, so re-recording a pass
+    cannot erase the finding."""
+    _run_step(
+        tmp_path,
+        [_record_step("refuse a self-review"), _record_step("File the review artifact")],
+        {"VERDICT": "fail"},
+    )
+    filed = sorted(LocalStore(tmp_path / "store").list_keys("reviews/"))
+    assert filed and filed[0].endswith("/fail.json"), filed

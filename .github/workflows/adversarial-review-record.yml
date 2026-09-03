@@ -1,0 +1,195 @@
+name: Adversarial Review Record
+
+# Files one independent adversarial review as a durable store artifact, for
+# `crucible gate` to read at a phase exit (plan §11 risk 1;
+# `alpha-engine-config-I9794`). The logic lives in `crucible/review.py` and is
+# tested there; this file is the trigger, the identity and the ordering.
+#
+# ── THIS IS NOT A REQUIRED CHECK, AND NEVER WILL BE ──────────────────────
+#
+# Brian ruling 2026-09-03: `adversarial-review-gate` is abandoned permanently
+# as a GitHub required status check on this repository. The review is a
+# practice that is RUN, not a check that BLOCKS. Two measured properties
+# decided it, and either alone makes a required check worse than none, because
+# each converts an unexamined PR into a green one:
+#
+#   * an `if:`-skipped job still posts a check-run under its own name, and a
+#     `skipped` conclusion counts as successful toward a required check — so a
+#     workflow carrying both a gate job and any second trigger let the graded
+#     party green the gate by pressing a dispatch button;
+#   * the author side of the independence comparison is read out of a commit
+#     message the author writes.
+#
+# So there is NO `pull_request` trigger here, no check-run, no commit status
+# and nothing else a pull request can read as red. An unreviewed PR is a
+# normal state. A phase exit with no review artifact is not, and that is where
+# the enforcement now sits — a gate clause cannot be pressed.
+#
+# A check-run posted through `POST /check-runs` could not have satisfied a
+# ruleset required check anyway: measured 2026-09-02 by removal, on a head
+# whose check-run read `completed/success`. That is recorded so nobody
+# rediscovers it, not as an argument for anything here.
+#
+# ── WHAT THE INDEPENDENCE CHECK DOES AND DOES NOT PROVE ──────────────────
+#
+# There is no `author` input, deliberately: it used to be free text supplied by
+# the very session asking to be passed, and a gate whose input is supplied by
+# the thing it grades measures nothing. The author set is read out of the
+# commits — `Claude-Session:` trailers plus commit author/committer identities.
+#
+# That is better-evidenced, NOT proof, and the difference is written down
+# rather than glossed: the trailer is author-written, so an author that omits
+# it, mistypes it, or records under a session id appearing in no commit still
+# passes; and the reviewer names itself, so an agent recording under another
+# session's id defeats the check. There is no cryptographic session
+# attestation in this fleet. What the control buys is that the honest path is
+# the cheap one, a deliberate bypass is legible afterwards in the commit
+# trailers and the review artifacts, and a CARELESS self-review — the common
+# failure — is refused outright. `crucible/review.py`'s docstring is the
+# normative statement of that residual.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number the adversarial review was run against'
+        required: true
+      reviewer:
+        description: 'The REVIEWING session id (session_<alnum>), not a GitHub login — every agent in this fleet dispatches as the same collaborator account, so a login can never prove independence. There is deliberately no `author` input: the author set is read out of the commits.'
+        required: true
+      phase:
+        description: 'The phase this review counts toward, as `crucible.gate.GATES` names it (e.g. phase1). A review filed under a phase no gate reads is filed and never read.'
+        required: true
+        default: phase1
+      verdict:
+        description: 'Review verdict. A `fail` is durable — the verdict is part of the key, so a later `pass` cannot overwrite it; it is superseded only by an independent pass naming a DIFFERENT head sha.'
+        required: true
+        type: choice
+        options: [pass, fail]
+      summary:
+        description: 'One-line verdict summary (e.g. "no findings against plan §2" or "3 findings, see review comment")'
+        required: true
+
+permissions: {}
+
+# A verdict write is never cancelled: it should queue behind another verdict
+# write, not be discarded mid-flight.
+concurrency:
+  group: ${{ github.workflow }}-record-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  # Created by nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml
+  # (`nous-ergon-ops-PR997`). Read-only over everything it does not write, and
+  # write-scoped to `crucible/reviews/*` with no `DeleteObject` — so a recorded
+  # finding cannot be removed by the party it was recorded against.
+  REVIEW_ROLE_ARN: arn:aws:iam::711398986525:role/crucible-v2-github-review
+  STORE_URI: s3://alpha-engine-crucible-v2/crucible
+
+jobs:
+  record-verdict:
+    name: record an adversarial review verdict
+    runs-on: ubuntu-latest
+    # No polling, no reruns, no waiting on another workflow: this job resolves
+    # a PR, refuses a self-review, and writes one object. The previous version
+    # of this file waited on a gate run it then re-ran, and paired
+    # `timeout-minutes: 10` with 600s of sleep — so GHA cancelled the job
+    # before its own loud-on-timeout branch could print. Deleting the required
+    # check deleted that whole mechanism rather than tuning it.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      # `alpha-engine-config-I9882`: the review role's trust condition pins
+      # `ref:refs/heads/main` (both the name-based and the immutable-id subject
+      # forms), while `workflow_dispatch` accepts any ref. A dispatch off a
+      # branch would therefore fail at the assume — AFTER the independence
+      # check had passed and with an error STS gives no useful text for.
+      # Refused here, first, with the actual remedy in the message.
+      - name: This workflow is dispatched from `main` only
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::dispatched from '${{ github.ref }}'. The review-writer role's OIDC trust condition pins ref:refs/heads/main, so the credential step below would fail with an error STS does not explain. Re-dispatch with --ref main; the PR number input is what selects the change under review, not the ref."
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # The same check `ci.yml` runs, and for the same reason: this job
+      # installs, and a job that installs from an unverified lockfile is what
+      # `uv lock --check` exists to stop.
+      - name: The lockfile agrees with pyproject.toml
+        run: uv lock --check
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Resolve the change under review and refuse a self-review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUM: ${{ inputs.pr_number }}
+          REVIEWER: ${{ inputs.reviewer }}
+        run: |
+          set -euo pipefail
+
+          gh api "/repos/$REPO/pulls/$PR_NUM" > pr.json
+          sha="$(uv run python -c 'import json;print(json.load(open("pr.json"))["head"]["sha"])')"
+          is_draft="$(uv run python -c 'import json;print(json.load(open("pr.json"))["draft"])')"
+
+          # A draft is not review-ready. A verdict recorded against one sits on
+          # a sha the author is still editing, and is honoured the moment the
+          # PR is marked ready with no further push and no re-review.
+          if [ "$is_draft" = "True" ]; then
+            echo "::error::PR #$PR_NUM is a draft. Mark it ready for review first — a verdict recorded against a draft would be honoured on the sha its author is still editing."
+            exit 1
+          fi
+
+          gh api --paginate "/repos/$REPO/pulls/$PR_NUM/commits" > commits.json
+
+          # The independence control, run BEFORE the credential step below: a
+          # session that may not record a verdict has no business holding a
+          # token that could write one. `check` writes nothing and exits
+          # non-zero on a self-review, a malformed reviewer id, an empty author
+          # set, or a commit list past GitHub's 250 page cap.
+          uv run python -m crucible.review check --commits commits.json --reviewer "$REVIEWER"
+
+          echo "REVIEW_SHA=$sha" >> "$GITHUB_ENV"
+
+      - name: Assume the review-writer identity
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          role-to-assume: ${{ env.REVIEW_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: File the review artifact
+        env:
+          PR_NUM: ${{ inputs.pr_number }}
+          REVIEWER: ${{ inputs.reviewer }}
+          PHASE: ${{ inputs.phase }}
+          VERDICT: ${{ inputs.verdict }}
+          SUMMARY: ${{ inputs.summary }}
+        run: |
+          set -euo pipefail
+
+          # The key, the trading-day resolution and the document shape all come
+          # from `crucible` — the same module the gate clause reads back — so
+          # there is nothing here for a workflow edit to restate incorrectly.
+          key="$(uv run python -m crucible.review record \
+            --commits commits.json \
+            --reviewer "$REVIEWER" \
+            --phase "$PHASE" \
+            --verdict "$VERDICT" \
+            --head-sha "$REVIEW_SHA" \
+            --pr-number "$PR_NUM" \
+            --summary "$SUMMARY" \
+            --store "$STORE_URI")"
+          echo "Filed $key"
+          echo "Filed \`$key\`" >> "$GITHUB_STEP_SUMMARY"
