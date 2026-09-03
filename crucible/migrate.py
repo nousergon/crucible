@@ -64,6 +64,15 @@ class V1Source:
     slot: str | None
     contributes: str
 
+    def series_prefix(self) -> str:
+        """The v1 listing prefix for a dated series: everything before the
+        `{date}` placeholder in :attr:`key`. A v1 shape, owned by this
+        migration and not by `crucible.keys` (which is the v2 grammar) —
+        registered as such in `tests/test_key_construction_placement.py`."""
+        if "{date}" not in self.key:
+            raise ValueError(f"{self.name}: {self.key!r} is not a dated series")
+        return self.key.split("{date}")[0]
+
 
 #: The exhaustive source list, with the literal v1 keys as they appear in the
 #: v1 code. They are literals HERE, in the migration, on purpose: a migration
@@ -175,7 +184,7 @@ def run_migrate_history(
             # A dated series: the migration takes whatever dates exist rather
             # than asserting a range, because a range asserted against a
             # system that has stopped writing is a range that will never fill.
-            prefix = source.key.split("{date}")[0]
+            prefix = source.series_prefix()
             keys = sorted(k for k in v1_store.list_keys(prefix) if k.endswith(".json"))
             if not keys:
                 missing.append(
