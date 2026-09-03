@@ -111,6 +111,20 @@ _KNOWN_ARCHITECTURAL_EXCEPTIONS: dict[str, dict[str, str]] = {
             "would duplicate sha validation in crucible.keys (I9807 sweep)."
         ),
         "wheel_key": "built on release_prefix; same reason as release_prefix.",
+        "published_wheel_key": (
+            "not a key SHAPE at all — it takes a Store, READS that release's "
+            "release.json and returns the shape wheel_key_for (already registered "
+            "here) builds from the recorded wheel_filename. crucible.keys is pure "
+            "string construction with no I/O and no imports from the release domain; "
+            "moving this there would make the key module depend on Store and on "
+            "parse_release_record, which is the inversion this whole test exists to "
+            "prevent. Permanent, not 'not moved yet'."
+        ),
+        # Added by the alpha-engine-config-I9917 residual fix, which made
+        # resolve_release/pin read the wheel filename from release.json
+        # instead of deriving it from the sha. Cited in a comment, not in the
+        # reason string: test_no_stale_tracker_literals.py permits a tracker
+        # number in prose only.
         "release_json_key": "built on release_prefix; same reason as release_prefix.",
         "provenance_key": "built on release_prefix; same reason as release_prefix.",
     },

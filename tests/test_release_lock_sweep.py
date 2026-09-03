@@ -308,6 +308,49 @@ class TestFindings:
 
         assert [f.key for f in findings] == [release_json_key(SHA_LOCKED)]
 
+    def test_a_wheel_below_the_sha_prefix_is_never_checked(self) -> None:
+        """alpha-engine-config-I9917 item 2. The pattern's own docstring says
+        "directly under the sha prefix", but `crucible-.+\\.whl` let `.` match
+        `/`, so a key whose FIRST segment merely starts with `crucible-`
+        matched at any depth below it — the regex contradicted the invariant
+        it was documented to enforce.
+
+        The issue's own example (`releases/{sha}/nested/crucible-x.whl`) does
+        NOT reproduce it: the segment after the sha has to start with
+        `crucible-` for `.+` to be reached at all. The case below does, and is
+        the one this narrowing actually closes.
+
+        A nested key is not a published release object: `publish_release`
+        writes exactly two keys directly under the prefix. Checking one would
+        report an Object Lock finding against something the release contract
+        does not own, and the sweep's denominator would count it."""
+        client = _FakeS3Client()
+        store = _store(client)
+        nested = f"releases/{SHA_LOCKED}/crucible-staging/inner/build.whl"
+        client.put(f"crucible/{nested}", locked=False)  # would be UNMET if checked
+        client.put(f"crucible/{release_json_key(SHA_LOCKED)}", locked=True)
+
+        findings = release_lock_findings(store)
+
+        assert [f.key for f in findings] == [release_json_key(SHA_LOCKED)]
+
+    def test_a_wheel_directly_under_the_sha_prefix_is_still_checked(self) -> None:
+        """The other direction, so the narrowing cannot be satisfied by a
+        pattern that matches nothing. Both the current PEP 440 name and the
+        pre-I9908 legacy name still match."""
+        for filename in (
+            "crucible-0.1.0+gaaaaaaaaaaaa-py3-none-any.whl",
+            f"crucible-{SHA_UNLOCKED}-py3-none-any.whl",
+        ):
+            client = _FakeS3Client()
+            store = _store(client)
+            key = f"releases/{SHA_UNLOCKED}/{filename}"
+            client.put(f"crucible/{key}", locked=False)
+
+            findings = release_lock_findings(store)
+
+            assert [f.key for f in findings] == [key], filename
+
     def test_a_non_s3_backend_reads_unmeasurable_never_a_silent_zero_findings(
         self, tmp_path
     ) -> None:
