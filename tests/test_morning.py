@@ -58,6 +58,7 @@ from crucible.morning import (
     MORNING_JOB,
     NO_OPERATOR_ACTION,
     SECTIONS,
+    STALE_AFTER,
     TRANSPORT_PREFIX,
     TRUNCATION_MARKER,
     MorningInputs,
@@ -79,9 +80,40 @@ WORKFLOW = REPO_ROOT / ".github" / "workflows" / "morning-report.yml"
 DAY = dt.date(2026, 9, 2)
 PREVIOUS = dt.date(2026, 9, 1)
 #: 13:00 UTC on the calendar day after DAY — the cron's own firing instant.
+#: Every board `generated_at` fixture and every handler path that reads wall
+#: clock is locked to this instant (see `_freeze_morning_now`) so the
+#: 24h staleness check cannot go red on a later calendar day (I9948).
 FIRED_AT = dt.datetime(2026, 9, 3, 13, 0, tzinfo=dt.UTC)
-GENERATED = "2026-09-02T21:35:04Z"
+#: Render time relative to FIRED_AT, inside STALE_AFTER — never a naked
+#: absolute pin against wall clock.
+GENERATED_AT = FIRED_AT - dt.timedelta(hours=15, minutes=24, seconds=56)
+GENERATED = GENERATED_AT.strftime("%Y-%m-%dT%H:%M:%SZ")
+#: Explicitly older than STALE_AFTER relative to FIRED_AT — the intentional
+#: stale-board case. Derived, not a second absolute calendar pin.
+STALE_GENERATED_AT = FIRED_AT - STALE_AFTER - dt.timedelta(hours=1)
+STALE_GENERATED = STALE_GENERATED_AT.strftime("%Y-%m-%dT%H:%M:%SZ")
+#: Acceptance reading stamp — also relative to the frozen board clock.
+MEASURED_AT = (GENERATED_AT + dt.timedelta(minutes=24, seconds=56)).strftime("%Y-%m-%dT%H:%M:%SZ")
 SHA = "8fc58b6c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a"
+
+
+@pytest.fixture(autouse=True)
+def _freeze_morning_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Handler paths take `now` from wall clock via `run_job`.
+
+    Lock that clock to FIRED_AT so fixtures whose `generated_at` is relative
+    to FIRED_AT stay fresh without depending on the day CI runs. Tests that
+    pass an explicit `now=` to `run_report` are unaffected.
+    """
+    import crucible.runner as runner
+
+    real_run_job = runner.run_job
+
+    def _run_job_at_fired_at(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("now", FIRED_AT)
+        return real_run_job(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "run_job", _run_job_at_fired_at)
 
 
 def _clause(name: str, met: bool) -> dict[str, Any]:
@@ -280,12 +312,14 @@ class TestTheMessage:
         )
 
     def test_a_stale_board_is_the_first_line_and_not_a_footnote(self, tmp_path):
-        store = _seed(tmp_path, previous=_board())
-        # Three calendar days after the render.
-        late = dt.datetime(2026, 9, 5, 13, 0, tzinfo=dt.UTC)
-        message = run_report(store, trading_day=DAY, now=late)
+        store = _seed(
+            tmp_path,
+            board=_board(generated_at=STALE_GENERATED),
+            previous=_board(),
+        )
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
         assert message.splitlines()[0].startswith("STALE BOARD:")
-        assert GENERATED in message.splitlines()[0]
+        assert STALE_GENERATED in message.splitlines()[0]
 
     def test_a_board_generated_within_the_day_carries_no_stale_headline(self, tmp_path):
         store = _seed(tmp_path, previous=_board())
@@ -334,7 +368,7 @@ class TestTheMessage:
                     "unmet": 3,
                     "unmeasurable": 0,
                     "commit": SHA,
-                    "measured_at": "2026-09-02T22:00:00Z",
+                    "measured_at": MEASURED_AT,
                 }
             ).encode(),
         )
@@ -924,7 +958,7 @@ class TestTheSixHeadedSections:
                     "unmet": 2,
                     "unmeasurable": 1,
                     "commit": SHA,
-                    "measured_at": "2026-09-02T22:00:00Z",
+                    "measured_at": MEASURED_AT,
                     "unmet_clauses": ["c_replays", "c_cost"],
                     "unmeasurable_clauses": ["c_spend"],
                 }
@@ -1254,7 +1288,7 @@ class TestOneAcceptanceReaderForBothSurfaces:
         "unmet": 2,
         "unmeasurable": 1,
         "commit": SHA,
-        "measured_at": "2026-09-02T22:00:00Z",
+        "measured_at": MEASURED_AT,
     }
     #: The review's own document: three counts, no commit.
     NO_COMMIT: dict[str, Any] = {"met": 21, "unmet": 2, "unmeasurable": 1}
