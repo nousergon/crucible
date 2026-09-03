@@ -189,19 +189,23 @@ class TestPromoteCommand:
         `--revert-to --dry-run` silently performed the revert for real —
         `--dry-run` had no effect on that path at all (`cli.py::_promote`'s
         `job()` called `revert_champion(store=store, ...)` unconditionally).
-        `_resolve_store` now returns a read-only store whenever `--dry-run`
-        is set, REGARDLESS of `--revert-to` — the pointer write is refused at
-        the store rather than silently succeeding. `alpha-engine-config-I9935`
-        tracks the cleaner fix (refuse the flag combination up front, before
-        any store call); this test pins the interim guarantee that matters
-        most: the pointer never actually moves."""
-        from crucible.store import DryRunWriteRefusedError
+        The interim guarantee (I9922) refused the pointer write at the
+        read-only store; I9935 closes the gap properly: the combination is
+        refused UP FRONT, with a message naming both flags, before the store
+        is opened at all. `_resolve_store` is patched to blow up so the test
+        proves "before touching the store" rather than inferring it."""
+        import crucible.cli as cli_module
 
         store, _, ids, dates = seeded
         seat(store, ids, dates, arm="chal")
         before = json.loads(store.get_bytes(champion_key("m")))
         monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
-        with pytest.raises(DryRunWriteRefusedError):
+
+        def _store_must_not_be_opened(args):
+            raise AssertionError("--revert-to --dry-run must be refused before the store opens")
+
+        monkeypatch.setattr(cli_module, "_resolve_store", _store_must_not_be_opened)
+        with pytest.raises(SystemExit, match="--revert-to is an operator action") as excinfo:
             main(
                 [
                     "promote",
@@ -216,6 +220,9 @@ class TestPromoteCommand:
                     "--dry-run",
                 ]
             )
+        # A refusal is non-zero: `SystemExit(str)` carries exit status 1.
+        assert excinfo.value.code != 0
+        assert "--dry-run" in str(excinfo.value)
         # `seat()` already pointed the champion at "chal"; the assertion that
         # matters is that the REVERT to `ids["champ"]` never landed — the
         # pointer document is byte-identical to what `seat()` wrote.
