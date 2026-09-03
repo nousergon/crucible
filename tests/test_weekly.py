@@ -170,6 +170,42 @@ class TestRunsTheRealCommand:
             assert RUN_MODE_LIVE not in argv, argv
             assert argv[argv.index("--run-mode") + 1] == RUN_MODE_REPLAY, argv
 
+    def test_a_dry_run_arc_puts_dry_run_on_every_stage(self) -> None:
+        """alpha-engine-config-I9922 R3-1 (independent review, 2026-09-03):
+        `Stage.argv(dry_run=)` / `run_arc(dry_run=)` had ZERO coverage —
+        deleting `argv.append("--dry-run")` (`weekly.py::Stage.argv`) left
+        this suite green. `--dry-run` must reach every stage's own argv, not
+        just the arc's own `run_job` call: each stage re-enters
+        `crucible.cli.main` as its own invocation with no shared `args`
+        object, so a stage missing the flag would run for real regardless of
+        what `weekly --dry-run` itself did."""
+        seen: list[list[str]] = []
+
+        def fake_main(argv: list[str]) -> int:
+            seen.append(argv)
+            return 0
+
+        run_arc(FRIDAY, store="/tmp/store", run_mode=RUN_MODE_REPLAY, main=fake_main, dry_run=True)
+        assert len(seen) == 12  # 4 unscoped stages + 2 slot-scoped stages x 4 slots
+        for argv in seen:
+            assert "--dry-run" in argv, argv
+            assert "--run-mode" in argv, argv
+            assert argv[argv.index("--run-mode") + 1] == RUN_MODE_REPLAY, argv
+
+    def test_a_real_arc_puts_dry_run_on_no_stage(self) -> None:
+        """The converse of the test above — `dry_run=False` (the default)
+        must not leak `--dry-run` onto any stage's argv either."""
+        seen: list[list[str]] = []
+
+        def fake_main(argv: list[str]) -> int:
+            seen.append(argv)
+            return 0
+
+        run_arc(FRIDAY, store="/tmp/store", run_mode=RUN_MODE_REPLAY, main=fake_main, dry_run=False)
+        assert len(seen) == 12
+        for argv in seen:
+            assert "--dry-run" not in argv, argv
+
     def test_a_failed_stage_stops_the_arc_and_names_itself(self) -> None:
         """No `continue`, no partial success. The stages after a failure read
         what it was to write, so running them would produce a report card

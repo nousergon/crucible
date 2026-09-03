@@ -374,21 +374,36 @@ class TestDryRunNeverWrites:
     `try: main(argv) except BaseException: pass`, which can never fail, and
     18 of 21 jobs died on MISSING INPUTS before ever reaching a write or the
     guard, making the empty-store assertion vacuous. This version seeds each
-    job far enough to reach either a clean return or the store's own
-    refusal, and asserts EXACTLY one of those two outcomes — any other
-    exception (a config error, a missing-input error unrelated to
-    `--dry-run`) is a test failure, not a swallowed pass.
+    job far enough to reach its real dry-run path, and every row below
+    asserts a CLEAN return (R3-1, non-blocking review note) — none of the
+    fifteen jobs tested here is documented to raise under `--dry-run`, so
+    accepting `DryRunWriteRefusedError` as an alternative legal outcome
+    would let a handler that lost its own `dry_run` branch and started
+    relying on the store guard alone keep passing. Any exception at all is a
+    test failure, not a swallowed pass.
 
     Six jobs are excluded, each for a stated reason rather than silently:
     `explain` has no dry-run semantics at all (always read-only, the flag is
     never read); `experiment.new` needs a synced strategy tree with real arm
     recipes; `migrate.history` needs seeded v1 sources; `smoke` needs a
     published release publishing through `crucible.deploy`'s own flow;
-    `weekly` is arc-level integration over the other rows here, each already
-    covered individually; `release.lock` is S3-only (`apply_release_retention`
-    refuses a `LocalStore` outright) and is covered instead, against a fake
-    S3 client, by `tests/test_release_retention.py::TestReleaseLockHandler::
+    `release.lock` is S3-only (`apply_release_retention` refuses a
+    `LocalStore` outright) and is covered instead, against a fake S3 client,
+    by `tests/test_release_retention.py::TestReleaseLockHandler::
     test_dry_run_writes_no_manifest_at_all`.
+
+    `weekly` is excluded here for a DIFFERENT reason than the other five: the
+    rows above each invoke one job directly, through its own argv — none of
+    them exercises `weekly`'s OWN responsibility, which is handing
+    `--dry-run` DOWN onto each of its twelve stages' own argv
+    (`weekly.py::Stage.argv`/`run_arc`, alpha-engine-config-I9922 R3-1). A
+    per-job row here could not observe that hand-down even if `weekly` were
+    added to the parametrisation — invoking `weekly` here would only prove
+    `weekly`'s OWN store is read-only, which is not the property that
+    matters. That property is asserted directly, against a fake `main`, by
+    `tests/test_weekly.py::TestRunsTheRealCommand::
+    test_a_dry_run_arc_puts_dry_run_on_every_stage` and
+    `test_a_real_arc_puts_dry_run_on_no_stage`.
     """
 
     #: Reach either outcome with NO seeding beyond a fresh, empty store —
@@ -407,23 +422,23 @@ class TestDryRunNeverWrites:
     )
 
     @staticmethod
-    def _assert_clean_or_refused(main_call, tmp_path) -> None:
-        """Run ``main_call`` (a zero-arg callable) and assert EXACTLY one of:
-        a clean return (no exception), or `DryRunWriteRefusedError` — with
-        the store left completely empty either way. Any other exception
-        propagates and fails the test; that is the point (R2-2)."""
-        from crucible.store import DryRunWriteRefusedError, LocalStore
+    def _assert_no_new_keys(tmp_path, before: list[str]) -> None:
+        from crucible.store import LocalStore
 
-        try:
-            main_call()
-        except DryRunWriteRefusedError:
-            pass
-        assert list(LocalStore(tmp_path).list_keys()) == []
+        assert sorted(LocalStore(tmp_path).list_keys()) == before
 
     @pytest.mark.parametrize("job", sorted(_CLEAN_ON_A_FRESH_STORE))
     def test_dry_run_completes_cleanly_against_a_fresh_store(
         self, job: str, tmp_path, monkeypatch
     ) -> None:
+        """These nine are documented (R2-1) to print their reading/report and
+        return — NOT to raise. Asserting a clean return directly, rather than
+        accepting `DryRunWriteRefusedError` as an alternative legal outcome,
+        is deliberate (R3-1, non-blocking review note): a two-outcome helper
+        here would keep passing the moment one of these nine LOST its own
+        `dry_run` branch and started relying on the store guard alone — a
+        real regression this test exists to catch, since a bare guard-refusal
+        is a worse operator experience than the print these jobs promise."""
         monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
         argv = [
             *_minimal_argv(job),
@@ -433,7 +448,10 @@ class TestDryRunNeverWrites:
             str(tmp_path),
             "--dry-run",
         ]
-        self._assert_clean_or_refused(lambda: main(argv), tmp_path)
+
+        main(argv)  # must not raise at all -- see the docstring above
+
+        self._assert_no_new_keys(tmp_path, [])
 
     @pytest.mark.parametrize("job", ["data.daily", "data.heal", "data.weekly"])
     def test_dry_run_completes_cleanly_with_an_arctic_bucket_configured(
@@ -443,7 +461,12 @@ class TestDryRunNeverWrites:
         bucket NAME, never a real connection) before their own dry-run
         branch prints and returns — a `CRUCIBLE_ARCTIC_BUCKET` config gap,
         not a store-write concern, and unrelated to `--dry-run` itself
-        (the same `ValueError` fires with `--dry-run` omitted)."""
+        (the same `ValueError` fires with `--dry-run` omitted). Also asserted
+        as a clean return, not a two-outcome one — same reasoning as above:
+        these three never reach the store guard at all on their real
+        dry-run path (they return before `run_job` is even called), so a
+        `DryRunWriteRefusedError` here would itself be a regression, not an
+        acceptable alternative."""
         monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
         monkeypatch.setenv("CRUCIBLE_ARCTIC_BUCKET", "fake-bucket")
         argv = [
@@ -454,7 +477,10 @@ class TestDryRunNeverWrites:
             str(tmp_path),
             "--dry-run",
         ]
-        self._assert_clean_or_refused(lambda: main(argv), tmp_path)
+
+        main(argv)  # must not raise at all -- see the docstring above
+
+        self._assert_no_new_keys(tmp_path, [])
 
     def test_dry_run_drift_completes_cleanly_with_its_inputs_seeded(
         self, tmp_path, monkeypatch
