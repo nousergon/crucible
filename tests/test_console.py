@@ -21,8 +21,10 @@ from crucible.console.render import (
     STATUS_COLORS,
     _read_representative_manifest,
     _state_class,
+    classify_registry,
     write_page,
 )
+from crucible.keys import attribution_key, champion_key, morning_report_key
 from crucible.manifest import manifest_key
 from crucible.store import LocalStore
 
@@ -285,9 +287,10 @@ class TestPage:
                     }
                 ).encode(),
             )
-        manifest = _read_representative_manifest(store, "experiment.run", FRIDAY.isoformat())
-        assert manifest["status"] == "failed"
-        assert manifest["discriminator"] == "r"
+        read = _read_representative_manifest(store, "experiment.run", FRIDAY.isoformat())
+        assert read.problem is None
+        assert read.manifest["status"] == "failed"
+        assert read.manifest["discriminator"] == "r"
 
     def test_deploys_appear_beside_runs(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
@@ -550,3 +553,131 @@ class TestPage:
         rendering with no CSS rule — the exact silent failure C14 was."""
         with pytest.raises(KeyError, match="no entry in STATUS_COLORS"):
             _state_class("SOMETHING_NOBODY_REGISTERED")
+
+
+class TestUnreadableArtifacts:
+    """alpha-engine-config-I9900, the live case.
+
+    Board run 33779775980, 2026-09-03T16:38Z: `_read_representative_manifest`
+    called `json.loads` on every key under `manifest_prefix("report.morning",
+    "2026-09-02")` and one of them was `message.txt` — the delivered report
+    text, filed under the job's OWN manifest prefix by design. It raised
+    `JSONDecodeError`, took `crucible board` with it, and published no board
+    and no ladder at all for seven hours.
+
+    Two properties, and the second is the one that generalises: a manifest
+    prefix is a NAMESPACE, not a manifest list; and no single unreadable
+    artifact may cost the whole page.
+    """
+
+    CALENDAR_DATE = "2026-08-29"
+    MANIFEST_KEY = manifest_key("report.morning", FRIDAY.isoformat())
+
+    def _registry(self) -> dict:
+        return {
+            "report.morning": _component(name="report.morning"),
+            "data.daily": _component(name="data.daily"),
+        }
+
+    def _classify(self, store) -> dict:
+        classifications, _ = classify_registry(
+            store, self._registry(), now=SATURDAY_NIGHT, trading_day=FRIDAY
+        )
+        return classifications
+
+    def test_evidence_filed_beside_a_manifest_is_not_read_as_a_manifest(self, tmp_path) -> None:
+        """The reproduction. `message.txt` sits under the same prefix as
+        `run.json` and is not JSON; the row classifies from `run.json`."""
+        store = LocalStore(tmp_path)
+        store.put_bytes(self.MANIFEST_KEY, json.dumps(_manifest()).encode())
+        store.put_bytes(
+            morning_report_key(FRIDAY.isoformat(), self.CALENDAR_DATE),
+            b"Good morning. Board: 14 of 23 clauses met.\n",
+        )
+        read = _read_representative_manifest(store, "report.morning", FRIDAY.isoformat())
+        assert read.problem is None
+        assert read.manifest["status"] == "ok"
+        assert self._classify(store)["report.morning"].state == "HEALTHY"
+
+    def test_a_zero_byte_manifest_is_unreadable_and_names_its_key(self, tmp_path) -> None:
+        """An interrupted write. UNREPORTED — never MISSED, which would send
+        an operator to the trigger, and never a crash."""
+        store = LocalStore(tmp_path)
+        store.put_bytes(self.MANIFEST_KEY, b"")
+        read = _read_representative_manifest(store, "report.morning", FRIDAY.isoformat())
+        assert read.manifest is None
+        assert self.MANIFEST_KEY in read.problem
+        classification = self._classify(store)["report.morning"]
+        assert classification.state == "UNREPORTED"
+        assert self.MANIFEST_KEY in classification.reason
+
+    def test_a_manifest_that_is_a_list_is_unreadable_not_an_empty_object(self, tmp_path) -> None:
+        """`[]` parses as JSON and then answers `.get("status")` with an
+        AttributeError one line further down. Refused at the reader."""
+        store = LocalStore(tmp_path)
+        store.put_bytes(self.MANIFEST_KEY, b"[]")
+        read = _read_representative_manifest(store, "report.morning", FRIDAY.isoformat())
+        assert read.manifest is None
+        assert "not an object with fields" in read.problem
+        classification = self._classify(store)["report.morning"]
+        assert classification.state == "UNREPORTED"
+        assert self.MANIFEST_KEY in classification.reason
+
+    def test_one_unreadable_manifest_does_not_cost_the_other_rows(self, tmp_path) -> None:
+        """The property the live failure violated: the page still renders,
+        every other component still classifies, and the fault is published
+        on the page rather than in a traceback nobody sees."""
+        store = LocalStore(tmp_path)
+        store.put_bytes(self.MANIFEST_KEY, b"")
+        store.put_bytes(
+            manifest_key("data.daily", FRIDAY.isoformat()), json.dumps(_manifest()).encode()
+        )
+        # The REAL registry, not a two-row stand-in: the property under test
+        # is that the whole page survives, and a page built from two rows
+        # would not have exercised the ladder the live failure also took down.
+        page = build_page(store, now=SATURDAY_NIGHT)
+        states = {row["component"]: row["state"] for row in page.rows}
+        assert len(states) > 2
+        assert states["report.morning"] == "UNREPORTED"
+        assert states["data.daily"] == "HEALTHY"
+        # Once, not twice: the same object is reachable through the component's
+        # manifest prefix AND through the week-cost roll-up's `runs/` listing.
+        assert [entry["key"] for entry in page.unreadable] == [self.MANIFEST_KEY]
+        html = render_html(page)
+        assert "Unreadable artifacts" in html
+        assert self.MANIFEST_KEY in html
+
+    def test_an_unreadable_champion_pointer_is_not_an_absent_one(self, tmp_path) -> None:
+        """`champions/u/current.json` is the trader's whole read surface.
+        Rendering a corrupt pointer as `no pointer written` says the slot has
+        never promoted when in fact the contract is broken."""
+        store = LocalStore(tmp_path)
+        store.put_bytes(champion_key("u"), b"{not json")
+        page = build_page(store, now=SATURDAY_NIGHT)
+        assert page.champions["u"]["unreadable"]
+        assert page.champions["r"] is None
+        assert champion_key("u") in {entry["key"] for entry in page.unreadable}
+        assert "unreadable" in render_html(page)
+
+    def test_an_attribution_artifact_with_a_wrong_typed_rows_field(self, tmp_path) -> None:
+        """It parses to an object and then carries `rows` as a string. The
+        crash used to happen in the renderer, one line later, with the same
+        outcome: no page."""
+        store = LocalStore(tmp_path)
+        store.put_bytes(
+            attribution_key(FRIDAY.isoformat()), json.dumps({"rows": "five rows"}).encode()
+        )
+        page = build_page(store, now=SATURDAY_NIGHT)
+        assert page.attribution == []
+        fault = next(e for e in page.unreadable if e["key"] == attribution_key(FRIDAY.isoformat()))
+        assert "not list" in fault["fault"]
+        assert "corrupt artifact, not an absent one" in render_html(page)
+
+    def test_an_unreadable_manifest_in_the_week_window_is_not_silently_free(self, tmp_path) -> None:
+        """The week-cost roll-up reads the same manifests. A hole nobody
+        publishes reads as $0 spent, which is principle 7 exactly."""
+        store = LocalStore(tmp_path)
+        store.put_bytes(manifest_key("deploy", FRIDAY.isoformat()), b"{truncated")
+        page = build_page(store, now=SATURDAY_NIGHT)
+        assert page.week_cost_usd == 0.0
+        assert manifest_key("deploy", FRIDAY.isoformat()) in {e["key"] for e in page.unreadable}
