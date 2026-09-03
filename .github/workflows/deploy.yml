@@ -254,11 +254,20 @@ jobs:
       # `nous-ergon-ops`'s spot-box bootstrap performs. A step failure here
       # fails the job before `Flip` runs, so an unpip-installable wheel
       # never reaches `releases/current`.
+      #
+      # The wheel keeps its PUBLISHED filename on disk. The first version of
+      # this step downloaded it as `/tmp/crucible-install-proof.whl`, and pip
+      # refused that name — the same defect I9908 fixed, re-created inside
+      # the step proving the fix (measured 2026-09-03, run 33778251060, on
+      # the first deploy after PR59 merged; the detector held and the pointer
+      # did not flip). pip validates the FILENAME against PEP 427/440, so any
+      # rename of a wheel is a different artifact as far as pip is concerned.
       - name: Prove the published wheel is pip-installable
         run: |
-          aws s3 cp "${STORE_URI}/releases/${{ needs.build.outputs.sha }}/${{ needs.build.outputs.wheel_filename }}" /tmp/crucible-install-proof.whl
+          mkdir -p /tmp/crucible-install-proof
+          aws s3 cp "${STORE_URI}/releases/${{ needs.build.outputs.sha }}/${{ needs.build.outputs.wheel_filename }}" "/tmp/crucible-install-proof/${{ needs.build.outputs.wheel_filename }}"
           python3 -m venv /tmp/crucible-install-proof-venv
-          /tmp/crucible-install-proof-venv/bin/pip install /tmp/crucible-install-proof.whl
+          /tmp/crucible-install-proof-venv/bin/pip install "/tmp/crucible-install-proof/${{ needs.build.outputs.wheel_filename }}"
           /tmp/crucible-install-proof-venv/bin/crucible --version
 
       # The opening half of the pointer compare-and-swap, taken BEFORE the

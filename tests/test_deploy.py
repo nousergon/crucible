@@ -722,6 +722,35 @@ class TestTheWorkflowItself:
             "must actually run the installed console script, not just call pip install"
         )
 
+    def test_the_install_proof_installs_the_wheel_under_its_published_filename(
+        self, workflow
+    ) -> None:
+        """Measured 2026-09-03 (run 33778251060, the first deploy after
+        crucible-PR59 merged): the proof downloaded the wheel as
+        `/tmp/crucible-install-proof.whl` and pip refused it — `is not a
+        valid wheel filename` — which is the I9908 defect re-created inside
+        the step that proves its fix. pip validates the FILENAME (PEP 427),
+        so a renamed wheel is a different artifact. The `pip install` target
+        must be the build's own `wheel_filename` output, and the download
+        destination must carry it too."""
+        names = [json.dumps(s) for s in self._release_steps(workflow)]
+        install_proof = next(i for i, s in enumerate(names) if "pip install" in s)
+        script = self._release_steps(workflow)[install_proof]["run"]
+        wheel_ref = "${{ needs.build.outputs.wheel_filename }}"
+        pip_lines = [ln for ln in script.splitlines() if "pip install" in ln]
+        assert pip_lines, "the proof must call pip install"
+        for line in pip_lines:
+            assert line.rstrip().rstrip('"').endswith(f"{wheel_ref}"), (
+                f"pip install must target the wheel under its PUBLISHED filename, got: {line!r}"
+            )
+        cp_lines = [ln for ln in script.splitlines() if "aws s3 cp" in ln]
+        assert cp_lines and all(ln.rstrip().rstrip('"').endswith(wheel_ref) for ln in cp_lines), (
+            "the download destination must keep the published wheel filename"
+        )
+        assert "crucible-install-proof.whl" not in script, (
+            "a renamed wheel is what pip refused on 2026-09-03"
+        )
+
 
 class TestTheSmokeGate:
     """The smoke is what the pointer flip is gated on, so it is tested here
