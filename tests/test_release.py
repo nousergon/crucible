@@ -22,13 +22,16 @@ from crucible.release import (
     assert_immutable_write,
     current_release,
     flip_on_smoke,
+    parse_release_record,
     pin,
     provenance_key,
     publish_release,
     read_pointer,
     release_json_key,
     resolve_release,
+    wheel_filename_for,
     wheel_key,
+    wheel_key_for,
 )
 from crucible.store import ETAG_ABSENT, LocalStore, PointerConflictError, S3Store
 
@@ -144,6 +147,132 @@ class TestLayout:
                 test_summary="",
                 workflow_run_url="",
             )
+
+
+class TestPipInstallableWheelName:
+    """alpha-engine-config-I9908: no wheel this pipeline ever published was
+    pip-installable — `crucible-{sha}-py3-none-any.whl` under either name
+    the workflow ever gave it, because a 40-hex git sha is not a PEP 440
+    version. These assert the replacement filename actually installs under
+    pip's own naming rules, not merely that it "looks different".
+    """
+
+    def test_wheel_filename_is_a_pep440_legal_wheel_name(self) -> None:
+        """The single fact `deploy.yml`'s console evidence proves is FALSE
+        for the old name: `pip` refuses a wheel filename whose version
+        segment is not PEP 440. `packaging` is the same library pip uses to
+        parse one, so this is pip's own acceptance test, not a guess at its
+        rules."""
+        from packaging.utils import parse_wheel_filename
+
+        name, version, build, tags = parse_wheel_filename(wheel_filename_for(SHA_A))
+        assert name == "crucible"
+        assert str(version).startswith("0.1.0")
+
+    def test_wheel_filename_is_deterministic_from_the_sha(self) -> None:
+        assert wheel_filename_for(SHA_A) == wheel_filename_for(SHA_A)
+        assert wheel_filename_for(SHA_A) != wheel_filename_for(SHA_B)
+
+    def test_wheel_filename_embeds_a_recoverable_sha_prefix(self) -> None:
+        """Round-trippable by eye — an operator reading the S3 console sees
+        which commit a wheel came from without opening release.json."""
+        assert SHA_A[:12] in wheel_filename_for(SHA_A)
+
+    def test_wheel_key_uses_the_pep440_filename(self) -> None:
+        assert wheel_key(SHA_A) == wheel_key_for(SHA_A, wheel_filename_for(SHA_A))
+
+    def test_a_sha_rejected_by_wheel_key_is_also_rejected_by_wheel_filename_for(
+        self,
+    ) -> None:
+        with pytest.raises(ValueError, match="40-character lowercase"):
+            wheel_filename_for("not-a-sha")
+
+    def test_base_version_matches_pyproject(self) -> None:
+        """`deploy.yml` writes `{pyproject base version}+g<sha12>` into
+        `pyproject.toml` at build time and never commits the edit (plan
+        §4.11 / I9908: "no committed pyproject change per release") — this
+        module's own `_BASE_VERSION` has to independently agree with the
+        CHECKED-IN version for the two derivations to ever produce the same
+        filename. A drift here is silent until the next deploy's install
+        proof fails against a filename the S3 upload used a different base
+        for."""
+        import tomllib
+        from pathlib import Path
+
+        import crucible.release as release_module
+
+        pyproject = tomllib.loads(
+            (Path(__file__).parent.parent / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        assert release_module._BASE_VERSION == pyproject["project"]["version"]
+
+    def test_the_release_lock_sweep_pattern_matches_the_new_wheel_name(self) -> None:
+        """PR56's `release_lock_sweep._RELEASE_OBJECT_RE` filters
+        `list_keys("releases/")` down to identity objects — a wheel keyed by
+        a name it does not recognize is silently EXCLUDED from every
+        finding, not flagged UNMET, which is a worse failure than a crash:
+        the sweep reports fewer findings and looks healthier. This is the
+        regression test the issue's "it needs no change — assert that with
+        a test" line asks for; the fix here widened the pattern to any
+        `crucible-*.whl`, since the literal sha-in-filename backreference
+        cannot match a version-named wheel."""
+        from crucible.release_lock_sweep import _RELEASE_OBJECT_RE
+
+        assert _RELEASE_OBJECT_RE.match(wheel_key(SHA_A))
+        # And the OLD (pre-I9908) naming, still published under some
+        # existing prefixes, keeps matching too — the sweep must not stop
+        # covering history the moment it starts covering the future.
+        assert _RELEASE_OBJECT_RE.match(f"releases/{SHA_A}/crucible-{SHA_A}-py3-none-any.whl")
+
+
+class TestReleaseRecordVersioning:
+    """alpha-engine-config-I9908: the reader accepts release.v2 (this
+    schema's predecessor) and release.v3 (current), and refuses release.v1
+    by name."""
+
+    def _v2_payload(self, sha: str = SHA_A) -> dict:
+        return {
+            "schema_version": "release.v2",
+            "sha": sha,
+            "lockfile_sha256": "0" * 64,
+            "wheel_sha256": "1" * 64,
+            "python_requires": ">=3.12,<3.13",
+            "extra": {},
+        }
+
+    def test_v3_round_trips(self) -> None:
+        record = ReleaseRecord(
+            schema_version=RELEASE_SCHEMA_VERSION,
+            sha=SHA_A,
+            lockfile_sha256="0" * 64,
+            wheel_sha256="1" * 64,
+            wheel_filename=wheel_filename_for(SHA_A),
+            python_requires=">=3.12,<3.13",
+        )
+        parsed = parse_release_record(json.loads(record.to_json()))
+        assert parsed == record
+
+    def test_v2_is_accepted_and_gets_the_legacy_wheel_filename_synthesized(self) -> None:
+        """A v2 record's wheel was published under
+        `crucible-{sha}-py3-none-any.whl` — the unpip-installable name this
+        whole issue exists to retire. The synthesized `wheel_filename` must
+        be THAT name, not a v3-shaped guess: nothing was ever written at
+        the v3 path for a v2 release."""
+        record = parse_release_record(self._v2_payload())
+        assert record.wheel_filename == f"crucible-{SHA_A}-py3-none-any.whl"
+        assert record.schema_version == RELEASE_SCHEMA_VERSION
+
+    def test_v1_is_refused_by_name(self) -> None:
+        payload = self._v2_payload()
+        payload["schema_version"] = "release.v1"
+        with pytest.raises(ValueError, match="release.v1"):
+            parse_release_record(payload)
+
+    def test_an_unrecognized_schema_version_is_refused(self) -> None:
+        payload = self._v2_payload()
+        payload["schema_version"] = "release.v99"
+        with pytest.raises(ValueError, match="not recognized"):
+            parse_release_record(payload)
 
 
 class TestObjectLock:
@@ -466,7 +595,7 @@ class TestIdentityProvenanceSplit:
                 "— its presence is exactly what made two builds of the same commit "
                 "byte-unequal."
             )
-        assert payload["schema_version"] == RELEASE_SCHEMA_VERSION == "release.v2"
+        assert payload["schema_version"] == RELEASE_SCHEMA_VERSION == "release.v3"
 
     def test_provenance_carries_the_three_fields_that_moved(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
@@ -501,11 +630,11 @@ class TestIdentityProvenanceSplit:
         store = LocalStore(tmp_path)
         _published(store)
         payload = json.loads(store.get_bytes(release_json_key(SHA_A)))
-        _validate_release_artifact("release.v2.json", payload)  # must not raise
+        _validate_release_artifact("release.v3.json", payload)  # must not raise
         bad = dict(payload)
         bad["sha"] = "not-a-sha"
         with pytest.raises(ValueError, match="does not conform"):
-            _validate_release_artifact("release.v2.json", bad)
+            _validate_release_artifact("release.v3.json", bad)
 
     def test_publish_validates_the_provenance_record_against_its_own_schema(self, tmp_path) -> None:
         from crucible.release import _validate_release_artifact
@@ -554,6 +683,7 @@ class TestValidationIsStructuralNotPerCaller:
                 sha=SHA_A,
                 lockfile_sha256="z" * 64,
                 wheel_sha256="a" * 64,
+                wheel_filename=wheel_filename_for(SHA_A),
                 python_requires="",
             )
 
@@ -577,6 +707,7 @@ class TestValidationIsStructuralNotPerCaller:
             sha=SHA_A,
             lockfile_sha256="0" * 64,
             wheel_sha256="1" * 64,
+            wheel_filename=wheel_filename_for(SHA_A),
             python_requires=">=3.12,<3.13",
         )
         assert record.sha == SHA_A
