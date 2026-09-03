@@ -527,7 +527,7 @@ class TestACostCeilingIsNeverMetByAnUnreadableApi:
         assert "$12.50 month-to-date" in clause.detail
         assert "27 of 31 days" in clause.detail
         assert "trailing 30 complete days (2026-07-29..2026-08-28) $30.00" in clause.detail
-        assert "ungraded: trailing 7-day mean $1.00/day" in clause.detail
+        assert "leading 7-day mean $1.00/day × 30 = $30.00" in clause.detail
 
     def test_a_month_boundary_lump_does_not_read_a_compliant_month_as_over(
         self, monkeypatch: pytest.MonkeyPatch
@@ -567,10 +567,33 @@ class TestACostCeilingIsNeverMetByAnUnreadableApi:
         )
         assert not clause.met and not clause.unmeasurable, clause.detail
         assert clause.detail.endswith("OVER")
-        # 30 days = 5 batch days ($300) + 25 quiet days ($5.00); the ungraded
-        # leading indicator over the last 7 sees one batch day.
+        # 30 days = 5 batch days ($300) + 25 quiet days ($5.00); the leading
+        # 7-day mean sees one batch day ($8.74/day × 30 = $262.29).
         assert "$305.00" in clause.detail
-        assert "trailing 7-day mean $8.74/day" in clause.detail
+        assert "leading 7-day mean $8.74/day × 30 = $262.29" in clause.detail
+
+    def test_accelerating_pace_is_unmet_while_trailing_total_is_still_under(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PR80 round 3, I9927 FAIL demo. Day-5 MTD `$40` (~`$240`/mo implied)
+        with a trailing-30 total of `$65` under a `$70` ceiling graded MET when
+        only the trailing total was the verdict. Leading 7-day mean × 30 must
+        hard-UNMET that acceleration — prefer a short false-UNMET after a
+        month-boundary lump over a false-MET during a blowout."""
+        # 22 × $0.39 + $0.42 + 7 × $8.00 = $65.00; leading mean $8 × 30 = $240.
+        daily = ["0.39"] * 22 + ["0.42"] + ["8.00"] * 7
+        client = _CostClient("40.00", daily=daily)
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: client)
+        clause = gate_module._clause_aws_cost_within_ceiling(
+            [dt.date(2026, 9, 6)],  # five complete days in: MTD $40
+            name="aws_total_within_ceiling",
+            ceiling_usd=PHASE4_MAX_TOTAL_USD,
+            tagged=False,
+        )
+        assert not clause.met and not clause.unmeasurable, clause.detail
+        assert clause.detail.endswith("OVER (leading pace)")
+        assert "$65.00" in clause.detail
+        assert "leading 7-day mean $8.00/day × 30 = $240.00" in clause.detail
 
     def test_four_free_days_in_the_window_cannot_make_it_met(
         self, monkeypatch: pytest.MonkeyPatch

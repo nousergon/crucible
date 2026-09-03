@@ -2090,10 +2090,10 @@ def _clause_pages_within_ceiling(store: Store, window: list[dt.date]) -> Clause:
 #: this is UNMEASURABLE, never a guess.
 COST_TRAILING_DAYS = 30
 
-#: Complete days in the ungraded leading indicator printed beside the verdict:
-#: the trailing week's mean is the first number to move when the pace changes,
-#: and it is never the verdict — over one week a batch estate reads as a quiet
-#: week six days in seven.
+#: Complete days in the leading-pace grade: the trailing week's mean ×
+#: COST_TRAILING_DAYS is a hard-UNMET when it exceeds the ceiling. Prefer a
+#: short false-UNMET after a month-boundary lump in this window over a
+#: false-MET while spend is accelerating (alpha-engine-config-I9927).
 COST_LEADING_DAYS = 7
 
 
@@ -2153,11 +2153,16 @@ def _clause_aws_cost_within_ceiling(
        window crosses the month boundary, so it is measurable on day 1 and a
        month-boundary lump is one day in thirty. Fewer daily periods than
        days, an unreadable window, or a `$0.00` total is UNMEASURABLE.
+    3. **Hard UNMET** when the leading COST_LEADING_DAYS (7) mean ×
+       COST_TRAILING_DAYS exceeds the ceiling — the previously ungraded
+       leading indicator, promoted. Trailing-30 alone false-METs an
+       accelerating month (day-5 MTD `$40` → ~`$240`/mo implied while
+       trailing `$65` still sits under a `$70` ceiling). Prefer a short
+       false-UNMET after a month-boundary lump lands inside the leading
+       window over a false-MET during acceleration.
 
-    The trailing COST_LEADING_DAYS (7) mean is PRINTED beside it as an
-    ungraded leading indicator — the number that moves first when the pace
-    changes — never as the verdict. No render ever grades a COMPLETED
-    calendar month; that is a separate clause (`alpha-engine-config-I9946`).
+    No render ever grades a COMPLETED calendar month; that is a separate
+    clause (`alpha-engine-config-I9946`).
     """
     from crucible.cost import (  # noqa: PLC0415
         CostUnreadableError,
@@ -2169,7 +2174,8 @@ def _clause_aws_cost_within_ceiling(
     requirement = (
         f"AWS spend for {scope} is at most ${ceiling_usd:.2f}/month, read from Cost "
         f"Explorer: UNMET once month-to-date exceeds it, otherwise graded on the total of "
-        f"the trailing {COST_TRAILING_DAYS} complete days"
+        f"the trailing {COST_TRAILING_DAYS} complete days, and UNMET when the leading "
+        f"{COST_LEADING_DAYS}-day mean × {COST_TRAILING_DAYS} exceeds the ceiling"
     )
     evidence = ("ce:GetCostAndUsage",)
     try:
@@ -2262,15 +2268,24 @@ def _clause_aws_cost_within_ceiling(
         )
     leading = trailing.amounts_usd[-COST_LEADING_DAYS:]
     leading_mean = sum(leading) / len(leading)
+    leading_pace = leading_mean * COST_TRAILING_DAYS
     trailing_total = (
         f"trailing {COST_TRAILING_DAYS} complete days "
         f"({trailing.start.isoformat()}..{trailing.end.isoformat()}) ${trailing.total_usd:.2f}, "
-        f"ceiling ${ceiling_usd:.2f}; leading indicator, ungraded: trailing "
-        f"{COST_LEADING_DAYS}-day mean ${leading_mean:.2f}/day"
+        f"ceiling ${ceiling_usd:.2f}; leading {COST_LEADING_DAYS}-day mean "
+        f"${leading_mean:.2f}/day × {COST_TRAILING_DAYS} = ${leading_pace:.2f}"
     )
     if trailing.total_usd > ceiling_usd:
         return Clause(
             name, requirement, False, f"{month_to_date}; {trailing_total}: OVER", evidence
+        )
+    if leading_pace > ceiling_usd:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{month_to_date}; {trailing_total}: OVER (leading pace)",
+            evidence,
         )
     return Clause(name, requirement, True, f"{month_to_date}; {trailing_total}: under", evidence)
 
