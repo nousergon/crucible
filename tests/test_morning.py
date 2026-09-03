@@ -207,6 +207,10 @@ class TestTheMessage:
                 "  phase0  UNMET  1 of 2 clauses — old_weekly_within_cadence",
                 "  phase1  OUT_OF_ORDER  1 of 5 clauses — phase0's gate is not met",
                 "",
+                "schedule (plan §6.1)",
+                "  no schedule row on the board — the plan §6.1 milestones are not being "
+                "rendered, which is a defect in the board, not an absent plan",
+                "",
                 "moved since 2026-09-01",
                 "  obj:cost: PLANNED -> UNMEASURED",
                 "",
@@ -465,6 +469,93 @@ class TestTheMessage:
         store = LocalStore(tmp_path)
         with pytest.raises(KeyError):
             run_report(store, trading_day=DAY, now=FIRED_AT)
+
+
+# ── the schedule section (alpha-engine-config-I9914) ──────────────────────
+
+
+class TestSchedule:
+    """Plan §6.1's milestone table, as its own report section.
+
+    This section renders `schedule:*` board rows exactly the way `phase
+    gates` renders `phase:*` rows -- it computes nothing new, it quotes what
+    `crucible.board._schedule_rows` already decided (`test_board.py` grades
+    that decision). What is graded here is that the section exists, sits
+    between `phase gates` and `moved since` (the exact-message test above),
+    and that a past-due row's line begins with the word `OVERDUE`.
+    """
+
+    def test_a_met_milestone_carries_no_overdue_word(self, tmp_path):
+        rows = [_row("schedule:day5_replays", "schedule", "MET", "met — due 2026-09-04")]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "  schedule:day5_replays  MET  met — due 2026-09-04" in message
+        assert "OVERDUE" not in message
+
+    def test_an_unmet_past_due_milestone_line_begins_with_overdue(self, tmp_path):
+        rows = [
+            _row(
+                "schedule:day5_replays",
+                "schedule",
+                "UNMET",
+                "OVERDUE since 2026-09-04 — reads: phase1 1/6",
+            )
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        line = next(ln for ln in message.splitlines() if "schedule:day5_replays" in ln)
+        assert line.strip().split()[0] == "OVERDUE", (
+            f"the first word of a past-due schedule line must be OVERDUE, got: {line!r}"
+        )
+
+    def test_a_planned_milestone_carries_no_overdue_word(self, tmp_path):
+        rows = [
+            _row(
+                "schedule:live1",
+                "schedule",
+                "PLANNED",
+                "due 2026-09-12, waiting on phase2 UNMEASURED",
+            )
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "  schedule:live1  PLANNED  due 2026-09-12" in message
+        assert "OVERDUE" not in message
+
+    def test_a_schedule_detail_carrying_a_progress_figure_is_withheld(self, tmp_path):
+        """Schedule details are ours to write, but this section still passes
+        through `_withhold_progress` like every other section — this module
+        trusts no board free text unchecked."""
+        rows = [
+            _row(
+                "schedule:live1",
+                "schedule",
+                "UNMET",
+                "OVERDUE since 2026-09-04; 3 PRs merged this week",
+            )
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "PRs merged" not in message
+        assert "[1 clause withheld — plan §12 rule 3]" in message
+
+    def test_no_schedule_rows_is_a_named_defect_not_an_empty_section(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())  # default fixture carries no schedule rows
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "no schedule row on the board" in message
+
+    def test_the_schedule_section_sits_between_phase_gates_and_moved_since(self, tmp_path):
+        rows = [
+            *_board()["rows"],
+            _row("schedule:day5_replays", "schedule", "MET", "met — due 2026-09-04"),
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        lines = message.splitlines()
+        phase_at = lines.index("phase gates")
+        schedule_at = lines.index("schedule (plan §6.1)")
+        moved_at = next(i for i, ln in enumerate(lines) if ln.startswith("moved since"))
+        assert phase_at < schedule_at < moved_at
 
 
 # ── the store it quotes ───────────────────────────────────────────────────

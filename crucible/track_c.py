@@ -599,6 +599,36 @@ def board_handler(args: argparse.Namespace) -> int:
                 "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
         )
+        # `alpha-engine-config-I9914`: the plan §6.1 schedule rows'
+        # own outcome signal. Unlike `board_rows_red` -- whose red count IS
+        # the declared day-one state of the whole board -- a schedule row
+        # reading UNMET is a plan date that has already passed without the
+        # phase it names reading MET, which plan §6.1 names as the one clock
+        # that "cannot be faked". BREACH, not OK, for that reason: a calm OK
+        # over a missed live Saturday would make the unfakeable clock read
+        # the same as every other red row on this board.
+        schedule_rows = [r for r in board.rows if r.source == "schedule"]
+        overdue = [r for r in schedule_rows if r.state == "UNMET"]
+        ctx.record_metric(
+            {
+                "name": "schedule_milestones_overdue",
+                "module": "crucible.board",
+                "metric_type": "operational",
+                "value": float(len(overdue)),
+                "unit": "milestones",
+                "n_floor": 0,
+                "status": "OK" if not overdue else "BREACH",
+                "status_reason": (
+                    f"{len(overdue)} of {len(schedule_rows)} plan §6.1 milestone(s) are "
+                    f"past their date without the phase they name reading MET: "
+                    f"{', '.join(r.id for r in overdue)}"
+                    if overdue
+                    else f"no §6.1 milestone is overdue ({len(schedule_rows)} declared)"
+                ),
+                "source_path": BOARD_CURRENT_KEY,
+                "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
 
     run_job("board", body, store=store, trading_day=args.trading_day)
     return 0
