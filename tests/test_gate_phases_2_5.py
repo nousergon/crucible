@@ -28,6 +28,7 @@ import json
 
 import pytest
 
+import crucible.alerts as alerts_module
 import crucible.autonomy as autonomy_module
 import crucible.cost as cost_module
 import crucible.gate as gate_module
@@ -42,11 +43,13 @@ from crucible.gate import (
     PHASE4_MAX_TOTAL_USD,
     PHASES,
     evaluate,
+    weekly_anchor,
 )
 from crucible.keys import (
     arm_register_key,
     champion_key,
     manifest_key,
+    parse_bus_key,
     runs_prefix,
     verdict_key,
 )
@@ -62,6 +65,20 @@ def _window(weeks: int) -> list[dt.date]:
 
 
 PHASE2_WINDOW = _window(PHASE2_LIVE_SATURDAYS)
+
+#: A render day that is NOT a weekly anchor, and the window `_window` builds
+#: off it. Weekly work binds to a Friday close while the ladder renders DAILY,
+#: so a clause that keys on the render weekday and one that anchors are
+#: indistinguishable when the fixture renders on a Friday — the shape that hid
+#: `alpha-engine-config-I9904` from this suite (PR68 adversarial review, F1).
+WEDNESDAY = dt.date(2026, 9, 9)
+PHASE2_RENDER_WINDOW = [
+    WEDNESDAY - dt.timedelta(weeks=n) for n in reversed(range(PHASE2_LIVE_SATURDAYS))
+]
+
+#: Where a weekly run's manifest is actually filed for those render days: the
+#: Friday close strictly before each, resolved through the trading calendar.
+PHASE2_ANCHORS = [weekly_anchor(day) for day in PHASE2_RENDER_WINDOW]
 
 
 @pytest.fixture
@@ -153,6 +170,21 @@ def _weekly(day: dt.date, *, mode: str = MANIFEST_RUN_MODE_LIVE, attempts: int =
 
 
 class TestLiveSaturdaysAreReadFromTheManifestNeverTheDate:
+    """Every case here renders on a WEDNESDAY and files on the Friday anchors.
+
+    The render day is deliberately not the anchor. `_window` steps back in raw
+    calendar weeks, so a Friday render day makes the window days and the Friday
+    anchors identical — a clause keyed on the render weekday would then pass
+    every case in this class while being unsatisfiable on the four other
+    weekdays the ladder renders on (PR68 adversarial review, F1;
+    `alpha-engine-config-I9904`).
+    """
+
+    def test_the_fixture_days_and_the_render_window_are_different_keys(self) -> None:
+        """The precondition every other case in this class depends on. If this
+        ever passes trivially again, the class has stopped testing anything."""
+        assert not set(PHASE2_ANCHORS) & set(PHASE2_RENDER_WINDOW)
+
     def test_unmeasurable_when_the_manifest_cannot_say_live_or_replay(
         self, store: LocalStore
     ) -> None:
@@ -160,7 +192,7 @@ class TestLiveSaturdaysAreReadFromTheManifestNeverTheDate:
         live/replay field, so the clause refuses to answer rather than
         inferring liveness from the trading day — which the accelerated replay
         schedule would satisfy."""
-        clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_WINDOW)
+        clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_RENDER_WINDOW)
         assert clause.unmeasurable and not clause.met
         assert MANIFEST_RUN_MODE_FIELD in clause.detail
 
@@ -168,10 +200,36 @@ class TestLiveSaturdaysAreReadFromTheManifestNeverTheDate:
         self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _live_schema(monkeypatch)
-        for day in PHASE2_WINDOW:
+        for day in PHASE2_ANCHORS:
             _put(store, manifest_key("weekly", day.isoformat()), _weekly(day))
-        clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_WINDOW)
+        clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_RENDER_WINDOW)
         assert clause.met and not clause.unmeasurable
+
+    def test_the_same_two_saturdays_read_met_on_every_render_weekday(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The regression that closes the class rather than the instance.
+
+        Two flawless live Saturdays are filed at their Friday closes and left
+        alone; only the day somebody rendered the ladder moves. A clause
+        windowed on the render weekday reads MET on the Friday and `never ran`
+        on the other four — the board renders DAILY, so that is a contract
+        unsatisfiable four days in five.
+        """
+        _live_schema(monkeypatch)
+        for day in PHASE2_ANCHORS:
+            _put(store, manifest_key("weekly", day.isoformat()), _weekly(day))
+        for render in (
+            dt.date(2026, 9, 7),
+            dt.date(2026, 9, 9),
+            dt.date(2026, 9, 10),
+            dt.date(2026, 9, 11),
+        ):
+            window = [
+                render - dt.timedelta(weeks=n) for n in reversed(range(PHASE2_LIVE_SATURDAYS))
+            ]
+            clause = gate_module._clause_live_saturdays_first_attempt_ok(store, window)
+            assert clause.met, f"{render.isoformat()}: {clause.detail}"
 
     def test_a_replay_is_unmet_not_met(
         self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
@@ -179,9 +237,9 @@ class TestLiveSaturdaysAreReadFromTheManifestNeverTheDate:
         """The whole reason the clause list was withheld. A perfect replay
         Saturday is UNMET here, and says which day was not live."""
         _live_schema(monkeypatch)
-        for day in PHASE2_WINDOW:
+        for day in PHASE2_ANCHORS:
             _put(store, manifest_key("weekly", day.isoformat()), _weekly(day, mode="replay"))
-        clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_WINDOW)
+        clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_RENDER_WINDOW)
         assert not clause.met and not clause.unmeasurable
         assert "not live" in clause.detail
 
@@ -189,19 +247,23 @@ class TestLiveSaturdaysAreReadFromTheManifestNeverTheDate:
         self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _live_schema(monkeypatch)
-        for day in PHASE2_WINDOW:
+        for day in PHASE2_ANCHORS:
             _put(store, manifest_key("weekly", day.isoformat()), _weekly(day, attempts=2))
-        clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_WINDOW)
+        clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_RENDER_WINDOW)
         assert not clause.met
         assert "retried" in clause.detail
 
-    def test_an_absent_manifest_is_unmet_by_name(
+    def test_an_absent_manifest_is_unmet_by_the_anchor_key_not_the_render_day(
         self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _live_schema(monkeypatch)
-        clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_WINDOW)
+        clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_RENDER_WINDOW)
         assert not clause.met
         assert "never ran" in clause.detail
+        for anchor in PHASE2_ANCHORS:
+            assert manifest_key("weekly", anchor.isoformat()) in clause.detail
+        for rendered in PHASE2_RENDER_WINDOW:
+            assert manifest_key("weekly", rendered.isoformat()) not in clause.detail
 
 
 class TestReplaysReuseThePhaseOnePredicate:
@@ -298,6 +360,42 @@ class TestPagesAreCountedOnlyOnceSomethingHasSwept:
             _put(store, f"alerts/{FRIDAY.isoformat()}/incident{n}.json", {"severity": "page"})
         clause = gate_module._clause_pages_within_ceiling(store, PHASE2_WINDOW)
         assert not clause.met and not clause.unmeasurable
+
+    def test_the_gate_and_the_alerts_module_count_the_same_bus(self, store: LocalStore) -> None:
+        """One implementation of "pages over a span", not two.
+
+        The clause used to carry its own copy of the count, and the copies
+        disagreed at the FIRST day of the window (`start <= day` against the
+        module's `start < day`), so the gate and the
+        `pages_per_20_trading_days` metric could report different numbers for
+        the same bus (PR68 adversarial review, F4). An incident filed on
+        exactly `window[0]` is the case that separates them.
+        """
+        self._sweep(store)
+        edge = PHASE2_WINDOW[0]
+        _put(store, f"alerts/{edge.isoformat()}/edge.json", {"severity": "page"})
+        counted = alerts_module.pages_in_range(store, start=edge, end=PHASE2_WINDOW[-1])
+        assert counted == [f"alerts/{edge.isoformat()}/edge.json"]
+        clause = gate_module._clause_pages_within_ceiling(store, PHASE2_WINDOW)
+        assert clause.evidence == tuple(counted)
+        assert f"{len(counted)} paged incident(s)" in clause.detail
+
+    def test_a_key_that_is_not_a_bus_row_is_not_counted(self, store: LocalStore) -> None:
+        """Parsed through `crucible.keys.parse_bus_key`, never by a positional
+        index or an arity restated as an integer outside that module — the
+        class where `len(parts) != 4` silently dropped every discriminated
+        manifest (`alpha-engine-config-I9879`)."""
+        assert parse_bus_key(f"alerts/{FRIDAY.isoformat()}/one.json") == (
+            FRIDAY.isoformat(),
+            "one",
+        )
+        assert parse_bus_key(f"alerts/{FRIDAY.isoformat()}/nested/one.json") is None
+        assert parse_bus_key(f"alerts/{FRIDAY.isoformat()}/one.txt") is None
+        assert parse_bus_key(f"runs/weekly/{FRIDAY.isoformat()}/run.json") is None
+        self._sweep(store)
+        _put(store, f"alerts/{FRIDAY.isoformat()}/nested/one.json", {"severity": "page"})
+        clause = gate_module._clause_pages_within_ceiling(store, PHASE2_WINDOW)
+        assert clause.met and clause.evidence == ()
         assert f"ceiling {PHASE2_MAX_PAGES}" in clause.detail
 
 
@@ -337,6 +435,24 @@ class TestACostCeilingIsNeverMetByAnUnreadableApi:
         )
         assert clause.unmeasurable and not clause.met
 
+    def test_an_untagged_zero_is_unmeasurable_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The same trap one level up, and the half that shipped untracked.
+
+        For a live AWS estate an ACCOUNT total of exactly `$0.00` means Cost
+        Explorer answered with nothing chargeable — a broken reading, not a
+        free month — so phase 4's row must not go green on it (PR68
+        adversarial review, F3).
+        """
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: _CostClient("0"))
+        clause = gate_module._clause_aws_cost_within_ceiling(
+            PHASE2_WINDOW,
+            name="aws_total_within_ceiling",
+            ceiling_usd=PHASE4_MAX_TOTAL_USD,
+            tagged=False,
+        )
+        assert clause.unmeasurable and not clause.met
+        assert "no spend recorded under this filter" in clause.detail.lower()
+
     def test_met_under_the_tagged_ceiling(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(gate_module, "_ce_client", lambda: _CostClient("12.50"))
         clause = gate_module._clause_aws_cost_within_ceiling(
@@ -348,8 +464,7 @@ class TestACostCeilingIsNeverMetByAnUnreadableApi:
         assert clause.met and not clause.unmeasurable
 
     def test_unmet_over_the_account_ceiling(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Phase 4's reading: same reader, no tag filter, the other ceiling.
-        An unfiltered zero is a real reading and is NOT special-cased."""
+        """Phase 4's reading: same reader, no tag filter, the other ceiling."""
         monkeypatch.setattr(gate_module, "_ce_client", lambda: _CostClient("230.21"))
         clause = gate_module._clause_aws_cost_within_ceiling(
             PHASE2_WINDOW,
@@ -448,6 +563,43 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
         clause = gate_module._clause_slot_promotion_or_non_promotion(store, "r", _window(4))
         assert not clause.met and not clause.unmeasurable
         assert "status_reason" in clause.detail
+
+    def test_a_filed_manifest_that_names_no_verdict_is_not_reported_as_absent(
+        self, store: LocalStore
+    ) -> None:
+        """A promote run that was filed, read `ok`, and said nothing about this
+        slot is a PRODUCER gap, not "nothing looked".
+
+        Reporting it as "no promote run manifest was filed" states something
+        false about the store — the manifest is right there — and principle 1
+        asks that someone reconstruct why from the artifact alone (PR68
+        adversarial review, F2).
+        """
+        from crucible.keys import arena_cycle_key
+
+        promote = manifest_key("promote", FRIDAY.isoformat())
+        _put(
+            store,
+            promote,
+            {
+                "status": "ok",
+                "reason": "",
+                "metrics": [
+                    {
+                        "name": "pointer_moved",
+                        "source_path": arena_cycle_key("m", FRIDAY.isoformat()),
+                        "value": 0,
+                        "status_reason": "the challenger lost 3 of 4 paired weeks",
+                    }
+                ],
+            },
+        )
+        clause = gate_module._clause_slot_promotion_or_non_promotion(store, "r", _window(4))
+        assert clause.unmeasurable and not clause.met
+        assert promote in clause.detail
+        assert "pointer_moved" in clause.detail
+        assert arena_cycle_key("r", FRIDAY.isoformat()) in clause.detail
+        assert "no promote run manifest was filed" not in clause.detail
 
     def test_one_clause_per_registered_slot(self, store: LocalStore) -> None:
         clauses = gate_module._phase3(store, _window(4), {})

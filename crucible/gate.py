@@ -28,7 +28,7 @@ import ast
 import datetime as dt
 import json
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
@@ -36,6 +36,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from crucible.alerts import pages_in_range
 from crucible.calendar import TRADING_DAYS_PER_WEEK, resolve_trading_day
 from crucible.components import Component, load_registry
 from crucible.documents import DocumentRead
@@ -1725,16 +1726,38 @@ def _clause_live_saturdays_first_attempt_ok(store: Store, window: list[dt.date])
     calendar would be satisfied by exactly the accelerated replay schedule
     §6.1 uses to build phase 2 — the "green on replays" failure the phase-2
     clause list was withheld for.
+
+    **The window is anchored, never keyed on the render weekday.** A weekly
+    artifact binds to a Friday close (§4.12), while `_window` steps back in
+    raw calendar weeks from whatever day the caller passed and the ladder
+    renders DAILY. Keying on those raw days would send Monday's read and
+    Wednesday's read to different objects, so two flawless live Saturdays
+    filed at Friday closes would read MET on a Friday and `never ran` on the
+    other four weekdays — a contract unsatisfiable rather than merely unmet.
+    Every window day therefore collapses through `weekly_anchor`, exactly as
+    phase 0's `_clause_old_weekly_within_cadence` does
+    (`alpha-engine-config-I9904`).
     """
     requirement = (
         f"{PHASE2_LIVE_SATURDAYS} consecutive LIVE Saturdays whose weekly run manifest "
         f"reads `status: ok` on its FIRST attempt (`attempts` is exactly one entry, "
         f"`n: 1`). LIVE is read from the manifest's `{MANIFEST_RUN_MODE_FIELD}` field, "
-        "never inferred from the trading day"
+        "never inferred from the trading day; the Saturdays are the weekly anchors of "
+        "the window, not the weekday the gate was rendered on"
     )
     name = "live_saturdays_first_attempt_ok"
-    days = window[-PHASE2_LIVE_SATURDAYS:]
+    days = list(dict.fromkeys(weekly_anchor(day) for day in window[-PHASE2_LIVE_SATURDAYS:]))
     evidence = [manifest_key("weekly", day.isoformat()) for day in days]
+    if len(days) != len(window[-PHASE2_LIVE_SATURDAYS:]):
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{len(window[-PHASE2_LIVE_SATURDAYS:])} window weeks collapsed onto "
+            f"{len(days)} week anchors ({', '.join(d.isoformat() for d in days)}); one "
+            "manifest would be graded twice",
+            tuple(evidence),
+        )
     if MANIFEST_RUN_MODE_FIELD not in _manifest_property_names():
         return _unmeasurable(
             name,
@@ -1946,6 +1969,14 @@ def _clause_pages_within_ceiling(store: Store, window: list[dt.date]) -> Clause:
     actually swept. `alerts.sweep` is the only producer of that prefix, so an
     empty `runs/alerts.sweep/` means the ledger was never written by anything
     — no data, which is UNMEASURABLE rather than a clean month.
+
+    **The count comes from `crucible.alerts.pages_in_range`, not from a copy
+    of it here.** This clause and the `pages_per_20_trading_days` metric grade
+    the same bus against the same ceiling; a second implementation here
+    disagreed with the module at the first day of the window and restated the
+    `alerts/{trading_day}/{incident}.json` shape as an integer arity outside
+    `crucible.keys` — the failure class where `len(parts) != 4` silently
+    dropped 100% of discriminated manifests (`alpha-engine-config-I9879`).
     """
     name = "pages_within_ceiling"
     requirement = (
@@ -1964,21 +1995,20 @@ def _clause_pages_within_ceiling(store: Store, window: list[dt.date]) -> Clause:
             "never ran is no data, not a month without pages",
             (runs_prefix("alerts.sweep"),),
         )
-    listed = _list_store_keys(store, ALERTS_ROOT)
-    if listed.problem is not None:
-        return _unmeasurable(name, requirement, listed.problem, (ALERTS_ROOT,))
     start, end = window[0], window[-1]
-    incidents: list[str] = []
-    for key in listed.keys or []:
-        parts = key.split("/")
-        if len(parts) != 3 or not key.endswith(".json"):
-            continue
-        try:
-            day = dt.date.fromisoformat(parts[1])
-        except ValueError:
-            continue
-        if start <= day <= end:
-            incidents.append(key)
+    try:
+        incidents = pages_in_range(store, start=start, end=end)
+    except Exception as exc:
+        # A denied or unreachable listing is a statement about OUR access. It
+        # must be a red reading on the ladder, never an exception out of
+        # `evaluate` taking `crucible gate` and the board render down with it.
+        return _unmeasurable(
+            name,
+            requirement,
+            f"listing {ALERTS_ROOT!r} could not be read: {type(exc).__name__}: {exc}. "
+            "That is a statement about our access, not about the system being measured",
+            (ALERTS_ROOT,),
+        )
     if len(incidents) > PHASE2_MAX_PAGES:
         return Clause(
             name,
@@ -2045,24 +2075,28 @@ def _clause_aws_cost_within_ceiling(
             "statement about our access, not about what was spent",
             evidence,
         )
-    if tagged and reading.amount_usd == 0.0:
-        # The empty-set trap, one level down from phase 5's. A TAG-FILTERED
-        # total of exactly $0.00 is a property of the FILTER, not of the
-        # spend: it is what a correctly-tagged month with no resources and an
-        # entirely UNTAGGED estate both return, and this account's untagged
-        # total was $230.21 on the day this was written. Reading it as "under
-        # the $40 ceiling" would put the phase-2 row green on the evidence
-        # that cost attribution is not working. Whether the tag is actually
-        # applied is `crucible.tags.audit_stack_tags`' question, and phase
-        # 0's `v2_resources_tagged_and_versioned` deliverable.
+    if reading.amount_usd == 0.0:
+        # The empty-set trap, one level down from phase 5's, and it applies to
+        # BOTH scopes. A TAG-FILTERED total of exactly $0.00 is a property of
+        # the FILTER, not of the spend: it is what a correctly-tagged month
+        # with no resources and an entirely UNTAGGED estate both return, and
+        # this account's untagged total was $230.21 on the day this was
+        # written. An ACCOUNT total of exactly $0.00 is the same shape one
+        # level up: for a live AWS estate it means Cost Explorer answered with
+        # nothing chargeable — a broken reading, not a free month. Reading
+        # either as "under the ceiling" would put a phase row green on the
+        # evidence that the cost reading is not working. Whether the tag is
+        # actually applied is `crucible.tags.audit_stack_tags`' question, and
+        # phase 0's `v2_resources_tagged_and_versioned` deliverable.
         return _unmeasurable(
             name,
             requirement,
             f"Cost Explorer returned exactly $0.00 for {reading.scope} over "
-            f"{reading.start.isoformat()}..{reading.end.isoformat()}. A tag-filtered "
-            "total of zero is what an untagged estate returns as well as a free one, so "
-            "it measures the filter rather than the spend. `crucible.tags."
-            "audit_stack_tags` is the reading that says whether the tag is applied",
+            f"{reading.start.isoformat()}..{reading.end.isoformat()}: no spend recorded "
+            "under this filter — the tag or the account read is not evidence of cost "
+            "under the ceiling. A total of zero is what a broken or misfiltered reading "
+            "returns as well as a free month. `crucible.tags.audit_stack_tags` is the "
+            "reading that says whether the tag is applied",
             evidence,
         )
     if reading.amount_usd > ceiling_usd:
@@ -2106,18 +2140,25 @@ def _phase2(store: Store, window: list[dt.date], registry: dict[str, Component])
 
 def _promote_non_promotion(
     store: Store, slot: str, window: list[dt.date]
-) -> tuple[bool, list[str], list[str], list[str]]:
+) -> tuple[bool, list[str], list[str], list[str], list[str]]:
     """Whether a verdict-backed NON-promotion was filed for ``slot``.
 
-    Returns (found, evidence, problems, access_problems). A promote run files
-    one manifest per trading day under `runs/promote/{day}/run.json` with a
-    `pointer_moved` metric per slot; the metric's `source_path` is that slot's
-    arena cycle key, which is how one manifest answers for four slots without
-    the key shape having to carry the slot.
+    Returns (found, evidence, problems, access_problems, silent). A promote
+    run files one manifest per trading day under `runs/promote/{day}/run.json`
+    with a `pointer_moved` metric per slot; the metric's `source_path` is that
+    slot's arena cycle key, which is how one manifest answers for four slots
+    without the key shape having to carry the slot.
+
+    ``silent`` names every manifest that was FILED and read `ok` but carried
+    no `pointer_moved` metric for this slot. "Nothing looked" and "promote ran
+    and said nothing about this slot" are different facts with different
+    owners (principle 1), and folding the second into the first makes the
+    clause state something false about the store: the manifest is right there.
     """
     evidence: list[str] = []
     problems: list[str] = []
     access: list[str] = []
+    silent: list[str] = []
     found = False
     for day in window:
         key = manifest_key("promote", day.isoformat())
@@ -2141,11 +2182,13 @@ def _promote_non_promotion(
             problems.append(problem)
             continue
         wanted = arena_cycle_key(slot, day.isoformat())
+        named = False
         for metric in document["metrics"]:
             if not isinstance(metric, dict) or metric.get("name") != "pointer_moved":
                 continue
             if metric.get("source_path") != wanted:
                 continue
+            named = True
             if metric.get("value"):
                 # The pointer MOVED. That is a promotion, graded by the
                 # champion branch above, not a non-promotion.
@@ -2158,7 +2201,12 @@ def _promote_non_promotion(
                     "`status_reason` — a non-promotion with no stated reason is not a "
                     "verdict-backed one"
                 )
-    return found, evidence, problems, access
+        if not named:
+            silent.append(
+                f"{key}: read `ok` but carries no `pointer_moved` metric whose "
+                f"`source_path` is {wanted}"
+            )
+    return found, evidence, problems, access, silent
 
 
 def _clause_slot_promotion_or_non_promotion(
@@ -2224,9 +2272,13 @@ def _clause_slot_promotion_or_non_promotion(
                         f"by {producing} (`ok`)",
                         tuple(evidence),
                     )
-    found, promote_evidence, promote_problems, promote_access = _promote_non_promotion(
-        store, slot, window
-    )
+    (
+        found,
+        promote_evidence,
+        promote_problems,
+        promote_access,
+        promote_silent,
+    ) = _promote_non_promotion(store, slot, window)
     evidence.extend(promote_evidence)
     problems.extend(promote_problems)
     access.extend(promote_access)
@@ -2246,6 +2298,23 @@ def _clause_slot_promotion_or_non_promotion(
         if access:
             detail = f"{detail}; {len(access)} could not be read: {'; '.join(access[:2])}"
         return Clause(name, requirement, False, detail, tuple(evidence))
+    if promote_silent:
+        # The manifest is IN the store and read `ok`; it simply said nothing
+        # about this slot. Reporting that as "no promote run manifest was
+        # filed" states something false about the store (F2, PR68 review).
+        # It is a producer gap in `crucible.promote`, not an absence, and the
+        # clause names the key and the missing field so the next action is in
+        # the output.
+        return _unmeasurable(
+            name,
+            requirement,
+            f"{champion} is absent, and {len(promote_silent)} promote run manifest(s) in "
+            f"{window[0].isoformat()}..{window[-1].isoformat()} were filed and read `ok` "
+            f"but recorded no verdict for slot {slot!r}: {'; '.join(promote_silent[:4])}. "
+            "`promote` ran and said nothing about this slot — a producer gap in "
+            "`crucible.promote`, not a slot that was never looked at",
+            evidence,
+        )
     return _unmeasurable(
         name,
         requirement,

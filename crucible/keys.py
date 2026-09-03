@@ -70,6 +70,7 @@ __all__ = [
     "migration_key",
     "morning_report_key",
     "parse_acceptance_reading",
+    "parse_bus_key",
     "parse_manifest_key",
     "retirement_log_key",
     "review_key",
@@ -121,6 +122,32 @@ MANIFEST_BASENAME = "run.json"
 #: lists this constant rather than hardcoding `"alerts/"` when it counts every
 #: incident across the whole trailing window, not one group.
 ALERTS_ROOT = "alerts/"
+
+
+def parse_bus_key(key: str) -> tuple[str, str] | None:
+    """The inverse of `crucible.alerts.bus_key`: ``(trading_day, incident_id)``.
+
+    The CONSTRUCTION of a bus key stays in `crucible.alerts` (it is a function
+    of that module's derived `incident_id`, see `bus_key`); the PARSE belongs
+    here, with every other key shape, because more than one reader counts the
+    bus — `crucible.alerts.pages_in_range` and `crucible.gate`'s phase-2
+    ceiling clause — and each one that restated the shape as ``len(parts) !=
+    3`` would be a second contract invisible to any grep for a key-shaped
+    literal. That is the `parse_manifest_key` failure one namespace over
+    (alpha-engine-config-I9879), where an arity restated as an integer
+    silently dropped 100% of discriminated manifests.
+
+    Returns ``None`` for any key that is not a bus row under this shape, so
+    the caller decides whether an unrecognised key under `alerts/` is an error
+    or simply not of interest.
+    """
+    if not key.startswith(ALERTS_ROOT) or not key.endswith(".json"):
+        return None
+    parts = key.split("/")
+    if len(parts) != 3:
+        return None
+    _, trading_day, filename = parts
+    return trading_day, filename[: -len(".json")]
 
 
 def arm_key_segment(arm_id: str) -> str:
