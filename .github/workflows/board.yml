@@ -84,12 +84,45 @@ env:
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   BOARD_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/crucible-v2-github-board
   STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
+  # alpha-engine-config-I9928. `crucible/config.py` sets
+  # `DEFAULT_CLOUDTRAIL_ARCHIVE = ""` deliberately — a guessed bucket name
+  # produces a `NoSuchBucket` that reads like a permissions problem — so phase
+  # 2's `zero_human_mutating_calls` clause is UNMEASURABLE in every context
+  # that does not set this. That included this job, which is the ONLY
+  # scheduled identity that evaluates the ladder. A repository variable for
+  # the same reason AWS_ACCOUNT_ID and CRUCIBLE_STORE_URI are: the value is an
+  # infrastructure identifier and this repo goes PUBLIC at phase-1 exit
+  # (I9775). Its source of truth is `fleet-cloudtrail.yaml`'s
+  # `fleet-cloudtrail-archive-uri` export, which crucible-v2.yaml already
+  # wires into the spot box's shell — one value, three consumers.
+  #
+  # It stops ABOVE CloudTrail's `{region}/` level, on purpose:
+  # `crucible.autonomy.date_partitions` discovers the delivered regions, so a
+  # multi-region trail stays fully counted. Pinning a region here would
+  # silently narrow a gate that asserts a count of ZERO.
+  CRUCIBLE_CLOUDTRAIL_ARCHIVE: ${{ vars.CRUCIBLE_CLOUDTRAIL_ARCHIVE }}
 
 jobs:
   board:
     name: render the declared board
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 10 was set when every clause read a stored artifact. Phase 2's
+    # `zero_human_mutating_calls` reads the CloudTrail archive over a
+    # fortnight, and MEASURED 2026-09-03 against the production archive one
+    # calendar day is ~1,123 objects / ~36 MB / ~181k records, ~150 s read
+    # sequentially — so the phase-2 window is ~9,000 objects and ~1.4M records,
+    # about 20 minutes sequentially. `crucible.autonomy` fetches a day's
+    # objects 32-at-a-time and filters each object as it decodes, which brings
+    # the archive read to a few minutes; this ceiling is the headroom around
+    # that, not a target. A board killed at its timeout publishes NOTHING —
+    # every row goes dark over one clause's reading, which is a measurement
+    # failing for a reason that has nothing to do with what it measures.
+    #
+    # Raise this only with a new measurement. If the archive read grows past
+    # it, the fix is the reader (a narrower prefix, a cheaper filter), not a
+    # larger number: a job allowed to run for an hour is one whose cost nobody
+    # notices.
+    timeout-minutes: 25
     permissions:
       contents: read
       id-token: write   # OIDC only; no long-lived AWS keys in this repository
@@ -108,6 +141,14 @@ jobs:
           if [ -z "$STORE_URI" ]; then
             echo "::error::repository variable CRUCIBLE_STORE_URI is not set — set it with: gh variable set CRUCIBLE_STORE_URI --repo nousergon/crucible --body '<s3-uri-of-the-crucible-v2-store>'"
             missing=1
+          fi
+          # A WARNING, not an error, and deliberately so: an unset archive
+          # does not stop the board rendering — it makes exactly one clause
+          # read UNMEASURABLE with its own reason attached, which is the
+          # honest answer and is already on the board. Failing the whole
+          # render here would take 40-odd readable rows down over one.
+          if [ -z "$CRUCIBLE_CLOUDTRAIL_ARCHIVE" ]; then
+            echo "::warning::repository variable CRUCIBLE_CLOUDTRAIL_ARCHIVE is not set, so phase 2's zero_human_mutating_calls will render UNMEASURABLE — set it with: gh variable set CRUCIBLE_CLOUDTRAIL_ARCHIVE --repo nousergon/crucible --body \"\$(AWS_PROFILE=ne-admin aws cloudformation list-exports --query \"Exports[?Name=='fleet-cloudtrail-archive-uri'].Value\" --output text)\""
           fi
           exit "$missing"
 
