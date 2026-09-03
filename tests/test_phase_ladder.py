@@ -138,8 +138,8 @@ class TestAbsenceRendersAsAbsence:
         _file_reading(store, "phase1", FRIDAY, met=False)
         rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
         assert rows["phase1"]["read_on"] == FRIDAY.isoformat()
-        assert last_read(store, "phase1") == FRIDAY.isoformat()
-        assert last_read(store, "phase0") is None
+        assert last_read(store, "phase1") == (FRIDAY.isoformat(), False)
+        assert last_read(store, "phase0") == (None, False)
 
     def test_the_unmeasured_COUNT_is_published_not_left_to_be_counted(
         self, store: LocalStore
@@ -245,6 +245,72 @@ class TestTheLadderKnowsWhereItIs:
         assert rows["phase1"]["clauses_met"] == sum(1 for c in reading.clauses if c.met)
         assert rows["phase1"]["clauses_total"] == len(reading.clauses)
         assert isinstance(reading, GateResult)
+
+
+class TestAnUnmeasurableClauseRendersAsSuchNotAsFailed:
+    """`alpha-engine-config-I9869` round 3, finding 4. A store access
+    failure on one clause used to render the ROW as plain `UNMET` carrying a
+    specific `met_ratio` — e.g. `0.5` (measured on a two-clause gate with one
+    unmeasurable clause) — indistinguishable from "we checked and it fell
+    short". `UNMEASURABLE` is `crucible.board`'s own vocabulary, reused
+    here, never restated (`LADDER_BOARD_STATE` in `crucible/board.py` maps it
+    straight through)."""
+
+    def test_an_unmeasurable_clause_renders_the_row_unmeasurable_not_unmet(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from crucible.gate import Clause
+
+        monkeypatch.setitem(
+            GATES,
+            "phase1",
+            (
+                5,
+                lambda *_a, **_k: [
+                    Clause("a", "req a", True, "met", ()),
+                    Clause("b", "req b", False, "could not be read", (), unmeasurable=True),
+                ],
+            ),
+        )
+        rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
+        assert rows["phase1"]["state"] == "UNMEASURABLE"
+        assert rows["phase1"]["console_state"] == "FAILED"
+        assert rows["phase1"]["clauses_unmeasurable"] == 1
+        assert rows["phase1"]["clauses_total"] == 2
+        # The rest of the ladder is unaffected: an unmeasurable phase 1 does
+        # not take the other rows down with it.
+        assert {
+            r["phase"] for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]
+        } == {p.id for p in PHASES}
+
+    def test_an_unmeasurable_clause_never_publishes_a_specific_ratio(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reproduction named in the finding: one unmeasurable clause out
+        of two used to publish `met_ratio: 0.5` — a number that reads as a
+        real, partial measurement rather than "this reading cannot be
+        trusted as a ratio". `None`, never a number computed from a partial
+        read (plan §6 rule 1: no data is never a pass)."""
+        from crucible.gate import Clause, evaluate
+
+        monkeypatch.setitem(
+            GATES,
+            "phase1",
+            (
+                5,
+                lambda *_a, **_k: [
+                    Clause("a", "req a", True, "met", ()),
+                    Clause("b", "req b", False, "could not be read", (), unmeasurable=True),
+                ],
+            ),
+        )
+        gate_reading = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        assert gate_reading.met_ratio is None
+        rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
+        assert rows["phase1"]["met_ratio"] is None
+        # And never silently absent either — the count that explains WHY the
+        # ratio is null is published on the same row.
+        assert rows["phase1"]["clauses_unmeasurable"] == 1
 
 
 class TestAnOutOfOrderPhaseIsVisibleAsSuch:
