@@ -314,16 +314,21 @@ BOARD_URL_CAVEAT = (
 #: list is the board, beside the phase ladder's own six rows. A path, not a
 #: host — the host is `CRUCIBLE_CONSOLE_URL` (`crucible.config`), which this
 #: tree carries no default for.
-BOARD_CONSOLE_PATH = "/decision?pipeline=crucible/board"
+BOARD_CONSOLE_PATH = "/decision?pipeline=crucible-board"
 
 #: Rendered beside the console link. It says what the presigned caveat could
 #: not: the address does not expire. It also says what the page IS — the
-#: console's Decision kind filtered to this board's rows — and where those
-#: rows come from, so a reader comparing the two surfaces knows they are one
-#: document.
+#: console's Decision kind filtered to this board's rows, ALL of them — and
+#: where those rows come from, so a reader comparing the two surfaces knows
+#: they are one document. The filter is a facet the console fragment stamps
+#: on every row as a literal (`pipeline: crucible-board`), not a field read
+#: off the rows: the board's own `surface` is per-row PROVENANCE (measured
+#: 2026-09-03: 10 distinct values across 46 rows), and filtering on it hid
+#: 20 rows, 17 of them the UNREPORTED component rows the board exists to
+#: show (I9926 review B3).
 BOARD_CONSOLE_CAVEAT = (
-    "fleet console — the Decision list filtered to this board; stable address, "
-    "no expiry; renders the same board/current.json this message is read from"
+    "fleet console — the Decision list filtered to this board, every row of "
+    "board/current.json and none hidden; stable address, no expiry"
 )
 
 #: The line emitted when there is no page to link to. FAILURE MODE SWALLOWED:

@@ -1021,22 +1021,33 @@ class TestTheConsoleLinkReplacesThePresignedOne:
     def test_the_console_url_is_the_link(self, tmp_path):
         store = _seed(tmp_path, previous=_board())
         message = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
-        assert f"  {self.CONSOLE}/decision?pipeline=crucible/board\n" in message
+        assert f"  {self.CONSOLE}/decision?pipeline=crucible-board\n" in message
 
     def test_the_link_is_the_decision_list_filtered_to_this_board(self):
-        # Every board row carries `surface: crucible/board`, which the console
-        # fragment lifts onto the `pipeline` facet; the filter is what makes
-        # the address THIS board's rather than every Decision in the fleet.
+        # The console fragment stamps a LITERAL `pipeline: crucible-board`
+        # facet on every row it mints; the filter is what makes the address
+        # THIS board's rather than every Decision in the fleet, and a literal
+        # is what makes it every row of this board rather than a subset.
         from crucible.morning import BOARD_CONSOLE_PATH
 
-        assert BOARD_CONSOLE_PATH == "/decision?pipeline=crucible/board"
+        assert BOARD_CONSOLE_PATH == "/decision?pipeline=crucible-board"
+
+    def test_the_filter_is_not_a_field_the_board_rows_disagree_on(self):
+        # Review B3: `surface` is per-row provenance — a real board carries
+        # ~10 distinct values across its rows — so a filter keyed on it hides
+        # the rows whose provenance is elsewhere, including the UNREPORTED
+        # component rows. The path must not filter on any row field.
+        from crucible.morning import BOARD_CONSOLE_PATH
+
+        assert "surface" not in BOARD_CONSOLE_PATH
+        assert "crucible/board" not in BOARD_CONSOLE_PATH
 
     def test_no_expiry_is_reported_when_nothing_was_presigned(self, tmp_path):
         store = _seed(tmp_path, previous=_board())
         inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
         assert inputs.board_url is None
         assert inputs.board_url_expires == ""
-        assert inputs.board_console_url == f"{self.CONSOLE}/decision?pipeline=crucible/board"
+        assert inputs.board_console_url == f"{self.CONSOLE}/decision?pipeline=crucible-board"
 
     def test_the_presigned_link_and_its_caveat_are_absent(self, tmp_path):
         store = _seed(tmp_path, previous=_board())
@@ -1055,7 +1066,7 @@ class TestTheConsoleLinkReplacesThePresignedOne:
     def test_a_trailing_slash_on_the_base_url_does_not_double_up(self, tmp_path):
         store = _seed(tmp_path, previous=_board())
         message = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE + "/")
-        assert f"{self.CONSOLE}/decision?pipeline=crucible/board" in message
+        assert f"{self.CONSOLE}/decision?pipeline=crucible-board" in message
         assert f"{self.CONSOLE}//decision" not in message
 
     def test_the_page_is_not_read_when_a_console_is_configured(self, tmp_path):
