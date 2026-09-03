@@ -60,6 +60,7 @@ __all__ = [
     "manifest_key",
     "manifest_prefix",
     "migration_key",
+    "parse_manifest_key",
     "retirement_log_key",
     "review_key",
     "review_prefix",
@@ -267,6 +268,38 @@ def manifest_prefix(job: str, trading_day: str) -> str:
     if not trading_day:
         raise ValueError("trading_day must be non-empty")
     return f"runs/{job}/{trading_day}/"
+
+
+def parse_manifest_key(key: str) -> tuple[str, str, str | None] | None:
+    """The inverse of :func:`manifest_key`: ``(job, trading_day, discriminator)``.
+
+    A reader that lists :data:`RUNS_ROOT` (or any manifest prefix) and needs
+    to know what each returned key names — `crucible.console.render`'s
+    weekly cost roll-up and `crucible.alerts._week_summary`, chiefly — parses
+    through this function rather than restating the shape as a positional
+    ``parts[i]`` or an arity check. Both `manifest_key(job, trading_day)`
+    (four segments) and `manifest_key(job, trading_day, discriminator=d)`
+    (five segments) are valid; a reader that checks ``len(parts) != 4`` alone
+    silently drops every discriminated manifest — which is every manifest
+    `experiment.run`/`experiment.grade` or `alerts.sweep` ever write
+    (alpha-engine-config-I9879).
+
+    Returns ``None`` for any key that is not a manifest under this module's
+    shape (wrong root, wrong suffix, or an arity other than four or five) —
+    the caller decides whether a non-manifest key under `runs/` is an error
+    or simply not of interest, this function only decides what it does not
+    understand.
+    """
+    if not key.startswith(RUNS_ROOT) or not key.endswith("/run.json"):
+        return None
+    parts = key.split("/")
+    if len(parts) == 4:
+        _, job, trading_day, _ = parts
+        return job, trading_day, None
+    if len(parts) == 5:
+        _, job, trading_day, discriminator, _ = parts
+        return job, trading_day, discriminator
+    return None
 
 
 def runs_prefix(job: str) -> str:

@@ -21,6 +21,7 @@ from crucible.alerts import (
     Page,
     PageGroup,
     TopicUnresolvedError,
+    _week_summary,
     cause_key,
     ceiling_metric,
     days_to_evaluate,
@@ -625,6 +626,29 @@ class TestHeartbeat:
         store = LocalStore(tmp_path)
         store.put_bytes(manifest_key("data.daily", FRIDAY.isoformat()), b"{oops")
         assert heartbeat(store, now=SATURDAY_NIGHT, transport=transport)["runs_failed"] == 1
+
+    def test_discriminated_manifests_are_counted_not_dropped(self, tmp_path, transport) -> None:
+        """alpha-engine-config-I9879: `_week_summary` used to filter store
+        keys on `len(parts) != 4`, the BARE manifest shape
+        (`runs/{job}/{trading_day}/run.json`). A discriminated manifest
+        (`runs/{job}/{trading_day}/{discriminator}/run.json`, 5 segments) —
+        what `experiment.run`/`experiment.grade` (by slot) and
+        `alerts.sweep` (by `calendar_date`) actually write — was silently
+        skipped, so the ok/failed counters and spend both undercounted the
+        highest-volume writers. Shown RED against pre-fix `main` in the PR
+        body; this asserts a bare AND a discriminated manifest for the SAME
+        job/trading-day are both counted.
+        """
+        store = LocalStore(tmp_path)
+        _write_manifest(store, "data.daily", status="ok", cost=0.25)
+        _write_manifest(store, "experiment.run", status="ok", cost=1.5, discriminator="r")
+        _write_manifest(
+            store, "experiment.run", status="failed", reason="boom", cost=0.75, discriminator="m"
+        )
+        ok, failed, spend = _week_summary(store, FRIDAY)
+        assert ok == 2
+        assert failed == 1
+        assert spend == pytest.approx(2.5)
 
 
 class TestSweep:

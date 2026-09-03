@@ -279,6 +279,45 @@ class TestPage:
             )
         assert build_page(store, now=SATURDAY_NIGHT).week_cost_usd == 1.75
 
+    def test_the_weeks_cost_includes_discriminated_manifests(self, tmp_path) -> None:
+        """alpha-engine-config-I9879: the roll-up used to filter on
+        `len(parts) != 4`, which is the BARE manifest shape
+        (`runs/{job}/{trading_day}/run.json`, 4 segments). A discriminated
+        manifest (`runs/{job}/{trading_day}/{discriminator}/run.json`, 5
+        segments) — what `experiment.run`/`experiment.grade` and
+        `alerts.sweep` actually write — was silently dropped. Shown RED
+        against pre-fix `main` in the PR body; this asserts both the bare
+        and the discriminated manifest for the SAME job/day are counted.
+        """
+        store = LocalStore(tmp_path)
+        store.put_bytes(
+            manifest_key("data.daily", FRIDAY.isoformat()),
+            json.dumps(
+                {
+                    "job": "data.daily",
+                    "trading_day": FRIDAY.isoformat(),
+                    "status": "ok",
+                    "reason": "",
+                    "cost_usd": 0.25,
+                    "run_id": "01JG0000000000000000000001",
+                }
+            ).encode(),
+        )
+        store.put_bytes(
+            manifest_key("experiment.run", FRIDAY.isoformat(), discriminator="r"),
+            json.dumps(
+                {
+                    "job": "experiment.run",
+                    "trading_day": FRIDAY.isoformat(),
+                    "status": "ok",
+                    "reason": "",
+                    "cost_usd": 1.5,
+                    "run_id": "01JG0000000000000000000002",
+                }
+            ).encode(),
+        )
+        assert build_page(store, now=SATURDAY_NIGHT).week_cost_usd == 1.75
+
     def test_a_missing_attribution_artifact_says_so_rather_than_showing_zeros(
         self, tmp_path
     ) -> None:

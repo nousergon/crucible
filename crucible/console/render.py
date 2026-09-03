@@ -21,7 +21,13 @@ from crucible.components import Component, load_registry
 from crucible.console.classify import STATES, Classification, classify
 from crucible.gate import LADDER_KEY, LADDER_STATES, PHASES, build_ladder
 from crucible.gate import validate_ladder_document as _validate_ladder_document
-from crucible.keys import RUNS_ROOT, attribution_key, champion_key, runs_prefix
+from crucible.keys import (
+    RUNS_ROOT,
+    attribution_key,
+    champion_key,
+    parse_manifest_key,
+    runs_prefix,
+)
 from crucible.manifest import manifest_prefix
 from crucible.store import Store
 
@@ -220,14 +226,15 @@ def build_page(
     week_cost = 0.0
     deploys: list[dict[str, Any]] = []
     for key in store.list_keys(RUNS_ROOT):
-        if not key.endswith("/run.json"):
+        parsed = parse_manifest_key(key)
+        if parsed is None:
             continue
-        parts = key.split("/")
-        if len(parts) != 4 or parts[2] not in day_set:
+        job, trading_day_str, _discriminator = parsed
+        if trading_day_str not in day_set:
             continue
         manifest = json.loads(store.get_bytes(key).decode("utf-8"))
         week_cost += float(manifest.get("cost_usd", 0.0))
-        if parts[1] == "deploy":
+        if job == "deploy":
             deploys.append(
                 {
                     "trading_day": manifest.get("trading_day"),
