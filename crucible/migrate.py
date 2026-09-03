@@ -35,7 +35,7 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from crucible.keys import champion_key
+from crucible.keys import champion_key, migration_key
 from crucible.slots.arms import ArmSpec, read_register, register_arms, write_register
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -306,7 +306,7 @@ def run_migrate_history(
         }
     )
     ctx.record_output(
-        f"migrations/{ctx.trading_day.isoformat()}/{ctx.run_id}.json",
+        migration_key(ctx.trading_day.isoformat(), ctx.run_id),
         json.dumps(result, indent=2, sort_keys=True).encode("utf-8"),
         schema_version="migration.v1",
     )

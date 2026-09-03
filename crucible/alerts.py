@@ -43,6 +43,7 @@ from crucible.calendar import (
     resolve_trading_day,
 )
 from crucible.components import Component, load_registry, scheduled_components
+from crucible.keys import ALERTS_ROOT, RUNS_ROOT
 from crucible.manifest import manifest_prefix
 from crucible.store import Store
 
@@ -942,7 +943,7 @@ def pages_in_window(
     for _ in range(window_trading_days):
         start = previous_trading_day(start)
     count = 0
-    for key in store.list_keys("alerts/"):
+    for key in store.list_keys(ALERTS_ROOT):
         parts = key.split("/")
         if len(parts) != 3 or not key.endswith(".json"):
             continue
@@ -1089,7 +1090,7 @@ def _week_summary(store: Store, trading_day: dt.date) -> tuple[int, int, float]:
         days.add(day)
     ok = failed = 0
     spend = 0.0
-    for key in store.list_keys("runs/"):
+    for key in store.list_keys(RUNS_ROOT):
         if not key.endswith("/run.json"):
             continue
         parts = key.split("/")

@@ -44,6 +44,7 @@ from crucible.gate import LADDER_KEY, LADDER_SCHEMA_VERSION, build_ladder
 from crucible.keys import (
     BOARD_CURRENT_KEY,
     BOARD_HTML_KEY,
+    DRIFT_INPUTS,
     board_key,
     drift_input_key,
     drift_metrics_key,
@@ -386,7 +387,7 @@ def drift_handler(args: argparse.Namespace) -> int:
 
     def body(ctx: RunContext) -> None:
         day = ctx.trading_day.isoformat()
-        inputs = {name: drift_input_key(name, day) for name in ("features", "predictions", "ic")}
+        inputs = {name: drift_input_key(name, day) for name in DRIFT_INPUTS}
         missing = [k for k, key in inputs.items() if not store.exists(key)]
         if missing:
             raise FileNotFoundError(

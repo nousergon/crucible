@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Any
 from crucible.calendar import assert_trading_day, is_trading_day
 from crucible.data.daily import DEFAULT_LOOKBACK_DAYS, run_daily
 from crucible.data.sources import PriceSource
-from crucible.keys import data_panel_key
+from crucible.keys import data_panel_key, heal_key
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from crucible.runner import RunContext
@@ -204,7 +204,7 @@ def run_heal(
         "already_present": already,
     }
     ctx.record_output(
-        f"heals/{ctx.trading_day.isoformat()}/{ctx.run_id}.json",
+        heal_key(ctx.trading_day.isoformat(), ctx.run_id),
         json.dumps(result, indent=2, sort_keys=True).encode("utf-8"),
         schema_version="heal.v1",
     )

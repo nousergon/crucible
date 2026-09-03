@@ -711,6 +711,11 @@ def _execution_row(spec: RowSpec, *, now: dt.datetime) -> dict[str, Any]:
         n_samples=0,
         baseline=0.0,
         now=now,
+        # Illustrative, unresolved template text, not a crucible store key:
+        # the trader is a separate system (module docstring) that publishes
+        # no `fills/` artifact into THIS store at all, so there is no
+        # `crucible.keys` function to own a shape nothing here ever writes
+        # or reads (alpha-engine-config-I9852).
         source_path="fills/{trading_day}/fills.json",
         implemented=False,
         reason=(
