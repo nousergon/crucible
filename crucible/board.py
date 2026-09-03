@@ -178,6 +178,11 @@ LADDER_BOARD_STATE: dict[str, str] = {
     "MET": "MET",
     "UNMET": "UNMET",
     "UNMEASURED": "UNMEASURED",
+    # Added when the ladder gained the state (`alpha-engine-config-I9869`
+    # round 3, finding 4) — the board already had this word (`BOARD_STATES`
+    # above), the ladder did not, and this map's job is precisely to refuse
+    # a ladder state with no declared board rendering.
+    "UNMEASURABLE": "UNMEASURABLE",
     "OUT_OF_ORDER": "OUT_OF_ORDER",
 }
 

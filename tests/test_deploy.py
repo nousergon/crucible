@@ -29,6 +29,7 @@ from crucible.release import (
     publish_release,
     read_pointer,
     release_json_key,
+    wheel_filename_for,
     wheel_key,
 )
 from crucible.store import LocalStore, S3Store, sha256_hex
@@ -85,10 +86,11 @@ def _release_json(sha=SHA, *, wheel: bytes = WHEEL_BYTES, wheel_sha256: str | No
     """
     return json.dumps(
         {
-            "schema_version": "release.v2",
+            "schema_version": "release.v3",
             "sha": sha,
             "lockfile_sha256": "0" * 64,
             "wheel_sha256": wheel_sha256 or sha256_hex(wheel),
+            "wheel_filename": wheel_filename_for(sha),
             "python_requires": ">=3.12,<3.13",
             "extra": {},
         }
@@ -151,7 +153,10 @@ class TestPublish:
         run_id="1",
         suffix="",
     ):
-        wheel_path = tmp_path / f"{sha[:6]}{suffix}.whl"
+        # Named exactly what release.json's `wheel_filename` declares
+        # (alpha-engine-config-I9908) — `_publish` now refuses a `--wheel`
+        # whose basename disagrees with the record it is publishing.
+        wheel_path = tmp_path / wheel_filename_for(sha)
         wheel_path.write_bytes(wheel)
         meta = tmp_path / f"{sha[:6]}{suffix}-release.json"
         meta.write_text(
@@ -242,7 +247,7 @@ class TestPublish:
         request `crucible.release.publish_release` makes, requested ON THE
         PUT itself, made here too, since this is the code path `deploy.yml`
         actually drives in CI."""
-        wheel_path = tmp_path / "a.whl"
+        wheel_path = tmp_path / wheel_filename_for(SHA)
         wheel_path.write_bytes(WHEEL_BYTES)
         meta = tmp_path / "a-release.json"
         meta.write_text(_release_json(SHA, wheel=WHEEL_BYTES))
@@ -291,6 +296,11 @@ class TestPublish:
                 "sha": SHA,
                 "lockfile_sha256": "z" * 64,
                 "wheel_sha256": sha256_hex(WHEEL_BYTES),
+                # Present (so construction reaches __post_init__ and the
+                # schema reports every bad field at once, not just the
+                # first missing kwarg) but non-conformant: I9908 requires
+                # `wheel_filename` to match `^crucible-.+-py3-none-any\.whl$`.
+                "wheel_filename": "not-a-wheel",
                 "python_requires": "",
                 "extra": {},
             }
@@ -314,7 +324,7 @@ class TestPublish:
                 provenance_json=bad_provenance_json,
             )
         message = str(excinfo.value)
-        assert "release.v2.json" in message
+        assert "release.v3.json" in message
         assert "lockfile_sha256" in message
         assert "python_requires" in message
         # The store must be untouched: the CLI's own construction of
@@ -682,6 +692,64 @@ class TestTheWorkflowItself:
         text = DEPLOY_YML.read_text(encoding="utf-8")
         assert "crucible.deploy flip" in text
         assert "Flip releases/current on an ok smoke" in text
+
+    def test_the_flip_is_gated_on_a_real_pip_install_not_only_the_upload(
+        self, workflow: dict
+    ) -> None:
+        """alpha-engine-config-I9908: `pointer_flipped_on_smoke` went MET on
+        every release this pipeline ever published, and none of them could
+        be installed anywhere — the smoke's S3 reads prove the bytes landed,
+        never that pip accepts the filename. A step that downloads the
+        JUST-PUBLISHED object and `pip install`s it into a throwaway venv
+        must run, and must run BEFORE the flip: a step failure stops the
+        job, so an unpip-installable wheel can never reach
+        `releases/current`."""
+        names = [json.dumps(s) for s in self._release_steps(workflow)]
+        publish = next(i for i, s in enumerate(names) if "crucible.deploy publish" in s)
+        install_proof = next(i for i, s in enumerate(names) if "pip install" in s)
+        flip = next(i for i, s in enumerate(names) if "crucible.deploy flip" in s)
+        assert publish < install_proof < flip, (
+            "the install proof must run against a wheel already PUBLISHED, and must "
+            "gate the flip — installed anywhere else in the sequence, it proves "
+            "nothing about what the pointer is about to promote"
+        )
+        proof_step = self._release_steps(workflow)[install_proof]
+        script = proof_step["run"]
+        assert "aws s3 cp" in script, (
+            "must download the object this deploy just PUBLISHED, not the local build artifact"
+        )
+        assert "crucible --version" in script, (
+            "must actually run the installed console script, not just call pip install"
+        )
+
+    def test_the_install_proof_installs_the_wheel_under_its_published_filename(
+        self, workflow
+    ) -> None:
+        """Measured 2026-09-03 (run 33778251060, the first deploy after
+        crucible-PR59 merged): the proof downloaded the wheel as
+        `/tmp/crucible-install-proof.whl` and pip refused it — `is not a
+        valid wheel filename` — which is the I9908 defect re-created inside
+        the step that proves its fix. pip validates the FILENAME (PEP 427),
+        so a renamed wheel is a different artifact. The `pip install` target
+        must be the build's own `wheel_filename` output, and the download
+        destination must carry it too."""
+        names = [json.dumps(s) for s in self._release_steps(workflow)]
+        install_proof = next(i for i, s in enumerate(names) if "pip install" in s)
+        script = self._release_steps(workflow)[install_proof]["run"]
+        wheel_ref = "${{ needs.build.outputs.wheel_filename }}"
+        pip_lines = [ln for ln in script.splitlines() if "pip install" in ln]
+        assert pip_lines, "the proof must call pip install"
+        for line in pip_lines:
+            assert line.rstrip().rstrip('"').endswith(f"{wheel_ref}"), (
+                f"pip install must target the wheel under its PUBLISHED filename, got: {line!r}"
+            )
+        cp_lines = [ln for ln in script.splitlines() if "aws s3 cp" in ln]
+        assert cp_lines and all(ln.rstrip().rstrip('"').endswith(wheel_ref) for ln in cp_lines), (
+            "the download destination must keep the published wheel filename"
+        )
+        assert "crucible-install-proof.whl" not in script, (
+            "a renamed wheel is what pip refused on 2026-09-03"
+        )
 
 
 class TestTheSmokeGate:

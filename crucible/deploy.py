@@ -56,7 +56,7 @@ from crucible.release import (
     read_pointer,
     release_json_key,
     release_object_lock_params,
-    wheel_key,
+    wheel_key_for,
     write_deploy_manifest,
 )
 from crucible.store import PointerConflictError, Store, open_store, sha256_hex
@@ -121,7 +121,7 @@ def _publish(args: argparse.Namespace, store: Store) -> int:
     try:
         record = ReleaseRecord(**json.loads(Path(args.release_json).read_text(encoding="utf-8")))
     except (TypeError, ValueError) as exc:
-        raise SystemExit(f"{args.release_json} does not conform to release.v2.json: {exc}") from exc
+        raise SystemExit(f"{args.release_json} does not conform to release.v3.json: {exc}") from exc
     try:
         provenance = ReleaseProvenance(
             **json.loads(Path(args.provenance_json).read_text(encoding="utf-8"))
@@ -149,13 +149,26 @@ def _publish(args: argparse.Namespace, store: Store) -> int:
             "thing anyone downstream has about these bytes; publishing a record that "
             "does not describe its own artifact makes every later verification vacuous."
         )
+    # alpha-engine-config-I9908: the record's OWN declared filename is what
+    # gets published to, not a filename this function re-derives from the
+    # sha — a `--wheel` file named anything else would publish under a key
+    # `wheel_filename` never described, which is exactly the "wheel this
+    # pipeline built is not the wheel a consumer can find" defect the issue
+    # is closing.
+    if Path(args.wheel).name != record.wheel_filename:
+        raise SystemExit(
+            f"--wheel is {Path(args.wheel).name}, but release.json for {args.sha} "
+            f"declares wheel_filename={record.wheel_filename!r}. Publishing the file "
+            "under a name release.json does not describe would make it undiscoverable "
+            "to any reader that trusts the record — which is every reader."
+        )
     # Both identity keys are checked before either is written: a refusal
     # must not be able to leave a wheel from one build beside a release.json
     # from another.
     writes = [
         (key, payload)
         for key, payload in (
-            (wheel_key(args.sha), wheel),
+            (wheel_key_for(args.sha, record.wheel_filename), wheel),
             (release_json_key(args.sha), record.to_json()),
         )
         if assert_immutable_write(store, key, payload)

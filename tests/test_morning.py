@@ -593,7 +593,9 @@ class TestDelivery:
         assert call["sns"] is False
         assert call["telegram"] is True
         assert call["severity"] == "info"
-        assert call["silent"] is True
+        # NOT silent: the 2026-09-03 delivery went out silent and was not
+        # seen (alpha-engine-config-I9916). A notification is not a page.
+        assert call["silent"] is False
         assert call["raise_on_total_failure"] is True
         # Explicit, never left to `krepis.alerts.resolve_destination`'s
         # fallback: an `info` severity reaches the operator chat TODAY only

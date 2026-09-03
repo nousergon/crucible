@@ -20,7 +20,7 @@ artifacts it reports on can satisfy its own reading.
 
 **It is not a page, and it must never become one.** Plan §4.6 admits exactly
 two page conditions — absence and failure — and a daily digest is neither.
-It goes out on the operator channel with `severity="info"` and `silent=True`,
+It goes out on the operator channel with `severity="info"` and `silent=False`,
 on Telegram only, so nothing about it touches either SNS pages topic and it
 cannot buzz a phone at 6am for a board that is red by design. `crucible.alerts`
 is deliberately NOT imported: routing a digest through the page path is how a
@@ -639,13 +639,20 @@ def _operator_chat() -> str:
 def deliver(message: str, *, transport: Callable[..., Any] | None = None) -> str:
     """Send ``message`` on the operator channel. Returns the destination.
 
-    **Telegram only, `severity="info"`, `silent=True`.** Plan §4.6 admits
+    **Telegram only, `severity="info"`, `silent=False`.** Plan §4.6 admits
     exactly two page conditions and this is neither, so it must not reach
     either SNS pages topic: `sns=False` is what keeps a daily digest out of
-    the path a page travels, and `silent=True` is what keeps it from buzzing
-    a phone at 6am about a board that is red by design. It is the same shape
+    the path a page travels. §4.6 governs PAGES; a Telegram notification is
+    not one. It is the same shape
     `nousergon-lib/.github/workflows/notify-ci-failure.yml` already runs
     fleet-wide, which is also why it needs no AWS credential to deliver.
+
+    **Why it notifies (Brian ruling 2026-09-03, `alpha-engine-config-I9916`).**
+    The first delivery (2026-09-03 07:26 PDT) went out `silent=True` into the
+    operator chat, under the day's CI-failure alerts; the manifest read `ok`
+    and Brian said he had not received it. A report the recipient does not
+    see is the accountability gap this job exists to close, one layer down.
+    One push per day at 06:00 PT is the accepted cost.
 
     **No dedup key.** `krepis.alerts.publish` suppresses a repeat within its
     window, and this message is SUPPOSED to arrive every day even when it is
@@ -685,7 +692,7 @@ def deliver(message: str, *, transport: Callable[..., Any] | None = None) -> str
         source=f"crucible-v2/{MORNING_JOB}",
         sns=False,
         telegram=True,
-        silent=True,
+        silent=False,
         dedup_key=None,
         destination=_operator_chat(),
         raise_on_total_failure=True,

@@ -2,16 +2,9 @@
   "note": "The acceptance gate's reading, committed as ID SETS — never as counts. CI compares every push:[main] run against them and fails on any difference, and the PR path compares the collected ids against their union so a rename or deletion is caught where it is made. Counts were the earlier defect twice over: a regression offset by a gain leaves a count unchanged, and a met clause could be renamed or deleted with a one-digit edit while everything read green. `unmeasurable` (alpha-engine-config-I9828, round 2) is a SUBSET of `unmet`'s keys, not a fourth bucket: the read itself failed (no credentials, no region, AccessDenied) rather than the property being read and found false. It stays inside `unmet` because crucible/gate.py's phase-0 clause (a different track — gate-side UNMEASURABLE Clause state: crucible-PR53, alpha-engine-config-I9869 round 2) reads this file's `met | unmet` as the full clause set — both fail the run and neither is ever a pass, but only the plain-unmet remainder is a statement about the system. Each `unmeasurable` VALUE is an object (`reason`, `blocked_on_class`, `last_moved`), not a bare string, so a clause moving into this bucket is a reviewable diff with a dated, typed record — never a string relocating silently between two JSON values. The suite being red by design is not the same thing as the run being red — the run is green while the reading is exactly what this file says.",
   "unmet": {
     "TestAutonomy::test_the_ruled_live_gate_two_live_saturdays_plus_five_replayed": "phase 2 — two live Saturdays (2026-09-12, 2026-09-19) plus five replayed",
-    "TestCost::test_every_v2_resource_is_tagged_for_cost_attribution": "phase 0 — UNMEASURABLE (see below), not a genuine gap: the read fails in both environments the suite runs in",
     "TestAttribution::test_alpha_is_factor_neutral_not_raw_excess_return": "phase 3 — factor-neutral residual alpha"
   },
-  "unmeasurable": {
-    "TestCost::test_every_v2_resource_is_tagged_for_cost_attribution": {
-      "reason": "phase 0 — the read fails in both environments the suite runs in: GitHub Actions grants the acceptance job no AWS credentials at all (Blocked on: You must specify a region), and ne-laptop-agent's assumed role lacks cloudformation:ListStackResources on the crucible-v2 stack (ClientError, code AccessDenied). Neither is a statement about whether resources are tagged. Follow-up to grant read-only access in at least one environment: alpha-engine-config-I9895",
-      "blocked_on_class": "ClientError",
-      "last_moved": "2026-09-02"
-    }
-  },
+  "unmeasurable": {},
   "met": [
     "TestAlerting::test_the_absence_condition_reads_the_declared_deadline_table",
     "TestAlerting::test_the_weekly_alert_count_is_a_metric_with_a_ceiling",
@@ -20,6 +13,7 @@
     "TestAutonomy::test_zero_human_mutating_calls_is_read_from_the_cloudtrail_archive",
     "TestControlArms::test_every_slot_declares_a_planted_and_a_null_control",
     "TestControlArms::test_the_grader_ranks_planted_above_real_above_null",
+    "TestCost::test_every_v2_resource_is_tagged_for_cost_attribution",
     "TestCost::test_the_llm_spend_cap_is_declared_and_enforced",
     "TestFaultInjection::test_each_scripted_fault_produces_one_failed_run_and_exactly_one_page[a data source withheld]",
     "TestFaultInjection::test_each_scripted_fault_produces_one_failed_run_and_exactly_one_page[spot instance terminated mid-job]",
@@ -35,5 +29,5 @@
     "TestTransparency::test_every_llm_call_site_is_in_the_registry",
     "TestTransparency::test_explain_walks_a_verdict_back_to_what_produced_it"
   ],
-  "last_moved": "2026-09-02"
+  "last_moved": "2026-09-03"
 }

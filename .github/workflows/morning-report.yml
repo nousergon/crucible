@@ -94,7 +94,7 @@ name: Morning report
 #
 # ── Delivery needs no AWS credential ──────────────────────────────────────
 #
-# Telegram only, `severity=info`, `silent`, SNS off — the same shape
+# Telegram only, `severity=info`, notifying (not silent — I9916), SNS off — the same shape
 # `nousergon-lib/.github/workflows/notify-ci-failure.yml` runs fleet-wide.
 # `ALPHA_ENGINE_SECRETS_SOURCE=env` forces `krepis.secrets` to resolve the
 # bot token and chat id from the environment rather than reaching SSM, which

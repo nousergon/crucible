@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nousergon/crucible/schemas/release.v3.json",
+  "title": "Crucible release identity, v3",
+  "description": "What release.json carries at releases/{sha}/release.json. Deterministic across every rebuild of the same commit (alpha-engine-config-I9786) — nothing in this document can differ between two builds of the same sha, which is what makes assert_immutable_write's byte comparison a correctness check rather than a false-alarm generator. v3 replaces v2 (alpha-engine-config-I9908): adds wheel_filename, the PEP-440-legal name the wheel was actually published under. Every release published before I9908 was named crucible-{sha}-py3-none-any.whl, which pip refuses outright (a 40-hex git sha is not a PEP 440 version) -- no wheel this pipeline ever published was installable. v3's wheel_filename lets a bash bootstrap on a spot box download the exact object by name without reimplementing crucible.release.wheel_filename_for's version derivation. additionalProperties: false because a field a reader does not understand is a field the producer expected it to act on.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sha",
+    "lockfile_sha256",
+    "wheel_sha256",
+    "wheel_filename",
+    "python_requires",
+    "extra"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
+      "const": "release.v3"
+    },
+    "sha": {
+      "description": "The commit this release is built from. Content-addresses the release prefix.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "lockfile_sha256": {
+      "description": "The resolved dependency tree's hash. The wheel does not pin its own transitive tree, so two wheels from one commit against two lockfiles are two different artifacts, and only this says which.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "wheel_sha256": {
+      "description": "The wheel's own hash, checked against the bytes actually uploaded by both the publisher and the smoke.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "wheel_filename": {
+      "description": "The exact object name the wheel is published under, at releases/{sha}/{wheel_filename}. PEP-440-legal (crucible-{version}-py3-none-any.whl), so pip can install it by name -- unlike every release published before alpha-engine-config-I9908, which pip refused under both the download name and the store's own filename.",
+      "type": "string",
+      "pattern": "^crucible-.+-py3-none-any\\.whl$"
+    },
+    "python_requires": {
+      "description": "The interpreter constraint this wheel was built against.",
+      "type": "string",
+      "minLength": 1
+    },
+    "extra": {
+      "description": "Reserved for future identity-bearing fields. Empty on every release today — anything that would vary per run belongs in release_provenance.v1, not here.",
+      "type": "object"
+    }
+  }
+}

@@ -70,13 +70,22 @@ ReleaseLockState = Literal["MET", "UNMET", "UNMEASURABLE"]
 #: `crucible.release.ReleaseProvenance`'s own docstring) and never
 #: `releases/current` (a pointer, deliberately unlocked —
 #: `crucible.release.POINTER_KEY`'s docstring; it also has no `{sha}/`
-#: segment, so it cannot match this pattern regardless). The sha is
-#: back-referenced into the wheel's own filename so a key whose directory
-#: and filename name two different shas — which should never happen, but a
-#: sweep exists to catch "should never happen" — is not silently treated as
-#: this sha's own wheel.
+#: segment, so it cannot match this pattern regardless).
+#:
+#: The wheel half matches ANY `crucible-*.whl` directly under the sha
+#: prefix, not a filename derived from the sha (alpha-engine-config-I9908):
+#: the wheel is now named by its PEP 440 version
+#: (`crucible.release.wheel_filename_for`), which embeds only the sha's
+#: first 12 hex characters as a local version segment, not the full
+#: 40-character sha this regex's own directory segment captures — a
+#: same-sha backreference on the filename half can never match the real
+#: object again. A release published before I9908 was named
+#: `crucible-{sha40}-py3-none-any.whl` (also matched here, since that name
+#: still starts with `crucible-` and ends in `.whl`), so this sweep keeps
+#: covering every release object ever published, old naming and new, with
+#: one pattern rather than two.
 _RELEASE_OBJECT_RE = re.compile(
-    r"^releases/(?P<sha>[0-9a-f]{40})/(?:release\.json|crucible-(?P=sha)-py3-none-any\.whl)$"
+    r"^releases/(?P<sha>[0-9a-f]{40})/(?:release\.json|crucible-.+\.whl)$"
 )
 
 #: Slack subtracted from the declared minimum retain-until before comparing

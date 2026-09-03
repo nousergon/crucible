@@ -86,10 +86,12 @@ a malformed input is an absence: it fails here with the field named.
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import sys
 import xml.etree.ElementTree as ET
+from datetime import UTC, datetime
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -344,10 +346,54 @@ def load_ratchet(path: pathlib.Path = RATCHET) -> Ratchet:
         raise SystemExit(_fail(f"{path.name} is not a valid ratchet: {exc}")) from exc
 
 
+def _write_reading_json(
+    path: pathlib.Path, *, met: int, unmet: int, unmeasurable: int, commit: str
+) -> None:
+    """Emit `crucible.keys.acceptance_reading_key`'s producer contract.
+
+    ``{"met": int, "unmet": int, "unmeasurable": int, "commit": str,
+    "measured_at": str}`` — declared in that module's docstring, which
+    `crucible.morning._acceptance_line` parses. This is the ONLY place that
+    computes the three counts (:func:`read_report`, via ``main``'s
+    ``reading``); a workflow that re-parsed this script's stdout to get them
+    would be a second parser of the same reading, which is the exact defect
+    this module's docstring opens with ("counting failed twice").
+
+    Written unconditionally, on both a clean reading and a failing one — a
+    red count is plan §12 rule 3's whole point, and skipping the write on
+    failure would make the one store artifact silent on exactly the runs
+    that moved.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    document = {
+        "met": met,
+        "unmet": unmet,
+        "unmeasurable": unmeasurable,
+        "commit": commit,
+        "measured_at": datetime.now(UTC).isoformat(),
+    }
+    path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        return _fail(f"usage: {argv[0]} <junit-xml>")
-    reading = read_report(pathlib.Path(argv[1]))
+    args = list(argv[1:])
+    write_json_path: pathlib.Path | None = None
+    commit = ""
+    if "--write-json" in args:
+        idx = args.index("--write-json")
+        if idx + 1 >= len(args):
+            return _fail("--write-json requires a path argument")
+        write_json_path = pathlib.Path(args[idx + 1])
+        del args[idx : idx + 2]
+    if "--commit" in args:
+        idx = args.index("--commit")
+        if idx + 1 >= len(args):
+            return _fail("--commit requires a value")
+        commit = args[idx + 1]
+        del args[idx : idx + 2]
+    if len(args) != 1:
+        return _fail(f"usage: {argv[0]} [--write-json <path>] [--commit <sha>] <junit-xml>")
+    reading = read_report(pathlib.Path(args[0]))
     ratchet = load_ratchet()
 
     met_n, plain_unmet_n, unmeasurable_n = (
@@ -355,6 +401,19 @@ def main(argv: list[str]) -> int:
         len(reading.plain_unmet),
         len(reading.unmeasurable),
     )
+
+    # Written before any of the checks below can return early — see
+    # `_write_reading_json`'s docstring for why a red reading must still be
+    # published.
+    if write_json_path is not None:
+        _write_reading_json(
+            write_json_path,
+            met=met_n,
+            unmet=plain_unmet_n,
+            unmeasurable=unmeasurable_n,
+            commit=commit or os.environ.get("GITHUB_SHA", ""),
+        )
+
     ratchet_unmeasurable_n = len(ratchet.unmeasurable)
     ratchet_plain_unmet_n = len(ratchet.unmet) - ratchet_unmeasurable_n
     _summary(
