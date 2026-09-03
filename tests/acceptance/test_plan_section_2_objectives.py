@@ -278,21 +278,50 @@ class TestAutonomy:
         }
         assert "a-role-nobody-declared" not in MACHINE_PRINCIPALS
 
+        real_key = "t/2026/08/03/part.json.gz"
+
         class _Body:
+            def __init__(self, key: str) -> None:
+                self._key = key
+
             def read(self) -> bytes:
-                return gzip.compress(json.dumps({"Records": [record]}).encode("utf-8"))
+                records = [record] if self._key == real_key else []
+                return gzip.compress(json.dumps({"Records": records}).encode("utf-8"))
+
+        # A real trail always delivers, even on quiet days (crucible-PR76,
+        # alpha-engine-config-I9928 round 2): `count_operator_actions` now
+        # asserts coverage PER CALENDAR DAY and raises ArchiveMissingError
+        # naming any uncovered day, so the fixture must carry an (empty)
+        # object for every day in the window — not just the one day with a
+        # real record — or it exercises the uncovered-day path instead of
+        # the counting logic under test.
+        window = [
+            dt.date(2026, 8, 1) + dt.timedelta(days=n)
+            for n in range((dt.date(2026, 8, 29) - dt.date(2026, 8, 1)).days + 1)
+        ]
+        keys = {f"t/2026/{d:%m/%d}/part.json.gz" for d in window}
 
         class _Paginator:
-            def paginate(self, *, Bucket: str, Prefix: str) -> Any:  # noqa: N803
-                key = "t/2026/08/03/part.json.gz"
-                yield {"Contents": [{"Key": key}] if key.startswith(Prefix) else []}
+            def paginate(
+                self, *, Bucket: str, Prefix: str, Delimiter: str | None = None
+            ) -> Any:  # noqa: N803
+                # A delimited listing is the region-discovery call in
+                # date_partitions: this fixture's archive names its region
+                # already (the documented single-partition shape), so it has
+                # no child regions to roll up and yields no CommonPrefixes —
+                # date_partitions then falls back to the prefix itself.
+                if Delimiter is not None:
+                    yield {"CommonPrefixes": []}
+                    return
+                matched = [k for k in keys if k.startswith(Prefix)]
+                yield {"Contents": [{"Key": k} for k in matched]}
 
         class _Client:
             def get_paginator(self, name: str) -> Any:
                 return _Paginator()
 
             def get_object(self, *, Bucket: str, Key: str) -> Any:  # noqa: N803
-                return {"Body": _Body()}
+                return {"Body": _Body(Key)}
 
         result = autonomy_module.count_operator_actions(
             _Client(),
