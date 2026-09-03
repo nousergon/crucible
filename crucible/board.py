@@ -18,7 +18,7 @@ Saturdays run and its own gate reading 1 of 5. Nothing rendered the gap, so
 nothing objected. A row reading `UNMEASURED — 0 of 5 replay Saturdays` since
 the first commit could not have been closed by accident.
 
-**Rows are derived from four declarations, never hand-listed.** A hand-kept
+**Rows are derived from five declarations, never hand-listed.** A hand-kept
 board drifts from what the plan promises, which is the same failure one level
 up. :func:`build_board` reads:
 
@@ -26,6 +26,11 @@ up. :func:`build_board` reads:
   predicates.
 * :data:`crucible.gate.PHASES` and :data:`crucible.gate.GATES` — the §6 ladder.
 * `crucible/components.yaml` — the observability registry.
+* :data:`crucible.schedule.MILESTONES` — the plan §6.1 milestone table
+  (`alpha-engine-config-I9914`). Informational: a milestone row is never a
+  page condition and never a gate input (§6.1: "weeks are sequencing, not
+  commitments"); it renders the SAME ladder reading `crucible.gate` already
+  produced for its phase, dated against the calendar the plan committed to.
 
 A row whose source declaration disappears raises. A board that shrinks quietly
 is the same defect as a green row over no data, wearing a different face.
@@ -88,9 +93,15 @@ DECLARATION_PATH = Path(__file__).parent / "board.yaml"
 #: Where a day's board is filed, and the pointer the console reads. Keyed by
 #: trading day like everything else (§4.12).
 
-#: The four declarations a row can come from. Closed: a fifth source is a
-#: design change visible in a diff, not a new dict key someone adds.
-SOURCES: tuple[str, ...] = ("objective", "phase", "component", "cutover")
+#: The five declarations a row can come from. Closed: a sixth source is a
+#: design change visible in a diff, not a new dict key someone adds. `schedule`
+#: was added deliberately on `alpha-engine-config-I9914` — the plan §6.1
+#: milestone table — rather than folded into `phase`, because a milestone is
+#: a DATED reflection of a phase's ladder reading, not the reading itself, and
+#: the two must be able to disagree (a milestone can be UNMET past its date
+#: while the phase it names is later read MET) without one silently standing
+#: in for the other.
+SOURCES: tuple[str, ...] = ("objective", "phase", "schedule", "component", "cutover")
 
 #: The board's closed state vocabulary. Total, with no fall-through.
 #:
@@ -741,6 +752,7 @@ def build_board(
         rows.append(_declared_row(store, f"objective:{row_id}", declaration, day))
 
     rows.extend(_phase_rows(ladder, day))
+    rows.extend(_schedule_rows(ladder, day))
 
     for name in sorted(reg):
         rows.append(_component_row(reg[name], (classifications or {}).get(name)))
@@ -864,6 +876,106 @@ def _ladder_detail(ladder_row: PhaseRow) -> str:
         f"the ladder placed this phase {ladder_row.state} (gate {ladder_row.gate_state}) "
         "and supplied no detail — the state is usable, the reason is missing"
     )
+
+
+def _schedule_rows(ladder: Ladder | None, trading_day: str) -> list[BoardRow]:
+    """One row per plan §6.1 milestone (`alpha-engine-config-I9914`).
+
+    Each row quotes the ladder reading of the phase the milestone names —
+    never a second evaluation of that phase's clauses. Closed three-way state:
+
+    * ``MET``     — the named phase's ladder row already reads `MET`, on or
+                    before the milestone's own trading-day anchor.
+    * ``UNMET``   — the trading day being rendered is on or past the
+                    milestone's anchor and the phase has not read `MET`. The
+                    row's own detail begins with `OVERDUE` (`morning.py`
+                    repeats that word as the first word of its line for the
+                    same row).
+    * ``PLANNED`` — the anchor is still ahead. There is no reader to register
+                    for a schedule row (`Declaration.reader`, `board.yaml`'s
+                    contract) because a milestone is never read from the
+                    store on its own account; the row still names the date
+                    and the phase/clause it is waiting on, which is the same
+                    information `planned_because` carries for a declared row.
+
+    A milestone naming a phase absent from the supplied ladder — or no ladder
+    at all — renders `UNMEASURED`, exactly like `_phase_rows` does for the
+    same absence: a row this build could not read is red for a reason about
+    the RENDER, never silently promoted to `PLANNED` or `MET`.
+    """
+    from crucible.gate import PHASES, gate_key  # noqa: PLC0415 - avoids a module import cycle
+    from crucible.schedule import MILESTONES
+
+    phases_by_id = {phase.id: phase for phase in PHASES}
+    by_id = {row.phase.id: row for row in ladder.rows} if ladder is not None else {}
+    today = dt.date.fromisoformat(trading_day)
+
+    rows: list[BoardRow] = []
+    for milestone in MILESTONES:
+        phase = phases_by_id.get(milestone.phase_id)
+        if phase is None:  # pragma: no cover - guarded by test_schedule.py
+            raise ValueError(
+                f"schedule milestone {milestone.id!r} names phase {milestone.phase_id!r}, "
+                "which is not in crucible.gate.PHASES. A milestone naming a phase that "
+                "does not exist would render forever with no way to ever read MET."
+            )
+        phase_row = by_id.get(milestone.phase_id)
+        due = milestone.trading_day.isoformat()
+
+        if phase_row is None:
+            state: str | None = "UNMEASURED"
+            quote = f"{phase.id} UNMEASURED — no ladder was supplied to this render"
+        elif phase_row.gate_state == "UNMEASURED":
+            # The ladder read this phase, but the reading itself is
+            # UNMEASURED (no registered gate yet) — a breach can only be
+            # derived from a reading that exists, so this renders UNMEASURED
+            # regardless of the date, never a date-driven UNMET.
+            state = "UNMEASURED"
+            quote = f"waiting on {phase.id}, which has no reading"
+        else:
+            quote = (
+                f"{phase.id} {phase_row.clauses_met}/{phase_row.clauses_total}"
+                if phase_row.clauses_total
+                else f"{phase.id} {phase_row.gate_state}"
+            )
+            state = "MET" if phase_row.gate_state == "MET" else None
+
+        if state is None:
+            # Strictly PAST the anchor: the anchor day itself is the session
+            # the milestone measures (rule 3), so the milestone is not yet
+            # overdue on that day — only once a later trading day is reached.
+            state = "UNMET" if today > milestone.trading_day else "PLANNED"
+
+        plan_date = milestone.plan_date.isoformat()
+        if state == "MET":
+            detail = f"met — due {due} (plan {plan_date}), reads: {quote}"
+        elif state == "UNMET":
+            detail = f"OVERDUE since {due} (plan {plan_date}) — reads: {quote}"
+        elif state == "UNMEASURED":
+            detail = f"due {due} (plan {plan_date}) — {quote}"
+        else:  # PLANNED
+            detail = f"due {due} (plan {plan_date}), waiting on {quote}"
+
+        rows.append(
+            BoardRow(
+                id=f"schedule:{milestone.id}",
+                source="schedule",
+                section="§6.1 schedule",
+                title=milestone.what,
+                state=state,
+                detail=detail,
+                surface="crucible/board",
+                artifact=gate_key(phase.gate, trading_day)
+                if phase.gate
+                else (f"(no gate is registered for {phase.id} yet)"),
+                means_when_red=(
+                    f"the plan's {due} milestone — {milestone.what} — is not met. "
+                    f"Tracker: {phase.tracker} ({phase.tracker_url})."
+                ),
+                last_read=phase_row.read_on if phase_row is not None else None,
+            )
+        )
+    return rows
 
 
 def _component_row(component: Component, classification: Classification | None) -> BoardRow:

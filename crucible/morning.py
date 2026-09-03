@@ -34,22 +34,35 @@ page channel becomes the channel someone mutes.
    commit". The commit comes from the BOARD's own run manifest, not from this
    process's checkout: this job may be running a newer build than the one
    that rendered the board it is reporting.
-2. Which rows MOVED since the previous trading day's board, old -> new. Not
+2. The plan §6.1 schedule — one line per milestone, read off the board's own
+   `schedule:*` rows (`crucible.schedule.MILESTONES`, `alpha-engine-config-
+   I9914`) so drift from the plan's dated milestones is visible on the SAME
+   surface phase gates are, every morning, rather than discoverable only by
+   holding the plan next to the board by hand. A past-due, not-met milestone
+   begins its line with `OVERDUE`. Purely a REFLECTION of the board's own
+   reading — this section renders exactly what `board.py` already computed
+   and adds no measurement of its own.
+3. Which rows MOVED since the previous trading day's board, old -> new. Not
    the absolute board: a board reading almost entirely PLANNED for weeks is
    correct and is also the thing people stop opening.
-3. The acceptance count — the ONLY progress figure (§12 rule 3) — if any
+4. The acceptance count — the ONLY progress figure (§12 rule 3) — if any
    artifact carries it, and :data:`ACCEPTANCE_NOT_ON_ANY_ARTIFACT` when
    none does. It is never reconstructed from this process's own checkout:
    that would report the branch the job ran from as though it were `main`'s
    reading, which is a fabricated provenance rather than a missing one.
-4. How many rows are UNMEASURED or UNMEASURABLE, so silence is visible on
+5. How many rows are UNMEASURED or UNMEASURABLE, so silence is visible on
    the same surface as the readings.
-5. The one pending operator action, when the board's own producer exposes
+6. The one pending operator action, when the board's own producer exposes
    one, and :data:`NO_OPERATOR_ACTION` when it does not.
 
 **Never a progress narrative.** No PR count, no commit count, no findings
 count, no prose about how the build is going. §12 rule 3: those are not
 progress, and putting them beside a real figure lends them its authority.
+The schedule section above is exempt from that count-word rule by
+construction — it renders dates and gate readings, never a PR/commit/findings
+figure — but its lines still pass through `_withhold_progress` like every
+other section, since it renders board free text and this module trusts no
+free text unchecked.
 
 **A stale board is the HEADLINE, not a footnote.** If `board/current.json`
 was generated more than one calendar day ago, the first line of the message
@@ -472,6 +485,32 @@ def _phase_lines(board: dict[str, Any]) -> list[str]:
     return [f"  {row['id']}  {row['state']}  {_withhold_progress(row['detail'])}" for row in rows]
 
 
+def _schedule_lines(board: dict[str, Any]) -> list[str]:
+    """One line per plan §6.1 milestone (`alpha-engine-config-I9914`), in the
+    board's own order.
+
+    Reads `schedule:*` board rows exactly the way :func:`_phase_lines` reads
+    `phase:*` rows — this function computes nothing; it quotes what
+    `crucible.board._schedule_rows` already decided. A `state` of `UNMET`
+    means the row's own `plan_date` has passed without the phase it names
+    reading `MET`, so its line begins with the literal word `OVERDUE` — the
+    board's own vocabulary has no `OVERDUE` state (`crucible.board.
+    BOARD_STATES`), so this is the one place that word is rendered, and it is
+    rendered from `UNMET`, never invented on a second condition.
+    """
+    rows = [row for row in board.get("rows", []) if row.get("source") == "schedule"]
+    if not rows:
+        return [
+            "  no schedule row on the board — the plan §6.1 milestones are not being "
+            "rendered, which is a defect in the board, not an absent plan"
+        ]
+    return [
+        f"  {'OVERDUE ' if row['state'] == 'UNMET' else ''}{row['id']}  {row['state']}  "
+        f"{_withhold_progress(row['detail'])}"
+        for row in rows
+    ]
+
+
 def _moved_lines(inputs: MorningInputs) -> list[str]:
     """What changed, old -> new. Never an absolute-state retelling.
 
@@ -553,6 +592,9 @@ def render_message(inputs: MorningInputs, *, now: dt.datetime) -> str:
     lines.append("")
     lines.append("phase gates")
     lines.extend(_phase_lines(board))
+    lines.append("")
+    lines.append("schedule (plan §6.1)")
+    lines.extend(_schedule_lines(board))
     lines.append("")
     lines.append(f"moved since {inputs.previous_day}")
     lines.extend(_moved_lines(inputs))

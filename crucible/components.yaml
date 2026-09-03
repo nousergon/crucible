@@ -399,7 +399,11 @@ components:
       cost: run.json:cost_usd
       resource: run.json:resource
       lineage: run.json:inputs[runs/**,gates/**,report/**,arms/**],outputs[board/index.html,board/current.json]
-      outcome: run.json:metrics[board_rows_unmeasurable]
+      # `schedule_milestones_overdue` added alpha-engine-config-I9914: the
+      # plan §6.1 milestone rows' own outcome signal, so a missed schedule
+      # date is a graded figure on this row rather than only a text detail
+      # inside `board_rows_red`.
+      outcome: run.json:metrics[board_rows_unmeasurable,schedule_milestones_overdue]
     log_location: /crucible/board
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
