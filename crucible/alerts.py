@@ -43,7 +43,13 @@ from crucible.calendar import (
     resolve_trading_day,
 )
 from crucible.components import Component, load_registry, scheduled_components
-from crucible.keys import ALERTS_ROOT, RUNS_ROOT, is_manifest_key, parse_manifest_key
+from crucible.keys import (
+    ALERTS_ROOT,
+    RUNS_ROOT,
+    is_manifest_key,
+    parse_bus_key,
+    parse_manifest_key,
+)
 from crucible.manifest import manifest_prefix
 from crucible.store import Store
 
@@ -75,6 +81,7 @@ __all__ = [
     "heartbeat",
     "incident_id",
     "incident_key",
+    "pages_in_range",
     "pages_in_window",
     "send",
     "sweep",
@@ -960,24 +967,51 @@ def pages_in_window(
     * **Counted from the bus**, not from an in-process counter, so it is
       reconstructible from artifacts by someone who was not here (principle
       1).
+
+    The counting itself is :func:`pages_in_range`; this function only decides
+    which trading days the trailing window covers.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     end = resolve_trading_day(moment)
     start = end
-    for _ in range(window_trading_days):
+    # `window_trading_days` days INCLUSIVE of `end`, so the walk back takes
+    # one step fewer than the count: `pages_in_range` is closed on both ends
+    # (see its docstring for why one boundary rule, not two).
+    for _ in range(window_trading_days - 1):
         start = previous_trading_day(start)
-    count = 0
+    return len(pages_in_range(store, start=start, end=end))
+
+
+def pages_in_range(store: Store, *, start: dt.date, end: dt.date) -> list[str]:
+    """Every bus row keyed on a day in ``start..end``, INCLUSIVE of both ends.
+
+    **The one implementation of "pages over a span".** `crucible.gate`'s
+    phase-2 ceiling clause grades the same bus against the same ceiling; when
+    it carried its own copy the two disagreed at the first day of the window
+    (`start <= day` here against `start < day` there), so the gate and the
+    `pages_per_20_trading_days` metric could report different counts for the
+    same bus. A second copy of a reading is a second contract.
+
+    Closed on both ends because that is what every caller means by "over the
+    window": `pages_in_window` subtracts one from its walk-back to keep
+    counting exactly ``window_trading_days`` sessions, and the gate passes the
+    first and last day of its window as written.
+
+    Keys are parsed through :func:`crucible.keys.parse_bus_key`, never by
+    positional index or an arity restated as an integer.
+    """
+    keys: list[str] = []
     for key in store.list_keys(ALERTS_ROOT):
-        parts = key.split("/")
-        if len(parts) != 3 or not key.endswith(".json"):
+        parsed = parse_bus_key(key)
+        if parsed is None:
             continue
         try:
-            day = dt.date.fromisoformat(parts[1])
+            day = dt.date.fromisoformat(parsed[0])
         except ValueError:
             continue
-        if start < day <= end:
-            count += 1
-    return count
+        if start <= day <= end:
+            keys.append(key)
+    return sorted(keys)
 
 
 def ceiling_metric(count: int, *, now: dt.datetime) -> dict[str, Any]:

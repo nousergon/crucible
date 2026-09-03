@@ -989,14 +989,32 @@ class TestTheProducerRunsWithoutTheWeeklyArc:
         Red is the declared day-one state and is graded OK. UNMEASURABLE is
         never expected and its objective is zero, so it is graded BREACH — the
         distinction `alpha-engine-config-I9828` exists because nothing made.
+
+        Against an empty store that BREACH is now non-empty, and deliberately:
+        `alpha-engine-config-I9913` registered a clause list for every plan §6
+        phase, and four of those clauses read UNMEASURABLE today because the
+        artifact they read does not exist yet (no live/replay field on the run
+        manifest, no Cost Explorer grant, no trader consumer-evidence
+        contract, no LLM-arm call-site field — each filed as its own issue).
+        That is the intended reading: a phase with nothing to read is
+        unmeasurable BY CLAUSE with a named reason, never blank.
+
+        What is asserted here is the GRADING, which is unchanged: red stays OK
+        because red is the declared day-one state, and unmeasurable stays
+        BREACH because no data is never green. The board's own objective for
+        this metric is a separate question from whether the reading is honest.
         """
         written = self._run(tmp_path)
         manifest = json.loads(written.get_bytes("runs/board/2026-08-28/run.json"))
         by_name = {m["name"]: m for m in manifest["metrics"]}
         assert by_name["board_rows_red"]["status"] == "OK"
         assert by_name["board_rows_red"]["value"] > 0
-        assert by_name["board_rows_unmeasurable"]["status"] == "OK"
-        assert by_name["board_rows_unmeasurable"]["value"] == 0
+        assert by_name["board_rows_unmeasurable"]["status"] == "BREACH"
+        assert by_name["board_rows_unmeasurable"]["value"] > 0
+        # And the run is still `ok`: an unmeasurable row is a reading the board
+        # publishes, not a failure of the job that published it. Same inversion
+        # `test_a_red_board_is_not_a_failed_run` guards.
+        assert manifest["status"] == "ok"
 
     def test_the_second_run_reports_deltas_rather_than_the_whole_board(self, tmp_path) -> None:
         """Deltas, and the board observes ITSELF among them.
@@ -1088,16 +1106,28 @@ class TestThePhaseRowsAreActionable:
         for row in build_board(store).rows:
             assert "{trading_day}" not in row.artifact, row.id
 
-    def test_an_unregistered_phase_says_so_rather_than_naming_a_fabricated_key(self, store) -> None:
+    def test_an_unregistered_phase_says_so_rather_than_naming_a_fabricated_key(
+        self, store, monkeypatch
+    ) -> None:
         """`phase.gate or phase.id` invented a key for five of six phases.
 
         `gate_key` is keyed by the REGISTERED gate name, so `gates/phase2/…` is
         a path no producer will ever write. Naming it would send a reader to
         an empty key and tell them nothing about why it is empty.
+
+        Every real phase now carries a gate (`alpha-engine-config-I9913`), so
+        the unregistered phase is INJECTED rather than borrowed from `PHASES`.
+        The property survives the condition that first exposed it; the old
+        shape would have gone quiet the moment the last blank phase was
+        filled in, and a guard that stops testing anything is worse than one
+        that fails.
         """
+        import crucible.gate as gate_module
+
+        phase6 = gate_module.Phase("phase6", 6, "A phase whose gate is unwritten", 9761, None)
+        monkeypatch.setattr(gate_module, "PHASES", (*PHASES, phase6))
         rows = {r.id: r for r in build_board(store).rows if r.source == "phase"}
-        unregistered = [p for p in PHASES if p.gate is None]
-        assert unregistered, "this test is vacuous if every phase has a gate"
+        unregistered = [phase6]
         for phase in unregistered:
             row = rows[f"phase:{phase.id}"]
             assert "no gate is registered" in row.artifact

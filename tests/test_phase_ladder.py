@@ -110,25 +110,67 @@ class TestTheLadderIsDeclaredWhole:
         _check_ladder_console_coverage(LADDER_STATES, dict(LADDER_CONSOLE_STATE))
 
 
-class TestAbsenceRendersAsAbsence:
-    def test_an_unwritten_gate_is_UNMEASURED_not_MET(self, store: LocalStore) -> None:
-        """Principle 7. Phases 2-5 have no clause list today; not one of them
-        may render as a phase that passed. Phase 0 is no longer among them —
-        its clause list was written for `alpha-engine-config-I9804`, which is
-        the only legitimate way a phase leaves this list."""
-        rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
-        for phase_id in ("phase2", "phase3", "phase4", "phase5"):
-            assert rows[phase_id]["state"] == "UNMEASURED"
-            assert rows[phase_id]["console_state"] == "UNREPORTED"
+@pytest.fixture
+def unregistered_phase(monkeypatch: pytest.MonkeyPatch) -> str:
+    """A SIXTH plan phase carrying no gate, injected for the duration of a test.
 
-    def test_an_unmeasured_phase_reports_a_NULL_ratio_never_zero(self, store: LocalStore) -> None:
+    Every phase in `PHASES` now carries a registered clause list
+    (`alpha-engine-config-I9913`), and `test_every_plan_phase_carries_a_gate`
+    is the structural guard that keeps it that way. That closes the condition
+    the tests below were originally written against — phases 2-5 rendering
+    blank — but it does NOT retire the property they assert: the ladder must
+    still refuse to call an unregistered phase met, and must still publish a
+    NULL ratio rather than a zero for it.
+
+    So the property is tested against an injected phase instead of against
+    whichever real phase happened to be unregistered that week. The old shape
+    would have gone quiet the moment the last blank phase was filled in — a
+    guard that stops testing anything is worse than one that fails.
+    """
+    import crucible.gate as gate_module
+
+    phase = gate_module.Phase("phase6", 6, "A phase whose gate is unwritten", 9761, None)
+    monkeypatch.setattr(gate_module, "PHASES", (*PHASES, phase))
+    return phase.id
+
+
+class TestAbsenceRendersAsAbsence:
+    def test_an_unwritten_gate_is_UNMEASURED_not_MET(
+        self, store: LocalStore, unregistered_phase: str
+    ) -> None:
+        """Principle 7. A phase with no clause list may never render as a
+        phase that passed, and may never render as one that was graded."""
+        rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
+        assert rows[unregistered_phase]["state"] == "UNMEASURED"
+        assert rows[unregistered_phase]["console_state"] == "UNREPORTED"
+
+    def test_every_registered_phase_is_graded_by_clause_not_left_blank(
+        self, store: LocalStore
+    ) -> None:
+        """`alpha-engine-config-I9913`. Against an EMPTY store not one plan
+        phase may read `UNMEASURED`: a phase whose inputs are absent is
+        UNMEASURABLE *by clause*, with a reason naming the missing artifact.
+        Blank and "no data yet" render identically, and that is the state this
+        asserts is gone."""
+        rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
+        assert set(rows) == {p.id for p in PHASES}
+        for phase_id, row in rows.items():
+            assert row["state"] != "UNMEASURED", (
+                f"{phase_id} rendered blank rather than graded by clause: {row['detail']}"
+            )
+            assert "no clause list is registered" not in row["detail"]
+            assert row["clauses_total"], f"{phase_id} was graded by zero clauses"
+
+    def test_an_unmeasured_phase_reports_a_NULL_ratio_never_zero(
+        self, store: LocalStore, unregistered_phase: str
+    ) -> None:
         """Zero is a measurement; absence is not. A ladder that published
         `met_ratio: 0.0` for a phase nobody has ever graded is publishing a
         figure it did not measure."""
         rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
-        assert rows["phase2"]["met_ratio"] is None
-        assert rows["phase2"]["clauses_total"] is None
-        assert rows["phase2"]["clauses_met"] is None
+        assert rows[unregistered_phase]["met_ratio"] is None
+        assert rows[unregistered_phase]["clauses_total"] is None
+        assert rows[unregistered_phase]["clauses_met"] is None
 
     def test_a_row_says_when_it_was_last_read_and_null_when_never(self, store: LocalStore) -> None:
         rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
@@ -142,15 +184,28 @@ class TestAbsenceRendersAsAbsence:
         assert last_read(store, "phase0") == (None, False)
 
     def test_the_unmeasured_COUNT_is_published_not_left_to_be_counted(
-        self, store: LocalStore
+        self, store: LocalStore, unregistered_phase: str
     ) -> None:
         """Same reasoning as the transparency gap: a number nobody publishes
         is a number nobody is held to."""
         document = build_ladder(store, trading_day=FRIDAY).to_dict()
-        assert document["unmeasured"] == 4
+        assert document["unmeasured"] == 1
         assert document["phases_met"] == 0
 
-    def test_the_html_renders_never_measured_not_a_blank_or_a_zero(self, store: LocalStore) -> None:
+    def test_the_published_unmeasured_count_is_zero_once_every_phase_is_registered(
+        self, store: LocalStore
+    ) -> None:
+        """The other direction of the same number. `alpha-engine-config-I9913`
+        closed the blank rows; the count that says so is published, so a phase
+        silently losing its clause list is a visible regression rather than a
+        row nobody re-reads."""
+        document = build_ladder(store, trading_day=FRIDAY).to_dict()
+        assert document["unmeasured"] == 0
+        assert document["phases_met"] == 0
+
+    def test_the_html_renders_never_measured_not_a_blank_or_a_zero(
+        self, store: LocalStore, unregistered_phase: str
+    ) -> None:
         page = build_page(store, now=NOW)
         html = render_html(page)
         assert "Phase ladder" in html
