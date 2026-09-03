@@ -55,6 +55,11 @@ permissions: {}
 
 env:
   AWS_REGION: us-east-1
+  # AWS_ACCOUNT_ID and STORE_URI come from repository variables
+  # (alpha-engine-config-I9906) — this repo goes PUBLIC at phase-1 exit
+  # (I9775) and `AGENTS.md` forbids infrastructure identifiers, bucket names
+  # and account numbers in the tree. The role NAME stays a literal below: it
+  # carries no secret on its own, and the account id is the sensitive half.
   # crucible-v2-github-acceptance, created by nous-ergon-ops/infrastructure/
   # cloudformation/crucible-v2.yaml (alpha-engine-config-I9895, I9902). Read
   # only: cloudformation:ListStackResources + tag:GetResources +
@@ -63,8 +68,15 @@ env:
   # report/acceptance/* (the reading this job publishes). It cannot write the
   # board, a run manifest, or anything else in the store — same separation
   # argument board.yml's own comment makes about BoardRole.
-  ACCEPTANCE_ROLE_ARN: arn:aws:iam::711398986525:role/crucible-v2-github-acceptance
-  STORE_URI: s3://alpha-engine-crucible-v2/crucible
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  ACCEPTANCE_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/crucible-v2-github-acceptance
+  STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
+  # The CloudFormation TEMPLATE upload bucket the operator remedy below
+  # prints — a separate bucket from CRUCIBLE_STORE_URI's store, and a bucket
+  # name is still an infrastructure identifier `crucible/AGENTS.md`
+  # (Visibility) forbids here (alpha-engine-config-I9906 finding 3). Set with:
+  # gh variable set CFN_TEMPLATE_BUCKET --repo nousergon/crucible --body '<s3-bucket-for-cfn-templates>'
+  CFN_TEMPLATE_BUCKET: ${{ vars.CFN_TEMPLATE_BUCKET }}
 
 concurrency:
   # The event name is part of the group so that two arms sharing a ref never
@@ -170,6 +182,9 @@ jobs:
     permissions:
       contents: read
       id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    # First step is the repository-variable guard (below the docstring-style
+    # comment block, in `steps:`) — before checkout, since neither the
+    # identity nor the store are reachable without it.
     # tests/acceptance holds the plan §2 clauses written BEFORE the code that
     # satisfies them (plan §6 phase-0 exit: "acceptance tests written as
     # failing pytest"). They fail today by design and go green one at a time
@@ -195,6 +210,23 @@ jobs:
     # runs list — can tell. A component emitting nothing is not healthy, it is
     # unobserved (principle 7).
     steps:
+      - name: Repository variables are set
+        run: |
+          missing=0
+          if [ -z "$AWS_ACCOUNT_ID" ]; then
+            echo "::error::repository variable AWS_ACCOUNT_ID is not set — set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/crucible --body '<12-digit-account-id>'"
+            missing=1
+          fi
+          if [ -z "$STORE_URI" ]; then
+            echo "::error::repository variable CRUCIBLE_STORE_URI is not set — set it with: gh variable set CRUCIBLE_STORE_URI --repo nousergon/crucible --body '<s3-uri-of-the-crucible-v2-store>'"
+            missing=1
+          fi
+          if [ -z "$CFN_TEMPLATE_BUCKET" ]; then
+            echo "::error::repository variable CFN_TEMPLATE_BUCKET is not set — set it with: gh variable set CFN_TEMPLATE_BUCKET --repo nousergon/crucible --body '<s3-bucket-for-cfn-templates>'"
+            missing=1
+          fi
+          exit "$missing"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
@@ -226,7 +258,7 @@ jobs:
         run: |
           assumed="$(aws sts get-caller-identity --query Arn --output text)"
           expected="${ACCEPTANCE_ROLE_ARN##*/}"
-          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. The acceptance job must run as a READ-ONLY identity plus a writer scoped to report/acceptance/* only; a wider identity would let a grading surface satisfy the clauses it grades. If the role does not exist yet the crucible-v2 stack has not been applied since the ops PR adding it merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 --s3-bucket alpha-engine-research --s3-prefix cfn-templates/crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until that happens is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. The acceptance job must run as a READ-ONLY identity plus a writer scoped to report/acceptance/* only; a wider identity would let a grading surface satisfy the clauses it grades. If the role does not exist yet the crucible-v2 stack has not been applied since the ops PR adding it merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 --s3-bucket ${CFN_TEMPLATE_BUCKET} --s3-prefix cfn-templates/crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until that happens is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
 
       # JUnit XML, not the terminal summary line. `pyproject.toml` sets
       # `addopts = "-q"`, so a command-line `-q` makes `-qq` and pytest prints

@@ -80,12 +80,18 @@ concurrency:
 
 env:
   AWS_REGION: us-east-1
+  # AWS_ACCOUNT_ID and STORE_URI come from repository variables
+  # (alpha-engine-config-I9906) — this repo goes PUBLIC at phase-1 exit
+  # (I9775) and `AGENTS.md` forbids infrastructure identifiers, bucket names
+  # and account numbers in the tree. The role NAME stays a literal below: it
+  # carries no secret on its own, and the account id is the sensitive half.
   # Created by nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml
   # (`nous-ergon-ops-PR997`). Read-only over everything it does not write, and
   # write-scoped to `crucible/reviews/*` with no `DeleteObject` — so a recorded
   # finding cannot be removed by the party it was recorded against.
-  REVIEW_ROLE_ARN: arn:aws:iam::711398986525:role/crucible-v2-github-review
-  STORE_URI: s3://alpha-engine-crucible-v2/crucible
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  REVIEW_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/crucible-v2-github-review
+  STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
 
 jobs:
   record-verdict:
@@ -108,12 +114,26 @@ jobs:
       # forms), while `workflow_dispatch` accepts any ref. A dispatch off a
       # branch would therefore fail at the assume — AFTER the independence
       # check had passed and with an error STS gives no useful text for.
-      # Refused here, first, with the actual remedy in the message.
+      # Refused here, first, with the actual remedy in the message. This must
+      # stay `steps[0]` — `test_the_dispatch_is_refused_off_main` asserts it.
       - name: This workflow is dispatched from `main` only
         if: github.ref != 'refs/heads/main'
         run: |
           echo "::error::dispatched from '${{ github.ref }}'. The review-writer role's OIDC trust condition pins ref:refs/heads/main, so the credential step below would fail with an error STS does not explain. Re-dispatch with --ref main; the PR number input is what selects the change under review, not the ref."
           exit 1
+
+      - name: Repository variables are set
+        run: |
+          missing=0
+          if [ -z "$AWS_ACCOUNT_ID" ]; then
+            echo "::error::repository variable AWS_ACCOUNT_ID is not set — set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/crucible --body '<12-digit-account-id>'"
+            missing=1
+          fi
+          if [ -z "$STORE_URI" ]; then
+            echo "::error::repository variable CRUCIBLE_STORE_URI is not set — set it with: gh variable set CRUCIBLE_STORE_URI --repo nousergon/crucible --body '<s3-uri-of-the-crucible-v2-store>'"
+            missing=1
+          fi
+          exit "$missing"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 

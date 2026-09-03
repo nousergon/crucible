@@ -480,6 +480,15 @@ def test_the_dispatch_is_refused_off_main() -> None:
     first = _record_job().steps[0]
     assert "github.ref != 'refs/heads/main'" in first.get("if", "")
     assert "--ref main" in first.get("run", "")
+    # Finding 1 (adversarial review, this PR): the guard's `exit 1` was moved
+    # into the NEXT step ("Repository variables are set") when that step was
+    # inserted above it, so this step echoed an `::error::` and exited 0 — a
+    # dispatch off a branch then ran on to `configure-aws-credentials` and
+    # died on the opaque STS error `alpha-engine-config-I9882` exists to
+    # prevent. `test_the_off_main_guard_actually_exits_non_zero` below
+    # executes this exact `run:` body under bash and proves the exit code;
+    # this assertion is the cheap static half.
+    assert "exit 1" in first.get("run", "")
 
 
 def test_the_job_holds_no_write_permission_beyond_the_oidc_token() -> None:
@@ -500,6 +509,107 @@ def test_a_verdict_write_is_never_cancelled_by_an_in_flight_dispatch() -> None:
     """A durable verdict write should queue behind another verdict write,
     never be discarded mid-flight."""
     assert _record().model_extra["concurrency"]["cancel-in-progress"] is False
+
+
+# `<workflow>:<job>` pairs carrying the "Repository variables are set" guard
+# introduced by `alpha-engine-config-I9906` — every AWS-touching job in the
+# five workflows this repo has. Finding 2 (adversarial review, this PR): the
+# guard was asserted for its `if:`/message text but never for actually
+# failing, which is exactly how Finding 1's `exit 1` went missing from the
+# off-main guard and was never caught. Each entry here is executed under real
+# bash, once with the two variables empty (must fail, must name the `gh
+# variable set` remedy) and once with them set (must succeed).
+VARIABLE_GUARD_JOBS: dict[str, str] = {
+    "board.yml": "board",
+    "ci.yml": "acceptance",
+    "deploy.yml": "release",
+    "morning-report.yml": "report",
+    "adversarial-review-record.yml": "record-verdict",
+}
+
+
+def _variable_guard_run(workflow_file: str, job_name: str) -> str:
+    workflow = Workflow.load(WORKFLOW_DIR / workflow_file)
+    job = workflow.jobs[job_name]
+    matches = [
+        step["run"]
+        for step in job.steps
+        if step.get("name") == "Repository variables are set" and "run" in step
+    ]
+    assert len(matches) == 1, (
+        f"{workflow_file}:{job_name} — expected exactly one "
+        f"'Repository variables are set' step, found {len(matches)}"
+    )
+    return matches[0]
+
+
+def test_every_variable_guard_job_still_exists() -> None:
+    """A stale entry in `VARIABLE_GUARD_JOBS` would silently stop exercising a
+    guard the moment its job was renamed — the same shape of hole
+    `test_every_allowlisted_job_still_exists` closes for `PR_REACHABLE_JOBS`."""
+    for workflow_file, job_name in VARIABLE_GUARD_JOBS.items():
+        workflow = Workflow.load(WORKFLOW_DIR / workflow_file)
+        assert job_name in workflow.jobs, f"{workflow_file}:{job_name} no longer exists"
+
+
+@pytest.mark.parametrize("workflow_file,job_name", sorted(VARIABLE_GUARD_JOBS.items()))
+def test_the_variable_guard_actually_exits_non_zero_when_unset(
+    tmp_path: pathlib.Path, workflow_file: str, job_name: str
+) -> None:
+    script = _variable_guard_run(workflow_file, job_name)
+    env = {"PATH": "/usr/bin:/bin", "AWS_ACCOUNT_ID": "", "STORE_URI": ""}
+    result = subprocess.run(
+        ["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True, env=env
+    )
+    assert result.returncode != 0, (
+        f"{workflow_file}:{job_name} 'Repository variables are set' step exited "
+        f"0 with both variables unset. stdout={result.stdout!r}"
+    )
+    assert "gh variable set" in result.stdout, result.stdout
+
+
+@pytest.mark.parametrize("workflow_file,job_name", sorted(VARIABLE_GUARD_JOBS.items()))
+def test_the_variable_guard_passes_when_both_variables_are_set(
+    tmp_path: pathlib.Path, workflow_file: str, job_name: str
+) -> None:
+    script = _variable_guard_run(workflow_file, job_name)
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "AWS_ACCOUNT_ID": "111111111111",
+        "STORE_URI": "s3://fake-bucket/prefix",
+        # ci.yml:acceptance carries a third variable (Finding 3,
+        # CFN_TEMPLATE_BUCKET) the other four guards do not — harmless as an
+        # unused env var on the other four.
+        "CFN_TEMPLATE_BUCKET": "fake-cfn-bucket",
+    }
+    result = subprocess.run(
+        ["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True, env=env
+    )
+    assert result.returncode == 0, (
+        f"{workflow_file}:{job_name} 'Repository variables are set' step failed "
+        f"with both variables set. stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+
+def test_the_off_main_guard_actually_exits_non_zero(tmp_path: pathlib.Path) -> None:
+    """The static half is `test_the_dispatch_is_refused_off_main`'s `"exit 1"
+    in ...` assertion; this is the executable half Finding 2 asked for —
+    proving the step fails rather than merely containing the string."""
+    first = _record_job().steps[0]
+    # GitHub evaluates `${{ github.ref }}` to a plain string BEFORE handing
+    # the script to bash — the runtime shell never sees the `${{ }}` syntax.
+    # A real off-branch dispatch is substituted here so the harness runs the
+    # same shell bash would actually receive, rather than choking on GHA
+    # expression syntax as a (invalid) parameter expansion.
+    script = first["run"].replace("${{ github.ref }}", "refs/heads/feat/some-branch")
+    env = {"PATH": "/usr/bin:/bin"}
+    result = subprocess.run(
+        ["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True, env=env
+    )
+    assert result.returncode != 0, (
+        f"off-main guard exited 0 for a dispatch off main. stdout={result.stdout!r}"
+    )
+    assert "dispatched from" in result.stdout
 
 
 _FAKE_GH = """#!/usr/bin/env bash

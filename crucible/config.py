@@ -6,9 +6,11 @@ code"), §4.12, and principle 8.
 **No literal bucket, prefix or path appears anywhere else in the package.**
 The CloudFormation template that creates the v2 bucket lands with track C;
 until it does, the bucket is an assumption recorded on
-`alpha-engine-config-I9757` (`alpha-engine-research`, prefix `crucible/`) and
-it lives HERE, in one declared adapter, so the track-C change is a one-line
-edit rather than a grep across the tree.
+`alpha-engine-config-I9757` (the store bucket named there, prefix `crucible/`)
+and resolved only through `CRUCIBLE_STORE_URI` / `--store` — never a literal
+in this package, which goes PUBLIC at phase-1 exit (`crucible/AGENTS.md`
+Visibility). It lives HERE, in one declared adapter, so the track-C change is
+a one-line edit rather than a grep across the tree.
 
 Three things are resolved, and each has exactly one resolution order —
 explicit argument, then environment variable, then the declared default:
@@ -66,9 +68,13 @@ __all__ = [
 DEFAULT_STORE_URI: str | None = None
 
 #: The ArcticDB store is a v1 asset v2 READS and never writes to from a
-#: laptop (the standing in-region rule). Named here so the read path carries
-#: no literal either.
-DEFAULT_ARCTIC_BUCKET = "alpha-engine-data"
+#: laptop (the standing in-region rule). **No default, deliberately**
+#: (`alpha-engine-config-I9906` finding 3): the bucket name is an
+#: infrastructure identifier `crucible/AGENTS.md` (Visibility) forbids in this
+#: repo, which goes PUBLIC at phase-1 exit. Set `CRUCIBLE_ARCTIC_BUCKET`;
+#: `ArcticPriceSource.__init__` raises on an empty bucket rather than reaching
+#: S3 with one — same shape as `DEFAULT_CLOUDTRAIL_ARCHIVE` below.
+DEFAULT_ARCTIC_BUCKET = ""
 
 #: The strategy tree's home inside the store. `current` is a pointer prefix,
 #: not a mutable directory: a strategy change is a sync of a new tree, and
