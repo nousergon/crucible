@@ -46,7 +46,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from crucible.documents import load_document_bytes, load_store_document
-from crucible.keys import manifest_key
+from crucible.keys import POINTER_KEY, TRADER_PIN_KEY, manifest_key
 from crucible.store import ETAG_ABSENT, PointerConflictError, S3Store, Store, sha256_hex
 
 _SCHEMA_DIR = Path(__file__).parent / "schemas"
@@ -181,14 +181,13 @@ def wheel_filename_for(sha: str) -> str:
 #: the one slot `release.json` occupies.
 RELEASE_PROVENANCE_SCHEMA_VERSION = "release_provenance.v1"
 
-#: The single mutable object in the whole release layout. Everything else is
-#: immutable and content-addressed by the sha in its own prefix.
-POINTER_KEY = "releases/current"
-
-#: The trader's separate pin. Two pointers, never one: a trader that followed
-#: `current` would be promoted by every merge, and release promotion to the
-#: trader is an explicit off-market-hours action (§4.11).
-TRADER_PIN_KEY = "trader/release_pin"
+#: `POINTER_KEY` (the single mutable object in the whole release layout —
+#: everything else is immutable and content-addressed by the sha in its own
+#: prefix) and `TRADER_PIN_KEY` (the trader's separate pin: two pointers,
+#: never one, since a trader that followed `current` would be promoted by
+#: every merge — §4.11) are defined in `crucible.keys` with every other
+#: store key shape and imported above; both stay in this module's `__all__`
+#: for their existing readers (alpha-engine-config-I9899, round 2).
 
 #: Exhaustive. `current` is what jobs follow; `trader` is what the trader
 #: follows. A third target is a design change.

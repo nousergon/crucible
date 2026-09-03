@@ -110,7 +110,6 @@ _RELEASE_OBJECT_RE = re.compile(
 _NO_RETENTION_ERROR_CODE = "NoSuchObjectLockConfiguration"
 
 
-
 @dataclass(frozen=True)
 class ReleaseLockReading:
     """One key's Object Lock reading. Never a bare bool — a bool cannot

@@ -59,7 +59,13 @@ from pathlib import Path
 
 import pytest
 
-_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*_(key|prefix)$")
+#: `..._key` / `..._prefix`, or a bare `key` / `prefix` (a METHOD such as
+#: `FeatureLayerSource.key` — the class-attribute form of the same
+#: convention, added in alpha-engine-config-I9899 round 2 so the call-site
+#: guard's accepted callees and this guard's accounted definitions stay one
+#: set). Kept textually identical to `tests/test_no_inline_store_keys.py`'s
+#: `_KEY_CALLEE_RE`, which asserts the equality.
+_NAME_RE = re.compile(r"^(?:[a-z][a-z0-9_]*_)?(key|prefix)$")
 
 _CRUCIBLE_ROOT = Path(__file__).resolve().parent.parent / "crucible"
 
@@ -92,6 +98,21 @@ _KNOWN_ARCHITECTURAL_EXCEPTIONS: dict[str, dict[str, str]] = {
             "widened to ast.walk for I9807's review) that splits a CloudTrail archive "
             "URI into (bucket, prefix) — returns a tuple, not a string, and is not "
             "the crucible store key grammar at all; unrelated AWS domain."
+        ),
+    },
+    "migrate": {
+        "V1Source.series_prefix": (
+            "a v1 listing prefix — everything before the `{date}` placeholder in a "
+            "declared v1 source key. The v1 layout is the migration's own, frozen, "
+            "and deliberately literal in migrate.py (its docstring says why); "
+            "crucible.keys is the v2 grammar and must not learn v1 shapes."
+        ),
+    },
+    "slots.model": {
+        "FeatureLayerSource.key": (
+            "a METHOD that delegates to crucible.keys.features_key with the source's "
+            "own version — the class-attribute form of the key function, not a second "
+            "shape. Registered because the bare-`key` form is now walked."
         ),
     },
     "alerts": {
