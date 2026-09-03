@@ -46,6 +46,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from crucible.documents import UnreadableDocumentError, load_store_document
 from crucible.keys import champion_key
 from crucible.store import Store
 
@@ -262,10 +263,13 @@ def read_champion(store: Store, slot: str) -> ChampionPointer:
     Raises :class:`KeyError` when no pointer exists and
     :class:`ChampionUnusableError` when one exists but fails either gate.
     """
-    raw = store.get_bytes(champion_key(slot))  # KeyError when absent, by contract
     try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        # KeyError when absent, by the store's contract; the strict face of
+        # the one reader (`crucible.documents`) for a present-but-unreadable
+        # pointer, so an array- or null-bodied pointer is refused here rather
+        # than raising out of `ChampionPointer.from_dict`.
+        payload = load_store_document(store, champion_key(slot))
+    except UnreadableDocumentError as exc:
         raise ChampionUnusableError(
             f"champion pointer for slot {slot!r} is not readable JSON: {exc}"
         ) from exc
@@ -278,14 +282,14 @@ def read_champion(store: Store, slot: str) -> ChampionPointer:
 
 def _assert_producing_run_ok(store: Store, pointer: ChampionPointer) -> None:
     try:
-        manifest = json.loads(store.get_bytes(pointer.manifest_key))
+        manifest = load_store_document(store, pointer.manifest_key)
     except KeyError as exc:
         raise ChampionUnusableError(
             f"champion {pointer.arm_id} names manifest {pointer.manifest_key!r}, which is "
             "not in the store. A pointer whose producing run cannot be found is "
             "indistinguishable from one no run ever wrote."
         ) from exc
-    except json.JSONDecodeError as exc:
+    except UnreadableDocumentError as exc:
         raise ChampionUnusableError(
             f"manifest {pointer.manifest_key!r} for champion {pointer.arm_id} is not "
             f"readable JSON: {exc}"

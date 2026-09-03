@@ -35,6 +35,7 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from crucible.documents import load_store_document
 from crucible.keys import champion_key, migration_key
 from crucible.slots.arms import ArmSpec, read_register, register_arms, write_register
 
@@ -111,7 +112,9 @@ def read_v1_json(store: Store, key: str) -> dict[str, Any] | None:
     """Read one v1 JSON artifact, or ``None`` when it is absent. Never raises on 404."""
     if not store.exists(key):
         return None
-    return json.loads(store.get_bytes(key).decode("utf-8"))
+    # STRICT face of the one reader: a present v1 artifact that is not an
+    # object stops the migration with the key named (rule 5).
+    return load_store_document(store, key)
 
 
 def _bootstrap_spec(

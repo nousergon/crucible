@@ -66,6 +66,7 @@ from krepis.metrics import MetricRecord, derive_status
 
 from crucible.calendar import previous_trading_day
 from crucible.data.daily import COVERAGE_FLOOR_RATIO
+from crucible.documents import load_store_document
 from crucible.keys import attribution_key, champion_key, experiments_prefix
 from crucible.manifest import manifest_key
 from crucible.slots.grading import CROSS_SECTION_MIN_NAMES, RankICSkip, spearman_ic
@@ -467,7 +468,7 @@ def _slot_row(
     for key in sorted(store.list_keys(prefix)):
         if not key.endswith("/verdict.json"):
             continue
-        verdict = json.loads(store.get_bytes(key).decode("utf-8"))
+        verdict = load_store_document(store, key)
         day = dt.date.fromisoformat(verdict["trading_day"])
         if not first <= day <= last:
             outside += 1
@@ -606,7 +607,7 @@ def _rank_ic_row(
     for key in sorted(store.list_keys(prefix)):
         if not key.endswith("/cross_section_settled.json"):
             continue
-        document = json.loads(store.get_bytes(key).decode("utf-8"))
+        document = load_store_document(store, key)
         day = dt.date.fromisoformat(document["trading_day"])
         if not first <= day <= last:
             outside += 1
@@ -826,7 +827,8 @@ def _read_json(store: Store, key: str) -> dict[str, Any] | None:
     """
     if not store.exists(key):
         return None
-    return json.loads(store.get_bytes(key).decode("utf-8"))
+    # STRICT face of the one reader: corrupt RAISES, with the key named.
+    return load_store_document(store, key)
 
 
 def _metric_value(manifest: dict[str, Any], name: str) -> float | None:

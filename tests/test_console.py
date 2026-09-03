@@ -654,7 +654,11 @@ class TestUnreadableArtifacts:
         store = LocalStore(tmp_path)
         store.put_bytes(champion_key("u"), b"{not json")
         page = build_page(store, now=SATURDAY_NIGHT)
-        assert page.champions["u"]["unreadable"]
+        # The fault lives in its own field; the pointer slot is None, never a
+        # look-alike document carrying a reader-state key (I9931 item 3).
+        assert page.champions["u"] is None
+        assert page.champion_faults["u"]
+        assert "r" not in page.champion_faults
         assert page.champions["r"] is None
         assert champion_key("u") in {entry["key"] for entry in page.unreadable}
         assert "unreadable" in render_html(page)
