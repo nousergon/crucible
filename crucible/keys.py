@@ -32,6 +32,7 @@ __all__ = [
     "DRIFT_INPUTS",
     "REVIEWER_PATTERN",
     "RUNS_ROOT",
+    "acceptance_reading_key",
     "arena_cycle_key",
     "arm_id_from_segment",
     "arm_key_segment",
@@ -61,6 +62,7 @@ __all__ = [
     "manifest_key",
     "manifest_prefix",
     "migration_key",
+    "morning_report_key",
     "parse_manifest_key",
     "retirement_log_key",
     "review_key",
@@ -652,3 +654,60 @@ def legacy_weekly_executions_key(week_anchor: str) -> str:
     moves there once the branch that owns that file lands.
     """
     return f"legacy/weekly/{week_anchor}/executions.json"
+
+
+# -- the 6am PT morning report (alpha-engine-config-I9896) ------------------
+
+
+def morning_report_key(trading_day: str, calendar_date: str) -> str:
+    """The exact message `report.morning` delivered, filed beside its manifest.
+
+    Filed at all because the delivery is the deliverable and Telegram is not a
+    durable artifact: principle 1 asks whether someone can reconstruct what an
+    unattended run did from durable artifacts alone, and "check Brian's phone"
+    is not one. Under the job's OWN manifest prefix, so the identity that
+    writes the manifest needs no second grant to write this — a report whose
+    evidence needed a wider IAM scope than its manifest would be a reason to
+    widen the scope.
+
+    ``calendar_date`` is the FIRING, and it is the same discriminator the job's
+    manifest carries. A 13:00 UTC cron fires every calendar day while
+    `resolve_trading_day` collapses Saturday, Sunday and Monday onto Friday's
+    close (§4.12), so three genuinely different deliveries would otherwise
+    overwrite one another at one key and the store's answer to "what was Brian
+    told on Sunday" would be decided by write ordering. Same shape
+    `crucible.alerts.sweep` already carries for the same reason.
+    """
+    return f"{manifest_prefix('report.morning', trading_day)}{calendar_date}/message.txt"
+
+
+# -- the acceptance suite's reading, filed as an artifact (I9902) -----------
+
+
+def acceptance_reading_key(trading_day: str) -> str:
+    """Where `main`'s plan §2 acceptance reading is filed.
+
+    §12 rule 3 makes the acceptance count the ONLY progress figure, and today
+    it exists solely in `tests/acceptance/ratchet.json` — a property of the
+    repository, readable from a git checkout and from nowhere else. Every
+    consumer outside a checkout therefore has no way to read the one number
+    the plan names as progress. `alpha-engine-config-I9902` builds the
+    producer; this is the key it writes to, declared here first so the
+    consumer (`crucible.morning`) and the producer cannot disagree about the
+    shape, and so the reader has something to name while it reads absent.
+
+    **The producer contract**, and the document `crucible.morning` parses::
+
+        {"met": int, "unmet": int, "unmeasurable": int,
+         "commit": str, "measured_at": str}
+
+    `unmeasurable` is its own integer and is never folded into `unmet`: "the
+    clause says no" and "we could not ask" are different facts and the second
+    one is about us (`alpha-engine-config-I9828` is exactly that distinction
+    for the cost clause). `commit` is the sha the reading was taken at — plan
+    §6 rule 2, a reading is always quoted with its store and commit — and a
+    count with no commit beside it is a number nobody can reproduce.
+    """
+    if not trading_day:
+        raise ValueError("trading_day must be non-empty")
+    return f"report/acceptance/{trading_day}.json"

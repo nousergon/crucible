@@ -507,3 +507,42 @@ components:
     schedule: null
     dispatch: null
     deadline: null
+
+  report.morning:
+    description: >-
+      Read the board rendered by board.yml and deliver its reading to the
+      operator channel at 06:00 PT. Reads; never renders and never runs.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[board/current.json,board/**,runs/board/**],outputs[runs/report.morning/**]
+      outcome: run.json:metrics[morning_report_delivered]
+    log_location: /crucible/report.morning
+    log_retention_days: 90
+    # NOT the pages channel, and this is the whole design constraint. Plan
+    # §4.6 admits exactly two page conditions - absence and failure - and a
+    # daily digest is neither; it is "a row on a page nobody is paged to".
+    # It reaches the same Telegram bot on `severity: info` with `silent`
+    # set and SNS off, so it never travels the path a page travels and
+    # cannot buzz a phone at 6am about a board that is red by design.
+    # `alert_channel` here is what pages about THIS ROW - an absent or
+    # failed report - and that is a real page on the real channel.
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: daily 13:00 UTC (06:00 PDT / 05:00 PST)
+    dispatch: github-actions
+    dispatch_workflow: morning-report.yml
+    # `next_calendar_day_at`, not `close_plus`: the report for trading day d
+    # is delivered on the calendar day AFTER d, before that day's session
+    # opens. 13:00 UTC is 09:00 ET in EDT and 08:00 ET in EST, so 10:00 ET
+    # covers both with an hour of slack for the cron drift GitHub is
+    # measured to have on this fleet (a `*/30` workflow ran 5-8x/day for its
+    # whole life). Tighter than that and the absence page fires on GitHub's
+    # scheduling rather than on a report that did not go out.
+    deadline:
+      anchor: next_calendar_day_at
+      at: "10:00"
