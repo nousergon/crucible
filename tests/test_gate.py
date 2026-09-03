@@ -279,6 +279,30 @@ class TestPhaseOne:
         clause = next(c for c in result.clauses if c.name == "independently_reviewed")
         assert clause.met, clause.detail
 
+    def test_a_review_dated_after_the_render_does_not_satisfy_it(self, tmp_path) -> None:
+        """The span stops at the render day. A review filed tomorrow did not
+        exist when today's gate was read, and counting it would let a future
+        document satisfy a present exit."""
+        store = _seed_met(tmp_path)
+        (tmp_path / review_key("phase1", FRIDAY.isoformat(), REVIEWER, "pass")).unlink()
+        _put(
+            store,
+            review_key("phase1", dt.date(2026, 9, 3).isoformat(), REVIEWER, "pass"),
+            _review(),
+        )
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
+        clause = next(c for c in result.clauses if c.name == "independently_reviewed")
+        assert not clause.met, clause.detail
+
+    def test_a_window_that_collapses_onto_fewer_anchors_is_refused(self, monkeypatch) -> None:
+        """A silently shortened window grades fewer weeks than the gate
+        declares — the same refusal `_clause_old_weekly_within_cadence` makes."""
+        from crucible import gate as gate_module
+
+        monkeypatch.setattr(gate_module, "weekly_anchor", lambda day: FRIDAY)
+        with pytest.raises(ValueError, match="collapsed onto 1 weekly anchor"):
+            gate_module.weekly_window(RENDER_DAY, 5)
+
     def test_one_failed_stage_in_one_week_fails_the_gate(self, tmp_path) -> None:
         store = _seed_met(tmp_path)
         _put(

@@ -439,12 +439,31 @@ class TestPagesAreCountedOnlyOnceSomethingHasSwept:
 
 
 class _CostClient:
-    """A Cost Explorer stand-in speaking the real response shape."""
+    """A Cost Explorer stand-in speaking the real response shape.
 
-    def __init__(self, amount: str) -> None:
+    ``amount`` answers the MONTHLY month-to-date request; ``daily`` answers the
+    DAILY trailing-window request with one period per day in the interval,
+    cycling the list. The default daily figure is a quiet `$1.00`/day so the
+    pre-existing month-to-date cases keep grading the month-to-date half.
+    """
+
+    def __init__(self, amount: str, daily: list[str] | None = None) -> None:
         self.amount = amount
+        self.daily = daily or ["1.00"]
+        self.requests: list[dict] = []
 
-    def get_cost_and_usage(self, **_) -> dict:
+    def get_cost_and_usage(self, **request) -> dict:
+        self.requests.append(request)
+        if request["Granularity"] == "DAILY":
+            start = dt.date.fromisoformat(request["TimePeriod"]["Start"])
+            end = dt.date.fromisoformat(request["TimePeriod"]["End"])
+            days = (end - start).days
+            return {
+                "ResultsByTime": [
+                    {"Total": {"UnblendedCost": {"Amount": self.daily[n % len(self.daily)]}}}
+                    for n in range(days)
+                ]
+            }
         return {"ResultsByTime": [{"Total": {"UnblendedCost": {"Amount": self.amount}}}]}
 
 
@@ -494,8 +513,8 @@ class TestACostCeilingIsNeverMetByAnUnreadableApi:
 
     def test_met_under_the_tagged_ceiling(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Read on the 28th. `month_to_date_usd` asks for [1st, today) —
-        yesterday's close is the last complete day Cost Explorer has — so the
-        interval is 27 days and the line is $40 x 27/31."""
+        yesterday's close is the last complete day Cost Explorer has — so 27
+        days are in; a quiet $1.00/day pace projects $12.50 + 4 x $1.00."""
         monkeypatch.setattr(gate_module, "_ce_client", lambda: _CostClient("12.50"))
         clause = gate_module._clause_aws_cost_within_ceiling(
             PHASE2_WINDOW,
@@ -504,80 +523,192 @@ class TestACostCeilingIsNeverMetByAnUnreadableApi:
             tagged=True,
         )
         assert clause.met and not clause.unmeasurable
-        assert "pro-rata ceiling $34.84" in clause.detail
+        assert "$12.50 month-to-date" in clause.detail
         assert "27 of 31 days" in clause.detail
+        assert "projected $16.50" in clause.detail
+        assert "median $1.00/day" in clause.detail
 
-    def test_a_young_month_under_the_raw_ceiling_is_not_met(
+    def test_a_month_boundary_lump_does_not_read_a_compliant_month_as_over(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """`alpha-engine-config-I9927`: on 2026-09-02 phase 4 read
-        `MET: $9.05 of $70.00` on two days of spend. Two days under a MONTHLY
-        ceiling cannot discriminate — the row must not go green for free."""
-        monkeypatch.setattr(gate_module, "_ce_client", lambda: _CostClient("1.50"))
+        """PR80 review, B1. This account posts `$15.59` on the 1st and
+        `$1.83`/day after, closing at `$69.90` under a `$70` ceiling. A
+        pro-rata line read that month OVER on days 1–26. The projection
+        takes the MEDIAN of the trailing week, so the lump is one sample and
+        the month reads as what it is: under."""
+        client = _CostClient("15.59", daily=["1.83"] * 6 + ["15.59"])
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: client)
+        clause = gate_module._clause_aws_cost_within_ceiling(
+            [dt.date(2026, 9, 2)],  # one complete day in: the lump
+            name="aws_total_within_ceiling",
+            ceiling_usd=PHASE4_MAX_TOTAL_USD,
+            tagged=False,
+        )
+        assert clause.met and not clause.unmeasurable, clause.detail
+        # $15.59 + median $1.83 x 29 remaining = $68.66
+        assert "projected $68.66" in clause.detail
+        assert "median $1.83/day" in clause.detail
+
+    def test_a_mean_pace_would_have_failed_that_month_and_a_median_does_not(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The property, not the instance: with the lump inside the trailing
+        window a MEAN daily pace is (6 x 1.83 + 15.59) / 7 = $3.80, projecting
+        $125.79 — over. The clause must not be reading a mean."""
+        client = _CostClient("15.59", daily=["1.83"] * 6 + ["15.59"])
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: client)
         clause = gate_module._clause_aws_cost_within_ceiling(
             [dt.date(2026, 9, 2)],
             name="aws_total_within_ceiling",
             ceiling_usd=PHASE4_MAX_TOTAL_USD,
             tagged=False,
         )
-        assert not clause.met
-        assert clause.unmeasurable
-        assert "1 day(s) old" in clause.detail
-        assert "cannot discriminate" in clause.detail
-        # The graded figure is stated: one complete day, $70 x 1/30 = $2.33.
-        assert "pro-rata ceiling $2.33" in clause.detail
+        assert clause.met
+        assert "$3.80/day" not in clause.detail
 
-    def test_a_young_month_over_the_pro_rata_line_is_unmet_on_day_two(
+    def test_the_same_compliant_month_stays_met_late_in_the_month(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """$9.05 on day 2 is well under $70 and OVER $4.67. An overspend does
-        not need a week to be an overspend — it reads UNMET, not unmeasurable
-        and never MET."""
-        monkeypatch.setattr(gate_module, "_ce_client", lambda: _CostClient("9.05"))
+        # 2026-09-27: 26 complete days in, $15.59 + 25 x $1.83 = $61.34.
+        client = _CostClient("61.34", daily=["1.83"])
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: client)
         clause = gate_module._clause_aws_cost_within_ceiling(
-            [dt.date(2026, 9, 2)],
+            [dt.date(2026, 9, 27)],
+            name="aws_total_within_ceiling",
+            ceiling_usd=PHASE4_MAX_TOTAL_USD,
+            tagged=False,
+        )
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert "projected $68.66" in clause.detail
+
+    def test_a_real_overspend_pace_is_unmet_on_day_two(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """This account on 2026-09-03: $11.95 over two days at a ~$3/day
+        baseline projects $95.95 against $70. UNMET on day 2, not "the month
+        is young" — an overspend does not need a week to be one."""
+        client = _CostClient("11.95", daily=["3.00"])
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: client)
+        clause = gate_module._clause_aws_cost_within_ceiling(
+            [dt.date(2026, 9, 3)],
             name="aws_total_within_ceiling",
             ceiling_usd=PHASE4_MAX_TOTAL_USD,
             tagged=False,
         )
         assert not clause.met and not clause.unmeasurable
-        assert "OVER" in clause.detail
-        assert "9.05" in clause.detail
+        assert "projected $95.95" in clause.detail
+        assert clause.detail.endswith("OVER")
 
-    def test_the_first_of_the_month_counts_as_one_day_not_zero(
+    def test_a_month_already_over_the_ceiling_is_unmet_whatever_the_pace(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """`month_to_date_usd` asks for [1st, 2nd) on the 1st, so the elapsed
-        count is one day and the pro-rata line is a real, non-zero figure — a
-        zero-day line would read every 1st as OVER on any spend at all."""
-        monkeypatch.setattr(gate_module, "_ce_client", lambda: _CostClient("1.00"))
+        client = _CostClient("70.01", daily=["0.01"])
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: client)
         clause = gate_module._clause_aws_cost_within_ceiling(
-            [dt.date(2026, 9, 1)],
+            [dt.date(2026, 9, 30)],
             name="aws_total_within_ceiling",
             ceiling_usd=PHASE4_MAX_TOTAL_USD,
             tagged=False,
         )
-        assert clause.unmeasurable and not clause.met
-        assert "1 of 30 days" in clause.detail
-        assert "pro-rata ceiling $2.33" in clause.detail
+        assert not clause.met and not clause.unmeasurable
+        assert "already over" in clause.detail
+        # No pace was needed to know it, and none was read.
+        assert all(r["Granularity"] == "MONTHLY" for r in client.requests)
 
-    def test_met_once_the_month_is_old_enough_to_discriminate(
+    def test_the_trailing_window_is_seven_complete_days_and_may_cross_the_month(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Rendered on the 8th, seven complete days are in: $9.05 against
-        $70 x 7/30 = $16.33 is a reading that could have failed and did not."""
-        monkeypatch.setattr(gate_module, "_ce_client", lambda: _CostClient("9.05"))
-        render_day = dt.date(2026, 9, 1) + dt.timedelta(
-            days=gate_module.COST_CEILING_MIN_ELAPSED_DAYS
-        )
+        """The pace is a property of the estate, not of the calendar month it
+        is read in, so on the 2nd the window reaches back into August and
+        the projection is measurable on day 1 — no "young month" branch."""
+        client = _CostClient("1.50")
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: client)
         clause = gate_module._clause_aws_cost_within_ceiling(
-            [render_day],
+            [dt.date(2026, 9, 2)],
             name="aws_total_within_ceiling",
             ceiling_usd=PHASE4_MAX_TOTAL_USD,
             tagged=False,
         )
         assert clause.met and not clause.unmeasurable
-        assert f"{gate_module.COST_CEILING_MIN_ELAPSED_DAYS} of 30 days" in clause.detail
+        (daily,) = [r for r in client.requests if r["Granularity"] == "DAILY"]
+        assert daily["TimePeriod"] == {"Start": "2026-08-26", "End": "2026-09-02"}
+        assert "2026-08-26..2026-09-02" in clause.detail
+
+    def test_the_tag_filter_reaches_the_pace_read_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _CostClient("1.50")
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: client)
+        gate_module._clause_aws_cost_within_ceiling(
+            [dt.date(2026, 9, 10)],
+            name="aws_cost_within_ceiling",
+            ceiling_usd=PHASE2_MAX_TAGGED_USD,
+            tagged=True,
+        )
+        assert len(client.requests) == 2
+        assert all("Filter" in r for r in client.requests)
+
+    def test_an_unreadable_pace_window_is_unmeasurable_not_met(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Month-to-date readable and under, the daily read denied: the clause
+        cannot say the month will stay under, and says so."""
+
+        class _DailyDenied(_CostClient):
+            def get_cost_and_usage(self, **request) -> dict:
+                if request["Granularity"] == "DAILY":
+                    raise RuntimeError("AccessDenied: ce:GetCostAndUsage DAILY")
+                return super().get_cost_and_usage(**request)
+
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: _DailyDenied("1.50"))
+        clause = gate_module._clause_aws_cost_within_ceiling(
+            [dt.date(2026, 9, 10)],
+            name="aws_total_within_ceiling",
+            ceiling_usd=PHASE4_MAX_TOTAL_USD,
+            tagged=False,
+        )
+        assert clause.unmeasurable and not clause.met
+        assert "pace could not be read" in clause.detail
+        assert "$1.50 month-to-date" in clause.detail
+
+    def test_fewer_daily_periods_than_days_is_unmeasurable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _Short(_CostClient):
+            def get_cost_and_usage(self, **request) -> dict:
+                if request["Granularity"] == "DAILY":
+                    return {
+                        "ResultsByTime": [
+                            {"Total": {"UnblendedCost": {"Amount": "1.00"}}} for _ in range(3)
+                        ]
+                    }
+                return super().get_cost_and_usage(**request)
+
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: _Short("1.50"))
+        clause = gate_module._clause_aws_cost_within_ceiling(
+            [dt.date(2026, 9, 10)],
+            name="aws_total_within_ceiling",
+            ceiling_usd=PHASE4_MAX_TOTAL_USD,
+            tagged=False,
+        )
+        assert clause.unmeasurable and not clause.met
+        assert "3 daily period(s)" in clause.detail
+
+    def test_a_free_trailing_week_is_unmeasurable_not_a_zero_pace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Seven days of exactly `$0.00` is what the tagged scope returns on an
+        untagged estate — the `$0.00` trap on the pace window."""
+        client = _CostClient("1.50", daily=["0"])
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: client)
+        clause = gate_module._clause_aws_cost_within_ceiling(
+            [dt.date(2026, 9, 10)],
+            name="aws_cost_within_ceiling",
+            ceiling_usd=PHASE2_MAX_TAGGED_USD,
+            tagged=True,
+        )
+        assert clause.unmeasurable and not clause.met
+        assert "read exactly $0.00" in clause.detail
 
     def test_unmet_over_the_account_ceiling(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Phase 4's reading: same reader, no tag filter, the other ceiling."""
@@ -617,6 +748,42 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
         _put(store, producing, {"status": "ok", "reason": "", "metrics": []})
         clause = gate_module._clause_slot_promotion_or_non_promotion(store, "r", _window(4))
         assert clause.met and not clause.unmeasurable
+
+    @pytest.mark.parametrize(
+        "render_day",
+        [
+            dt.date(2026, 8, 31),
+            dt.date(2026, 9, 1),
+            dt.date(2026, 9, 2),
+            dt.date(2026, 9, 3),
+            dt.date(2026, 9, 4),
+        ],
+        ids=["mon", "tue", "wed", "thu", "fri"],
+    )
+    def test_the_promote_manifest_is_found_on_every_render_weekday(
+        self, store: LocalStore, render_day: dt.date
+    ) -> None:
+        """PR80 review, B2 — `alpha-engine-config-I9904` in phase 3. Promote
+        runs on Saturday and files at the Friday close; over the raw render
+        window the clause found `runs/promote/2026-08-28/run.json` on a
+        Friday render only. Phase 3 is now in `WEEKLY_ANCHORED_GATES`."""
+        producing = manifest_key("promote", FRIDAY.isoformat())
+        _put(
+            store,
+            champion_key("r"),
+            {
+                "arm_id": "r:momentum:ab12cd",
+                "promotion_source": "evidence",
+                "manifest_key": producing,
+            },
+        )
+        _put(store, producing, {"status": "ok", "reason": "", "metrics": []})
+        result = evaluate(store, gate="phase3", trading_day=render_day)
+        assert result.window[-1] == FRIDAY
+        clause = next(
+            c for c in result.clauses if c.name == "r_promotion_or_verdict_backed_non_promotion"
+        )
+        assert clause.met and not clause.unmeasurable, clause.detail
 
     def test_a_bootstrap_pointer_is_not_a_promotion_the_system_won(self, store: LocalStore) -> None:
         _put(
@@ -718,7 +885,7 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
         assert "no promote run manifest was filed" not in clause.detail
 
     def test_one_clause_per_registered_slot(self, store: LocalStore) -> None:
-        clauses = gate_module._phase3(store, _window(4), {})
+        clauses = gate_module._phase3(store, _window(4), {}, trading_day=FRIDAY)
         assert [c.name for c in clauses] == [
             f"{slot}_promotion_or_verdict_backed_non_promotion" for slot in sorted(SLOTS)
         ]
