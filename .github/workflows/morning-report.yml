@@ -1,0 +1,148 @@
+name: Morning report
+
+# The 6am PT accountability delivery — `alpha-engine-config-I9896`.
+#
+# Brian stated on 2026-09-02 that a daily 6am PT report existed. It did not:
+# the three claude.ai cloud routines were disabled (the groom since
+# 2026-06-23), and the only Crucible v2 schedule was `board.yml`, which
+# renders the board into the store every day and hands it to nobody. An
+# accountability surface that exists only as a belief is worse than one that
+# is missing — it is trusted while emitting nothing (principle 7).
+#
+# ── Why a SEPARATE workflow rather than a second job in board.yml ─────────
+#
+# A workflow carries ONE schedule set, and this job's cadence is not the
+# board's: the board renders at 21:30 UTC (after the close plus the
+# registry's 6h window) and this reads that render at 13:00 UTC the next
+# morning. Putting both in one file means both jobs fire at both times unless
+# each is gated on `github.event.schedule` — a string comparison against a
+# cron literal, which fails open the moment either cron is edited and reads
+# green while doing so. It would also make `components.yaml`'s
+# `dispatch_workflow` name a workflow whose declared cadence is not this
+# row's, which is the exact blindness that field exists to remove
+# (`alpha-engine-config-I9878`).
+#
+# `crucible/AGENTS.md` says "deploy.yml is the only other workflow this repo
+# will ever have". That sentence is already stale — `board.yml` and
+# `adversarial-review-record.yml` both exist and both post-date it
+# (`alpha-engine-config-I9887` owns the correction) — so it is not a
+# constraint on this file.
+#
+# ── UTC, and what it drifts to in November ────────────────────────────────
+#
+# GitHub Actions crons are UTC and have no timezone. `0 13 * * *` is
+# **06:00 PDT** today and becomes **05:00 PST** on 2026-11-01, when the US
+# leaves daylight time. That drift is DECLARED rather than discovered: the
+# message itself prints the local time it was delivered at
+# (`crucible.morning.DELIVERY_TZ`), and `tests/test_morning.py` asserts this
+# exact cron resolves to 06:00 PDT and 05:00 PST, so the November change is a
+# committed fact a reader can look up rather than a surprise.
+#
+# The rejected alternative was two crons (`0 13` and `0 14`) with a job-level
+# `if: github.event.schedule == '...'` picking the right one per season. That
+# is a partial parser over a cron literal deciding whether the day's report
+# goes out at all, and `tests/test_workflow_triggers.py` records five rounds
+# of adversarial review on why a predicate of that shape is a denylist of the
+# syntax someone thought of. One cron that lands an hour early for four
+# months is a smaller defect than a guard that can silently deliver twice or
+# not at all.
+#
+# ── Why there is no notify-failure job here ───────────────────────────────
+#
+# `board.yml` carries one; this deliberately does not. Every failure mode of
+# this job is ALREADY a page on the declared path: a delivery that raises
+# leaves `status: failed` in `runs/report.morning/{day}/{firing}/run.json`
+# and `alerts.sweep`'s FAILURE condition pages on it, and a job that dies
+# before the manifest exists (a failed OIDC assume, a cancelled runner)
+# leaves it absent and the ABSENCE condition pages at the registry deadline.
+# Adding a workflow-level notification would make one incident two pages,
+# which breaks `crucible.alerts`' one-key-per-`(job, trading_day)` dedup and
+# spends the <=2 pages/month ceiling on duplicates.
+#
+# ── What the identity may do ──────────────────────────────────────────────
+#
+# `crucible-v2-github-morning-report` (nous-ergon-ops/infrastructure/
+# cloudformation/crucible-v2.yaml) reads `crucible/board/*` and
+# `crucible/runs/board/*` and writes exactly `crucible/runs/report.morning/*`
+# — its own manifest and the message it delivered, and nothing else. It is
+# NOT BoardRole: a reporting surface that could write the board would be able
+# to author the reading it reports.
+#
+# That role is created by an OPERATOR-GATED apply, not by merging the ops PR
+# (`pull-request-policy` §4.2 form 3 — the merge emits the exact command AND a
+# detector stays red until it runs). The same apply is already pending for
+# `alpha-engine-config-I9881`, so this adds no operator step that was not
+# already outstanding. Until it happens this workflow fails daily on the
+# identity check below, naming the exact command. That is the detector
+# working.
+#
+# ── Delivery needs no AWS credential ──────────────────────────────────────
+#
+# Telegram only, `severity=info`, `silent`, SNS off — the same shape
+# `nousergon-lib/.github/workflows/notify-ci-failure.yml` runs fleet-wide.
+# `ALPHA_ENGINE_SECRETS_SOURCE=env` forces `krepis.secrets` to resolve the
+# bot token and chat id from the environment rather than reaching SSM, which
+# this role is not granted and does not need.
+
+on:
+  schedule:
+    # 06:00 PDT / 05:00 PST. See the DST section above.
+    - cron: '0 13 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+# Serialised, and a superseded run is NOT cancelled. A cancelled run here is
+# a morning with no report and no failed manifest — an ABSENCE page for a
+# scheduling artefact.
+concurrency:
+  group: morning-report
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  REPORT_ROLE_ARN: arn:aws:iam::711398986525:role/crucible-v2-github-morning-report
+  STORE_URI: s3://alpha-engine-crucible-v2/crucible
+
+jobs:
+  report:
+    name: deliver the board's reading
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          role-to-assume: ${{ env.REPORT_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The identity actually obtained, read back from AWS rather than
+      # restated from `env`. Same argument board.yml and deploy.yml make:
+      # what is falsifiable is the identity, not the literal.
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${REPORT_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. The morning report must run as an identity that cannot write the board it reports. If the role does not exist yet the crucible-v2 stack has not been applied since the ops PR adding it merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until that happens is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+
+      - name: Read the board and deliver it
+        env:
+          # Forces `krepis.secrets` to resolve from the environment instead of
+          # reaching SSM, which this role is deliberately not granted.
+          ALPHA_ENGINE_SECRETS_SOURCE: env
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: uv run crucible report.morning --store "$STORE_URI"

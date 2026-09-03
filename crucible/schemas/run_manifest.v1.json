@@ -62,7 +62,8 @@
         "board",
         "deploy",
         "weekly",
-        "gate"
+        "gate",
+        "report.morning"
       ]
     },
     "trading_day": {

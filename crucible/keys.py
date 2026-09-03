@@ -60,6 +60,7 @@ __all__ = [
     "manifest_key",
     "manifest_prefix",
     "migration_key",
+    "morning_report_key",
     "parse_manifest_key",
     "retirement_log_key",
     "review_key",
@@ -634,3 +635,28 @@ def legacy_weekly_executions_key(week_anchor: str) -> str:
     moves there once the branch that owns that file lands.
     """
     return f"legacy/weekly/{week_anchor}/executions.json"
+
+
+# -- the 6am PT morning report (alpha-engine-config-I9896) ------------------
+
+
+def morning_report_key(trading_day: str, calendar_date: str) -> str:
+    """The exact message `report.morning` delivered, filed beside its manifest.
+
+    Filed at all because the delivery is the deliverable and Telegram is not a
+    durable artifact: principle 1 asks whether someone can reconstruct what an
+    unattended run did from durable artifacts alone, and "check Brian's phone"
+    is not one. Under the job's OWN manifest prefix, so the identity that
+    writes the manifest needs no second grant to write this — a report whose
+    evidence needed a wider IAM scope than its manifest would be a reason to
+    widen the scope.
+
+    ``calendar_date`` is the FIRING, and it is the same discriminator the job's
+    manifest carries. A 13:00 UTC cron fires every calendar day while
+    `resolve_trading_day` collapses Saturday, Sunday and Monday onto Friday's
+    close (§4.12), so three genuinely different deliveries would otherwise
+    overwrite one another at one key and the store's answer to "what was Brian
+    told on Sunday" would be decided by write ordering. Same shape
+    `crucible.alerts.sweep` already carries for the same reason.
+    """
+    return f"{manifest_prefix('report.morning', trading_day)}{calendar_date}/message.txt"

@@ -31,7 +31,7 @@ import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from crucible import __version__, track_c, track_e, track_f  # track-C, track-E, track-F
+from crucible import __version__, morning, track_c, track_e, track_f  # track-C, track-E, track-F
 from crucible.calendar import resolve_trading_day
 from crucible.keys import arena_cycle_key, champion_key
 from crucible.keys import manifest_key as _promote_manifest_key
@@ -247,6 +247,16 @@ JOBS: dict[str, JobSpec] = {
     # is a MEASUREMENT cannot be satisfied by a merge.
     "weekly": JobSpec("weekly", "Run the declared weekly arc for one trading day", True),
     "gate": JobSpec("gate", "Read a phase's artifacts and report its exit gate", False),
+    # alpha-engine-config-I9896. The daily accountability delivery Brian
+    # believed existed on 2026-09-02 and did not: the board was rendered into
+    # the store every day and handed to nobody. It READS that board -- it does
+    # not render one -- so the reporting surface cannot produce the artifact
+    # it reports on.
+    morning.MORNING_JOB: JobSpec(
+        morning.MORNING_JOB,
+        "Deliver the board's reading to the operator channel at 06:00 PT",
+        True,
+    ),
 }
 
 HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
@@ -299,6 +309,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     # track-F
     "weekly": track_f.weekly_handler,
     "gate": track_f.gate_handler,
+    morning.MORNING_JOB: morning.morning_handler,
 }
 
 
