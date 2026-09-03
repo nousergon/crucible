@@ -48,7 +48,7 @@ from crucible.keys import (
     review_prefix,
     runs_prefix,
 )  # noqa: F401 - re-exported
-from crucible.manifest import manifest_key
+from crucible.manifest import load_schema, manifest_key
 from crucible.release import POINTER_KEY
 from crucible.report import attribution_key
 from crucible.slots import SLOTS
@@ -98,19 +98,30 @@ GATE_SCHEMA_VERSION = "gate.v1"
 
 @dataclass(frozen=True)
 class Clause:
-    """One gate condition and what the store said about it."""
+    """One gate condition and what the store said about it.
+
+    A clause is met, unmet, or UNMEASURABLE, and unmeasurable is never met
+    (module docstring; `alpha-engine-config-I9869` round 2). ``unmeasurable``
+    is a fact about OUR access — a store read that raised (a permission
+    denial, a transient AccessDenied) — never a fact about the system being
+    graded, and it renders distinctly rather than being folded into "unmet"
+    so an operator does not go fix a producer when the real fault is our own
+    credentials.
+    """
 
     name: str
     requirement: str
     met: bool
     detail: str
     evidence: tuple[str, ...] = ()
+    unmeasurable: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "requirement": self.requirement,
             "met": self.met,
+            "unmeasurable": self.unmeasurable,
             "detail": self.detail,
             # Ordered, not de-duplicated. Each arc stage now reads its own
             # discriminated manifest key (alpha-engine-config-I9781), so a
@@ -150,8 +161,21 @@ class GateResult:
         ratio is computed; `build_ladder` and `PhaseRow` both read it from
         here rather than re-deriving it, so the durable gate artifact and the
         overwritten ladder cannot disagree about the same reading.
+
+        `None` too when ANY clause is `unmeasurable` — round 3 of
+        `alpha-engine-config-I9869`: a store access failure on one clause,
+        with the rest genuinely measured, was rendering as e.g. `0.5`, a
+        specific number that reads as "half the requirement was checked and
+        failed" when the truth is "one of two checks could not even run".
+        `None` over "exclude the unmeasurable clause from the denominator"
+        because the second option still publishes a number computed from a
+        PARTIAL read, and plan §6 rule 1 is "no data is never a pass" — a
+        partial read is not "no data", but averaging over what happened to
+        succeed is the same shape of overclaim in miniature. `None` says
+        plainly that this reading cannot be trusted as a ratio; the clause
+        list itself still names exactly which one is unmeasurable.
         """
-        if not self.clauses:
+        if not self.clauses or any(c.unmeasurable for c in self.clauses):
             return None
         return sum(1 for c in self.clauses if c.met) / len(self.clauses)
 
@@ -183,7 +207,8 @@ class GateResult:
         if self.coverage:
             lines.append(f"coverage: {self.coverage}")
         for clause in self.clauses:
-            lines.append(f"  [{'x' if clause.met else ' '}] {clause.name}: {clause.detail}")
+            marker = "x" if clause.met else ("?" if clause.unmeasurable else " ")
+            lines.append(f"  [{marker}] {clause.name}: {clause.detail}")
         return "\n".join(lines)
 
 
@@ -193,57 +218,59 @@ class GateResult:
 # ---------------------------------------------------------------------------
 
 
-def _read_json(store: Store, key: str) -> dict[str, Any] | None:
-    """Read a FIRST-PARTY artifact this repository wrote.
-
-    Malformed is deliberately an exception here: every caller is a phase-1
-    clause over a `run_manifest.v1`/arena artifact written by
-    `crucible.runner` and validated against its schema at write time, so a
-    malformed one is a broken build, not a producer we do not control. Reads
-    of documents written OUTSIDE this repository go through
-    :func:`_read_document`, which turns every malformed shape into a red
-    clause instead (`alpha-engine-config-I9869` tracks giving the phase-1
-    clauses the same treatment).
-    """
-    if not store.exists(key):
-        return None
-    return json.loads(store.get_bytes(key))
-
-
 @dataclass(frozen=True)
 class DocumentRead:
-    """One external document, or the reason it could not be read.
+    """One document this gate reads, or the reason it could not be read.
 
     Three outcomes, never two: present-and-readable, ABSENT, and
     UNREADABLE. Collapsing the last two is the defect this exists to prevent
     — "no filed count" and "the file is corrupt" call for different actions,
     and only one of them is about the system rather than about us.
+
+    This is the ONE reader in `gate.py`, for external documents (phase-0
+    clauses, over artifacts written by producers outside this repository) and
+    first-party ones alike (phase-1 clauses, over `run_manifest.v1` and arena
+    artifacts `crucible.runner` writes and validates at write time). A
+    validated-at-write-time schema is not a validated-at-READ-time guarantee
+    — a truncated `run.json` (an interrupted write, a partial multipart
+    upload, a hand-edited artifact) is unreadable regardless of who wrote it,
+    and reading it unguarded was exactly the gap `alpha-engine-config-I9869`
+    closed: `json.loads` plus direct field indexing, raising the same way an
+    external read used to.
     """
 
     document: dict[str, Any] | None
     absent: bool
     problem: str | None
+    #: True when ``problem`` is a statement about OUR ACCESS (the reader
+    #: raised: PermissionError, AccessDenied) rather than about the content
+    #: (unparseable JSON, wrong shape). The distinction is what lets a caller
+    #: report UNMEASURABLE instead of UNMET — round 2 of
+    #: `alpha-engine-config-I9869`: the two were collapsed, so a store outage
+    #: read identically to a broken build.
+    access_problem: bool = False
 
 
 def _read_document(source: str, reader: Callable[[], bytes | None]) -> DocumentRead:
-    """Read one document written by a producer OUTSIDE this repository.
+    """Read one document — first-party or written by a producer outside this
+    repository, this module makes no distinction.
 
     ``reader`` returns the raw bytes, or ``None`` when the source is absent.
 
     The shape of `crucible.board._fetch`, and here for the same reason: this
-    is the only place in `gate.py` where a document nobody in this repository
-    wrote is parsed, and **an exception raised here does not fail one clause —
-    it propagates out of `evaluate` and takes `crucible gate`, `build_ladder`
-    and the board render down together.** One malformed upstream file would
+    is the only place in `gate.py` where a document is parsed, and **an
+    exception raised here does not fail one clause — it propagates out of
+    `evaluate` and takes `crucible gate`, `build_ladder` and the board render
+    down together.** One malformed file — upstream or first-party — would
     then publish NOTHING where a red reading belongs, which is precisely the
     absence-instead-of-red failure the whole gate exists to refuse. So every
     failure mode below becomes a clause detail naming the source and the
     fault.
 
     The broad `except` is deliberate and is not a swallow: the failure mode
-    caught is "an external document cannot be parsed", and the recording
-    surface is the returned :class:`DocumentRead`, which every caller renders
-    into an unmet clause. Nothing is discarded and nothing degrades silently.
+    caught is "a document cannot be parsed", and the recording surface is the
+    returned :class:`DocumentRead`, which every caller renders into an unmet
+    clause. Nothing is discarded and nothing degrades silently.
     """
     try:
         raw = reader()
@@ -253,6 +280,7 @@ def _read_document(source: str, reader: Callable[[], bytes | None]) -> DocumentR
             False,
             f"{source} could not be read: {type(exc).__name__}: {exc}. That is a "
             "statement about our access, not about the system being measured",
+            access_problem=True,
         )
     if raw is None:
         return DocumentRead(None, True, None)
@@ -296,6 +324,161 @@ def _read_path_document(path: Path) -> DocumentRead:
     return _read_document(str(path), reader)
 
 
+@dataclass(frozen=True)
+class LinesRead:
+    """One newline-delimited JSON event log, or the reason it could not be
+    read.
+
+    :class:`DocumentRead`'s shape does not fit an arm register: it is a JSONL
+    event log, not one JSON object, and reporting the first bad line as "the
+    whole key is unreadable" would lose which line. Same three outcomes —
+    present-and-readable, absent, unreadable — and the same access-vs-content
+    distinction as :class:`DocumentRead`, for the same reason.
+    """
+
+    lines: list[dict[str, Any]] | None
+    absent: bool
+    problem: str | None
+    access_problem: bool = False
+
+
+def _read_store_lines(store: Store, key: str) -> LinesRead:
+    """Read one JSONL event log, guarded the same way :func:`_read_document`
+    guards a single document.
+
+    `_register_arms` used to do a bare `json.loads` per line with no guard at
+    all: one malformed line (`arms/{slot}/register.jsonl` = `{not json`)
+    raised `JSONDecodeError` out of `_clause_arms_all_scored`, out of
+    `_phase1`, out of `evaluate` — no ladder, no artifact
+    (`alpha-engine-config-I9869` round 2).
+    """
+    try:
+        present = store.exists(key)
+    except Exception as exc:
+        return LinesRead(
+            None,
+            False,
+            f"{key} could not be read: {type(exc).__name__}: {exc}. That is a statement "
+            "about our access, not about the system being measured",
+            access_problem=True,
+        )
+    if not present:
+        return LinesRead(None, True, None)
+    try:
+        raw = store.get_bytes(key)
+    except Exception as exc:
+        return LinesRead(
+            None,
+            False,
+            f"{key} could not be read: {type(exc).__name__}: {exc}. That is a statement "
+            "about our access, not about the system being measured",
+            access_problem=True,
+        )
+    try:
+        text = raw.decode("utf-8")
+    except Exception as exc:
+        return LinesRead(None, False, f"{key} is not readable UTF-8: {type(exc).__name__}: {exc}")
+    lines: list[dict[str, Any]] = []
+    for lineno, entry in enumerate(text.splitlines(), start=1):
+        if not entry.strip():
+            continue
+        try:
+            parsed = json.loads(entry)
+        except Exception as exc:
+            return LinesRead(
+                None, False, f"{key}:{lineno} is not readable JSON: {type(exc).__name__}: {exc}"
+            )
+        if not isinstance(parsed, dict):
+            return LinesRead(
+                None,
+                False,
+                f"{key}:{lineno} parsed to {type(parsed).__name__}, not an object with fields",
+            )
+        lines.append(parsed)
+    return LinesRead(lines, False, None)
+
+
+@dataclass(frozen=True)
+class KeysRead:
+    """Every key under one store prefix, or the reason the listing could not
+    be read.
+
+    Round 2 of `alpha-engine-config-I9869` guarded every single-key read
+    (`DocumentRead`, `LinesRead`) and left every LISTING unguarded:
+    `store.list_keys` can raise a permission denial mid-listing exactly the
+    way `get_bytes` can, and a bare call at three sites
+    (`_clause_pointer_flipped_on_smoke`, `_clause_independently_reviewed`,
+    `last_read`) raised straight out of `evaluate`/`build_ladder` — round 3,
+    finding 2. No `absent` outcome: an empty listing under a prefix that
+    exists is a legitimate, ordinary reading (zero artifacts filed yet), not
+    an error — unlike a single key, a prefix has no not-there state to
+    distinguish from empty.
+    """
+
+    keys: list[str] | None
+    problem: str | None
+    access_problem: bool = False
+
+
+def _list_store_keys(store: Store, prefix: str) -> KeysRead:
+    try:
+        keys = list(store.list_keys(prefix))
+    except Exception as exc:
+        return KeysRead(
+            None,
+            f"listing {prefix!r} could not be read: {type(exc).__name__}: {exc}. That is a "
+            "statement about our access, not about the system being measured",
+            access_problem=True,
+        )
+    return KeysRead(keys, None)
+
+
+@dataclass(frozen=True)
+class BytesRead:
+    """One key's raw bytes, guarded the same way :class:`DocumentRead` is,
+    for a caller that wants the bytes themselves rather than a parsed
+    document.
+
+    `track_f.gate_handler` records each clause's evidence keys as job
+    lineage (`ctx.record_input`), which hashes the exact bytes the store
+    holds — re-serializing a `DocumentRead.document` back to JSON would not
+    reliably round-trip to those same bytes (key order, whitespace), so
+    lineage recording needs the raw bytes, guarded, not a parsed-and-
+    re-emitted copy.
+    """
+
+    raw: bytes | None
+    absent: bool
+    problem: str | None
+    access_problem: bool = False
+
+
+def _read_store_bytes(store: Store, key: str) -> BytesRead:
+    try:
+        present = store.exists(key)
+    except Exception as exc:
+        return BytesRead(
+            None,
+            False,
+            f"{key} could not be read: {type(exc).__name__}: {exc}. That is a statement "
+            "about our access, not about the system being measured",
+            access_problem=True,
+        )
+    if not present:
+        return BytesRead(None, True, None)
+    try:
+        raw = store.get_bytes(key)
+    except Exception as exc:
+        return BytesRead(
+            None,
+            False,
+            f"{key} could not be read: {type(exc).__name__}: {exc}. That is a statement "
+            "about our access, not about the system being measured",
+            access_problem=True,
+        )
+    return BytesRead(raw, False, None)
+
+
 def arm_name(arm_id: str) -> str:
     """The NAME component of a registered arm id.
 
@@ -312,24 +495,100 @@ def arm_name(arm_id: str) -> str:
     return parts[1] if len(parts) == 3 else arm_id
 
 
-def _register_arms(store: Store, slot: str) -> tuple[set[str], str | None]:
-    """The slot's ACTIVE registered arm ids, and the key they came from."""
+def _register_arms(store: Store, slot: str) -> tuple[set[str], str, str | None, bool]:
+    """The slot's ACTIVE registered arm ids, the key, and the reason if the
+    register could not be read (``problem``, ``access_problem``).
+
+    Guarded through :func:`_read_store_lines` rather than the bare
+    `json.loads` per line this used to run: an unreadable register is a red
+    `arms_all_scored` reading naming the key, never an exception out of
+    `evaluate` (`alpha-engine-config-I9869` round 2).
+    """
     key = arm_register_key(slot)
-    if not store.exists(key):
-        return set(), None
+    read = _read_store_lines(store, key)
+    if read.problem is not None:
+        return set(), key, read.problem, read.access_problem
+    if read.absent:
+        return set(), key, None, False
     from nousergon_lib.arena import ArmRegister  # noqa: PLC0415 - heavy import, one call site
 
-    events = [
-        json.loads(line)
-        for line in store.get_bytes(key).decode("utf-8").splitlines()
-        if line.strip()
-    ]
-    return set(ArmRegister.from_dicts(events).active_arms()), key
+    return set(ArmRegister.from_dicts(read.lines or []).active_arms()), key, None, False
 
 
 # ---------------------------------------------------------------------------
 # phase 1 clauses
 # ---------------------------------------------------------------------------
+
+
+def _field(key: str, document: dict[str, Any], field_name: str, expected_type: type) -> str | None:
+    """``None`` when ``field_name`` is present on ``document`` AND of
+    ``expected_type``, else the malformed detail naming the key, the field,
+    and what is wrong.
+
+    A missing REQUIRED field and a present-but-wrong-typed one are both
+    malformed, not absent: the document exists and is readable JSON, it just
+    does not carry the shape the schema promises. Reporting either as
+    "absent" would send the operator looking for a producer that already
+    ran. Round 1 of `alpha-engine-config-I9869` guarded presence only —
+    `{"rows": 5}`, `{"scored_arms": [{"a": 1}]}` and `{"sha": 12345}` each
+    still crashed a downstream index (`len()`, `set()`, a slice) on a
+    present-but-wrong-typed value; round 2 closes that.
+
+    ``bool`` is a `Python` subclass of `int`, so a caller checking `int`
+    would otherwise accept `True`/`False` — no phase-1 field is typed `int`
+    today, so this is not yet exercised, but the exclusion is written down
+    rather than left to be found the way `alpha-engine-config-I9870`'s
+    `executions_started` check found it.
+    """
+    if field_name not in document:
+        return f"{key}: missing required field `{field_name}`"
+    value = document[field_name]
+    if isinstance(value, bool) and expected_type is not bool:
+        return f"{key}: `{field_name}` is {value!r}, not {expected_type.__name__}"
+    if not isinstance(value, expected_type):
+        return f"{key}: `{field_name}` is {value!r}, not {expected_type.__name__}"
+    return None
+
+
+@lru_cache(maxsize=1)
+def _manifest_status_values() -> frozenset[str]:
+    """The exhaustive `run_manifest.v1` `status` vocabulary, derived from the
+    SCHEMA every manifest is validated against at write time — never a
+    restated literal, so a schema change is picked up here without a second
+    edit that could drift from it. `alpha-engine-config-I9869` round 2: a
+    manifest carrying `status: "degraded"` or `status: 3` was re-rendered as
+    `failed` by the `!= "ok"` comparison every phase-1 clause used, silently
+    accepting any value the schema itself forbids.
+    """
+    return frozenset(load_schema()["properties"]["status"]["enum"])
+
+
+def _status(key: str, document: dict[str, Any]) -> tuple[str | None, str | None]:
+    """The document's validated `status`, or the malformed detail naming why
+    it is not one.
+
+    Three checks, in order: `status` is present and a string; it is one of
+    the schema's exhaustive values (never `!= "ok"`, which lets anything
+    through); and `status: "ok"` implies `reason == ""` — the same
+    implication `run_manifest.v1`'s own conditional schema enforces at write
+    time, so a manifest that satisfied it when written and was since
+    hand-edited is exactly the malformed input this clause exists to catch.
+    """
+    problem = _field(key, document, "status", str)
+    if problem is not None:
+        return None, problem
+    status = document["status"]
+    if status not in _manifest_status_values():
+        return None, (
+            f"{key}: `status` is {status!r}, not one of {sorted(_manifest_status_values())}"
+        )
+    problem = _field(key, document, "reason", str)
+    if problem is not None:
+        return None, problem
+    reason = document["reason"]
+    if status == "ok" and reason != "":
+        return None, f"{key}: status `ok` but `reason` is {reason!r}, not empty"
+    return status, None
 
 
 def _clause_arc_runs_ok(
@@ -340,24 +599,50 @@ def _clause_arc_runs_ok(
         "trading day in the window"
     )
     missing: list[str] = []
+    malformed: list[str] = []
+    unmeasurable: list[str] = []
     failed: list[str] = []
     evidence: list[str] = []
     for day in window:
         for stage in arc_stages(day, registry):
             key = manifest_key(stage.job, day.isoformat(), discriminator=stage.slot)
             evidence.append(key)
-            document = _read_json(store, key)
-            if document is None:
+            read = _read_store_document(store, key)
+            if read.problem is not None:
+                (unmeasurable if read.access_problem else malformed).append(read.problem)
+                continue
+            if read.absent:
                 missing.append(f"{stage.label}@{day.isoformat()}")
-            elif document["status"] != "ok":
+                continue
+            document = read.document or {}
+            status, problem = _status(key, document)
+            if problem is not None:
+                malformed.append(problem)
+                continue
+            if status != "ok":
                 failed.append(f"{stage.label}@{day.isoformat()}: {document['reason']}")
-    if missing or failed:
+    if missing or malformed or unmeasurable or failed:
         parts = []
+        if unmeasurable:
+            parts.append(f"{len(unmeasurable)} could not be read: {'; '.join(unmeasurable[:2])}")
         if missing:
             parts.append(f"{len(missing)} never ran ({', '.join(missing[:4])}...)")
+        if malformed:
+            parts.append(f"{len(malformed)} malformed: {'; '.join(malformed[:4])}")
         if failed:
             parts.append(f"{len(failed)} failed ({'; '.join(failed[:2])})")
-        return Clause("arc_runs_ok", requirement, False, "; ".join(parts), tuple(evidence))
+        content_gap = bool(missing or malformed or failed)
+        return Clause(
+            "arc_runs_ok",
+            requirement,
+            False,
+            "; ".join(parts),
+            tuple(evidence),
+            # A content gap (missing/malformed/failed) is a real reading —
+            # never masked as "could not measure" just because an unrelated
+            # access failure also occurred (round 3, finding 6).
+            unmeasurable=bool(unmeasurable) and not content_gap,
+        )
     return Clause(
         "arc_runs_ok",
         requirement,
@@ -373,17 +658,49 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
         "arms, on every trading day in the window"
     )
     gaps: list[str] = []
+    unmeasurable: list[str] = []
     evidence: list[str] = []
+    # Each slot's register is read ONCE, before the day loop. `_register_arms`
+    # reads a single key per SLOT, not per day — re-reading it inside the day
+    # x slot loop (round 2's shape) meant one malformed register filed the
+    # SAME problem up to `len(window)` times, filling `gaps[:4]` with
+    # duplicates of it and hiding a genuinely missing arena cycle for an
+    # unrelated slot/day (`alpha-engine-config-I9869` round 3, finding 5).
+    registers: dict[str, tuple[set[str], str | None, str | None, bool]] = {}
+    for slot in SLOTS:
+        registered, register_key, register_problem, register_access = _register_arms(store, slot)
+        registers[slot] = (registered, register_key, register_problem, register_access)
+        if register_key is not None:
+            evidence.append(register_key)
+        if register_problem is not None:
+            (unmeasurable if register_access else gaps).append(register_problem)
     for day in window:
         for slot, spec in SLOTS.items():
             key = arena_cycle_key(slot, day.isoformat())
             evidence.append(key)
-            cycle = _read_json(store, key)
-            if cycle is None:
+            read = _read_store_document(store, key)
+            if read.problem is not None:
+                (unmeasurable if read.access_problem else gaps).append(read.problem)
+                continue
+            if read.absent:
                 gaps.append(f"{slot}@{day.isoformat()}: no arena_cycle artifact")
                 continue
+            cycle = read.document or {}
+            problem = _field(key, cycle, "scored_arms", list)
+            if problem is not None:
+                gaps.append(problem)
+                continue
+            non_str = [a for a in cycle["scored_arms"] if not isinstance(a, str)]
+            if non_str:
+                gaps.append(f"{key}: `scored_arms` contains non-string element(s): {non_str[:2]!r}")
+                continue
             scored = set(cycle["scored_arms"])
-            registered, _ = _register_arms(store, slot)
+            registered, _register_key, register_problem, _register_access = registers[slot]
+            if register_problem is not None:
+                # Already recorded once, above, when the register was read.
+                # This day's contribution to the SAME problem is not a
+                # second independent finding.
+                continue
             unscored = registered - scored
             if unscored:
                 gaps.append(f"{slot}@{day.isoformat()}: {sorted(unscored)} registered but unscored")
@@ -393,8 +710,29 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
                     f"{slot}@{day.isoformat()}: no control arm was scored — an unscored "
                     "control is an unverified grader (§10.1)"
                 )
-    if gaps:
-        return Clause("arms_all_scored", requirement, False, "; ".join(gaps[:4]), tuple(evidence))
+    # De-duplicated before truncating: a defensive backstop over the hoist
+    # above, not a substitute for it — the hoist removes the duplication at
+    # its source, this just refuses to let any future duplicate source push
+    # a distinct finding out of the `[:4]` window.
+    gaps = list(dict.fromkeys(gaps))
+    unmeasurable = list(dict.fromkeys(unmeasurable))
+    if gaps or unmeasurable:
+        parts = []
+        if unmeasurable:
+            parts.append(f"{len(unmeasurable)} could not be read: {'; '.join(unmeasurable[:2])}")
+        if gaps:
+            parts.append("; ".join(gaps[:4]))
+        return Clause(
+            "arms_all_scored",
+            requirement,
+            False,
+            "; ".join(parts),
+            tuple(evidence),
+            # A content gap is a real reading — never masked as "could not
+            # measure" just because an unrelated access failure also
+            # occurred (round 3, finding 6).
+            unmeasurable=bool(unmeasurable) and not gaps,
+        )
     return Clause(
         "arms_all_scored",
         requirement,
@@ -411,21 +749,47 @@ def _clause_attribution_renders(store: Store, window: list[dt.date]) -> Clause:
     )
     day = window[-1]
     key = attribution_key(day.isoformat())
-    document = _read_json(store, key)
-    if document is None:
+    read = _read_store_document(store, key)
+    if read.problem is not None:
+        return Clause(
+            "attribution_renders",
+            requirement,
+            False,
+            read.problem,
+            (key,),
+            unmeasurable=read.access_problem,
+        )
+    if read.absent:
         return Clause("attribution_renders", requirement, False, f"{key} is absent", (key,))
-    rows = document.get("rows", [])
+    document = read.document or {}
+    rows_problem = _field(key, document, "rows", list)
+    if rows_problem is not None:
+        return Clause("attribution_renders", requirement, False, rows_problem, (key,))
+    rows = document["rows"]
     if len(rows) != 5:
         return Clause(
             "attribution_renders", requirement, False, f"{len(rows)} rows, expected 5", (key,)
         )
-    silent = [
-        r["name"]
-        for r in rows
-        if r.get("value") is None
-        and not str(r.get("status", "")).startswith("N/A")
-        or not r.get("status_reason")
-    ]
+    silent: list[str] = []
+    for idx, r in enumerate(rows):
+        row_key = f"{key}[{idx}]"
+        if not isinstance(r, dict):
+            return Clause(
+                "attribution_renders",
+                requirement,
+                False,
+                f"{row_key}: row is {type(r).__name__}, not an object with fields",
+                (key,),
+            )
+        name_problem = _field(row_key, r, "name", str)
+        if name_problem is not None:
+            return Clause("attribution_renders", requirement, False, name_problem, (key,))
+        if (
+            r.get("value") is None
+            and not str(r.get("status", "")).startswith("N/A")
+            or not r.get("status_reason")
+        ):
+            silent.append(r["name"])
     if silent:
         return Clause(
             "attribution_renders",
@@ -445,12 +809,47 @@ def _clause_explain_walks_a_verdict(store: Store, window: list[dt.date]) -> Clau
         "was exercised on real output, not only in tests"
     )
     evidence = [manifest_key("explain", d.isoformat()) for d in window]
+    malformed: list[str] = []
+    unmeasurable: list[str] = []
     for key in evidence:
-        document = _read_json(store, key)
-        if document is None or document["status"] != "ok":
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            (unmeasurable if read.access_problem else malformed).append(read.problem)
             continue
-        if any("verdict.json" in i["key"] for i in document.get("inputs", [])):
+        if read.absent:
+            continue
+        document = read.document or {}
+        status, problem = _status(key, document)
+        if problem is not None:
+            malformed.append(problem)
+            continue
+        if status != "ok":
+            continue
+        inputs_problem = _field(key, document, "inputs", list)
+        if inputs_problem is not None:
+            malformed.append(inputs_problem)
+            continue
+        inputs = document["inputs"]
+        if any(isinstance(i, dict) and "verdict.json" in str(i.get("key", "")) for i in inputs):
             return Clause("explain_walks_a_verdict", requirement, True, f"walked at {key}", (key,))
+    if unmeasurable or malformed:
+        detail = ""
+        if unmeasurable:
+            detail = f"{len(unmeasurable)} could not be read: {'; '.join(unmeasurable[:2])}"
+        if malformed:
+            detail = f"{detail}; " if detail else detail
+            detail += "; ".join(malformed)
+        return Clause(
+            "explain_walks_a_verdict",
+            requirement,
+            False,
+            detail,
+            tuple(evidence),
+            # A content gap (malformed) is a real reading — never masked as
+            # "could not measure" just because an unrelated access failure
+            # also occurred (round 3, finding 6).
+            unmeasurable=bool(unmeasurable) and not malformed,
+        )
     return Clause(
         "explain_walks_a_verdict",
         requirement,
@@ -465,8 +864,17 @@ def _clause_pointer_flipped_on_smoke(store: Store, window: list[dt.date]) -> Cla
         "releases/current names a sha, and an `ok` smoke manifest carries that same "
         "release_sha — the pointer flipped on a real smoke, not by hand"
     )
-    pointer = _read_json(store, POINTER_KEY)
-    if pointer is None:
+    pointer_read = _read_store_document(store, POINTER_KEY)
+    if pointer_read.problem is not None:
+        return Clause(
+            "pointer_flipped_on_smoke",
+            requirement,
+            False,
+            pointer_read.problem,
+            (POINTER_KEY,),
+            unmeasurable=pointer_read.access_problem,
+        )
+    if pointer_read.absent:
         return Clause(
             "pointer_flipped_on_smoke",
             requirement,
@@ -474,14 +882,46 @@ def _clause_pointer_flipped_on_smoke(store: Store, window: list[dt.date]) -> Cla
             f"{POINTER_KEY} is absent; no release has ever been published",
             (POINTER_KEY,),
         )
-    sha = pointer.get("sha", "")
+    pointer = pointer_read.document or {}
+    sha_problem = _field(POINTER_KEY, pointer, "sha", str)
+    if sha_problem is not None:
+        return Clause(
+            "pointer_flipped_on_smoke",
+            requirement,
+            False,
+            sha_problem,
+            (POINTER_KEY,),
+        )
+    sha = pointer["sha"]
     evidence = [POINTER_KEY]
-    for key in store.list_keys(runs_prefix("smoke")):
+    malformed: list[str] = []
+    unmeasurable: list[str] = []
+    smoke_keys = _list_store_keys(store, runs_prefix("smoke"))
+    if smoke_keys.problem is not None:
+        return Clause(
+            "pointer_flipped_on_smoke",
+            requirement,
+            False,
+            smoke_keys.problem,
+            tuple(evidence),
+            unmeasurable=smoke_keys.access_problem,
+        )
+    for key in smoke_keys.keys or []:
         if not key.endswith("run.json"):
             continue
         evidence.append(key)
-        document = _read_json(store, key)
-        if document and document["status"] == "ok" and document.get("release_sha") == sha:
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            (unmeasurable if read.access_problem else malformed).append(read.problem)
+            continue
+        if read.absent:
+            continue
+        document = read.document or {}
+        status, problem = _status(key, document)
+        if problem is not None:
+            malformed.append(problem)
+            continue
+        if status == "ok" and document.get("release_sha") == sha:
             return Clause(
                 "pointer_flipped_on_smoke",
                 requirement,
@@ -489,6 +929,24 @@ def _clause_pointer_flipped_on_smoke(store: Store, window: list[dt.date]) -> Cla
                 f"{POINTER_KEY} -> {sha[:12]}, smoked at {key}",
                 tuple(evidence),
             )
+    if unmeasurable or malformed:
+        detail = ""
+        if unmeasurable:
+            detail = f"{len(unmeasurable)} could not be read: {'; '.join(unmeasurable[:2])}"
+        if malformed:
+            detail = f"{detail}; " if detail else detail
+            detail += "; ".join(malformed)
+        return Clause(
+            "pointer_flipped_on_smoke",
+            requirement,
+            False,
+            detail,
+            tuple(evidence),
+            # A content gap (malformed) is a real reading — never masked as
+            # "could not measure" just because an unrelated access failure
+            # also occurred in the same window (round 3, finding 6).
+            unmeasurable=bool(unmeasurable) and not malformed,
+        )
     return Clause(
         "pointer_flipped_on_smoke",
         requirement,
@@ -578,7 +1036,21 @@ def _clause_independently_reviewed(store: Store, phase: str, window: list[dt.dat
     )
     prefix = review_prefix(phase)
     days = {day.isoformat() for day in window}
-    keys = sorted(key for key in store.list_keys(prefix) if key.endswith(".json"))
+    listed = _list_store_keys(store, prefix)
+    if listed.problem is not None:
+        # A listing that could not even be attempted is not "no review has
+        # ever been filed" — it is "we could not ask", which is a fact about
+        # our access, not about whether an independent review exists
+        # (`alpha-engine-config-I9869` round 3, finding 2).
+        return Clause(
+            "independently_reviewed",
+            requirement,
+            False,
+            listed.problem,
+            (prefix,),
+            unmeasurable=listed.access_problem,
+        )
+    keys = sorted(key for key in listed.keys or [] if key.endswith(".json"))
     if not keys:
         return Clause(
             "independently_reviewed",
@@ -592,11 +1064,12 @@ def _clause_independently_reviewed(store: Store, phase: str, window: list[dt.dat
 
     evidence = tuple(keys)
     problems: list[str] = []
+    access_problems: list[str] = []
     reviews: list[_Review] = []
     for key in keys:
         read = _read_store_document(store, key)
         if read.problem is not None:
-            problems.append(read.problem)
+            (access_problems if read.access_problem else problems).append(read.problem)
             continue
         if read.absent:
             problems.append(f"{key} was listed and then could not be read")
@@ -607,8 +1080,25 @@ def _clause_independently_reviewed(store: Store, phase: str, window: list[dt.dat
             continue
         if review is not None:
             reviews.append(review)
-    if problems:
-        return Clause("independently_reviewed", requirement, False, "; ".join(problems), evidence)
+    if problems or access_problems:
+        parts = []
+        if access_problems:
+            parts.append(
+                f"{len(access_problems)} could not be read: {'; '.join(access_problems[:2])}"
+            )
+        if problems:
+            parts.append("; ".join(problems))
+        return Clause(
+            "independently_reviewed",
+            requirement,
+            False,
+            "; ".join(parts),
+            evidence,
+            # A content problem is a real reading — never masked as "could
+            # not measure" just because an unrelated access failure also
+            # occurred (round 3, finding 6, same class as finding 3).
+            unmeasurable=bool(access_problems) and not problems,
+        )
 
     self_reviews = [r for r in reviews if r.is_self_review]
     independent = [r for r in reviews if not r.is_self_review]
@@ -1310,25 +1800,37 @@ PHASES: tuple[Phase, ...] = (
 #: remove (`observability-policy` §8.3, same posture as
 #: `crucible.console.classify`).
 #:
-#: * `MET`          — the gate was read and every clause is met.
-#: * `UNMET`        — the gate was read and at least one clause is not met.
-#:                    A real result, not a failure.
-#: * `UNMEASURED`   — no clause list is registered for this phase, or no
-#:                    reading has ever been filed. Never green, never zero.
-#: * `OUT_OF_ORDER` — a later phase is being graded while an earlier phase's
-#:                    gate is not met. Brian's ruling of 2026-09-02: phase 0's
-#:                    gate must READ before phase 2 opens.
-LADDER_STATES: tuple[str, ...] = ("MET", "UNMET", "UNMEASURED", "OUT_OF_ORDER")
+#: * `MET`           — the gate was read and every clause is met.
+#: * `UNMET`         — the gate was read and at least one clause is not met.
+#:                     A real result, not a failure.
+#: * `UNMEASURED`    — no clause list is registered for this phase, or no
+#:                     reading has ever been filed. Never green, never zero.
+#: * `UNMEASURABLE`  — a read was attempted and could not complete: a store
+#:                     access failure on one clause, or on the listing that
+#:                     answers "when was this last read". Reusing
+#:                     `crucible.board`'s vocabulary, not restating it —
+#:                     `board.BOARD_STATES` already carries this exact word
+#:                     and `LADDER_BOARD_STATE` maps it straight through
+#:                     (`alpha-engine-config-I9869` round 3, finding 4). Red,
+#:                     never folded into `UNMET`: "it says no" and "I could
+#:                     not ask" are different facts, and the second is about
+#:                     us.
+#: * `OUT_OF_ORDER`  — a later phase is being graded while an earlier phase's
+#:                     gate is not met. Brian's ruling of 2026-09-02: phase 0's
+#:                     gate must READ before phase 2 opens.
+LADDER_STATES: tuple[str, ...] = ("MET", "UNMET", "UNMEASURED", "UNMEASURABLE", "OUT_OF_ORDER")
 
 #: How a ladder state renders on the fleet console, in `observability-policy`
 #: §8.3's vocabulary. `UNMEASURED` maps to `UNREPORTED` and therefore counts
 #: against the transparency gap whose objective is zero — a phase nobody can
-#: read is unobserved, not healthy. `OUT_OF_ORDER` maps to `FAILED` because it
-#: is an invariant breach, not a slow phase.
+#: read is unobserved, not healthy. `UNMEASURABLE` and `OUT_OF_ORDER` both map
+#: to `FAILED`: one is an access fault, the other an invariant breach, but
+#: neither is a slow phase or a plain shortfall.
 LADDER_CONSOLE_STATE: dict[str, str] = {
     "MET": "HEALTHY",
     "UNMET": "DEGRADED",
     "UNMEASURED": "UNREPORTED",
+    "UNMEASURABLE": "FAILED",
     "OUT_OF_ORDER": "FAILED",
 }
 
@@ -1354,21 +1856,32 @@ def _check_ladder_console_coverage(states: Iterable[str], console_map: dict[str,
 _check_ladder_console_coverage(LADDER_STATES, LADDER_CONSOLE_STATE)
 
 
-def last_read(store: Store, gate: str) -> str | None:
-    """The most recent trading day a reading of ``gate`` was filed for.
+def last_read(store: Store, gate: str) -> tuple[str | None, bool]:
+    """The most recent trading day a reading of ``gate`` was filed for, and
+    whether the listing itself could not be read.
 
-    ``None`` when the gate has never been read. That is the field the ladder
-    row publishes as "when was this last measured", and a row that cannot
-    answer it says so rather than borrowing the ladder's own generation time —
-    a freshly written ladder full of never-measured phases would otherwise look
-    entirely fresh.
+    ``(None, False)`` when the gate has never been read. That is the field
+    the ladder row publishes as "when was this last measured", and a row
+    that cannot answer it says so rather than borrowing the ladder's own
+    generation time — a freshly written ladder full of never-measured phases
+    would otherwise look entirely fresh.
+
+    ``(None, True)`` is a THIRD, different answer: the listing itself could
+    not be read (a store access failure), not "never measured". A bare
+    `store.list_keys` here used to raise straight out of `build_ladder`, the
+    one guarded-single-key-read discipline round 2 established applied to
+    every `_read_store_document`/`_read_store_lines` call but not to this
+    listing (`alpha-engine-config-I9869` round 3, finding 2).
     """
+    listed = _list_store_keys(store, gate_prefix(gate))
+    if listed.problem is not None:
+        return None, listed.access_problem
     days: list[str] = []
-    for key in store.list_keys(gate_prefix(gate)):
+    for key in listed.keys or []:
         parts = key.split("/")
         if key.endswith("/gate.json") and len(parts) == 4:
             days.append(parts[2])
-    return max(days) if days else None
+    return (max(days) if days else None), False
 
 
 @dataclass(frozen=True)
@@ -1381,6 +1894,13 @@ class PhaseRow:
     detail: str
     clauses_met: int | None
     clauses_total: int | None
+    #: How many of this phase's clauses read UNMEASURABLE — a store access
+    #: failure, distinct from a clause that was read and found unmet. `None`
+    #: exactly where `clauses_total` is `None` (no clause list registered at
+    #: all); otherwise always a count, `0` included, so its absence on the
+    #: wire is never ambiguous with "not counted"
+    #: (`alpha-engine-config-I9869` round 3, finding 4).
+    clauses_unmeasurable: int | None
     met_ratio: float | None
     read_on: str | None
     blocked_by: str | None
@@ -1402,6 +1922,7 @@ class PhaseRow:
             "detail": self.detail,
             "clauses_met": self.clauses_met,
             "clauses_total": self.clauses_total,
+            "clauses_unmeasurable": self.clauses_unmeasurable,
             # `null`, never 0.0, when nothing was measured. Zero is a
             # measurement; absence is not, and rendering one as the other is
             # the whole defect (principle 7).
@@ -1492,7 +2013,9 @@ def build_ladder(
     reg = registry if registry is not None else load_registry()
     supplied = readings or {}
 
-    gate_states: list[tuple[Phase, str, str, int | None, int | None, float | None, str | None]] = []
+    gate_states: list[
+        tuple[Phase, str, str, int | None, int | None, int | None, float | None, str | None]
+    ] = []
     for phase in PHASES:
         if phase.gate is None or phase.gate not in GATES:
             gate_states.append(
@@ -1505,6 +2028,7 @@ def build_ladder(
                     None,
                     None,
                     None,
+                    None,
                 )
             )
             continue
@@ -1513,7 +2037,8 @@ def build_ladder(
         )
         met = sum(1 for c in reading.clauses if c.met)
         total = len(reading.clauses)
-        read_on = last_read(store, phase.gate)
+        unmeasurable_count = sum(1 for c in reading.clauses if c.unmeasurable)
+        read_on, read_on_access_problem = last_read(store, phase.gate)
         if total == 0:
             # A gate with no clauses measured nothing. `met` would be
             # vacuously true, and `reading.met_ratio` is already `None` here
@@ -1530,17 +2055,19 @@ def build_ladder(
                     f"gate {phase.gate} has no clauses",
                     0,
                     0,
+                    0,
                     reading.met_ratio,
                     read_on,
                 )
             )
             continue
-        unmet = [c.name for c in reading.clauses if not c.met]
-        detail = (
-            f"{met}/{total} clauses met"
-            if not unmet
-            else f"{met}/{total} clauses met; holding: {', '.join(unmet)}"
-        )
+        unmet = [c.name for c in reading.clauses if not c.met and not c.unmeasurable]
+        unmeasurable_names = [c.name for c in reading.clauses if c.unmeasurable]
+        detail = f"{met}/{total} clauses met"
+        if unmeasurable_names:
+            detail = f"{detail}; unmeasurable: {', '.join(unmeasurable_names)}"
+        if unmet:
+            detail = f"{detail}; holding: {', '.join(unmet)}"
         # The coverage line travels with the row. Without it a phase whose
         # gate grades a SUBSET of its deliverables renders MET on the ladder
         # and on the board with nothing saying so — partial coverage reported
@@ -1548,13 +2075,28 @@ def build_ladder(
         # exists to make visible rather than one this row gets to repeat.
         if reading.coverage:
             detail = f"{detail}; {reading.coverage}"
+        if read_on_access_problem:
+            detail = (
+                f"{detail}; could not determine when gate {phase.gate} was last read "
+                "(store access failure)"
+            )
+        # `UNMEASURABLE` outranks `MET`/`UNMET`: a phase with one unreadable
+        # clause, or whose own read-history listing failed, was rendering as
+        # plain `UNMET` with a specific `met_ratio` — indistinguishable from
+        # "we checked and it fell short" (`alpha-engine-config-I9869` round
+        # 3, finding 4).
+        if unmeasurable_count > 0 or read_on_access_problem:
+            state = "UNMEASURABLE"
+        else:
+            state = "MET" if reading.met else "UNMET"
         gate_states.append(
             (
                 phase,
-                "MET" if reading.met else "UNMET",
+                state,
                 detail,
                 met,
                 total,
+                unmeasurable_count,
                 reading.met_ratio,
                 read_on,
             )
@@ -1565,7 +2107,16 @@ def build_ladder(
     # depends on a hand-maintained claim about which phase is "open".
     first_unmet = next((i for i, s in enumerate(gate_states) if s[1] != "MET"), len(gate_states))
     rows: list[PhaseRow] = []
-    for index, (phase, gate_state, detail, met, total, ratio, read_on) in enumerate(gate_states):
+    for index, (
+        phase,
+        gate_state,
+        detail,
+        met,
+        total,
+        unmeasurable_count,
+        ratio,
+        read_on,
+    ) in enumerate(gate_states):
         state = gate_state
         blocked_by = None
         if index > first_unmet and read_on is not None:
@@ -1585,6 +2136,7 @@ def build_ladder(
                 detail=detail,
                 clauses_met=met,
                 clauses_total=total,
+                clauses_unmeasurable=unmeasurable_count,
                 met_ratio=ratio,
                 read_on=read_on,
                 blocked_by=blocked_by,

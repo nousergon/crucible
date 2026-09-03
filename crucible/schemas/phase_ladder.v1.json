@@ -70,6 +70,7 @@
         "detail",
         "clauses_met",
         "clauses_total",
+        "clauses_unmeasurable",
         "met_ratio",
         "read_on",
         "blocked_by",
@@ -91,9 +92,9 @@
           "type": ["string", "null"]
         },
         "state": {
-          "description": "crucible.gate.LADDER_STATES: MET | UNMET | UNMEASURED | OUT_OF_ORDER. Closed set.",
+          "description": "crucible.gate.LADDER_STATES: MET | UNMET | UNMEASURED | UNMEASURABLE | OUT_OF_ORDER. Closed set.",
           "type": "string",
-          "enum": ["MET", "UNMET", "UNMEASURED", "OUT_OF_ORDER"]
+          "enum": ["MET", "UNMET", "UNMEASURED", "UNMEASURABLE", "OUT_OF_ORDER"]
         },
         "console_state": {
           "description": "crucible.gate.LADDER_CONSOLE_STATE's rendering, in observability-policy §8.3's vocabulary.",
@@ -102,7 +103,7 @@
         },
         "gate_state": {
           "type": "string",
-          "enum": ["MET", "UNMET", "UNMEASURED"]
+          "enum": ["MET", "UNMET", "UNMEASURED", "UNMEASURABLE"]
         },
         "detail": { "type": "string" },
         "clauses_met": {
@@ -111,6 +112,11 @@
           "minimum": 0
         },
         "clauses_total": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "clauses_unmeasurable": {
+          "description": "Count of this phase's clauses that read UNMEASURABLE (a store access failure, distinct from a clause that was read and found unmet). null exactly where clauses_total is null (no registered gate).",
           "type": ["integer", "null"],
           "minimum": 0
         },
