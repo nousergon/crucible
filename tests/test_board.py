@@ -896,6 +896,44 @@ class TestTheProducerRunsWithoutTheWeeklyArc:
             "the `on.schedule` cron in .github/workflows/board.yml"
         )
 
+    def test_the_row_names_the_workflow_that_starts_it(self) -> None:
+        """The link is DECLARED, not inferred from shell text.
+
+        The first version of the cross-repo guard matched `crucible board` in
+        board.yml's `run:` bodies. An adversarial review commented the command
+        out, left `echo skipped` in its place, and the guard read green — the
+        I9878 defect reproduced through the value added to fix it.
+        `tests/test_workflow_triggers.py` already carries the general result
+        from five rounds against a different guard: any predicate over a
+        `run:` body is a partial shell parser, and a partial shell parser is a
+        denylist of the syntax someone thought of.
+        """
+        assert load_registry()["board"].dispatch_workflow == "board.yml"
+
+    def test_a_github_actions_row_that_names_no_workflow_is_refused(self) -> None:
+        """The field is not optional on the rows that need it. A
+        `github-actions` row naming no workflow would be verifiable against
+        nothing, which is a hole in the vocabulary rather than a value in it.
+        """
+        import dataclasses as _dc
+
+        from crucible.components import Component as _Component
+
+        row = load_registry()["board"]
+        with pytest.raises(ValueError, match="dispatch_workflow is required"):
+            _dc.replace(row, dispatch_workflow=None)
+        assert isinstance(row, _Component)
+
+    def test_a_non_github_actions_row_may_not_name_a_workflow(self) -> None:
+        """The converse. A workflow name on a `scheduler` or `arc` row is a
+        second declaration of the starter that nothing reads and nothing
+        checks, so it can say anything and drift silently."""
+        import dataclasses as _dc
+
+        arc_row = next(r for r in load_registry().values() if r.dispatch == "arc")
+        with pytest.raises(ValueError, match="forbidden on any other"):
+            _dc.replace(arc_row, dispatch_workflow="board.yml")
+
     def test_the_workflow_named_by_the_row_is_the_one_that_actually_crons_it(self) -> None:
         """The half of the claim this repository can check on its own.
 
@@ -908,12 +946,10 @@ class TestTheProducerRunsWithoutTheWeeklyArc:
         """
         import yaml
 
+        named = load_registry()["board"].dispatch_workflow
         workflow = yaml.safe_load(
             (
-                pathlib.Path(__file__).resolve().parent.parent
-                / ".github"
-                / "workflows"
-                / "board.yml"
+                pathlib.Path(__file__).resolve().parent.parent / ".github" / "workflows" / named
             ).read_text(encoding="utf-8")
         )
         # `on` parses as the boolean True under YAML 1.1 — the key is not the

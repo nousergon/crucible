@@ -189,6 +189,31 @@ class Component:
     #: against the CloudFormation template and this repo's workflows, because
     #: that is where the other half of each pair lives.
     dispatch: str | None = None
+    #: WHICH workflow file starts a `github-actions` row — the basename only,
+    #: e.g. `board.yml`. Required on exactly those rows and forbidden on every
+    #: other, enforced by :func:`load_registry`.
+    #:
+    #: It exists because the link has to be something a workflow DECLARES.
+    #: The first version of the cross-repo guard matched `crucible <job>` in
+    #: each step's `run:` body, and an adversarial review defeated it by
+    #: commenting the command out: the board rendered nothing and the guard
+    #: read green. `tests/test_workflow_triggers.py` already records the
+    #: general result, from five rounds against a different guard — any
+    #: predicate over a `run:` body is a partial shell parser, and a partial
+    #: shell parser is a denylist of the syntax someone thought of. So the
+    #: workflow is named here, in the file whose whole job is declaring
+    #: wiring, and the naming is checked BOTH ways: no row may name a
+    #: workflow that does not exist or carries no cron, and no workflow
+    #: carrying a cron may go unnamed.
+    #:
+    #: What this proves and what it does not: that the declared starter
+    #: EXISTS, exactly as the `scheduler` half proves an
+    #: `AWS::Scheduler::Schedule` exists with this job in its `Target.Input`.
+    #: Neither half proves the started thing does its work — no structural
+    #: artifact in either system encodes that. That is `absence_watched_by`'s
+    #: question, and it is answered by the missing artifact rather than by
+    #: reading a schedule or a workflow.
+    dispatch_workflow: str | None = None
     #: WHO would notice this row's absence. Almost always `alerts.sweep`.
     #: The two exceptions are the sweep itself (a sweep that never ran
     #: cannot report itself missing) and the heartbeat, whose watcher is
@@ -205,6 +230,15 @@ class Component:
     def __post_init__(self) -> None:
         if self.dispatch is not None and self.dispatch not in DISPATCHES:
             raise ValueError(f"{self.name}: dispatch {self.dispatch!r} not in {DISPATCHES}")
+        if (self.dispatch == "github-actions") != (self.dispatch_workflow is not None):
+            raise ValueError(
+                f"{self.name}: dispatch_workflow is required on a `github-actions` row "
+                f"and forbidden on any other, and this row has dispatch "
+                f"{self.dispatch!r} with dispatch_workflow {self.dispatch_workflow!r}. "
+                "A `github-actions` row naming no workflow could not be verified "
+                "against anything, and a name on a row nothing reads it for is a "
+                "second declaration that can drift."
+            )
         if self.lifecycle not in LIFECYCLES:
             raise ValueError(f"{self.name}: lifecycle {self.lifecycle!r} not in {LIFECYCLES}")
         if self.scheduled and self.deadline is None:
@@ -257,6 +291,7 @@ def load_registry(path: str | None = None) -> dict[str, Component]:
             artifact_retention=row["artifact_retention"],
             schedule=row["schedule"],
             dispatch=row["dispatch"],
+            dispatch_workflow=row.get("dispatch_workflow"),
             absence_watched_by=row.get("absence_watched_by", "alerts.sweep"),
             deadline=Deadline.from_yaml(row["deadline"]),
         )
