@@ -47,7 +47,6 @@ from __future__ import annotations
 
 import ast
 import datetime as dt
-import json
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -56,6 +55,7 @@ from typing import Any
 import yaml
 from krepis.usage_pacing import PaceStatus, pace_check
 
+from crucible.documents import load_store_document
 from crucible.keys import RUNS_ROOT, is_manifest_key
 from crucible.store import Store
 
@@ -298,7 +298,10 @@ def week_to_date_llm_spend(store: Store, *, window_start: dt.date, trading_day: 
         # arity too (alpha-engine-config-I9900).
         if not is_manifest_key(key):
             continue
-        manifest = json.loads(store.get_bytes(key).decode("utf-8"))
+        # STRICT face of the one reader: a cap that skipped an unreadable
+        # manifest would under-count spend in exactly the run most likely to
+        # have overspent, so a corrupt one stops the job with its key named.
+        manifest = load_store_document(store, key)
         day = dt.date.fromisoformat(manifest["trading_day"])
         if not window_start <= day <= trading_day:
             continue

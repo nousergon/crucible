@@ -40,6 +40,7 @@ from crucible.console.render import (
     classify_registry,
     write_page,
 )
+from crucible.documents import load_store_document, read_store_document
 from crucible.drift import drift_metrics
 from crucible.gate import (
     GATES,
@@ -279,7 +280,7 @@ def smoke_handler(args: argparse.Namespace) -> int:
             ctx.record_input(key, payload, schema_version=release.RELEASE_SCHEMA_VERSION)
             read.append(key)
             if key == release.POINTER_KEY:
-                pointed = json.loads(payload.decode("utf-8"))["sha"]
+                pointed = load_store_document(store, key)["sha"]
                 # A v2-or-v3 record for the POINTED sha, not `sha` under
                 # test — its wheel may live at the legacy (unpip-installable)
                 # v2 path, so `wheel_key(pointed)` alone cannot answer this.
@@ -290,7 +291,7 @@ def smoke_handler(args: argparse.Namespace) -> int:
                 if store.exists(pointed_meta_k):
                     try:
                         pointed_record = release.parse_release_record(
-                            json.loads(store.get_bytes(pointed_meta_k).decode("utf-8"))
+                            load_store_document(store, pointed_meta_k)
                         )
                     except (ValueError, TypeError):
                         # Swallowed here only: this whole branch is the
@@ -504,9 +505,7 @@ def drift_handler(args: argparse.Namespace) -> int:
                 "UNREPORTED and an exit code of 0 is what a monitor looks like when it "
                 "has been measuring nothing for months."
             )
-        payloads = {
-            k: json.loads(store.get_bytes(key).decode("utf-8")) for k, key in inputs.items()
-        }
+        payloads = {k: load_store_document(store, key) for k, key in inputs.items()}
         for key in inputs.values():
             ctx.record_input(key, store.get_bytes(key), schema_version="drift_input.v1")
 
@@ -792,15 +791,14 @@ def _read_previous_board(store: Store) -> tuple[dict[str, Any] | None, str | Non
     could not read it" want opposite responses, and the second is
     `UNMEASURABLE` in this board's own vocabulary.
     """
-    try:
-        if not store.exists(BOARD_CURRENT_KEY):
-            return None, None
-        document = json.loads(store.get_bytes(BOARD_CURRENT_KEY))
-    except Exception as exc:  # noqa: BLE001 - reported, never swallowed; see the docstring
-        return None, f"{type(exc).__name__}: {exc}"
-    if not isinstance(document, dict):
-        return None, f"{BOARD_CURRENT_KEY} parsed to {type(document).__name__}, not an object"
-    return document, None
+    # The one guarded reader: absent → (None, None); present-and-unreadable
+    # or denied → (None, reason), reported by the caller as UNMEASURABLE.
+    read = read_store_document(store, BOARD_CURRENT_KEY)
+    if read.absent:
+        return None, None
+    if read.problem is not None or read.document is None:
+        return None, read.problem or f"{BOARD_CURRENT_KEY} read as absent mid-read"
+    return read.document, None
 
 
 def console_handler(args: argparse.Namespace) -> int:

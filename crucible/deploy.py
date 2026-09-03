@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from crucible.calendar import resolve_trading_day
+from crucible.documents import load_store_document
 from crucible.manifest import RUN_MANIFEST_SCHEMA_VERSION, manifest_key
 from crucible.release import (
     POINTER_KEY,
@@ -253,7 +254,9 @@ def _flip(args: argparse.Namespace, store: Store) -> int:
             f"no smoke manifest at {key}. The gate is the smoke RUN; promoting without "
             "one would flip the pointer on a step that may never have executed."
         )
-    smoke = json.loads(store.get_bytes(key).decode("utf-8"))
+    # STRICT face of the one reader (`crucible.documents`): a smoke manifest
+    # that is not an object stops the flip with the key named.
+    smoke = load_store_document(store, key)
     before = current_release(store)
     try:
         flipped = flip_on_smoke(store, sha=args.sha, smoke_manifest=smoke, expect=expect)

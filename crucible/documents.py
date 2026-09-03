@@ -31,18 +31,38 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from crucible.keys import is_manifest_key
 from crucible.store import Store
 
 __all__ = [
     "DocumentRead",
+    "PrefixRead",
+    "UnreadableDocumentError",
+    "load_store_document",
     "read_document",
+    "read_listed_document",
+    "read_manifests_under",
     "read_path_document",
     "read_store_document",
 ]
+
+
+class UnreadableDocumentError(ValueError):
+    """A stored document that is present and cannot be read as an object.
+
+    Raised by :func:`load_store_document`, the STRICT face of this reader,
+    for a producer or writer whose correct response to a corrupt input is to
+    stop (AGENTS.md rule 5) rather than to publish a fault row. The message is
+    the same sentence :func:`read_document` would have returned as
+    ``problem``, so the two faces of the reader never disagree about what was
+    wrong — only about who handles it. A `ValueError`, so the call sites that
+    already caught `json.JSONDecodeError` (itself a `ValueError`) still catch
+    this without knowing which face they went through.
+    """
 
 
 @dataclass(frozen=True)
@@ -133,26 +153,34 @@ def read_document(source: str, reader: Callable[[], bytes | None]) -> DocumentRe
         )
     if raw is None:
         return DocumentRead(None, True, None)
+    document, problem = _parse_object(source, raw)
+    if problem is not None:
+        return DocumentRead(None, False, problem)
+    return DocumentRead(document, False, None)
+
+
+def _parse_object(source: str, raw: bytes | str) -> tuple[dict[str, Any] | None, str | None]:
+    """``(document, None)`` or ``(None, why)``. The ONE place bytes become an object.
+
+    Both faces of the reader — the guarded :func:`read_document` and the
+    strict :func:`load_store_document` — parse through here, so "what counts
+    as unreadable" (not JSON, literal `null`, an array, a string) has exactly
+    one definition. `alpha-engine-config-I9931` is the shape this prevents: a
+    manifest whose body was an array parsed cleanly under `json.loads` and
+    then raised `AttributeError` on the first `.get()`, out of the sweep.
+    """
     try:
         document = json.loads(raw)
     except Exception as exc:
-        return DocumentRead(
-            None,
-            False,
-            f"{source} is present but is not readable JSON: {type(exc).__name__}: {exc}",
-        )
+        return None, f"{source} is present but is not readable JSON: {type(exc).__name__}: {exc}"
     if document is None:
-        return DocumentRead(
-            None,
-            False,
+        return None, (
             f"{source} is present and its body is literal `null` — present-but-null is "
-            "unreadable, not absent, and reporting it as absent names the wrong remedy",
+            "unreadable, not absent, and reporting it as absent names the wrong remedy"
         )
     if not isinstance(document, dict):
-        return DocumentRead(
-            None, False, f"{source} parsed to {type(document).__name__}, not an object with fields"
-        )
-    return DocumentRead(document, False, None)
+        return None, f"{source} parsed to {type(document).__name__}, not an object with fields"
+    return document, None
 
 
 def read_store_document(store: Store, key: str) -> DocumentRead:
@@ -162,6 +190,110 @@ def read_store_document(store: Store, key: str) -> DocumentRead:
         return store.get_bytes(key) if store.exists(key) else None
 
     return read_document(key, reader)
+
+
+def read_listed_document(store: Store, key: str) -> DocumentRead:
+    """:func:`read_document` over a key the caller obtained FROM A LISTING.
+
+    Differs from :func:`read_store_document` in exactly one outcome: a key
+    that was listed and is then gone at read time is a **fault**, never
+    ``absent``. A reader that has just seen the key cannot honestly report
+    "nothing filed"; what it observed is a listing/read race — a concurrent
+    delete, an eventually-consistent listing, a retention sweep — and that is
+    a fact about the store worth a row of its own. `alpha-engine-config-I9931`
+    item 2 measured the console recording this race in one loop and silently
+    dropping it in the other (`ManifestRead(None, None, {})`).
+    """
+
+    def reader() -> bytes:
+        return store.get_bytes(key)
+
+    try:
+        raw = reader()
+    except KeyError:
+        return DocumentRead(
+            None,
+            False,
+            f"{key} was listed and then absent before it could be read — a listing/read "
+            "race (concurrent delete, eventually-consistent listing or a retention sweep), "
+            "recorded rather than dropped",
+        )
+    except Exception as exc:
+        return DocumentRead(
+            None,
+            False,
+            f"{key} could not be read: {type(exc).__name__}: {exc}. That is a "
+            "statement about our access, not about the system being measured",
+            access_problem=True,
+        )
+    document, problem = _parse_object(key, raw)
+    if problem is not None:
+        return DocumentRead(None, False, problem)
+    return DocumentRead(document, False, None)
+
+
+def load_store_document(store: Store, key: str) -> dict[str, Any]:
+    """The STRICT face: the object at ``key``, or a raise that names why not.
+
+    For producers and writers, where AGENTS.md rule 5 wants a corrupt input to
+    stop the job — with the cause in the manifest — rather than to become a
+    fault row on a page that may not exist. Absence propagates as the store's
+    own `KeyError` (the documented contract of `Store.get_bytes`); a present
+    document that is not an object raises :class:`UnreadableDocumentError`
+    carrying the same sentence the guarded face would have published.
+
+    This exists so that "every read of stored JSON goes through one reader"
+    is true for the whole package and not only for the surfaces
+    (`alpha-engine-config-I9931` closes-when: no `json.loads(store.get_bytes(`
+    outside this module).
+    """
+    raw = store.get_bytes(key)
+    document, problem = _parse_object(key, raw)
+    if problem is not None:
+        raise UnreadableDocumentError(problem)
+    assert document is not None  # _parse_object returns exactly one of the pair
+    return document
+
+
+@dataclass(frozen=True)
+class PrefixRead:
+    """Every manifest under one prefix, and every key there that could not be read.
+
+    ``documents`` is ``(key, document)`` in listing order for each key that
+    :func:`crucible.keys.is_manifest_key` accepts and that read as an object.
+    ``faults`` is ``{key: why}`` for each manifest key that did not — corrupt,
+    wrong shape, vanished between list and read, or denied. Non-manifest keys
+    under the prefix (a job's own evidence filed beside its manifest, such as
+    `report.morning`'s `message.txt`) appear in neither: a manifest prefix is a
+    namespace, not a manifest list (`alpha-engine-config-I9900`).
+    """
+
+    documents: tuple[tuple[str, dict[str, Any]], ...] = ()
+    faults: dict[str, str] = field(default_factory=dict)
+
+
+def read_manifests_under(store: Store, prefix: str) -> PrefixRead:
+    """List ``prefix``, keep manifest keys only, read each through the guard.
+
+    The one implementation of "read the manifests under this prefix" that
+    every surface and sweep shares, so a new consumer cannot reintroduce the
+    `json.loads`-every-listed-key shape that took the board down for seven
+    hours (`alpha-engine-config-I9900`, `-I9929`). Listing order is preserved
+    (sorted, as `Store.list_keys` documents) so callers that pick "the last
+    manifest" keep their deterministic choice.
+    """
+    documents: list[tuple[str, dict[str, Any]]] = []
+    faults: dict[str, str] = {}
+    for key in sorted(store.list_keys(prefix)):
+        if not is_manifest_key(key):
+            continue
+        read = read_listed_document(store, key)
+        if read.problem is not None:
+            faults[key] = read.problem
+            continue
+        assert read.document is not None  # a listed key reads as an object or as a fault
+        documents.append((key, read.document))
+    return PrefixRead(tuple(documents), faults)
 
 
 def read_path_document(path: Path) -> DocumentRead:

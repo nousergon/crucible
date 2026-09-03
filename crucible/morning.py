@@ -92,13 +92,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from crucible.calendar import previous_trading_day
+from crucible.documents import load_store_document, read_document
 from crucible.keys import (
     BOARD_CURRENT_KEY,
     BOARD_HTML_KEY,
@@ -554,10 +554,13 @@ def _read_json(store: Store, key: str) -> _Read:
         if code in ("NoSuchKey", "404"):
             return _Read(None, f"absent at {key}", None)
         return _Read(None, f"unreadable at {key}: {code}", code)
-    try:
-        return _Read(json.loads(raw), "", None)
-    except ValueError as exc:
-        return _Read(None, f"unreadable at {key}: {exc}", None)
+    # The one guarded parser (`crucible.documents`): an array- or null-bodied
+    # previous board is "unreadable", never a document the next line's `.get`
+    # raises on (alpha-engine-config-I9931).
+    parsed = read_document(key, lambda: raw)
+    if parsed.problem is not None:
+        return _Read(None, f"unreadable at {key}: {parsed.problem}", None)
+    return _Read(parsed.document, "", None)
 
 
 def _board_url(store: Store, *, now: dt.datetime) -> tuple[str | None, str, str | None]:
@@ -616,7 +619,10 @@ def read_inputs(
     the rendered message deterministic in its inputs.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
-    board = json.loads(store.get_bytes(BOARD_CURRENT_KEY))
+    # STRICT face of the one reader: a corrupt current board raises with the
+    # cause named, and the manifest reads `failed` — this artifact is not
+    # optional (see `_read_json`).
+    board = load_store_document(store, BOARD_CURRENT_KEY)
     board_day = str(board.get("trading_day") or trading_day.isoformat())
 
     previous_day = previous_trading_day(dt.date.fromisoformat(board_day))

@@ -19,7 +19,12 @@ from krepis.metrics import StatusLiteral
 from crucible.calendar import previous_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
 from crucible.console.classify import STATES, Classification, classify
-from crucible.documents import DocumentRead, read_store_document
+from crucible.documents import (
+    DocumentRead,
+    read_listed_document,
+    read_manifests_under,
+    read_store_document,
+)
 from crucible.gate import LADDER_KEY, LADDER_STATES, PHASES, build_ladder
 from crucible.gate import validate_ladder_document as _validate_ladder_document
 from crucible.keys import (
@@ -86,7 +91,16 @@ class ConsolePage:
     #: is the defect `alpha-engine-config-I9757` published three times.
     phase_ladder: dict[str, Any] = field(default_factory=dict)
     attribution: list[dict[str, Any]] = field(default_factory=list)
+    #: The champion pointer document per slot, or None when no pointer has
+    #: been written OR the pointer could not be read. Which of those two it is
+    #: lives in ``champion_faults``: a reader-state field carried INSIDE the
+    #: pointer document (`{"unreadable": ...}`) overloaded the trader's
+    #: contract namespace with a fact about our read of it
+    #: (`alpha-engine-config-I9931` item 3).
     champions: dict[str, Any] = field(default_factory=dict)
+    #: `{slot: fault}` for every champion pointer that is present and could
+    #: not be read. Empty when every pointer read or is honestly absent.
+    champion_faults: dict[str, str] = field(default_factory=dict)
     deploys: list[dict[str, Any]] = field(default_factory=list)
     week_cost_usd: float = 0.0
     unreported: int = 0
@@ -165,23 +179,18 @@ def _read_representative_manifest(store: Store, job: str, trading_day: str) -> M
 
     An unreadable manifest is reported, never skipped and never raised: it
     becomes this row's `problem`, which `classify` renders UNREPORTED with the
-    key and the fault in the detail.
+    key and the fault in the detail. A key that was listed and had vanished by
+    the time it was read is a fault too, not an absence — the `runs/` loop in
+    :func:`build_page` already recorded that race and this function silently
+    dropped it (`alpha-engine-config-I9931` item 2); both now read through
+    :func:`crucible.documents.read_manifests_under`, so there is one answer.
 
     Per-writer rows (one per slot) are a console redesign this fix does not
     make — tracked as a follow-up in the PR body.
     """
-    candidates: list[dict[str, Any]] = []
-    faults: dict[str, str] = {}
-    for key in sorted(store.list_keys(manifest_prefix(job, trading_day))):
-        if not is_manifest_key(key):
-            continue
-        read = _read(store, key)
-        fault = _fault(read, key)
-        if fault is not None:
-            faults[key] = fault
-            continue
-        if read.document is not None:
-            candidates.append(read.document)
+    listed = read_manifests_under(store, manifest_prefix(job, trading_day))
+    candidates = [document for _key, document in listed.documents]
+    faults = dict(listed.faults)
     if faults:
         # Reported even when a readable sibling exists. A component with one
         # corrupt writer and one healthy one is not healthy — the same rule
@@ -324,9 +333,10 @@ def build_page(
         job, trading_day_str, _discriminator = parsed
         if trading_day_str not in day_set:
             continue
-        read = _read(store, key)
-        fault = _fault(read, key)
-        if fault is not None or read.document is None:
+        # `read_listed_document`, not `_read`: this key came from a listing, so
+        # "gone by the time it was read" is a race to record, never an absence.
+        read = read_listed_document(store, key)
+        if read.problem is not None or read.document is None:
             # A manifest in the window we cannot read is a hole in the week's
             # cost, and a hole nobody publishes reads as $0 spent. Named on
             # the page instead, and the row it belongs to is already
@@ -336,9 +346,7 @@ def build_page(
             # `RUNS_ROOT`) and listing it twice would make the page's own
             # unreadable count depend on how many readers happened to touch it.
             if key not in manifest_faults:
-                unreadable.append(
-                    {"key": key, "fault": fault or "present but read as absent mid-listing"}
-                )
+                unreadable.append({"key": key, "fault": _fault(read, key) or read.problem or ""})
             continue
         manifest = read.document
         cost = manifest.get("cost_usd", 0.0)
@@ -365,7 +373,7 @@ def build_page(
     if attribution_fault is not None:
         unreadable.append({"key": attribution_key_, "fault": attribution_fault})
     attribution_rows = _attribution_rows(attribution_read, attribution_key_, unreadable)
-    champions = _champions(store, unreadable)
+    champions, champion_faults = _champions(store, unreadable)
     ladder = build_ladder(store, trading_day=trading_day, registry=reg, now=moment)
 
     return ConsolePage(
@@ -377,6 +385,7 @@ def build_page(
         # that reads like five rows of zero.
         attribution=attribution_rows,
         champions=champions,
+        champion_faults=champion_faults,
         deploys=sorted(deploys, key=lambda d: str(d.get("trading_day"))),
         week_cost_usd=round(week_cost, 4),
         phase_ladder=ladder.to_dict(),
@@ -430,19 +439,26 @@ def _attribution_rows(
     return list(read.document["rows"])
 
 
-def _champions(store: Store, unreadable: list[dict[str, str]]) -> dict[str, Any]:
-    """The champion pointer per slot, or an honest absence.
+def _champions(
+    store: Store, unreadable: list[dict[str, str]]
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """``(pointer per slot, fault per unreadable slot)``.
 
     Track B owns `promote` and therefore the pointers. Reading them here is a
     one-way dependency on an artifact contract, not on their code.
 
     A pointer that is present and unreadable is neither a champion nor "no
-    pointer written": it is recorded in ``unreadable`` and the slot renders as
-    an unreadable pointer, because a corrupt pointer rendered as an absent one
-    says the slot has never promoted when in fact the trader's whole read
-    surface is broken.
+    pointer written": it is recorded in ``unreadable`` AND in the returned
+    faults, and the slot renders as an unreadable pointer, because a corrupt
+    pointer rendered as an absent one says the slot has never promoted when
+    in fact the trader's whole read surface is broken. The fault travels in
+    its own map rather than as a field inside the pointer slot: the pointer
+    document is the trader's contract, and a reader-state key smuggled into
+    it (`{"unreadable": ...}`) is a second schema nobody declared
+    (`alpha-engine-config-I9931` item 3).
     """
     out: dict[str, Any] = {}
+    faults: dict[str, str] = {}
     for slot in ("u", "r", "m", "s"):
         # `keys.champion_key`, not a restatement of its shape. Handed over
         # from the I9807 sweep, which fixed the other five instances and could
@@ -455,10 +471,11 @@ def _champions(store: Store, unreadable: list[dict[str, str]]) -> dict[str, Any]
         fault = _fault(read, key)
         if fault is not None:
             unreadable.append({"key": key, "fault": fault})
-            out[slot] = {"unreadable": fault}
+            faults[slot] = fault
+            out[slot] = None
             continue
         out[slot] = read.document if read.document else None
-    return out
+    return out, faults
 
 
 #: alpha-engine-config-I9757 (C14): the stylesheet used to hand-list CSS
@@ -702,11 +719,11 @@ def render_html(page: ConsolePage) -> str:
         "<th>Since</th></tr></thead><tbody>"
     )
     for slot, champ in sorted(page.champions.items()):
-        if champ and champ.get("unreadable"):
+        if slot in page.champion_faults:
             parts.append(
                 f"<tr><td><code>{_e(slot)}</code></td>"
                 f'<td class="state {_state_class("UNREPORTED")}" colspan="2">unreadable: '
-                f"{_e(champ['unreadable'])}</td></tr>"
+                f"{_e(page.champion_faults[slot])}</td></tr>"
             )
         elif champ:
             parts.append(

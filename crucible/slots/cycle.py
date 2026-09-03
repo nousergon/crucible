@@ -34,6 +34,7 @@ from nousergon_lib.arena.window import ArmSeries
 
 from crucible.calendar import assert_trading_day
 from crucible.config import Settings
+from crucible.documents import load_store_document
 from crucible.features import DEFAULT_FEATURE_VERSION, read_features
 from crucible.keys import (
     arena_cycle_key,
@@ -127,7 +128,7 @@ def _incumbent(store: Store, slot: str) -> str | None:
     key = champion_key(slot)
     if not store.exists(key):
         return None
-    return json.loads(store.get_bytes(key).decode("utf-8")).get("champion")
+    return load_store_document(store, key).get("champion")
 
 
 def _shadow_dates(store: Store, arm_id: str) -> list[str]:
@@ -376,7 +377,7 @@ def run_grade(
             if window is None:
                 unsettled.setdefault(arm_id, []).append(day)
                 continue
-            shadow = json.loads(ctx.store.get_bytes(shadow_key(arm_id, day)).decode("utf-8"))
+            shadow = load_store_document(ctx.store, shadow_key(arm_id, day))
             try:
                 score, detail = score_selection(
                     tuple(shadow["selection"]), tuple(shadow["population"]), window.returns
@@ -425,7 +426,7 @@ def run_grade(
                 # row reads n_samples off what settlement actually wrote.
                 cs_key = cross_section_key(arm_id, day)
                 if ctx.store.exists(cs_key):
-                    cross_section_doc = json.loads(ctx.store.get_bytes(cs_key).decode("utf-8"))
+                    cross_section_doc = load_store_document(ctx.store, cs_key)
                     settled = settle_cross_section(
                         cross_section_doc,
                         returns=window.returns,

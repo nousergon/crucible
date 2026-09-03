@@ -25,6 +25,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 from nousergon_lib.arena import ArenaCycle
 
+from crucible.documents import load_store_document
 from crucible.keys import arena_cycle_key
 from crucible.store import Store
 
@@ -100,6 +101,6 @@ def read_arena_cycle(store: Store, slot: str, trading_day: str) -> dict[str, Any
     release is still refused if it does not conform, rather than being
     partially understood.
     """
-    payload = json.loads(store.get_bytes(arena_cycle_key(slot, trading_day)))
+    payload = load_store_document(store, arena_cycle_key(slot, trading_day))
     validate_arena_cycle(payload)
     return payload
