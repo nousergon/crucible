@@ -148,13 +148,25 @@ def _promote(args: argparse.Namespace) -> int:
     from crucible.slots import get_slot
 
     spec = get_slot(args.slot)
-    store = _resolve_store(args)
     revert_to = getattr(args, "revert_to", None)
     if revert_to and not getattr(args, "reason", None):
         raise SystemExit(
             "--revert-to requires --reason: an operator override with no recorded "
             "reason cannot be reviewed later (principles.md §2.1)."
         )
+    if revert_to and getattr(args, "dry_run", False):
+        # Refused BEFORE the store is even opened (alpha-engine-config-I9935):
+        # a revert is a real pointer move with a recorded reason, a dry run
+        # writes nothing, and the two flags together are not a request the CLI
+        # can honour either way. Before this refusal the combination silently
+        # reverted for real (then, after the read-only store landed, died at
+        # the first write with a store error that named neither flag).
+        raise SystemExit(
+            "--revert-to is an operator action; --dry-run has no effect on it — drop one "
+            "flag. A revert moves the champion pointer for real and records why; a dry "
+            "run writes nothing. Asking for both at once is refused rather than guessed."
+        )
+    store = _resolve_store(args)
 
     def job(ctx) -> None:
         as_of = ctx.trading_day.isoformat()
@@ -215,20 +227,18 @@ def _promote(args: argparse.Namespace) -> int:
         )
 
     # `--revert-to` always writes for real — an explicit operator-authority
-    # action, `reason` mandatory — even when `--dry-run` is also passed;
-    # nothing today refuses that combination at the argparse layer (a
-    # separate, out-of-scope gap named in the PR body). So `dry_run` is
-    # passed to `run_job` only for the evidence-gated path: if it were passed
-    # unconditionally, a `--revert-to --dry-run` invocation would move the
-    # champion pointer for real while `run_job` silently skipped writing the
-    # manifest recording that it happened — a real write with no manifest is
-    # exactly the failure mode rule 1 exists to make impossible.
+    # action, `reason` mandatory. `--revert-to --dry-run` is refused above
+    # before the store opens, so by this line `dry_run` implies "not a
+    # revert": a revert always reaches `run_job` with `dry_run=False` and gets
+    # its manifest, and a dry run never reaches the revert branch at all. The
+    # `and not revert_to` this used to carry was the guard against a real
+    # pointer move with no manifest; the refusal makes that state unreachable.
     run_job(
         "promote",
         job,
         store=store,
         trading_day=args.trading_day,
-        dry_run=bool(args.dry_run) and not revert_to,
+        dry_run=bool(args.dry_run),
         run_mode=getattr(args, "run_mode", None),
     )
     return 0
