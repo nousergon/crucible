@@ -12,7 +12,7 @@ import datetime as dt
 
 import pytest
 
-from crucible.components import Component, Deadline, load_registry
+from crucible.components import DISPATCHES, Component, Deadline, load_registry
 from crucible.slots import SLOTS
 from crucible.weekly import ARC_SLOT_JOBS, ArcStageFailed, arc_stages, run_arc
 
@@ -29,13 +29,16 @@ class TestDerivation:
 
     def test_every_weekly_component_is_started_by_something(self) -> None:
         """The defect, as an assertion. A row that is scheduled and dispatched
-        by neither the arc nor a scheduler is a page every cycle for work
-        nobody was going to run."""
+        by nothing in the exhaustive vocabulary is a page every cycle for work
+        nobody was going to run.
+
+        Derived from `DISPATCHES`, not restated: a fourth value added to the
+        vocabulary and wired to nothing would otherwise fail here for the
+        wrong reason, and a value removed from it would silently keep passing.
+        """
         for name, row in load_registry().items():
             if row.scheduled:
-                assert row.dispatch in ("arc", "scheduler"), (
-                    f"{name} is scheduled and nothing starts it"
-                )
+                assert row.dispatch in DISPATCHES, f"{name} is scheduled and nothing starts it"
 
     def test_the_order_is_the_deadline_order(self) -> None:
         """The deadline table IS the dependency order — data at 09:00 is what

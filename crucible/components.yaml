@@ -14,10 +14,19 @@
 # omitted class is indistinguishable from a forgotten one.
 #
 # `dispatch` says WHO starts a scheduled row: `arc` (a stage of the weekly
-# driver, `crucible weekly`) or `scheduler` (its own EventBridge schedule).
+# driver, `crucible weekly`), `scheduler` (its own EventBridge schedule) or
+# `github-actions` (a cron in this repository's own .github/workflows/).
 # On-demand rows declare `null`. It is a separate field from `schedule`
 # because `schedule` is prose and this is wiring: six rows read
 # "weekly, Saturday" while exactly one of them was dispatched by anything.
+#
+# Each value is verified against the thing it names, in BOTH directions, by
+# nous-ergon-ops/tests/crossrepo/test_crucible_dispatch_lockstep.py:
+# `scheduler` against the AWS::Scheduler::Schedule set in crucible-v2.yaml,
+# `github-actions` against the `on.schedule.cron` workflows in this repo. A
+# value checked in one direction only would let a row name a starter that
+# does not exist — which is exactly what `board` did between
+# 2026-09-02T21:47Z and alpha-engine-config-I9878.
 #
 # `deadline` is expressed relative to the TRADING calendar (§4.12): "present
 # by T after the close of trading day d". A Monday holiday therefore raises no
@@ -387,14 +396,28 @@ components:
     console_surface: crucible/board
     artifact_retention: forever
     absence_watched_by: alerts.sweep
-    # DAILY, and `scheduler`, not `arc`. The weekly driver is phase-2 work
+    # DAILY, and not `arc`. The weekly driver is phase-2 work
     # (alpha-engine-config-I9758); a board dispatched by it would go dark for
     # the whole of phase 0 and phase 1 - which are exactly the phases whose
     # gaps this instrument exists to render. It is also why `dispatch: arc`
     # would be wrong even though `console` is: six rows in this file once read
     # "weekly, Saturday" while exactly one of them was dispatched by anything.
+    #
+    # `github-actions`, not `scheduler`: the starter is the `on.schedule`
+    # cron in .github/workflows/board.yml (`30 21 * * *`), and there is no
+    # AWS::Scheduler::Schedule for this job. This row read `scheduler` from
+    # 2026-09-02T21:47Z until alpha-engine-config-I9878, which is a row
+    # naming a starter that does not exist - the same blindness the field
+    # exists to remove, one layer up. The GHA cron is the RIGHT dispatcher
+    # here: board.yml already holds the narrowly-scoped OIDC BoardRole, and
+    # converting the job to a Lambda to satisfy a field value would be
+    # shaping the system around the guard. GitHub drops scheduled events
+    # under load (measured on this fleet: a `*/30` workflow ran 5-8x/day for
+    # its whole life), which is why `absence_watched_by: alerts.sweep` above
+    # is load-bearing on this row - the page fires on the missing artifact,
+    # never on trusting the cron.
     schedule: daily
-    dispatch: scheduler
+    dispatch: github-actions
     deadline:
       anchor: close_plus
       offset_hours: 6
