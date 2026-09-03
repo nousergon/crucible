@@ -22,6 +22,7 @@ from typing import Any
 
 from krepis.metrics import derive_status
 
+from crucible import gate as gate_module
 from crucible.gate import (
     GATES,
     LADDER_KEY,
@@ -112,8 +113,21 @@ def gate_handler(args: argparse.Namespace) -> int:
         ctx.record_output(key, payload)
         for clause in reading.clauses:
             for evidence in clause.evidence:
-                if store.exists(evidence):
-                    ctx.record_input(evidence, store.get_bytes(evidence))
+                # Guarded, not a bare `exists`/`get_bytes` pair: a clause can
+                # already read UNMEASURABLE over this exact key (an access
+                # failure `gate.py` itself caught and turned into a red
+                # reading), and re-reading it here unguarded raised the
+                # `PermissionError` straight out of this job body — the
+                # gate's own careful non-raising read, undone one call later
+                # by its own lineage recorder (`alpha-engine-config-I9869`
+                # round 3, finding 1). An evidence key this job cannot read
+                # is simply not recorded as an input; the clause reading
+                # itself already carries the fact, on the artifact this job
+                # writes regardless.
+                read = gate_module._read_store_bytes(store, evidence)
+                if read.problem is not None or read.absent or read.raw is None:
+                    continue
+                ctx.record_input(evidence, read.raw)
         # The phase LADDER, republished on every gate read. The gate above
         # answers "is phase N met"; the ladder answers "which phase is the
         # rebuild on, and is any phase being graded ahead of an earlier one" —

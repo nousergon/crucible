@@ -28,7 +28,14 @@ from crucible.gate import (
     legacy_weekly_executions_key,
     weekly_anchor,
 )
-from crucible.keys import arena_cycle_key, arm_register_key, review_key
+from crucible.keys import (
+    arena_cycle_key,
+    arm_register_key,
+    gate_prefix,
+    review_key,
+    review_prefix,
+    runs_prefix,
+)
 from crucible.manifest import manifest_key
 from crucible.report import attribution_key
 from crucible.review import review_document
@@ -476,6 +483,21 @@ class _AccessDenied(LocalStore):
         return super().get_bytes(key)
 
 
+class _ListDenied(LocalStore):
+    """A store whose `list_keys` raises for one prefix — round 3's finding
+    2: `store.list_keys` can fail an access check exactly the way
+    `get_bytes` can, and three call sites read it unguarded."""
+
+    def __init__(self, root, denied_prefix: str) -> None:
+        super().__init__(root)
+        self._denied_prefix = denied_prefix
+
+    def list_keys(self, prefix: str = ""):
+        if prefix == self._denied_prefix:
+            raise PermissionError(f"access denied listing: {prefix}")
+        return super().list_keys(prefix)
+
+
 class TestPhaseOneGuardedReadsRound2:
     """`alpha-engine-config-I9869` round 2, findings from independent
     adversarial review of round 1's PR: the register was still unguarded, the
@@ -679,8 +701,14 @@ class TestPhaseOneGuardedReadsRound2:
         clause = next(c for c in result.clauses if c.name == "arc_runs_ok")
         assert clause.unmeasurable
         rows = {r["phase"]: r for r in build_ladder(denied, trading_day=FRIDAY).to_dict()["phases"]}
-        assert rows["phase1"]["state"] == "UNMET"
+        # Round 3 (`alpha-engine-config-I9869`, finding 4): an unmeasurable
+        # clause now renders the ROW as UNMEASURABLE, not UNMET — "we could
+        # not measure" and "we measured and it fell short" are different
+        # facts.
+        assert rows["phase1"]["state"] == "UNMEASURABLE"
         assert rows["phase1"]["clauses_total"] == 6
+        assert rows["phase1"]["clauses_unmeasurable"] == 1
+        assert rows["phase1"]["met_ratio"] is None
 
     def test_an_access_failure_on_the_register_reads_unmeasurable(self, tmp_path) -> None:
         key = arm_register_key("m")
@@ -708,6 +736,163 @@ class TestPhaseOneGuardedReadsRound2:
     def test_a_met_clause_defaults_unmeasurable_false(self, tmp_path) -> None:
         result = evaluate(_seed_met(tmp_path), gate="phase1", trading_day=FRIDAY)
         assert all(not c.unmeasurable for c in result.clauses)
+
+
+class TestPhaseOneGuardedReadsRound3:
+    """`alpha-engine-config-I9869` round 3, findings from independent
+    adversarial re-verification of round 2's PR: round 2's claim 4
+    (unmeasurable) was defeated at both boundaries — a still-unguarded
+    LISTING (finding 2) and an unmeasurable flag that lost precedence to a
+    real content gap (finding 6) — plus a still-unguarded register re-read
+    (finding 5, a correctness bug independent of round 2) and the same
+    listing gap inside the independent-review clause (finding 3)."""
+
+    # -- finding 2: BLOCKING — `store.list_keys` unguarded at three sites. --
+
+    def test_pointer_clause_smoke_listing_access_failure_is_unmeasurable(self, tmp_path) -> None:
+        _seed_met(tmp_path)
+        denied = _ListDenied(tmp_path, denied_prefix=runs_prefix("smoke"))
+        clause = next(
+            c
+            for c in evaluate(denied, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "pointer_flipped_on_smoke"
+        )
+        assert not clause.met
+        assert clause.unmeasurable
+        # `evaluate` returning at all (rather than raising) is the assertion
+        # that matters most here — round 2's own bug class, applied to a listing.
+
+    def test_independently_reviewed_listing_access_failure_is_unmeasurable(self, tmp_path) -> None:
+        _seed_met(tmp_path)
+        denied = _ListDenied(tmp_path, denied_prefix=review_prefix("phase1"))
+        clause = next(
+            c
+            for c in evaluate(denied, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "independently_reviewed"
+        )
+        assert not clause.met
+        assert clause.unmeasurable
+
+    def test_last_read_reports_an_access_failure_distinct_from_never_read(self, tmp_path) -> None:
+        from crucible.gate import last_read
+
+        _seed_met(tmp_path)
+        denied = _ListDenied(tmp_path, denied_prefix=gate_prefix("phase1"))
+        assert last_read(denied, "phase1") == (None, True)
+        # A gate genuinely never read is a DIFFERENT answer — same shape,
+        # `access_problem` false — not confusable with the listing above.
+        assert last_read(LocalStore(tmp_path / "empty"), "phase1") == (None, False)
+
+    def test_a_listing_access_failure_does_not_take_the_ladder_down(self, tmp_path) -> None:
+        _seed_met(tmp_path)
+        denied = _ListDenied(tmp_path, denied_prefix=runs_prefix("smoke"))
+        rows = {r["phase"]: r for r in build_ladder(denied, trading_day=FRIDAY).to_dict()["phases"]}
+        assert rows["phase1"]["state"] == "UNMEASURABLE"
+
+    # -- finding 3: BLOCKING — `_clause_independently_reviewed` ignored
+    # `read.access_problem`, rendering `[ ]` with an access sentence buried
+    # in `detail` rather than `unmeasurable=True`. ---------------------------
+
+    def test_a_review_read_access_failure_is_unmeasurable_not_plain_unmet(self, tmp_path) -> None:
+        _seed_met(tmp_path)
+        key = review_key("phase1", FRIDAY.isoformat(), REVIEWER, "pass")
+        denied = _AccessDenied(tmp_path, denied_key=key)
+        clause = next(
+            c
+            for c in evaluate(denied, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "independently_reviewed"
+        )
+        assert not clause.met
+        assert clause.unmeasurable
+
+    # A combined content-problem-alongside-access-failure case for THIS
+    # clause is not a separate test: pre-fix, `_clause_independently_reviewed`
+    # never set `unmeasurable=True` at all (finding 3), so an assertion of
+    # `not clause.unmeasurable` in a combined case would be true before this
+    # fix for the wrong reason and prove nothing. Finding 6's precedence rule
+    # is exercised where it is genuinely at risk of flipping the wrong way:
+    # `arc_runs_ok` and `arms_all_scored`, below.
+
+    # -- finding 5: MEDIUM — `_clause_arms_all_scored` re-read the register
+    # inside the day loop; one malformed register filled `gaps[:4]` up to
+    # `len(window)` times and could hide an unrelated, genuinely missing
+    # arena cycle. -----------------------------------------------------------
+
+    def test_a_malformed_register_and_a_missing_cycle_are_both_named(self, tmp_path) -> None:
+        """The missing cycle is seeded on the LAST window day deliberately:
+        under the round-2 shape (the register re-read inside the day loop),
+        the malformed register filed its problem once per day BEFORE this
+        day's slot was ever reached, so by the last day `gaps[:4]` was
+        already full of duplicates of the SAME register problem and the
+        genuinely missing `s` cycle — found only on this final day — was
+        truncated away entirely."""
+        store = _seed_met(tmp_path)
+        register_key = arm_register_key("m")
+        store.put_bytes(register_key, b"{not json\n")
+        missing_key = arena_cycle_key("s", WINDOW[-1].isoformat())
+        (tmp_path / missing_key).unlink()
+        clause = next(
+            c
+            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "arms_all_scored"
+        )
+        assert not clause.met
+        assert register_key in clause.detail
+        assert f"s@{WINDOW[-1].isoformat()}" in clause.detail
+
+    def test_the_malformed_register_is_named_only_once(self, tmp_path) -> None:
+        """The bug round 2 shipped: reading the register inside the day loop
+        filed the SAME problem once per day in the window (5x here), which
+        the round-1-style `gaps[:4]` truncation could crowd an unrelated
+        finding out of entirely. Hoisting the read to once-per-slot removes
+        the duplication at its source."""
+        store = _seed_met(tmp_path)
+        register_key = arm_register_key("m")
+        store.put_bytes(register_key, b"{not json\n")
+        clause = next(
+            c
+            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "arms_all_scored"
+        )
+        assert clause.detail.count(register_key) == 1
+
+    # -- finding 6: LOW — `unmeasurable=bool(unmeasurable)` rendered `?` even
+    # when a real content gap was ALSO present, across every phase-1 clause
+    # that combines the two. ------------------------------------------------
+
+    def test_arc_runs_ok_content_gap_alongside_access_failure_is_not_unmeasurable(
+        self, tmp_path
+    ) -> None:
+        store = _seed_met(tmp_path)
+        denied_key = manifest_key("report", WINDOW[2].isoformat())
+        malformed_key = manifest_key("drift", WINDOW[1].isoformat())
+        _put(store, malformed_key, {"status": "degraded", "reason": ""})
+        denied = _AccessDenied(tmp_path, denied_key=denied_key)
+        clause = next(
+            c
+            for c in evaluate(denied, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "arc_runs_ok"
+        )
+        assert not clause.met
+        assert not clause.unmeasurable
+        assert "access" in clause.detail or "could not be read" in clause.detail
+        assert malformed_key in clause.detail
+
+    def test_arms_all_scored_content_gap_alongside_access_failure_is_not_unmeasurable(
+        self, tmp_path
+    ) -> None:
+        _seed_met(tmp_path)
+        register_key = arm_register_key("m")
+        denied = _AccessDenied(tmp_path, denied_key=register_key)
+        missing_key = arena_cycle_key("s", WINDOW[0].isoformat())
+        (tmp_path / missing_key).unlink()
+        clause = next(
+            c
+            for c in evaluate(denied, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "arms_all_scored"
+        )
+        assert not clause.met
+        assert not clause.unmeasurable
 
 
 class TestArtifact:
