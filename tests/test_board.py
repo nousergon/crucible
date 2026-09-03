@@ -1298,3 +1298,128 @@ class TestTheHeldPointerDeltaGuardIsTested:
         self._run(tmp_path, dt.date(2026, 8, 28))
         written = LocalStore(tmp_path)
         assert json.loads(written.get_bytes("board/current.json"))["trading_day"] == "2026-09-01"
+
+
+# ── `_schedule_rows` — plan §6.1 milestones on the board (I9914 review) ────
+
+
+class TestScheduleRows:
+    """`_schedule_rows`'s own state machine, exercised directly rather than
+    through `build_board` — the adversarial review on PR63 found both of its
+    blocking defects here: the date boundary and the UNMEASURED fall-through
+    were never given a fixture of their own (`crucible/board.py::_schedule_rows`).
+
+    Fixed date literals throughout, per `crucible/AGENTS.md` test discipline.
+    """
+
+    @staticmethod
+    def _row(phase_id: str, gate_state: str, *, met: int | None = None, total: int | None = None):
+        (phase,) = [p for p in PHASES if p.id == phase_id]
+
+        class _Row:
+            pass
+
+        row = _Row()
+        row.phase = phase
+        row.gate_state = gate_state
+        row.clauses_met = met
+        row.clauses_total = total
+        row.read_on = None
+        return row
+
+    @staticmethod
+    def _ladder(*rows):
+        class _Ladder:
+            pass
+
+        ladder = _Ladder()
+        ladder.rows = list(rows)
+        return ladder
+
+    @staticmethod
+    def _schedule_row(rows_ladder, trading_day: str, milestone_id: str):
+        from crucible.board import _schedule_rows
+
+        want = f"schedule:{milestone_id}"
+        (row,) = [r for r in _schedule_rows(rows_ladder, trading_day) if r.id == want]
+        return row
+
+    # -- finding 1: the deadline is the anchor day itself, not the day before --
+
+    def test_the_anchor_day_itself_is_not_yet_overdue(self) -> None:
+        """day5_replays: plan 2026-09-06 (Sun), anchor 2026-09-04 (Fri). The
+        review's false red fired ON the anchor day (`>=`); the fix must not."""
+        ladder = self._ladder(self._row("phase1", "UNMET", met=0, total=6))
+        row = self._schedule_row(ladder, "2026-09-04", "day5_replays")
+        assert row.state == "PLANNED"
+        assert "OVERDUE" not in row.detail
+
+    def test_the_day_before_the_anchor_is_planned(self) -> None:
+        ladder = self._ladder(self._row("phase1", "UNMET", met=0, total=6))
+        row = self._schedule_row(ladder, "2026-09-03", "day5_replays")
+        assert row.state == "PLANNED"
+        assert "OVERDUE" not in row.detail
+
+    def test_the_day_after_the_anchor_is_overdue(self) -> None:
+        ladder = self._ladder(self._row("phase1", "UNMET", met=0, total=6))
+        row = self._schedule_row(ladder, "2026-09-05", "day5_replays")
+        assert row.state == "UNMET"
+        assert row.detail.startswith("OVERDUE")
+
+    def test_a_saturday_milestone_is_not_overdue_on_its_friday_anchor(self) -> None:
+        """live1: plan 2026-09-12 (Sat), anchor 2026-09-11 (Fri). The review's
+        false red fired a full calendar day before the Saturday it measures."""
+        ladder = self._ladder(self._row("phase2", "UNMET", met=1, total=5))
+        row = self._schedule_row(ladder, "2026-09-11", "live1")
+        assert row.state == "PLANNED"
+        assert "OVERDUE" not in row.detail
+
+    def test_a_saturday_milestone_is_overdue_the_monday_after(self) -> None:
+        ladder = self._ladder(self._row("phase2", "UNMET", met=1, total=5))
+        row = self._schedule_row(ladder, "2026-09-14", "live1")
+        assert row.state == "UNMET"
+        assert row.detail.startswith("OVERDUE")
+
+    def test_the_overdue_detail_quotes_the_plans_own_calendar_date(self) -> None:
+        """Finding 1: the rendered text must not name only the anchored
+        session — a reader has to be able to check it against plan §6.1."""
+        ladder = self._ladder(self._row("phase2", "UNMET", met=1, total=5))
+        row = self._schedule_row(ladder, "2026-09-14", "live1")
+        assert "2026-09-12" in row.detail
+
+    # -- finding 2: an UNMEASURED phase reading is never rendered as a breach --
+
+    def test_an_unmeasured_phase_reading_renders_unmeasured_past_its_due_date(self) -> None:
+        """live1 names phase2, which has no registered gate (`PHASES`) and
+        reads UNMEASURED on the ladder. Rendered well past the anchor, this
+        must stay UNMEASURED, never a date-driven UNMET/OVERDUE."""
+        ladder = self._ladder(self._row("phase2", "UNMEASURED"))
+        row = self._schedule_row(ladder, "2026-09-14", "live1")
+        assert row.state == "UNMEASURED"
+        assert not row.detail.startswith("OVERDUE")
+        assert "phase2" in row.detail
+
+    def test_an_unmeasured_phase_reading_renders_unmeasured_before_its_due_date(self) -> None:
+        ladder = self._ladder(self._row("phase2", "UNMEASURED"))
+        row = self._schedule_row(ladder, "2026-09-05", "live1")
+        assert row.state == "UNMEASURED"
+
+    def test_an_unmeasured_reading_never_asserts_a_breach(self) -> None:
+        """The exact defect: UNMET is an assertion the milestone was missed,
+        derived from a reading that does not exist."""
+        ladder = self._ladder(self._row("phase2", "UNMEASURED"))
+        row = self._schedule_row(ladder, "2026-09-14", "live1")
+        assert row.state != "UNMET"
+
+    # -- the MET and PLANNED paths, and the no-ladder-supplied path --
+
+    def test_a_met_phase_renders_met_regardless_of_date(self) -> None:
+        ladder = self._ladder(self._row("phase1", "MET", met=6, total=6))
+        row = self._schedule_row(ladder, "2026-09-01", "day5_replays")
+        assert row.state == "MET"
+
+    def test_no_ladder_supplied_renders_unmeasured(self) -> None:
+        from crucible.board import _schedule_rows
+
+        (row,) = [r for r in _schedule_rows(None, "2026-09-14") if r.id == "schedule:live1"]
+        assert row.state == "UNMEASURED"

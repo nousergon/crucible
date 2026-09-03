@@ -920,6 +920,13 @@ def _schedule_rows(ladder: Ladder | None, trading_day: str) -> list[BoardRow]:
         if phase_row is None:
             state: str | None = "UNMEASURED"
             quote = f"{phase.id} UNMEASURED — no ladder was supplied to this render"
+        elif phase_row.gate_state == "UNMEASURED":
+            # The ladder read this phase, but the reading itself is
+            # UNMEASURED (no registered gate yet) — a breach can only be
+            # derived from a reading that exists, so this renders UNMEASURED
+            # regardless of the date, never a date-driven UNMET.
+            state = "UNMEASURED"
+            quote = f"waiting on {phase.id}, which has no reading"
         else:
             quote = (
                 f"{phase.id} {phase_row.clauses_met}/{phase_row.clauses_total}"
@@ -929,16 +936,20 @@ def _schedule_rows(ladder: Ladder | None, trading_day: str) -> list[BoardRow]:
             state = "MET" if phase_row.gate_state == "MET" else None
 
         if state is None:
-            state = "UNMET" if today >= milestone.trading_day else "PLANNED"
+            # Strictly PAST the anchor: the anchor day itself is the session
+            # the milestone measures (rule 3), so the milestone is not yet
+            # overdue on that day — only once a later trading day is reached.
+            state = "UNMET" if today > milestone.trading_day else "PLANNED"
 
+        plan_date = milestone.plan_date.isoformat()
         if state == "MET":
-            detail = f"met — due {due}, reads: {quote}"
+            detail = f"met — due {due} (plan {plan_date}), reads: {quote}"
         elif state == "UNMET":
-            detail = f"OVERDUE since {due} — reads: {quote}"
+            detail = f"OVERDUE since {due} (plan {plan_date}) — reads: {quote}"
         elif state == "UNMEASURED":
-            detail = f"due {due} — {quote}"
+            detail = f"due {due} (plan {plan_date}) — {quote}"
         else:  # PLANNED
-            detail = f"due {due}, waiting on {quote}"
+            detail = f"due {due} (plan {plan_date}), waiting on {quote}"
 
         rows.append(
             BoardRow(
