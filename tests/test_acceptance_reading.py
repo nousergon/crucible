@@ -736,15 +736,33 @@ def _run_test_cost(module, *, audit_stack_tags, recorder: _Recorder) -> None:
     with `crucible.tags.audit_stack_tags` replaced, so the method's own
     except-clause structure is exercised directly rather than re-implemented
     here as a second copy of the contract. Any exception the method raises
-    (or fails to catch) propagates to the caller — this does not swallow."""
+    (or fails to catch) propagates to the caller — this does not swallow.
+
+    `boto3.client` is ALSO stubbed. Reproduced live (2026-09-03): on a
+    runner with no AWS region configured at all — every GitHub Actions
+    runner, unlike this laptop's default profile — the real
+    `boto3.client("cloudformation")` call inside the method's `try` block
+    raises `NoRegionError` before `audit_stack_tags` (the thing actually
+    being exercised) is ever reached, so every case except the one
+    expecting `NoRegionError` itself failed in CI with `blocked_on_class ==
+    "NoRegionError"` regardless of what was injected. The client
+    construction is not what these tests are about; stubbing it removes
+    the environment as a variable entirely, matching what the mocked
+    `audit_stack_tags` already does for the call it wraps.
+    """
+    import boto3
+
     import crucible.tags as tags_module
 
-    original = tags_module.audit_stack_tags
+    original_audit = tags_module.audit_stack_tags
+    original_client = boto3.client
     tags_module.audit_stack_tags = audit_stack_tags
+    boto3.client = lambda *args, **kwargs: object()
     try:
         module.TestCost().test_every_v2_resource_is_tagged_for_cost_attribution(recorder)
     finally:
-        tags_module.audit_stack_tags = original
+        tags_module.audit_stack_tags = original_audit
+        boto3.client = original_client
 
 
 def test_a_typeerror_from_the_audit_is_not_caught_and_is_not_unmeasurable() -> None:
