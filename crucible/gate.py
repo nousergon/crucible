@@ -28,34 +28,38 @@ import ast
 import datetime as dt
 import json
 import re
-from collections.abc import Iterable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from crucible.calendar import resolve_trading_day
+from crucible.calendar import TRADING_DAYS_PER_WEEK, resolve_trading_day
 from crucible.components import Component, load_registry
 from crucible.documents import DocumentRead
 from crucible.documents import read_path_document as _read_path_document
 from crucible.documents import read_store_document as _read_store_document
 from crucible.keys import (
+    ALERTS_ROOT,
     arena_cycle_key,
     arm_register_key,
+    champion_key,
     gate_key,
     gate_prefix,
     legacy_weekly_executions_key,
     review_key,
     review_prefix,
     runs_prefix,
+    verdict_key,
 )  # noqa: F401 - re-exported
 from crucible.manifest import load_schema, manifest_key
 from crucible.release import POINTER_KEY
 from crucible.report import attribution_key
 from crucible.slots import SLOTS
 from crucible.store import Store
+from crucible.tags import TAG_KEY, TAG_VALUE
 from crucible.weekly import arc_stages
 
 __all__ = [
@@ -68,8 +72,17 @@ __all__ = [
     "LADDER_SCHEMA_VERSION",
     "LADDER_STATES",
     "GATE_DELIVERABLES",
+    "LLM_ARM_CALLSITE_FIELD",
+    "MANIFEST_RUN_MODE_FIELD",
+    "MANIFEST_RUN_MODE_LIVE",
     "PHASE0_DELIVERABLES",
+    "PHASE2_LIVE_SATURDAYS",
+    "PHASE2_MAX_PAGES",
+    "PHASE2_MAX_TAGGED_USD",
+    "PHASE2_REPLAY_SATURDAYS",
+    "PHASE4_MAX_TOTAL_USD",
     "PHASES",
+    "TRADER_EVIDENCE_KEY",
     "REVIEW_SCHEMA_VERSION",
     "SOURCE_SCAN_SCOPE",
     "Clause",
@@ -1300,9 +1313,25 @@ def _acceptance_source_scan(directory: Path) -> SourceScan:
     return SourceScan(ids, module_level, problems)
 
 
-def _clause_old_weekly_within_cadence(store: Store, window: list[dt.date]) -> Clause:
+def _clause_old_weekly_within_cadence(
+    store: Store,
+    window: list[dt.date],
+    *,
+    name: str = "old_weekly_within_cadence",
+    maximum: int = LEGACY_WEEKLY_MAX_STARTS_PER_WEEK,
+) -> Clause:
+    """The v1 weekly start count, read from a filed document, against a ceiling.
+
+    ``maximum`` is a parameter because plan §6 asks the SAME question at two
+    ceilings: phase 0 tolerates one start a week while the v1 system is being
+    quieted, and phase 4 requires ZERO once it is decommissioned. A second
+    function for the second ceiling would be the same reader restated, and
+    this repository has already found one of those drifting inside the change
+    that introduced it (`_review_problem`). ``name`` travels with it so the
+    two readings do not both land on the ladder under one clause name.
+    """
     requirement = (
-        f"the v1 weekly state machine started at most {LEGACY_WEEKLY_MAX_STARTS_PER_WEEK} "
+        f"the v1 weekly state machine started at most {maximum} "
         "execution in EACH week of the window, read from a filed count keyed on the "
         "week, not on the day the gate was read"
     )
@@ -1310,7 +1339,7 @@ def _clause_old_weekly_within_cadence(store: Store, window: list[dt.date]) -> Cl
     evidence = [legacy_weekly_executions_key(a.isoformat()) for a in anchors]
     if len(anchors) != len(window):
         return Clause(
-            "old_weekly_within_cadence",
+            name,
             requirement,
             False,
             f"{len(window)} window weeks collapsed onto {len(anchors)} week anchors "
@@ -1340,8 +1369,8 @@ def _clause_old_weekly_within_cadence(store: Store, window: list[dt.date]) -> Cl
         if isinstance(started, bool) or not isinstance(started, int) or started < 0:
             malformed.append(f"{key}: `executions_started` is {started!r}, not a count")
             continue
-        if started > LEGACY_WEEKLY_MAX_STARTS_PER_WEEK:
-            over.append(f"{key}: {started} starts")
+        if started > maximum:
+            over.append(f"{key}: {started} starts, ceiling {maximum}")
     if missing or malformed or over:
         parts: list[str] = []
         if missing:
@@ -1354,14 +1383,12 @@ def _clause_old_weekly_within_cadence(store: Store, window: list[dt.date]) -> Cl
             parts.append(f"{len(malformed)} malformed: {'; '.join(malformed)}")
         if over:
             parts.append("; ".join(over))
-        return Clause(
-            "old_weekly_within_cadence", requirement, False, "; ".join(parts), tuple(evidence)
-        )
+        return Clause(name, requirement, False, "; ".join(parts), tuple(evidence))
     return Clause(
-        "old_weekly_within_cadence",
+        name,
         requirement,
         True,
-        f"{len(evidence)} consecutive weeks at <= {LEGACY_WEEKLY_MAX_STARTS_PER_WEEK} start each",
+        f"{len(evidence)} consecutive weeks at <= {maximum} start each",
         tuple(evidence),
     )
 
@@ -1578,19 +1605,921 @@ def _phase0(store: Store, window: list[dt.date], registry: dict[str, Component])
     ]
 
 
-#: The gates this command can read, and how wide a window each needs. Phase 0's
-#: window is TWO weeks, which is `alpha-engine-config-I9756`'s own closes-when
-#: ("<= 1 start per calendar week for two consecutive weeks") — one quiet week
-#: is a gap between reruns, not a cadence. Phase 1 is five replay Saturdays; the
-#: phase-2 gate is two consecutive LIVE ones (§6.1's ruled minimum —
-#: "2 consecutive first-attempt `ok` Saturdays, not 4", the other two soak weeks
-#: traded for the five replays) and is not registered here, because it is
-#: measured over production manifests that do not exist yet and a clause list
-#: without them would be a gate that could go green on replays
-#: (`alpha-engine-config-I9757`).
+# ---------------------------------------------------------------------------
+# phases 2-5 clauses
+#
+# `alpha-engine-config-I9913`. Every plan §6 phase is registered, and a phase
+# with nothing to read is UNMEASURABLE by clause — never blank. Blank and
+# "no data yet" render identically, so a ladder row with no clause list gives
+# a reader no way to tell whether the instrument for phase 3 EXISTS or merely
+# has nothing to read. Brian, 2026-09-03: "set up the eval mechanism
+# completely red and evaluate our progress by gradually hooking up the eval".
+# Red is a reading; blank is not.
+#
+# The comment this replaces argued a phase-2 list "would be a gate that could
+# go green on replays". That risk is closed twice over: the live clause reads
+# the manifest's own LIVE/REPLAY field rather than inferring it from the date,
+# and `Clause.unmeasurable` (`alpha-engine-config-I9869`) means a clause whose
+# input does not exist reads UNMEASURABLE with the reason, never MET.
+# ---------------------------------------------------------------------------
+
+
+def _unmeasurable(
+    name: str, requirement: str, detail: str, evidence: Iterable[str] = ()
+) -> Clause:
+    """One clause that could not be read, with the reason.
+
+    `met=False` and `unmeasurable=True` together, always: `met` is what the
+    ladder and `met_ratio` count, and an unmeasurable clause that set `met`
+    True would be *no data* painted green — the single failure mode plan §6
+    rule 1 exists to forbid.
+    """
+    return Clause(name, requirement, False, detail, tuple(evidence), unmeasurable=True)
+
+
+@lru_cache(maxsize=1)
+def _manifest_property_names() -> frozenset[str]:
+    """Every field `run_manifest.v1` declares, read from the SCHEMA.
+
+    Derived, never restated: the phase-2 live clause asks whether the manifest
+    contract can distinguish a live Saturday from a replay at all, and that is
+    a question about the schema. Restating the field list here would make the
+    clause answer it from a copy that drifts.
+    """
+    return frozenset(load_schema().get("properties", {}))
+
+
+#: The `run_manifest.v1` field that says whether a weekly run was a LIVE
+#: Saturday or a REPLAY of a historical one, and the value meaning live.
+#:
+#: **The field does not exist today**, and this constant is not a claim that
+#: it does — `_clause_live_saturdays_first_attempt_ok` checks the schema
+#: before reading anything, so the clause reads UNMEASURABLE naming the gap
+#: until a producer can actually write it. The gap is filed as
+#: `alpha-engine-config-I9918`: `run_manifest.v1` declares
+#: `additionalProperties: false`, so no producer can add the field without a
+#: schema change, and a schema change is a contract change that gets its own
+#: design note rather than riding along in a gate PR.
+#:
+#: `calendar_date` is NOT this field and must never be used as it: the schema
+#: says it is "recorded for provenance ONLY. Never used as a key, never an
+#: input to a promotion, retirement, freshness or grading decision."
+MANIFEST_RUN_MODE_FIELD = "run_mode"
+MANIFEST_RUN_MODE_LIVE = "live"
+
+#: The tracker issues owning the two CONTRACT GAPS that make a clause below
+#: unmeasurable today: the manifest cannot say live-or-replay
+#: (`alpha-engine-config-I9918`), and an arm recipe cannot name an LLM call
+#: site (`alpha-engine-config-I9920`).
+#:
+#: Held as plain `int`s and rendered into the reading with an f-string at the
+#: one call site, never as a full literal:
+#: `tests/test_no_stale_tracker_literals.py` (`alpha-engine-config-I9839`)
+#: forbids the whole `alpha-engine-config-I<N>` shape in any string a reader
+#: can reach, because such a literal goes stale silently. Neither of these is
+#: a PHASE issue, so neither can be derived from `PHASES` the way
+#: `phase_tracker` derives phase 4's.
+MANIFEST_RUN_MODE_GAP_ISSUE = 9918
+LLM_ARM_CALLSITE_GAP_ISSUE = 9920
+
+#: How many first-attempt `ok` LIVE Saturdays phase 2 requires. §6.1's ruled
+#: minimum — "2 consecutive first-attempt `ok` Saturdays, not 4", the other
+#: two soak weeks traded for the five replays.
+PHASE2_LIVE_SATURDAYS = 2
+
+#: How many replay Saturdays phase 2 re-grades through the phase-1 predicate.
+PHASE2_REPLAY_SATURDAYS = 5
+
+#: Plan §6 row 2: at most two pages over the phase-2 window.
+PHASE2_MAX_PAGES = 2
+
+#: Plan §6 row 2 and row 4, in USD. Row 2 is the spend carrying
+#: `system=crucible-v2`; row 4 is the whole account.
+PHASE2_MAX_TAGGED_USD = 40.0
+PHASE4_MAX_TOTAL_USD = 70.0
+
+#: The store key carrying the trader's evidence that it ran a week on the v2
+#: champion — `None` because the trader contract declares no such artifact
+#: today. Phase 4's trader clause reads UNMEASURABLE naming that missing
+#: declaration; the gap is `alpha-engine-config-I9760`'s own scope (plan §3:
+#: the trader is a separate system, and the harness may not reach into it).
+#:
+#: A declared constant rather than an inline `None` check so the day the
+#: contract names its artifact is a one-line edit here, and so the MET and
+#: UNMET branches below are reachable and tested today.
+TRADER_EVIDENCE_KEY: str | None = None
+
+#: The arm-recipe field that would name which registered LLM call site an arm
+#: reaches a model through — `None` because no such field exists.
+#: `ArmSpec`/`REQUIRED_ARM_FIELDS` carry `name`, `slot`, `ranker`, `params`
+#: and `registered_at`, and the id-hashed `spec` carries no call-site
+#: reference, so "which arms are LLM arms" is not answerable from the register
+#: today. Filed as `alpha-engine-config-I9920`.
+LLM_ARM_CALLSITE_FIELD: str | None = None
+
+
+def _clause_live_saturdays_first_attempt_ok(store: Store, window: list[dt.date]) -> Clause:
+    """Plan §6 row 2 / §6.1: consecutive LIVE first-attempt `ok` Saturdays.
+
+    **LIVE is read from the manifest, never inferred from the date.** A replay
+    of a future Saturday and a re-run of a live one are both indistinguishable
+    from their `trading_day`, and a gate that inferred liveness from the
+    calendar would be satisfied by exactly the accelerated replay schedule
+    §6.1 uses to build phase 2 — the "green on replays" failure the phase-2
+    clause list was withheld for.
+    """
+    requirement = (
+        f"{PHASE2_LIVE_SATURDAYS} consecutive LIVE Saturdays whose weekly run manifest "
+        f"reads `status: ok` on its FIRST attempt (`attempts` is exactly one entry, "
+        f"`n: 1`). LIVE is read from the manifest's `{MANIFEST_RUN_MODE_FIELD}` field, "
+        "never inferred from the trading day"
+    )
+    name = "live_saturdays_first_attempt_ok"
+    days = window[-PHASE2_LIVE_SATURDAYS:]
+    evidence = [manifest_key("weekly", day.isoformat()) for day in days]
+    if MANIFEST_RUN_MODE_FIELD not in _manifest_property_names():
+        return _unmeasurable(
+            name,
+            requirement,
+            f"`run_manifest.v1` declares no `{MANIFEST_RUN_MODE_FIELD}` field, so no "
+            "manifest can say whether its run was a live Saturday or a replay of a "
+            "historical one. The schema sets `additionalProperties: false`, so a "
+            "producer cannot add it either. Inferring liveness from the trading day is "
+            "exactly what this clause must not do (§6.1 runs replays of past "
+            "Saturdays on an accelerated schedule). Filed as "
+            f"`alpha-engine-config-I{MANIFEST_RUN_MODE_GAP_ISSUE}`",
+            evidence,
+        )
+    missing: list[str] = []
+    malformed: list[str] = []
+    unreadable: list[str] = []
+    replayed: list[str] = []
+    failed: list[str] = []
+    retried: list[str] = []
+    for day, key in zip(days, evidence, strict=True):
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            (unreadable if read.access_problem else malformed).append(read.problem)
+            continue
+        if read.absent:
+            missing.append(f"{key} is absent")
+            continue
+        document = read.document or {}
+        problem = _field(key, document, MANIFEST_RUN_MODE_FIELD, str)
+        if problem is not None:
+            malformed.append(problem)
+            continue
+        if document[MANIFEST_RUN_MODE_FIELD] != MANIFEST_RUN_MODE_LIVE:
+            replayed.append(
+                f"{day.isoformat()}: {MANIFEST_RUN_MODE_FIELD} is "
+                f"{document[MANIFEST_RUN_MODE_FIELD]!r}, not {MANIFEST_RUN_MODE_LIVE!r}"
+            )
+            continue
+        status, problem = _status(key, document)
+        if problem is not None:
+            malformed.append(problem)
+            continue
+        if status != "ok":
+            failed.append(f"{day.isoformat()}: {document.get('reason')!r}")
+            continue
+        problem = _field(key, document, "attempts", list)
+        if problem is not None:
+            malformed.append(problem)
+            continue
+        attempts = document["attempts"]
+        if len(attempts) != 1 or not isinstance(attempts[0], dict) or attempts[0].get("n") != 1:
+            retried.append(
+                f"{day.isoformat()}: {len(attempts)} attempt(s) — a retried run is not a "
+                "first-attempt ok"
+            )
+    content_gap = bool(missing or malformed or replayed or failed or retried)
+    if unreadable and not content_gap:
+        return _unmeasurable(name, requirement, "; ".join(unreadable), evidence)
+    if content_gap or unreadable:
+        parts: list[str] = []
+        if unreadable:
+            parts.append(f"{len(unreadable)} could not be read: {'; '.join(unreadable)}")
+        for label, rows in (
+            ("never ran", missing),
+            ("malformed", malformed),
+            ("not live", replayed),
+            ("failed", failed),
+            ("retried", retried),
+        ):
+            if rows:
+                parts.append(f"{len(rows)} {label}: {'; '.join(rows)}")
+        return Clause(name, requirement, False, "; ".join(parts), tuple(evidence))
+    return Clause(
+        name,
+        requirement,
+        True,
+        f"{len(days)} consecutive live Saturdays "
+        f"({days[0].isoformat()}..{days[-1].isoformat()}), each first-attempt ok",
+        tuple(evidence),
+    )
+
+
+def _clause_replays_ok(
+    store: Store, window: list[dt.date], registry: dict[str, Component]
+) -> Clause:
+    """Phase 1's replay predicate, re-read over phase 2's five replay Saturdays.
+
+    `_clause_arc_runs_ok` verbatim — the same function phase 1 registers, over
+    a five-week window anchored on the same trading day. Restating the
+    predicate would let phase 2 and phase 1 disagree about what a good replay
+    is, which is the drift `crucible.gate`'s single-reader discipline exists
+    to prevent. Only the NAME and the requirement sentence change, so the two
+    readings land on the ladder as two clauses rather than one.
+    """
+    replay_window = _window(window[-1], PHASE2_REPLAY_SATURDAYS)
+    clause = _clause_arc_runs_ok(store, replay_window, registry)
+    return replace(
+        clause,
+        name="replays_ok",
+        requirement=(
+            f"the same predicate phase 1 grades ({clause.requirement}), re-read over the "
+            f"{PHASE2_REPLAY_SATURDAYS} replay Saturdays "
+            f"{replay_window[0].isoformat()}..{replay_window[-1].isoformat()}"
+        ),
+    )
+
+
+def _s3_client() -> Any:  # pragma: no cover - constructed only outside tests
+    """An S3 client for the CloudTrail archive read.
+
+    A module-level function so a test can substitute it without reaching for a
+    credential chain, and lazy for the reason `crucible.store.S3Store` is:
+    importing `crucible.gate` must not require an AWS SDK.
+    """
+    import boto3  # noqa: PLC0415 - lazy on purpose
+
+    return boto3.client("s3")
+
+
+def _clause_zero_human_mutating_calls(window: list[dt.date]) -> Clause:
+    """Plan §6 row 2 and §11 risk 8: zero human-originated mutating calls.
+
+    Read through `crucible.autonomy`, which walks the CloudTrail **S3
+    archive** over the whole window. `aws cloudtrail lookup-events` is
+    forbidden there and the acceptance suite asserts the module has no path to
+    it: the username lookup silently truncates to ~2 days, so a gate built on
+    it reports zero because it looked at two days.
+    """
+    name = "zero_human_mutating_calls"
+    requirement = (
+        "zero human-originated mutating calls touched a v2 resource over the window, "
+        "counted from the CloudTrail S3 archive (never `lookup-events`, which truncates "
+        "its username lookup to ~2 days — §11 risk 8)"
+    )
+    from crucible.autonomy import (  # noqa: PLC0415 - heavy import, one call site
+        ArchiveMissingError,
+        count_operator_actions,
+    )
+    from crucible.config import settings  # noqa: PLC0415 - one call site
+
+    archive = settings().cloudtrail_archive
+    evidence = (archive,) if archive else ()
+    if not archive:
+        return _unmeasurable(
+            name,
+            requirement,
+            "no CloudTrail archive is configured (`CRUCIBLE_CLOUDTRAIL_ARCHIVE` is "
+            "unset and there is no default, deliberately — a guessed bucket name "
+            "produces a `NoSuchBucket` that reads like a permissions problem). "
+            "Reporting 0 would make 'no trail' and 'no human touched it' the same "
+            "answer",
+            evidence,
+        )
+    bucket, _, prefix = archive.removeprefix("s3://").partition("/")
+    try:
+        counted = count_operator_actions(
+            _s3_client(),
+            bucket=bucket,
+            prefix=prefix,
+            start=window[0],
+            end=window[-1],
+        )
+    except ArchiveMissingError as exc:
+        return _unmeasurable(name, requirement, f"ArchiveMissingError: {exc}", evidence)
+    except Exception as exc:
+        # Not a swallow: the failure mode is "the archive could not be read",
+        # the primary deliverable (a gate reading) survives as an UNMEASURABLE
+        # clause, and the recording surface is this clause's own detail, which
+        # names the exception class. A raise here would take `crucible gate`,
+        # `build_ladder` and the board render down together over a credential
+        # that expired.
+        return _unmeasurable(
+            name,
+            requirement,
+            f"the CloudTrail archive could not be read: {type(exc).__name__}: {exc}. "
+            "That is a statement about our access, not about the system being measured",
+            evidence,
+        )
+    if counted.count:
+        offenders = ", ".join(
+            f"{a.principal} {a.event_name}@{a.event_time}" for a in counted.actions[:4]
+        )
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{counted.count} human mutating call(s) over "
+            f"{window[0].isoformat()}..{window[-1].isoformat()}: {offenders}",
+            evidence,
+        )
+    return Clause(
+        name,
+        requirement,
+        True,
+        f"0 human mutating calls over {counted.records_scanned} records in "
+        f"{counted.objects_read} archive objects",
+        evidence,
+    )
+
+
+def _clause_pages_within_ceiling(store: Store, window: list[dt.date]) -> Clause:
+    """Plan §6 row 2: at most two paged INCIDENTS over the window.
+
+    Incidents, not observations and not members: `crucible.alerts` files one
+    bus row per incident under `alerts/{trading_day}/{incident}.json`, and
+    five arms failing on one data outage is one page (§9.3).
+
+    A listing that comes back empty is NOT zero pages unless something has
+    actually swept. `alerts.sweep` is the only producer of that prefix, so an
+    empty `runs/alerts.sweep/` means the ledger was never written by anything
+    — no data, which is UNMEASURABLE rather than a clean month.
+    """
+    name = "pages_within_ceiling"
+    requirement = (
+        f"at most {PHASE2_MAX_PAGES} paged incidents over the window, counted from the "
+        "alert bus (one row per incident, not per observation or per member)"
+    )
+    sweeps = _list_store_keys(store, runs_prefix("alerts.sweep"))
+    if sweeps.problem is not None:
+        return _unmeasurable(name, requirement, sweeps.problem, (runs_prefix("alerts.sweep"),))
+    if not sweeps.keys:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"no `alerts.sweep` manifest exists under {runs_prefix('alerts.sweep')}, so "
+            "nothing has ever written the alert bus. An empty bus beside a sweep that "
+            "never ran is no data, not a month without pages",
+            (runs_prefix("alerts.sweep"),),
+        )
+    listed = _list_store_keys(store, ALERTS_ROOT)
+    if listed.problem is not None:
+        return _unmeasurable(name, requirement, listed.problem, (ALERTS_ROOT,))
+    start, end = window[0], window[-1]
+    incidents: list[str] = []
+    for key in listed.keys or []:
+        parts = key.split("/")
+        if len(parts) != 3 or not key.endswith(".json"):
+            continue
+        try:
+            day = dt.date.fromisoformat(parts[1])
+        except ValueError:
+            continue
+        if start <= day <= end:
+            incidents.append(key)
+    if len(incidents) > PHASE2_MAX_PAGES:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{len(incidents)} paged incidents over {start.isoformat()}..{end.isoformat()}, "
+            f"ceiling {PHASE2_MAX_PAGES}: {', '.join(sorted(incidents)[:4])}",
+            tuple(sorted(incidents)),
+        )
+    return Clause(
+        name,
+        requirement,
+        True,
+        f"{len(incidents)} paged incident(s) over {start.isoformat()}..{end.isoformat()}, "
+        f"ceiling {PHASE2_MAX_PAGES}",
+        tuple(sorted(incidents)),
+    )
+
+
+def _ce_client() -> Any:  # pragma: no cover - constructed only outside tests
+    from crucible.cost import default_client  # noqa: PLC0415 - lazy on purpose
+
+    return default_client()
+
+
+def _clause_aws_cost_within_ceiling(
+    window: list[dt.date], *, name: str, ceiling_usd: float, tagged: bool
+) -> Clause:
+    """Plan §6 row 2 (`<= $40`, tagged) and row 4 (`<= $70/mo`, whole account).
+
+    One reader at two ceilings and two scopes, for the reason
+    `_clause_old_weekly_within_cadence` takes a ceiling: a second copy of a
+    reading is a second contract.
+
+    **A denied, unregioned or uncredentialed read is UNMEASURABLE, never
+    `$0.00`.** `ce:GetCostAndUsage` is not granted to the reading identity
+    today; granting it is filed as `alpha-engine-config-I9919` against
+    `nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml` and is
+    deliberately not done in this PR.
+    """
+    from crucible.cost import CostUnreadableError, month_to_date_usd  # noqa: PLC0415
+
+    scope = f"tagged `{TAG_KEY}={TAG_VALUE}`" if tagged else "the whole account"
+    requirement = (
+        f"month-to-date AWS spend for {scope} is at most ${ceiling_usd:.2f}, read from "
+        "Cost Explorer"
+    )
+    evidence = ("ce:GetCostAndUsage",)
+    try:
+        reading = month_to_date_usd(_ce_client(), today=window[-1], tagged=tagged)
+    except CostUnreadableError as exc:
+        return _unmeasurable(name, requirement, f"CostUnreadableError: {exc}", evidence)
+    except Exception as exc:
+        # See `_clause_zero_human_mutating_calls`: an unavailable SDK or an
+        # unresolvable credential chain must be a red clause, never an
+        # exception out of `evaluate`.
+        return _unmeasurable(
+            name,
+            requirement,
+            f"Cost Explorer could not be reached: {type(exc).__name__}: {exc}. That is a "
+            "statement about our access, not about what was spent",
+            evidence,
+        )
+    if tagged and reading.amount_usd == 0.0:
+        # The empty-set trap, one level down from phase 5's. A TAG-FILTERED
+        # total of exactly $0.00 is a property of the FILTER, not of the
+        # spend: it is what a correctly-tagged month with no resources and an
+        # entirely UNTAGGED estate both return, and this account's untagged
+        # total was $230.21 on the day this was written. Reading it as "under
+        # the $40 ceiling" would put the phase-2 row green on the evidence
+        # that cost attribution is not working. Whether the tag is actually
+        # applied is `crucible.tags.audit_stack_tags`' question, and phase
+        # 0's `v2_resources_tagged_and_versioned` deliverable.
+        return _unmeasurable(
+            name,
+            requirement,
+            f"Cost Explorer returned exactly $0.00 for {reading.scope} over "
+            f"{reading.start.isoformat()}..{reading.end.isoformat()}. A tag-filtered "
+            "total of zero is what an untagged estate returns as well as a free one, so "
+            "it measures the filter rather than the spend. `crucible.tags."
+            "audit_stack_tags` is the reading that says whether the tag is applied",
+            evidence,
+        )
+    if reading.amount_usd > ceiling_usd:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"${reading.amount_usd:.2f} month-to-date for {reading.scope} "
+            f"({reading.start.isoformat()}..{reading.end.isoformat()}), ceiling "
+            f"${ceiling_usd:.2f}",
+            evidence,
+        )
+    return Clause(
+        name,
+        requirement,
+        True,
+        f"${reading.amount_usd:.2f} month-to-date for {reading.scope} "
+        f"({reading.start.isoformat()}..{reading.end.isoformat()}), ceiling "
+        f"${ceiling_usd:.2f}",
+        evidence,
+    )
+
+
+def _phase2(store: Store, window: list[dt.date], registry: dict[str, Component]) -> list[Clause]:
+    """Phase 2's exit gate (plan §6 row 2, §6.1's ruled minimum)."""
+    return [
+        _clause_live_saturdays_first_attempt_ok(store, window),
+        _clause_replays_ok(store, window, registry),
+        _clause_zero_human_mutating_calls(window),
+        _clause_pages_within_ceiling(store, window),
+        _clause_aws_cost_within_ceiling(
+            window, name="aws_cost_within_ceiling", ceiling_usd=PHASE2_MAX_TAGGED_USD, tagged=True
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# phase 3
+# ---------------------------------------------------------------------------
+
+
+def _promote_non_promotion(
+    store: Store, slot: str, window: list[dt.date]
+) -> tuple[bool, list[str], list[str], list[str]]:
+    """Whether a verdict-backed NON-promotion was filed for ``slot``.
+
+    Returns (found, evidence, problems, access_problems). A promote run files
+    one manifest per trading day under `runs/promote/{day}/run.json` with a
+    `pointer_moved` metric per slot; the metric's `source_path` is that slot's
+    arena cycle key, which is how one manifest answers for four slots without
+    the key shape having to carry the slot.
+    """
+    evidence: list[str] = []
+    problems: list[str] = []
+    access: list[str] = []
+    found = False
+    for day in window:
+        key = manifest_key("promote", day.isoformat())
+        evidence.append(key)
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            (access if read.access_problem else problems).append(read.problem)
+            continue
+        if read.absent:
+            continue
+        document = read.document or {}
+        status, problem = _status(key, document)
+        if problem is not None:
+            problems.append(problem)
+            continue
+        if status != "ok":
+            problems.append(f"{key}: promote run status {status!r}")
+            continue
+        problem = _field(key, document, "metrics", list)
+        if problem is not None:
+            problems.append(problem)
+            continue
+        wanted = arena_cycle_key(slot, day.isoformat())
+        for metric in document["metrics"]:
+            if not isinstance(metric, dict) or metric.get("name") != "pointer_moved":
+                continue
+            if metric.get("source_path") != wanted:
+                continue
+            if metric.get("value"):
+                # The pointer MOVED. That is a promotion, graded by the
+                # champion branch above, not a non-promotion.
+                continue
+            if str(metric.get("status_reason") or "").strip():
+                found = True
+            else:
+                problems.append(
+                    f"{key}: the `pointer_moved` metric for slot {slot!r} carries no "
+                    "`status_reason` — a non-promotion with no stated reason is not a "
+                    "verdict-backed one"
+                )
+    return found, evidence, problems, access
+
+
+def _clause_slot_promotion_or_non_promotion(
+    store: Store, slot: str, window: list[dt.date]
+) -> Clause:
+    """Plan §6 row 3: one evidence-won promotion, or a verdict-backed
+    non-promotion, in ``slot``.
+
+    Two artifacts answer it and NEITHER existing is UNMEASURABLE, not UNMET:
+    a slot with no champion pointer and no promote run has not held its
+    pointer on the evidence — nothing has looked.
+    """
+    name = f"{slot}_promotion_or_verdict_backed_non_promotion"
+    requirement = (
+        f"slot {slot!r} either carries a champion promoted on EVIDENCE whose producing "
+        "run manifest reads `ok`, or filed a promote run in the window whose "
+        "`pointer_moved` metric records a non-promotion with a stated reason"
+    )
+    champion = champion_key(slot)
+    read = _read_store_document(store, champion)
+    problems: list[str] = []
+    access: list[str] = []
+    evidence: list[str] = [champion]
+    if read.problem is not None:
+        (access if read.access_problem else problems).append(read.problem)
+    elif not read.absent:
+        pointer = read.document or {}
+        source_problem = _field(champion, pointer, "promotion_source", str)
+        manifest_problem = _field(champion, pointer, "manifest_key", str)
+        if source_problem is not None or manifest_problem is not None:
+            problems.extend(p for p in (source_problem, manifest_problem) if p is not None)
+        elif pointer["promotion_source"] != "evidence":
+            problems.append(
+                f"{champion}: `promotion_source` is "
+                f"{pointer['promotion_source']!r}, not `evidence` — a bootstrap or an "
+                "operator revert is not a promotion the system won"
+            )
+        else:
+            producing = pointer["manifest_key"]
+            evidence.append(producing)
+            producing_read = _read_store_document(store, producing)
+            if producing_read.problem is not None:
+                (access if producing_read.access_problem else problems).append(
+                    producing_read.problem
+                )
+            elif producing_read.absent:
+                problems.append(
+                    f"{producing} is absent — the champion names a producing run whose "
+                    "manifest does not exist, so the promotion cannot be verified"
+                )
+            else:
+                status, problem = _status(producing, producing_read.document or {})
+                if problem is not None:
+                    problems.append(problem)
+                elif status != "ok":
+                    problems.append(f"{producing}: producing run status {status!r}")
+                else:
+                    return Clause(
+                        name,
+                        requirement,
+                        True,
+                        f"{champion} names {pointer.get('arm_id')!r}, promoted on evidence "
+                        f"by {producing} (`ok`)",
+                        tuple(evidence),
+                    )
+    found, promote_evidence, promote_problems, promote_access = _promote_non_promotion(
+        store, slot, window
+    )
+    evidence.extend(promote_evidence)
+    problems.extend(promote_problems)
+    access.extend(promote_access)
+    if found:
+        return Clause(
+            name,
+            requirement,
+            True,
+            f"no promotion, and a verdict-backed non-promotion was filed for slot {slot!r} "
+            f"over {window[0].isoformat()}..{window[-1].isoformat()}",
+            tuple(evidence),
+        )
+    if access and not problems:
+        return _unmeasurable(name, requirement, "; ".join(access), evidence)
+    if problems:
+        detail = "; ".join(problems[:4])
+        if access:
+            detail = f"{detail}; {len(access)} could not be read: {'; '.join(access[:2])}"
+        return Clause(name, requirement, False, detail, tuple(evidence))
+    return _unmeasurable(
+        name,
+        requirement,
+        f"neither artifact exists: {champion} is absent and no promote run manifest was "
+        f"filed over {window[0].isoformat()}..{window[-1].isoformat()}. A slot that has "
+        "never run `promote` has not held its pointer on the evidence — nothing looked",
+        evidence,
+    )
+
+
+def _phase3(store: Store, window: list[dt.date], registry: dict[str, Component]) -> list[Clause]:
+    """Phase 3's exit gate (plan §6 row 3), one clause per slot in `SLOTS`."""
+    _unused((registry,))
+    return [
+        _clause_slot_promotion_or_non_promotion(store, slot, window) for slot in sorted(SLOTS)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# phase 4
+# ---------------------------------------------------------------------------
+
+
+def _clause_trader_week_on_v2_champion(store: Store, window: list[dt.date]) -> Clause:
+    """Plan §6 row 4: the trader ran one week on the v2 champion.
+
+    **The harness may not reach into the trader** (plan §3: separate systems,
+    coupled by one contract). So this clause reads the CONSUMER EVIDENCE
+    artifact the trader contract declares — and the contract declares none
+    today, which is `alpha-engine-config-I9760`'s own scope, so the clause
+    reads UNMEASURABLE naming the missing declaration rather than inventing a
+    key the trader has never agreed to write.
+    """
+    name = "trader_one_week_on_v2_champion"
+    requirement = (
+        "the trader ran one week on the v2 champion, read from the consumer-evidence "
+        "artifact the trader contract declares"
+    )
+    if TRADER_EVIDENCE_KEY is None:
+        return _unmeasurable(
+            name,
+            requirement,
+            "the trader contract declares no consumer-evidence artifact, so there is "
+            "nothing in this store to read. The harness may not reach into the trader "
+            "(plan §3), and inventing a key it has never agreed to write would grade a "
+            f"contract that does not exist. Declaring one is `{phase_tracker('phase4')}`'s "
+            "own scope",
+        )
+    key = TRADER_EVIDENCE_KEY
+    read = _read_store_document(store, key)
+    if read.problem is not None:
+        if read.access_problem:
+            return _unmeasurable(name, requirement, read.problem, (key,))
+        return Clause(name, requirement, False, read.problem, (key,))
+    if read.absent:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{key} is absent — the trader has filed no evidence of a week on the v2 "
+            "champion",
+            (key,),
+        )
+    document = read.document or {}
+    problem = _field(key, document, "trading_days", int)
+    if problem is not None:
+        return Clause(name, requirement, False, problem, (key,))
+    days = document["trading_days"]
+    if days < TRADING_DAYS_PER_WEEK:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{key}: {days} trading day(s) on the v2 champion, "
+            f"{TRADING_DAYS_PER_WEEK} required",
+            (key,),
+        )
+    return Clause(
+        name,
+        requirement,
+        True,
+        f"{key}: {days} trading day(s) on the v2 champion",
+        (key,),
+    )
+
+
+def _phase4(store: Store, window: list[dt.date], registry: dict[str, Component]) -> list[Clause]:
+    """Phase 4's exit gate (plan §6 row 4)."""
+    _unused((registry,))
+    return [
+        _clause_trader_week_on_v2_champion(store, window),
+        _clause_aws_cost_within_ceiling(
+            window, name="aws_total_within_ceiling", ceiling_usd=PHASE4_MAX_TOTAL_USD, tagged=False
+        ),
+        # The phase-0 reader at phase 4's ceiling: decommissioned means ZERO
+        # starts, not "within cadence". `alpha-engine-config-I9860` adds the
+        # preopen and postclose counts; until it files them this clause grades
+        # the weekly pipeline only, and the two absent pipelines are named in
+        # `alpha-engine-config-I9758`'s coverage rather than silently omitted.
+        _clause_old_weekly_within_cadence(
+            store, window, name="old_sf_execution_count_zero", maximum=0
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# phase 5
+# ---------------------------------------------------------------------------
+
+
+def _clause_every_llm_arm_has_a_verdict(store: Store, window: list[dt.date]) -> Clause:
+    """Plan §6 row 5: every LLM arm has a verdict inside one weekly cycle.
+
+    **Zero registered LLM arms is UNMEASURABLE, never MET.** A property over
+    an empty set is vacuously true, and that exact trap put a v1 row green
+    (`gotcha_a_test_that_passes_on_an_empty_list`: a null implementation
+    returning `[]` from every query passed 7 of 11 tests).
+
+    Two preconditions, both absent today and each named separately so the
+    reason is actionable: no LLM call site is registered at all, and no arm
+    recipe carries a field declaring which call site it reaches a model
+    through.
+    """
+    name = "every_llm_arm_has_a_verdict_within_one_cycle"
+    requirement = (
+        "every ACTIVE registered arm whose recipe declares an LLM call site has a "
+        "verdict in the most recent weekly cycle. Zero such arms is UNMEASURABLE, never "
+        "met — a property over an empty set is vacuously true"
+    )
+    from crucible.llm import (  # noqa: PLC0415 - one call site
+        CALLSITE_REGISTRY_PATH,
+        LLM_CALLSITE_REGISTRY,
+    )
+
+    if not LLM_CALLSITE_REGISTRY:
+        return _unmeasurable(
+            name,
+            requirement,
+            "no LLM call site is registered (`crucible/llm_callsites.yaml` declares "
+            "`callsites: {}`), so no arm can declare one and the LLM-arm set is empty. "
+            "An empty set satisfies this property vacuously, which is why it reads "
+            "unmeasurable rather than met",
+            (str(CALLSITE_REGISTRY_PATH),),
+        )
+    if LLM_ARM_CALLSITE_FIELD is None:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"{len(LLM_CALLSITE_REGISTRY)} LLM call site(s) are registered, but an arm "
+            "recipe carries no field naming which one it uses (`ArmSpec` declares "
+            "`name`, `slot`, `ranker`, `params`, `registered_at`, and the id-hashed "
+            "`spec` carries no call-site reference), so the LLM-arm SET is not "
+            f"derivable from the register. Filed as "
+            f"`alpha-engine-config-I{LLM_ARM_CALLSITE_GAP_ISSUE}`",
+            tuple(arm_register_key(slot) for slot in sorted(SLOTS)),
+        )
+    day = window[-1]
+    evidence: list[str] = []
+    access: list[str] = []
+    missing: list[str] = []
+    llm_arms: list[str] = []
+    for slot in sorted(SLOTS):
+        key = arm_register_key(slot)
+        evidence.append(key)
+        read = _read_store_lines(store, key)
+        if read.problem is not None:
+            (access if read.access_problem else missing).append(read.problem)
+            continue
+        if read.absent:
+            continue
+        active, _, problem, access_problem = _register_arms(store, slot)
+        if problem is not None:
+            (access if access_problem else missing).append(problem)
+            continue
+        specs = {
+            str(event.get("arm_id")): (event.get("spec") or {})
+            for event in (read.lines or [])
+            if isinstance(event.get("spec"), dict)
+        }
+        for arm_id in sorted(active):
+            params = specs.get(arm_id, {}).get("params")
+            if not isinstance(params, dict):
+                continue
+            callsite = params.get(LLM_ARM_CALLSITE_FIELD)
+            if callsite in LLM_CALLSITE_REGISTRY:
+                llm_arms.append(arm_id)
+    if access and not missing:
+        return _unmeasurable(name, requirement, "; ".join(access), evidence)
+    if missing:
+        return Clause(name, requirement, False, "; ".join(missing[:4]), tuple(evidence))
+    if not llm_arms:
+        return _unmeasurable(
+            name,
+            requirement,
+            "no ACTIVE registered arm declares an LLM call site, so the set this "
+            "property quantifies over is empty and the property holds vacuously. "
+            "Phase 5 is the phase that ADDS those arms; until one exists there is "
+            "nothing to measure",
+            evidence,
+        )
+    unverdicted: list[str] = []
+    for arm_id in llm_arms:
+        key = verdict_key(arm_id, day.isoformat())
+        evidence.append(key)
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            (access if read.access_problem else unverdicted).append(read.problem)
+            continue
+        if read.absent:
+            unverdicted.append(f"{arm_id}: no verdict at {key}")
+    if access and not unverdicted:
+        return _unmeasurable(name, requirement, "; ".join(access), evidence)
+    if unverdicted:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{len(unverdicted)} of {len(llm_arms)} LLM arm(s) have no verdict for "
+            f"{day.isoformat()}: {'; '.join(unverdicted[:4])}",
+            tuple(evidence),
+        )
+    return Clause(
+        name,
+        requirement,
+        True,
+        f"{len(llm_arms)} LLM arm(s), each with a verdict for {day.isoformat()}",
+        tuple(evidence),
+    )
+
+
+def _phase5(store: Store, window: list[dt.date], registry: dict[str, Component]) -> list[Clause]:
+    """Phase 5's exit gate (plan §6 row 5)."""
+    _unused((registry,))
+    return [_clause_every_llm_arm_has_a_verdict(store, window)]
+
+
+
+#: The gates this command can read, and how wide a window each needs.
+#:
+#: **Every plan §6 phase is registered, and a phase with nothing to read is
+#: UNMEASURABLE by clause, not blank** (`alpha-engine-config-I9913`). An
+#: earlier revision withheld phases 2-5 on the argument that a phase-2 list
+#: "would be a gate that could go green on replays" — but the result was four
+#: ladder rows with no instrument behind them, and blank renders identically
+#: to "no data yet", so nobody could tell from the board whether the
+#: instrument for phase 3 existed or merely had nothing to read. The
+#: green-on-replays risk is closed properly instead: the live clause reads the
+#: manifest's own LIVE/REPLAY field rather than inferring it from the date,
+#: and `Clause.unmeasurable` makes a clause whose input does not exist read
+#: UNMEASURABLE with the reason, never MET.
+#:
+#: Windows, each from the plan rather than chosen here:
+#:
+#: * phase 0 — TWO weeks, `alpha-engine-config-I9756`'s own closes-when
+#:   ("<= 1 start per calendar week for two consecutive weeks"); one quiet
+#:   week is a gap between reruns, not a cadence.
+#: * phase 1 — FIVE replay Saturdays (§6 row 1).
+#: * phase 2 — TWO, §6.1's ruled minimum ("2 consecutive first-attempt `ok`
+#:   Saturdays, not 4", the other two soak weeks traded for the five replays).
+#:   Its `replays_ok` clause re-reads phase 1's predicate over its own
+#:   five-week window, so the narrow live window does not narrow the replay
+#:   one.
+#: * phase 3 — FOUR, `promote_min_weeks` (§5.0): a promotion cannot be won on
+#:   fewer paired weeks than the eligibility age requires, so a shorter window
+#:   could only ever read UNMET.
+#: * phase 4 — TWO, covering §6 row 4's "one week" trader claim plus the same
+#:   two-week cadence evidence phase 0 needs for the SF count.
+#: * phase 5 — ONE, §6 row 5's "verdict within one weekly cycle".
 GATES: dict[str, tuple[int, Any]] = {
     "phase0": (2, _phase0),
     "phase1": (5, _phase1),
+    "phase2": (PHASE2_LIVE_SATURDAYS, _phase2),
+    "phase3": (4, _phase3),
+    "phase4": (2, _phase4),
+    "phase5": (1, _phase5),
 }
 
 
@@ -1686,21 +2615,47 @@ class Phase:
         return f"https://github.com/{TRACKER_REPO}/issues/{self.issue}"
 
 
-#: The plan §6 ladder. Phases 2-5 carry no registered gate: their clause lists
-#: are not written yet, and inventing one here would be a gate that could go
-#: green over nothing. They render `UNMEASURED` until a clause list exists in
-#: `GATES` — which is exactly what principle 7 asks for, and is the fact that
-#: was invisible when phase 1 closed ahead of phase 0. Phase 0's list was
-#: written for `alpha-engine-config-I9804`, so the phase actually in flight is
-#: measured rather than unreadable.
+#: The plan §6 ladder. EVERY phase carries a registered gate
+#: (`alpha-engine-config-I9913`), and `tests/test_gate.py` asserts both
+#: directions of that — `all(p.gate is not None for p in PHASES)` and
+#: `set(GATES) == {p.gate for p in PHASES}` — so a plan phase can never again
+#: render blank, and a gate can never be registered that no phase reads.
+#:
+#: `gate: None` is still representable, because a SIXTH phase added to the
+#: plan before its clause list is written must render `UNMEASURED` rather than
+#: fail an import; the structural test is what makes leaving it that way a red
+#: CI run instead of a silent hole on the board.
 PHASES: tuple[Phase, ...] = (
     Phase("phase0", 0, "Stop the bleeding", 9756, "phase0"),
     Phase("phase1", 1, "One command, locally", 9757, "phase1"),
-    Phase("phase2", 2, "Unattended", 9758, None),
-    Phase("phase3", 3, "All three slots", 9759, None),
-    Phase("phase4", 4, "Trader on the contract; decommission", 9760, None),
-    Phase("phase5", 5, "Grow", 9761, None),
+    Phase("phase2", 2, "Unattended", 9758, "phase2"),
+    Phase("phase3", 3, "All three slots", 9759, "phase3"),
+    Phase("phase4", 4, "Trader on the contract; decommission", 9760, "phase4"),
+    Phase("phase5", 5, "Grow", 9761, "phase5"),
 )
+
+
+def phase_tracker(phase_id: str) -> str:
+    """The tracker identifier owning ``phase_id``, DERIVED from :data:`PHASES`.
+
+    The one legitimate way for a clause reading to name a phase's issue.
+    `tests/test_no_stale_tracker_literals.py` (`alpha-engine-config-I9839`)
+    forbids the literal shape in any string a reader can reach, because a
+    restated issue number stays pointed at a phase after that phase closes —
+    which is exactly what happened to `I9757`, cited by phase-2 and phase-3
+    acceptance clauses that had nothing to do with it.
+
+    Defined below :data:`PHASES` and called at read time, never at import
+    time, so a clause defined earlier in the module can still use it.
+    """
+    for phase in PHASES:
+        if phase.id == phase_id:
+            return phase.tracker
+    raise KeyError(
+        f"no registered phase {phase_id!r}; the registered phases are "
+        f"{[p.id for p in PHASES]}. A tracker derived from an unregistered phase would "
+        "be an invented issue number, which is the defect this function exists to remove."
+    )
 
 #: The ladder's closed state vocabulary. Total, with no fall-through, and no
 #: fifth member: `UNKNOWN`/`PENDING`/`N/A` are the shapes this exists to
