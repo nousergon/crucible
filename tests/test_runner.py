@@ -303,3 +303,66 @@ class TestKeyRefusal:
                 store=store,
                 trading_day=dt.date(2026, 8, 29),
             )
+
+
+class TestDryRun:
+    """alpha-engine-config-I9922: `run_job(dry_run=True)` writes nothing at
+    all — before this, `report.morning --dry-run` was documented as
+    "renders and files nothing" while `run_job` wrote the manifest anyway,
+    leaving a real `ok` firing in the production store for `alerts.sweep`
+    and the board to read as a genuine run."""
+
+    def test_dry_run_leaves_the_store_completely_empty(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+
+        run_job("data.daily", lambda ctx: None, store=store, trading_day=TRADING_DAY, dry_run=True)
+
+        assert list(store.list_keys()) == []
+
+    def test_dry_run_false_writes_the_manifest_as_normal(self, tmp_path) -> None:
+        """The control: the same job, `dry_run=False` (the default), does
+        write — proving the emptiness above is `dry_run`'s effect and not an
+        accident of the fixture."""
+        store = LocalStore(tmp_path)
+
+        run_job("data.daily", lambda ctx: None, store=store, trading_day=TRADING_DAY, dry_run=False)
+
+        doc = _read_manifest(store, "data.daily")
+        validate(doc)
+        assert doc["status"] == "ok"
+
+    def test_dry_run_still_runs_fn_but_records_nothing_from_it(self, tmp_path) -> None:
+        """A dry run still calls `fn` — a caller like `report.morning` needs
+        the rendered result to print it — but whatever `fn` recorded onto the
+        `RunContext` (rows, cost, metrics) is discarded rather than folded
+        into a manifest, since no manifest is written."""
+        store = LocalStore(tmp_path)
+        called: list[bool] = []
+
+        def job(ctx: RunContext) -> None:
+            called.append(True)
+            ctx.record_rows(rows_in=10, rows_out=10)
+            ctx.record_cost(1.23)
+
+        run_job("report", job, store=store, trading_day=TRADING_DAY, dry_run=True)
+
+        assert called == [True]
+        assert list(store.list_keys()) == []
+
+    def test_dry_run_on_a_raising_job_still_reraises_and_still_writes_nothing(
+        self, tmp_path
+    ) -> None:
+        """Fail loud survives a dry run: the exception is never swallowed
+        just because nothing was going to be written. The one thing dry_run
+        changes is that the FAILURE, too, produces no manifest — a caller
+        that dry-runs a job and hits a real bug in it still sees the
+        exception at the terminal."""
+        store = LocalStore(tmp_path)
+
+        def job(ctx: RunContext) -> None:
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            run_job("report", job, store=store, trading_day=TRADING_DAY, dry_run=True)
+
+        assert list(store.list_keys()) == []

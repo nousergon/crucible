@@ -141,11 +141,21 @@ class TestPromoteCommand:
         assert pointer.arm_id == ids["chal"]
 
     def test_a_dry_run_decides_and_writes_nothing(self, seeded, monkeypatch) -> None:
+        """alpha-engine-config-I9922: before `run_job` gained `dry_run`, this
+        call still filed an `ok` run manifest for a promotion that never
+        happened — "writes nothing" was true of the pointer and the arena
+        cycle but false of `runs/promote/{DAY}/run.json`. Covered here
+        alongside the pointer/cycle assertions rather than as a bare
+        "no manifest" check, since a dry run that decided nothing writing no
+        manifest is a vacuous pass."""
+        from crucible.manifest import manifest_key
+
         store, _, _, _ = seeded
         monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
         assert main(["promote", "--slot", "m", "--date", DAY, "--dry-run"]) == 0
         assert not store.exists(champion_key("m"))
         assert not store.exists(arena_cycle_key("m", DAY))
+        assert not store.exists(manifest_key("promote", DAY))
 
     def test_revert_records_the_operator(self, seeded, monkeypatch) -> None:
         store, _, ids, dates = seeded

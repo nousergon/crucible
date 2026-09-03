@@ -349,6 +349,7 @@ def run_job(
     release_sha: str | None = None,
     transient_retry: bool = True,
     discriminator: str | Callable[[RunContext], str] | None = None,
+    dry_run: bool = False,
 ) -> RunContext:
     """Run ``fn`` as job ``job`` and write its manifest, whatever happens.
 
@@ -387,8 +388,23 @@ def run_job(
     failure — the fault-injection suite asserts the no-retry path as well as
     the retry path.
 
+    ``dry_run=True`` runs ``fn`` exactly as a real invocation would — a caller
+    still needs the rendered/resolved result to report it — but skips the
+    write path entirely: no `run.json` is written and nothing `fn` recorded
+    is folded into a manifest, since there is no manifest. One line is
+    printed instead, naming the job and trading day, so a dry run is visibly
+    a dry run in the operator's own terminal rather than silent. This is the
+    fix for alpha-engine-config-I9922: `report.morning --dry-run` is
+    documented as "renders and files nothing", but before this flag existed
+    the write below ran unconditionally, so a dry run against the production
+    store left a real `ok` firing in `runs/` for `alerts.sweep` and the board
+    to read. `fn` itself must still avoid any OTHER real write (a store put
+    outside `ctx.record_output`, an external delivery) — this flag only
+    covers the one write `run_job` itself makes.
+
     Returns the :class:`RunContext` on success. Re-raises on failure, after
-    the manifest is on disk.
+    the manifest is on disk (or, on ``dry_run=True``, after the one line is
+    printed in its place).
     """
     started = now or dt.datetime.now(dt.UTC)
     if trading_day is None:
@@ -448,15 +464,28 @@ def run_job(
             # answer to "did this run work" decided by write ordering, which is
             # the last-writer-wins shape this system is built to refuse.
             if transient is None:
-                _write_manifest(
-                    ctx,
-                    store=store,
-                    status=status,
-                    reason=reason,
-                    started=started,
-                    now=now,
-                    release_sha=release_sha,
-                )
+                if dry_run:
+                    # No manifest, no outputs record — `dry_run` means this
+                    # function makes exactly zero writes of its own. `fn` may
+                    # still have returned data for the caller to print; what
+                    # it must not have done is write to `store` itself, which
+                    # is the caller's obligation (mirrored in `report.morning`
+                    # and `board`, both of which branch on the same flag
+                    # before touching the store).
+                    print(
+                        f"dry_run: {job} {ctx.trading_day.isoformat()} — no manifest written, "
+                        f"no outputs recorded (status would have been {status!r})"
+                    )
+                else:
+                    _write_manifest(
+                        ctx,
+                        store=store,
+                        status=status,
+                        reason=reason,
+                        started=started,
+                        now=now,
+                        release_sha=release_sha,
+                    )
 
         if transient is None:
             return ctx

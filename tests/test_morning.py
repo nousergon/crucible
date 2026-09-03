@@ -741,7 +741,15 @@ class TestTheJob:
         assert keys[0] != manifest_key(MORNING_JOB, DAY.isoformat())
         assert keys[0].startswith(f"runs/{MORNING_JOB}/{DAY.isoformat()}/")
 
-    def test_a_dry_run_delivers_nothing_and_claims_nothing(self, tmp_path, monkeypatch):
+    def test_a_dry_run_delivers_nothing_and_files_no_manifest(self, tmp_path, monkeypatch):
+        """alpha-engine-config-I9922. Before this fix, `run_job` wrote a
+        manifest regardless of `--dry-run` — this test itself asserted that
+        as correct (`manifest["outputs"] == []`), which is exactly the
+        documented-but-false claim the issue names: `--dry-run` "renders and
+        files nothing", and a manifest at `runs/report.morning/{day}/{firing}/
+        run.json` is a real firing that `alerts.sweep` and the board read as
+        genuine. A dry run against production must leave the store
+        completely untouched under this job's own `runs/` prefix."""
         store = _seed(tmp_path, previous=_board())
 
         def refuse(*args: Any, **kwargs: Any) -> Any:
@@ -750,9 +758,7 @@ class TestTheJob:
         monkeypatch.setattr("crucible.morning._krepis_publish", refuse)
         assert morning_handler(_args(tmp_path, dry_run=True)) == 0
         keys = [k for k in store.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
-        manifest = json.loads(store.get_bytes(keys[0]))
-        assert manifest["status"] == "ok"
-        assert manifest["outputs"] == []
+        assert keys == []
 
 
 # ── the three declarations that must agree ────────────────────────────────

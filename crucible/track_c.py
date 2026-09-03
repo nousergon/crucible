@@ -494,8 +494,15 @@ def board_handler(args: argparse.Namespace) -> int:
     would be a daily failure alert on a working producer, and a daily failure
     alert nobody can act on is how a channel gets muted. The job fails when
     the MEASUREMENT fails; the reading lives in the artifact.
+
+    `--dry-run` already held the pointer and skipped `board/current.json`
+    (I9863's narrow guard, below); passed through to `run_job` as
+    `dry_run=True` (alpha-engine-config-I9922) so the run manifest itself is
+    skipped too, rather than filing an `ok` firing for a run that touched
+    neither the board nor the pointer.
     """
     store = _store(args)
+    dry_run = bool(getattr(args, "dry_run", False))
 
     def body(ctx: RunContext) -> None:
         moment = dt.datetime.now(dt.UTC)
@@ -544,8 +551,9 @@ def board_handler(args: argparse.Namespace) -> int:
         # repo-wide fix), and honouring it for `board` alone would normally be
         # the wrong shape — but this is the one job whose `--dry-run` clobbers
         # `board/current.json`, the key the fleet-console adapter reads. One
-        # narrow guard here, the class fix in I9863.
-        dry_run = bool(getattr(args, "dry_run", False))
+        # narrow guard here, the class fix in I9863. `dry_run` is the
+        # `board_handler`-level variable closed over here, not a fresh read —
+        # `run_job` below is passed the same value (I9922).
         if dry_run:
             may_move = False
             pointer_reason = "--dry-run: the pointer and the page are not written"
@@ -696,7 +704,7 @@ def board_handler(args: argparse.Namespace) -> int:
             }
         )
 
-    run_job("board", body, store=store, trading_day=args.trading_day)
+    run_job("board", body, store=store, trading_day=args.trading_day, dry_run=dry_run)
     return 0
 
 

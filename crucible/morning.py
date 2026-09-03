@@ -1200,7 +1200,10 @@ def morning_handler(args: argparse.Namespace) -> int:
     the production board without writing to it, and it is honoured rather
     than ignored for the same reason `board` honours it: this job's outputs
     land under `runs/`, where a dry run would otherwise fabricate a manifest
-    saying a report was delivered.
+    saying a report was delivered. Passed through to `run_job` as
+    `dry_run=True` (alpha-engine-config-I9922) so the manifest itself is
+    never written either — before that fix, this docstring's claim was false:
+    `run_job` wrote `runs/report.morning/{day}/{firing}/run.json` regardless.
     """
     from crucible.runner import RunContext, run_job  # noqa: PLC0415 - lazy; see cli.py
 
@@ -1254,6 +1257,7 @@ def morning_handler(args: argparse.Namespace) -> int:
         # report go out on Sunday" is decided by write ordering. Same shape,
         # same reason, as `alerts.sweep`.
         discriminator=lambda ctx: ctx.calendar_date.isoformat(),
+        dry_run=dry_run,
     )
     return 0
 

@@ -176,6 +176,17 @@ def _promote(args: argparse.Namespace) -> int:
             manifest_key=_promote_manifest_key("promote", as_of),
             run_id=ctx.run_id,
         )
+        if args.dry_run:
+            # `run_promotion(store=None)` already wrote nothing (promote.py's
+            # own docstring: "a caller grading in memory ... gets the same
+            # decision and writes nothing"); `result.keys_written` is empty,
+            # so `_record_written` would be a no-op here regardless. Skipped
+            # explicitly rather than relied on implicitly, since `run_job`
+            # itself now also skips the manifest write on `dry_run=True`
+            # (alpha-engine-config-I9922) — before that fix this branch's
+            # sibling call still wrote an `ok` manifest for a promotion that
+            # never happened.
+            return
         _record_written(ctx, store, result.keys_written)
         # §11: the console renders "cycles since the pointer last moved", and
         # a pointer that has never moved on evidence is a FINDING. It can only
@@ -195,7 +206,22 @@ def _promote(args: argparse.Namespace) -> int:
             }
         )
 
-    run_job("promote", job, store=store, trading_day=args.trading_day)
+    # `--revert-to` always writes for real — an explicit operator-authority
+    # action, `reason` mandatory — even when `--dry-run` is also passed;
+    # nothing today refuses that combination at the argparse layer (a
+    # separate, out-of-scope gap named in the PR body). So `dry_run` is
+    # passed to `run_job` only for the evidence-gated path: if it were passed
+    # unconditionally, a `--revert-to --dry-run` invocation would move the
+    # champion pointer for real while `run_job` silently skipped writing the
+    # manifest recording that it happened — a real write with no manifest is
+    # exactly the failure mode rule 1 exists to make impossible.
+    run_job(
+        "promote",
+        job,
+        store=store,
+        trading_day=args.trading_day,
+        dry_run=bool(args.dry_run) and not revert_to,
+    )
     return 0
 
 
