@@ -346,7 +346,9 @@ def build_page(
             # `RUNS_ROOT`) and listing it twice would make the page's own
             # unreadable count depend on how many readers happened to touch it.
             if key not in manifest_faults:
-                unreadable.append({"key": key, "fault": _fault(read, key) or read.problem or ""})
+                # `read.problem` is set on every non-document outcome of a
+                # listed read, so the fault is never an empty string.
+                unreadable.append({"key": key, "fault": _fault(read, key) or str(read.problem)})
             continue
         manifest = read.document
         cost = manifest.get("cost_usd", 0.0)

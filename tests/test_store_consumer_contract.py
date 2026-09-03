@@ -22,13 +22,16 @@ raise, never drop. A STRICT consumer (a producer, or a writer about to act on
 what it read) must raise `UnreadableDocumentError` naming the key — never
 return a partial answer.
 
-Every consumer is listed here BY NAME. A new module that lists a manifest
-prefix has to be added to one of the two lists below, and the grep test at the
-bottom is what makes forgetting to do so a failure rather than a habit.
+Every consumer is listed here BY NAME; registering a new consumer in one of
+the two lists is a convention, not something the tree can enforce. What the
+tree test at the bottom DOES enforce is the property underneath it: no module
+outside `crucible.documents` hands store bytes to a JSON parser, so a new
+consumer cannot reintroduce the unguarded read even if it is never registered.
 """
 
 from __future__ import annotations
 
+import ast
 import datetime as dt
 import json
 import re
@@ -260,16 +263,109 @@ class TestTheRuleHolds:
         assert manifest_key("x", "2026-08-28", discriminator="d").endswith("/d/run.json")
 
     def test_no_module_parses_a_store_read_outside_the_reader(self) -> None:
-        """`alpha-engine-config-I9931` closes-when, as a test rather than a
-        grep someone remembers to run: the only `json.loads(store.get_bytes(`
-        in the package is inside `crucible.documents`."""
+        """`alpha-engine-config-I9931` closes-when, as a PROPERTY of the tree:
+        no module outside `crucible.documents` hands bytes obtained from a
+        `.get_bytes(...)` call to a JSON parser — directly, or through a local
+        name bound from that call, on one line or several. The first version
+        of this test was a line-wise regex for the literal spelling and three
+        live sites escaped it by binding the bytes to a local first
+        (crucible-PR81 review, B2). Exempt: this module's own reader, by path
+        identity, never by name."""
         package = Path(crucible.__file__).parent
-        offenders = []
-        pattern = re.compile(r"json\.loads\(\s*(?:ctx\.)?store\.get_bytes\(")
-        for path in sorted(package.rglob("*.py")):
-            if path.name in {"documents.py", "store.py"}:
-                continue
-            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                if pattern.search(line):
-                    offenders.append(f"{path.relative_to(package)}:{lineno}")
+        reader = (package / "documents.py").resolve()
+        offenders = [
+            f"{path.relative_to(package)}:{lineno}"
+            for path in sorted(package.rglob("*.py"))
+            if path.resolve() != reader
+            for lineno in _unguarded_parses(path)
+        ]
         assert offenders == [], offenders
+
+    def test_the_tree_guard_fires(self, tmp_path) -> None:
+        """A guard nobody has seen fail is a guard nobody knows works. Each
+        of the three escapes the first version missed, plus the direct form,
+        is caught; the routed form is not."""
+        cases = {
+            "direct.py": (
+                "import json\ndef f(store, k):\n    return json.loads(store.get_bytes(k))\n"
+            ),
+            "bound.py": (
+                "import json\ndef f(store, k):\n    payload = store.get_bytes(k)\n"
+                "    return json.loads(payload.decode('utf-8'))\n"
+            ),
+            "multiline.py": (
+                "import json\ndef f(ctx, k):\n    raw = ctx.store.get_bytes(\n        k\n    )\n"
+                "    doc = json.loads(\n        raw\n    )\n    return doc\n"
+            ),
+            "load.py": (
+                "import json, io\ndef f(store, k):\n"
+                "    return json.load(io.BytesIO(store.get_bytes(k)))\n"
+            ),
+        }
+        for name, source in cases.items():
+            path = tmp_path / name
+            path.write_text(source, encoding="utf-8")
+            assert _unguarded_parses(path), name
+        routed = tmp_path / "routed.py"
+        routed.write_text(
+            "from crucible.documents import load_store_document\n"
+            "def f(store, k):\n    return load_store_document(store, k)\n",
+            encoding="utf-8",
+        )
+        assert _unguarded_parses(routed) == []
+
+
+_PARSERS = {("json", "loads"), ("json", "load"), ("orjson", "loads")}
+
+
+def _unguarded_parses(path: Path) -> list[int]:
+    """Line numbers in ``path`` where a JSON parser receives store bytes.
+
+    Two passes over the module's AST. First: every name bound (by assignment,
+    annotated assignment or walrus) from an expression whose subtree contains
+    an ``X.get_bytes(...)`` call — that is "bytes from the store", whatever the
+    store is called (`store`, `ctx.store`, `self.store`). Second: every call to
+    `json.loads` / `json.load` / `orjson.loads` whose argument subtree contains
+    either such a call directly or one of those bound names. Both passes are
+    over nodes, so a call split across lines is one call.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+    def has_get_bytes(node: ast.AST) -> bool:
+        return any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "get_bytes"
+            for n in ast.walk(node)
+        )
+
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        targets: list[ast.expr] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        elif isinstance(node, ast.NamedExpr):
+            targets, value = [node.target], node.value
+        if value is not None and has_get_bytes(value):
+            for target in targets:
+                for n in ast.walk(target):
+                    if isinstance(n, ast.Name):
+                        bound.add(n.id)
+
+    hits: list[int] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        owner = node.func.value
+        if not (isinstance(owner, ast.Name) and (owner.id, node.func.attr) in _PARSERS):
+            continue
+        for arg in node.args:
+            if has_get_bytes(arg) or any(
+                isinstance(n, ast.Name) and n.id in bound for n in ast.walk(arg)
+            ):
+                hits.append(node.lineno)
+                break
+    return hits

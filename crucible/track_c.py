@@ -40,7 +40,7 @@ from crucible.console.render import (
     classify_registry,
     write_page,
 )
-from crucible.documents import load_store_document, read_store_document
+from crucible.documents import load_document_bytes, load_store_document, read_store_document
 from crucible.drift import drift_metrics
 from crucible.gate import (
     GATES,
@@ -200,7 +200,9 @@ def _verify_release_artifacts(store: Store, sha: str, ctx: RunContext) -> list[s
             "smokes, so this means the publish did not land."
         )
     meta_bytes = store.get_bytes(meta_k)
-    record = release.parse_release_record(json.loads(meta_bytes.decode("utf-8")))
+    # Parsed from the bytes already in hand (recorded as lineage below), never
+    # re-fetched: one read, one version.
+    record = release.parse_release_record(load_document_bytes(meta_k, meta_bytes))
     if record.sha != sha:
         raise ValueError(
             f"smoke: {meta_k} describes {record.sha}, not {sha}. Gating a promotion on "
@@ -280,7 +282,11 @@ def smoke_handler(args: argparse.Namespace) -> int:
             ctx.record_input(key, payload, schema_version=release.RELEASE_SCHEMA_VERSION)
             read.append(key)
             if key == release.POINTER_KEY:
-                pointed = load_store_document(store, key)["sha"]
+                # The SAME bytes recorded as lineage decide `pointed`. A second
+                # fetch here is a TOCTOU on the one object `deploy._flip` moves
+                # concurrently: lineage would say one sha and the smoke act on
+                # another (crucible-PR81 review, B1).
+                pointed = load_document_bytes(key, payload)["sha"]
                 # A v2-or-v3 record for the POINTED sha, not `sha` under
                 # test — its wheel may live at the legacy (unpip-installable)
                 # v2 path, so `wheel_key(pointed)` alone cannot answer this.

@@ -19,8 +19,9 @@ those pairs names the wrong remedy: "no file filed", "the file is corrupt"
 and "we were denied" call for three different actions and only one of them is
 about the system being measured.
 
-This module is deliberately dependency-free apart from `crucible.store`, so
-any module may import it without creating a cycle. `crucible.gate` imports
+This module depends only on `crucible.store` and `crucible.keys` (for the
+manifest-key predicate), neither of which imports anything above it, so any
+module may import it without creating a cycle. `crucible.gate` imports
 these three names rather than defining a second copy, and
 `crucible.console.render` imports them rather than defining a third — a
 contract restated at each surface is a contract one of the surfaces has
@@ -42,6 +43,7 @@ __all__ = [
     "DocumentRead",
     "PrefixRead",
     "UnreadableDocumentError",
+    "load_document_bytes",
     "load_store_document",
     "read_document",
     "read_listed_document",
@@ -247,8 +249,22 @@ def load_store_document(store: Store, key: str) -> dict[str, Any]:
     (`alpha-engine-config-I9931` closes-when: no `json.loads(store.get_bytes(`
     outside this module).
     """
-    raw = store.get_bytes(key)
-    document, problem = _parse_object(key, raw)
+    return load_document_bytes(key, store.get_bytes(key))
+
+
+def load_document_bytes(source: str, raw: bytes | str) -> dict[str, Any]:
+    """The STRICT face over bytes the caller ALREADY HOLDS.
+
+    For the caller that has fetched an object once — to record it as lineage,
+    to compare-and-swap against its version, to hash it — and must decide on
+    exactly those bytes. Re-fetching through :func:`load_store_document` would
+    read the object a second time, and on the one object built to move under
+    concurrent writers (`releases/current`, CAS-flipped by `crucible.deploy`)
+    the lineage and the decision could then describe two different versions
+    (crucible-PR81 review, B1). Same parser, same sentence, same exception as
+    the store face; only the fetch is the caller's.
+    """
+    document, problem = _parse_object(source, raw)
     if problem is not None:
         raise UnreadableDocumentError(problem)
     assert document is not None  # _parse_object returns exactly one of the pair

@@ -62,7 +62,7 @@ from crucible.champion import (
     read_champion_etag,
     write_champion,
 )
-from crucible.documents import load_store_document
+from crucible.documents import load_document_bytes, load_store_document
 from crucible.keys import (
     arm_register_key,
     arm_series_key,
@@ -878,7 +878,8 @@ def _current_arm(store: Store, slot: str) -> str | None:
         # not even parse to an object re-raises here as UnreadableDocumentError
         # from the strict face, which is the honest answer — there is no arm_id
         # to report.
-        payload = load_store_document(store, champion_key(slot))
+        key = champion_key(slot)
+        payload = load_document_bytes(key, store.get_bytes(key))
         arm_id = payload.get("arm_id")
         return str(arm_id) if arm_id is not None else None
 
