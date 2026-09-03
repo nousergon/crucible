@@ -84,15 +84,26 @@ def test_the_reading_is_computed_with_write_json_and_a_commit() -> None:
 
 
 def test_a_publish_step_exists_and_writes_the_acceptance_prefix() -> None:
+    """The producer must resolve the key through `crucible.keys.
+    acceptance_reading_key` — never restate the path as a literal — so the
+    producer (this workflow) and the consumer (`crucible/morning.py`) cannot
+    diverge on the shape (alpha-engine-config-I9902 adversarial review)."""
     job = _acceptance_job()
     names = _step_names(job)
     assert any("publish" in name.lower() for name in names), (
         "no step in ci.yml's acceptance job publishes the acceptance reading"
     )
     bodies = "\n".join(_step_bodies(job))
-    assert "report/acceptance/" in bodies, (
-        "the publish step must write to report/acceptance/{trading_day}.json "
-        "(crucible.keys.acceptance_reading_key)"
+    assert "acceptance_reading_key" in bodies, (
+        "the workflow must resolve the publish key by calling "
+        "crucible.keys.acceptance_reading_key, not restating the path"
+    )
+    steps = job["steps"]
+    publish_idx = next(i for i, s in enumerate(steps) if "publish" in s.get("name", "").lower())
+    publish_body = steps[publish_idx].get("run", "")
+    assert "report/acceptance/" not in publish_body, (
+        "the publish step must not hand-write the report/acceptance/ literal "
+        "— it must use the key resolved from keys.acceptance_reading_key"
     )
 
 

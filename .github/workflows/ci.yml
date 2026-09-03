@@ -272,10 +272,19 @@ jobs:
       # and `alpha-engine-config-I9902`'s whole point: this is the ONE place
       # that files `crucible.keys.acceptance_reading_key`'s producer
       # contract, so `crucible report.morning` and the board can read it from
-      # a store artifact instead of a git checkout of `main`.
+      # a store artifact instead of a git checkout of `main`. The key is
+      # resolved through `crucible.keys.acceptance_reading_key` itself —
+      # never restated as a literal — so the producer and the consumer
+      # (`crucible/morning.py`) cannot diverge on the shape.
+      - name: Resolve the acceptance reading key
+        id: reading_key
+        run: |
+          key="$(uv run --frozen python -c 'from crucible.keys import acceptance_reading_key; print(acceptance_reading_key("${{ steps.trading_day.outputs.day }}"))')"
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
+
       - name: Publish the acceptance reading
         run: |
-          aws s3 cp acceptance-reading.json "${STORE_URI}/report/acceptance/${{ steps.trading_day.outputs.day }}.json" --only-show-errors
+          aws s3 cp acceptance-reading.json "${STORE_URI}/${{ steps.reading_key.outputs.key }}" --only-show-errors
 
       - name: Fail the job if the reading moved
         if: steps.check.outcome != 'success'
