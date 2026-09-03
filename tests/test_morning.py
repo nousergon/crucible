@@ -29,6 +29,7 @@ import argparse
 import datetime as dt
 import json
 import pathlib
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -225,6 +226,39 @@ class TestTheMessage:
         store = _seed(tmp_path, previous=previous)
         assert "obj:gone: MET -> VANISHED" in run_report(store, trading_day=DAY, now=FIRED_AT)
 
+    def test_a_filed_acceptance_reading_is_quoted_with_its_commit(self, tmp_path):
+        """§12 rule 3's one progress figure, READ rather than asserted. The
+        producer contract is `crucible.keys.acceptance_reading_key`'s
+        docstring; `alpha-engine-config-I9902` implements it."""
+        from crucible.keys import acceptance_reading_key
+
+        store = _seed(tmp_path, previous=_board())
+        store.put_bytes(
+            acceptance_reading_key(DAY.isoformat()),
+            json.dumps(
+                {
+                    "met": 21,
+                    "unmet": 3,
+                    "unmeasurable": 0,
+                    "commit": SHA,
+                    "measured_at": "2026-09-02T22:00:00Z",
+                }
+            ).encode(),
+        )
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert f"acceptance count: 21 met / 3 unmet / 0 unmeasurable (commit {SHA})" in message
+        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT not in message
+
+    def test_a_corrupt_acceptance_reading_is_absent_rather_than_guessed(self, tmp_path):
+        """A malformed reading is not a number. Rendering a partial parse of
+        the only progress figure is exactly the fabrication the literal
+        exists to avoid."""
+        from crucible.keys import acceptance_reading_key
+
+        store = _seed(tmp_path, previous=_board())
+        store.put_bytes(acceptance_reading_key(DAY.isoformat()), b"{not json")
+        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT in run_report(store, trading_day=DAY, now=FIRED_AT)
+
     def test_the_acceptance_count_is_never_invented(self, tmp_path):
         """§12 rule 3 makes it the only progress figure — which is exactly why
         a fabricated one is worse than an absent one. `tests/acceptance/
@@ -276,6 +310,47 @@ class TestTheMessage:
         for forbidden in ("pull request", " prs ", "merged", "progress", "findings", "commits"):
             assert forbidden not in message
 
+    def test_a_board_detail_carrying_a_progress_figure_is_withheld(self, tmp_path):
+        """The guard above grades the TEMPLATE unless the fixture's details
+        contain the phrasing. `row['detail']` is the board's free text and is
+        rendered verbatim, so a detail reading "3 of 5 PRs merged" ships
+        straight onto the one surface §12 rule 3 exists for."""
+        rows = [
+            _row(
+                "phase0",
+                "phase",
+                "UNMET",
+                "1/2 clauses met; 3 of 5 PRs merged this week; holding: old_weekly",
+            )
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "PRs merged" not in message
+        # The surviving clauses are kept, and the withholding is DECLARED --
+        # a clause silently dropped is indistinguishable from a board that
+        # never carried it.
+        assert "1/2 clauses met" in message
+        assert "holding: old_weekly" in message
+        assert "[1 clause withheld — plan §12 rule 3]" in message
+
+    def test_a_detail_with_no_progress_figure_is_rendered_verbatim(self, tmp_path):
+        """A scrubber that rewrites clean text would make the report an
+        unfaithful copy of the board, which is worse than the defect."""
+        detail = "1/2 clauses met; holding: old_weekly_within_cadence; grades 2 of 5 deliverables"
+        rows = [_row("phase0", "phase", "UNMET", detail)]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert f"  phase0  UNMET  {detail}" in message
+        assert "withheld" not in message
+
+    def test_a_detail_that_is_entirely_a_progress_figure_leaves_the_marker(self, tmp_path):
+        """The row never vanishes. A phase row missing from the report is the
+        one thing the board's own guards refuse one layer down."""
+        rows = [_row("phase0", "phase", "UNMET", "6 findings this week")]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "  phase0  UNMET  [1 clause withheld — plan §12 rule 3]" in message
+
     def test_the_reading_is_quoted_with_its_store(self, tmp_path):
         """Plan §6 rule 2. Derived from the live store, never a literal."""
         store = _seed(tmp_path, previous=_board())
@@ -326,6 +401,12 @@ class TestDelivery:
         assert call["severity"] == "info"
         assert call["silent"] is True
         assert call["raise_on_total_failure"] is True
+        # Explicit, never left to `krepis.alerts.resolve_destination`'s
+        # fallback: an `info` severity reaches the operator chat TODAY only
+        # because no log chat is configured, so configuring
+        # TELEGRAM_LOG_CHAT_ID fleet-wide would silently move this report off
+        # Brian's chat with the manifest still reading `ok`.
+        assert call["destination"] == "operator_chat"
 
     def test_it_carries_no_dedup_key(self):
         """An identical report must still arrive tomorrow: a digest that stops
@@ -445,13 +526,37 @@ class TestDeclarations:
         assert (summer.hour, summer.tzname()) == (6, "PDT")
         assert (winter.hour, winter.tzname()) == (5, "PST")
 
-    def test_the_workflow_does_not_double_page_the_operator(self):
-        """Every failure mode is already a page on the declared path — a
-        `failed` manifest (FAILURE) or an absent one (ABSENCE). A second,
-        workflow-level notification would make one incident two pages and
-        break `crucible.alerts`' one-key-per-(job, trading_day) dedup."""
+    def test_a_failed_run_notifies_because_alerts_sweep_has_never_produced(self):
+        """MEASURED 2026-09-03 (`alpha-engine-config-I9905`): `alerts.sweep`
+        has NEVER written a manifest — its dispatcher fails `RunInstances` on
+        every invocation since the stack existed. The declared page path is
+        therefore dark, so a 06:00 failure would tell nobody at all. This job
+        carries `board.yml`'s notify block until that is measurably false."""
         spec = yaml.safe_load(WORKFLOW.read_text())
-        assert list(spec["jobs"]) == ["report"]
+        assert list(spec["jobs"]) == ["report", "notify-failure"]
+        notify = spec["jobs"]["notify-failure"]
+        assert notify["needs"] == ["report"]
+        assert "failure()" in notify["if"]
+        assert notify["uses"] == (
+            "nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml"
+            "@619de3f32aef2e63329e7270afb87ec6b1e381e3"
+        )
+        assert notify["secrets"] == "inherit"
+
+    def test_the_notify_block_names_what_would_let_it_be_removed(self):
+        """A stopgap with no stated removal condition is permanent. The
+        comment must name the artifact whose existence retires it, so the
+        next reader can check rather than guess."""
+        text = WORKFLOW.read_text()
+        assert "REMOVE THIS JOB WHEN" in text
+        # The artifact whose existence retires the stopgap, named so the next
+        # reader can CHECK the condition rather than re-derive it.
+        assert "runs/alerts.sweep/" in text
+        # A tracker reference, matched by SHAPE rather than by number:
+        # `tests/test_no_stale_tracker_literals.py` forbids an issue literal
+        # in code, and a guard that pinned one would go stale the way the
+        # thing it guards does.
+        assert re.search(r"alpha-engine-config-I\d+", text)
 
     def test_the_workflow_is_not_reachable_on_a_pull_request(self):
         """A live-state job on a PR reports the author's own change as drift,

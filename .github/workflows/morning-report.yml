@@ -47,17 +47,33 @@ name: Morning report
 # months is a smaller defect than a guard that can silently deliver twice or
 # not at all.
 #
-# ── Why there is no notify-failure job here ───────────────────────────────
+# ── Why notify-failure IS here, and what would remove it ─────────────────
 #
-# `board.yml` carries one; this deliberately does not. Every failure mode of
-# this job is ALREADY a page on the declared path: a delivery that raises
-# leaves `status: failed` in `runs/report.morning/{day}/{firing}/run.json`
-# and `alerts.sweep`'s FAILURE condition pages on it, and a job that dies
-# before the manifest exists (a failed OIDC assume, a cancelled runner)
-# leaves it absent and the ABSENCE condition pages at the registry deadline.
-# Adding a workflow-level notification would make one incident two pages,
-# which breaks `crucible.alerts`' one-key-per-`(job, trading_day)` dedup and
-# spends the <=2 pages/month ceiling on duplicates.
+# The design argument for omitting it is that this job's failures are already
+# pages on the declared path: a delivery that raises leaves `status: failed`
+# in `runs/report.morning/{day}/{firing}/run.json` and `alerts.sweep`'s
+# FAILURE condition pages on it; a job that dies before the manifest exists
+# (a failed OIDC assume, a cancelled runner) leaves it absent and the ABSENCE
+# condition pages at the registry deadline. That argument rests on a premise
+# that is FALSE TODAY.
+#
+# MEASURED 2026-09-03, `alpha-engine-config-I9905`: `alerts.sweep` has NEVER
+# written a manifest. Its dispatcher fails `RunInstances` on every invocation
+# since the stack existed, so both declared page conditions are DARK -- a
+# component emitting nothing is unobserved, not healthy, and that includes
+# the thing whose job is to notice silence. A 06:00 failure would therefore
+# reach nobody at all, which is precisely the state this workflow exists to
+# end: Brian trusting a surface that emits nothing.
+#
+# So this carries `board.yml`'s notify block, as a STOPGAP with a stated
+# removal condition rather than a permanent second channel. The double-page
+# concern is real and is the accepted cost: while the sweep is dark there is
+# no page to double.
+#
+# REMOVE THIS JOB WHEN: `crucible/runs/alerts.sweep/` holds `status: ok`
+# manifests on five consecutive scheduled firings, i.e. the declared page
+# path is demonstrably alive. Until then, deleting it re-creates the silence.
+# The fix for the sweep itself is `nous-ergon-ops-PR1007`.
 #
 # ── What the identity may do ──────────────────────────────────────────────
 #
@@ -146,3 +162,11 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: uv run crucible report.morning --store "$STORE_URI"
+
+  # The stopgap. See "Why notify-failure IS here" above for the measured
+  # reason and the condition that retires it.
+  notify-failure:
+    needs: [report]
+    if: ${{ failure() }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@619de3f32aef2e63329e7270afb87ec6b1e381e3
+    secrets: inherit

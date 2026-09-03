@@ -74,11 +74,19 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from crucible.calendar import previous_trading_day
-from crucible.keys import BOARD_CURRENT_KEY, board_key, manifest_key, morning_report_key
+from crucible.keys import (
+    BOARD_CURRENT_KEY,
+    acceptance_reading_key,
+    board_key,
+    manifest_key,
+    morning_report_key,
+)
 from crucible.store import LocalStore, S3Store, Store, open_store
 
 __all__ = [
     "ACCEPTANCE_NOT_ON_ANY_ARTIFACT",
+    "CLAUSE_SEPARATOR",
+    "FORBIDDEN_PROGRESS_TOKENS",
     "BOARD_JOB",
     "DELIVERY_TZ",
     "MORNING_JOB",
@@ -146,6 +154,69 @@ ACCEPTANCE_NOT_ON_ANY_ARTIFACT = "acceptance count: not on any artifact"
 NO_OPERATOR_ACTION = "pending operator action: none exposed by the board's producer"
 
 
+#: How the board separates the clauses of one row's `detail`. Read off the
+#: live board 2026-09-02: "1/2 clauses met; holding: ...; grades 2 of 5 ...".
+#: Declared here rather than inlined so :func:`_withhold_progress` has one
+#: definition of what it is splitting, and so a board that changed separator
+#: fails the scrubber's own tests rather than silently withholding whole rows.
+CLAUSE_SEPARATOR = "; "
+
+#: Phrasings plan §12 rule 3 forbids from a status report: "the only progress
+#: number is the acceptance count; PRs merged / findings / commits are NOT
+#: progress and do not appear in a status report."
+#:
+#: **This is a guard over CONTENT, not over the template.** `row["detail"]`
+#: is the board's free text and is rendered verbatim, so a board detail
+#: reading "1/2 clauses met; 3 of 5 PRs merged" ships a forbidden figure onto
+#: the one surface the rule exists for. A test that greps the rendered
+#: message over a fixture whose details are placeholders grades the template
+#: and passes while that happens.
+#:
+#: Deliberately a small closed set of PHRASES rather than a growing denylist
+#: of everything anyone might write: it is the rule's own vocabulary, and a
+#: clause it misses is a clause the rule's own wording does not name either.
+#: The failure mode is a false NEGATIVE (a novel phrasing passes through),
+#: never a false positive that silently deletes a real reading — every
+#: withholding is declared on the line it happened.
+FORBIDDEN_PROGRESS_TOKENS: tuple[str, ...] = (
+    "pull request",
+    " pr ",
+    " prs ",
+    "merged",
+    "commits",
+    "findings",
+    "progress",
+)
+
+#: What replaces a withheld clause. Carries no forbidden token itself — a
+#: marker that trips the guard it implements would make the whole-message
+#: assertion unfalsifiable.
+WITHHELD_MARKER = "[{n} clause{s} withheld — plan §12 rule 3]"
+
+
+def _withhold_progress(detail: str) -> str:
+    """Drop the clauses of ``detail`` that state a forbidden progress figure.
+
+    **Withheld, never silently dropped.** The count of removed clauses is
+    rendered in their place, so a reader can see that the board said
+    something this surface refused to repeat and go read the board. A clause
+    that vanished without a trace is indistinguishable from a board that
+    never carried it, which is the defect this whole instrument exists to
+    remove one layer down.
+
+    **Clean text is passed through byte for byte.** A scrubber that rewrote
+    detail it had no objection to would make the report an unfaithful copy of
+    the board, which is worse than the defect it fixes.
+    """
+    clauses = detail.split(CLAUSE_SEPARATOR)
+    kept = [c for c in clauses if not any(t in f" {c.lower()} " for t in FORBIDDEN_PROGRESS_TOKENS)]
+    removed = len(clauses) - len(kept)
+    if not removed:
+        return detail
+    marker = WITHHELD_MARKER.format(n=removed, s="" if removed == 1 else "s")
+    return CLAUSE_SEPARATOR.join([*kept, marker]) if kept else marker
+
+
 class UndeliveredError(RuntimeError):
     """The report was rendered and did not reach the operator.
 
@@ -193,6 +264,11 @@ class MorningInputs:
     board_code_sha: str | None
     board_run_note: str
     operator_action: str | None
+    #: §12 rule 3's one progress figure as FILED, or `None` when no artifact
+    #: carries it. Never reconstructed from this process's own checkout: that
+    #: would print the branch the job ran from as though it were `main`'s
+    #: reading (`alpha-engine-config-I9902` builds the producer).
+    acceptance: dict[str, Any] | None
 
 
 def _read_json(store: Store, key: str) -> tuple[dict[str, Any] | None, str]:
@@ -251,6 +327,8 @@ def read_inputs(store: Store, *, trading_day: dt.date) -> MorningInputs:
                 f"{run.get('reason') or 'no reason recorded'}"
             )
 
+    acceptance, _ = _read_json(store, acceptance_reading_key(board_day))
+
     return MorningInputs(
         board=board,
         board_uri=store_uri(store),
@@ -260,6 +338,7 @@ def read_inputs(store: Store, *, trading_day: dt.date) -> MorningInputs:
         board_code_sha=code_sha,
         board_run_note=note,
         operator_action=operator_action,
+        acceptance=acceptance,
     )
 
 
@@ -297,7 +376,7 @@ def _phase_lines(board: dict[str, Any]) -> list[str]:
             "  no phase row on the board — the ladder is not being rendered, which is a "
             "defect in the board, not a phase that has no gate"
         ]
-    return [f"  {row['id']}  {row['state']}  {row['detail']}" for row in rows]
+    return [f"  {row['id']}  {row['state']}  {_withhold_progress(row['detail'])}" for row in rows]
 
 
 def _moved_lines(inputs: MorningInputs) -> list[str]:
@@ -318,6 +397,30 @@ def _moved_lines(inputs: MorningInputs) -> list[str]:
         if before.get(row_id) != after.get(row_id)
     ]
     return moved or ["  nothing moved"]
+
+
+def _acceptance_line(reading: dict[str, Any] | None) -> str:
+    """§12 rule 3's one progress figure, read or honestly absent.
+
+    A reading missing any of the four fields the producer contract declares
+    (`crucible.keys.acceptance_reading_key`) is treated as ABSENT, not as a
+    partial reading: rendering three of four fields of the only number the
+    plan calls progress would be a fabrication that looks exactly like a
+    measurement, and the absent line is the honest alternative.
+    """
+    if reading is None:
+        return ACCEPTANCE_NOT_ON_ANY_ARTIFACT
+    try:
+        met = int(reading["met"])
+        unmet = int(reading["unmet"])
+        unmeasurable = int(reading["unmeasurable"])
+        commit = str(reading["commit"])
+    except (KeyError, TypeError, ValueError):
+        return ACCEPTANCE_NOT_ON_ANY_ARTIFACT
+    return (
+        f"acceptance count: {met} met / {unmet} unmet / {unmeasurable} unmeasurable "
+        f"(commit {commit})"
+    )
 
 
 def _silence_line(board: dict[str, Any]) -> str:
@@ -355,7 +458,7 @@ def render_message(inputs: MorningInputs, *, now: dt.datetime) -> str:
     lines.append(f"moved since {inputs.previous_day}")
     lines.extend(_moved_lines(inputs))
     lines.append("")
-    lines.append(ACCEPTANCE_NOT_ON_ANY_ARTIFACT)
+    lines.append(_acceptance_line(inputs.acceptance))
     lines.append(_silence_line(board))
     lines.append(
         f"pending operator action: {inputs.operator_action}"
@@ -377,6 +480,21 @@ def _krepis_publish(*args: Any, **kwargs: Any) -> Any:
     return publish(*args, **kwargs)
 
 
+def _operator_chat() -> str:
+    """krepis' own name for the incident channel. Imported at call time.
+
+    Lazy for the same reason :func:`_krepis_publish` is, and read from krepis
+    rather than restated as `"operator_chat"` here: a literal would keep
+    passing this module's tests on the day krepis renamed the destination,
+    and a routing value that no longer names anything falls back to whatever
+    the resolver decides — which is the failure this argument exists to
+    prevent.
+    """
+    from krepis.alerts import DESTINATION_OPERATOR_CHAT  # noqa: PLC0415 - lazy on purpose
+
+    return DESTINATION_OPERATOR_CHAT
+
+
 def deliver(message: str, *, transport: Callable[..., Any] | None = None) -> str:
     """Send ``message`` on the operator channel. Returns the destination.
 
@@ -393,11 +511,31 @@ def deliver(message: str, *, transport: Callable[..., Any] | None = None) -> str
     byte-identical to yesterday's — a report that stops arriving when nothing
     changed is indistinguishable from a report that stopped arriving.
 
+    **The destination is EXPLICIT, not resolved.**
+    `krepis.alerts.resolve_destination` routes a non-`error` severity to the
+    LOG chat when `TELEGRAM_LOG_CHAT_ID` is configured, and reaches the
+    operator chat only through its documented "no log chat configured"
+    fallback. So this report lands on Brian's chat today by the absence of a
+    fleet-wide setting, and the day someone configures one it would move off
+    his chat with this job's manifest still reading `ok` — a delivery that
+    silently changed audience is exactly the class of silent success this
+    module refuses everywhere else. `DESTINATION_OPERATOR_CHAT` is passed by
+    name, from krepis' own constant rather than a literal here, so the
+    routing is a decision in this diff instead of a property of the
+    environment.
+
     **Undelivered raises.** `raise_on_total_failure=True` covers a transport
     that reached nothing; the explicit check below covers the case krepis
     calls a success — `any_ok` is True on a muted or dedup-suppressed publish
     by its documented contract, and neither of those put the report in
     Brian's hands.
+
+    **Known: a manifest write that fails AFTER a successful delivery re-sends
+    on the retry**, because the send is not idempotent and `run_job`'s one
+    declared transient retry re-runs the whole body — two identical reports
+    on the operator's phone, never a missing one. Filed by the parent session;
+    the failure direction is deliberate, since a delivery skipped to avoid a
+    duplicate is the silence this job exists to end.
     """
     publish = transport if transport is not None else _krepis_publish
     result = publish(
@@ -408,6 +546,7 @@ def deliver(message: str, *, transport: Callable[..., Any] | None = None) -> str
         telegram=True,
         silent=True,
         dedup_key=None,
+        destination=_operator_chat(),
         raise_on_total_failure=True,
     )
     if not hasattr(result, "any_ok"):

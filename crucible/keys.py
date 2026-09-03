@@ -32,6 +32,7 @@ __all__ = [
     "DRIFT_INPUTS",
     "REVIEWER_PATTERN",
     "RUNS_ROOT",
+    "acceptance_reading_key",
     "arena_cycle_key",
     "arm_id_from_segment",
     "arm_key_segment",
@@ -660,3 +661,35 @@ def morning_report_key(trading_day: str, calendar_date: str) -> str:
     `crucible.alerts.sweep` already carries for the same reason.
     """
     return f"{manifest_prefix('report.morning', trading_day)}{calendar_date}/message.txt"
+
+
+# -- the acceptance suite's reading, filed as an artifact (I9902) -----------
+
+
+def acceptance_reading_key(trading_day: str) -> str:
+    """Where `main`'s plan §2 acceptance reading is filed.
+
+    §12 rule 3 makes the acceptance count the ONLY progress figure, and today
+    it exists solely in `tests/acceptance/ratchet.json` — a property of the
+    repository, readable from a git checkout and from nowhere else. Every
+    consumer outside a checkout therefore has no way to read the one number
+    the plan names as progress. `alpha-engine-config-I9902` builds the
+    producer; this is the key it writes to, declared here first so the
+    consumer (`crucible.morning`) and the producer cannot disagree about the
+    shape, and so the reader has something to name while it reads absent.
+
+    **The producer contract**, and the document `crucible.morning` parses::
+
+        {"met": int, "unmet": int, "unmeasurable": int,
+         "commit": str, "measured_at": str}
+
+    `unmeasurable` is its own integer and is never folded into `unmet`: "the
+    clause says no" and "we could not ask" are different facts and the second
+    one is about us (`alpha-engine-config-I9828` is exactly that distinction
+    for the cost clause). `commit` is the sha the reading was taken at — plan
+    §6 rule 2, a reading is always quoted with its store and commit — and a
+    count with no commit beside it is a number nobody can reproduce.
+    """
+    if not trading_day:
+        raise ValueError("trading_day must be non-empty")
+    return f"report/acceptance/{trading_day}.json"
