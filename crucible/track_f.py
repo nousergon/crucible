@@ -147,18 +147,32 @@ def gate_handler(args: argparse.Namespace) -> int:
         ctx.record_rows(rows_in=len(reading.window), rows_out=len(reading.clauses))
         n_clauses = len(reading.clauses)
         met_count = sum(1 for c in reading.clauses if c.met)
-        # `reading.met_ratio` is `None` for an unmeasured (empty-clause) gate
-        # (`crucible.gate.GateResult.met_ratio`, alpha-engine-config-I9824).
-        # `derive_status` turns that absence into an explicit N/A-shaped
-        # status rather than a bare 0.0 that would read as "measured, none
-        # passed" — the same vocabulary `crucible/report.py::_row` publishes
-        # through, not a second one invented here. The measured branch keeps
-        # this job's own OK/FAIL vocabulary (met vs not met), unchanged from
-        # before this fix — only the previously-impossible-to-express
-        # "nothing was measured" case is new.
-        if reading.met_ratio is None:
+        # `reading.met_ratio` is `None` for two DISTINCT reasons
+        # (`crucible.gate.GateResult.met_ratio`, alpha-engine-config-I9824,
+        # widened round 3 of I9869) and this job's own outcome metric must
+        # tell them apart rather than publish one wording for both:
+        #
+        # 1. Zero clauses registered — nothing to measure. `derive_status`
+        #    reads this from `n_samples < 0.5 * n_floor` (n_clauses == 0).
+        # 2. N of M clauses registered but one or more could not be READ (a
+        #    store access failure, not a fact about the system graded) —
+        #    `n_clauses` is the true registered count, so `derive_status`
+        #    would read it as measured and pick GREEN/WATCH/RED off a `None`
+        #    value. `input_present=False` routes it to `N/A-MISSING-INPUT`
+        #    instead — the vocabulary already has a state for exactly this,
+        #    round 4 finding 2: it must not be re-typed as "no clauses
+        #    registered, nothing measured" when clauses ARE registered, nor
+        #    invented as a new status outside the existing taxonomy.
+        if reading.met_ratio is None and n_clauses == 0:
             status = derive_status(value=None, n_samples=n_clauses, n_floor=1)
             status_reason = f"gate {reading.gate}: no clauses registered, nothing measured"
+        elif reading.met_ratio is None:
+            unmeasurable_names = [c.name for c in reading.clauses if c.unmeasurable]
+            status = derive_status(value=None, n_samples=n_clauses, n_floor=1, input_present=False)
+            status_reason = (
+                f"gate {reading.gate}: {len(unmeasurable_names)} of {n_clauses} clauses "
+                f"unmeasurable: {', '.join(unmeasurable_names)}"
+            )
         else:
             status = "OK" if reading.met else "FAIL"
             status_reason = f"gate {reading.gate}: {met_count}/{n_clauses} clauses met"

@@ -825,7 +825,11 @@ def _clause_explain_walks_a_verdict(store: Store, window: list[dt.date]) -> Clau
             continue
         if status != "ok":
             continue
-        inputs = document.get("inputs", [])
+        inputs_problem = _field(key, document, "inputs", list)
+        if inputs_problem is not None:
+            malformed.append(inputs_problem)
+            continue
+        inputs = document["inputs"]
         if any(isinstance(i, dict) and "verdict.json" in str(i.get("key", "")) for i in inputs):
             return Clause("explain_walks_a_verdict", requirement, True, f"walked at {key}", (key,))
     if unmeasurable or malformed:
@@ -879,15 +883,16 @@ def _clause_pointer_flipped_on_smoke(store: Store, window: list[dt.date]) -> Cla
             (POINTER_KEY,),
         )
     pointer = pointer_read.document or {}
-    sha = pointer.get("sha", "")
-    if not isinstance(sha, str):
+    sha_problem = _field(POINTER_KEY, pointer, "sha", str)
+    if sha_problem is not None:
         return Clause(
             "pointer_flipped_on_smoke",
             requirement,
             False,
-            f"{POINTER_KEY}: `sha` is {sha!r}, not str",
+            sha_problem,
             (POINTER_KEY,),
         )
+    sha = pointer["sha"]
     evidence = [POINTER_KEY]
     malformed: list[str] = []
     unmeasurable: list[str] = []

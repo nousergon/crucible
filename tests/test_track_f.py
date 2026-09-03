@@ -13,6 +13,7 @@ guard, undone by its own lineage recorder.
 
 from __future__ import annotations
 
+import json
 from unittest import mock
 
 from crucible.cli import main
@@ -61,3 +62,60 @@ class TestGateHandlerLineageReadIsGuarded:
         # reaching its own output write.
         ladder_bytes = store.get_bytes("gates/ladder.json")
         assert ladder_bytes
+
+
+class TestGateHandlerOutcomeMetricNamesTheUnmeasurableCause:
+    """`alpha-engine-config-I9869` round 4, finding 2 (BLOCKING). Round 3
+    widened `GateResult.met_ratio` to `None` for ANY unmeasurable clause, not
+    only for zero registered clauses, but left `gate_handler`'s branch text
+    unchanged: it always said "no clauses registered, nothing measured" —
+    false when clauses ARE registered and one merely could not be read. That
+    false statement lands on `gate_clauses_met_ratio`, the gate job's
+    declared outcome metric (`crucible/components.yaml:498`), and points an
+    operator at the wrong remedy ("register the clauses" instead of "fix our
+    credentials")."""
+
+    def test_status_reason_names_the_unmeasurable_clause_not_no_clauses_registered(
+        self, tmp_path
+    ) -> None:
+        store = LocalStore(tmp_path)
+
+        def fake_clauses(*_args, **_kwargs) -> list[Clause]:
+            # Six clauses registered, five measured and met, one
+            # UNMEASURABLE — the exact shape round 4's reproduction used
+            # (a chmod-000 arc manifest): registered-but-unmeasurable, not
+            # "nothing registered".
+            return [
+                Clause("arc_runs_ok", "req", False, "1 could not be read", (), unmeasurable=True),
+                Clause("arms_all_scored", "req", True, "ok", ()),
+                Clause("attribution_renders", "req", True, "ok", ()),
+                Clause("explain_walks_a_verdict", "req", True, "ok", ()),
+                Clause("pointer_flipped_on_smoke", "req", True, "ok", ()),
+                Clause("independently_reviewed", "req", True, "ok", ()),
+            ]
+
+        with mock.patch.dict(GATES, {"phase1": (6, fake_clauses)}):
+            main(
+                [
+                    "gate",
+                    "--gate",
+                    "phase1",
+                    "--store",
+                    str(tmp_path),
+                    "--date",
+                    "2026-08-28",
+                    "--dry-run",
+                ]
+            )
+
+        run_document = json.loads(store.get_bytes("runs/gate/2026-08-28/run.json"))
+        metric = next(m for m in run_document["metrics"] if m["name"] == "gate_clauses_met_ratio")
+        assert metric["value"] is None
+        assert metric["n_samples"] == 6
+        assert "arc_runs_ok" in metric["status_reason"]
+        assert "no clauses registered" not in metric["status_reason"]
+        assert "1 of 6" in metric["status_reason"]
+        # The honest status for "registered but could not be read" — not the
+        # zero-clause N/A-LOW-N branch, and not a status invented outside the
+        # existing `krepis.metrics.derive_status` vocabulary.
+        assert metric["status"] == "N/A-MISSING-INPUT"

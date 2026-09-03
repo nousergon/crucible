@@ -591,6 +591,39 @@ class TestPhaseOneGuardedReadsRound2:
         assert not clause.met
         assert "sha" in clause.detail
 
+    def test_pointer_sha_absent_is_a_red_reading_not_an_empty_string(self, tmp_path) -> None:
+        """Round 4 finding 3: presence was unchecked, only type — an absent
+        `sha` silently became `""` and was compared against every smoke
+        manifest's `release_sha` instead of being reported as malformed."""
+        store = _seed_met(tmp_path)
+        _put(store, "releases/current", {})
+        clause = next(
+            c
+            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            if c.name == "pointer_flipped_on_smoke"
+        )
+        assert not clause.met
+        assert "releases/current" in clause.detail
+        assert "missing required field" in clause.detail
+        assert "sha" in clause.detail
+
+    def test_explain_inputs_field_wrong_type_is_a_red_reading_not_a_typeerror(
+        self, tmp_path
+    ) -> None:
+        """Round 4 finding 1 (BLOCKING): `inputs` was the one required field
+        the PR body named that never got routed through `_field` — a present
+        but non-iterable `inputs` raised straight out of `evaluate`, and the
+        whole gate command died with no ladder and no artifact published."""
+        store = _seed_met(tmp_path)
+        key = manifest_key("explain", FRIDAY.isoformat())
+        for day in WINDOW:
+            _put(store, manifest_key("explain", day.isoformat()), _manifest(inputs=5))
+        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        clause = next(c for c in result.clauses if c.name == "explain_walks_a_verdict")
+        assert not clause.met
+        assert key in clause.detail
+        assert "inputs" in clause.detail
+
     # -- finding 3: SHOULD-FIX — status vocabulary compared with `!= "ok"`
     # instead of against the schema's exhaustive enum. ----------------------
 
