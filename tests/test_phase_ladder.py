@@ -272,7 +272,10 @@ class TestAnOutOfOrderPhaseIsVisibleAsSuch:
         rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
         assert rows["phase1"]["state"] == "OUT_OF_ORDER"
         assert rows["phase1"]["gate_state"] == "UNMET"
-        assert rows["phase1"]["clauses_total"] == 5
+        # Six since alpha-engine-config-I9794 added the independent-review
+        # clause. The number is the point of the assertion — it is the reading
+        # the ordering breach must not erase.
+        assert rows["phase1"]["clauses_total"] == 6
 
     def test_an_UNGRADED_later_phase_is_not_called_out_of_order(self, store: LocalStore) -> None:
         """Phases 2-5 have never been read. They are UNMEASURED, which is the

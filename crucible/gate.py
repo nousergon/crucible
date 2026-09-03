@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import datetime as dt
 import json
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -42,6 +43,8 @@ from crucible.keys import (
     arm_register_key,
     gate_key,
     legacy_weekly_executions_key,
+    review_key,
+    review_prefix,
     runs_prefix,
 )  # noqa: F401 - re-exported
 from crucible.manifest import manifest_key
@@ -63,6 +66,7 @@ __all__ = [
     "GATE_DELIVERABLES",
     "PHASE0_DELIVERABLES",
     "PHASES",
+    "REVIEW_SCHEMA_VERSION",
     "SOURCE_SCAN_SCOPE",
     "Clause",
     "Deliverable",
@@ -79,6 +83,8 @@ __all__ = [
     "gate_key",
     "ladder_payload",
     "legacy_weekly_executions_key",
+    "review_key",
+    "review_prefix",
     "weekly_anchor",
     "last_read",
     "ladder_schema",
@@ -490,6 +496,168 @@ def _clause_pointer_flipped_on_smoke(store: Store, window: list[dt.date]) -> Cla
     )
 
 
+#: The review document's schema token. Written by
+#: `.github/workflows/adversarial-review-gate.yml`'s `record-verdict` job and
+#: read by :func:`_clause_independently_reviewed`; a document without it is a
+#: shape this clause has never agreed to read, and is refused rather than
+#: guessed at.
+REVIEW_SCHEMA_VERSION = "review.v1"
+
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _clause_independently_reviewed(store: Store, phase: str, window: list[dt.date]) -> Clause:
+    """Plan §11 risk 1, as a MEASUREMENT over the store.
+
+    "Every track's exit is reviewed by an independent adversarial agent
+    against §2's acceptance tests, not by its author." Until this clause
+    existed that lived only as a GitHub check-run, so `crucible gate` — the
+    thing that decides whether a phase may exit — could not read it at all,
+    and a phase could exit with no review having happened.
+
+    **The independence comparison is between a reviewer and a DERIVED author
+    set.** ``authors`` on the document is not the dispatcher's opinion of who
+    wrote the code: the producer derives it from the commits under review
+    (their `Claude-Session:` trailers and their commit author/committer
+    identities). A gate whose input is supplied by the thing it grades
+    measures nothing, and that is exactly what the first version of this
+    control did — `reviewer` and `author` were free-text `workflow_dispatch`
+    inputs typed by the session asking to be passed
+    (`alpha-engine-config-I9873`).
+
+    **A `fail` verdict is not cleared by a later `pass` from someone else.**
+    A reviewer who found blocking defects is evidence about the code; a second
+    reviewer who did not look at the same thing is not a rebuttal. The phase
+    re-reviews, which files a NEW document for the round that fixed them —
+    under a later session, so the superseded round falls out of the window on
+    its own rather than being deleted.
+
+    **The review's date comes from the KEY, never the body.** ``reviewed_at``
+    is the producer's claim about when it reviewed; the key is where the
+    artifact actually is, and `Store.assert_keys_bind_to_trading_days` already
+    holds it to a session. A review from outside the window is a review of a
+    superseded state of the code and does not satisfy a later exit.
+    """
+    requirement = (
+        "at least one review document in the window records `pass` from a reviewer who "
+        "is not in the authors derived from the commits reviewed, and no independent "
+        "reviewer in the window recorded `fail`"
+    )
+    prefix = review_prefix(phase)
+    days = {day.isoformat() for day in window}
+    keys = sorted(key for key in store.list_keys(prefix) if key.endswith(".json"))
+    if not keys:
+        return Clause(
+            "independently_reviewed",
+            requirement,
+            False,
+            f"no review document under `{prefix}`. No independent adversarial review of "
+            f"{phase} has ever been filed, so this gate has nothing to read (plan §11 "
+            "risk 1)",
+            (prefix,),
+        )
+
+    evidence = tuple(keys)
+    problems: list[str] = []
+    self_reviews: list[str] = []
+    stale: list[str] = []
+    passes: list[str] = []
+    for key in keys:
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            problems.append(read.problem)
+            continue
+        if read.absent:
+            problems.append(f"{key} was listed and then could not be read")
+            continue
+        document = read.document or {}
+        problem = _review_document_problem(key, document)
+        if problem is not None:
+            problems.append(problem)
+            continue
+        review_day = key[len(prefix) :].split("/")[0]
+        reviewer = str(document["reviewer"]).lower()
+        authors = {str(a).lower() for a in document["authors"]}
+        if reviewer in authors:
+            self_reviews.append(
+                f"{key}: reviewer `{reviewer}` is one of the authors derived from the "
+                "commits reviewed — a self-review is not a review"
+            )
+            continue
+        if review_day not in days:
+            stale.append(f"{key}: filed on {review_day}, outside this gate's window")
+            continue
+        if document["verdict"] == "fail":
+            return Clause(
+                "independently_reviewed",
+                requirement,
+                False,
+                f"{key}: independent reviewer `{reviewer}` recorded `fail` on "
+                f"{document['head_sha'][:12]} — {document.get('summary', '(no summary)')}. "
+                "A failing round is answered by fixing it and filing a new round, never "
+                "by a second reviewer passing it",
+                evidence,
+            )
+        passes.append(f"{key}: `pass` from {reviewer} on {document['head_sha'][:12]}")
+
+    if problems:
+        return Clause(
+            "independently_reviewed",
+            requirement,
+            False,
+            "; ".join(problems),
+            evidence,
+        )
+    if passes:
+        return Clause("independently_reviewed", requirement, True, "; ".join(passes), evidence)
+    detail = self_reviews + stale
+    return Clause(
+        "independently_reviewed",
+        requirement,
+        False,
+        "; ".join(detail)
+        or f"{len(keys)} review documents under `{prefix}`, none of them an independent "
+        "`pass` in the window",
+        evidence,
+    )
+
+
+def _review_document_problem(key: str, document: dict[str, Any]) -> str | None:
+    """Why ``document`` is not a review this clause will read, or None.
+
+    Every branch is a RED clause, never an exception and never a skip: a
+    review document we cannot read is `no data`, and `no data` is never a pass
+    (principle 7). It is also never silently ignored — a malformed document
+    sitting in the prefix would otherwise let the gate report "no review
+    exists" when what happened is "the producer wrote something we do not
+    understand", and those two name different remedies.
+    """
+    if document.get("schema_version") != REVIEW_SCHEMA_VERSION:
+        return (
+            f"{key}: schema_version is {document.get('schema_version')!r}, not "
+            f"{REVIEW_SCHEMA_VERSION!r}"
+        )
+    if document.get("verdict") not in ("pass", "fail"):
+        return f"{key}: verdict is {document.get('verdict')!r}, not 'pass' or 'fail'"
+    reviewer = document.get("reviewer")
+    if not isinstance(reviewer, str) or not reviewer.strip():
+        return f"{key}: reviewer is {reviewer!r}, not a session identity"
+    authors = document.get("authors")
+    if not isinstance(authors, list) or not authors or not all(isinstance(a, str) for a in authors):
+        return (
+            f"{key}: authors is {authors!r}, not a non-empty list of identities derived "
+            "from the commits reviewed. An empty author set would make every reviewer "
+            "independent by construction"
+        )
+    head_sha = document.get("head_sha")
+    if not isinstance(head_sha, str) or not _SHA_RE.match(head_sha):
+        return (
+            f"{key}: head_sha is {head_sha!r}, not a full 40-hex commit sha. A review "
+            "that does not name what it reviewed grades nothing"
+        )
+    return None
+
+
 def _phase1(store: Store, window: list[dt.date], registry: dict[str, Component]) -> list[Clause]:
     return [
         _clause_arc_runs_ok(store, window, registry),
@@ -497,6 +665,7 @@ def _phase1(store: Store, window: list[dt.date], registry: dict[str, Component])
         _clause_attribution_renders(store, window),
         _clause_explain_walks_a_verdict(store, window),
         _clause_pointer_flipped_on_smoke(store, window),
+        _clause_independently_reviewed(store, "phase1", window),
     ]
 
 

@@ -19,6 +19,7 @@ from crucible.gate import (
     GATES,
     PHASE0_DELIVERABLES,
     PHASES,
+    REVIEW_SCHEMA_VERSION,
     SOURCE_SCAN_SCOPE,
     Deliverable,
     build_ladder,
@@ -28,7 +29,7 @@ from crucible.gate import (
     legacy_weekly_executions_key,
     weekly_anchor,
 )
-from crucible.keys import arena_cycle_key, arm_register_key
+from crucible.keys import arena_cycle_key, arm_register_key, review_key
 from crucible.manifest import manifest_key
 from crucible.report import attribution_key
 from crucible.slots import SLOTS
@@ -38,6 +39,24 @@ from crucible.weekly import arc_stages
 FRIDAY = dt.date(2026, 8, 28)
 WINDOW = [FRIDAY - dt.timedelta(weeks=n) for n in reversed(range(5))]
 SHA = "a" * 40
+REVIEWER = "session_01ReviewerBBBBB"
+
+
+def _review() -> dict:
+    """One independent adversarial review, in the shape the clause reads."""
+    return {
+        "schema_version": REVIEW_SCHEMA_VERSION,
+        "phase": "phase1",
+        "verdict": "pass",
+        "reviewer": REVIEWER,
+        # Derived from the commits under review by the recording job — never
+        # supplied by the session asking to be passed.
+        "authors": ["session_01AuthorAAAAAAAA", "cipher813"],
+        "pr_number": 46,
+        "head_sha": SHA,
+        "summary": "no findings against plan §2",
+        "reviewed_at": "2026-08-28T18:00:00Z",
+    }
 
 
 def _put(store: LocalStore, key: str, document: dict) -> None:
@@ -117,6 +136,12 @@ def _seed_met(tmp_path) -> LocalStore:
     )
     _put(store, "releases/current", {"sha": SHA})
     _put(store, manifest_key("smoke", FRIDAY.isoformat()), _manifest())
+    # The independent adversarial review (plan §11 risk 1,
+    # alpha-engine-config-I9794). Every refusal this clause makes is graded in
+    # `tests/test_gate_independent_review.py`; here it only has to be present
+    # and independent, so `_seed_met` still means "every phase-1 clause is
+    # satisfied" rather than "every clause except the newest one".
+    _put(store, review_key("phase1", FRIDAY.isoformat(), REVIEWER), _review())
     return store
 
 
@@ -252,6 +277,7 @@ class TestArtifact:
             "attribution_renders",
             "explain_walks_a_verdict",
             "pointer_flipped_on_smoke",
+            "independently_reviewed",
         }
         assert all(c["requirement"] and c["detail"] for c in document["clauses"])
 
