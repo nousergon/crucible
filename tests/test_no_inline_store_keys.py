@@ -253,9 +253,7 @@ class TestTheAllowlistIsOfShapesNotOfSyntaxes:
             ("get_bytes", "call to str(...)"),
         ]
 
-    def test_a_key_function_call_a_name_and_an_attribute_are_not_hits(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_key_function_call_a_name_and_an_attribute_are_not_hits(self, tmp_path: Path) -> None:
         """The three shapes a correctly-written call site uses. `release.
         wheel_key(...)` is accepted by NAME — `test_key_construction_placement.py`
         is what guarantees that every `*_key` callee is either in
