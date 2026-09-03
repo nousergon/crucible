@@ -67,6 +67,46 @@ def _attempt(clause: str, requirement: str, fn: Callable[[], Any], *, phase: str
         _unmet(clause, requirement, exc, phase=phase)
 
 
+def _unmeasurable(clause: str, requirement: str, exc: BaseException, *, phase: str) -> NoReturn:
+    """Fail this clause because the READ failed, not because the property was
+    read and found false.
+
+    Normative source: alpha-engine-config-I9828. A clause that reads live
+    infrastructure can fail two ways that must never render the same:
+    UNMET (the read succeeded and the property does not hold — call `_unmet`
+    or assert directly) and UNMEASURABLE (no credentials, no region,
+    AccessDenied, an unreachable endpoint — the caller could not read at
+    all). Both fail the job (`tests/acceptance/check_reading.py`'s
+    `Reading.unmeasurable` is a SUBSET of `.unmet` — `crucible/gate.py`'s
+    own phase-0 clause reads `met | unmet` as this suite's full clause set,
+    so an unmeasurable clause stays inside `unmet` for that coarse view —
+    and neither `unmet` nor `unmeasurable` is ever a pass), but only UNMET is
+    a statement about the system. Rendering them
+    identically is the exact defect this function exists to end: it made a
+    permanently-uncredentialed CI job indistinguishable from three real
+    plan-clause gaps, forever, with no artifact showing which was which.
+
+    The `UNMEASURABLE — ` prefix is the wire format `check_reading.py`
+    classifies on (JUnit's `<failure message=...>`, which survives
+    `--tb=no`) — a marker or a third pytest outcome would need a plugin this
+    suite does not otherwise carry, and the prefix is legible in the raw
+    `pytest -q` terminal output too, which a marker's XML-only signal is not.
+    """
+    try:
+        owning_phase = _PHASES_BY_ID[phase]
+    except KeyError:
+        raise ValueError(
+            f"{clause!r} names unknown phase {phase!r}; must be one of {sorted(_PHASES_BY_ID)}"
+        ) from None
+    pytest.fail(
+        f"UNMEASURABLE — {clause}\n"
+        f"  Required: {requirement}\n"
+        f"  Status:   could not be read (crucible v2 phase {owning_phase.number}, "
+        f"{owning_phase.tracker}). Blocked on: {exc}",
+        pytrace=False,
+    )
+
+
 class TestAutonomy:
     """§2 row 1: 'Runs autonomously, minimal input'."""
 
@@ -323,11 +363,18 @@ class TestCost:
                 iam=boto3.client("iam"),
             )
         except StackNotAppliedError as exc:
-            _unmet(clause, requirement, exc, phase="phase0")
+            # crucible.tags's own docstring: an absent stack is UNMEASURABLE,
+            # never a pass — there is nothing to tag yet.
+            _unmeasurable(clause, requirement, exc, phase="phase0")
         except Exception as exc:  # noqa: BLE001 - reported, never swallowed
-            # Credentials, region, permissions: every one of these means the
-            # clause was not measured, and an unmeasured clause is unmet.
-            _unmet(clause, requirement, exc, phase="phase0")
+            # Credentials, region, permissions, network: every one of these
+            # means the READ failed, not that the property was read and
+            # found false — alpha-engine-config-I9828. Rendered identically
+            # to UNMET, this clause could never read green in CI (no OIDC,
+            # no region) and reads AccessDenied on the laptop, so the
+            # published gate carried a caller-credential failure as one of
+            # its three "unmet plan objectives" forever.
+            _unmeasurable(clause, requirement, exc, phase="phase0")
         assert audit.met, f"UNMET — {clause}: {audit.detail()}"
 
 

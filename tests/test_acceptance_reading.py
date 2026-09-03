@@ -22,7 +22,9 @@ CHECKER = ROOT / "tests" / "acceptance" / "check_reading.py"
 RATCHET = ROOT / "tests" / "acceptance" / "ratchet.json"
 
 
-def _report(path: Path, *, met: list[str], unmet: list[str]) -> Path:
+def _report(
+    path: Path, *, met: list[str], unmet: list[str], unmeasurable: list[str] | None = None
+) -> Path:
     cases = "".join(
         f'<testcase classname="tests.acceptance.mod.{name.split("::")[0]}" '
         f'name="{name.split("::")[1]}"/>'
@@ -30,8 +32,15 @@ def _report(path: Path, *, met: list[str], unmet: list[str]) -> Path:
     )
     cases += "".join(
         f'<testcase classname="tests.acceptance.mod.{name.split("::")[0]}" '
-        f'name="{name.split("::")[1]}"><failure>UNMET</failure></testcase>'
+        f'name="{name.split("::")[1]}"><failure message="Failed: UNMET — {name}">'
+        f"UNMET</failure></testcase>"
         for name in unmet
+    )
+    cases += "".join(
+        f'<testcase classname="tests.acceptance.mod.{name.split("::")[0]}" '
+        f'name="{name.split("::")[1]}"><failure message="Failed: UNMEASURABLE — {name}">'
+        f"UNMEASURABLE</failure></testcase>"
+        for name in (unmeasurable or [])
     )
     path.write_text(f'<?xml version="1.0"?><testsuites><testsuite>{cases}</testsuite></testsuites>')
     return path
@@ -54,6 +63,24 @@ def _run(report: Path, ratchet: Path) -> subprocess.CompletedProcess[str]:
 def ratchet(tmp_path: Path) -> Path:
     path = tmp_path / "ratchet.json"
     path.write_text(json.dumps({"unmet": {"T::a": "phase 2"}, "met": ["T::b", "T::c"]}))
+    return path
+
+
+@pytest.fixture
+def ratchet_with_unmeasurable(tmp_path: Path) -> Path:
+    """`unmeasurable` is a SUBSET of `unmet`'s keys: T::d is listed in both,
+    since `crucible/gate.py`'s phase-0 clause reads `met | unmet` as the full
+    clause set and does not know about the finer `unmeasurable` bucket."""
+    path = tmp_path / "ratchet.json"
+    path.write_text(
+        json.dumps(
+            {
+                "unmet": {"T::a": "phase 2", "T::d": "no AWS credentials in this environment"},
+                "unmeasurable": {"T::d": "no AWS credentials in this environment"},
+                "met": ["T::b", "T::c"],
+            }
+        )
+    )
     return path
 
 
@@ -134,7 +161,7 @@ def test_the_committed_ratchet_matches_the_real_suite() -> None:
         "Two same-named classes in different modules collapse to one id, and one "
         "can then regress invisibly."
     )
-    want = set(ratchet["met"]) | set(ratchet["unmet"])
+    want = set(ratchet["met"]) | set(ratchet["unmet"]) | set(ratchet.get("unmeasurable", {}))
     vanished = sorted(want - set(ids))
     appeared = sorted(set(ids) - want)
     assert not vanished and not appeared, (
@@ -288,6 +315,116 @@ def test_a_collection_error_is_red(tmp_path: Path, ratchet: Path) -> None:
     assert "Gone:" in result.stderr or "New:" in result.stderr
 
 
+def test_a_credential_failure_reads_unmeasurable_never_unmet(tmp_path: Path) -> None:
+    """alpha-engine-config-I9828: the whole point of the marker.
+
+    A clause whose message carries the `UNMEASURABLE — ` marker (what
+    `_unmeasurable` in `test_plan_section_2_objectives.py` writes) is
+    classified into `Reading.unmeasurable`, a SUBSET of `Reading.unmet` (so
+    `crucible/gate.py`'s coarse `met | unmet` view still sees it as
+    not-met) — and it is not counted in `Reading.met`, nor in
+    `Reading.plain_unmet` (the genuine, code-fixable gaps), either.
+    """
+    checker = _checker()
+    report = _report(tmp_path / "r.xml", met=["T::b"], unmet=["T::a"], unmeasurable=["T::d"])
+    reading = checker.read_report(report)
+    assert reading.unmeasurable == {"T::d"}
+    assert reading.unmet == {"T::a", "T::d"}
+    assert reading.plain_unmet == {"T::a"}
+    assert reading.met == {"T::b"}, "neither an unmet nor an unmeasurable clause is a pass"
+
+
+def test_an_unmet_reading_renders_unmet_not_unmeasurable(tmp_path: Path) -> None:
+    """A plain UNMET failure — no marker — stays in `unmet`, unchanged from
+    before this clause-taxonomy existed."""
+    checker = _checker()
+    report = _report(tmp_path / "r.xml", met=["T::b"], unmet=["T::a"])
+    reading = checker.read_report(report)
+    assert reading.unmet == {"T::a"}
+    assert reading.unmeasurable == set()
+
+
+def test_a_matching_unmeasurable_reading_is_green(
+    tmp_path: Path, ratchet_with_unmeasurable: Path
+) -> None:
+    report = _report(
+        tmp_path / "r.xml", met=["T::b", "T::c"], unmet=["T::a"], unmeasurable=["T::d"]
+    )
+    result = _run(report, ratchet_with_unmeasurable)
+    assert result.returncode == 0, result.stderr
+    assert "unmeasurable" in result.stdout
+
+
+def test_an_undeclared_unmeasurable_clause_is_red(
+    tmp_path: Path, ratchet_with_unmeasurable: Path
+) -> None:
+    """A clause reading UNMEASURABLE that the ratchet does not list at all is
+    a vanished/appeared collection drift, exactly like an unmet clause would
+    be — it must not be silently absorbed as "extra credit"."""
+    report = _report(
+        tmp_path / "r.xml",
+        met=["T::b", "T::c"],
+        unmet=["T::a"],
+        unmeasurable=["T::d", "T::e"],
+    )
+    result = _run(report, ratchet_with_unmeasurable)
+    assert result.returncode == 1
+    assert "New: T::e" in result.stderr
+
+
+def test_a_clause_that_stops_being_readable_is_red_not_silently_absorbed(
+    tmp_path: Path, ratchet_with_unmeasurable: Path
+) -> None:
+    """A clause the ratchet says is MET that now fails to read at all is not
+    a regression (no code broke it) but it is still a drifted reading that
+    must fail the run and name the ratchet as needing an update."""
+    report = _report(
+        tmp_path / "r.xml", met=["T::c"], unmet=["T::a"], unmeasurable=["T::b", "T::d"]
+    )
+    result = _run(report, ratchet_with_unmeasurable)
+    assert result.returncode == 1
+    assert "no longer be READ" in result.stderr
+    assert "T::b" in result.stderr
+
+
+def test_a_clause_reclassified_between_unmet_and_unmeasurable_is_red(
+    tmp_path: Path, ratchet_with_unmeasurable: Path
+) -> None:
+    """T::a is `unmet` in the ratchet; reading it as `unmeasurable` instead
+    is neither a regression nor progress, but the ratchet no longer
+    describes the actual reading and must fail."""
+    report = _report(
+        tmp_path / "r.xml", met=["T::b", "T::c"], unmet=[], unmeasurable=["T::a", "T::d"]
+    )
+    result = _run(report, ratchet_with_unmeasurable)
+    assert result.returncode == 1
+    assert "failure reason changed" in result.stderr
+    assert "T::a" in result.stderr
+
+
+def test_progress_out_of_unmeasurable_is_recorded_like_progress_out_of_unmet(
+    tmp_path: Path, ratchet_with_unmeasurable: Path
+) -> None:
+    report = _report(
+        tmp_path / "r.xml", met=["T::b", "T::c", "T::d"], unmet=["T::a"], unmeasurable=[]
+    )
+    result = _run(report, ratchet_with_unmeasurable)
+    assert result.returncode == 1
+    assert "not recorded" in result.stderr
+    assert "T::d" in result.stderr
+
+
+def test_a_malformed_unmeasurable_bucket_is_red(tmp_path: Path) -> None:
+    """`unmeasurable` gets the same field-level rules as `unmet`: well-formed
+    ids, a non-empty reason, and disjointness from the other two buckets."""
+    ratchet = tmp_path / "ratchet.json"
+    ratchet.write_text(json.dumps({"unmet": {}, "unmeasurable": {"T::a": "   "}, "met": ["T::a"]}))
+    report = _report(tmp_path / "r.xml", met=["T::a"], unmet=[])
+    result = _run(report, ratchet)
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+
+
 def test_the_module_path_is_not_part_of_a_clause_id() -> None:
     """Renaming a file is not a moved reading."""
     from importlib.util import module_from_spec, spec_from_file_location
@@ -328,7 +465,7 @@ def test_ratchets_unmet_phase_agrees_with_the_clauses_own_phase_kwarg() -> None:
     source_path = ROOT / "tests" / "acceptance" / "test_plan_section_2_objectives.py"
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
 
-    # method name -> {phase kwargs it passes to _unmet/_attempt}
+    # method name -> {phase kwargs it passes to _unmet/_attempt/_unmeasurable}
     phases_by_method: dict[str, set[str]] = {}
     for cls in ast.walk(tree):
         if not isinstance(cls, ast.ClassDef):
@@ -341,7 +478,7 @@ def test_ratchets_unmet_phase_agrees_with_the_clauses_own_phase_kwarg() -> None:
                 if (
                     isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Name)
-                    and node.func.id in {"_unmet", "_attempt"}
+                    and node.func.id in {"_unmet", "_attempt", "_unmeasurable"}
                 ):
                     for kw in node.keywords:
                         if kw.arg == "phase" and isinstance(kw.value, ast.Constant):
@@ -357,9 +494,10 @@ def test_ratchets_unmet_phase_agrees_with_the_clauses_own_phase_kwarg() -> None:
 
         code_phases = phases_by_method.get(clause_id)
         assert code_phases, (
-            f"{clause_id!r} is unmet in the ratchet but calls no `_unmet`/`_attempt` "
-            "with a `phase=` kwarg in test_plan_section_2_objectives.py — either the "
-            "clause moved, or it no longer names its phase"
+            f"{clause_id!r} is unmet in the ratchet but calls no "
+            "`_unmet`/`_attempt`/`_unmeasurable` with a `phase=` kwarg in "
+            "test_plan_section_2_objectives.py — either the clause moved, or it "
+            "no longer names its phase"
         )
         code_numbers = {phase_number[p] for p in code_phases}
         if code_numbers != {ratchet_phase_number}:
