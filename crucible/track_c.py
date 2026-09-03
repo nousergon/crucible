@@ -49,6 +49,7 @@ from crucible.keys import (
     drift_input_key,
     drift_metrics_key,
 )
+from crucible.release_lock_sweep import release_lock_findings, release_lock_metric
 from crucible.runner import RunContext, run_job, spot_interruption_guard
 from crucible.store import Store, open_store, sha256_hex
 
@@ -323,6 +324,21 @@ def sweep_handler(args: argparse.Namespace) -> int:
                 "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
         )
+        # alpha-engine-config-I9798: I9787 fixed the write-time race — the
+        # lock now rides on the same `put_object` that writes the bytes —
+        # but nothing detected a release object published before that fix,
+        # or one whose lock was lost some other way. Read-only, piggybacked
+        # on this sweep rather than a second scheduled job: it is the same
+        # "walk the store, find a fact nobody is watching" shape as the two
+        # page conditions above, and a release object with no retention is a
+        # console row (plan §4.6), not a page — it does not name an
+        # operator's next action the way an absent or failed manifest does.
+        lock_findings = release_lock_findings(store)
+        lock_metric = release_lock_metric(lock_findings, now=ctx.started)
+        result["release_lock_findings"] = [
+            {"key": f.key, "state": f.state, "detail": f.detail} for f in lock_findings
+        ]
+        ctx.record_metric(lock_metric)
 
     run_job(
         "alerts.sweep",

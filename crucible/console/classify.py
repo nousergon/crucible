@@ -139,6 +139,16 @@ def classify(
             unreported_metrics = [
                 m.get("name", "?") for m in metrics if m.get("status") == "UNREPORTED"
             ]
+            # alpha-engine-config-I9798 (round 2, adversarial review): a
+            # `status: ok` manifest can carry a metric whose OWN status is
+            # `BREACH` — `crucible.release_lock_sweep`'s
+            # `release_objects_unlocked` inside `alerts.sweep` is the first
+            # producer of one — and reading only `manifest["status"]` (or
+            # only the UNREPORTED branch above) let it render HEALTHY: a
+            # correctness failure hidden inside a run that otherwise
+            # succeeded, the same C5 shape as the UNREPORTED case, one
+            # status word over.
+            breached_metrics = [m.get("name", "?") for m in metrics if m.get("status") == "BREACH"]
             if metrics and len(unreported_metrics) == len(metrics):
                 # Total blindness: the run reports OK and declared metrics,
                 # and every one of them carries no value. Its own status is
@@ -161,17 +171,29 @@ def classify(
                     trading_day=day,
                     run_id=run_id,
                 )
-            if unreported_metrics:
-                # Partial blindness: some metrics are real, some are silent.
-                # This is not a failure — the run did measure something —
-                # but it is not a clean HEALTHY either, or the silent
-                # metric is invisible on the one row that owns it.
+            if breached_metrics or unreported_metrics:
+                # Partial blindness, a breached ceiling, or both: the run
+                # did measure something, so this is not the total-blindness
+                # case above — but it is not a clean HEALTHY either, or the
+                # breached/silent metric is invisible on the one row that
+                # owns it.
+                clauses = []
+                if breached_metrics:
+                    clauses.append(
+                        f"{len(breached_metrics)} declared metric(s) breached their "
+                        f"ceiling ({', '.join(breached_metrics)})"
+                    )
+                if unreported_metrics:
+                    clauses.append(
+                        f"{len(unreported_metrics)} of its {len(metrics)} declared "
+                        f"metric(s) carry no value ({', '.join(unreported_metrics)})"
+                    )
                 return Classification(
                     component.name,
                     "DEGRADED",
                     f"ran inside its declared window and ended ok{note}, but "
-                    f"{len(unreported_metrics)} of its {len(metrics)} declared "
-                    f"metric(s) carry no value ({', '.join(unreported_metrics)}).",
+                    + "; and ".join(clauses)
+                    + ".",
                     trading_day=day,
                     run_id=run_id,
                 )

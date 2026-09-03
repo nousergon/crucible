@@ -191,6 +191,53 @@ class TestClassifier:
         manifest = _manifest(metrics=[_metric("prediction_psi_ratio", "OK")])
         assert classify(_component(), manifest, now=SATURDAY_NIGHT).state == "HEALTHY"
 
+    def test_an_ok_run_with_a_breach_metric_is_not_healthy(self) -> None:
+        """alpha-engine-config-I9798 round 2 (adversarial review): a
+        `status: ok` manifest carrying a metric whose own status is
+        `BREACH` rendered HEALTHY before this fix —
+        `crucible.release_lock_sweep`'s `release_objects_unlocked` inside
+        `alerts.sweep` is the producer that surfaced it. `classify` must
+        not read the run's own exit status as the whole story when one of
+        its declared metrics says otherwise."""
+        manifest = _manifest(
+            metrics=[
+                _metric("pages_per_20_trading_days", "OK"),
+                _metric("release_objects_unlocked", "BREACH"),
+            ]
+        )
+        c = classify(_component(), manifest, now=SATURDAY_NIGHT)
+        assert c.state != "HEALTHY"
+        assert c.state == "DEGRADED"
+        assert "release_objects_unlocked" in c.reason
+        assert "pages_per_20_trading_days" not in c.reason
+
+    def test_a_breach_and_an_unreported_metric_together_name_both(self) -> None:
+        manifest = _manifest(
+            metrics=[
+                _metric("release_objects_unlocked", "BREACH"),
+                _metric("some_other_metric", "UNREPORTED"),
+            ]
+        )
+        c = classify(_component(), manifest, now=SATURDAY_NIGHT)
+        assert c.state == "DEGRADED"
+        assert "release_objects_unlocked" in c.reason
+        assert "some_other_metric" in c.reason
+
+    def test_the_real_alerts_sweep_component_with_a_breach_metric_is_not_healthy(self) -> None:
+        """Reproduces the finding against the REAL registry component
+        (`alerts.sweep`), not just the test fixture's stand-in — the
+        adversarial review's own reproduction case."""
+        component = load_registry()["alerts.sweep"]
+        manifest = _manifest(
+            metrics=[
+                _metric("pages_emitted", "OK"),
+                _metric("release_objects_unlocked", "BREACH"),
+            ]
+        )
+        c = classify(component, manifest, now=SATURDAY_NIGHT)
+        assert c.state != "HEALTHY"
+        assert "release_objects_unlocked" in c.reason
+
 
 class TestPage:
     def test_the_population_is_the_whole_registry(self, tmp_path) -> None:
