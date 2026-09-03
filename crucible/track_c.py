@@ -190,22 +190,28 @@ def _verify_release_artifacts(store: Store, sha: str, ctx: RunContext) -> list[s
     # computed: `wheel_key_for` needs `record.wheel_filename`, and a v2
     # record's wheel is not at the v3-derived `wheel_key(sha)` path
     # (alpha-engine-config-I9908 — see `crucible.release.parse_release_record`).
-    meta_k = release.release_json_key(sha)
-    if not store.exists(meta_k):
+    # One resolver (alpha-engine-config-I9932): read release.json, check it
+    # describes THIS sha, take the wheel key the record itself names. The
+    # three restatements of that sequence disagreed on the sha guard.
+    try:
+        published = release.resolve_published_wheel(store, sha)
+    except release.StaleReleasePointerError as exc:
         raise FileNotFoundError(
-            f"smoke: the release under test is not published. [{meta_k!r}] absent "
-            f"for {sha}. Promoting a pointer at a prefix whose artifacts are not there "
-            "is a stale pointer written deliberately; the deploy publishes before it "
-            "smokes, so this means the publish did not land."
-        )
-    meta_bytes = store.get_bytes(meta_k)
-    record = release.parse_release_record(json.loads(meta_bytes.decode("utf-8")))
-    if record.sha != sha:
+            f"smoke: the release under test is not published. "
+            f"[{release.release_json_key(sha)!r}] absent for {sha}. Promoting a pointer "
+            "at a prefix whose artifacts are not there is a stale pointer written "
+            "deliberately; the deploy publishes before it smokes, so this means the "
+            "publish did not land."
+        ) from exc
+    except release.ReleaseRecordMismatchError as exc:
         raise ValueError(
-            f"smoke: {meta_k} describes {record.sha}, not {sha}. Gating a promotion on "
-            "a record belonging to another build is the gate failing open."
-        )
-    wheel_k = release.wheel_key_for(sha, record.wheel_filename)
+            f"smoke: {exc} Gating a promotion on a record belonging to another build is "
+            "the gate failing open."
+        ) from exc
+    meta_k = published.record_key
+    meta_bytes = published.record_bytes
+    record = published.record
+    wheel_k = published.wheel_key
     if not store.exists(wheel_k):
         raise FileNotFoundError(
             f"smoke: the release under test is not published. [{wheel_k!r}] absent "
@@ -285,25 +291,20 @@ def smoke_handler(args: argparse.Namespace) -> int:
                 # v2 path, so `wheel_key(pointed)` alone cannot answer this.
                 # A missing or unreadable release.json here means the same
                 # thing as a missing wheel: the pointed build is broken.
-                pointed_meta_k = release.release_json_key(pointed)
                 pointed_wheel_present = False
-                if store.exists(pointed_meta_k):
-                    try:
-                        pointed_record = release.parse_release_record(
-                            json.loads(store.get_bytes(pointed_meta_k).decode("utf-8"))
-                        )
-                    except (ValueError, TypeError):
-                        # Swallowed here only: this whole branch is the
-                        # documented single non-raise in the job (see below)
-                        # — a malformed record for the POINTED release is
-                        # itself evidence the pointed build is broken, which
-                        # is exactly what this branch already records as
-                        # `degraded`, never as a raise.
-                        pointed_wheel_present = False
-                    else:
-                        pointed_wheel_present = store.exists(
-                            release.wheel_key_for(pointed, pointed_record.wheel_filename)
-                        )
+                try:
+                    pointed_wheel_present = store.exists(
+                        release.resolve_published_wheel(store, pointed).wheel_key
+                    )
+                except (release.StaleReleasePointerError, ValueError, TypeError):
+                    # Swallowed here only: this whole branch is the
+                    # documented single non-raise in the job (see below)
+                    # — an absent, malformed, or wrong-sha record for the
+                    # POINTED release (`ReleaseRecordMismatchError` is a
+                    # `ValueError`) is itself evidence the pointed build is
+                    # broken, which is exactly what this branch already
+                    # records as `degraded`, never as a raise.
+                    pointed_wheel_present = False
                 if not pointed_wheel_present:
                     # Recorded, NOT raised, and this is the only deliberate
                     # non-raise in the job. Failure mode swallowed: a stale

@@ -56,7 +56,6 @@ from crucible.release import (
     read_pointer,
     release_json_key,
     release_object_lock_params,
-    wheel_key_for,
     write_deploy_manifest,
 )
 from crucible.runmode import RUN_MODES, resolve_run_mode
@@ -169,7 +168,10 @@ def _publish(args: argparse.Namespace, store: Store) -> int:
     writes = [
         (key, payload)
         for key, payload in (
-            (wheel_key_for(args.sha, record.wheel_filename), wheel),
+            # `record.sha == args.sha` was asserted above, so the record's own
+            # key IS this sha's key (alpha-engine-config-I9932: one pairing of
+            # sha and wheel_filename, stated on the record).
+            (record.wheel_key, wheel),
             (release_json_key(args.sha), record.to_json()),
         )
         if assert_immutable_write(store, key, payload)

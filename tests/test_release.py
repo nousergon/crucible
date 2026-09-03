@@ -18,6 +18,7 @@ from crucible.release import (
     ReleaseImmutabilityError,
     ReleaseProvenance,
     ReleaseRecord,
+    ReleaseRecordMismatchError,
     StaleReleasePointerError,
     assert_immutable_write,
     current_release,
@@ -29,6 +30,7 @@ from crucible.release import (
     published_wheel_key,
     read_pointer,
     release_json_key,
+    resolve_published_wheel,
     resolve_release,
     wheel_filename_for,
     wheel_key,
@@ -460,6 +462,71 @@ class TestAPriorReleaseIsStillAddressable:
         record = _published(store)
         assert published_wheel_key(store, SHA_A) == wheel_key_for(SHA_A, record.wheel_filename)
         assert published_wheel_key(store, SHA_A) == wheel_key(SHA_A)
+        assert record.wheel_key == wheel_key_for(SHA_A, record.wheel_filename)
+
+
+class TestARecordUnderTheWrongPrefixIsRefusedByName:
+    """alpha-engine-config-I9932 finding 1. `published_wheel_key` read
+    `release.json` and built a wheel key from it WITHOUT checking the record
+    described the sha it was read for — the guard `track_c`'s smoke and
+    `deploy`'s publish both carried. A `release.json` copied under another
+    sha's prefix therefore resolved to a wheel key for a build that was never
+    published there, and `pin` / `resolve_release` refused with "no wheel at
+    <wrong key>" — a message about an object that was never supposed to exist.
+    Now one resolver (`resolve_published_wheel`) carries the guard for every
+    caller, and refuses by name.
+    """
+
+    def _cross_wire(self, store) -> None:
+        publish_release(
+            store, sha=SHA_A, wheel=b"w-a", lockfile=b"l", test_summary="", workflow_run_url=""
+        )
+        publish_release(
+            store, sha=SHA_B, wheel=b"w-b", lockfile=b"l", test_summary="", workflow_run_url=""
+        )
+        # SHA_A's prefix now carries SHA_B's record.
+        store.put_bytes(release_json_key(SHA_A), store.get_bytes(release_json_key(SHA_B)))
+
+    def test_the_resolver_names_both_shas(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        self._cross_wire(store)
+        with pytest.raises(ReleaseRecordMismatchError, match=f"describes {SHA_B}, not {SHA_A}"):
+            resolve_published_wheel(store, SHA_A)
+
+    def test_pin_refuses_rather_than_naming_the_wrong_wheel(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        self._cross_wire(store)
+        with pytest.raises(ReleaseRecordMismatchError, match="describes"):
+            pin(store, SHA_A)
+        assert current_release(store) is None
+
+    def test_resolve_release_refuses_a_pointer_at_a_cross_wired_prefix(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        publish_release(
+            store, sha=SHA_A, wheel=b"w-a", lockfile=b"l", test_summary="", workflow_run_url=""
+        )
+        pin(store, SHA_A)
+        publish_release(
+            store, sha=SHA_B, wheel=b"w-b", lockfile=b"l", test_summary="", workflow_run_url=""
+        )
+        store.put_bytes(release_json_key(SHA_A), store.get_bytes(release_json_key(SHA_B)))
+        with pytest.raises(ReleaseRecordMismatchError, match="describes"):
+            resolve_release(store)
+
+    def test_the_mismatch_is_a_value_error_for_callers_that_already_catch_one(self) -> None:
+        assert issubclass(ReleaseRecordMismatchError, ValueError)
+
+    def test_the_resolver_hands_back_the_record_and_the_bytes_it_read(self, tmp_path) -> None:
+        """`track_c`'s smoke records the release.json bytes as lineage; the
+        resolver returns them so the smoke does not read the object twice and
+        risk recording bytes other than the ones it parsed."""
+        store = LocalStore(tmp_path)
+        record = _published(store)
+        published = resolve_published_wheel(store, SHA_A)
+        assert published.record == record
+        assert published.record_key == release_json_key(SHA_A)
+        assert published.record_bytes == store.get_bytes(release_json_key(SHA_A))
+        assert published.wheel_key == record.wheel_key
 
 
 class TestSmokeGate:
