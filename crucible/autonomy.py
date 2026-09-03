@@ -39,18 +39,29 @@ import datetime as dt
 import gzip
 import json
 import re
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
 __all__ = [
     "MACHINE_PRINCIPALS",
     "ArchiveMissingError",
+    "ArchiveRead",
     "OperatorAction",
     "OperatorActionCount",
     "count_operator_actions",
     "date_partitions",
     "iter_archive_records",
 ]
+
+#: How many archive objects are fetched at once within one calendar day. Each
+#: is one S3 round-trip and a gzip decode, so the work is latency, not CPU.
+#: Measured 2026-09-03: one production day is ~1,123 objects / ~36 MB, which
+#: took ~150 s sequentially — a fortnight is ~20 minutes, past the board job's
+#: timeout. Bounded rather than unbounded: a day with tens of thousands of
+#: objects must not open a socket per object.
+_ARCHIVE_WORKERS = 32
 
 #: A date partition's first level. CloudTrail's key layout is
 #: ``AWSLogs/{account}/CloudTrail/{region}/{YYYY}/{MM}/{DD}/``, so the only
@@ -104,6 +115,31 @@ class OperatorAction:
             "principal_type": self.principal_type,
             "request_id": self.request_id,
         }
+
+
+@dataclass(frozen=True)
+class ArchiveRead:
+    """What one pass over the archive read, and what it FAILED to read.
+
+    ``objects_by_day`` carries a key for every calendar day asked for, holding
+    zero where the trail delivered nothing. A single total cannot distinguish
+    "eight covered days, no human touched anything" from "two covered days and
+    six the trail did not exist for", and those are the two answers §11 risk 8
+    exists to keep apart.
+    """
+
+    records: list[dict[str, Any]]
+    objects_by_day: dict[dt.date, int]
+    records_scanned: int
+
+    @property
+    def objects_read(self) -> int:
+        return sum(self.objects_by_day.values())
+
+    @property
+    def uncovered_days(self) -> tuple[dt.date, ...]:
+        """Every day the archive delivered no object for, in order."""
+        return tuple(day for day in sorted(self.objects_by_day) if not self.objects_by_day[day])
 
 
 @dataclass(frozen=True)
@@ -196,6 +232,13 @@ def date_partitions(client: Any, *, bucket: str, prefix: str) -> tuple[str, ...]
     return partitions or (base,)
 
 
+def _fetch_records(client: Any, *, bucket: str, key: str) -> list[dict[str, Any]]:
+    """One archive object's records. The unit of work a worker thread does."""
+    body = client.get_object(Bucket=bucket, Key=key)["Body"].read()
+    payload = json.loads(gzip.decompress(body).decode("utf-8"))
+    return list(payload.get("Records") or [])
+
+
 def iter_archive_records(
     client: Any,
     *,
@@ -203,7 +246,8 @@ def iter_archive_records(
     prefix: str,
     start: dt.date,
     end: dt.date,
-) -> tuple[list[dict[str, Any]], int]:
+    keep: Callable[[dict[str, Any]], bool] | None = None,
+) -> ArchiveRead:
     """Every CloudTrail record delivered for the calendar days in the window.
 
     The archive's layout is `.../CloudTrail/{region}/{YYYY}/{MM}/{DD}/*.json.gz`,
@@ -216,23 +260,54 @@ def iter_archive_records(
     Calendar days, not trading days — one of §4.12's exhaustive exceptions.
     CloudTrail delivers on wall-clock time, and a gate that skipped weekends
     would skip precisely the hours when a Saturday run is repaired by hand.
+
+    **Coverage is reported PER DAY, and that is the point.** A single count
+    over the whole window cannot tell "the trail covered every day and nobody
+    touched anything" from "the trail started on Tuesday". Only the caller can
+    decide what a hole means, but it cannot decide what it never sees, so
+    :attr:`ArchiveRead.objects_by_day` carries a key for every calendar day in
+    the window — including the ones that yielded nothing.
+
+    **``keep`` filters per object, before anything accumulates.** Measured
+    2026-09-03 against the production archive: one day is ~1,123 objects and
+    ~181k records, so a fortnight is ~1.4M records and 6–7 GB of resident
+    dicts if every record is held. The gate wants the mutating records that
+    name a v2 resource — a handful — so the predicate is applied as each
+    object is decoded and peak memory is the size of the ANSWER rather than
+    the size of the archive. ``records_scanned`` still counts everything read,
+    because "how much was looked at" is half of what makes the count credible.
+
+    Objects within one day are fetched concurrently: the work is a few hundred
+    milliseconds of S3 round-trip each and nothing else, and sequentially a
+    fortnight took ~20 minutes — past the board job's timeout, which is a
+    measurement failing for a reason that has nothing to do with what is being
+    measured.
     """
-    records: list[dict[str, Any]] = []
-    objects = 0
+    kept: list[dict[str, Any]] = []
+    scanned = 0
+    objects_by_day: dict[dt.date, int] = {}
     paginator = client.get_paginator("list_objects_v2")
     partitions = date_partitions(client, bucket=bucket, prefix=prefix)
-    for partition in partitions:
-        day = start
-        while day <= end:
+    day = start
+    while day <= end:
+        keys: list[str] = []
+        for partition in partitions:
             day_prefix = f"{partition}/{day:%Y/%m/%d}/"
             for page in paginator.paginate(Bucket=bucket, Prefix=day_prefix):
-                for entry in page.get("Contents", []):
-                    body = client.get_object(Bucket=bucket, Key=entry["Key"])["Body"].read()
-                    payload = json.loads(gzip.decompress(body).decode("utf-8"))
-                    records.extend(payload.get("Records", []))
-                    objects += 1
-            day += dt.timedelta(days=1)
-    return records, objects
+                keys.extend(entry["Key"] for entry in page.get("Contents") or [])
+        objects_by_day[day] = len(keys)
+        if keys:
+            workers = min(_ARCHIVE_WORKERS, len(keys))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(_fetch_records, client, bucket=bucket, key=key) for key in keys
+                ]
+                for future in futures:
+                    records = future.result()
+                    scanned += len(records)
+                    kept.extend(r for r in records if keep is None or keep(r))
+        day += dt.timedelta(days=1)
+    return ArchiveRead(records=kept, objects_by_day=objects_by_day, records_scanned=scanned)
 
 
 def count_operator_actions(
@@ -249,6 +324,17 @@ def count_operator_actions(
     ``client`` is an S3 client. There is no CloudTrail client here and there
     is not meant to be one: the API this gate is forbidden to use is the only
     thing a CloudTrail client would be for.
+
+    **Coverage is asserted PER CALENDAR DAY.** A window total greater than
+    zero says only that the trail existed for SOME of it, and a count read
+    from a covered fraction reads exactly like a count read from the whole —
+    the §11 risk 8 failure with a different cause. Measured 2026-09-03: the
+    fleet trail was created 2026-09-01, so a phase-2 window of
+    2026-08-26..2026-09-02 had six of eight days with nothing delivered, and
+    the count taken over it would have been presented as a full-window figure.
+    Any uncovered day therefore raises :class:`ArchiveMissingError` NAMING the
+    days, which the gate renders as UNMEASURABLE — the honest answer until the
+    trail has the window's worth of history.
     """
     if not bucket:
         raise ArchiveMissingError(
@@ -257,25 +343,31 @@ def count_operator_actions(
             "without a trail there is nothing to read, and reporting 0 would make "
             "'no trail' and 'no human touched it' the same answer."
         )
-    records, objects = iter_archive_records(
-        client, bucket=bucket, prefix=prefix, start=start, end=end
-    )
-    if objects == 0:
-        raise ArchiveMissingError(
-            f"the CloudTrail archive s3://{bucket}/{prefix} delivered no objects for "
-            f"{start.isoformat()}..{end.isoformat()}. A trail always delivers — even a "
-            "silent account gets periodic objects — so an empty window means the trail "
-            "does not cover it. UNMEASURABLE, not zero."
-        )
-    actions: list[OperatorAction] = []
-    for record in records:
+
+    def _is_candidate(record: dict[str, Any]) -> bool:
         # An ABSENT `readOnly` counts as mutating. CloudTrail omits the field
         # for some services, and defaulting the unknown to read-only would
         # drop exactly the events nobody has classified yet.
-        if record.get("readOnly") is True:
-            continue
-        if not _touches(record, marker):
-            continue
+        return record.get("readOnly") is not True and _touches(record, marker)
+
+    read = iter_archive_records(
+        client, bucket=bucket, prefix=prefix, start=start, end=end, keep=_is_candidate
+    )
+    uncovered = read.uncovered_days
+    if uncovered:
+        shown = ", ".join(day.isoformat() for day in uncovered[:8])
+        more = "" if len(uncovered) <= 8 else f" (and {len(uncovered) - 8} more)"
+        raise ArchiveMissingError(
+            f"the CloudTrail archive s3://{bucket}/{prefix} delivered no objects for "
+            f"{len(uncovered)} of the {len(read.objects_by_day)} calendar days in "
+            f"{start.isoformat()}..{end.isoformat()}: {shown}{more}. A trail always "
+            "delivers — even a silent account gets periodic objects — so an uncovered "
+            "day means the trail does not cover it. Counting over the covered days "
+            "would report a fraction of the window as if it were the whole. "
+            "UNMEASURABLE, not zero."
+        )
+    actions: list[OperatorAction] = []
+    for record in read.records:
         name, kind = _principal(record)
         if _is_machine(name):
             continue
@@ -292,7 +384,7 @@ def count_operator_actions(
     return OperatorActionCount(
         start=start,
         end=end,
-        objects_read=objects,
-        records_scanned=len(records),
+        objects_read=read.objects_read,
+        records_scanned=read.records_scanned,
         actions=tuple(sorted(actions, key=lambda a: a.event_time)),
     )

@@ -13,6 +13,8 @@ import datetime as dt
 import gzip
 import inspect
 import json
+import threading
+import time
 
 import pytest
 
@@ -77,6 +79,33 @@ class _FakeS3:
         return {"Body": _Body()}
 
 
+class _ConcurrencyTrackingS3(_FakeS3):
+    """A fake that records how many `get_object` calls overlapped.
+
+    The property under test is not speed — a timing assertion would be a test
+    of the machine — but whether more than one round-trip is ever in flight.
+    Each call holds briefly so overlap is observable without making the suite
+    slow.
+    """
+
+    def __init__(self, objects: dict[str, list[dict]]) -> None:
+        super().__init__(objects)
+        self._lock = threading.Lock()
+        self._in_flight = 0
+        self.peak_in_flight = 0
+
+    def get_object(self, *, Bucket: str, Key: str):  # noqa: N803 - boto3's shape
+        with self._lock:
+            self._in_flight += 1
+            self.peak_in_flight = max(self.peak_in_flight, self._in_flight)
+        try:
+            time.sleep(0.02)
+            return super().get_object(Bucket=Bucket, Key=Key)
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+
+
 def _record(**over) -> dict:
     document = {
         "eventTime": "2026-08-03T18:00:00Z",
@@ -99,13 +128,31 @@ def _record(**over) -> dict:
 ARCHIVE_PREFIX = "AWSLogs/711398986525/CloudTrail"
 
 
+#: Every calendar day the default fixture archive delivers an object for.
+WINDOW = (START, END)
+
+
 def _archive(
     records_by_day: dict[dt.date, list[dict]],
     *,
     regions: tuple[str, ...] = ("us-east-1",),
+    cover: tuple[dt.date, ...] = WINDOW,
 ) -> _FakeS3:
+    """A fixture archive that DELIVERS on every day in ``cover``.
+
+    A real trail always delivers — even a silent account gets periodic
+    objects — so a day with no interesting records still has an object with an
+    empty `Records` list. Modelling that is not decoration: the reader raises
+    on any day the archive delivered nothing for, and a fixture that skipped
+    quiet days would make every ordinary assertion below exercise the
+    uncovered-day path instead of the thing it names.
+
+    ``cover=()`` is the archive that does not exist.
+    """
     objects: dict[str, list[dict]] = {}
     for region in regions:
+        for day in cover:
+            objects[f"{ARCHIVE_PREFIX}/{region}/{day:%Y/%m/%d}/part.json.gz"] = []
         for day, records in records_by_day.items():
             objects[f"{ARCHIVE_PREFIX}/{region}/{day:%Y/%m/%d}/part.json.gz"] = records
     return _FakeS3(objects)
@@ -167,7 +214,30 @@ class TestUnmeasurableIsNeverZero:
         produce the same artifact set — no objects — and the two must not be
         the same answer (principle 7)."""
         with pytest.raises(ArchiveMissingError, match="UNMEASURABLE, not zero"):
-            _count(_archive({}))
+            _count(_archive({}, cover=()))
+
+    def test_a_day_the_trail_did_not_cover_raises_and_names_it(self) -> None:
+        """`alpha-engine-config-I9928`, round 2. Coverage was asserted ONCE
+        over the whole window, so a window the trail existed for only part of
+        produced a count read from the covered fraction and presented as the
+        whole — the §11 risk 8 failure with a different cause.
+
+        MEASURED: the fleet trail was created 2026-09-01, and a phase-2 window
+        of 2026-08-26..2026-09-02 had six of its eight days uncovered."""
+        with pytest.raises(ArchiveMissingError) as caught:
+            _count(_archive({START: [_record()]}, cover=(START,)))
+        message = str(caught.value)
+        assert END.isoformat() in message, "the uncovered day must be NAMED, not counted"
+        assert "1 of the 2 calendar days" in message
+        assert "UNMEASURABLE, not zero" in message
+
+    def test_a_partially_covered_window_never_returns_a_count(self) -> None:
+        """The dangerous shape is not the exception — it is the plausible
+        integer. A partial window must never come back as a number, whatever
+        that number is."""
+        for supplied in ([_record()], []):
+            with pytest.raises(ArchiveMissingError):
+                _count(_archive({START: supplied}, cover=(START,)))
 
 
 class TestCounting:
@@ -176,7 +246,9 @@ class TestCounting:
         assert result.count == 1
         assert result.actions[0].principal == "AWSReservedSSO_admin"
         assert result.actions[0].event_name == "UpdateFunctionCode"
-        assert result.objects_read == 1
+        # Two: one object per covered day, and the window is two days. A trail
+        # delivers on the quiet days too.
+        assert result.objects_read == 2
 
     def test_a_declared_machine_principal_does_not_count(self) -> None:
         machine = _record(
@@ -250,7 +322,7 @@ class TestCounting:
         document = _count(_archive({START: [_record()]})).to_dict()
         assert document["start"] == START.isoformat()
         assert document["end"] == END.isoformat()
-        assert document["objects_read"] == 1
+        assert document["objects_read"] == 2
         assert document["count"] == 1
         assert document["actions"][0]["event_name"] == "UpdateFunctionCode"
 
@@ -269,7 +341,7 @@ class TestTheRegionPartitionIsDiscovered:
 
     def test_the_exported_region_agnostic_prefix_reads_the_archive(self) -> None:
         result = _count(_archive({START: [_record()]}), prefix=ARCHIVE_PREFIX)
-        assert result.objects_read == 1
+        assert result.objects_read == 2
         assert result.count == 1
 
     def test_every_delivered_region_is_counted(self) -> None:
@@ -280,7 +352,8 @@ class TestTheRegionPartitionIsDiscovered:
             _archive({START: [_record()]}, regions=("us-east-1", "us-west-2")),
             prefix=ARCHIVE_PREFIX,
         )
-        assert result.objects_read == 2
+        # Two regions x two covered days.
+        assert result.objects_read == 4
         assert result.count == 2
 
     def test_a_prefix_that_already_names_a_region_is_honoured(self) -> None:
@@ -295,6 +368,99 @@ class TestTheRegionPartitionIsDiscovered:
 
     def test_an_empty_archive_still_raises_rather_than_reporting_zero(self) -> None:
         """Region discovery must not become a second place "there is no trail"
-        is decided — the objects-read branch owns that judgement."""
+        is decided — the coverage branch owns that judgement."""
         with pytest.raises(ArchiveMissingError, match="UNMEASURABLE, not zero"):
-            _count(_archive({}), prefix=ARCHIVE_PREFIX)
+            _count(_archive({}, cover=()), prefix=ARCHIVE_PREFIX)
+
+
+class TestTheReadIsStreamedNotAccumulated:
+    """`alpha-engine-config-I9928`, round 2.
+
+    MEASURED 2026-09-03 against the production archive: one calendar day is
+    ~1,123 objects / ~36 MB / ~181k records, and ~150 s read sequentially. A
+    phase-2 fortnight is therefore ~9,000 objects and ~1.4M records — about 20
+    minutes and 6-7 GB resident if every record is held to be filtered at the
+    end. The board job's timeout is ten minutes, so the gate would have died
+    of its own reading rather than reported one.
+
+    Both halves are asserted here because both are invisible in the output: a
+    slow, memory-hungry reader and a fast, lean one return the identical
+    `OperatorActionCount`, and only the first one is what you get by writing
+    the obvious loop.
+    """
+
+    def test_only_the_candidate_records_are_ever_held(self) -> None:
+        """The peak is the size of the ANSWER, not of the archive."""
+        noise = [
+            _record(readOnly=True, requestID=f"read-{i}", eventName="GetFunction")
+            for i in range(200)
+        ]
+        offender = _record(requestID="the-one")
+        read = autonomy.iter_archive_records(
+            _archive({START: [*noise, offender]}),
+            bucket="trail",
+            prefix=ARCHIVE_PREFIX,
+            start=START,
+            end=END,
+            keep=lambda r: r.get("readOnly") is not True,
+        )
+        assert len(read.records) == 1, "read-only records must not be accumulated"
+        assert read.records[0]["requestID"] == "the-one"
+        # …and the count of what was LOOKED AT survives the filtering, because
+        # "0 over 3 records" and "0 over 181k records" are different readings.
+        assert read.records_scanned == 201
+
+    def test_the_scanned_count_is_reported_even_when_nothing_is_kept(self) -> None:
+        read = autonomy.iter_archive_records(
+            _archive({START: [_record(readOnly=True) for _ in range(5)]}),
+            bucket="trail",
+            prefix=ARCHIVE_PREFIX,
+            start=START,
+            end=END,
+            keep=lambda r: r.get("readOnly") is not True,
+        )
+        assert read.records == []
+        assert read.records_scanned == 5
+
+    def test_a_days_objects_are_fetched_concurrently(self) -> None:
+        """Sequential is the shape that times out. Asserted by observing that
+        more than one `get_object` is in flight at once — the property that
+        makes ~9,000 round-trips fit in a job timeout — rather than by timing,
+        which would be a flaky test of the machine it runs on."""
+        keys = {
+            f"{ARCHIVE_PREFIX}/us-east-1/{START:%Y/%m/%d}/part-{i}.json.gz": [_record()]
+            for i in range(16)
+        }
+        keys[f"{ARCHIVE_PREFIX}/us-east-1/{END:%Y/%m/%d}/part.json.gz"] = []
+        client = _ConcurrencyTrackingS3(keys)
+        autonomy.iter_archive_records(
+            client,
+            bucket="trail",
+            prefix=ARCHIVE_PREFIX,
+            start=START,
+            end=END,
+        )
+        assert client.peak_in_flight > 1, (
+            "objects within a day must be fetched concurrently; sequentially a "
+            "phase-2 window takes ~20 minutes and the board job is killed at its timeout"
+        )
+
+    def test_every_record_still_reaches_the_caller_when_nothing_is_filtered(self) -> None:
+        """`keep=None` is the unfiltered read the public signature promises.
+        Concurrency must not lose an object on the way."""
+        keys = {
+            f"{ARCHIVE_PREFIX}/us-east-1/{START:%Y/%m/%d}/part-{i}.json.gz": [
+                _record(requestID=f"req-{i}")
+            ]
+            for i in range(16)
+        }
+        keys[f"{ARCHIVE_PREFIX}/us-east-1/{END:%Y/%m/%d}/part.json.gz"] = []
+        read = autonomy.iter_archive_records(
+            _FakeS3(keys),
+            bucket="trail",
+            prefix=ARCHIVE_PREFIX,
+            start=START,
+            end=END,
+        )
+        assert read.records_scanned == 16
+        assert {r["requestID"] for r in read.records} == {f"req-{i}" for i in range(16)}

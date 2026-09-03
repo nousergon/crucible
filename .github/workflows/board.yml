@@ -106,7 +106,23 @@ jobs:
   board:
     name: render the declared board
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 10 was set when every clause read a stored artifact. Phase 2's
+    # `zero_human_mutating_calls` reads the CloudTrail archive over a
+    # fortnight, and MEASURED 2026-09-03 against the production archive one
+    # calendar day is ~1,123 objects / ~36 MB / ~181k records, ~150 s read
+    # sequentially — so the phase-2 window is ~9,000 objects and ~1.4M records,
+    # about 20 minutes sequentially. `crucible.autonomy` fetches a day's
+    # objects 32-at-a-time and filters each object as it decodes, which brings
+    # the archive read to a few minutes; this ceiling is the headroom around
+    # that, not a target. A board killed at its timeout publishes NOTHING —
+    # every row goes dark over one clause's reading, which is a measurement
+    # failing for a reason that has nothing to do with what it measures.
+    #
+    # Raise this only with a new measurement. If the archive read grows past
+    # it, the fix is the reader (a narrower prefix, a cheaper filter), not a
+    # larger number: a job allowed to run for an hour is one whose cost nobody
+    # notices.
+    timeout-minutes: 25
     permissions:
       contents: read
       id-token: write   # OIDC only; no long-lived AWS keys in this repository
