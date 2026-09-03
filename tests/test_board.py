@@ -1465,12 +1465,21 @@ class TestThePageIsTheDetailedArtifact:
         for source in SOURCES:
             assert f"<h2>{source} (" in page, f"the {source} rows are not grouped on the page"
 
-    def test_every_row_carries_its_store_key_and_its_generated_at(self, tmp_path) -> None:
+    def test_every_row_carries_its_store_key_and_when_it_was_last_read(self, tmp_path) -> None:
         """A row with no key is a red dot a reader has to ask an agent about,
-        and a reading with no stamp cannot be told from one taken in March."""
+        and a reading with no stamp cannot be told from one taken in March.
+
+        The header names `last read` because the cell renders
+        `BoardRow.last_read` (review F5): the column was headed `generated at`
+        while carrying a different fact, which makes every stamp under it a
+        misquotation rather than a missing one.
+        """
         page = self._page(tmp_path)
         assert "<th>store key</th>" in page
-        assert "<th>generated at</th>" in page
+        assert "<th>last read</th>" in page
+        assert "<th>generated at</th>" not in page, (
+            "the column renders row.last_read; a `generated at` header misnames every cell"
+        )
         # Every row renders a stamp cell; the unread ones say so in words
         # rather than leaving a cell that reads as a formatting gap.
         assert "never read" in page

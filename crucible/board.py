@@ -1254,7 +1254,12 @@ def render_board_html(
         parts.append(f"<h2>{_esc(source)} ({len(rows)})</h2>")
         parts.append(
             "<table><tr><th>state</th><th>row</th><th>how it knows</th>"
-            "<th>store key</th><th>generated at</th><th>what red means</th></tr>"
+            # `last read`, not `generated at`. The cell under it renders
+            # `BoardRow.last_read` — when this ROW's reading was taken — which
+            # is a different fact from when the artifact behind it was
+            # generated, and a header naming the wrong one makes every stamp
+            # in the column a misquotation.
+            "<th>store key</th><th>last read</th><th>what red means</th></tr>"
         )
         for row in rows:
             parts.append(
@@ -1312,7 +1317,24 @@ def _acceptance_section(acceptance: dict[str, Any] | None, note: str) -> list[st
     Never omitted. When the artifact cannot be read the section states that
     in the words the reader needs — an absent section and a broken producer
     look identical, and this is the one number the plan calls progress.
+
+    **The completeness rule is not stated here.** It is
+    `crucible.keys.parse_acceptance_reading`, which `crucible.morning` reads
+    the same artifact through, so this page and the message that links to it
+    cannot disagree about whether a document is a reading. They did: the
+    adversarial review on `alpha-engine-config-I9921` fed ONE document to both
+    and got `acceptance count: not on any artifact` in the message beside
+    `21 met / 2 unmet / 1 unmeasurable ... at commit UNKNOWN` on the page,
+    because this reader required only the three integers and rendered an
+    absent `commit` as the literal `UNKNOWN`. A commit is what makes the
+    count reproducible (plan §6 rule 2); `UNKNOWN` in its place is a figure
+    nobody can check, printed under a link that says it does not exist.
     """
+    from crucible.keys import (  # noqa: PLC0415 - avoids a cycle
+        ACCEPTANCE_REQUIRED_FIELDS,
+        parse_acceptance_reading,
+    )
+
     parts = ["<h2>acceptance (plan §2 — the only progress figure, §12 rule 3)</h2>"]
     if acceptance is None:
         parts.append(
@@ -1323,24 +1345,26 @@ def _acceptance_section(acceptance: dict[str, Any] | None, note: str) -> list[st
             "fabricated provenance rather than a missing one.</p>"
         )
         return parts
-    fields = ("met", "unmet", "unmeasurable")
-    if not all(isinstance(acceptance.get(f), int) for f in fields):
+    reading = parse_acceptance_reading(acceptance)
+    if reading is None:
         parts.append(
             "<p class='d'>The acceptance artifact is present and does not carry "
-            f"{' / '.join(fields)} as integers, so it answers a different question than "
-            "the one asked. Rendering part of it would look exactly like a measurement.</p>"
+            f"{' / '.join(ACCEPTANCE_REQUIRED_FIELDS)} in the shape the producer contract "
+            "declares, so it answers a different question than the one asked. Rendering "
+            "part of it would look exactly like a measurement.</p>"
         )
         return parts
-    total = sum(int(acceptance[f]) for f in fields)
     parts.append(
-        f"<p><strong>{acceptance['met']} met / {acceptance['unmet']} unmet / "
-        f"{acceptance['unmeasurable']} unmeasurable</strong> of {total} clauses, at commit "
-        f"<span class='k'>{_esc(acceptance.get('commit', 'UNKNOWN'))}</span>, measured "
-        f"{_esc(acceptance.get('measured_at', 'at an unrecorded time'))}.</p>"
+        f"<p><strong>{reading.met} met / {reading.unmet} unmet / "
+        f"{reading.unmeasurable} unmeasurable</strong> of {reading.total} clauses, at commit "
+        f"<span class='k'>{_esc(reading.commit)}</span>, measured "
+        f"{_esc(reading.measured_at or 'at an unrecorded time')}.</p>"
     )
-    for field_name, label in (("unmet_clauses", "unmet"), ("unmeasurable_clauses", "unmeasurable")):
-        named = acceptance.get(field_name)
-        if not isinstance(named, list) or not named:
+    for named, label in (
+        (reading.unmet_clauses, "unmet"),
+        (reading.unmeasurable_clauses, "unmeasurable"),
+    ):
+        if not named:
             parts.append(
                 f"<p class='d'>The artifact names no {label} clause ids, so this page "
                 f"cannot list which {label} clauses they are — only how many.</p>"
