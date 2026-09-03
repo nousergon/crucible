@@ -35,12 +35,14 @@ from typing import Any
 
 import pytest
 import yaml
+from botocore.exceptions import ClientError
 
 from crucible.cli import HANDLERS, JOBS
 from crucible.components import load_registry
 from crucible.keys import BOARD_CURRENT_KEY, board_key, manifest_key, morning_report_key
 from crucible.morning import (
     ACCEPTANCE_NOT_ON_ANY_ARTIFACT,
+    ACCEPTANCE_UNREADABLE,
     DELIVERY_TZ,
     MORNING_JOB,
     NO_OPERATOR_ACTION,
@@ -129,6 +131,34 @@ def _seed(
     if board_run is not None:
         store.put_bytes(manifest_key("board", DAY.isoformat()), json.dumps(board_run).encode())
     return store
+
+
+class _DeniedKeyStore(LocalStore):
+    """A `LocalStore` that raises like an S3 caller denied `s3:ListBucket`
+    on specific keys — reproducing run 33766008781 (2026-09-03T14:18Z),
+    where `report.morning`'s first live run died on exactly this shape
+    reading `report/acceptance/{day}.json`. `ClientError` codes are asserted
+    by name (`AccessDenied`, `NoSuchKey`) rather than by constructing a real
+    `S3Store`, since the fact under test is how `crucible.morning` reacts to
+    the *code*, not how boto3 raises it.
+    """
+
+    def __init__(self, root: pathlib.Path, *, denied: dict[str, str]) -> None:
+        super().__init__(root)
+        self._denied = denied
+
+    def get_bytes(self, key: str) -> bytes:
+        if key in self._denied:
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": self._denied[key],
+                        "Message": f"not authorized to perform: s3:ListBucket on resource: {key!r}",
+                    }
+                },
+                "GetObject",
+            )
+        return super().get_bytes(key)
 
 
 @dataclass
@@ -258,6 +288,79 @@ class TestTheMessage:
         store = _seed(tmp_path, previous=_board())
         store.put_bytes(acceptance_reading_key(DAY.isoformat()), b"{not json")
         assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT in run_report(store, trading_day=DAY, now=FIRED_AT)
+
+    def test_an_access_denied_acceptance_read_is_unreadable_not_absent(self, tmp_path, monkeypatch):
+        """§6 rule 1: an ACCESS FAILURE reported as absence conflates a
+        permissions gap with the artifact never having been filed —
+        `alpha-engine-config-I9896` measured this exact `AccessDenied` on the
+        first live `report.morning` run. The run manifest must still read
+        `ok`: this artifact is OPTIONAL, and a report that cannot read it
+        still has four other things to say."""
+        from crucible.keys import acceptance_reading_key
+
+        denied = _DeniedKeyStore(
+            tmp_path, denied={acceptance_reading_key(DAY.isoformat()): "AccessDenied"}
+        )
+        denied.put_bytes(BOARD_CURRENT_KEY, json.dumps(_board()).encode())
+        denied.put_bytes(board_key(PREVIOUS.isoformat()), json.dumps(_board()).encode())
+        denied.put_bytes(
+            manifest_key("board", DAY.isoformat()),
+            json.dumps({"status": "ok", "code_sha": SHA, "reason": ""}).encode(),
+        )
+        monkeypatch.setattr("crucible.morning.open_store", lambda uri: denied)
+        monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
+
+        assert morning_handler(_args(tmp_path, dry_run=False)) == 0
+
+        keys = [k for k in denied.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
+        manifest = json.loads(denied.get_bytes(keys[0]))
+        assert manifest["status"] == "ok"
+        (output,) = manifest["outputs"]
+        message = denied.get_bytes(output["key"]).decode()
+        assert ACCEPTANCE_UNREADABLE.format(code="AccessDenied") in message
+        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT not in message
+
+    def test_a_not_found_acceptance_read_is_still_the_absent_literal(self, tmp_path):
+        """The same `_DeniedKeyStore` shape, a `NoSuchKey` code instead of
+        `AccessDenied` — proving the new access-failure branch does not
+        swallow the ordinary not-found case it sits beside."""
+        from crucible.keys import acceptance_reading_key
+
+        store = _DeniedKeyStore(
+            tmp_path, denied={acceptance_reading_key(DAY.isoformat()): "NoSuchKey"}
+        )
+        store.put_bytes(BOARD_CURRENT_KEY, json.dumps(_board()).encode())
+        store.put_bytes(board_key(PREVIOUS.isoformat()), json.dumps(_board()).encode())
+        store.put_bytes(
+            manifest_key("board", DAY.isoformat()),
+            json.dumps({"status": "ok", "code_sha": SHA, "reason": ""}).encode(),
+        )
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT in message
+        assert "unreadable" not in message.lower()
+
+    def test_an_access_denied_previous_board_is_unreadable_not_absent_or_a_crash(self, tmp_path):
+        """Same three-way handling on the previous-day board read (it goes
+        through the same `_read_json` helper as acceptance): denied is named,
+        never rendered as `nothing moved` and never crashes the report."""
+        store = _DeniedKeyStore(tmp_path, denied={board_key(PREVIOUS.isoformat()): "AccessDenied"})
+        store.put_bytes(BOARD_CURRENT_KEY, json.dumps(_board()).encode())
+        store.put_bytes(
+            manifest_key("board", DAY.isoformat()),
+            json.dumps({"status": "ok", "code_sha": SHA, "reason": ""}).encode(),
+        )
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "nothing moved" not in message
+        assert "cannot say" in message
+        assert "AccessDenied" in message
+
+    def test_an_access_denied_current_board_still_raises(self, tmp_path):
+        """`board/current.json` is read directly, not through `_read_json` —
+        the current board is not optional, so a denied read must still fail
+        the manifest rather than being absorbed like the optional reads."""
+        store = _DeniedKeyStore(tmp_path, denied={BOARD_CURRENT_KEY: "AccessDenied"})
+        with pytest.raises(ClientError):
+            run_report(store, trading_day=DAY, now=FIRED_AT)
 
     def test_the_acceptance_count_is_never_invented(self, tmp_path):
         """§12 rule 3 makes it the only progress figure — which is exactly why
@@ -399,7 +502,9 @@ class TestDelivery:
         assert call["sns"] is False
         assert call["telegram"] is True
         assert call["severity"] == "info"
-        assert call["silent"] is True
+        # NOT silent: the 2026-09-03 delivery went out silent and was not
+        # seen (alpha-engine-config-I9916). A notification is not a page.
+        assert call["silent"] is False
         assert call["raise_on_total_failure"] is True
         # Explicit, never left to `krepis.alerts.resolve_destination`'s
         # fallback: an `info` severity reaches the operator chat TODAY only

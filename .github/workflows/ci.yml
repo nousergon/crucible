@@ -206,11 +206,20 @@ jobs:
       # JUnit XML, not the terminal summary line. `pyproject.toml` sets
       # `addopts = "-q"`, so a command-line `-q` makes `-qq` and pytest prints
       # no summary at all — parsing stdout is how a wrong count goes unnoticed.
+      #
+      # `-o junit_family=legacy`: `_unmeasurable` (test_plan_section_2_objectives.py,
+      # alpha-engine-config-I9828 round 2) uses pytest-core `record_property`
+      # to write `outcome`/`blocked_on_class` into `<testcase><properties>`,
+      # which is how `check_reading.py` classifies UNMEASURABLE without
+      # trusting message text. pytest's default `junit_family` (`xunit2`)
+      # warns that per-testcase `<properties>` are non-conformant there —
+      # `legacy` is the family that actually declares them, and is pytest's
+      # own documented fix for `record_property`, not a local workaround.
       - name: Acceptance clauses (plan §2)
         run: |
           set +e
           uv run --frozen pytest tests/acceptance -p no:cacheprovider --tb=no \
-            --junitxml=acceptance.xml > acceptance.txt 2>&1
+            -o junit_family=legacy --junitxml=acceptance.xml > acceptance.txt 2>&1
           set -e
           tail -40 acceptance.txt
 

@@ -20,7 +20,7 @@ artifacts it reports on can satisfy its own reading.
 
 **It is not a page, and it must never become one.** Plan §4.6 admits exactly
 two page conditions — absence and failure — and a daily digest is neither.
-It goes out on the operator channel with `severity="info"` and `silent=True`,
+It goes out on the operator channel with `severity="info"` and `silent=False`,
 on Telegram only, so nothing about it touches either SNS pages topic and it
 cannot buzz a phone at 6am for a board that is red by design. `crucible.alerts`
 is deliberately NOT imported: routing a digest through the page path is how a
@@ -85,6 +85,7 @@ from crucible.store import LocalStore, S3Store, Store, open_store
 
 __all__ = [
     "ACCEPTANCE_NOT_ON_ANY_ARTIFACT",
+    "ACCEPTANCE_UNREADABLE",
     "CLAUSE_SEPARATOR",
     "FORBIDDEN_PROGRESS_TOKENS",
     "BOARD_JOB",
@@ -146,6 +147,20 @@ DELIVERY_TZ = ZoneInfo("America/Los_Angeles")
 #: and printing it as `main`'s reading would be a fabrication that looks
 #: exactly like a measurement.
 ACCEPTANCE_NOT_ON_ANY_ARTIFACT = "acceptance count: not on any artifact"
+
+#: The line emitted when the acceptance read failed because it could not be
+#: REACHED, not because it is absent — measured live: the first
+#: `report.morning` run (33766008781, 2026-09-03T14:18Z) died with
+#: `AccessDenied` on `s3:ListBucket` reading this OPTIONAL artifact, because
+#: S3 returns 403 for a missing key when the caller also lacks
+#: `s3:ListBucket` on the prefix. Rendering that as
+#: :data:`ACCEPTANCE_NOT_ON_ANY_ARTIFACT` would be the exact conflation plan
+#: §6 rule 1 forbids: "absent" and "we are not permitted to look" are
+#: different facts, and only one of them is an IAM gap somebody needs to
+#: hear about. A `{code}` template rather than a second literal, so the
+#: reader sees WHICH failure (`AccessDenied` today; a throttle or a network
+#: failure would name itself here too) instead of a generic "broken".
+ACCEPTANCE_UNREADABLE = "acceptance count: unreadable ({code})"
 
 #: The literal line emitted when the board's producer exposes no pending
 #: operator action. Declared, never omitted: an absent line reads as "there
@@ -264,34 +279,97 @@ class MorningInputs:
     board_code_sha: str | None
     board_run_note: str
     operator_action: str | None
-    #: §12 rule 3's one progress figure as FILED, or `None` when no artifact
-    #: carries it. Never reconstructed from this process's own checkout: that
-    #: would print the branch the job ran from as though it were `main`'s
-    #: reading (`alpha-engine-config-I9902` builds the producer).
+    #: §12 rule 3's one progress figure as FILED, or `None` when it is
+    #: absent/corrupt OR denied — see `acceptance_denied_code` for telling
+    #: those two apart. Never reconstructed from this process's own
+    #: checkout: that would print the branch the job ran from as though it
+    #: were `main`'s reading (`alpha-engine-config-I9902` builds the
+    #: producer).
     acceptance: dict[str, Any] | None
+    #: The botocore failure code (`AccessDenied`, ...) when the acceptance
+    #: read failed because it could not be REACHED, or `None` when it was
+    #: simply absent/corrupt/present. `alpha-engine-config-I9896`: an
+    #: `AccessDenied` rendered through `ACCEPTANCE_NOT_ON_ANY_ARTIFACT`
+    #: would report an IAM gap as "nobody has filed this yet".
+    acceptance_denied_code: str | None
 
 
-def _read_json(store: Store, key: str) -> tuple[dict[str, Any] | None, str]:
-    """``(document, reason)``. Absent and unreadable are DIFFERENT answers.
+def _client_error_code(exc: BaseException) -> str | None:
+    """The service failure code for a botocore read failure, or `None`.
 
-    FAILURE MODE SWALLOWED: a malformed document is reported as a reason
-    string rather than raised, because a corrupt PREVIOUS board must not stop
-    today's report from going out — the report is the thing that would tell
-    somebody the board is corrupt. RECORDING SURFACE: the returned reason is
-    rendered verbatim into the delivered message and into the run manifest's
-    `metrics`, so the swallow is visible on the operator's phone rather than
-    only in a log. `board/current.json` itself is NOT read through this path:
-    :func:`read_inputs` calls `store.get_bytes` directly for it, so a missing
-    or corrupt CURRENT board raises and the manifest reads `failed`.
+    `None` means "not a botocore failure at all" (`LocalStore` raises only
+    `KeyError`/`ValueError`) — the caller re-raises in that case, so this
+    stays a classifier and never widens what :func:`_read_json` swallows.
+
+    Imported lazily, like every botocore reference in this tree
+    (`crucible.store`'s own precedent): `crucible --help` and every unit
+    test that never touches S3 should not need the SDK on the import path.
+    """
+    from botocore.exceptions import BotoCoreError, ClientError  # noqa: PLC0415 - lazy on purpose
+
+    if isinstance(exc, ClientError):
+        return str(exc.response.get("Error", {}).get("Code", "")) or type(exc).__name__
+    if isinstance(exc, BotoCoreError):
+        return type(exc).__name__
+    return None
+
+
+@dataclass(frozen=True)
+class _Read:
+    """One optional-artifact read: present, absent/corrupt, or denied.
+
+    Three outcomes because absent and denied are different facts about an
+    artifact this job does not own and cannot write: reporting a denied read
+    as absent hides an IAM gap behind a normal-looking report (plan §6 rule
+    1's conflation, forbidden by name), and it is exactly what happened live
+    on 2026-09-03 before this fix — S3 returns 403 for a missing key when
+    the caller also lacks `s3:ListBucket` on the prefix.
+    """
+
+    document: dict[str, Any] | None
+    reason: str
+    denied_code: str | None
+
+
+def _read_json(store: Store, key: str) -> _Read:
+    """Read and parse ``key``. Never raises for absent, corrupt or denied.
+
+    FAILURE MODES SWALLOWED: a missing key, a malformed document, and a
+    botocore read failure that is not a not-found (`AccessDenied`, a
+    throttle, a network failure before the request reached S3) are all
+    reported rather than raised, because a corrupt or unreachable PREVIOUS
+    board or acceptance reading must not stop today's report from going
+    out — the report is the thing that would tell somebody either is
+    broken. RECORDING SURFACE: `.reason` / `.denied_code` are rendered
+    verbatim into the delivered message, so every swallow here is visible
+    on the operator's phone rather than only in a log.
+
+    A `NoSuchKey`/`404`-coded `ClientError` is still ABSENT, not denied —
+    `S3Store.get_bytes` already normalizes that shape to `KeyError` in
+    production, but this branch matches it too so a caller that raises the
+    `ClientError` directly (a mock, or a future backend) degrades to the
+    same honest answer rather than a spurious "denied".
+
+    `board/current.json` itself is NOT read through this path:
+    :func:`read_inputs` calls `store.get_bytes` directly for it, so a
+    missing, corrupt, or denied CURRENT board raises and the manifest reads
+    `failed` — that artifact is not optional.
     """
     try:
         raw = store.get_bytes(key)
     except KeyError:
-        return None, f"absent at {key}"
+        return _Read(None, f"absent at {key}", None)
+    except Exception as exc:  # reclassified below; re-raised unless it's a named botocore code
+        code = _client_error_code(exc)
+        if code is None:
+            raise
+        if code in ("NoSuchKey", "404"):
+            return _Read(None, f"absent at {key}", None)
+        return _Read(None, f"unreadable at {key}: {code}", code)
     try:
-        return json.loads(raw), ""
+        return _Read(json.loads(raw), "", None)
     except ValueError as exc:
-        return None, f"unreadable at {key}: {exc}"
+        return _Read(None, f"unreadable at {key}: {exc}", None)
 
 
 def read_inputs(store: Store, *, trading_day: dt.date) -> MorningInputs:
@@ -306,13 +384,27 @@ def read_inputs(store: Store, *, trading_day: dt.date) -> MorningInputs:
     board_day = str(board.get("trading_day") or trading_day.isoformat())
 
     previous_day = previous_trading_day(dt.date.fromisoformat(board_day))
-    previous, previous_reason = _read_json(store, board_key(previous_day.isoformat()))
+    previous_read = _read_json(store, board_key(previous_day.isoformat()))
+    previous = previous_read.document
+    # A DENIED previous board is still "cannot say", never "nothing moved" —
+    # `.reason` already carries the right sentence for the absent/corrupt
+    # cases, and the denied case gets its own, naming the code rather than
+    # a generic "unreadable at <key>" (plan §6 rule 1).
+    previous_reason = (
+        previous_read.reason
+        if previous_read.denied_code is None
+        else f"unreadable ({previous_read.denied_code})"
+    )
 
-    run, run_reason = _read_json(store, manifest_key(BOARD_JOB, board_day))
+    run_read = _read_json(store, manifest_key(BOARD_JOB, board_day))
+    run = run_read.document
     code_sha: str | None = None
     operator_action: str | None = None
     if run is None:
-        note = f"no board run manifest ({run_reason})"
+        run_note_reason = (
+            f"unreadable ({run_read.denied_code})" if run_read.denied_code else run_read.reason
+        )
+        note = f"no board run manifest ({run_note_reason})"
         operator_action = (
             f"the {BOARD_JOB} render filed no manifest for {board_day} "
             f"({manifest_key(BOARD_JOB, board_day)}) — the daily render is not completing, "
@@ -327,7 +419,7 @@ def read_inputs(store: Store, *, trading_day: dt.date) -> MorningInputs:
                 f"{run.get('reason') or 'no reason recorded'}"
             )
 
-    acceptance, _ = _read_json(store, acceptance_reading_key(board_day))
+    acceptance_read = _read_json(store, acceptance_reading_key(board_day))
 
     return MorningInputs(
         board=board,
@@ -338,7 +430,8 @@ def read_inputs(store: Store, *, trading_day: dt.date) -> MorningInputs:
         board_code_sha=code_sha,
         board_run_note=note,
         operator_action=operator_action,
-        acceptance=acceptance,
+        acceptance=acceptance_read.document,
+        acceptance_denied_code=acceptance_read.denied_code,
     )
 
 
@@ -399,15 +492,21 @@ def _moved_lines(inputs: MorningInputs) -> list[str]:
     return moved or ["  nothing moved"]
 
 
-def _acceptance_line(reading: dict[str, Any] | None) -> str:
-    """§12 rule 3's one progress figure, read or honestly absent.
+def _acceptance_line(reading: dict[str, Any] | None, *, denied_code: str | None) -> str:
+    """§12 rule 3's one progress figure — read, honestly absent, or denied.
 
     A reading missing any of the four fields the producer contract declares
     (`crucible.keys.acceptance_reading_key`) is treated as ABSENT, not as a
     partial reading: rendering three of four fields of the only number the
     plan calls progress would be a fabrication that looks exactly like a
     measurement, and the absent line is the honest alternative.
+
+    ``denied_code`` takes priority over both: an access failure is a THIRD
+    fact, never routed through the absent literal (`alpha-engine-config-I9896`
+    measured `AccessDenied` on the first live run — see `ACCEPTANCE_UNREADABLE`).
     """
+    if denied_code is not None:
+        return ACCEPTANCE_UNREADABLE.format(code=denied_code)
     if reading is None:
         return ACCEPTANCE_NOT_ON_ANY_ARTIFACT
     try:
@@ -458,7 +557,7 @@ def render_message(inputs: MorningInputs, *, now: dt.datetime) -> str:
     lines.append(f"moved since {inputs.previous_day}")
     lines.extend(_moved_lines(inputs))
     lines.append("")
-    lines.append(_acceptance_line(inputs.acceptance))
+    lines.append(_acceptance_line(inputs.acceptance, denied_code=inputs.acceptance_denied_code))
     lines.append(_silence_line(board))
     lines.append(
         f"pending operator action: {inputs.operator_action}"
@@ -498,13 +597,20 @@ def _operator_chat() -> str:
 def deliver(message: str, *, transport: Callable[..., Any] | None = None) -> str:
     """Send ``message`` on the operator channel. Returns the destination.
 
-    **Telegram only, `severity="info"`, `silent=True`.** Plan §4.6 admits
+    **Telegram only, `severity="info"`, `silent=False`.** Plan §4.6 admits
     exactly two page conditions and this is neither, so it must not reach
     either SNS pages topic: `sns=False` is what keeps a daily digest out of
-    the path a page travels, and `silent=True` is what keeps it from buzzing
-    a phone at 6am about a board that is red by design. It is the same shape
+    the path a page travels. §4.6 governs PAGES; a Telegram notification is
+    not one. It is the same shape
     `nousergon-lib/.github/workflows/notify-ci-failure.yml` already runs
     fleet-wide, which is also why it needs no AWS credential to deliver.
+
+    **Why it notifies (Brian ruling 2026-09-03, `alpha-engine-config-I9916`).**
+    The first delivery (2026-09-03 07:26 PDT) went out `silent=True` into the
+    operator chat, under the day's CI-failure alerts; the manifest read `ok`
+    and Brian said he had not received it. A report the recipient does not
+    see is the accountability gap this job exists to close, one layer down.
+    One push per day at 06:00 PT is the accepted cost.
 
     **No dedup key.** `krepis.alerts.publish` suppresses a repeat within its
     window, and this message is SUPPOSED to arrive every day even when it is
@@ -544,7 +650,7 @@ def deliver(message: str, *, transport: Callable[..., Any] | None = None) -> str
         source=f"crucible-v2/{MORNING_JOB}",
         sns=False,
         telegram=True,
-        silent=True,
+        silent=False,
         dedup_key=None,
         destination=_operator_chat(),
         raise_on_total_failure=True,
