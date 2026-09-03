@@ -9,6 +9,7 @@ a gain.
 
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 import sys
@@ -20,11 +21,25 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 CHECKER = ROOT / "tests" / "acceptance" / "check_reading.py"
 RATCHET = ROOT / "tests" / "acceptance" / "ratchet.json"
+OBJECTIVES_SOURCE = ROOT / "tests" / "acceptance" / "test_plan_section_2_objectives.py"
 
 
 def _report(
-    path: Path, *, met: list[str], unmet: list[str], unmeasurable: list[str] | None = None
+    path: Path,
+    *,
+    met: list[str],
+    unmet: list[str],
+    unmeasurable: dict[str, str] | list[str] | None = None,
 ) -> Path:
+    """Build a JUnit report. `unmeasurable` maps clause id -> `blocked_on_class`
+    (a bare list defaults every entry to `"NoCredentialsError"`) and is
+    written as `<properties>` — `record_property`'s real wire shape — never
+    as message text, matching what `_unmeasurable` actually emits (round 2)."""
+    if unmeasurable is None:
+        unmeasurable = {}
+    elif isinstance(unmeasurable, list):
+        unmeasurable = dict.fromkeys(unmeasurable, "NoCredentialsError")
+
     cases = "".join(
         f'<testcase classname="tests.acceptance.mod.{name.split("::")[0]}" '
         f'name="{name.split("::")[1]}"/>'
@@ -38,9 +53,12 @@ def _report(
     )
     cases += "".join(
         f'<testcase classname="tests.acceptance.mod.{name.split("::")[0]}" '
-        f'name="{name.split("::")[1]}"><failure message="Failed: UNMEASURABLE — {name}">'
+        f'name="{name.split("::")[1]}"><properties>'
+        f'<property name="outcome" value="unmeasurable" />'
+        f'<property name="blocked_on_class" value="{blocked_on_class}" />'
+        f'</properties><failure message="Failed: UNMEASURABLE — {name}">'
         f"UNMEASURABLE</failure></testcase>"
-        for name in (unmeasurable or [])
+        for name, blocked_on_class in unmeasurable.items()
     )
     path.write_text(f'<?xml version="1.0"?><testsuites><testsuite>{cases}</testsuite></testsuites>')
     return path
@@ -70,13 +88,22 @@ def ratchet(tmp_path: Path) -> Path:
 def ratchet_with_unmeasurable(tmp_path: Path) -> Path:
     """`unmeasurable` is a SUBSET of `unmet`'s keys: T::d is listed in both,
     since `crucible/gate.py`'s phase-0 clause reads `met | unmet` as the full
-    clause set and does not know about the finer `unmeasurable` bucket."""
+    clause set and does not know about the finer `unmeasurable` bucket. Each
+    `unmeasurable` VALUE is an object — `reason`, `blocked_on_class`,
+    `last_moved` (round 2, review finding 1/3) — matching `_report`'s default
+    `blocked_on_class` of `"NoCredentialsError"` for a bare id list."""
     path = tmp_path / "ratchet.json"
     path.write_text(
         json.dumps(
             {
                 "unmet": {"T::a": "phase 2", "T::d": "no AWS credentials in this environment"},
-                "unmeasurable": {"T::d": "no AWS credentials in this environment"},
+                "unmeasurable": {
+                    "T::d": {
+                        "reason": "no AWS credentials in this environment",
+                        "blocked_on_class": "NoCredentialsError",
+                        "last_moved": "2026-09-02",
+                    }
+                },
                 "met": ["T::b", "T::c"],
             }
         )
@@ -85,12 +112,42 @@ def ratchet_with_unmeasurable(tmp_path: Path) -> Path:
 
 
 def _checker():
-    """Import `check_reading` as a module, for the model-level assertions."""
+    """Import `check_reading` as a module, for the model-level assertions.
+
+    Registered into `sys.modules` under its own name before `exec_module` —
+    `Ratchet`'s `unmeasurable: dict[str, UnmeasurableEntry]` needs pydantic to
+    resolve the `UnmeasurableEntry` forward reference via the module's own
+    globals (`from __future__ import annotations` makes every annotation a
+    string), which pydantic looks up through `sys.modules[cls.__module__]` —
+    unregistered, that lookup fails with `PydanticUserError: not fully
+    defined` even though the class is defined earlier in the same file.
+    """
+    import sys
     from importlib.util import module_from_spec, spec_from_file_location
 
     spec = spec_from_file_location("check_reading", CHECKER)
     assert spec and spec.loader
     module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _objectives():
+    """Import `test_plan_section_2_objectives` as a module, for round-2 tests
+    that need `TestCost`, `_unmeasurable` and its allowlists directly.
+    Registered into `sys.modules` for the same reason `_checker()` is (see
+    its docstring); the name is distinct from pytest's own collected copy of
+    this file, so this never shadows or is shadowed by it. Loading it
+    executes no test body (only class/function definitions), the same
+    guarantee pytest's own collection of this file already relies on."""
+    import sys
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    spec = spec_from_file_location("_round2_objectives_reflection", OBJECTIVES_SOURCE)
+    assert spec and spec.loader
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -316,11 +373,12 @@ def test_a_collection_error_is_red(tmp_path: Path, ratchet: Path) -> None:
 
 
 def test_a_credential_failure_reads_unmeasurable_never_unmet(tmp_path: Path) -> None:
-    """alpha-engine-config-I9828: the whole point of the marker.
+    """alpha-engine-config-I9828: the whole point of the taxonomy.
 
-    A clause whose message carries the `UNMEASURABLE — ` marker (what
-    `_unmeasurable` in `test_plan_section_2_objectives.py` writes) is
-    classified into `Reading.unmeasurable`, a SUBSET of `Reading.unmet` (so
+    A clause whose `<properties>` carry `outcome=unmeasurable` (round 2 —
+    what `_unmeasurable` in `test_plan_section_2_objectives.py` writes via
+    `record_property`, never message text) is classified into
+    `Reading.unmeasurable`, a SUBSET of `Reading.unmet` (so
     `crucible/gate.py`'s coarse `met | unmet` view still sees it as
     not-met) — and it is not counted in `Reading.met`, nor in
     `Reading.plain_unmet` (the genuine, code-fixable gaps), either.
@@ -509,3 +567,396 @@ def test_ratchets_unmet_phase_agrees_with_the_clauses_own_phase_kwarg() -> None:
         "ratchet.json's unmet reason and the clause's own phase= kwarg disagree — "
         "one of the two restatements drifted:\n" + "\n".join(f"  - {m}" for m in mismatches)
     )
+
+
+# ============================================================================
+# Round 2 — independent adversarial review of alpha-engine-config-I9828's
+# first PR (crucible-PR55) found two BLOCKING gaps and one SHOULD-FIX in the
+# taxonomy itself. Each test below reproduces the finding before asserting
+# the fix; see each docstring for what failed under the round-1 code.
+# ============================================================================
+
+
+def _unmeasurable_handler_types(source: str) -> list[frozenset[str] | None]:
+    """For every call to `_unmeasurable(...)` in `source`, the exception type
+    name(s) of its immediately-enclosing `except` handler.
+
+    `None` means the call sits outside any `except` handler, OR the handler
+    is bare (`except:`) — both are violations, never distinguished from each
+    other because neither is allowed to reach `_unmeasurable` at all.
+
+    Mirrors `crucible/gate.py::_acceptance_source_scan`'s shape (parse the
+    committed source with `ast`, never import-and-run) for the same reason
+    that module gives: this file's own docstring is explicit that
+    collection, never execution, belongs on the PR path, and some of these
+    clauses read live AWS.
+    """
+
+    def _names(node: ast.expr | None) -> frozenset[str] | None:
+        if node is None:
+            return None
+        if isinstance(node, ast.Name):
+            return frozenset({node.id})
+        if isinstance(node, ast.Attribute):
+            return frozenset({node.attr})
+        if isinstance(node, ast.Tuple):
+            names: set[str] = set()
+            for elt in node.elts:
+                resolved = _names(elt)
+                if resolved is None:
+                    return None
+                names |= resolved
+            return frozenset(names)
+        return None
+
+    tree = ast.parse(source)
+    results: list[frozenset[str] | None] = []
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.stack: list[ast.ExceptHandler] = []
+
+        def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+            self.stack.append(node)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if isinstance(node.func, ast.Name) and node.func.id == "_unmeasurable":
+                handler = self.stack[-1] if self.stack else None
+                results.append(_names(handler.type) if handler is not None else None)
+            self.generic_visit(node)
+
+    _Visitor().visit(tree)
+    return results
+
+
+def test_the_except_handler_scanner_fires_on_a_bare_except_and_a_disallowed_type() -> None:
+    """Self-test: the scanner must show its own detection firing, on synthetic
+    input, before it is trusted against the real file (repo convention — "a
+    detector nobody has made fail is a detector nobody knows works")."""
+    outside_any_handler = textwrap.dedent(
+        """
+        def f():
+            _unmeasurable("c", "r", exc, phase="phase0")
+        """
+    )
+    bare_except = textwrap.dedent(
+        """
+        def f():
+            try:
+                x()
+            except:
+                _unmeasurable("c", "r", exc, phase="phase0")
+        """
+    )
+    disallowed_type = textwrap.dedent(
+        """
+        def f():
+            try:
+                x()
+            except Exception as exc:
+                _unmeasurable("c", "r", exc, phase="phase0")
+        """
+    )
+    allowed_type = textwrap.dedent(
+        """
+        def f():
+            try:
+                x()
+            except NoCredentialsError as exc:
+                _unmeasurable("c", "r", exc, phase="phase0")
+        """
+    )
+    assert _unmeasurable_handler_types(outside_any_handler) == [None]
+    assert _unmeasurable_handler_types(bare_except) == [None]
+    assert _unmeasurable_handler_types(disallowed_type) == [frozenset({"Exception"})]
+    assert _unmeasurable_handler_types(allowed_type) == [frozenset({"NoCredentialsError"})]
+
+
+def test_unmeasurable_is_only_called_from_an_allowed_except_handler() -> None:
+    """BLOCKING, round-2 review finding 1: without this, an author can turn
+    ANY code bug into "unmeasurable" by wrapping `_unmeasurable(...)` in
+    `except Exception` (or calling it unconditionally) — `check_reading.py`
+    has no way to tell that apart from a genuine read failure, because both
+    of its inputs (the JUnit reading and the ratchet) would agree if the
+    author also edited `ratchet.json` in the same PR. This is the structural
+    half of the fix: `_unmeasurable` can only be reached from a handler whose
+    caught type(s) are in the declared allowlist, checked here on every PR
+    (this file is in the FOUNDATION suite, which — unlike the acceptance job,
+    per review finding 1's `ci.yml:159` note — DOES run on `pull_request`).
+    """
+    module = _objectives()
+    allowed = module._UNMEASURABLE_ALLOWED_EXCEPTIONS
+    handler_types = _unmeasurable_handler_types(OBJECTIVES_SOURCE.read_text(encoding="utf-8"))
+    assert handler_types, "no _unmeasurable calls found in the source — nothing to check"
+    violations = [h for h in handler_types if h is None or not h.issubset(allowed)]
+    assert not violations, (
+        f"{len(violations)} call(s) to _unmeasurable are not reachable only from an "
+        f"allowed except handler (allowed: {sorted(allowed)}); found: {violations}. "
+        "Either the call sits outside any except handler / a bare except, or it "
+        "catches a type not in _UNMEASURABLE_ALLOWED_EXCEPTIONS."
+    )
+
+
+def test_unmeasurable_raises_on_an_exception_type_outside_the_allowlist() -> None:
+    """Redundant runtime guard inside `_unmeasurable` itself (belt, not the
+    braces — the AST test above is the real enforcement, since a call site
+    is trusted to pass the exception it actually caught). Shows the guard
+    firing: calling with a `TypeError` — not in the allowlist — raises
+    `TypeError`, not `pytest.fail`."""
+    module = _objectives()
+    calls: list[tuple[str, object]] = []
+    with pytest.raises(TypeError, match="not in the declared allowlist"):
+        module._unmeasurable(
+            "clause", "requirement", TypeError("boom"), phase="phase0", record_property=calls.append
+        )
+    assert calls == [], "no property should be recorded for a rejected exception type"
+
+
+class _Recorder:
+    """Collects `record_property(name, value)` calls, pytest's own fixture
+    shape, without needing a live pytest run."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object]] = []
+
+    def __call__(self, name: str, value: object) -> None:
+        self.calls.append((name, value))
+
+    def get(self, name: str) -> object | None:
+        for recorded_name, value in self.calls:
+            if recorded_name == name:
+                return value
+        return None
+
+
+def _run_test_cost(module, *, audit_stack_tags, recorder: _Recorder) -> None:
+    """Invoke the real `TestCost.test_every_v2_resource_is_tagged_for_cost_attribution`
+    with `crucible.tags.audit_stack_tags` replaced, so the method's own
+    except-clause structure is exercised directly rather than re-implemented
+    here as a second copy of the contract. Any exception the method raises
+    (or fails to catch) propagates to the caller — this does not swallow."""
+    import crucible.tags as tags_module
+
+    original = tags_module.audit_stack_tags
+    tags_module.audit_stack_tags = audit_stack_tags
+    try:
+        module.TestCost().test_every_v2_resource_is_tagged_for_cost_attribution(recorder)
+    finally:
+        tags_module.audit_stack_tags = original
+
+
+def test_a_typeerror_from_the_audit_is_not_caught_and_is_not_unmeasurable() -> None:
+    """BLOCKING, round-2 review finding 2, reproduced exactly as named: an
+    injected `TypeError` from `audit_stack_tags` used to be caught by the
+    round-1 bare `except Exception` and read as UNMEASURABLE. It must now
+    propagate uncaught — a pytest ERROR, not a classified outcome — and
+    record no property.
+    """
+    module = _objectives()
+    recorder = _Recorder()
+
+    def _raise(**kwargs):
+        raise TypeError("audit_stack_tags: unexpected keyword")
+
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        _run_test_cost(module, audit_stack_tags=_raise, recorder=recorder)
+    assert recorder.calls == [], "a code bug must record no outcome property"
+
+
+def test_a_clienterror_with_a_disallowed_code_is_not_swallowed() -> None:
+    """A `ClientError` whose code is NOT in the access/auth allowlist (e.g. a
+    throttle, a malformed request) is a real API problem, not an environment
+    one — it must re-raise, exactly like the `TypeError` case."""
+    from botocore.exceptions import ClientError
+
+    module = _objectives()
+    recorder = _Recorder()
+
+    def _raise(**kwargs):
+        raise ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "slow down"}}, "ListStackResources"
+        )
+
+    with pytest.raises(ClientError):
+        _run_test_cost(module, audit_stack_tags=_raise, recorder=recorder)
+    assert recorder.calls == [], "a non-auth ClientError code must record no outcome property"
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_class"),
+    [
+        ("AccessDenied", "ClientError"),
+        ("AccessDeniedException", "ClientError"),
+        ("UnauthorizedOperation", "ClientError"),
+        ("ExpiredToken", "ClientError"),
+        ("InvalidClientTokenId", "ClientError"),
+    ],
+)
+def test_a_clienterror_with_an_access_denied_code_is_unmeasurable(
+    code: str, expected_class: str
+) -> None:
+    """The laptop's real failure mode (measured: `AccessDenied` on
+    `cloudformation:ListStackResources`) and its four siblings all classify
+    as UNMEASURABLE, with `blocked_on_class` recording the exception TYPE
+    (`ClientError`), not the AWS error code — matching what
+    `type(exc).__name__` actually is for every one of these."""
+    from botocore.exceptions import ClientError
+
+    module = _objectives()
+    recorder = _Recorder()
+
+    def _raise(**kwargs):
+        raise ClientError({"Error": {"Code": code, "Message": "denied"}}, "ListStackResources")
+
+    with pytest.raises(pytest.fail.Exception, match="UNMEASURABLE"):
+        _run_test_cost(module, audit_stack_tags=_raise, recorder=recorder)
+    assert recorder.get("outcome") == "unmeasurable"
+    assert recorder.get("blocked_on_class") == expected_class
+
+
+@pytest.mark.parametrize(
+    ("build_exc", "expected_class"),
+    [
+        (
+            lambda: __import__(
+                "crucible.tags", fromlist=["StackNotAppliedError"]
+            ).StackNotAppliedError("no stack"),
+            "StackNotAppliedError",
+        ),
+        (
+            lambda: __import__(
+                "botocore.exceptions", fromlist=["NoCredentialsError"]
+            ).NoCredentialsError(),
+            "NoCredentialsError",
+        ),
+        (
+            lambda: __import__("botocore.exceptions", fromlist=["NoRegionError"]).NoRegionError(),
+            "NoRegionError",
+        ),
+        (
+            lambda: __import__(
+                "botocore.exceptions", fromlist=["EndpointConnectionError"]
+            ).EndpointConnectionError(
+                endpoint_url="https://cloudformation.us-east-1.amazonaws.com"
+            ),
+            "EndpointConnectionError",
+        ),
+    ],
+)
+def test_every_allowed_exception_type_classifies_unmeasurable_with_its_own_class_name(
+    build_exc, expected_class: str
+) -> None:
+    """Every type in `_UNMEASURABLE_ALLOWED_EXCEPTIONS` actually reaches
+    UNMEASURABLE through the real method, each recording ITS OWN type name —
+    not a shared constant — so a future family drift (finding 3) has
+    something true to compare against."""
+    module = _objectives()
+    recorder = _Recorder()
+
+    def _raise(**kwargs):
+        raise build_exc()
+
+    with pytest.raises(pytest.fail.Exception, match="UNMEASURABLE"):
+        _run_test_cost(module, audit_stack_tags=_raise, recorder=recorder)
+    assert recorder.get("outcome") == "unmeasurable"
+    assert recorder.get("blocked_on_class") == expected_class
+
+
+def test_message_text_alone_no_longer_classifies_as_unmeasurable(
+    tmp_path: Path, ratchet: Path
+) -> None:
+    """SHOULD-FIX, round-2 review finding 3, both reproductions in one test:
+    an `AssertionError` that happens to quote the marker word, and the
+    marker surviving inside an unrelated `<failure>` body. Round 1 classified
+    both as unmeasurable via substring search; round 2 reads `<properties>`
+    only, so neither has any effect without the property being present.
+    """
+    report = tmp_path / "r.xml"
+    report.write_text(
+        textwrap.dedent(
+            """\
+            <?xml version="1.0"?><testsuites><testsuite>
+            <testcase classname="tests.acceptance.mod.T" name="a">
+            <failure message="AssertionError: expected UNMEASURABLE — clause, got MET">
+            Traceback shows an old UNMEASURABLE — clause failure body quoted for context
+            </failure>
+            </testcase>
+            </testsuite></testsuites>
+            """
+        )
+    )
+    reading = _checker().read_report(report)
+    assert reading.unmeasurable == set(), (
+        "message text alone must not classify anything as unmeasurable"
+    )
+    assert reading.unmet == {"T::a"}
+
+
+def test_a_blocked_on_class_family_drift_is_red(
+    tmp_path: Path, ratchet_with_unmeasurable: Path
+) -> None:
+    """SHOULD-FIX, round-2 review finding 3's second half: T::d stays
+    unmeasurable in both ratchet and reading, but the OBSERVED exception type
+    changed from what the ratchet commits (`NoCredentialsError` ->
+    `ClientError`, e.g. credentials went from entirely absent to merely
+    insufficient) — a real change in the failure story that the earlier
+    reclassification checks cannot see, because the clause never left
+    `unmeasurable`."""
+    report = _report(
+        tmp_path / "r.xml",
+        met=["T::b", "T::c"],
+        unmet=["T::a"],
+        unmeasurable={"T::d": "ClientError"},
+    )
+    result = _run(report, ratchet_with_unmeasurable)
+    assert result.returncode == 1
+    assert "blocked_on_class" in result.stderr
+    assert "T::d" in result.stderr
+    assert "NoCredentialsError" in result.stderr
+    assert "ClientError" in result.stderr
+
+
+def test_a_matching_blocked_on_class_is_still_green(
+    tmp_path: Path, ratchet_with_unmeasurable: Path
+) -> None:
+    """The family-drift check must not false-positive when nothing changed —
+    T::d's `blocked_on_class` in the reading matches the ratchet exactly."""
+    report = _report(
+        tmp_path / "r.xml",
+        met=["T::b", "T::c"],
+        unmet=["T::a"],
+        unmeasurable={"T::d": "NoCredentialsError"},
+    )
+    result = _run(report, ratchet_with_unmeasurable)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "bad_entry",
+    [
+        {"reason": "   ", "blocked_on_class": "ClientError", "last_moved": "2026-09-02"},
+        {"reason": "why", "blocked_on_class": "   ", "last_moved": "2026-09-02"},
+        {"reason": "why", "blocked_on_class": "ClientError", "last_moved": "09-02-2026"},
+        {"reason": "why", "blocked_on_class": "ClientError", "last_moved": ""},
+        {"reason": "why", "blocked_on_class": "ClientError"},
+    ],
+)
+def test_a_malformed_unmeasurable_entry_is_red_and_names_the_field(
+    tmp_path: Path, bad_entry: dict
+) -> None:
+    """Round 2: `unmeasurable` values are objects now (`reason`,
+    `blocked_on_class`, `last_moved`) — each field gets the same
+    fail-loud-with-the-field-named treatment as every other malformed shape
+    in this grader (principle 7: a malformed input is an absence)."""
+    ratchet = tmp_path / "ratchet.json"
+    ratchet.write_text(
+        json.dumps({"unmet": {"T::a": "phase 2"}, "unmeasurable": {"T::a": bad_entry}, "met": []})
+    )
+    report = _report(
+        tmp_path / "r.xml", met=[], unmet=["T::a"], unmeasurable={"T::a": "ClientError"}
+    )
+    result = _run(report, ratchet)
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr

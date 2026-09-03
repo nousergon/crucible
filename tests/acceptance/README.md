@@ -83,21 +83,52 @@ A clause raises `_unmeasurable(...)` (defined beside `_unmet` in
 `test_plan_section_2_objectives.py`) rather than `_unmet(...)` when the
 failure is in the READ, not the property — structurally, that means the
 `try` block around the live call, never the `assert` that follows it once
-the read succeeded. `_unmeasurable` tags the JUnit failure message
-`UNMEASURABLE — `, which `check_reading.py` (`UNMEASURABLE_MARKER`) reads to
-sort the clause into its own bucket.
+the read succeeded. **Only from an allowed `except` handler**: `_unmeasurable`
+may be reached only from a handler whose caught type(s) are in
+`_UNMEASURABLE_ALLOWED_EXCEPTIONS` (`StackNotAppliedError`,
+`NoCredentialsError`, `NoRegionError`, `EndpointConnectionError`,
+`ClientError` — the last further gated on its AWS error code, at the call
+site, to an access/auth allowlist). This is round-2 hardening
+(alpha-engine-config-I9828): the round-1 version caught a bare `except
+Exception`, and an independent adversarial review reproduced turning an
+injected `TypeError` into a false UNMEASURABLE reading with it. A PR-blocking
+AST test (`tests/test_acceptance_reading.py::test_unmeasurable_is_only_called_from_an_allowed_except_handler`,
+part of the FOUNDATION suite, so it runs on every `pull_request`) enforces
+this; a self-test shows it firing on a bare except and on `except Exception`.
+
+**Classification is by JUnit `<properties>`, never by message text.**
+`_unmeasurable` calls the pytest-core `record_property` fixture (no plugin)
+to write `outcome=unmeasurable` and `blocked_on_class=<exception type name>`;
+`check_reading.py` reads only those two properties. Round 1 classified on a
+substring search over the failure message and traceback body — the same
+review reproduced two ways past that (an `AssertionError` quoting the marker
+word, and the marker surviving inside an unrelated traceback) — so the
+`UNMEASURABLE — ` message prefix survives for terminal legibility only and is
+read by nothing.
 
 `ratchet.json`'s `unmeasurable` map is a **subset of `unmet`'s keys**, not a
 fourth top-level bucket — `crucible/gate.py`'s phase-0 clause reads this same
-file and requires `met | unmet` to equal every clause the suite defines
-(that two-bucket contract predates this issue and is owned by a different
-track, alpha-engine-config-I9869), so an unmeasurable clause id is listed in
-both `unmet` (for that coarse view) and `unmeasurable` (naming why the read
-failed, for the finer one). `push: [main]`'s step summary reports
-`N met / M unmet / K unmeasurable`, with `M` counting only the plain-unmet
-remainder (`unmet` minus `unmeasurable`); a clause moving between met,
-plain-unmet and unmeasurable without the ratchet moving with it fails the
-run.
+file and requires `met | unmet` to equal every clause the suite defines (that
+two-bucket contract predates this issue; the gate-side UNMEASURABLE `Clause`
+state is a separate track, crucible-PR53 / alpha-engine-config-I9869 round 2),
+so an unmeasurable clause id is listed in both `unmet` (for that coarse view)
+and `unmeasurable` (naming why the read failed, for the finer one). Each
+`unmeasurable` VALUE is an object — `reason`, `blocked_on_class`, `last_moved`
+— not a bare string, so moving a clause into this bucket is a reviewable
+diff (a new key appearing, never a string relocating silently between two
+JSON values), and a later drift in WHICH exception is actually observed
+fails the run until the ratchet is updated to match.
+
+`push: [main]`'s step summary reports `N met / M unmet / K unmeasurable`,
+with `M` counting only the plain-unmet remainder (`unmet` minus
+`unmeasurable`); a clause moving between met, plain-unmet and unmeasurable,
+or whose `blocked_on_class` drifts from what the ratchet commits, without the
+ratchet moving with it, fails the run.
+
+**Why the suite mirrors `crucible/board.py`'s UNMEASURABLE/UNMEASURED
+vocabulary instead of importing it:** the acceptance suite grades the system
+from outside it, and a suite that imports the code it grades can be broken by
+the exact code change it exists to catch.
 
 **Currently unmeasurable, and why:**
 
