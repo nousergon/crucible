@@ -27,6 +27,7 @@ import json
 
 import pytest
 
+from crucible import keys as crucible_keys
 from crucible.keys import (
     DRIFT_INPUTS,
     cross_section_key,
@@ -69,12 +70,32 @@ class TestExperimentsPrefix:
         ):
             assert key.startswith(prefix), f"{key!r} does not start with {prefix!r}"
 
+    def test_the_shape_is_literal(self) -> None:
+        """`startswith` above only proves `experiments_prefix` and its four
+        sibling `*_key` functions agree with EACH OTHER — a consistent rename
+        of the shared segment in both would leave it green
+        (`alpha-engine-config-I9889`, verified: renaming
+        `strategy/current/arms/` in both `strategy_arm_key` and
+        `strategy_arms_prefix` left the whole suite green the same way).
+        Anchoring to an absolute literal, as `TestDriftKeys` already does for
+        `drift_input_key`, is what catches that."""
+        assert experiments_prefix("u:momentum_sleeve:ab12cd") == (
+            "experiments/u~momentum_sleeve~ab12cd/"
+        )
+
 
 class TestFeaturesPrefix:
     @pytest.mark.parametrize("version", ["v1", "2026-08-28-v3"])
     def test_the_key_starts_with_the_prefix(self, version: str) -> None:
         prefix = features_prefix(version)
         assert features_key(version, FRIDAY.isoformat()).startswith(prefix)
+
+    def test_the_shape_is_literal(self) -> None:
+        """See `TestExperimentsPrefix.test_the_shape_is_literal` — the
+        `startswith` test above cannot catch a consistent rename of the
+        shared `features/{version}/` segment in both `features_key` and
+        `features_prefix` at once."""
+        assert features_prefix("v1") == "features/v1/"
 
     def test_an_empty_version_raises_rather_than_listing_every_version(self) -> None:
         """Fail loud (`AGENTS.md` rule 5): a blank version would list under
@@ -90,6 +111,15 @@ class TestStrategyArmsPrefix:
         prefix = strategy_arms_prefix(slot)
         assert strategy_arm_key(slot, "momentum_sleeve").startswith(prefix)
 
+    def test_the_shape_is_literal(self) -> None:
+        """`alpha-engine-config-I9889`, verified by execution: renaming
+        `strategy/current/arms/` in BOTH `strategy_arm_key` and
+        `strategy_arms_prefix` at once left the whole suite green before this
+        test existed, because every prior assertion here compared two
+        `crucible.keys` outputs to each other rather than to the actual
+        on-disk shape."""
+        assert strategy_arms_prefix("r") == "strategy/current/arms/r/"
+
     def test_an_empty_slot_raises_rather_than_listing_every_slot(self) -> None:
         with pytest.raises(ValueError):
             strategy_arms_prefix("")
@@ -100,6 +130,12 @@ class TestRunsPrefix:
         prefix = runs_prefix("report")
         assert manifest_key("report", FRIDAY.isoformat()).startswith(prefix)
         assert manifest_key("report", FRIDAY.isoformat(), discriminator="r").startswith(prefix)
+
+    def test_the_shape_is_literal(self) -> None:
+        """See `TestExperimentsPrefix.test_the_shape_is_literal` — anchors
+        `runs_prefix` to the actual on-disk shape rather than only to
+        `manifest_key`'s own output."""
+        assert runs_prefix("report") == "runs/report/"
 
     def test_an_empty_job_raises(self) -> None:
         with pytest.raises(ValueError):
@@ -128,6 +164,47 @@ class TestDriftKeys:
         producing a fourth, orphaned key shape."""
         with pytest.raises(ValueError, match="unknown drift input"):
             drift_input_key("feature", "2026-08-28")
+
+
+class TestAllIsSortedAndDeduplicated:
+    """`crucible.keys.__all__` is hand-maintained (`crucible/keys.py` has no
+    mechanism deriving it), and it is the exact anchor a concurrent PR
+    conflicts on: `crucible-PR48`/`I9873` adds `review_key`/`review_prefix`
+    to the same list this PR edits. Taking "both sides" of that conflict in
+    conflict order — rather than re-sorting — silently produces
+    `runs_prefix, review_key, review_prefix` (wrong alphabetical order) or a
+    duplicated entry, and nothing caught either until now
+    (`alpha-engine-config-I9889`).
+    """
+
+    def test_all_is_alphabetically_sorted(self) -> None:
+        assert crucible_keys.__all__ == sorted(crucible_keys.__all__), (
+            "crucible.keys.__all__ is out of alphabetical order — likely a merge "
+            "conflict resolved by taking both sides in conflict order instead of "
+            "re-sorting."
+        )
+
+    def test_all_has_no_duplicate_entries(self) -> None:
+        seen: list[str] = []
+        duplicates: list[str] = []
+        for name in crucible_keys.__all__:
+            (duplicates if name in seen else seen).append(name)
+        assert not duplicates, f"crucible.keys.__all__ names {duplicates} more than once"
+
+    def test_the_guards_actually_fire(self) -> None:
+        """A detector nobody has made fail is a detector nobody knows works.
+        Both mutated lists are LOCAL — the real `crucible.keys.__all__` is
+        never touched — so this cannot be made to pass by editing the module
+        out from under it."""
+        unsorted = ["strategy_arm_key", "arm_key_segment", "champion_key"]
+        assert unsorted != sorted(unsorted)
+
+        duplicated = ["champion_key", "arm_key_segment", "champion_key"]
+        seen: list[str] = []
+        duplicates: list[str] = []
+        for name in duplicated:
+            (duplicates if name in seen else seen).append(name)
+        assert duplicates == ["champion_key"]
 
 
 class TestDriftHandlerKeyShape:
