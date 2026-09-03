@@ -1009,6 +1009,72 @@ class TestTheLinkToTheFullBoard:
         assert "LADDER" in message, "the rest of the report must still be there"
 
 
+class TestTheConsoleLinkReplacesThePresignedOne:
+    """`alpha-engine-config-I9926`: when a console is configured, the FULL
+    BOARD section carries its stable Decision-list address and nothing
+    presigned — one link to one board, with a caveat that says it does not
+    expire. When none is configured, the presigned path is untouched.
+    """
+
+    CONSOLE = "https://console.example.test"
+
+    def test_the_console_url_is_the_link(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        message = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
+        assert f"  {self.CONSOLE}/decision\n" in message
+
+    def test_the_presigned_link_and_its_caveat_are_absent(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        message = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
+        assert (tmp_path / "board" / "index.html").resolve().as_uri() not in message
+        assert "presigned GET" not in message
+
+    def test_the_caveat_says_the_address_does_not_expire(self, tmp_path):
+        from crucible.morning import BOARD_CONSOLE_CAVEAT
+
+        store = _seed(tmp_path, previous=_board())
+        message = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
+        assert BOARD_CONSOLE_CAVEAT in message
+        assert "no expiry" in BOARD_CONSOLE_CAVEAT
+
+    def test_a_trailing_slash_on_the_base_url_does_not_double_up(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        message = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE + "/")
+        assert f"{self.CONSOLE}/decision" in message
+        assert f"{self.CONSOLE}//decision" not in message
+
+    def test_the_page_is_not_read_when_a_console_is_configured(self, tmp_path):
+        # No presign, no `exists()` on the page: a console-linked report must
+        # not fail on — or pay for — a page it does not link.
+        store = _seed(tmp_path, previous=_board(), page=False)
+        message = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
+        assert BOARD_URL_UNAVAILABLE not in message
+        assert f"{self.CONSOLE}/decision" in message
+
+    def test_no_console_means_the_presigned_path_is_unchanged(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        with_none = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=None)
+        default = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert with_none == default
+        assert "presigned GET" in default
+
+    def test_the_console_link_rides_the_never_dropped_tier(self, tmp_path):
+        rows = [
+            _row(
+                f"phase{i}",
+                "phase",
+                "UNMET",
+                "d",
+                [_clause(f"clause_number_{i}_{j}_with_a_long_name", False) for j in range(12)],
+            )
+            for i in range(60)
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        message = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
+        assert f"{self.CONSOLE}/decision" in message
+        assert "(truncated" in message
+
+
 class TestTheTruncationRule:
     """Telegram takes 4096 characters. What gets dropped is a decision, and
     dropping it silently is the same defect as a green row over no data.

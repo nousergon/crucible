@@ -47,6 +47,7 @@ from crucible.store import LocalStore, S3Store, Store, read_only
 __all__ = [
     "DEFAULT_ARCTIC_BUCKET",
     "DEFAULT_CLOUDTRAIL_ARCHIVE",
+    "DEFAULT_CONSOLE_URL",
     "DEFAULT_STACK_NAME",
     "DEFAULT_LLM_CAP_USD",
     "DEFAULT_LLM_CAP_USD_MEASURED",
@@ -93,6 +94,16 @@ DEFAULT_STACK_NAME = "crucible-v2"
 #: raises `ArchiveMissingError` on an empty value.
 DEFAULT_CLOUDTRAIL_ARCHIVE = ""
 
+#: The fleet console's base URL (`policy-console`), where the board's rows are
+#: rendered as Decision entities at a STABLE address — the durable replacement
+#: for the presigned board link the morning report otherwise carries
+#: (`alpha-engine-config-I9926`). Empty by default, deliberately: a hostname is
+#: an infrastructure identifier this tree carries none of (it goes public at
+#: phase-1 exit), and an unset value means the report falls back to the
+#: presigned page and SAYS so, rather than linking a console that may not have
+#: the board yet. Set `CRUCIBLE_CONSOLE_URL`, scheme and host, no trailing slash.
+DEFAULT_CONSOLE_URL = ""
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -106,6 +117,9 @@ class Settings:
     strategy_dir: Path | None
     cloudtrail_archive: str = DEFAULT_CLOUDTRAIL_ARCHIVE
     stack_name: str = DEFAULT_STACK_NAME
+    #: `alpha-engine-config-I9926` — see :data:`DEFAULT_CONSOLE_URL`. Read by
+    #: `crucible.morning`; nothing else in this tree links out.
+    console_url: str = DEFAULT_CONSOLE_URL
     origins: dict[str, str] = field(default_factory=dict)
     #: The per-weekly-run LLM spend ceiling, in USD (plan §2 row 3). Declared
     #: HERE, in config, rather than at a call site: a ceiling that lives beside
@@ -171,6 +185,7 @@ class Settings:
             "arctic_bucket": self.arctic_bucket,
             "cloudtrail_archive": self.cloudtrail_archive,
             "stack_name": self.stack_name,
+            "console_url": self.console_url,
             "strategy_dir": str(self.strategy_dir) if self.strategy_dir else None,
             "llm_cap_usd": self.llm_cap_usd,
             "llm_cap_usd_measured": self.llm_cap_usd_measured,
@@ -195,6 +210,7 @@ def settings(
     llm_cap_usd: float | None = None,
     cloudtrail_archive: str | None = None,
     stack_name: str | None = None,
+    console_url: str | None = None,
     dry_run: bool = False,
 ) -> Settings:
     """Resolve configuration once, and record where each value came from."""
@@ -213,6 +229,9 @@ def settings(
     )
     resolved_stack, origins["stack_name"] = _resolve(
         stack_name, "CRUCIBLE_STACK", DEFAULT_STACK_NAME
+    )
+    resolved_console, origins["console_url"] = _resolve(
+        console_url, "CRUCIBLE_CONSOLE_URL", DEFAULT_CONSOLE_URL
     )
     raw_dir = strategy_dir or os.environ.get("CRUCIBLE_STRATEGY_DIR")
     if raw_dir:
@@ -236,6 +255,7 @@ def settings(
         strategy_dir=resolved_dir,
         cloudtrail_archive=resolved_archive,
         stack_name=resolved_stack,
+        console_url=resolved_console.rstrip("/") if resolved_console else DEFAULT_CONSOLE_URL,
         llm_cap_usd=_positive_cap(resolved_cap, origins["llm_cap_usd"]),
         llm_cap_usd_measured=cap_measured,
         origins=origins,
