@@ -1624,9 +1624,7 @@ def _phase0(store: Store, window: list[dt.date], registry: dict[str, Component])
 # ---------------------------------------------------------------------------
 
 
-def _unmeasurable(
-    name: str, requirement: str, detail: str, evidence: Iterable[str] = ()
-) -> Clause:
+def _unmeasurable(name: str, requirement: str, detail: str, evidence: Iterable[str] = ()) -> Clause:
     """One clause that could not be read, with the reason.
 
     `met=False` and `unmeasurable=True` together, always: `met` is what the
@@ -2016,10 +2014,13 @@ def _clause_aws_cost_within_ceiling(
     reading is a second contract.
 
     **A denied, unregioned or uncredentialed read is UNMEASURABLE, never
-    `$0.00`.** `ce:GetCostAndUsage` is not granted to the reading identity
-    today; granting it is filed as `alpha-engine-config-I9919` against
-    `nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml` and is
-    deliberately not done in this PR.
+    `$0.00`.** Measured 2026-09-03 from the laptop: the human admin identity
+    CAN read Cost Explorer — the account total came back `$9.05` and the
+    tag-filtered total `$0.00` — so the denial this was written against is
+    not the whole gap. What remains is that the SCHEDULED reader (the board
+    render) holds no such grant, and that the tag returning `$0.00` measures
+    the filter rather than the spend. Both are tracked; the grant is
+    deliberately not made in this PR, which changes no IAM.
     """
     from crucible.cost import CostUnreadableError, month_to_date_usd  # noqa: PLC0415
 
@@ -2258,9 +2259,7 @@ def _clause_slot_promotion_or_non_promotion(
 def _phase3(store: Store, window: list[dt.date], registry: dict[str, Component]) -> list[Clause]:
     """Phase 3's exit gate (plan §6 row 3), one clause per slot in `SLOTS`."""
     _unused((registry,))
-    return [
-        _clause_slot_promotion_or_non_promotion(store, slot, window) for slot in sorted(SLOTS)
-    ]
+    return [_clause_slot_promotion_or_non_promotion(store, slot, window) for slot in sorted(SLOTS)]
 
 
 # ---------------------------------------------------------------------------
@@ -2304,8 +2303,7 @@ def _clause_trader_week_on_v2_champion(store: Store, window: list[dt.date]) -> C
             name,
             requirement,
             False,
-            f"{key} is absent — the trader has filed no evidence of a week on the v2 "
-            "champion",
+            f"{key} is absent — the trader has filed no evidence of a week on the v2 champion",
             (key,),
         )
     document = read.document or {}
@@ -2318,8 +2316,7 @@ def _clause_trader_week_on_v2_champion(store: Store, window: list[dt.date]) -> C
             name,
             requirement,
             False,
-            f"{key}: {days} trading day(s) on the v2 champion, "
-            f"{TRADING_DAYS_PER_WEEK} required",
+            f"{key}: {days} trading day(s) on the v2 champion, {TRADING_DAYS_PER_WEEK} required",
             (key,),
         )
     return Clause(
@@ -2479,7 +2476,6 @@ def _phase5(store: Store, window: list[dt.date], registry: dict[str, Component])
     """Phase 5's exit gate (plan §6 row 5)."""
     _unused((registry,))
     return [_clause_every_llm_arm_has_a_verdict(store, window)]
-
 
 
 #: The gates this command can read, and how wide a window each needs.
@@ -2656,6 +2652,7 @@ def phase_tracker(phase_id: str) -> str:
         f"{[p.id for p in PHASES]}. A tracker derived from an unregistered phase would "
         "be an invented issue number, which is the defect this function exists to remove."
     )
+
 
 #: The ladder's closed state vocabulary. Total, with no fall-through, and no
 #: fifth member: `UNKNOWN`/`PENDING`/`N/A` are the shapes this exists to
