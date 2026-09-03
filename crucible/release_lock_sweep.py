@@ -178,13 +178,35 @@ def _read_one(store: S3Store, key: str) -> ReleaseLockReading:
                 "UNMET",
                 f"{key}: no Object Lock retention (get_object_retention: {code})",
             )
+        if code == "NoSuchKey":
+            # The one code that names the RACE, not our access or the
+            # object's state: `head_object` just confirmed the key exists,
+            # so `get_object_retention` losing it a moment later is a
+            # release deleted between the `list_keys` walk and this read —
+            # distinct wording from every other failure below, since an
+            # operator reading a generic "failed" would go check IAM, the
+            # wrong action for a key that is simply gone (round 2,
+            # should-fix finding 3).
+            return ReleaseLockReading(
+                key,
+                "UNMEASURABLE",
+                f"get_object_retention({key}) returned {code}, right after "
+                f"head_object({key}) succeeded — the object was very likely deleted "
+                "between the list and this read (a release deleted mid-sweep), not a "
+                "statement about its retention.",
+            )
+        # Every OTHER ClientError — Throttling, InternalError, an SDK/API
+        # code this module has never seen — is neither "denied", "no
+        # retention" nor "gone". Round 2 re-verification: labelling ALL of
+        # these as a mid-sweep deletion gave a false diagnosis for a
+        # transient failure like Throttling. Generic and accurate: the call
+        # failed, naming the code, and nothing more is claimed about why.
         return ReleaseLockReading(
             key,
             "UNMEASURABLE",
-            f"get_object_retention({key}) failed: {code or type(exc).__name__}, right "
-            f"after head_object({key}) succeeded — the object was very likely deleted "
-            "between the list and this read (a release deleted mid-sweep), not a "
-            "statement about its retention.",
+            f"get_object_retention({key}) failed: {code or type(exc).__name__}. This "
+            "is a statement about the call failing, not about the object's "
+            "retention, and it must never be counted as an UNMET finding.",
         )
 
     retention = retention_response.get("Retention") or {}

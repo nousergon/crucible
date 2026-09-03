@@ -85,6 +85,12 @@ class _FakeS3Client:
         self.objects[key] = {"LastModified": last_modified or _PUBLISHED_AT}
         self.retentions[key] = "NoSuchKey"
 
+    def throttle(self, key: str, *, last_modified=None) -> None:
+        """A transient `get_object_retention` failure that is neither
+        denial, absence, nor the key having vanished."""
+        self.objects[key] = {"LastModified": last_modified or _PUBLISHED_AT}
+        self.retentions[key] = "Throttling"
+
     def head_object(self, **kw) -> dict:
         key = kw["Key"]
         if key not in self.objects:
@@ -226,6 +232,24 @@ class TestFindings:
         assert findings[0].state == "UNMEASURABLE"
         assert "deleted" in findings[0].detail
         assert "AccessDenied" not in findings[0].detail
+
+    def test_a_transient_failure_is_unmeasurable_and_named_never_a_false_deletion(self) -> None:
+        """Round 2 re-verification: labelling EVERY non-AccessDenied,
+        non-NoSuchObjectLockConfiguration `ClientError` as a mid-sweep
+        deletion gave `Throttling` a false deletion diagnosis. `Throttling`
+        is neither denial, absence, nor the key having vanished — it must
+        read `UNMEASURABLE` and its detail must name `Throttling`, not
+        claim the object was deleted."""
+        client = _FakeS3Client()
+        store = _store(client)
+        key = release_json_key(SHA_RACE)
+        client.throttle(f"crucible/{key}")
+
+        findings = release_lock_findings(store)
+
+        assert findings[0].state == "UNMEASURABLE"
+        assert "Throttling" in findings[0].detail
+        assert "deleted" not in findings[0].detail
 
     def test_locked_unlocked_and_denied_together_all_three_readings(self) -> None:
         client = _FakeS3Client()
