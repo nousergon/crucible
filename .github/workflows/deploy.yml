@@ -83,6 +83,7 @@ jobs:
       contents: read
     outputs:
       sha: ${{ steps.meta.outputs.sha }}
+      wheel_filename: ${{ steps.meta.outputs.wheel_filename }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -104,6 +105,24 @@ jobs:
           uv run pytest -q --ignore=tests/acceptance | tee pytest.txt
           echo "summary=$(tail -1 pytest.txt | tr -d '\r')" >> "$GITHUB_OUTPUT"
 
+      # alpha-engine-config-I9908: `pyproject.toml`'s committed version
+      # (0.1.0) never moves — the plan (§4.11) is explicit that no release
+      # gets its own pyproject commit. A 40-hex git sha is not a PEP 440
+      # version, and every wheel this pipeline had published under one
+      # (`crucible-{sha}-py3-none-any.whl`) was refused outright by pip:
+      # `ERROR: crucible.whl is not a valid wheel filename`. This appends a
+      # PEP-440-legal local version segment carrying the sha, IN THE
+      # CHECKOUT ONLY — never committed — so `uv build` names the wheel
+      # something pip will actually install. `crucible.release._BASE_VERSION`
+      # carries the same "0.1.0" literal so a reader that never ran this
+      # build can still name the file a given sha produced; the two are kept
+      # from drifting by `tests/test_release.py::test_base_version_matches_pyproject`.
+      - name: Set the release version
+        run: |
+          sha='${{ inputs.sha || github.sha }}'
+          sed -i "s/^version = .*/version = \"0.1.0+g${sha:0:12}\"/" pyproject.toml
+          grep '^version = ' pyproject.toml
+
       - name: Build
         run: uv build --wheel
 
@@ -116,23 +135,33 @@ jobs:
       # workflow_run_url and test_summary move on every rebuild and go to
       # provenance.json instead, which is written unconditionally and never
       # immutable-checked.
+      #
+      # The wheel is published under the EXACT filename `uv build` gave it
+      # above (alpha-engine-config-I9908) — never renamed — so
+      # `wheel_filename` in release.json and the object actually in S3 can
+      # never disagree.
       - name: Name the artifact by its commit
         id: meta
         run: |
           sha='${{ inputs.sha || github.sha }}'
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
           mkdir -p out
-          cp dist/*.whl "out/crucible-${sha}-py3-none-any.whl"
+          cp dist/*.whl out/
+          wheel_filename="$(basename out/*.whl)"
+          echo "wheel_filename=${wheel_filename}" >> "$GITHUB_OUTPUT"
+          export WHEEL_FILENAME="${wheel_filename}"
           python3 - <<'PY' > "out/release.json"
           import hashlib, json, os, pathlib
           sha = os.environ["SHA"]
-          wheel = pathlib.Path(f"out/crucible-{sha}-py3-none-any.whl").read_bytes()
+          wheel_filename = os.environ["WHEEL_FILENAME"]
+          wheel = pathlib.Path(f"out/{wheel_filename}").read_bytes()
           lock = pathlib.Path("uv.lock").read_bytes()
           print(json.dumps({
-              "schema_version": "release.v2",
+              "schema_version": "release.v3",
               "sha": sha,
               "lockfile_sha256": hashlib.sha256(lock).hexdigest(),
               "wheel_sha256": hashlib.sha256(wheel).hexdigest(),
+              "wheel_filename": wheel_filename,
               "python_requires": ">=3.12,<3.13",
               "extra": {},
           }, indent=2, sort_keys=True))
@@ -206,7 +235,25 @@ jobs:
       # Publish the IMMUTABLE half. Safe and repeatable; it promotes nothing.
       - name: Publish the release artifacts
         run: |
-          uv run python -m crucible.deploy publish --sha '${{ needs.build.outputs.sha }}' --wheel 'out/crucible-${{ needs.build.outputs.sha }}-py3-none-any.whl' --release-json out/release.json --provenance-json out/provenance.json --store "$STORE_URI"
+          uv run python -m crucible.deploy publish --sha '${{ needs.build.outputs.sha }}' --wheel 'out/${{ needs.build.outputs.wheel_filename }}' --release-json out/release.json --provenance-json out/provenance.json --store "$STORE_URI"
+
+      # alpha-engine-config-I9908: the flip is gated on INSTALLABILITY, not
+      # only on the upload landing. Every wheel this pipeline published
+      # before this fix passed `Publish` and even `Smoke` while being
+      # pip-refused on every box that tried to install it — S3 read paths
+      # prove the bytes are THERE, never that pip accepts them. This
+      # downloads the object this deploy just published (not the local
+      # build artifact — proving what a box will actually fetch) and
+      # installs it into a throwaway venv on the runner, the same operation
+      # `nous-ergon-ops`'s spot-box bootstrap performs. A step failure here
+      # fails the job before `Flip` runs, so an unpip-installable wheel
+      # never reaches `releases/current`.
+      - name: Prove the published wheel is pip-installable
+        run: |
+          aws s3 cp "${STORE_URI}/releases/${{ needs.build.outputs.sha }}/${{ needs.build.outputs.wheel_filename }}" /tmp/crucible-install-proof.whl
+          python3 -m venv /tmp/crucible-install-proof-venv
+          /tmp/crucible-install-proof-venv/bin/pip install /tmp/crucible-install-proof.whl
+          /tmp/crucible-install-proof-venv/bin/crucible --version
 
       # The opening half of the pointer compare-and-swap, taken BEFORE the
       # smoke so the swap covers the whole verification window. Reading the
