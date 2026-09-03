@@ -385,6 +385,13 @@ def drift_metrics(
             worst_value,
             unit="psi",
             now=moment,
+            # Human-readable diagnostic text, not a store key — no store call
+            # reads this string (alpha-engine-config-I9852). Not calling
+            # `crucible.keys.drift_input_key` here: that function's actual
+            # write shape is `drift/{day}/input_{name}.json`
+            # (`input_features.json`), one segment longer than the friendlier
+            # `features.json` this MetricRecord shows a human on the console
+            # (alpha-engine-config-I9875).
             source_path=f"drift/{day}/features.json",
             detail=(
                 f"Worst of {len(feature_psi_by_name)} feature(s): "
@@ -398,6 +405,9 @@ def drift_metrics(
             prediction_psi,
             unit="psi",
             now=moment,
+            # Same reasoning as feature_psi_max_ratio's source_path above:
+            # display text, not a store key; drift_input_key's real shape is
+            # `input_predictions.json` (alpha-engine-config-I9875).
             source_path=f"drift/{day}/predictions.json",
             detail=(
                 f"Prediction distribution against the training window: {prediction_psi:.4f}."
@@ -410,6 +420,9 @@ def drift_metrics(
             worst_decay,
             unit="ratio",
             now=moment,
+            # Same reasoning as feature_psi_max_ratio's source_path above:
+            # display text, not a store key; drift_input_key's real shape is
+            # `input_ic.json` (alpha-engine-config-I9875).
             source_path=f"drift/{day}/ic.json",
             detail=(
                 f"Worst horizon: {worst_horizon} trading days, "

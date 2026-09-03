@@ -37,7 +37,11 @@ from crucible.keys import (
     experiments_prefix,
     features_key,
     features_prefix,
+    gate_key,
+    gate_prefix,
+    heal_key,
     manifest_key,
+    migration_key,
     runs_prefix,
     shadow_key,
     strategy_arm_key,
@@ -140,6 +144,44 @@ class TestRunsPrefix:
     def test_an_empty_job_raises(self) -> None:
         with pytest.raises(ValueError):
             runs_prefix("")
+
+
+class TestGatePrefix:
+    """`gate_prefix`, added by `alpha-engine-config-I9875` alongside
+    `gate_key`'s own prior move — `crucible.gate.last_read` lists this
+    prefix instead of restating `f"gates/{gate}/"` inline."""
+
+    @pytest.mark.parametrize("gate", ["phase0", "phase1"])
+    def test_the_key_starts_with_the_prefix(self, gate: str) -> None:
+        prefix = gate_prefix(gate)
+        assert gate_key(gate, FRIDAY.isoformat()).startswith(prefix)
+
+    def test_the_shape_is_literal(self) -> None:
+        """See `TestExperimentsPrefix.test_the_shape_is_literal` — anchors
+        `gate_prefix` to the actual on-disk shape rather than only to
+        `gate_key`'s own output."""
+        assert gate_prefix("phase0") == "gates/phase0/"
+
+    def test_an_empty_gate_raises_rather_than_listing_every_gate(self) -> None:
+        with pytest.raises(ValueError):
+            gate_prefix("")
+
+
+class TestMigrationAndHealKeys:
+    """`migration_key`/`heal_key` (`alpha-engine-config-I9852` part 2) had no
+    dedicated test anywhere before `alpha-engine-config-I9875` added this
+    class — both are real `ctx.record_output` store writes, so an
+    unliteralized shape is exactly the class this file exists to catch."""
+
+    def test_the_shapes_are_literal(self) -> None:
+        assert migration_key("2026-08-28", "run-42") == "migrations/2026-08-28/run-42.json"
+        assert heal_key("2026-08-28", "run-42") == "heals/2026-08-28/run-42.json"
+
+    def test_an_empty_run_id_raises_for_both(self) -> None:
+        with pytest.raises(ValueError):
+            migration_key("2026-08-28", "")
+        with pytest.raises(ValueError):
+            heal_key("2026-08-28", "")
 
 
 class TestDriftKeys:

@@ -42,6 +42,7 @@ from crucible.keys import (
     arena_cycle_key,
     arm_register_key,
     gate_key,
+    gate_prefix,
     legacy_weekly_executions_key,
     review_key,
     review_prefix,
@@ -81,6 +82,7 @@ __all__ = [
     "coverage_note",
     "evaluate",
     "gate_key",
+    "gate_prefix",
     "ladder_payload",
     "legacy_weekly_executions_key",
     "review_key",
@@ -1362,7 +1364,7 @@ def last_read(store: Store, gate: str) -> str | None:
     entirely fresh.
     """
     days: list[str] = []
-    for key in store.list_keys(f"gates/{gate}/"):
+    for key in store.list_keys(gate_prefix(gate)):
         parts = key.split("/")
         if key.endswith("/gate.json") and len(parts) == 4:
             days.append(parts[2])

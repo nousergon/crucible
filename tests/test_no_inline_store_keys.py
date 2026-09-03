@@ -42,17 +42,13 @@ human rather than derived — named as a limitation, not claimed as
 exhaustive.
 
 **Scope, stated rather than suppressed.** This walks every `.py` file under
-`crucible/` EXCEPT `crucible/keys.py` itself (the producer, not a call site)
-and `crucible/gate.py`. `gate.py` is excluded by IDENTITY, not by a growing
-allowlist: it is a single, named, structural boundary tied to a live,
-concurrent PR under `alpha-engine-config-I9875` that owns adding
-`gate_prefix(gate)` for the one remaining hit inside it —
-`gate.py`'s OTHER hit (`store.list_keys("runs/smoke/")`) was fixed directly
-in this PR (`runs_prefix("smoke")` already existed), leaving exactly one:
-`store.list_keys(f"gates/{gate}/")`. `self_test_gate_py_hits_are_real`
-proves that hit still exists, so an accidental widening of the exclusion (or
-a stale one, once I9875 lands) is caught rather than silently made
-permanent.
+`crucible/` EXCEPT `crucible/keys.py` itself (the producer, not a call site).
+`crucible/gate.py` was excluded here through `alpha-engine-config-I9875`
+landing: it carried one remaining hit, `store.list_keys(f"gates/{gate}/")`,
+held back only because a concurrent session owned the file while this
+detector was written. `I9875` added `gate_prefix(gate)` to `crucible/keys.py`
+and switched `gate.py:last_read` to call it, so `gate.py` is walked like
+every other file below — no exclusion, and no allowlist to go stale later.
 """
 
 from __future__ import annotations
@@ -82,12 +78,9 @@ _CONTEXT_METHODS = frozenset({"record_input", "record_output", "record_output_ca
 
 #: `crucible/keys.py` is the producer, not a call site — excluded by path
 #: identity, exactly like `test_key_construction_placement.py` excludes it.
-#: `crucible/gate.py` is excluded for the reason the module docstring gives:
-#: a live, concurrent PR under `alpha-engine-config-I9875` owns its one
-#: remaining hit. ONE path, by identity, not a pattern and not a name that
-#: could silently match a second file later.
+#: This is the only exclusion left; `crucible/gate.py`'s was removed once
+#: `alpha-engine-config-I9875` fixed its one remaining hit.
 _SELF_EXCLUDED = {_CRUCIBLE_ROOT / "keys.py"}
-_GATE_PY = _CRUCIBLE_ROOT / "gate.py"
 
 
 def _hits_in(path: Path) -> list[tuple[int, str, str]]:
@@ -110,12 +103,10 @@ def _hits_in(path: Path) -> list[tuple[int, str, str]]:
     return found
 
 
-def _walk(*, exclude_gate: bool) -> dict[Path, list[tuple[int, str, str]]]:
+def _walk() -> dict[Path, list[tuple[int, str, str]]]:
     results: dict[Path, list[tuple[int, str, str]]] = {}
     for path in sorted(_CRUCIBLE_ROOT.rglob("*.py")):
         if path in _SELF_EXCLUDED:
-            continue
-        if exclude_gate and path == _GATE_PY:
             continue
         hits = _hits_in(path)
         if hits:
@@ -124,8 +115,8 @@ def _walk(*, exclude_gate: bool) -> dict[Path, list[tuple[int, str, str]]]:
 
 
 class TestNoInlineStoreKeyLiterals:
-    def test_no_call_site_outside_gate_py_hardcodes_a_key_or_prefix(self) -> None:
-        results = _walk(exclude_gate=True)
+    def test_no_call_site_hardcodes_a_key_or_prefix(self) -> None:
+        results = _walk()
         assert not results, (
             "a store or manifest call passed a literal string or f-string as its key "
             "instead of calling the crucible.keys function/constant that owns that "
@@ -172,17 +163,3 @@ class TestNoInlineStoreKeyLiterals:
         )
         shapes = [shape for _, _, shape in hits]
         assert shapes == ["f-string", "literal 'champions/current.json'"]
-
-    def test_gate_py_hits_are_real_not_a_stale_exclusion(self) -> None:
-        """`gate.py` is excluded above by identity, with a stated reason:
-        a live, concurrent PR (`alpha-engine-config-I9875`) owns its one
-        remaining hit. This proves the exclusion is still covering a REAL
-        hit rather than having gone stale once that PR lands — if `gate.py`
-        stops carrying it, remove the exclusion from `_walk()` above instead
-        of leaving a boundary that no longer excludes anything real."""
-        hits = _hits_in(_GATE_PY)
-        assert hits, (
-            "crucible/gate.py carries no inline store-key literals any more — the "
-            "concurrent PR named in this test's docstring must have landed. Remove the "
-            "gate.py exclusion from this test's _walk() and let the main test cover it."
-        )
