@@ -302,9 +302,7 @@ class TestAutonomy:
         keys = {f"t/2026/{d:%m/%d}/part.json.gz" for d in window}
 
         class _Paginator:
-            def paginate(
-                self, *, Bucket: str, Prefix: str, Delimiter: str | None = None
-            ) -> Any:  # noqa: N803
+            def paginate(self, *, Bucket: str, Prefix: str, Delimiter: str | None = None) -> Any:  # noqa: N803
                 # A delimited listing is the region-discovery call in
                 # date_partitions: this fixture's archive names its region
                 # already (the documented single-partition shape), so it has
