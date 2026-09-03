@@ -123,7 +123,13 @@ def gate_handler(args: argparse.Namespace) -> int:
         document["run_id"] = ctx.run_id
         payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
         key = gate_key(reading.gate, ctx.trading_day.isoformat())
-        ctx.record_output(key, payload)
+        # alpha-engine-config-I9922 R2-1: the store guard (dry_run-wrapped
+        # `store` above) is the backstop, not the primary path — `gate` has a
+        # natural report (`reading.render()`/`ladder.render()`, printed
+        # below), so under `--dry-run` it skips the write and reaches that
+        # print rather than dying on the guard before it ever gets there.
+        if not dry_run:
+            ctx.record_output(key, payload)
         for clause in reading.clauses:
             for evidence in clause.evidence:
                 # Guarded, not a bare `exists`/`get_bytes` pair: a clause can
@@ -155,7 +161,10 @@ def gate_handler(args: argparse.Namespace) -> int:
             now=ctx.started,
             readings={reading.gate: reading},
         )
-        ctx.record_output(LADDER_KEY, ladder_payload(ladder), schema_version=LADDER_SCHEMA_VERSION)
+        if not dry_run:
+            ctx.record_output(
+                LADDER_KEY, ladder_payload(ladder), schema_version=LADDER_SCHEMA_VERSION
+            )
         result["ladder"] = ladder
         ctx.record_rows(rows_in=len(reading.window), rows_out=len(reading.clauses))
         n_clauses = len(reading.clauses)

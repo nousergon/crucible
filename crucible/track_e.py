@@ -52,7 +52,14 @@ def report_handler(args: argparse.Namespace) -> int:
             ctx.record_input(key, store.get_bytes(key))
         payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
         key = attribution_key(ctx.trading_day.isoformat())
-        ctx.record_output(key, payload, schema_version=ATTRIBUTION_SCHEMA_VERSION)
+        # alpha-engine-config-I9922 R2-1: the store guard is the backstop —
+        # `report` has a natural report (the attribution document itself),
+        # printed below under `--dry-run` rather than reached only by dying
+        # on the guard.
+        if dry_run:
+            print(payload.decode("utf-8"))
+        else:
+            ctx.record_output(key, payload, schema_version=ATTRIBUTION_SCHEMA_VERSION)
         ctx.record_rows(rows_in=len(sources), rows_out=len(document["rows"]))
 
         # §9.2 class 5: every row of the table is a manifest metric too, so the

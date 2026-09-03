@@ -1052,6 +1052,7 @@ def heartbeat(
     now: dt.datetime | None = None,
     transport: Callable[..., Any] | None = None,
     run_id: str | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Emit proof that the alerting path itself ran, and return its summary.
 
@@ -1081,17 +1082,29 @@ def heartbeat(
     writes. Absent, the row records `alert_id: null`: an absence page has no
     run to join to anyway, and inventing an id would be worse than saying
     there is none.
+
+    ``dry_run=True`` evaluates the same watched-absence condition and
+    computes the same summary, but never calls :func:`emit` (no bus row, no
+    page for a genuine watched absence) and never calls the final `publish`
+    below (no heartbeat message sent at all) — alpha-engine-config-I9922
+    R2-1: a dry-run heartbeat that still messaged the real channel would be a
+    worse defect than the store-write bug this closes, since a message send
+    is not something the store guard (`crucible.store.read_only`) can see or
+    refuse.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     trading_day = resolve_trading_day(moment)
     watched = evaluate_absence(store, now=moment, watched_by="heartbeat")
-    bus_keys = emit(
-        store,
-        group_pages(watched),
-        sweep_run_id=run_id,
-        transport=transport,
-        now=moment,
-    )
+    if dry_run:
+        bus_keys: list[str] = []
+    else:
+        bus_keys = emit(
+            store,
+            group_pages(watched),
+            sweep_run_id=run_id,
+            transport=transport,
+            now=moment,
+        )
     # After emit, so a sweep-absence raised by THIS run is inside the number
     # the same run reports. A count taken first would publish a heartbeat
     # whose own finding was missing from its own metric.
@@ -1121,16 +1134,22 @@ def heartbeat(
             + ". The alerting path did not run; neither page condition was evaluated "
             "on the day(s) named in the bus row."
         )
-    publish = transport if transport is not None else _krepis_publish
-    publish(
-        message,
-        severity="error" if unwatched else "info",
-        source="crucible-v2/heartbeat",
-        dedup_key=f"heartbeat:{trading_day.isoformat()}",
-        dedup_window_min=None,
-        sns_topic_arn=topic_arn(),
-        raise_on_total_failure=True,
-    )
+    if not dry_run:
+        publish = transport if transport is not None else _krepis_publish
+        publish(
+            message,
+            severity="error" if unwatched else "info",
+            source="crucible-v2/heartbeat",
+            dedup_key=f"heartbeat:{trading_day.isoformat()}",
+            dedup_window_min=None,
+            sns_topic_arn=topic_arn(),
+            raise_on_total_failure=True,
+        )
+    # Always carried, not only under `dry_run`: the caller's own print (under
+    # `--dry-run`, `heartbeat_handler`) needs the exact text that either was,
+    # or would have been, sent — one string, not two call sites composing it
+    # differently.
+    summary["message"] = message
     return summary
 
 
@@ -1189,17 +1208,35 @@ def sweep(
     registry: dict[str, Component] | None = None,
     transport: Callable[..., Any] | None = None,
     sweep_run_id: str,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Evaluate both conditions, group by cause, page once per group.
 
     The whole alerting pass, in one function, so "what does the alerter do"
     has one answer and the fault-injection suite has one thing to call.
+
+    ``dry_run=True`` evaluates and groups exactly as a real sweep would —
+    both conditions are pure reads — but never calls :func:`emit`: no page is
+    sent and no bus row is written (alpha-engine-config-I9922 R2-1).
+    `pages_emitted` and `bus_keys` read as `0`/`()` on this path (nothing was
+    emitted, by definition); `incidents_open` and `members` are the real
+    counts, since both come from evaluating and reading the bus, not from
+    writing to it.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     pages = evaluate_absence(store, now=moment, registry=registry) + evaluate_failure(
         store, now=moment, registry=registry
     )
     groups = group_pages(pages)
+    if dry_run:
+        count = pages_in_window(store, now=moment)
+        return {
+            "pages_emitted": 0,
+            "incidents_open": len(groups),
+            "members": len(pages),
+            "bus_keys": [],
+            "metric": ceiling_metric(count, now=moment),
+        }
     # Read before emitting: `pages_emitted` is what this run actually SENT,
     # not how many incidents it saw. A run that re-observed three open
     # incidents and paged for none of them reporting "3 pages emitted" is the

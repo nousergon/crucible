@@ -348,7 +348,8 @@ class TestAlertingSurface:
 
 
 class TestDryRunNeverWrites:
-    """alpha-engine-config-I9922 N1 (independent-review finding, 2026-09-03).
+    """alpha-engine-config-I9922 N1 / R2-1 / R2-2 (independent review,
+    2026-09-03, two rounds).
 
     `--dry-run`'s own CLI help ("write nothing") was true only of the jobs
     whose handler body happened to check `args.dry_run` before touching the
@@ -360,25 +361,69 @@ class TestDryRunNeverWrites:
     artifact in the store with no manifest, while the runner printed "no
     outputs recorded".
 
-    The fix is enforced at store construction (`open_store(..., dry_run=)`,
-    `Settings.store(dry_run=)`) rather than in each handler body, so this is
-    parametrized over every entry in `JOBS` — a job added later is covered
-    automatically, with no new test to remember to write for it.
+    **R2-1**: the store-level guard (`crucible.store.read_only`, enforced at
+    `open_store`/`Settings.store`) is the BACKSTOP, not the primary path —
+    every handler that has a natural report (`gate`, `report`, `console`,
+    `drift`, `alerts.sweep`, `heartbeat`, `release.pin`) now checks `dry_run`
+    itself and prints that report rather than reaching the guard and dying on
+    it, which is what made `crucible gate --gate phase1 --dry-run` (a
+    documented, previously-working read) crash with a bare traceback instead
+    of printing the reading it always printed before.
+
+    **R2-2**: the round-1 version of this test wrapped every job in
+    `try: main(argv) except BaseException: pass`, which can never fail, and
+    18 of 21 jobs died on MISSING INPUTS before ever reaching a write or the
+    guard, making the empty-store assertion vacuous. This version seeds each
+    job far enough to reach either a clean return or the store's own
+    refusal, and asserts EXACTLY one of those two outcomes — any other
+    exception (a config error, a missing-input error unrelated to
+    `--dry-run`) is a test failure, not a swallowed pass.
+
+    Six jobs are excluded, each for a stated reason rather than silently:
+    `explain` has no dry-run semantics at all (always read-only, the flag is
+    never read); `experiment.new` needs a synced strategy tree with real arm
+    recipes; `migrate.history` needs seeded v1 sources; `smoke` needs a
+    published release publishing through `crucible.deploy`'s own flow;
+    `weekly` is arc-level integration over the other rows here, each already
+    covered individually; `release.lock` is S3-only (`apply_release_retention`
+    refuses a `LocalStore` outright) and is covered instead, against a fake
+    S3 client, by `tests/test_release_retention.py::TestReleaseLockHandler::
+    test_dry_run_writes_no_manifest_at_all`.
     """
 
-    @pytest.mark.parametrize("job", sorted(JOBS))
-    def test_dry_run_leaves_a_fresh_store_empty(self, job: str, tmp_path, monkeypatch) -> None:
-        """A job with nothing to read (a fresh store, no prior runs) is
-        expected to RAISE under `--dry-run` for many jobs here — `gate`,
-        `report`, `weekly`, `smoke`, `release.pin`, `alerts.sweep`,
-        `heartbeat`, `drift`, `console` never learned to check the flag, so
-        their body's first write attempt is refused loudly rather than
-        succeeding. That raise is the CORRECT outcome (the class docstring
-        above), not a test failure — the one fact that must hold regardless
-        of whether the job reported cleanly or raised is the assertion
-        below: nothing landed in the store."""
-        from crucible.store import LocalStore
+    #: Reach either outcome with NO seeding beyond a fresh, empty store —
+    #: verified individually (2026-09-03) by running each against a fresh
+    #: `tmp_path` and confirming it returns 0 rather than raising.
+    _CLEAN_ON_A_FRESH_STORE = (
+        "alerts.sweep",
+        "board",
+        "console",
+        "experiment.grade",
+        "experiment.run",
+        "gate",
+        "heartbeat",
+        "release.pin",
+        "report",
+    )
 
+    @staticmethod
+    def _assert_clean_or_refused(main_call, tmp_path) -> None:
+        """Run ``main_call`` (a zero-arg callable) and assert EXACTLY one of:
+        a clean return (no exception), or `DryRunWriteRefusedError` — with
+        the store left completely empty either way. Any other exception
+        propagates and fails the test; that is the point (R2-2)."""
+        from crucible.store import DryRunWriteRefusedError, LocalStore
+
+        try:
+            main_call()
+        except DryRunWriteRefusedError:
+            pass
+        assert list(LocalStore(tmp_path).list_keys()) == []
+
+    @pytest.mark.parametrize("job", sorted(_CLEAN_ON_A_FRESH_STORE))
+    def test_dry_run_completes_cleanly_against_a_fresh_store(
+        self, job: str, tmp_path, monkeypatch
+    ) -> None:
         monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
         argv = [
             *_minimal_argv(job),
@@ -388,8 +433,118 @@ class TestDryRunNeverWrites:
             str(tmp_path),
             "--dry-run",
         ]
-        try:
-            main(argv)
-        except BaseException:  # noqa: BLE001 - deliberately unconditional; see docstring
-            pass
-        assert list(LocalStore(tmp_path).list_keys()) == []
+        self._assert_clean_or_refused(lambda: main(argv), tmp_path)
+
+    @pytest.mark.parametrize("job", ["data.daily", "data.heal", "data.weekly"])
+    def test_dry_run_completes_cleanly_with_an_arctic_bucket_configured(
+        self, job: str, tmp_path, monkeypatch
+    ) -> None:
+        """These three construct an `ArcticPriceSource` (which needs a
+        bucket NAME, never a real connection) before their own dry-run
+        branch prints and returns — a `CRUCIBLE_ARCTIC_BUCKET` config gap,
+        not a store-write concern, and unrelated to `--dry-run` itself
+        (the same `ValueError` fires with `--dry-run` omitted)."""
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        monkeypatch.setenv("CRUCIBLE_ARCTIC_BUCKET", "fake-bucket")
+        argv = [
+            *_minimal_argv(job),
+            "--date",
+            FRIDAY.isoformat(),
+            "--store",
+            str(tmp_path),
+            "--dry-run",
+        ]
+        self._assert_clean_or_refused(lambda: main(argv), tmp_path)
+
+    def test_dry_run_drift_completes_cleanly_with_its_inputs_seeded(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """`drift` deliberately raises `FileNotFoundError` on missing inputs
+        REGARDLESS of `--dry-run` (`track_c.py::drift_handler`'s own
+        docstring) — that is correct behaviour unrelated to this class, so
+        the three input keys are seeded to reach the actual dry-run path
+        (the print-instead-of-`record_output` branch, R2-1)."""
+        import json
+
+        from crucible.keys import drift_input_key
+        from crucible.store import LocalStore
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        store = LocalStore(tmp_path)
+        store.put_bytes(
+            drift_input_key("features", FRIDAY.isoformat()),
+            json.dumps({"psi_by_feature": {"f1": 0.01}}).encode(),
+        )
+        store.put_bytes(
+            drift_input_key("predictions", FRIDAY.isoformat()), json.dumps({"psi": 0.02}).encode()
+        )
+        store.put_bytes(
+            drift_input_key("ic", FRIDAY.isoformat()),
+            json.dumps({"decay_by_horizon": {"21": 0.1}}).encode(),
+        )
+        before = sorted(store.list_keys())
+        argv = ["drift", "--date", FRIDAY.isoformat(), "--store", str(tmp_path), "--dry-run"]
+
+        main(argv)  # must not raise at all -- inputs are present
+
+        assert sorted(store.list_keys()) == before  # nothing NEW landed
+
+    def test_dry_run_promote_completes_cleanly_with_an_empty_register_seeded(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """`crucible.promote.load_slot_inputs` does a bare
+        `store.get_bytes(arm_register_key(slot))` with no absent-is-empty
+        fallback (unlike `crucible.slots.arms.read_register`), so `promote`
+        needs the register key to exist at all — an empty one is enough to
+        reach the real dry-run path (`run_promotion(store=None)`,
+        pre-existing, `cli.py::_promote`)."""
+        from crucible.promote import arm_register_key
+        from crucible.store import LocalStore
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        store = LocalStore(tmp_path)
+        store.put_bytes(arm_register_key("r"), b"")
+        before = sorted(store.list_keys())
+        argv = [
+            *_minimal_argv("promote"),
+            "--date",
+            FRIDAY.isoformat(),
+            "--store",
+            str(tmp_path),
+            "--dry-run",
+        ]
+
+        main(argv)  # must not raise at all -- an empty register is a valid read
+
+        assert sorted(store.list_keys()) == before  # nothing NEW landed
+
+    def test_dry_run_report_morning_completes_cleanly_with_a_board_seeded(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """`report.morning` reads `board/current.json`; seeded with the same
+        `_board()` fixture `tests/test_morning.py` itself builds against, so
+        this reaches `morning.py::morning_handler`'s own pre-existing
+        dry-run branch (print, no delivery, no write) rather than the
+        `KeyError` an empty store produces before ever reaching it."""
+        import json
+
+        from crucible.keys import BOARD_CURRENT_KEY
+        from crucible.store import LocalStore
+        from tests.test_morning import _board
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        store = LocalStore(tmp_path)
+        store.put_bytes(BOARD_CURRENT_KEY, json.dumps(_board()).encode())
+        before = sorted(store.list_keys())
+        argv = [
+            "report.morning",
+            "--date",
+            FRIDAY.isoformat(),
+            "--store",
+            str(tmp_path),
+            "--dry-run",
+        ]
+
+        main(argv)  # must not raise at all -- morning_handler's own dry-run branch
+
+        assert sorted(store.list_keys()) == before  # nothing NEW landed
