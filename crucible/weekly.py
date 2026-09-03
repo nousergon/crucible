@@ -50,7 +50,14 @@ class Stage:
     slot: str | None
     due_at: dt.datetime
 
-    def argv(self, *, trading_day: dt.date, store: str | None, run_mode: str) -> list[str]:
+    def argv(
+        self,
+        *,
+        trading_day: dt.date,
+        store: str | None,
+        run_mode: str,
+        dry_run: bool = False,
+    ) -> list[str]:
         """The exact argv an operator would type for this stage.
 
         ``run_mode`` is required and always emitted. Each stage re-enters
@@ -63,12 +70,26 @@ class Stage:
         the field exists to prevent, and `_clause_replays_ok` reads the STAGE
         manifests. With the environment unset it is worse and better at once:
         every stage refuses, so the arc fails loudly at stage one.
+
+        ``dry_run=True`` appends `--dry-run` for the same reason
+        (alpha-engine-config-I9922 N1): the arc's own `--dry-run` reaches a
+        stage ONLY via that stage's own argv, since there is no `args` object
+        shared between this call and the stage's.
         """
         argv = [self.job, "--date", trading_day.isoformat(), "--run-mode", run_mode]
         if store:
             argv += ["--store", store]
         if self.slot:
             argv += ["--slot", self.slot]
+        if dry_run:
+            # alpha-engine-config-I9922 N1: `weekly --dry-run` used to ignore
+            # the flag entirely and dispatch every stage for real. Each stage
+            # runs through `crucible.cli.main` as a fresh process-in-process
+            # invocation (this module's own docstring), so the ONLY way for
+            # the arc's own `--dry-run` to reach a stage is to hand it back
+            # down on that stage's own argv — there is no shared `args`
+            # object between this call and the stage's.
+            argv.append("--dry-run")
         return argv
 
     @property
@@ -125,6 +146,7 @@ def run_arc(
     run_mode: str,
     registry: dict[str, Component] | None = None,
     main: object | None = None,
+    dry_run: bool = False,
 ) -> list[Stage]:
     """Run every stage for ``trading_day``. Raises on the first failure.
 
@@ -138,6 +160,10 @@ def run_arc(
     imported lazily because `cli` imports this module's handler. A test that
     passed a fake would be testing its fake, so `tests/test_weekly.py` also
     asserts the real default is `crucible.cli.main` itself.
+
+    ``dry_run=True`` passes `--dry-run` down to every stage's own argv
+    (alpha-engine-config-I9922 N1) — the arc previously ignored the flag and
+    dispatched every stage for real regardless of it.
     """
     if main is None:
         from crucible.cli import main as cli_main  # noqa: PLC0415 - cycle; see docstring
@@ -147,7 +173,7 @@ def run_arc(
     for stage in arc_stages(trading_day, registry):
         try:
             code = main(  # type: ignore[operator]
-                stage.argv(trading_day=trading_day, store=store, run_mode=run_mode)
+                stage.argv(trading_day=trading_day, store=store, run_mode=run_mode, dry_run=dry_run)
             )
         except BaseException as exc:  # noqa: BLE001 - re-raised on the next line
             # NOT a swallow: re-raised immediately, chained to the original.

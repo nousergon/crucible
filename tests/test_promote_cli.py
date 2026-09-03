@@ -141,11 +141,21 @@ class TestPromoteCommand:
         assert pointer.arm_id == ids["chal"]
 
     def test_a_dry_run_decides_and_writes_nothing(self, seeded, monkeypatch) -> None:
+        """alpha-engine-config-I9922: before `run_job` gained `dry_run`, this
+        call still filed an `ok` run manifest for a promotion that never
+        happened — "writes nothing" was true of the pointer and the arena
+        cycle but false of `runs/promote/{DAY}/run.json`. Covered here
+        alongside the pointer/cycle assertions rather than as a bare
+        "no manifest" check, since a dry run that decided nothing writing no
+        manifest is a vacuous pass."""
+        from crucible.manifest import manifest_key
+
         store, _, _, _ = seeded
         monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
         assert main(["promote", "--slot", "m", "--date", DAY, "--dry-run"]) == 0
         assert not store.exists(champion_key("m"))
         assert not store.exists(arena_cycle_key("m", DAY))
+        assert not store.exists(manifest_key("promote", DAY))
 
     def test_revert_records_the_operator(self, seeded, monkeypatch) -> None:
         store, _, ids, dates = seeded
@@ -171,6 +181,45 @@ class TestPromoteCommand:
         assert pointer["arm_id"] == ids["champ"]
         assert pointer["promotion_source"] == "operator_bootstrap"
         assert pointer["evidence"]["reason"] == "challenger degraded live"
+
+    def test_a_revert_under_dry_run_refuses_rather_than_reverting_for_real(
+        self, seeded, monkeypatch
+    ) -> None:
+        """alpha-engine-config-I9922 N1 / I9935. Before this fix,
+        `--revert-to --dry-run` silently performed the revert for real —
+        `--dry-run` had no effect on that path at all (`cli.py::_promote`'s
+        `job()` called `revert_champion(store=store, ...)` unconditionally).
+        `_resolve_store` now returns a read-only store whenever `--dry-run`
+        is set, REGARDLESS of `--revert-to` — the pointer write is refused at
+        the store rather than silently succeeding. `alpha-engine-config-I9935`
+        tracks the cleaner fix (refuse the flag combination up front, before
+        any store call); this test pins the interim guarantee that matters
+        most: the pointer never actually moves."""
+        from crucible.store import DryRunWriteRefusedError
+
+        store, _, ids, dates = seeded
+        seat(store, ids, dates, arm="chal")
+        before = json.loads(store.get_bytes(champion_key("m")))
+        monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
+        with pytest.raises(DryRunWriteRefusedError):
+            main(
+                [
+                    "promote",
+                    "--slot",
+                    "m",
+                    "--date",
+                    DAY,
+                    "--revert-to",
+                    ids["champ"],
+                    "--reason",
+                    "challenger degraded live",
+                    "--dry-run",
+                ]
+            )
+        # `seat()` already pointed the champion at "chal"; the assertion that
+        # matters is that the REVERT to `ids["champ"]` never landed — the
+        # pointer document is byte-identical to what `seat()` wrote.
+        assert json.loads(store.get_bytes(champion_key("m"))) == before
 
     def test_a_revert_without_a_reason_is_refused(self, seeded, monkeypatch) -> None:
         store, _, ids, _ = seeded

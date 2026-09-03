@@ -387,6 +387,19 @@ class TestReleaseLockHandler:
         assert "AccessDenied" in manifest["reason"]
 
     def test_dry_run_writes_no_manifest_at_all(self) -> None:
+        """alpha-engine-config-I9922 round-2 review, non-blocking note:
+        `store.client` passes through `crucible.store.read_only` unchanged
+        (it is not in `Store.MUTATORS`), and `apply_release_retention`
+        mutates Object Lock via `store.client.put_object_retention` directly
+        — a second write path the store guard cannot see at all, double
+        -guarded today only because `release_lock_handler`'s own `--dry-run`
+        branch (`release_retention.py`) never calls `apply_release_retention`
+        with `dry_run=False` in the first place. Pinned here against the
+        FAKE CLIENT itself, not just the higher-level manifest/pointer
+        assertions: no `put_object_retention` call AND no `put_object` call
+        of any kind landed — `client.blobs` is empty, so nothing was written
+        through `S3Store.put_bytes` either (the manifest included, already
+        covered by the assertion below)."""
         client = _FakeS3Client()
         store = _store(client)
         _publish(client, SHA, locked=False, last_modified=_PUBLISHED_AT)
@@ -398,4 +411,5 @@ class TestReleaseLockHandler:
 
         assert rc == 0
         assert client.put_object_retention_calls == []
+        assert client.blobs == {}
         assert f"crucible/runs/release.lock/2026-08-28/{SHA}/run.json" not in client.blobs

@@ -91,7 +91,11 @@ SMOKE_READS: tuple[tuple[str, str], ...] = (
 
 
 def _store(args: argparse.Namespace) -> Store:
-    return open_store(getattr(args, "store", None))
+    # alpha-engine-config-I9922 N1: read-only under `--dry-run` regardless of
+    # whether the calling handler's own body checks the flag — this is the
+    # single point every one of this module's six handlers resolves a store
+    # through.
+    return open_store(getattr(args, "store", None), dry_run=bool(getattr(args, "dry_run", False)))
 
 
 # ── release.pin ───────────────────────────────────────────────────────────
@@ -104,12 +108,26 @@ def release_pin_handler(args: argparse.Namespace) -> int:
     a manifest saying who moved what and when — which is the difference
     between an incident with a timeline and one reconstructed from memory.
     """
+    dry_run = bool(getattr(args, "dry_run", False))
     store = _store(args)
 
     def body(ctx: RunContext) -> None:
         before = release.current_release(store)
-        release.pin(store, args.sha, target=args.target)
         key = release.POINTER_KEY if args.target == "current" else release.TRADER_PIN_KEY
+        # alpha-engine-config-I9922 R2-1: the store guard is the backstop —
+        # `release.pin` MOVES A POINTER, so under `--dry-run` it never calls
+        # `release.pin()` at all (rather than calling it and letting the
+        # guard refuse mid-write, which is the wrong shape for a pointer
+        # move specifically: `release.pin`'s own internals, not just
+        # `ctx.record_output`, are what write). The preview is exactly the
+        # move it would make.
+        if dry_run:
+            print(
+                f"release.pin --target {args.target}: {before or '(unset)'} would move to "
+                f"{args.sha}"
+            )
+            return
+        release.pin(store, args.sha, target=args.target)
         ctx.record_output(key, store.get_bytes(key), schema_version=release.RELEASE_SCHEMA_VERSION)
         ctx.record_metric(
             {
@@ -131,6 +149,7 @@ def release_pin_handler(args: argparse.Namespace) -> int:
         body,
         store=store,
         trading_day=args.trading_day,
+        dry_run=bool(getattr(args, "dry_run", False)),
         run_mode=getattr(args, "run_mode", None),
     )
     return 0
@@ -336,6 +355,7 @@ def smoke_handler(args: argparse.Namespace) -> int:
             # Retrying it would promote a build whose first attempt failed,
             # and the deploy would read a green manifest over an amber fact.
             transient_retry=False,
+            dry_run=bool(getattr(args, "dry_run", False)),
         )
     return 0
 
@@ -345,11 +365,16 @@ def smoke_handler(args: argparse.Namespace) -> int:
 
 def sweep_handler(args: argparse.Namespace) -> int:
     """Evaluate both page conditions, group by cause, page once per group."""
+    dry_run = bool(getattr(args, "dry_run", False))
     store = _store(args)
     result: dict[str, Any] = {}
 
     def body(ctx: RunContext) -> None:
-        outcome = alerts.sweep(store, sweep_run_id=ctx.run_id)
+        # `alerts.sweep(dry_run=)` evaluates and groups exactly as a real
+        # sweep would but never calls `emit` — `outcome["bus_keys"]` is `()`
+        # on this path, so the loop below writes nothing without needing its
+        # own guard (alpha-engine-config-I9922 R2-1).
+        outcome = alerts.sweep(store, sweep_run_id=ctx.run_id, dry_run=dry_run)
         result.update(outcome)
         for key in outcome["bus_keys"]:
             ctx.record_output(
@@ -401,6 +426,7 @@ def sweep_handler(args: argparse.Namespace) -> int:
         # the runner resolves `trading_day`/`started`, so it is a callable
         # rather than a value computed here (alpha-engine-config-I9781).
         discriminator=lambda ctx: ctx.calendar_date.isoformat(),
+        dry_run=bool(getattr(args, "dry_run", False)),
     )
     print(json.dumps({k: v for k, v in result.items() if k != "metric"}, indent=2))
     return 0
@@ -408,10 +434,17 @@ def sweep_handler(args: argparse.Namespace) -> int:
 
 def heartbeat_handler(args: argparse.Namespace) -> int:
     """The weekly proof that the alerting path itself is alive."""
+    dry_run = bool(getattr(args, "dry_run", False))
     store = _store(args)
+    result: dict[str, Any] = {}
 
     def body(ctx: RunContext) -> None:
-        summary = alerts.heartbeat(store)
+        # `alerts.heartbeat(dry_run=)` computes the same summary and message
+        # but never calls `emit` and never sends the heartbeat message itself
+        # (alpha-engine-config-I9922 R2-1) — a store guard alone cannot catch
+        # a real message send, which is not a store write.
+        summary = alerts.heartbeat(store, dry_run=dry_run)
+        result.update(summary)
         ctx.record_metric(summary["metric"])
         ctx.record_metric(
             {
@@ -437,8 +470,11 @@ def heartbeat_handler(args: argparse.Namespace) -> int:
         body,
         store=store,
         trading_day=args.trading_day,
+        dry_run=dry_run,
         run_mode=getattr(args, "run_mode", None),
     )
+    if dry_run:
+        print(result["message"])
     return 0
 
 
@@ -455,6 +491,7 @@ def drift_handler(args: argparse.Namespace) -> int:
     months while measuring nothing, and this repository's whole reason for
     existing is that that happened.
     """
+    dry_run = bool(getattr(args, "dry_run", False))
     store = _store(args)
 
     def body(ctx: RunContext) -> None:
@@ -481,17 +518,22 @@ def drift_handler(args: argparse.Namespace) -> int:
         )
         for record in records:
             ctx.record_metric(record)
-        ctx.record_output(
-            drift_metrics_key(day),
-            json.dumps(records, indent=2, sort_keys=True).encode("utf-8"),
-            schema_version="metric_record.v1",
-        )
+        payload = json.dumps(records, indent=2, sort_keys=True).encode("utf-8")
+        # alpha-engine-config-I9922 R2-1: the store guard is the backstop —
+        # `drift` has a natural report (the three records themselves),
+        # printed below under `--dry-run` rather than reached only by dying
+        # on the guard.
+        if dry_run:
+            print(payload.decode("utf-8"))
+        else:
+            ctx.record_output(drift_metrics_key(day), payload, schema_version="metric_record.v1")
 
     run_job(
         "drift",
         body,
         store=store,
         trading_day=args.trading_day,
+        dry_run=bool(getattr(args, "dry_run", False)),
         run_mode=getattr(args, "run_mode", None),
     )
     return 0
@@ -514,8 +556,15 @@ def board_handler(args: argparse.Namespace) -> int:
     would be a daily failure alert on a working producer, and a daily failure
     alert nobody can act on is how a channel gets muted. The job fails when
     the MEASUREMENT fails; the reading lives in the artifact.
+
+    `--dry-run` already held the pointer and skipped `board/current.json`
+    (I9863's narrow guard, below); passed through to `run_job` as
+    `dry_run=True` (alpha-engine-config-I9922) so the run manifest itself is
+    skipped too, rather than filing an `ok` firing for a run that touched
+    neither the board nor the pointer.
     """
     store = _store(args)
+    dry_run = bool(getattr(args, "dry_run", False))
 
     def body(ctx: RunContext) -> None:
         moment = dt.datetime.now(dt.UTC)
@@ -564,8 +613,9 @@ def board_handler(args: argparse.Namespace) -> int:
         # repo-wide fix), and honouring it for `board` alone would normally be
         # the wrong shape — but this is the one job whose `--dry-run` clobbers
         # `board/current.json`, the key the fleet-console adapter reads. One
-        # narrow guard here, the class fix in I9863.
-        dry_run = bool(getattr(args, "dry_run", False))
+        # narrow guard here, the class fix in I9863. `dry_run` is the
+        # `board_handler`-level variable closed over here, not a fresh read —
+        # `run_job` below is passed the same value (I9922).
         if dry_run:
             may_move = False
             pointer_reason = "--dry-run: the pointer and the page are not written"
@@ -721,6 +771,7 @@ def board_handler(args: argparse.Namespace) -> int:
         body,
         store=store,
         trading_day=args.trading_day,
+        dry_run=dry_run,
         run_mode=getattr(args, "run_mode", None),
     )
     return 0
@@ -754,6 +805,7 @@ def _read_previous_board(store: Store) -> tuple[dict[str, Any] | None, str | Non
 
 def console_handler(args: argparse.Namespace) -> int:
     """Render the static page and its JSON from the manifests."""
+    dry_run = bool(getattr(args, "dry_run", False))
     store = _store(args)
 
     def body(ctx: RunContext) -> None:
@@ -772,8 +824,18 @@ def console_handler(args: argparse.Namespace) -> int:
             CONSOLE_JSON_KEY: "console_page.v1",
             LADDER_KEY: LADDER_SCHEMA_VERSION,
         }
-        for key in write_page(store, page):
-            ctx.record_output(key, store.get_bytes(key), schema_version=key_schema_versions[key])
+        # alpha-engine-config-I9922 R2-1: the store guard is the backstop —
+        # `console` has a natural report (the page's own JSON), printed below
+        # under `--dry-run` rather than reached only by dying on the guard
+        # inside `write_page` (which calls `store.put_bytes` directly, not
+        # through `ctx`).
+        if dry_run:
+            print(page.to_json().decode("utf-8"))
+        else:
+            for key in write_page(store, page):
+                ctx.record_output(
+                    key, store.get_bytes(key), schema_version=key_schema_versions[key]
+                )
         ctx.record_metric(
             {
                 "name": "components_unreported",
@@ -801,6 +863,7 @@ def console_handler(args: argparse.Namespace) -> int:
         body,
         store=store,
         trading_day=args.trading_day,
+        dry_run=bool(getattr(args, "dry_run", False)),
         run_mode=getattr(args, "run_mode", None),
     )
     return 0

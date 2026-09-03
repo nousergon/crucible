@@ -17,6 +17,7 @@ from crucible.gate import (
     ACCEPTANCE_RATCHET_PATH,
     GATE_DELIVERABLES,
     GATES,
+    LADDER_KEY,
     PHASE0_DELIVERABLES,
     PHASES,
     SOURCE_SCAN_SCOPE,
@@ -531,16 +532,44 @@ class TestPhaseOneGuardedReadsRound2:
         assert not clause.met
         assert f"{key}:2" in clause.detail
 
-    def test_the_register_can_still_be_read_via_the_cli_dry_run_path(self, tmp_path) -> None:
+    def test_the_register_can_still_be_read_via_the_cli_dry_run_path(
+        self, tmp_path, capsys
+    ) -> None:
         """The reproduction named in the review: `crucible gate ... --dry-run`
-        over a store seeded with a malformed register must not raise."""
+        over a store seeded with a malformed register must not raise, and
+        must print the reading (alpha-engine-config-I9922 R2-1) — a
+        `--dry-run` that reaches `DryRunWriteRefusedError` before printing
+        anything is the exact defect this test now pins closed. Runs
+        `crucible.cli.main` itself rather than calling `evaluate()` directly:
+        the earlier version of this test asserted the library function
+        behaved, which is a different and weaker claim than the CLI
+        reproduction named in its own docstring."""
+        from crucible.cli import main
+
         store = _seed_met(tmp_path)
         store.put_bytes(arm_register_key("m"), b"{not json\n")
-        # `evaluate` is exactly what the CLI's gate command calls; asserting
-        # it returns (rather than raises) is the same guarantee the CLI
-        # reproduction depends on, without shelling out to a second process.
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
-        assert not result.met
+
+        exit_code = main(
+            [
+                "gate",
+                "--gate",
+                "phase1",
+                "--store",
+                str(tmp_path),
+                "--date",
+                FRIDAY.isoformat(),
+                "--dry-run",
+            ]
+        )
+
+        assert exit_code == 1  # phase1 is not met -- the malformed register clause fails
+        printed = capsys.readouterr().out
+        assert "phase1" in printed
+        assert "arms_all_scored" in printed
+        # And still nothing was written -- the store guard as backstop,
+        # `dry_run` reaching the print as the primary path.
+        assert not store.exists(gate_key("phase1", FRIDAY.isoformat()))
+        assert not store.exists(LADDER_KEY)
 
     # -- finding 2: BLOCKING — the guard checked container type only; a
     # wrong-typed FIELD still crashed a downstream index. -------------------

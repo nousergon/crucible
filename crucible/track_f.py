@@ -54,15 +54,22 @@ def weekly_handler(args: argparse.Namespace) -> int:
     non-zero.
     """
     store_uri = getattr(args, "store", None)
-    store = open_store(store_uri)
+    dry_run = bool(getattr(args, "dry_run", False))
+    store = open_store(store_uri, dry_run=dry_run)
 
     def body(ctx: RunContext) -> None:
         planned = arc_stages(ctx.trading_day)
-        # `ctx.run_mode`, not `args` and not the environment: the arc's mode is
-        # whatever `run_job` resolved for THIS invocation, and every stage is
-        # run under that one answer. A stage left to re-resolve would let the
-        # arc manifest and its stage manifests disagree about the same week.
-        ran = run_arc(ctx.trading_day, store=store_uri, run_mode=ctx.run_mode)
+        # `dry_run` is passed to `run_arc` so every stage's own argv carries
+        # `--dry-run` too (alpha-engine-config-I9922 N1) — each stage is a
+        # fresh `crucible.cli.main` invocation with no shared `args`, so
+        # `weekly --dry-run` previously ran every stage for real.
+        #
+        # `run_mode=ctx.run_mode`, not `args` and not the environment: the
+        # arc's mode is whatever `run_job` resolved for THIS invocation, and
+        # every stage is run under that one answer. A stage left to
+        # re-resolve would let the arc manifest and its stage manifests
+        # disagree about the same week.
+        ran = run_arc(ctx.trading_day, store=store_uri, dry_run=dry_run, run_mode=ctx.run_mode)
         for stage in ran:
             key = manifest_key(stage.job, ctx.trading_day.isoformat(), discriminator=stage.slot)
             ctx.record_input(key, store.get_bytes(key))
@@ -93,8 +100,9 @@ def weekly_handler(args: argparse.Namespace) -> int:
         body,
         store=store,
         trading_day=args.trading_day,
-        run_mode=getattr(args, "run_mode", None),
         transient_retry=False,
+        dry_run=dry_run,
+        run_mode=getattr(args, "run_mode", None),
     )
     return 0
 
@@ -109,7 +117,8 @@ def gate_handler(args: argparse.Namespace) -> int:
     until it passes. The manifest records `ok` and the reading; the exit code
     is what a caller branches on.
     """
-    store = open_store(getattr(args, "store", None))
+    dry_run = bool(getattr(args, "dry_run", False))
+    store = open_store(getattr(args, "store", None), dry_run=dry_run)
     result: dict[str, Any] = {}
 
     def body(ctx: RunContext) -> None:
@@ -121,7 +130,13 @@ def gate_handler(args: argparse.Namespace) -> int:
         document["run_id"] = ctx.run_id
         payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
         key = gate_key(reading.gate, ctx.trading_day.isoformat())
-        ctx.record_output(key, payload)
+        # alpha-engine-config-I9922 R2-1: the store guard (dry_run-wrapped
+        # `store` above) is the backstop, not the primary path — `gate` has a
+        # natural report (`reading.render()`/`ladder.render()`, printed
+        # below), so under `--dry-run` it skips the write and reaches that
+        # print rather than dying on the guard before it ever gets there.
+        if not dry_run:
+            ctx.record_output(key, payload)
         for clause in reading.clauses:
             for evidence in clause.evidence:
                 # Guarded, not a bare `exists`/`get_bytes` pair: a clause can
@@ -153,7 +168,10 @@ def gate_handler(args: argparse.Namespace) -> int:
             now=ctx.started,
             readings={reading.gate: reading},
         )
-        ctx.record_output(LADDER_KEY, ladder_payload(ladder), schema_version=LADDER_SCHEMA_VERSION)
+        if not dry_run:
+            ctx.record_output(
+                LADDER_KEY, ladder_payload(ladder), schema_version=LADDER_SCHEMA_VERSION
+            )
         result["ladder"] = ladder
         ctx.record_rows(rows_in=len(reading.window), rows_out=len(reading.clauses))
         n_clauses = len(reading.clauses)
@@ -203,11 +221,17 @@ def gate_handler(args: argparse.Namespace) -> int:
             }
         )
 
+    # `gate` never checked `--dry-run` (alpha-engine-config-I9922 N1 — measured
+    # writing `gates/ladder.json` and `gates/phase1/<day>/gate.json`). The
+    # read-only `store` above turns those `ctx.record_output` calls into a
+    # loud `DryRunWriteRefusedError`; `dry_run=` here keeps `run_job` from
+    # also attempting its own manifest write on top of that.
     run_job(
         "gate",
         body,
         store=store,
         trading_day=args.trading_day,
+        dry_run=dry_run,
         run_mode=getattr(args, "run_mode", None),
     )
     reading = result["reading"]

@@ -118,11 +118,18 @@ def _resolve_store(args: argparse.Namespace):
     `python -m crucible.deploy`, which does not go through this CLI. All this
     adds is the CLI's exit convention: a missing store is a usage error, and
     a traceback for one is noise in front of a one-line fix.
+
+    Read-only when `--dry-run` is set (alpha-engine-config-I9922 N1) — the
+    store this returns is the one every handler writes through, so this is
+    where `--dry-run`'s own CLI help ("write nothing") becomes true for every
+    job rather than only the ones whose handler body happened to check it.
     """
     from crucible.store import open_store
 
     try:
-        return open_store(getattr(args, "store", None))
+        return open_store(
+            getattr(args, "store", None), dry_run=bool(getattr(args, "dry_run", False))
+        )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -177,6 +184,17 @@ def _promote(args: argparse.Namespace) -> int:
             manifest_key=_promote_manifest_key("promote", as_of),
             run_id=ctx.run_id,
         )
+        if args.dry_run:
+            # `run_promotion(store=None)` already wrote nothing (promote.py's
+            # own docstring: "a caller grading in memory ... gets the same
+            # decision and writes nothing"); `result.keys_written` is empty,
+            # so `_record_written` would be a no-op here regardless. Skipped
+            # explicitly rather than relied on implicitly, since `run_job`
+            # itself now also skips the manifest write on `dry_run=True`
+            # (alpha-engine-config-I9922) — before that fix this branch's
+            # sibling call still wrote an `ok` manifest for a promotion that
+            # never happened.
+            return
         _record_written(ctx, store, result.keys_written)
         # §11: the console renders "cycles since the pointer last moved", and
         # a pointer that has never moved on evidence is a FINDING. It can only
@@ -196,11 +214,21 @@ def _promote(args: argparse.Namespace) -> int:
             }
         )
 
+    # `--revert-to` always writes for real — an explicit operator-authority
+    # action, `reason` mandatory — even when `--dry-run` is also passed;
+    # nothing today refuses that combination at the argparse layer (a
+    # separate, out-of-scope gap named in the PR body). So `dry_run` is
+    # passed to `run_job` only for the evidence-gated path: if it were passed
+    # unconditionally, a `--revert-to --dry-run` invocation would move the
+    # champion pointer for real while `run_job` silently skipped writing the
+    # manifest recording that it happened — a real write with no manifest is
+    # exactly the failure mode rule 1 exists to make impossible.
     run_job(
         "promote",
         job,
         store=store,
         trading_day=args.trading_day,
+        dry_run=bool(args.dry_run) and not revert_to,
         run_mode=getattr(args, "run_mode", None),
     )
     return 0
@@ -373,6 +401,13 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument(
             "--dry-run",
             action="store_true",
+            # Enforced at the store (`crucible.store.open_store`,
+            # `crucible.config.Settings.store` — see `read_only`), not in this
+            # help text or in each handler: a job whose own body does not
+            # check this flag now reports and writes nothing where it can, or
+            # raises loudly on the first write it attempts otherwise, rather
+            # than the silent real write this closed (alpha-engine-config-
+            # I9922 N1, independent review of crucible-PR74, 2026-09-03).
             help="Resolve inputs and report what would be written; write nothing.",
         )
         sub.add_argument(

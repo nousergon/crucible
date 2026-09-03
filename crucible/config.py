@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from crucible.llm import DEFAULT_LLM_CAP_USD, DEFAULT_LLM_CAP_USD_MEASURED
-from crucible.store import LocalStore, S3Store, Store
+from crucible.store import LocalStore, S3Store, Store, read_only
 
 __all__ = [
     "DEFAULT_ARCTIC_BUCKET",
@@ -129,6 +129,11 @@ class Settings:
     #: ``"default"``) — nothing here needed a second, weaker channel to carry
     #: the same fact.
     llm_cap_usd_measured: bool = False
+    #: alpha-engine-config-I9922. Set from `--dry-run` at resolution
+    #: (`track_a._settings`), so every track-A handler's store is read-only
+    #: without each of the eight handlers threading the flag individually —
+    #: one field on the object every one of them already carries.
+    dry_run: bool = False
 
     def store(self) -> Store:
         """The resolved store, or a refusal naming how to resolve one.
@@ -136,6 +141,11 @@ class Settings:
         Deliberately the same refusal `crucible.store.open_store` gives. Two
         entry points into the same decision that disagreed is what let a
         `--dry-run` reach a production bucket through one of them.
+
+        Wrapped by :func:`crucible.store.read_only` when :attr:`dry_run` is
+        set — the same wrapping `open_store(..., dry_run=True)` does, so a
+        caller cannot get a real write out of `--dry-run` by resolving its
+        store through this method instead of that function.
         """
         if not self.store_uri:
             raise ValueError(
@@ -144,7 +154,8 @@ class Settings:
                 "hardcoded production bucket fallback — a job that wrote to "
                 "production because a flag was missing is noticed once."
             )
-        return store_from_uri(self.store_uri)
+        resolved = store_from_uri(self.store_uri)
+        return read_only(resolved) if self.dry_run else resolved
 
     def cloudtrail_bucket_prefix(self) -> tuple[str, str]:
         """The archive URI split into bucket and prefix, or ("", "") if unset."""
@@ -184,6 +195,7 @@ def settings(
     llm_cap_usd: float | None = None,
     cloudtrail_archive: str | None = None,
     stack_name: str | None = None,
+    dry_run: bool = False,
 ) -> Settings:
     """Resolve configuration once, and record where each value came from."""
     origins: dict[str, str] = {}
@@ -227,6 +239,7 @@ def settings(
         llm_cap_usd=_positive_cap(resolved_cap, origins["llm_cap_usd"]),
         llm_cap_usd_measured=cap_measured,
         origins=origins,
+        dry_run=dry_run,
     )
 
 

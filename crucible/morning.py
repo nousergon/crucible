@@ -1200,12 +1200,20 @@ def morning_handler(args: argparse.Namespace) -> int:
     the production board without writing to it, and it is honoured rather
     than ignored for the same reason `board` honours it: this job's outputs
     land under `runs/`, where a dry run would otherwise fabricate a manifest
-    saying a report was delivered.
+    saying a report was delivered. Passed through to `run_job` as
+    `dry_run=True` (alpha-engine-config-I9922) so the manifest itself is
+    never written either — before that fix, this docstring's claim was false:
+    `run_job` wrote `runs/report.morning/{day}/{firing}/run.json` regardless.
     """
     from crucible.runner import RunContext, run_job  # noqa: PLC0415 - lazy; see cli.py
 
-    store = open_store(getattr(args, "store", None))
     dry_run = bool(getattr(args, "dry_run", False))
+    # Wrapped read-only under `--dry-run` (alpha-engine-config-I9922 N1),
+    # defense-in-depth: `body` below already skips `ctx.record_output` when
+    # `dry_run`, so nothing here should ever reach a MUTATOR, but a store that
+    # refuses on its own is what makes that true structurally rather than by
+    # this function remembering to check the flag correctly forever.
+    store = open_store(getattr(args, "store", None), dry_run=dry_run)
     rendered: list[str] = []
 
     def body(ctx: RunContext) -> None:
@@ -1213,9 +1221,12 @@ def morning_handler(args: argparse.Namespace) -> int:
         message = run_report(store, trading_day=ctx.trading_day, now=now)
         rendered.append(message)
         if dry_run:
-            # No output, no delivery, and the manifest that `run_job` writes
-            # regardless says `outputs: []` -- so a dry run is visibly a dry
-            # run rather than one that claims a delivery it did not make.
+            # No output, no delivery, and (as of alpha-engine-config-I9922)
+            # no manifest either: `run_job(dry_run=True)` below skips its own
+            # write, and `store` above is read-only regardless -- a dry run
+            # is visibly a dry run because nothing under `runs/` or
+            # `reports/` changes at all, not because the manifest it used to
+            # write happened to say `outputs: []`.
             print(message)
             return
         destination = deliver(message)
@@ -1255,6 +1266,7 @@ def morning_handler(args: argparse.Namespace) -> int:
         # report go out on Sunday" is decided by write ordering. Same shape,
         # same reason, as `alerts.sweep`.
         discriminator=lambda ctx: ctx.calendar_date.isoformat(),
+        dry_run=dry_run,
     )
     return 0
 

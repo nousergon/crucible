@@ -39,6 +39,10 @@ class TestGateHandlerLineageReadIsGuarded:
 
         try:
             with mock.patch.dict(GATES, {"phase1": (5, fake_clauses)}):
+                # No `--dry-run`: this test asserts the ladder was WRITTEN
+                # for real (below) — `--dry-run` here was vestigial and, as
+                # of alpha-engine-config-I9922 N1, would now correctly refuse
+                # that write rather than silently being a no-op.
                 exit_code = main(
                     [
                         "gate",
@@ -48,7 +52,6 @@ class TestGateHandlerLineageReadIsGuarded:
                         str(tmp_path),
                         "--date",
                         "2026-08-28",
-                        "--dry-run",
                     ]
                 )
         finally:
@@ -95,6 +98,9 @@ class TestGateHandlerOutcomeMetricNamesTheUnmeasurableCause:
             ]
 
         with mock.patch.dict(GATES, {"phase1": (6, fake_clauses)}):
+            # No `--dry-run`: this test reads the real run manifest below —
+            # see the sibling test's comment above for why the flag was
+            # dropped rather than kept as a (now-refusing) no-op.
             main(
                 [
                     "gate",
@@ -104,7 +110,6 @@ class TestGateHandlerOutcomeMetricNamesTheUnmeasurableCause:
                     str(tmp_path),
                     "--date",
                     "2026-08-28",
-                    "--dry-run",
                 ]
             )
 

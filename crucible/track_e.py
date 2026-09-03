@@ -39,7 +39,8 @@ def report_handler(args: argparse.Namespace) -> int:
     a `failed` manifest naming the cause instead of an absent report card
     whose absence looks like a scheduler that never fired.
     """
-    store = open_store(getattr(args, "store", None))
+    dry_run = bool(getattr(args, "dry_run", False))
+    store = open_store(getattr(args, "store", None), dry_run=dry_run)
     config = load_settings()
 
     def body(ctx: RunContext) -> None:
@@ -51,7 +52,14 @@ def report_handler(args: argparse.Namespace) -> int:
             ctx.record_input(key, store.get_bytes(key))
         payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
         key = attribution_key(ctx.trading_day.isoformat())
-        ctx.record_output(key, payload, schema_version=ATTRIBUTION_SCHEMA_VERSION)
+        # alpha-engine-config-I9922 R2-1: the store guard is the backstop —
+        # `report` has a natural report (the attribution document itself),
+        # printed below under `--dry-run` rather than reached only by dying
+        # on the guard.
+        if dry_run:
+            print(payload.decode("utf-8"))
+        else:
+            ctx.record_output(key, payload, schema_version=ATTRIBUTION_SCHEMA_VERSION)
         ctx.record_rows(rows_in=len(sources), rows_out=len(document["rows"]))
 
         # §9.2 class 5: every row of the table is a manifest metric too, so the
@@ -112,11 +120,17 @@ def report_handler(args: argparse.Namespace) -> int:
             }
         )
 
+    # `report` never checked `--dry-run` (alpha-engine-config-I9922 N1); the
+    # read-only `store` above turns `ctx.record_output`'s write into a loud
+    # `DryRunWriteRefusedError` instead of a real `attribution.json`, and
+    # `dry_run=` here means `run_job` reports that rather than also failing
+    # to write its own manifest afterward.
     run_job(
         "report",
         body,
         store=store,
         trading_day=args.trading_day,
+        dry_run=dry_run,
         run_mode=getattr(args, "run_mode", None),
     )
     return 0

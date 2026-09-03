@@ -1159,6 +1159,17 @@ class TestADryRunDoesNotTouchThePointer:
         assert not written.exists("board/index.html")
         assert not written.exists("board/2026-09-01/board.json")
 
+    def test_a_dry_run_files_no_run_manifest_either(self, tmp_path) -> None:
+        """alpha-engine-config-I9922: `board`'s own local `dry_run` branch
+        above already kept it from clobbering `board/current.json`, but
+        `run_job` itself wrote `runs/board/2026-09-01/run.json` regardless —
+        a real firing for a run that touched nothing, which is the exact
+        shape `alerts.sweep` and the board read as genuine."""
+        written = self._run(tmp_path, dt.date(2026, 9, 1), dry_run=True)
+        from crucible.manifest import manifest_key
+
+        assert not written.exists(manifest_key("board", "2026-09-01"))
+
     def test_a_dry_run_does_not_overwrite_a_good_pointer(self, tmp_path) -> None:
         self._run(tmp_path, dt.date(2026, 9, 1))
         written = self._run(tmp_path, dt.date(2026, 8, 28), dry_run=True)
