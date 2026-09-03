@@ -715,17 +715,21 @@ def _packages_that_raise(module: str) -> frozenset[str]:
     """The import bindings a `try` body must call INTO for an exception
     defined in ``module`` to be reachable from it.
 
-    The module itself and its top-level package always qualify. For
-    `botocore.exceptions` the SDK front door `boto3` qualifies too — not as
-    a restated fact but as one asserted here: a `boto3.client(...)` IS a
+    The imported module itself qualifies; so does any more-specific child
+    (matched by prefix in `_binding_reaches_module`). Ancestor packages do
+    NOT — a call into `botocore.session` must not satisfy a handler for a
+    type imported from `botocore.exceptions`, and a call into bare
+    `crucible` must not satisfy `crucible.tags`.
+
+    For `botocore.exceptions` the SDK front door `boto3` qualifies too — not
+    as a restated fact but as one asserted here: a `boto3.client(...)` IS a
     `botocore.client.BaseClient`, and that class is what raises
     `botocore.exceptions.*` from `_make_api_call`. If that ever stops being
     true, this function stops accepting `boto3` and the guard goes red on
     the real handler, which is the correct direction to fail in.
     """
-    top = module.split(".")[0]
-    accepted = {module, top}
-    if top == "botocore":
+    accepted = {module}
+    if module.split(".")[0] == "botocore":
         import boto3
         import botocore.client
 
@@ -740,6 +744,17 @@ def _packages_that_raise(module: str) -> frozenset[str]:
     return frozenset(accepted)
 
 
+def _binding_reaches_module(reached: set[str], module: str) -> bool:
+    """True when a reached import binding is ``module``, a more-specific
+    child of it, or another package `_packages_that_raise` accepts (e.g.
+    `boto3` for botocore exceptions). Ancestors and siblings do not match."""
+    accepted = _packages_that_raise(module)
+    for binding in reached:
+        if binding in accepted or binding.startswith(module + "."):
+            return True
+    return False
+
+
 def _unmeasurable_unreachable_handlers(source: str, provenance: dict[str, str]) -> list[str]:
     """One violation string per `except <allowed type>` handler that reaches
     `_unmeasurable` from a `try` body that calls NOTHING which could raise
@@ -750,14 +765,19 @@ def _unmeasurable_unreachable_handlers(source: str, provenance: dict[str, str]) 
 
     "Could raise" is import-binding based, not name based: a call whose root
     name was bound by `from M import f` reaches `M`; one bound by `import P`
-    (or `import P.Q`) reaches `P`. The body must reach one of
-    `_packages_that_raise(module)` for the module the caught type is
-    imported from. Disallowed types are ignored here — they are the other
-    guard's violation, and reporting them twice would let a fix for one
-    read as a fix for both.
+    (or `import P.Q`) reaches `P`. The body must reach the imported module
+    (or a more-specific child / accepted alias via `_binding_reaches_module`)
+    for the module the caught type is imported from. Disallowed types are
+    ignored here — they are the other guard's violation, and reporting them
+    twice would let a fix for one read as a fix for both.
 
-    **Residuals, named rather than claimed away.** This is a syntactic
-    reachability check over one function body, not a call graph:
+    Constructing an allowlisted exception type (`NoCredentialsError()`) is
+    NOT reach into its defining module — the Call's root binds to that
+    module, but instantiating the caught class is the launder, not a read.
+
+    **Residuals, named rather than claimed away.** Syntactic reachability
+    over one try body, plus same-scope call-graph into nested defs the body
+    actually invokes:
 
     - A body that calls a same-module helper which in turn calls boto3 is
       FLAGGED (the helper is not an import binding) — fails closed; the fix
@@ -770,17 +790,24 @@ def _unmeasurable_unreachable_handlers(source: str, provenance: dict[str, str]) 
       whether an inner handler ate the raise is control flow this scanner
       does not model.
     - A qualifying call inside a nested `def`/`lambda` the body only defines
-      is NOT accepted (explicit-stack walk, `_reached`).
+      is NOT accepted; if the body CALLS that nested function (same-scope
+      name resolution), its body counts as reach.
     """
     tree = ast.parse(source)
     bindings: dict[str, str] = {}
+    # Local names bound to allowlisted exception types — calling them is
+    # construction, not a call into the raising module.
+    exception_locals: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 bindings[(alias.asname or alias.name).split(".")[0]] = alias.name.split(".")[0]
         elif isinstance(node, ast.ImportFrom) and node.module:
             for alias in node.names:
-                bindings[alias.asname or alias.name] = node.module
+                local = alias.asname or alias.name
+                bindings[local] = node.module
+                if alias.name in provenance:
+                    exception_locals.add(local)
 
     def _root(func: ast.expr) -> str | None:
         while isinstance(func, ast.Attribute):
@@ -788,22 +815,58 @@ def _unmeasurable_unreachable_handlers(source: str, provenance: dict[str, str]) 
         return func.id if isinstance(func, ast.Name) else None
 
     def _reached(body: list[ast.stmt]) -> set[str]:
-        """Import bindings the `try` body's calls reach — walking with an
-        explicit stack that does NOT descend into a nested `def`, `async
-        def` or `lambda`: a qualifying call inside a function the body only
-        DEFINES is never executed by the body, and `ast.walk` counted it
-        (round-1 review of alpha-engine-config-I9910)."""
+        """Import bindings the `try` body's calls reach.
+
+        Nested `def`/`async def`/`lambda` bodies are entered only when the
+        try body (or an already-entered nested function) CALLS them by
+        same-scope name — define-only does not count (round-1); define-then-
+        call does (round-2). Exception-type construction never counts.
+        """
         reached: set[str] = set()
-        stack: list[ast.AST] = list(body)
-        while stack:
-            node = stack.pop()
+        local_funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda] = {}
+        seen_funcs: set[str] = set()
+
+        def _index(nodes: list[ast.AST]) -> None:
+            stack = list(nodes)
+            while stack:
+                node = stack.pop()
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                    local_funcs[node.name] = node
+                    continue
+                if (
+                    isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Lambda)
+                ):
+                    local_funcs[node.targets[0].id] = node.value
+                    continue
+                stack.extend(ast.iter_child_nodes(node))
+
+        def _enter(name: str, work: list[ast.AST]) -> None:
+            if name in seen_funcs or name not in local_funcs:
+                return
+            seen_funcs.add(name)
+            fn = local_funcs[name]
+            if isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+                _index(list(fn.body))
+                work.extend(fn.body)
+            else:
+                work.append(fn.body)
+
+        _index(list(body))
+        work: list[ast.AST] = list(body)
+        while work:
+            node = work.pop()
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
                 continue
             if isinstance(node, ast.Call):
                 root = _root(node.func)
-                if root in bindings:
-                    reached.add(bindings[root])
-            stack.extend(ast.iter_child_nodes(node))
+                if root is not None:
+                    _enter(root, work)
+                    if root in bindings and root not in exception_locals:
+                        reached.add(bindings[root])
+            work.extend(ast.iter_child_nodes(node))
         return reached
 
     def _type_names(node: ast.expr | None) -> frozenset[str]:
@@ -838,7 +901,7 @@ def _unmeasurable_unreachable_handlers(source: str, provenance: dict[str, str]) 
                     module = provenance.get(type_name)
                     if module is None:
                         continue
-                    if not (reached & _packages_that_raise(module)):
+                    if not _binding_reaches_module(reached, module):
                         violations.append(
                             f"line {handler.lineno}: `except {type_name}` reaches _unmeasurable, "
                             f"but its try body calls nothing imported from {module} (it reaches "
@@ -930,6 +993,87 @@ def test_a_qualifying_call_inside_a_nested_def_the_body_never_calls_is_not_reach
     violations = _unmeasurable_unreachable_handlers(_NESTED_DEF_LAUNDER, provenance)
     assert len(violations) == 1, violations
     assert "NoCredentialsError" in violations[0]
+
+
+_EXCEPTION_CONSTRUCTION_LAUNDER = textwrap.dedent(
+    """
+    from botocore.exceptions import NoCredentialsError
+    from crucible.tags import StackNotAppliedError
+
+    def f(record_property):
+        try:
+            _ = NoCredentialsError()
+        except NoCredentialsError as exc:
+            _unmeasurable("c", "r", exc, phase="phase0", record_property=record_property)
+        try:
+            _ = StackNotAppliedError("no stack")
+        except StackNotAppliedError as exc:
+            _unmeasurable("c", "r", exc, phase="phase0", record_property=record_property)
+    """
+)
+
+
+def test_constructing_the_caught_exception_is_not_reach_into_its_module() -> None:
+    """Round-2 adversarial FAIL: `NoCredentialsError()` / `StackNotAppliedError()`
+    are Calls whose roots bind to the raising modules, so the scanner false-OKed
+    a body that never called into anything that could raise them."""
+    provenance = _exception_provenance(
+        _EXCEPTION_CONSTRUCTION_LAUNDER,
+        frozenset({"NoCredentialsError", "StackNotAppliedError"}),
+    )
+    violations = _unmeasurable_unreachable_handlers(_EXCEPTION_CONSTRUCTION_LAUNDER, provenance)
+    assert len(violations) == 2, violations
+    assert "NoCredentialsError" in violations[0] and "botocore.exceptions" in violations[0]
+    assert "StackNotAppliedError" in violations[1] and "crucible.tags" in violations[1]
+
+
+_SIBLING_PACKAGE_LAUNDER = textwrap.dedent(
+    """
+    import botocore.session
+    from botocore.exceptions import NoCredentialsError
+
+    def f(record_property):
+        try:
+            botocore.session.get_session()
+        except NoCredentialsError as exc:
+            _unmeasurable("c", "r", exc, phase="phase0", record_property=record_property)
+    """
+)
+
+
+def test_a_call_into_a_sibling_package_does_not_satisfy_the_exception_module() -> None:
+    """Round-2 adversarial FAIL: accepting the top-level package `botocore`
+    let any `botocore.session...` call false-OK a `NoCredentialsError` handler.
+    Matching is the imported module (and children), not ancestors."""
+    provenance = _exception_provenance(_SIBLING_PACKAGE_LAUNDER, frozenset({"NoCredentialsError"}))
+    violations = _unmeasurable_unreachable_handlers(_SIBLING_PACKAGE_LAUNDER, provenance)
+    assert len(violations) == 1, violations
+    assert "NoCredentialsError" in violations[0]
+    assert "botocore.exceptions" in violations[0]
+
+
+_NESTED_DEF_CALLED = textwrap.dedent(
+    """
+    from botocore.exceptions import NoCredentialsError
+
+    def f(record_property):
+        try:
+            import boto3
+            def do():
+                return boto3.client("sts")
+            do()
+        except NoCredentialsError as exc:
+            _unmeasurable("c", "r", exc, phase="phase0", record_property=record_property)
+    """
+)
+
+
+def test_a_nested_def_the_try_body_calls_counts_as_reach() -> None:
+    """Round-2 adversarial FAIL: residual covered define-only, but
+    `def do(): return boto3.client("sts"); do()` was false-rejected even
+    though the call runs. Same-scope call-graph enter."""
+    provenance = _exception_provenance(_NESTED_DEF_CALLED, frozenset({"NoCredentialsError"}))
+    assert _unmeasurable_unreachable_handlers(_NESTED_DEF_CALLED, provenance) == []
 
 
 def test_the_reachability_scanner_accepts_a_body_that_calls_into_the_raising_module() -> None:
