@@ -38,9 +38,32 @@ class _FakeS3:
         objects = self._objects
 
         class _Paginator:
-            def paginate(self, *, Bucket: str, Prefix: str):  # noqa: N803 - boto3's shape
-                contents = [{"Key": k} for k in sorted(objects) if k.startswith(Prefix)]
-                yield {"Contents": contents}
+            def paginate(  # noqa: N803 - boto3's shape
+                self, *, Bucket: str, Prefix: str, Delimiter: str | None = None
+            ):
+                keys = [k for k in sorted(objects) if k.startswith(Prefix)]
+                if Delimiter is None:
+                    yield {"Contents": [{"Key": k} for k in keys]}
+                    return
+                # S3's own semantics: a key with the delimiter after the
+                # prefix is rolled up into CommonPrefixes and does NOT appear
+                # in Contents. Modelled rather than approximated — the region
+                # discovery this fixture now exercises reads only the rolled-up
+                # half, so a fake that returned everything in Contents would
+                # pass a reader that asked for the wrong thing.
+                common: dict[str, None] = {}
+                contents: list[dict[str, str]] = []
+                for key in keys:
+                    rest = key[len(Prefix) :]
+                    head, sep, _ = rest.partition(Delimiter)
+                    if sep:
+                        common[f"{Prefix}{head}{Delimiter}"] = None
+                    else:
+                        contents.append({"Key": key})
+                yield {
+                    "Contents": contents,
+                    "CommonPrefixes": [{"Prefix": p} for p in common],
+                }
 
         return _Paginator()
 
@@ -72,17 +95,29 @@ def _record(**over) -> dict:
     return document
 
 
-def _archive(records_by_day: dict[dt.date, list[dict]]) -> _FakeS3:
+#: The prefix `fleet-cloudtrail.yaml` exports — it stops ABOVE the region.
+ARCHIVE_PREFIX = "AWSLogs/711398986525/CloudTrail"
+
+
+def _archive(
+    records_by_day: dict[dt.date, list[dict]],
+    *,
+    regions: tuple[str, ...] = ("us-east-1",),
+) -> _FakeS3:
     objects: dict[str, list[dict]] = {}
-    for day, records in records_by_day.items():
-        objects[f"AWSLogs/711398986525/CloudTrail/us-east-1/{day:%Y/%m/%d}/part.json.gz"] = records
+    for region in regions:
+        for day, records in records_by_day.items():
+            objects[f"{ARCHIVE_PREFIX}/{region}/{day:%Y/%m/%d}/part.json.gz"] = records
     return _FakeS3(objects)
 
 
 def _count(client, **over):
     kwargs = {
         "bucket": "trail",
-        "prefix": "AWSLogs/711398986525/CloudTrail/us-east-1",
+        # The region-scoped spelling, deliberately: every existing assertion
+        # below keeps reading through a prefix that already names a region, so
+        # region DISCOVERY cannot quietly become the only shape that works.
+        "prefix": f"{ARCHIVE_PREFIX}/us-east-1",
         "start": START,
         "end": END,
     }
@@ -218,3 +253,48 @@ class TestCounting:
         assert document["objects_read"] == 1
         assert document["count"] == 1
         assert document["actions"][0]["event_name"] == "UpdateFunctionCode"
+
+
+class TestTheRegionPartitionIsDiscovered:
+    """`alpha-engine-config-I9928`: the archive URI stops above `{region}/`.
+
+    `fleet-cloudtrail.yaml` exports one URI —
+    `s3://<bucket>/AWSLogs/<account>/CloudTrail` — and `crucible-v2.yaml`
+    already exports THAT value into every job's shell as
+    `CRUCIBLE_CLOUDTRAIL_ARCHIVE`. Read as a date prefix it names
+    `.../CloudTrail/2026/09/03/`, which holds nothing, so the gate raised
+    `ArchiveMissingError` on a trail that was delivering — UNMEASURABLE for a
+    reason that was configuration, not evidence.
+    """
+
+    def test_the_exported_region_agnostic_prefix_reads_the_archive(self) -> None:
+        result = _count(_archive({START: [_record()]}), prefix=ARCHIVE_PREFIX)
+        assert result.objects_read == 1
+        assert result.count == 1
+
+    def test_every_delivered_region_is_counted(self) -> None:
+        """A multi-region trail delivers one directory per region. Counting
+        only one of them narrows a ZERO-assertion gate by configuration, in
+        the direction that reads clean."""
+        result = _count(
+            _archive({START: [_record()]}, regions=("us-east-1", "us-west-2")),
+            prefix=ARCHIVE_PREFIX,
+        )
+        assert result.objects_read == 2
+        assert result.count == 2
+
+    def test_a_prefix_that_already_names_a_region_is_honoured(self) -> None:
+        """Its immediate children are years, not regions. Descending a level
+        there would build `.../us-east-1/2026/2026/08/03/` and read nothing."""
+        partitions = autonomy.date_partitions(
+            _archive({START: [_record()]}),
+            bucket="trail",
+            prefix=f"{ARCHIVE_PREFIX}/us-east-1",
+        )
+        assert partitions == (f"{ARCHIVE_PREFIX}/us-east-1",)
+
+    def test_an_empty_archive_still_raises_rather_than_reporting_zero(self) -> None:
+        """Region discovery must not become a second place "there is no trail"
+        is decided — the objects-read branch owns that judgement."""
+        with pytest.raises(ArchiveMissingError, match="UNMEASURABLE, not zero"):
+            _count(_archive({}), prefix=ARCHIVE_PREFIX)

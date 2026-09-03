@@ -24,6 +24,13 @@ principals are the exhaustive allowlist; everything else that mutates counts.
 **No archive is UNMEASURABLE, never zero.** A missing trail is the loudest
 possible way to have no human calls, and rendering it as `0` would be *no
 data* painted green (principle 7).
+
+**The region partition is discovered, never configured.** The archive URI is
+the one `fleet-cloudtrail.yaml` exports, which stops above CloudTrail's
+`{region}/` level. Pinning a region there would narrow a zero-assertion gate
+by configuration — it would stop counting the day the trail delivered a second
+region, in the direction that reads clean. :func:`date_partitions` lists that
+level instead, and still honours a prefix that already names one region.
 """
 
 from __future__ import annotations
@@ -31,6 +38,7 @@ from __future__ import annotations
 import datetime as dt
 import gzip
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,8 +48,15 @@ __all__ = [
     "OperatorAction",
     "OperatorActionCount",
     "count_operator_actions",
+    "date_partitions",
     "iter_archive_records",
 ]
+
+#: A date partition's first level. CloudTrail's key layout is
+#: ``AWSLogs/{account}/CloudTrail/{region}/{YYYY}/{MM}/{DD}/``, so the only
+#: thing distinguishing "this prefix already names a region" from "this prefix
+#: is the region LEVEL" is whether its immediate children are years.
+_YEAR = re.compile(r"^\d{4}$")
 
 #: The exhaustive set of principals whose mutating calls are the system
 #: working rather than a human touching it. Matched against the role or user
@@ -149,6 +164,38 @@ def _touches(record: dict[str, Any], marker: str) -> bool:
     return marker in json.dumps(record, separators=(",", ":"))
 
 
+def date_partitions(client: Any, *, bucket: str, prefix: str) -> tuple[str, ...]:
+    """The prefixes a day's objects hang from, one per delivered region.
+
+    CloudTrail's layout is `.../CloudTrail/{region}/{YYYY}/{MM}/{DD}/`, and the
+    archive URI this module is pointed at deliberately stops ABOVE the region:
+    a multi-region trail delivers one region directory per region it sees, and
+    a configured region would make the gate stop counting the day a second one
+    appears — silently, and in the direction that reads clean. **A gate that
+    asserts a count of ZERO must never be narrowed by configuration.** So the
+    region level is DISCOVERED, once, by listing one level with a delimiter.
+
+    A prefix that already names a region is honoured as given: its immediate
+    children are years, and the whole archive is then that single partition.
+    That is the shape `tests/test_autonomy.py` fixtures use and the shape a
+    single-region trail would be configured with, and neither should have to
+    change to be read correctly.
+
+    An unlistable or empty level yields the prefix itself, so the caller's
+    "no objects" branch — not this one — is what raises
+    :class:`ArchiveMissingError`. Deciding "there is no trail" from a listing
+    that returned no common prefixes would put that judgement in two places.
+    """
+    base = prefix.rstrip("/")
+    children: list[str] = []
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=f"{base}/", Delimiter="/"):
+        for entry in page.get("CommonPrefixes") or []:
+            children.append(entry["Prefix"].rstrip("/").rsplit("/", 1)[-1])
+    partitions = tuple(f"{base}/{child}" for child in sorted(children) if not _YEAR.match(child))
+    return partitions or (base,)
+
+
 def iter_archive_records(
     client: Any,
     *,
@@ -160,10 +207,11 @@ def iter_archive_records(
     """Every CloudTrail record delivered for the calendar days in the window.
 
     The archive's layout is `.../CloudTrail/{region}/{YYYY}/{MM}/{DD}/*.json.gz`,
-    so the window is walked one calendar day at a time and each day's objects
-    are listed under their own prefix. Listing the whole trail and filtering
-    client-side would work and would also read years of objects to answer a
-    question about a handful of weeks.
+    so the region partitions are resolved once (:func:`date_partitions`) and the
+    window is then walked one calendar day at a time, each day's objects listed
+    under their own prefix. Listing the whole trail and filtering client-side
+    would work and would also read years of objects to answer a question about
+    a handful of weeks.
 
     Calendar days, not trading days — one of §4.12's exhaustive exceptions.
     CloudTrail delivers on wall-clock time, and a gate that skipped weekends
@@ -172,16 +220,18 @@ def iter_archive_records(
     records: list[dict[str, Any]] = []
     objects = 0
     paginator = client.get_paginator("list_objects_v2")
-    day = start
-    while day <= end:
-        day_prefix = f"{prefix.rstrip('/')}/{day:%Y/%m/%d}/"
-        for page in paginator.paginate(Bucket=bucket, Prefix=day_prefix):
-            for entry in page.get("Contents", []):
-                body = client.get_object(Bucket=bucket, Key=entry["Key"])["Body"].read()
-                payload = json.loads(gzip.decompress(body).decode("utf-8"))
-                records.extend(payload.get("Records", []))
-                objects += 1
-        day += dt.timedelta(days=1)
+    partitions = date_partitions(client, bucket=bucket, prefix=prefix)
+    for partition in partitions:
+        day = start
+        while day <= end:
+            day_prefix = f"{partition}/{day:%Y/%m/%d}/"
+            for page in paginator.paginate(Bucket=bucket, Prefix=day_prefix):
+                for entry in page.get("Contents", []):
+                    body = client.get_object(Bucket=bucket, Key=entry["Key"])["Body"].read()
+                    payload = json.loads(gzip.decompress(body).decode("utf-8"))
+                    records.extend(payload.get("Records", []))
+                    objects += 1
+            day += dt.timedelta(days=1)
     return records, objects
 
 
