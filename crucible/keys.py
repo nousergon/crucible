@@ -30,6 +30,7 @@ __all__ = [
     "BOARD_CURRENT_KEY",
     "BOARD_HTML_KEY",
     "DRIFT_INPUTS",
+    "REVIEWER_PATTERN",
     "RUNS_ROOT",
     "arena_cycle_key",
     "arm_id_from_segment",
@@ -60,6 +61,8 @@ __all__ = [
     "manifest_prefix",
     "migration_key",
     "retirement_log_key",
+    "review_key",
+    "review_prefix",
     "runs_prefix",
     "shadow_key",
     "signals_key",
@@ -332,6 +335,90 @@ def retirement_log_key(slot: str) -> str:
     trading day of something that spans all of them.
     """
     return f"retirements/{slot}/events.jsonl"
+
+
+#: A reviewer identity is a Claude session id — the ONE identity in this fleet
+#: that separates one agent from another. Every agent dispatches as the same
+#: single GitHub collaborator, so a login can never tell a reviewer from an
+#: author; a session id can, and it is already written into every commit this
+#: fleet produces (the `Claude-Session:` trailer). That is what lets the
+#: AUTHOR side of the independence comparison be DERIVED from the commit under
+#: review rather than asserted by the party asking to be graded
+#: (alpha-engine-config-I9873).
+#: Case-INSENSITIVE, matching `.github/scripts/adversarial_review.py`'s
+#: `REVIEWER_PATTERN` exactly — flags included, asserted equal by
+#: `tests/test_adversarial_review.py`. The first version of these two had
+#: different flags while a comment claimed they matched, so `SESSION_01AB...`
+#: passed the workflow and would have raised here the moment the store writer
+#: landed: a contract restated in two places had already drifted inside the
+#: change that introduced it.
+REVIEWER_PATTERN = r"^session_[A-Za-z0-9]{8,}$"
+_REVIEWER_RE = re.compile(REVIEWER_PATTERN, re.IGNORECASE)
+
+
+def _reviewer_segment(reviewer: str) -> str:
+    """``reviewer`` as one key segment, lower-cased, or raise.
+
+    Lower-cased because every comparison downstream is, and the GitHub status
+    context is too: two spellings of one session would otherwise be two
+    reviewers to the store and one reviewer to the gate.
+
+    Rule 5, fail loud: a reviewer id carrying a `/` would file one review
+    document under a key nothing lists back, and a review that cannot be read
+    back is indistinguishable from a review that never happened. Free text is
+    refused for the same reason the clause exists at all — an identity field
+    the dispatcher may fill with any string measures nothing.
+    """
+    if not _REVIEWER_RE.match(reviewer):
+        raise ValueError(
+            f"reviewer {reviewer!r} is not a Claude session id (`session_<alnum>`). "
+            "Independence is measured between session identities, which is the only "
+            "identity that differs between two agents in this fleet"
+        )
+    return reviewer.lower()
+
+
+def review_prefix(phase: str) -> str:
+    """Every independent adversarial review filed against ``phase``.
+
+    A phase exit is reviewed once per ROUND, not once per trading day, and the
+    gate cannot know in advance which session reviewed or on which session —
+    so the clause LISTS this prefix rather than reading one known key.
+    """
+    return f"reviews/{phase}/"
+
+
+def review_key(phase: str, trading_day: str, reviewer: str, verdict: str) -> str:
+    """One reviewer's verdict on ``phase``, filed on ``trading_day``.
+
+    Two segments carry identity rather than living only in the body, and each
+    closes a different overwrite.
+
+    **The reviewer**, because one key per ``(phase, trading_day)`` would make
+    two reviewers on the same session a last-writer-wins race whose survivor is
+    whichever execution finished second — the shape that gave a cycle's verdict
+    to its worst-informed author.
+
+    **The verdict**, because otherwise a reviewer could erase its own adverse
+    finding by re-recording a `pass` on the same session: one write, no code
+    change, and the phase gate goes green on a change nobody re-reviewed. With
+    the verdict in the key the two are different objects and `put_bytes` cannot
+    make one replace the other — under ANY caller, including an `aws s3 cp`
+    that never imports `crucible.review`. The review-writer role carries
+    `PutObject`/`GetObject` and no `DeleteObject`, so a recorded finding cannot
+    be removed by the party it was recorded against either.
+
+    How a fail is legitimately superseded is a question for the reader, not the
+    key, and `crucible.gate._clause_independently_reviewed` states its rule:
+    an independent `pass` naming a DIFFERENT head sha, filed no earlier than
+    the fail.
+    """
+    if verdict not in ("pass", "fail"):
+        raise ValueError(
+            f"verdict {verdict!r} is not 'pass' or 'fail'. A third verdict would be a "
+            "third key shape the gate clause has never agreed to read"
+        )
+    return f"{review_prefix(phase)}{trading_day}/{_reviewer_segment(reviewer)}/{verdict}.json"
 
 
 def experiments_key(trading_day: str) -> str:

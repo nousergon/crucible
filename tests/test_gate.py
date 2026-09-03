@@ -28,9 +28,10 @@ from crucible.gate import (
     legacy_weekly_executions_key,
     weekly_anchor,
 )
-from crucible.keys import arena_cycle_key, arm_register_key
+from crucible.keys import arena_cycle_key, arm_register_key, review_key
 from crucible.manifest import manifest_key
 from crucible.report import attribution_key
+from crucible.review import review_document
 from crucible.slots import SLOTS
 from crucible.store import LocalStore
 from crucible.weekly import arc_stages
@@ -38,6 +39,41 @@ from crucible.weekly import arc_stages
 FRIDAY = dt.date(2026, 8, 28)
 WINDOW = [FRIDAY - dt.timedelta(weeks=n) for n in reversed(range(5))]
 SHA = "a" * 40
+REVIEWER = "session_01ReviewerBBBBB"
+
+
+def _review() -> dict:
+    """One independent adversarial review, built by the REAL producer.
+
+    `crucible.review.review_document`, not a hand-written dict: a fixture that
+    restates the shape is a second contract, and this repository has already
+    found one of those drifting inside the change that introduced it.
+    """
+    return review_document(
+        phase="phase1",
+        verdict="pass",
+        reviewer=REVIEWER,
+        # The author set is read out of the commits, never supplied by the
+        # session asking to be passed.
+        commits=[
+            {
+                "commit": {
+                    "message": (
+                        "fix: a thing\n\nClaude-Session: "
+                        "https://claude.ai/code/session_01AuthorAAAAAAAA\n"
+                    ),
+                    "author": {"email": "someone@example.invalid"},
+                    "committer": {"email": "someone@example.invalid"},
+                },
+                "author": {"login": "cipher813"},
+                "committer": {"login": "cipher813"},
+            }
+        ],
+        head_sha=SHA,
+        pr_number=46,
+        summary="no findings against plan section 2",
+        reviewed_at=dt.datetime(2026, 8, 28, 18, 0, tzinfo=dt.UTC),
+    )
 
 
 def _put(store: LocalStore, key: str, document: dict) -> None:
@@ -117,6 +153,17 @@ def _seed_met(tmp_path) -> LocalStore:
     )
     _put(store, "releases/current", {"sha": SHA})
     _put(store, manifest_key("smoke", FRIDAY.isoformat()), _manifest())
+    # The independent adversarial review (plan §11 risk 1,
+    # alpha-engine-config-I9794). Every refusal this clause makes is graded in
+    # `tests/test_gate_independent_review.py`; here it only has to be present
+    # and independent, so `_seed_met` still means "every phase-1 clause is
+    # satisfied" rather than "every clause except the newest one".
+    _review_document = _review()
+    _put(
+        store,
+        review_key("phase1", FRIDAY.isoformat(), REVIEWER, "pass"),
+        _review_document,
+    )
     return store
 
 
@@ -252,6 +299,7 @@ class TestArtifact:
             "attribution_renders",
             "explain_walks_a_verdict",
             "pointer_flipped_on_smoke",
+            "independently_reviewed",
         }
         assert all(c["requirement"] and c["detail"] for c in document["clauses"])
 

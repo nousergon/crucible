@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import datetime as dt
 import json
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -42,6 +43,8 @@ from crucible.keys import (
     arm_register_key,
     gate_key,
     legacy_weekly_executions_key,
+    review_key,
+    review_prefix,
     runs_prefix,
 )  # noqa: F401 - re-exported
 from crucible.manifest import manifest_key
@@ -63,6 +66,7 @@ __all__ = [
     "GATE_DELIVERABLES",
     "PHASE0_DELIVERABLES",
     "PHASES",
+    "REVIEW_SCHEMA_VERSION",
     "SOURCE_SCAN_SCOPE",
     "Clause",
     "Deliverable",
@@ -79,6 +83,8 @@ __all__ = [
     "gate_key",
     "ladder_payload",
     "legacy_weekly_executions_key",
+    "review_key",
+    "review_prefix",
     "weekly_anchor",
     "last_read",
     "ladder_schema",
@@ -490,6 +496,239 @@ def _clause_pointer_flipped_on_smoke(store: Store, window: list[dt.date]) -> Cla
     )
 
 
+#: The review document's schema token. Written by `crucible.review.record`,
+#: driven by `.github/workflows/adversarial-review-record.yml`, and read by
+#: :func:`_clause_independently_reviewed`. A document without it is a shape
+#: this clause has never agreed to read, and is refused rather than guessed at.
+REVIEW_SCHEMA_VERSION = "review.v1"
+
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+@dataclass(frozen=True)
+class _Review:
+    """One review artifact, with the facts its key carries kept separate.
+
+    ``day``, ``reviewer`` and ``verdict`` come from the KEY; the rest from the
+    body. Held apart on purpose: the key is what the store actually did, the
+    body is what a producer claimed, and :func:`_review_problem` refuses a
+    document whose body disagrees with its own key. Reading either alone would
+    let a `fail` be filed under a `pass` key — the exact overwrite the key
+    shape exists to prevent, wearing a different hat.
+    """
+
+    key: str
+    day: str
+    verdict: str
+    reviewer: str
+    authors: frozenset[str]
+    head_sha: str
+    summary: str
+
+    @property
+    def is_self_review(self) -> bool:
+        return self.reviewer in self.authors
+
+
+def _clause_independently_reviewed(store: Store, phase: str, window: list[dt.date]) -> Clause:
+    """Plan §11 risk 1, as a MEASUREMENT over the store.
+
+    "Every track's exit is reviewed by an independent adversarial agent
+    against §2's acceptance tests, not by its author." Until this clause
+    existed that lived only as a GitHub check-run, so `crucible gate` — the
+    thing that decides whether a phase may exit — could not see it at all, and
+    a phase could exit with no review having happened (plan §11 risk 1: "v2
+    passes its gates because its tests were written to pass").
+
+    It is now the ONLY place the review is enforced. `adversarial-review-gate`
+    is never re-armed as a required status check (Brian ruling 2026-09-03): a
+    `skipped` check-run under a required name counts as success, so the graded
+    party could green it by pressing a dispatch button. A phase gate cannot be
+    pressed.
+
+    **The independence comparison is between a reviewer and a DERIVED author
+    set.** ``authors`` is not the recorder's opinion of who wrote the code:
+    `crucible.review.author_identities` reads it out of the commits under
+    review. A gate whose input is supplied by the thing it grades measures
+    nothing, and that is what the first version of this control did — reviewer
+    and author were free-text `workflow_dispatch` inputs typed by the session
+    asking to be passed (`alpha-engine-config-I9873`). It is better-evidenced,
+    not proof; `crucible.review`'s docstring states the residual exactly, and
+    this clause does not claim more than that module does.
+
+    **An adverse verdict is superseded, never erased.** The verdict is a key
+    segment, so a `pass` cannot overwrite a `fail`. A fail in the window is
+    cleared only by an independent `pass` that names a DIFFERENT head sha and
+    was filed no earlier than the fail — findings are answered by changing the
+    code, and changing the code changes the sha. A second reviewer passing the
+    same sha is not a rebuttal, and neither is the first reviewer changing its
+    own mind on it.
+
+    **The review's date, reviewer and verdict come from the KEY**, never from
+    the body: those are what the store actually holds, and
+    `Store.assert_keys_bind_to_trading_days` already holds the date to a
+    session. A review from outside the window reviewed a superseded state of
+    the code and does not satisfy a later exit.
+    """
+    requirement = (
+        "an independent reviewer recorded `pass` in the window against the commits "
+        "under review, and no adverse verdict in the window is still outstanding"
+    )
+    prefix = review_prefix(phase)
+    days = {day.isoformat() for day in window}
+    keys = sorted(key for key in store.list_keys(prefix) if key.endswith(".json"))
+    if not keys:
+        return Clause(
+            "independently_reviewed",
+            requirement,
+            False,
+            f"no review document under `{prefix}`. No independent adversarial review of "
+            f"{phase} has ever been filed, so this gate has nothing to read (plan §11 "
+            "risk 1)",
+            (prefix,),
+        )
+
+    evidence = tuple(keys)
+    problems: list[str] = []
+    reviews: list[_Review] = []
+    for key in keys:
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            problems.append(read.problem)
+            continue
+        if read.absent:
+            problems.append(f"{key} was listed and then could not be read")
+            continue
+        problem, review = _review_problem(key, prefix, read.document or {})
+        if problem is not None:
+            problems.append(problem)
+            continue
+        if review is not None:
+            reviews.append(review)
+    if problems:
+        return Clause("independently_reviewed", requirement, False, "; ".join(problems), evidence)
+
+    self_reviews = [r for r in reviews if r.is_self_review]
+    independent = [r for r in reviews if not r.is_self_review]
+    in_window = [r for r in independent if r.day in days]
+    stale = [r for r in independent if r.day not in days]
+
+    passes = [r for r in in_window if r.verdict == "pass"]
+    outstanding = [
+        r
+        for r in in_window
+        if r.verdict == "fail"
+        and not any(p.head_sha != r.head_sha and p.day >= r.day for p in passes)
+    ]
+    if outstanding:
+        return Clause(
+            "independently_reviewed",
+            requirement,
+            False,
+            "; ".join(
+                f"{r.key}: `{r.reviewer}` recorded `fail` on {r.head_sha[:12]} — "
+                f"{r.summary or '(no summary)'}, and no later independent pass names a "
+                "different head sha. Findings are answered by changing the code, which "
+                "changes the sha — not by re-recording a pass on this one"
+                for r in sorted(outstanding, key=lambda r: r.key)
+            ),
+            evidence,
+        )
+    if passes:
+        return Clause(
+            "independently_reviewed",
+            requirement,
+            True,
+            "; ".join(
+                f"{r.key}: `pass` from {r.reviewer} on {r.head_sha[:12]}"
+                for r in sorted(passes, key=lambda r: r.key)
+            ),
+            evidence,
+        )
+
+    detail = [
+        f"{r.key}: reviewer `{r.reviewer}` is one of the authors read out of the commits "
+        "reviewed — a self-review is not a review"
+        for r in sorted(self_reviews, key=lambda r: r.key)
+    ] + [
+        f"{r.key}: filed on {r.day}, outside this gate's window"
+        for r in sorted(stale, key=lambda r: r.key)
+    ]
+    return Clause(
+        "independently_reviewed",
+        requirement,
+        False,
+        "; ".join(detail)
+        or f"{len(keys)} review documents under `{prefix}`, none of them an independent "
+        "`pass` in the window",
+        evidence,
+    )
+
+
+def _review_problem(
+    key: str, prefix: str, document: dict[str, Any]
+) -> tuple[str | None, _Review | None]:
+    """Why ``document`` is not a review this clause will read, or the review.
+
+    Every branch is a RED clause, never an exception and never a skip: a review
+    document we cannot read is `no data`, and `no data` is never a pass
+    (principle 7). It is also never silently ignored — a malformed document
+    sitting in the prefix would otherwise let the gate report "no review
+    exists" when what happened is "the producer wrote something we do not
+    understand", and those two name different remedies.
+    """
+    segments = key[len(prefix) :].removesuffix(".json").split("/")
+    if len(segments) != 3:
+        return (
+            f"{key}: not a `{{trading_day}}/{{reviewer}}/{{verdict}}.json` key. A review "
+            "filed under a shape this clause cannot parse is unreadable, not absent",
+            None,
+        )
+    day, reviewer, verdict = segments
+    if document.get("schema_version") != REVIEW_SCHEMA_VERSION:
+        return (
+            f"{key}: schema_version is {document.get('schema_version')!r}, not "
+            f"{REVIEW_SCHEMA_VERSION!r}",
+            None,
+        )
+    # The body must agree with the key. A `fail` body filed under a `pass` key
+    # would be counted as a pass by the key and as a fail by the body, and the
+    # verdict-in-the-key durability would mean nothing.
+    for name, from_key in (("verdict", verdict), ("reviewer", reviewer)):
+        claimed = document.get(name)
+        if not isinstance(claimed, str) or claimed.lower() != from_key:
+            return (
+                f"{key}: body says {name}={claimed!r} while its own key says "
+                f"{from_key!r}. A document that disagrees with the key it was filed "
+                "under is refused, not reconciled",
+                None,
+            )
+    authors = document.get("authors")
+    if not isinstance(authors, list) or not authors or not all(isinstance(a, str) for a in authors):
+        return (
+            f"{key}: authors is {authors!r}, not a non-empty list of identities read out "
+            "of the commits reviewed. An empty author set would make every reviewer "
+            "independent by construction",
+            None,
+        )
+    head_sha = document.get("head_sha")
+    if not isinstance(head_sha, str) or not _SHA_RE.match(head_sha):
+        return (
+            f"{key}: head_sha is {head_sha!r}, not a full 40-hex commit sha. A review "
+            "that does not name what it reviewed grades nothing",
+            None,
+        )
+    return None, _Review(
+        key=key,
+        day=day,
+        verdict=verdict,
+        reviewer=reviewer,
+        authors=frozenset(a.lower() for a in authors),
+        head_sha=head_sha,
+        summary=str(document.get("summary") or ""),
+    )
+
+
 def _phase1(store: Store, window: list[dt.date], registry: dict[str, Component]) -> list[Clause]:
     return [
         _clause_arc_runs_ok(store, window, registry),
@@ -497,6 +736,7 @@ def _phase1(store: Store, window: list[dt.date], registry: dict[str, Component])
         _clause_attribution_renders(store, window),
         _clause_explain_walks_a_verdict(store, window),
         _clause_pointer_flipped_on_smoke(store, window),
+        _clause_independently_reviewed(store, "phase1", window),
     ]
 
 
