@@ -816,9 +816,21 @@ class TestAnEmptyArmSetIsNeverAPass:
         """
         from nousergon_lib.arena.arms import ArmRegister
 
-        from crucible.slots.arms import ArmSpec, write_register
+        from crucible.slots import get_slot
+        from crucible.slots.arms import ArmSpec, control_specs, write_register
 
         register = ArmRegister()
+        # Production registers the slot's two controls beside every filed arm
+        # (`crucible.slots.cycle`, both call sites), and controls are never in
+        # the strategy tree — so the fixture carries them too, or the join
+        # below is proven only on a register production never writes.
+        for control in control_specs(get_slot(slot)):
+            register, _ = register.register(
+                slot=slot,
+                name=control.name,
+                spec=control.spec,
+                created_date=control.registered_at,
+            )
         arm_id = ""
         for name, params in arms:
             field = gate_module.LLM_ARM_CALLSITE_FIELD
