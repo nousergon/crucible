@@ -28,7 +28,6 @@ import ast
 import datetime as dt
 import json
 import re
-import statistics
 from calendar import monthrange
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
@@ -85,7 +84,8 @@ __all__ = [
     "PHASE2_MAX_PAGES",
     "PHASE2_MAX_TAGGED_USD",
     "PHASE2_REPLAY_SATURDAYS",
-    "COST_PACE_WINDOW_DAYS",
+    "COST_LEADING_DAYS",
+    "COST_TRAILING_DAYS",
     "WEEKLY_ANCHORED_GATES",
     "weekly_window",
     "PHASE4_MAX_TOTAL_USD",
@@ -1623,7 +1623,7 @@ def _phase0(
     `GATES` holds one callable shape, and a second signature would be a
     per-gate special case in `evaluate`.
     """
-    _unused((registry,))
+    _unused((registry, trading_day))
     return [
         _clause_old_weekly_within_cadence(store, window),
         _clause_acceptance_suite_committed(),
@@ -2083,12 +2083,18 @@ def _clause_pages_within_ceiling(store: Store, window: list[dt.date]) -> Clause:
     )
 
 
-#: Complete days in the trailing window whose MEDIAN daily spend projects the
-#: rest of the month (`alpha-engine-config-I9927`). One week: long enough that
-#: a single month-boundary accrual is one sample out of seven and cannot move
-#: the median, short enough that a real change of pace shows within a week.
-#: Fewer complete daily periods than this is UNMEASURABLE, never a guess.
-COST_PACE_WINDOW_DAYS = 7
+#: Complete days whose TOTAL is graded against the monthly ceiling
+#: (`alpha-engine-config-I9927`): the ceiling's own period, so a weekly batch
+#: lands in the window four or five times and a month-boundary accrual once,
+#: whatever weekday the gate is read on. Fewer complete daily periods than
+#: this is UNMEASURABLE, never a guess.
+COST_TRAILING_DAYS = 30
+
+#: Complete days in the ungraded leading indicator printed beside the verdict:
+#: the trailing week's mean is the first number to move when the pace changes,
+#: and it is never the verdict — over one week a batch estate reads as a quiet
+#: week six days in seven.
+COST_LEADING_DAYS = 7
 
 
 def _ce_client() -> Any:  # pragma: no cover - constructed only outside tests
@@ -2127,24 +2133,31 @@ def _clause_aws_cost_within_ceiling(
     `$2.50–4.00`/day baseline), so a compliant month reads OVER the line until
     the lump is amortised, deterministically, for most of the month.
 
-    So the clause grades:
+    A projection from a trailing-week MEDIAN was the second cut and was wrong
+    for the estate's real shape: eight of the eleven `components.yaml` rows
+    are Saturday-weekly and the Saturday spot run is the expensive compute, so
+    with one batch day in seven the median is a quiet day by construction —
+    `$60` every Saturday and `$0.20` otherwise (~`$245`/month) projected
+    `$66.00` MET until month-to-date itself crossed the ceiling on the 10th,
+    after the month was blown. Today's daily v1 residue is the only thing that
+    hid it, and it leaves at exactly the phase-4 exit this clause grades.
+
+    So the clause matches the window to the ceiling's own period and grades:
 
     1. **Hard UNMET** when month-to-date spend already exceeds the FULL
-       ceiling. No projection is needed to know a breached month is breached.
-    2. **A projection** otherwise: ``month_to_date + median(daily spend over
-       the trailing COST_PACE_WINDOW_DAYS complete days) x days remaining``,
-       against the full ceiling. The MEDIAN, not the mean, is what makes a
-       day-1 lump inside the trailing week harmless — a mean would inflate
-       the pace by ``days_in_month / 7`` for a week after every lump, which is
-       the pro-rata defect moved one week later. The trailing window may cross
-       a month boundary: a spending pace is a property of the estate, not of
-       the month it is read in, so the projection is measurable on day 1.
-       Fewer than the full window of complete daily periods is UNMEASURABLE.
+       ceiling — the fast path; no trailing read is needed to know a breached
+       month is breached.
+    2. **The trailing COST_TRAILING_DAYS (30) complete days' TOTAL** against
+       the full ceiling. No projection, no mean, no median: thirty days of
+       spend is a month of spend whatever weekday the batch lands on, and the
+       window crosses the month boundary, so it is measurable on day 1 and a
+       month-boundary lump is one day in thirty. Fewer daily periods than
+       days, an unreadable window, or a `$0.00` total is UNMEASURABLE.
 
-    Both figures are in every detail string, so a reader can see which one
-    the verdict rests on. No render ever grades a COMPLETED month — a
-    month-close reading over the prior month is a separate clause
-    (`alpha-engine-config-I9946`), not this one.
+    The trailing COST_LEADING_DAYS (7) mean is PRINTED beside it as an
+    ungraded leading indicator — the number that moves first when the pace
+    changes — never as the verdict. No render ever grades a COMPLETED
+    calendar month; that is a separate clause (`alpha-engine-config-I9946`).
     """
     from crucible.cost import (  # noqa: PLC0415
         CostUnreadableError,
@@ -2155,9 +2168,8 @@ def _clause_aws_cost_within_ceiling(
     scope = f"tagged `{TAG_KEY}={TAG_VALUE}`" if tagged else "the whole account"
     requirement = (
         f"AWS spend for {scope} is at most ${ceiling_usd:.2f}/month, read from Cost "
-        f"Explorer: UNMET once month-to-date exceeds it, otherwise graded on month-to-date "
-        f"plus the median daily spend of the trailing {COST_PACE_WINDOW_DAYS} complete days "
-        "projected over the days remaining"
+        f"Explorer: UNMET once month-to-date exceeds it, otherwise graded on the total of "
+        f"the trailing {COST_TRAILING_DAYS} complete days"
     )
     evidence = ("ce:GetCostAndUsage",)
     try:
@@ -2203,7 +2215,6 @@ def _clause_aws_cost_within_ceiling(
     # interval length: a reading taken on the 1st covers one day, not zero.
     days_elapsed = (reading.end - reading.start).days
     days_in_month = monthrange(reading.start.year, reading.start.month)[1]
-    days_remaining = days_in_month - days_elapsed
     month_to_date = (
         f"${reading.amount_usd:.2f} month-to-date for {reading.scope} over {days_elapsed} of "
         f"{days_in_month} days ({reading.start.isoformat()}..{reading.end.isoformat()})"
@@ -2218,47 +2229,50 @@ def _clause_aws_cost_within_ceiling(
         )
     try:
         trailing = trailing_daily_usd(
-            _ce_client(), today=window[-1], days=COST_PACE_WINDOW_DAYS, tagged=tagged
+            _ce_client(), today=window[-1], days=COST_TRAILING_DAYS, tagged=tagged
         )
     except CostUnreadableError as exc:
         return _unmeasurable(
             name,
             requirement,
             f"{month_to_date}: under the ceiling so far, but the trailing "
-            f"{COST_PACE_WINDOW_DAYS}-day pace could not be read — CostUnreadableError: {exc}",
+            f"{COST_TRAILING_DAYS}-day total could not be read — CostUnreadableError: {exc}",
             evidence,
         )
     except Exception as exc:
         return _unmeasurable(
             name,
             requirement,
-            f"{month_to_date}: under the ceiling so far, but the trailing pace read failed: "
-            f"{type(exc).__name__}: {exc}. That is a statement about our access, not about "
-            "what was spent",
+            f"{month_to_date}: under the ceiling so far, but the trailing "
+            f"{COST_TRAILING_DAYS}-day read failed: {type(exc).__name__}: {exc}. That is a "
+            "statement about our access, not about what was spent",
             evidence,
         )
     if trailing.total_usd == 0.0:
-        # The `$0.00` trap again, on the pace window: seven free days is what
-        # an untagged estate returns for the tagged scope, and what a broken
-        # daily read returns for either.
+        # The `$0.00` trap again, on the trailing window: thirty free days is
+        # what an untagged estate returns for the tagged scope, and what a
+        # broken daily read returns for either.
         return _unmeasurable(
             name,
             requirement,
-            f"{month_to_date}: the trailing {COST_PACE_WINDOW_DAYS} complete days "
+            f"{month_to_date}: the trailing {COST_TRAILING_DAYS} complete days "
             f"({trailing.start.isoformat()}..{trailing.end.isoformat()}) read exactly $0.00, "
-            "which is what a misfiltered or broken daily read returns as well as a free week",
+            "which is what a misfiltered or broken daily read returns as well as a free month",
             evidence,
         )
-    median_daily = statistics.median(trailing.amounts_usd)
-    projected = reading.amount_usd + median_daily * days_remaining
-    projection = (
-        f"projected ${projected:.2f} for the month = month-to-date + median "
-        f"${median_daily:.2f}/day over {trailing.start.isoformat()}..{trailing.end.isoformat()} "
-        f"x {days_remaining} days remaining, ceiling ${ceiling_usd:.2f}"
+    leading = trailing.amounts_usd[-COST_LEADING_DAYS:]
+    leading_mean = sum(leading) / len(leading)
+    trailing_total = (
+        f"trailing {COST_TRAILING_DAYS} complete days "
+        f"({trailing.start.isoformat()}..{trailing.end.isoformat()}) ${trailing.total_usd:.2f}, "
+        f"ceiling ${ceiling_usd:.2f}; leading indicator, ungraded: trailing "
+        f"{COST_LEADING_DAYS}-day mean ${leading_mean:.2f}/day"
     )
-    if projected > ceiling_usd:
-        return Clause(name, requirement, False, f"{month_to_date}; {projection}: OVER", evidence)
-    return Clause(name, requirement, True, f"{month_to_date}; {projection}: under", evidence)
+    if trailing.total_usd > ceiling_usd:
+        return Clause(
+            name, requirement, False, f"{month_to_date}; {trailing_total}: OVER", evidence
+        )
+    return Clause(name, requirement, True, f"{month_to_date}; {trailing_total}: under", evidence)
 
 
 def _phase2(
@@ -2269,6 +2283,7 @@ def _phase2(
     trading_day: dt.date,
 ) -> list[Clause]:
     """Phase 2's exit gate (plan §6 row 2, §6.1's ruled minimum)."""
+    _unused((trading_day,))
     return [
         _clause_live_saturdays_first_attempt_ok(store, window),
         _clause_replays_ok(store, window, registry),
@@ -2480,7 +2495,7 @@ def _phase3(
     trading_day: dt.date,
 ) -> list[Clause]:
     """Phase 3's exit gate (plan §6 row 3), one clause per slot in `SLOTS`."""
-    _unused((registry,))
+    _unused((registry, trading_day))
     return [_clause_slot_promotion_or_non_promotion(store, slot, window) for slot in sorted(SLOTS)]
 
 
@@ -2558,7 +2573,7 @@ def _phase4(
     trading_day: dt.date,
 ) -> list[Clause]:
     """Phase 4's exit gate (plan §6 row 4)."""
-    _unused((registry,))
+    _unused((registry, trading_day))
     return [
         _clause_trader_week_on_v2_champion(store, window),
         _clause_aws_cost_within_ceiling(
@@ -2730,7 +2745,7 @@ def _phase5(
     trading_day: dt.date,
 ) -> list[Clause]:
     """Phase 5's exit gate (plan §6 row 5)."""
-    _unused((registry,))
+    _unused((registry, trading_day))
     return [_clause_every_llm_arm_has_a_verdict(store, window)]
 
 
