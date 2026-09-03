@@ -314,14 +314,16 @@ BOARD_URL_CAVEAT = (
 #: list is the board, beside the phase ladder's own six rows. A path, not a
 #: host — the host is `CRUCIBLE_CONSOLE_URL` (`crucible.config`), which this
 #: tree carries no default for.
-BOARD_CONSOLE_PATH = "/decision"
+BOARD_CONSOLE_PATH = "/decision?pipeline=crucible/board"
 
 #: Rendered beside the console link. It says what the presigned caveat could
-#: not: the address does not expire. It also says where the rows come from,
-#: so a reader comparing the two surfaces knows they are one document.
+#: not: the address does not expire. It also says what the page IS — the
+#: console's Decision kind filtered to this board's rows — and where those
+#: rows come from, so a reader comparing the two surfaces knows they are one
+#: document.
 BOARD_CONSOLE_CAVEAT = (
-    "fleet console — stable address, no expiry; "
-    "renders the same board/current.json this message is read from"
+    "fleet console — the Decision list filtered to this board; stable address, "
+    "no expiry; renders the same board/current.json this message is read from"
 )
 
 #: The line emitted when there is no page to link to. FAILURE MODE SWALLOWED:
@@ -695,8 +697,10 @@ def read_inputs(
     board_console_url: str | None = None
     if console_url:
         board_console_url = console_url.rstrip("/") + BOARD_CONSOLE_PATH
-        board_url, board_url_denied_code = None, None
-        board_url_expires = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # No presign was taken, so there is no expiry to report — an empty
+        # string, not a stamp that would read as a bound on a link that has
+        # none (review C1).
+        board_url, board_url_denied_code, board_url_expires = None, None, ""
     else:
         board_url, board_url_expires, board_url_denied_code = _board_url(store, now=moment)
 
@@ -1004,8 +1008,9 @@ def _fit(lines: list[_Line]) -> str:
 
     RESIDUAL, stated rather than hidden: if the :data:`_URL` lines ALONE
     exceeded the budget nothing here could drop them, and the returned body
-    would be over the cap. That block is one heading, one presigned URL and
-    one fixed caveat — bounded, and
+    would be over the cap. That block is one heading, one URL (presigned, or
+    the console's :data:`BOARD_CONSOLE_PATH` when a console is configured) and
+    one fixed caveat for whichever it is — bounded in both variants, and
     `tests/test_morning.py::TestTheWireBodyFitsTheCap::
     test_the_url_block_alone_fits_the_cap` asserts the bound, so the case is
     measured rather than assumed away.

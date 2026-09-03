@@ -1021,7 +1021,22 @@ class TestTheConsoleLinkReplacesThePresignedOne:
     def test_the_console_url_is_the_link(self, tmp_path):
         store = _seed(tmp_path, previous=_board())
         message = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
-        assert f"  {self.CONSOLE}/decision\n" in message
+        assert f"  {self.CONSOLE}/decision?pipeline=crucible/board\n" in message
+
+    def test_the_link_is_the_decision_list_filtered_to_this_board(self):
+        # Every board row carries `surface: crucible/board`, which the console
+        # fragment lifts onto the `pipeline` facet; the filter is what makes
+        # the address THIS board's rather than every Decision in the fleet.
+        from crucible.morning import BOARD_CONSOLE_PATH
+
+        assert BOARD_CONSOLE_PATH == "/decision?pipeline=crucible/board"
+
+    def test_no_expiry_is_reported_when_nothing_was_presigned(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
+        assert inputs.board_url is None
+        assert inputs.board_url_expires == ""
+        assert inputs.board_console_url == f"{self.CONSOLE}/decision?pipeline=crucible/board"
 
     def test_the_presigned_link_and_its_caveat_are_absent(self, tmp_path):
         store = _seed(tmp_path, previous=_board())
@@ -1040,7 +1055,7 @@ class TestTheConsoleLinkReplacesThePresignedOne:
     def test_a_trailing_slash_on_the_base_url_does_not_double_up(self, tmp_path):
         store = _seed(tmp_path, previous=_board())
         message = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE + "/")
-        assert f"{self.CONSOLE}/decision" in message
+        assert f"{self.CONSOLE}/decision?pipeline=crucible/board" in message
         assert f"{self.CONSOLE}//decision" not in message
 
     def test_the_page_is_not_read_when_a_console_is_configured(self, tmp_path):
@@ -1232,13 +1247,32 @@ class TestTheWireBodyFitsTheCap:
         message = run_report(store, trading_day=DAY, now=FIRED_AT)
         assert self._wire(message) <= MESSAGE_MAX_CHARS
 
+    def test_the_console_url_block_alone_fits_the_cap(self, tmp_path):
+        """The console variant of the residual below (`alpha-engine-config-
+        I9926`): one heading, the console address and its fixed caveat. The
+        caveat is the longer of the two, so this is the bound that matters
+        once `CRUCIBLE_CONSOLE_URL` is set."""
+        from crucible.morning import _URL, _board_lines, wire_length
+
+        inputs = read_inputs(
+            _seed(tmp_path, previous=_board()),
+            trading_day=DAY,
+            now=FIRED_AT,
+            console_url="https://console.example.test",
+        )
+        block = _board_lines(inputs)
+        assert block and all(tier == _URL for _, tier in block)
+        pinned = "\n".join(["", SECTIONS[-1], *(text for text, _ in block)])
+        assert wire_length(pinned) < MESSAGE_MAX_CHARS // 4
+
     def test_the_url_block_alone_fits_the_cap(self, tmp_path):
         """`_fit`'s stated residual, measured rather than assumed away.
 
         The `_URL` tier is never dropped, so if it alone exceeded the budget
         nothing could bring the message under the cap. It is one heading, one
-        presigned URL and one fixed caveat — this asserts that bound holds on
-        a real render rather than trusting that it is obviously small.
+        URL (presigned here; the console variant is the test above) and one
+        fixed caveat — this asserts that bound holds on a real render rather
+        than trusting that it is obviously small.
         """
         from crucible.morning import _URL, _board_lines
 
