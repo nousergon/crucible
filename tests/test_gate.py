@@ -46,6 +46,14 @@ from crucible.weekly import arc_stages
 
 FRIDAY = dt.date(2026, 8, 28)
 WINDOW = [FRIDAY - dt.timedelta(weeks=n) for n in reversed(range(5))]
+#: The day the phase-1 gate is RENDERED in these tests — a Wednesday, not a
+#: weekly close. `weekly_window(RENDER_DAY, 5)` is exactly `WINDOW`: the five
+#: Friday closes strictly before it. Rendering on `FRIDAY` itself would anchor
+#: one week earlier (strictly before), and rendering on the same weekday the
+#: artifacts are keyed to is the shape that hid `alpha-engine-config-I9904`
+#: from this suite — a render-keyed window and an anchored one are
+#: indistinguishable when the fixture renders on a Friday.
+RENDER_DAY = dt.date(2026, 9, 2)
 SHA = "a" * 40
 REVIEWER = "session_01ReviewerBBBBB"
 
@@ -180,7 +188,7 @@ class TestVacuity:
         """The one answer a gate must never give. Every clause is unmet with
         the missing artifact named, so the operator's next action is in the
         output."""
-        result = evaluate(LocalStore(tmp_path), gate="phase1", trading_day=FRIDAY)
+        result = evaluate(LocalStore(tmp_path), gate="phase1", trading_day=RENDER_DAY)
         assert not result.met
         assert result.met_ratio == 0.0
         assert all(not c.met for c in result.clauses)
@@ -194,7 +202,7 @@ class TestVacuity:
         from "we never measured" (alpha-engine-config-I9824)."""
         from crucible.gate import GateResult
 
-        empty = GateResult(gate="phase1", trading_day=FRIDAY, window=WINDOW)
+        empty = GateResult(gate="phase1", trading_day=RENDER_DAY, window=WINDOW)
         assert empty.met_ratio is None
         assert empty.to_dict()["met_ratio"] is None
         assert not empty.met
@@ -206,15 +214,70 @@ class TestVacuity:
 
     def test_a_window_of_zero_weeks_is_refused(self, tmp_path) -> None:
         with pytest.raises(ValueError, match="measures nothing"):
-            evaluate(LocalStore(tmp_path), gate="phase1", trading_day=FRIDAY, weeks=0)
+            evaluate(LocalStore(tmp_path), gate="phase1", trading_day=RENDER_DAY, weeks=0)
 
 
 class TestPhaseOne:
     def test_the_seeded_store_meets_every_clause(self, tmp_path) -> None:
-        result = evaluate(_seed_met(tmp_path), gate="phase1", trading_day=FRIDAY)
+        result = evaluate(_seed_met(tmp_path), gate="phase1", trading_day=RENDER_DAY)
         assert result.met, result.render()
         assert result.met_ratio == 1.0
         assert len(result.window) == GATES["phase1"][0]
+
+    @pytest.mark.parametrize(
+        "render_day",
+        [
+            dt.date(2026, 8, 31),  # Monday
+            dt.date(2026, 9, 1),  # Tuesday
+            dt.date(2026, 9, 2),  # Wednesday
+            dt.date(2026, 9, 3),  # Thursday
+            dt.date(2026, 9, 4),  # Friday — strictly before, so still 08-28
+        ],
+        ids=["mon", "tue", "wed", "thu", "fri"],
+    )
+    def test_every_render_weekday_reads_the_same_five_friday_closes(
+        self, tmp_path, render_day: dt.date
+    ) -> None:
+        """`alpha-engine-config-I9904`: the window is anchored to weekly
+        closes, so the key set does not depend on which weekday the board
+        rendered. Before this, the gate read five Wednesdays on a Wednesday
+        and could not see the Friday-keyed replays — MET one day in five."""
+        result = evaluate(_seed_met(tmp_path), gate="phase1", trading_day=render_day)
+        assert result.window == WINDOW, result.render()
+        assert result.trading_day == render_day
+        assert result.met, result.render()
+
+    def test_the_raw_render_window_is_not_what_the_gate_reads(self, tmp_path) -> None:
+        """The negative half: manifests filed at the RENDER weekday's dates
+        satisfy nothing, because no weekly run is ever keyed there."""
+        store = LocalStore(tmp_path)
+        for day in [RENDER_DAY - dt.timedelta(weeks=n) for n in reversed(range(5))]:
+            for stage in arc_stages(day):
+                _put(
+                    store,
+                    manifest_key(stage.job, day.isoformat(), discriminator=stage.slot),
+                    _manifest(),
+                )
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
+        clause = next(c for c in result.clauses if c.name == "arc_runs_ok")
+        assert not clause.met
+        assert "never ran" in clause.detail
+        assert RENDER_DAY.isoformat() not in " ".join(result.to_dict()["window"])
+
+    def test_a_review_filed_on_a_weekday_is_still_seen(self, tmp_path) -> None:
+        """A review is keyed to the day it was WRITTEN, on any weekday, so the
+        anchored window alone would hide a Wednesday review; the clause reads
+        every session in the span instead."""
+        store = _seed_met(tmp_path)
+        (tmp_path / review_key("phase1", FRIDAY.isoformat(), REVIEWER, "pass")).unlink()
+        _put(
+            store,
+            review_key("phase1", dt.date(2026, 8, 26).isoformat(), REVIEWER, "pass"),
+            _review(),
+        )
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
+        clause = next(c for c in result.clauses if c.name == "independently_reviewed")
+        assert clause.met, clause.detail
 
     def test_one_failed_stage_in_one_week_fails_the_gate(self, tmp_path) -> None:
         store = _seed_met(tmp_path)
@@ -223,7 +286,7 @@ class TestPhaseOne:
             manifest_key("report", WINDOW[2].isoformat()),
             _manifest("failed", reason="MissingSourceError: yfinance returned no rows"),
         )
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         assert not result.met
         clause = next(c for c in result.clauses if c.name == "arc_runs_ok")
         assert not clause.met
@@ -234,7 +297,7 @@ class TestPhaseOne:
         absent manifest read as `no news` is how five weeks of nothing pass."""
         store = _seed_met(tmp_path)
         (tmp_path / manifest_key("drift", WINDOW[0].isoformat())).unlink()
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "arc_runs_ok")
         assert not clause.met
         assert "never ran" in clause.detail
@@ -244,7 +307,7 @@ class TestPhaseOne:
         store.put_bytes(
             arm_register_key("r"), _register_lines("r", [("alpha", "abc123"), ("beta", "def456")])
         )
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "arms_all_scored")
         assert not clause.met
         assert "r:beta:def456" in clause.detail
@@ -258,7 +321,7 @@ class TestPhaseOne:
             arena_cycle_key("m", FRIDAY.isoformat()),
             {"scored_arms": ["m:alpha:abc123"], "active_arms": ["m:alpha:abc123"]},
         )
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "arms_all_scored")
         assert not clause.met
         assert "control" in clause.detail
@@ -271,14 +334,14 @@ class TestPhaseOne:
         ]
         rows.append({"name": "row4", "value": None, "status": "OK", "status_reason": ""})
         _put(store, attribution_key(FRIDAY.isoformat()), {"rows": rows})
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         assert not next(c for c in result.clauses if c.name == "attribution_renders").met
 
     def test_an_explain_run_that_read_no_verdict_does_not_satisfy_the_walk(self, tmp_path) -> None:
         store = _seed_met(tmp_path)
         for day in WINDOW:
             _put(store, manifest_key("explain", day.isoformat()), _manifest(inputs=[]))
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         assert not next(c for c in result.clauses if c.name == "explain_walks_a_verdict").met
 
     def test_a_pointer_with_no_matching_smoke_fails(self, tmp_path) -> None:
@@ -286,13 +349,13 @@ class TestPhaseOne:
         and a pointer moved on evidence are the same bytes."""
         store = _seed_met(tmp_path)
         _put(store, "releases/current", {"sha": "b" * 40})
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         assert not next(c for c in result.clauses if c.name == "pointer_flipped_on_smoke").met
 
     def test_a_failed_smoke_does_not_satisfy_the_pointer_clause(self, tmp_path) -> None:
         store = _seed_met(tmp_path)
         _put(store, manifest_key("smoke", FRIDAY.isoformat()), _manifest("failed", reason="boom"))
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         assert not next(c for c in result.clauses if c.name == "pointer_flipped_on_smoke").met
 
 
@@ -323,7 +386,7 @@ class TestPhaseOneGuardedReads:
         store = _seed_met(tmp_path)
         key = manifest_key("report", WINDOW[2].isoformat())
         store.put_bytes(key, body)
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "arc_runs_ok")
         assert not clause.met
         assert key in clause.detail
@@ -336,7 +399,7 @@ class TestPhaseOneGuardedReads:
         store = _seed_met(tmp_path)
         key = arena_cycle_key("m", FRIDAY.isoformat())
         store.put_bytes(key, body)
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "arms_all_scored")
         assert not clause.met
         assert key in clause.detail
@@ -349,7 +412,7 @@ class TestPhaseOneGuardedReads:
         store = _seed_met(tmp_path)
         key = attribution_key(FRIDAY.isoformat())
         store.put_bytes(key, body)
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "attribution_renders")
         assert not clause.met
         assert key in clause.detail
@@ -366,7 +429,7 @@ class TestPhaseOneGuardedReads:
         key = manifest_key("explain", FRIDAY.isoformat())
         for day in WINDOW:
             store.put_bytes(manifest_key("explain", day.isoformat()), body)
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "explain_walks_a_verdict")
         assert not clause.met
         assert key in clause.detail
@@ -376,7 +439,7 @@ class TestPhaseOneGuardedReads:
     def test_pointer_malformed_is_a_red_reading(self, tmp_path, body: bytes, expected: str) -> None:
         store = _seed_met(tmp_path)
         store.put_bytes("releases/current", body)
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "pointer_flipped_on_smoke")
         assert not clause.met
         assert "releases/current" in clause.detail
@@ -389,7 +452,7 @@ class TestPhaseOneGuardedReads:
         store = _seed_met(tmp_path)
         key = manifest_key("smoke", FRIDAY.isoformat())
         store.put_bytes(key, body)
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "pointer_flipped_on_smoke")
         assert not clause.met
         assert key in clause.detail
@@ -402,7 +465,7 @@ class TestPhaseOneGuardedReads:
         store = _seed_met(tmp_path)
         key = manifest_key("report", WINDOW[2].isoformat())
         _put(store, key, {"reason": ""})
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "arc_runs_ok")
         assert not clause.met
         assert key in clause.detail
@@ -413,7 +476,7 @@ class TestPhaseOneGuardedReads:
         store = _seed_met(tmp_path)
         key = manifest_key("report", WINDOW[2].isoformat())
         _put(store, key, {"status": "failed"})
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "arc_runs_ok")
         assert not clause.met
         assert key in clause.detail
@@ -423,7 +486,7 @@ class TestPhaseOneGuardedReads:
         store = _seed_met(tmp_path)
         key = arena_cycle_key("m", FRIDAY.isoformat())
         _put(store, key, {"active_arms": []})
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "arms_all_scored")
         assert not clause.met
         assert key in clause.detail
@@ -434,7 +497,7 @@ class TestPhaseOneGuardedReads:
         key = manifest_key("explain", FRIDAY.isoformat())
         for day in WINDOW:
             _put(store, manifest_key("explain", day.isoformat()), {"inputs": []})
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "explain_walks_a_verdict")
         assert not clause.met
         assert key in clause.detail
@@ -444,7 +507,7 @@ class TestPhaseOneGuardedReads:
         store = _seed_met(tmp_path)
         key = manifest_key("smoke", FRIDAY.isoformat())
         _put(store, key, {"release_sha": SHA})
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "pointer_flipped_on_smoke")
         assert not clause.met
         assert key in clause.detail
@@ -513,7 +576,7 @@ class TestPhaseOneGuardedReadsRound2:
         store = _seed_met(tmp_path)
         key = arm_register_key("m")
         store.put_bytes(key, b"{not json\n")
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "arms_all_scored")
         assert not clause.met
         assert key in clause.detail
@@ -526,7 +589,7 @@ class TestPhaseOneGuardedReadsRound2:
         store.put_bytes(key, b'{"kind": "registered"}\n[1, 2]\n')
         clause = next(
             c
-            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(store, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "arms_all_scored"
         )
         assert not clause.met
@@ -568,7 +631,7 @@ class TestPhaseOneGuardedReadsRound2:
         assert "arms_all_scored" in printed
         # And still nothing was written -- the store guard as backstop,
         # `dry_run` reaching the print as the primary path.
-        assert not store.exists(gate_key("phase1", FRIDAY.isoformat()))
+        assert not store.exists(gate_key("phase1", RENDER_DAY.isoformat()))
         assert not store.exists(LADDER_KEY)
 
     # -- finding 2: BLOCKING — the guard checked container type only; a
@@ -580,7 +643,7 @@ class TestPhaseOneGuardedReadsRound2:
         _put(store, key, {"rows": 5})
         clause = next(
             c
-            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(store, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "attribution_renders"
         )
         assert not clause.met
@@ -592,7 +655,7 @@ class TestPhaseOneGuardedReadsRound2:
         _put(store, key, {"rows": ["a", "b", "c", "d", "e"]})
         clause = next(
             c
-            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(store, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "attribution_renders"
         )
         assert not clause.met
@@ -603,7 +666,7 @@ class TestPhaseOneGuardedReadsRound2:
         _put(store, key, {"scored_arms": [{"a": 1}], "active_arms": []})
         clause = next(
             c
-            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(store, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "arms_all_scored"
         )
         assert not clause.met
@@ -614,7 +677,7 @@ class TestPhaseOneGuardedReadsRound2:
         _put(store, "releases/current", {"sha": 12345})
         clause = next(
             c
-            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(store, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "pointer_flipped_on_smoke"
         )
         assert not clause.met
@@ -628,7 +691,7 @@ class TestPhaseOneGuardedReadsRound2:
         _put(store, "releases/current", {})
         clause = next(
             c
-            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(store, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "pointer_flipped_on_smoke"
         )
         assert not clause.met
@@ -647,7 +710,7 @@ class TestPhaseOneGuardedReadsRound2:
         key = manifest_key("explain", FRIDAY.isoformat())
         for day in WINDOW:
             _put(store, manifest_key("explain", day.isoformat()), _manifest(inputs=5))
-        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "explain_walks_a_verdict")
         assert not clause.met
         assert key in clause.detail
@@ -662,7 +725,7 @@ class TestPhaseOneGuardedReadsRound2:
         _put(store, key, {"status": "degraded", "reason": ""})
         clause = next(
             c
-            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(store, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "arc_runs_ok"
         )
         assert not clause.met
@@ -675,7 +738,7 @@ class TestPhaseOneGuardedReadsRound2:
         _put(store, key, {"status": 3, "reason": ""})
         clause = next(
             c
-            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(store, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "arc_runs_ok"
         )
         assert not clause.met
@@ -687,7 +750,7 @@ class TestPhaseOneGuardedReadsRound2:
         _put(store, key, {"status": "ok", "reason": "x"})
         clause = next(
             c
-            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(store, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "arc_runs_ok"
         )
         assert not clause.met, "status `ok` with a non-empty reason read MET"
@@ -698,7 +761,7 @@ class TestPhaseOneGuardedReadsRound2:
         _put(store, key, {"status": None, "reason": ""})
         clause = next(
             c
-            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(store, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "arc_runs_ok"
         )
         assert not clause.met
@@ -719,7 +782,7 @@ class TestPhaseOneGuardedReadsRound2:
             )
         clause = next(
             c
-            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(store, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "explain_walks_a_verdict"
         )
         assert not clause.met
@@ -732,7 +795,7 @@ class TestPhaseOneGuardedReadsRound2:
         _put(store, key, {"status": "degraded", "reason": ""})
         clause = next(
             c
-            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(store, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "pointer_flipped_on_smoke"
         )
         assert not clause.met
@@ -746,7 +809,7 @@ class TestPhaseOneGuardedReadsRound2:
         key = manifest_key("report", WINDOW[2].isoformat())
         _seed_met(tmp_path)
         denied = _AccessDenied(tmp_path, denied_key=key)
-        result = evaluate(denied, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(denied, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "arc_runs_ok")
         assert not clause.met
         assert clause.unmeasurable
@@ -759,10 +822,12 @@ class TestPhaseOneGuardedReadsRound2:
         key = manifest_key("report", WINDOW[2].isoformat())
         _seed_met(tmp_path)
         denied = _AccessDenied(tmp_path, denied_key=key)
-        result = evaluate(denied, gate="phase1", trading_day=FRIDAY)
+        result = evaluate(denied, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "arc_runs_ok")
         assert clause.unmeasurable
-        rows = {r["phase"]: r for r in build_ladder(denied, trading_day=FRIDAY).to_dict()["phases"]}
+        rows = {
+            r["phase"]: r for r in build_ladder(denied, trading_day=RENDER_DAY).to_dict()["phases"]
+        }
         # Round 3 (`alpha-engine-config-I9869`, finding 4): an unmeasurable
         # clause now renders the ROW as UNMEASURABLE, not UNMET — "we could
         # not measure" and "we measured and it fell short" are different
@@ -778,7 +843,7 @@ class TestPhaseOneGuardedReadsRound2:
         denied = _AccessDenied(tmp_path, denied_key=key)
         clause = next(
             c
-            for c in evaluate(denied, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(denied, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "arms_all_scored"
         )
         assert not clause.met
@@ -790,13 +855,13 @@ class TestPhaseOneGuardedReadsRound2:
         denied = _AccessDenied(tmp_path, denied_key=key)
         clause = next(
             c
-            for c in evaluate(denied, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(denied, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "arc_runs_ok"
         )
         assert clause.to_dict()["unmeasurable"] is True
 
     def test_a_met_clause_defaults_unmeasurable_false(self, tmp_path) -> None:
-        result = evaluate(_seed_met(tmp_path), gate="phase1", trading_day=FRIDAY)
+        result = evaluate(_seed_met(tmp_path), gate="phase1", trading_day=RENDER_DAY)
         assert all(not c.unmeasurable for c in result.clauses)
 
 
@@ -816,7 +881,7 @@ class TestPhaseOneGuardedReadsRound3:
         denied = _ListDenied(tmp_path, denied_prefix=runs_prefix("smoke"))
         clause = next(
             c
-            for c in evaluate(denied, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(denied, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "pointer_flipped_on_smoke"
         )
         assert not clause.met
@@ -829,7 +894,7 @@ class TestPhaseOneGuardedReadsRound3:
         denied = _ListDenied(tmp_path, denied_prefix=review_prefix("phase1"))
         clause = next(
             c
-            for c in evaluate(denied, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(denied, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "independently_reviewed"
         )
         assert not clause.met
@@ -848,7 +913,9 @@ class TestPhaseOneGuardedReadsRound3:
     def test_a_listing_access_failure_does_not_take_the_ladder_down(self, tmp_path) -> None:
         _seed_met(tmp_path)
         denied = _ListDenied(tmp_path, denied_prefix=runs_prefix("smoke"))
-        rows = {r["phase"]: r for r in build_ladder(denied, trading_day=FRIDAY).to_dict()["phases"]}
+        rows = {
+            r["phase"]: r for r in build_ladder(denied, trading_day=RENDER_DAY).to_dict()["phases"]
+        }
         assert rows["phase1"]["state"] == "UNMEASURABLE"
 
     # -- finding 3: BLOCKING — `_clause_independently_reviewed` ignored
@@ -861,7 +928,7 @@ class TestPhaseOneGuardedReadsRound3:
         denied = _AccessDenied(tmp_path, denied_key=key)
         clause = next(
             c
-            for c in evaluate(denied, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(denied, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "independently_reviewed"
         )
         assert not clause.met
@@ -895,7 +962,7 @@ class TestPhaseOneGuardedReadsRound3:
         (tmp_path / missing_key).unlink()
         clause = next(
             c
-            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(store, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "arms_all_scored"
         )
         assert not clause.met
@@ -913,7 +980,7 @@ class TestPhaseOneGuardedReadsRound3:
         store.put_bytes(register_key, b"{not json\n")
         clause = next(
             c
-            for c in evaluate(store, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(store, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "arms_all_scored"
         )
         assert clause.detail.count(register_key) == 1
@@ -932,7 +999,7 @@ class TestPhaseOneGuardedReadsRound3:
         denied = _AccessDenied(tmp_path, denied_key=denied_key)
         clause = next(
             c
-            for c in evaluate(denied, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(denied, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "arc_runs_ok"
         )
         assert not clause.met
@@ -950,7 +1017,7 @@ class TestPhaseOneGuardedReadsRound3:
         (tmp_path / missing_key).unlink()
         clause = next(
             c
-            for c in evaluate(denied, gate="phase1", trading_day=FRIDAY).clauses
+            for c in evaluate(denied, gate="phase1", trading_day=RENDER_DAY).clauses
             if c.name == "arms_all_scored"
         )
         assert not clause.met
@@ -959,7 +1026,7 @@ class TestPhaseOneGuardedReadsRound3:
 
 class TestArtifact:
     def test_the_reading_serializes_with_its_window_and_every_clause(self, tmp_path) -> None:
-        document = evaluate(_seed_met(tmp_path), gate="phase1", trading_day=FRIDAY).to_dict()
+        document = evaluate(_seed_met(tmp_path), gate="phase1", trading_day=RENDER_DAY).to_dict()
         assert document["window"] == [d.isoformat() for d in WINDOW]
         assert document["met"] is True
         assert {c["name"] for c in document["clauses"]} == {
@@ -978,7 +1045,7 @@ class TestArtifact:
         )
 
     def test_the_render_names_the_unmet_clauses(self, tmp_path) -> None:
-        text = evaluate(LocalStore(tmp_path), gate="phase1", trading_day=FRIDAY).render()
+        text = evaluate(LocalStore(tmp_path), gate="phase1", trading_day=RENDER_DAY).render()
         assert "NOT MET" in text
         assert "arc_runs_ok" in text
 
@@ -997,19 +1064,21 @@ class TestTheGateJobPublishesAnHonestMetric:
 
         monkeypatch.setitem(GATES, "phase1", (5, lambda *_a, **_k: []))
         store_uri = str(tmp_path)
-        args = argparse.Namespace(gate="phase1", trading_day=FRIDAY, weeks=None, store=store_uri)
+        args = argparse.Namespace(
+            gate="phase1", trading_day=RENDER_DAY, weeks=None, store=store_uri
+        )
         exit_code = gate_handler(args)
         assert exit_code == 1  # unmet, per the fail-loud-on-exit-code invariant
 
         store = LocalStore(tmp_path)
-        manifest = json.loads(store.get_bytes(f"runs/gate/{FRIDAY.isoformat()}/run.json"))
+        manifest = json.loads(store.get_bytes(f"runs/gate/{RENDER_DAY.isoformat()}/run.json"))
         (metric,) = [m for m in manifest["metrics"] if m["name"] == "gate_clauses_met_ratio"]
         assert metric["value"] is None
         assert metric["status"].startswith("N/A")
         assert metric["status_reason"]
         assert metric["status"] != "0.0"
 
-        gate_artifact = json.loads(store.get_bytes(gate_key("phase1", FRIDAY.isoformat())))
+        gate_artifact = json.loads(store.get_bytes(gate_key("phase1", RENDER_DAY.isoformat())))
         assert gate_artifact["met_ratio"] is None
 
     def test_a_real_measurement_still_publishes_its_ratio_as_a_number(
@@ -1030,11 +1099,13 @@ class TestTheGateJobPublishesAnHonestMetric:
             (5, lambda *_a, **_k: [Clause("c", "req", False, "unmet", ())]),
         )
         store_uri = str(tmp_path)
-        args = argparse.Namespace(gate="phase1", trading_day=FRIDAY, weeks=None, store=store_uri)
+        args = argparse.Namespace(
+            gate="phase1", trading_day=RENDER_DAY, weeks=None, store=store_uri
+        )
         gate_handler(args)
 
         store = LocalStore(tmp_path)
-        manifest = json.loads(store.get_bytes(f"runs/gate/{FRIDAY.isoformat()}/run.json"))
+        manifest = json.loads(store.get_bytes(f"runs/gate/{RENDER_DAY.isoformat()}/run.json"))
         (metric,) = [m for m in manifest["metrics"] if m["name"] == "gate_clauses_met_ratio"]
         assert metric["value"] == 0.0
         assert not metric["status"].startswith("N/A")
@@ -1443,7 +1514,7 @@ class TestPhaseZeroSaysWhatItDoesNotGrade:
     def test_a_gate_with_no_declared_deliverables_gets_no_coverage_line(self, tmp_path) -> None:
         """Silence is "not declared", never "grades everything". Phase 1
         declares no deliverable table, so it publishes no claim about one."""
-        result = evaluate(LocalStore(tmp_path), gate="phase1", trading_day=FRIDAY)
+        result = evaluate(LocalStore(tmp_path), gate="phase1", trading_day=RENDER_DAY)
         assert result.coverage is None
         assert result.to_dict()["coverage"] is None
 
