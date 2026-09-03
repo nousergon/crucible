@@ -15,16 +15,34 @@ frozen to the generic :class:`~crucible.store.Store` interface by design
 (`Store`'s own class docstring: "anything larger is a backend feature
 leaking into the callers and pinning us to one provider"). Object Lock
 retention is exactly such a backend feature: it has no `LocalStore` analogue
-at all, so this module reaches `S3Store.client.head_object` directly — the
-same way `release.py`'s pre-I9787 `_lock_release_object` reached the client
-— rather than widening `Store` for a single caller.
+at all, so this module reaches `S3Store.client` directly, rather than
+widening `Store` for a single caller.
 
-A read is a **typed reading**, never a swallowed exception. A
-`head_object` `AccessDenied` is UNMEASURABLE, not UNMET: reporting it as
+**`GetObjectRetention`, never `HeadObject`, for the retention fields**
+(alpha-engine-config-I9798 round 2, adversarial review). `HeadObject`
+returns 200 with `ObjectLockMode`/`ObjectLockRetainUntilDate` simply
+*omitted* when the caller lacks `s3:GetObjectRetention` — a role change
+that narrowed permissions would silently flip every future run's "no
+`ObjectLockMode`" into a false UNMET, indistinguishable from a genuinely
+unlocked object. `GetObjectRetention` is the API S3 dedicates to exactly
+this question: it raises a *distinct*, named error
+(`NoSuchObjectLockConfiguration`) when the object truly has no retention,
+so "denied" and "absent" are two different exceptions rather than one
+ambiguous 200. `HeadObject` is still called once per key, but only for
+`LastModified` — the retention-shorter-than-policy comparison's baseline —
+never for the lock fields themselves.
+
+A read is a **typed reading**, never a swallowed exception. An
+`AccessDenied` from either call is UNMEASURABLE, not UNMET: reporting it as
 UNMET would page for a retention that may well be present and simply
 unreachable from here, which is the same "absence read as a page" defect
 `S3Store`'s own docstring calls out for `exists`/`get_bytes` — a statement
-about *our* access, never rendered as a statement about the object.
+about *our* access, never rendered as a statement about the object. A
+`GetObjectRetention` failure that names the *key* rather than our access
+(e.g. `NoSuchKey` — the release was deleted between the `list_keys` walk and
+this read) is UNMEASURABLE too, but named as the race it is, distinctly from
+an access failure: an operator reading "AccessDenied" would go check IAM,
+which is the wrong action for a key that simply is not there any more.
 """
 
 from __future__ import annotations
@@ -62,7 +80,7 @@ _RELEASE_OBJECT_RE = re.compile(
 )
 
 #: Slack subtracted from the declared minimum retain-until before comparing
-#: it against `HeadObject`'s `ObjectLockRetainUntilDate`. `release.py` stamps
+#: it against `GetObjectRetention`'s `RetainUntilDate`. `release.py` stamps
 #: `retain_until` as `now() + RELEASE_OBJECT_LOCK_RETENTION` at publish time,
 #: and `HeadObject`'s `LastModified` is that same publish instant as S3
 #: recorded it — the two should agree exactly, but a reading that failed on
@@ -71,6 +89,12 @@ _RELEASE_OBJECT_RE = re.compile(
 #: a single request round trip and costs nothing: a retention genuinely short
 #: by a day is still short against the plan's ten-year horizon.
 _CLOCK_SKEW_SLACK = dt.timedelta(days=1)
+
+#: `GetObjectRetention`'s error code for "this object has no Object Lock
+#: retention set" — the genuinely-unlocked case, distinct from every other
+#: `ClientError` this call can raise (access denial, the key having
+#: disappeared between the list and this read).
+_NO_RETENTION_ERROR_CODE = "NoSuchObjectLockConfiguration"
 
 #: The `releases/` root, derived from `crucible.release.POINTER_KEY`
 #: ("releases/current") rather than restated as a fresh literal —
@@ -114,8 +138,17 @@ def _release_object_keys(store: Store) -> list[str]:
 def _read_one(store: S3Store, key: str) -> ReleaseLockReading:
     from botocore.exceptions import ClientError  # noqa: PLC0415 - lazy, mirrors crucible.store
 
+    s3_key = store._s3_key(key)
+
+    # `HeadObject` first, but ONLY for `LastModified` — the baseline the
+    # retention-shorter-than-policy comparison needs. Never read
+    # `ObjectLockMode`/`ObjectLockRetainUntilDate` from this response: S3
+    # omits both, silently, on a 200, when the caller lacks
+    # `s3:GetObjectRetention` (round 2 finding 1) — indistinguishable from a
+    # genuinely unlocked object unless the lock fields are never trusted
+    # from this call at all.
     try:
-        response = store.client.head_object(Bucket=store.bucket, Key=store._s3_key(key))
+        head = store.client.head_object(Bucket=store.bucket, Key=s3_key)
     except ClientError as exc:
         code = store._error_code(exc)
         return ReleaseLockReading(
@@ -125,13 +158,52 @@ def _read_one(store: S3Store, key: str) -> ReleaseLockReading:
             "statement about our access, not about the object's retention, and it "
             "must never be counted as an UNMET finding.",
         )
-    mode = response.get("ObjectLockMode")
-    retain_until = response.get("ObjectLockRetainUntilDate")
-    if not mode or retain_until is None:
+    last_modified = head.get("LastModified")
+
+    try:
+        retention_response = store.client.get_object_retention(Bucket=store.bucket, Key=s3_key)
+    except ClientError as exc:
+        code = store._error_code(exc)
+        if code == "AccessDenied":
+            return ReleaseLockReading(
+                key,
+                "UNMEASURABLE",
+                f"get_object_retention({key}) denied: {code}. This is a statement "
+                "about our access, not about the object's retention, and it must "
+                "never be counted as an UNMET finding.",
+            )
+        if code == _NO_RETENTION_ERROR_CODE:
+            return ReleaseLockReading(
+                key,
+                "UNMET",
+                f"{key}: no Object Lock retention (get_object_retention: {code})",
+            )
         return ReleaseLockReading(
-            key, "UNMET", f"{key}: no Object Lock retention (ObjectLockMode={mode!r})"
+            key,
+            "UNMEASURABLE",
+            f"get_object_retention({key}) failed: {code or type(exc).__name__}, right "
+            f"after head_object({key}) succeeded — the object was very likely deleted "
+            "between the list and this read (a release deleted mid-sweep), not a "
+            "statement about its retention.",
         )
-    last_modified = response.get("LastModified")
+
+    retention = retention_response.get("Retention") or {}
+    mode = retention.get("Mode")
+    retain_until = retention.get("RetainUntilDate")
+    if not mode or retain_until is None:
+        # `GetObjectRetention` succeeding without an error is contractually
+        # supposed to always carry both fields (unlike `HeadObject`, which
+        # can omit them silently). A success response missing them is a
+        # malformed answer this module cannot make sense of — UNMEASURABLE,
+        # never UNMET, so a genuine future API/SDK shape change is loud
+        # rather than read as "confirmed unlocked".
+        return ReleaseLockReading(
+            key,
+            "UNMEASURABLE",
+            f"get_object_retention({key}) succeeded but returned no Mode/"
+            f"RetainUntilDate ({retention!r}) — a malformed response, not a "
+            "confirmed absence of retention.",
+        )
     if last_modified is not None:
         floor = last_modified.astimezone(dt.UTC) + RELEASE_OBJECT_LOCK_RETENTION - _CLOCK_SKEW_SLACK
         if retain_until.astimezone(dt.UTC) < floor:

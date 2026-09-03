@@ -20,37 +20,70 @@ from crucible.store import LocalStore, S3Store
 SHA_LOCKED = "a" * 40
 SHA_UNLOCKED = "b" * 40
 SHA_DENIED = "c" * 40
+SHA_HEAD_ONLY_DENIED = "d" * 40
+SHA_MALFORMED = "e" * 40
+SHA_RACE = "f" * 40
 
 _PUBLISHED_AT = dt.datetime(2026, 8, 1, 12, 0, tzinfo=dt.UTC)
 
 
 class _FakeS3Client:
-    """Enough of the boto3 surface to drive `head_object` three ways: a
-    locked object, an unlocked one, and a read that fails outright.
+    """Models `head_object` and `get_object_retention` as the two SEPARATE
+    real S3 calls they are, never one call standing in for the other.
+
+    This is the direct fix for round 2's blocking finding 1:
+    `HeadObject` returns 200 with `ObjectLockMode`/`ObjectLockRetainUntilDate`
+    *omitted* — never an error — when the caller lacks
+    `s3:GetObjectRetention`. A fake that put the lock fields on
+    `head_object`'s response (the round-1 shape) could not exercise that
+    failure mode at all. Here, `head_object` only ever answers existence and
+    `LastModified`; `get_object_retention` is the only source of lock info,
+    and it fails in three district ways: `AccessDenied` (denied), the
+    `NoSuchObjectLockConfiguration` code (genuinely unlocked), or `NoSuchKey`
+    (the object vanished between `list_keys` and this read — the race
+    finding 3 asks to be named distinctly).
 
     Deliberately separate from `tests/test_release.py::_FakeS3Client` — that
-    fixture has no `ObjectLockMode`/`ObjectLockRetainUntilDate` on its
-    `head_object` responses and is owned by that module's tests; this one
-    exists for exactly the three readings this sweep must produce.
+    fixture is owned by that module's tests and has no
+    `get_object_retention` concept at all.
     """
 
     def __init__(self) -> None:
-        # key -> None (denied) | dict of head_object fields to return
+        # key -> None (absent entirely) | dict with "LastModified" (existence)
         self.objects: dict[str, dict | None] = {}
+        # key -> "AccessDenied" | "NoSuchObjectLockConfiguration" | "NoSuchKey"
+        #        | dict with "Mode"/"RetainUntilDate" | {} (malformed 200)
+        self.retentions: dict[str, str | dict] = {}
 
     def put(self, key: str, *, locked: bool = True, retain_until=None, last_modified=None) -> None:
+        self.objects[key] = {"LastModified": last_modified or _PUBLISHED_AT}
         if locked:
-            self.objects[key] = {
-                "ObjectLockMode": "GOVERNANCE",
-                "ObjectLockRetainUntilDate": retain_until
-                or (_PUBLISHED_AT + RELEASE_OBJECT_LOCK_RETENTION),
-                "LastModified": last_modified or _PUBLISHED_AT,
+            self.retentions[key] = {
+                "Mode": "GOVERNANCE",
+                "RetainUntilDate": retain_until or (_PUBLISHED_AT + RELEASE_OBJECT_LOCK_RETENTION),
             }
         else:
-            self.objects[key] = {"LastModified": last_modified or _PUBLISHED_AT}
+            self.retentions[key] = "NoSuchObjectLockConfiguration"
 
-    def deny(self, key: str) -> None:
+    def deny_head(self, key: str) -> None:
         self.objects[key] = None
+
+    def deny_retention(self, key: str, *, last_modified=None) -> None:
+        self.objects[key] = {"LastModified": last_modified or _PUBLISHED_AT}
+        self.retentions[key] = "AccessDenied"
+
+    def malform_retention(self, key: str, *, last_modified=None) -> None:
+        """`get_object_retention` succeeds (200) but the payload carries
+        neither `Mode` nor `RetainUntilDate` — never observed against real
+        S3, but a shape this module must not silently read as UNMET."""
+        self.objects[key] = {"LastModified": last_modified or _PUBLISHED_AT}
+        self.retentions[key] = {}
+
+    def race(self, key: str, *, last_modified=None) -> None:
+        """`head_object` sees the key; by the time `get_object_retention`
+        runs, it is gone — a release deleted mid-sweep."""
+        self.objects[key] = {"LastModified": last_modified or _PUBLISHED_AT}
+        self.retentions[key] = "NoSuchKey"
 
     def head_object(self, **kw) -> dict:
         key = kw["Key"]
@@ -61,6 +94,13 @@ class _FakeS3Client:
             raise ClientError({"Error": {"Code": "AccessDenied"}}, "head_object")
         return response
 
+    def get_object_retention(self, **kw) -> dict:
+        key = kw["Key"]
+        outcome = self.retentions.get(key)
+        if isinstance(outcome, str):
+            raise ClientError({"Error": {"Code": outcome}}, "get_object_retention")
+        return {"Retention": outcome or {}}
+
     def get_paginator(self, name: str) -> _Paginator:
         assert name == "list_objects_v2"
         return _Paginator(self)
@@ -69,8 +109,8 @@ class _FakeS3Client:
 class _Paginator:
     """Enough of boto3's list_objects_v2 paginator for `S3Store.list_keys`.
 
-    A key that is `denied` still LISTS — S3 lists what exists regardless of
-    whether the caller can subsequently `head_object` it — only the
+    A key that will later be denied or raced still LISTS — S3 lists what
+    exists regardless of whether a subsequent call on it succeeds — only the
     per-object read fails.
     """
 
@@ -100,6 +140,8 @@ class TestFindings:
         assert "GOVERNANCE" in findings[0].detail
 
     def test_an_unlocked_object_reads_unmet(self) -> None:
+        """`get_object_retention` raising `NoSuchObjectLockConfiguration` —
+        the genuinely-unlocked case."""
         client = _FakeS3Client()
         store = _store(client)
         key = wheel_key(SHA_UNLOCKED)
@@ -112,17 +154,78 @@ class TestFindings:
         assert findings[0].state == "UNMET"
         assert "no Object Lock retention" in findings[0].detail
 
-    def test_a_read_that_fails_is_unmeasurable_never_unmet(self) -> None:
+    def test_head_object_omitting_lock_fields_on_200_is_never_read(self) -> None:
+        """Round 2, blocking finding 1: `HeadObject` returns 200 with the
+        lock fields OMITTED, not an error, when the caller lacks
+        `s3:GetObjectRetention`. This fake's `head_object` never carries
+        lock fields at all — proving the sweep's `_read_one` gets its
+        reading from `get_object_retention` alone. A locked object still
+        reads MET even though `head_object`'s own response here has no
+        `ObjectLockMode`/`ObjectLockRetainUntilDate` key whatsoever."""
+        client = _FakeS3Client()
+        store = _store(client)
+        key = release_json_key(SHA_LOCKED)
+        client.put(f"crucible/{key}", locked=True)
+        assert "ObjectLockMode" not in client.objects[f"crucible/{key}"]
+
+        findings = release_lock_findings(store)
+
+        assert findings[0].state == "MET"
+
+    def test_get_object_retention_denied_is_unmeasurable_never_unmet(self) -> None:
         client = _FakeS3Client()
         store = _store(client)
         key = release_json_key(SHA_DENIED)
-        client.deny(f"crucible/{key}")
+        client.deny_retention(f"crucible/{key}")
 
         findings = release_lock_findings(store)
 
         assert len(findings) == 1
         assert findings[0].state == "UNMEASURABLE"
         assert "AccessDenied" in findings[0].detail
+
+    def test_head_object_denied_is_unmeasurable_never_unmet(self) -> None:
+        client = _FakeS3Client()
+        store = _store(client)
+        key = release_json_key(SHA_HEAD_ONLY_DENIED)
+        client.deny_head(f"crucible/{key}")
+
+        findings = release_lock_findings(store)
+
+        assert len(findings) == 1
+        assert findings[0].state == "UNMEASURABLE"
+        assert "head_object" in findings[0].detail
+
+    def test_a_malformed_200_is_unmeasurable_never_unmet(self) -> None:
+        """`get_object_retention` succeeding without `Mode`/`RetainUntilDate`
+        has no real-S3 precedent, but the sweep must not read a shape it
+        cannot make sense of as a confirmed absence of retention."""
+        client = _FakeS3Client()
+        store = _store(client)
+        key = release_json_key(SHA_MALFORMED)
+        client.malform_retention(f"crucible/{key}")
+
+        findings = release_lock_findings(store)
+
+        assert findings[0].state == "UNMEASURABLE"
+        assert "malformed" in findings[0].detail
+
+    def test_a_release_deleted_between_head_and_retention_is_named_as_a_race(self) -> None:
+        """Round 2, should-fix finding 3: `NoSuchKey` from
+        `get_object_retention` right after `head_object` succeeded is a
+        release deleted mid-sweep, named DISTINCTLY from an access
+        failure — an operator reading "AccessDenied" would check IAM, the
+        wrong action for a key that is simply gone."""
+        client = _FakeS3Client()
+        store = _store(client)
+        key = release_json_key(SHA_RACE)
+        client.race(f"crucible/{key}")
+
+        findings = release_lock_findings(store)
+
+        assert findings[0].state == "UNMEASURABLE"
+        assert "deleted" in findings[0].detail
+        assert "AccessDenied" not in findings[0].detail
 
     def test_locked_unlocked_and_denied_together_all_three_readings(self) -> None:
         client = _FakeS3Client()
@@ -132,7 +235,7 @@ class TestFindings:
         denied_key = release_json_key(SHA_DENIED)
         client.put(f"crucible/{locked_key}", locked=True)
         client.put(f"crucible/{unlocked_key}", locked=False)
-        client.deny(f"crucible/{denied_key}")
+        client.deny_retention(f"crucible/{denied_key}")
 
         findings = {f.key: f.state for f in release_lock_findings(store)}
 
