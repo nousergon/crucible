@@ -101,6 +101,12 @@ jobs:
       # deploy gated on a check it cannot see.
       - name: Foundation tests
         id: tests
+        # shell: bash makes GitHub run this as `bash --noprofile --norc -eo
+        # pipefail {0}` instead of the default `bash -e {0}` (no pipefail):
+        # without it, `pytest | tee` reports tee's exit code, not pytest's,
+        # so a red foundation suite could not fail this step and the wheel
+        # it gates would still get published.
+        shell: bash
         run: |
           uv run pytest -q --ignore=tests/acceptance | tee pytest.txt
           echo "summary=$(tail -1 pytest.txt | tr -d '\r')" >> "$GITHUB_OUTPUT"
