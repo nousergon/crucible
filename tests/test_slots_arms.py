@@ -66,6 +66,68 @@ class TestIdentity:
             load_arm_specs("u", strategy_dir=tmp_path)
 
 
+def _write_llm_arm(directory, name, callsite):
+    (directory / f"{name}.yaml").write_text(
+        f"name: {name}\nslot: u\nranker: momentum_sleeve\nregistered_at: '2026-06-01'\n"
+        f"params:\n  top_n: 8\n  llm_callsite: {callsite}\n",
+        encoding="utf-8",
+    )
+
+
+class TestAnArmDeclaresItsLlmCallSite:
+    """alpha-engine-config-I9920: "which arms are LLM arms" is a question the
+    register answers by itself, never a heuristic over ranker names."""
+
+    def test_an_unregistered_call_site_is_refused_at_load(self, tmp_path) -> None:
+        """The registry is empty until phase 5, so ANY declared site is
+        unregistered today — and the arm must not register-and-be-ignored."""
+        arms = tmp_path / "arms" / "u"
+        arms.mkdir(parents=True)
+        _write_llm_arm(arms, "thesis", "research.thesis")
+        with pytest.raises(ValueError, match="not a key of LLM_CALLSITE_REGISTRY"):
+            load_arm_specs("u", strategy_dir=tmp_path)
+
+    def test_a_non_string_call_site_is_refused(self, tmp_path) -> None:
+        arms = tmp_path / "arms" / "u"
+        arms.mkdir(parents=True)
+        _write_llm_arm(arms, "thesis", "[a, b]")
+        with pytest.raises(ValueError, match="non-empty string"):
+            load_arm_specs("u", strategy_dir=tmp_path)
+
+    def test_a_registered_call_site_loads_and_is_in_the_hashed_spec(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The contract test: the LLM-arm set is derivable from the register's
+        `spec.params` alone, with no producer state — and it is part of the
+        arm's identity, so two arms differing only in the model they call are
+        two arms."""
+        import crucible.llm as llm
+
+        monkeypatch.setattr(llm, "LLM_CALLSITE_REGISTRY", {"research.thesis": object()})
+        arms = tmp_path / "arms" / "u"
+        arms.mkdir(parents=True)
+        _write_llm_arm(arms, "thesis", "research.thesis")
+        (spec,) = load_arm_specs("u", strategy_dir=tmp_path)
+        assert spec.spec["params"]["llm_callsite"] == "research.thesis"
+
+        # The register carries the spec HASH, never the spec — so the join
+        # from "active arm id" back to "this recipe declares that site" is the
+        # id itself, which the gate reproduces by loading the synced recipes.
+        register, _ = register_arms(ArmRegister(), [spec])
+        (event,) = register.to_dicts()
+        assert event["arm_id"] == spec.arm_id
+        assert event["record"]["spec_hash"] == spec.arm_id.rsplit(":", 1)[-1]
+        assert "spec" not in event
+
+        plain = ArmSpec(**{**spec.__dict__, "params": {"top_n": 8}})
+        assert plain.arm_id != spec.arm_id, (
+            "the call site changes what the arm IS; it must change the id"
+        )
+        assert "llm_callsite" not in plain.spec["params"], (
+            "an arm that never declared the key is hashed exactly as before — no re-id"
+        )
+
+
 class TestVacuityGuard:
     def test_two_arms_sharing_a_ranking_callable_are_refused_at_load(self, tmp_path) -> None:
         arms = tmp_path / "arms" / "u"
