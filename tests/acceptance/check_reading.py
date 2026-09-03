@@ -82,6 +82,29 @@ earlier version read `ratchet["met"]` straight off `json.loads` and a missing
 field surfaced as a KeyError traceback in the Actions log — indistinguishable
 from the grader itself being broken. Absence is never a pass (principle 7), and
 a malformed input is an absence: it fails here with the field named.
+
+**Every `unmeasurable` entry commits WHICH ENVIRONMENT observed the class, and
+CI refuses a class that environment cannot produce (alpha-engine-config-I9915).**
+`crucible-PR55` committed `blocked_on_class: "ClientError"` — the laptop's
+assumed-role `AccessDenied` — and merged straight to `main`, where the
+`push: [main]` acceptance job runs with no AWS credentials at all and observes
+`NoRegionError` instead; the mismatch turned `main` red on its own merge
+(2026-09-03T14:40Z). `observed_in` names the environment that produced
+`blocked_on_class`, from a closed set (`"ci"`, `"laptop"`). When
+`observed_in == "ci"`, `blocked_on_class` must be one of the exception type
+names a credential-less GitHub Actions runner can actually raise —
+`NoRegionError`, `NoCredentialsError`, `EndpointConnectionError` — and the PR
+path (which loads and validates this file via `load_ratchet`, in the
+foundation suite's `test_the_committed_ratchet_is_wellformed`) refuses the
+ratchet outright otherwise. This is **not a suppression list** (crucible
+`AGENTS.md` rule 4): the three names are not exceptions we have chosen to
+tolerate, they are the exhaustive contract of what botocore raises when
+`boto3.client(...)` is constructed with neither a region nor credentials —
+closed by the runner's own environment, not by author discretion. A
+non-`"ci"` `observed_in` (e.g. `"laptop"`) is not refused — CI cannot verify
+what a human's own machine observed — but `load_ratchet` prints a warning
+(and a `::warning::` annotation under Actions) naming it, because that entry's
+`blocked_on_class` is then unverified by every job that reads this file.
 """
 
 from __future__ import annotations
@@ -108,6 +131,29 @@ CLAUSE_ID = r"^[A-Za-z_][\w]*::[A-Za-z_][\w]*(\[.*\])?$"
 #: is a visible, dated field appearing in the diff — round 2, review finding 1.
 _DATE = r"^\d{4}-\d{2}-\d{2}$"
 
+#: The exhaustive set of environments an `unmeasurable` entry may claim to
+#: have observed `blocked_on_class` in (see module docstring). `"ci"` is
+#: the only one any job reading this file can verify — both the PR-path
+#: schema load and the `push: [main]` acceptance job run on a GitHub Actions
+#: runner. `"laptop"` documents a class a human observed running the suite
+#: locally with real (assumed-role) credentials; no CI job can confirm or
+#: refute it, so `load_ratchet` warns rather than refuses (see module
+#: docstring).
+_ALLOWED_ENVIRONMENTS = frozenset({"ci", "laptop"})
+
+#: The exhaustive set of `botocore`/`boto3` exception TYPE NAMES a
+#: credential-less GitHub Actions runner can raise when a clause's code
+#: attempts `boto3.client(...)` with no AWS region and no credentials
+#: configured — the closed contract of that fixed environment, not a
+#: suppression list the crucible `AGENTS.md` rule 4 forbids. Measured
+#: 2026-09-03: `crucible-PR55` committed `"ClientError"` (the laptop's
+#: assumed-role `AccessDenied`), and the `push: [main]` runner — which has no
+#: credentials at all — raised `NoRegionError` before ever reaching a real
+#: API call, failing the run it had just merged.
+_CI_RUNNER_BLOCKED_ON_CLASSES = frozenset(
+    {"NoRegionError", "NoCredentialsError", "EndpointConnectionError"}
+)
+
 
 class UnmeasurableEntry(BaseModel):
     """Why one clause's read could not happen, and what last observed it.
@@ -129,6 +175,12 @@ class UnmeasurableEntry(BaseModel):
     #: fails the run until the ratchet is updated to match (review finding 3).
     blocked_on_class: str
     last_moved: str
+    #: Which environment produced `blocked_on_class` — `"ci"` or `"laptop"`
+    #: (see module docstring). Required so a class committed against one
+    #: environment cannot silently stand in for another: `"ci"` entries are
+    #: checked against `_CI_RUNNER_BLOCKED_ON_CLASSES` at load time; anything
+    #: else is unverifiable here and only warned about.
+    observed_in: str
 
     @model_validator(mode="after")
     def _fields_are_well_formed(self) -> UnmeasurableEntry:
@@ -140,6 +192,18 @@ class UnmeasurableEntry(BaseModel):
             raise ValueError("carries no blocked_on_class")
         if not re.match(_DATE, self.last_moved):
             raise ValueError(f"last_moved {self.last_moved!r} is not YYYY-MM-DD")
+        if self.observed_in not in _ALLOWED_ENVIRONMENTS:
+            raise ValueError(
+                f"observed_in {self.observed_in!r} is not one of {sorted(_ALLOWED_ENVIRONMENTS)}"
+            )
+        if self.observed_in == "ci" and self.blocked_on_class not in _CI_RUNNER_BLOCKED_ON_CLASSES:
+            raise ValueError(
+                f"blocked_on_class {self.blocked_on_class!r} is outside the closed set a "
+                "credential-less GitHub Actions runner can produce "
+                f"({sorted(_CI_RUNNER_BLOCKED_ON_CLASSES)}) for an entry with "
+                "observed_in='ci' — either the class was observed somewhere else (name that "
+                "environment) or this entry was committed against the wrong environment"
+            )
         return self
 
 
@@ -339,11 +403,37 @@ def read_report(report: pathlib.Path) -> Reading:
         raise SystemExit(_fail(f"the acceptance report is not a usable reading: {exc}")) from exc
 
 
+def _warn_non_ci_observations(ratchet: Ratchet) -> None:
+    """Name every `unmeasurable` entry whose `observed_in` is not `"ci"`.
+
+    Not a refusal: CI can neither confirm nor refute a `blocked_on_class`
+    someone observed on their own machine, so the schema check above only
+    constrains the CI-observable subset (alpha-engine-config-I9915). This is
+    the documented decision for that half of the entry — a warning, printed
+    wherever `load_ratchet` runs (the PR-path schema load included), so an
+    unverifiable entry is never silently indistinguishable from a verified
+    one.
+    """
+    non_ci = sorted(cid for cid, entry in ratchet.unmeasurable.items() if entry.observed_in != "ci")
+    if not non_ci:
+        return
+    message = (
+        f"{len(non_ci)} unmeasurable entr{'y' if len(non_ci) == 1 else 'ies'} name an "
+        f"observed_in other than 'ci' ({', '.join(non_ci)}) — no CI job can verify that "
+        "blocked_on_class; only a human re-observing that environment can confirm it still holds."
+    )
+    if os.environ.get("GITHUB_ACTIONS"):
+        print(f"::warning::{message}")
+    print(message, file=sys.stderr)
+
+
 def load_ratchet(path: pathlib.Path = RATCHET) -> Ratchet:
     try:
-        return Ratchet.model_validate_json(path.read_text())
+        ratchet = Ratchet.model_validate_json(path.read_text())
     except ValidationError as exc:
         raise SystemExit(_fail(f"{path.name} is not a valid ratchet: {exc}")) from exc
+    _warn_non_ci_observations(ratchet)
+    return ratchet
 
 
 def _write_reading_json(

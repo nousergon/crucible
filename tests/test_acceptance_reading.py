@@ -118,6 +118,7 @@ def ratchet_with_unmeasurable(tmp_path: Path) -> Path:
                         "reason": "no AWS credentials in this environment",
                         "blocked_on_class": "NoCredentialsError",
                         "last_moved": "2026-09-02",
+                        "observed_in": "ci",
                     }
                 },
                 "met": ["T::b", "T::c"],
@@ -970,11 +971,47 @@ def test_a_matching_blocked_on_class_is_still_green(
 @pytest.mark.parametrize(
     "bad_entry",
     [
-        {"reason": "   ", "blocked_on_class": "ClientError", "last_moved": "2026-09-02"},
-        {"reason": "why", "blocked_on_class": "   ", "last_moved": "2026-09-02"},
-        {"reason": "why", "blocked_on_class": "ClientError", "last_moved": "09-02-2026"},
-        {"reason": "why", "blocked_on_class": "ClientError", "last_moved": ""},
-        {"reason": "why", "blocked_on_class": "ClientError"},
+        {
+            "reason": "   ",
+            "blocked_on_class": "NoCredentialsError",
+            "last_moved": "2026-09-02",
+            "observed_in": "ci",
+        },
+        {
+            "reason": "why",
+            "blocked_on_class": "   ",
+            "last_moved": "2026-09-02",
+            "observed_in": "ci",
+        },
+        {
+            "reason": "why",
+            "blocked_on_class": "NoCredentialsError",
+            "last_moved": "09-02-2026",
+            "observed_in": "ci",
+        },
+        {
+            "reason": "why",
+            "blocked_on_class": "NoCredentialsError",
+            "last_moved": "",
+            "observed_in": "ci",
+        },
+        # observed_in missing entirely.
+        {"reason": "why", "blocked_on_class": "NoCredentialsError", "last_moved": "2026-09-02"},
+        # observed_in outside the closed environment set.
+        {
+            "reason": "why",
+            "blocked_on_class": "NoCredentialsError",
+            "last_moved": "2026-09-02",
+            "observed_in": "staging",
+        },
+        # observed_in="ci" with a class outside the CI-runner closed set — the
+        # crucible-PR55 defect itself.
+        {
+            "reason": "why",
+            "blocked_on_class": "ClientError",
+            "last_moved": "2026-09-02",
+            "observed_in": "ci",
+        },
     ],
 )
 def test_a_malformed_unmeasurable_entry_is_red_and_names_the_field(
@@ -994,6 +1031,129 @@ def test_a_malformed_unmeasurable_entry_is_red_and_names_the_field(
     result = _run(report, ratchet)
     assert result.returncode == 1
     assert "Traceback" not in result.stderr
+
+
+# ── `observed_in` and the CI-runner class contract ──────────────────────────
+#
+# crucible-PR55 committed `blocked_on_class: "ClientError"` (the laptop's
+# assumed-role AccessDenied) and merged straight to main, where the
+# credential-less `push: [main]` runner observes `NoRegionError` instead —
+# main went red on its own merge, 2026-09-03T14:40Z. `observed_in` names
+# which environment produced `blocked_on_class`; an entry claiming `"ci"`
+# is checked against the closed set a credential-less GitHub Actions runner
+# can actually raise.
+
+
+def _unmeasurable_ratchet(tmp_path: Path, entry: dict) -> Path:
+    """A minimal, otherwise-valid ratchet with exactly one `unmeasurable`
+    entry under `T::d`, `T::d` also listed in `unmet` (the subset contract)."""
+    path = tmp_path / "ratchet.json"
+    path.write_text(
+        json.dumps(
+            {
+                "unmet": {"T::a": "phase 2", "T::d": "read failure"},
+                "unmeasurable": {"T::d": entry},
+                "met": ["T::b", "T::c"],
+            }
+        )
+    )
+    return path
+
+
+def test_a_ci_observed_class_in_the_closed_set_is_accepted(tmp_path: Path) -> None:
+    """`NoRegionError` with `observed_in: "ci"` — the class a credential-less
+    GitHub Actions runner actually raises — loads cleanly."""
+    ratchet = _unmeasurable_ratchet(
+        tmp_path,
+        {
+            "reason": "no AWS region configured on this runner",
+            "blocked_on_class": "NoRegionError",
+            "last_moved": "2026-09-03",
+            "observed_in": "ci",
+        },
+    )
+    loaded = _checker().load_ratchet(ratchet)
+    assert loaded.unmeasurable["T::d"].blocked_on_class == "NoRegionError"
+
+
+def test_a_ci_observed_class_outside_the_closed_set_is_refused(tmp_path: Path) -> None:
+    """`ClientError` with `observed_in: "ci"` is exactly the crucible-PR55
+    defect: a credential-less GitHub Actions runner cannot raise `ClientError`
+    from a bare `boto3.client(...)` call (no client is ever constructed far
+    enough to make a request) — refused at load time, on the PR path."""
+    ratchet = _unmeasurable_ratchet(
+        tmp_path,
+        {
+            "reason": "AccessDenied on ListStackResources",
+            "blocked_on_class": "ClientError",
+            "last_moved": "2026-09-03",
+            "observed_in": "ci",
+        },
+    )
+    with pytest.raises(SystemExit):
+        _checker().load_ratchet(ratchet)
+
+
+def test_a_laptop_observed_class_outside_the_ci_set_is_accepted_but_unverifiable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`ClientError` with `observed_in: "laptop"` loads — CI cannot verify a
+    class a human observed on their own machine — but `load_ratchet` warns,
+    naming the clause, so the entry is never silently indistinguishable from
+    a CI-verified one. Decision: warn, not refuse — refusing would make it
+    impossible to ever RECORD a laptop-only observation at all, and this
+    ratchet is the only durable place such an observation can live."""
+    ratchet = _unmeasurable_ratchet(
+        tmp_path,
+        {
+            "reason": "AccessDenied on ListStackResources, observed locally",
+            "blocked_on_class": "ClientError",
+            "last_moved": "2026-09-03",
+            "observed_in": "laptop",
+        },
+    )
+    loaded = _checker().load_ratchet(ratchet)
+    assert loaded.unmeasurable["T::d"].blocked_on_class == "ClientError"
+    captured = capsys.readouterr()
+    assert "T::d" in captured.err
+    assert "cannot verify" in captured.err or "no CI job can verify" in captured.err
+
+
+def test_a_missing_observed_in_is_refused(tmp_path: Path) -> None:
+    ratchet = _unmeasurable_ratchet(
+        tmp_path,
+        {
+            "reason": "AccessDenied on ListStackResources",
+            "blocked_on_class": "NoCredentialsError",
+            "last_moved": "2026-09-03",
+        },
+    )
+    with pytest.raises(SystemExit):
+        _checker().load_ratchet(ratchet)
+
+
+def test_an_empty_unmeasurable_dict_is_accepted(tmp_path: Path) -> None:
+    """No `unmeasurable` entries at all — the committed ratchet's current
+    state — loads cleanly and warns about nothing."""
+    path = tmp_path / "ratchet.json"
+    path.write_text(json.dumps({"unmet": {"T::a": "phase 2"}, "unmeasurable": {}, "met": []}))
+    loaded = _checker().load_ratchet(path)
+    assert loaded.unmeasurable == {}
+
+
+def test_the_committed_ratchet_carries_no_undeclared_environment_or_class(tmp_path: Path) -> None:
+    """The live `tests/acceptance/ratchet.json` — currently `unmeasurable: {}`
+    (crucible-PR67) — loads through the same guard used above, so a future
+    commit that reintroduces an entry is caught by this same contract."""
+    loaded = _checker().load_ratchet(RATCHET)
+    for cid, entry in loaded.unmeasurable.items():
+        assert entry.observed_in in {"ci", "laptop"}, cid
+        if entry.observed_in == "ci":
+            assert entry.blocked_on_class in {
+                "NoRegionError",
+                "NoCredentialsError",
+                "EndpointConnectionError",
+            }, cid
 
 
 # ── `--write-json` — the producer contract, alpha-engine-config-I9902 ───────
