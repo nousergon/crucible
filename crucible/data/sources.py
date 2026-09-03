@@ -247,6 +247,19 @@ class ArcticPriceSource(PriceSource):
     name = "arcticdb:universe"
 
     def __init__(self, bucket: str, *, region: str | None = None) -> None:
+        # `crucible/config.py::DEFAULT_ARCTIC_BUCKET` carries no default bucket
+        # name (`alpha-engine-config-I9906` finding 3 — a bucket name in a
+        # public repo's package source is an infrastructure identifier
+        # `crucible/AGENTS.md` forbids). An empty bucket here means
+        # `CRUCIBLE_ARCTIC_BUCKET` was never set, and failing loud here — at
+        # construction, before any S3 call — beats the opaque `NoSuchBucket`
+        # or empty-name error the SDK would otherwise raise deep inside
+        # `load_panel`.
+        if not bucket:
+            raise ValueError(
+                "ArcticPriceSource needs a bucket name — set CRUCIBLE_ARCTIC_BUCKET "
+                "(there is no default; see crucible/config.py::DEFAULT_ARCTIC_BUCKET)"
+            )
         self.bucket = bucket
         self.region = region
 

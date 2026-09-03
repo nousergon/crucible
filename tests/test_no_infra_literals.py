@@ -38,14 +38,34 @@ The 12-digit pattern already catches a FULLY literal ARN (one with the
 account id inlined); a prefix with no digit run inlined carries nothing this
 guard needs to refuse.
 
-**Why a bare 12-digit run and not a scoped ARN regex.** A 12-digit account id
-can appear inside an ARN, an IAM policy `Principal`, a CloudTrail log path, or
-plain prose — the SHAPE that matters is the twelve digits, not the syntax
-around them. `\b\d{12}\b` (word-boundary anchored) does not false-positive on
-a longer digit run (a run id, a float literal in `crucible/slots/strategy.py`
-carries 15-digit mantissas) because a word boundary cannot occur in the
-MIDDLE of a contiguous digit sequence — verified directly in
-`TestTheAccountIdPatternDoesNotFalsePositiveOnLongerDigitRuns` below.
+**Why the account-id pattern requires an adjacent marker, and not a bare
+12-digit run (corrected 2026-09-03 — Finding 4, adversarial review of
+`alpha-engine-config-I9906`).** An earlier version of this pattern was
+`\b\d{12}\b` alone, on the argument that a 12-digit account id can appear
+inside an ARN, an IAM policy `Principal`, a CloudTrail log path, or plain
+prose, and the SHAPE that matters is the twelve digits, not the syntax around
+them. That argument is still correct for what it covers, but it is
+**unsound against the clock**: GitHub Actions run ids are monotonically
+increasing and 11 digits today (`TestTheAccountIdPatternDoesNotFalsePositiveOnLongerDigitRuns`
+already carries an 11-digit exemption test for exactly this reason) — the
+next order of magnitude makes a run id 12 digits, and a bare `\b\d{12}\b`
+would then fail this repo's CI on every comment that cites one (this file's
+own docstrings already cite run ids by number, e.g. `deploy.yml:283`).
+
+The pattern now requires the 12 digits to sit immediately after
+`arn:aws:iam::`, a bare `::`, or an `--account`/`account` token — the three
+shapes an account id actually appears in across `.github/` and `crucible/`
+today (an ARN literal, or a CloudFormation/CLI `--account` flag). **The
+accepted delta:** a bare account id typed into unstructured prose with no
+adjacent marker — the "plain prose" case the original argument named — no
+longer matches. That gap is accepted deliberately rather than closed by a
+context-sniffing exclusion (a denylist of "this looks like a run id", the
+exact partial-parser shape this file's sibling guards have already been
+beaten by five times over): the account-id leak surface in this repo's
+`.github/` and `crucible/` is ARNs and CLI flags, not free-form prose, and a
+scanner that goes silently red on a legitimate run-id citation gets its
+whole pattern deleted by someone in a hurry — which is a bigger, permanent
+hole than the narrower one this trades for.
 """
 
 from __future__ import annotations
@@ -70,10 +90,20 @@ _IGNORED_DIRS = {".git", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff
 
 _SCANNED_SUFFIXES = {".py", ".yaml", ".yml", ".json", ".toml", ".cfg", ".ini"}
 
+#: A 12-digit account id, but ONLY when it sits immediately after
+#: `arn:aws:iam::`, a bare `::`, or an `--account`/`account` token — see the
+#: module docstring ("Why the account-id pattern requires an adjacent
+#: marker...") for why a bare `\b\d{12}\b` was tightened (Finding 4,
+#: adversarial review of `alpha-engine-config-I9906`). A module constant
+#: rather than a repeated literal: every test below that needs to reason
+#: about this specific pattern imports it, so the pattern cannot drift
+#: between the table and its own tests.
+ACCOUNT_ID_PATTERN = r"(?:arn:aws:iam::|::|--account[ =]|\baccount[ :=])\d{12}\b"
+
 #: What is forbidden, and why. See the module docstring for why `arn:aws:` on
 #: its own is deliberately absent from this table.
 FORBIDDEN: dict[str, str] = {
-    r"\b\d{12}\b": (
+    ACCOUNT_ID_PATTERN: (
         "a bare 12-digit AWS account id — the sensitive half of an "
         "infrastructure identifier per crucible/AGENTS.md; resolve it "
         "through ${{ vars.AWS_ACCOUNT_ID }} instead"
@@ -81,6 +111,23 @@ FORBIDDEN: dict[str, str] = {
     r"s3://alpha-engine-": (
         "a literal alpha-engine bucket name — resolve it through "
         "${{ vars.CRUCIBLE_STORE_URI }} instead"
+    ),
+    # Finding 3 (adversarial review, `alpha-engine-config-I9906`): the two
+    # patterns above catch the `s3://` URI form and a fully-inlined account
+    # id, but a bucket name written bare — no scheme, just the identifier —
+    # matched neither. `crucible/config.py:71 DEFAULT_ARCTIC_BUCKET =
+    # "alpha-engine-data"` and `ci.yml:251 --s3-bucket alpha-engine-research`
+    # were both live instances the tree-clean reading missed. Scoped to the
+    # KNOWN bucket stems this fleet actually has, not a bare `alpha-engine-`
+    # prefix: that broader prefix also matches non-bucket identifiers this
+    # repo legitimately carries as literals (the `alpha-engine-alerts` /
+    # `alpha-engine-alerts-muted` SNS topic names in `crucible/alerts.py`,
+    # and every `alpha-engine-config-I####` tracker reference), and a
+    # detector that forbids its own class of false positive gets deleted
+    # rather than fixed the first time it fires on one.
+    r"\balpha-engine-(data|research|crucible-v2)\b": (
+        "a literal alpha-engine-* bucket name (no s3:// scheme) — resolve it "
+        "through a repository variable instead, per crucible/AGENTS.md"
     ),
 }
 
@@ -156,8 +203,9 @@ def test_the_scan_can_actually_find_something() -> None:
     """The detector is shown firing. A guard nobody has made fail is a guard
     nobody knows works."""
     samples = {
-        r"\b\d{12}\b": "role/x  # arn:aws:iam::711398986525:role/x",
+        ACCOUNT_ID_PATTERN: "role/x  # arn:aws:iam::711398986525:role/x",
         r"s3://alpha-engine-": "STORE_URI: s3://alpha-engine-crucible-v2/crucible",
+        r"\balpha-engine-(data|research|crucible-v2)\b": 'BUCKET = "alpha-engine-data"',
     }
     assert set(samples) == set(FORBIDDEN), (
         "every forbidden pattern needs a sample proving the matcher fires on it; "
@@ -171,22 +219,65 @@ def test_the_scan_can_actually_find_something() -> None:
 
 
 class TestTheAccountIdPatternDoesNotFalsePositiveOnLongerDigitRuns:
-    r"""`\b\d{12}\b` is word-boundary anchored, so it cannot match a 12-digit
-    SUBSTRING of a longer contiguous digit run — a word boundary can only
-    occur at the edge of the whole run, never in its middle. Verified against
-    the real shape this repository carries: `crucible/slots/strategy.py`'s
-    15-digit float mantissas (e.g. `1.959963984540054`), and a GitHub Actions
-    run id (11 digits, one short of the account-id pattern).
+    r"""The account-id pattern (`ACCOUNT_ID_PATTERN`) is word-boundary
+    anchored on its digit run, so it cannot match a 12-digit SUBSTRING of a
+    longer contiguous digit run — a word boundary can only occur at the edge
+    of the whole run, never in its middle. Verified against the real shape
+    this repository carries: `crucible/slots/strategy.py`'s 15-digit float
+    mantissas (e.g. `1.959963984540054`), and a GitHub Actions run id (11
+    digits today, one short of the account-id pattern).
+
+    Since Finding 4 (adversarial review, `alpha-engine-config-I9906`) the
+    pattern ALSO requires an adjacent marker (`arn:aws:iam::`, `::`,
+    `--account`/`account`) — `test_a_bare_12_digit_run_id_does_not_match_with_no_adjacent_marker`
+    proves the accepted delta: a future 12-digit run id with no such marker
+    nearby does not trip this detector, which a bare `\b\d{12}\b` would have.
     """
 
     def test_a_15_digit_float_mantissa_does_not_match(self) -> None:
-        assert not _PATTERNS[r"\b\d{12}\b"].search("z = 1.959963984540054 if abs(...)")
+        assert not _PATTERNS[ACCOUNT_ID_PATTERN].search("z = 1.959963984540054 if abs(...)")
 
     def test_an_11_digit_run_id_does_not_match(self) -> None:
-        assert not _PATTERNS[r"\b\d{12}\b"].search("run 33778251060")
+        assert not _PATTERNS[ACCOUNT_ID_PATTERN].search("run 33778251060")
+
+    def test_a_bare_12_digit_run_id_does_not_match_with_no_adjacent_marker(self) -> None:
+        """The exact seeded proof from Finding 4: a 12-digit GHA run id, cited
+        the way `deploy.yml` already cites run ids, with no `arn:aws:iam::`,
+        `::` or `account` token nearby."""
+        assert not _PATTERNS[ACCOUNT_ID_PATTERN].search("# see run 337782510601")
 
     def test_a_genuine_12_digit_account_id_does_match(self) -> None:
-        assert _PATTERNS[r"\b\d{12}\b"].search("arn:aws:iam::711398986525:role/x")
+        assert _PATTERNS[ACCOUNT_ID_PATTERN].search("arn:aws:iam::711398986525:role/x")
+
+    def test_a_bare_account_id_after_a_double_colon_does_match(self) -> None:
+        assert _PATTERNS[ACCOUNT_ID_PATTERN].search("Principal: arn::711398986525")
+
+    def test_an_account_flag_literal_does_match(self) -> None:
+        assert _PATTERNS[ACCOUNT_ID_PATTERN].search("--account 711398986525")
+
+    def test_a_bare_alpha_engine_bucket_name_does_match(self) -> None:
+        pattern = r"\balpha-engine-(data|research|crucible-v2)\b"
+        assert _PATTERNS[pattern].search('DEFAULT_ARCTIC_BUCKET = "alpha-engine-data"')
+        assert _PATTERNS[pattern].search("--s3-bucket alpha-engine-research")
+
+    def test_the_bare_bucket_pattern_does_not_match_the_alerts_topic_names(self) -> None:
+        """`crucible/alerts.py` carries `alpha-engine-alerts` and
+        `alpha-engine-alerts-muted` as SNS topic names, deliberately literal —
+        a topic name grants no access and is not a bucket. The scoped
+        alternation (not a bare `alpha-engine-` prefix) is what keeps this
+        pattern from also catching those."""
+        pattern = r"\balpha-engine-(data|research|crucible-v2)\b"
+        assert not _PATTERNS[pattern].search('MUTED_TOPIC = "alpha-engine-alerts-muted"')
+        assert not _PATTERNS[pattern].search("default is `alpha-engine-alerts`")
+
+    def test_the_bare_bucket_pattern_does_not_match_a_tracker_reference(self) -> None:
+        # No literal tracker number here on purpose — `test_no_stale_tracker_
+        # literals.py` forbids exactly that shape in a non-docstring string,
+        # in this very package. `config-` never appears in the bucket
+        # alternation, so any `alpha-engine-config-I<N>` reference is already
+        # excluded by construction; this proves it without citing one.
+        pattern = r"\balpha-engine-(data|research|crucible-v2)\b"
+        assert not _PATTERNS[pattern].search("alpha-engine-config-" + "I" + "9906")
 
     def test_a_var_interpolated_account_id_carries_no_bare_digit_run(self) -> None:
         """The exact form this PR ships: no 12-digit literal appears at all,
@@ -195,5 +286,5 @@ class TestTheAccountIdPatternDoesNotFalsePositiveOnLongerDigitRuns:
             "DEPLOY_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}"
             ":role/crucible-v2-github-deploy"
         )
-        assert not _PATTERNS[r"\b\d{12}\b"].search(line)
+        assert not _PATTERNS[ACCOUNT_ID_PATTERN].search(line)
         assert not _PATTERNS[r"s3://alpha-engine-"].search(line)

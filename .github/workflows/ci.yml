@@ -71,6 +71,12 @@ env:
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   ACCEPTANCE_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/crucible-v2-github-acceptance
   STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
+  # The CloudFormation TEMPLATE upload bucket the operator remedy below
+  # prints — a separate bucket from CRUCIBLE_STORE_URI's store, and a bucket
+  # name is still an infrastructure identifier `crucible/AGENTS.md`
+  # (Visibility) forbids here (alpha-engine-config-I9906 finding 3). Set with:
+  # gh variable set CFN_TEMPLATE_BUCKET --repo nousergon/crucible --body '<s3-bucket-for-cfn-templates>'
+  CFN_TEMPLATE_BUCKET: ${{ vars.CFN_TEMPLATE_BUCKET }}
 
 concurrency:
   # The event name is part of the group so that two arms sharing a ref never
@@ -215,6 +221,10 @@ jobs:
             echo "::error::repository variable CRUCIBLE_STORE_URI is not set — set it with: gh variable set CRUCIBLE_STORE_URI --repo nousergon/crucible --body '<s3-uri-of-the-crucible-v2-store>'"
             missing=1
           fi
+          if [ -z "$CFN_TEMPLATE_BUCKET" ]; then
+            echo "::error::repository variable CFN_TEMPLATE_BUCKET is not set — set it with: gh variable set CFN_TEMPLATE_BUCKET --repo nousergon/crucible --body '<s3-bucket-for-cfn-templates>'"
+            missing=1
+          fi
           exit "$missing"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -248,7 +258,7 @@ jobs:
         run: |
           assumed="$(aws sts get-caller-identity --query Arn --output text)"
           expected="${ACCEPTANCE_ROLE_ARN##*/}"
-          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. The acceptance job must run as a READ-ONLY identity plus a writer scoped to report/acceptance/* only; a wider identity would let a grading surface satisfy the clauses it grades. If the role does not exist yet the crucible-v2 stack has not been applied since the ops PR adding it merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 --s3-bucket alpha-engine-research --s3-prefix cfn-templates/crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until that happens is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. The acceptance job must run as a READ-ONLY identity plus a writer scoped to report/acceptance/* only; a wider identity would let a grading surface satisfy the clauses it grades. If the role does not exist yet the crucible-v2 stack has not been applied since the ops PR adding it merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 --s3-bucket ${CFN_TEMPLATE_BUCKET} --s3-prefix cfn-templates/crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until that happens is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
 
       # JUnit XML, not the terminal summary line. `pyproject.toml` sets
       # `addopts = "-q"`, so a command-line `-q` makes `-qq` and pytest prints

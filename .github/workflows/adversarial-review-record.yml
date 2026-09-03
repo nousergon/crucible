@@ -120,6 +120,7 @@ jobs:
         if: github.ref != 'refs/heads/main'
         run: |
           echo "::error::dispatched from '${{ github.ref }}'. The review-writer role's OIDC trust condition pins ref:refs/heads/main, so the credential step below would fail with an error STS does not explain. Re-dispatch with --ref main; the PR number input is what selects the change under review, not the ref."
+          exit 1
 
       - name: Repository variables are set
         run: |
@@ -133,7 +134,6 @@ jobs:
             missing=1
           fi
           exit "$missing"
-          exit 1
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
