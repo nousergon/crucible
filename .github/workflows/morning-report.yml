@@ -180,7 +180,10 @@ jobs:
           ALPHA_ENGINE_SECRETS_SOURCE: env
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: uv run crucible report.morning --store "$STORE_URI"
+        # `--run-mode live`: a scheduled firing is a live run, and
+        # `run_manifest.v2` requires the field with no default (there is no
+        # date this could be inferred from — see `crucible.runmode`).
+        run: uv run crucible report.morning --run-mode live --store "$STORE_URI"
 
   # The stopgap. See "Why notify-failure IS here" above for the measured
   # reason and the condition that retires it.

@@ -84,7 +84,14 @@ def weekly_handler(args: argparse.Namespace) -> int:
     # `console` met a 5xx — twelve jobs repeated for one, each rewriting its
     # own manifest, and the store's answer to "did this week work" decided by
     # write ordering.
-    run_job("weekly", body, store=store, trading_day=args.trading_day, transient_retry=False)
+    run_job(
+        "weekly",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
+        transient_retry=False,
+    )
     return 0
 
 
@@ -192,7 +199,13 @@ def gate_handler(args: argparse.Namespace) -> int:
             }
         )
 
-    run_job("gate", body, store=store, trading_day=args.trading_day)
+    run_job(
+        "gate",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
+    )
     reading = result["reading"]
     print(reading.render())
     print(result["ladder"].render())

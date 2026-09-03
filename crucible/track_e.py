@@ -112,5 +112,11 @@ def report_handler(args: argparse.Namespace) -> int:
             }
         )
 
-    run_job("report", body, store=store, trading_day=args.trading_day)
+    run_job(
+        "report",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
+    )
     return 0

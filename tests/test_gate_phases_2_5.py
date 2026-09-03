@@ -53,6 +53,7 @@ from crucible.keys import (
     runs_prefix,
     verdict_key,
 )
+from crucible.manifest import PREDECESSOR_SCHEMA_VERSION, RUN_MANIFEST_SCHEMA_VERSION
 from crucible.slots import SLOTS
 from crucible.store import LocalStore
 
@@ -145,23 +146,26 @@ def _raising_client() -> object:
 # ---------------------------------------------------------------------------
 
 
-def _live_schema(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pretend `run_manifest.v1` declares the live/replay field.
+def _schema_without_run_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A build whose run-manifest schema declares no live/replay field.
 
-    It does NOT today — that gap is filed as its own issue and is exactly what
-    the unmeasurable case below asserts. Patched here so the MET and UNMET
-    branches are reachable and tested BEFORE the schema lands, rather than
-    shipping two untested branches that first run in production.
+    That was the real state until `run_manifest.v2` landed
+    (alpha-engine-config-I9918), and the guard reading it is kept — a clause
+    that answered from `crucible.gate`'s own constant rather than from the
+    CONTRACT would grade every manifest as malformed on a build whose schema
+    had lost the field. Patched rather than deleted so the unmeasurable branch
+    stays exercised now that the real schema satisfies it.
     """
     monkeypatch.setattr(
         gate_module,
         "_manifest_property_names",
-        lambda: frozenset({MANIFEST_RUN_MODE_FIELD, "status", "attempts"}),
+        lambda: frozenset({"status", "attempts"}),
     )
 
 
 def _weekly(day: dt.date, *, mode: str = MANIFEST_RUN_MODE_LIVE, attempts: int = 1) -> dict:
     return {
+        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
         "status": "ok",
         "reason": "",
         MANIFEST_RUN_MODE_FIELD: mode,
@@ -186,27 +190,32 @@ class TestLiveSaturdaysAreReadFromTheManifestNeverTheDate:
         assert not set(PHASE2_ANCHORS) & set(PHASE2_RENDER_WINDOW)
 
     def test_unmeasurable_when_the_manifest_cannot_say_live_or_replay(
-        self, store: LocalStore
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Today's reading, and the one that matters: the schema declares no
-        live/replay field, so the clause refuses to answer rather than
-        inferring liveness from the trading day — which the accelerated replay
-        schedule would satisfy."""
+        """The reading on a build whose schema declares no live/replay field:
+        the clause refuses to answer rather than inferring liveness from the
+        trading day — which the accelerated replay schedule would satisfy."""
+        _schema_without_run_mode(monkeypatch)
         clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_RENDER_WINDOW)
         assert clause.unmeasurable and not clause.met
         assert MANIFEST_RUN_MODE_FIELD in clause.detail
 
-    def test_met_when_both_saturdays_are_live_and_first_attempt_ok(
-        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _live_schema(monkeypatch)
+    def test_the_shipped_schema_makes_this_clause_measurable(self, store: LocalStore) -> None:
+        """The half `alpha-engine-config-I9918` actually closed: with NO
+        monkeypatch, against the schema this build ships, the clause grades
+        the store instead of reporting that it could not look."""
+        clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_RENDER_WINDOW)
+        assert not clause.unmeasurable and not clause.met
+        assert "never ran" in clause.detail
+
+    def test_met_when_both_saturdays_are_live_and_first_attempt_ok(self, store: LocalStore) -> None:
         for day in PHASE2_ANCHORS:
             _put(store, manifest_key("weekly", day.isoformat()), _weekly(day))
         clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_RENDER_WINDOW)
         assert clause.met and not clause.unmeasurable
 
     def test_the_same_two_saturdays_read_met_on_every_render_weekday(
-        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+        self, store: LocalStore
     ) -> None:
         """The regression that closes the class rather than the instance.
 
@@ -216,7 +225,6 @@ class TestLiveSaturdaysAreReadFromTheManifestNeverTheDate:
         on the other four — the board renders DAILY, so that is a contract
         unsatisfiable four days in five.
         """
-        _live_schema(monkeypatch)
         for day in PHASE2_ANCHORS:
             _put(store, manifest_key("weekly", day.isoformat()), _weekly(day))
         for render in (
@@ -231,22 +239,33 @@ class TestLiveSaturdaysAreReadFromTheManifestNeverTheDate:
             clause = gate_module._clause_live_saturdays_first_attempt_ok(store, window)
             assert clause.met, f"{render.isoformat()}: {clause.detail}"
 
-    def test_a_replay_is_unmet_not_met(
-        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_a_replay_is_unmet_not_met(self, store: LocalStore) -> None:
         """The whole reason the clause list was withheld. A perfect replay
         Saturday is UNMET here, and says which day was not live."""
-        _live_schema(monkeypatch)
         for day in PHASE2_ANCHORS:
             _put(store, manifest_key("weekly", day.isoformat()), _weekly(day, mode="replay"))
         clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_RENDER_WINDOW)
         assert not clause.met and not clause.unmeasurable
         assert "not live" in clause.detail
 
-    def test_a_retried_run_is_not_a_first_attempt_ok(
-        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _live_schema(monkeypatch)
+    def test_a_manifest_predating_the_field_cannot_be_counted_live(self, store: LocalStore) -> None:
+        """The grandfathering half. A weekly manifest written under
+        `run_manifest.v1` is not malformed and is not condemned — it simply
+        cannot establish liveness, so it reads UNMET with that said in terms.
+        Counting it live on the strength of its date is the one thing this
+        clause exists not to do.
+        """
+        for day in PHASE2_ANCHORS:
+            document = _weekly(day)
+            del document[MANIFEST_RUN_MODE_FIELD]
+            document["schema_version"] = PREDECESSOR_SCHEMA_VERSION
+            _put(store, manifest_key("weekly", day.isoformat()), document)
+        clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_RENDER_WINDOW)
+        assert not clause.met and not clause.unmeasurable
+        assert "predate the live/replay field" in clause.detail
+        assert PREDECESSOR_SCHEMA_VERSION in clause.detail
+
+    def test_a_retried_run_is_not_a_first_attempt_ok(self, store: LocalStore) -> None:
         for day in PHASE2_ANCHORS:
             _put(store, manifest_key("weekly", day.isoformat()), _weekly(day, attempts=2))
         clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_RENDER_WINDOW)
@@ -254,9 +273,8 @@ class TestLiveSaturdaysAreReadFromTheManifestNeverTheDate:
         assert "retried" in clause.detail
 
     def test_an_absent_manifest_is_unmet_by_the_anchor_key_not_the_render_day(
-        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+        self, store: LocalStore
     ) -> None:
-        _live_schema(monkeypatch)
         clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_RENDER_WINDOW)
         assert not clause.met
         assert "never ran" in clause.detail

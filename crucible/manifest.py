@@ -29,10 +29,41 @@ from jsonschema import Draft202012Validator
 
 from crucible.keys import manifest_key, manifest_prefix  # noqa: F401 - re-exported
 
-RUN_MANIFEST_SCHEMA_VERSION = "run_manifest.v1"
+#: The version every producer writes TODAY. Bumped to v2 by
+#: alpha-engine-config-I9918: v1 declared no live/replay field and set
+#: `additionalProperties: false`, so no producer could say whether a run was
+#: a live Saturday or a replay of a historical one, and phase 2's exit gate
+#: was permanently unmeasurable. v2 adds one REQUIRED field, `run_mode`, and
+#: is otherwise v1's contract unchanged.
+#:
+#: **A new version rather than a v1 addition, and nothing is backfilled.** A
+#: required field added to v1 would retroactively invalidate every manifest
+#: already in the store, and `read_manifest` validates on READ — so the board,
+#: the morning report and the alert sweep would all start refusing documents
+#: that were correct when they were written. Instead each document is checked
+#: against the version it declares (see :func:`validate`): a v1 object stays
+#: valid as v1, forever, and is never rewritten. Backfilling one would mean
+#: inventing a `run_mode` for a run nobody observed, which is the false
+#: liveness claim the field exists to prevent.
+RUN_MANIFEST_SCHEMA_VERSION = "run_manifest.v2"
+
+#: v2's predecessor. Frozen: it gains no fields and no producer writes it.
+#: It stays in the package because the objects written under it are still in
+#: the store and are still read.
+PREDECESSOR_SCHEMA_VERSION = "run_manifest.v1"
 
 SCHEMA_DIR = Path(__file__).parent / "schemas"
-SCHEMA_PATH = SCHEMA_DIR / "run_manifest.v1.json"
+
+#: Every run-manifest version this package can check a document against,
+#: newest first. Not a suppression list and not an exemption list — each entry
+#: is a real, strict schema that shipped, and a document is graded against the
+#: one it declares rather than waved through.
+SCHEMA_PATHS: dict[str, Path] = {
+    RUN_MANIFEST_SCHEMA_VERSION: SCHEMA_DIR / "run_manifest.v2.json",
+    PREDECESSOR_SCHEMA_VERSION: SCHEMA_DIR / "run_manifest.v1.json",
+}
+
+SCHEMA_PATH = SCHEMA_PATHS[RUN_MANIFEST_SCHEMA_VERSION]
 
 #: The exhaustive status set. Imported by the runner and by tests so that
 #: adding a third state requires editing this line, where the reason it must
@@ -57,22 +88,46 @@ class ManifestValidationError(ValueError):
 
 @lru_cache(maxsize=1)
 def load_schema() -> dict[str, Any]:
-    """The v1 run-manifest schema, as a dict.
+    """The CURRENT run-manifest schema, as a dict.
 
     Cached because the validator is constructed per process, and the file
-    never changes within one.
+    never changes within one. A test that mutates what this returns must call
+    ``load_schema.cache_clear()``.
     """
-    if not SCHEMA_PATH.is_file():
+    return load_schema_for(RUN_MANIFEST_SCHEMA_VERSION)
+
+
+@lru_cache(maxsize=len(SCHEMA_PATHS))
+def load_schema_for(version: str) -> dict[str, Any]:
+    """The run-manifest schema for ``version``.
+
+    An unrecognised version is refused rather than checked against the newest
+    schema on the assumption that it is close enough — a document declaring a
+    version this build does not carry is a document this build cannot make any
+    claim about.
+    """
+    path = SCHEMA_PATHS.get(version)
+    if path is None:
+        raise ManifestValidationError(
+            f"run manifest declares schema_version {version!r}; this build carries "
+            f"{sorted(SCHEMA_PATHS)}. A document whose contract this process does not "
+            "ship cannot be checked, and an unchecked manifest read as valid is worse "
+            "than none."
+        )
+    if not path.is_file():
         raise FileNotFoundError(
-            f"run manifest schema missing at {SCHEMA_PATH}. It ships inside the "
+            f"run manifest schema missing at {path}. It ships inside the "
             "package; a missing schema means a broken build, not a degraded run."
         )
-    return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-@lru_cache(maxsize=1)
-def _validator() -> Draft202012Validator:
-    schema = load_schema()
+@lru_cache(maxsize=len(SCHEMA_PATHS))
+def _validator(version: str) -> Draft202012Validator:
+    """A checked validator per version. A test that mutates a schema must
+    clear `load_schema`, `load_schema_for` AND this cache, or it will grade
+    its mutation against the validator built from the file on disk."""
+    schema = load_schema_for(version)
     Draft202012Validator.check_schema(schema)
     return Draft202012Validator(schema)
 
@@ -80,19 +135,32 @@ def _validator() -> Draft202012Validator:
 def validate(manifest: dict[str, Any]) -> None:
     """Raise :class:`ManifestValidationError` unless ``manifest`` conforms.
 
+    **Checked against the version the document itself declares.** Producers
+    write :data:`RUN_MANIFEST_SCHEMA_VERSION` and nothing else, so on the
+    write path this is always the current schema; on the read path it is what
+    lets a manifest written before v2 stay readable at its own contract
+    instead of being condemned by a field that did not exist when it was
+    written (alpha-engine-config-I9918). Each version is checked strictly —
+    a v1 document is held to every one of v1's rules.
+
     Every error is reported, not just the first: a writer fixing one field at
     a time against a validator that reports one error at a time is how a
     half-conformant producer ships.
     """
-    errors = sorted(_validator().iter_errors(manifest), key=lambda e: list(e.absolute_path))
+    declared = manifest.get("schema_version")
+    if not isinstance(declared, str):
+        raise ManifestValidationError(
+            f"run manifest declares no schema_version (got {declared!r}). The version "
+            "is what says which contract the document was written to; a consumer that "
+            "cannot read it refuses the document rather than guessing."
+        )
+    errors = sorted(_validator(declared).iter_errors(manifest), key=lambda e: list(e.absolute_path))
     if not errors:
         return
     detail = "\n".join(
         f"  - {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors
     )
-    raise ManifestValidationError(
-        f"run manifest does not conform to {RUN_MANIFEST_SCHEMA_VERSION}:\n{detail}"
-    )
+    raise ManifestValidationError(f"run manifest does not conform to {declared}:\n{detail}")
 
 
 def read_manifest(

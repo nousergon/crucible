@@ -126,7 +126,13 @@ def release_pin_handler(args: argparse.Namespace) -> int:
             }
         )
 
-    run_job("release.pin", body, store=store, trading_day=args.trading_day)
+    run_job(
+        "release.pin",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
+    )
     return 0
 
 
@@ -324,6 +330,7 @@ def smoke_handler(args: argparse.Namespace) -> int:
             body,
             store=store,
             trading_day=args.trading_day,
+            run_mode=getattr(args, "run_mode", None),
             release_sha=args.release,
             # A smoke that needed a retry is a smoke that told us something.
             # Retrying it would promote a build whose first attempt failed,
@@ -387,6 +394,7 @@ def sweep_handler(args: argparse.Namespace) -> int:
         body,
         store=store,
         trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
         # The sweep fires every calendar day at 21:00 ET, and Friday,
         # Saturday and Sunday all resolve to Friday's trading day — three
         # writers, one key, without this. `calendar_date` is only known once
@@ -424,7 +432,13 @@ def heartbeat_handler(args: argparse.Namespace) -> int:
             }
         )
 
-    run_job("heartbeat", body, store=store, trading_day=args.trading_day)
+    run_job(
+        "heartbeat",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
+    )
     return 0
 
 
@@ -473,7 +487,13 @@ def drift_handler(args: argparse.Namespace) -> int:
             schema_version="metric_record.v1",
         )
 
-    run_job("drift", body, store=store, trading_day=args.trading_day)
+    run_job(
+        "drift",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
+    )
     return 0
 
 
@@ -696,7 +716,13 @@ def board_handler(args: argparse.Namespace) -> int:
             }
         )
 
-    run_job("board", body, store=store, trading_day=args.trading_day)
+    run_job(
+        "board",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
+    )
     return 0
 
 
@@ -770,5 +796,11 @@ def console_handler(args: argparse.Namespace) -> int:
             }
         )
 
-    run_job("console", body, store=store, trading_day=args.trading_day)
+    run_job(
+        "console",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
+    )
     return 0

@@ -140,7 +140,9 @@ jobs:
           case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. The board must render as a READ-ONLY identity; rendering it as a writer would let a grading surface satisfy the clauses it grades. If the role does not exist yet the crucible-v2 stack has not been applied since nous-ergon-ops-PR990 merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until that happens is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
 
       - name: Render the board
-        run: uv run crucible board --store "$STORE_URI"
+        # `--run-mode live`: a scheduled render is a live run, and
+        # `run_manifest.v2` requires the field with no default.
+        run: uv run crucible board --run-mode live --store "$STORE_URI"
 
       # The one line a human reads if they open the run. Deltas, not absolute
       # state: a board reading almost entirely PLANNED for weeks is correct,

@@ -1,4 +1,10 @@
-"""Contract test for `crucible/schemas/run_manifest.v1.json`.
+"""Contract test for the CURRENT run manifest schema.
+
+(`crucible/schemas/run_manifest.v2.json` today — read through
+`crucible.manifest.load_schema`, never by filename, so a version bump does
+not need this file edited to keep testing the shipped contract. The
+live-or-replay field v2 added has its own producer/consumer contract test in
+`tests/test_run_mode_contract.py`.)
 
 Written before the schema (fleet TDD rule) and seen failing.
 
@@ -37,6 +43,10 @@ def _valid_manifest() -> dict:
         "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
         "run_id": "01JG0000000000000000000000",
         "job": "experiment.run",
+        # v2's one addition (alpha-engine-config-I9918). Required with no
+        # default, so it belongs in the FLOOR fixture: an optional field here
+        # would prove nothing about a producer that omitted it.
+        "run_mode": "live",
         "trading_day": "2026-08-28",
         "calendar_date": "2026-08-29",
         "status": "ok",

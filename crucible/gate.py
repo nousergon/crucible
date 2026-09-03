@@ -1638,7 +1638,7 @@ def _unmeasurable(name: str, requirement: str, detail: str, evidence: Iterable[s
 
 @lru_cache(maxsize=1)
 def _manifest_property_names() -> frozenset[str]:
-    """Every field `run_manifest.v1` declares, read from the SCHEMA.
+    """Every field the CURRENT run manifest schema declares, read from it.
 
     Derived, never restated: the phase-2 live clause asks whether the manifest
     contract can distinguish a live Saturday from a replay at all, and that is
@@ -1648,17 +1648,17 @@ def _manifest_property_names() -> frozenset[str]:
     return frozenset(load_schema().get("properties", {}))
 
 
-#: The `run_manifest.v1` field that says whether a weekly run was a LIVE
-#: Saturday or a REPLAY of a historical one, and the value meaning live.
+#: The run-manifest field that says whether a weekly run was a LIVE Saturday
+#: or a REPLAY of a historical one, and the value meaning live.
 #:
-#: **The field does not exist today**, and this constant is not a claim that
-#: it does — `_clause_live_saturdays_first_attempt_ok` checks the schema
-#: before reading anything, so the clause reads UNMEASURABLE naming the gap
-#: until a producer can actually write it. The gap is filed as
-#: `alpha-engine-config-I9918`: `run_manifest.v1` declares
-#: `additionalProperties: false`, so no producer can add the field without a
-#: schema change, and a schema change is a contract change that gets its own
-#: design note rather than riding along in a gate PR.
+#: **The field landed in `run_manifest.v2`** (`alpha-engine-config-I9918`):
+#: required, closed vocabulary, no default, set from the invocation by
+#: `crucible.runmode.resolve_run_mode`. v1 declared no such field and set
+#: `additionalProperties: false`, so no producer could write one and this
+#: clause read UNMEASURABLE. The schema check below stays regardless — it is
+#: what makes the clause answer from the CONTRACT rather than from this
+#: constant, so a build whose schema does not declare the field reads
+#: unmeasurable again instead of grading every manifest as malformed.
 #:
 #: `calendar_date` is NOT this field and must never be used as it: the schema
 #: says it is "recorded for provenance ONLY. Never used as a key, never an
@@ -1666,10 +1666,11 @@ def _manifest_property_names() -> frozenset[str]:
 MANIFEST_RUN_MODE_FIELD = "run_mode"
 MANIFEST_RUN_MODE_LIVE = "live"
 
-#: The tracker issues owning the two CONTRACT GAPS that make a clause below
-#: unmeasurable today: the manifest cannot say live-or-replay
-#: (`alpha-engine-config-I9918`), and an arm recipe cannot name an LLM call
-#: site (`alpha-engine-config-I9920`).
+#: The tracker issues owning the two manifest/recipe CONTRACT questions a
+#: clause below reads: which issue introduced the live-or-replay field
+#: (`alpha-engine-config-I9918`, landed in `run_manifest.v2`), and which owns
+#: the still-open gap where an arm recipe cannot name an LLM call site
+#: (`alpha-engine-config-I9920`).
 #:
 #: Held as plain `int`s and rendered into the reading with an f-string at the
 #: one call site, never as a full literal:
@@ -1762,12 +1763,12 @@ def _clause_live_saturdays_first_attempt_ok(store: Store, window: list[dt.date])
         return _unmeasurable(
             name,
             requirement,
-            f"`run_manifest.v1` declares no `{MANIFEST_RUN_MODE_FIELD}` field, so no "
-            "manifest can say whether its run was a live Saturday or a replay of a "
-            "historical one. The schema sets `additionalProperties: false`, so a "
-            "producer cannot add it either. Inferring liveness from the trading day is "
-            "exactly what this clause must not do (§6.1 runs replays of past "
-            "Saturdays on an accelerated schedule). Filed as "
+            f"the current run manifest schema declares no `{MANIFEST_RUN_MODE_FIELD}` "
+            "field, so no manifest can say whether its run was a live Saturday or a "
+            "replay of a historical one. The schema sets `additionalProperties: "
+            "false`, so a producer cannot add it either. Inferring liveness from the "
+            "trading day is exactly what this clause must not do (§6.1 runs replays of "
+            "past Saturdays on an accelerated schedule). The field was introduced by "
             f"`alpha-engine-config-I{MANIFEST_RUN_MODE_GAP_ISSUE}`",
             evidence,
         )
@@ -1775,6 +1776,7 @@ def _clause_live_saturdays_first_attempt_ok(store: Store, window: list[dt.date])
     malformed: list[str] = []
     unreadable: list[str] = []
     replayed: list[str] = []
+    predates_field: list[str] = []
     failed: list[str] = []
     retried: list[str] = []
     for day, key in zip(days, evidence, strict=True):
@@ -1786,6 +1788,17 @@ def _clause_live_saturdays_first_attempt_ok(store: Store, window: list[dt.date])
             missing.append(f"{key} is absent")
             continue
         document = read.document or {}
+        if MANIFEST_RUN_MODE_FIELD not in document:
+            # A manifest written before the field existed. It is UNMET, never
+            # MET and never "malformed": the document was correct against the
+            # contract it declares, and it simply cannot establish liveness.
+            # Counting it live on the strength of its date is the one thing
+            # this clause exists not to do.
+            predates_field.append(
+                f"{day.isoformat()}: {document.get('schema_version')!r} carries no "
+                f"`{MANIFEST_RUN_MODE_FIELD}`, so this run cannot be shown to be live"
+            )
+            continue
         problem = _field(key, document, MANIFEST_RUN_MODE_FIELD, str)
         if problem is not None:
             malformed.append(problem)
@@ -1813,7 +1826,7 @@ def _clause_live_saturdays_first_attempt_ok(store: Store, window: list[dt.date])
                 f"{day.isoformat()}: {len(attempts)} attempt(s) — a retried run is not a "
                 "first-attempt ok"
             )
-    content_gap = bool(missing or malformed or replayed or failed or retried)
+    content_gap = bool(missing or malformed or replayed or predates_field or failed or retried)
     if unreadable and not content_gap:
         return _unmeasurable(name, requirement, "; ".join(unreadable), evidence)
     if content_gap or unreadable:
@@ -1824,6 +1837,7 @@ def _clause_live_saturdays_first_attempt_ok(store: Store, window: list[dt.date])
             ("never ran", missing),
             ("malformed", malformed),
             ("not live", replayed),
+            ("predate the live/replay field", predates_field),
             ("failed", failed),
             ("retried", retried),
         ):
