@@ -10,6 +10,7 @@ a gain.
 from __future__ import annotations
 
 import ast
+import functools
 import json
 import subprocess
 import sys
@@ -709,6 +710,7 @@ def _exception_provenance(source: str, allowed: frozenset[str]) -> dict[str, str
     return {name: imported[name] for name in allowed}
 
 
+@functools.cache
 def _packages_that_raise(module: str) -> frozenset[str]:
     """The import bindings a `try` body must call INTO for an exception
     defined in ``module`` to be reachable from it.
@@ -753,6 +755,22 @@ def _unmeasurable_unreachable_handlers(source: str, provenance: dict[str, str]) 
     imported from. Disallowed types are ignored here — they are the other
     guard's violation, and reporting them twice would let a fix for one
     read as a fix for both.
+
+    **Residuals, named rather than claimed away.** This is a syntactic
+    reachability check over one function body, not a call graph:
+
+    - A body that calls a same-module helper which in turn calls boto3 is
+      FLAGGED (the helper is not an import binding) — fails closed; the fix
+      is to name the SDK call in the try body or import the helper.
+    - A boto3 call reached through an attribute chain rooted at an import
+      (`boto3.session.Session().client(...)`) is accepted — the root name is
+      what is resolved.
+    - A qualifying call in a NESTED `try` inside the body whose own handler
+      swallows the exception is accepted: the call is in the body, and
+      whether an inner handler ate the raise is control flow this scanner
+      does not model.
+    - A qualifying call inside a nested `def`/`lambda` the body only defines
+      is NOT accepted (explicit-stack walk, `_reached`).
     """
     tree = ast.parse(source)
     bindings: dict[str, str] = {}
@@ -770,13 +788,22 @@ def _unmeasurable_unreachable_handlers(source: str, provenance: dict[str, str]) 
         return func.id if isinstance(func, ast.Name) else None
 
     def _reached(body: list[ast.stmt]) -> set[str]:
+        """Import bindings the `try` body's calls reach — walking with an
+        explicit stack that does NOT descend into a nested `def`, `async
+        def` or `lambda`: a qualifying call inside a function the body only
+        DEFINES is never executed by the body, and `ast.walk` counted it
+        (round-1 review of alpha-engine-config-I9910)."""
         reached: set[str] = set()
-        for stmt in body:
-            for node in ast.walk(stmt):
-                if isinstance(node, ast.Call):
-                    root = _root(node.func)
-                    if root in bindings:
-                        reached.add(bindings[root])
+        stack: list[ast.AST] = list(body)
+        while stack:
+            node = stack.pop()
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+                continue
+            if isinstance(node, ast.Call):
+                root = _root(node.func)
+                if root in bindings:
+                    reached.add(bindings[root])
+            stack.extend(ast.iter_child_nodes(node))
         return reached
 
     def _type_names(node: ast.expr | None) -> frozenset[str]:
@@ -875,6 +902,34 @@ def test_the_reachability_scanner_fires_on_the_launder_the_declared_type_guard_a
     assert len(violations) == 2, violations
     assert "NoCredentialsError" in violations[0] and "botocore.exceptions" in violations[0]
     assert "StackNotAppliedError" in violations[1] and "crucible.tags" in violations[1]
+
+
+_NESTED_DEF_LAUNDER = textwrap.dedent(
+    """
+    from botocore.exceptions import NoCredentialsError
+
+    def f(record_property):
+        try:
+            import boto3
+            def never_called():
+                return boto3.client("sts")
+            g = lambda: boto3.client("sts")
+            assert 1 == 1
+        except NoCredentialsError as exc:
+            _unmeasurable("c", "r", exc, phase="phase0", record_property=record_property)
+    """
+)
+
+
+def test_a_qualifying_call_inside_a_nested_def_the_body_never_calls_is_not_reach() -> None:
+    """Round-1 review of alpha-engine-config-I9910: `ast.walk` descended
+    into a nested `def`/`lambda`, so a boto3 call the body merely DEFINES
+    counted as reaching botocore. The explicit-stack walk stops at function
+    boundaries."""
+    provenance = _exception_provenance(_NESTED_DEF_LAUNDER, frozenset({"NoCredentialsError"}))
+    violations = _unmeasurable_unreachable_handlers(_NESTED_DEF_LAUNDER, provenance)
+    assert len(violations) == 1, violations
+    assert "NoCredentialsError" in violations[0]
 
 
 def test_the_reachability_scanner_accepts_a_body_that_calls_into_the_raising_module() -> None:
