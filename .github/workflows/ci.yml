@@ -35,20 +35,16 @@ on:
     # on `push`, where nothing is waiting on the result. The extra runs are
     # metered while the repo is private, and cost a few minutes a month
     # against the §4.11 budget.
-  # NO `schedule:`, deliberately, and this is worth reading before adding one.
-  #
-  # A daily arm is the right shape for a gate with a live-state clause: it
-  # catches what no merge can see, an account changing out of band. But the
-  # `acceptance` job below holds `permissions: {contents: read}` — no OIDC, no
-  # AWS credentials — so its one live-state clause (`TestCost`) cannot reach
-  # the account at all and lands in the same UNMET branch a genuine failure
-  # would. A cron here would regrade an unchanged tree against an unchanged
-  # lockfile and return the same reading every day, forever: metered minutes
-  # on a private repo buying a signal it is not able to produce.
-  #
-  # `alpha-engine-config-I9828` gives the job read-only OIDC and makes
-  # UNMEASURABLE a distinct outcome from UNMET. The cron belongs in that
-  # change, where it starts measuring something, not in this one.
+  # STILL no `schedule:`. `alpha-engine-config-I9828` gave the acceptance
+  # job's one live-state clause (`TestCost`) a distinct UNMEASURABLE outcome,
+  # and `alpha-engine-config-I9895` (this change) gives the job the read-only
+  # OIDC it needs to actually read the account on the paths that already run
+  # it (`push: [main]`) — but a cron here would still regrade an UNCHANGED
+  # tree against an unchanged lockfile and republish the identical reading
+  # every day, forever: metered minutes on a private repo buying a signal
+  # that only a merge, not the clock, can move. A schedule earns its keep
+  # once there is a reason the account can drift without a push — that is a
+  # separate change, not a reason to withhold OIDC from this one.
 
 # Default-deny at the workflow level; each job re-grants only what it needs.
 # `contents: read` is NOT optional while this repo is private: with no
@@ -56,6 +52,19 @@ on:
 # fails with "Repository not found" — which reads like a missing repo rather
 # than a missing scope. Measured 2026-09-01 on the first CI run.
 permissions: {}
+
+env:
+  AWS_REGION: us-east-1
+  # crucible-v2-github-acceptance, created by nous-ergon-ops/infrastructure/
+  # cloudformation/crucible-v2.yaml (alpha-engine-config-I9895, I9902). Read
+  # only: cloudformation:ListStackResources + tag:GetResources +
+  # iam:ListRoleTags on the crucible-v2 stack's own resources (TestCost's
+  # tag-attribution clause), and s3:PutObject scoped to exactly
+  # report/acceptance/* (the reading this job publishes). It cannot write the
+  # board, a run manifest, or anything else in the store — same separation
+  # argument board.yml's own comment makes about BoardRole.
+  ACCEPTANCE_ROLE_ARN: arn:aws:iam::711398986525:role/crucible-v2-github-acceptance
+  STORE_URI: s3://alpha-engine-crucible-v2/crucible
 
 concurrency:
   # The event name is part of the group so that two arms sharing a ref never
@@ -160,6 +169,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
     # tests/acceptance holds the plan §2 clauses written BEFORE the code that
     # satisfies them (plan §6 phase-0 exit: "acceptance tests written as
     # failing pytest"). They fail today by design and go green one at a time
@@ -203,6 +213,21 @@ jobs:
       - name: Install
         run: uv sync --frozen
 
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          role-to-assume: ${{ env.ACCEPTANCE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The identity actually obtained, read back from AWS rather than
+      # restated from `env` — same argument board.yml and morning-report.yml
+      # make: what is falsifiable is the identity, not the literal.
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${ACCEPTANCE_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. The acceptance job must run as a READ-ONLY identity plus a writer scoped to report/acceptance/* only; a wider identity would let a grading surface satisfy the clauses it grades. If the role does not exist yet the crucible-v2 stack has not been applied since the ops PR adding it merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 --s3-bucket alpha-engine-research --s3-prefix cfn-templates/crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until that happens is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+
       # JUnit XML, not the terminal summary line. `pyproject.toml` sets
       # `addopts = "-q"`, so a command-line `-q` makes `-qq` and pytest prints
       # no summary at all — parsing stdout is how a wrong count goes unnoticed.
@@ -223,8 +248,40 @@ jobs:
           set -e
           tail -40 acceptance.txt
 
+      # `continue-on-error`, deliberately: publishing the reading must not be
+      # skipped just because the reading MOVED — a red count is plan §12
+      # rule 3's whole point (`check_reading.py`'s `--write-json` writes the
+      # document before any of its own fail branches can return early, so the
+      # local file exists here regardless of this step's outcome). The job
+      # itself still fails, in the "Fail the job if the reading moved" step
+      # below, once the artifact is safely published.
       - name: The reading has not moved
-        run: uv run --frozen python tests/acceptance/check_reading.py acceptance.xml
+        id: check
+        continue-on-error: true
+        run: |
+          uv run --frozen python tests/acceptance/check_reading.py \
+            --write-json acceptance-reading.json --commit "${GITHUB_SHA}" acceptance.xml
+
+      - name: Resolve the trading day
+        id: trading_day
+        run: |
+          day="$(uv run --frozen python -c 'from crucible.calendar import resolve_trading_day; print(resolve_trading_day())')"
+          echo "day=${day}" >> "$GITHUB_OUTPUT"
+
+      # Plan §12 rule 3 — the acceptance count is the only progress figure —
+      # and `alpha-engine-config-I9902`'s whole point: this is the ONE place
+      # that files `crucible.keys.acceptance_reading_key`'s producer
+      # contract, so `crucible report.morning` and the board can read it from
+      # a store artifact instead of a git checkout of `main`.
+      - name: Publish the acceptance reading
+        run: |
+          aws s3 cp acceptance-reading.json "${STORE_URI}/report/acceptance/${{ steps.trading_day.outputs.day }}.json" --only-show-errors
+
+      - name: Fail the job if the reading moved
+        if: steps.check.outcome != 'success'
+        run: |
+          echo "::error::the acceptance reading moved — see 'The reading has not moved' step above."
+          exit 1
 
   # A moved reading on main blocks nothing and is green
   # to the next author, so without this nothing announces it — the same gap

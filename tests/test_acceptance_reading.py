@@ -77,6 +77,22 @@ def _run(report: Path, ratchet: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _run_with_args(
+    report: Path, ratchet: Path, *extra_args: str
+) -> subprocess.CompletedProcess[str]:
+    """Same shape as `_run`, with extra CLI args inserted before the report
+    path — `--write-json <path>` and `--commit <sha>`, for
+    `alpha-engine-config-I9902`'s publisher."""
+    checker = ratchet.parent / "check_reading.py"
+    checker.write_text(CHECKER.read_text())
+    return subprocess.run(
+        [sys.executable, str(checker), *extra_args, str(report)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 @pytest.fixture
 def ratchet(tmp_path: Path) -> Path:
     path = tmp_path / "ratchet.json"
@@ -978,3 +994,124 @@ def test_a_malformed_unmeasurable_entry_is_red_and_names_the_field(
     result = _run(report, ratchet)
     assert result.returncode == 1
     assert "Traceback" not in result.stderr
+
+
+# ── `--write-json` — the producer contract, alpha-engine-config-I9902 ───────
+#
+# `crucible.keys.acceptance_reading_key`'s docstring declares the shape
+# `crucible.morning._acceptance_line` parses:
+#   {"met": int, "unmet": int, "unmeasurable": int, "commit": str, "measured_at": str}
+# These tests assert the checker actually emits exactly that shape, on both a
+# clean reading and a moved one — the moved case is the one that matters,
+# since plan §12 rule 3 makes a RED count the progress figure, and a
+# publisher that only wrote on success would be silent on every run that
+# moved.
+
+
+def test_write_json_emits_the_producer_contract(tmp_path: Path, ratchet: Path) -> None:
+    report = _report(tmp_path / "r.xml", met=["T::b", "T::c"], unmet=["T::a"])
+    out = tmp_path / "reading.json"
+    result = _run_with_args(report, ratchet, "--write-json", str(out), "--commit", "deadbeef")
+    assert result.returncode == 0, result.stderr
+    document = json.loads(out.read_text())
+    assert set(document) == {"met", "unmet", "unmeasurable", "commit", "measured_at"}
+    assert document["met"] == 2
+    assert document["unmet"] == 1
+    assert document["unmeasurable"] == 0
+    assert document["commit"] == "deadbeef"
+    # ISO-8601, parseable — the exact format is not the contract, but a
+    # non-parseable timestamp would be.
+    from datetime import datetime as _dt
+
+    _dt.fromisoformat(document["measured_at"])
+
+
+def test_write_json_counts_unmeasurable_separately_from_unmet(
+    tmp_path: Path, ratchet_with_unmeasurable: Path
+) -> None:
+    report = _report(
+        tmp_path / "r.xml",
+        met=["T::b", "T::c"],
+        unmet=["T::a"],
+        unmeasurable={"T::d": "NoCredentialsError"},
+    )
+    out = tmp_path / "reading.json"
+    result = _run_with_args(
+        report, ratchet_with_unmeasurable, "--write-json", str(out), "--commit", "abc123"
+    )
+    assert result.returncode == 0, result.stderr
+    document = json.loads(out.read_text())
+    # plain_unmet (T::a) is 1; unmeasurable (T::d) is its own count, never
+    # folded into unmet — the same distinction `crucible.tags`'s own
+    # docstring and this grader's module docstring both make.
+    assert document["unmet"] == 1
+    assert document["unmeasurable"] == 1
+
+
+def test_write_json_still_writes_on_a_moved_reading(tmp_path: Path, ratchet: Path) -> None:
+    """The publish must NOT be skipped when the reading is red — a regressed
+    clause is exactly the run whose reading matters most to publish."""
+    report = _report(tmp_path / "r.xml", met=["T::c"], unmet=["T::a", "T::b"])
+    out = tmp_path / "reading.json"
+    result = _run_with_args(report, ratchet, "--write-json", str(out), "--commit", "cafef00d")
+    assert result.returncode == 1, "a regression must still fail the run"
+    assert out.exists(), "the reading must be published even when it moved"
+    document = json.loads(out.read_text())
+    assert document["met"] == 1
+    assert document["unmet"] == 2
+    assert document["commit"] == "cafef00d"
+
+
+def test_write_json_falls_back_to_github_sha_variable_when_commit_flag_absent(
+    tmp_path: Path, ratchet: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The workflow passes `--commit "${GITHUB_SHA}"` explicitly; the fallback
+    exists for a bare local invocation run from inside a checkout, where the
+    variable is already set and re-typing the sha is friction, not safety."""
+    import os as _os
+
+    report = _report(tmp_path / "r.xml", met=["T::b", "T::c"], unmet=["T::a"])
+    out = tmp_path / "reading.json"
+    checker = ratchet.parent / "check_reading.py"
+    checker.write_text(CHECKER.read_text())
+    variables = dict(_os.environ)
+    variables["GITHUB_SHA"] = "envsha"
+    result = subprocess.run(
+        [sys.executable, str(checker), "--write-json", str(out), str(report)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=variables,
+    )
+    assert result.returncode == 0, result.stderr
+    document = json.loads(out.read_text())
+    assert document["commit"] == "envsha"
+
+
+def test_write_json_with_no_path_argument_at_all_fails_with_usage(
+    tmp_path: Path, ratchet: Path
+) -> None:
+    """`--write-json` with nothing after it at all (not even a swallowed
+    report path) is the genuine "requires a path argument" case."""
+    checker = ratchet.parent / "check_reading.py"
+    checker.write_text(CHECKER.read_text())
+    result = subprocess.run(
+        [sys.executable, str(checker), "--write-json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "requires a path argument" in result.stderr
+
+
+def test_write_json_swallowing_the_report_path_fails_with_usage(
+    tmp_path: Path, ratchet: Path
+) -> None:
+    """`--write-json` as the LAST argument consumes the report path as its
+    own value, leaving no positional report argument — the usage message,
+    not a crash, is the correct failure here."""
+    report = _report(tmp_path / "r.xml", met=["T::b", "T::c"], unmet=["T::a"])
+    result = _run_with_args(report, ratchet, "--write-json")
+    assert result.returncode == 1
+    assert "usage:" in result.stderr
