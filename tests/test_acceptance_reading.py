@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import importlib
 import json
 import subprocess
 import sys
@@ -771,9 +772,11 @@ def _unmeasurable_unreachable_handlers(source: str, provenance: dict[str, str]) 
     ignored here — they are the other guard's violation, and reporting them
     twice would let a fix for one read as a fix for both.
 
-    Constructing an allowlisted exception type (`NoCredentialsError()`) is
-    NOT reach into its defining module — the Call's root binds to that
-    module, but instantiating the caught class is the launder, not a read.
+    Constructing ANY class imported from the raising module
+    (`NoCredentialsError()`, a non-allowlisted sibling like `SSLError()`,
+    or `TagAudit(...)`) is NOT reach — the Call's root binds to that
+    module, but instantiating a class is the launder, not a read. A
+    non-class ImportFrom callable (`audit_stack_tags`) still counts.
 
     **Residuals, named rather than claimed away.** Syntactic reachability
     over one try body, plus same-scope call-graph into nested defs the body
@@ -795,9 +798,10 @@ def _unmeasurable_unreachable_handlers(source: str, provenance: dict[str, str]) 
     """
     tree = ast.parse(source)
     bindings: dict[str, str] = {}
-    # Local names bound to allowlisted exception types — calling them is
-    # construction, not a call into the raising module.
-    exception_locals: set[str] = set()
+    # ImportFrom local -> (module, attribute). Calling a *class* bound this
+    # way is construction (exception or otherwise), not a call that could
+    # raise the caught type — SSLError()/TagAudit() were round-3 launders.
+    from_imports: dict[str, tuple[str, str]] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -806,13 +810,32 @@ def _unmeasurable_unreachable_handlers(source: str, provenance: dict[str, str]) 
             for alias in node.names:
                 local = alias.asname or alias.name
                 bindings[local] = node.module
-                if alias.name in provenance:
-                    exception_locals.add(local)
+                from_imports[local] = (node.module, alias.name)
 
     def _root(func: ast.expr) -> str | None:
         while isinstance(func, ast.Attribute):
             func = func.value
+        if isinstance(func, ast.NamedExpr) and isinstance(func.target, ast.Name):
+            return func.target.id
         return func.id if isinstance(func, ast.Name) else None
+
+    def _from_import_is_type(local: str) -> bool:
+        """True when ``local`` was bound by ImportFrom and resolves to a class.
+
+        Calling it is construction — `NoCredentialsError()`, a non-allowlisted
+        sibling like `SSLError()`, or `TagAudit(...)` — not a read into the
+        module that could raise the caught type. Unresolvable symbols fail
+        closed (treated as construction so they do not launder).
+        """
+        spec = from_imports.get(local)
+        if spec is None:
+            return False
+        module_name, attr = spec
+        try:
+            obj = getattr(importlib.import_module(module_name), attr)
+        except Exception:
+            return True
+        return isinstance(obj, type)
 
     def _reached(body: list[ast.stmt]) -> set[str]:
         """Import bindings the `try` body's calls reach.
@@ -820,7 +843,9 @@ def _unmeasurable_unreachable_handlers(source: str, provenance: dict[str, str]) 
         Nested `def`/`async def`/`lambda` bodies are entered only when the
         try body (or an already-entered nested function) CALLS them by
         same-scope name — define-only does not count (round-1); define-then-
-        call does (round-2). Exception-type construction never counts.
+        call does (round-2). ImportFrom class construction never counts
+        (round-2 allowlisted exceptions; round-3 any class, including
+        non-allowlisted siblings and dataclasses).
         """
         reached: set[str] = set()
         local_funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda] = {}
@@ -840,6 +865,13 @@ def _unmeasurable_unreachable_handlers(source: str, provenance: dict[str, str]) 
                     and isinstance(node.value, ast.Lambda)
                 ):
                     local_funcs[node.targets[0].id] = node.value
+                    continue
+                if (
+                    isinstance(node, ast.NamedExpr)
+                    and isinstance(node.target, ast.Name)
+                    and isinstance(node.value, ast.Lambda)
+                ):
+                    local_funcs[node.target.id] = node.value
                     continue
                 stack.extend(ast.iter_child_nodes(node))
 
@@ -861,10 +893,16 @@ def _unmeasurable_unreachable_handlers(source: str, provenance: dict[str, str]) 
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
                 continue
             if isinstance(node, ast.Call):
+                if (
+                    isinstance(node.func, ast.NamedExpr)
+                    and isinstance(node.func.target, ast.Name)
+                    and isinstance(node.func.value, ast.Lambda)
+                ):
+                    local_funcs[node.func.target.id] = node.func.value
                 root = _root(node.func)
                 if root is not None:
                     _enter(root, work)
-                    if root in bindings and root not in exception_locals:
+                    if root in bindings and not _from_import_is_type(root):
                         reached.add(bindings[root])
             work.extend(ast.iter_child_nodes(node))
         return reached
@@ -1027,6 +1065,41 @@ def test_constructing_the_caught_exception_is_not_reach_into_its_module() -> Non
     assert "StackNotAppliedError" in violations[1] and "crucible.tags" in violations[1]
 
 
+_NON_ALLOWLISTED_EXCEPTION_CONSTRUCTION_LAUNDER = textwrap.dedent(
+    """
+    from botocore.exceptions import NoCredentialsError, SSLError
+    from crucible.tags import StackNotAppliedError, TagAudit
+
+    def f(record_property):
+        try:
+            _ = SSLError(error=None)
+        except NoCredentialsError as exc:
+            _unmeasurable("c", "r", exc, phase="phase0", record_property=record_property)
+        try:
+            TagAudit(stack="s", resources=(), untagged=(), skipped=())
+        except StackNotAppliedError as exc:
+            _unmeasurable("c", "r", exc, phase="phase0", record_property=record_property)
+    """
+)
+
+
+def test_constructing_any_importfrom_class_is_not_reach_into_its_module() -> None:
+    """Round-3 adversarial FAIL: only *allowlisted* exception locals were
+    excluded, so `SSLError()` (same module, not on the allowlist) and
+    `TagAudit(...)` (a dataclass from `crucible.tags`) false-OKed handlers
+    that never called anything that could raise the caught type."""
+    provenance = {
+        "NoCredentialsError": "botocore.exceptions",
+        "StackNotAppliedError": "crucible.tags",
+    }
+    violations = _unmeasurable_unreachable_handlers(
+        _NON_ALLOWLISTED_EXCEPTION_CONSTRUCTION_LAUNDER, provenance
+    )
+    assert len(violations) == 2, violations
+    assert "NoCredentialsError" in violations[0] and "botocore.exceptions" in violations[0]
+    assert "StackNotAppliedError" in violations[1] and "crucible.tags" in violations[1]
+
+
 _SIBLING_PACKAGE_LAUNDER = textwrap.dedent(
     """
     import botocore.session
@@ -1074,6 +1147,26 @@ def test_a_nested_def_the_try_body_calls_counts_as_reach() -> None:
     though the call runs. Same-scope call-graph enter."""
     provenance = _exception_provenance(_NESTED_DEF_CALLED, frozenset({"NoCredentialsError"}))
     assert _unmeasurable_unreachable_handlers(_NESTED_DEF_CALLED, provenance) == []
+
+
+_WALRUS_LAMBDA_CALLED = textwrap.dedent(
+    """
+    from botocore.exceptions import NoCredentialsError
+
+    def f(record_property):
+        try:
+            import boto3
+            (g := (lambda: boto3.client("sts")))()
+        except NoCredentialsError as exc:
+            _unmeasurable("c", "r", exc, phase="phase0", record_property=record_property)
+    """
+)
+
+
+def test_a_walrus_bound_lambda_the_try_body_calls_counts_as_reach() -> None:
+    """Round-3: NamedExpr-bound lambdas are the same call-graph as Assign."""
+    provenance = _exception_provenance(_WALRUS_LAMBDA_CALLED, frozenset({"NoCredentialsError"}))
+    assert _unmeasurable_unreachable_handlers(_WALRUS_LAMBDA_CALLED, provenance) == []
 
 
 def test_the_reachability_scanner_accepts_a_body_that_calls_into_the_raising_module() -> None:
