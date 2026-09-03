@@ -45,7 +45,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from crucible.documents import load_store_document
+from crucible.documents import load_document_bytes, load_store_document
 from crucible.keys import manifest_key
 from crucible.store import ETAG_ABSENT, PointerConflictError, S3Store, Store, sha256_hex
 
@@ -95,10 +95,13 @@ __all__ = [
     "assert_immutable_write",
     "flip_on_smoke",
     "RELEASE_SCHEMA_VERSION",
+    "PublishedWheel",
     "ReleaseProvenance",
     "ReleaseRecord",
+    "ReleaseRecordMismatchError",
     "StaleReleasePointerError",
     "TRADER_PIN_KEY",
+    "assert_sha",
     "current_release",
     "parse_release_record",
     "pin",
@@ -110,6 +113,7 @@ __all__ = [
     "release_json_key",
     "release_object_lock_params",
     "release_prefix",
+    "resolve_published_wheel",
     "resolve_release",
     "retention_meets_target",
     "wheel_filename_for",
@@ -341,6 +345,20 @@ def assert_immutable_write(store: Store, key: str, payload: bytes) -> bool:
     )
 
 
+def assert_sha(sha: str) -> str:
+    """Refuse anything but a 40-character lowercase git sha; return it.
+
+    Public so a caller that reads a sha out of a document it does not own —
+    `track_c`'s smoke reading `releases/current` — can validate it BEFORE
+    entering a block that swallows record-shaped failures. Measured on the
+    review of alpha-engine-config-I9932: with the check only inside
+    :func:`resolve_published_wheel`, a corrupt pointer (`"sha":
+    "NOT-A-VALID-SHA"`) was swallowed with the record conditions and the
+    smoke reported `ok` over it.
+    """
+    return _assert_sha(sha)
+
+
 def _assert_sha(sha: str) -> str:
     if not _SHA_RE.match(sha):
         raise ValueError(
@@ -460,6 +478,45 @@ class ReleaseRecord:
 
     def to_json(self) -> bytes:
         return json.dumps(asdict(self), indent=2, sort_keys=True).encode("utf-8")
+
+    @property
+    def wheel_key(self) -> str:
+        """The store key THIS record's wheel is published at.
+
+        `wheel_key_for(self.sha, self.wheel_filename)` — stated once, on the
+        record, so no caller pairs a sha with a `wheel_filename` read from
+        some OTHER record. Before alpha-engine-config-I9932 that pairing was
+        restated at three call sites (`release.published_wheel_key`,
+        `track_c._verify_release_artifacts`, `track_c`'s pointed-release
+        branch) and one of them omitted the `record.sha == sha` guard the
+        others carried. A property on the record cannot be handed the wrong
+        sha: it only knows its own.
+        """
+        return wheel_key_for(self.sha, self.wheel_filename)
+
+
+@dataclass(frozen=True)
+class PublishedWheel:
+    """What :func:`resolve_published_wheel` hands back: the record it read,
+    the bytes it read it from (for a caller's lineage), and the wheel key the
+    record itself names."""
+
+    record: ReleaseRecord
+    record_key: str
+    record_bytes: bytes
+    wheel_key: str
+
+
+class ReleaseRecordMismatchError(ValueError):
+    """A `release.json` under one sha's prefix describes another sha.
+
+    A record under the wrong prefix yields a wrong wheel key and a misleading
+    refusal ("no wheel at ...") for an object that was never supposed to be
+    there. Raised by name so a caller gating a promotion (`track_c`'s smoke)
+    fails closed on it and a caller merely reporting (`track_c`'s
+    pointed-release branch) can record it as the pointed build being broken.
+    `ValueError` for the callers that already catch that.
+    """
 
 
 #: `release.json`'s retired schema. Predates `wheel_sha256` integrity
@@ -662,26 +719,34 @@ def current_release(store: Store) -> str | None:
     return read_pointer(store)[0]
 
 
-def published_wheel_key(store: Store, sha: str) -> str:
-    """The key ``sha``'s wheel was ACTUALLY published at.
+def resolve_published_wheel(store: Store, sha: str) -> PublishedWheel:
+    """Read ``sha``'s own `release.json`, check it describes ``sha``, and
+    return the wheel key the record names.
 
-    Read out of that release's own `release.json`
+    THE one read → parse → `wheel_key_for` sequence (alpha-engine-config-
+    I9932). It used to exist in three places — here (as
+    `published_wheel_key`), `crucible.track_c._verify_release_artifacts`, and
+    `track_c`'s pointed-release branch — and this one omitted the
+    `record.sha == sha` guard the other two carried, so a `release.json`
+    copied under the wrong prefix resolved to a wheel key for a build that
+    was never published there, and `pin` / `resolve_release` then refused
+    with "no wheel at <wrong key>" — a message about the wrong object.
+
+    The wheel filename is read out of the record
     (:attr:`ReleaseRecord.wheel_filename`, synthesized for a `release.v2`
-    document by :func:`parse_release_record`) rather than derived from the sha
-    — which is the same lookup `crucible.track_c._verify_release_artifacts`
-    already performs, for the same reason.
+    document by :func:`parse_release_record`) rather than derived from the
+    sha. alpha-engine-config-I9917 item 1: :func:`wheel_key` derives the
+    CURRENT (v3, PEP 440) name unconditionally, and every release published
+    before alpha-engine-config-I9908's fix is stored under the legacy
+    `crucible-{sha40}-py3-none-any.whl` name, so deriving refused every prior
+    release — the exact set a rollback reaches for.
 
-    alpha-engine-config-I9917 item 1: :func:`wheel_key` derives the CURRENT
-    (v3, PEP 440) name unconditionally, and every release published before
-    alpha-engine-config-I9908's fix is stored under the legacy
-    `crucible-{sha40}-py3-none-any.whl` name. Deriving the name therefore
-    refused every prior release — the exact set a rollback reaches for — with
-    a message naming a key nothing ever wrote, which reads as "the object was
-    deleted" rather than "this release predates the naming fix".
-
-    Raises :class:`StaleReleasePointerError` for a sha with no `release.json`,
-    naming THAT absence: a sha with no release record was never published at
-    all, and the two conditions want different operator responses.
+    Raises :class:`StaleReleasePointerError` for a sha with no `release.json`
+    (never published — a different operator response from "published, wheel
+    deleted", which names the wheel key), and
+    :class:`ReleaseRecordMismatchError` when the record under ``sha``'s
+    prefix describes another sha. Does NOT check the wheel object exists:
+    callers do, each with the message their situation needs.
     """
     _assert_sha(sha)
     meta_key = release_json_key(sha)
@@ -692,8 +757,25 @@ def published_wheel_key(store: Store, sha: str) -> str:
             "has no addressable wheel — this is not the same condition as a published "
             "release whose wheel was deleted, which names the wheel key instead."
         )
-    record = parse_release_record(load_store_document(store, meta_key))
-    return wheel_key_for(sha, record.wheel_filename)
+    # Bytes held once for lineage (track_c records them); parse through the
+    # documents reader so the store-consumer contract holds (I9929/I9931).
+    record_bytes = store.get_bytes(meta_key)
+    record = parse_release_record(load_document_bytes(meta_key, record_bytes))
+    if record.sha != sha:
+        raise ReleaseRecordMismatchError(
+            f"{meta_key} describes {record.sha}, not {sha}. A release record under another "
+            "build's prefix names a wheel that was never published there; trusting it "
+            "would resolve, pin or gate on the wrong artifact."
+        )
+    return PublishedWheel(
+        record=record, record_key=meta_key, record_bytes=record_bytes, wheel_key=record.wheel_key
+    )
+
+
+def published_wheel_key(store: Store, sha: str) -> str:
+    """The key ``sha``'s wheel was ACTUALLY published at — see
+    :func:`resolve_published_wheel`, of which this is the key-only view."""
+    return resolve_published_wheel(store, sha).wheel_key
 
 
 def resolve_release(store: Store, key: str = POINTER_KEY) -> str:

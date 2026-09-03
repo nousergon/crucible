@@ -87,7 +87,7 @@ _CRUCIBLE_ROOT = Path(__file__).resolve().parent.parent / "crucible"
 #: alpha-engine-config-I9807, 2026-09-02).
 _KNOWN_ARCHITECTURAL_EXCEPTIONS: dict[str, dict[str, str]] = {
     "config": {
-        "cloudtrail_bucket_prefix": (
+        "Settings.cloudtrail_bucket_prefix": (
             "a Settings METHOD (bound to self, found only once the AST walk was "
             "widened to ast.walk for I9807's review) that splits a CloudTrail archive "
             "URI into (bucket, prefix) — returns a tuple, not a string, and is not "
@@ -111,6 +111,18 @@ _KNOWN_ARCHITECTURAL_EXCEPTIONS: dict[str, dict[str, str]] = {
             "would duplicate sha validation in crucible.keys (I9807 sweep)."
         ),
         "wheel_key": "built on release_prefix; same reason as release_prefix.",
+        # A METHOD, keyed by its class-qualified name so it cannot inherit
+        # the module-level `wheel_key` entry's reason (review of
+        # alpha-engine-config-I9932: an earlier version of this registry was
+        # keyed on the bare name, and the property silently borrowed a reason
+        # that was untrue of it).
+        "ReleaseRecord.wheel_key": (
+            "a property on the record that pairs ITS OWN sha with ITS OWN "
+            "wheel_filename through wheel_key_for — the one pairing that cannot be "
+            "handed the wrong sha. The shape it builds is wheel_key_for's, registered "
+            "under release_prefix's reason; this entry only exists because a method "
+            "is a def the walk sees."
+        ),
         "published_wheel_key": (
             "not a key SHAPE at all — it takes a Store, READS that release's "
             "release.json and returns the shape wheel_key_for (already registered "
@@ -135,13 +147,21 @@ def _module_level_key_functions() -> list[tuple[str, str]]:
     """(module, function name) for every `*_key`/`*_prefix` def under
     `crucible/`, excluding `crucible/keys.py` itself.
 
-    `ast.walk`, not `tree.body`: catches a nested `def foo_key` (inside a
-    class, an `if`, or another function) and `async def foo_key`, not only a
-    plain top-level `def`. An assignment-defined callable
+    A full-tree walk, not `tree.body`: catches a nested `def foo_key` (inside
+    a class, an `if`, or another function) and `async def foo_key`, not only
+    a plain top-level `def`. An assignment-defined callable
     (`foo_key = _make_key_fn(...)`) is still not caught — `ast.Name` targets
     are not function definitions, and matching them would mean matching
     every assignment in the package by name, which is a real risk of a false
     positive this test's own docstring warns against elsewhere.
+
+    The NAME is class-qualified (`ReleaseRecord.wheel_key` for a method,
+    `wheel_key` for a module-level function): review of
+    alpha-engine-config-I9932 found a property named like an existing
+    module-level function silently inheriting that function's registry
+    entry, and its reason, when the walk keyed on the bare name. Two defs
+    resolving to the same qualified name in one module is reported as a
+    duplicate rather than collapsed.
     """
     hits: list[tuple[str, str]] = []
     for path in sorted(_CRUCIBLE_ROOT.rglob("*.py")):
@@ -149,11 +169,20 @@ def _module_level_key_functions() -> list[tuple[str, str]]:
             continue
         module = path.relative_to(_CRUCIBLE_ROOT).with_suffix("").as_posix().replace("/", ".")
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
+        stack: list[tuple[ast.AST, tuple[str, ...]]] = [(tree, ())]
+        while stack:
+            node, classes = stack.pop()
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and _NAME_RE.match(
                 node.name
             ):
-                hits.append((module, node.name))
+                hits.append((module, ".".join((*classes, node.name))))
+            inner = (*classes, node.name) if isinstance(node, ast.ClassDef) else classes
+            stack.extend((child, inner) for child in ast.iter_child_nodes(node))
+    duplicates = sorted({hit for hit in hits if hits.count(hit) > 1})
+    assert not duplicates, (
+        "two *_key/*_prefix defs resolve to the same qualified name, so one registry "
+        f"entry would cover both: {duplicates}"
+    )
     return hits
 
 
