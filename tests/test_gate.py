@@ -288,6 +288,179 @@ class TestPhaseOne:
         assert not next(c for c in result.clauses if c.name == "pointer_flipped_on_smoke").met
 
 
+#: `alpha-engine-config-I9869` malformation shapes, shared with the phase-0
+#: coverage above: an unreadable body, a JSON array, literal `null`, and a
+#: bare string — every shape that is not an object with fields.
+MALFORMED_BODIES = [
+    (b"{not json", "not readable JSON"),
+    (b"[1, 2]", "parsed to list"),
+    (b"null", "literal `null`"),
+    (b'"a string"', "parsed to str"),
+]
+MALFORMED_IDS = ["truncated json", "a list", "literal null", "a bare string"]
+
+
+class TestPhaseOneGuardedReads:
+    """`alpha-engine-config-I9869`: phase-1 clauses now read first-party
+    `run_manifest.v1` / arena artifacts through the SAME guarded reader as the
+    phase-0 clauses over external documents. Every malformed shape must
+    become an UNMET clause naming the key and the fault, never an exception
+    out of `evaluate`, `build_ladder`, or the board render — and absence must
+    stay a distinct reading from malformed."""
+
+    @pytest.mark.parametrize(("body", "expected"), MALFORMED_BODIES, ids=MALFORMED_IDS)
+    def test_arc_runs_ok_malformed_manifest_is_a_red_reading(
+        self, tmp_path, body: bytes, expected: str
+    ) -> None:
+        store = _seed_met(tmp_path)
+        key = manifest_key("report", WINDOW[2].isoformat())
+        store.put_bytes(key, body)
+        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        clause = next(c for c in result.clauses if c.name == "arc_runs_ok")
+        assert not clause.met
+        assert key in clause.detail
+        assert expected in clause.detail
+
+    @pytest.mark.parametrize(("body", "expected"), MALFORMED_BODIES, ids=MALFORMED_IDS)
+    def test_arms_all_scored_malformed_cycle_is_a_red_reading(
+        self, tmp_path, body: bytes, expected: str
+    ) -> None:
+        store = _seed_met(tmp_path)
+        key = arena_cycle_key("m", FRIDAY.isoformat())
+        store.put_bytes(key, body)
+        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        clause = next(c for c in result.clauses if c.name == "arms_all_scored")
+        assert not clause.met
+        assert key in clause.detail
+        assert expected in clause.detail
+
+    @pytest.mark.parametrize(("body", "expected"), MALFORMED_BODIES, ids=MALFORMED_IDS)
+    def test_attribution_renders_malformed_document_is_a_red_reading(
+        self, tmp_path, body: bytes, expected: str
+    ) -> None:
+        store = _seed_met(tmp_path)
+        key = attribution_key(FRIDAY.isoformat())
+        store.put_bytes(key, body)
+        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        clause = next(c for c in result.clauses if c.name == "attribution_renders")
+        assert not clause.met
+        assert key in clause.detail
+        assert expected in clause.detail
+
+    @pytest.mark.parametrize(("body", "expected"), MALFORMED_BODIES, ids=MALFORMED_IDS)
+    def test_explain_walks_a_verdict_malformed_manifest_is_a_red_reading(
+        self, tmp_path, body: bytes, expected: str
+    ) -> None:
+        """Every day in the window is corrupted, not only the day named in
+        the assertion — a single still-readable day elsewhere in the window
+        would satisfy the clause on its own and hide the malformed one."""
+        store = _seed_met(tmp_path)
+        key = manifest_key("explain", FRIDAY.isoformat())
+        for day in WINDOW:
+            store.put_bytes(manifest_key("explain", day.isoformat()), body)
+        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        clause = next(c for c in result.clauses if c.name == "explain_walks_a_verdict")
+        assert not clause.met
+        assert key in clause.detail
+        assert expected in clause.detail
+
+    @pytest.mark.parametrize(("body", "expected"), MALFORMED_BODIES, ids=MALFORMED_IDS)
+    def test_pointer_malformed_is_a_red_reading(self, tmp_path, body: bytes, expected: str) -> None:
+        store = _seed_met(tmp_path)
+        store.put_bytes("releases/current", body)
+        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        clause = next(c for c in result.clauses if c.name == "pointer_flipped_on_smoke")
+        assert not clause.met
+        assert "releases/current" in clause.detail
+        assert expected in clause.detail
+
+    @pytest.mark.parametrize(("body", "expected"), MALFORMED_BODIES, ids=MALFORMED_IDS)
+    def test_smoke_manifest_malformed_is_a_red_reading(
+        self, tmp_path, body: bytes, expected: str
+    ) -> None:
+        store = _seed_met(tmp_path)
+        key = manifest_key("smoke", FRIDAY.isoformat())
+        store.put_bytes(key, body)
+        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        clause = next(c for c in result.clauses if c.name == "pointer_flipped_on_smoke")
+        assert not clause.met
+        assert key in clause.detail
+        assert expected in clause.detail
+
+    def test_arc_runs_ok_missing_status_field_is_malformed_not_absent(self, tmp_path) -> None:
+        """The key EXISTS. Reporting it as "never ran" would name the wrong
+        remedy — the stage did run and wrote something, just not a manifest
+        this reader can trust."""
+        store = _seed_met(tmp_path)
+        key = manifest_key("report", WINDOW[2].isoformat())
+        _put(store, key, {"reason": ""})
+        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        clause = next(c for c in result.clauses if c.name == "arc_runs_ok")
+        assert not clause.met
+        assert key in clause.detail
+        assert "status" in clause.detail
+        assert "never ran" not in clause.detail
+
+    def test_arc_runs_ok_missing_reason_on_failure_is_malformed(self, tmp_path) -> None:
+        store = _seed_met(tmp_path)
+        key = manifest_key("report", WINDOW[2].isoformat())
+        _put(store, key, {"status": "failed"})
+        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        clause = next(c for c in result.clauses if c.name == "arc_runs_ok")
+        assert not clause.met
+        assert key in clause.detail
+        assert "reason" in clause.detail
+
+    def test_arms_all_scored_missing_scored_arms_field_is_malformed(self, tmp_path) -> None:
+        store = _seed_met(tmp_path)
+        key = arena_cycle_key("m", FRIDAY.isoformat())
+        _put(store, key, {"active_arms": []})
+        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        clause = next(c for c in result.clauses if c.name == "arms_all_scored")
+        assert not clause.met
+        assert key in clause.detail
+        assert "scored_arms" in clause.detail
+
+    def test_explain_missing_status_field_is_malformed(self, tmp_path) -> None:
+        store = _seed_met(tmp_path)
+        key = manifest_key("explain", FRIDAY.isoformat())
+        for day in WINDOW:
+            _put(store, manifest_key("explain", day.isoformat()), {"inputs": []})
+        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        clause = next(c for c in result.clauses if c.name == "explain_walks_a_verdict")
+        assert not clause.met
+        assert key in clause.detail
+        assert "status" in clause.detail
+
+    def test_smoke_missing_status_field_is_malformed(self, tmp_path) -> None:
+        store = _seed_met(tmp_path)
+        key = manifest_key("smoke", FRIDAY.isoformat())
+        _put(store, key, {"release_sha": SHA})
+        result = evaluate(store, gate="phase1", trading_day=FRIDAY)
+        clause = next(c for c in result.clauses if c.name == "pointer_flipped_on_smoke")
+        assert not clause.met
+        assert key in clause.detail
+        assert "status" in clause.detail
+
+    def test_a_malformed_phase1_document_does_not_take_the_ladder_down_with_it(
+        self, tmp_path
+    ) -> None:
+        """The doctrine both modules now state identically: an unreadable
+        input is a red READING on the surface, never absence from it, and
+        never an exception that takes the whole ladder down."""
+        store = _seed_met(tmp_path)
+        store.put_bytes(manifest_key("report", WINDOW[2].isoformat()), b"{not json")
+        rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
+        assert rows["phase1"]["state"] == "UNMET"
+        assert rows["phase1"]["clauses_total"] == 6
+
+    def test__read_json_is_retired(self) -> None:
+        """One reader, not two with different failure semantics."""
+        import crucible.gate as gate_module
+
+        assert not hasattr(gate_module, "_read_json")
+
+
 class TestArtifact:
     def test_the_reading_serializes_with_its_window_and_every_clause(self, tmp_path) -> None:
         document = evaluate(_seed_met(tmp_path), gate="phase1", trading_day=FRIDAY).to_dict()

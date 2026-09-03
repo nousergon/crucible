@@ -193,31 +193,25 @@ class GateResult:
 # ---------------------------------------------------------------------------
 
 
-def _read_json(store: Store, key: str) -> dict[str, Any] | None:
-    """Read a FIRST-PARTY artifact this repository wrote.
-
-    Malformed is deliberately an exception here: every caller is a phase-1
-    clause over a `run_manifest.v1`/arena artifact written by
-    `crucible.runner` and validated against its schema at write time, so a
-    malformed one is a broken build, not a producer we do not control. Reads
-    of documents written OUTSIDE this repository go through
-    :func:`_read_document`, which turns every malformed shape into a red
-    clause instead (`alpha-engine-config-I9869` tracks giving the phase-1
-    clauses the same treatment).
-    """
-    if not store.exists(key):
-        return None
-    return json.loads(store.get_bytes(key))
-
-
 @dataclass(frozen=True)
 class DocumentRead:
-    """One external document, or the reason it could not be read.
+    """One document this gate reads, or the reason it could not be read.
 
     Three outcomes, never two: present-and-readable, ABSENT, and
     UNREADABLE. Collapsing the last two is the defect this exists to prevent
     — "no filed count" and "the file is corrupt" call for different actions,
     and only one of them is about the system rather than about us.
+
+    This is the ONE reader in `gate.py`, for external documents (phase-0
+    clauses, over artifacts written by producers outside this repository) and
+    first-party ones alike (phase-1 clauses, over `run_manifest.v1` and arena
+    artifacts `crucible.runner` writes and validates at write time). A
+    validated-at-write-time schema is not a validated-at-READ-time guarantee
+    — a truncated `run.json` (an interrupted write, a partial multipart
+    upload, a hand-edited artifact) is unreadable regardless of who wrote it,
+    and reading it unguarded was exactly the gap `alpha-engine-config-I9869`
+    closed: `json.loads` plus direct field indexing, raising the same way an
+    external read used to.
     """
 
     document: dict[str, Any] | None
@@ -226,24 +220,25 @@ class DocumentRead:
 
 
 def _read_document(source: str, reader: Callable[[], bytes | None]) -> DocumentRead:
-    """Read one document written by a producer OUTSIDE this repository.
+    """Read one document — first-party or written by a producer outside this
+    repository, this module makes no distinction.
 
     ``reader`` returns the raw bytes, or ``None`` when the source is absent.
 
     The shape of `crucible.board._fetch`, and here for the same reason: this
-    is the only place in `gate.py` where a document nobody in this repository
-    wrote is parsed, and **an exception raised here does not fail one clause —
-    it propagates out of `evaluate` and takes `crucible gate`, `build_ladder`
-    and the board render down together.** One malformed upstream file would
+    is the only place in `gate.py` where a document is parsed, and **an
+    exception raised here does not fail one clause — it propagates out of
+    `evaluate` and takes `crucible gate`, `build_ladder` and the board render
+    down together.** One malformed file — upstream or first-party — would
     then publish NOTHING where a red reading belongs, which is precisely the
     absence-instead-of-red failure the whole gate exists to refuse. So every
     failure mode below becomes a clause detail naming the source and the
     fault.
 
     The broad `except` is deliberate and is not a swallow: the failure mode
-    caught is "an external document cannot be parsed", and the recording
-    surface is the returned :class:`DocumentRead`, which every caller renders
-    into an unmet clause. Nothing is discarded and nothing degrades silently.
+    caught is "a document cannot be parsed", and the recording surface is the
+    returned :class:`DocumentRead`, which every caller renders into an unmet
+    clause. Nothing is discarded and nothing degrades silently.
     """
     try:
         raw = reader()
@@ -332,6 +327,20 @@ def _register_arms(store: Store, slot: str) -> tuple[set[str], str | None]:
 # ---------------------------------------------------------------------------
 
 
+def _missing_field(key: str, document: dict[str, Any], field: str) -> str | None:
+    """``None`` when ``field`` is present on ``document``, else the malformed
+    detail naming it.
+
+    A missing REQUIRED field is malformed, not absent: the document exists
+    and is readable JSON, it just does not carry the shape the schema
+    promises. Reporting it as "absent" would send the operator looking for a
+    producer that already ran (`alpha-engine-config-I9869`).
+    """
+    if field not in document:
+        return f"{key}: missing required field `{field}`"
+    return None
+
+
 def _clause_arc_runs_ok(
     store: Store, window: list[dt.date], registry: dict[str, Component]
 ) -> Clause:
@@ -340,21 +349,37 @@ def _clause_arc_runs_ok(
         "trading day in the window"
     )
     missing: list[str] = []
+    malformed: list[str] = []
     failed: list[str] = []
     evidence: list[str] = []
     for day in window:
         for stage in arc_stages(day, registry):
             key = manifest_key(stage.job, day.isoformat(), discriminator=stage.slot)
             evidence.append(key)
-            document = _read_json(store, key)
-            if document is None:
+            read = _read_store_document(store, key)
+            if read.problem is not None:
+                malformed.append(read.problem)
+                continue
+            if read.absent:
                 missing.append(f"{stage.label}@{day.isoformat()}")
-            elif document["status"] != "ok":
+                continue
+            document = read.document or {}
+            problem = _missing_field(key, document, "status")
+            if problem is not None:
+                malformed.append(problem)
+                continue
+            if document["status"] != "ok":
+                problem = _missing_field(key, document, "reason")
+                if problem is not None:
+                    malformed.append(problem)
+                    continue
                 failed.append(f"{stage.label}@{day.isoformat()}: {document['reason']}")
-    if missing or failed:
+    if missing or malformed or failed:
         parts = []
         if missing:
             parts.append(f"{len(missing)} never ran ({', '.join(missing[:4])}...)")
+        if malformed:
+            parts.append(f"{len(malformed)} malformed: {'; '.join(malformed[:4])}")
         if failed:
             parts.append(f"{len(failed)} failed ({'; '.join(failed[:2])})")
         return Clause("arc_runs_ok", requirement, False, "; ".join(parts), tuple(evidence))
@@ -378,9 +403,17 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
         for slot, spec in SLOTS.items():
             key = arena_cycle_key(slot, day.isoformat())
             evidence.append(key)
-            cycle = _read_json(store, key)
-            if cycle is None:
+            read = _read_store_document(store, key)
+            if read.problem is not None:
+                gaps.append(read.problem)
+                continue
+            if read.absent:
                 gaps.append(f"{slot}@{day.isoformat()}: no arena_cycle artifact")
+                continue
+            cycle = read.document or {}
+            problem = _missing_field(key, cycle, "scored_arms")
+            if problem is not None or not isinstance(cycle["scored_arms"], list):
+                gaps.append(problem or f"{key}: `scored_arms` is not a list")
                 continue
             scored = set(cycle["scored_arms"])
             registered, _ = _register_arms(store, slot)
@@ -411,9 +444,12 @@ def _clause_attribution_renders(store: Store, window: list[dt.date]) -> Clause:
     )
     day = window[-1]
     key = attribution_key(day.isoformat())
-    document = _read_json(store, key)
-    if document is None:
+    read = _read_store_document(store, key)
+    if read.problem is not None:
+        return Clause("attribution_renders", requirement, False, read.problem, (key,))
+    if read.absent:
         return Clause("attribution_renders", requirement, False, f"{key} is absent", (key,))
+    document = read.document or {}
     rows = document.get("rows", [])
     if len(rows) != 5:
         return Clause(
@@ -445,12 +481,28 @@ def _clause_explain_walks_a_verdict(store: Store, window: list[dt.date]) -> Clau
         "was exercised on real output, not only in tests"
     )
     evidence = [manifest_key("explain", d.isoformat()) for d in window]
+    malformed: list[str] = []
     for key in evidence:
-        document = _read_json(store, key)
-        if document is None or document["status"] != "ok":
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            malformed.append(read.problem)
             continue
-        if any("verdict.json" in i["key"] for i in document.get("inputs", [])):
+        if read.absent:
+            continue
+        document = read.document or {}
+        problem = _missing_field(key, document, "status")
+        if problem is not None:
+            malformed.append(problem)
+            continue
+        if document["status"] != "ok":
+            continue
+        inputs = document.get("inputs", [])
+        if any(isinstance(i, dict) and "verdict.json" in str(i.get("key", "")) for i in inputs):
             return Clause("explain_walks_a_verdict", requirement, True, f"walked at {key}", (key,))
+    if malformed:
+        return Clause(
+            "explain_walks_a_verdict", requirement, False, "; ".join(malformed), tuple(evidence)
+        )
     return Clause(
         "explain_walks_a_verdict",
         requirement,
@@ -465,8 +517,12 @@ def _clause_pointer_flipped_on_smoke(store: Store, window: list[dt.date]) -> Cla
         "releases/current names a sha, and an `ok` smoke manifest carries that same "
         "release_sha — the pointer flipped on a real smoke, not by hand"
     )
-    pointer = _read_json(store, POINTER_KEY)
-    if pointer is None:
+    pointer_read = _read_store_document(store, POINTER_KEY)
+    if pointer_read.problem is not None:
+        return Clause(
+            "pointer_flipped_on_smoke", requirement, False, pointer_read.problem, (POINTER_KEY,)
+        )
+    if pointer_read.absent:
         return Clause(
             "pointer_flipped_on_smoke",
             requirement,
@@ -474,14 +530,26 @@ def _clause_pointer_flipped_on_smoke(store: Store, window: list[dt.date]) -> Cla
             f"{POINTER_KEY} is absent; no release has ever been published",
             (POINTER_KEY,),
         )
+    pointer = pointer_read.document or {}
     sha = pointer.get("sha", "")
     evidence = [POINTER_KEY]
+    malformed: list[str] = []
     for key in store.list_keys(runs_prefix("smoke")):
         if not key.endswith("run.json"):
             continue
         evidence.append(key)
-        document = _read_json(store, key)
-        if document and document["status"] == "ok" and document.get("release_sha") == sha:
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            malformed.append(read.problem)
+            continue
+        if read.absent:
+            continue
+        document = read.document or {}
+        problem = _missing_field(key, document, "status")
+        if problem is not None:
+            malformed.append(problem)
+            continue
+        if document["status"] == "ok" and document.get("release_sha") == sha:
             return Clause(
                 "pointer_flipped_on_smoke",
                 requirement,
@@ -489,6 +557,10 @@ def _clause_pointer_flipped_on_smoke(store: Store, window: list[dt.date]) -> Cla
                 f"{POINTER_KEY} -> {sha[:12]}, smoked at {key}",
                 tuple(evidence),
             )
+    if malformed:
+        return Clause(
+            "pointer_flipped_on_smoke", requirement, False, "; ".join(malformed), tuple(evidence)
+        )
     return Clause(
         "pointer_flipped_on_smoke",
         requirement,
