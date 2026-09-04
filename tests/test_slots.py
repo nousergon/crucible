@@ -13,7 +13,10 @@ Written before `crucible/slots/__init__.py` and seen failing.
 
 from __future__ import annotations
 
+import datetime as dt
+
 import pytest
+from conftest import sessions_ending
 from nousergon_lib.arena.arms import derive_arm_id
 from nousergon_lib.arena.engine import ArenaConfig, ArenaConfigError
 
@@ -181,6 +184,112 @@ class TestControlArms:
 
         with pytest.raises(ValueError, match="planted|null"):
             ControlArm(arm_id="c", kind="mostly_planted")
+
+
+class TestControlArmsExcludedFromRetirementMath:
+    """`alpha-engine-config-I9993`: `crucible/slots/cycle.py` self-reported
+    `controls_counted_in_retirement_cap: True`, with a comment claiming the
+    installed library had no `control` flag on `ArmRecord`. That premise is
+    false as of `nousergon-lib==0.124.108` — the library carries
+    `ArmRecord.control` and a control-aware `evaluate_retirements`
+    (`alpha-engine-config-I9770`).
+
+    Verifying that surfaced a SECOND, live defect the stale comment had
+    masked: `crucible.slots.arms.control_specs` builds each control's recipe
+    with `ArmSpec.control=True`, but `register_arms` never forwarded it to
+    `ArmRegister.register(control=...)` — every control arm was actually
+    registered with `ArmRecord.control=False`, the flag the library reads.
+    The retirement math was NOT already correct; both are fixed by this PR.
+    """
+
+    def test_register_arms_carries_the_control_flag_onto_the_registered_record(
+        self,
+    ) -> None:
+        """The exact regression: `ArmSpec.control` reaching `ArmRecord.control`
+        through `register_arms`. Failed before the fix — every control
+        registered with `control=False` regardless of its recipe's flag."""
+        from nousergon_lib.arena import ArmRegister
+
+        from crucible.slots.arms import control_specs, register_arms
+
+        spec = get_slot("r")
+        controls = control_specs(spec)
+        register, _ = register_arms(ArmRegister(), controls)
+        for control in controls:
+            assert register.state(control.arm_id).record.control is True, (
+                f"{control.arm_id} was registered with control=False; register_arms "
+                "dropped ArmSpec.control on the way into ArmRegister.register()"
+            )
+
+    def test_a_controls_pairwise_win_does_not_count_toward_a_real_arms_retirement_cap(
+        self,
+    ) -> None:
+        """An actual `run_cycle` call (`nousergon_lib.arena.engine.run_cycle`),
+        fed a register built exactly the way `crucible.slots.cycle` builds
+        it. `beaten` loses to `cap - 1` real arms — one short of the cap of
+        5, so not retirable on those alone — and to both controls. If a
+        control's win counted toward the cap, `beaten`'s losses would read 6
+        and it would be retired; correctly excluded, they read 4 and it
+        survives.
+        """
+        from nousergon_lib.arena import ArmRegister, ArmSeries
+        from nousergon_lib.arena.engine import run_cycle
+
+        from crucible.slots.arms import CONTROL_REGISTERED_AT, ArmSpec, control_specs, register_arms
+
+        spec = get_slot("r")
+        assert spec.arena.cap == 5, "fixture assumes r's cap is 5 real beaters short one"
+
+        real_names = ["beaten"] + [f"beater_{i}" for i in range(spec.arena.cap - 1)]
+        real_specs = [
+            ArmSpec(
+                name=name,
+                slot="r",
+                ranker="momentum_sleeve",
+                params={},
+                registered_at=CONTROL_REGISTERED_AT,
+            )
+            for name in real_names
+        ]
+        controls = control_specs(spec)
+        register, by_id = register_arms(ArmRegister(), real_specs + controls)
+        control_by_kind = {c.control_kind: c.arm_id for c in controls}
+
+        dates = [d.isoformat() for d in sessions_ending(dt.date(2026, 8, 28), 3)]
+        beaten_id = real_specs[0].arm_id
+        beater_ids = [s.arm_id for s in real_specs[1:]]
+
+        series_by_arm = {
+            beaten_id: ArmSeries(arm_id=beaten_id, scores=dict.fromkeys(dates, 0.0)),
+            **{a: ArmSeries(arm_id=a, scores=dict.fromkeys(dates, 1.0)) for a in beater_ids},
+            control_by_kind["planted"]: ArmSeries(
+                arm_id=control_by_kind["planted"], scores=dict.fromkeys(dates, 2.0)
+            ),
+            control_by_kind["null"]: ArmSeries(
+                arm_id=control_by_kind["null"], scores=dict.fromkeys(dates, 3.0)
+            ),
+        }
+
+        cycle = run_cycle(
+            config=spec.arena,
+            as_of=dt.date(2026, 8, 28).isoformat(),
+            register=register,
+            series_by_arm=series_by_arm,
+            incumbent=None,
+        )
+
+        verdict = next(v for v in cycle.retirements if v.arm_id == beaten_id)
+        assert verdict.pairwise_losses == len(beater_ids), (
+            f"expected {len(beater_ids)} real losses excluding both controls' wins, "
+            f"got {verdict.pairwise_losses} — a control's win is being counted toward the cap"
+        )
+        assert not verdict.retire, (
+            "beaten lost to only 4 real arms (cap is 5); it must not be retired unless "
+            "a control's win is (incorrectly) counted toward the cap"
+        )
+        assert not any(v.arm_id in control_by_kind.values() for v in cycle.retirements), (
+            "a control arm must never receive a retirement verdict at all (§10.1)"
+        )
 
 
 class TestSpecIntegrity:

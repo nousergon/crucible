@@ -732,15 +732,6 @@ def run_grade(
         "pointer": cycle.decision.to_dict(),
         "controls": control_detail,
         "trial_rows_appended": len(rows),
-        # A DECLARED divergence from §10.1, not an oversight. Controls are
-        # excluded from the pointer here (above) but the installed
-        # `nousergon_lib.arena` has no notion of a control arm, so
-        # `evaluate_retirements` still counts a control's pairwise win
-        # against a real arm toward the cap of five. The correct fix is a
-        # `control` flag on the library's ArmRecord so the engine skips them
-        # — a nousergon-lib change, tracked; `promote` (track B) is what
-        # APPLIES a retirement, so nothing acts on this in track A.
-        "controls_counted_in_retirement_cap": True,
         "verdict_keys": [
             verdict_key(arm, day)
             for arm, scores in sorted(verdicts.items())
