@@ -382,7 +382,9 @@ class TestMetric:
             ReleaseLockReading("locked", "MET", "locked"),
             ReleaseLockReading("unlocked", "UNMET", "no retention"),
             ReleaseLockReading(
-                "denied", "UNMEASURABLE", "AccessDenied",
+                "denied",
+                "UNMEASURABLE",
+                "AccessDenied",
                 cause="get_object_retention:AccessDenied",
             ),
         ]
@@ -395,7 +397,9 @@ class TestMetric:
         findings = [
             ReleaseLockReading("locked", "MET", "locked"),
             ReleaseLockReading(
-                "denied", "UNMEASURABLE", "AccessDenied",
+                "denied",
+                "UNMEASURABLE",
+                "AccessDenied",
                 cause="get_object_retention:AccessDenied",
             ),
         ]
@@ -430,7 +434,6 @@ class TestMetric:
 
 
 class TestUnmeasurableSummaryNamesTheCause:
-
     def test_an_unmeasurable_reading_without_a_cause_is_refused(self) -> None:
         """The field is not optional where it is load-bearing. An
         unattributed UNMEASURABLE is exactly the state I9952 removes, so it
@@ -448,13 +451,17 @@ class TestUnmeasurableSummaryNamesTheCause:
     def test_the_reason_counts_by_cause_commonest_first(self) -> None:
         findings = [
             ReleaseLockReading(
-                f"denied-{i}", "UNMEASURABLE", "denied",
+                f"denied-{i}",
+                "UNMEASURABLE",
+                "denied",
                 cause="get_object_retention:AccessDenied",
             )
             for i in range(3)
         ] + [
             ReleaseLockReading(
-                "gone", "UNMEASURABLE", "deleted",
+                "gone",
+                "UNMEASURABLE",
+                "deleted",
                 cause="get_object_retention:NoSuchKey (deleted mid-sweep)",
             ),
         ]
@@ -470,7 +477,9 @@ class TestUnmeasurableSummaryNamesTheCause:
         which together name the missing IAM action."""
         findings = [
             ReleaseLockReading(
-                f"releases/{i:040x}/release.json", "UNMEASURABLE", "denied",
+                f"releases/{i:040x}/release.json",
+                "UNMEASURABLE",
+                "denied",
                 cause="get_object_retention:AccessDenied",
             )
             for i in range(120)
@@ -485,7 +494,9 @@ class TestUnmeasurableSummaryNamesTheCause:
         a list of 120 is being misled about the blast radius."""
         findings = [
             ReleaseLockReading(
-                f"k{i}", "UNMEASURABLE", "denied",
+                f"k{i}",
+                "UNMEASURABLE",
+                "denied",
                 cause="get_object_retention:AccessDenied",
             )
             for i in range(120)
@@ -500,7 +511,9 @@ class TestUnmeasurableSummaryNamesTheCause:
     def test_a_short_list_is_not_truncated(self) -> None:
         findings = [
             ReleaseLockReading(
-                f"k{i}", "UNMEASURABLE", "denied",
+                f"k{i}",
+                "UNMEASURABLE",
+                "denied",
                 cause="get_object_retention:AccessDenied",
             )
             for i in range(2)
@@ -513,9 +526,7 @@ class TestUnmeasurableSummaryNamesTheCause:
     def test_the_breach_reason_is_capped_too(self) -> None:
         """A BREACH over every object has the same 12 KB problem, and BREACH
         is the case somebody actually reads."""
-        findings = [
-            ReleaseLockReading(f"k{i}", "UNMET", "no retention") for i in range(120)
-        ]
+        findings = [ReleaseLockReading(f"k{i}", "UNMET", "no retention") for i in range(120)]
         metric = release_lock_metric(findings, now=_PUBLISHED_AT)
         assert metric["status"] == "BREACH"
         assert "and 115 more" in metric["status_reason"]
