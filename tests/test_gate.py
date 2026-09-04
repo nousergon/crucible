@@ -1175,38 +1175,42 @@ def _legacy_week(
     answers the cadence question and not the routing one.
     """
     day = anchor.isoformat()
-    executions = [
-        {
-            "name": f"uuid_skip_{n}",
-            "start": f"{day}T09:00:49+00:00",
-            "stop": f"{day}T09:00:52+00:00",
-            "duration_seconds": 3.0,
-            "status": "SUCCEEDED",
-        }
-        for n in range(skips)
-    ] + [
-        {
-            "name": f"uuid_run_{n}",
-            "start": f"{day}T09:00:49+00:00",
-            "stop": f"{day}T14:02:40+00:00",
-            "duration_seconds": 18111.0,
-            "status": "SUCCEEDED",
-        }
-        for n in range(runs)
-    ] + [
-        # Reruns carry the PAGING topic on purpose: every real one in the
-        # store does, so a fixture that muted them would let the routing
-        # clause pass for the wrong reason.
-        {
-            "name": name,
-            "start": f"{day}T09:00:49+00:00",
-            "stop": f"{day}T09:35:00+00:00",
-            "duration_seconds": 2100.0,
-            "status": "FAILED",
-            "sns_topic_arn": "arn:aws:sns:us-east-1:acct:alpha-engine-alerts",
-        }
-        for name in reruns
-    ]
+    executions = (
+        [
+            {
+                "name": f"uuid_skip_{n}",
+                "start": f"{day}T09:00:49+00:00",
+                "stop": f"{day}T09:00:52+00:00",
+                "duration_seconds": 3.0,
+                "status": "SUCCEEDED",
+            }
+            for n in range(skips)
+        ]
+        + [
+            {
+                "name": f"uuid_run_{n}",
+                "start": f"{day}T09:00:49+00:00",
+                "stop": f"{day}T14:02:40+00:00",
+                "duration_seconds": 18111.0,
+                "status": "SUCCEEDED",
+            }
+            for n in range(runs)
+        ]
+        + [
+            # Reruns carry the PAGING topic on purpose: every real one in the
+            # store does, so a fixture that muted them would let the routing
+            # clause pass for the wrong reason.
+            {
+                "name": name,
+                "start": f"{day}T09:00:49+00:00",
+                "stop": f"{day}T09:35:00+00:00",
+                "duration_seconds": 2100.0,
+                "status": "FAILED",
+                "sns_topic_arn": "arn:aws:sns:us-east-1:acct:alpha-engine-alerts",
+            }
+            for name in reruns
+        ]
+    )
     if with_topic_field:
         for execution in executions:
             execution.setdefault("sns_topic_arn", topic)
@@ -1991,9 +1995,12 @@ class TestARerunIsGradedAgainstTheWeekItRetries:
         _put(
             store,
             legacy_weekly_executions_key(anchor.isoformat()),
-            _legacy_week(anchor, runs=1, reruns=(f"watch-rerun-{other}-1", f"watch-rerun-{other}-2")),
+            _legacy_week(
+                anchor, runs=1, reruns=(f"watch-rerun-{other}-1", f"watch-rerun-{other}-2")
+            ),
         )
-        clause = _clause(evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence")
+        result = evaluate(store, gate="phase0", trading_day=FRIDAY)
+        clause = _clause(result, "old_weekly_within_cadence")
         assert clause.met, clause.detail
 
     def test_it_is_named_on_the_reading_even_when_the_clause_is_met(self, tmp_path) -> None:
@@ -2008,7 +2015,8 @@ class TestARerunIsGradedAgainstTheWeekItRetries:
             legacy_weekly_executions_key(anchor.isoformat()),
             _legacy_week(anchor, runs=1, reruns=(f"watch-rerun-{other}-1",)),
         )
-        clause = _clause(evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence")
+        result = evaluate(store, gate="phase0", trading_day=FRIDAY)
+        clause = _clause(result, "old_weekly_within_cadence")
         assert clause.met
         assert other in clause.detail
         assert "attributed there" in clause.detail
@@ -2022,7 +2030,8 @@ class TestARerunIsGradedAgainstTheWeekItRetries:
             legacy_weekly_executions_key(anchor.isoformat()),
             _legacy_week(anchor, runs=1, reruns=(f"watch-rerun-{anchor.isoformat()}-1",)),
         )
-        clause = _clause(evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence")
+        result = evaluate(store, gate="phase0", trading_day=FRIDAY)
+        clause = _clause(result, "old_weekly_within_cadence")
         assert not clause.met
         assert "watch-rerun" in clause.detail
 
@@ -2041,7 +2050,8 @@ class TestARerunIsGradedAgainstTheWeekItRetries:
             legacy_weekly_executions_key(anchor.isoformat()),
             _legacy_week(anchor, runs=1, reruns=("watch-rerun-recovery",)),
         )
-        clause = _clause(evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence")
+        result = evaluate(store, gate="phase0", trading_day=FRIDAY)
+        clause = _clause(result, "old_weekly_within_cadence")
         assert not clause.met
         assert "watch-rerun-recovery" in clause.detail
 
@@ -2058,7 +2068,8 @@ class TestARerunIsGradedAgainstTheWeekItRetries:
             legacy_weekly_executions_key(anchor.isoformat()),
             _legacy_week(anchor, runs=1, reruns=(f"watch-rerun-{other}-1",)),
         )
-        clause = _clause(evaluate(store, gate="phase0", trading_day=FRIDAY), "old_alerts_muted")
+        result = evaluate(store, gate="phase0", trading_day=FRIDAY)
+        clause = _clause(result, "old_alerts_muted")
         assert clause.met, clause.detail
         assert "attributed there" in clause.detail
 
@@ -2070,7 +2081,8 @@ class TestARerunIsGradedAgainstTheWeekItRetries:
             legacy_weekly_executions_key(anchor.isoformat()),
             _legacy_week(anchor, runs=1, reruns=(f"watch-rerun-{anchor.isoformat()}-1",)),
         )
-        clause = _clause(evaluate(store, gate="phase0", trading_day=FRIDAY), "old_alerts_muted")
+        result = evaluate(store, gate="phase0", trading_day=FRIDAY)
+        clause = _clause(result, "old_alerts_muted")
         assert not clause.met
         assert "alpha-engine-alerts" in clause.detail
 
@@ -2087,7 +2099,8 @@ class TestARerunIsGradedAgainstTheWeekItRetries:
             legacy_weekly_executions_key(anchor.isoformat()),
             _legacy_week(anchor, runs=0, skips=0, reruns=(f"watch-rerun-{other}-1",)),
         )
-        clause = _clause(evaluate(store, gate="phase0", trading_day=FRIDAY), "old_alerts_muted")
+        result = evaluate(store, gate="phase0", trading_day=FRIDAY)
+        clause = _clause(result, "old_alerts_muted")
         assert not clause.met
         assert clause.unmeasurable
 

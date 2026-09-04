@@ -1319,6 +1319,7 @@ def rerun_names_another_week(name: object, anchor: dt.date) -> bool:
     except ValueError:  # a name-shaped string that is not a real date
         return False
 
+
 #: The schema the dead-Lambda probe must declare. Same refusal rule as the
 #: weekly executions document: an unrecognised version is UNMEASURABLE, never
 #: a pass. Producer:
@@ -1775,7 +1776,7 @@ def _clause_old_weekly_within_cadence(
     reruns: list[str] = []
     elsewhere: list[str] = []
     skipped_total = 0
-    for anchor, key in zip(anchors, evidence):
+    for anchor, key in zip(anchors, evidence, strict=True):
         # Read through the guarded reader, never `json.loads` + indexing. This
         # document is written by a producer outside this repository, and an
         # exception here does not fail one clause: it propagates out of
@@ -2083,7 +2084,7 @@ def _clause_old_alerts_muted(store: Store, window: list[dt.date]) -> Clause:
     paging: list[str] = []
     elsewhere: list[str] = []
     routed_total = 0
-    for anchor, key in zip(anchors, evidence):
+    for anchor, key in zip(anchors, evidence, strict=True):
         read = _read_store_document(store, key)
         if read.problem is not None:
             unreadable.append(read.problem)
@@ -2195,8 +2196,7 @@ def _clause_old_alerts_muted(store: Store, window: list[dt.date]) -> Clause:
         requirement,
         True,
         f"{routed_total} execution(s) across {len(evidence)} week(s), every input naming "
-        f"`{MUTED_ALERTS_TOPIC_NAME}`"
-        + ("; " + "; ".join(elsewhere) if elsewhere else ""),
+        f"`{MUTED_ALERTS_TOPIC_NAME}`" + ("; " + "; ".join(elsewhere) if elsewhere else ""),
         tuple(evidence),
     )
 
