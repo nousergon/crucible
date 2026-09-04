@@ -772,6 +772,13 @@ class TestTheJob:
     def test_a_delivered_report_is_filed_beside_its_manifest(self, tmp_path, monkeypatch):
         store = _seed(tmp_path, previous=_board())
         monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
+        # The trigger environment is CONTROLLED, not inherited. CI runs this
+        # suite with `GITHUB_EVENT_NAME=pull_request` set by the platform, so
+        # a test asserting the declared default read green on a laptop and
+        # red in CI — the ambient-environment shape, caught on the first CI
+        # run of alpha-engine-config-I9960.
+        monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+        monkeypatch.delenv("CRUCIBLE_TRIGGER", raising=False)
         assert morning_handler(_args(tmp_path, dry_run=False)) == 0
         keys = [k for k in store.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
         manifest = json.loads(store.get_bytes(keys[0]))
