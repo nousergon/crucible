@@ -58,7 +58,6 @@ import inspect
 import json
 import pathlib
 import re
-import shutil
 import subprocess
 import sys
 from typing import NamedTuple
@@ -695,6 +694,15 @@ def _run_step(
         '#!/usr/bin/env bash\nset -euo pipefail\n[ "$1" = "run" ] || exit 0\nshift\nexec "$@"\n'
     )
     (bin_dir / "uv").chmod(0o755)
+    # The workflow text under test calls `uv run python ...`, which is what CI
+    # runs — a machine that only has `python3` on PATH (this laptop, measured)
+    # must still exercise that exact text rather than a rewritten one. The
+    # harness supplies the interpreter the workflow asks for, in its own temp
+    # `bin/`, pointed at the running interpreter's own executable, rather than
+    # relying on whatever the host happens to name its interpreter
+    # (`alpha-engine-config-I9953`).
+    (bin_dir / "python").write_text(f'#!/usr/bin/env bash\nexec {sys.executable!r} "$@"\n')
+    (bin_dir / "python").chmod(0o755)
 
     def _dump(name: str, payload: object) -> str:
         path = tmp_path / name
@@ -751,8 +759,46 @@ def _run_step(
     )
 
 
-def _python_is_available_as_python() -> bool:
-    return shutil.which("python") is not None or shutil.which("python3") is not None
+def _assert_step_refused_for_the_reason_under_test(step: _StepResult) -> None:
+    """Fail loudly when the step died before reaching the control under test.
+
+    A step can exit non-zero for a reason that has nothing to do with the
+    guard a test names — a missing interpreter, a shell syntax slip, an
+    unstubbed endpoint — and an assertion that only checks for a substring in
+    `stderr` cannot tell that failure apart from the real one. Measured,
+    `alpha-engine-config-I9953`: every refusal case below "passed" on a
+    machine with no `python` binary on `PATH`, because the shell died with
+    `exec: python: not found` before the code under test ever ran, and no
+    assertion here distinguished that from the guard actually firing.
+
+    Every intentional refusal in this workflow prints an `::error::`-prefixed
+    line — bash's own `echo "::error::..."` for the draft guard, or
+    `crucible.review.main`'s `print(f"::error::{exc}", file=sys.stderr)` for a
+    `ReviewError`. Its absence means the step never reached that code, and an
+    assertion on the surrounding text at that point proves nothing about the
+    guard.
+    """
+    combined = step.result.stdout + step.result.stderr
+    assert "::error::" in combined, (
+        "the step exited without an `::error::`-marked message — it died "
+        "before reaching the guard this test asserts on, not because the "
+        f"guard refused it. stdout={step.result.stdout!r} "
+        f"stderr={step.result.stderr!r}"
+    )
+
+
+def test_the_reached_its_subject_guard_actually_fires_on_a_dead_shell(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`_assert_step_refused_for_the_reason_under_test` is worth nothing
+    unless something has been seen making it fail (Test discipline: "a
+    detector nobody has made fail is a detector nobody knows works"). A step
+    that dies at the shell level before any `::error::` line — exactly what a
+    missing interpreter produced on this laptop before
+    `alpha-engine-config-I9953` — must trip it."""
+    step = _run_step(tmp_path, 'echo "no error marker here" >&2; exit 1', {})
+    with pytest.raises(AssertionError, match="died before reaching the guard"):
+        _assert_step_refused_for_the_reason_under_test(step)
 
 
 def test_the_fake_gh_stub_rejects_an_unrecognised_endpoint(tmp_path: pathlib.Path) -> None:
@@ -771,6 +817,7 @@ def test_the_authoring_session_cannot_record_a_verdict_on_its_own_change(
     the real shell and the real module rather than read off the file."""
     step = _run_step(tmp_path, _record_step("refuse a self-review"), {"REVIEWER": _AUTHOR_SESSION})
     assert step.result.returncode != 0, step.result.stdout
+    _assert_step_refused_for_the_reason_under_test(step)
     assert "independent of the author" in step.result.stderr
 
 
@@ -779,6 +826,7 @@ def test_free_text_is_not_accepted_as_a_reviewer_identity(tmp_path: pathlib.Path
         tmp_path, _record_step("refuse a self-review"), {"REVIEWER": "the reviewing agent"}
     )
     assert step.result.returncode != 0
+    _assert_step_refused_for_the_reason_under_test(step)
     assert "not a Claude session id" in step.result.stderr
 
 
@@ -788,6 +836,7 @@ def test_a_verdict_is_refused_against_a_draft_pr(tmp_path: pathlib.Path) -> None
     push, no re-review."""
     step = _run_step(tmp_path, _record_step("refuse a self-review"), {}, draft=True)
     assert step.result.returncode != 0
+    _assert_step_refused_for_the_reason_under_test(step)
     assert "draft" in step.result.stdout.lower() + step.result.stderr.lower()
 
 
