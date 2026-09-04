@@ -449,6 +449,24 @@ def test_the_dispatch_has_no_author_input() -> None:
     assert "reviewer" in inputs
 
 
+def test_the_dispatch_requires_head_sha() -> None:
+    """`alpha-engine-config-I9861`: the reviewed sha is supplied as data, the
+    same way `reviewer` is, rather than inferred from the PR's head at
+    dispatch time — a push landing between the review finishing and the
+    dispatch firing must not stamp the verdict on unreviewed code."""
+    inputs = _record().triggers["workflow_dispatch"]["inputs"]
+    assert inputs.get("head_sha", {}).get("required") is True
+
+
+def test_the_head_sha_mismatch_guard_runs_before_the_draft_check() -> None:
+    """The moved-under-review refusal is the FIRST thing this step checks —
+    before the draft check, before the commits fetch, before the independence
+    comparison — so a stale sha is caught before any other work happens on
+    it."""
+    script = _record_step("refuse a self-review")
+    assert script.index('"$HEAD_SHA" != "$live_sha"') < script.index('"$is_draft" = "True"')
+
+
 def test_the_workflow_calls_crucible_review_rather_than_reimplementing_it() -> None:
     """One independence comparison and one key shape, not a shell copy of
     each. The module is imported by the gate clause too, so a drift between
@@ -729,6 +747,7 @@ def _run_step(
         "REPO": "nousergon/crucible",
         "PR_NUM": "48",
         "REVIEWER": _REVIEWER_SESSION,
+        "HEAD_SHA": _HEAD_SHA,
         "PHASE": "phase1",
         "VERDICT": "pass",
         "SUMMARY": "no findings against plan section 2",
@@ -838,6 +857,24 @@ def test_a_verdict_is_refused_against_a_draft_pr(tmp_path: pathlib.Path) -> None
     assert step.result.returncode != 0
     _assert_step_refused_for_the_reason_under_test(step)
     assert "draft" in step.result.stdout.lower() + step.result.stderr.lower()
+
+
+def test_a_verdict_is_refused_when_the_pr_moved_under_review(tmp_path: pathlib.Path) -> None:
+    """`alpha-engine-config-I9861`: a push landing between the review
+    finishing and the dispatch firing must not stamp the verdict on
+    unreviewed code. `_HEAD_SHA` is what the fake PR's live head reports;
+    dispatching with a DIFFERENT sha simulates exactly that push, and the
+    step must refuse rather than silently recording against whichever sha is
+    live."""
+    stale_sha = "d" * 40
+    step = _run_step(tmp_path, _record_step("refuse a self-review"), {"HEAD_SHA": stale_sha})
+    assert step.result.returncode != 0, step.result.stdout
+    _assert_step_refused_for_the_reason_under_test(step)
+    combined = step.result.stdout + step.result.stderr
+    assert stale_sha in combined, combined
+    assert _HEAD_SHA in combined, combined
+    assert "re-review" in combined.lower(), combined
+    assert "re-dispatch" in combined.lower(), combined
 
 
 def test_an_independent_session_passes_the_check_and_exports_the_sha(
