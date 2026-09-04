@@ -565,6 +565,41 @@ class TestRecord:
             == 0
         )
 
+    def test_a_corrupt_pointer_still_writes_a_failed_deploy_manifest(self, tmp_path) -> None:
+        """alpha-engine-config-I9945: `_record` runs under `if: always()` so a
+        deploy manifest must exist on this path too. Before the fix,
+        `current_release(store)` went through `load_store_document` (the
+        STRICT face) and raised `UnreadableDocumentError` straight out of
+        `_record`, so the ONE job designed to always record wrote nothing at
+        all for the deploy that observed the corruption."""
+        store = LocalStore(tmp_path)
+        store.put_bytes(POINTER_KEY, b"not json at all")
+        assert (
+            deploy_main(
+                [
+                    "record",
+                    "--sha",
+                    SHA,
+                    "--store",
+                    str(tmp_path),
+                    "--outcome",
+                    "success",
+                    "--run-url",
+                    "https://x",
+                ]
+            )
+            == 0
+        )
+        from crucible.calendar import resolve_trading_day
+
+        manifest = json.loads(
+            store.get_bytes(manifest_key("deploy", resolve_trading_day().isoformat()))
+        )
+        validate(manifest)
+        assert manifest["status"] == "failed"
+        assert "releases/current" in manifest["reason"]
+        assert "unreadable" in manifest["reason"]
+
 
 class TestTheWorkflowItself:
     @pytest.fixture
