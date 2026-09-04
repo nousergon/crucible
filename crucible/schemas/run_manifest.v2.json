@@ -315,6 +315,7 @@
         "callsite_id",
         "model_requested",
         "model_served",
+        "route_degraded",
         "tokens_in",
         "tokens_out",
         "cache_read",
@@ -336,6 +337,10 @@
           "description": "What the router actually served. Required and separate from `model_requested`: a routed call that silently served a different model is the failure this field exists to make visible.",
           "type": "string",
           "minLength": 1
+        },
+        "route_degraded": {
+          "description": "Whether RESOLUTION had already fallen past the group's primary entry when this call was routed (model-router-policy R12: serving from a fallback is an alert, not a log line). Required and boolean, so a fallback-served call is distinguishable from a primary-served one in the durable record rather than only in a log; `false` is an assertion that the primary served, never an absence. Added by alpha-engine-config-I9969 WITHOUT a version bump, unlike `run_mode`: the field is on `llmCall`, `crucible.llm.call` is the only writer of one, and it could not complete a call at all before this change (the registry it admits against is empty and the spec it resolved came from an SSM path that does not exist) — so no manifest in the store carries an `llm_calls` row this could retroactively invalidate.",
+          "type": "boolean"
         },
         "tokens_in": {
           "type": "integer",

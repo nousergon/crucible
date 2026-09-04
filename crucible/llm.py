@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import ast
 import datetime as dt
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -61,7 +62,10 @@ from crucible.store import Store
 
 __all__ = [
     "CALLSITE_REGISTRY_PATH",
+    "CAPABILITY_CLASS_GROUPS",
+    "EXEC_CONTEXT_ENV",
     "CallSite",
+    "CapabilityClassNotRouted",
     "DEFAULT_LLM_CAP_USD",
     "DEFAULT_LLM_CAP_USD_MEASURED",
     "Finding",
@@ -74,6 +78,7 @@ __all__ = [
     "SpendCap",
     "audit_call_sites",
     "call",
+    "capability_group",
     "load_capability_classes",
     "load_registry",
     "spend_pace",
@@ -124,9 +129,23 @@ PACING_PERIOD = dt.timedelta(days=7)
 #: The router modules are first-party and the rest are vendor SDKs. Both are
 #: refused for the same reason (principle 8): a call site holding an SDK
 #: client is a call site shaped around one provider.
+#:
+#: ``krepis.llm_config`` is listed for a sharper reason
+#: (`alpha-engine-config-I9969`). It is the PRE-router flip surface: its
+#: ``resolve_model_spec`` reads a ``provider:model`` string out of SSM and
+#: hands back a spec naming a vendor endpoint directly — no router edge, no
+#: cross-provider fallback chain, no per-consumer attribution, and outside
+#: the egress proxy. Those are verbatim the three objections
+#: ``krepis.llm_config.ModelSpec.__post_init__`` writes down as its reason
+#: for refusing ``provider="litellm"`` at construction, and this adapter
+#: reached all three through that function for the whole of phase 1. It is
+#: refused here so the same shape cannot come back anywhere in the package —
+#: and, because THIS module is the exempt path, a dedicated assertion in
+#: ``tests/test_llm_router_route.py`` refuses it here too.
 PROVIDER_MODULES: frozenset[str] = frozenset(
     {
         "krepis.llm",
+        "krepis.llm_config",
         "krepis.llm_search",
         "krepis.router",
         "litellm",
@@ -201,6 +220,188 @@ class CallSite:
     owner: str
 
 
+# --------------------------------------------------------------------------
+# Capability class -> router model group.
+# --------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=1)
+def _capability_classes() -> frozenset[str]:
+    """Every capability class this package may ask the router for.
+
+    **An ALLOWLIST, not a denylist of vendor name fragments.** The shape here
+    used to be nine substrings — ``gpt-``, ``claude-``, ``llama`` and so on —
+    and ``grok-``, ``qwen``, ``command-r``, ``nova-`` and ``kimi`` all walked
+    straight through it, as did a bare base url and a bare provider name.
+    Principle 8 is not "refuse the model ids somebody thought of"; it is that
+    a call site addresses a capability and nothing else, which is a
+    *membership* question and therefore has a positive answer. A denylist is
+    wrong by default and wrong again with every vendor that launches.
+
+    Two sources, unioned, and neither is a restatement of the other:
+
+    ``krepis.router.TIER_GROUPS``
+        the router's own tier-to-group mapping, read rather than copied, so a
+        group added there is askable here without an edit and a group removed
+        there stops being askable.
+
+    ``capability_classes`` in ``llm_callsites.yaml``
+        the classes this deployment's router serves beyond the bare tiers,
+        declared once beside the call sites that use them. A call site cannot
+        add its own — the list is a deliberate edit in the file where the
+        reason for each name is written down.
+    """
+    from krepis.router import TIER_GROUPS
+
+    return (
+        frozenset(TIER_GROUPS)
+        | frozenset(TIER_GROUPS.values())
+        | frozenset(load_capability_classes())
+    )
+
+
+def _require_capability_class(value: str, *, callsite_id: str) -> None:
+    allowed = _capability_classes()
+    if value in allowed:
+        return
+    raise ValueError(
+        f"call site {callsite_id!r} asked for {value!r}, which is not a router capability "
+        f"class. The router declares {sorted(allowed)}; anything else — a vendor model id, "
+        "a base url, a provider name — is the lock-in principle 8 forbids, and is refused "
+        "by membership rather than by a list of model-name fragments that a new vendor "
+        "walks through."
+    )
+
+
+class CapabilityClassNotRouted(RuntimeError):
+    """A declared capability class that addresses no ruled router group.
+
+    Raised BEFORE a provider, an endpoint or a credential is reached, and
+    deliberately in preference to the two alternatives
+    (`alpha-engine-config-I9969`):
+
+    * **A silent default.** Resolving an unmapped class to `high`, or to any
+      other group, ships a model nobody chose — strictly worse than a crash,
+      because a run would then produce a graded result attributed to a
+      capability class that never served it.
+    * **A pre-router flip surface.** The shape this replaces read
+      a per-class SSM parameter through
+      ``krepis.llm_config.resolve_model_spec``, so an unmapped class was not
+      an error at all — it was a second, one-rung routing plane naming a
+      provider directly.
+
+    A class reaching this exception is a MAPPING that has not been made, and
+    the message says whose it is to make.
+    """
+
+
+#: Declared capability class -> the registry MODEL GROUP it addresses.
+#:
+#: **The one place the mapping is written down, and it is checkable.** A
+#: class absent from this table addresses the group of the SAME NAME: `high`
+#: means the registry's `high` group, and `krepis.router` refuses a name the
+#: registry does not declare, naming the groups it does — so identity needs
+#: no entry here and cannot drift. An entry exists only for a class whose
+#: name is NOT a group name, and it carries one of two things:
+#:
+#: ``a group name``
+#:     the ruled mapping. Everything below the group — which model, which
+#:     provider, which endpoint, which credential, which reasoning params,
+#:     and the cross-provider fallback chain — stays a registry decision
+#:     resolved above this consumer (`model-router-policy` §2 layer 5).
+#:
+#: ``None``
+#:     the mapping is a RULING that has not been made. Every use of the class
+#:     raises :class:`CapabilityClassNotRouted` naming the ruling. This is
+#:     not a placeholder to be filled in by whoever next needs the class: it
+#:     is the refusal that keeps an unruled name from quietly acquiring an
+#:     answer.
+#:
+#: `reasoning_high` is the live instance. It is declared in
+#: `llm_callsites.yaml` as the class the phase-5 research arms ask for, and
+#: it is a group in NO registry — measured 2026-09-04, the registry declares
+#: exactly `low`, `med`, `high`, `ultra`. Which of those the phase-5 arms and
+#: their judge address is Brian's ruling, open as
+#: `alpha-engine-config-I9970`; the mechanism that routes them is this file's
+#: to own and does not wait on it.
+CAPABILITY_CLASS_GROUPS: dict[str, str | None] = {
+    "reasoning_high": None,
+}
+
+
+def capability_group(capability_class: str) -> str:
+    """The router model group *capability_class* addresses.
+
+    Pure, offline and total: it reads :data:`CAPABILITY_CLASS_GROUPS` and
+    nothing else, so it can be called at registry-load time — the earliest
+    point at which an unrouted class is knowable — without a registry file,
+    a network, or an AWS credential.
+
+    Whether the returned name is a group the registry actually declares is
+    the ROUTER's question, answered by `krepis.router` against the registry
+    document with a `ValueError` naming every available group. Restating the
+    group set here would be the copied list `alpha-engine-config-I9971`
+    already records against this package's capability-class allowlist.
+    """
+    if capability_class in CAPABILITY_CLASS_GROUPS:
+        group = CAPABILITY_CLASS_GROUPS[capability_class]
+        if group is None:
+            # The tracker for the ruling is cited in `CAPABILITY_CLASS_GROUPS`'s
+            # own documentation above, not here: a tracker literal in a raised
+            # message is the stale-pointer class `tests/
+            # test_no_stale_tracker_literals.py` refuses package-wide.
+            raise CapabilityClassNotRouted(
+                f"capability class {capability_class!r} addresses no router model group. "
+                "Which group it maps to is an open RULING — see the tracker named in "
+                "`crucible.llm.CAPABILITY_CLASS_GROUPS`'s documentation — and until that "
+                "ruling is made this class REFUSES rather than resolving: a default here "
+                "would ship a model nobody chose, and the manifest would attribute the "
+                "result to a class that never served it. Rule the group, then write it "
+                f"beside {capability_class!r} in `crucible.llm.CAPABILITY_CLASS_GROUPS`."
+            )
+        return group
+    return capability_class
+
+
+#: The fleet's ONE name for "where is this code running" — krepis' own
+#: variable, not a crucible-shaped second one. `krepis.router` reads it when a
+#: caller passes no `exec_context`, and every launcher and deploy config in
+#: the fleet already sets it.
+EXEC_CONTEXT_ENV = "KREPIS_EXEC_CONTEXT"
+
+
+def _exec_context() -> str:
+    """Where this process is running, DECLARED — never inferred, never defaulted.
+
+    `model-router-policy` R28/R29: which registry entries are reachable is a
+    function of the execution context, and the context may not be guessed. A
+    wrong guess produces a resolution that reads as a health failure — a spot
+    box with no local egress proxy handed a `laptop`-reachable endpoint fails
+    with an opaque "no model reachable" instead of an honest "you never said
+    where you are".
+
+    krepis' own resolution currently DEFAULTS an undeclared context to
+    `laptop` with a warning — a staged migration
+    (`alpha-engine-config-I7409`) toward raising, kept permissive for the
+    call sites that predate the rule. This package has none: it is refused
+    here, so crucible cannot be one of the call sites that migration is
+    waiting on, and a log line nobody reads is never what stands between a
+    run and the wrong endpoint.
+    """
+    declared = (os.environ.get(EXEC_CONTEXT_ENV) or "").strip()
+    if not declared:
+        from krepis.router import EXEC_CONTEXTS
+
+        raise ValueError(
+            f"{EXEC_CONTEXT_ENV} is not set, so this process has not said where it is "
+            f"running. Which models are reachable depends on it (model-router-policy "
+            f"R28/R29) and it may not be inferred — a guess hands a spot box an endpoint "
+            f"only a laptop can reach and reports it as a health failure. Set it to one of "
+            f"{list(EXEC_CONTEXTS)} in this job's launcher or deploy config."
+        )
+    return declared
+
+
 @lru_cache(maxsize=1)
 def load_registry() -> dict[str, CallSite]:
     """``LLM_CALLSITE_REGISTRY``, read from ``llm_callsites.yaml``.
@@ -237,6 +438,13 @@ def load_registry() -> dict[str, CallSite]:
                 "nothing anyone can act on."
             )
         _require_capability_class(str(row["capability_class"]), callsite_id=str(callsite_id))
+        # The EARLIEST point an unrouted class is knowable: a row declaring a
+        # class that addresses no ruled group is refused when the registry
+        # loads, not on the first call in the first weekly run. Offline and
+        # pure — no registry document, no network, no credential — so this
+        # holds in CI, where none of those exist
+        # (`alpha-engine-config-I9969`).
+        capability_group(str(row["capability_class"]))
         registry[str(callsite_id)] = CallSite(
             callsite_id=str(callsite_id),
             purpose=str(row["purpose"]),
@@ -482,9 +690,19 @@ def call(
     cost, requested model and served model land in its manifest, so §9.2
     class 2 is a property of the door rather than of each caller remembering.
 
-    ``capability_class`` is a router group. A value that looks like a vendor
+    ``capability_class`` is a router group, or a declared class that
+    :func:`capability_group` maps to one. A value that looks like a vendor
     model id is REFUSED — a call site naming a model is a call site that has
     to be edited when the provider changes (principle 8).
+
+    **The group is resolved through `krepis.router`, and only through it**
+    (`alpha-engine-config-I9969`). What the call site states is a capability;
+    which model serves it, at which endpoint, on which credential, and in
+    what order its cross-provider fallback chain is walked are registry
+    decisions resolved above this package (`model-router-policy` §2 layer 5).
+    The row this writes to the manifest carries both halves of the answer:
+    ``model_served`` (which model actually answered) and ``route_degraded``
+    (whether resolution had already fallen past the group's primary).
 
     ``registry`` and ``client_factory`` are injection points, in that order:
     the first lets a test exercise the cap against a call site that does not
@@ -516,12 +734,30 @@ def call(
         )
     reserved_usd = cap.reserve(site.max_usd_per_call, callsite_id=callsite_id)
 
+    # THE ROUTER, and nothing beside it (`alpha-engine-config-I9969`).
+    #
+    # `resolve_group_spec` is the supported way to address a model GROUP: it
+    # returns a spec pointing at the authenticated router edge, behind which
+    # the cross-provider fallback chain is walked, the request body is
+    # scanned by the egress proxy, and the call is attributed to this
+    # consumer. What it is NOT is the shape this replaces —
+    # `krepis.llm_config.resolve_model_spec`, which read a `provider:model`
+    # string out of a per-class SSM parameter and returned a spec naming one
+    # vendor endpoint directly. That is a second routing plane with a single
+    # rung: one 429, one 5xx or one read timeout is terminal, exactly the
+    # shape of #9728, and nothing about it is visible to the proxy.
+    #
+    # `wire="openai"`: this call site builds an `LLMClient` on the openai
+    # transport, so asking for the anthropic wire would let a fallback hand
+    # it a URL its transport cannot speak.
     from krepis.llm import LLMClient
-    from krepis.llm_config import resolve_model_spec
+    from krepis.router import resolve_group_spec, route_is_degraded
 
-    spec = resolve_model_spec(
-        ssm_param=f"/crucible/llm/{capability_class}",
-        env_var=f"CRUCIBLE_LLM_{capability_class.upper()}",
+    group = capability_group(capability_class)
+    spec, route = resolve_group_spec(
+        group,
+        exec_context=_exec_context(),
+        wire="openai",
     )
     client = LLMClient(spec, callsite_id=callsite_id, client_factory=client_factory)
     result = client.complete(messages=messages, **kwargs)
@@ -535,6 +771,21 @@ def call(
             "callsite_id": callsite_id,
             "model_requested": capability_class,
             "model_served": result.model,
+            # RESOLUTION already fell past the group's primary entry
+            # (`model-router-policy` R12: serving from a fallback is an
+            # alert, not a log line). Recorded on the row rather than
+            # re-derived by each reader, so a fallback-served call is
+            # DISTINGUISHABLE from a primary-served one in the durable
+            # record — the half `crucible-evaluator/director/agent.py`
+            # already carries on its artifact, and the half this package
+            # could not carry at all while the spec came from SSM.
+            #
+            # It answers the resolve-time question only. On the router-edge
+            # route the chain is walked by the proxy, so WHICH entry served
+            # arrives at call time — as `model_served` above, which is why
+            # the two fields are recorded together and neither replaces the
+            # other.
+            "route_degraded": bool(route_is_degraded(route)),
             "tokens_in": int(usage.input_tokens),
             "tokens_out": int(usage.output_tokens),
             "cache_read": int(usage.cache_read_tokens),
@@ -544,54 +795,6 @@ def call(
     )
     cap.record(usd, reserved_usd=reserved_usd, callsite_id=callsite_id)
     return result
-
-
-@lru_cache(maxsize=1)
-def _capability_classes() -> frozenset[str]:
-    """Every capability class this package may ask the router for.
-
-    **An ALLOWLIST, not a denylist of vendor name fragments.** The shape here
-    used to be nine substrings — ``gpt-``, ``claude-``, ``llama`` and so on —
-    and ``grok-``, ``qwen``, ``command-r``, ``nova-`` and ``kimi`` all walked
-    straight through it, as did a bare base url and a bare provider name.
-    Principle 8 is not "refuse the model ids somebody thought of"; it is that
-    a call site addresses a capability and nothing else, which is a
-    *membership* question and therefore has a positive answer. A denylist is
-    wrong by default and wrong again with every vendor that launches.
-
-    Two sources, unioned, and neither is a restatement of the other:
-
-    ``krepis.router.TIER_GROUPS``
-        the router's own tier-to-group mapping, read rather than copied, so a
-        group added there is askable here without an edit and a group removed
-        there stops being askable.
-
-    ``capability_classes`` in ``llm_callsites.yaml``
-        the classes this deployment's router serves beyond the bare tiers,
-        declared once beside the call sites that use them. A call site cannot
-        add its own — the list is a deliberate edit in the file where the
-        reason for each name is written down.
-    """
-    from krepis.router import TIER_GROUPS
-
-    return (
-        frozenset(TIER_GROUPS)
-        | frozenset(TIER_GROUPS.values())
-        | frozenset(load_capability_classes())
-    )
-
-
-def _require_capability_class(value: str, *, callsite_id: str) -> None:
-    allowed = _capability_classes()
-    if value in allowed:
-        return
-    raise ValueError(
-        f"call site {callsite_id!r} asked for {value!r}, which is not a router capability "
-        f"class. The router declares {sorted(allowed)}; anything else — a vendor model id, "
-        "a base url, a provider name — is the lock-in principle 8 forbids, and is refused "
-        "by membership rather than by a list of model-name fragments that a new vendor "
-        "walks through."
-    )
 
 
 # --------------------------------------------------------------------------

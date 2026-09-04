@@ -79,6 +79,7 @@ def _valid_manifest() -> dict:
                 "callsite_id": "research.rank.v1",
                 "model_requested": "tier:high",
                 "model_served": "glm-4.6",
+                "route_degraded": False,
                 "tokens_in": 12000,
                 "tokens_out": 900,
                 "cache_read": 11000,
@@ -236,6 +237,28 @@ def test_llm_call_records_the_model_actually_served(validator: Draft202012Valida
     silently served a different model is the failure this field exists for."""
     doc = _valid_manifest()
     del doc["llm_calls"][0]["model_served"]
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+
+def test_llm_call_records_whether_the_route_was_degraded(
+    validator: Draft202012Validator,
+) -> None:
+    """`alpha-engine-config-I9969`: a fallback-served call is
+    DISTINGUISHABLE from a primary-served one in the durable record.
+
+    Required rather than optional, and boolean rather than truthy: an absent
+    field would make "the primary served" and "nobody recorded which served"
+    the same reading, which is the `no data rendered as green` shape
+    principle 7 forbids.
+    """
+    doc = _valid_manifest()
+    del doc["llm_calls"][0]["route_degraded"]
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+    doc = _valid_manifest()
+    doc["llm_calls"][0]["route_degraded"] = "false"
     with pytest.raises(ValidationError):
         validator.validate(doc)
 
