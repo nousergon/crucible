@@ -100,6 +100,46 @@ name: Morning report
 # bot token and chat id from the environment rather than reaching SSM, which
 # this role is not granted and does not need.
 
+# ── Why the trigger STAYS a GitHub cron (alpha-engine-config-I9960) ───────
+#
+# The alternative considered and rejected: move `report.morning` onto the
+# crucible-v2 EventBridge schedule group beside the dispatcher's four
+# existing schedules, which do not silently drop events. Three measured
+# reasons it is the wrong trade TODAY, and the one measurement that reverses
+# it.
+#
+# 1. IT DOES NOT REMOVE THE CLASS. EventBridge delivers reliably; the
+#    dispatcher it delivers TO does not. Measured 2026-09-03: every
+#    dispatcher invocation since the stack existed failed `RunInstances` --
+#    9 of 9 scheduled v2 jobs launched nothing, and NOTHING PAGED. Swapping
+#    triggers changes which mechanism can silently not fire. Only a detector
+#    on the DELIVERED ARTIFACT removes it, and that detector
+#    (`crucible.alerts.evaluate_absence`, this row's `deadline` in
+#    `components.yaml`) is required under either choice and sufficient under
+#    both.
+#
+# 2. IT COSTS THE IDENTITY SEPARATION. The dispatcher launches ONE launch
+#    template with ONE instance profile, `RuntimeRole`, which writes
+#    `crucible/board/*`. `crucible-v2-github-morning-report` exists precisely
+#    so the reporting surface cannot author the reading it reports (see "What
+#    the identity may do" above, and `crucible/morning.py`'s own docstring).
+#    Trading a stated invariant for a latency property is the wrong direction.
+#
+# 3. EVIDENCE FAVOURS NEITHER YET. GitHub's scheduler on this repository: one
+#    scheduled firing on record (`board.yml`, 113 minutes late, succeeded),
+#    one occurrence that did not fire. The dispatcher: one successful
+#    scheduled run on record, 2026-09-04, after a repair. Neither is proven,
+#    and the cheaper, more separated option is the one to keep while the
+#    detector generates the evidence.
+#
+# WHAT REVERSES THIS, mechanically and with no new surface: two ABSENCE
+# incidents for `report.morning` inside `CEILING_WINDOW_TRADING_DAYS`
+# BREACHES the declared two-a-month page ceiling, which `crucible/alerts.py`
+# says "is a defect in this module, never a reason to add a suppression".
+# A ceiling breach whose members are all this row disqualifies GitHub cron on
+# measurement, and the job moves to EventBridge behind its OWN instance
+# profile -- the separation in (2) is a requirement of that move, not a
+# casualty of it.
 on:
   schedule:
     # 06:00 PDT / 05:00 PST. See the DST section above.

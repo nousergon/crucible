@@ -192,6 +192,12 @@ def _read_representative_manifest(store: Store, job: str, trading_day: str) -> M
     make — tracked as a follow-up in the PR body.
     """
     listed = read_manifests_under(store, manifest_prefix(job, trading_day))
+    if listed.listing_problem is not None:
+        # "Could not ask", rendered as itself. The console has a fault channel
+        # already; folding an unlistable prefix into `no manifests` would put a
+        # blank row where an access failure belongs, and *no data* is never
+        # rendered green (principle 7, alpha-engine-config-I9960).
+        return ManifestRead(None, listed.listing_problem, {})
     candidates = [document for _key, document in listed.documents]
     faults = dict(listed.faults)
     if faults:

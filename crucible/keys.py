@@ -42,6 +42,8 @@ __all__ = [
     "REVIEWER_PATTERN",
     "RUNS_ROOT",
     "TRADER_PIN_KEY",
+    "TRIGGER_RE",
+    "TRIGGER_UNKNOWN",
     "acceptance_reading_key",
     "arena_cycle_key",
     "arm_id_from_segment",
@@ -74,6 +76,7 @@ __all__ = [
     "manifest_prefix",
     "migration_key",
     "morning_report_key",
+    "morning_trigger_key",
     "parse_acceptance_reading",
     "parse_bus_key",
     "parse_manifest_key",
@@ -783,6 +786,49 @@ def morning_report_key(trading_day: str, calendar_date: str) -> str:
     `crucible.alerts.sweep` already carries for the same reason.
     """
     return f"{manifest_prefix('report.morning', trading_day)}{calendar_date}/message.txt"
+
+
+#: What a trigger name may be, before it becomes a key segment. Not a
+#: convenience: `GITHUB_EVENT_NAME` is an environment string, and an
+#: unvalidated one concatenated into an S3 key is a path the caller chooses.
+TRIGGER_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+#: The value recorded when the invocation said nothing about what started it
+#: — a laptop run, or any dispatcher that sets neither variable. DECLARED,
+#: like a `null` signal class in `components.yaml`, rather than omitted: an
+#: absent trigger object is indistinguishable from a forgotten one, and this
+#: value satisfies no predicate that asks for a scheduled firing.
+TRIGGER_UNKNOWN = "unknown"
+
+
+def morning_trigger_key(trading_day: str, calendar_date: str, trigger: str) -> str:
+    """Evidence of WHAT started this delivery, filed beside its manifest.
+
+    The trigger is in the KEY, not in a body: `alpha-engine-config-I9896` /
+    `-I9914` / `-I9921` each close on "at least one delivery that no human
+    dispatched", and the sweep that closes a tracker issue on evidence
+    (`alpha-engine-config/scripts/cross_repo_close_reconciliation.py`)
+    evaluates an S3 `Verified-when:` predicate whose ops are existence,
+    object count, age and one JSON field. A key that is itself the answer is
+    readable by the `exists` op with a wildcard and needs no body parse:
+
+        Verified-when: s3://<store>/crucible/runs/report.morning/*/*/trigger.schedule exists
+
+    Nothing about the manifest could have carried this. `run_manifest.v2`
+    declares `additionalProperties: false`, and `run_mode` is live-vs-replay
+    — a scheduled run and a dispatched one are both live, which is why the
+    three issues could not close on any artifact that existed.
+
+    ``trigger`` comes from the INVOCATION and is validated (`TRIGGER_RE`)
+    rather than trusted: it is an environment string on its way into a key.
+    """
+    if not TRIGGER_RE.match(trigger):
+        raise ValueError(
+            f"{trigger!r} is not a trigger name. It becomes a key segment, so it is "
+            f"constrained to {TRIGGER_RE.pattern} rather than trusted — an environment "
+            "variable concatenated into an S3 key is a path the caller chooses."
+        )
+    return f"{manifest_prefix('report.morning', trading_day)}{calendar_date}/trigger.{trigger}"
 
 
 # -- the acceptance suite's reading, filed as an artifact (I9902) -----------

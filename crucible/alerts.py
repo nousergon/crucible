@@ -68,6 +68,7 @@ __all__ = [
     "SWEEP_JOB",
     "Page",
     "PageGroup",
+    "StoreAccessError",
     "TopicUnresolvedError",
     "bus_key",
     "bus_row",
@@ -336,13 +337,17 @@ def days_to_evaluate(
     *,
     window_trading_days: int = CATCH_UP_TRADING_DAYS,
 ) -> list[dt.date]:
-    """Today's trading day, plus every recent day the sweep did not run.
+    """Today's trading day, plus every day in the window since the sweep's
+    first observed run — whether or not it ran on them.
 
-    The sweep writes its own ``run.json`` like every other job, so the days
-    it was down are readable from the store rather than inferred. A day whose
-    sweep manifest is absent is a day nothing evaluated either condition, and
-    re-evaluating it now is the difference between a late page and no page
-    ever.
+    The sweep writes its own ``run.json`` like every other job, so the day it
+    first existed is readable from the store rather than inferred. Everything
+    at or after that day is re-evaluated on every pass, because a pass over
+    day *d* is a reading taken at one instant and not a verdict on *d*: a
+    manifest written after it, and a deadline that had not yet arrived when
+    it looked, are both facts about *d* that the pass could not have seen.
+    Restricting this to the days the sweep MISSED made those facts
+    permanently invisible (alpha-engine-config-I9960; see the body).
 
     **Bounded below by the sweep's own first observed run in the window.**
     The sweep was not blind on a day before it existed; claiming otherwise
@@ -383,9 +388,67 @@ def days_to_evaluate(
         # and the second is the heartbeat's finding (§9.3) rather than a
         # backlog this run should invent.
         return [today]
+    # EVERY candidate at or after the first observed run — not only the ones
+    # the sweep missed. "The sweep ran on day d" is not "day d was fully
+    # evaluated": both conditions are evaluated against `moment`, and a row
+    # whose deadline is anchored `next_calendar_day_at` is ALWAYS still in
+    # the future when the 21:00 ET sweep looks at its own trading day. Those
+    # rows were therefore never absence-checked by any sweep, ever — the day
+    # they came due was the one day the old set excluded, precisely because
+    # the sweep had run on it (alpha-engine-config-I9960).
+    #
+    # MEASURED 2026-09-04: `report.morning`'s 13:00Z occurrence for trading
+    # day 2026-09-03 did not deliver; `runs/report.morning/2026-09-03/` was
+    # empty and `runs/alerts.sweep/2026-09-03/2026-09-04/run.json` existed,
+    # so the missed report was structurally unreachable by every future
+    # sweep. `data.weekly` (`next_calendar_day_at 09:00`) carries the same
+    # shape. This is the class, not the instance: any fact about day d that
+    # becomes true after the sweep's own pass over d — a late manifest, a
+    # deadline that had not yet arrived — was invisible forever.
+    #
+    # Re-paging is still impossible by construction: a re-evaluated day
+    # resolves to the same :func:`incident_key`, and :func:`emit` records a
+    # second observation of an open incident rather than sending again.
     first_seen = min(ran)
-    missed = [d for d in candidates if d >= first_seen and d not in ran]
-    return sorted({today, *missed})
+    return sorted({today, *(d for d in candidates if d >= first_seen)})
+
+
+class StoreAccessError(RuntimeError):
+    """One or more manifest prefixes could not be LISTED at all.
+
+    Distinct from "listed, and nothing was there", which is an absence page.
+    A listing that fails is a statement about our access, not about the
+    system being measured — the same distinction
+    :func:`crucible.gate._list_store_keys` draws, mirrored here rather than
+    collapsed: an absence page raised on a permissions error would name a job
+    that may well have delivered, and an operator who acts on it twice stops
+    reading the third one.
+
+    It is raised, never returned as a page: §4.6 admits exactly two page
+    conditions, and "we could not tell" is neither. The sweep's own manifest
+    is where it lands, `status: failed` with this as the reason, which the
+    FAILURE condition then pages on — one surface, the declared one.
+    """
+
+
+@dataclass(frozen=True)
+class _KeysRead:
+    """A prefix listing, or the reason it could not be taken. Never both."""
+
+    keys: tuple[str, ...] | None
+    problem: str | None
+
+
+def _list_manifest_keys(store: Store, prefix: str) -> _KeysRead:
+    try:
+        keys = tuple(store.list_keys(prefix))
+    except Exception as exc:
+        return _KeysRead(
+            None,
+            f"listing {prefix!r} could not be read: {type(exc).__name__}: {exc}. That is a "
+            "statement about our access, not about the job being watched",
+        )
+    return _KeysRead(keys, None)
 
 
 # ── The two page conditions ───────────────────────────────────────────────
@@ -397,6 +460,7 @@ def evaluate_absence(
     now: dt.datetime | None = None,
     registry: dict[str, Component] | None = None,
     watched_by: str = SWEEP_JOB,
+    access_faults: list[str] | None = None,
 ) -> list[Page]:
     """Page for every scheduled job whose manifest is missing past its deadline.
 
@@ -420,6 +484,14 @@ def evaluate_absence(
     **Every day the sweep is answerable for**, not only today's — see
     :func:`days_to_evaluate`. A missed sweep day used to be a permanent
     blind spot; it is now a caught-up page carrying the day it belongs to.
+
+    ``access_faults``: pass a list to collect "could not ask" problems and
+    keep evaluating; leave it ``None`` and the first one raises
+    :class:`StoreAccessError`. A caller that pages (:func:`sweep`,
+    :func:`heartbeat`) passes the list, so one unreadable prefix cannot
+    withhold the pages the same pass already found, and then raises once it
+    has emitted them. A caller that only wants the reading gets the loud
+    default.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     reg = scheduled_components(registry)
@@ -441,10 +513,23 @@ def evaluate_absence(
             # manifest (`report.morning`'s `message.txt`) is not a manifest,
             # and letting it satisfy this check would suppress a real absence
             # page for the one job that files evidence (alpha-engine-config-I9900).
-            if any(
-                is_manifest_key(k)
-                for k in store.list_keys(manifest_prefix(name, trading_day.isoformat()))
-            ):
+            #
+            # Guarded, and the guard is the point (alpha-engine-config-I9960):
+            # a listing that RAISES used to abort the whole pass, so one
+            # unreadable prefix withheld every real page the same run had
+            # already found. The access problem is now carried out to the
+            # caller — which pages what it found, then fails loudly naming
+            # every prefix it could not read — while a prefix we could not
+            # ask about produces no page, because we did not observe an
+            # absence there.
+            prefix = manifest_prefix(name, trading_day.isoformat())
+            read = _list_manifest_keys(store, prefix)
+            if read.problem is not None:
+                if access_faults is None:
+                    raise StoreAccessError(read.problem)
+                access_faults.append(read.problem)
+                continue
+            if any(is_manifest_key(k) for k in read.keys or ()):
                 continue
             pages.append(
                 Page(
@@ -467,6 +552,7 @@ def evaluate_failure(
     *,
     now: dt.datetime | None = None,
     registry: dict[str, Component] | None = None,
+    access_faults: list[str] | None = None,
 ) -> list[Page]:
     """Page for every manifest written with `status: failed`.
 
@@ -505,6 +591,16 @@ def evaluate_failure(
             # whose body is an array or a string into a fault instead of an
             # `AttributeError` out of the sweep (alpha-engine-config-I9931).
             listed = read_manifests_under(store, manifest_prefix(name, trading_day.isoformat()))
+            if listed.listing_problem is not None:
+                # Same split as the absence condition (I9960): a prefix we
+                # could not LIST tells us nothing about whether a manifest
+                # there says `failed`, and it must not abort the rows we can
+                # still read. Carried out; raised by the caller after it has
+                # paged what it observed.
+                if access_faults is None:
+                    raise StoreAccessError(listed.listing_problem)
+                access_faults.append(listed.listing_problem)
+                continue
             for key, problem in sorted(listed.faults.items()):
                 pages.append(
                     Page(
@@ -1097,7 +1193,10 @@ def heartbeat(
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     trading_day = resolve_trading_day(moment)
-    watched = evaluate_absence(store, now=moment, watched_by="heartbeat")
+    access_faults: list[str] = []
+    watched = evaluate_absence(
+        store, now=moment, watched_by="heartbeat", access_faults=access_faults
+    )
     if dry_run:
         bus_keys: list[str] = []
     else:
@@ -1148,6 +1247,10 @@ def heartbeat(
             sns_topic_arn=topic_arn(),
             raise_on_total_failure=True,
         )
+    # After the heartbeat has been SENT: a pass that could not list a prefix
+    # still owes the operator the proof that the alerting path is alive, and
+    # then fails loudly naming what it could not read (I9960).
+    _raise_on_access_faults(access_faults)
     # Always carried, not only under `dry_run`: the caller's own print (under
     # `--dry-run`, `heartbeat_handler`) needs the exact text that either was,
     # or would have been, sent — one string, not two call sites composing it
@@ -1207,6 +1310,15 @@ def _week_summary(store: Store, trading_day: dt.date) -> tuple[int, int, float]:
     return ok, failed, spend
 
 
+def _raise_on_access_faults(faults: Sequence[str]) -> None:
+    """Raise if any prefix could not be listed. Called after emitting."""
+    if faults:
+        raise StoreAccessError(
+            f"{len(faults)} manifest prefix(es) could not be listed, so ABSENCE was "
+            "not evaluated for them. This is not an absence: " + " | ".join(sorted(faults))
+        )
+
+
 def sweep(
     store: Store,
     *,
@@ -1230,11 +1342,13 @@ def sweep(
     writing to it.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
-    pages = evaluate_absence(store, now=moment, registry=registry) + evaluate_failure(
-        store, now=moment, registry=registry
-    )
+    access_faults: list[str] = []
+    pages = evaluate_absence(
+        store, now=moment, registry=registry, access_faults=access_faults
+    ) + evaluate_failure(store, now=moment, registry=registry, access_faults=access_faults)
     groups = group_pages(pages)
     if dry_run:
+        _raise_on_access_faults(access_faults)
         count = pages_in_window(store, now=moment)
         return {
             "pages_emitted": 0,
@@ -1249,6 +1363,11 @@ def sweep(
     # same false claim the bus rows used to make, one layer up.
     already_open = {bus_key(gp) for gp in groups if store.exists(bus_key(gp))}
     keys = emit(store, groups, sweep_run_id=sweep_run_id, transport=transport, now=moment)
+    # AFTER emit, deliberately. Everything this pass could observe has now
+    # been paged; what it could not observe is a failure of this job, and it
+    # exits non-zero through `run_job`'s `try/finally` with the prefixes
+    # named in its own manifest (alpha-engine-config-I9960).
+    _raise_on_access_faults(access_faults)
     count = pages_in_window(store, now=moment)
     return {
         "pages_emitted": len([k for k in keys if k not in already_open]),

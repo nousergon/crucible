@@ -282,10 +282,23 @@ class PrefixRead:
     under the prefix (a job's own evidence filed beside its manifest, such as
     `report.morning`'s `message.txt`) appear in neither: a manifest prefix is a
     namespace, not a manifest list (`alpha-engine-config-I9900`).
+
+    ``listing_problem`` is set, and both other fields are empty, when the
+    PREFIX ITSELF could not be listed. That is not "no manifests are there";
+    it is "we could not ask", and the two must not collapse — the same
+    distinction `crucible.gate._list_store_keys` draws
+    (`alpha-engine-config-I9960`). A caller that ignores it and reads the
+    empty `documents` as an answer is claiming a fact it does not have.
     """
 
     documents: tuple[tuple[str, dict[str, Any]], ...] = ()
     faults: dict[str, str] = field(default_factory=dict)
+    listing_problem: str | None = None
+
+    def raise_if_unlistable(self) -> None:
+        """Fail loud for the caller that has no honest way to carry it."""
+        if self.listing_problem is not None:
+            raise UnreadableDocumentError(self.listing_problem)
 
 
 def read_manifests_under(store: Store, prefix: str) -> PrefixRead:
@@ -300,7 +313,23 @@ def read_manifests_under(store: Store, prefix: str) -> PrefixRead:
     """
     documents: list[tuple[str, dict[str, Any]]] = []
     faults: dict[str, str] = {}
-    for key in sorted(store.list_keys(prefix)):
+    try:
+        listed = sorted(store.list_keys(prefix))
+    except Exception as exc:
+        # NOT a swallow, and not an empty result: the failure mode is a
+        # listing denial reading as "no manifests here", which is an ABSENCE
+        # page about a job that may well have delivered. It is carried out as
+        # `listing_problem`, and the recording surface is the caller's — the
+        # sweep pages what it DID observe and then fails with this in its own
+        # manifest (`alpha-engine-config-I9960`); `raise_if_unlistable` is
+        # there for every caller with nowhere honest to put it.
+        return PrefixRead(
+            listing_problem=(
+                f"listing {prefix!r} could not be read: {type(exc).__name__}: {exc}. That "
+                "is a statement about our access, not about what is there"
+            )
+        )
+    for key in listed:
         if not is_manifest_key(key):
             continue
         read = read_listed_document(store, key)
