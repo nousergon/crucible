@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from crucible.calendar import resolve_trading_day
-from crucible.documents import load_store_document
+from crucible.documents import load_store_document, read_store_document
 from crucible.manifest import RUN_MANIFEST_SCHEMA_VERSION, manifest_key
 from crucible.release import (
     POINTER_KEY,
@@ -288,17 +288,33 @@ def _record(args: argparse.Namespace, store: Store) -> int:
     from the job's outcome and from whether the pointer actually moved, never
     declared: a deploy that reported itself ok while the pointer had not moved
     would be the degraded-SUCCEEDED this whole system refuses.
+
+    Reads the pointer through the GUARDED face (`read_store_document`), not
+    `current_release`/`load_store_document`'s STRICT one
+    (alpha-engine-config-I9945): this step is the one job designed to always
+    record, under `if: always()`, so a corrupt `releases/current` must become
+    a `status: failed` manifest naming the fault — never a raise that leaves
+    the deploy that observed the corruption with no manifest at all.
     """
     now = dt.datetime.now(dt.UTC)
     trading_day = resolve_trading_day(now)
-    promoted = current_release(store)
-    ok = args.outcome == "success" and promoted == args.sha
+    pointer_read = read_store_document(store, POINTER_KEY)
+    pointer_fault = pointer_read.require("sha", str)
+    promoted = (
+        pointer_read.document["sha"]
+        if pointer_fault is None and pointer_read.document is not None
+        else None
+    )
+    ok = args.outcome == "success" and pointer_fault is None and promoted == args.sha
     reason = ""
     if not ok:
-        reason = (
-            f"deploy outcome={args.outcome!r}; releases/current is "
-            f"{promoted or '(unset)'}, expected {args.sha}. See {args.run_url}"
-        )
+        if pointer_fault is not None:
+            reason = f"releases/current is unreadable: {pointer_fault}. See {args.run_url}"
+        else:
+            reason = (
+                f"deploy outcome={args.outcome!r}; releases/current is "
+                f"{promoted or '(unset)'}, expected {args.sha}. See {args.run_url}"
+            )
     manifest: dict[str, Any] = {
         "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
         "run_id": _run_id_from(args.sha, now),

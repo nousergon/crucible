@@ -750,6 +750,121 @@ class TestACostCeilingIsNeverMetByAnUnreadableApi:
         assert "230.21" in clause.detail
 
 
+class _ClosedMonthCostClient:
+    """Distinguishes the month-to-date MONTHLY request from the closed-month
+    one by the requested interval: `month_to_date_usd` always asks for fewer
+    than 28 days (it is graded early in the month, which is the only time the
+    closed-month reader ever fires); `closed_month_usd` always asks for a
+    full prior calendar month, `>= 28` days starting on the 1st. DAILY always
+    answers a flat, quiet `$1.00`/day so only the closed-month behaviour is
+    under test."""
+
+    def __init__(self, amount: str, closed_amount: str, *, estimated: bool = False) -> None:
+        self.amount = amount
+        self.closed_amount = closed_amount
+        self.estimated = estimated
+        self.requests: list[dict] = []
+
+    def get_cost_and_usage(self, **request) -> dict:
+        self.requests.append(request)
+        start = dt.date.fromisoformat(request["TimePeriod"]["Start"])
+        end = dt.date.fromisoformat(request["TimePeriod"]["End"])
+        if request["Granularity"] == "DAILY":
+            days = (end - start).days
+            return {
+                "ResultsByTime": [
+                    {"Total": {"UnblendedCost": {"Amount": "1.00"}}} for _ in range(days)
+                ]
+            }
+        if start.day == 1 and (end - start).days >= 28:
+            return {
+                "ResultsByTime": [
+                    {
+                        "Total": {"UnblendedCost": {"Amount": self.closed_amount}},
+                        "Estimated": self.estimated,
+                    }
+                ]
+            }
+        return {"ResultsByTime": [{"Total": {"UnblendedCost": {"Amount": self.amount}}}]}
+
+
+class TestAClosedCalendarMonthIsAlsoGraded:
+    """alpha-engine-config-I9946: `month_to_date_usd` and `trailing_daily_usd`
+    both grade a month IN PROGRESS. No render ever graded a COMPLETED
+    calendar month before this — a month that projected under all the way
+    through and then closed over would leave no red row anywhere. Measured
+    before this landed: this whole class red, `_clause_aws_cost_within_ceiling`
+    made no request whose interval reached 28 days on any render day."""
+
+    def test_a_closed_month_over_the_ceiling_is_unmet_regardless_of_the_new_month(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _ClosedMonthCostClient(amount="0.50", closed_amount="80.00")
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: client)
+        clause = gate_module._clause_aws_cost_within_ceiling(
+            [dt.date(2026, 10, 1)],
+            name="aws_total_within_ceiling",
+            ceiling_usd=PHASE4_MAX_TOTAL_USD,
+            tagged=False,
+        )
+        assert not clause.met and not clause.unmeasurable, clause.detail
+        assert "closed month 2026-09-01..2026-10-01" in clause.detail
+        assert "$80.00" in clause.detail
+        assert "over the $70.00" in clause.detail
+        # Hard UNMET on the closed reading alone — no in-progress read needed.
+        assert all(r["Granularity"] == "MONTHLY" for r in client.requests)
+
+    def test_a_render_past_the_third_of_the_month_never_attempts_the_closed_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _CostClient("1.50")
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: client)
+        clause = gate_module._clause_aws_cost_within_ceiling(
+            [dt.date(2026, 9, 15)],
+            name="aws_total_within_ceiling",
+            ceiling_usd=PHASE4_MAX_TOTAL_USD,
+            tagged=False,
+        )
+        assert clause.met and not clause.unmeasurable
+        assert "closed month" not in clause.detail
+        # One month-to-date read, one trailing-30 read — no third request for
+        # the closed-month figure at all, past the 3rd of the month.
+        assert len(client.requests) == 2
+
+    def test_a_provisional_closed_month_is_named_but_not_graded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cost Explorer finalises a month a few days into the next; a closed
+        month still marked `Estimated: true` can still move, so it is stated
+        in the detail rather than turning a render UNMET on a number that is
+        not final yet."""
+        client = _ClosedMonthCostClient(amount="0.50", closed_amount="80.00", estimated=True)
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: client)
+        clause = gate_module._clause_aws_cost_within_ceiling(
+            [dt.date(2026, 10, 2)],
+            name="aws_total_within_ceiling",
+            ceiling_usd=PHASE4_MAX_TOTAL_USD,
+            tagged=False,
+        )
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert "PROVISIONAL" in clause.detail
+        assert "$80.00" in clause.detail
+
+    def test_a_zero_closed_month_is_not_graded_as_a_free_month(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _ClosedMonthCostClient(amount="0.50", closed_amount="0")
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: client)
+        clause = gate_module._clause_aws_cost_within_ceiling(
+            [dt.date(2026, 10, 1)],
+            name="aws_total_within_ceiling",
+            ceiling_usd=PHASE4_MAX_TOTAL_USD,
+            tagged=False,
+        )
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert "not graded" in clause.detail
+
+
 # ---------------------------------------------------------------------------
 # phase 3
 # ---------------------------------------------------------------------------
