@@ -391,8 +391,10 @@ class TestEnforcement:
         # The router edge is stubbed at the adapter's own two imports rather
         # than at a network boundary: this test is about what the cap does
         # with a bill, and reaching a real router would make it a test of
-        # SSM permissions instead.
-        monkeypatch.setattr("krepis.llm_config.resolve_model_spec", lambda **_kw: object())
+        # registry permissions instead.
+        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "ci")
+        monkeypatch.setattr("krepis.router.resolve_group_spec", lambda *a, **k: (object(), {}))
+        monkeypatch.setattr("krepis.router.route_is_degraded", lambda _route: False)
         monkeypatch.setattr("krepis.llm.LLMClient", lambda *a, **k: factory())
 
         def body(ctx):
@@ -428,6 +430,7 @@ class TestWindow:
                     "callsite_id": "test.cap_probe",
                     "model_requested": "high",
                     "model_served": "router:high:primary",
+                    "route_degraded": False,
                     "tokens_in": 10,
                     "tokens_out": 5,
                     "cache_read": 0,

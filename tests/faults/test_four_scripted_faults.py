@@ -208,11 +208,14 @@ class TestFaultThreeRouterReturns500:
         error (a bare `except` around `client.complete(...)`) turns this test
         red — no manifest would carry `status: failed` at all."""
         store = LocalStore(tmp_path)
-        # `resolve_model_spec` would otherwise reach SSM/env for a real
-        # deployment spec — irrelevant here. Same seam `test_llm_cap.py`'s
-        # overrun test patches, so `crucible.llm.call`'s cap admission runs
-        # for real and only the provider transport is faked.
-        monkeypatch.setattr("krepis.llm_config.resolve_model_spec", lambda **_kw: object())
+        # `resolve_group_spec` would otherwise read the private model
+        # registry for a real routing decision — irrelevant here. Same seam
+        # `test_llm_cap.py`'s overrun test patches, so `crucible.llm.call`'s
+        # cap admission runs for real and only the provider transport is
+        # faked.
+        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "ci")
+        monkeypatch.setattr("krepis.router.resolve_group_spec", lambda *a, **k: (object(), {}))
+        monkeypatch.setattr("krepis.router.route_is_degraded", lambda _route: False)
         monkeypatch.setattr("krepis.llm.LLMClient", lambda *a, **k: _Provider5xxClient())
 
         def router_500(ctx: RunContext) -> None:
@@ -243,11 +246,14 @@ class TestFaultThreeRouterReturns500:
         self, tmp_path, transport, monkeypatch
     ) -> None:
         store = LocalStore(tmp_path)
-        # `resolve_model_spec` would otherwise reach SSM/env for a real
-        # deployment spec — irrelevant here. Same seam `test_llm_cap.py`'s
-        # overrun test patches, so `crucible.llm.call`'s cap admission runs
-        # for real and only the provider transport is faked.
-        monkeypatch.setattr("krepis.llm_config.resolve_model_spec", lambda **_kw: object())
+        # `resolve_group_spec` would otherwise read the private model
+        # registry for a real routing decision — irrelevant here. Same seam
+        # `test_llm_cap.py`'s overrun test patches, so `crucible.llm.call`'s
+        # cap admission runs for real and only the provider transport is
+        # faked.
+        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "ci")
+        monkeypatch.setattr("krepis.router.resolve_group_spec", lambda *a, **k: (object(), {}))
+        monkeypatch.setattr("krepis.router.route_is_degraded", lambda _route: False)
         monkeypatch.setattr("krepis.llm.LLMClient", lambda *a, **k: _Provider5xxClient())
 
         def router_500(ctx: RunContext) -> None:

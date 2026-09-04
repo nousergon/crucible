@@ -203,6 +203,7 @@ class TestCostAssertion:
                     "callsite_id": "research.rank.v1",
                     "model_requested": "tier:high",
                     "model_served": "glm-4.6",
+                    "route_degraded": False,
                     "tokens_in": 100,
                     "tokens_out": 10,
                     "cache_read": 0,
