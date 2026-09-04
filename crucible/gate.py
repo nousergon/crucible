@@ -130,6 +130,22 @@ __all__ = [
     "last_read",
     "ladder_schema",
     "validate_ladder_document",
+    # The closing reading (`alpha-engine-config-I9967`). Public because its
+    # ENFORCER lives in another repository: `alpha-engine-config`'s
+    # phase-tracker consistency sweep imports these names rather than
+    # restating the contract, the way `crucible.slots`' registries are
+    # imported rather than mirrored (`alpha-engine-config-I9766`).
+    "CLOSING_READING_SCHEMA_VERSION",
+    "CLOSING_READING_FENCE",
+    "CLOSING_READING_COMMIT_MIN",
+    "closing_reading",
+    "closing_reading_refusals",
+    "closing_reading_schema",
+    "gate_state_for",
+    "parse_closing_comment",
+    "phase_for_gate",
+    "render_closing_comment",
+    "validate_closing_reading_document",
 ]
 
 GATE_SCHEMA_VERSION = "gate.v1"
@@ -4362,10 +4378,13 @@ def build_ladder(
         # plain `UNMET` with a specific `met_ratio` — indistinguishable from
         # "we checked and it fell short" (`alpha-engine-config-I9869` round
         # 3, finding 4).
-        if unmeasurable_count > 0 or read_on_access_problem:
-            state = "UNMEASURABLE"
-        else:
-            state = "MET" if reading.met else "UNMET"
+        #
+        # The three-way choice itself is `gate_state_for`, not re-derived here:
+        # the closing block a phase issue is closed with renders its
+        # `gate_state` from the same function, so a ladder row and the block on
+        # the tracker beside it cannot disagree about one reading
+        # (`alpha-engine-config-I9967`).
+        state = "UNMEASURABLE" if read_on_access_problem else gate_state_for(reading)
         gate_states.append(
             (
                 phase,
@@ -4479,3 +4498,353 @@ def ladder_payload(ladder: Ladder) -> bytes:
     document = ladder.to_dict()
     validate_ladder_document(document)
     return json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# The closing reading — `alpha-engine-config-I9967`, deliverables 2 and 3.
+#
+# The ladder above answers "is phase N met" on a surface nobody has to close.
+# The BACKLOG answers the same question by a human closing an issue, and on
+# 2026-09-02 the two disagreed: `alpha-engine-config-I9757` was closed the
+# moment its build PRs merged while its own gate read 1 of 6 clauses met and
+# the phase beneath it was unmet. Two instruments, one question, and the one a
+# human reads on a board was the wrong one.
+#
+# A convention ("paste the reading before you close it") has now failed twice.
+# What follows is the machine-checkable form of that convention: one canonical
+# block, rendered from a real reading by `crucible gate --closing-comment`,
+# and one refusal predicate — `closing_reading_refusals` — that says why a
+# CLOSED phase issue is not justified by the block on it.
+#
+# **Crucible renders and defines; it does not enforce.** Enforcement lives in
+# `alpha-engine-config`, because that is the only side that can read BOTH
+# facts: this package has an AWS identity and no GitHub credential for the
+# private tracker, and the tracker's own CI has a GitHub credential and no
+# read on this store. Splitting it any other way needs a new identity in one
+# repo or the other; splitting it this way needs none.
+# ---------------------------------------------------------------------------
+
+CLOSING_READING_SCHEMA_VERSION = "phase_closing_reading.v1"
+
+#: The fenced-code info string that marks a closing reading inside a GitHub
+#: comment. A fence info string rather than an HTML comment: GitHub renders it
+#: as a plain code block (so a human sees the reading), it survives quoting
+#: and editing, and it is one token a `re` can find without parsing Markdown.
+CLOSING_READING_FENCE = "crucible-gate-reading"
+
+_CLOSING_READING_BLOCK = re.compile(
+    r"```" + CLOSING_READING_FENCE + r"\s*\n(?P<body>.*?)\n?```",
+    re.DOTALL,
+)
+
+#: Minimum length of the `commit` field, in lowercase hex characters. Twelve,
+#: matching `crucible.release`'s `+g<sha12>` local version segment, so a block
+#: rendered on a box that only knows its wheel's version can still carry real
+#: provenance.
+CLOSING_READING_COMMIT_MIN = 12
+
+_COMMIT_RE = re.compile(r"^[0-9a-f]{12,40}$")
+
+
+def gate_state_for(reading: GateResult) -> str:
+    """`MET`, `UNMET` or `UNMEASURABLE` for one gate reading.
+
+    The single derivation of a gate's own state from its clauses. `UNMEASURABLE`
+    outranks both others: a reading with one unreadable clause is not "we
+    checked and it fell short" (`alpha-engine-config-I9869` round 3). A gate
+    with NO clauses is `UNMEASURED` on the ladder — that case is the ladder's,
+    because it is a fact about registration rather than about a reading, and
+    this function is only ever handed a reading that has clauses; it returns
+    `UNMET` for an empty clause list, which `GateResult.met` already does and
+    which is never a pass.
+
+    `build_ladder` calls this rather than re-deriving the same three-way
+    choice inline, so a ladder row and a closing block rendered from the same
+    reading cannot disagree about its state.
+    """
+    if any(c.unmeasurable for c in reading.clauses):
+        return "UNMEASURABLE"
+    return "MET" if reading.met else "UNMET"
+
+
+def phase_for_gate(gate: str) -> Phase:
+    """The registered phase whose exit this ``gate`` grades.
+
+    Raises rather than returning None: a closing block rendered for a gate no
+    phase reads would name a tracker nobody could derive, which is the
+    invented-issue-number defect `phase_tracker` exists to remove.
+    """
+    for phase in PHASES:
+        if phase.gate == gate:
+            return phase
+    raise KeyError(
+        f"no registered phase reads gate {gate!r}; the registered gates are "
+        f"{sorted(p.gate for p in PHASES if p.gate)}. A closing reading for an "
+        "unregistered gate would name no tracker."
+    )
+
+
+def closing_reading(
+    reading: GateResult,
+    *,
+    store_uri: str,
+    commit: str,
+) -> dict[str, Any]:
+    """The `phase_closing_reading.v1` document for one gate reading.
+
+    A TRANSCRIPT, not a claim. Every count comes off ``reading`` — `met_ratio`
+    from `GateResult.met_ratio` and the state from :func:`gate_state_for`, both
+    of which the ladder also reads — so the block, the ladder row and the
+    durable `gates/{gate}/{day}/gate.json` artifact are three renderings of one
+    measurement rather than three numbers that happen to agree today.
+
+    It is rendered for an UNMET gate exactly as readily as for a MET one. The
+    honest block on a phase that may not close yet is the one that says so; a
+    renderer that refused to produce it would leave "no block" meaning both
+    "not measured" and "measured and failing".
+    """
+    phase = phase_for_gate(reading.gate)
+    if not store_uri:
+        raise ValueError(
+            "a closing reading needs the store URI it was read against: without it "
+            "`gate_artifact` names a key in no particular bucket and the block cannot "
+            "be checked by anyone who doubts it."
+        )
+    if not _COMMIT_RE.match(commit):
+        raise ValueError(
+            f"commit {commit!r} is not at least {CLOSING_READING_COMMIT_MIN} lowercase hex "
+            "characters. A reading with no commit cannot be re-run against the clause "
+            "definitions that produced it, which is the reason it is recorded at all."
+        )
+    ratio = reading.met_ratio
+    document: dict[str, Any] = {
+        "schema_version": CLOSING_READING_SCHEMA_VERSION,
+        "phase": phase.id,
+        "tracker": phase.tracker,
+        "tracker_url": phase.tracker_url,
+        "gate": reading.gate,
+        "gate_state": gate_state_for(reading),
+        "clauses_met": sum(1 for c in reading.clauses if c.met),
+        "clauses_total": len(reading.clauses),
+        "clauses_unmeasurable": sum(1 for c in reading.clauses if c.unmeasurable),
+        "met_ratio": None if ratio is None else round(ratio, 6),
+        "coverage": reading.coverage,
+        "trading_day": reading.trading_day.isoformat(),
+        "generated_utc": dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "store": store_uri,
+        "commit": commit,
+        "gate_artifact": gate_key(reading.gate, reading.trading_day.isoformat()),
+        "clauses": [
+            {
+                "name": c.name,
+                "met": c.met,
+                "unmeasurable": c.unmeasurable,
+                "detail": c.detail,
+            }
+            for c in reading.clauses
+        ],
+    }
+    validate_closing_reading_document(document)
+    return document
+
+
+CLOSING_READING_SCHEMA_PATH = Path(__file__).parent / "schemas" / "phase_closing_reading.v1.json"
+
+
+@lru_cache(maxsize=1)
+def closing_reading_schema() -> dict[str, Any]:
+    """The `phase_closing_reading.v1` JSON Schema, loaded once.
+
+    A missing schema is a broken build, not a degraded read — the posture
+    :func:`ladder_schema` already takes.
+    """
+    if not CLOSING_READING_SCHEMA_PATH.is_file():
+        raise FileNotFoundError(
+            f"phase closing reading schema missing at {CLOSING_READING_SCHEMA_PATH}. It "
+            "ships inside the package; a missing schema means a broken build."
+        )
+    return json.loads(CLOSING_READING_SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+@lru_cache(maxsize=1)
+def _closing_reading_validator() -> Draft202012Validator:
+    schema = closing_reading_schema()
+    Draft202012Validator.check_schema(schema)
+    return Draft202012Validator(schema)
+
+
+def validate_closing_reading_document(document: dict[str, Any]) -> None:
+    """Refuse a closing reading that does not conform to `phase_closing_reading.v1`."""
+    errors = sorted(
+        _closing_reading_validator().iter_errors(document),
+        key=lambda e: list(e.absolute_path),
+    )
+    if errors:
+        detail = "\n".join(
+            f"  - {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}"
+            for e in errors
+        )
+        raise ValueError(
+            f"closing reading does not conform to {CLOSING_READING_SCHEMA_VERSION}:\n{detail}"
+        )
+
+
+def render_closing_comment(document: dict[str, Any]) -> str:
+    """The comment body a phase issue is closed with.
+
+    A human-readable summary line, then the machine-readable block. Both, not
+    one: a reader scrolling the issue sees the verdict without decoding JSON,
+    and the sweep reads the block without parsing prose. The summary is
+    DERIVED from the same document, so the two halves cannot drift.
+    """
+    validate_closing_reading_document(document)
+    state = document["gate_state"]
+    verdict = (
+        f"`crucible gate --gate {document['gate']}` reads **{state}** "
+        f"({document['clauses_met']}/{document['clauses_total']} clauses met"
+    )
+    if document["clauses_unmeasurable"]:
+        verdict += f", {document['clauses_unmeasurable']} unmeasurable"
+    verdict += f") on trading day {document['trading_day']}."
+    lines = [
+        verdict,
+        "",
+        f"Read from `{document['store']}` at commit `{document['commit']}`; the durable "
+        f"artifact is `{document['gate_artifact']}`.",
+    ]
+    if document["coverage"]:
+        lines += ["", f"Coverage: {document['coverage']}"]
+    lines += [
+        "",
+        f"```{CLOSING_READING_FENCE}",
+        json.dumps(document, indent=2, sort_keys=True),
+        "```",
+    ]
+    return "\n".join(lines)
+
+
+def parse_closing_comment(text: str) -> dict[str, Any] | None:
+    """The closing reading inside ``text``, or ``None`` when there is none.
+
+    ``None`` means "this comment carries no block" — a real answer, and the
+    one the sweep turns into a refusal. A block that IS present and cannot be
+    parsed raises: a malformed reading is not an absent one, and swallowing
+    the difference would let a corrupted paste read as "no reading here yet".
+
+    The LAST block wins when a comment carries several. A comment edited to
+    correct a reading appends; the correction is the later block.
+    """
+    matches = list(_CLOSING_READING_BLOCK.finditer(text or ""))
+    if not matches:
+        return None
+    body = matches[-1].group("body")
+    try:
+        document = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"a `{CLOSING_READING_FENCE}` block is present but is not valid JSON: {exc}. "
+            "A malformed reading is not an absent one."
+        ) from exc
+    if not isinstance(document, dict):
+        raise ValueError(
+            f"a `{CLOSING_READING_FENCE}` block is present but is not a JSON object "
+            f"(got {type(document).__name__})."
+        )
+    return document
+
+
+def closing_reading_refusals(document: dict[str, Any] | None, *, phase_id: str) -> list[str]:
+    """Why a CLOSED phase issue is NOT justified by ``document``. Empty means it is.
+
+    The whole predicate, in one place, so the sweep that enforces it in
+    `alpha-engine-config` mirrors a list rather than inventing one. Every check
+    is stated as a refusal with its reason, because the sweep's output is read
+    by whoever has to fix the issue.
+
+    Rules 5–8 are the mutation guards: a block that merely SAYS `MET` while its
+    own counts, ratio or per-clause verdicts disagree is refused. Forging one
+    now takes editing five mutually-consistent fields, which is a different act
+    from the carelessness that closed `alpha-engine-config-I9757` — a phase
+    closed on merged PRs, with nobody having read anything.
+    """
+    if document is None:
+        return [
+            f"no `{CLOSING_READING_FENCE}` block on the closing comment — nothing records "
+            f"what {phase_id}'s gate read when it was closed. Render one with "
+            f"`crucible gate --gate {phase_id} --closing-comment --store <uri>`."
+        ]
+    problems: list[str] = []
+    version = document.get("schema_version")
+    if version != CLOSING_READING_SCHEMA_VERSION:
+        return [
+            f"the block declares schema_version {version!r}, not "
+            f"{CLOSING_READING_SCHEMA_VERSION!r}; a reader that cannot read the version "
+            "refuses the document rather than guessing at its fields."
+        ]
+    if document.get("phase") != phase_id:
+        problems.append(
+            f"the block was rendered for phase {document.get('phase')!r}, not {phase_id!r} "
+            "— a reading pasted onto the wrong issue."
+        )
+    state = document.get("gate_state")
+    if state != "MET":
+        problems.append(
+            f"the gate reads {state!r}, not 'MET'. A phase issue may not rest closed while "
+            "its own exit gate says it has not exited."
+        )
+    total = document.get("clauses_total")
+    met = document.get("clauses_met")
+    unmeasurable = document.get("clauses_unmeasurable")
+    clauses = document.get("clauses")
+    if not isinstance(total, int) or total < 1:
+        problems.append(
+            f"the block records {total!r} clauses. A gate with no clauses measured nothing, "
+            "and nothing is never a pass (plan §6 rule 1)."
+        )
+    elif met != total:
+        problems.append(
+            f"the block records {met} of {total} clauses met, not {total} of {total} — a "
+            "phase whose gate holds on a clause has not exited."
+        )
+    if unmeasurable:
+        problems.append(
+            f"{unmeasurable} clause(s) read UNMEASURABLE. Unmeasurable is never met: it is a "
+            "fact about our reading, not about the phase."
+        )
+    if document.get("met_ratio") != 1.0:
+        problems.append(
+            f"met_ratio is {document.get('met_ratio')!r}, not 1.0 — a fully met gate reads 1.0 "
+            "and nothing else does."
+        )
+    if not isinstance(clauses, list):
+        problems.append("the block carries no clause list, so its counts cannot be checked.")
+    else:
+        if isinstance(total, int) and len(clauses) != total:
+            problems.append(
+                f"the block lists {len(clauses)} clauses but claims {total} — the transcript "
+                "does not match its own summary."
+            )
+        unmet = [
+            c.get("name")
+            for c in clauses
+            if not isinstance(c, dict) or c.get("met") is not True or c.get("unmeasurable")
+        ]
+        if unmet:
+            problems.append(
+                f"clause(s) {unmet} are not met on the block's own transcript, while the block "
+                "claims MET."
+            )
+    store = document.get("store")
+    if not isinstance(store, str) or not store:
+        problems.append(
+            "the block names no store, so the gate artifact it cites cannot be fetched and the "
+            "reading cannot be checked by anyone who doubts it."
+        )
+    commit = document.get("commit")
+    if not isinstance(commit, str) or not _COMMIT_RE.match(commit):
+        problems.append(
+            f"commit {commit!r} is not at least {CLOSING_READING_COMMIT_MIN} lowercase hex "
+            "characters, so the clause definitions that produced this reading cannot be "
+            "recovered."
+        )
+    return problems

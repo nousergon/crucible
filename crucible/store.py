@@ -43,6 +43,7 @@ __all__ = [
     "Store",
     "open_store",
     "read_only",
+    "resolve_store_uri",
     "sha256_hex",
 ]
 
@@ -636,6 +637,26 @@ class S3Store(Store):
         return str(resp.get("ETag", "")).strip('"')
 
 
+def resolve_store_uri(uri: str | None) -> str:
+    """The store URI a caller actually gets, `--store` or `$CRUCIBLE_STORE`.
+
+    Extracted from :func:`open_store` so a caller that must RECORD which store
+    it read — `crucible gate --closing-comment`, whose block is worthless
+    without the store its `gate_artifact` key sits in
+    (`alpha-engine-config-I9967`) — resolves it through the same one place
+    rather than restating the `or os.environ.get(...)` fallback and drifting
+    from it the first time the default moves.
+    """
+    target = uri or os.environ.get("CRUCIBLE_STORE")
+    if not target:
+        raise ValueError(
+            "no store: pass --store s3://bucket/prefix or a directory path, or set "
+            "CRUCIBLE_STORE. There is no default production bucket on purpose — a job "
+            "that wrote to production because a flag was missing is noticed once."
+        )
+    return target
+
+
 def open_store(uri: str | None, *, dry_run: bool = False) -> Store:
     """`s3://bucket/prefix` or a directory path, resolved to a backend.
 
@@ -652,13 +673,7 @@ def open_store(uri: str | None, *, dry_run: bool = False) -> Store:
     true of every job regardless of whether that job's own handler body
     checks the flag.
     """
-    target = uri or os.environ.get("CRUCIBLE_STORE")
-    if not target:
-        raise ValueError(
-            "no store: pass --store s3://bucket/prefix or a directory path, or set "
-            "CRUCIBLE_STORE. There is no default production bucket on purpose — a job "
-            "that wrote to production because a flag was missing is noticed once."
-        )
+    target = resolve_store_uri(uri)
     if target.startswith("s3://"):
         rest = target[len("s3://") :]
         bucket, _, prefix = rest.partition("/")

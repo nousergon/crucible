@@ -506,6 +506,17 @@ def build_parser() -> argparse.ArgumentParser:
                     "debugging affordance and is recorded in the gate artifact."
                 ),
             )
+            sub.add_argument(
+                "--closing-comment",
+                action="store_true",
+                help=(
+                    "Also print the `phase_closing_reading.v1` block this reading "
+                    "justifies, for pasting into the phase issue's closing comment. "
+                    "`alpha-engine-config`'s phase-tracker consistency sweep refuses a "
+                    "CLOSED phase issue that carries no such block or one that does not "
+                    "read MET."
+                ),
+            )
         if spec.name == "data.heal":
             sub.add_argument("--gap", required=True, help="The named gap to repair.")
 

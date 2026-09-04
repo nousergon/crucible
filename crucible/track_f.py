@@ -18,6 +18,9 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
+import subprocess
+from pathlib import Path
 from typing import Any
 
 from krepis.metrics import derive_status
@@ -28,16 +31,61 @@ from crucible.gate import (
     LADDER_KEY,
     LADDER_SCHEMA_VERSION,
     build_ladder,
+    closing_reading,
     evaluate,
     gate_key,
     ladder_payload,
+    render_closing_comment,
 )
 from crucible.keys import manifest_key
 from crucible.runner import RunContext, run_job
-from crucible.store import open_store
+from crucible.store import open_store, resolve_store_uri
 from crucible.weekly import arc_stages, run_arc
 
-__all__ = ["gate_handler", "weekly_handler"]
+__all__ = ["gate_handler", "reading_commit", "weekly_handler"]
+
+
+def reading_commit() -> str:
+    """The commit of the crucible tree taking a gate reading.
+
+    Three sources, most authoritative first, and a raise if none answers:
+
+    1. ``$GITHUB_SHA`` — what Actions sets, so a reading taken by the board or
+       by any workflow carries the sha of the checkout that took it without
+       anybody wiring it.
+    2. ``$CRUCIBLE_COMMIT`` — the explicit override, for a context that knows
+       its commit and is not a checkout (a spot box running an installed
+       wheel, whose commit is the one its release was built from).
+    3. ``git rev-parse HEAD`` in the working tree the package is imported
+       from — the laptop case.
+
+    It RAISES rather than returning a placeholder. A closing reading exists so
+    a later reader can re-run the same clause definitions; ``"unknown"`` in
+    that field would be a block that looks complete and cannot be checked,
+    which is the shape of overclaim this whole mechanism removes.
+    """
+    for name in ("GITHUB_SHA", "CRUCIBLE_COMMIT"):
+        value = (os.environ.get(name) or "").strip().lower()
+        if value:
+            return value
+    root = Path(__file__).resolve().parent.parent
+    # Fixed argv, no shell, no caller-supplied component.
+    completed = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    value = completed.stdout.strip().lower()
+    if completed.returncode == 0 and value:
+        return value
+    raise RuntimeError(
+        "cannot determine the commit this reading was taken at: $GITHUB_SHA and "
+        f"$CRUCIBLE_COMMIT are unset and `git -C {root} rev-parse HEAD` failed "
+        f"({completed.stderr.strip() or 'no output'}). Set CRUCIBLE_COMMIT to the sha "
+        "this build came from. A closing reading with no commit cannot be re-run "
+        "against the clause definitions that produced it."
+    )
 
 
 def weekly_handler(args: argparse.Namespace) -> int:
@@ -237,6 +285,23 @@ def gate_handler(args: argparse.Namespace) -> int:
     reading = result["reading"]
     print(reading.render())
     print(result["ladder"].render())
+    # `alpha-engine-config-I9967` deliverable 3. Printed AFTER the reading and
+    # the ladder, and only when asked for: the block is a paste target, not a
+    # second rendering everyone reads past. It is emitted for an UNMET gate as
+    # readily as a MET one — the honest block on a phase that may not close is
+    # the one that says so, and `closing_reading_refusals` is what turns it
+    # into a refusal rather than the renderer declining to render.
+    if getattr(args, "closing_comment", False):
+        print()
+        print(
+            render_closing_comment(
+                closing_reading(
+                    reading,
+                    store_uri=resolve_store_uri(getattr(args, "store", None)),
+                    commit=reading_commit(),
+                )
+            )
+        )
     return 0 if reading.met else 1
 
 
