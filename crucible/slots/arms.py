@@ -463,6 +463,18 @@ def register_arms(
             supersedes=supersedes,
             bootstrap=spec.bootstrap,
             notes=spec.notes,
+            # `ArmSpec.control` (set by `control_specs()`) must reach the
+            # REGISTERED `ArmRecord.control`, because that is the flag
+            # `nousergon_lib.arena.engine.evaluate_retirements` reads to
+            # exclude a control's pairwise win from a real arm's retirement
+            # cap and to exclude the control itself from the cap pool
+            # (`alpha-engine-config-I9770`). Before this fix, every control
+            # arm registered here read `ArmRecord.control=False` regardless
+            # of `ArmSpec.control` — the flag existed on the recipe and was
+            # dropped exactly here, so the retirement math was NOT already
+            # correct despite the library carrying the fix
+            # (`alpha-engine-config-I9993`).
+            control=spec.control,
         )
         known.add(spec.arm_id)
     return register, by_id
