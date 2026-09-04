@@ -57,6 +57,9 @@ on:
       reviewer:
         description: 'The REVIEWING session id (session_<alnum>), not a GitHub login — every agent in this fleet dispatches as the same collaborator account, so a login can never prove independence. There is deliberately no `author` input: the author set is read out of the commits.'
         required: true
+      head_sha:
+        description: 'The full 40-hex commit sha the reviewer actually reviewed (alpha-engine-config-I9861). Supplied as data, the same way `reviewer` is, rather than inferred from the PR''s head at dispatch time: the review may finish minutes before the dispatch fires, and a push landing in that window must not stamp the verdict on code the reviewer never read. Refused when it disagrees with the PR''s CURRENT head.'
+        required: true
       phase:
         description: 'The phase this review counts toward, as `crucible.gate.GATES` names it (e.g. phase1). A review filed under a phase no gate reads is filed and never read.'
         required: true
@@ -157,12 +160,27 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUM: ${{ inputs.pr_number }}
           REVIEWER: ${{ inputs.reviewer }}
+          HEAD_SHA: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
 
           gh api "/repos/$REPO/pulls/$PR_NUM" > pr.json
-          sha="$(uv run python -c 'import json;print(json.load(open("pr.json"))["head"]["sha"])')"
+          live_sha="$(uv run python -c 'import json;print(json.load(open("pr.json"))["head"]["sha"])')"
           is_draft="$(uv run python -c 'import json;print(json.load(open("pr.json"))["draft"])')"
+
+          # alpha-engine-config-I9861: the dispatch NAMES the sha it reviewed
+          # rather than this step inferring it from the live PR head. A review
+          # routinely runs 10+ minutes while the author keeps working
+          # (measured, alpha-engine-config-I9848), so a push landing between
+          # the review finishing and this dispatch firing must be caught here,
+          # loud — not silently recorded as a verdict on code the reviewer
+          # never read. Branch protection evaluates the CURRENT head only, so
+          # recording against the stale sha the reviewer named would satisfy
+          # nothing while reading as reviewed.
+          if [ "$HEAD_SHA" != "$live_sha" ]; then
+            echo "::error::PR #$PR_NUM moved under review. head_sha input was $HEAD_SHA but the PR's current head is $live_sha. A verdict on $HEAD_SHA would satisfy nothing: branch protection evaluates the CURRENT head only. Re-review $live_sha, then re-dispatch this workflow with head_sha=$live_sha."
+            exit 1
+          fi
 
           # A draft is not review-ready. A verdict recorded against one sits on
           # a sha the author is still editing, and is honoured the moment the
@@ -181,7 +199,7 @@ jobs:
           # set, or a commit list past GitHub's 250 page cap.
           uv run python -m crucible.review check --commits commits.json --reviewer "$REVIEWER"
 
-          echo "REVIEW_SHA=$sha" >> "$GITHUB_ENV"
+          echo "REVIEW_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
 
       - name: Assume the review-writer identity
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
