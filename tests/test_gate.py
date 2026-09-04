@@ -18,6 +18,7 @@ from crucible.gate import (
     GATE_DELIVERABLES,
     GATES,
     LADDER_KEY,
+    LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
     PHASE0_DELIVERABLES,
     PHASES,
     SOURCE_SCAN_SCOPE,
@@ -1138,18 +1139,61 @@ class TestTheGateJobPublishesAnHonestMetric:
 PHASE0_WINDOW = [FRIDAY - dt.timedelta(weeks=n) for n in reversed(range(2))]
 
 
+def _legacy_week(anchor: dt.date, *, runs: int = 1, skips: int = 2) -> dict:
+    """One filed week in the `legacy-weekly-executions.v2` shape.
+
+    `skips` defaults to 2 because that is what the live system produces:
+    `alpha-engine-saturday`'s `cron(0 9 ? * THU-SAT *)` fires three times a
+    week by design and two of those Succeed-skip at `WeeklyRunDayGate` in
+    about three seconds. A fixture without them would never exercise the
+    metric Brian ruled on 2026-09-04. Shape, thresholds and the refusals
+    around them are graded in `tests/test_legacy_weekly_executions_contract.py`.
+    """
+    day = anchor.isoformat()
+    executions = [
+        {
+            "name": f"uuid_skip_{n}",
+            "start": f"{day}T09:00:49+00:00",
+            "stop": f"{day}T09:00:52+00:00",
+            "duration_seconds": 3.0,
+            "status": "SUCCEEDED",
+        }
+        for n in range(skips)
+    ] + [
+        {
+            "name": f"uuid_run_{n}",
+            "start": f"{day}T09:00:49+00:00",
+            "stop": f"{day}T14:02:40+00:00",
+            "duration_seconds": 18111.0,
+            "status": "SUCCEEDED",
+        }
+        for n in range(runs)
+    ]
+    return {
+        "schema_version": LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
+        "executions_started": len(executions),
+        "executions": executions,
+        "source": "a filed record, not a live API call",
+    }
+
+
 def _seed_phase0_met(tmp_path, starts: int = 1) -> LocalStore:
     """A store in which the v1 weekly cadence clause is satisfied.
+
+    `starts` is the number of executions that PASS `WeeklyRunDayGate` — the
+    metric since the 2026-09-04 ruling (`alpha-engine-config-I9962`), not raw
+    starts.
 
     The acceptance clause reads the committed ratchet, not the store, so a
     seeded store plus the real repository is the whole met state.
     """
     store = LocalStore(tmp_path)
     for day in PHASE0_WINDOW:
+        anchor = weekly_anchor(day)
         _put(
             store,
-            legacy_weekly_executions_key(weekly_anchor(day).isoformat()),
-            {"executions_started": starts, "source": "a filed count, not a live API call"},
+            legacy_weekly_executions_key(anchor.isoformat()),
+            _legacy_week(anchor, runs=starts),
         )
     return store
 
@@ -1195,17 +1239,18 @@ class TestPhaseZeroOldWeeklyCadence:
     def test_a_week_over_the_cadence_fails_the_gate(self, tmp_path) -> None:
         """19 executions since 2026-08-26 was the live reading on 2026-09-02
         (`alpha-engine-config-I9831`); a gate that called that met would be
-        measuring nothing."""
+        measuring nothing. Under the ruled metric the same week is 19 REAL
+        cycles — the Succeed-skips are excluded and it is still far over."""
         store = _seed_phase0_met(tmp_path)
         _put(
             store,
             legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat()),
-            {"executions_started": 19},
+            _legacy_week(weekly_anchor(FRIDAY), runs=19),
         )
         result = evaluate(store, gate="phase0", trading_day=FRIDAY)
         clause = _clause(result, "old_weekly_within_cadence")
         assert not clause.met
-        assert "19 starts" in clause.detail
+        assert "19 gate-passing executions" in clause.detail
         assert not result.met
 
     def test_one_quiet_week_is_not_a_cadence(self, tmp_path) -> None:
@@ -1280,7 +1325,15 @@ class TestPhaseZeroOldWeeklyCadence:
         rather than a red reading."""
         store = _seed_phase0_met(tmp_path)
         key = legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat())
-        _put(store, key, {"count": 1})
+        _put(
+            store,
+            key,
+            {
+                "schema_version": LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
+                "executions": [],
+                "count": 1,
+            },
+        )
         clause = _clause(
             evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
         )
@@ -1294,7 +1347,15 @@ class TestPhaseZeroOldWeeklyCadence:
         one start and satisfy the cadence."""
         store = _seed_phase0_met(tmp_path)
         key = legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat())
-        _put(store, key, {"executions_started": True})
+        _put(
+            store,
+            key,
+            {
+                "schema_version": LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
+                "executions": [],
+                "executions_started": True,
+            },
+        )
         clause = _clause(
             evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
         )

@@ -957,6 +957,28 @@ class TestTheTraderIsGradedThroughItsContractOrNotAtAll:
         assert not clause.met and not clause.unmeasurable
 
 
+def _legacy_week_v2(executions: list[dict]) -> dict:
+    """A `legacy-weekly-executions.v2` week — the shape the producer files
+    since `alpha-engine-config-I9962`. A `v1` document (one integer) is read as
+    UNMEASURABLE at every ceiling, so a phase-4 fixture must be v2 too."""
+    return {
+        "schema_version": gate_module.LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
+        "executions_started": len(executions),
+        "executions": executions,
+        "source": "fixture",
+    }
+
+
+def _v2_execution(name: str, duration_seconds: float | None, status: str = "SUCCEEDED") -> dict:
+    return {
+        "name": name,
+        "start": "2026-08-22T09:00:49+00:00",
+        "stop": None if duration_seconds is None else "2026-08-22T09:00:52+00:00",
+        "duration_seconds": duration_seconds,
+        "status": status,
+    }
+
+
 class TestDecommissionedMeansZeroNotWithinCadence:
     def test_the_phase_four_reading_is_the_phase_zero_reader_at_a_zero_ceiling(
         self, store: LocalStore
@@ -964,7 +986,11 @@ class TestDecommissionedMeansZeroNotWithinCadence:
         """One reader, two ceilings. A second copy of this count is how phase 0
         and phase 4 would come to disagree about what a v1 start is."""
         clause = gate_module._clause_old_weekly_within_cadence(
-            store, _window(2), name="old_sf_execution_count_zero", maximum=0
+            store,
+            _window(2),
+            name="old_sf_execution_count_zero",
+            maximum=0,
+            skips_count_as_runs=True,
         )
         assert clause.name == "old_sf_execution_count_zero"
         assert not clause.met
@@ -977,10 +1003,14 @@ class TestDecommissionedMeansZeroNotWithinCadence:
             _put(
                 store,
                 legacy_weekly_executions_key(weekly_anchor(day).isoformat()),
-                {"executions_started": 1},
+                _legacy_week_v2([_v2_execution("uuid_run", 18000.0)]),
             )
         clause = gate_module._clause_old_weekly_within_cadence(
-            store, _window(2), name="old_sf_execution_count_zero", maximum=0
+            store,
+            _window(2),
+            name="old_sf_execution_count_zero",
+            maximum=0,
+            skips_count_as_runs=True,
         )
         assert not clause.met
         assert "ceiling 0" in clause.detail
@@ -992,12 +1022,41 @@ class TestDecommissionedMeansZeroNotWithinCadence:
             _put(
                 store,
                 legacy_weekly_executions_key(weekly_anchor(day).isoformat()),
-                {"executions_started": 0},
+                _legacy_week_v2([]),
             )
         clause = gate_module._clause_old_weekly_within_cadence(
-            store, _window(2), name="old_sf_execution_count_zero", maximum=0
+            store,
+            _window(2),
+            name="old_sf_execution_count_zero",
+            maximum=0,
+            skips_count_as_runs=True,
         )
         assert clause.met
+
+    def test_the_registered_phase_four_clause_counts_succeed_skips(self, store: LocalStore) -> None:
+        """The clause the PHASE reads, not one this test constructs.
+
+        `alpha-engine-config-I9962` changed phase 0's metric to exclude
+        `WeeklyRunDayGate` Succeed-skips. Phase 4 asks a different question —
+        is the v1 pipeline DECOMMISSIONED — and a surviving Succeed-skip is
+        evidence the trigger is still firing, so excluding them here would
+        have silently weakened phase 4 while fixing phase 0.
+        """
+        from crucible.gate import legacy_weekly_executions_key, weekly_anchor
+
+        for day in _window(2):
+            _put(
+                store,
+                legacy_weekly_executions_key(weekly_anchor(day).isoformat()),
+                _legacy_week_v2([_v2_execution("uuid_skip", 3.0)]),
+            )
+        (clause,) = [
+            c
+            for c in gate_module._phase4(store, _window(2), {}, trading_day=_window(2)[-1])
+            if c.name == "old_sf_execution_count_zero"
+        ]
+        assert not clause.met, "a 3.0s Succeed-skip still means the v1 trigger is alive"
+        assert "1 start, ceiling 0" in clause.detail
 
 
 # ---------------------------------------------------------------------------
