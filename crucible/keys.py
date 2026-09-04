@@ -751,14 +751,25 @@ def legacy_weekly_executions_key(week_anchor: str) -> str:
     **The gate reads this; it never counts.** A clause that called
     `states:ListExecutions` would reach live AWS, which makes the reading
     unreplayable, untestable without credentials, and impossible to grade at a
-    past date — and phase 0's whole claim is about a cadence sustained over
-    two consecutive weeks, which is a claim about the past.
+    past date — and phase 0's whole claim is about a cadence sustained over a
+    completed week, which is a claim about the past.
 
-    Nothing files this key yet, and that is the honest state of the
-    measurement rather than a reason to relax the clause: the clause reads
-    UNMET and names the key, so the operator's next action is in the output
-    (`alpha-engine-config-I9860`). The shape belongs in `crucible.keys` and
-    moves there once the branch that owns that file lands.
+    An absent document reads UNMET and names the key, so the operator's next
+    action is in the output (`alpha-engine-config-I9860`).
+
+    **The document at this key is versioned, and the key is not.** `v1` filed
+    one integer, `executions_started`. Since Brian's 2026-09-04 ruling
+    (`alpha-engine-config-I9756`, implemented under
+    `alpha-engine-config-I9962`) the clause grades executions that PASSED
+    `WeeklyRunDayGate`, which needs a per-execution record — so
+    `nous-ergon-ops/scripts/legacy_weekly_executions_producer.py` files
+    `schema_version: legacy-weekly-executions.v2` carrying name, start, stop,
+    duration and status per execution. The key stays the same because the week
+    it identifies is the same; a `v1` document still sitting at it reads
+    UNMEASURABLE, never a pass. Producer and consumer are held together by
+    `crucible/tests/test_legacy_weekly_executions_contract.py` and
+    `nous-ergon-ops/tests/test_legacy_weekly_executions_producer.py`, which
+    grade the same fixture from the two sides.
     """
     return f"legacy/weekly/{week_anchor}/executions.json"
 

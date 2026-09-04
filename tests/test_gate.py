@@ -18,6 +18,7 @@ from crucible.gate import (
     GATE_DELIVERABLES,
     GATES,
     LADDER_KEY,
+    LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
     PHASE0_DELIVERABLES,
     PHASES,
     SOURCE_SCAN_SCOPE,
@@ -1135,21 +1136,70 @@ class TestTheGateJobPublishesAnHonestMetric:
         assert not metric["status"].startswith("N/A")
 
 
-PHASE0_WINDOW = [FRIDAY - dt.timedelta(weeks=n) for n in reversed(range(2))]
+#: ONE week since Brian's ruling of 2026-09-04 ("we can't wait a week on phase
+#: 0. it should clear after this week's weekly sf."). What the second week
+#: bought — evidence that the disabled rerun issuer had not returned — is now
+#: bought continuously by the daily `trigger-undeclared` check
+#: (`nousergon-data-PR1637`), and the narrower window is made safe by the
+#: clause's lower bound (`alpha-engine-config-I9962`).
+PHASE0_WINDOW = [FRIDAY - dt.timedelta(weeks=n) for n in reversed(range(1))]
+
+
+def _legacy_week(anchor: dt.date, *, runs: int = 1, skips: int = 2) -> dict:
+    """One filed week in the `legacy-weekly-executions.v2` shape.
+
+    `skips` defaults to 2 because that is what the live system produces:
+    `alpha-engine-saturday`'s `cron(0 9 ? * THU-SAT *)` fires three times a
+    week by design and two of those Succeed-skip at `WeeklyRunDayGate` in
+    about three seconds. A fixture without them would never exercise the
+    metric Brian ruled on 2026-09-04. Shape, thresholds and the refusals
+    around them are graded in `tests/test_legacy_weekly_executions_contract.py`.
+    """
+    day = anchor.isoformat()
+    executions = [
+        {
+            "name": f"uuid_skip_{n}",
+            "start": f"{day}T09:00:49+00:00",
+            "stop": f"{day}T09:00:52+00:00",
+            "duration_seconds": 3.0,
+            "status": "SUCCEEDED",
+        }
+        for n in range(skips)
+    ] + [
+        {
+            "name": f"uuid_run_{n}",
+            "start": f"{day}T09:00:49+00:00",
+            "stop": f"{day}T14:02:40+00:00",
+            "duration_seconds": 18111.0,
+            "status": "SUCCEEDED",
+        }
+        for n in range(runs)
+    ]
+    return {
+        "schema_version": LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
+        "executions_started": len(executions),
+        "executions": executions,
+        "source": "a filed record, not a live API call",
+    }
 
 
 def _seed_phase0_met(tmp_path, starts: int = 1) -> LocalStore:
     """A store in which the v1 weekly cadence clause is satisfied.
+
+    `starts` is the number of executions that PASS `WeeklyRunDayGate` — the
+    metric since the 2026-09-04 ruling (`alpha-engine-config-I9962`), not raw
+    starts.
 
     The acceptance clause reads the committed ratchet, not the store, so a
     seeded store plus the real repository is the whole met state.
     """
     store = LocalStore(tmp_path)
     for day in PHASE0_WINDOW:
+        anchor = weekly_anchor(day)
         _put(
             store,
-            legacy_weekly_executions_key(weekly_anchor(day).isoformat()),
-            {"executions_started": starts, "source": "a filed count, not a live API call"},
+            legacy_weekly_executions_key(anchor.isoformat()),
+            _legacy_week(anchor, runs=starts),
         )
     return store
 
@@ -1168,10 +1218,21 @@ class TestPhaseZeroIsRegisteredAtAll:
         assert PHASES[0].id == "phase0"
         assert PHASES[0].gate == "phase0"
 
-    def test_the_window_is_the_two_consecutive_weeks_the_issue_asks_for(self, tmp_path) -> None:
-        """I9756's closes-when is "<= 1 start per calendar week for two
-        consecutive weeks". One quiet week is a gap between reruns."""
-        assert GATES["phase0"][0] == 2
+    def test_the_window_is_the_one_week_brian_ruled_and_phase_four_keeps_two(
+        self, tmp_path
+    ) -> None:
+        """Brian, 2026-09-04: "we can't wait a week on phase 0. it should clear
+        after this week's weekly sf." `alpha-engine-config-I9756`'s original
+        closes-when asked for two consecutive weeks; the second week bought
+        evidence that a disabled rerun issuer had not silently returned, and
+        that is now a DAILY `trigger-undeclared` check rather than one extra
+        week of watching.
+
+        Phase 4 keeps two, asserted here so a future narrowing of phase 0
+        cannot quietly take phase 4's window with it: phase 0 asks whether a
+        live pipeline is quiet, phase 4 whether it is gone."""
+        assert GATES["phase0"][0] == 1
+        assert GATES["phase4"][0] == 2
         result = evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY)
         assert result.window == PHASE0_WINDOW
 
@@ -1195,22 +1256,24 @@ class TestPhaseZeroOldWeeklyCadence:
     def test_a_week_over_the_cadence_fails_the_gate(self, tmp_path) -> None:
         """19 executions since 2026-08-26 was the live reading on 2026-09-02
         (`alpha-engine-config-I9831`); a gate that called that met would be
-        measuring nothing."""
+        measuring nothing. Under the ruled metric the same week is 19 REAL
+        cycles — the Succeed-skips are excluded and it is still far over."""
         store = _seed_phase0_met(tmp_path)
         _put(
             store,
             legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat()),
-            {"executions_started": 19},
+            _legacy_week(weekly_anchor(FRIDAY), runs=19),
         )
         result = evaluate(store, gate="phase0", trading_day=FRIDAY)
         clause = _clause(result, "old_weekly_within_cadence")
         assert not clause.met
-        assert "19 starts" in clause.detail
+        assert "19 gate-passing executions" in clause.detail
         assert not result.met
 
-    def test_one_quiet_week_is_not_a_cadence(self, tmp_path) -> None:
-        """A single filed week may not carry the clause: two consecutive weeks
-        is the requirement, and an absent second week is an absence."""
+    def test_the_sole_window_week_must_answer_the_ruled_question(self, tmp_path) -> None:
+        """The window is one week now, so that week carries the whole clause.
+        A `v1` document there is UNMEASURABLE with the reason named — never a
+        pass on the retired integer, and never a bare unmet."""
         store = LocalStore(tmp_path)
         _put(
             store,
@@ -1220,10 +1283,34 @@ class TestPhaseZeroOldWeeklyCadence:
         result = evaluate(store, gate="phase0", trading_day=FRIDAY)
         clause = _clause(result, "old_weekly_within_cadence")
         assert not clause.met
+        assert clause.unmeasurable
         assert (
             legacy_weekly_executions_key(weekly_anchor(PHASE0_WINDOW[0]).isoformat())
             in clause.detail
         )
+
+    def test_a_week_with_no_gate_passing_run_is_unmet_not_met(self, tmp_path) -> None:
+        """The lower bound. "At most one gate-passing execution" is satisfied
+        by ZERO — a week in which the weekly pipeline never ran, which
+        `sf-pipeline-policy.md` §5 calls worse than a duplicate. With a
+        one-week window that is one bad Saturday away, so phase 0 grades
+        EXACTLY one (`alpha-engine-config-I9962`)."""
+        store = LocalStore(tmp_path)
+        for day in PHASE0_WINDOW:
+            anchor = weekly_anchor(day)
+            _put(
+                store,
+                legacy_weekly_executions_key(anchor.isoformat()),
+                _legacy_week(anchor, runs=0, skips=2),
+            )
+        result = evaluate(store, gate="phase0", trading_day=FRIDAY)
+        clause = _clause(result, "old_weekly_within_cadence")
+        assert not clause.met
+        # A reading, not an inability to read. `[?]` here would hide a missing
+        # weekly run behind the same symbol an unobtainable document gets.
+        assert not clause.unmeasurable
+        assert "did not run this week" in clause.detail
+        assert not result.met
 
     def test_every_week_of_the_window_is_named_as_evidence(self, tmp_path) -> None:
         result = evaluate(_seed_phase0_met(tmp_path), gate="phase0", trading_day=FRIDAY)
@@ -1263,11 +1350,20 @@ class TestPhaseZeroOldWeeklyCadence:
         """Two anchors 7 days apart cannot normally collide, but a future
         change to the anchor could make them. One document graded twice is a
         cadence claim backed by half the evidence it names, so the collapse is
-        a red reading rather than a silently shorter window."""
+        a red reading rather than a silently shorter window.
+
+        Read through the CLAUSE at a two-week window rather than through
+        `evaluate(gate="phase0")`: phase 0's window is one week since
+        2026-09-04 and one week cannot collapse. Phase 4 still passes two
+        weeks through this same reader, so the refusal is still reachable and
+        still has to hold."""
+        from crucible import gate as gate_module
+
         monkeypatch.setattr("crucible.gate.weekly_anchor", lambda day: FRIDAY)
-        clause = _clause(
-            evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY),
-            "old_weekly_within_cadence",
+        clause = gate_module._clause_old_weekly_within_cadence(
+            LocalStore(tmp_path),
+            [FRIDAY - dt.timedelta(weeks=n) for n in reversed(range(2))],
+            minimum=0,
         )
         assert not clause.met
         assert "collapsed" in clause.detail
@@ -1280,7 +1376,15 @@ class TestPhaseZeroOldWeeklyCadence:
         rather than a red reading."""
         store = _seed_phase0_met(tmp_path)
         key = legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat())
-        _put(store, key, {"count": 1})
+        _put(
+            store,
+            key,
+            {
+                "schema_version": LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
+                "executions": [],
+                "count": 1,
+            },
+        )
         clause = _clause(
             evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
         )
@@ -1294,7 +1398,15 @@ class TestPhaseZeroOldWeeklyCadence:
         one start and satisfy the cadence."""
         store = _seed_phase0_met(tmp_path)
         key = legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat())
-        _put(store, key, {"executions_started": True})
+        _put(
+            store,
+            key,
+            {
+                "schema_version": LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
+                "executions": [],
+                "executions_started": True,
+            },
+        )
         clause = _clause(
             evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
         )

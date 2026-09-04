@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nousergon/crucible/schemas/legacy_weekly_executions.v2.json",
+  "title": "v1 weekly state machine executions for one week, v2",
+  "description": "The document at `legacy/weekly/{week_anchor}/executions.json` (crucible.keys.legacy_weekly_executions_key), PRODUCED by nous-ergon-ops/scripts/legacy_weekly_executions_producer.py and CONSUMED by crucible.gate._clause_old_weekly_within_cadence. v1 carried one integer, `executions_started`; Brian's 2026-09-04 ruling (alpha-engine-config-I9756) made the phase-0 metric 'executions that PASSED WeeklyRunDayGate per week', which one integer cannot answer, so v2 files the per-execution facts and the consumer classifies them (alpha-engine-config-I9962). A v1 document is read as UNMEASURABLE, never as a pass. The producer states facts only: no field here says whether an execution passed the gate, because the threshold that decides that is reviewable only beside the clause that applies it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "executions_started",
+    "executions",
+    "source"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Version of THIS schema. A consumer that does not recognise the version refuses the document rather than guessing — which is what makes the key safe to reuse across a schema change.",
+      "const": "legacy-weekly-executions.v2"
+    },
+    "executions_started": {
+      "description": "Every execution started in the week, regardless of launch source. Retained from v1 for backward reading, and REQUIRED to equal the length of `executions`: a document that answers 'how many' twice with two answers is refused, not reconciled.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "executions": {
+      "description": "One entry per execution started in the week, ordered oldest-first so two reads of the same week produce byte-identical documents.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/execution" }
+    },
+    "source": {
+      "description": "How the reading was taken, in prose: the API called, how it was paginated, the window, and what the producer did NOT decide.",
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "$defs": {
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "start", "stop", "duration_seconds", "status"],
+      "properties": {
+        "name": {
+          "description": "The Step Functions execution name. Load-bearing, not decoration: a `watch-rerun-*` name identifies a rerun ISSUER and fails the consuming clause regardless of duration.",
+          "type": "string",
+          "minLength": 1
+        },
+        "start": {
+          "description": "ISO-8601 `startDate`, timezone-aware.",
+          "type": "string",
+          "minLength": 1
+        },
+        "stop": {
+          "description": "ISO-8601 `stopDate`, or null for an execution still RUNNING at the moment of the read.",
+          "type": ["string", "null"]
+        },
+        "duration_seconds": {
+          "description": "stop - start in seconds, or null when there is no stop. Null is never 0: the consumer treats 'no duration' as 'not a Succeed-skip', and 0 would read as the fastest possible skip — the one value that would exclude a live run from the count grading it.",
+          "type": ["number", "null"],
+          "minimum": 0
+        },
+        "status": {
+          "description": "The Step Functions execution status verbatim (SUCCEEDED, FAILED, RUNNING, TIMED_OUT, ABORTED). Not normalised: the consumer's Succeed-skip rule is keyed on SUCCEEDED specifically.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}
