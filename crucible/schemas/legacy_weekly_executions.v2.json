@@ -30,6 +30,24 @@
       "description": "How the reading was taken, in prose: the API called, how it was paginated, the window, and what the producer did NOT decide.",
       "type": "string",
       "minLength": 1
+    },
+    "window": {
+      "description": "The collection window, as `{start, end}` calendar dates the producer actually queried `states:ListExecutions` over — the fact `source`'s prose could describe but nothing could CHECK, which is what let alpha-engine-config-I9983 (a wrong window, anchor-6..anchor, collecting every off-day Succeed-skip of the anchor's week and none of its runs) file plausible-looking documents undetected for a week. OPTIONAL, and deliberately not a schema-version bump — the same call and the same reasoning as `sns_topic_arn` above: bumping would make every already-filed week UNMEASURABLE for the cadence clause, and keying on the FIELD's presence instead gives crucible.gate the honest reading — a document without `window` is measurable exactly as it was before this field existed, and one WITH it is checked against the span the clause expects for its anchor before its counts are trusted at all. The producer may not emit this field until crucible has shipped the consumer in a released wheel (this schema's `additionalProperties: false` makes an early-emitted field invalid on every document, not just unread).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {
+        "start": {
+          "description": "ISO-8601 calendar date (YYYY-MM-DD), the first day the producer's query covered.",
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        },
+        "end": {
+          "description": "ISO-8601 calendar date (YYYY-MM-DD), the last day the producer's query covered.",
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        }
+      }
     }
   },
   "$defs": {

@@ -58,6 +58,7 @@ from crucible.gate import (
     LEGACY_WEEKLY_RERUN_NAME_PREFIX,
     WEEKLY_RUN_DAY_GATE_SKIP_MAX_SECONDS,
     _clause_old_weekly_within_cadence,
+    expected_legacy_weekly_window,
     legacy_weekly_executions_key,
     weekly_anchor,
 )
@@ -184,6 +185,42 @@ class TestTheSchemaConstrainsTheDocument:
         payload["executions"][0]["stop"] = None
         payload["executions"][0]["status"] = "RUNNING"
         assert _errors(payload) == []
+
+    def test_window_is_optional_a_document_without_it_still_validates(self) -> None:
+        """`alpha-engine-config-I9992`. No `schema_version` bump: a document
+        filed before this field existed must keep validating exactly as it
+        did, or every already-filed week would go invalid."""
+        assert "window" not in _ruled_week(FRIDAY)
+        assert _errors(_ruled_week(FRIDAY)) == []
+
+    def test_a_correctly_shaped_window_validates(self) -> None:
+        payload = _ruled_week(FRIDAY)
+        start, end = expected_legacy_weekly_window(FRIDAY)
+        payload["window"] = {"start": start, "end": end}
+        assert _errors(payload) == []
+
+    @pytest.mark.parametrize("missing_key", ["start", "end"])
+    def test_window_requires_both_start_and_end(self, missing_key: str) -> None:
+        payload = _ruled_week(FRIDAY)
+        start, end = expected_legacy_weekly_window(FRIDAY)
+        window = {"start": start, "end": end}
+        del window[missing_key]
+        payload["window"] = window
+        assert _errors(payload) != []
+
+    def test_window_refuses_an_unrecognised_field(self) -> None:
+        """`additionalProperties: false` on the window object too — a
+        producer-added field the consumer has never heard of is a silent
+        contract break otherwise."""
+        payload = _ruled_week(FRIDAY)
+        start, end = expected_legacy_weekly_window(FRIDAY)
+        payload["window"] = {"start": start, "end": end, "timezone": "UTC"}
+        assert _errors(payload) != []
+
+    def test_window_refuses_a_non_date_string(self) -> None:
+        payload = _ruled_week(FRIDAY)
+        payload["window"] = {"start": "not-a-date", "end": "2026-08-29"}
+        assert _errors(payload) != []
 
 
 # ── the consumer grades the ruled metric ────────────────────────────────────
@@ -392,6 +429,91 @@ class TestAnOldSchemaWeekIsUnmeasurable:
         clause = _clause(_seed(tmp_path, week))
         assert not clause.met
         assert clause.unmeasurable
+
+
+# ── the optional window is checked before a count is trusted ────────────────
+
+
+class TestTheDeclaredWindowGatesTheClause:
+    """`alpha-engine-config-I9992`. `alpha-engine-config-I9983` filed a week
+    collected over `anchor-6..anchor` — every off-day Succeed-skip of the
+    anchor's week and none of its runs — and the gate read a plausible count
+    each time, because nothing in the document said what span it covered.
+    Found by reading the producer, not by any detector. This is that
+    detector, demonstrated against the exact wrong span that shipped."""
+
+    def test_a_correct_window_reads_exactly_as_no_window_at_all(self, tmp_path) -> None:
+        def week(anchor: dt.date) -> dict[str, Any]:
+            payload = _ruled_week(anchor)
+            start, end = expected_legacy_weekly_window(anchor)
+            payload["window"] = {"start": start, "end": end}
+            return payload
+
+        clause = _clause(_seed(tmp_path, week))
+        assert clause.met, clause.detail
+        assert not clause.unmeasurable
+
+    def test_the_i9983_wrong_span_is_unmeasurable_with_both_spans_named(self, tmp_path) -> None:
+        """The actual defective producer window (`anchor-6..anchor`), not a
+        made-up mismatch — the regression this issue was filed to prevent
+        recurring."""
+
+        def week(anchor: dt.date) -> dict[str, Any]:
+            payload = _ruled_week(anchor)
+            payload["window"] = {
+                "start": (anchor - dt.timedelta(days=6)).isoformat(),
+                "end": anchor.isoformat(),
+            }
+            return payload
+
+        clause = _clause(_seed(tmp_path, week))
+        assert not clause.met
+        assert clause.unmeasurable, clause.detail
+        anchor = weekly_anchor(WINDOW[-1])
+        expected_start, expected_end = expected_legacy_weekly_window(anchor)
+        assert expected_start in clause.detail and expected_end in clause.detail
+        declared_start = (anchor - dt.timedelta(days=6)).isoformat()
+        assert declared_start in clause.detail and anchor.isoformat() in clause.detail
+
+    def test_a_window_mismatch_is_never_read_as_met_or_as_a_plain_unmet(self, tmp_path) -> None:
+        """The ruled third answer: a wrong window is a broken READING, not a
+        finding about the pipeline, so it must be `[?]`, never `[x]` and
+        never a bare `[ ]` folded into an ordinary miss."""
+
+        def week(anchor: dt.date) -> dict[str, Any]:
+            payload = _ruled_week(anchor)
+            payload["window"] = {"start": "2000-01-01", "end": "2000-01-02"}
+            return payload
+
+        clause = _clause(_seed(tmp_path, week))
+        assert not clause.met
+        assert clause.unmeasurable
+
+    def test_a_window_mismatch_beside_a_genuine_ceiling_violation_is_a_finding_not_a_shrug(
+        self, tmp_path
+    ) -> None:
+        """One week's window is wrong; the OTHER week genuinely violates the
+        ceiling. `[?]` here would hide a real finding behind an unreadable
+        week — the same rule `test_a_mixed_window_is_a_finding_not_a_shrug`
+        already holds for a stale schema version."""
+
+        def document_for(anchor: dt.date) -> dict[str, Any]:
+            if anchor == weekly_anchor(WINDOW[-1]):
+                payload = _ruled_week(anchor)
+                payload["executions"].append(
+                    _execution("uuid_second_run", f"{anchor.isoformat()}T20:00:00+00:00", 4000.0)
+                )
+                payload["executions_started"] = len(payload["executions"])
+                return payload
+            payload = _ruled_week(anchor)
+            payload["window"] = {"start": "2000-01-01", "end": "2000-01-02"}
+            return payload
+
+        clause = _clause(_seed(tmp_path, document_for))
+        assert not clause.met
+        assert not clause.unmeasurable
+        assert "window" in clause.detail
+        assert "ceiling 1" in clause.detail
 
 
 # ── malformed v2 documents are red readings, not exceptions ─────────────────
