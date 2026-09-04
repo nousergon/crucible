@@ -33,7 +33,13 @@ from crucible.keys import arm_register_key
 from crucible.manifest import manifest_key
 from crucible.runner import run_job
 from crucible.slots import research, universe
-from crucible.slots.arms import load_arm_specs, read_register, register_arms, write_register
+from crucible.slots.arms import (
+    ForeignRecipeSchemaError,
+    load_arm_specs,
+    read_register,
+    register_arms,
+    write_register,
+)
 
 __all__ = ["HANDLERS", "add_track_a_arguments"]
 
@@ -260,10 +266,27 @@ def handle_experiment_new(args: argparse.Namespace) -> int:
     not a manifest (defect #4b, 2026-09-01 adversarial review — the flag's
     own help text is "report what would be written; write nothing", and
     this handler wrote the register regardless of it).
+
+    **M and S are refused here in the same shape :func:`_slot_module` uses**
+    (`alpha-engine-config-I9961`). `--slot` admits all four, and for M and S
+    this command used to reach `load_arm_specs`, fail on a missing `ranker`,
+    and present as a malformed recipe tree — for recipes that are well-formed
+    under the schema their own slot declares. The loader now refuses the slot
+    by name; this converts that into the same exit `experiment.run --slot m`
+    already produces, so the two commands give one answer about when M and S
+    arrive rather than two unrelated failures.
     """
     config = _settings(args)
     store = config.store()
-    specs = load_arm_specs(args.slot, store=store, strategy_dir=config.strategy_dir)
+    try:
+        specs = load_arm_specs(args.slot, store=store, strategy_dir=config.strategy_dir)
+    except ForeignRecipeSchemaError as exc:
+        raise SystemExit(
+            f"{exc} U and R are here; M and S arrive with track B "
+            f"({_ALL_SLOTS_PHASE.tracker}), which is when their recipes gain a register "
+            "writer. Registering nothing and exiting 0 would be indistinguishable from a "
+            "slot whose arms were all already present."
+        ) from exc
     arm = getattr(args, "arm", None)
     if arm:
         specs = [s for s in specs if s.name == arm]

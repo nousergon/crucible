@@ -62,9 +62,11 @@ from crucible.store import Store
 
 __all__ = [
     "CONTROL_REGISTERED_AT",
+    "FOREIGN_RECIPE_LOADERS",
     "LLM_CALLSITE_PARAM",
     "REQUIRED_ARM_FIELDS",
     "ArmSpec",
+    "ForeignRecipeSchemaError",
     "InapplicableArmError",
     "control_specs",
     "load_arm_specs",
@@ -96,6 +98,49 @@ REQUIRED_ARM_FIELDS: tuple[str, ...] = ("name", "slot", "ranker", "params", "reg
 #: answerable from the register alone and is never a string heuristic over
 #: ranker names. `crucible.gate.LLM_ARM_CALLSITE_FIELD` names the same key.
 LLM_CALLSITE_PARAM = "llm_callsite"
+
+#: The slots whose recipes are NOT `ArmSpec`-shaped, and the loader that reads
+#: each (`alpha-engine-config-I9961`).
+#:
+#: `strategy/arms/` holds four sibling directories and THREE recipe schemas.
+#: U and R recipes are `ArmSpec`s — `ranker`, `params`, `registered_at`. M
+#: recipes are `ModelRecipe`s — `spec.features`, `spec.estimator`,
+#: `spec.cpcv` — and S recipes are `StrategyRecipe`s — `spec.rules`,
+#: `spec.cost_model`. Neither carries a `ranker` or a `params`, so
+#: :func:`load_arm_specs` used to fail on them at
+#: :data:`REQUIRED_ARM_FIELDS` with a message that reads like a MALFORMED
+#: recipe, for a file that is perfectly well-formed under the schema its own
+#: slot declares. `crucible experiment.new --slot m` was broken that way for
+#: the whole life of the command, and nothing surfaced it because the M path
+#: has no production caller at all (`alpha-engine-config-I9957`).
+#:
+#: The refusal below names the slot and the loader that reads it, mirroring
+#: `crucible.track_a._slot_module`'s shape: a slot this entry point does not
+#: serve says so, rather than failing somewhere that sends the reader to the
+#: wrong file.
+#:
+#: **The loaders are named as STRINGS, deliberately.** Importing either one
+#: here would make `crucible.slots.model` and `crucible.slots.strategy`
+#: reachable from production code, which is precisely the property
+#: `tests/test_slot_inputs_wiring.py` pins as a measured phase-3 gap. A
+#: pointer in a message is not a caller and must not be recorded as one — the
+#: M path still has no production entry point, and this constant does not
+#: give it one.
+FOREIGN_RECIPE_LOADERS: dict[str, str] = {
+    "m": "crucible.slots.model.load_model_recipes",
+    "s": "crucible.slots.strategy.load_strategy_recipes",
+}
+
+
+class ForeignRecipeSchemaError(ValueError):
+    """`load_arm_specs` was asked for a slot whose recipes another loader reads.
+
+    A `ValueError` subclass because every existing caller that classifies a
+    load failure already catches `ValueError` (`crucible.gate`), and this IS
+    a refusal to load — not a new class of outage. What it adds is the NAME
+    of the loader that does read the slot, which a `KeyError` on `ranker`
+    could never carry.
+    """
 
 
 class InapplicableArmError(ValueError):
@@ -255,7 +300,24 @@ def load_arm_specs(
     `alpha-engine-config/strategy/` expects the edit to take effect; a spot
     instance has no checkout and reads the store. Which one was used is
     recorded on each spec's `source_key`, so `explain` reports it.
+
+    **This loader serves U and R only.** M and S recipes are a different kind
+    of document that happens to live in a sibling directory, and a slot in
+    :data:`FOREIGN_RECIPE_LOADERS` is refused BY NAME here, before a single
+    byte is read — see that constant for the measurement and the reason a
+    field-level failure was the wrong shape (`alpha-engine-config-I9961`).
     """
+    loader = FOREIGN_RECIPE_LOADERS.get(slot)
+    if loader is not None:
+        raise ForeignRecipeSchemaError(
+            f"slot {slot!r} does not use `ArmSpec` recipes and is not loaded here: "
+            f"`strategy/arms/{slot}/*.yaml` is read by `{loader}`. `load_arm_specs` "
+            f"serves U and R, whose recipes declare {list(REQUIRED_ARM_FIELDS)}; a "
+            f"{slot.upper()} recipe declares none of `ranker`, `params` and is not "
+            "malformed for it. Failing on a missing field instead of on the slot is "
+            "what made `experiment.new --slot m` read as a broken recipe tree for the "
+            "whole life of the command."
+        )
     specs: list[ArmSpec] = []
     if strategy_dir is not None:
         directory = Path(strategy_dir) / "arms" / slot

@@ -189,8 +189,8 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.35" },
     { name = "jsonschema", specifier = ">=4.26.0" },
     { name = "krepis", specifier = "==0.59.45" },
-    { name = "nousergon-lib", specifier = "==0.124.106" },
-    { name = "nousergon-lib", extras = ["arcticdb"], marker = "extra == 'arcticdb'", specifier = "==0.124.106" },
+    { name = "nousergon-lib", specifier = "==0.124.108" },
+    { name = "nousergon-lib", extras = ["arcticdb"], marker = "extra == 'arcticdb'", specifier = "==0.124.108" },
     { name = "numpy", specifier = ">=2.5.2" },
     { name = "pandas", specifier = ">=2.0" },
     { name = "pyarrow", specifier = ">=25.0.1" },
@@ -296,7 +296,7 @@ wheels = [
 
 [[package]]
 name = "nousergon-lib"
-version = "0.124.106"
+version = "0.124.108"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -305,9 +305,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a5/d7/d2bbbd52a5c4ebca573a2c83da7747cd69e145b64f2290b7f8fa03795c38/nousergon_lib-0.124.106.tar.gz", hash = "sha256:56194c85a44f2c4f4ccab20c440b5892e2aabf519cb34011e347f241b548f938", size = 803324, upload-time = "2026-09-01T00:37:14.256Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/62/c9/0ebbdc2bd42fc2302d3290a482f958aa580dcb09aa093627c2b75c91fd1b/nousergon_lib-0.124.108.tar.gz", hash = "sha256:5f5e147dbbcc895b4964916fb24e80b9f458bd4dd5c5ad338ae67442c92c3ef6", size = 808199, upload-time = "2026-09-04T16:13:03.864Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3a/c9/49663ff01e4b9c5ddacd16cdba8a577e0ddf9f74eec5386bc4c36980de6b/nousergon_lib-0.124.106-py3-none-any.whl", hash = "sha256:f0242f6e20b6da585481b0044890c20fc4942e9ad80e2a5f9171a5bfb36c3384", size = 562210, upload-time = "2026-09-01T00:37:12.682Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/ea/c57efc6d8a2cc70849bb1d6ab2a5fc2fd859f652052b03ffeb4f2e6a5199/nousergon_lib-0.124.108-py3-none-any.whl", hash = "sha256:8ea7a5d7ce93ac18da2554490519a3a471fb43fafa644c2d1d81a177c248f5d5", size = 565279, upload-time = "2026-09-04T16:13:01.812Z" },
 ]
 
 [package.optional-dependencies]

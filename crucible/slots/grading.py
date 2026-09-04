@@ -225,7 +225,27 @@ class ForwardReturnWindow:
 
 @dataclass(frozen=True)
 class ShadowSelection:
-    """What one arm chose on one trading day, before any outcome existed."""
+    """What one arm chose on one trading day, before any outcome existed.
+
+    ``feature_version`` is the feature-layer version the selection was
+    computed from, and it is REQUIRED (`alpha-engine-config-I9963`). It is
+    the per-day half of the lineage `nousergon_lib.arena.ArmSeries.lineage`
+    carries to the verdict surface: at grade time the run knows the version
+    resolved for the GRADE date only, while each scored day's shadow was
+    produced under whatever the catalogue hashed to on THAT day. Attaching
+    the grade-date version to another day's score would be a fabrication, so
+    the version is recorded where it is known — here, at produce time — and
+    read back per (arm, day) when the series is assembled.
+
+    Additive-optional on `shadow.v1`, matching how `lineage` stayed on
+    `arena_cycle.v1`: the field is emitted only when it is set, so a shadow
+    written before it existed simply has no key, and "produced before this
+    was recorded" never renders as a version. There is no JSON Schema for
+    this document and every reader ignores unknown keys, so no version bump
+    is owed; the constructor requires the field because a PRODUCER that
+    silently omits it is the defect, while an old artifact that lacks it is
+    a migration date.
+    """
 
     arm_id: str
     trading_day: str
@@ -233,7 +253,18 @@ class ShadowSelection:
     population: tuple[str, ...]
     ranker: str
     params: dict[str, Any]
+    feature_version: str
     look_ahead: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.feature_version:
+            raise ValueError(
+                f"arm {self.arm_id}: a shadow must record the feature-layer version it "
+                f"was produced from ({self.trading_day}). An empty version is not "
+                "'unknown' — it is a producer that had the value and dropped it, and it "
+                "would reach the verdict surface as a series whose lineage cannot be "
+                "assembled."
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -244,6 +275,7 @@ class ShadowSelection:
             "population": list(self.population),
             "ranker": self.ranker,
             "params": dict(self.params),
+            "feature_version": self.feature_version,
             "look_ahead": self.look_ahead,
         }
 
@@ -259,6 +291,8 @@ def produce_shadow(
     spec: ArmSpec,
     features: pd.DataFrame,
     trading_day: dt.date,
+    *,
+    feature_version: str,
 ) -> ShadowSelection:
     """Run one arm's recipe against the feature cross-section.
 
@@ -267,6 +301,11 @@ def produce_shadow(
     turns that into a failed run. It is deliberately NOT recorded as a miss:
     a miss means "this arm legitimately had nothing to say", and a missing
     input means the cycle's inputs were compromised (plan §4.4).
+
+    ``feature_version`` is the version of the layer ``features`` was read
+    from. It is a required keyword, not a default: the caller resolved it to
+    read the frame at all, and a default would let a second caller produce a
+    shadow whose lineage silently claims a version it never used.
     """
     population = tuple(sorted(str(t) for t in features["ticker"].unique()))
     scores = rank_with(spec.ranker, features, spec.params)
@@ -286,6 +325,7 @@ def produce_shadow(
         population=population,
         ranker=spec.ranker,
         params=dict(spec.params),
+        feature_version=feature_version,
     )
 
 
