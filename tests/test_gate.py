@@ -1158,6 +1158,7 @@ def _legacy_week(
     skips: int = 2,
     topic: str | None = f"arn:aws:sns:us-east-1:acct:{MUTED_ALERTS_TOPIC_NAME}",
     with_topic_field: bool = True,
+    reruns: tuple[str, ...] = (),
 ) -> dict:
     """One filed week in the `legacy-weekly-executions.v2` shape.
 
@@ -1192,10 +1193,26 @@ def _legacy_week(
             "status": "SUCCEEDED",
         }
         for n in range(runs)
+    ] + [
+        # Reruns carry the PAGING topic on purpose: every real one in the
+        # store does, so a fixture that muted them would let the routing
+        # clause pass for the wrong reason.
+        {
+            "name": name,
+            "start": f"{day}T09:00:49+00:00",
+            "stop": f"{day}T09:35:00+00:00",
+            "duration_seconds": 2100.0,
+            "status": "FAILED",
+            "sns_topic_arn": "arn:aws:sns:us-east-1:acct:alpha-engine-alerts",
+        }
+        for name in reruns
     ]
     if with_topic_field:
         for execution in executions:
-            execution["sns_topic_arn"] = topic
+            execution.setdefault("sns_topic_arn", topic)
+    else:
+        for execution in executions:
+            execution.pop("sns_topic_arn", None)
     return {
         "schema_version": LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
         "executions_started": len(executions),
@@ -1952,3 +1969,135 @@ class TestTheSourceScanSeesWhatPytestCollects:
         assert SOURCE_SCAN_SCOPE in clause.requirement
         assert "inherit" in clause.requirement
         assert "setattr" in clause.requirement
+
+
+class TestARerunIsGradedAgainstTheWeekItRetries:
+    """`alpha-engine-config-I9756`, 2026-09-04.
+
+    Thirteen `watch-rerun-2026-08-28-*` executions ran on Sunday 2026-08-30 —
+    retries of the 08-28 cycle's failure. By start date they land in the week
+    ending Friday 2026-09-04, and failing THAT week on them reports a finding
+    about a week in which nothing went wrong.
+
+    No 7-day window that tiles the calendar and is complete when it is filed
+    separates them; the fact that does is the name, which is what this
+    repository classifies.
+    """
+
+    def test_a_rerun_of_another_week_does_not_fail_this_weeks_cadence(self, tmp_path) -> None:
+        anchor = weekly_anchor(FRIDAY)
+        other = (anchor - dt.timedelta(weeks=1)).isoformat()
+        store = _seed_phase0_met(tmp_path)
+        _put(
+            store,
+            legacy_weekly_executions_key(anchor.isoformat()),
+            _legacy_week(anchor, runs=1, reruns=(f"watch-rerun-{other}-1", f"watch-rerun-{other}-2")),
+        )
+        clause = _clause(evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence")
+        assert clause.met, clause.detail
+
+    def test_it_is_named_on_the_reading_even_when_the_clause_is_met(self, tmp_path) -> None:
+        """An execution the clause chose not to grade here must never be
+        invisible. Excluding it silently would be the detector-blindness this
+        gate keeps finding, wearing the fix's clothes."""
+        anchor = weekly_anchor(FRIDAY)
+        other = (anchor - dt.timedelta(weeks=1)).isoformat()
+        store = _seed_phase0_met(tmp_path)
+        _put(
+            store,
+            legacy_weekly_executions_key(anchor.isoformat()),
+            _legacy_week(anchor, runs=1, reruns=(f"watch-rerun-{other}-1",)),
+        )
+        clause = _clause(evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence")
+        assert clause.met
+        assert other in clause.detail
+        assert "attributed there" in clause.detail
+
+    def test_a_rerun_of_THIS_week_still_fails_it(self, tmp_path) -> None:
+        """The rule narrowed, it did not go away."""
+        anchor = weekly_anchor(FRIDAY)
+        store = _seed_phase0_met(tmp_path)
+        _put(
+            store,
+            legacy_weekly_executions_key(anchor.isoformat()),
+            _legacy_week(anchor, runs=1, reruns=(f"watch-rerun-{anchor.isoformat()}-1",)),
+        )
+        clause = _clause(evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence")
+        assert not clause.met
+        assert "watch-rerun" in clause.detail
+
+    def test_an_unparseable_rerun_name_is_attributed_to_the_week_it_was_filed_under(
+        self, tmp_path
+    ) -> None:
+        """Fails loudly rather than letting an execution escape every clause.
+
+        `watch-rerun-recovery` carries the issuer's prefix and no week, so no
+        week can claim it by name. The week it was FILED under is the only one
+        guaranteed to read it, so that is the week it fails."""
+        anchor = weekly_anchor(FRIDAY)
+        store = _seed_phase0_met(tmp_path)
+        _put(
+            store,
+            legacy_weekly_executions_key(anchor.isoformat()),
+            _legacy_week(anchor, runs=1, reruns=("watch-rerun-recovery",)),
+        )
+        clause = _clause(evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence")
+        assert not clause.met
+        assert "watch-rerun-recovery" in clause.detail
+
+    def test_a_rerun_of_another_week_does_not_fail_this_weeks_routing(self, tmp_path) -> None:
+        """The two clauses must agree about which executions belong to a week,
+        or one anchor grades two different weeks. Every real rerun in the store
+        carries the PAGING topic, so this is the assertion that would fail if
+        only the cadence clause had been narrowed."""
+        anchor = weekly_anchor(FRIDAY)
+        other = (anchor - dt.timedelta(weeks=1)).isoformat()
+        store = _seed_phase0_met(tmp_path)
+        _put(
+            store,
+            legacy_weekly_executions_key(anchor.isoformat()),
+            _legacy_week(anchor, runs=1, reruns=(f"watch-rerun-{other}-1",)),
+        )
+        clause = _clause(evaluate(store, gate="phase0", trading_day=FRIDAY), "old_alerts_muted")
+        assert clause.met, clause.detail
+        assert "attributed there" in clause.detail
+
+    def test_a_rerun_of_THIS_week_still_fails_the_routing_clause(self, tmp_path) -> None:
+        anchor = weekly_anchor(FRIDAY)
+        store = _seed_phase0_met(tmp_path)
+        _put(
+            store,
+            legacy_weekly_executions_key(anchor.isoformat()),
+            _legacy_week(anchor, runs=1, reruns=(f"watch-rerun-{anchor.isoformat()}-1",)),
+        )
+        clause = _clause(evaluate(store, gate="phase0", trading_day=FRIDAY), "old_alerts_muted")
+        assert not clause.met
+        assert "alpha-engine-alerts" in clause.detail
+
+    def test_a_week_of_nothing_but_other_weeks_reruns_is_unmeasurable_for_routing(
+        self, tmp_path
+    ) -> None:
+        """Not MET. The week declared no routing of its own, and routing can
+        never be read from an absence — the same refusal an empty week gets."""
+        anchor = weekly_anchor(FRIDAY)
+        other = (anchor - dt.timedelta(weeks=1)).isoformat()
+        store = _seed_phase0_met(tmp_path)
+        _put(
+            store,
+            legacy_weekly_executions_key(anchor.isoformat()),
+            _legacy_week(anchor, runs=0, skips=0, reruns=(f"watch-rerun-{other}-1",)),
+        )
+        clause = _clause(evaluate(store, gate="phase0", trading_day=FRIDAY), "old_alerts_muted")
+        assert not clause.met
+        assert clause.unmeasurable
+
+    def test_the_two_clauses_share_one_attribution_implementation(self) -> None:
+        """Both call `rerun_names_another_week`. A second copy is how the two
+        readers drift into grading two different weeks under one anchor."""
+        import inspect
+
+        from crucible import gate as gate_module
+
+        source = inspect.getsource(gate_module._clause_old_alerts_muted)
+        assert "rerun_names_another_week(" in source
+        assert "LEGACY_WEEKLY_RERUN_NAME_RE" not in source

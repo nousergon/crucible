@@ -240,7 +240,11 @@ class TestTheConsumerGradesTheRuledMetric:
             payload = _ruled_week(anchor)
             payload["executions"].append(
                 _execution(
-                    f"{LEGACY_WEEKLY_RERUN_NAME_PREFIX}2026-08-28-1",
+                    # Named for THIS anchor's week: since
+                    # `alpha-engine-config-I9756` (2026-09-04) a rerun is
+                    # graded against the week it retries, and this test is
+                    # about duration being irrelevant, not about attribution.
+                    f"{LEGACY_WEEKLY_RERUN_NAME_PREFIX}{anchor.isoformat()}-1",
                     f"{anchor.isoformat()}T21:00:00+00:00",
                     1.0,
                 )
@@ -259,7 +263,7 @@ class TestTheConsumerGradesTheRuledMetric:
             payload = _ruled_week(anchor)
             payload["executions"].append(
                 _execution(
-                    f"{LEGACY_WEEKLY_RERUN_NAME_PREFIX}2026-08-28-2",
+                    f"{LEGACY_WEEKLY_RERUN_NAME_PREFIX}{anchor.isoformat()}-2",
                     f"{anchor.isoformat()}T21:00:00+00:00",
                     9000.0,
                     status="FAILED",
