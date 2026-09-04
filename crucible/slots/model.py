@@ -81,9 +81,11 @@ from crucible.features.registry import UNIT_SUFFIXES
 from crucible.keys import features_key, features_prefix
 from crucible.slots.inputs import (
     InputRef,
+    InputRefusal,
+    SlotUnservableError,
     UnresolvedInputError,
-    assert_inputs_producible,
     parse_input_ref,
+    partition_producible,
     resolve_declared_inputs,
     write_arm_predictions,
 )
@@ -106,7 +108,10 @@ __all__ = [
     "MetricScaleError",
     "ModelGrade",
     "InputRef",
+    "InputRefusal",
     "ModelRecipe",
+    "SlotRecipes",
+    "SlotUnservableError",
     "UnresolvedInputError",
     "design_panel",
     "predict_cross_section",
@@ -878,9 +883,93 @@ REQUIRED_RECIPE_FIELDS: tuple[str, ...] = (
 )
 
 
+#: The metric a refused arm emits, one row per arm, on the manifest of
+#: whatever job loaded the slot. Named rather than spelled at the call site so
+#: a console adapter and a test read the same literal.
+ARM_REFUSED_METRIC = "arm_refused_at_registration"
+
+
+@dataclass(frozen=True)
+class SlotRecipes:
+    """What a slot directory REGISTERS and what it REFUSES, side by side.
+
+    `alpha-engine-config-I9955`. Until this type existed the loader returned
+    a tuple and threw on the first unbuildable arm, so a directory carrying
+    one arm that will not be producible until phase 5 registered nothing at
+    all — and Brian's `alpha-engine-config-I9808` ruling (b), whose entire
+    justification is that the M slot accumulates evidence BEFORE phase 5,
+    accumulated none.
+
+    Returning both halves is what makes the refusal impossible to drop by
+    accident: a caller cannot iterate this object as if it were the recipe
+    list, so every call site is made to say what it does with :attr:`refused`
+    rather than inheriting silence from a tuple that no longer mentions it.
+    """
+
+    registered: tuple[ModelRecipe, ...]
+    refused: tuple[InputRefusal, ...] = ()
+
+    def __post_init__(self) -> None:
+        overlap = {r.name for r in self.registered} & {r.arm for r in self.refused}
+        if overlap:
+            raise ValueError(
+                f"arm(s) {sorted(overlap)} appear as both registered and refused. An arm is "
+                "one or the other; a set that says both renders as healthy on whichever "
+                "surface reads the registered half first."
+            )
+
+    @property
+    def unservable(self) -> bool:
+        """True iff NOTHING registered while something was refused (plan §5.3).
+
+        Deliberately not `not self.registered`: an EMPTY directory registers
+        nothing and refuses nothing, and calling that `unservable` would page
+        for a slot nobody has written an arm for yet — an absence condition,
+        which `crucible.alerts` already owns.
+        """
+        return not self.registered and bool(self.refused)
+
+    def refusal_metrics(
+        self, *, slot: str = "m", now: dt.datetime | None = None
+    ) -> list[dict[str, Any]]:
+        """One MetricRecord per refused arm, naming the arm and its input.
+
+        This is deliverable 2 of `alpha-engine-config-I9955` and it is what
+        keeps a per-arm refusal from being quieter than the slot-wide
+        exception it replaces: the arm and the exact unresolvable input reach
+        the manifest — and through it the console and the board — with the
+        same precision the exception carried.
+
+        ``status`` is `unservable`, the arena's own vocabulary (plan §7:
+        "`unmeasurable` and `unservable` are first-class statuses"), forwarded
+        verbatim rather than re-encoded into a second word that would drift
+        from the first.
+        """
+        stamp = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return [
+            {
+                "name": ARM_REFUSED_METRIC,
+                "module": f"crucible.slots.{slot}",
+                "metric_type": "count",
+                "value": float(len(refusal.unresolvable)),
+                "unit": "inputs",
+                "n_floor": 1,
+                "status": "unservable",
+                "status_reason": (
+                    f"slot {slot}: arm {refusal.arm!r} is refused at registration and cannot "
+                    f"be graded; unresolvable input(s) {list(refusal.unresolvable)}. "
+                    f"{refusal.reason}"
+                ),
+                "source_path": f"strategy/arms/{slot}/{refusal.arm}.yaml",
+                "last_updated_utc": stamp,
+            }
+            for refusal in self.refused
+        ]
+
+
 def load_model_recipes(
     directory: Path | str, *, feature_columns: tuple[str, ...] | None = None
-) -> tuple[ModelRecipe, ...]:
+) -> SlotRecipes:
     """Load every `*.yaml` M recipe under ``directory``, sorted by name.
 
     The directory is `alpha-engine-config/strategy/arms/m/` in production —
@@ -895,6 +984,27 @@ def load_model_recipes(
     `FeatureLayerSource.panel()` at grading time. An arm nobody can grade is
     indistinguishable, on every surface, from an arm nobody has graded yet;
     that is the failure mode this refusal makes structurally impossible.
+
+    **The refusal is PER ARM** (`alpha-engine-config-I9955`). It used to end
+    the load, so one arm declaring an input nothing can produce refused the
+    whole directory — three arms in `alpha-engine-config/strategy/arms/m/`,
+    one unbuildable until phase 5, and none of the three loaded. The refusal
+    itself is unchanged and is not softened: a refused arm does not register,
+    it is returned as an :class:`~crucible.slots.inputs.InputRefusal` naming
+    the exact unresolvable input, and :meth:`SlotRecipes.refusal_metrics`
+    puts it on the loading job's manifest. What changed is the blast radius.
+
+    When NOTHING registers the slot is `unservable` and
+    :class:`~crucible.slots.inputs.SlotUnservableError` is raised — which
+    reaches `crucible.runner.run_job`'s `try/finally`, writes a
+    `status: failed` manifest, and pages through the existing failure
+    condition. A slot with one good arm and one refused arm SERVES and
+    reports the refusal, which is the honest reading and the one that lets
+    Brian's `alpha-engine-config-I9808` ruling (b) accumulate the evidence it
+    was chosen for.
+
+    A dependency CYCLE still refuses the whole slot: a cycle is a property of
+    the graph, not of one member, and so is two files sharing a name.
 
     ``feature_columns`` defaults to the live catalogue, exactly as
     :class:`FeatureLayerSource` resolves its version rather than taking one
@@ -942,8 +1052,11 @@ def load_model_recipes(
         from crucible.features import CATALOG  # noqa: PLC0415
 
         feature_columns = tuple(f.name for f in CATALOG)
-    assert_inputs_producible(recipes, feature_columns=feature_columns)
-    return tuple(recipes)
+    registered, refused = partition_producible(recipes, feature_columns=feature_columns)
+    result = SlotRecipes(registered=tuple(registered), refused=refused)
+    if result.unservable:
+        raise SlotUnservableError(refused)
+    return result
 
 
 # ---------------------------------------------------------------------------

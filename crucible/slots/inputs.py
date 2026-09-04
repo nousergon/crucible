@@ -64,13 +64,26 @@ produced each column (plan §10.8).
 
 **Wiring is a table, not a call site.** :data:`INPUT_RESOLVERS` maps every
 kind in :data:`INPUT_KINDS` to the function that materialises it onto a
-panel. :func:`assert_inputs_producible` refuses at registration any declared
+panel. :func:`partition_producible` refuses at registration any declared
 kind with no row, importing this module fails outright if the grammar admits
 a kind nothing resolves, and :func:`resolve_declared_inputs` — reached from
 the M slot's one panel-building seam — iterates the table rather than naming
 kinds. A producer declared and never wired is the defect this module was
 written to remove and then reproduced once; the table is what stops a third
 occurrence, because there is no longer a call site to forget.
+
+**The refusal is PER ARM, not per directory** (`alpha-engine-config-I9955`).
+:func:`partition_producible` returns the arms that register beside the
+:class:`InputRefusal` values for the arms that do not, because an exception
+is slot-wide by construction: one arm that will not be buildable until phase
+5 used to refuse every sibling in the same directory, so a slot with two
+perfectly producible arms accumulated no evidence at all. The refusal is not
+softened — a refused arm still does not register, it is recorded as a metric
+on the loading job's manifest, and an EMPTY registered set raises
+:class:`SlotUnservableError`, which pages through the existing failure
+condition. Two conditions stay slot-wide because they are properties of the
+graph rather than of a member: a dependency cycle
+(:class:`InputCycleError`) and two recipes sharing a name.
 """
 
 from __future__ import annotations
@@ -100,16 +113,17 @@ __all__ = [
     "BasePredictionsUnavailableError",
     "InputCycleError",
     "InputRef",
+    "InputRefusal",
+    "SlotUnservableError",
     "UnproducibleInputError",
     "UnresolvedInputError",
     "arm_name_from_id",
     "arm_predictions_key",
-    "assert_inputs_producible",
     "parse_input_ref",
+    "partition_producible",
     "prediction_column",
     "read_arm_predictions",
     "resolve_declared_inputs",
-    "resolve_prediction_inputs",
     "stack_prediction_columns",
     "write_arm_predictions",
 ]
@@ -245,17 +259,86 @@ def parse_input_ref(text: str) -> InputRef:
 # ---------------------------------------------------------------------------
 
 
-def resolve_prediction_inputs(recipes: Sequence[Any]) -> dict[str, tuple[str, ...]]:
-    """`{arm name: base arm names}` for every recipe, cycle-checked.
+@dataclass(frozen=True)
+class InputRefusal:
+    """One arm that cannot be graded, carried as a VALUE rather than thrown.
 
-    Two refusals, both at registration:
+    The refusal itself is not the defect `alpha-engine-config-I9955` names —
+    a declared input with no producer is exactly as unbuildable as it was
+    before, and softening that would put `registers fine, dies at grading`
+    back. What was wrong is the BLAST RADIUS: an exception ends the load, so
+    one unbuildable arm took every sibling in the directory down with it, and
+    the M slot accumulated no evidence at all while two perfectly producible
+    arms sat in the same directory.
 
-    * a `predictions[<name>]` naming an arm that is not a recipe in the same
-      slot — there is no producer, so the stacked arm can never be graded;
-    * a dependency cycle, including an arm naming itself. A self-stacked arm
-      would need its own prediction for the day it is computing, which is not
-      a slow path but an impossible one, and a two-arm cycle is the same
-      thing wearing a second file.
+    An exception is slot-wide by construction; a value is per-arm. So the
+    refusal becomes a first-class fact that is returned, recorded as a metric
+    on the manifest of whatever job loaded the slot
+    (:meth:`crucible.slots.model.SlotRecipes.refusal_metrics`), and — when
+    NOTHING registers — raised as :class:`SlotUnservableError`, which is what
+    makes the job's manifest `status: failed` and pages through the existing
+    failure condition. No third page condition, and nothing quieter than a
+    refused arm is today.
+
+    ``unresolvable`` names the exact inputs that have no producer — the input
+    reference text for a typed input, the bare column name for a
+    `spec.features` entry the feature layer does not produce.
+    """
+
+    arm: str
+    unresolvable: tuple[str, ...]
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not str(self.arm).strip():
+            raise ValueError(
+                "a refusal that does not name the arm it refuses is unactionable: the "
+                "whole point of carrying it as a value is that a surface can say WHICH "
+                "arm is unservable."
+            )
+        if not self.unresolvable:
+            raise ValueError(
+                f"the refusal of arm {self.arm!r} names no unresolvable input. A refusal "
+                "whose cause is not in it is a red row nobody can act on, which is the "
+                "defect this type exists to prevent rather than to reproduce."
+            )
+        if not str(self.reason).strip():
+            raise ValueError(f"the refusal of arm {self.arm!r} carries no reason")
+
+
+class SlotUnservableError(UnproducibleInputError):
+    """EVERY arm in the slot is refused, so the slot can serve nothing.
+
+    The honest reading of an empty registered set (plan §5.3, §7:
+    `unservable` is a first-class status that PAGES). It is a subclass of
+    :class:`UnproducibleInputError` because that is precisely what it is —
+    the whole-slot case of it — and because a single-arm slot whose one arm
+    is unproducible must keep raising exactly as it did before this change.
+
+    It raises rather than returning a value on purpose: a raise reaches
+    :func:`crucible.runner.run_job`'s `try/finally`, which writes
+    `status: failed` with this message as the cause, and
+    :func:`crucible.alerts.evaluate_failure` pages on that manifest. That is
+    how `unservable` pages without inventing a third page condition.
+    """
+
+    def __init__(self, refusals: Sequence[InputRefusal]) -> None:
+        self.refusals: tuple[InputRefusal, ...] = tuple(refusals)
+        names = [r.arm for r in self.refusals]
+        super().__init__(
+            f"every arm in this slot is refused, so the slot is `unservable` and pages "
+            f"(plan §5.3, §7). Refused arm(s) {names}: " + " ".join(r.reason for r in self.refusals)
+        )
+
+
+def _by_name(recipes: Sequence[Any]) -> dict[str, Any]:
+    """`{name: recipe}`, refusing an ambiguous slot SLOT-WIDE.
+
+    Two files sharing a name is a property of the directory, not of one
+    member: a `predictions[...]` reference would resolve to whichever loaded
+    last, so no arm in the slot can be trusted to have read the graph the
+    operator wrote. Partitioning that would be dishonest, exactly as
+    partitioning a cycle would be.
     """
     by_name = {r.name: r for r in recipes}
     if len(by_name) != len(list(recipes)):
@@ -265,28 +348,160 @@ def resolve_prediction_inputs(recipes: Sequence[Any]) -> dict[str, tuple[str, ..
             f"two recipes share the name(s) {duplicated}; a `predictions[...]` reference "
             "would resolve to whichever loaded last, so the graph is ambiguous."
         )
+    return by_name
 
-    edges: dict[str, tuple[str, ...]] = {}
-    for recipe in recipes:
-        bases: list[str] = []
-        for ref in getattr(recipe, "inputs", ()):
-            if ref.kind != "predictions":
-                continue
-            if ref.ref not in by_name:
-                raise UnproducibleInputError(
-                    f"arm {recipe.name!r} declares input {ref.text!r}, but no recipe named "
-                    f"{ref.ref!r} exists in this slot; the slot declares "
-                    f"{sorted(by_name)}. A stacked arm's base model is itself an arm — it "
-                    "is registered, scored and promoted like any other — so an input "
-                    "naming something that is not one has no producer and the arm does "
-                    "not register (plan §9.1). This is the refusal that replaces "
-                    "`registers fine, dies at grading`."
-                )
-            bases.append(ref.ref)
-        edges[recipe.name] = tuple(bases)
 
+def _declared_edges(
+    recipes: Sequence[Any], by_name: Mapping[str, Any]
+) -> dict[str, tuple[str, ...]]:
+    """`{arm name: base arm names that EXIST}`, one key per recipe.
+
+    A base that does not exist is left out of the edge set and reported as a
+    refusal instead; it cannot participate in a cycle, and putting it in the
+    graph would make the cycle walk raise `KeyError` on a condition that has
+    a precise message of its own.
+    """
+    return {
+        recipe.name: tuple(
+            ref.ref
+            for ref in getattr(recipe, "inputs", ())
+            if ref.kind == "predictions" and ref.ref in by_name
+        )
+        for recipe in recipes
+    }
+
+
+def _absent_base_reason(recipe: Any, absent: Sequence[str], by_name: Mapping[str, Any]) -> str:
+    names = sorted({t[t.index("[") + 1 : -1] for t in absent})
+    return (
+        f"arm {recipe.name!r} declares input(s) {sorted(absent)}, but no recipe named "
+        f"{names} exists in this slot; the slot declares {sorted(by_name)}. A stacked "
+        "arm's base model is itself an arm — it is registered, scored and promoted like "
+        "any other — so an input naming something that is not one has no producer and "
+        "the arm does not register (plan §9.1). This is the refusal that replaces "
+        "`registers fine, dies at grading`."
+    )
+
+
+def _unwired_kind_reason(recipe: Any, ref: InputRef) -> str:
+    return (
+        f"arm {recipe.name!r} declares input {ref.text!r}, but the harness has no producer "
+        f"wired for kind {ref.kind!r}: `crucible.slots.inputs.INPUT_RESOLVERS` carries "
+        f"{sorted(INPUT_RESOLVERS)}. The arm does NOT register. A kind that is declarable "
+        "but not resolvable is exactly `registers fine, could never be graded` with a new "
+        "name."
+    )
+
+
+def _missing_feature_reason(recipe: Any, missing: Sequence[str], produced: set[str]) -> str:
+    return (
+        f"arm {recipe.name!r} declares feature column(s) {sorted(missing)}, which the "
+        f"feature layer does not produce; it produces {sorted(produced)}. "
+        "The arm does NOT register. A column that is itself another model's output is not "
+        "a feature — declare it as `predictions[<arm-name>]` under `spec.inputs` and "
+        "register that model as an arm. Registering here and failing later at "
+        "`FeatureLayerSource.panel()` is the failure mode this refusal replaces: an arm "
+        "nobody can grade is indistinguishable, on every surface, from an arm nobody has "
+        "graded yet."
+    )
+
+
+def partition_producible(
+    recipes: Sequence[Any], *, feature_columns: Sequence[str]
+) -> tuple[tuple[Any, ...], tuple[InputRefusal, ...]]:
+    """Split ``recipes`` into what registers and what is refused, PER ARM.
+
+    The whole content of `alpha-engine-config-I9955`. Everything the strict
+    the old all-or-nothing `assert_inputs_producible` refused is refused here
+    too, with the same message; what changes is that the refusal names one arm
+    and the slot's other arms keep loading.
+
+    Two conditions stay SLOT-WIDE because they are properties of the graph
+    rather than of a member, and partitioning them would be dishonest:
+
+    * two recipes sharing a name (:func:`_by_name`) — no arm in the slot can
+      be trusted to have read the graph the operator wrote;
+    * a dependency cycle (:func:`_assert_acyclic`) — a cycle belongs to the
+      set of arms in it, and reporting it as "these three arms are each
+      individually refused" loses the one fact an operator needs.
+
+    Refusal is TRANSITIVE. An arm stacking on a refused arm cannot be graded
+    either — its base has no producer — so it is refused too, to a fixed
+    point. Registering it because its own declaration parses would move
+    `registers fine, dies at grading` up one level instead of removing it.
+    """
+    by_name = _by_name(recipes)
+    edges = _declared_edges(recipes, by_name)
     _assert_acyclic(edges)
-    return edges
+
+    produced = set(feature_columns)
+    refusals: dict[str, InputRefusal] = {}
+    for recipe in recipes:
+        causes: list[str] = []
+        reasons: list[str] = []
+        declared = tuple(getattr(recipe, "inputs", ()))
+
+        unwired = [ref for ref in declared if ref.kind not in INPUT_RESOLVERS]
+        for ref in unwired:
+            causes.append(ref.text)
+            reasons.append(_unwired_kind_reason(recipe, ref))
+
+        wanted = {c: "spec.features" for c in recipe.features}
+        for ref in declared:
+            if ref.kind == "features":
+                wanted[ref.ref] = "spec.inputs"
+        missing = sorted(c for c in wanted if c not in produced)
+        if missing:
+            causes.extend(missing)
+            reasons.append(_missing_feature_reason(recipe, missing, produced))
+
+        absent = [r.text for r in declared if r.kind == "predictions" and r.ref not in by_name]
+        if absent:
+            causes.extend(absent)
+            reasons.append(_absent_base_reason(recipe, absent, by_name))
+
+        if causes:
+            refusals[recipe.name] = InputRefusal(
+                arm=recipe.name, unresolvable=tuple(causes), reason=" ".join(reasons)
+            )
+
+    _propagate_refusals(edges, refusals)
+    registered = tuple(r for r in recipes if r.name not in refusals)
+    return registered, tuple(refusals[name] for name in sorted(refusals))
+
+
+def _propagate_refusals(
+    edges: Mapping[str, tuple[str, ...]], refusals: dict[str, InputRefusal]
+) -> None:
+    """An arm stacking on a refused arm is refused too — to a fixed point.
+
+    Mutates ``refusals`` in place. Without this, a partition would register
+    an arm whose base cannot be produced: its own declaration parses, its
+    base names a real recipe in the slot, and it still dies the first time
+    anything tries to build its design matrix. That is the defect this whole
+    module exists to remove, arriving one frame later.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for name, bases in edges.items():
+            if name in refusals:
+                continue
+            bad = tuple(f"predictions[{b}]" for b in sorted(set(bases)) if b in refusals)
+            if not bad:
+                continue
+            refusals[name] = InputRefusal(
+                arm=name,
+                unresolvable=bad,
+                reason=(
+                    f"arm {name!r} stacks on {list(bad)}, which is itself refused in this "
+                    "slot, so this arm has no producer either. A stacked arm is exactly as "
+                    "gradable as the least gradable arm it consumes; registering it because "
+                    "its OWN declaration parses is `registers fine, dies at grading` one "
+                    "level up."
+                ),
+            )
+            changed = True
 
 
 def _assert_acyclic(edges: Mapping[str, tuple[str, ...]]) -> None:
@@ -318,46 +533,6 @@ def _assert_acyclic(edges: Mapping[str, tuple[str, ...]]) -> None:
     for node in sorted(edges):
         if colour[node] == WHITE:
             visit(node, [])
-
-
-def assert_inputs_producible(recipes: Sequence[Any], *, feature_columns: Sequence[str]) -> None:
-    """Every declared input of every recipe has a producer, or nothing registers.
-
-    ``feature_columns`` is the feature layer's catalogue. Both declaration
-    surfaces are checked — the legacy `spec.features` list and the typed
-    `features[...]` entries under `spec.inputs` — because a check that read
-    one of two channels is its own measured bug class.
-    """
-    produced = set(feature_columns)
-    for recipe in recipes:
-        for ref in getattr(recipe, "inputs", ()):
-            if ref.kind not in INPUT_RESOLVERS:
-                raise UnproducibleInputError(
-                    f"arm {recipe.name!r} declares input {ref.text!r}, but the harness has "
-                    f"no producer wired for kind {ref.kind!r}: "
-                    f"`crucible.slots.inputs.INPUT_RESOLVERS` carries "
-                    f"{sorted(INPUT_RESOLVERS)}. The arm does NOT register. A kind that is "
-                    "declarable but not resolvable is exactly `registers fine, could never "
-                    "be graded` with a new name."
-                )
-        wanted = {c: "spec.features" for c in recipe.features}
-        for ref in getattr(recipe, "inputs", ()):
-            if ref.kind == "features":
-                wanted[ref.ref] = "spec.inputs"
-        missing = sorted(c for c in wanted if c not in produced)
-        if missing:
-            raise UnproducibleInputError(
-                f"arm {recipe.name!r} declares feature column(s) {missing}, which the "
-                f"feature layer does not produce; it produces {sorted(produced)}. "
-                "The arm does NOT register. A column that is itself another model's "
-                "output is not a feature — declare it as `predictions[<arm-name>]` "
-                "under `spec.inputs` and register that model as an arm. "
-                "Registering here and failing later at "
-                "`FeatureLayerSource.panel()` is the failure mode this refusal replaces: "
-                "an arm nobody can grade is indistinguishable, on every surface, from an "
-                "arm nobody has graded yet."
-            )
-    resolve_prediction_inputs(recipes)
 
 
 # ---------------------------------------------------------------------------
@@ -615,7 +790,7 @@ def _with_resolved(
 
 #: kind -> the function that materialises that kind's columns onto a panel.
 #:
-#: The table is the wiring. :func:`assert_inputs_producible` refuses at
+#: The table is the wiring. :func:`partition_producible` refuses at
 #: REGISTRATION any declared kind absent from it, and the import-time check
 #: below refuses to load a module whose grammar admits a kind nothing
 #: resolves — so the shape of `alpha-engine-config-I9777` (a producer

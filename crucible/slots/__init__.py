@@ -48,6 +48,7 @@ __all__ = [
     "UNITS_SUFFIXES",
     "ControlArm",
     "EstimatorSpec",
+    "SlotRecipes",
     "SlotSpec",
     "arena_config_for",
     "arm_name",
@@ -293,6 +294,7 @@ from crucible.slots.model import (  # noqa: E402
     REQUIRED_RECIPE_FIELDS,
     UNITS_SUFFIXES,
     EstimatorSpec,
+    SlotRecipes,
     load_model_recipes,
 )
 from crucible.slots.strategy import EXIT_RULES, load_strategy_recipes  # noqa: E402

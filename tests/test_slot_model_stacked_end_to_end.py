@@ -121,7 +121,8 @@ def recipes(tmp_path):
     _write_recipe(arms, "base", features=[BASE_COLUMN])
     _write_recipe(arms, "stacked", features=[STACKED_COLUMN], inputs=("predictions[base]",))
     loaded = load_model_recipes(arms)
-    return {r.name: r for r in loaded}, loaded
+    assert loaded.refused == (), "both arms are producible; a refusal here is a fixture bug"
+    return {r.name: r for r in loaded.registered}, loaded.registered
 
 
 class _Ctx:
