@@ -32,8 +32,10 @@ from crucible.tags import TAG_KEY, TAG_VALUE
 __all__ = [
     "CostReading",
     "CostUnreadableError",
+    "DailyReading",
     "default_client",
     "month_to_date_usd",
+    "trailing_daily_usd",
 ]
 
 
@@ -64,6 +66,37 @@ class CostReading:
             "start": self.start.isoformat(),
             "end": self.end.isoformat(),
             "amount_usd": self.amount_usd,
+            "tag_filter": self.tag_filter,
+        }
+
+
+@dataclass(frozen=True)
+class DailyReading:
+    """One amount per COMPLETE calendar day over ``[start, end)``, oldest first.
+
+    ``end`` is exclusive and is the day the reading was taken, so every day
+    carried here has closed — Cost Explorer's figure for the current day is
+    partial by construction and would read as a cheap day on every render.
+    """
+
+    start: dt.date
+    end: dt.date
+    amounts_usd: tuple[float, ...]
+    tag_filter: str | None
+
+    @property
+    def scope(self) -> str:
+        return self.tag_filter or "the whole account"
+
+    @property
+    def total_usd(self) -> float:
+        return sum(self.amounts_usd)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "start": self.start.isoformat(),
+            "end": self.end.isoformat(),
+            "amounts_usd": list(self.amounts_usd),
             "tag_filter": self.tag_filter,
         }
 
@@ -104,9 +137,60 @@ def month_to_date_usd(
     """
     start = today.replace(day=1)
     end = max(today, start + dt.timedelta(days=1))
+    amounts = _amounts(client, start=start, end=end, granularity="MONTHLY", tagged=tagged)
+    return CostReading(
+        start=start,
+        end=end,
+        amount_usd=sum(amounts),
+        tag_filter=f"{TAG_KEY}={TAG_VALUE}" if tagged else None,
+    )
+
+
+def trailing_daily_usd(
+    client: Any,
+    *,
+    today: dt.date,
+    days: int,
+    tagged: bool,
+) -> DailyReading:
+    """Unblended USD for each of the ``days`` complete days before ``today``.
+
+    The window is ``[today - days, today)`` — it ends at yesterday's close and
+    may cross a month boundary, because a spending PACE is a property of the
+    estate, not of the calendar month it happens to be read in. Cost Explorer
+    must answer with exactly one period per day; fewer periods than days is
+    not "the rest were free", it is an incomplete answer and raises.
+    """
+    if days < 1:
+        raise ValueError("a trailing window of fewer than one day measures nothing")
+    start = today - dt.timedelta(days=days)
+    amounts = _amounts(client, start=start, end=today, granularity="DAILY", tagged=tagged)
+    if len(amounts) != days:
+        raise CostUnreadableError(
+            f"Cost Explorer returned {len(amounts)} daily period(s) for "
+            f"{start.isoformat()}..{today.isoformat()}, not {days}. A day the API did not "
+            "answer for is not a day that cost nothing."
+        )
+    return DailyReading(
+        start=start,
+        end=today,
+        amounts_usd=tuple(amounts),
+        tag_filter=f"{TAG_KEY}={TAG_VALUE}" if tagged else None,
+    )
+
+
+def _amounts(
+    client: Any, *, start: dt.date, end: dt.date, granularity: str, tagged: bool
+) -> list[float]:
+    """The `UnblendedCost` amount of every period Cost Explorer returns.
+
+    One request shape for both readers — the month-to-date total and the
+    trailing daily pace differ only in granularity and interval, and two
+    request builders would be two places for the tag filter to drift.
+    """
     request: dict[str, Any] = {
         "TimePeriod": {"Start": start.isoformat(), "End": end.isoformat()},
-        "Granularity": "MONTHLY",
+        "Granularity": granularity,
         "Metrics": ["UnblendedCost"],
     }
     if tagged:
@@ -132,7 +216,7 @@ def month_to_date_usd(
             f"Cost Explorer returned no period for {start.isoformat()}..{end.isoformat()}. "
             "An empty response is not a spend of zero."
         )
-    total = 0.0
+    amounts: list[float] = []
     for period in periods:
         amount = ((period.get("Total") or {}).get("UnblendedCost") or {}).get("Amount")
         if amount is None:
@@ -141,15 +225,10 @@ def month_to_date_usd(
                 f"{start.isoformat()}..{end.isoformat()}. A missing amount is not zero."
             )
         try:
-            total += float(amount)
+            amounts.append(float(amount))
         except (TypeError, ValueError) as exc:
             raise CostUnreadableError(
                 f"Cost Explorer returned {amount!r} as an amount, which is not a "
                 f"number: {type(exc).__name__}"
             ) from exc
-    return CostReading(
-        start=start,
-        end=end,
-        amount_usd=total,
-        tag_filter=f"{TAG_KEY}={TAG_VALUE}" if tagged else None,
-    )
+    return amounts

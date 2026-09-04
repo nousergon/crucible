@@ -28,6 +28,7 @@ import ast
 import datetime as dt
 import json
 import re
+from calendar import monthrange
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -37,7 +38,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from crucible.alerts import pages_in_range
-from crucible.calendar import TRADING_DAYS_PER_WEEK, resolve_trading_day
+from crucible.calendar import TRADING_DAYS_PER_WEEK, is_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
 from crucible.documents import DocumentRead
 from crucible.documents import read_path_document as _read_path_document
@@ -83,6 +84,10 @@ __all__ = [
     "PHASE2_MAX_PAGES",
     "PHASE2_MAX_TAGGED_USD",
     "PHASE2_REPLAY_SATURDAYS",
+    "COST_LEADING_DAYS",
+    "COST_TRAILING_DAYS",
+    "WEEKLY_ANCHORED_GATES",
+    "weekly_window",
     "PHASE4_MAX_TOTAL_USD",
     "PHASES",
     "TRADER_EVIDENCE_KEY",
@@ -1144,14 +1149,25 @@ def _review_problem(
     )
 
 
-def _phase1(store: Store, window: list[dt.date], registry: dict[str, Component]) -> list[Clause]:
+def _phase1(
+    store: Store,
+    window: list[dt.date],
+    registry: dict[str, Component],
+    *,
+    trading_day: dt.date,
+) -> list[Clause]:
+    # ``window`` is the anchored weekly window (`WEEKLY_ANCHORED_GATES`): the
+    # arc, arena and attribution artifacts are filed at those closes. The
+    # review and the explain walk are filed on the day they happened, so they
+    # read the whole span up to the render day — see `_session_span`.
+    span = _session_span(window, trading_day)
     return [
         _clause_arc_runs_ok(store, window, registry),
         _clause_arms_all_scored(store, window),
         _clause_attribution_renders(store, window),
-        _clause_explain_walks_a_verdict(store, window),
+        _clause_explain_walks_a_verdict(store, span),
         _clause_pointer_flipped_on_smoke(store, window),
-        _clause_independently_reviewed(store, "phase1", window),
+        _clause_independently_reviewed(store, "phase1", span),
     ]
 
 
@@ -1592,7 +1608,13 @@ def coverage_note(gate: str, clause_names: Iterable[str]) -> str | None:
     )
 
 
-def _phase0(store: Store, window: list[dt.date], registry: dict[str, Component]) -> list[Clause]:
+def _phase0(
+    store: Store,
+    window: list[dt.date],
+    registry: dict[str, Component],
+    *,
+    trading_day: dt.date,
+) -> list[Clause]:
     """Phase 0's exit gate.
 
     ``registry`` is unused: phase 0 predates the weekly arc entirely — it is
@@ -1601,7 +1623,7 @@ def _phase0(store: Store, window: list[dt.date], registry: dict[str, Component])
     `GATES` holds one callable shape, and a second signature would be a
     per-gate special case in `evaluate`.
     """
-    _unused((registry,))
+    _unused((registry, trading_day))
     return [
         _clause_old_weekly_within_cadence(store, window),
         _clause_acceptance_suite_committed(),
@@ -1881,7 +1903,11 @@ def _clause_replays_ok(
     to prevent. Only the NAME and the requirement sentence change, so the two
     readings land on the ladder as two clauses rather than one.
     """
-    replay_window = _window(window[-1], PHASE2_REPLAY_SATURDAYS)
+    # Anchored, not raw: phase 2's window is render-keyed (its live clause
+    # collapses it itself), and the replay manifests are Friday closes. Read
+    # 2026-09-03 on `main`, the raw form named `data.weekly@2026-08-06` — a
+    # Thursday — as "never ran" (`alpha-engine-config-I9904`).
+    replay_window = weekly_window(window[-1], PHASE2_REPLAY_SATURDAYS)
     clause = _clause_arc_runs_ok(store, replay_window, registry)
     return replace(
         clause,
@@ -2057,6 +2083,20 @@ def _clause_pages_within_ceiling(store: Store, window: list[dt.date]) -> Clause:
     )
 
 
+#: Complete days whose TOTAL is graded against the monthly ceiling
+#: (`alpha-engine-config-I9927`): the ceiling's own period, so a weekly batch
+#: lands in the window four or five times and a month-boundary accrual once,
+#: whatever weekday the gate is read on. Fewer complete daily periods than
+#: this is UNMEASURABLE, never a guess.
+COST_TRAILING_DAYS = 30
+
+#: Complete days in the leading-pace grade: the trailing week's mean ×
+#: COST_TRAILING_DAYS is a hard-UNMET when it exceeds the ceiling. Prefer a
+#: short false-UNMET after a month-boundary lump in this window over a
+#: false-MET while spend is accelerating (alpha-engine-config-I9927).
+COST_LEADING_DAYS = 7
+
+
 def _ce_client() -> Any:  # pragma: no cover - constructed only outside tests
     from crucible.cost import default_client  # noqa: PLC0415 - lazy on purpose
 
@@ -2080,13 +2120,62 @@ def _clause_aws_cost_within_ceiling(
     render) holds no such grant, and that the tag returning `$0.00` measures
     the filter rather than the spend. Both are tracked; the grant is
     deliberately not made in this PR, which changes no IAM.
+
+    **A monthly ceiling is two readings, and a partial month is never MET on
+    its own.** The first reading (`alpha-engine-config-I9913`) compared
+    month-to-date spend against the whole month's ceiling, so on 2026-09-02
+    phase 4 read `MET: $9.05 of $70.00` on two days of a month — green by
+    default on the 1st of every month, able only to fall out of MET later
+    (`alpha-engine-config-I9927`). A pro-rata line (`ceiling x elapsed /
+    days_in_month`) was the first fix and was wrong the other way: this
+    account posts a month-boundary lump on the 1st (`$15.59` on 2026-07-01,
+    `$30.88` on 2026-08-01 — Savings Plan and reserved accruals against a
+    `$2.50–4.00`/day baseline), so a compliant month reads OVER the line until
+    the lump is amortised, deterministically, for most of the month.
+
+    A projection from a trailing-week MEDIAN was the second cut and was wrong
+    for the estate's real shape: eight of the eleven `components.yaml` rows
+    are Saturday-weekly and the Saturday spot run is the expensive compute, so
+    with one batch day in seven the median is a quiet day by construction —
+    `$60` every Saturday and `$0.20` otherwise (~`$245`/month) projected
+    `$66.00` MET until month-to-date itself crossed the ceiling on the 10th,
+    after the month was blown. Today's daily v1 residue is the only thing that
+    hid it, and it leaves at exactly the phase-4 exit this clause grades.
+
+    So the clause matches the window to the ceiling's own period and grades:
+
+    1. **Hard UNMET** when month-to-date spend already exceeds the FULL
+       ceiling — the fast path; no trailing read is needed to know a breached
+       month is breached.
+    2. **The trailing COST_TRAILING_DAYS (30) complete days' TOTAL** against
+       the full ceiling. No projection, no mean, no median: thirty days of
+       spend is a month of spend whatever weekday the batch lands on, and the
+       window crosses the month boundary, so it is measurable on day 1 and a
+       month-boundary lump is one day in thirty. Fewer daily periods than
+       days, an unreadable window, or a `$0.00` total is UNMEASURABLE.
+    3. **Hard UNMET** when the leading COST_LEADING_DAYS (7) mean ×
+       COST_TRAILING_DAYS exceeds the ceiling — the previously ungraded
+       leading indicator, promoted. Trailing-30 alone false-METs an
+       accelerating month (day-5 MTD `$40` → ~`$240`/mo implied while
+       trailing `$65` still sits under a `$70` ceiling). Prefer a short
+       false-UNMET after a month-boundary lump lands inside the leading
+       window over a false-MET during acceleration.
+
+    No render ever grades a COMPLETED calendar month; that is a separate
+    clause (`alpha-engine-config-I9946`).
     """
-    from crucible.cost import CostUnreadableError, month_to_date_usd  # noqa: PLC0415
+    from crucible.cost import (  # noqa: PLC0415
+        CostUnreadableError,
+        month_to_date_usd,
+        trailing_daily_usd,
+    )
 
     scope = f"tagged `{TAG_KEY}={TAG_VALUE}`" if tagged else "the whole account"
     requirement = (
-        f"month-to-date AWS spend for {scope} is at most ${ceiling_usd:.2f}, read from "
-        "Cost Explorer"
+        f"AWS spend for {scope} is at most ${ceiling_usd:.2f}/month, read from Cost "
+        f"Explorer: UNMET once month-to-date exceeds it, otherwise graded on the total of "
+        f"the trailing {COST_TRAILING_DAYS} complete days, and UNMET when the leading "
+        f"{COST_LEADING_DAYS}-day mean × {COST_TRAILING_DAYS} exceeds the ceiling"
     )
     evidence = ("ce:GetCostAndUsage",)
     try:
@@ -2128,29 +2217,88 @@ def _clause_aws_cost_within_ceiling(
             "reading that says whether the tag is applied",
             evidence,
         )
+    # `end` is exclusive in Cost Explorer's grammar, so the day count is the
+    # interval length: a reading taken on the 1st covers one day, not zero.
+    days_elapsed = (reading.end - reading.start).days
+    days_in_month = monthrange(reading.start.year, reading.start.month)[1]
+    month_to_date = (
+        f"${reading.amount_usd:.2f} month-to-date for {reading.scope} over {days_elapsed} of "
+        f"{days_in_month} days ({reading.start.isoformat()}..{reading.end.isoformat()})"
+    )
     if reading.amount_usd > ceiling_usd:
         return Clause(
             name,
             requirement,
             False,
-            f"${reading.amount_usd:.2f} month-to-date for {reading.scope} "
-            f"({reading.start.isoformat()}..{reading.end.isoformat()}), ceiling "
-            f"${ceiling_usd:.2f}",
+            f"{month_to_date}: already over the ${ceiling_usd:.2f}/month ceiling",
             evidence,
         )
-    return Clause(
-        name,
-        requirement,
-        True,
-        f"${reading.amount_usd:.2f} month-to-date for {reading.scope} "
-        f"({reading.start.isoformat()}..{reading.end.isoformat()}), ceiling "
-        f"${ceiling_usd:.2f}",
-        evidence,
+    try:
+        trailing = trailing_daily_usd(
+            _ce_client(), today=window[-1], days=COST_TRAILING_DAYS, tagged=tagged
+        )
+    except CostUnreadableError as exc:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"{month_to_date}: under the ceiling so far, but the trailing "
+            f"{COST_TRAILING_DAYS}-day total could not be read — CostUnreadableError: {exc}",
+            evidence,
+        )
+    except Exception as exc:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"{month_to_date}: under the ceiling so far, but the trailing "
+            f"{COST_TRAILING_DAYS}-day read failed: {type(exc).__name__}: {exc}. That is a "
+            "statement about our access, not about what was spent",
+            evidence,
+        )
+    if trailing.total_usd == 0.0:
+        # The `$0.00` trap again, on the trailing window: thirty free days is
+        # what an untagged estate returns for the tagged scope, and what a
+        # broken daily read returns for either.
+        return _unmeasurable(
+            name,
+            requirement,
+            f"{month_to_date}: the trailing {COST_TRAILING_DAYS} complete days "
+            f"({trailing.start.isoformat()}..{trailing.end.isoformat()}) read exactly $0.00, "
+            "which is what a misfiltered or broken daily read returns as well as a free month",
+            evidence,
+        )
+    leading = trailing.amounts_usd[-COST_LEADING_DAYS:]
+    leading_mean = sum(leading) / len(leading)
+    leading_pace = leading_mean * COST_TRAILING_DAYS
+    trailing_total = (
+        f"trailing {COST_TRAILING_DAYS} complete days "
+        f"({trailing.start.isoformat()}..{trailing.end.isoformat()}) ${trailing.total_usd:.2f}, "
+        f"ceiling ${ceiling_usd:.2f}; leading {COST_LEADING_DAYS}-day mean "
+        f"${leading_mean:.2f}/day × {COST_TRAILING_DAYS} = ${leading_pace:.2f}"
     )
+    if trailing.total_usd > ceiling_usd:
+        return Clause(
+            name, requirement, False, f"{month_to_date}; {trailing_total}: OVER", evidence
+        )
+    if leading_pace > ceiling_usd:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{month_to_date}; {trailing_total}: OVER (leading pace)",
+            evidence,
+        )
+    return Clause(name, requirement, True, f"{month_to_date}; {trailing_total}: under", evidence)
 
 
-def _phase2(store: Store, window: list[dt.date], registry: dict[str, Component]) -> list[Clause]:
+def _phase2(
+    store: Store,
+    window: list[dt.date],
+    registry: dict[str, Component],
+    *,
+    trading_day: dt.date,
+) -> list[Clause]:
     """Phase 2's exit gate (plan §6 row 2, §6.1's ruled minimum)."""
+    _unused((trading_day,))
     return [
         _clause_live_saturdays_first_attempt_ok(store, window),
         _clause_replays_ok(store, window, registry),
@@ -2354,9 +2502,15 @@ def _clause_slot_promotion_or_non_promotion(
     )
 
 
-def _phase3(store: Store, window: list[dt.date], registry: dict[str, Component]) -> list[Clause]:
+def _phase3(
+    store: Store,
+    window: list[dt.date],
+    registry: dict[str, Component],
+    *,
+    trading_day: dt.date,
+) -> list[Clause]:
     """Phase 3's exit gate (plan §6 row 3), one clause per slot in `SLOTS`."""
-    _unused((registry,))
+    _unused((registry, trading_day))
     return [_clause_slot_promotion_or_non_promotion(store, slot, window) for slot in sorted(SLOTS)]
 
 
@@ -2426,9 +2580,15 @@ def _clause_trader_week_on_v2_champion(store: Store, window: list[dt.date]) -> C
     )
 
 
-def _phase4(store: Store, window: list[dt.date], registry: dict[str, Component]) -> list[Clause]:
+def _phase4(
+    store: Store,
+    window: list[dt.date],
+    registry: dict[str, Component],
+    *,
+    trading_day: dt.date,
+) -> list[Clause]:
     """Phase 4's exit gate (plan §6 row 4)."""
-    _unused((registry,))
+    _unused((registry, trading_day))
     return [
         _clause_trader_week_on_v2_champion(store, window),
         _clause_aws_cost_within_ceiling(
@@ -2592,9 +2752,15 @@ def _clause_every_llm_arm_has_a_verdict(store: Store, window: list[dt.date]) -> 
     )
 
 
-def _phase5(store: Store, window: list[dt.date], registry: dict[str, Component]) -> list[Clause]:
+def _phase5(
+    store: Store,
+    window: list[dt.date],
+    registry: dict[str, Component],
+    *,
+    trading_day: dt.date,
+) -> list[Clause]:
     """Phase 5's exit gate (plan §6 row 5)."""
-    _unused((registry,))
+    _unused((registry, trading_day))
     return [_clause_every_llm_arm_has_a_verdict(store, window)]
 
 
@@ -2644,10 +2810,91 @@ def _window(trading_day: dt.date, weeks: int) -> list[dt.date]:
 
     Weekly work binds to a Friday close (§4.12), so the window steps back in
     calendar weeks and every element is the same weekday as the anchor.
+
+    This is the RAW window: its elements share the render day's weekday. A
+    clause that reads a per-day key with it is keyed to the day somebody
+    rendered the gate, which is the defect `weekly_anchor` documents — use
+    `weekly_window` for any gate whose artifacts are filed at a weekly close.
     """
     if weeks < 1:
         raise ValueError("a gate window of fewer than one week measures nothing")
     return [trading_day - dt.timedelta(weeks=n) for n in reversed(range(weeks))]
+
+
+def weekly_window(trading_day: dt.date, weeks: int) -> list[dt.date]:
+    """The ``weeks`` weekly CLOSES a gate rendered on ``trading_day`` reads.
+
+    `_window` stepped back from the render day, so a gate rendered on
+    Wednesday 2026-09-02 read five Wednesdays and could not see the five
+    replay runs keyed to Friday closes — MET on Fridays, UNMET the other four
+    weekdays, forever (`alpha-engine-config-I9904`; the same class phase 0
+    fixed in `crucible-PR46`). Every element here is `weekly_anchor` of the
+    raw window's element: the Friday close strictly before it, resolved
+    through the trading calendar, so a holiday Friday walks back to a real
+    session and Monday through Friday of one week resolve to the identical
+    key set. ONE producer of the anchor shape, shared with phase 0 and the
+    phase-2 live clause — not a second stepping rule.
+    """
+    anchors = list(dict.fromkeys(weekly_anchor(day) for day in _window(trading_day, weeks)))
+    if len(anchors) != weeks:
+        # Two raw days a week apart always straddle one Friday close, so this
+        # cannot happen through `weekly_anchor` as written — but a window that
+        # silently shrank would grade fewer weeks than the gate declares and
+        # read MET over the ones it kept. Same refusal as
+        # `_clause_old_weekly_within_cadence`.
+        raise ValueError(
+            f"{weeks} window weeks from {trading_day.isoformat()} collapsed onto "
+            f"{len(anchors)} weekly anchor(s) {[d.isoformat() for d in anchors]}; a gate may "
+            "not grade fewer weeks than it declares"
+        )
+    return anchors
+
+
+def _session_span(window: list[dt.date], render_day: dt.date) -> list[dt.date]:
+    """Every trading session from the oldest anchor through ``render_day``.
+
+    Two phase-1 clauses read artifacts that are NOT weekly closes: a review is
+    filed on the day it was written and an `explain` run is keyed to the day
+    it ran, both on any weekday. Reading them at five Friday keys would make a
+    Wednesday review invisible — the I9904 defect reflected. So they read
+    every session in the span the weekly window covers, up to and including
+    the render day and never past it: a document dated after the render is a
+    document that did not exist when the gate was read, and counting it would
+    let a review filed tomorrow satisfy today's exit.
+
+    Read amplification, stated: a five-week window is ~26 sessions, so the
+    `explain` clause makes ~26 manifest GETs per render instead of five. That
+    is the cost of reading the artifact at the key it is actually filed under;
+    the review clause lists one prefix and is unaffected.
+    """
+    span: list[dt.date] = []
+    day = window[0]
+    while day <= render_day:
+        if is_trading_day(day):
+            span.append(day)
+        day += dt.timedelta(days=1)
+    return span
+
+
+#: Gates whose per-day artifacts are weekly closes, so `evaluate` derives the
+#: window through `weekly_window` and `GateResult.window` — the dates the
+#: filed `gate.json` names — is the key set actually read.
+#:
+#: * phase 1 — the weekly arc's stage manifests, arena cycles and the
+#:   attribution table are all keyed to the Friday close.
+#: * phase 3 — `runs/promote/{day}` is filed by the Saturday promote run at
+#:   the Friday close; over the raw window the clause could find it on a
+#:   Friday render only, hidden behind "neither artifact exists" (PR80 review,
+#:   B2). `champions/{slot}/current.json` is not date-keyed and is unaffected.
+#: * phase 0 and phase 2 — NOT here: they collapse the raw window onto anchors
+#:   inside their own clauses (`weekly_anchor` per element, and the phase-2
+#:   replay clause through `weekly_window`), and their tests pin that shape.
+#: * phase 4 — reads phase 0's cadence reader (anchored inside) and the
+#:   calendar-month cost reader; nothing per-day-keyed.
+#: * phase 5 — `verdict_key(arm, day)` per window day, an arena-cycle artifact
+#:   keyed to the Friday close like phase 1's; it joins this set when its
+#:   clause is next touched (`alpha-engine-config-I9920` owns that clause).
+WEEKLY_ANCHORED_GATES: frozenset[str] = frozenset({"phase1", "phase3"})
 
 
 def evaluate(
@@ -2667,9 +2914,15 @@ def evaluate(
             "that is not registered has no clause list, so running it would report a "
             "pass over nothing."
         ) from exc
-    window = _window(trading_day, default_weeks if weeks is None else weeks)
+    weeks_to_read = default_weeks if weeks is None else weeks
+    if gate in WEEKLY_ANCHORED_GATES:
+        window = weekly_window(trading_day, weeks_to_read)
+    else:
+        window = _window(trading_day, weeks_to_read)
     result = GateResult(gate=gate, trading_day=trading_day, window=window)
-    result.clauses = list(clauses_fn(store, window, registry or load_registry()))
+    result.clauses = list(
+        clauses_fn(store, window, registry or load_registry(), trading_day=trading_day)
+    )
     result.coverage = coverage_note(gate, [c.name for c in result.clauses])
     return result
 
