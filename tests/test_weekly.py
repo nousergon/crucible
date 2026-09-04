@@ -14,7 +14,7 @@ import pytest
 
 from crucible.components import DISPATCHES, Component, Deadline, load_registry
 from crucible.runmode import RUN_MODE_ENV, RUN_MODE_LIVE, RUN_MODE_REPLAY
-from crucible.slots import SLOTS
+from crucible.slots import SLOTS, dispatchable_slots
 from crucible.weekly import ARC_SLOT_JOBS, ArcStageFailed, arc_stages, run_arc
 
 FRIDAY = dt.date(2026, 8, 28)
@@ -52,10 +52,36 @@ class TestDerivation:
         assert names.index("experiment.grade") < names.index("report")
         assert names.index("report") < names.index("console")
 
-    def test_a_slot_scoped_job_expands_to_every_slot_in_dependency_order(self) -> None:
+    def test_a_slot_scoped_job_expands_to_every_dispatchable_slot_in_dependency_order(
+        self,
+    ) -> None:
+        """Every slot the CLI can run, in `SLOTS` order — and no other. M and
+        S have no `produce`/`grade` until phase 3; expanding over them made
+        every arc fail at `experiment.run[m]` (measured 2026-09-04)."""
+        expected = [slot for slot in SLOTS if slot in dispatchable_slots()]
+        assert expected == ["u", "r"], expected
         for job in ARC_SLOT_JOBS:
             slots = [s.slot for s in arc_stages(FRIDAY) if s.job == job]
-            assert slots == list(SLOTS), f"{job} must run for every slot, u then r then m then s"
+            assert slots == expected, f"{job} must run for every dispatchable slot, in SLOTS order"
+
+    def test_a_slot_without_entry_points_is_not_a_stage(self, monkeypatch) -> None:
+        """The derivation is real: take `grade` away from a dispatchable slot's
+        module and its stages leave the arc — no list to edit anywhere."""
+        from crucible.slots import research
+
+        monkeypatch.delattr(research, "grade")
+        assert "r" not in dispatchable_slots()
+        slots = {s.slot for s in arc_stages(FRIDAY) if s.job in ARC_SLOT_JOBS}
+        assert slots == {"u"}
+
+    def test_the_dispatch_table_and_the_arc_read_one_source(self) -> None:
+        """`experiment.run --slot m` refuses by name (track A) and the arc
+        never asks for it: both derive from `dispatchable_slots`, so the arc
+        cannot schedule a stage the CLI will refuse."""
+        from crucible.track_a import _SLOT_MODULES
+
+        assert set(_SLOT_MODULES) == set(dispatchable_slots())
+        assert set(_SLOT_MODULES) == {s.slot for s in arc_stages(FRIDAY) if s.slot}
 
     def test_an_empty_arc_raises_rather_than_reporting_a_quiet_week(self) -> None:
         """A registry in which nothing declares `dispatch: arc` would make the
@@ -186,7 +212,8 @@ class TestRunsTheRealCommand:
             return 0
 
         run_arc(FRIDAY, store="/tmp/store", run_mode=RUN_MODE_REPLAY, main=fake_main, dry_run=True)
-        assert len(seen) == 12  # 4 unscoped stages + 2 slot-scoped stages x 4 slots
+        # 4 unscoped stages + 2 slot-scoped stages x every DISPATCHABLE slot
+        assert len(seen) == 4 + 2 * len(dispatchable_slots())
         for argv in seen:
             assert "--dry-run" in argv, argv
             assert "--run-mode" in argv, argv
@@ -202,7 +229,7 @@ class TestRunsTheRealCommand:
             return 0
 
         run_arc(FRIDAY, store="/tmp/store", run_mode=RUN_MODE_REPLAY, main=fake_main, dry_run=False)
-        assert len(seen) == 12
+        assert len(seen) == 4 + 2 * len(dispatchable_slots())
         for argv in seen:
             assert "--dry-run" not in argv, argv
 

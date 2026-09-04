@@ -307,5 +307,6 @@ class TestSpecIntegrity:
                 slot="r",
                 slot_kind="selection_producer",
                 benchmark="population",
+                module="research",
                 promote_min_weeks=0,
             )

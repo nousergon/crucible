@@ -32,7 +32,7 @@ import datetime as dt
 from dataclasses import dataclass
 
 from crucible.components import Component, load_registry
-from crucible.slots import SLOTS
+from crucible.slots import SLOTS, dispatchable_slots
 
 __all__ = ["ARC_SLOT_JOBS", "Stage", "arc_stages", "run_arc"]
 
@@ -118,17 +118,22 @@ def arc_stages(trading_day: dt.date, registry: dict[str, Component] | None = Non
     disagree. The name is the tie-break, so two stages sharing a deadline
     have a deterministic order rather than a dict-insertion one.
 
-    A slot-scoped job expands into one stage per slot, in `SLOTS` order (u
-    then r then m then s), which is the data dependency: the universe cut
-    feeds the signal, the signal feeds the model, the model feeds the
-    strategy.
+    A slot-scoped job expands into one stage per DISPATCHABLE slot
+    (`crucible.slots.dispatchable_slots`), in `SLOTS` order (u then r then m
+    then s), which is the data dependency: the universe cut feeds the
+    signal, the signal feeds the model, the model feeds the strategy. A slot
+    whose entry points do not exist yet is not a stage: expanding over all
+    of `SLOTS` made every arc fail at `experiment.run[m]` until phase 3, and
+    the phase-1 gate — which derives its expected set from this function —
+    unreadable for the same reason.
     """
     registry = registry or load_registry()
+    slots = [slot for slot in SLOTS if slot in dispatchable_slots()]
     stages: list[Stage] = []
     for row in sorted(_arc_rows(registry), key=lambda c: (c.deadline.due_at(trading_day), c.name)):
         due = row.deadline.due_at(trading_day)
         if row.name in ARC_SLOT_JOBS:
-            stages.extend(Stage(row.name, slot, due) for slot in SLOTS)
+            stages.extend(Stage(row.name, slot, due) for slot in slots)
         else:
             stages.append(Stage(row.name, None, due))
     return stages

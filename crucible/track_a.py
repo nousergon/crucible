@@ -33,7 +33,7 @@ from crucible.gate import PHASES
 from crucible.keys import arm_register_key
 from crucible.manifest import manifest_key
 from crucible.runner import run_job
-from crucible.slots import research, universe
+from crucible.slots import dispatchable_slots
 from crucible.slots.arms import (
     ForeignRecipeSchemaError,
     load_arm_specs,
@@ -44,7 +44,11 @@ from crucible.slots.arms import (
 
 __all__ = ["HANDLERS", "add_track_a_arguments"]
 
-_SLOT_MODULES = {"u": universe, "r": research}
+#: Derived from the slot modules themselves (`crucible.slots.dispatchable_slots`),
+#: so the arc, the phase-1 gate and this dispatch table cannot disagree about
+#: which slots the CLI can run. Today that resolves to `universe` and
+#: `research`; `tests/test_weekly.py` pins it.
+_SLOT_MODULES = dispatchable_slots()
 
 #: "M and S arrive with track B" names phase 3 ("All three slots" — plan
 #: §6). Derived rather than hardcoded so a phase renumbering cannot leave
