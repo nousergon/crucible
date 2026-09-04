@@ -184,7 +184,7 @@ def run_produce(
     produced: list[ShadowSelection] = []
     for spec in specs:
         try:
-            shadow = produce_shadow(spec, features, trading_day)
+            shadow = produce_shadow(spec, features, trading_day, feature_version=feature_version)
             # shadow.v2 (alpha-engine-config-I9778): the WHOLE ranked
             # cross-section, not only the top-N `shadow.v1` selection above.
             # Produced from the same `features` frame and the same recipe as
@@ -315,6 +315,19 @@ def run_grade(
     returns_cache: dict[str, ForwardReturnWindow] = {}
     unsettled_days: dict[str, str] = {}
     verdicts: dict[str, dict[str, float]] = {}
+    # `alpha-engine-config-I9963`, deliverable 3. The DISTINCT feature-layer
+    # versions each arm's SCORED dates were produced under, read back off each
+    # day's own shadow rather than taken from this run's `feature_version`
+    # argument. The two are not the same fact: the argument is the version
+    # resolved for the GRADE date, while a day scored here may have been
+    # produced weeks ago under whatever the catalogue hashed to then, and
+    # attaching the grade-date version to it would be a fabrication.
+    #
+    # A shadow written before `feature_version` was recorded contributes
+    # NOTHING rather than a placeholder — the dimension is simply absent for
+    # an arm whose whole series predates the field, which is the honest
+    # reading and the one `ArmSeries` refuses to let be an empty claim.
+    lineage_by_arm: dict[str, set[str]] = {}
     unsettled: dict[str, list[str]] = {}
     misses: dict[str, list[str]] = {}
     label_control: dict[str, dict[str, Any]] = {}
@@ -404,6 +417,9 @@ def run_grade(
                 raise_training_integrity(arm_id, exc)
             else:
                 verdicts[arm_id][day] = score
+                produced_under = shadow.get("feature_version")
+                if produced_under:
+                    lineage_by_arm.setdefault(arm_id, set()).add(str(produced_under))
                 write_verdict(
                     ctx.store,
                     arm_id=arm_id,
@@ -484,7 +500,19 @@ def run_grade(
             )
 
     series_by_arm: dict[str, ArmSeries] = {
-        arm_id: ArmSeries(arm_id=arm_id, scores=scores)
+        arm_id: ArmSeries(
+            arm_id=arm_id,
+            scores=scores,
+            # A control has no shadow — it is generated here, at grade time,
+            # from the settled returns — so it contributes no dimension and
+            # its lineage is `{}`. That is "this arm declares none", which is
+            # exactly right and is distinct from a missing key.
+            lineage=(
+                {"feature_version": tuple(sorted(lineage_by_arm[arm_id]))}
+                if lineage_by_arm.get(arm_id)
+                else {}
+            ),
+        )
         for arm_id, scores in sorted(verdicts.items())
     }
     # An arm with NO settled score is still SUPPLIED, carrying an empty

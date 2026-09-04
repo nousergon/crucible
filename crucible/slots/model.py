@@ -1747,6 +1747,21 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
     label block — is a MISS on the series (`ArmSeries.misses`), which the
     engine excludes from every window, because "unrankable" is not "zero
     skill".
+
+    **The series carries its feature-layer lineage** (`alpha-engine-config-
+    I9903`, wired by `-I9963`). `ArmSeries.lineage` is an opaque
+    `dimension -> distinct values` map the arena engine passes through
+    unread and `ScoreLadder` emits per ladder entry, so a verdict artifact
+    can answer "did this champion's score series rest on one feature-layer
+    version or several" without walking every constituent run manifest. The
+    M slot declares one dimension, `feature_version`, and its value is the
+    panel's — not a version supplied by a caller.
+
+    **No scheduled job calls this function** (`alpha-engine-config-I9957`,
+    still true: the whole of this module is reachable only from `tests/`).
+    The lineage above is therefore a CONTRACT exercised by tests, not a fact
+    observed on a live M cycle, and it reaches no `arena_cycle` document any
+    scheduled run writes until phase 3 builds the M cycle job.
     """
     fit = train_arm(recipe, panel, as_of=as_of)
     horizon = recipe.label_horizon_trading_days
@@ -1812,7 +1827,25 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
             "120-date track record past `promote_min_weeks` (plan §9.1)."
         )
     return ModelGrade(
-        series=ArmSeries(arm_id=fit.arm_id, scores=scores, misses=frozenset(unrankable)),
+        series=ArmSeries(
+            arm_id=fit.arm_id,
+            scores=scores,
+            misses=frozenset(unrankable),
+            # The M slot's own provenance, carried to the verdict surface
+            # (`alpha-engine-config-I9903`/`-I9963`). Every date scored above
+            # comes from THIS panel, so the panel's resolved feature-layer
+            # version is the lineage of the whole series and no manifest walk
+            # is needed to derive it.
+            #
+            # Declared only when there IS a scored date. The contract is "the
+            # distinct values this dimension took across the dates in
+            # `scores`", and an unmeasurable arm has no dates — declaring the
+            # panel's version anyway would record a version the series never
+            # rested on. `{}` is the honest reading, and the engine's own
+            # normaliser refuses a dimension with nothing to report rather
+            # than emitting an empty claim.
+            lineage={"feature_version": (panel.feature_version,)} if scores else {},
+        ),
         cpcv=cpcv,
         fit=fit,
         status=status,

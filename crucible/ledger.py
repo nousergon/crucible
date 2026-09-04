@@ -64,6 +64,16 @@ def trial_rows(
     `n_dates_scored` is carried because a trial measured over two dates and
     a trial measured over forty are not equally informative, and a DSR that
     counted them alike would treat a rumour as a result.
+
+    ``lineage`` is the slot's own provenance for the series this row counts,
+    forwarded verbatim from :attr:`ArmSeries.lineage`
+    (`alpha-engine-config-I9963`). The DSR denominator's log carries the same
+    fact as the cycle artifact, so "how many trials" and "over which upstream
+    versions" are answerable from one file rather than by joining two.
+    Additive on `trial.v1`: the row has no JSON Schema, every reader ignores
+    unknown keys, and an OLDER row that predates the field carries no
+    `lineage` key at all — which is deliberately distinct from `{}`, "this
+    slot declares none", exactly as on `arena_cycle.v1`.
     """
     written = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     rows: list[dict[str, Any]] = []
@@ -83,6 +93,11 @@ def trial_rows(
                 "first_date": min(scores) if scores else None,
                 "last_date": max(scores) if scores else None,
                 "mean_score_ratio": (sum(scores.values()) / len(scores)) if scores else None,
+                "lineage": (
+                    {k: list(v) for k, v in sorted(series.lineage.items())}
+                    if series is not None
+                    else {}
+                ),
                 "run_id": run_id,
                 "arena_cycle_key": arena_cycle_key,
                 "written_at_utc": written,
