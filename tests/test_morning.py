@@ -42,9 +42,11 @@ from crucible.components import load_registry
 from crucible.keys import (
     BOARD_CURRENT_KEY,
     BOARD_HTML_KEY,
+    TRIGGER_UNKNOWN,
     board_key,
     manifest_key,
     morning_report_key,
+    morning_trigger_key,
 )
 from crucible.morning import (
     ACCEPTANCE_NOT_ON_ANY_ARTIFACT,
@@ -72,6 +74,19 @@ from crucible.morning import (
     wire_length,
 )
 from crucible.store import LocalStore
+
+
+def _message_output(manifest: dict) -> dict:
+    """The delivered MESSAGE's output row.
+
+    The job files two outputs (alpha-engine-config-I9960): the message it
+    delivered, and what started the delivery. Selected by suffix rather than
+    by position so a third artifact cannot silently change which one a test
+    is asserting about.
+    """
+    (row,) = [o for o in manifest["outputs"] if o["key"].endswith("message.txt")]
+    return row
+
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "morning-report.yml"
@@ -417,8 +432,7 @@ class TestTheMessage:
         keys = [k for k in denied.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
         manifest = json.loads(denied.get_bytes(keys[0]))
         assert manifest["status"] == "ok"
-        (output,) = manifest["outputs"]
-        message = denied.get_bytes(output["key"]).decode()
+        message = denied.get_bytes(_message_output(manifest)["key"]).decode()
         assert ACCEPTANCE_UNREADABLE.format(code="AccessDenied") in message
         assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT not in message
 
@@ -758,14 +772,64 @@ class TestTheJob:
     def test_a_delivered_report_is_filed_beside_its_manifest(self, tmp_path, monkeypatch):
         store = _seed(tmp_path, previous=_board())
         monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
+        # The trigger environment is CONTROLLED, not inherited. CI runs this
+        # suite with `GITHUB_EVENT_NAME=pull_request` set by the platform, so
+        # a test asserting the declared default read green on a laptop and
+        # red in CI — the ambient-environment shape, caught on the first CI
+        # run of alpha-engine-config-I9960.
+        monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+        monkeypatch.delenv("CRUCIBLE_TRIGGER", raising=False)
         assert morning_handler(_args(tmp_path, dry_run=False)) == 0
         keys = [k for k in store.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
         manifest = json.loads(store.get_bytes(keys[0]))
         assert manifest["status"] == "ok"
-        (output,) = manifest["outputs"]
+        output = _message_output(manifest)
         message = store.get_bytes(output["key"]).decode()
         assert message.startswith("CRUCIBLE V2 — BOARD FOR TRADING DAY")
         assert output["key"] == morning_report_key(DAY.isoformat(), manifest["calendar_date"])
+        # And the SECOND output: what started this delivery
+        # (alpha-engine-config-I9960). A test asserting exactly one output
+        # here is what would silently drop the trigger evidence the three
+        # blocked tracker issues close on, so it asserts BOTH by name.
+        assert {o["key"] for o in manifest["outputs"]} == {
+            output["key"],
+            morning_trigger_key(DAY.isoformat(), manifest["calendar_date"], TRIGGER_UNKNOWN),
+        }
+
+    def test_a_scheduled_firing_files_evidence_that_no_human_started_it(
+        self, tmp_path, monkeypatch
+    ):
+        """alpha-engine-config-I9960, and the thing I9896 / I9914 / I9921 each
+        close on: "at least one delivery without a human dispatching it".
+
+        Nothing in `run_manifest.v2` could carry that — `run_mode` is
+        live-vs-replay and a dispatched run is just as live — so the three
+        issues sat open on a `closes-when` no artifact could satisfy. The
+        trigger is the KEY, so the closing sweep's S3 `exists` op answers it
+        with no body parse.
+        """
+        store = _seed(tmp_path, previous=_board())
+        monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+        assert morning_handler(_args(tmp_path, dry_run=False)) == 0
+        keys = [k for k in store.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
+        manifest = json.loads(store.get_bytes(keys[0]))
+        expected = morning_trigger_key(DAY.isoformat(), manifest["calendar_date"], "schedule")
+        assert expected in {o["key"] for o in manifest["outputs"]}
+        assert store.get_bytes(expected).decode().strip() == "schedule"
+
+    def test_a_dispatched_firing_cannot_file_evidence_of_a_schedule(self, tmp_path, monkeypatch):
+        """The half that makes the other half mean anything. `GITHUB_*` is a
+        reserved prefix a workflow `env:` block cannot override, so a human
+        dispatch is recorded as one even when `CRUCIBLE_TRIGGER` says
+        otherwise — and the `trigger.schedule` predicate stays unsatisfied.
+        """
+        store = _seed(tmp_path, previous=_board())
+        monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+        monkeypatch.setenv("CRUCIBLE_TRIGGER", "schedule")
+        assert morning_handler(_args(tmp_path, dry_run=False)) == 0
+        assert not [k for k in store.list_keys(f"runs/{MORNING_JOB}/") if k.endswith(".schedule")]
 
     def test_the_manifest_key_is_discriminated_by_the_firing(self, tmp_path, monkeypatch):
         """A 13:00 UTC cron fires every calendar day while three of them

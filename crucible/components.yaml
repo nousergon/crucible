@@ -564,11 +564,40 @@ components:
     dispatch_workflow: morning-report.yml
     # `next_calendar_day_at`, not `close_plus`: the report for trading day d
     # is delivered on the calendar day AFTER d, before that day's session
-    # opens. 13:00 UTC is 09:00 ET in EDT and 08:00 ET in EST, so 10:00 ET
-    # covers both with an hour of slack for the cron drift GitHub is
-    # measured to have on this fleet (a `*/30` workflow ran 5-8x/day for its
-    # whole life). Tighter than that and the absence page fires on GitHub's
-    # scheduling rather than on a report that did not go out.
+    # opens. 13:00 UTC is 09:00 ET in EDT and 08:00 ET in EST.
+    #
+    # 15:00 ET, from this ACCOUNT's measured cron-delivery envelope
+    # (alpha-engine-config-I9960, -I9966), not from crucible's own single
+    # sample. The first cut of this deadline (12:30 ET / 210 minutes) was set
+    # from `board.yml`'s one recorded firing — cron `30 21 * * *`, due
+    # 2026-09-03T21:30Z, ran at 2026-09-03T23:23:13Z, 113 minutes late — and
+    # that sample is this account's *best* case, not a representative one.
+    # Four `nous-ergon-ops` GitHub Actions crons, each declaring exactly one
+    # schedule, measured on 2026-09-04:
+    #
+    #   workflow                   declared      actual        delay
+    #   authority-surface          07:00Z        12:04:45Z     +304 min
+    #   llm-callsite-surface       07:30Z        12:11:00Z     +281 min
+    #   observability-registry     07:30Z        12:10:51Z     +280 min
+    #   cloudwatch-alarm-drift     09:45Z        13:46:19Z     +241 min
+    #
+    # and it is chronic, not a bad day: `0 7 * * *` landed at 12:02-12:05Z on
+    # each of 2026-09-02, -03 and -04. Three of those four delays exceed
+    # 210 minutes, so the 12:30 ET deadline would have paged on a report that
+    # was merely late, not absent — a false alarm on most days trains the
+    # reader to ignore the one true page, which is the exact failure this
+    # detector exists to prevent.
+    #
+    # 15:00 ET (19:00Z) is 360 minutes after the EDT occurrence (09:00 ET)
+    # and 420 after the EST one (08:00 ET) — clearing the worst measured
+    # delay (304 min) with ~56 minutes of headroom, while still paging the
+    # same calendar day on a genuine no-show.
+    #
+    # This constant is calibrated to THIS ACCOUNT's GitHub Actions delivery
+    # behaviour, not a universal or vendor-documented figure. If that
+    # envelope moves, re-measuring it — not adjusting this number on
+    # preference — is the maintenance action; re-run the four-workflow
+    # measurement above and update both the table and `at:`.
     deadline:
       anchor: next_calendar_day_at
-      at: "10:00"
+      at: "15:00"

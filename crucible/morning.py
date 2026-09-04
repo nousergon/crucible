@@ -92,6 +92,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -102,10 +103,13 @@ from crucible.documents import load_store_document, read_document
 from crucible.keys import (
     BOARD_CURRENT_KEY,
     BOARD_HTML_KEY,
+    TRIGGER_RE,
+    TRIGGER_UNKNOWN,
     acceptance_reading_key,
     board_key,
     manifest_key,
     morning_report_key,
+    morning_trigger_key,
     parse_acceptance_reading,
 )
 from crucible.store import PRESIGN_MAX_S, LocalStore, S3Store, Store, open_store
@@ -137,6 +141,7 @@ __all__ = [
     "morning_handler",
     "read_inputs",
     "render_message",
+    "resolve_trigger",
     "run_report",
     "store_uri",
     "wire_length",
@@ -1247,6 +1252,46 @@ def deliver(message: str, *, transport: Callable[..., Any] | None = None) -> str
     return str(getattr(result, "telegram_destination", None) or "telegram")
 
 
+#: Where the trigger is read from, in priority order.
+#:
+#: `GITHUB_EVENT_NAME` FIRST, and that ordering is the whole provenance
+#: argument: GitHub Actions sets it itself on every run, and `GITHUB_*` is a
+#: reserved prefix a workflow's own `env:` block cannot override. A human who
+#: dispatches the report therefore cannot produce evidence saying a schedule
+#: did. `CRUCIBLE_TRIGGER` is second and exists for a non-GitHub dispatcher,
+#: where it is the only thing that can say.
+TRIGGER_VARS: tuple[str, ...] = ("GITHUB_EVENT_NAME", "CRUCIBLE_TRIGGER")
+
+
+def resolve_trigger(environ: dict[str, str] | None = None) -> str:
+    """What started this run, as a key-safe name.
+
+    Never inferred from the clock or the calendar. `run_mode` records
+    live-vs-replay and a dispatched run is just as live as a scheduled one,
+    so nothing already in the manifest can answer "did a human start this" —
+    which is why `alpha-engine-config-I9896`, `-I9914` and `-I9921` all sat
+    open on a `closes-when` no artifact could satisfy.
+
+    Returns `TRIGGER_UNKNOWN` when the invocation said nothing. That is a
+    declared value, not a swallow: it is written to the store like any other
+    trigger, so a run whose starter is unknown is VISIBLE as unknown rather
+    than missing, and it satisfies no predicate asking for a schedule.
+    """
+    env = environ if environ is not None else os.environ
+    for var in TRIGGER_VARS:
+        value = (env.get(var) or "").strip()
+        if not value:
+            continue
+        if not TRIGGER_RE.match(value):
+            raise ValueError(
+                f"{var}={value!r} is not a usable trigger name (must match "
+                f"{TRIGGER_RE.pattern}). It becomes an S3 key segment; refusing is the "
+                "only reading that is not a guess about what started this run."
+            )
+        return value
+    return TRIGGER_UNKNOWN
+
+
 def morning_handler(args: argparse.Namespace) -> int:
     """`crucible report.morning [--date] [--dry-run] [--store]`.
 
@@ -1302,6 +1347,22 @@ def morning_handler(args: argparse.Namespace) -> int:
         payload = message.encode("utf-8")
         artifact = morning_report_key(ctx.trading_day.isoformat(), ctx.calendar_date.isoformat())
         ctx.record_output(artifact, payload)
+        # WHAT started this delivery, filed as its own object beside the
+        # message (alpha-engine-config-I9960). The trigger is the KEY, so an
+        # `exists` predicate over
+        # `runs/report.morning/*/*/trigger.schedule` answers "has a
+        # delivery ever happened that no human dispatched" with no body
+        # parse — which is exactly what I9896/I9914/I9921 close on. It goes
+        # under the job's own manifest prefix, so the delivering identity
+        # needs no second IAM grant, and it is not a manifest
+        # (`is_manifest_key`), so it satisfies no absence check.
+        trigger = resolve_trigger()
+        ctx.record_output(
+            morning_trigger_key(
+                ctx.trading_day.isoformat(), ctx.calendar_date.isoformat(), trigger
+            ),
+            f"{trigger}\n".encode(),
+        )
         ctx.record_metric(
             {
                 "name": "morning_report_delivered",
