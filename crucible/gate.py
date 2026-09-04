@@ -63,7 +63,7 @@ from crucible.keys import (
 from crucible.manifest import load_schema, manifest_key
 from crucible.release import POINTER_KEY
 from crucible.report import attribution_key
-from crucible.slots import SLOTS, is_control_arm
+from crucible.slots import SLOTS, dispatchable_slots, is_control_arm
 from crucible.store import Store
 from crucible.tags import TAG_KEY, TAG_VALUE
 from crucible.weekly import arc_stages
@@ -620,7 +620,13 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
     # duplicates of it and hiding a genuinely missing arena cycle for an
     # unrelated slot/day (`alpha-engine-config-I9869` round 3, finding 5).
     registers: dict[str, tuple[set[str], str | None, str | None, bool]] = {}
-    for slot in SLOTS:
+    # The slots the CLI can RUN, not every slot the harness declares: M and
+    # S have no `produce`/`grade` until phase 3, and a phase-1 clause that
+    # demanded their arena cycles could never read MET before phase 3 shipped
+    # (measured 2026-09-04). Same derivation `arc_stages` uses, so the two
+    # phase-1 clauses agree about which slots a week must have scored.
+    slots = {slot: SLOTS[slot] for slot in SLOTS if slot in dispatchable_slots()}
+    for slot in slots:
         registered, register_key, register_problem, register_access = _register_arms(store, slot)
         registers[slot] = (registered, register_key, register_problem, register_access)
         if register_key is not None:
@@ -628,7 +634,7 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
         if register_problem is not None:
             (unmeasurable if register_access else gaps).append(register_problem)
     for day in window:
-        for slot, spec in SLOTS.items():
+        for slot, spec in slots.items():
             key = arena_cycle_key(slot, day.isoformat())
             evidence.append(key)
             read = _read_store_document(store, key)
@@ -690,7 +696,7 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
         "arms_all_scored",
         requirement,
         True,
-        f"{len(SLOTS)} slots x {len(window)} days, every registered arm and both controls scored",
+        f"{len(slots)} slots x {len(window)} days, every registered arm and both controls scored",
         tuple(evidence),
     )
 

@@ -349,7 +349,7 @@ class TestPhaseOne:
         store = _seed_met(tmp_path)
         _put(
             store,
-            arena_cycle_key("m", FRIDAY.isoformat()),
+            arena_cycle_key("r", FRIDAY.isoformat()),
             {"scored_arms": ["m:alpha:abc123"], "active_arms": ["m:alpha:abc123"]},
         )
         result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
@@ -428,7 +428,7 @@ class TestPhaseOneGuardedReads:
         self, tmp_path, body: bytes, expected: str
     ) -> None:
         store = _seed_met(tmp_path)
-        key = arena_cycle_key("m", FRIDAY.isoformat())
+        key = arena_cycle_key("r", FRIDAY.isoformat())
         store.put_bytes(key, body)
         result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "arms_all_scored")
@@ -515,7 +515,7 @@ class TestPhaseOneGuardedReads:
 
     def test_arms_all_scored_missing_scored_arms_field_is_malformed(self, tmp_path) -> None:
         store = _seed_met(tmp_path)
-        key = arena_cycle_key("m", FRIDAY.isoformat())
+        key = arena_cycle_key("r", FRIDAY.isoformat())
         _put(store, key, {"active_arms": []})
         result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "arms_all_scored")
@@ -605,7 +605,7 @@ class TestPhaseOneGuardedReadsRound2:
 
     def test_a_malformed_register_line_is_a_red_reading_not_an_exception(self, tmp_path) -> None:
         store = _seed_met(tmp_path)
-        key = arm_register_key("m")
+        key = arm_register_key("r")
         store.put_bytes(key, b"{not json\n")
         result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         clause = next(c for c in result.clauses if c.name == "arms_all_scored")
@@ -616,7 +616,7 @@ class TestPhaseOneGuardedReadsRound2:
 
     def test_a_malformed_register_line_names_the_line_number(self, tmp_path) -> None:
         store = _seed_met(tmp_path)
-        key = arm_register_key("m")
+        key = arm_register_key("r")
         store.put_bytes(key, b'{"kind": "registered"}\n[1, 2]\n')
         clause = next(
             c
@@ -641,7 +641,7 @@ class TestPhaseOneGuardedReadsRound2:
         from crucible.cli import main
 
         store = _seed_met(tmp_path)
-        store.put_bytes(arm_register_key("m"), b"{not json\n")
+        store.put_bytes(arm_register_key("r"), b"{not json\n")
 
         exit_code = main(
             [
@@ -693,7 +693,7 @@ class TestPhaseOneGuardedReadsRound2:
 
     def test_arena_cycle_scored_arms_element_wrong_type_is_a_red_reading(self, tmp_path) -> None:
         store = _seed_met(tmp_path)
-        key = arena_cycle_key("m", FRIDAY.isoformat())
+        key = arena_cycle_key("r", FRIDAY.isoformat())
         _put(store, key, {"scored_arms": [{"a": 1}], "active_arms": []})
         clause = next(
             c
@@ -869,7 +869,7 @@ class TestPhaseOneGuardedReadsRound2:
         assert rows["phase1"]["met_ratio"] is None
 
     def test_an_access_failure_on_the_register_reads_unmeasurable(self, tmp_path) -> None:
-        key = arm_register_key("m")
+        key = arm_register_key("r")
         _seed_met(tmp_path)
         denied = _AccessDenied(tmp_path, denied_key=key)
         clause = next(
@@ -987,9 +987,9 @@ class TestPhaseOneGuardedReadsRound3:
         genuinely missing `s` cycle — found only on this final day — was
         truncated away entirely."""
         store = _seed_met(tmp_path)
-        register_key = arm_register_key("m")
+        register_key = arm_register_key("r")
         store.put_bytes(register_key, b"{not json\n")
-        missing_key = arena_cycle_key("s", WINDOW[-1].isoformat())
+        missing_key = arena_cycle_key("u", WINDOW[-1].isoformat())
         (tmp_path / missing_key).unlink()
         clause = next(
             c
@@ -998,7 +998,7 @@ class TestPhaseOneGuardedReadsRound3:
         )
         assert not clause.met
         assert register_key in clause.detail
-        assert f"s@{WINDOW[-1].isoformat()}" in clause.detail
+        assert f"u@{WINDOW[-1].isoformat()}" in clause.detail
 
     def test_the_malformed_register_is_named_only_once(self, tmp_path) -> None:
         """The bug round 2 shipped: reading the register inside the day loop
@@ -1007,7 +1007,7 @@ class TestPhaseOneGuardedReadsRound3:
         finding out of entirely. Hoisting the read to once-per-slot removes
         the duplication at its source."""
         store = _seed_met(tmp_path)
-        register_key = arm_register_key("m")
+        register_key = arm_register_key("r")
         store.put_bytes(register_key, b"{not json\n")
         clause = next(
             c
@@ -1042,9 +1042,9 @@ class TestPhaseOneGuardedReadsRound3:
         self, tmp_path
     ) -> None:
         _seed_met(tmp_path)
-        register_key = arm_register_key("m")
+        register_key = arm_register_key("r")
         denied = _AccessDenied(tmp_path, denied_key=register_key)
-        missing_key = arena_cycle_key("s", WINDOW[0].isoformat())
+        missing_key = arena_cycle_key("u", WINDOW[0].isoformat())
         (tmp_path / missing_key).unlink()
         clause = next(
             c
