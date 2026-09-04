@@ -88,16 +88,41 @@ class _Usage:
 
 
 class _Result:
+    """Stands in for `krepis.llm.LLMResult`.
+
+    The call-time fields carry the SAME defaults the real dataclass declares
+    (`fallback_used: bool = False`, `served_deployment: Optional[str] = None`)
+    so a stub that silently diverged from the contract would be caught by
+    `TestTheCallTimeFactsComeFromTheResult::
+    test_the_result_contract_this_stub_stands_in_for_is_real`, which asserts
+    the fields against the installed krepis rather than against this class.
+    """
+
     model = "some-vendor-model-the-router-picked"
     usage = _Usage()
+    fallback_used = False
+    served_deployment: str | None = None
+
+    def __init__(self, *, fallback_used: bool = False, served_deployment: str | None = None):
+        self.fallback_used = fallback_used
+        self.served_deployment = served_deployment
 
 
 class _Client:
+    def __init__(self, *, fallback_used: bool = False, served_deployment: str | None = None):
+        self._result = _Result(fallback_used=fallback_used, served_deployment=served_deployment)
+
     def complete(self, **_kw):
-        return _Result()
+        return self._result
 
 
-def _asked(monkeypatch, *, degraded: bool = False) -> dict:
+def _asked(
+    monkeypatch,
+    *,
+    degraded: bool = False,
+    fallback_used: bool = False,
+    served_deployment: str | None = None,
+) -> dict:
     """Stub the router edge and return the dict it records the ask into.
 
     The stub stands in for the REGISTRY, not for the router's contract: it
@@ -114,7 +139,10 @@ def _asked(monkeypatch, *, degraded: bool = False) -> dict:
     monkeypatch.setenv(EXEC_CONTEXT_ENV, "ci")
     monkeypatch.setattr("krepis.router.resolve_group_spec", _resolve)
     monkeypatch.setattr("krepis.router.route_is_degraded", lambda route: route["degraded"])
-    monkeypatch.setattr("krepis.llm.LLMClient", lambda *a, **k: _Client())
+    monkeypatch.setattr(
+        "krepis.llm.LLMClient",
+        lambda *a, **k: _Client(fallback_used=fallback_used, served_deployment=served_deployment),
+    )
     return recorded
 
 
@@ -244,6 +272,113 @@ class TestDegradationIsRecorded:
             "resolve-time answer and `model_served` the call-time one, and on the "
             "router-edge route only the second can say which entry served"
         )
+
+
+class TestTheCallTimeFactsComeFromTheResult:
+    """`alpha-engine-config-I10006`: the manifest records what happened to
+    THIS CALL, not what the route object declared about itself.
+
+    `route_is_degraded` answers a resolve-time question about the route. On
+    the router edge the fallback chain is walked by the proxy AFTER
+    resolution, and on `litellm_proxy` — the route krepis prefers whenever
+    the health probe answers, so the route v2 actually takes — it returned
+    `False` unconditionally. A manifest carrying only that predicate does not
+    leave the fact missing; it states it FALSE beside a call the primary
+    never answered, which is a run grading a model nobody selected.
+
+    The discriminating case is the FIRST test below: route not degraded,
+    call served by a fallback. Stamping either field from
+    `route_is_degraded` makes it red; nothing else in this module would.
+    """
+
+    def test_a_fallback_served_call_says_so_even_when_the_route_reads_healthy(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        _asked(
+            monkeypatch,
+            degraded=False,
+            fallback_used=True,
+            served_deployment="high-2",
+        )
+        store = LocalStore(tmp_path)
+        run_job("report", _body(), store=store, trading_day=DAY, now=NOW)
+
+        row = _manifest(store)["llm_calls"][0]
+        assert row["fallback_used"] is True, (
+            "the call was served by a fallback; a manifest saying otherwise grades "
+            "a model nobody selected"
+        )
+        assert row["served_deployment"] == "high-2"
+        assert row["route_degraded"] is False, (
+            "the resolve-time answer is recorded UNCHANGED beside the call-time one — "
+            "this row is exactly the disagreement the two fields exist to expose, and "
+            "collapsing either into the other would erase it"
+        )
+
+    def test_a_primary_served_call_is_distinguishable_from_a_fallback_served_one(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        _asked(monkeypatch, degraded=False, fallback_used=False, served_deployment="high-1")
+        store = LocalStore(tmp_path)
+        run_job("report", _body(), store=store, trading_day=DAY, now=NOW)
+
+        row = _manifest(store)["llm_calls"][0]
+        assert row["fallback_used"] is False
+        assert row["served_deployment"] == "high-1"
+
+    def test_a_route_reporting_no_deployment_records_null_not_a_missing_field(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """`None` is the router's own answer, and it is not an absence.
+
+        The schema requires the key and admits `null`, so a reader can tell
+        "the router reported no deployment" from "this producer does not
+        record the field" — the distinction `Store.get_bytes` raising on a
+        missing key makes everywhere else in this package.
+        """
+        _asked(monkeypatch, degraded=False, fallback_used=False, served_deployment=None)
+        store = LocalStore(tmp_path)
+        run_job("report", _body(), store=store, trading_day=DAY, now=NOW)
+
+        row = _manifest(store)["llm_calls"][0]
+        assert "served_deployment" in row
+        assert row["served_deployment"] is None
+
+    def test_a_result_without_the_call_time_fields_RAISES(self, tmp_path, monkeypatch) -> None:
+        """Rule 5. A krepis that withdrew the field must not read `false`.
+
+        `getattr(result, "fallback_used", False)` would record a plausible
+        answer forever — the `dropped_params` failure mode (I7232) the field
+        was itself added to end, one layer out. The attribute is read
+        directly so its absence is loud.
+        """
+
+        class _Bare:
+            model = "m"
+            usage = _Usage()
+
+        class _BareClient:
+            def complete(self, **_kw):
+                return _Bare()
+
+        _asked(monkeypatch)
+        monkeypatch.setattr("krepis.llm.LLMClient", lambda *a, **k: _BareClient())
+        store = LocalStore(tmp_path)
+        with pytest.raises(AttributeError, match="fallback_used"):
+            run_job("report", _body(), store=store, trading_day=DAY, now=NOW)
+
+    def test_the_result_contract_this_stub_stands_in_for_is_real(self) -> None:
+        """The stub above is only evidence if the real class carries the fields.
+
+        Asserted against the INSTALLED krepis, so the pin in `pyproject.toml`
+        is what this test grades — a downgrade past `LLMResult.fallback_used`
+        turns it red here rather than at the first phase-5 call.
+        """
+        from krepis.llm import LLMResult
+
+        fields = LLMResult.__dataclass_fields__
+        assert "fallback_used" in fields
+        assert "served_deployment" in fields
 
 
 class TestAnUnroutedCapabilityClass:

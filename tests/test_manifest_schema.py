@@ -80,6 +80,8 @@ def _valid_manifest() -> dict:
                 "model_requested": "tier:high",
                 "model_served": "glm-4.6",
                 "route_degraded": False,
+                "fallback_used": False,
+                "served_deployment": "high-1",
                 "tokens_in": 12000,
                 "tokens_out": 900,
                 "cache_read": 11000,
@@ -259,6 +261,55 @@ def test_llm_call_records_whether_the_route_was_degraded(
 
     doc = _valid_manifest()
     doc["llm_calls"][0]["route_degraded"] = "false"
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+
+def test_the_call_time_fallback_fact_is_required_and_boolean(
+    validator: Draft202012Validator,
+) -> None:
+    """`alpha-engine-config-I10006`: the CALL-time fact, beside the
+    resolve-time one.
+
+    `route_degraded` answers whether the ROUTE object declared a degraded
+    shape at resolution; on the router-edge route the chain is walked by the
+    proxy afterwards, so it can read `false` on a call the primary never
+    answered. Required for the same reason `route_degraded` is: an absent
+    field makes "the primary served" and "nobody recorded which served" one
+    reading.
+    """
+    doc = _valid_manifest()
+    del doc["llm_calls"][0]["fallback_used"]
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+    doc = _valid_manifest()
+    doc["llm_calls"][0]["fallback_used"] = "false"
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+
+def test_served_deployment_is_required_and_admits_null_but_not_a_number(
+    validator: Draft202012Validator,
+) -> None:
+    """`null` is the router reporting no deployment — an ANSWER, not an
+    absence — so the key is required and the value is nullable.
+
+    A reader must be able to tell "the route reported none" from "this
+    producer does not record the field", which is the same distinction
+    `Store.get_bytes` raising on a missing key makes everywhere else.
+    """
+    doc = _valid_manifest()
+    del doc["llm_calls"][0]["served_deployment"]
+    with pytest.raises(ValidationError):
+        validator.validate(doc)
+
+    doc = _valid_manifest()
+    doc["llm_calls"][0]["served_deployment"] = None
+    validator.validate(doc)
+
+    doc = _valid_manifest()
+    doc["llm_calls"][0]["served_deployment"] = 7
     with pytest.raises(ValidationError):
         validator.validate(doc)
 
