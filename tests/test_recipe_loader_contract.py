@@ -210,16 +210,28 @@ def test_the_contract_goes_red_when_a_recipe_matches_no_loader(tmp_path: Path) -
         _assert_exactly_one_loader(strategy, "m", SLOT_LOADERS["m"])
 
 
-def test_the_contract_goes_red_when_two_loaders_accept_one_recipe(tmp_path: Path) -> None:
-    """Policy §7.4, half two: a document deliberately well-formed under TWO schemas.
+def test_the_contract_goes_red_when_two_loaders_accept_one_recipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Policy §7.4, half two: `_assert_exactly_one_loader` must fail loud when
+    the partition it checks is violated.
 
-    A file carrying an `ArmSpec`'s `ranker`/`params`/`registered_at` AND a
-    `ModelRecipe`'s whole `spec` block satisfies both, so both loaders read
-    it. Filed under a slot `load_arm_specs` serves, that ambiguity is real
-    and the assertion catches it. Filed under M it cannot arise at all,
-    because the slot is refused BY NAME before a byte is read — which is what
-    the I9961 fix buys, stated here as a measurement of the two readings
-    DIFFERING rather than as a belief about the refusal.
+    **The historical repro is gone, and that is `alpha-engine-config-I9944`,
+    not a regression in this test.** A file carrying an `ArmSpec`'s
+    `ranker`/`params` AND a `ModelRecipe`'s `spec` block used to satisfy both
+    `load_arm_specs` and `load_model_recipes`, because each loader read the
+    keys it knew and silently accepted-and-ignored the rest. I9944 gave every
+    loader a CLOSED top-level vocabulary — `load_arm_specs` now refuses
+    `spec` (not an `ArmSpec` field) and `load_model_recipes` now refuses
+    `ranker`/`params` (not `ModelRecipe` fields) — so the hybrid below is
+    refused by every loader, not merely read by one. That is a strictly
+    stronger fix than I9961's refuse-the-foreign-slot-by-name, applied here
+    to prove it holds rather than assumed.
+
+    The partition helper's own "two loaders" failure branch is still real
+    code that must still fire correctly, so it is exercised directly against
+    a fabricated acceptance list — the one shape closed vocabularies cannot
+    make untestable.
     """
     hybrid = {
         **_model_recipe(name="momentum_sleeve"),
@@ -227,24 +239,27 @@ def test_the_contract_goes_red_when_two_loaders_accept_one_recipe(tmp_path: Path
     }
     hybrid["spec"] = _model_recipe()["spec"]
 
+    # The closed-vocabulary fix (see the docstring above) means a document
+    # naming a key outside a loader's closed vocabulary is refused by EVERY
+    # loader now, not merely by one.
     ambiguous = _write(tmp_path / "u-tree", "u", {**hybrid, "slot": "u"})
     accepted_u = _accepting_loaders(ambiguous, "u")
-    assert sorted(accepted_u) == ["load_arm_specs", "load_model_recipes"], (
-        "a document satisfying BOTH schemas was not seen as ambiguous, so the "
-        f"partition assertion proves nothing; got {accepted_u}"
-    )
-    with pytest.raises(AssertionError, match="Two loaders accepting one directory"):
+    assert accepted_u == [], f"expected every loader to refuse the hybrid; got {accepted_u}"
+    with pytest.raises(AssertionError, match="NO loader"):
         _assert_exactly_one_loader(ambiguous, "u", SLOT_LOADERS["u"])
 
-    unambiguous = _write(tmp_path / "m-tree", "m", {**hybrid, "slot": "m"})
-    accepted_m = _accepting_loaders(unambiguous, "m")
-    assert accepted_m == ["load_model_recipes"]
-    _assert_exactly_one_loader(unambiguous, "m", SLOT_LOADERS["m"])
+    # The "two loaders accepted" branch, exercised directly: no real document
+    # can trigger it any more (that is the point above), so the branch itself
+    # is proved by monkeypatching what `_accepting_loaders` reports.
+    import sys
 
-    assert accepted_u != accepted_m, (
-        "the check reports the same verdict for an unambiguous recipe and for one two "
-        "loaders both read, so passing it proves nothing"
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_accepting_loaders",
+        lambda strategy, slot: ["load_arm_specs", "load_model_recipes"],
     )
+    with pytest.raises(AssertionError, match="Two loaders accepting one directory"):
+        _assert_exactly_one_loader(tmp_path, "u", SLOT_LOADERS["u"])
 
 
 class TestTheForeignSlotRefusalNamesItsLoader:

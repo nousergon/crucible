@@ -89,6 +89,7 @@ from crucible.slots.inputs import (
     resolve_declared_inputs,
     write_arm_predictions,
 )
+from crucible.slots.vocab import refuse_unknown_keys
 
 __all__ = [
     "DISPERSION_METRICS",
@@ -882,6 +883,23 @@ REQUIRED_RECIPE_FIELDS: tuple[str, ...] = (
     "cpcv",
 )
 
+#: Every key a filed M recipe's `spec:` may declare (`alpha-engine-config-
+#: I9944`) — the required fields above, plus `inputs`, the one optional
+#: stacked-input declaration `load_model_recipes` also reads
+#: (`alpha-engine-config-I9777`). A key outside this set is accepted-and-
+#: ignored nowhere: it is a guarantee the loader cannot honour, and the
+#: loader refuses it by name.
+M_SPEC_KEYS: frozenset[str] = frozenset({*REQUIRED_RECIPE_FIELDS, "inputs"})
+
+#: Every top-level key a filed M recipe may declare (`alpha-engine-config-
+#: I9944`) — named explicitly in the issue rather than derived, because
+#: `supersedes_v1` is provenance-only and read by `crucible migrate.history`,
+#: not by this loader, and a derivation off this module's own reads would
+#: miss it.
+M_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
+    {"slot", "name", "registered_at", "supersedes", "supersedes_v1", "notes", "spec"}
+)
+
 
 #: The metric a refused arm emits, one row per arm, on the manifest of
 #: whatever job loaded the slot. Named rather than spelled at the call site so
@@ -1046,6 +1064,20 @@ def load_model_recipes(
                 "missing fields mean the arm does not register — a half-declared arm's "
                 "verdicts cannot be interpreted later."
             )
+        refuse_unknown_keys(
+            path=path,
+            keys=set(payload),
+            vocabulary=M_TOP_LEVEL_KEYS,
+            level="top-level recipe",
+            slot_label="M",
+        )
+        refuse_unknown_keys(
+            path=path,
+            keys=set(spec),
+            vocabulary=M_SPEC_KEYS,
+            level="spec",
+            slot_label="M",
+        )
         recipes.append(
             ModelRecipe(
                 slot=payload.get("slot", "m"),

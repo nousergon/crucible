@@ -674,19 +674,31 @@ class TestRecipeLoading:
         `spec` was hashed into the arm id and read by nothing — the same bug
         class as `avg_volume_20d` (AGENTS.md), a hand-maintained value
         standing where a derived one belongs. It is now gone from the recipe
-        entirely: `REQUIRED_RECIPE_FIELDS` does not name it, a recipe that
-        still declares it under `spec` registers with the key silently
-        ignored (a private-repo recipe transitioning off the old field is not
-        refused mid-migration), and it is absent from the hashed `spec` —
-        which feature-layer artifact a run actually reads is resolved by
-        `FeatureLayerSource` and recorded as lineage
+        entirely: `REQUIRED_RECIPE_FIELDS` does not name it, and it is absent
+        from the hashed `spec` — which feature-layer artifact a run actually
+        reads is resolved by `FeatureLayerSource` and recorded as lineage
         (`FeaturePanel.feature_version`), never declared by the recipe.
+
+        A recipe that still declares it is now REFUSED, not silently
+        accepted mid-migration — see
+        `test_feature_version_under_spec_is_refused_by_name`
+        (`alpha-engine-config-I9944`, which closed the "transitional
+        accept-and-ignore" loophole this test used to document once both
+        live M recipes had already been cleaned up).
         """
         assert "feature_version" not in REQUIRED_RECIPE_FIELDS
         recipe = _recipe()
         assert "feature_version" not in recipe.spec
         assert not hasattr(recipe, "feature_version")
 
+    def test_feature_version_under_spec_is_refused_by_name(self, tmp_path) -> None:
+        """`alpha-engine-config-I9944`: `load_model_recipes` accepted-and-
+        ignored any `spec:` key it did not read, so `feature_version` (dead
+        per `alpha-engine-config-I9801`) could sit in a recipe unnoticed.
+        The loader now refuses ANY unknown `spec` key by name, naming
+        `feature_version` specifically since it has a documented reason it
+        is not an M field.
+        """
         (tmp_path / "legacy.yaml").write_text(
             "\n".join(
                 [
@@ -705,10 +717,87 @@ class TestRecipeLoading:
             ),
             encoding="utf-8",
         )
+        # The I9801 citation lives in a comment beside `_NAMED_REASONS`, never
+        # in the raised text itself (`tests/test_no_stale_tracker_literals.py`
+        # refuses a hardcoded tracker literal reachable from a raise).
+        with pytest.raises(ValueError, match="feature_version") as exc:
+            load_model_recipes(tmp_path, feature_columns=("mom_21d_ratio",))
+        assert "hashed spec that nothing read" in str(exc.value)
+
+    def test_llm_callsite_under_spec_is_refused_by_name(self, tmp_path) -> None:
+        """`alpha-engine-config-I9944`: `params.llm_callsite` binds on a U/R
+        recipe's `params`; an M recipe author writing `llm_callsite:` under
+        `spec:` — the natural place for it — would otherwise register an arm
+        the phase-5 LLM-arm gate silently never counts.
+        """
+        (tmp_path / "sneaky.yaml").write_text(
+            "\n".join(
+                [
+                    "slot: m",
+                    "name: sneaky",
+                    "spec:",
+                    "  features: [mom_21d_ratio]",
+                    "  estimator: {kind: ridge, alpha: 1.0}",
+                    "  label_horizon_trading_days: 21",
+                    "  refit_cadence_trading_days: 5",
+                    "  training_window: {kind: expanding, min_trading_days: 504}",
+                    "  cpcv: {n_groups: 6, k_test: 2, embargo_trading_days: 2}",
+                    "  llm_callsite: research.thinktank",
+                    "registered_at: '2026-06-01'",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="llm_callsite") as exc:
+            load_model_recipes(tmp_path, feature_columns=("mom_21d_ratio",))
+        assert "phase-5 gate" in str(exc.value)
+
+    def test_an_unknown_top_level_key_is_refused_by_name(self, tmp_path) -> None:
+        (tmp_path / "extra.yaml").write_text(
+            "\n".join(
+                [
+                    "slot: m",
+                    "name: extra",
+                    "bogus_field: nope",
+                    "spec:",
+                    "  features: [mom_21d_ratio]",
+                    "  estimator: {kind: ridge, alpha: 1.0}",
+                    "  label_horizon_trading_days: 21",
+                    "  refit_cadence_trading_days: 5",
+                    "  training_window: {kind: expanding, min_trading_days: 504}",
+                    "  cpcv: {n_groups: 6, k_test: 2, embargo_trading_days: 2}",
+                    "registered_at: '2026-06-01'",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="bogus_field"):
+            load_model_recipes(tmp_path, feature_columns=("mom_21d_ratio",))
+
+    def test_a_recipe_with_no_unknown_keys_still_loads(self, tmp_path) -> None:
+        """Sanity: the closed vocabulary does not reject a clean recipe,
+        including the optional `inputs` key a stacked arm declares."""
+        (tmp_path / "residual_momentum.yaml").write_text(
+            "\n".join(
+                [
+                    "slot: m",
+                    "name: residual_momentum",
+                    "spec:",
+                    "  features: [mom_21d_ratio]",
+                    "  estimator: {kind: ridge, alpha: 1.0}",
+                    "  label_horizon_trading_days: 21",
+                    "  refit_cadence_trading_days: 5",
+                    "  training_window: {kind: expanding, min_trading_days: 504}",
+                    "  cpcv: {n_groups: 6, k_test: 2, embargo_trading_days: 2}",
+                    "registered_at: '2026-06-01'",
+                    "supersedes_v1: spec-residual-mom-2026-07-17-f478ece3",
+                ]
+            ),
+            encoding="utf-8",
+        )
         loaded = load_model_recipes(tmp_path, feature_columns=("mom_21d_ratio",))
         assert loaded.refused == ()
         assert len(loaded.registered) == 1
-        assert "feature_version" not in loaded.registered[0].spec
 
     def test_arm_id_is_independent_of_which_feature_layer_version_is_resolved(
         self, tmp_path

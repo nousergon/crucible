@@ -692,18 +692,23 @@ def run_grade(
     # §10.1 as an EXCLUSION that BINDS here, not as a field this run reports.
     #
     # `promotable_arms` is the slot registry's filter and stays the shared
-    # implementation of the rule. What it cannot know is the identity a
-    # control actually carries in the register: an arm is
-    # `{slot}:{name}:{spec_hash}` everywhere it is scored — `u:control_null_u:
-    # 082d1c6a2c86` — while the slot spec holds the bare name `control_null_u`.
-    # This call site is the one place that holds BOTH, because it derived the
-    # registered ids from `control_specs` to score them, so it passes what it
-    # knows rather than leaving the exclusion to a filter matching on the
-    # other half of the identity. Once the registry filter resolves registered
-    # ids itself this intersection is a no-op, which is the correct end state:
-    # the same names removed twice, never a control removed by neither.
+    # implementation of the rule. It is now REGISTER-BACKED
+    # (`alpha-engine-config-I9943`): `register_arms` forwards `ArmSpec.control`
+    # onto the registered `ArmRecord.control`, so `is_control_arm` reads the
+    # recorded flag for any id this `register` carries rather than matching
+    # the name component against `slot_spec.control_arms`. Passing `register`
+    # here is the end state this call site's prior comment named as correct
+    # once the registry filter could resolve registered ids itself — the
+    # `not in control_ids` intersection below is now redundant with the
+    # filter and is KEPT anyway as the belt-and-suspenders check the raise
+    # immediately after it depends on: a control that reached `promotable`
+    # despite the register-backed filter is exactly the defect
+    # `GraderControlError` exists to catch, and removing the redundancy would
+    # remove the second witness that catches it.
     promotable = [
-        a for a in promotable_arms(slot_spec, list(cycle.active_arms)) if a not in control_ids
+        a
+        for a in promotable_arms(slot_spec, list(cycle.active_arms), register)
+        if a not in control_ids
     ]
     leaked = sorted(set(promotable) & control_ids)
     if leaked:

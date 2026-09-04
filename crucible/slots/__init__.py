@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Literal
 
+from nousergon_lib.arena import ArmRegister
 from nousergon_lib.arena.engine import ArenaConfig
 
 __all__ = [
@@ -288,22 +289,40 @@ def arm_name(arm_id: str) -> str:
     return parts[1]
 
 
-def is_control_arm(spec: SlotSpec, arm_id: str) -> bool:
+def is_control_arm(spec: SlotSpec, arm_id: str, register: ArmRegister | None = None) -> bool:
     """Whether ``arm_id`` is one of ``spec``'s control arms.
 
-    **Matched on the NAME component, never on the whole string.** A
-    :class:`ControlArm` carries the bare name (``control_planted_m``) because
-    that is what `crucible.slots.arms.control_specs` passes to
-    `derive_arm_id` as the recipe's name; the arm the register, the series
-    and the pointer all speak about is ``m:control_planted_m:7e8059f49558``.
-    An equality test against the literal therefore matched nothing that had
-    ever been registered — the exclusion existed and could not fire
+    **Register-backed when a register is given and carries the arm**
+    (`alpha-engine-config-I9943`). `crucible.slots.arms.register_arms` now
+    forwards `ArmSpec.control` onto the registered `ArmRecord.control`
+    (`crucible-PR102`), so once an arm is registered the FLAG is the fact —
+    read from `register.state(arm_id).record.control` — and the name match
+    below is only the FALLBACK for a bare (unregistered) id or for a row
+    written before the flag existed. The flag is authoritative even when it
+    disagrees with the name: a filed, non-control recipe whose generated
+    name happens to collide with a control's is not excluded once it is
+    registered with `control=False`, and a control is excluded even if
+    `spec.control_arms` is later emptied, because its own record still says
+    `control=True`.
+
+    **Matched on the NAME component when falling back, never on the whole
+    string.** A :class:`ControlArm` carries the bare name
+    (``control_planted_m``) because that is what
+    `crucible.slots.arms.control_specs` passes to `derive_arm_id` as the
+    recipe's name; the arm the register, the series and the pointer all
+    speak about is ``m:control_planted_m:7e8059f49558``. An equality test
+    against the literal therefore matched nothing that had ever been
+    registered — the exclusion existed and could not fire
     (`alpha-engine-config-I9757`, F4).
     """
+    if register is not None and arm_id in register:
+        return register.state(arm_id).record.control
     return arm_name(arm_id) in {c.arm_id for c in spec.control_arms}
 
 
-def promotable_arms(spec: SlotSpec, arm_ids: list[str]) -> list[str]:
+def promotable_arms(
+    spec: SlotSpec, arm_ids: list[str], register: ArmRegister | None = None
+) -> list[str]:
     """``arm_ids`` minus the slot's control arms, order preserved.
 
     §10.1: controls are scored every cycle and are excluded from the pointer
@@ -318,8 +337,11 @@ def promotable_arms(spec: SlotSpec, arm_ids: list[str]) -> list[str]:
     both shapes exist: a recipe is loaded by name and scored by id, and a
     filter that only understood one of them is a filter that never fired on
     the path that matters.
+
+    ``register``, when given, makes the exclusion register-backed rather than
+    name-matched — see :func:`is_control_arm` (`alpha-engine-config-I9943`).
     """
-    return [a for a in arm_ids if not is_control_arm(spec, a)]
+    return [a for a in arm_ids if not is_control_arm(spec, a, register)]
 
 
 # ---------------------------------------------------------------------------

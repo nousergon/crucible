@@ -88,6 +88,36 @@ class TestRecipes:
         with pytest.raises(ValueError, match="teleport"):
             load_strategy_recipes(tmp_path)
 
+    def test_an_unknown_spec_key_is_refused_by_name(self, tmp_path) -> None:
+        """`alpha-engine-config-I9944`: an S recipe author writing
+        `llm_callsite:` under `spec:` — the natural place for it — would
+        otherwise register an arm the phase-5 LLM-arm gate silently never
+        counts. Every unrecognised `spec` key is refused, named."""
+        (tmp_path / "sneaky.yaml").write_text(
+            "slot: s\nname: sneaky\nspec:\n"
+            "  cost_model: {name: flat_bps_v0, placeholder: true, params: "
+            "{half_spread_bps: 2.5, commission_bps: 0.5, slippage_bps: 10.0}}\n"
+            "  rules:\n    - {rule_id: position_loss_floor,"
+            " params: {position_loss_floor_pct: 0.08}}\n"
+            "  llm_callsite: research.thinktank\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="llm_callsite") as exc:
+            load_strategy_recipes(tmp_path)
+        assert "phase-5 gate" in str(exc.value)
+
+    def test_an_unknown_top_level_key_is_refused_by_name(self, tmp_path) -> None:
+        (tmp_path / "extra.yaml").write_text(
+            "slot: s\nname: extra\nbogus_field: nope\nspec:\n"
+            "  cost_model: {name: flat_bps_v0, placeholder: true, params: "
+            "{half_spread_bps: 2.5, commission_bps: 0.5, slippage_bps: 10.0}}\n"
+            "  rules:\n    - {rule_id: position_loss_floor,"
+            " params: {position_loss_floor_pct: 0.08}}\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="bogus_field"):
+            load_strategy_recipes(tmp_path)
+
 
 class TestWalkForward:
     """The fold geometry, asserted as PROPERTIES rather than as arithmetic.
