@@ -46,9 +46,13 @@ FRIDAY_SWEEP = dt.datetime(2026, 9, 5, 1, 0, tzinfo=dt.UTC)
 #: report: 13:00 UTC on the following calendar day.
 OCCURRENCE = dt.datetime(2026, 9, 4, 13, 0, tzinfo=dt.UTC)
 
-#: The floor I9960 sets for the deadline, from the ONE measured GitHub
-#: scheduler latency on this fleet (113 minutes, `board.yml`, 2026-09-03).
-LATENCY_FLOOR_MINUTES = 180
+#: The floor I9960/I9966 set for the deadline, from the worst of four
+#: measured `nous-ergon-ops` GitHub Actions cron delays on 2026-09-04
+#: (authority-surface, +304 min) — not from the single 113-minute
+#: `board.yml` sample, which was this account's best case, not its
+#: envelope. See `components.yaml`'s `report.morning.deadline` comment for
+#: the full four-workflow table.
+LATENCY_FLOOR_MINUTES = 304
 
 MORNING = "report.morning"
 
@@ -124,12 +128,13 @@ class TestTheMissedFiringIsSeen:
 
 
 class TestTheDeadlineComesFromAMeasurement:
-    def test_the_registry_allows_at_least_the_measured_github_latency(self) -> None:
-        """N is set from the 113-minute observation, not from a preference for
-        a faster page. A deadline tighter than the only latency this fleet has
-        measured produces a first page about GitHub's scheduler rather than
-        about a report that did not go out, and an operator who dismisses one
-        page dismisses the next.
+    def test_the_registry_allows_at_least_the_measured_account_envelope(self) -> None:
+        """N is set from the worst of four measured account-wide cron delays,
+        not from a preference for a faster page. A deadline tighter than the
+        delivery envelope this account has actually measured produces a
+        near-daily page about GitHub's scheduler rather than about a report
+        that did not go out, and an operator who dismisses one page dismisses
+        the next.
         """
         deadline = load_registry()[MORNING].deadline
         assert deadline is not None
@@ -143,6 +148,46 @@ class TestTheDeadlineComesFromAMeasurement:
         deadline = load_registry()[MORNING].deadline
         assert deadline is not None
         assert deadline.due_at(THURSDAY) < OCCURRENCE + dt.timedelta(hours=24)
+
+
+class TestTheCalibratedThresholdChangesTheReading:
+    """§7.4: the constant is not decorative. A report delivered 300 minutes
+    after its occurrence is inside the account's measured worst cron delay
+    (304 minutes, `authority-surface`, 2026-09-04) — the recalibrated
+    360-minute deadline reads it as on time, and the original 210-minute one
+    (12:30 ET, set from the single 113-minute `board.yml` sample) would have
+    read it as absent.
+    """
+
+    ARRIVAL = OCCURRENCE + dt.timedelta(minutes=300)
+
+    def test_the_new_360_minute_deadline_reads_a_300_minute_arrival_as_on_time(self) -> None:
+        deadline = load_registry()[MORNING].deadline
+        assert deadline is not None
+        assert self.ARRIVAL <= deadline.due_at(THURSDAY)
+
+    def test_the_original_210_minute_deadline_would_have_read_it_as_absent(self) -> None:
+        from crucible.components import Deadline
+
+        old_deadline = Deadline(anchor="next_calendar_day_at", at=dt.time(12, 30))
+        assert self.ARRIVAL > old_deadline.due_at(THURSDAY)
+
+    def test_the_two_readings_differ(self) -> None:
+        """The load-bearing assertion: the same arrival, judged by the two
+        constants, does not produce the same verdict.
+        """
+        from crucible.components import Deadline
+
+        new_deadline = load_registry()[MORNING].deadline
+        assert new_deadline is not None
+        old_deadline = Deadline(anchor="next_calendar_day_at", at=dt.time(12, 30))
+
+        new_reads_on_time = self.ARRIVAL <= new_deadline.due_at(THURSDAY)
+        old_reads_on_time = self.ARRIVAL <= old_deadline.due_at(THURSDAY)
+
+        assert new_reads_on_time is True
+        assert old_reads_on_time is False
+        assert new_reads_on_time != old_reads_on_time
 
 
 class _Unlistable(LocalStore):
