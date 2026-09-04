@@ -28,6 +28,8 @@ from crucible.documents import (
 from crucible.gate import LADDER_KEY, LADDER_STATES, PHASES, build_ladder
 from crucible.gate import validate_ladder_document as _validate_ladder_document
 from crucible.keys import (
+    CONSOLE_JSON_KEY,
+    CONSOLE_KEY,
     RUNS_ROOT,
     attribution_key,
     champion_key,
@@ -56,8 +58,9 @@ __all__ = [
 #: (alpha-engine-config-I9839).
 _C14_PHASE = next(p for p in PHASES if p.id == "phase1")
 
-CONSOLE_KEY = "console/index.html"
-CONSOLE_JSON_KEY = "console/index.json"
+# `CONSOLE_KEY` / `CONSOLE_JSON_KEY` live in `crucible.keys` like every other
+# store key shape (alpha-engine-config-I9899, round 2) and are imported above;
+# `CONSOLE_KEY` stays in this module's `__all__` for its existing readers.
 
 
 @dataclass

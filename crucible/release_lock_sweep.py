@@ -52,8 +52,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from crucible.keys import RELEASES_ROOT
 from crucible.release import (
-    POINTER_KEY,
     RELEASE_OBJECT_LOCK_RETENTION,
     RETENTION_CLOCK_SKEW_SLACK,
     retention_meets_target,
@@ -109,17 +109,6 @@ _RELEASE_OBJECT_RE = re.compile(
 #: disappeared between the list and this read).
 _NO_RETENTION_ERROR_CODE = "NoSuchObjectLockConfiguration"
 
-#: The `releases/` root, derived from `crucible.release.POINTER_KEY`
-#: ("releases/current") rather than restated as a fresh literal —
-#: `crucible/keys.py` (alpha-engine-config-I9875, a live concurrent PR owns
-#: it) has no `RELEASES_ROOT` constant today; naming the gap here rather
-#: than editing `keys.py` avoids a conflicting concurrent edit to a file
-#: this track does not own. `tests/test_no_inline_store_keys.py` requires
-#: `list_keys`'s first argument to be a `Name`/`Attribute`/`Call`, never an
-#: inline string constant — this satisfies that by construction, not by
-#: coincidence.
-_RELEASES_ROOT = POINTER_KEY.rsplit("/", 1)[0] + "/"
-
 
 @dataclass(frozen=True)
 class ReleaseLockReading:
@@ -145,7 +134,7 @@ def _release_object_keys(store: Store) -> list[str]:
     a release identity object from a same-named object living somewhere
     else under the prefix.
     """
-    return sorted(key for key in store.list_keys(_RELEASES_ROOT) if _RELEASE_OBJECT_RE.match(key))
+    return sorted(key for key in store.list_keys(RELEASES_ROOT) if _RELEASE_OBJECT_RE.match(key))
 
 
 def _read_one(store: S3Store, key: str) -> ReleaseLockReading:

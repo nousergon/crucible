@@ -33,10 +33,15 @@ __all__ = [
     "AcceptanceReading",
     "BOARD_CURRENT_KEY",
     "BOARD_HTML_KEY",
+    "CONSOLE_JSON_KEY",
+    "CONSOLE_KEY",
     "DRIFT_INPUTS",
     "MANIFEST_BASENAME",
+    "POINTER_KEY",
+    "RELEASES_ROOT",
     "REVIEWER_PATTERN",
     "RUNS_ROOT",
+    "TRADER_PIN_KEY",
     "acceptance_reading_key",
     "arena_cycle_key",
     "arm_id_from_segment",
@@ -694,6 +699,33 @@ BOARD_CURRENT_KEY = "board/current.json"
 #: alongside its HTML: a page whose numbers can only be scraped out of markup
 #: is a page the next automated reader re-derives incorrectly.
 BOARD_HTML_KEY = "board/index.html"
+
+#: The fleet console's served page and its agent-readable JSON twin
+#: (`console-policy`), previously two literals in `crucible/console/render.py`
+#: that `tests/test_no_inline_store_keys.py` could not see until it learned
+#: to resolve a module-level Name (alpha-engine-config-I9899, round 2).
+CONSOLE_KEY = "console/index.html"
+CONSOLE_JSON_KEY = "console/index.json"
+
+#: Every published release lives under here — `releases/{sha}/...` (owned by
+#: `crucible.release.release_prefix`, an architectural exception registered
+#: in `tests/test_key_construction_placement.py`) and the `releases/current`
+#: pointer. The listing root for the release-lock sweep, which used to
+#: derive it from the pointer key with `rsplit` because this constant did not
+#: exist (same round).
+RELEASES_ROOT = "releases/"
+
+#: The single mutable object in the whole release layout — the pointer every
+#: job follows. Everything else under `releases/` is immutable and
+#: content-addressed by the sha in its own prefix. Lived in
+#: `crucible/release.py` until alpha-engine-config-I9899 round 2, when the
+#: call-site guard learned to resolve a module-level Name and found it.
+POINTER_KEY = f"{RELEASES_ROOT}current"
+
+#: The trader's separate pin. Two pointers, never one: a trader that followed
+#: `current` would be promoted by every merge, and release promotion to the
+#: trader is an explicit off-market-hours action (plan §4.11).
+TRADER_PIN_KEY = "trader/release_pin"
 
 
 def board_key(trading_day: str) -> str:
