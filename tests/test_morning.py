@@ -48,18 +48,6 @@ from crucible.keys import (
     morning_report_key,
     morning_trigger_key,
 )
-
-
-def _message_output(manifest: dict) -> dict:
-    """The delivered MESSAGE's output row.
-
-    The job files two outputs (alpha-engine-config-I9960): the message it
-    delivered, and what started the delivery. Selected by suffix rather than
-    by position so a third artifact cannot silently change which one a test
-    is asserting about.
-    """
-    (row,) = [o for o in manifest["outputs"] if o["key"].endswith("message.txt")]
-    return row
 from crucible.morning import (
     ACCEPTANCE_NOT_ON_ANY_ARTIFACT,
     ACCEPTANCE_UNREADABLE,
@@ -86,6 +74,19 @@ from crucible.morning import (
     wire_length,
 )
 from crucible.store import LocalStore
+
+
+def _message_output(manifest: dict) -> dict:
+    """The delivered MESSAGE's output row.
+
+    The job files two outputs (alpha-engine-config-I9960): the message it
+    delivered, and what started the delivery. Selected by suffix rather than
+    by position so a third artifact cannot silently change which one a test
+    is asserting about.
+    """
+    (row,) = [o for o in manifest["outputs"] if o["key"].endswith("message.txt")]
+    return row
+
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "morning-report.yml"
