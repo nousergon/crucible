@@ -1286,6 +1286,40 @@ WEEKLY_RUN_DAY_GATE_SKIP_MAX_SECONDS = 10.0
 #: a rerun that happened to be short is still a rerun.
 LEGACY_WEEKLY_RERUN_NAME_PREFIX = "watch-rerun-"
 
+#: The week a `watch-rerun-*` execution names, as the sf-watch rerun path
+#: spelled it: `watch-rerun-YYYY-MM-DD-N`, where the date is the week being
+#: retried and `N` is the attempt number.
+LEGACY_WEEKLY_RERUN_NAME_RE = re.compile(
+    rf"^{re.escape(LEGACY_WEEKLY_RERUN_NAME_PREFIX)}(\d{{4}}-\d{{2}}-\d{{2}})-\d+$"
+)
+
+
+def rerun_names_another_week(name: object, anchor: dt.date) -> bool:
+    """True when `name` is a `watch-rerun-*` naming a week other than `anchor`.
+
+    ONE implementation, called by both `_clause_old_weekly_within_cadence`
+    (through `_LegacyWeeklyExecution`) and `_clause_old_alerts_muted` (on the
+    raw filed entry, which it reads as dicts). Two clauses that disagreed
+    about which executions belong to a week would grade two different weeks
+    under one anchor, and this repository has already found one reader
+    drifting from its twin inside the change that introduced it.
+
+    Anything that is not a parseable rerun name returns False, so the
+    execution stays attributed to the week it was FILED under. That is the
+    deliberate direction: an unparseable name must fail somewhere, and the
+    week it was filed under is the only week guaranteed to read it.
+    """
+    if not isinstance(name, str) or not name.startswith(LEGACY_WEEKLY_RERUN_NAME_PREFIX):
+        return False
+    match = LEGACY_WEEKLY_RERUN_NAME_RE.match(name)
+    if match is None:
+        return False
+    try:
+        return dt.date.fromisoformat(match.group(1)) != anchor
+    except ValueError:  # a name-shaped string that is not a real date
+        return False
+
+
 #: The schema the dead-Lambda probe must declare. Same refusal rule as the
 #: weekly executions document: an unrecognised version is UNMEASURABLE, never
 #: a pass. Producer:
@@ -1501,6 +1535,36 @@ class _LegacyWeeklyExecution:
         return self.name.startswith(LEGACY_WEEKLY_RERUN_NAME_PREFIX)
 
     @property
+    def rerun_target_week(self) -> dt.date | None:
+        """The week this rerun RETRIES, from its own name — or `None`.
+
+        `None` covers both "not a rerun" and "a rerun whose name this reader
+        cannot parse". The two are distinguished by `is_rerun`, and the
+        callers treat an unparseable rerun as belonging to the week it was
+        filed under, which is the reading that fails loudly rather than the
+        one that lets an execution escape every clause.
+        """
+        if not self.is_rerun:
+            return None
+        match = LEGACY_WEEKLY_RERUN_NAME_RE.match(self.name)
+        if match is None:
+            return None
+        try:
+            return dt.date.fromisoformat(match.group(1))
+        except ValueError:  # a name-shaped string that is not a real date
+            return None
+
+    def reruns_a_week_other_than(self, anchor: dt.date) -> bool:
+        """True when this is a rerun that names some OTHER week than `anchor`.
+
+        Delegates to `rerun_names_another_week` so the routing clause, which
+        reads raw filed entries, cannot drift from this one. See
+        `_clause_old_weekly_within_cadence` for why the distinction is
+        load-bearing and what it deliberately stops detecting.
+        """
+        return rerun_names_another_week(self.name, anchor)
+
+    @property
     def is_gate_skip(self) -> bool:
         """A `WeeklyRunDayGate` Succeed-skip: the fail-open margin, not a run.
 
@@ -1638,6 +1702,34 @@ def _clause_old_weekly_within_cadence(
     list, and a reader that branches on another parameter's value hides one
     phase's semantics inside the other's.
 
+    **A rerun is graded against the week it RETRIES, not the week it ran in**
+    (`alpha-engine-config-I9756`, 2026-09-04). The sf-watch rerun path names
+    its executions `watch-rerun-YYYY-MM-DD-N`, where the date is the week
+    being retried, so the execution declares its own subject. Thirteen
+    `watch-rerun-2026-08-28-*` executions ran on Sunday 2026-08-30 — retries
+    of the 08-28 cycle's failure — and by start date they land in the week
+    ending Friday 2026-09-04. Failing THAT week on them reports a finding
+    about a week in which nothing went wrong; the reruns are evidence about
+    2026-08-28.
+
+    No 7-day window that tiles the calendar and is complete when it is filed
+    can separate them, which is why the fix is here and not in the producer's
+    window: the fact that distinguishes them is the name, and names are what
+    this repository classifies (see `_LegacyWeeklyExecution`).
+
+    **What this deliberately stops detecting, stated so it can be reversed.**
+    A rerun of an EARLIER week now fails no week's clause: the week it names
+    was already graded and its document, keyed by start date, does not contain
+    it. So a rerun issuer that only ever retried old weeks would be invisible
+    HERE. It is not invisible: `_clause_dead_lambdas_deleted` grades the
+    issuer itself — `alpha-engine-sf-watch-reclaim-sweep-handler` must be
+    absent by exact name — which is the direct measurement this clause only
+    ever proxied. Every such execution is also named in this clause's detail
+    on both a MET and an UNMET reading, so it appears on the ladder either
+    way. A rerun naming THIS week still fails it, and an unparseable rerun
+    name is attributed to the week it was filed under, which fails loudly
+    rather than letting an execution escape every clause.
+
     ``skips_count_as_runs`` keeps phase 4's meaning intact across this change.
     Phase 4 asks whether the v1 pipeline is DECOMMISSIONED, and a
     decommissioned state machine emits no executions at all — a surviving
@@ -1682,8 +1774,9 @@ def _clause_old_weekly_within_cadence(
     over: list[str] = []
     under: list[str] = []
     reruns: list[str] = []
+    elsewhere: list[str] = []
     skipped_total = 0
-    for key in evidence:
+    for anchor, key in zip(anchors, evidence, strict=True):
         # Read through the guarded reader, never `json.loads` + indexing. This
         # document is written by a producer outside this repository, and an
         # exception here does not fail one clause: it propagates out of
@@ -1712,6 +1805,16 @@ def _clause_old_weekly_within_cadence(
         if problem is not None or executions is None:
             malformed.append(problem or f"{key}: unreadable")
             continue
+        # A rerun is attributed to the week its NAME retries, not to the week
+        # its StartDate fell in. `alpha-engine-config-I9756`, 2026-09-04.
+        foreign = [e for e in executions if e.reruns_a_week_other_than(anchor)]
+        if foreign:
+            elsewhere.append(
+                f"{key}: {len(foreign)} watch-rerun execution(s) naming other week(s) "
+                f"({', '.join(sorted({str(e.rerun_target_week) for e in foreign}))}) — "
+                "attributed there, not graded against this week"
+            )
+        executions = [e for e in executions if not e.reruns_a_week_other_than(anchor)]
         week_reruns = [e for e in executions if e.is_rerun]
         if week_reruns:
             reruns.append(
@@ -1762,6 +1865,11 @@ def _clause_old_weekly_within_cadence(
             parts.append("; ".join(over))
         if under:
             parts.append("; ".join(under))
+        if elsewhere:
+            # Named even on a FAILING reading: an execution the clause chose
+            # not to grade here must never be invisible, whichever way the
+            # clause lands.
+            parts.append("; ".join(elsewhere))
         return Clause(
             name,
             requirement,
@@ -1784,7 +1892,8 @@ def _clause_old_weekly_within_cadence(
         f"watch-rerun executions ({skipped_total} sub-"
         f"{WEEKLY_RUN_DAY_GATE_SKIP_MAX_SECONDS:g}s Succeed-skip"
         f"{'s' if skipped_total != 1 else ''} "
-        f"{'counted' if skips_count_as_runs else 'excluded'})",
+        f"{'counted' if skips_count_as_runs else 'excluded'})"
+        + ("; " + "; ".join(elsewhere) if elsewhere else ""),
         tuple(evidence),
     )
 
@@ -1973,8 +2082,9 @@ def _clause_old_alerts_muted(store: Store, window: list[dt.date]) -> Clause:
     evidence = [legacy_weekly_executions_key(a.isoformat()) for a in anchors]
     unreadable: list[str] = []
     paging: list[str] = []
+    elsewhere: list[str] = []
     routed_total = 0
-    for key in evidence:
+    for anchor, key in zip(anchors, evidence, strict=True):
         read = _read_store_document(store, key)
         if read.problem is not None:
             unreadable.append(read.problem)
@@ -2007,12 +2117,19 @@ def _clause_old_alerts_muted(store: Store, window: list[dt.date]) -> Clause:
             continue
         malformed = False
         unrouted: list[str] = []
+        foreign = 0
         for entry in entries:
             if not isinstance(entry, dict):
                 unreadable.append(f"{key}: an entry in `executions` is not an object")
                 malformed = True
                 break
             name = entry.get("name")
+            # Attributed to the week its name retries, exactly as the cadence
+            # clause does — the two clauses must agree about which executions
+            # belong to a week or one anchor grades two different weeks.
+            if rerun_names_another_week(name, anchor):
+                foreign += 1
+                continue
             if LEGACY_WEEKLY_TOPIC_FIELD not in entry:
                 unreadable.append(
                     f"{key}: execution {name!r} carries no `{LEGACY_WEEKLY_TOPIC_FIELD}` — "
@@ -2036,24 +2153,41 @@ def _clause_old_alerts_muted(store: Store, window: list[dt.date]) -> Clause:
                 unrouted.append(f"{name}: {arn.rsplit(':', 1)[-1]}")
         if malformed:
             continue
+        if foreign:
+            elsewhere.append(
+                f"{key}: {foreign} watch-rerun execution(s) naming other week(s), "
+                "attributed there and not graded for routing here"
+            )
         if unrouted:
             paging.append(
                 f"{key}: {len(unrouted)} execution(s) not routed to "
                 f"`{MUTED_ALERTS_TOPIC_NAME}`: {'; '.join(unrouted)}"
             )
             continue
-        routed_total += len(entries)
+        if foreign == len(entries):
+            # Every execution the week filed was another week's rerun, so this
+            # week declared no routing of its own. That is an absence, and the
+            # clause already refuses to read routing from one.
+            unreadable.append(
+                f"{key}: every filed execution is a watch-rerun of another week, so this "
+                "week's own publish path named no topic. Routing cannot be read from an "
+                "absence"
+            )
+            continue
+        routed_total += len(entries) - foreign
     if paging:
         detail = "; ".join(paging)
         if unreadable:
             detail += f"; {len(unreadable)} week(s) also unreadable: {'; '.join(unreadable)}"
+        if elsewhere:
+            detail += "; " + "; ".join(elsewhere)
         return Clause("old_alerts_muted", requirement, False, detail, tuple(evidence))
     if unreadable:
         return Clause(
             "old_alerts_muted",
             requirement,
             False,
-            "; ".join(unreadable),
+            "; ".join(unreadable) + ("; " + "; ".join(elsewhere) if elsewhere else ""),
             tuple(evidence),
             unmeasurable=True,
         )
@@ -2062,7 +2196,7 @@ def _clause_old_alerts_muted(store: Store, window: list[dt.date]) -> Clause:
         requirement,
         True,
         f"{routed_total} execution(s) across {len(evidence)} week(s), every input naming "
-        f"`{MUTED_ALERTS_TOPIC_NAME}`",
+        f"`{MUTED_ALERTS_TOPIC_NAME}`" + ("; " + "; ".join(elsewhere) if elsewhere else ""),
         tuple(evidence),
     )
 
