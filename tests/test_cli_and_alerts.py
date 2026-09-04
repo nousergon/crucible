@@ -421,6 +421,71 @@ class TestDryRunNeverWrites:
         "report",
     )
 
+    #: The jobs each covered by their own one-off SEEDED row below rather
+    #: than the shared fresh-store parametrisation above -- each needs
+    #: something present in the store, or a config env var, before it can
+    #: reach its real dry-run path (a bucket name for the three ArcticDB
+    #: jobs, drift's three input keys, promote's empty register, morning's
+    #: seeded board).
+    _COVERED_BY_A_SEEDED_ROW = frozenset(
+        {"data.daily", "data.heal", "data.weekly", "drift", "promote", "report.morning"}
+    )
+
+    #: Every job in `JOBS` NOT covered by a row above, each with the reason
+    #: it is excluded rather than tested here -- lifted from this class's own
+    #: docstring, which states the reason but never asserted it against
+    #: `JOBS` itself.
+    _EXCLUDED_WITH_REASON = {
+        "explain": "no dry-run semantics at all -- always read-only, the flag is never read",
+        "experiment.new": "needs a synced strategy tree with real arm recipes",
+        "migrate.history": "needs seeded v1 sources",
+        "smoke": "needs a published release publishing through crucible.deploy's own flow",
+        "release.lock": (
+            "S3-only (apply_release_retention refuses a LocalStore outright); covered "
+            "instead, against a fake S3 client, by tests/test_release_retention.py::"
+            "TestReleaseLockHandler::test_dry_run_writes_no_manifest_at_all"
+        ),
+        "weekly": (
+            "hands --dry-run DOWN onto twelve stages' own argv; a per-job row here could "
+            "not observe that hand-down, so it is asserted directly, against a fake main, "
+            "by tests/test_weekly.py::TestRunsTheRealCommand::"
+            "test_a_dry_run_arc_puts_dry_run_on_every_stage and "
+            "test_a_real_arc_puts_dry_run_on_no_stage"
+        ),
+    }
+
+    def test_every_job_is_dry_run_tested_or_excluded_with_a_reason(self) -> None:
+        """The class fix for alpha-engine-config-I9863.
+
+        `_CLEAN_ON_A_FRESH_STORE` and the seeded rows below are all
+        hand-written lists of job names, not derived from `crucible.cli.JOBS`
+        -- which is exactly how the sixth handler (and the fourteenth, and
+        the twenty-first) gets added with no dry-run coverage at all: nothing
+        here would notice, because nothing here reads `JOBS`.
+
+        This is the derivation: every job in `JOBS` is either covered
+        directly (by one of the two sets above) or named in
+        `_EXCLUDED_WITH_REASON`, and never simply absent from both. A new
+        job that is neither seeded here nor given a stated exclusion fails
+        this test loudly, by name, rather than silently inheriting zero
+        dry-run assurance.
+        """
+        covered = set(self._CLEAN_ON_A_FRESH_STORE) | self._COVERED_BY_A_SEEDED_ROW
+        excluded = set(self._EXCLUDED_WITH_REASON)
+        double_counted = covered & excluded
+        assert not double_counted, (
+            f"{sorted(double_counted)} listed as both dry-run tested AND excluded -- pick one."
+        )
+        accounted_for = covered | excluded
+        missing = set(JOBS) - accounted_for
+        assert not missing, (
+            f"{sorted(missing)} are registered in crucible.cli.JOBS with NO dry-run "
+            "coverage and no stated exclusion. Add a --dry-run test row for each, or a "
+            "reason to _EXCLUDED_WITH_REASON if one genuinely cannot be tested here."
+        )
+        stale = accounted_for - set(JOBS)
+        assert not stale, f"{sorted(stale)} are named here but no longer in crucible.cli.JOBS."
+
     @staticmethod
     def _assert_no_new_keys(tmp_path, before: list[str]) -> None:
         from crucible.store import LocalStore
