@@ -35,6 +35,7 @@ This module holds the slot *shape* only, which is why it is publishable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import ModuleType
 from typing import Literal
 
 from nousergon_lib.arena.engine import ArenaConfig
@@ -52,6 +53,7 @@ __all__ = [
     "SlotSpec",
     "arena_config_for",
     "arm_name",
+    "dispatchable_slots",
     "get_slot",
     "is_control_arm",
     "load_arm_specs",
@@ -111,6 +113,12 @@ class SlotSpec:
     slot: str
     slot_kind: str
     benchmark: str
+    #: The `crucible.slots.<module>` that carries this slot's `produce` and
+    #: `grade` entry points once it has them. A declared fact about where
+    #: the code lives, read by :func:`dispatchable_slots`; it says nothing
+    #: about whether the entry points EXIST yet -- that is read off the
+    #: module itself, never asserted here.
+    module: str
     #: Brian's ruling, 2026-09-01. Four paired weeks = 20 paired trading
     #: days; a holiday week is still one rung (§4.12). Scored and laddered
     #: from week one, but the pointer cannot move to the arm before week 4;
@@ -167,6 +175,7 @@ SLOTS: dict[str, SlotSpec] = {
     "u": SlotSpec(
         slot="u",
         slot_kind="universe_cut",
+        module="universe",
         # A selection stage is graded against the population it drew from,
         # count-matched. Never SPY.
         benchmark="population",
@@ -175,12 +184,14 @@ SLOTS: dict[str, SlotSpec] = {
     "r": SlotSpec(
         slot="r",
         slot_kind="selection_producer",
+        module="research",
         benchmark="population",
         control_arms=_controls("r"),
     ),
     "m": SlotSpec(
         slot="m",
         slot_kind="model",
+        module="model",
         # CPCV OOS IC on canonical 21 trading-day labels; the population is
         # the scored cross-section, not an index.
         benchmark="population",
@@ -189,6 +200,7 @@ SLOTS: dict[str, SlotSpec] = {
     "s": SlotSpec(
         slot="s",
         slot_kind="strategy",
+        module="strategy",
         # S is not a selection stage: market-relative canonical alpha net of
         # the cost model, against SPY, is the correct axis here. The
         # population rule above must not be over-applied into a second defect.
@@ -196,6 +208,36 @@ SLOTS: dict[str, SlotSpec] = {
         control_arms=_controls("s"),
     ),
 }
+
+
+def dispatchable_slots() -> dict[str, ModuleType]:
+    """The slots the CLI can actually run, in `SLOTS` order.
+
+    A slot is dispatchable when the module its spec names exposes both
+    ``produce`` and ``grade`` -- the entry points `experiment.run` and
+    `experiment.grade` call. Read off the modules, never listed: the plan
+    brings M and S onto the CLI at phase 3 (§6 row 3), and until their
+    entry points exist a weekly arc that expanded over all four slots failed
+    by construction at ``experiment.run[m]`` while the phase-1 gate, deriving
+    the same set, could never read MET. Measured 2026-09-04 with
+    ``crucible weekly --date 2026-08-28 --run-mode replay --dry-run``.
+
+    So the arc grows the moment a slot's entry points land, with no list to
+    update and no gate clause to re-derive -- both read this.
+    """
+    import importlib  # noqa: PLC0415 - lazy: the submodules import from this package
+
+    found: dict[str, ModuleType] = {}
+    for slot, spec in SLOTS.items():
+        module = importlib.import_module(f"crucible.slots.{spec.module}")
+        if callable(getattr(module, "produce", None)) and callable(getattr(module, "grade", None)):
+            found[slot] = module
+    if not found:
+        raise RuntimeError(
+            "no slot module exposes both `produce` and `grade`; the weekly arc would "
+            "run no experiment at all and report `ok`"
+        )
+    return found
 
 
 def get_slot(slot: str) -> SlotSpec:

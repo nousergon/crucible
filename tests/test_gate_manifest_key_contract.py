@@ -31,7 +31,7 @@ from crucible.cli import HANDLERS
 from crucible.components import load_registry
 from crucible.gate import _clause_arc_runs_ok
 from crucible.manifest import manifest_key
-from crucible.slots import SLOTS
+from crucible.slots import SLOTS, dispatchable_slots
 from crucible.store import LocalStore
 from crucible.weekly import ARC_SLOT_JOBS, arc_stages
 
@@ -133,10 +133,11 @@ class TestGateReadsWhatTheRealWriterWrote:
             )
         clause = _clause_arc_runs_ok(store, [FRIDAY], registry)
         assert not clause.met
-        # Exactly the 8 slot-scoped stages (4 slots x {experiment.run,
-        # experiment.grade}) are missing — the 4 non-slot stages, which
-        # never had a discriminator to begin with, are unaffected.
-        assert "8 never ran" in clause.detail, clause.detail
+        # Exactly the slot-scoped stages (every DISPATCHABLE slot x
+        # {experiment.run, experiment.grade}) are missing — the 4 non-slot
+        # stages, which never had a discriminator to begin with, are unaffected.
+        expected = 2 * len(dispatchable_slots())
+        assert f"{expected} never ran" in clause.detail, clause.detail
 
     def test_removing_the_discriminator_from_the_gate_read_reintroduces_the_defect(
         self, tmp_path, monkeypatch

@@ -23,6 +23,10 @@ explicit argument, then environment variable, then the declared default:
   what a spot instance sees;
 * the **ArcticDB bucket** (``CRUCIBLE_ARCTIC_BUCKET``), the production price
   source's backing bucket;
+* the **declared universe** (``CRUCIBLE_UNIVERSE_URI``), the document the
+  data jobs measure coverage against when ``--symbols`` is not given — see
+  :mod:`crucible.data.universe` for the two accepted shapes and why a
+  source-derived denominator is refused;
 * the **CloudTrail archive** (``CRUCIBLE_CLOUDTRAIL_ARCHIVE``), an
   ``s3://bucket/prefix`` URI the autonomy gate reads human-originated mutating
   calls from (§11 risk 8);
@@ -52,6 +56,7 @@ __all__ = [
     "DEFAULT_LLM_CAP_USD",
     "DEFAULT_LLM_CAP_USD_MEASURED",
     "DEFAULT_STORE_URI",
+    "DEFAULT_UNIVERSE_URI",
     "STRATEGY_PREFIX",
     "Settings",
     "settings",
@@ -76,6 +81,16 @@ DEFAULT_STORE_URI: str | None = None
 #: `ArcticPriceSource.__init__` raises on an empty bucket rather than reaching
 #: S3 with one — same shape as `DEFAULT_CLOUDTRAIL_ARCHIVE` below.
 DEFAULT_ARCTIC_BUCKET = ""
+
+#: The declared universe the data jobs grade coverage against when
+#: `--symbols` is absent — a membership document or a pointer to one
+#: (`crucible.data.universe`). **No default, deliberately**, for the same two
+#: reasons as `DEFAULT_ARCTIC_BUCKET`: the value is an `s3://` URI into a
+#: bucket this public-at-phase-1 tree may not name, and an empty value must
+#: keep producing `UndeclaredUniverseError` rather than a guessed document.
+#: Measured 2026-09-04: every scheduled `data.daily` failed on exactly that
+#: refusal because nothing on a schedule can type a 903-name `--symbols`.
+DEFAULT_UNIVERSE_URI = ""
 
 #: The strategy tree's home inside the store. `current` is a pointer prefix,
 #: not a mutable directory: a strategy change is a sync of a new tree, and
@@ -115,6 +130,9 @@ class Settings:
     store_uri: str | None
     arctic_bucket: str
     strategy_dir: Path | None
+    #: See :data:`DEFAULT_UNIVERSE_URI`. Read by `crucible.track_a` for the
+    #: three data jobs; empty means "nothing declared", and the job refuses.
+    universe_uri: str = DEFAULT_UNIVERSE_URI
     cloudtrail_archive: str = DEFAULT_CLOUDTRAIL_ARCHIVE
     stack_name: str = DEFAULT_STACK_NAME
     #: `alpha-engine-config-I9926` — see :data:`DEFAULT_CONSOLE_URL`. Read by
@@ -183,6 +201,7 @@ class Settings:
         return {
             "store_uri": self.store_uri,
             "arctic_bucket": self.arctic_bucket,
+            "universe_uri": self.universe_uri,
             "cloudtrail_archive": self.cloudtrail_archive,
             "stack_name": self.stack_name,
             "console_url": self.console_url,
@@ -207,6 +226,7 @@ def settings(
     store_uri: str | None = None,
     arctic_bucket: str | None = None,
     strategy_dir: str | os.PathLike[str] | None = None,
+    universe_uri: str | None = None,
     llm_cap_usd: float | None = None,
     cloudtrail_archive: str | None = None,
     stack_name: str | None = None,
@@ -218,6 +238,9 @@ def settings(
     resolved_store, origins["store_uri"] = _resolve(store_uri, "CRUCIBLE_STORE", DEFAULT_STORE_URI)
     resolved_arctic, origins["arctic_bucket"] = _resolve(
         arctic_bucket, "CRUCIBLE_ARCTIC_BUCKET", DEFAULT_ARCTIC_BUCKET
+    )
+    resolved_universe, origins["universe_uri"] = _resolve(
+        universe_uri, "CRUCIBLE_UNIVERSE_URI", DEFAULT_UNIVERSE_URI
     )
     resolved_cap, origins["llm_cap_usd"] = _resolve(
         None if llm_cap_usd is None else str(llm_cap_usd),
@@ -253,6 +276,7 @@ def settings(
         store_uri=resolved_store,
         arctic_bucket=resolved_arctic,
         strategy_dir=resolved_dir,
+        universe_uri=resolved_universe,
         cloudtrail_archive=resolved_archive,
         stack_name=resolved_stack,
         console_url=resolved_console.rstrip("/") if resolved_console else DEFAULT_CONSOLE_URL,
