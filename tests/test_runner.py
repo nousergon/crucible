@@ -204,6 +204,8 @@ class TestCostAssertion:
                     "model_requested": "tier:high",
                     "model_served": "glm-4.6",
                     "route_degraded": False,
+                    "fallback_used": False,
+                    "served_deployment": "high-1",
                     "tokens_in": 100,
                     "tokens_out": 10,
                     "cache_read": 0,

@@ -380,6 +380,14 @@ class TestEnforcement:
         class _Result:
             model = "router:high:primary"
             usage = _Usage()
+            # The call-time facts `krepis.llm.LLMResult` declares
+            # (`alpha-engine-config-I10006`). Carried on the stub with the
+            # real dataclass's own defaults — the adapter reads them as
+            # attributes rather than with a `getattr` default, so a stub
+            # missing them raises here instead of recording a plausible
+            # `false` on every call.
+            fallback_used = False
+            served_deployment = "router:high:primary"
 
         class _Client:
             def complete(self, **_kw):
@@ -431,6 +439,8 @@ class TestWindow:
                     "model_requested": "high",
                     "model_served": "router:high:primary",
                     "route_degraded": False,
+                    "fallback_used": False,
+                    "served_deployment": "high-1",
                     "tokens_in": 10,
                     "tokens_out": 5,
                     "cache_read": 0,
