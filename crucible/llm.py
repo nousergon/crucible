@@ -700,9 +700,19 @@ def call(
     which model serves it, at which endpoint, on which credential, and in
     what order its cross-provider fallback chain is walked are registry
     decisions resolved above this package (`model-router-policy` §2 layer 5).
-    The row this writes to the manifest carries both halves of the answer:
-    ``model_served`` (which model actually answered) and ``route_degraded``
-    (whether resolution had already fallen past the group's primary).
+    The row this writes to the manifest carries every half of the answer:
+    ``model_served`` (which model actually answered), ``route_degraded``
+    (whether RESOLUTION had already fallen past the group's primary), and —
+    the call-time facts, `alpha-engine-config-I10006` — ``fallback_used`` and
+    ``served_deployment``, read off :class:`krepis.llm.LLMResult`.
+
+    **The resolve-time and call-time facts are not interchangeable.** On the
+    router-edge route the chain is walked by the proxy AFTER resolution, so
+    ``route_is_degraded`` can report a healthy route on a call the primary
+    never answered — and it returned ``False`` unconditionally on
+    ``litellm_proxy``, the route krepis prefers whenever the health probe
+    answers and therefore the one v2 takes. Recording only the resolve-time
+    predicate does not leave the fact missing; it leaves it stated FALSE.
 
     ``registry`` and ``client_factory`` are injection points, in that order:
     the first lets a test exercise the cap against a call site that does not
@@ -782,10 +792,37 @@ def call(
             #
             # It answers the resolve-time question only. On the router-edge
             # route the chain is walked by the proxy, so WHICH entry served
-            # arrives at call time — as `model_served` above, which is why
-            # the two fields are recorded together and neither replaces the
-            # other.
+            # arrives at call time — as `fallback_used` and
+            # `served_deployment` below, which is why the fields are recorded
+            # together and none of them replaces another.
             "route_degraded": bool(route_is_degraded(route)),
+            # The CALL-TIME answer (`alpha-engine-config-I10006`), from the
+            # result rather than from the route. `route_is_degraded` asks
+            # whether the route OBJECT declares a degraded shape; on the
+            # `litellm_proxy` route — the one krepis prefers whenever the
+            # health probe answers, and therefore the one v2 actually takes —
+            # it returned `False` unconditionally, so the predicate could not
+            # fire at all on the live path. `LLMResult.fallback_used` is the
+            # fact about THIS call: the primary failed and the chain was
+            # walked. Stamping the weaker predicate here does not leave the
+            # field missing, it leaves it FALSE beside a fallback-served
+            # call, and a run that grades a model nobody selected is worse
+            # than one that admits it cannot say.
+            #
+            # Read as an ATTRIBUTE, not with a `getattr(..., False)` default:
+            # a krepis that withdrew the field would then record `false` on
+            # every call forever, which is the `dropped_params` failure mode
+            # (I7232) the field itself was added to end. Rule 5 — an absent
+            # contract raises here rather than degrading into a plausible
+            # answer.
+            "fallback_used": bool(result.fallback_used),
+            # Which deployment the router reported. `None` is the router
+            # reporting none, kept distinct from the field being absent:
+            # `model_served` is the resolved upstream id, two deployments can
+            # share one, and the comparison deciding `fallback_used` happens
+            # at the deployment layer — so this is not reconstructible from
+            # `model_served` and is recorded rather than derived.
+            "served_deployment": result.served_deployment,
             "tokens_in": int(usage.input_tokens),
             "tokens_out": int(usage.output_tokens),
             "cache_read": int(usage.cache_read_tokens),
