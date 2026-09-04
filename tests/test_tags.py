@@ -253,3 +253,33 @@ class TestEveryChannelIsRead:
         assert audit.met
         assert audit.skipped[0][0] == "WeeklySchedule"
         assert "GROUP" in UNTAGGABLE_TYPES["AWS::Scheduler::Schedule"]
+
+    def test_an_sns_subscription_is_untaggable_by_type(self) -> None:
+        """`AWS::SNS::Subscription` has no `Tags` property and no tagging API;
+        the topic carries the tag. Measured 2026-09-04: the pages topic's two
+        new legs (`nous-ergon-ops-PR1036`) read UNTAGGED under this audit and
+        took the phase-0 clause down with them. A subscription is skipped
+        with its reason; the TOPIC is still graded."""
+        topic = "arn:aws:sns:us-east-1:000000000000:crucible-v2-pages"
+        audit = audit_stack_tags(
+            stack=STACK,
+            cfn=_FakeCfn(
+                [
+                    _summary("PagesTopic", "AWS::SNS::Topic", topic),
+                    _summary("PagesEmailSubscription", "AWS::SNS::Subscription", f"{topic}:1"),
+                ]
+            ),
+            tagging=_FakeTagging([topic]),
+            iam=_FakeIam(set()),
+        )
+        assert audit.met, audit.untagged
+        assert audit.skipped == (
+            ("PagesEmailSubscription", UNTAGGABLE_TYPES["AWS::SNS::Subscription"]),
+        )
+        untagged_topic = audit_stack_tags(
+            stack=STACK,
+            cfn=_FakeCfn([_summary("PagesTopic", "AWS::SNS::Topic", topic)]),
+            tagging=_FakeTagging([]),
+            iam=_FakeIam(set()),
+        )
+        assert not untagged_topic.met

@@ -1159,6 +1159,7 @@ def _legacy_week(
     topic: str | None = f"arn:aws:sns:us-east-1:acct:{MUTED_ALERTS_TOPIC_NAME}",
     with_topic_field: bool = True,
     reruns: tuple[str, ...] = (),
+    run_status: str = "SUCCEEDED",
 ) -> dict:
     """One filed week in the `legacy-weekly-executions.v2` shape.
 
@@ -1192,7 +1193,7 @@ def _legacy_week(
                 "start": f"{day}T09:00:49+00:00",
                 "stop": f"{day}T14:02:40+00:00",
                 "duration_seconds": 18111.0,
-                "status": "SUCCEEDED",
+                "status": run_status,
             }
             for n in range(runs)
         ]
@@ -1346,22 +1347,73 @@ class TestPhaseZeroOldWeeklyCadence:
         assert _clause(result, "old_weekly_within_cadence").met
         assert result.met, result.render()
 
-    def test_a_week_over_the_cadence_fails_the_gate(self, tmp_path) -> None:
-        """19 executions since 2026-08-26 was the live reading on 2026-09-02
-        (`alpha-engine-config-I9831`); a gate that called that met would be
-        measuring nothing. Under the ruled metric the same week is 19 REAL
-        cycles — the Succeed-skips are excluded and it is still far over."""
+    def test_a_week_of_failed_runs_is_unmet_until_one_succeeds(self, tmp_path) -> None:
+        """Brian's 2026-09-04 (evening) ruling: the last three Saturday
+        canonical runs all FAILED; phase 0 exits on a SUCCESSFUL cycle, and
+        fix-and-rerun is how it gets one. So a week of failures — however
+        many — is UNMET naming them, and the same week with ONE success among
+        them is MET. There is no ceiling any more: "rerun until it is
+        successful" cannot be bounded."""
         store = _seed_phase0_met(tmp_path)
+        anchor = weekly_anchor(FRIDAY)
         _put(
             store,
-            legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat()),
-            _legacy_week(weekly_anchor(FRIDAY), runs=19),
+            legacy_weekly_executions_key(anchor.isoformat()),
+            _legacy_week(anchor, runs=3, run_status="FAILED"),
         )
         result = evaluate(store, gate="phase0", trading_day=FRIDAY)
         clause = _clause(result, "old_weekly_within_cadence")
         assert not clause.met
-        assert "19 gate-passing executions" in clause.detail
+        assert not clause.unmeasurable
+        assert "3 gate-passing execution(s), 0 SUCCEEDED" in clause.detail
+        assert "uuid_run_0: FAILED" in clause.detail
+        assert "fix and rerun" in clause.detail
         assert not result.met
+
+        document = _legacy_week(anchor, runs=3, run_status="FAILED")
+        document["executions"].append(
+            {
+                "name": "manual-rerun-after-fix",
+                "start": f"{anchor.isoformat()}T18:00:00+00:00",
+                "stop": f"{anchor.isoformat()}T23:00:00+00:00",
+                "duration_seconds": 18000.0,
+                "status": "SUCCEEDED",
+                "sns_topic_arn": f"arn:aws:sns:us-east-1:acct:{MUTED_ALERTS_TOPIC_NAME}",
+            }
+        )
+        document["executions_started"] = len(document["executions"])
+        _put(store, legacy_weekly_executions_key(anchor.isoformat()), document)
+        result = evaluate(store, gate="phase0", trading_day=FRIDAY)
+        clause = _clause(result, "old_weekly_within_cadence")
+        assert clause.met, clause.detail
+        assert "at least 1 SUCCEEDED" in clause.detail
+        assert ">= 1 gate-passing execution" in clause.detail
+
+    def test_a_still_running_rerun_is_not_yet_a_success(self, tmp_path) -> None:
+        """A RUNNING execution has no duration and no verdict. It counts as a
+        gate-passing run (it is not a skip) and NOT as a success; the week
+        reads UNMET until the producer next files it as SUCCEEDED."""
+        store = _seed_phase0_met(tmp_path)
+        anchor = weekly_anchor(FRIDAY)
+        document = _legacy_week(anchor, runs=1, run_status="FAILED")
+        document["executions"].append(
+            {
+                "name": "manual-rerun-in-flight",
+                "start": f"{anchor.isoformat()}T18:00:00+00:00",
+                "stop": None,
+                "duration_seconds": None,
+                "status": "RUNNING",
+                "sns_topic_arn": f"arn:aws:sns:us-east-1:acct:{MUTED_ALERTS_TOPIC_NAME}",
+            }
+        )
+        document["executions_started"] = len(document["executions"])
+        _put(store, legacy_weekly_executions_key(anchor.isoformat()), document)
+        clause = _clause(
+            evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
+        )
+        assert not clause.met
+        assert "2 gate-passing execution(s), 0 SUCCEEDED" in clause.detail
+        assert "manual-rerun-in-flight: RUNNING" in clause.detail
 
     def test_the_sole_window_week_must_answer_the_ruled_question(self, tmp_path) -> None:
         """The window is one week now, so that week carries the whole clause.
@@ -2021,8 +2073,11 @@ class TestARerunIsGradedAgainstTheWeekItRetries:
         assert other in clause.detail
         assert "attributed there" in clause.detail
 
-    def test_a_rerun_of_THIS_week_still_fails_it(self, tmp_path) -> None:
-        """The rule narrowed, it did not go away."""
+    def test_a_rerun_of_THIS_week_is_permitted_at_phase_0_and_named(self, tmp_path) -> None:
+        """Brian's 2026-09-04 (evening) ruling: fix and rerun until
+        successful. A rerun in the graded week no longer fails phase 0's
+        clause — the automated issuer is graded by `dead_lambdas_deleted` —
+        but it is NAMED on the reading either way, so it is never invisible."""
         anchor = weekly_anchor(FRIDAY)
         store = _seed_phase0_met(tmp_path)
         _put(
@@ -2032,17 +2087,37 @@ class TestARerunIsGradedAgainstTheWeekItRetries:
         )
         result = evaluate(store, gate="phase0", trading_day=FRIDAY)
         clause = _clause(result, "old_weekly_within_cadence")
-        assert not clause.met
+        assert clause.met, clause.detail
         assert "watch-rerun" in clause.detail
+        assert "permitted" in clause.detail
+
+    def test_a_rerun_of_THIS_week_still_fails_phase_4(self, tmp_path) -> None:
+        """The narrowing is phase 0's alone. Phase 4 grades a decommissioned
+        pipeline, where any execution — a rerun included — is the finding."""
+        anchor = weekly_anchor(FRIDAY)
+        store = _seed_phase0_met(tmp_path)
+        _put(
+            store,
+            legacy_weekly_executions_key(anchor.isoformat()),
+            _legacy_week(anchor, runs=0, skips=0, reruns=(f"watch-rerun-{anchor.isoformat()}-1",)),
+        )
+        from crucible import gate as gate_module
+
+        clause = gate_module._clause_old_weekly_within_cadence(
+            store, [FRIDAY], maximum=0, minimum=0, skips_count_as_runs=True
+        )
+        assert not clause.met
+        assert "a rerun issuer fails" in clause.detail
 
     def test_an_unparseable_rerun_name_is_attributed_to_the_week_it_was_filed_under(
         self, tmp_path
     ) -> None:
-        """Fails loudly rather than letting an execution escape every clause.
+        """Named loudly rather than letting an execution escape every clause.
 
         `watch-rerun-recovery` carries the issuer's prefix and no week, so no
         week can claim it by name. The week it was FILED under is the only one
-        guaranteed to read it, so that is the week it fails."""
+        guaranteed to read it, so that is the week that names it — and, where
+        reruns fail (phase 4), the week it fails."""
         anchor = weekly_anchor(FRIDAY)
         store = _seed_phase0_met(tmp_path)
         _put(
@@ -2052,8 +2127,14 @@ class TestARerunIsGradedAgainstTheWeekItRetries:
         )
         result = evaluate(store, gate="phase0", trading_day=FRIDAY)
         clause = _clause(result, "old_weekly_within_cadence")
-        assert not clause.met
         assert "watch-rerun-recovery" in clause.detail
+        from crucible import gate as gate_module
+
+        strict = gate_module._clause_old_weekly_within_cadence(
+            store, [FRIDAY], maximum=None, minimum=1
+        )
+        assert not strict.met
+        assert "watch-rerun-recovery" in strict.detail
 
     def test_a_rerun_of_another_week_does_not_fail_this_weeks_routing(self, tmp_path) -> None:
         """The two clauses must agree about which executions belong to a week,

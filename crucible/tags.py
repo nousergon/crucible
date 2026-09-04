@@ -76,6 +76,14 @@ UNTAGGABLE_TYPES: dict[str, str] = {
     "AWS::IAM::Policy": "an inline policy is a property of the tagged role",
     "AWS::Lambda::Permission": "a permission is a property of the tagged function",
     "AWS::SNS::TopicPolicy": "a topic policy is a property of the tagged topic",
+    # `AWS::SNS::Subscription` has no `Tags` property in CloudFormation and no
+    # tagging API of its own; a subscription's cost is the topic's, and the
+    # topic is tagged. Measured 2026-09-04: `nous-ergon-ops-PR1036` added the
+    # pages topic's email and Lambda legs and the acceptance tag clause went
+    # UNMET on both, taking the phase-0 `v2_resources_tagged_and_versioned`
+    # clause with it — the audit had a rule for a permission and none for a
+    # subscription, and the acceptance suite is the surface that noticed.
+    "AWS::SNS::Subscription": "a subscription is a property of the tagged topic",
 }
 
 

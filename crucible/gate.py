@@ -1718,11 +1718,40 @@ def _clause_old_weekly_within_cadence(
     window: list[dt.date],
     *,
     name: str = "old_weekly_within_cadence",
-    maximum: int = LEGACY_WEEKLY_MAX_STARTS_PER_WEEK,
+    maximum: int | None = LEGACY_WEEKLY_MAX_STARTS_PER_WEEK,
     minimum: int = LEGACY_WEEKLY_MIN_RUNS_PER_WEEK,
     skips_count_as_runs: bool = False,
+    minimum_succeeded: int = 0,
+    reruns_fail: bool = True,
 ) -> Clause:
     """The v1 weekly cycle count, read from a filed document, against a ceiling.
+
+    **Phase 0's exit is a SUCCESSFUL run, and reruns are how it gets one**
+    (Brian's ruling, 2026-09-04 evening, on `alpha-engine-config-I9756`:
+    *"assume the weekly sf tomorrow will fail. we will fix and rerun until it
+    is successful, and that needs to be the trigger to complete phase 0."*).
+    The last three Saturday canonical runs — 08-15, 08-22, 08-29 — all
+    FAILED, each for a different reason, so a clause that graded EXACTLY one
+    gate-passing execution would have exited phase 0 on a week whose only
+    run failed, and would have FAILED the week in which the pipeline was
+    repaired and re-run to success. Two parameters carry the ruling, both
+    passed explicitly at phase 0's call site and left at their defaults by
+    phase 4:
+
+    * ``minimum_succeeded`` — how many of the week's gate-passing executions
+      must have ``status == "SUCCEEDED"``. Phase 0 passes 1: the trigger is
+      a cycle that WORKED, not one that started. A week of failures reads
+      UNMET naming every failed run, never MET on the count alone.
+    * ``reruns_fail`` — whether a `watch-rerun-*` execution naming THIS week
+      fails the clause. Phase 0 passes ``False``: the automated rerun issuer
+      is graded by `_clause_dead_lambdas_deleted` (absent by exact name), and
+      a rerun in the graded week is now Brian repairing the pipeline, which
+      the ruling asks for. Reruns are still NAMED in the detail on every
+      reading. Phase 4 keeps ``True``: a decommissioned pipeline emits
+      nothing, reruns included.
+
+    ``maximum=None`` removes the ceiling, which is what "rerun until it is
+    successful" means; phase 4 keeps ``0``.
 
     **What is counted changed on 2026-09-04** (Brian's ruling on
     `alpha-engine-config-I9756`; implemented under
@@ -1820,21 +1849,40 @@ def _clause_old_weekly_within_cadence(
     so the two readings differ where they are CALLED, in the phase's own
     clause list, rather than inside a reader neither phase names.
     """
-    if minimum > maximum:
+    if maximum is not None and minimum > maximum:
         # A bound pair that can never be satisfied would read UNMET on every
         # week forever with a reason that looks like a finding about the
         # pipeline. Refuse at the call site instead.
         raise ValueError(
             f"minimum {minimum} exceeds maximum {maximum}; no week can satisfy this clause"
         )
+    if minimum_succeeded > minimum:
+        raise ValueError(
+            f"minimum_succeeded {minimum_succeeded} exceeds minimum {minimum}; a succeeded "
+            "execution is a gate-passing execution, so the floor on successes cannot "
+            "exceed the floor on runs"
+        )
     counted = "execution of any kind" if skips_count_as_runs else "execution that PASSED"
     requirement = (
-        f"the v1 weekly state machine started at most {maximum} {counted}"
+        "the v1 weekly state machine started "
+        + (f"at most {maximum} " if maximum is not None else "any number of ")
+        + counted
         + ("" if skips_count_as_runs else " `WeeklyRunDayGate`")
         + (f" — and at least {minimum} — " if minimum else " ")
-        + "in EACH week of the window, and no `watch-rerun-*` execution at all, read "
-        "from a filed per-execution record keyed on the week, not on the day the gate "
-        "was read"
+        + "in EACH week of the window"
+        + (
+            f", of which at least {minimum_succeeded} SUCCEEDED (a fix-and-rerun cycle "
+            "that ended in success is the pass; Brian ruling 2026-09-04)"
+            if minimum_succeeded
+            else ""
+        )
+        + (
+            ", and no `watch-rerun-*` execution at all"
+            if reruns_fail
+            else " (reruns permitted and named)"
+        )
+        + ", read from a filed per-execution record keyed on the week, not on the day "
+        "the gate was read"
     )
     anchors = list(dict.fromkeys(weekly_anchor(day) for day in window))
     evidence = [legacy_weekly_executions_key(a.isoformat()) for a in anchors]
@@ -1853,7 +1901,9 @@ def _clause_old_weekly_within_cadence(
     stale: list[str] = []
     over: list[str] = []
     under: list[str] = []
+    unsucceeded: list[str] = []
     reruns: list[str] = []
+    rerun_notes: list[str] = []
     elsewhere: list[str] = []
     skipped_total = 0
     for anchor, key in zip(anchors, evidence, strict=True):
@@ -1900,16 +1950,22 @@ def _clause_old_weekly_within_cadence(
             )
         executions = [e for e in executions if not e.reruns_a_week_other_than(anchor)]
         week_reruns = [e for e in executions if e.is_rerun]
-        if week_reruns:
+        if week_reruns and reruns_fail:
             reruns.append(
                 f"{key}: {len(week_reruns)} watch-rerun execution(s) "
                 f"({', '.join(e.name for e in week_reruns[:3])}) — a rerun issuer fails "
                 "regardless of duration"
             )
+        elif week_reruns:
+            rerun_notes.append(
+                f"{key}: {len(week_reruns)} watch-rerun execution(s) "
+                f"({', '.join(e.name for e in week_reruns[:3])}) — permitted under the "
+                "2026-09-04 fix-and-rerun ruling, named here"
+            )
         skips = [e for e in executions if e.is_gate_skip]
         skipped_total += len(skips)
         runs = executions if skips_count_as_runs else [e for e in executions if not e.is_gate_skip]
-        if len(runs) > maximum:
+        if maximum is not None and len(runs) > maximum:
             over.append(
                 f"{key}: {len(runs)} {'start' if skips_count_as_runs else 'gate-passing execution'}"
                 f"{'s' if len(runs) != 1 else ''}, ceiling {maximum} "
@@ -1931,7 +1987,22 @@ def _clause_old_weekly_within_cadence(
                 "the day, not a cycle). A missing weekly run is worse than a duplicate "
                 "(`sf-pipeline-policy.md` §5)"
             )
-    if missing or malformed or stale or over or under or reruns:
+        if minimum_succeeded:
+            succeeded = [e for e in runs if e.status == "SUCCEEDED"]
+            if len(runs) >= minimum and len(succeeded) < minimum_succeeded:
+                # Every run this week FAILED (or was still running when the
+                # producer filed). The ruling's trigger is a cycle that
+                # worked: fix the pipeline and re-run it; the next filing of
+                # this week's document carries the successful execution.
+                failed = [e for e in runs if e.status != "SUCCEEDED"]
+                unsucceeded.append(
+                    f"{key}: {len(runs)} gate-passing execution(s), "
+                    f"{len(succeeded)} SUCCEEDED (floor {minimum_succeeded}) — "
+                    + ", ".join(f"{e.name}: {e.status}" for e in failed[:4])
+                    + ". Phase 0 exits on a SUCCESSFUL run: fix and rerun "
+                    "(Brian ruling 2026-09-04)"
+                )
+    if missing or malformed or stale or over or under or unsucceeded or reruns:
         parts: list[str] = []
         if missing:
             parts.append(
@@ -1949,6 +2020,10 @@ def _clause_old_weekly_within_cadence(
             parts.append("; ".join(over))
         if under:
             parts.append("; ".join(under))
+        if unsucceeded:
+            parts.append("; ".join(unsucceeded))
+        if rerun_notes:
+            parts.append("; ".join(rerun_notes))
         if elsewhere:
             # Named even on a FAILING reading: an execution the clause chose
             # not to grade here must never be invisible, whichever way the
@@ -1963,20 +2038,27 @@ def _clause_old_weekly_within_cadence(
             # UNMEASURABLE only when nothing else is wrong. A window with one
             # stale week and one week genuinely over the ceiling has a finding
             # in it, and `[?]` would hide the finding behind the stale read.
-            unmeasurable=bool(stale) and not (missing or malformed or over or under or reruns),
+            unmeasurable=bool(stale)
+            and not (missing or malformed or over or under or unsucceeded or reruns),
         )
     counted_noun = "start" if skips_count_as_runs else "gate-passing execution"
+    bound = (
+        (f"{minimum}-{maximum}" if minimum else f"<= {maximum}")
+        if maximum is not None
+        else f">= {minimum}"
+    )
     return Clause(
         name,
         requirement,
         True,
-        f"{len(evidence)} consecutive weeks at "
-        + (f"{minimum}-{maximum}" if minimum else f"<= {maximum}")
-        + f" {counted_noun} each, no "
-        f"watch-rerun executions ({skipped_total} sub-"
+        f"{len(evidence)} consecutive weeks at {bound} {counted_noun} each"
+        + (f", at least {minimum_succeeded} SUCCEEDED" if minimum_succeeded else "")
+        + (", no watch-rerun executions" if reruns_fail else "")
+        + f" ({skipped_total} sub-"
         f"{WEEKLY_RUN_DAY_GATE_SKIP_MAX_SECONDS:g}s Succeed-skip"
         f"{'s' if skipped_total != 1 else ''} "
         f"{'counted' if skips_count_as_runs else 'excluded'})"
+        + ("; " + "; ".join(rerun_notes) if rerun_notes else "")
         + ("; " + "; ".join(elsewhere) if elsewhere else ""),
         tuple(evidence),
     )
@@ -2648,11 +2730,18 @@ def _phase0(
         _clause_old_weekly_within_cadence(
             store,
             window,
-            # EXACTLY one gate-passing run a week, not "at most one". Passed
-            # explicitly beside phase 4's `minimum=0` so the two phases'
-            # lower bounds are visible in the clause lists that hold them,
-            # not inferred inside the shared reader.
+            # Brian ruling 2026-09-04 (evening): "assume the weekly sf
+            # tomorrow will fail. we will fix and rerun until it is
+            # successful, and that needs to be the trigger to complete phase
+            # 0." So: no ceiling, at least one gate-passing run, at least one
+            # of them SUCCEEDED, reruns permitted and named. Every value is
+            # passed explicitly beside phase 4's, so the two phases' bounds
+            # are visible in the clause lists that hold them, not inferred
+            # inside the shared reader.
+            maximum=None,
             minimum=LEGACY_WEEKLY_MIN_RUNS_PER_WEEK,
+            minimum_succeeded=1,
+            reruns_fail=False,
         ),
         _clause_dead_lambdas_deleted(store, window),
         _clause_old_alerts_muted(store, window),
