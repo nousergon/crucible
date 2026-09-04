@@ -455,13 +455,25 @@ class TestPhaseFourStillCountsEveryStart:
 
         store = _seed(tmp_path, week)
         phase4 = _clause(
-            store, name="old_sf_execution_count_zero", maximum=0, skips_count_as_runs=True
+            store,
+            name="old_sf_execution_count_zero",
+            maximum=0,
+            minimum=0,
+            skips_count_as_runs=True,
         )
         assert not phase4.met
         assert "2 starts, ceiling 0" in phase4.detail
-        # And the SAME week at phase 0's reading is clean — the two rows are
-        # deliberately different questions over one document.
-        assert _clause(store).met
+        # The SAME week at phase 0's reading is UNMET for the OPPOSITE reason:
+        # phase 4 sees two starts where it requires none, phase 0 sees zero
+        # gate-passing runs where it requires one. Skips alone mean the gate
+        # declined every day of the week, so the weekly pipeline never ran —
+        # worse than a duplicate (`sf-pipeline-policy.md` §5). Before
+        # `alpha-engine-config-I9962`'s lower bound this read MET, which is
+        # the whole defect: absent graded as clean.
+        phase0 = _clause(store)
+        assert not phase0.met
+        assert not phase0.unmeasurable
+        assert "did not run this week" in phase0.detail
 
     def test_an_empty_week_meets_the_zero_ceiling(self, tmp_path) -> None:
         def week(_anchor: dt.date) -> dict[str, Any]:
@@ -476,6 +488,7 @@ class TestPhaseFourStillCountsEveryStart:
             _seed(tmp_path, week),
             name="old_sf_execution_count_zero",
             maximum=0,
+            minimum=0,
             skips_count_as_runs=True,
         )
         assert clause.met
@@ -544,3 +557,195 @@ class TestTheFixChangesTheReading:
         mutated["executions_started"] = len(mutated["executions"])
         assert mutated != base
         assert mutated["executions_started"] != base["executions_started"]
+
+
+# ── policy §7.4 for the 2026-09-04 amendment: one week, and a floor ─────────
+#
+# Brian ruled on 2026-09-04: "we can't wait a week on phase 0. it should clear
+# after this week's weekly sf." Two changes went in together and only one of
+# them is safe alone, so each is demonstrated as a DIFFERENCE between two
+# readings of one store.
+#
+# What the second graded week bought was evidence that the disabled rerun
+# issuer had not silently returned. That protection is not deleted, it is
+# replaced by a CONTINUOUS one: `nousergon-data-PR1637` adds a
+# `trigger-undeclared` finding to `automation_pause.py --check`, which runs
+# daily and reports any live enabled trigger declared in neither manifest
+# block. A standing detector beats one extra week of watching.
+
+ONE_WEEK_WINDOW = [FRIDAY]
+TWO_WEEK_WINDOW = [FRIDAY - dt.timedelta(weeks=n) for n in reversed(range(2))]
+
+
+def _seed_window(tmp_path: Path, window: list[dt.date], document_for) -> LocalStore:
+    store = LocalStore(tmp_path)
+    for day in window:
+        anchor = weekly_anchor(day)
+        key = legacy_weekly_executions_key(anchor.isoformat())
+        store.put_bytes(key, json.dumps(document_for(anchor)).encode("utf-8"))
+    return store
+
+
+def _skips_only_week(anchor: dt.date) -> dict[str, Any]:
+    """A week in which `WeeklyRunDayGate` declined every day it was asked.
+
+    Three sub-10s Succeed-skips and no cycle at all: the weekly pipeline never
+    ran. `sf-pipeline-policy.md` §5 line 213 — "missing a weekly run is worse
+    than a duplicate; the mutex handles duplicates".
+    """
+    day = anchor.isoformat()
+    return {
+        "schema_version": LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
+        "executions_started": 3,
+        "executions": [
+            _execution("uuid_thursday", f"{day}T09:00:49.259000+00:00", 3.016),
+            _execution("uuid_friday", f"{day}T09:00:49.312000+00:00", 3.907),
+            _execution("uuid_saturday", f"{day}T09:00:49.100000+00:00", 2.8),
+        ],
+        "source": "states:ListExecutions, fixture",
+    }
+
+
+def _superseded_upper_bound_only(store: LocalStore, window: list[dt.date]) -> bool:
+    """The amended clause as it stood BEFORE the lower bound — "at most one".
+
+    A faithful reconstruction of the ruled predicate read literally: count the
+    gate-passing executions, pass if there are no more than one. Zero passes,
+    which is the defect. Kept in the test file, never in `gate.py`.
+    """
+    for day in window:
+        key = legacy_weekly_executions_key(weekly_anchor(day).isoformat())
+        document = json.loads(store.get_bytes(key).decode("utf-8"))
+        runs = [
+            e
+            for e in document["executions"]
+            if not (
+                e["status"] == "SUCCEEDED"
+                and e["duration_seconds"] is not None
+                and e["duration_seconds"] < WEEKLY_RUN_DAY_GATE_SKIP_MAX_SECONDS
+            )
+        ]
+        if any(e["name"].startswith(LEGACY_WEEKLY_RERUN_NAME_PREFIX) for e in runs):
+            return False
+        if len(runs) > 1:
+            return False
+    return True
+
+
+class TestTheOneWeekWindowChangesTheReading:
+    """Demonstration (a): the WINDOW change, shown as a difference."""
+
+    def test_one_clean_week_is_MET_at_one_week_and_not_at_the_old_two(self, tmp_path) -> None:
+        store = _seed_window(tmp_path, ONE_WEEK_WINDOW, _ruled_week)
+        after = _clause_old_weekly_within_cadence(store, ONE_WEEK_WINDOW, minimum=1)
+        before = _clause_old_weekly_within_cadence(store, TWO_WEEK_WINDOW, minimum=1)
+        assert after.met is True, "the ruled week must clear phase 0 on its own"
+        assert before.met is False, "the superseded two-week window had a second week to fill"
+        assert after.met != before.met, (
+            "both windows read the same, so this fixture demonstrates nothing — the "
+            "window change is not exercised by it"
+        )
+        # And the difference is the WINDOW, not a broken store: fill the second
+        # week and the two-week reading agrees. Without this the test would pass
+        # just as well against a store nothing could ever satisfy.
+        filled = _seed_window(tmp_path / "filled", TWO_WEEK_WINDOW, _ruled_week)
+        assert _clause_old_weekly_within_cadence(filled, TWO_WEEK_WINDOW, minimum=1).met
+
+    def test_the_registered_phase_zero_window_is_one_and_phase_four_keeps_two(self) -> None:
+        from crucible.gate import GATES
+
+        assert GATES["phase0"][0] == 1
+        assert GATES["phase4"][0] == 2
+
+
+class TestTheLowerBoundChangesTheReading:
+    """Demonstration (b): the FLOOR, which is what makes (a) safe.
+
+    "At most one gate-passing execution per calendar week" is satisfied by
+    ZERO. With a two-week window a silent week was unlikely; with one week it
+    is one bad Saturday, and phase 0 would have exited on a week the weekly
+    pipeline never ran.
+    """
+
+    def test_a_week_with_no_run_is_UNMET_now_and_was_MET_before(self, tmp_path) -> None:
+        store = _seed_window(tmp_path, ONE_WEEK_WINDOW, _skips_only_week)
+        after = _clause_old_weekly_within_cadence(store, ONE_WEEK_WINDOW, minimum=1)
+        before = _superseded_upper_bound_only(store, ONE_WEEK_WINDOW)
+        assert after.met is False, "a week with no weekly run must not read MET"
+        assert before is True, "the upper-bound-only rule must have accepted it"
+        assert after.met != before, (
+            "the two readings are identical, so this fixture demonstrates nothing — "
+            "the lower bound is not exercised by it"
+        )
+        # UNMET, not UNMEASURABLE. "We read the document and it lists no
+        # gate-passing execution" is a reading; `[?]` is for a document we
+        # could not obtain, and collapsing the two would hide a missing weekly
+        # run behind the symbol an absent input gets.
+        assert after.unmeasurable is False
+        assert "did not run this week" in after.detail
+        assert "floor 1" in after.detail
+
+    def test_phase_four_still_reads_a_silent_week_as_MET(self, tmp_path) -> None:
+        """The floor is a per-call-site bound, not a global rule. Phase 4
+        grades a DECOMMISSIONED pipeline: no executions at all is the pass, so
+        its call site passes `minimum=0`. A branch on `maximum == 0` inside the
+        reader would have produced the same answer here while hiding one
+        phase's semantics inside the other's."""
+        store = _seed_window(tmp_path, TWO_WEEK_WINDOW, lambda a: _legacy_week_empty())
+        phase4 = _clause_old_weekly_within_cadence(
+            store,
+            TWO_WEEK_WINDOW,
+            name="old_sf_execution_count_zero",
+            maximum=0,
+            minimum=0,
+            skips_count_as_runs=True,
+        )
+        assert phase4.met is True
+
+    def test_an_unsatisfiable_bound_pair_is_refused_at_the_call_site(self, tmp_path) -> None:
+        """`minimum > maximum` can never be met, and would read UNMET every
+        week forever with a reason that looks like a finding about the
+        pipeline. Loud, not a permanently red row."""
+        store = _seed_window(tmp_path, ONE_WEEK_WINDOW, _ruled_week)
+        with pytest.raises(ValueError, match="no week can satisfy"):
+            _clause_old_weekly_within_cadence(store, ONE_WEEK_WINDOW, maximum=0, minimum=1)
+
+
+def _legacy_week_empty() -> dict[str, Any]:
+    return {
+        "schema_version": LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
+        "executions_started": 0,
+        "executions": [],
+        "source": "fixture",
+    }
+
+
+class TestTheAmendmentFixturesActuallyDiffer:
+    """The specific way a §7.4 demonstration silently proves nothing: a
+    fixture edit that matched nothing, leaving both readings taken over the
+    same untouched document. Every mutation these two demonstrations rely on
+    is asserted to have changed something."""
+
+    def test_the_skips_only_week_really_differs_from_the_ruled_week(self) -> None:
+        ruled = _ruled_week(FRIDAY)
+        silent = _skips_only_week(FRIDAY)
+        assert ruled != silent
+        long_runs = [
+            e
+            for e in ruled["executions"]
+            if e["duration_seconds"] >= WEEKLY_RUN_DAY_GATE_SKIP_MAX_SECONDS
+        ]
+        silent_runs = [
+            e
+            for e in silent["executions"]
+            if e["duration_seconds"] >= WEEKLY_RUN_DAY_GATE_SKIP_MAX_SECONDS
+        ]
+        assert len(long_runs) == 1
+        assert silent_runs == []
+
+    def test_the_two_windows_really_name_different_evidence(self, tmp_path) -> None:
+        store = _seed_window(tmp_path, TWO_WEEK_WINDOW, _ruled_week)
+        one = _clause_old_weekly_within_cadence(store, ONE_WEEK_WINDOW, minimum=1)
+        two = _clause_old_weekly_within_cadence(store, TWO_WEEK_WINDOW, minimum=1)
+        assert set(one.evidence) < set(two.evidence)
+        assert len(one.evidence) == 1 and len(two.evidence) == 2

@@ -71,6 +71,7 @@ __all__ = [
     "GATES",
     "LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION",
     "LEGACY_WEEKLY_MAX_STARTS_PER_WEEK",
+    "LEGACY_WEEKLY_MIN_RUNS_PER_WEEK",
     "LEGACY_WEEKLY_RERUN_NAME_PREFIX",
     "WEEKLY_RUN_DAY_GATE_SKIP_MAX_SECONDS",
     "LADDER_CONSOLE_STATE",
@@ -1211,6 +1212,24 @@ def _phase1(
 #: `_clause_old_weekly_within_cadence`.
 LEGACY_WEEKLY_MAX_STARTS_PER_WEEK = 1
 
+#: The FEWEST gate-passing executions phase 0 accepts in one week.
+#:
+#: The ruled predicate reads "at most one execution that passes
+#: `WeeklyRunDayGate` per calendar week". Taken literally, a week with ZERO
+#: gate-passing executions satisfies it — while meaning the weekly pipeline
+#: never ran, which `sf-pipeline-policy.md` §5 line 213 calls worse than a
+#: duplicate ("missing a weekly run is worse than a duplicate; the mutex
+#: handles duplicates"). The THU-SAT fail-open margin exists to prevent
+#: exactly that, so a clause certifying a silent week as "clean" would grade
+#: the absence of the thing the margin protects. With phase 0's window
+#: narrowed to ONE week on 2026-09-04, that failure mode goes from unlikely to
+#: one bad Saturday, so phase 0 grades EXACTLY one run a week, not at most one
+#: (`alpha-engine-config-I9962`).
+#:
+#: This is a bound, not a ceiling variant: phase 4's correct lower bound is
+#: ZERO, and it says so at its own call site.
+LEGACY_WEEKLY_MIN_RUNS_PER_WEEK = 1
+
 #: The schema the filed weekly document must declare for the ruled metric to be
 #: answerable. `v1` carried one integer, `executions_started`, and nothing else;
 #: a `v1` week is UNMEASURABLE under the ruled question rather than a pass, so
@@ -1482,6 +1501,7 @@ def _clause_old_weekly_within_cadence(
     *,
     name: str = "old_weekly_within_cadence",
     maximum: int = LEGACY_WEEKLY_MAX_STARTS_PER_WEEK,
+    minimum: int = LEGACY_WEEKLY_MIN_RUNS_PER_WEEK,
     skips_count_as_runs: bool = False,
 ) -> Clause:
     """The v1 weekly cycle count, read from a filed document, against a ceiling.
@@ -1524,6 +1544,26 @@ def _clause_old_weekly_within_cadence(
     that introduced it (`_review_problem`). ``name`` travels with it so the
     two readings do not both land on the ladder under one clause name.
 
+    ``minimum`` is the LOWER bound, and it is the half that makes phase 0's
+    one-week window safe. The ruled predicate says "at most one execution that
+    passes `WeeklyRunDayGate` per calendar week"; read literally, a week with
+    ZERO gate-passing executions satisfies it — while meaning the weekly
+    pipeline never ran, the failure `sf-pipeline-policy.md` §5 line 213 calls
+    worse than a duplicate. A window of one week makes that a single bad
+    Saturday away, so phase 0 grades EXACTLY one run a week and a silent week
+    reads UNMET with the missing run named. Not MET; and not UNMEASURABLE
+    either — "we read the document and it lists no gate-passing execution" is
+    a real reading, distinct from "we could not obtain the document", which
+    this clause already reports separately (`alpha-engine-config-I9962`).
+
+    Phase 4's correct lower bound is ZERO: it grades a DECOMMISSIONED
+    pipeline, where no executions at all is the pass. So ``minimum`` is
+    explicitly passed at BOTH call sites and is never inferred from
+    ``maximum == 0`` — for the same reason ``skips_count_as_runs`` is not: the
+    two phases must differ where they are CALLED, in each phase's own clause
+    list, and a reader that branches on another parameter's value hides one
+    phase's semantics inside the other's.
+
     ``skips_count_as_runs`` keeps phase 4's meaning intact across this change.
     Phase 4 asks whether the v1 pipeline is DECOMMISSIONED, and a
     decommissioned state machine emits no executions at all — a surviving
@@ -1534,11 +1574,19 @@ def _clause_old_weekly_within_cadence(
     so the two readings differ where they are CALLED, in the phase's own
     clause list, rather than inside a reader neither phase names.
     """
+    if minimum > maximum:
+        # A bound pair that can never be satisfied would read UNMET on every
+        # week forever with a reason that looks like a finding about the
+        # pipeline. Refuse at the call site instead.
+        raise ValueError(
+            f"minimum {minimum} exceeds maximum {maximum}; no week can satisfy this clause"
+        )
     counted = "execution of any kind" if skips_count_as_runs else "execution that PASSED"
     requirement = (
         f"the v1 weekly state machine started at most {maximum} {counted}"
         + ("" if skips_count_as_runs else " `WeeklyRunDayGate`")
-        + " in EACH week of the window, and no `watch-rerun-*` execution at all, read "
+        + (f" — and at least {minimum} — " if minimum else " ")
+        + "in EACH week of the window, and no `watch-rerun-*` execution at all, read "
         "from a filed per-execution record keyed on the week, not on the day the gate "
         "was read"
     )
@@ -1558,6 +1606,7 @@ def _clause_old_weekly_within_cadence(
     malformed: list[str] = []
     stale: list[str] = []
     over: list[str] = []
+    under: list[str] = []
     reruns: list[str] = []
     skipped_total = 0
     for key in evidence:
@@ -1606,7 +1655,22 @@ def _clause_old_weekly_within_cadence(
                 f"({len(skips)} sub-{WEEKLY_RUN_DAY_GATE_SKIP_MAX_SECONDS:g}s Succeed-skip"
                 f"{'s' if len(skips) != 1 else ''} excluded)"
             )
-    if missing or malformed or stale or over or reruns:
+        if len(runs) < minimum:
+            # The document was read and it lists no run. That is a READING,
+            # not an inability to measure, so it is UNMET with the missing
+            # run named — never `[?]`, and never MET on the ruled predicate's
+            # literal upper bound.
+            under.append(
+                f"{key}: {len(runs)} "
+                f"{'start' if skips_count_as_runs else 'gate-passing execution'}"
+                f"{'s' if len(runs) != 1 else ''}, floor {minimum} — the weekly pipeline "
+                f"did not run this week ({len(skips)} sub-"
+                f"{WEEKLY_RUN_DAY_GATE_SKIP_MAX_SECONDS:g}s Succeed-skip"
+                f"{'s' if len(skips) != 1 else ''} present, which is the gate declining "
+                "the day, not a cycle). A missing weekly run is worse than a duplicate "
+                "(`sf-pipeline-policy.md` §5)"
+            )
+    if missing or malformed or stale or over or under or reruns:
         parts: list[str] = []
         if missing:
             parts.append(
@@ -1622,6 +1686,8 @@ def _clause_old_weekly_within_cadence(
             parts.append("; ".join(reruns))
         if over:
             parts.append("; ".join(over))
+        if under:
+            parts.append("; ".join(under))
         return Clause(
             name,
             requirement,
@@ -1631,14 +1697,16 @@ def _clause_old_weekly_within_cadence(
             # UNMEASURABLE only when nothing else is wrong. A window with one
             # stale week and one week genuinely over the ceiling has a finding
             # in it, and `[?]` would hide the finding behind the stale read.
-            unmeasurable=bool(stale) and not (missing or malformed or over or reruns),
+            unmeasurable=bool(stale) and not (missing or malformed or over or under or reruns),
         )
     counted_noun = "start" if skips_count_as_runs else "gate-passing execution"
     return Clause(
         name,
         requirement,
         True,
-        f"{len(evidence)} consecutive weeks at <= {maximum} {counted_noun} each, no "
+        f"{len(evidence)} consecutive weeks at "
+        + (f"{minimum}-{maximum}" if minimum else f"<= {maximum}")
+        + f" {counted_noun} each, no "
         f"watch-rerun executions ({skipped_total} sub-"
         f"{WEEKLY_RUN_DAY_GATE_SKIP_MAX_SECONDS:g}s Succeed-skip"
         f"{'s' if skipped_total != 1 else ''} "
@@ -1860,7 +1928,15 @@ def _phase0(
     """
     _unused((registry, trading_day))
     return [
-        _clause_old_weekly_within_cadence(store, window),
+        _clause_old_weekly_within_cadence(
+            store,
+            window,
+            # EXACTLY one gate-passing run a week, not "at most one". Passed
+            # explicitly beside phase 4's `minimum=0` so the two phases'
+            # lower bounds are visible in the clause lists that hold them,
+            # not inferred inside the shared reader.
+            minimum=LEGACY_WEEKLY_MIN_RUNS_PER_WEEK,
+        ),
         _clause_acceptance_suite_committed(),
     ]
 
@@ -2839,6 +2915,12 @@ def _phase4(
             window,
             name="old_sf_execution_count_zero",
             maximum=0,
+            # ZERO is the PASS here, so the floor is zero too. Phase 0 grades
+            # a live pipeline and a silent week there is a missing run; phase
+            # 4 grades a decommissioned one and a silent week is the whole
+            # point. Stated here rather than derived from `maximum == 0`, for
+            # the same reason as `skips_count_as_runs` below.
+            minimum=0,
             # Decommissioned means the state machine emits NOTHING. A
             # `WeeklyRunDayGate` Succeed-skip is phase 0's fail-open margin
             # and phase 4's evidence that the trigger is still alive, so this
@@ -3023,9 +3105,21 @@ def _phase5(
 #:
 #: Windows, each from the plan rather than chosen here:
 #:
-#: * phase 0 — TWO weeks, `alpha-engine-config-I9756`'s own closes-when
-#:   ("<= 1 start per calendar week for two consecutive weeks"); one quiet
-#:   week is a gap between reruns, not a cadence.
+#: * phase 0 — ONE week. `alpha-engine-config-I9756`'s original closes-when
+#:   said "<= 1 start per calendar week for two consecutive weeks", and the
+#:   second week bought exactly one thing: evidence that a disabled rerun
+#:   issuer had not silently returned. Brian ruled on 2026-09-04, "we can't
+#:   wait a week on phase 0. it should clear after this week's weekly sf."
+#:   That protection is not deleted, it is REPLACED by a continuous one:
+#:   `nousergon-data-PR1637` adds a `trigger-undeclared` finding to
+#:   `automation_pause.py --check`, which runs DAILY and reports any live
+#:   enabled trigger declared in neither manifest block. A standing detector
+#:   is strictly stronger than one extra week of watching, so one graded week
+#:   plus a daily guard beats two graded weeks and none. What makes the
+#:   narrower window safe is `minimum=LEGACY_WEEKLY_MIN_RUNS_PER_WEEK` at the
+#:   phase-0 call site: with one week in the window, a Saturday on which the
+#:   pipeline never ran at all would otherwise satisfy "at most one" and read
+#:   MET (`alpha-engine-config-I9962`).
 #: * phase 1 — FIVE replay Saturdays (§6 row 1).
 #: * phase 2 — TWO, §6.1's ruled minimum ("2 consecutive first-attempt `ok`
 #:   Saturdays, not 4", the other two soak weeks traded for the five replays).
@@ -3035,11 +3129,15 @@ def _phase5(
 #: * phase 3 — FOUR, `promote_min_weeks` (§5.0): a promotion cannot be won on
 #:   fewer paired weeks than the eligibility age requires, so a shorter window
 #:   could only ever read UNMET.
-#: * phase 4 — TWO, covering §6 row 4's "one week" trader claim plus the same
-#:   two-week cadence evidence phase 0 needs for the SF count.
+#: * phase 4 — TWO, covering §6 row 4's "one week" trader claim plus a second
+#:   week of cadence evidence for the SF count. Phase 0's window narrowed to
+#:   one on 2026-09-04; phase 4's did NOT, and this is not an oversight. Phase
+#:   0 asks whether a live pipeline is QUIET, which a daily trigger-declaration
+#:   check now also watches continuously; phase 4 asks whether it is GONE, and
+#:   nothing else grades that.
 #: * phase 5 — ONE, §6 row 5's "verdict within one weekly cycle".
 GATES: dict[str, tuple[int, Any]] = {
-    "phase0": (2, _phase0),
+    "phase0": (1, _phase0),
     "phase1": (5, _phase1),
     "phase2": (PHASE2_LIVE_SATURDAYS, _phase2),
     "phase3": (4, _phase3),

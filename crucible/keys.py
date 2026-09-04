@@ -748,8 +748,8 @@ def legacy_weekly_executions_key(week_anchor: str) -> str:
     **The gate reads this; it never counts.** A clause that called
     `states:ListExecutions` would reach live AWS, which makes the reading
     unreplayable, untestable without credentials, and impossible to grade at a
-    past date — and phase 0's whole claim is about a cadence sustained over
-    two consecutive weeks, which is a claim about the past.
+    past date — and phase 0's whole claim is about a cadence sustained over a
+    completed week, which is a claim about the past.
 
     An absent document reads UNMET and names the key, so the operator's next
     action is in the output (`alpha-engine-config-I9860`).

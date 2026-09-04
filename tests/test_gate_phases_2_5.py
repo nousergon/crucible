@@ -990,6 +990,7 @@ class TestDecommissionedMeansZeroNotWithinCadence:
             _window(2),
             name="old_sf_execution_count_zero",
             maximum=0,
+            minimum=0,
             skips_count_as_runs=True,
         )
         assert clause.name == "old_sf_execution_count_zero"
@@ -1010,6 +1011,7 @@ class TestDecommissionedMeansZeroNotWithinCadence:
             _window(2),
             name="old_sf_execution_count_zero",
             maximum=0,
+            minimum=0,
             skips_count_as_runs=True,
         )
         assert not clause.met
@@ -1029,6 +1031,7 @@ class TestDecommissionedMeansZeroNotWithinCadence:
             _window(2),
             name="old_sf_execution_count_zero",
             maximum=0,
+            minimum=0,
             skips_count_as_runs=True,
         )
         assert clause.met
