@@ -69,6 +69,7 @@ __all__ = [
     "heal_key",
     "is_manifest_key",
     "ledger_key",
+    "legacy_dead_lambdas_key",
     "legacy_weekly_executions_key",
     "manifest_key",
     "manifest_prefix",
@@ -771,6 +772,33 @@ def legacy_weekly_executions_key(week_anchor: str) -> str:
     return f"legacy/weekly/{week_anchor}/executions.json"
 
 
+def legacy_dead_lambdas_key(week_anchor: str) -> str:
+    """Where the probe of the six deleted v1 Lambda functions is filed.
+
+    ``week_anchor`` is a :func:`weekly_anchor` session, the same anchor
+    :func:`legacy_weekly_executions_key` uses, so phase 0's clauses read one
+    week's worth of v1 facts at one set of keys.
+
+    **The gate reads this; it never probes.** `alpha-engine-config-I9756`'s
+    second deliverable is that six zero-invocation v1 functions are gone, and
+    the only surface that answers it is a live AWS read, which a gate may not
+    make — the same separation `legacy_weekly_executions_key` states for
+    itself. `nous-ergon-ops/scripts/legacy_dead_lambdas_producer.py` holds the
+    identity and files the answer here
+    (`schema_version: legacy-dead-lambdas.v1`).
+
+    **The probe is per EXACT name, never a prefix.** Four live functions --
+    `alpha-engine-research-eval-judge-process`, `-poll`, `-submit` and
+    `-spot-dispatcher` -- share a prefix with the deleted
+    `alpha-engine-research-eval-judge`, and every one of them would match a
+    `startswith` or a substring search. A prefix-matching probe would report
+    this deliverable UNMET forever against a system that satisfies it, so the
+    document carries one entry per exact name and the consumer refuses a
+    document that does not cover the full name set.
+    """
+    return f"legacy/lambdas/{week_anchor}/probe.json"
+
+
 # -- the 6am PT morning report (alpha-engine-config-I9896) ------------------
 
 
@@ -815,15 +843,41 @@ def acceptance_reading_key(trading_day: str) -> str:
 
         {"met": int, "unmet": int, "unmeasurable": int,
          "commit": str, "measured_at": str,
-         "unmet_clauses": [str], "unmeasurable_clauses": [str]}
+         "met_clauses": [str],
+         "unmet_clauses": [str], "unmeasurable_clauses": [str],
+         "store_versioning": str}
 
-    The two clause-id lists are OPTIONAL and are the only optional fields
-    here (`alpha-engine-config-I9921`): the report and the board page name the
-    failing clauses when the producer files them, and say "the artifact names
-    no unmet clause ids" when it does not. Optional rather than required so a
-    producer shipping the counts first is a partial producer rather than a
-    broken one — but never inferred: an absent list means "not filed", never
-    "there are none", and the consumers render those differently.
+    The three clause-id lists are OPTIONAL, and so is `store_versioning`
+    (`alpha-engine-config-I9921`, extended by `alpha-engine-config-I9964`):
+    the report and the board page name the failing clauses when the producer
+    files them, and say "the artifact names no unmet clause ids" when it does
+    not. Optional rather than required so a producer shipping the counts first
+    is a partial producer rather than a broken one — but never inferred: an
+    absent list means "not filed", never "there are none", and the consumers
+    render those differently.
+
+    **`met_clauses` is why the counts were not enough** (`I9964`). Phase 0's
+    `v2_resources_tagged_and_versioned` deliverable is declared, in this
+    gate's own deliverable table, to be graded by ONE §2 clause —
+    `TestCost::test_every_v2_resource_is_tagged_for_cost_attribution`. A
+    document carrying only `{"met": 22, "unmet": 2}` cannot answer whether
+    THAT clause is one of the 22, and "not named in `unmet_clauses`" is not an
+    answer either: an absent list means not filed. So the producer files the
+    met ids as well, and the gate clause reads UNMEASURABLE — never MET —
+    when they are absent.
+
+    **`store_versioning` is the second half of that same deliverable**, and it
+    rides on this document rather than on one of its own for a stated reason.
+    The deliverable names two properties of the v2 resources: the cost tag,
+    which the §2 clause above grades, and S3 versioning on the store. The
+    acceptance job is the one v2 CI identity that may read either — it holds
+    `cloudformation:ListStackResources`, `tag:GetResources`, `iam:ListRoleTags`
+    and `s3:GetBucketVersioning`, and can write exactly this prefix. Two
+    documents from the same job at the same instant would be two artifacts
+    that can disagree about one deliverable, and the gate would then have to
+    decide which one wins. The value is the bucket's `Status` verbatim
+    (`Enabled`, `Suspended`) and the field is ABSENT rather than guessed when
+    the read failed — a failed read is UNMEASURABLE, never `Suspended`.
 
     `unmeasurable` is its own integer and is never folded into `unmet`: "the
     clause says no" and "we could not ask" are different facts and the second
@@ -863,6 +917,14 @@ class AcceptanceReading:
     #: two render differently on both surfaces.
     unmet_clauses: tuple[str, ...] | None
     unmeasurable_clauses: tuple[str, ...] | None
+    #: The ids the suite reported MET, or `None` when the producer filed no
+    #: list. `None` is never "no clause was met" and never "every clause not
+    #: named unmet was met" — a gate clause asking about ONE id reads
+    #: UNMEASURABLE against `None` (`alpha-engine-config-I9964`).
+    met_clauses: tuple[str, ...] | None = None
+    #: The store bucket's S3 versioning `Status` verbatim, or `None` when the
+    #: producer did not file one. `None` is never `Suspended`.
+    store_versioning: str | None = None
 
     @property
     def total(self) -> int:
@@ -911,6 +973,7 @@ def parse_acceptance_reading(document: Any) -> AcceptanceReading | None:
     if not isinstance(commit, str) or not commit:
         return None
     measured_at = document.get("measured_at")
+    versioning = document.get("store_versioning")
     return AcceptanceReading(
         met=counts[0],
         unmet=counts[1],
@@ -919,4 +982,6 @@ def parse_acceptance_reading(document: Any) -> AcceptanceReading | None:
         measured_at=measured_at if isinstance(measured_at, str) and measured_at else None,
         unmet_clauses=_clause_ids(document, "unmet_clauses"),
         unmeasurable_clauses=_clause_ids(document, "unmeasurable_clauses"),
+        met_clauses=_clause_ids(document, "met_clauses"),
+        store_versioning=versioning if isinstance(versioning, str) and versioning else None,
     )

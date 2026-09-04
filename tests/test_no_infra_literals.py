@@ -100,6 +100,14 @@ _SCANNED_SUFFIXES = {".py", ".yaml", ".yml", ".json", ".toml", ".cfg", ".ini"}
 #: between the table and its own tests.
 ACCOUNT_ID_PATTERN = r"(?:arn:aws:iam::|::|--account[ =]|\baccount[ :=])\d{12}\b"
 
+#: A bare `alpha-engine-*` BUCKET stem, with no `s3://` scheme. A module
+#: constant for the same reason :data:`ACCOUNT_ID_PATTERN` is one: it was
+#: written out four times below, and the correction of 2026-09-04 had to be
+#: made in all five places or the tests would have kept asserting the old
+#: pattern's behaviour while the scan ran the new one — a self-test that
+#: grades a string nothing uses.
+BUCKET_STEM_PATTERN = r"\balpha-engine-(data|research|crucible-v2)(?![\w-])"
+
 #: What is forbidden, and why. See the module docstring for why `arn:aws:` on
 #: its own is deliberately absent from this table.
 FORBIDDEN: dict[str, str] = {
@@ -125,7 +133,19 @@ FORBIDDEN: dict[str, str] = {
     # and every `alpha-engine-config-I####` tracker reference), and a
     # detector that forbids its own class of false positive gets deleted
     # rather than fixed the first time it fires on one.
-    r"\balpha-engine-(data|research|crucible-v2)\b": (
+    # `(?![\w-])`, not `\b` (corrected 2026-09-04, `alpha-engine-config-I9964`).
+    # `\b` matches before a hyphen, so `\balpha-engine-research\b` fired on
+    # `alpha-engine-research-eval-judge` — a v1 LAMBDA FUNCTION name, not a
+    # bucket, and one of the six `alpha-engine-config-I9756` deletes. The
+    # guard's own note above says this pattern is scoped to "the KNOWN bucket
+    # stems this fleet actually has" precisely so it does not fire on
+    # non-bucket identifiers, and `-research-` collided with that intent the
+    # first time a function name landed in `crucible/`. Requiring the stem to
+    # END there keeps every bucket form it was written for — bare
+    # `alpha-engine-research`, `--s3-bucket alpha-engine-research`,
+    # `alpha-engine-crucible-v2/crucible` (a `/` is not `[\w-]`) — and stops
+    # matching a longer identifier that merely starts with one.
+    BUCKET_STEM_PATTERN: (
         "a literal alpha-engine-* bucket name (no s3:// scheme) — resolve it "
         "through a repository variable instead, per crucible/AGENTS.md"
     ),
@@ -205,7 +225,7 @@ def test_the_scan_can_actually_find_something() -> None:
     samples = {
         ACCOUNT_ID_PATTERN: "role/x  # arn:aws:iam::711398986525:role/x",
         r"s3://alpha-engine-": "STORE_URI: s3://alpha-engine-crucible-v2/crucible",
-        r"\balpha-engine-(data|research|crucible-v2)\b": 'BUCKET = "alpha-engine-data"',
+        BUCKET_STEM_PATTERN: 'BUCKET = "alpha-engine-data"',
     }
     assert set(samples) == set(FORBIDDEN), (
         "every forbidden pattern needs a sample proving the matcher fires on it; "
@@ -256,7 +276,7 @@ class TestTheAccountIdPatternDoesNotFalsePositiveOnLongerDigitRuns:
         assert _PATTERNS[ACCOUNT_ID_PATTERN].search("--account 711398986525")
 
     def test_a_bare_alpha_engine_bucket_name_does_match(self) -> None:
-        pattern = r"\balpha-engine-(data|research|crucible-v2)\b"
+        pattern = BUCKET_STEM_PATTERN
         assert _PATTERNS[pattern].search('DEFAULT_ARCTIC_BUCKET = "alpha-engine-data"')
         assert _PATTERNS[pattern].search("--s3-bucket alpha-engine-research")
 
@@ -266,9 +286,40 @@ class TestTheAccountIdPatternDoesNotFalsePositiveOnLongerDigitRuns:
         a topic name grants no access and is not a bucket. The scoped
         alternation (not a bare `alpha-engine-` prefix) is what keeps this
         pattern from also catching those."""
-        pattern = r"\balpha-engine-(data|research|crucible-v2)\b"
+        pattern = BUCKET_STEM_PATTERN
         assert not _PATTERNS[pattern].search('MUTED_TOPIC = "alpha-engine-alerts-muted"')
         assert not _PATTERNS[pattern].search("default is `alpha-engine-alerts`")
+
+    def test_the_bare_bucket_pattern_does_not_match_a_longer_lambda_name(self) -> None:
+        """`alpha-engine-config-I9964`. `\\b` matches before a hyphen, so the
+        pre-correction pattern fired on `alpha-engine-research-eval-judge` —
+        a v1 LAMBDA function name that `crucible/gate.py` now carries as a
+        literal because the phase-0 clause probes those six by EXACT name.
+
+        The old and new patterns are compared here as READINGS THAT DIFFER,
+        not as one assertion about the new one: a self-test that only shows
+        the current pattern accepting the sample cannot show the correction
+        changed anything."""
+        old = re.compile(r"\balpha-engine-(data|research|crucible-v2)\b")
+        for name in (
+            "alpha-engine-research-eval-judge",
+            "alpha-engine-research-perturbation-battery",
+            "alpha-engine-research-thinktank",
+        ):
+            assert old.search(name), f"{name} did not reproduce the old false positive"
+            assert not _PATTERNS[BUCKET_STEM_PATTERN].search(name), name
+
+    def test_the_correction_did_not_stop_catching_the_bucket_forms(self) -> None:
+        """The other half of the same comparison: every form the pattern was
+        written for still matches, so the fix narrowed the false positive and
+        not the detector."""
+        for line in (
+            'DEFAULT_ARCTIC_BUCKET = "alpha-engine-data"',
+            "--s3-bucket alpha-engine-research",
+            "STORE_URI: s3://alpha-engine-crucible-v2/crucible",
+            "bucket: alpha-engine-crucible-v2,",
+        ):
+            assert _PATTERNS[BUCKET_STEM_PATTERN].search(line), line
 
     def test_the_bare_bucket_pattern_does_not_match_a_tracker_reference(self) -> None:
         # No literal tracker number here on purpose — `test_no_stale_tracker_
@@ -276,7 +327,7 @@ class TestTheAccountIdPatternDoesNotFalsePositiveOnLongerDigitRuns:
         # in this very package. `config-` never appears in the bucket
         # alternation, so any `alpha-engine-config-I<N>` reference is already
         # excluded by construction; this proves it without citing one.
-        pattern = r"\balpha-engine-(data|research|crucible-v2)\b"
+        pattern = BUCKET_STEM_PATTERN
         assert not _PATTERNS[pattern].search("alpha-engine-config-" + "I" + "9906")
 
     def test_a_var_interpolated_account_id_carries_no_bare_digit_run(self) -> None:

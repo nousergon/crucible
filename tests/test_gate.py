@@ -18,19 +18,25 @@ from crucible.gate import (
     GATE_DELIVERABLES,
     GATES,
     LADDER_KEY,
+    LEGACY_DEAD_LAMBDA_NAMES,
+    LEGACY_DEAD_LAMBDAS_SCHEMA_VERSION,
     LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
+    MUTED_ALERTS_TOPIC_NAME,
     PHASE0_DELIVERABLES,
     PHASES,
     SOURCE_SCAN_SCOPE,
+    V2_TAG_ACCEPTANCE_CLAUSE_ID,
     Deliverable,
     build_ladder,
     coverage_note,
     evaluate,
     gate_key,
+    legacy_dead_lambdas_key,
     legacy_weekly_executions_key,
     weekly_anchor,
 )
 from crucible.keys import (
+    acceptance_reading_key,
     arena_cycle_key,
     arm_register_key,
     gate_prefix,
@@ -1145,7 +1151,14 @@ class TestTheGateJobPublishesAnHonestMetric:
 PHASE0_WINDOW = [FRIDAY - dt.timedelta(weeks=n) for n in reversed(range(1))]
 
 
-def _legacy_week(anchor: dt.date, *, runs: int = 1, skips: int = 2) -> dict:
+def _legacy_week(
+    anchor: dt.date,
+    *,
+    runs: int = 1,
+    skips: int = 2,
+    topic: str | None = f"arn:aws:sns:us-east-1:acct:{MUTED_ALERTS_TOPIC_NAME}",
+    with_topic_field: bool = True,
+) -> dict:
     """One filed week in the `legacy-weekly-executions.v2` shape.
 
     `skips` defaults to 2 because that is what the live system produces:
@@ -1154,6 +1167,11 @@ def _legacy_week(anchor: dt.date, *, runs: int = 1, skips: int = 2) -> dict:
     about three seconds. A fixture without them would never exercise the
     metric Brian ruled on 2026-09-04. Shape, thresholds and the refusals
     around them are graded in `tests/test_legacy_weekly_executions_contract.py`.
+
+    `topic` is the `sns_topic_arn` every execution's input declared, and
+    `with_topic_field=False` drops the field entirely — the shape of a
+    document filed between `alpha-engine-config-I9962` and `I9964`, which
+    answers the cadence question and not the routing one.
     """
     day = anchor.isoformat()
     executions = [
@@ -1175,6 +1193,9 @@ def _legacy_week(anchor: dt.date, *, runs: int = 1, skips: int = 2) -> dict:
         }
         for n in range(runs)
     ]
+    if with_topic_field:
+        for execution in executions:
+            execution["sns_topic_arn"] = topic
     return {
         "schema_version": LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
         "executions_started": len(executions),
@@ -1183,15 +1204,64 @@ def _legacy_week(anchor: dt.date, *, runs: int = 1, skips: int = 2) -> dict:
     }
 
 
+def _dead_lambda_probe(
+    *, alive: tuple[str, ...] = (), cover: tuple[str, ...] | None = None
+) -> dict:
+    """One filed probe in the `legacy-dead-lambdas.v1` shape.
+
+    `alive` names the probed functions that still exist; `cover` narrows which
+    names the probe answered at all, which is how the "a probe of five of the
+    six answers a narrower question" refusal is exercised.
+    """
+    names = LEGACY_DEAD_LAMBDA_NAMES if cover is None else cover
+    return {
+        "schema_version": LEGACY_DEAD_LAMBDAS_SCHEMA_VERSION,
+        "probed_at": "2026-08-29T15:00:00+00:00",
+        "region": "us-east-1",
+        "functions": [{"name": name, "present": name in alive} for name in names],
+        "source": "a filed record, not a live API call",
+    }
+
+
+def _acceptance_document(
+    *,
+    tag_clause_met: bool = True,
+    versioning: str | None = "Enabled",
+    with_met_clauses: bool = True,
+) -> dict:
+    """One filed §2 acceptance reading in `acceptance_reading_key`'s shape."""
+    met = ["TestAlerting::test_there_are_exactly_two_page_conditions"]
+    unmet = []
+    (met if tag_clause_met else unmet).append(V2_TAG_ACCEPTANCE_CLAUSE_ID)
+    document: dict = {
+        "met": len(met),
+        "unmet": len(unmet),
+        "unmeasurable": 0,
+        "commit": "0" * 40,
+        "measured_at": "2026-08-28T12:00:00+00:00",
+        "unmet_clauses": sorted(unmet),
+        "unmeasurable_clauses": [],
+    }
+    if with_met_clauses:
+        document["met_clauses"] = sorted(met)
+    if versioning is not None:
+        document["store_versioning"] = versioning
+    return document
+
+
 def _seed_phase0_met(tmp_path, starts: int = 1) -> LocalStore:
-    """A store in which the v1 weekly cadence clause is satisfied.
+    """A store in which every phase-0 clause that reads the store is satisfied.
 
     `starts` is the number of executions that PASS `WeeklyRunDayGate` — the
     metric since the 2026-09-04 ruling (`alpha-engine-config-I9962`), not raw
     starts.
 
-    The acceptance clause reads the committed ratchet, not the store, so a
-    seeded store plus the real repository is the whole met state.
+    Since `alpha-engine-config-I9964` that is four documents, not one: the
+    weekly executions record (cadence AND routing), the dead-Lambda probe, and
+    the §2 acceptance reading (the cost-tag clause plus the store's versioning
+    status). The acceptance-suite clause still reads the committed ratchet
+    rather than the store, so a seeded store plus the real repository is the
+    whole met state.
     """
     store = LocalStore(tmp_path)
     for day in PHASE0_WINDOW:
@@ -1201,6 +1271,8 @@ def _seed_phase0_met(tmp_path, starts: int = 1) -> LocalStore:
             legacy_weekly_executions_key(anchor.isoformat()),
             _legacy_week(anchor, runs=starts),
         )
+        _put(store, legacy_dead_lambdas_key(anchor.isoformat()), _dead_lambda_probe())
+    _put(store, acceptance_reading_key(PHASE0_WINDOW[-1].isoformat()), _acceptance_document())
     return store
 
 
@@ -1463,8 +1535,14 @@ class TestPhaseZeroOldWeeklyCadence:
             legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat()), b"{not json"
         )
         rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
-        assert rows["phase0"]["state"] == "UNMET"
-        assert rows["phase0"]["clauses_total"] == 2
+        # UNMEASURABLE, not UNMET, since `alpha-engine-config-I9964`: this one
+        # key now feeds TWO clauses, and `old_alerts_muted` reads an
+        # unparseable document as "we could not ask" rather than as a finding
+        # about the routing. A row with any unmeasurable clause publishes no
+        # ratio, which is the point — what must never happen is MET, and the
+        # ladder rendering at all is what this test is here for.
+        assert rows["phase0"]["state"] == "UNMEASURABLE"
+        assert rows["phase0"]["clauses_total"] == 5
 
 
 def _fake_acceptance_tree(
@@ -1631,21 +1709,34 @@ class TestPhaseZeroSaysWhatItDoesNotGrade:
         self, tmp_path
     ) -> None:
         result = evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY)
-        assert "2 of 5" in result.coverage
+        assert "5 of 5" in result.coverage, result.coverage
+        assert "not gate-readable" not in result.coverage, result.coverage
         assert result.to_dict()["coverage"] == result.coverage
         assert result.coverage in result.render()
         for deliverable in PHASE0_DELIVERABLES:
             if deliverable.graded_by is None:
                 assert deliverable.id in result.coverage
 
-    def test_the_ladder_row_detail_carries_it_so_a_MET_phase_still_says_so(self, tmp_path) -> None:
+    def test_every_deliverable_has_a_clause_in_the_reading(self, tmp_path) -> None:
+        """`alpha-engine-config-I9964`'s acceptance test. Three of the five
+        deliverables were declared "not gate-readable" on the argument that
+        the fact lives in AWS and a gate does not call AWS — an argument about
+        the READ that was applied to the CLAUSE, while
+        `old_weekly_within_cadence` had been reading a live AWS fact through a
+        producer all along."""
+        result = evaluate(LocalStore(tmp_path), gate="phase0", trading_day=FRIDAY)
+        graded = {d.graded_by for d in PHASE0_DELIVERABLES}
+        assert None not in graded
+        assert graded <= {c.name for c in result.clauses}
+
+    def test_the_ladder_row_detail_carries_the_full_coverage_claim(self, tmp_path) -> None:
         """A phase whose gate grades a SUBSET renders MET on the ladder and on
-        the board with nothing saying so unless the row itself carries it."""
+        the board with nothing saying so unless the row itself carries it. The
+        subset is now the whole set, and the row still has to say which."""
         store = _seed_phase0_met(tmp_path)
         rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
-        assert rows["phase0"]["state"] == "MET"
-        assert "not gate-readable" in rows["phase0"]["detail"]
-        assert "dead_lambdas_deleted" in rows["phase0"]["detail"]
+        assert rows["phase0"]["state"] == "MET", rows["phase0"]["detail"]
+        assert "5 of 5" in rows["phase0"]["detail"]
 
     def test_a_gate_with_no_declared_deliverables_gets_no_coverage_line(self, tmp_path) -> None:
         """Silence is "not declared", never "grades everything". Phase 1
@@ -1729,8 +1820,11 @@ class TestTheAcceptanceReadIsAlsoGuarded:
             r["phase"]: r
             for r in build_ladder(LocalStore(tmp_path), trading_day=FRIDAY).to_dict()["phases"]
         }
-        assert rows["phase0"]["state"] == "UNMET"
-        assert rows["phase0"]["clauses_total"] == 2
+        # The store is empty here too, so the three clauses added by
+        # `alpha-engine-config-I9964` read UNMEASURABLE and the row follows
+        # them. Never MET is the invariant; rendering at all is the test.
+        assert rows["phase0"]["state"] == "UNMEASURABLE"
+        assert rows["phase0"]["clauses_total"] == 5
 
     def test_a_suite_module_that_does_not_parse_is_a_red_clause(
         self, tmp_path, monkeypatch
