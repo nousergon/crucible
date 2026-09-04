@@ -59,6 +59,7 @@ __all__ = [
     "cross_section_key",
     "cross_section_settled_key",
     "data_panel_key",
+    "declared_universe_key",
     "drift_input_key",
     "drift_metrics_key",
     "experiments_key",
@@ -615,6 +616,21 @@ def gate_prefix(gate: str) -> str:
 def universe_members_key(trading_day: str) -> str:
     """The U champion's feed: which names reach the predictor."""
     return f"universe/{trading_day}/members.json"
+
+
+def declared_universe_key(trading_day: str) -> str:
+    """`universe/declared/{trading_day}/members.json` — the store copy of the
+    universe a data job graded ``trading_day``'s coverage against
+    (`crucible.data.universe`).
+
+    Beside, not inside, the U slot's :func:`universe_members_key` feed: that
+    one is what the U arms SELECT, this one is what the data layer must
+    COVER, and a reader that conflated them would grade selection quality
+    against the denominator it was selected from.
+    """
+    if not trading_day:
+        raise ValueError("trading_day must be non-empty")
+    return f"universe/declared/{trading_day}/members.json"
 
 
 def signals_key(trading_day: str) -> str:

@@ -26,6 +26,7 @@ from crucible import migrate as migrate_module
 from crucible.calendar import is_trading_day
 from crucible.config import settings as resolve_settings
 from crucible.data import ArcticPriceSource, PriceSource, run_daily, run_heal, run_weekly
+from crucible.data.universe import DeclaredUniverse, load_declared_universe, universe_from_argv
 from crucible.explain import explain as explain_lineage
 from crucible.explain import render as render_lineage
 from crucible.gate import PHASES
@@ -88,11 +89,36 @@ def _source(args: argparse.Namespace, config: Any) -> PriceSource:
     )
 
 
-def _symbols(args: argparse.Namespace) -> list[str] | None:
+def _declared_universe(args: argparse.Namespace, config: Any) -> DeclaredUniverse | None:
+    """The denominator of the coverage ratio, with its provenance.
+
+    Resolution order is the one every other setting uses: the explicit
+    argument (`--symbols`), then the environment (`CRUCIBLE_UNIVERSE_URI`,
+    via `config.universe_uri`), then nothing — and nothing is returned as
+    `None` so `run_daily`/`run_weekly` raise their own
+    `UndeclaredUniverseError`, which names the fix. A document that exists
+    and is malformed raises here, before the source is touched, and never
+    degrades to "whatever the source has" (`crucible.data.universe`).
+    """
     raw = getattr(args, "symbols", None)
-    if not raw:
+    if raw:
+        return universe_from_argv(raw)
+    if config.universe_uri:
+        return load_declared_universe(config.universe_uri, origin=config.origins["universe_uri"])
+    return None
+
+
+def _expected_symbols(declared: DeclaredUniverse | None, ctx: Any) -> list[str] | None:
+    """Record the universe beside the run, then hand its symbols to the job.
+
+    Called from inside the job body so the store copy lands under the run's
+    own lineage (`outputs[]`); a copy written before `run_job` would belong
+    to no manifest.
+    """
+    if declared is None:
         return None
-    return sorted({s.strip().upper() for s in raw.split(",") if s.strip()})
+    declared.record(ctx)
+    return list(declared.symbols)
 
 
 # -- data -------------------------------------------------------------------
@@ -161,10 +187,16 @@ def handle_data_daily(args: argparse.Namespace) -> int:
         print(json.dumps({"run_id": ctx.run_id, "outputs": [], "detail": detail}, indent=2))
         return 0
     source = _source(args, config)
+    declared = _declared_universe(args, config)
     if args.dry_run:
         print(
             f"data.daily --date {args.trading_day} would read {source.name} and write to "
-            f"{config.store_uri}"
+            f"{config.store_uri}; universe: "
+            + (
+                f"{len(declared.symbols)} symbols from {declared.source_uri}"
+                if declared
+                else "NONE declared"
+            )
         )
         return 0
     ctx = run_job(
@@ -172,7 +204,7 @@ def handle_data_daily(args: argparse.Namespace) -> int:
         lambda c: run_daily(
             c,
             source=source,
-            expected_symbols=_symbols(args),
+            expected_symbols=_expected_symbols(declared, c),
         ),
         store=store,
         trading_day=args.trading_day,
@@ -186,10 +218,16 @@ def handle_data_weekly(args: argparse.Namespace) -> int:
     config = _settings(args)
     store = config.store()
     source = _source(args, config)
+    declared = _declared_universe(args, config)
     if args.dry_run:
         print(
             f"data.weekly --date {args.trading_day} would read {source.name} and write to "
-            f"{config.store_uri}"
+            f"{config.store_uri}; universe: "
+            + (
+                f"{len(declared.symbols)} symbols from {declared.source_uri}"
+                if declared
+                else "NONE declared"
+            )
         )
         return 0
     ctx = run_job(
@@ -197,7 +235,7 @@ def handle_data_weekly(args: argparse.Namespace) -> int:
         lambda c: run_weekly(
             c,
             source=source,
-            expected_symbols=_symbols(args),
+            expected_symbols=_expected_symbols(declared, c),
         ),
         store=store,
         trading_day=args.trading_day,
@@ -213,6 +251,7 @@ def handle_data_heal(args: argparse.Namespace) -> int:
     source = _source(args, config)
     start = dt.date.fromisoformat(args.from_date)
     end = dt.date.fromisoformat(args.to_date)
+    declared = _declared_universe(args, config)
     if args.dry_run:
         from crucible.data.heal import in_region, sessions_in_range
 
@@ -232,7 +271,7 @@ def handle_data_heal(args: argparse.Namespace) -> int:
             end=end,
             gap=args.gap,
             i_am_in_region=getattr(args, "i_am_in_region", False),
-            expected_symbols=_symbols(args),
+            expected_symbols=_expected_symbols(declared, c),
         ),
         store=store,
         trading_day=end,
@@ -468,14 +507,17 @@ def add_track_a_arguments(name: str, sub: argparse.ArgumentParser) -> None:
         sub.add_argument(
             "--symbols",
             help=(
-                "Comma-separated expected universe. MANDATORY: this is the DENOMINATOR "
-                "of the coverage ratio, and `run_daily`/`run_weekly` refuse to run "
-                "without it — a ratio computed over whatever arrived always reads 1.0, "
-                "and the coverage floor cannot fire with no denominator to measure it "
+                "Comma-separated expected universe. This is the DENOMINATOR of the "
+                "coverage ratio, and `run_daily`/`run_weekly` refuse to run without one "
+                "— a ratio computed over whatever arrived always reads 1.0, and the "
+                "coverage floor cannot fire with no denominator to measure it against. "
+                "Absent, the universe is read from the document CRUCIBLE_UNIVERSE_URI "
+                "names (a membership document or a pointer to one; see "
+                "crucible.data.universe), and a copy is written beside the run under "
                 # Historical citation, not a phase pointer: alpha-engine-config-I9757
                 # defect #2 is where this specific gap was first found. Kept in this
                 # comment rather than the --help text per alpha-engine-config-I9839.
-                "against."
+                "universe/declared/. Neither given: the job refuses."
             ),
         )
     if name == "data.heal":
