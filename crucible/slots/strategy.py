@@ -48,6 +48,8 @@ from typing import Any
 import yaml
 from nousergon_lib.arena import ArmSeries, derive_arm_id
 
+from crucible.slots.vocab import refuse_unknown_keys
+
 __all__ = [
     "ATTESTATION_STATUSES",
     "EXIT_RULES",
@@ -273,6 +275,18 @@ class StrategyRecipe:
 
 REQUIRED_STRATEGY_FIELDS: tuple[str, ...] = ("rules", "cost_model")
 
+#: Every key a filed S recipe's `spec:` may declare (`alpha-engine-config-
+#: I9944`) — the required fields above, plus the two optional keys this
+#: loader also reads: `walk_forward` (defaults to `WalkForwardSpec()`) and
+#: `benchmark` (defaults to `"SPY"`).
+S_SPEC_KEYS: frozenset[str] = frozenset({*REQUIRED_STRATEGY_FIELDS, "walk_forward", "benchmark"})
+
+#: Every top-level key a filed S recipe may declare (`alpha-engine-config-
+#: I9944`). `StrategyRecipe` has no `registered_at` field — an S arm is not
+#: OOS-clocked the way U/R/M arms are (no such key is read anywhere in this
+#: module) — so it is deliberately absent from this vocabulary too.
+S_TOP_LEVEL_KEYS: frozenset[str] = frozenset({"slot", "name", "notes", "supersedes", "spec"})
+
 
 def load_strategy_recipes(directory: Path | str) -> tuple[StrategyRecipe, ...]:
     """Load every `*.yaml` S recipe under ``directory``, sorted by filename.
@@ -291,6 +305,20 @@ def load_strategy_recipes(directory: Path | str) -> tuple[StrategyRecipe, ...]:
                 f"{path}: recipe is missing pre-registration field(s) {missing}. Plan §9.1: "
                 "missing fields mean the arm does not register."
             )
+        refuse_unknown_keys(
+            path=path,
+            keys=set(payload),
+            vocabulary=S_TOP_LEVEL_KEYS,
+            level="top-level recipe",
+            slot_label="S",
+        )
+        refuse_unknown_keys(
+            path=path,
+            keys=set(spec),
+            vocabulary=S_SPEC_KEYS,
+            level="spec",
+            slot_label="S",
+        )
         cost = spec["cost_model"]
         recipes.append(
             StrategyRecipe(

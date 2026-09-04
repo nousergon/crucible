@@ -65,6 +65,17 @@ class TestIdentity:
         with pytest.raises(FileNotFoundError, match="no arm recipes"):
             load_arm_specs("u", strategy_dir=tmp_path)
 
+    def test_an_unknown_top_level_key_is_refused_by_name(self, tmp_path) -> None:
+        """`alpha-engine-config-I9944`: a top-level key `_parse` does not
+        read used to register cleanly and bind nothing. `params` stays open
+        — it is the ranker's own argument mapping, hashed as-is — but every
+        other top-level key is a closed vocabulary."""
+        arms = tmp_path / "arms" / "u"
+        arms.mkdir(parents=True)
+        _write(arms, "extra", "momentum_sleeve", bogus_field="nope")
+        with pytest.raises(ValueError, match="bogus_field"):
+            load_arm_specs("u", strategy_dir=tmp_path)
+
 
 def _write_llm_arm(directory, name, callsite):
     (directory / f"{name}.yaml").write_text(

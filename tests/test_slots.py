@@ -186,6 +186,67 @@ class TestControlArms:
             ControlArm(arm_id="c", kind="mostly_planted")
 
 
+class TestIsControlArmIsRegisterBacked:
+    """`alpha-engine-config-I9943`: the register never recorded whether an
+    arm was a control, so every consumer answered off `SlotSpec.control_arms`
+    BY NAME. `crucible-PR102` threads `ArmSpec.control` into the registered
+    `ArmRecord.control`; this is the read side — `is_control_arm`, given a
+    register, must prefer the RECORDED flag over the name match, in both
+    directions: a name collision must not exclude a real arm, and emptying
+    `SlotSpec.control_arms` must not un-exclude a real control.
+    """
+
+    def test_a_filed_non_control_recipe_whose_name_collides_with_a_control_is_not_excluded(
+        self,
+    ) -> None:
+        from nousergon_lib.arena import ArmRegister
+
+        from crucible.slots.arms import ArmSpec, register_arms
+
+        spec = get_slot("m")
+        collider_name = spec.control_arms[0].arm_id  # e.g. "control_planted_m"
+        filed = ArmSpec(
+            name=collider_name,
+            slot="m",
+            ranker="momentum_sleeve",
+            params={"not": "a control, just a name collision"},
+            registered_at="2026-09-01",
+            control=False,
+        )
+        register, _ = register_arms(ArmRegister(), [filed])
+        registered_id = filed.arm_id
+
+        assert is_control_arm(spec, registered_id), (
+            "sanity: the NAME-ONLY fallback (no register) still matches the colliding name"
+        )
+        assert not is_control_arm(spec, registered_id, register), (
+            "the record says control=False; a name collision must not override it once "
+            "the arm is registered"
+        )
+
+    def test_a_control_is_excluded_by_its_record_even_if_control_arms_is_emptied(self) -> None:
+        import dataclasses
+
+        from nousergon_lib.arena import ArmRegister
+
+        from crucible.slots.arms import control_specs, register_arms
+
+        spec = get_slot("m")
+        controls = control_specs(spec)
+        register, _ = register_arms(ArmRegister(), controls)
+        emptied = dataclasses.replace(spec, control_arms=())
+
+        for control in controls:
+            assert is_control_arm(emptied, control.arm_id, register), (
+                f"{control.arm_id} is control=True on its own record; emptying "
+                "SlotSpec.control_arms must not un-exclude it"
+            )
+        # The name-only FALLBACK (no register) is what `control_arms` being
+        # emptied WOULD have broken before this fix — shown here to make the
+        # register path's necessity concrete, not asserted from prose.
+        assert not is_control_arm(emptied, controls[0].arm_id)
+
+
 class TestControlArmsExcludedFromRetirementMath:
     """`alpha-engine-config-I9993`: `crucible/slots/cycle.py` self-reported
     `controls_counted_in_retirement_cap: True`, with a comment claiming the
