@@ -118,12 +118,32 @@ class ReleaseLockReading:
     key: str
     state: ReleaseLockState
     detail: str
+    #: A short machine token naming WHY an UNMEASURABLE reading could not be
+    #: taken — `"<call>:<error code>"`, e.g. `get_object_retention:AccessDenied`.
+    #: Empty for MET and UNMET, which have nothing unexplained about them.
+    #:
+    #: This exists because the metric summarises 120 findings into one
+    #: `status_reason` (alpha-engine-config-I9952). Deriving the cause by
+    #: regexing `detail` — an English sentence written for a human — is the
+    #: failure this fleet keeps re-buying; the cause travels as its own field
+    #: so the summary reads a token rather than parsing prose.
+    cause: str = ""
 
     def __post_init__(self) -> None:
         if self.state not in ("MET", "UNMET", "UNMEASURABLE"):
             raise ValueError(f"{self.state!r} is not a release-lock reading state")
         if not self.detail.strip():
             raise ValueError(f"{self.key}: a {self.state} reading with no detail is not actionable")
+        # Fail loud rather than let an unattributed UNMEASURABLE through: the
+        # whole point of I9952 is that "120 of 120 unreadable" with no cause
+        # cost a `simulate-principal-policy` call to learn what the sweep
+        # already knew.
+        if self.state == "UNMEASURABLE" and not self.cause.strip():
+            raise ValueError(
+                f"{self.key}: an UNMEASURABLE reading with no `cause` cannot be "
+                "summarised, and an unattributed unmeasurable is what I9952 exists "
+                "to remove"
+            )
 
 
 def _release_object_keys(store: Store) -> list[str]:
@@ -159,6 +179,7 @@ def _read_one(store: S3Store, key: str) -> ReleaseLockReading:
             f"head_object({key}) failed: {code or type(exc).__name__}. This is a "
             "statement about our access, not about the object's retention, and it "
             "must never be counted as an UNMET finding.",
+            cause=f"head_object:{code or type(exc).__name__}",
         )
     last_modified = head.get("LastModified")
 
@@ -173,6 +194,7 @@ def _read_one(store: S3Store, key: str) -> ReleaseLockReading:
                 f"get_object_retention({key}) denied: {code}. This is a statement "
                 "about our access, not about the object's retention, and it must "
                 "never be counted as an UNMET finding.",
+                cause=f"get_object_retention:{code}",
             )
         if code == _NO_RETENTION_ERROR_CODE:
             return ReleaseLockReading(
@@ -196,6 +218,7 @@ def _read_one(store: S3Store, key: str) -> ReleaseLockReading:
                 f"head_object({key}) succeeded — the object was very likely deleted "
                 "between the list and this read (a release deleted mid-sweep), not a "
                 "statement about its retention.",
+                cause=f"get_object_retention:{code} (deleted mid-sweep)",
             )
         # Every OTHER ClientError — Throttling, InternalError, an SDK/API
         # code this module has never seen — is neither "denied", "no
@@ -209,6 +232,7 @@ def _read_one(store: S3Store, key: str) -> ReleaseLockReading:
             f"get_object_retention({key}) failed: {code or type(exc).__name__}. This "
             "is a statement about the call failing, not about the object's "
             "retention, and it must never be counted as an UNMET finding.",
+            cause=f"get_object_retention:{code or type(exc).__name__}",
         )
 
     retention = retention_response.get("Retention") or {}
@@ -227,6 +251,7 @@ def _read_one(store: S3Store, key: str) -> ReleaseLockReading:
             f"get_object_retention({key}) succeeded but returned no Mode/"
             f"RetainUntilDate ({retention!r}) — a malformed response, not a "
             "confirmed absence of retention.",
+            cause="get_object_retention:malformed response (no Mode/RetainUntilDate)",
         )
     if last_modified is not None:
         target_retain_until = last_modified.astimezone(dt.UTC) + RELEASE_OBJECT_LOCK_RETENTION
@@ -265,10 +290,46 @@ def release_lock_findings(store: Store) -> list[ReleaseLockReading]:
                 "UNMEASURABLE",
                 f"{key}: store is {type(store).__name__}, which has no Object Lock "
                 "concept — this sweep is only meaningful against S3Store.",
+                cause=f"unsupported backend:{type(store).__name__}",
             )
             for key in keys
         ]
     return [_read_one(store, key) for key in keys]
+
+
+#: How many keys a `status_reason` names before it truncates. The first
+#: unmeasurable sweep wrote all 120 into one manifest field -- over 12 KB of
+#: `status_reason` -- which no console pane renders and no reader reads
+#: (alpha-engine-config-I9952). Every key is still carried in full on its own
+#: `ReleaseLockReading`, which `track_c.sweep_handler` writes to
+#: `release_lock_findings` in the same manifest; this is the summary line, not
+#: the record.
+_KEYS_IN_REASON = 5
+
+
+def _keys_excerpt(findings: list[ReleaseLockReading]) -> str:
+    """Up to `_KEYS_IN_REASON` keys, saying so when it truncated."""
+    shown_keys = [f.key for f in findings]
+    shown = ", ".join(shown_keys[:_KEYS_IN_REASON])
+    if len(shown_keys) <= _KEYS_IN_REASON:
+        return shown
+    return f"{shown}, and {len(shown_keys) - _KEYS_IN_REASON} more"
+
+
+def _causes_summary(findings: list[ReleaseLockReading]) -> str:
+    """The unmeasurable findings counted BY CAUSE, commonest first.
+
+    This is the half that was missing. "120 of 120 could not be read" sent an
+    operator to look at IAM, a deleted key, a throttle and a malformed
+    response with equal probability; "120 x get_object_retention:AccessDenied"
+    names the grant to add. Four conditions, four different fixes, and the
+    module already knew which one it hit on every single reading.
+    """
+    counts: dict[str, int] = {}
+    for finding in findings:
+        counts[finding.cause] = counts.get(finding.cause, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return "Cause: " + "; ".join(f"{count} x {cause}" for cause, count in ranked) + "."
 
 
 def release_lock_metric(findings: list[ReleaseLockReading], *, now: dt.datetime) -> dict[str, Any]:
@@ -288,13 +349,14 @@ def release_lock_metric(findings: list[ReleaseLockReading], *, now: dt.datetime)
         status = "BREACH"
         status_reason = (
             f"{len(unmet)} of {len(findings)} release object(s) lack Object Lock "
-            f"retention: {', '.join(f.key for f in unmet)}"
+            f"retention: {_keys_excerpt(unmet)}"
         )
     elif unmeasurable:
         status = "unmeasurable"
         status_reason = (
             f"{len(unmeasurable)} of {len(findings)} release object(s) could not be "
-            f"read for retention: {', '.join(f.key for f in unmeasurable)}"
+            f"read for retention. {_causes_summary(unmeasurable)} "
+            f"Keys: {_keys_excerpt(unmeasurable)}"
         )
     else:
         status = "OK"

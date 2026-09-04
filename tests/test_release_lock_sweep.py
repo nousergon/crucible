@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime as dt
 
+import pytest
 from botocore.exceptions import ClientError
 
 from crucible.release import RELEASE_OBJECT_LOCK_RETENTION, release_json_key, wheel_key
@@ -380,7 +381,10 @@ class TestMetric:
         findings = [
             ReleaseLockReading("locked", "MET", "locked"),
             ReleaseLockReading("unlocked", "UNMET", "no retention"),
-            ReleaseLockReading("denied", "UNMEASURABLE", "AccessDenied"),
+            ReleaseLockReading(
+                "denied", "UNMEASURABLE", "AccessDenied",
+                cause="get_object_retention:AccessDenied",
+            ),
         ]
         metric = release_lock_metric(findings, now=_PUBLISHED_AT)
         assert metric["status"] == "BREACH"
@@ -390,7 +394,10 @@ class TestMetric:
     def test_unmeasurable_without_any_unmet_is_unmeasurable_not_ok(self) -> None:
         findings = [
             ReleaseLockReading("locked", "MET", "locked"),
-            ReleaseLockReading("denied", "UNMEASURABLE", "AccessDenied"),
+            ReleaseLockReading(
+                "denied", "UNMEASURABLE", "AccessDenied",
+                cause="get_object_retention:AccessDenied",
+            ),
         ]
         metric = release_lock_metric(findings, now=_PUBLISHED_AT)
         assert metric["status"] == "unmeasurable"
@@ -409,3 +416,106 @@ class TestMetric:
             "last_updated_utc",
         ):
             assert field in metric
+
+
+# --- The unmeasurable summary must be actionable (alpha-engine-config-I9952) -
+#
+# The first live sweep (2026-09-04T01:01:30Z) wrote
+# "120 of 120 release object(s) could not be read for retention: <120 keys>"
+# -- over 12 KB of one manifest field, naming no cause. Four conditions reach
+# UNMEASURABLE (denied / deleted mid-sweep / transient / malformed) and they
+# have four different fixes, so a reader could not act on it. It took a
+# `simulate-principal-policy` call to learn what the sweep already knew on
+# every single reading.
+
+
+class TestUnmeasurableSummaryNamesTheCause:
+
+    def test_an_unmeasurable_reading_without_a_cause_is_refused(self) -> None:
+        """The field is not optional where it is load-bearing. An
+        unattributed UNMEASURABLE is exactly the state I9952 removes, so it
+        fails at construction rather than surfacing as an unactionable
+        summary a day later."""
+        with pytest.raises(ValueError, match="cause"):
+            ReleaseLockReading("k", "UNMEASURABLE", "something went wrong")
+
+    def test_met_and_unmet_need_no_cause(self) -> None:
+        """Nothing is unexplained about them, so requiring a token there
+        would be ceremony."""
+        assert ReleaseLockReading("k", "MET", "locked").cause == ""
+        assert ReleaseLockReading("k", "UNMET", "no retention").cause == ""
+
+    def test_the_reason_counts_by_cause_commonest_first(self) -> None:
+        findings = [
+            ReleaseLockReading(
+                f"denied-{i}", "UNMEASURABLE", "denied",
+                cause="get_object_retention:AccessDenied",
+            )
+            for i in range(3)
+        ] + [
+            ReleaseLockReading(
+                "gone", "UNMEASURABLE", "deleted",
+                cause="get_object_retention:NoSuchKey (deleted mid-sweep)",
+            ),
+        ]
+        reason = release_lock_metric(findings, now=_PUBLISHED_AT)["status_reason"]
+        assert "3 x get_object_retention:AccessDenied" in reason
+        assert "1 x get_object_retention:NoSuchKey (deleted mid-sweep)" in reason
+        # Commonest first: the majority cause is the one to act on.
+        assert reason.index("3 x ") < reason.index("1 x ")
+
+    def test_the_real_incident_reads_as_one_grant_to_add(self) -> None:
+        """The 2026-09-04 shape, reproduced: 120 keys, all AccessDenied on
+        `get_object_retention`. The summary must name the call and the code,
+        which together name the missing IAM action."""
+        findings = [
+            ReleaseLockReading(
+                f"releases/{i:040x}/release.json", "UNMEASURABLE", "denied",
+                cause="get_object_retention:AccessDenied",
+            )
+            for i in range(120)
+        ]
+        metric = release_lock_metric(findings, now=_PUBLISHED_AT)
+        assert metric["status"] == "unmeasurable"
+        assert "120 x get_object_retention:AccessDenied" in metric["status_reason"]
+
+    def test_the_reason_truncates_the_key_list_and_says_that_it_did(self) -> None:
+        """12 KB of keys in one field is not a summary. Truncation must be
+        stated, never silent -- a reader who cannot tell a list of five from
+        a list of 120 is being misled about the blast radius."""
+        findings = [
+            ReleaseLockReading(
+                f"k{i}", "UNMEASURABLE", "denied",
+                cause="get_object_retention:AccessDenied",
+            )
+            for i in range(120)
+        ]
+        reason = release_lock_metric(findings, now=_PUBLISHED_AT)["status_reason"]
+        assert "and 115 more" in reason
+        assert len(reason) < 500
+        # The full record survives elsewhere: every key is on its own reading,
+        # which `track_c.sweep_handler` writes to `release_lock_findings`.
+        assert "k0" in reason
+
+    def test_a_short_list_is_not_truncated(self) -> None:
+        findings = [
+            ReleaseLockReading(
+                f"k{i}", "UNMEASURABLE", "denied",
+                cause="get_object_retention:AccessDenied",
+            )
+            for i in range(2)
+        ]
+        reason = release_lock_metric(findings, now=_PUBLISHED_AT)["status_reason"]
+        assert "more" not in reason
+        assert "k0" in reason
+        assert "k1" in reason
+
+    def test_the_breach_reason_is_capped_too(self) -> None:
+        """A BREACH over every object has the same 12 KB problem, and BREACH
+        is the case somebody actually reads."""
+        findings = [
+            ReleaseLockReading(f"k{i}", "UNMET", "no retention") for i in range(120)
+        ]
+        metric = release_lock_metric(findings, now=_PUBLISHED_AT)
+        assert metric["status"] == "BREACH"
+        assert "and 115 more" in metric["status_reason"]
