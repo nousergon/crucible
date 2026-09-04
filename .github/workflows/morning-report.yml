@@ -180,6 +180,11 @@ jobs:
           ALPHA_ENGINE_SECRETS_SOURCE: env
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # The fleet console's base URL (alpha-engine-config-I9926): a
+          # repository variable, like the store URI above, because a hostname
+          # is an infrastructure identifier this tree carries none of. Unset
+          # means the report links the presigned page instead, and says so.
+          CRUCIBLE_CONSOLE_URL: ${{ vars.CRUCIBLE_CONSOLE_URL }}
         # `--run-mode live`: a scheduled firing is a live run, and
         # `run_manifest.v2` requires the field with no default (there is no
         # date this could be inferred from — see `crucible.runmode`).

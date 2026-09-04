@@ -309,6 +309,28 @@ BOARD_URL_CAVEAT = (
     "presigned GET, expires {expires} or when the signing role's session ends, whichever is first"
 )
 
+#: The console pane the board's rows render on (`alpha-engine-config-I9926`):
+#: every row of `board/current.json` is a Decision entity, so the Decision
+#: list is the board, beside the phase ladder's own six rows. A path, not a
+#: host — the host is `CRUCIBLE_CONSOLE_URL` (`crucible.config`), which this
+#: tree carries no default for.
+BOARD_CONSOLE_PATH = "/decision?pipeline=crucible-board"
+
+#: Rendered beside the console link. It says what the presigned caveat could
+#: not: the address does not expire. It also says what the page IS — the
+#: console's Decision kind filtered to this board's rows, ALL of them — and
+#: where those rows come from, so a reader comparing the two surfaces knows
+#: they are one document. The filter is a facet the console fragment stamps
+#: on every row as a literal (`pipeline: crucible-board`), not a field read
+#: off the rows: the board's own `surface` is per-row PROVENANCE (measured
+#: 2026-09-03: 10 distinct values across 46 rows), and filtering on it hid
+#: 20 rows, 17 of them the UNREPORTED component rows the board exists to
+#: show (I9926 review B3).
+BOARD_CONSOLE_CAVEAT = (
+    "fleet console — the Decision list filtered to this board, every row of "
+    "board/current.json and none hidden; stable address, no expiry"
+)
+
 #: The line emitted when there is no page to link to. FAILURE MODE SWALLOWED:
 #: `board/index.html` absent — the board render never published a page, or
 #: published one under a held pointer. RECORDING SURFACE: this line, in the
@@ -480,6 +502,11 @@ class MorningInputs:
     #: `AccessDenied` rendered through `ACCEPTANCE_NOT_ON_ANY_ARTIFACT`
     #: would report an IAM gap as "nobody has filed this yet".
     acceptance_denied_code: str | None
+    #: The stable console address for the board (`alpha-engine-config-I9926`),
+    #: or `None` when no console is configured — in which case the presigned
+    #: page above is the link and its caveat is rendered. Never both: two links
+    #: to one board is a reader deciding which to trust.
+    board_console_url: str | None = None
 
 
 def _client_error_code(exc: BaseException) -> str | None:
@@ -604,7 +631,11 @@ def _board_url(store: Store, *, now: dt.datetime) -> tuple[str | None, str, str 
 
 
 def read_inputs(
-    store: Store, *, trading_day: dt.date, now: dt.datetime | None = None
+    store: Store,
+    *,
+    trading_day: dt.date,
+    now: dt.datetime | None = None,
+    console_url: str | None = None,
 ) -> MorningInputs:
     """Read every artifact the message quotes. Reads; never runs.
 
@@ -617,6 +648,12 @@ def read_inputs(
     so an existing caller cannot silently get a WRONG expiry from a forgotten
     argument; `run_report` passes the run's own instant, which is what makes
     the rendered message deterministic in its inputs.
+
+    ``console_url`` (`alpha-engine-config-I9926`) is the fleet console's base
+    URL when one is configured. When set, the FULL BOARD section links the
+    console's Decision list — a stable address — and the presigned page is
+    not read at all, so a console-linked report never pays for, or fails on,
+    a presign it does not use. When unset, the presigned path is what it was.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     # STRICT face of the one reader: a corrupt current board raises with the
@@ -662,7 +699,15 @@ def read_inputs(
             )
 
     acceptance_read = _read_json(store, acceptance_reading_key(board_day))
-    board_url, board_url_expires, board_url_denied_code = _board_url(store, now=moment)
+    board_console_url: str | None = None
+    if console_url:
+        board_console_url = console_url.rstrip("/") + BOARD_CONSOLE_PATH
+        # No presign was taken, so there is no expiry to report — an empty
+        # string, not a stamp that would read as a bound on a link that has
+        # none (review C1).
+        board_url, board_url_denied_code, board_url_expires = None, None, ""
+    else:
+        board_url, board_url_expires, board_url_denied_code = _board_url(store, now=moment)
 
     return MorningInputs(
         board=board,
@@ -670,6 +715,7 @@ def read_inputs(
         board_url=board_url,
         board_url_expires=board_url_expires,
         board_url_denied_code=board_url_denied_code,
+        board_console_url=board_console_url,
         previous=previous,
         previous_reason=previous_reason,
         previous_day=previous_day,
@@ -967,8 +1013,9 @@ def _fit(lines: list[_Line]) -> str:
 
     RESIDUAL, stated rather than hidden: if the :data:`_URL` lines ALONE
     exceeded the budget nothing here could drop them, and the returned body
-    would be over the cap. That block is one heading, one presigned URL and
-    one fixed caveat — bounded, and
+    would be over the cap. That block is one heading, one URL (presigned, or
+    the console's :data:`BOARD_CONSOLE_PATH` when a console is configured) and
+    one fixed caveat for whichever it is — bounded in both variants, and
     `tests/test_morning.py::TestTheWireBodyFitsTheCap::
     test_the_url_block_alone_fits_the_cap` asserts the bound, so the case is
     measured rather than assumed away.
@@ -1075,6 +1122,15 @@ def _board_lines(inputs: MorningInputs) -> list[_Line]:
     measured exactly that shape — S3 returns 403 for a missing key when the
     caller also lacks `s3:ListBucket` on the prefix).
     """
+    if inputs.board_console_url is not None:
+        # `alpha-engine-config-I9926`: the console address is the link, and
+        # the only link. The presigned page is not offered as a second one —
+        # it was never read (see `read_inputs`), and a reader handed two URLs
+        # to one board is a reader deciding which to trust.
+        return [
+            (f"  {inputs.board_console_url}", _URL),
+            (f"  {BOARD_CONSOLE_CAVEAT}", _URL),
+        ]
     if inputs.board_url_denied_code is not None:
         return [(f"  {BOARD_URL_UNREADABLE.format(code=inputs.board_url_denied_code)}", _URL)]
     if inputs.board_url is None:
@@ -1220,11 +1276,18 @@ def morning_handler(args: argparse.Namespace) -> int:
     # refuses on its own is what makes that true structurally rather than by
     # this function remembering to check the flag correctly forever.
     store = open_store(getattr(args, "store", None), dry_run=dry_run)
+    # `alpha-engine-config-I9926`: the console's base URL is configuration
+    # (`CRUCIBLE_CONSOLE_URL`), resolved through `crucible.config.settings` so
+    # its provenance is recorded like every other value; empty means "no
+    # console" and the presigned page is linked instead.
+    from crucible.config import settings as _settings  # noqa: PLC0415 - lazy; see cli.py
+
+    console_url = _settings().console_url or None
     rendered: list[str] = []
 
     def body(ctx: RunContext) -> None:
         now = ctx.started
-        message = run_report(store, trading_day=ctx.trading_day, now=now)
+        message = run_report(store, trading_day=ctx.trading_day, now=now, console_url=console_url)
         rendered.append(message)
         if dry_run:
             # No output, no delivery, and (as of alpha-engine-config-I9922)
@@ -1277,12 +1340,22 @@ def morning_handler(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_report(store: Store, *, trading_day: dt.date, now: dt.datetime) -> str:
+def run_report(
+    store: Store,
+    *,
+    trading_day: dt.date,
+    now: dt.datetime,
+    console_url: str | None = None,
+) -> str:
     """Read the board and render the message. The whole job, minus delivery.
 
     Split out so the render is exercisable without argparse, without a
     runner and without a transport — and so `--dry-run` differs from a real
     run in exactly one branch of the handler rather than in a code path the
-    tests cannot reach.
+    tests cannot reach. ``console_url`` is `crucible.config.Settings.console_url`
+    when the handler resolved one (`alpha-engine-config-I9926`).
     """
-    return render_message(read_inputs(store, trading_day=trading_day, now=now), now=now)
+    return render_message(
+        read_inputs(store, trading_day=trading_day, now=now, console_url=console_url),
+        now=now,
+    )
