@@ -940,6 +940,11 @@ class SlotRecipes:
         the manifest — and through it the console and the board — with the
         same precision the exception carried.
 
+        **Reached by no scheduled job yet** (`alpha-engine-config-I9957`): the
+        rows are well-formed and schema-validated, and the only caller of
+        :func:`load_model_recipes` is `tests/`. See that function's docstring
+        for the measurement and the phase-3 blocker.
+
         ``status`` is `unservable`, the arena's own vocabulary (plan §7:
         "`unmeasurable` and `unservable` are first-class statuses"), forwarded
         verbatim rather than re-encoded into a second word that would drift
@@ -992,14 +997,26 @@ def load_model_recipes(
     itself is unchanged and is not softened: a refused arm does not register,
     it is returned as an :class:`~crucible.slots.inputs.InputRefusal` naming
     the exact unresolvable input, and :meth:`SlotRecipes.refusal_metrics`
-    puts it on the loading job's manifest. What changed is the blast radius.
+    renders it as a MetricRecord for the loading job's manifest. What changed
+    is the blast radius.
+
+    **This function has NO production caller** (`alpha-engine-config-I9957`,
+    measured 2026-09-04 on `main` 32933bf; the whole of this module's
+    ``__all__`` is in the same position). `crucible.track_a._slot_module`
+    refuses slots `m` and `s` by design until phase 3, so `experiment.run
+    --slot m` and `experiment.grade --slot m` — both declared weekly-arc
+    stages — exit non-zero, and the refusal metrics above therefore reach no
+    manifest a scheduled run ever writes. `tests/test_slot_inputs_wiring.py::
+    TestTheModelPathIsNotDeclaredAndLeftUnwired` pins that as a measured gap
+    and goes red the day it closes. Read every "…on the manifest" sentence in
+    this module against that fact until the M cycle job exists.
 
     When NOTHING registers the slot is `unservable` and
-    :class:`~crucible.slots.inputs.SlotUnservableError` is raised — which
-    reaches `crucible.runner.run_job`'s `try/finally`, writes a
-    `status: failed` manifest, and pages through the existing failure
-    condition. A slot with one good arm and one refused arm SERVES and
-    reports the refusal, which is the honest reading and the one that lets
+    :class:`~crucible.slots.inputs.SlotUnservableError` is raised — which,
+    once a job does load the slot, reaches `crucible.runner.run_job`'s
+    `try/finally`, writes a `status: failed` manifest, and pages through the
+    existing failure condition. A slot with one good arm and one refused arm
+    SERVES and reports the refusal, which is the honest reading and the one that lets
     Brian's `alpha-engine-config-I9808` ruling (b) accumulate the evidence it
     was chosen for.
 

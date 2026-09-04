@@ -17,6 +17,14 @@ tests here assert properties instead.
 * Every kind the grammar admits has a resolver, and every resolver is
   actually exercised by the one panel-building seam. A kind that is
   declarable and unresolvable is `I9777` with a new name.
+
+`alpha-engine-config-I9957` extends the first property to
+`crucible/slots/model.py`, one module over, where it had never been applied:
+`crucible-PR92` gave a refused M arm an `unservable` metric whose declared
+home is the manifest of the job that loaded the slot, and no job loads it.
+The reading there is a PINNED gap rather than a bare assertion — see
+:class:`TestTheModelPathIsNotDeclaredAndLeftUnwired` for why, and for what
+must happen to it when the M cycle job lands.
 """
 
 from __future__ import annotations
@@ -105,10 +113,32 @@ def _reachable(graph: dict[str, set[str]], seeds: set[str]) -> set[str]:
     return seen
 
 
-def _exported_callables() -> list[str]:
+def _exported_callables(module_obj: object) -> list[str]:
     return sorted(
-        name for name in inputs_module.__all__ if inspect.isfunction(getattr(inputs_module, name))
+        name
+        for name in module_obj.__all__  # type: ignore[attr-defined]
+        if inspect.isfunction(getattr(module_obj, name))
     )
+
+
+def _orphan_callables(module_obj: object) -> list[str]:
+    """Every callable ``module_obj`` exports that no production code reaches.
+
+    The whole check, for one module, in the terms
+    :class:`TestNothingIsDeclaredAndLeftUnwired` established: seeds are the
+    names `crucible/` references OUTSIDE the module (a re-export in
+    `crucible/slots/__init__.py` is an `ast.ImportFrom` alias and an `__all__`
+    string, neither of which is an `ast.Name`, so re-exporting does NOT count
+    as wiring — which is exactly the distinction `alpha-engine-config-I9957`
+    turns on).
+    """
+    module = Path(module_obj.__file__)  # type: ignore[attr-defined]
+    graph = _definition_graph(module)
+    seeds = _entry_points(PACKAGE, module=module)
+    reachable = _reachable(graph, seeds)
+    exported = _exported_callables(module_obj)
+    assert exported, f"{module_obj!r} exports no callables; the check would be vacuous"
+    return sorted(n for n in exported if n not in reachable)
 
 
 class TestNothingIsDeclaredAndLeftUnwired:
@@ -125,10 +155,7 @@ class TestNothingIsDeclaredAndLeftUnwired:
         graph = _definition_graph(module)
         seeds = _entry_points(PACKAGE, module=module)
         assert seeds & set(graph), "no production code references this module at all"
-        reachable = _reachable(graph, seeds)
-        exported = _exported_callables()
-        assert exported, "the module exports no callables; the check would be vacuous"
-        orphans = sorted(n for n in exported if n not in reachable)
+        orphans = _orphan_callables(inputs_module)
         assert orphans == [], (
             f"{orphans} are exported by `crucible.slots.inputs` and are not reachable "
             "from anything `crucible/` references. A producer with no production caller "
@@ -237,6 +264,108 @@ class TestEveryDeclarableKindResolves:
         for ref in refs.values():
             assert ref.column in resolved.features, ref.text
         assert set(resolved.resolved_inputs) == {r.text for r in refs.values()}
+
+
+#: The M-path callables `crucible/` reaches from NOTHING today, pinned as a
+#: known gap rather than left to prose (`alpha-engine-config-I9957`).
+#:
+#: Measured 2026-09-04 on `main` (32933bf): the orphan set is `crucible.slots.
+#: model.__all__`'s callables ENTIRELY — all eleven. The M slot has no
+#: production entry point at all, so this is not "one function nobody wired",
+#: it is a 1807-line module reachable only from `tests/`.
+#:
+#: Why it is pinned and not simply red: `crucible.track_a._slot_module`
+#: refuses slots `m` and `s` BY DESIGN, in a message naming phase 3 as their
+#: arrival, so `experiment.run --slot m` and `experiment.grade --slot m` —
+#: both declared arc stages (`crucible.weekly.ARC_SLOT_JOBS` x
+#: `crucible.slots.SLOTS`) — exit non-zero every Saturday. Nothing this test
+#: could assert changes that; the M cycle job is phase 3's deliverable.
+#: Pinning it makes the gap a MEASURED number in CI instead of a sentence in
+#: an issue, and the assertion below is an equality, so the day deliverable 1
+#: of I9957 wires the loader this test goes red and the pin must be re-stated
+#: — a gap register that cannot rot in the direction of "we wired it and
+#: forgot to say so".
+#:
+#: The tracker id is cited in prose only, never as a code literal:
+#: `tests/test_no_stale_tracker_literals.py` refuses a hardcoded issue number
+#: in the package, and it caught this constant on the first run.
+
+
+class TestTheModelPathIsNotDeclaredAndLeftUnwired:
+    """The same property as above, applied to `crucible/slots/model.py`.
+
+    `alpha-engine-config-I9957`: `crucible-PR92` gave a refused M arm a
+    per-arm `unservable` metric (`SlotRecipes.refusal_metrics`) whose declared
+    home is "the manifest of whatever job loaded the slot". No job loads the
+    slot. The guard one module over (`crucible/slots/inputs.py`) catches
+    exactly this class and never scanned `model.py`, so the metric could ship
+    green while reaching no manifest a scheduled run ever writes.
+    """
+
+    def test_the_whole_m_path_is_unreachable_from_production_code(self) -> None:
+        from crucible.slots import model as model_module  # noqa: PLC0415 - local to this class
+
+        orphans = _orphan_callables(model_module)
+        assert "load_model_recipes" in orphans, (
+            "`load_model_recipes` is reachable from production code, so the M slot now "
+            "HAS a caller and `SlotRecipes.refusal_metrics` can land on a real manifest. "
+            "That is deliverable 1 of the tracker this class's docstring names — "
+            "re-state the pin to the callables that are still orphaned, rather than "
+            "deleting the guard: the class it detects outlives its first instance."
+        )
+        assert orphans == _exported_callables(model_module), (
+            "the set of M-path callables with no production caller is no longer the "
+            "WHOLE module. Something wired part of `crucible.slots.model` without "
+            "wiring the loader; re-state this pin to the measured set. "
+            f"Orphans now: {orphans}."
+        )
+
+    def test_the_reachability_check_distinguishes_a_wired_loader_from_an_unwired_one(
+        self, tmp_path
+    ) -> None:
+        """Policy §7.4: the detector, run on both sides, asserting the outputs DIFFER.
+
+        The real functions (`_entry_points`, `_definition_graph`,
+        `_reachable`) over a real two-file package, because the claim under
+        test is about what this algorithm reports — not about what a mocked
+        graph would. Same shape as the live condition: a module defining a
+        loader, and a sibling that either calls it or only re-exports it.
+        """
+
+        def orphans_for(name: str, job_body: str) -> list[str]:
+            root = tmp_path / name
+            root.mkdir()
+            module = root / "slot.py"
+            module.write_text(
+                "__all__ = ['load_recipes']\n\n\ndef load_recipes():\n    return ()\n",
+                encoding="utf-8",
+            )
+            (root / "job.py").write_text(job_body, encoding="utf-8")
+            graph = _definition_graph(module)
+            reachable = _reachable(graph, _entry_points(root, module=module))
+            return sorted(n for n in ["load_recipes"] if n not in reachable)
+
+        # The live condition: `crucible/slots/__init__.py` names the loader in
+        # an `ImportFrom` and an `__all__` string, and nothing calls it.
+        reexport_only = orphans_for(
+            "unwired", "from slot import load_recipes\n\n__all__ = ['load_recipes']\n"
+        )
+        # Deliverable 1: a job that loads the slot and records the refusals.
+        wired = orphans_for(
+            "wired",
+            "from slot import load_recipes\n\n\ndef run(ctx):\n"
+            "    loaded = load_recipes()\n    return loaded\n",
+        )
+
+        assert reexport_only == ["load_recipes"], (
+            "a re-export was counted as production wiring — the guard would pass "
+            "vacuously on exactly the condition it exists to catch"
+        )
+        assert wired == []
+        assert reexport_only != wired, (
+            "the detector reports the same verdict for a loader with a caller and a "
+            "loader with only a re-export, so passing it proves nothing"
+        )
 
 
 class _Ctx:
