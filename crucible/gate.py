@@ -121,6 +121,7 @@ __all__ = [
     "gate_key",
     "gate_prefix",
     "ladder_payload",
+    "expected_legacy_weekly_window",
     "legacy_dead_lambdas_key",
     "legacy_weekly_executions_key",
     "review_key",
@@ -1402,6 +1403,69 @@ def weekly_anchor(day: dt.date) -> dt.date:
     return resolve_trading_day(dt.datetime.combine(friday, dt.time(23, 59)))
 
 
+#: The optional per-document `window` object's key names
+#: (`crucible/schemas/legacy_weekly_executions.v2.json`), named once so a
+#: reader and a producer can never spell the shape differently.
+LEGACY_WEEKLY_WINDOW_FIELD = "window"
+
+
+def expected_legacy_weekly_window(anchor: dt.date) -> tuple[str, str]:
+    """The one true span a `legacy/weekly/{anchor}/executions.json` document
+    should declare it collected over — the Sunday of the anchor's week
+    through the Saturday that measures it.
+
+    `nous-ergon-ops-PR1034` set the producer's window to exactly this span
+    after `alpha-engine-config-I9983` (a wrong window, `anchor-6..anchor`,
+    collecting every off-day Succeed-skip of the anchor's week and none of
+    its runs). The `+1` is load-bearing, not a rounding choice:
+    `WeeklyRunDayGate` passes the day AFTER a week's last trading session, so
+    the run measuring the week ending `anchor` starts on `anchor + 1` — the
+    Saturday `alpha-engine-saturday`'s `cron(0 9 ? * THU-SAT *)` targets.
+    `anchor - 5` is the Sunday that opens that same calendar week (`anchor`
+    is always a Friday — see `weekly_anchor`).
+
+    Derived here, in ONE place, so `_clause_old_weekly_within_cadence` and
+    `_clause_old_alerts_muted` — the two readers of this document — cannot
+    restate the arithmetic and drift from each other or from the producer.
+    Calendar dates, not trading-day keys: this is bookkeeping about WHEN the
+    producer queried, not an input to a promotion, retirement, freshness or
+    grading decision (§3's exhaustive exceptions already cover a collection
+    window).
+    """
+    start = anchor - dt.timedelta(days=5)
+    end = anchor + dt.timedelta(days=1)
+    return start.isoformat(), end.isoformat()
+
+
+def _legacy_weekly_window_mismatch(document: dict[str, Any], anchor: dt.date) -> str | None:
+    """`None` when `window` is absent (nothing to check) or agrees with
+    `anchor`; otherwise a message naming both spans.
+
+    **Presence-keyed, like `sns_topic_arn`, never version-keyed.** A document
+    with no `window` at all is unaffected — it is read exactly as it was
+    before this field existed, per the schema's own description of why this
+    was not a `schema_version` bump. A document that DOES declare a window
+    is checked before a single count in it is trusted: a wrong window is a
+    broken reading, not a finding about the pipeline
+    (`alpha-engine-config-I9983` was found by reading the producer, not by
+    any detector — this is that detector).
+    """
+    window = document.get(LEGACY_WEEKLY_WINDOW_FIELD)
+    if window is None:
+        return None
+    expected_start, expected_end = expected_legacy_weekly_window(anchor)
+    if not isinstance(window, dict):
+        return f"`window` is {window!r}, not an object with start/end"
+    declared_start, declared_end = window.get("start"), window.get("end")
+    if (declared_start, declared_end) == (expected_start, expected_end):
+        return None
+    return (
+        f"`window` declares {declared_start!r}..{declared_end!r}, expected "
+        f"{expected_start!r}..{expected_end!r} for anchor {anchor.isoformat()} — a wrong "
+        "window is a broken reading, not a finding about the pipeline"
+    )
+
+
 #: The committed reading of the plan §2 acceptance suite. Not a store artifact:
 #: the suite's existence is a property of the REPOSITORY, and git is the
 #: durable record of it. `tests/acceptance/ratchet.json` commits the exact id
@@ -1801,6 +1865,10 @@ def _clause_old_weekly_within_cadence(
                 "unmeasurable, not a pass"
             )
             continue
+        window_mismatch = _legacy_weekly_window_mismatch(document, anchor)
+        if window_mismatch is not None:
+            stale.append(f"{key}: {window_mismatch}")
+            continue
         problem, executions = _legacy_weekly_executions(key, document)
         if problem is not None or executions is None:
             malformed.append(problem or f"{key}: unreadable")
@@ -2103,6 +2171,10 @@ def _clause_old_alerts_muted(store: Store, window: list[dt.date]) -> Clause:
                 f"{LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION!r} — it records no per-execution "
                 "input at all"
             )
+            continue
+        window_mismatch = _legacy_weekly_window_mismatch(document, anchor)
+        if window_mismatch is not None:
+            unreadable.append(f"{key}: {window_mismatch}")
             continue
         entries = document.get("executions")
         if not isinstance(entries, list):

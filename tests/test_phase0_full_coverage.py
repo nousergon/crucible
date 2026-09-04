@@ -51,6 +51,7 @@ from crucible.gate import (
     V2_STORE_VERSIONING_ENABLED,
     V2_TAG_ACCEPTANCE_CLAUSE_ID,
     evaluate,
+    expected_legacy_weekly_window,
     legacy_dead_lambdas_key,
     legacy_weekly_executions_key,
     weekly_anchor,
@@ -342,6 +343,37 @@ class TestOldAlertsMuted:
         clause = _clause(store, "old_alerts_muted")
         assert clause.unmeasurable and not clause.met
         assert "about our access" in clause.detail
+
+    def test_a_declared_window_disagreeing_with_the_anchor_is_unmeasurable(self, tmp_path) -> None:
+        """`alpha-engine-config-I9992`. The routing clause reads the SAME
+        document the cadence clause does
+        (`tests/test_legacy_weekly_executions_contract.py::TestTheDeclaredWindowGatesTheClause`
+        holds the cadence side), so a wrong window must gate it here too — a
+        producer bug that mis-collected the week would otherwise still let a
+        confidently wrong routing count through."""
+        good = _executions()
+        wrong_window = copy.deepcopy(good)
+        wrong_window["window"] = {"start": "2000-01-01", "end": "2000-01-02"}
+        clause = _clause(
+            _seed(tmp_path, executions=_mutated(good, wrong_window, "wrong window")),
+            "old_alerts_muted",
+        )
+        assert not clause.met
+        assert clause.unmeasurable, clause.detail
+        expected_start, expected_end = expected_legacy_weekly_window(ANCHOR)
+        assert expected_start in clause.detail and expected_end in clause.detail
+
+    def test_a_correctly_declared_window_reads_exactly_as_no_window_at_all(self, tmp_path) -> None:
+        good = _executions()
+        start, end = expected_legacy_weekly_window(ANCHOR)
+        with_window = copy.deepcopy(good)
+        with_window["window"] = {"start": start, "end": end}
+        clause = _clause(
+            _seed(tmp_path, executions=_mutated(good, with_window, "correct window")),
+            "old_alerts_muted",
+        )
+        assert clause.met, clause.detail
+        assert not clause.unmeasurable
 
 
 class TestV2ResourcesTaggedAndVersioned:
