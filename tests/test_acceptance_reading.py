@@ -1532,10 +1532,26 @@ def test_write_json_emits_the_producer_contract(tmp_path: Path, ratchet: Path) -
     result = _run_with_args(report, ratchet, "--write-json", str(out), "--commit", "deadbeef")
     assert result.returncode == 0, result.stderr
     document = json.loads(out.read_text())
-    assert set(document) == {"met", "unmet", "unmeasurable", "commit", "measured_at"}
+    assert set(document) == {
+        "met",
+        "unmet",
+        "unmeasurable",
+        "commit",
+        "measured_at",
+        # alpha-engine-config-I9964: the counts alone cannot answer "is THIS
+        # clause met", which is what phase 0's `v2_resources_tagged_and_versioned`
+        # gate clause asks. `store_versioning` is absent here because no
+        # `--store-versioning` was passed — see the tests below.
+        "met_clauses",
+        "unmet_clauses",
+        "unmeasurable_clauses",
+    }
     assert document["met"] == 2
     assert document["unmet"] == 1
     assert document["unmeasurable"] == 0
+    assert document["met_clauses"] == ["T::b", "T::c"]
+    assert document["unmet_clauses"] == ["T::a"]
+    assert document["unmeasurable_clauses"] == []
     assert document["commit"] == "deadbeef"
     # ISO-8601, parseable — the exact format is not the contract, but a
     # non-parseable timestamp would be.
@@ -1564,6 +1580,84 @@ def test_write_json_counts_unmeasurable_separately_from_unmet(
     # docstring and this grader's module docstring both make.
     assert document["unmet"] == 1
     assert document["unmeasurable"] == 1
+
+
+def test_write_json_names_the_unmeasurable_clause_ids_too(
+    tmp_path: Path, ratchet_with_unmeasurable: Path
+) -> None:
+    """`alpha-engine-config-I9964`. `unmeasurable_clauses` is a THIRD list, not
+    a slice of `unmet_clauses`: a consumer asking whether one clause is met
+    must be able to tell "the property is false" from "the read failed"
+    without re-deriving the subset relation the ratchet holds."""
+    report = _report(
+        tmp_path / "r.xml",
+        met=["T::b", "T::c"],
+        unmet=["T::a"],
+        unmeasurable={"T::d": "NoCredentialsError"},
+    )
+    out = tmp_path / "reading.json"
+    result = _run_with_args(
+        report, ratchet_with_unmeasurable, "--write-json", str(out), "--commit", "abc123"
+    )
+    assert result.returncode == 0, result.stderr
+    document = json.loads(out.read_text())
+    assert document["met_clauses"] == ["T::b", "T::c"]
+    assert document["unmet_clauses"] == ["T::a"]
+    assert document["unmeasurable_clauses"] == ["T::d"]
+    assert "T::d" not in document["unmet_clauses"], (
+        "an unmeasurable clause must not also be named as a plain unmet one — "
+        "the two are different facts and the counts already split them"
+    )
+
+
+def test_write_json_carries_the_store_versioning_status_when_given_one(
+    tmp_path: Path, ratchet: Path
+) -> None:
+    report = _report(tmp_path / "r.xml", met=["T::b", "T::c"], unmet=["T::a"])
+    out = tmp_path / "reading.json"
+    result = _run_with_args(
+        report,
+        ratchet,
+        "--write-json",
+        str(out),
+        "--commit",
+        "deadbeef",
+        "--store-versioning",
+        "Enabled",
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(out.read_text())["store_versioning"] == "Enabled"
+
+
+def test_an_unreadable_store_versioning_is_ABSENT_not_guessed(
+    tmp_path: Path, ratchet: Path
+) -> None:
+    """The §7.4 half of the field. `ci.yml` passes an EMPTY value when
+    `get-bucket-versioning` failed, and the document must then omit the field
+    entirely so the gate clause reads UNMEASURABLE. Filing `Suspended` — or
+    any placeholder — would render a permissions failure as a finding about
+    the bucket, which is the defect class this repository keeps finding.
+
+    Asserted as a DIFFERENCE against the readable case above, not as a lone
+    fact about the empty one."""
+    report = _report(tmp_path / "r.xml", met=["T::b", "T::c"], unmet=["T::a"])
+    readable = tmp_path / "readable.json"
+    unreadable = tmp_path / "unreadable.json"
+    ok = _run_with_args(
+        report, ratchet, "--write-json", str(readable), "--store-versioning", "Enabled"
+    )
+    denied = _run_with_args(
+        report, ratchet, "--write-json", str(unreadable), "--store-versioning", ""
+    )
+    assert ok.returncode == 0 and denied.returncode == 0
+    with_status = json.loads(readable.read_text())
+    without_status = json.loads(unreadable.read_text())
+    assert with_status["store_versioning"] == "Enabled"
+    assert "store_versioning" not in without_status
+    assert set(with_status) - set(without_status) == {"store_versioning"}, (
+        "the two documents must differ in exactly the versioning field — if they "
+        "did not differ at all, the empty value was silently written as a status"
+    )
 
 
 def test_write_json_still_writes_on_a_moved_reading(tmp_path: Path, ratchet: Path) -> None:

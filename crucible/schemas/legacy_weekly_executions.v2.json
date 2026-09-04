@@ -61,6 +61,10 @@
           "description": "The Step Functions execution status verbatim (SUCCEEDED, FAILED, RUNNING, TIMED_OUT, ABORTED). Not normalised: the consumer's Succeed-skip rule is keyed on SUCCEEDED specifically.",
           "type": "string",
           "minLength": 1
+        },
+        "sns_topic_arn": {
+          "description": "The `sns_topic_arn` this execution's INPUT carried, or null when the input declared none — the fact alpha-engine-config-I9756's third deliverable ('mute the v1 weekly alerts') is measured on, read via states:DescribeExecution and consumed by crucible.gate._clause_old_alerts_muted (alpha-engine-config-I9964). OPTIONAL, and deliberately not a schema-version bump: documents filed between I9962 and I9964 carry every other v2 field and answer the cadence clause correctly, and bumping the version would make that clause -- phase 0's only currently-graded one -- read UNMEASURABLE on the weeks already filed. The consumer therefore keys on the FIELD's presence, not on the version: an execution entry without this key is unmeasurable for routing and measurable for cadence, which is exactly what the two documents are.",
+          "type": ["string", "null"]
         }
       }
     }

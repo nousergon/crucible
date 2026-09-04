@@ -295,12 +295,34 @@ jobs:
       # local file exists here regardless of this step's outcome). The job
       # itself still fails, in the "Fail the job if the reading moved" step
       # below, once the artifact is safely published.
+      # alpha-engine-config-I9964. The OTHER half of phase 0's
+      # `v2_resources_tagged_and_versioned` deliverable: the §2 suite grades
+      # the cost tag, and nothing grades S3 versioning on the store. This job
+      # holds the only v2 CI identity that may read it.
+      #
+      # `|| true` deliberately, and it is not a swallow: the value is left
+      # EMPTY, `check_reading.py` then omits the field entirely, and the gate
+      # clause reads UNMEASURABLE naming the missing field. Failing the step
+      # instead would take the acceptance READING down with it — a reading
+      # that is the only progress figure plan §12 rule 3 admits — over a fact
+      # that is not the reading. What is forbidden is publishing a GUESS, and
+      # nothing here guesses: absent is absent.
+      - name: The store bucket's S3 versioning status
+        id: versioning
+        run: |
+          bucket="${STORE_URI#s3://}"; bucket="${bucket%%/*}"
+          status="$(aws s3api get-bucket-versioning --bucket "${bucket}" --query 'Status' --output text 2>/dev/null || true)"
+          if [ "${status}" = "None" ]; then status=""; fi
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          echo "store versioning: ${status:-<unreadable — the gate clause will read UNMEASURABLE>}"
+
       - name: The reading has not moved
         id: check
         continue-on-error: true
         run: |
           uv run --frozen python tests/acceptance/check_reading.py \
-            --write-json acceptance-reading.json --commit "${GITHUB_SHA}" acceptance.xml
+            --write-json acceptance-reading.json --commit "${GITHUB_SHA}" \
+            --store-versioning "${{ steps.versioning.outputs.status }}" acceptance.xml
 
       - name: Resolve the trading day
         id: trading_day

@@ -347,17 +347,37 @@ def load_ratchet(path: pathlib.Path = RATCHET) -> Ratchet:
 
 
 def _write_reading_json(
-    path: pathlib.Path, *, met: int, unmet: int, unmeasurable: int, commit: str
+    path: pathlib.Path,
+    *,
+    reading: Reading,
+    commit: str,
+    store_versioning: str = "",
 ) -> None:
     """Emit `crucible.keys.acceptance_reading_key`'s producer contract.
 
     ``{"met": int, "unmet": int, "unmeasurable": int, "commit": str,
-    "measured_at": str}`` — declared in that module's docstring, which
-    `crucible.morning._acceptance_line` parses. This is the ONLY place that
-    computes the three counts (:func:`read_report`, via ``main``'s
-    ``reading``); a workflow that re-parsed this script's stdout to get them
-    would be a second parser of the same reading, which is the exact defect
-    this module's docstring opens with ("counting failed twice").
+    "measured_at": str, "met_clauses": [str], "unmet_clauses": [str],
+    "unmeasurable_clauses": [str], "store_versioning": str}`` — declared in
+    that module's docstring, which `crucible.keys.parse_acceptance_reading`
+    is the one reader of. This is the ONLY place that computes the counts
+    (:func:`read_report`, via ``main``'s ``reading``); a workflow that
+    re-parsed this script's stdout to get them would be a second parser of
+    the same reading, which is the exact defect this module's docstring opens
+    with ("counting failed twice").
+
+    **Why the ID LISTS, not only the counts** (`alpha-engine-config-I9964`).
+    Phase 0's `v2_resources_tagged_and_versioned` gate clause is declared to
+    be graded by ONE §2 clause, and `{"met": 22}` cannot say whether that
+    clause is one of the 22. The ids come from the same :class:`Reading` the
+    counts do, so a count and its list cannot disagree.
+
+    **Why `store_versioning` rides here.** It is the OTHER half of that same
+    deliverable, no §2 clause grades it, and this job's identity is the only
+    v2 CI identity that may read it. It is passed in rather than read here:
+    this module parses a JUnit report and knows nothing about AWS. Empty
+    means the caller could not read it, and the field is then ABSENT from the
+    document — never guessed, because a failed read published as `Suspended`
+    would be a permissions failure rendered as a finding about the bucket.
 
     Written unconditionally, on both a clean reading and a failing one — a
     red count is plan §12 rule 3's whole point, and skipping the write on
@@ -365,13 +385,18 @@ def _write_reading_json(
     that moved.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    document = {
-        "met": met,
-        "unmet": unmet,
-        "unmeasurable": unmeasurable,
+    document: dict[str, object] = {
+        "met": len(reading.met),
+        "unmet": len(reading.plain_unmet),
+        "unmeasurable": len(reading.unmeasurable),
         "commit": commit,
         "measured_at": datetime.now(UTC).isoformat(),
+        "met_clauses": sorted(reading.met),
+        "unmet_clauses": sorted(reading.plain_unmet),
+        "unmeasurable_clauses": sorted(reading.unmeasurable),
     }
+    if store_versioning:
+        document["store_versioning"] = store_versioning
     path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -391,8 +416,18 @@ def main(argv: list[str]) -> int:
             return _fail("--commit requires a value")
         commit = args[idx + 1]
         del args[idx : idx + 2]
+    store_versioning = ""
+    if "--store-versioning" in args:
+        idx = args.index("--store-versioning")
+        if idx + 1 >= len(args):
+            return _fail("--store-versioning requires a value")
+        store_versioning = args[idx + 1]
+        del args[idx : idx + 2]
     if len(args) != 1:
-        return _fail(f"usage: {argv[0]} [--write-json <path>] [--commit <sha>] <junit-xml>")
+        return _fail(
+            f"usage: {argv[0]} [--write-json <path>] [--commit <sha>] "
+            f"[--store-versioning <status>] <junit-xml>"
+        )
     reading = read_report(pathlib.Path(args[0]))
     ratchet = load_ratchet()
 
@@ -408,10 +443,9 @@ def main(argv: list[str]) -> int:
     if write_json_path is not None:
         _write_reading_json(
             write_json_path,
-            met=met_n,
-            unmet=plain_unmet_n,
-            unmeasurable=unmeasurable_n,
+            reading=reading,
             commit=commit or os.environ.get("GITHUB_SHA", ""),
+            store_versioning=store_versioning,
         )
 
     ratchet_unmeasurable_n = len(ratchet.unmeasurable)

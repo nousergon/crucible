@@ -45,12 +45,15 @@ from crucible.documents import read_path_document as _read_path_document
 from crucible.documents import read_store_document as _read_store_document
 from crucible.keys import (
     ALERTS_ROOT,
+    acceptance_reading_key,
     arena_cycle_key,
     arm_register_key,
     champion_key,
     gate_key,
     gate_prefix,
+    legacy_dead_lambdas_key,
     legacy_weekly_executions_key,
+    parse_acceptance_reading,
     review_key,
     review_prefix,
     runs_prefix,
@@ -69,10 +72,16 @@ __all__ = [
     "ACCEPTANCE_RATCHET_PATH",
     "GATE_SCHEMA_VERSION",
     "GATES",
+    "LEGACY_DEAD_LAMBDAS_SCHEMA_VERSION",
+    "LEGACY_DEAD_LAMBDA_NAMES",
     "LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION",
     "LEGACY_WEEKLY_MAX_STARTS_PER_WEEK",
     "LEGACY_WEEKLY_MIN_RUNS_PER_WEEK",
     "LEGACY_WEEKLY_RERUN_NAME_PREFIX",
+    "LEGACY_WEEKLY_TOPIC_FIELD",
+    "MUTED_ALERTS_TOPIC_NAME",
+    "V2_STORE_VERSIONING_ENABLED",
+    "V2_TAG_ACCEPTANCE_CLAUSE_ID",
     "WEEKLY_RUN_DAY_GATE_SKIP_MAX_SECONDS",
     "LADDER_CONSOLE_STATE",
     "LADDER_KEY",
@@ -112,6 +121,7 @@ __all__ = [
     "gate_key",
     "gate_prefix",
     "ladder_payload",
+    "legacy_dead_lambdas_key",
     "legacy_weekly_executions_key",
     "review_key",
     "review_prefix",
@@ -1254,8 +1264,15 @@ LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION = "legacy-weekly-executions.v2"
 #: (`crucible-v2-legacy-weekly-producer`, defined in
 #: `nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml`) holds
 #: `states:ListExecutions` and nothing else, and IAM in that template is an
-#: operator-applied security boundary — widening it would make this change
-#: undeployable by the merge button alone. `ListExecutions` already returns
+#: operator-applied security boundary — widening it puts the reading behind
+#: that apply (`pull-request-policy` §4.2 form 3), which is a real cost even
+#: though it is a legitimate form. (Corrected 2026-09-04, `I9964`: an earlier
+#: revision of this comment called a widening "undeployable by the merge
+#: button alone", which overstated it — that template's whole apply path is
+#: form 3, and `alpha-engine-config-I9964` does widen this role, for the
+#: routing fact `ListExecutions` cannot answer at all. The proxy still stands:
+#: it costs no extra call for the fact it answers.) `ListExecutions` already
+#: returns
 #: `startDate`, `stopDate`, `status` and `name` for every execution, so the
 #: proxy costs no extra call and no extra grant. If the grant is ever widened,
 #: the producer should file the gate state and this constant becomes a
@@ -1268,6 +1285,63 @@ WEEKLY_RUN_DAY_GATE_SKIP_MAX_SECONDS = 10.0
 #: FAILS the clause regardless of duration: the name identifies the issuer, and
 #: a rerun that happened to be short is still a rerun.
 LEGACY_WEEKLY_RERUN_NAME_PREFIX = "watch-rerun-"
+
+#: The schema the dead-Lambda probe must declare. Same refusal rule as the
+#: weekly executions document: an unrecognised version is UNMEASURABLE, never
+#: a pass. Producer:
+#: `nous-ergon-ops/scripts/legacy_dead_lambdas_producer.py`.
+LEGACY_DEAD_LAMBDAS_SCHEMA_VERSION = "legacy-dead-lambdas.v1"
+
+#: The six zero-invocation v1 Lambda functions `alpha-engine-config-I9756`'s
+#: second deliverable deletes, by EXACT name.
+#:
+#: **The prefix trap, stated because it is one edit away.**
+#: `alpha-engine-research-eval-judge-process`, `-poll`, `-submit` and
+#: `-spot-dispatcher` all EXIST and are live, different functions (measured
+#: 2026-09-04). Every one of them starts with the fifth name here. A clause
+#: matching on prefix, substring, or a `startswith` over a live function list
+#: would find four survivors and report this deliverable UNMET forever against
+#: a system that satisfies it — the mirror image of the defect this gate keeps
+#: finding, a detector that can never go green rather than one that can never
+#: go red. So the contract is per exact name on both sides: the producer files
+#: one entry per name, and :func:`_clause_dead_lambdas_deleted` refuses a
+#: document that does not cover this exact set.
+LEGACY_DEAD_LAMBDA_NAMES: tuple[str, ...] = (
+    "alpha-engine-ci-watch-liveness-probe",
+    "alpha-engine-ec2-lifecycle",
+    "alpha-engine-research-eval-judge",
+    "alpha-engine-research-perturbation-battery",
+    "alpha-engine-research-thinktank",
+    "alpha-engine-sf-watch-reclaim-sweep-handler",
+)
+
+#: The SNS topic the v1 weekly pipeline's alerts must land in for
+#: `alpha-engine-config-I9756`'s third deliverable to hold. Matched on the
+#: ARN's last segment, never on the whole ARN: the account id is an
+#: infrastructure identifier this repo forbids (`tests/test_no_infra_literals.py`),
+#: and the topic NAME is the part that carries the meaning. The same literal
+#: already lives in `crucible/alerts.py`.
+MUTED_ALERTS_TOPIC_NAME = "alpha-engine-alerts-muted"
+
+#: The per-execution field carrying the topic that execution's INPUT named.
+#: Presence of the FIELD, not the document's `schema_version`, is what
+#: :func:`_clause_old_alerts_muted` keys on — see the field's own description
+#: in `crucible/schemas/legacy_weekly_executions.v2.json` for why it was added
+#: without a version bump.
+LEGACY_WEEKLY_TOPIC_FIELD = "sns_topic_arn"
+
+#: The ONE §2 acceptance clause `alpha-engine-config-I9756`'s fourth
+#: deliverable declares as its reading surface for the cost-attribution tag.
+#: Named here rather than re-derived: the deliverable table has said since it
+#: was written that this clause is what grades that half, and
+#: :func:`_clause_v2_resources_tagged_and_versioned` reads exactly it.
+V2_TAG_ACCEPTANCE_CLAUSE_ID = "TestCost::test_every_v2_resource_is_tagged_for_cost_attribution"
+
+#: The S3 versioning `Status` the store must report for the other half of that
+#: deliverable. `Suspended`, and a bucket that was never versioned (which
+#: reports no status at all), are both UNMET; an absent reading is
+#: UNMEASURABLE.
+V2_STORE_VERSIONING_ENABLED = "Enabled"
 
 
 def weekly_anchor(day: dt.date) -> dt.date:
@@ -1715,6 +1789,419 @@ def _clause_old_weekly_within_cadence(
     )
 
 
+def _weekly_anchors(window: list[dt.date]) -> list[dt.date]:
+    """``window``'s days collapsed onto their weekly closes, order preserved.
+
+    The same collapse `_clause_old_weekly_within_cadence` does inline, lifted
+    so phase 0's three v1 clauses read ONE key set. Two clauses stepping back
+    by two different rules would grade two different weeks and report them
+    under one phase.
+    """
+    return list(dict.fromkeys(weekly_anchor(day) for day in window))
+
+
+def _clause_dead_lambdas_deleted(store: Store, window: list[dt.date]) -> Clause:
+    """The six zero-invocation v1 functions are gone, read from a filed probe.
+
+    `alpha-engine-config-I9756`'s second deliverable. Until
+    `alpha-engine-config-I9964` this deliverable was declared *not
+    gate-readable* on the argument that "the only surface that answers it is a
+    live AWS read, which a gate may not make" — true about the READ, and a
+    non-sequitur about the CLAUSE. A gate may not call AWS; a producer holding
+    the identity may, and the gate reads what it filed. That is exactly the
+    shape `_clause_old_weekly_within_cadence` already had, so the deliverable
+    was ungraded for want of a producer, not for want of a clause. Phase 0 was
+    therefore on course to exit on gate evidence covering two of its five
+    deliverables, with the other three resting on somebody having checked by
+    hand and said so.
+
+    **`present: true` is the only UNMET.** Everything else that can go wrong
+    here is a statement about our reading, not about the system:
+
+    * the document is absent, or the store refused the read — UNMEASURABLE;
+    * it declares a schema version this clause does not recognise, or its
+      shape is unreadable — UNMEASURABLE, because a document this clause
+      cannot parse has not told it anything about the six functions;
+    * it does not cover exactly :data:`LEGACY_DEAD_LAMBDA_NAMES` —
+      UNMEASURABLE naming the difference. A probe of five of the six answers a
+      narrower question than the deliverable asks, and grading it MET would
+      publish the narrower answer under the wider name.
+
+    A producer that could not decide presence for a name does not file
+    `present: false`: it raises, and the document's ABSENCE is the reading
+    (see the schema's `present` description). That is what keeps an
+    AccessDenied from arriving here as a met deliverable.
+    """
+    requirement = (
+        f"none of the {len(LEGACY_DEAD_LAMBDA_NAMES)} zero-invocation v1 Lambda functions "
+        f"named by `{phase_tracker('phase0')}` still exists, read per EXACT name from a "
+        "filed probe — never by prefix, which four live sibling functions would match"
+    )
+    anchors = _weekly_anchors(window)
+    evidence = [legacy_dead_lambdas_key(a.isoformat()) for a in anchors]
+    required = set(LEGACY_DEAD_LAMBDA_NAMES)
+    unreadable: list[str] = []
+    surviving: list[str] = []
+    probed_total = 0
+    for key in evidence:
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            unreadable.append(read.problem)
+            continue
+        if read.absent:
+            unreadable.append(
+                f"{key}: no filed probe. Nothing writes this key yet, and a gate may not "
+                "call `lambda:GetFunctionConfiguration` to find out"
+            )
+            continue
+        document = read.document or {}
+        version = document.get("schema_version")
+        if version != LEGACY_DEAD_LAMBDAS_SCHEMA_VERSION:
+            unreadable.append(
+                f"{key}: schema_version is {version!r}, not {LEGACY_DEAD_LAMBDAS_SCHEMA_VERSION!r}"
+            )
+            continue
+        entries = document.get("functions")
+        if not isinstance(entries, list) or not entries:
+            unreadable.append(f"{key}: `functions` is {type(entries).__name__}, not a list")
+            continue
+        probed: dict[str, Any] = {}
+        malformed = False
+        for entry in entries:
+            if not isinstance(entry, dict):
+                unreadable.append(f"{key}: an entry in `functions` is not an object")
+                malformed = True
+                break
+            name = entry.get("name")
+            present = entry.get("present")
+            if not isinstance(name, str) or not name:
+                unreadable.append(f"{key}: an entry in `functions` carries no `name`")
+                malformed = True
+                break
+            if not isinstance(present, bool):
+                unreadable.append(
+                    f"{key}: {name} carries `present` as {type(present).__name__}, not a "
+                    "boolean — a probe that did not answer is not an absent function"
+                )
+                malformed = True
+                break
+            probed[name] = present
+        if malformed:
+            continue
+        missing = sorted(required - set(probed))
+        if missing:
+            unreadable.append(
+                f"{key}: the probe does not cover {len(missing)} of the "
+                f"{len(LEGACY_DEAD_LAMBDA_NAMES)} names this deliverable asks about "
+                f"({', '.join(missing)}) — it answers a narrower question"
+            )
+            continue
+        probed_total += 1
+        alive = sorted(name for name in LEGACY_DEAD_LAMBDA_NAMES if probed[name])
+        if alive:
+            surviving.append(f"{key}: {len(alive)} still present: {', '.join(alive)}")
+    if surviving:
+        # A real reading about the system, and it takes precedence: a window
+        # with one unreadable week and one surviving function has a FINDING in
+        # it, and `[?]` would hide the finding behind the unreadable week.
+        detail = "; ".join(surviving)
+        if unreadable:
+            detail += f"; {len(unreadable)} week(s) also unreadable: {'; '.join(unreadable)}"
+        return Clause("dead_lambdas_deleted", requirement, False, detail, tuple(evidence))
+    if unreadable:
+        return Clause(
+            "dead_lambdas_deleted",
+            requirement,
+            False,
+            "; ".join(unreadable),
+            tuple(evidence),
+            unmeasurable=True,
+        )
+    return Clause(
+        "dead_lambdas_deleted",
+        requirement,
+        True,
+        f"{probed_total} filed probe(s) report all {len(LEGACY_DEAD_LAMBDA_NAMES)} named "
+        "functions absent, matched per exact name",
+        tuple(evidence),
+    )
+
+
+def _clause_old_alerts_muted(store: Store, window: list[dt.date]) -> Clause:
+    """Every v1 weekly execution in the window was routed to the muted topic.
+
+    `alpha-engine-config-I9756`'s third deliverable, and the fact Brian
+    measured it on: the 2026-09-03 execution's INPUT carries
+    ``"sns_topic_arn": "...:alpha-engine-alerts-muted"``, so all 28 of the
+    weekly state machine's `sns:publish` states land in a topic with no
+    subscribers. The deliverable's prior "not gate-readable" reason called the
+    evidence "an observation about a notification channel, which leaves no
+    artifact in this store" — but the routing is declared in each execution's
+    input, which is a durable, per-execution fact, and
+    `nous-ergon-ops/scripts/legacy_weekly_executions_producer.py` now files it
+    beside the cadence facts it already files.
+
+    **Scope, stated so a MET reading is not read as wider than it is.** This
+    grades the state machine's OWN publish path — the `sns_topic_arn` its
+    input names. The second, independent paging path on the same pipeline is
+    the native CloudWatch alarm `ExecutionsFailed`, repointed separately
+    (`nous-ergon-ops-PR988`); it is not an execution input and this clause
+    does not see it. The requirement string says so.
+
+    **A week with no executions is UNMEASURABLE, not MET.** Routing cannot be
+    read from an absence: "no execution named a paging topic" and "no
+    execution ran" are the same reading, and only one of them is the
+    deliverable. The cadence clause is the one that grades a silent week, and
+    it reads UNMET there with the missing run named — the two clauses split
+    the two questions rather than both half-answering each.
+
+    **An execution entry without the field is UNMEASURABLE too.** Documents
+    filed between `alpha-engine-config-I9962` and `I9964` carry every other
+    `legacy-weekly-executions.v2` field and answer the cadence question
+    correctly; they simply predate the routing fact. Keying on the FIELD
+    rather than on a bumped `schema_version` is what lets one week be
+    measurable for cadence and unmeasurable for routing, which is what those
+    weeks actually are.
+    """
+    requirement = (
+        "every execution of the v1 weekly state machine in the window declared "
+        f"`{LEGACY_WEEKLY_TOPIC_FIELD}` = `{MUTED_ALERTS_TOPIC_NAME}` in its input, so the "
+        "state machine's own publish states page nobody. The pipeline's native "
+        "CloudWatch alarm is a separate path and is not read here"
+    )
+    anchors = _weekly_anchors(window)
+    evidence = [legacy_weekly_executions_key(a.isoformat()) for a in anchors]
+    unreadable: list[str] = []
+    paging: list[str] = []
+    routed_total = 0
+    for key in evidence:
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            unreadable.append(read.problem)
+            continue
+        if read.absent:
+            unreadable.append(
+                f"{key}: no filed execution record. Nothing writes this key yet, and a "
+                "gate may not call `states:DescribeExecution` to find out"
+            )
+            continue
+        document = read.document or {}
+        version = document.get("schema_version")
+        if version != LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION:
+            unreadable.append(
+                f"{key}: schema_version is {version!r}, not "
+                f"{LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION!r} — it records no per-execution "
+                "input at all"
+            )
+            continue
+        entries = document.get("executions")
+        if not isinstance(entries, list):
+            unreadable.append(f"{key}: `executions` is {type(entries).__name__}, not a list")
+            continue
+        if not entries:
+            unreadable.append(
+                f"{key}: the week lists no execution, so no input named a topic. Routing "
+                "cannot be read from an absence — the cadence clause is what grades a "
+                "week in which the pipeline did not run"
+            )
+            continue
+        malformed = False
+        unrouted: list[str] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                unreadable.append(f"{key}: an entry in `executions` is not an object")
+                malformed = True
+                break
+            name = entry.get("name")
+            if LEGACY_WEEKLY_TOPIC_FIELD not in entry:
+                unreadable.append(
+                    f"{key}: execution {name!r} carries no `{LEGACY_WEEKLY_TOPIC_FIELD}` — "
+                    "filed by a producer that predates the routing fact; this week is "
+                    "unmeasurable for routing and still measurable for cadence"
+                )
+                malformed = True
+                break
+            arn = entry.get(LEGACY_WEEKLY_TOPIC_FIELD)
+            if arn is None:
+                unrouted.append(f"{name}: input declared no topic")
+                continue
+            if not isinstance(arn, str) or not arn:
+                unreadable.append(
+                    f"{key}: execution {name!r} carries `{LEGACY_WEEKLY_TOPIC_FIELD}` as "
+                    f"{type(arn).__name__}, which is neither an ARN nor a declared absence"
+                )
+                malformed = True
+                break
+            if arn.rsplit(":", 1)[-1] != MUTED_ALERTS_TOPIC_NAME:
+                unrouted.append(f"{name}: {arn.rsplit(':', 1)[-1]}")
+        if malformed:
+            continue
+        if unrouted:
+            paging.append(
+                f"{key}: {len(unrouted)} execution(s) not routed to "
+                f"`{MUTED_ALERTS_TOPIC_NAME}`: {'; '.join(unrouted)}"
+            )
+            continue
+        routed_total += len(entries)
+    if paging:
+        detail = "; ".join(paging)
+        if unreadable:
+            detail += f"; {len(unreadable)} week(s) also unreadable: {'; '.join(unreadable)}"
+        return Clause("old_alerts_muted", requirement, False, detail, tuple(evidence))
+    if unreadable:
+        return Clause(
+            "old_alerts_muted",
+            requirement,
+            False,
+            "; ".join(unreadable),
+            tuple(evidence),
+            unmeasurable=True,
+        )
+    return Clause(
+        "old_alerts_muted",
+        requirement,
+        True,
+        f"{routed_total} execution(s) across {len(evidence)} week(s), every input naming "
+        f"`{MUTED_ALERTS_TOPIC_NAME}`",
+        tuple(evidence),
+    )
+
+
+def _clause_v2_resources_tagged_and_versioned(
+    store: Store, window: list[dt.date], trading_day: dt.date
+) -> Clause:
+    """The v2 store is versioned and every v2 resource carries the cost tag.
+
+    `alpha-engine-config-I9756`'s fourth deliverable, and the one whose prior
+    "not gate-readable" reason already named the condition that would close
+    it: *"it becomes a gate clause the day that audit files its result to the
+    store."* That day is now — `crucible-v2-github-acceptance` runs the §2
+    suite on every push to `main` and files
+    :func:`crucible.keys.acceptance_reading_key`. What the filed document
+    lacked was per-clause detail: `{"met": 22, "unmet": 2}` cannot say whether
+    :data:`V2_TAG_ACCEPTANCE_CLAUSE_ID` is one of the 22.
+
+    So the producer files `met_clauses` and, from the same read, the store
+    bucket's S3 versioning `Status` — the deliverable's other half, which no
+    §2 clause grades. Both halves must hold, and each is read from a NAMED
+    field: `met_clauses` absent is UNMEASURABLE, never "the clause must have
+    passed since it is not in `unmet_clauses`", and `store_versioning` absent
+    is UNMEASURABLE, never `Suspended`.
+
+    **Which day's reading.** The document is keyed to the trading day CI ran,
+    and CI runs on merges, not on a schedule — so reading only
+    ``trading_day`` would make this clause flap with the merge calendar. It
+    scans the sessions the window covers, newest first, and grades the most
+    recent reading it finds, naming that day and its commit. Never past
+    ``trading_day``: a reading filed tomorrow did not exist when the gate was
+    read, and letting it satisfy today's exit is how a phase closes on
+    evidence that post-dates it.
+    """
+    requirement = (
+        f"the most recent §2 acceptance reading in the window reports "
+        f"`{V2_TAG_ACCEPTANCE_CLAUSE_ID}` MET by name, and reports the store bucket's S3 "
+        f"versioning status as `{V2_STORE_VERSIONING_ENABLED}`"
+    )
+    sessions = _session_span(_weekly_anchors(window), trading_day)
+    if not sessions:
+        # `weekly_anchor` is strictly before its argument, so the span always
+        # holds at least the anchor itself. Refuse rather than index into an
+        # empty list: a clause that reads no key at all would report the
+        # deliverable on no evidence.
+        return Clause(
+            "v2_resources_tagged_and_versioned",
+            requirement,
+            False,
+            f"the window's anchor is not on or before {trading_day.isoformat()}, so there "
+            "is no session to read a reading from",
+            (),
+            unmeasurable=True,
+        )
+    evidence = [acceptance_reading_key(day.isoformat()) for day in sessions]
+    problems: list[str] = []
+    for day in reversed(sessions):
+        key = acceptance_reading_key(day.isoformat())
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            # An access failure is about us, and it is the FIRST thing the
+            # scan hits going backwards — stop rather than silently grading an
+            # older day, which would report a reading taken before whatever
+            # the denial is hiding.
+            return Clause(
+                "v2_resources_tagged_and_versioned",
+                requirement,
+                False,
+                read.problem,
+                tuple(evidence),
+                unmeasurable=True,
+            )
+        if read.absent:
+            continue
+        reading = parse_acceptance_reading(read.document)
+        if reading is None:
+            problems.append(f"{key} is not an acceptance reading")
+            continue
+        if reading.met_clauses is None:
+            problems.append(
+                f"{key} (commit {reading.commit}) names no `met_clauses`, so it cannot say "
+                f"whether `{V2_TAG_ACCEPTANCE_CLAUSE_ID}` is one of its {reading.met} met "
+                "clauses. An absent list is 'not filed', never 'there are none'"
+            )
+            continue
+        if reading.store_versioning is None:
+            problems.append(
+                f"{key} (commit {reading.commit}) names no `store_versioning`; the "
+                "producer could not read the bucket's versioning status, which is a "
+                "statement about its access, not about the bucket"
+            )
+            continue
+        failures: list[str] = []
+        if V2_TAG_ACCEPTANCE_CLAUSE_ID not in reading.met_clauses:
+            where = (
+                "unmet"
+                if reading.unmet_clauses and V2_TAG_ACCEPTANCE_CLAUSE_ID in reading.unmet_clauses
+                else "not named at all"
+            )
+            failures.append(f"`{V2_TAG_ACCEPTANCE_CLAUSE_ID}` is {where}, not met")
+        if reading.store_versioning != V2_STORE_VERSIONING_ENABLED:
+            failures.append(
+                f"store versioning is {reading.store_versioning!r}, not "
+                f"{V2_STORE_VERSIONING_ENABLED!r}"
+            )
+        if failures:
+            return Clause(
+                "v2_resources_tagged_and_versioned",
+                requirement,
+                False,
+                f"{key} (commit {reading.commit}): " + "; ".join(failures),
+                tuple(evidence),
+            )
+        return Clause(
+            "v2_resources_tagged_and_versioned",
+            requirement,
+            True,
+            f"{key} (commit {reading.commit}): `{V2_TAG_ACCEPTANCE_CLAUSE_ID}` met and "
+            f"store versioning {reading.store_versioning}",
+            tuple(evidence),
+        )
+    detail = (
+        f"no §2 acceptance reading in {sessions[0].isoformat()}..{trading_day.isoformat()} "
+        f"({len(sessions)} session(s)) answers this deliverable"
+    )
+    if problems:
+        detail += f": {'; '.join(problems)}"
+    else:
+        detail += "; nothing is filed under this prefix for those days"
+    return Clause(
+        "v2_resources_tagged_and_versioned",
+        requirement,
+        False,
+        detail,
+        tuple(evidence),
+        unmeasurable=True,
+    )
+
+
 def _clause_acceptance_suite_committed() -> Clause:
     """The §2 suite exists in source, and the committed reading matches it.
 
@@ -1817,12 +2304,19 @@ class Deliverable:
 
 #: `alpha-engine-config-I9756`'s five deliverables, mapped onto this gate.
 #:
-#: Two are graded. The other three are each a property of AWS that no artifact
-#: in this store records, and a gate does not call AWS — so they are named here
-#: with their reason and their real reading surface, and :func:`coverage_note`
-#: publishes that subset onto every surface the reading reaches. The
-#: alternative, an ungraded deliverable simply missing from the clause list, is
-#: how "the gate is met" comes to mean less than a reader assumes.
+#: **All five are graded** since `alpha-engine-config-I9964`. Three were
+#: ungraded until then, each on the same argument: the fact lives in AWS and a
+#: gate does not call AWS. That is true about the READ and a non-sequitur
+#: about the CLAUSE — `old_weekly_within_cadence` reads a live AWS fact too,
+#: filed by a producer that holds the identity, and the other three needed the
+#: same shape rather than a different rule. Brian ruled option (a) on
+#: 2026-09-04: phase 0 exits on evidence covering all five, not two.
+#:
+#: :func:`coverage_note` still publishes the subset onto every surface the
+#: reading reaches, and still RAISES on a table that disagrees with the clause
+#: list — an ungraded deliverable simply missing from the clause list is how
+#: "the gate is met" comes to mean less than a reader assumes, and that guard
+#: is what keeps this table honest if a clause is later renamed or dropped.
 PHASE0_DELIVERABLES: tuple[Deliverable, ...] = (
     Deliverable(
         "old_weekly_once_per_week",
@@ -1832,28 +2326,17 @@ PHASE0_DELIVERABLES: tuple[Deliverable, ...] = (
     Deliverable(
         "dead_lambdas_deleted",
         "the six zero-invocation v1 functions are deleted via their owning IaC",
-        None,
-        "plan §6 names the deleted-Lambda count as a PROGRESS figure and explicitly "
-        "not the gate; the only surface that answers it is a live AWS read, which a "
-        "gate may not make. Graded by the owning repo's IaC drift check.",
+        "dead_lambdas_deleted",
     ),
     Deliverable(
         "old_alerts_muted",
         "v1 weekly/rehearsal alert emitters route to the muted topic, trading alerts unchanged",
-        None,
-        "the evidence is a forced v1 failure arriving in the muted topic and not in "
-        "the paging one — an observation about a notification channel, which leaves "
-        "no artifact in this store. Graded by the routing change's own PR.",
+        "old_alerts_muted",
     ),
     Deliverable(
         "v2_resources_tagged_and_versioned",
         "S3 versioning on the v2 prefix and `system=crucible-v2` on every v2 resource",
-        None,
-        "`crucible.tags.audit_stack_tags` resolves this against live CloudFormation "
-        "and IAM and raises when the stack is absent. It is carried as an acceptance "
-        "clause (`TestCost::test_every_v2_resource_is_tagged_for_cost_attribution`), "
-        "committed unmet; it becomes a gate clause the day that audit files its "
-        "result to the store.",
+        "v2_resources_tagged_and_versioned",
     ),
     Deliverable(
         "acceptance_tests_written_as_failing_pytest",
@@ -1904,7 +2387,11 @@ def coverage_note(gate: str, clause_names: Iterable[str]) -> str | None:
     tracker = f"alpha-engine-config-I{issue}" if issue else gate
     ungraded = [d for d in deliverables if d.graded_by is None]
     if not ungraded:
-        return f"grades all {len(deliverables)} {tracker} deliverables"
+        # `all N of N`, not a bare `all N`: the incomplete branch below reads
+        # `grades 2 of 5`, and a reader comparing two renderings of this line
+        # across a change should be able to read the ratio in both without
+        # knowing the denominator from somewhere else.
+        return f"grades all {len(deliverables)} of {len(deliverables)} {tracker} deliverables"
     return (
         f"grades {len(deliverables) - len(ungraded)} of {len(deliverables)} {tracker} "
         f"deliverables; not gate-readable: {', '.join(d.id for d in ungraded)}"
@@ -1925,8 +2412,16 @@ def _phase0(
     there is no `components.yaml` row to read. The parameter is kept because
     `GATES` holds one callable shape, and a second signature would be a
     per-gate special case in `evaluate`.
+
+    ``trading_day`` IS used since `alpha-engine-config-I9964`: the §2
+    acceptance reading is filed on the day CI ran, not at a weekly close, so
+    the deliverable-4 clause needs the render day to know which readings
+    already existed when the gate was read.
+
+    Five clauses, one per `alpha-engine-config-I9756` deliverable — see
+    :data:`PHASE0_DELIVERABLES`.
     """
-    _unused((registry, trading_day))
+    _unused((registry,))
     return [
         _clause_old_weekly_within_cadence(
             store,
@@ -1937,6 +2432,9 @@ def _phase0(
             # not inferred inside the shared reader.
             minimum=LEGACY_WEEKLY_MIN_RUNS_PER_WEEK,
         ),
+        _clause_dead_lambdas_deleted(store, window),
+        _clause_old_alerts_muted(store, window),
+        _clause_v2_resources_tagged_and_versioned(store, window, trading_day),
         _clause_acceptance_suite_committed(),
     ]
 
