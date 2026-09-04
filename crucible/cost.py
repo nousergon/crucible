@@ -30,9 +30,11 @@ from typing import Any
 from crucible.tags import TAG_KEY, TAG_VALUE
 
 __all__ = [
+    "ClosedMonthReading",
     "CostReading",
     "CostUnreadableError",
     "DailyReading",
+    "closed_month_usd",
     "default_client",
     "month_to_date_usd",
     "trailing_daily_usd",
@@ -97,6 +99,42 @@ class DailyReading:
             "start": self.start.isoformat(),
             "end": self.end.isoformat(),
             "amounts_usd": list(self.amounts_usd),
+            "tag_filter": self.tag_filter,
+        }
+
+
+@dataclass(frozen=True)
+class ClosedMonthReading:
+    """The unblended total for one CLOSED prior calendar month.
+
+    Normative source: `alpha-engine-config-I9946`. `month_to_date_usd` and
+    `trailing_daily_usd` both grade a month IN PROGRESS; neither ever compares
+    a completed month against its own ceiling, so a month that projected
+    under all the way through and closed over left no red row anywhere.
+
+    ``estimated`` is Cost Explorer's own `Estimated` flag on this period, not
+    derived: Cost Explorer finalises a month a few days into the next one, so
+    a reading taken while it is still `True` is a statement that can move —
+    reading it as final would grade a closed month against a number that
+    is not actually closed yet.
+    """
+
+    start: dt.date
+    end: dt.date
+    amount_usd: float
+    estimated: bool
+    tag_filter: str | None
+
+    @property
+    def scope(self) -> str:
+        return self.tag_filter or "the whole account"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "start": self.start.isoformat(),
+            "end": self.end.isoformat(),
+            "amount_usd": self.amount_usd,
+            "estimated": self.estimated,
             "tag_filter": self.tag_filter,
         }
 
@@ -177,6 +215,78 @@ def trailing_daily_usd(
         amounts_usd=tuple(amounts),
         tag_filter=f"{TAG_KEY}={TAG_VALUE}" if tagged else None,
     )
+
+
+def closed_month_usd(client: Any, *, today: dt.date, tagged: bool) -> ClosedMonthReading:
+    """The PRIOR calendar month's closed total (`alpha-engine-config-I9946`).
+
+    The prior month is derived from ``today`` regardless of which day of the
+    month it names — the CALL SITE decides when it is worth asking (only the
+    first few days of a month; a read taken mid-month would just restate
+    month-to-date under another name). One request, MONTHLY granularity,
+    over exactly ``[prior month's 1st, this month's 1st)`` — Cost Explorer
+    answers with exactly one period for that interval, and this reads its
+    `Estimated` flag rather than assuming the number is final.
+    """
+    end = today.replace(day=1)
+    start = (end - dt.timedelta(days=1)).replace(day=1)
+    amount, estimated = _single_period(client, start=start, end=end, tagged=tagged)
+    return ClosedMonthReading(
+        start=start,
+        end=end,
+        amount_usd=amount,
+        estimated=estimated,
+        tag_filter=f"{TAG_KEY}={TAG_VALUE}" if tagged else None,
+    )
+
+
+def _single_period(
+    client: Any, *, start: dt.date, end: dt.date, tagged: bool
+) -> tuple[float, bool]:
+    """One MONTHLY period's amount and its `Estimated` flag.
+
+    Shares `_amounts`'s request shape and exception handling exactly; the
+    difference is this reader also needs the `Estimated` bit `_amounts`
+    discards, since a month-close reading must say when the number can still
+    move (`alpha-engine-config-I9946`).
+    """
+    request: dict[str, Any] = {
+        "TimePeriod": {"Start": start.isoformat(), "End": end.isoformat()},
+        "Granularity": "MONTHLY",
+        "Metrics": ["UnblendedCost"],
+    }
+    if tagged:
+        request["Filter"] = {"Tags": {"Key": TAG_KEY, "Values": [TAG_VALUE]}}
+    try:
+        response = client.get_cost_and_usage(**request)
+    except Exception as exc:
+        raise CostUnreadableError(
+            f"Cost Explorer could not be read for "
+            f"{start.isoformat()}..{end.isoformat()}: {type(exc).__name__}: {exc}. "
+            "That is a statement about our access, not about what was spent."
+        ) from exc
+    periods = response.get("ResultsByTime") or []
+    if len(periods) != 1:
+        raise CostUnreadableError(
+            f"Cost Explorer returned {len(periods)} period(s) for "
+            f"{start.isoformat()}..{end.isoformat()}, not 1. A closed-month reading needs "
+            "exactly one MONTHLY period."
+        )
+    period = periods[0]
+    amount = ((period.get("Total") or {}).get("UnblendedCost") or {}).get("Amount")
+    if amount is None:
+        raise CostUnreadableError(
+            f"Cost Explorer returned a period with no `UnblendedCost` amount for "
+            f"{start.isoformat()}..{end.isoformat()}. A missing amount is not zero."
+        )
+    try:
+        amount_usd = float(amount)
+    except (TypeError, ValueError) as exc:
+        raise CostUnreadableError(
+            f"Cost Explorer returned {amount!r} as an amount, which is not a number: "
+            f"{type(exc).__name__}"
+        ) from exc
+    return amount_usd, bool(period.get("Estimated", False))
 
 
 def _amounts(
