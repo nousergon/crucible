@@ -58,6 +58,7 @@ from crucible.calendar import assert_trading_day
 from crucible.keys import arm_register_key, strategy_arms_prefix
 from crucible.slots import ControlArm, SlotSpec
 from crucible.slots.rankers import get_ranker, ranker_identity
+from crucible.slots.vocab import refuse_unknown_keys
 from crucible.store import Store
 
 __all__ = [
@@ -145,6 +146,28 @@ class ForeignRecipeSchemaError(ValueError):
 
 class InapplicableArmError(ValueError):
     """Two arms that are not two arms. Policy §4's vacuity refusal."""
+
+
+#: Every top-level key a filed U/R recipe may declare (`alpha-engine-config-
+#: I9944`) — exactly :class:`ArmSpec`'s fields, minus `source_key`, which is
+#: set from the recipe's own path and never read out of the YAML document.
+#: `params` is a MEMBER of this set (the key itself, not its contents): what
+#: it may contain stays an open mapping, hashed as-is.
+_ARM_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
+    {
+        "name",
+        "slot",
+        "ranker",
+        "params",
+        "registered_at",
+        "supersedes",
+        "control",
+        "control_kind",
+        "bootstrap",
+        "promotion_source",
+        "notes",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -237,6 +260,15 @@ def _parse(payload: bytes, origin: str) -> ArmSpec:
             "`benchmark` are deliberately NOT arm fields — they are the SLOT's, so "
             "every arm is scored on the same axis (policy §4)."
         )
+    # Top-level keys only (`alpha-engine-config-I9944`) — `params` is the
+    # ranker's own open argument mapping and is hashed as-is, by design.
+    refuse_unknown_keys(
+        path=origin,
+        keys=set(document),
+        vocabulary=_ARM_TOP_LEVEL_KEYS,
+        level="top-level recipe",
+        slot_label="U/R",
+    )
     params = document.get("params") or {}
     if not isinstance(params, dict):
         raise ValueError(f"{origin}: `params` must be a mapping; got {type(params).__name__}")

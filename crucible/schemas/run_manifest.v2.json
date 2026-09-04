@@ -316,6 +316,8 @@
         "model_requested",
         "model_served",
         "route_degraded",
+        "fallback_used",
+        "served_deployment",
         "tokens_in",
         "tokens_out",
         "cache_read",
@@ -341,6 +343,14 @@
         "route_degraded": {
           "description": "Whether RESOLUTION had already fallen past the group's primary entry when this call was routed (model-router-policy R12: serving from a fallback is an alert, not a log line). Required and boolean, so a fallback-served call is distinguishable from a primary-served one in the durable record rather than only in a log; `false` is an assertion that the primary served, never an absence. Added by alpha-engine-config-I9969 WITHOUT a version bump, unlike `run_mode`: the field is on `llmCall`, `crucible.llm.call` is the only writer of one, and it could not complete a call at all before this change (the registry it admits against is empty and the spec it resolved came from an SSM path that does not exist) — so no manifest in the store carries an `llm_calls` row this could retroactively invalidate.",
           "type": "boolean"
+        },
+        "fallback_used": {
+          "description": "Whether a fallback entry in the group's chain actually SERVED this call — the call-time fact, from `krepis.llm.LLMResult.fallback_used`. Distinct from `route_degraded`, which is the resolve-time fact about the route object: on the router-edge route the chain is walked by the proxy AFTER resolution, so resolution can report a healthy route while the proxy serves from a fallback, and `route_degraded` alone would then read `false` beside a call the primary never answered. Both are recorded because they answer different questions and neither can be derived from the other; a run whose arm was served by a fallback and whose manifest says the primary served is a run that grades a model nobody selected. Added by alpha-engine-config-I10006 WITHOUT a version bump, on the same reasoning `route_degraded` records: the field is on `llmCall`, `crucible.llm.call` is its only writer, and `crucible/llm_callsites.yaml` still declares `callsites: {}` so the door has never completed a call — no manifest in the store carries an `llm_calls` row this could retroactively invalidate.",
+          "type": "boolean"
+        },
+        "served_deployment": {
+          "description": "The deployment name the router reported for this call — `{group}-{mid}` on the router edge, the upstream model id elsewhere — from `krepis.llm.LLMResult.served_deployment`. `null` when the route reported none, which is an absence of the router's own answer and is NOT the same as an absent field. Recorded beside `model_served` rather than folded into it: `model_served` is the resolved upstream id price cards key on, and two deployments can share one upstream model, so the comparison that decides `fallback_used` happens at the deployment layer and an artifact reader cannot reconstruct it from `model_served` alone (krepis, alpha-engine-config-I9995). Added by alpha-engine-config-I10006 without a version bump, same reasoning as `fallback_used`.",
+          "type": ["string", "null"]
         },
         "tokens_in": {
           "type": "integer",

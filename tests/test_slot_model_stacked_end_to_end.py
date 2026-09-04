@@ -108,7 +108,6 @@ def _write_recipe(directory, name, *, features, inputs=()):
         "  refit_cadence_trading_days: 5",
         "  training_window: {kind: expanding, min_trading_days: 10}",
         "  cpcv: {n_groups: 4, k_test: 1, embargo_trading_days: 1}",
-        f"  feature_version: {DEFAULT_FEATURE_VERSION}",
         "registered_at: '2026-06-01'",
     ]
     (directory / f"{name}.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
