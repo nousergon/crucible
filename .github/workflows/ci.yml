@@ -140,8 +140,16 @@ jobs:
       # The blocking gate. tests/acceptance is excluded here and run as its
       # own reporting job below — see the comment there for why that is not a
       # suppression.
+      #
+      # --cov=crucible measures the WHOLE package (repository-baseline-policy.md
+      # §4.2 C1), not just the modules this invocation happens to import — a
+      # coverage tool reporting only loaded files understates nothing untested
+      # by omitting it. `--cov-fail-under` is not passed explicitly:
+      # pytest-cov reads `[tool.coverage.report] fail_under` from
+      # pyproject.toml automatically once `--cov` is passed, so the ratchet
+      # lives in one place. A drop below the measured floor fails this job.
       - name: Foundation tests
-        run: uv run --frozen pytest -q --ignore=tests/acceptance
+        run: uv run --frozen pytest -q --ignore=tests/acceptance --cov=crucible --cov-report=term-missing
 
       # Collection, not execution — and it belongs HERE, on the PR path.
       # Importing a test module grades the TREE: it proves every symbol

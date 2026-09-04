@@ -1,6 +1,7 @@
 # crucible
 
 [![CI](https://github.com/nousergon/crucible/actions/workflows/ci.yml/badge.svg)](https://github.com/nousergon/crucible/actions/workflows/ci.yml)
+[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fnousergon%2Fcrucible%2Fbadges%2Fcoverage.json)](https://github.com/nousergon/crucible/actions/workflows/coverage-badge.yml)
 
 An experiment harness for systematic strategies. It runs champion/challenger
 experiments on a trading-day axis, writes one machine-readable manifest per

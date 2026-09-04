@@ -70,6 +70,7 @@ Homepage = "https://github.com/nousergon/crucible"
 [dependency-groups]
 dev = [
     "pytest>=8.3",
+    "pytest-cov>=6.0",
     "ruff>=0.16.5",
 ]
 
@@ -90,3 +91,24 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.coverage.run]
+# repository-baseline-policy.md §4.2 C1: the denominator is the whole source
+# tree, not the files a test happened to import. `source` makes coverage.py
+# report modules the foundation suite never loaded; `omit` stays empty so the
+# scope cannot be narrowed into a flattering number.
+source = ["crucible"]
+omit = []
+
+[tool.coverage.report]
+# §4.2 C3: a ratchet set at the measured value (93%, tests/ --ignore=tests/acceptance,
+# 2026-09-03). Raise it when coverage improves; lowering it is a policy
+# amendment, never a way to make a change pass. tests/acceptance is excluded
+# from the measured run because those clauses fail by design until the phase
+# they gate exits (see ci.yml) and are not part of the PR-path gate.
+fail_under = 93
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]

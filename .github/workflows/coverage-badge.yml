@@ -1,0 +1,96 @@
+name: coverage-badge
+
+# Publishes the measured line-coverage percentage as a shields.io endpoint file
+# on the `badges` branch, so README.md renders a number that came from a real
+# run.
+#
+# repository-baseline-policy.md §5.1 forbids a hand-set badge outright: it
+# renders identically to a real one, so a reader cannot tell them apart, and it
+# becomes false the moment reality moves without anyone editing a file. §5.3
+# requires a coverage badge on a Tier A repo, so "no badge" is not an option
+# either — the only compliant answer is a generated one.
+#
+# Mirrors scannerctl's and symposion's coverage-badge.yml (AGENTS.md: mirror
+# the fleet's existing SOTA pattern rather than inventing a parallel one).
+# In-house on purpose: the alternatives were a gist plus a long-lived PAT, or
+# a third-party coverage vendor with access to a repo that is private today.
+# Both buy presentation with a permanent cost; this buys it with a branch.
+#
+# tests/acceptance is excluded from the measured run — see ci.yml's
+# "Foundation tests" step comment for why: those clauses fail by design until
+# the phase they gate exits and are not part of the PR-path gate. The number
+# published here is the same one ci.yml's coverage floor enforces.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  publish:
+    name: publish coverage badge
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Scoped to this job alone. Write access exists here only to push one JSON
+    # file to a branch that contains nothing else.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Measure coverage
+        id: cov
+        run: |
+          set -o pipefail
+          uv run --frozen pytest -q --ignore=tests/acceptance --cov=crucible --cov-report=term-missing --no-cov-on-fail 2>&1 | tee /tmp/cov.txt || true
+          PCT=$(grep -oE '^TOTAL[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+%' /tmp/cov.txt | grep -oE '[0-9]+%$' | tr -d '%')
+          if [ -z "$PCT" ]; then
+            echo "could not parse a coverage percentage from the run output" >&2
+            echo "refusing to publish a badge rather than publishing a wrong one" >&2
+            exit 1
+          fi
+          echo "pct=$PCT" >> "$GITHUB_OUTPUT"
+          echo "Measured line coverage: $PCT%"
+
+      - name: Build the shields endpoint payload
+        run: |
+          PCT="${{ steps.cov.outputs.pct }}"
+          if   [ "$PCT" -ge 90 ]; then COLOR=brightgreen
+          elif [ "$PCT" -ge 75 ]; then COLOR=green
+          elif [ "$PCT" -ge 60 ]; then COLOR=yellowgreen
+          elif [ "$PCT" -ge 40 ]; then COLOR=orange
+          else                         COLOR=red
+          fi
+          mkdir -p out
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$PCT" "$COLOR" > out/coverage.json
+          cat out/coverage.json
+
+      - name: Publish to the badges branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Orphan branch: it carries badge payloads and nothing else, so it
+          # never needs the history of main and can never conflict with it.
+          git fetch origin badges --depth=1 2>/dev/null && git checkout badges || git checkout --orphan badges
+          find . -maxdepth 1 -mindepth 1 ! -name .git ! -name out -exec rm -rf {} +
+          mv out/coverage.json ./coverage.json
+          rmdir out 2>/dev/null || true
+          git add coverage.json
+          if git diff --cached --quiet; then
+            echo "coverage unchanged — nothing to publish"
+            exit 0
+          fi
+          git commit -m "chore(badges): coverage ${{ steps.cov.outputs.pct }}%"
+          git push origin badges
