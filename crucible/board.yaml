@@ -1,0 +1,301 @@
+# The board's declarations (alpha-engine-config-I9837).
+#
+# Every row of the v2 board is declared BEFORE the thing it measures exists.
+# That is the whole instrument: a board assembled from what already reports
+# can only ever show you the parts that report, and the failure this exists to
+# prevent is the one that closed `alpha-engine-config-I9757` on 2026-09-02 —
+# a phase issue closed the moment its PRs merged, with zero replay Saturdays
+# run and its gate reading 1 of 5, because nothing rendered the gap. A row
+# reading `UNMEASURED — 0 of 5 replay Saturdays` since day one could not have
+# been closed by accident.
+#
+# THIS FILE IS NOT THE WHOLE ROW SET. The board draws from four declarations
+# and this file carries two of them; the other two are read from code that
+# already exists, because a second copy of a declaration is a contract
+# restated in two places and this repository has already watched one drift:
+#
+#   objectives  -> here            (plan §2 table, plan §10 components)
+#   cutover     -> here            (the v1 -> v2 predicates, plan §6 phase 4)
+#   phases      -> crucible/gate.py `PHASES` + `GATES`
+#   components  -> crucible/components.yaml
+#
+# `tests/test_board.py` asserts the derivation in BOTH directions for all
+# four. A row whose source declaration disappears is an error, never a
+# silently smaller board — a board that shrinks quietly is the same defect as
+# a green row over no data, wearing a different face.
+#
+# ── `reader` and `artifact`: why neither is a key literal ─────────────────
+#
+# An earlier draft of this file carried a literal S3 key per row and a field
+# name to read a boolean out of. Independent adversarial review killed it, and
+# was right to: eight of the ten keys were INVENTED. `ledger/cost/current.json`
+# against the real `ledger/trials.jsonl`; `features/current.json` against a
+# `features/{version}/{day}.parquet`; `arms/controls/current.json` against an
+# `arms/{slot}/register.jsonl`. Those rows would have read UNMEASURED forever —
+# including after the real producers shipped, at which point the red would have
+# been about the KEY rather than about the objective, and indistinguishable
+# from the gap this board exists to show. Three of them would have landed
+# `UNMEASURABLE` (parquet and JSONL through `json.loads`), firing the one
+# BREACH-graded metric here for a typo.
+#
+# `crucible/keys.py` exists precisely so this cannot happen — "a key format
+# restated at each call site is a contract restated fifty times, and one of
+# them has already drifted" — and that draft restated fourteen through none of
+# it. So this file names no keys at all:
+#
+#   `reader`   the name of a reader registered in `crucible/board.py::READERS`.
+#              The reader derives its key from `keys.py` (or from the module
+#              that owns the artifact) and knows the artifact's real shape.
+#              `null` means NO PRODUCER EXISTS YET, and that is what makes a
+#              row PLANNED.
+#   `artifact` the key template a reader resolves, restated here for the
+#              READER OF THE BOARD, not for the code. It is asserted equal to
+#              the key the registered reader actually derives
+#              (`test_every_declared_artifact_matches_the_key_its_reader_uses`),
+#              so it cannot drift into decoration.
+#
+# `PLANNED` is DECLARED, never inferred from an absent artifact: "nobody built
+# it" and "it broke" want opposite responses and are indistinguishable from
+# the store alone. A planned row still names the artifact it is waiting for,
+# so the gap is actionable rather than merely red.
+
+version: 1
+
+# ── Plan §2: "Objectives, made testable" ──────────────────────────────────
+#
+# One row per §2 objective, plus the §10 components whose absence makes a
+# verdict wrong. `clause_class` is the acceptance-suite class that tests this
+# objective; the bijection between these rows and those classes is asserted,
+# so an objective cannot be declared without a test and a test class cannot
+# exist without a board row.
+
+objectives:
+  autonomy:
+    section: "§2 row 1"
+    statement: Runs autonomously, minimal input.
+    clause_class: TestAutonomy
+    surface: crucible/board
+    reader: null
+    artifact: runs/weekly/{trading_day}/run.json
+    planned_because: >-
+      The window is read from the run manifests of 2 live plus 5 replayed
+      Saturdays, and no run has been made under phase-2 conditions yet. Phase 2
+      is alpha-engine-config-I9758; the ruled gate is §6.1's 2 live + 5
+      replayed, NOT §2's superseded "4 consecutive Saturdays". A reader for
+      this row can only be written once a weekly arc has run unattended.
+    means_when_red: >-
+      The weekly arc has not yet completed the ruled live window unattended.
+
+  one_command:
+    section: "§2 row 2"
+    statement: Easy to run experiments — one command returns a verdict.
+    clause_class: TestOneCommand
+    surface: crucible/board
+    reader: null
+    artifact: experiments/{arm}/{trading_day}/verdict.json
+    planned_because: >-
+      `crucible.keys.verdict_key` gives the real shape, and it is keyed by ARM
+      as well as trading day — so "did one command return a verdict today" is a
+      question about the arm register, not about a single pointer key. The
+      register (`arms/{slot}/register.jsonl`) is written by `experiment.new`,
+      which is still a stub. A reader is writable the day that job lands.
+    means_when_red: >-
+      No arm produced a verdict for the current trading day.
+
+  cost:
+    section: "§2 row 3"
+    statement: Low API and AWS cost, with the spend cap declared and enforced.
+    clause_class: TestCost
+    surface: crucible/board
+    reader: null
+    artifact: ledger/trials.jsonl
+    planned_because: >-
+      The fleet trial ledger is the real artifact (`crucible.keys.ledger_key`)
+      and it is an append-only JSONL log, not a cost document — it carries per
+      trial rows, not a monthly AWS figure. Nothing in this repository writes a
+      cost reading at all today; `alpha-engine-config-I9828` is where the cost
+      clause's own unmeasurability is tracked, and it must be answered before
+      this row can have a reader.
+    means_when_red: >-
+      Either the monthly figure is over its ceiling, or — the case that has
+      actually bitten — the reading cannot be taken at all. Those are different
+      facts: an unmeasurable cost is a statement about our access, and this
+      board renders it UNMEASURABLE rather than UNMET for that reason.
+
+  no_third_state:
+    section: "§2 row 4"
+    statement: Works flawlessly from day 1 — two statuses, never a third.
+    clause_class: TestNoThirdState
+    surface: crucible/board
+    reader: null
+    artifact: crucible/schemas/run_manifest.v2.json
+    planned_because: >-
+      This objective is enforced by the manifest SCHEMA, which is a repository
+      property rather than a store artifact. The schema passing in CI is not a
+      reading of PRODUCTION, and rendering it MET on the strength of a green
+      test would be the "a merge satisfied the gate" defect this board exists
+      to prevent. A reader would sweep production manifests for a status
+      outside {ok, failed}; that sweep does not exist.
+    means_when_red: >-
+      Some job in the production store declared a status outside {ok, failed}.
+
+  attribution:
+    section: "§2 row 5"
+    statement: Pinpoint underperformance — the five-row attribution table.
+    clause_class: TestAttribution
+    surface: crucible/board
+    reader: attribution_table_is_complete
+    artifact: report/{trading_day}/attribution.json
+    means_when_red: >-
+      The attribution table is missing rows, or a row it does carry reports no
+      value — a report card that grades fewer layers than it declares is the
+      shape that table exists to make impossible.
+
+  alerting:
+    section: "§2 row 6"
+    statement: Alerts only when wrong — exactly two page conditions.
+    clause_class: TestAlerting
+    surface: crucible/board
+    reader: null
+    artifact: alerts/{trading_day}/{incident_id}.json
+    planned_because: >-
+      `crucible.alerts` writes one key per INCIDENT per day, deliberately —
+      the weekly ceiling counts incidents, and there is no weekly rollup
+      document to read. A reader must count incident keys across the week's
+      trading days against the declared ceiling; that rollup is not written and
+      counting it here would put the ceiling's definition in two places.
+    means_when_red: >-
+      The week's alert count is over its ceiling, or the absence condition did
+      not evaluate against the declared deadline table.
+
+  transparency:
+    section: "§2 row 7"
+    statement: Transparency — every LLM call site registered, every verdict explainable.
+    clause_class: TestTransparency
+    surface: crucible/board
+    reader: null
+    artifact: crucible/llm_callsites.yaml
+    planned_because: >-
+      The registry half is a repository property; the explain half needs a real
+      production verdict for `crucible explain` to walk back, and there is
+      none. Rendering half an objective MET is how a partial reading becomes a
+      claim of completeness.
+    means_when_red: >-
+      A call site is unregistered, or a verdict cannot be walked back to its
+      inputs.
+
+  control_arms:
+    section: "§10 component 1"
+    statement: Every slot declares a planted and a null control, scored every cycle.
+    clause_class: TestControlArms
+    surface: crucible/board
+    reader: null
+    artifact: arms/{slot}/register.jsonl
+    planned_because: >-
+      `crucible.keys.arm_register_key` is per-SLOT and is a JSONL register, so
+      "every slot declares both controls" is a read across four registers that
+      `experiment.new` has not written yet — that job is still a stub.
+    means_when_red: >-
+      A slot is missing a control arm, so no replay run in that slot counts —
+      this is a hard precondition, not a nice-to-have.
+
+  fault_injection:
+    section: "§10 component 7"
+    statement: Each scripted fault produces one failed run and exactly one page.
+    clause_class: TestFaultInjection
+    surface: crucible/board
+    reader: null
+    artifact: runs/{job}/{trading_day}/run.json
+    planned_because: >-
+      "Flawless from day 1" is proven on the FAILURE path, and the fault
+      harness has not been run against the production store. Nothing about the
+      happy path can substitute for this reading.
+    means_when_red: >-
+      A scripted fault did not produce exactly one failed run and one page.
+
+  feature_layer:
+    section: "§10 component 4"
+    statement: R and M read the same materialized, hashed, versioned feature artifact.
+    clause_class: TestFeatureLayer
+    surface: crucible/board
+    reader: null
+    artifact: features/{version}/{trading_day}.parquet
+    planned_because: >-
+      `crucible.keys.features_key` is a PARQUET panel keyed by feature version
+      and trading day, not a JSON verdict. Whether R and M read the same
+      version is a question about the two slots' recipes, and the answer
+      belongs in a feature-registry reading that `features/{version}/registry.json`
+      does not yet carry.
+    means_when_red: >-
+      The R and M slots are reading different feature artifacts or different
+      versions of one, which makes every comparison between them meaningless.
+
+# ── The v1 -> v2 cutover, as four individually readable predicates ─────────
+#
+# Deliberately NOT "phase 4 is MET". Inferring the cutover from a phase state
+# is how a milestone gets declared from a merge: the four below are separately
+# observable, separately reversible, and three of them are about resources
+# whose non-existence is the evidence. A single rolled-up row would let one of
+# them be quietly outstanding.
+#
+# All four are PLANNED, and all four name what must be written. They read v1
+# AWS state, which is outside this repository's store entirely — so the
+# producer is a job that does not exist rather than a key nobody has filled,
+# and saying so is the point.
+
+cutover:
+  old_step_functions_disabled:
+    statement: The three v1 Step Functions are disabled.
+    surface: crucible/board
+    reader: null
+    artifact: cutover/{trading_day}/step_functions.json
+    planned_because: >-
+      Reads v1 Step Function state, which lives in the old account surface and
+      in no v2 artifact. A producer must file the reading; the board will not
+      reach AWS itself, because a gate reads artifacts and never runs.
+    means_when_red: >-
+      At least one v1 Step Function can still fire. Until this is green the two
+      systems can both act on the same trading day.
+
+  v1_resources_deleted:
+    statement: The 66 v1 Lambdas and 153 v1 alarms are deleted.
+    surface: crucible/board
+    reader: null
+    artifact: cutover/{trading_day}/v1_resources.json
+    planned_because: >-
+      Same shape: an inventory of things that must NOT exist, which only a job
+      with v1 read access can establish. Absence is the evidence here, and
+      absence is exactly what cannot be inferred from this store.
+    means_when_red: >-
+      v1 compute or alarms still exist. Alarms outliving their producer is the
+      shape that pages on a system nobody operates.
+
+  trader_on_the_v2_contract:
+    statement: >-
+      The trader reads champions/{slot}/current.json produced by v2, not by v1.
+    surface: crucible/board
+    reader: null
+    artifact: cutover/{trading_day}/trader_contract.json
+    planned_because: >-
+      The trader is a separate system (see the crucible skill: the harness is
+      not the trader). Which producer it reads is a fact about the trader's
+      configuration, and it must be filed here rather than guessed from the
+      champion pointer's existence — `crucible.keys.champion_key` gives the
+      same key whichever system wrote it.
+    means_when_red: >-
+      The trader is still consuming a v1-produced champion pointer, so v2 is
+      running beside production rather than as production.
+
+  aws_cost_under_ceiling:
+    statement: AWS spend is at or under $70/month.
+    surface: crucible/board
+    reader: null
+    artifact: cutover/{trading_day}/aws_cost.json
+    planned_because: >-
+      Needs Cost Explorer against the `system=crucible-v2` tag, which no v2 job
+      reads today. `alpha-engine-config-I9828` covers the credential half of
+      the same problem for the acceptance cost clause.
+    means_when_red: >-
+      The v1 teardown has not produced its saving, or v2 costs more than
+      planned. Read alongside v1_resources_deleted — cost not falling while
+      resources are gone means the saving was somewhere else.

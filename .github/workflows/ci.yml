@@ -1,0 +1,347 @@
+name: CI
+
+# Plan §4.11. Target: <= 5 min per PR, <= 300 GHA minutes/month, CodeBuild $0,
+# ECR $0, Inspector $0. This repository is PRIVATE today, so these minutes are
+# metered; the budget above is what keeps that immaterial. It goes public at
+# phase-1 exit (alpha-engine-config-I9775), and only then are they free. The
+# earlier version of this comment asserted "public, so those minutes are free"
+# in the present tense, which was wrong on the day it was written.
+#
+# Three workflows in this repo and no others (revised 2026-09-02 — plan §11
+# risk 1 added `adversarial-review-gate.yml` after this comment was written;
+# see that file for why it does not repeat the sixteen-workflows-per-repo
+# mistake: it is two thin `gh api` calls, no checkout, no `uv sync`). Every
+# guard the v1 repos carry as a per-repo workflow is a pytest in `tests/`
+# here, or it is not carried: sixteen workflows per repo is how a fleet
+# spends 66% of its metered CI minutes on one private repo. deploy.yml is
+# track C's.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'docs/**']
+  pull_request:
+    # EVERY base branch, not just `main`. A stacked PR — the shape this
+    # repository uses constantly, because a fix for an open PR's file has to
+    # branch from it — targets the branch it stacks on, so `branches: [main]`
+    # meant `gh pr checks` reported "no checks reported" and the PR merged
+    # unmeasured. A lane where a defect lands with no CI is worse than a slow
+    # lane (measured on crucible-PR8, 2026-09-01).
+    branches: ['**']
+    # No `paths-ignore` on pull_request, deliberately. GitHub records a
+    # workflow skipped by a path filter as never having started, so a
+    # docs-only PR leaves a REQUIRED check pending forever — the check never
+    # goes green and never goes red, and the PR cannot merge. The filter stays
+    # on `push`, where nothing is waiting on the result. The extra runs are
+    # metered while the repo is private, and cost a few minutes a month
+    # against the §4.11 budget.
+  # STILL no `schedule:`. `alpha-engine-config-I9828` gave the acceptance
+  # job's one live-state clause (`TestCost`) a distinct UNMEASURABLE outcome,
+  # and `alpha-engine-config-I9895` (this change) gives the job the read-only
+  # OIDC it needs to actually read the account on the paths that already run
+  # it (`push: [main]`) — but a cron here would still regrade an UNCHANGED
+  # tree against an unchanged lockfile and republish the identical reading
+  # every day, forever: metered minutes on a private repo buying a signal
+  # that only a merge, not the clock, can move. A schedule earns its keep
+  # once there is a reason the account can drift without a push — that is a
+  # separate change, not a reason to withhold OIDC from this one.
+
+# Default-deny at the workflow level; each job re-grants only what it needs.
+# `contents: read` is NOT optional while this repo is private: with no
+# permissions at all the token cannot see the repository, and actions/checkout
+# fails with "Repository not found" — which reads like a missing repo rather
+# than a missing scope. Measured 2026-09-01 on the first CI run.
+permissions: {}
+
+env:
+  AWS_REGION: us-east-1
+  # AWS_ACCOUNT_ID and STORE_URI come from repository variables
+  # (alpha-engine-config-I9906) — this repo goes PUBLIC at phase-1 exit
+  # (I9775) and `AGENTS.md` forbids infrastructure identifiers, bucket names
+  # and account numbers in the tree. The role NAME stays a literal below: it
+  # carries no secret on its own, and the account id is the sensitive half.
+  # crucible-v2-github-acceptance, created by nous-ergon-ops/infrastructure/
+  # cloudformation/crucible-v2.yaml (alpha-engine-config-I9895, I9902). Read
+  # only: cloudformation:ListStackResources + tag:GetResources +
+  # iam:ListRoleTags on the crucible-v2 stack's own resources (TestCost's
+  # tag-attribution clause), and s3:PutObject scoped to exactly
+  # report/acceptance/* (the reading this job publishes). It cannot write the
+  # board, a run manifest, or anything else in the store — same separation
+  # argument board.yml's own comment makes about BoardRole.
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  ACCEPTANCE_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/crucible-v2-github-acceptance
+  STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
+  # The CloudFormation TEMPLATE upload bucket the operator remedy below
+  # prints — a separate bucket from CRUCIBLE_STORE_URI's store, and a bucket
+  # name is still an infrastructure identifier `crucible/AGENTS.md`
+  # (Visibility) forbids here (alpha-engine-config-I9906 finding 3). Set with:
+  # gh variable set CFN_TEMPLATE_BUCKET --repo nousergon/crucible --body '<s3-bucket-for-cfn-templates>'
+  CFN_TEMPLATE_BUCKET: ${{ vars.CFN_TEMPLATE_BUCKET }}
+
+concurrency:
+  # The event name is part of the group so that two arms sharing a ref never
+  # cancel each other — a cancelled run is neither green nor red, which is the
+  # one outcome nothing notices. There is no scheduled arm today (see above),
+  # but the group is written so adding one does not silently reintroduce that.
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: lint + foundation tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # The lockfile agrees with pyproject.toml. FIRST, before anything
+      # installs or runs.
+      #
+      # Measured 2026-09-02: seven Dependabot PRs (#31-#37) raised dependency
+      # floors in pyproject.toml -- numpy >=2.1 to >=2.5.2, pyarrow >=14.0 to
+      # >=25.0.1, jsonschema, PyYAML, ruff -- and none regenerated uv.lock.
+      # All seven merged with fully green CI, and main then carried a lockfile
+      # whose recorded requirements named the OLD floors.
+      #
+      # `uv sync --frozen` does not catch this: verified against main at
+      # 44d00a5, it exits 0. `--frozen` installs the locked versions without
+      # re-checking them against pyproject.toml, so the drift is invisible to
+      # the one command every job here runs.
+      #
+      # `uv lock --check` is uv's own contract check and is the thing that
+      # cannot be fooled: exit 1 on main's stale lockfile, exit 0 once
+      # regenerated, both measured. A pytest guard was written first and
+      # DISCARDED, because `uv run --frozen pytest` implicitly re-locks before running
+      # -- so the test would have rewritten the very file it was grading and
+      # reported green. A guard that reads as coverage while being blind is
+      # worse than none, and that is the class this repository keeps finding
+      # in other people's systems.
+      - name: The lockfile agrees with pyproject.toml
+        run: uv lock --check
+
+      # --frozen, never a re-resolve. The lockfile is the supply chain: a CI
+      # run that resolves its own dependencies has not tested what ships.
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run --frozen ruff check
+
+      - name: Format check
+        run: uv run --frozen ruff format --check
+
+      # The blocking gate. tests/acceptance is excluded here and run as its
+      # own reporting job below — see the comment there for why that is not a
+      # suppression.
+      #
+      # --cov=crucible measures the WHOLE package (repository-baseline-policy.md
+      # §4.2 C1), not just the modules this invocation happens to import — a
+      # coverage tool reporting only loaded files understates nothing untested
+      # by omitting it. `--cov-fail-under` is not passed explicitly:
+      # pytest-cov reads `[tool.coverage.report] fail_under` from
+      # pyproject.toml automatically once `--cov` is passed, so the ratchet
+      # lives in one place. A drop below the measured floor fails this job.
+      - name: Foundation tests
+        run: uv run --frozen pytest -q --ignore=tests/acceptance --cov=crucible --cov-report=term-missing
+
+      # Collection, not execution — and it belongs HERE, on the PR path.
+      # Importing a test module grades the TREE: it proves every symbol
+      # tests/acceptance references still exists. Running the clauses grades
+      # the SYSTEM, which is why that half moved off the PR path.
+      #
+      # Without this, renaming a `crucible/` symbol an acceptance test imports
+      # passes ruff, passes the foundation suite (which --ignores that
+      # directory) and passes every other PR check, then breaks the acceptance
+      # job on main at collection time. `--collect-only` executes no test body,
+      # so it touches no live AWS and stays on the correct side of
+      # scm-platform-policy.md §3.1.
+      - name: Acceptance clauses still import
+        run: uv run --frozen pytest tests/acceptance --collect-only -q
+
+  acceptance:
+    name: acceptance gate (RED until the phase exits — reporting only)
+    runs-on: ubuntu-latest
+    # NOT on the pull_request path — not required, not advisory, not present.
+    # `scm-platform-policy.md` §3.1 (Brian ruling 2026-08-10): a check grades
+    # the diff; a check whose subject is live infrastructure does not belong on
+    # a PR at all. These clauses grade the SYSTEM at a phase boundary — live
+    # AWS among them (`TestCost` calls cloudformation:ListStackResources) — so
+    # their answer is a property of the account and the phase, never of the
+    # branch under review. An author cannot clear them and is not meant to.
+    #
+    # Leaving them here made every PR in this repo read red, which trains the
+    # operator to merge past red and destroys the value of every other check:
+    # measured 2026-09-02, all seven open Dependabot PRs sat UNSTABLE on this
+    # single failure, and merging any of them required a human to decide, per
+    # PR, that a red check did not count.
+    #
+    # The reading is not lost — it moves to `push: [main]`, which is where a
+    # phase gate belongs: graded minutes after each merge, with a deploy behind
+    # it, rather than attributed to an author who cannot change the answer.
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    # First step is the repository-variable guard (below the docstring-style
+    # comment block, in `steps:`) — before checkout, since neither the
+    # identity nor the store are reachable without it.
+    # tests/acceptance holds the plan §2 clauses written BEFORE the code that
+    # satisfies them (plan §6 phase-0 exit: "acceptance tests written as
+    # failing pytest"). They fail today by design and go green one at a time
+    # as the tracks land.
+    #
+    # This is not a suppression: the tests are not skipped, not xfailed and
+    # not marked — nothing in the tree hides them, and
+    # tests/test_no_suppressions.py enforces that. They are RUN, in full.
+    #
+    # NO `continue-on-error`, and that is the point. The job does not grade
+    # pass/fail on the suite — a suite red by design would page forever, which
+    # is the desensitisation this whole PR removes. It grades the READING
+    # against `tests/acceptance/ratchet.json` and fails the RUN on any
+    # movement of the SET of unmet clauses — a clause that regressed, a clause
+    # that started passing without the ratchet moving with it, or a change in
+    # how many clauses exist. The set, not a count: one clause going green
+    # while another regresses leaves a count unchanged, and a scalar
+    # comparison then reports "unchanged" on the day something broke.
+    #
+    # Without this the arm was structurally incapable of signalling: a
+    # job-level `continue-on-error` reports the RUN as success while the job
+    # is red, so nothing downstream — mail, notify job, or a human reading the
+    # runs list — can tell. A component emitting nothing is not healthy, it is
+    # unobserved (principle 7).
+    steps:
+      - name: Repository variables are set
+        run: |
+          missing=0
+          if [ -z "$AWS_ACCOUNT_ID" ]; then
+            echo "::error::repository variable AWS_ACCOUNT_ID is not set — set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/crucible --body '<12-digit-account-id>'"
+            missing=1
+          fi
+          if [ -z "$STORE_URI" ]; then
+            echo "::error::repository variable CRUCIBLE_STORE_URI is not set — set it with: gh variable set CRUCIBLE_STORE_URI --repo nousergon/crucible --body '<s3-uri-of-the-crucible-v2-store>'"
+            missing=1
+          fi
+          if [ -z "$CFN_TEMPLATE_BUCKET" ]; then
+            echo "::error::repository variable CFN_TEMPLATE_BUCKET is not set — set it with: gh variable set CFN_TEMPLATE_BUCKET --repo nousergon/crucible --body '<s3-bucket-for-cfn-templates>'"
+            missing=1
+          fi
+          exit "$missing"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # The same check the `test` job runs, and for the same reason: this job
+      # installs too, and a job that installs from an unverified lockfile is
+      # exactly what `uv lock --check` exists to stop. Repeated rather than
+      # inherited -- GitHub jobs share nothing, so "the other job checked it"
+      # is not a property of this runner.
+      - name: The lockfile agrees with pyproject.toml
+        run: uv lock --check
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          role-to-assume: ${{ env.ACCEPTANCE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The identity actually obtained, read back from AWS rather than
+      # restated from `env` — same argument board.yml and morning-report.yml
+      # make: what is falsifiable is the identity, not the literal.
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${ACCEPTANCE_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. The acceptance job must run as a READ-ONLY identity plus a writer scoped to report/acceptance/* only; a wider identity would let a grading surface satisfy the clauses it grades. If the role does not exist yet the crucible-v2 stack has not been applied since the ops PR adding it merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 --s3-bucket ${CFN_TEMPLATE_BUCKET} --s3-prefix cfn-templates/crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until that happens is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+
+      # JUnit XML, not the terminal summary line. `pyproject.toml` sets
+      # `addopts = "-q"`, so a command-line `-q` makes `-qq` and pytest prints
+      # no summary at all — parsing stdout is how a wrong count goes unnoticed.
+      #
+      # `-o junit_family=legacy`: `_unmeasurable` (test_plan_section_2_objectives.py,
+      # alpha-engine-config-I9828 round 2) uses pytest-core `record_property`
+      # to write `outcome`/`blocked_on_class` into `<testcase><properties>`,
+      # which is how `check_reading.py` classifies UNMEASURABLE without
+      # trusting message text. pytest's default `junit_family` (`xunit2`)
+      # warns that per-testcase `<properties>` are non-conformant there —
+      # `legacy` is the family that actually declares them, and is pytest's
+      # own documented fix for `record_property`, not a local workaround.
+      - name: Acceptance clauses (plan §2)
+        run: |
+          set +e
+          uv run --frozen pytest tests/acceptance -p no:cacheprovider --tb=no \
+            -o junit_family=legacy --junitxml=acceptance.xml > acceptance.txt 2>&1
+          set -e
+          tail -40 acceptance.txt
+
+      # `continue-on-error`, deliberately: publishing the reading must not be
+      # skipped just because the reading MOVED — a red count is plan §12
+      # rule 3's whole point (`check_reading.py`'s `--write-json` writes the
+      # document before any of its own fail branches can return early, so the
+      # local file exists here regardless of this step's outcome). The job
+      # itself still fails, in the "Fail the job if the reading moved" step
+      # below, once the artifact is safely published.
+      - name: The reading has not moved
+        id: check
+        continue-on-error: true
+        run: |
+          uv run --frozen python tests/acceptance/check_reading.py \
+            --write-json acceptance-reading.json --commit "${GITHUB_SHA}" acceptance.xml
+
+      - name: Resolve the trading day
+        id: trading_day
+        run: |
+          day="$(uv run --frozen python -c 'from crucible.calendar import resolve_trading_day; print(resolve_trading_day())')"
+          echo "day=${day}" >> "$GITHUB_OUTPUT"
+
+      # Plan §12 rule 3 — the acceptance count is the only progress figure —
+      # and `alpha-engine-config-I9902`'s whole point: this is the ONE place
+      # that files `crucible.keys.acceptance_reading_key`'s producer
+      # contract, so `crucible report.morning` and the board can read it from
+      # a store artifact instead of a git checkout of `main`. The key is
+      # resolved through `crucible.keys.acceptance_reading_key` itself —
+      # never restated as a literal — so the producer and the consumer
+      # (`crucible/morning.py`) cannot diverge on the shape.
+      - name: Resolve the acceptance reading key
+        id: reading_key
+        run: |
+          key="$(uv run --frozen python -c 'from crucible.keys import acceptance_reading_key; print(acceptance_reading_key("${{ steps.trading_day.outputs.day }}"))')"
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the acceptance reading
+        run: |
+          aws s3 cp acceptance-reading.json "${STORE_URI}/${{ steps.reading_key.outputs.key }}" --only-show-errors
+
+      - name: Fail the job if the reading moved
+        if: steps.check.outcome != 'success'
+        run: |
+          echo "::error::the acceptance reading moved — see 'The reading has not moved' step above."
+          exit 1
+
+  # A moved reading on main blocks nothing and is green
+  # to the next author, so without this nothing announces it — the same gap
+  # that left a router config undeployed for 16 hours
+  # (alpha-engine-config-I7169), which is why deploy.yml already carries this
+  # job. Mirrored here rather than reinvented.
+  #
+  # It fires only on the arms that grade the system. A red `test` job on a PR
+  # already blocks that PR and is the author's to see.
+  notify-main-failure:
+    needs: [acceptance]
+    if: ${{ failure() && github.event_name != 'pull_request' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@619de3f32aef2e63329e7270afb87ec6b1e381e3
+    secrets: inherit

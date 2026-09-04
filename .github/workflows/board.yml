@@ -1,0 +1,200 @@
+name: Board
+
+# The fully-declared board's producer — `alpha-engine-config-I9837`.
+#
+# It runs DAILY, on its own schedule, and deliberately not as a stage of the
+# weekly arc. `crucible weekly` is phase-2 work (alpha-engine-config-I9758);
+# a board dispatched by it would go dark for the whole of phase 0 and phase 1,
+# which are exactly the phases whose gaps this instrument exists to render.
+# The board that could have stopped `alpha-engine-config-I9757` closing on
+# 2026-09-02 with zero replay Saturdays run had to exist BEFORE phase 2, not
+# after it.
+#
+# ── Why this workflow can hold credentials when ci.yml cannot ─────────────
+#
+# `ci.yml` has `permissions: {contents: read}`, no OIDC and no credentials,
+# which is why its acceptance job carries no `schedule:` — a cron there could
+# not signal anything, because the clauses it would run read live AWS. This
+# workflow is the opposite shape on purpose: it exists to read live AWS, so it
+# has `id-token: write` and one narrowly-scoped role.
+#
+# ── What the role may and may not do ──────────────────────────────────────
+#
+# `crucible-v2-github-board` (nous-ergon-ops/infrastructure/cloudformation/
+# crucible-v2.yaml) reads `crucible/*` and writes exactly `crucible/board/*`
+# and `crucible/console/*`.
+#
+# That role is created by an OPERATOR-GATED apply, not by merging the ops PR:
+# the crucible-v2 stack is deliberately applied by a human with operator
+# credentials because a named-IAM apply is a security boundary
+# (`pull-request-policy` §4.2 form 3 — the merge emits the exact command AND a
+# detector stays red until it runs). Until the apply happens this workflow
+# fails daily on the identity check below, naming the exact command. That is
+# the detector working, not a defect: an operator step recorded in an issue
+# and nowhere else is `alpha-engine-config-I1906`, closed as *fixed* on a PR
+# whose `aws iam put-role-policy` was never performed.
+#
+# It is NOT the deploy role and NOT the runtime role. `crucible/gate.py`'s
+# binding rule is "a gate reads; it never runs", and this is that rule
+# expressed as an identity rather than as a convention: an identity that
+# cannot write a run manifest cannot be used to satisfy a clause it is
+# grading, whatever the code does.
+#
+# ── Why a red board is not a failed run ───────────────────────────────────
+#
+# Almost every row is red on day one and that is the correct reading. A
+# non-zero exit here would be a daily failure alert on a working producer, and
+# a daily failure alert nobody can act on is how a channel gets muted — which
+# is the state the acceptance gate had reached on every PR in this repository
+# before 2026-09-02. This job fails when the MEASUREMENT fails. The reading
+# lives in `board/current.json` and on `board/index.html`.
+
+on:
+  schedule:
+    # 21:30 UTC — after the US close plus the registry's declared 6h deadline
+    # window for the `board` row, and on CALENDAR time. §4.12's first
+    # exhaustive exception: the SCHEDULER runs on calendar time and the JOB
+    # resolves the trading day. A cron that tried to skip holidays would
+    # diverge from the calendar the artifacts are keyed by, and nothing would
+    # say so.
+    - cron: '30 21 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+# Serialised, and a superseded run is NOT cancelled. `post-pending-check` in
+# adversarial-review-gate.yml was cancelled by exactly this setting on
+# 2026-09-02 and left `crucible-PR38` unmergeable with no in-workflow remedy
+# (alpha-engine-config-I9848). Here the cost of cancelling is smaller but the
+# shape is the same: this job's whole purpose is to CREATE a durable artifact
+# other things read.
+concurrency:
+  group: board
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  # AWS_ACCOUNT_ID and STORE_URI come from repository variables
+  # (alpha-engine-config-I9906) — this repo goes PUBLIC at phase-1 exit
+  # (I9775) and `AGENTS.md` forbids infrastructure identifiers, bucket names
+  # and account numbers in the tree. The role NAME stays a literal below: it
+  # carries no secret on its own, and the account id is the sensitive half.
+  # Read back from AWS below, and created by
+  # nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml.
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  BOARD_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/crucible-v2-github-board
+  STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
+  # alpha-engine-config-I9928. `crucible/config.py` sets
+  # `DEFAULT_CLOUDTRAIL_ARCHIVE = ""` deliberately — a guessed bucket name
+  # produces a `NoSuchBucket` that reads like a permissions problem — so phase
+  # 2's `zero_human_mutating_calls` clause is UNMEASURABLE in every context
+  # that does not set this. That included this job, which is the ONLY
+  # scheduled identity that evaluates the ladder. A repository variable for
+  # the same reason AWS_ACCOUNT_ID and CRUCIBLE_STORE_URI are: the value is an
+  # infrastructure identifier and this repo goes PUBLIC at phase-1 exit
+  # (I9775). Its source of truth is `fleet-cloudtrail.yaml`'s
+  # `fleet-cloudtrail-archive-uri` export, which crucible-v2.yaml already
+  # wires into the spot box's shell — one value, three consumers.
+  #
+  # It stops ABOVE CloudTrail's `{region}/` level, on purpose:
+  # `crucible.autonomy.date_partitions` discovers the delivered regions, so a
+  # multi-region trail stays fully counted. Pinning a region here would
+  # silently narrow a gate that asserts a count of ZERO.
+  CRUCIBLE_CLOUDTRAIL_ARCHIVE: ${{ vars.CRUCIBLE_CLOUDTRAIL_ARCHIVE }}
+
+jobs:
+  board:
+    name: render the declared board
+    runs-on: ubuntu-latest
+    # 10 was set when every clause read a stored artifact. Phase 2's
+    # `zero_human_mutating_calls` reads the CloudTrail archive over a
+    # fortnight, and MEASURED 2026-09-03 against the production archive one
+    # calendar day is ~1,123 objects / ~36 MB / ~181k records, ~150 s read
+    # sequentially — so the phase-2 window is ~9,000 objects and ~1.4M records,
+    # about 20 minutes sequentially. `crucible.autonomy` fetches a day's
+    # objects 32-at-a-time and filters each object as it decodes, which brings
+    # the archive read to a few minutes; this ceiling is the headroom around
+    # that, not a target. A board killed at its timeout publishes NOTHING —
+    # every row goes dark over one clause's reading, which is a measurement
+    # failing for a reason that has nothing to do with what it measures.
+    #
+    # Raise this only with a new measurement. If the archive read grows past
+    # it, the fix is the reader (a narrower prefix, a cheaper filter), not a
+    # larger number: a job allowed to run for an hour is one whose cost nobody
+    # notices.
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      # First step, before checkout: neither identity nor the store are
+      # reachable without these, and failing here names the exact operator
+      # command rather than dying deep inside `configure-aws-credentials`
+      # with an opaque OIDC/ARN error.
+      - name: Repository variables are set
+        run: |
+          missing=0
+          if [ -z "$AWS_ACCOUNT_ID" ]; then
+            echo "::error::repository variable AWS_ACCOUNT_ID is not set — set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/crucible --body '<12-digit-account-id>'"
+            missing=1
+          fi
+          if [ -z "$STORE_URI" ]; then
+            echo "::error::repository variable CRUCIBLE_STORE_URI is not set — set it with: gh variable set CRUCIBLE_STORE_URI --repo nousergon/crucible --body '<s3-uri-of-the-crucible-v2-store>'"
+            missing=1
+          fi
+          # A WARNING, not an error, and deliberately so: an unset archive
+          # does not stop the board rendering — it makes exactly one clause
+          # read UNMEASURABLE with its own reason attached, which is the
+          # honest answer and is already on the board. Failing the whole
+          # render here would take 40-odd readable rows down over one.
+          if [ -z "$CRUCIBLE_CLOUDTRAIL_ARCHIVE" ]; then
+            echo "::warning::repository variable CRUCIBLE_CLOUDTRAIL_ARCHIVE is not set, so phase 2's zero_human_mutating_calls will render UNMEASURABLE — set it with: gh variable set CRUCIBLE_CLOUDTRAIL_ARCHIVE --repo nousergon/crucible --body \"\$(AWS_PROFILE=ne-admin aws cloudformation list-exports --query \"Exports[?Name=='fleet-cloudtrail-archive-uri'].Value\" --output text)\""
+          fi
+          exit "$missing"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          role-to-assume: ${{ env.BOARD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The identity actually obtained, read back from AWS rather than
+      # restated from `env`. Same argument deploy.yml makes: what is
+      # falsifiable is the identity, not the literal. A board rendered by the
+      # DEPLOY role would be a grading surface produced by an identity that
+      # can write the artifacts it grades, which is the one property this
+      # separation exists to guarantee.
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${BOARD_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. The board must render as a READ-ONLY identity; rendering it as a writer would let a grading surface satisfy the clauses it grades. If the role does not exist yet the crucible-v2 stack has not been applied since nous-ergon-ops-PR990 merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until that happens is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+
+      - name: Render the board
+        # `--run-mode live`: a scheduled render is a live run, and
+        # `run_manifest.v2` requires the field with no default.
+        run: uv run crucible board --run-mode live --store "$STORE_URI"
+
+      # The one line a human reads if they open the run. Deltas, not absolute
+      # state: a board reading almost entirely PLANNED for weeks is correct,
+      # and is also the thing people stop opening.
+      - name: What moved
+        run: |
+          aws s3 cp "${STORE_URI}/board/current.json" board.json --only-show-errors
+          uv run python -c "import json,sys; d=json.load(open('board.json')); print(f\"{d['red_count']} of {d['row_count']} rows red\"); print(json.dumps(d['counts'], indent=2))"
+
+  notify-failure:
+    needs: [board]
+    if: ${{ failure() }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@619de3f32aef2e63329e7270afb87ec6b1e381e3
+    secrets: inherit

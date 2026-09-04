@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nousergon/crucible/schemas/release_provenance.v1.json",
+  "title": "Crucible release provenance, v1",
+  "description": "One publish ATTEMPT for a release, at releases/{sha}/provenance/{run_id}-{run_attempt}.json. Split out of release.json by alpha-engine-config-I9786: these three fields move on every rebuild of the same commit, so keeping them in the immutable identity record made a re-run of an unchanged commit an unconditional ReleaseImmutabilityError. Never immutable-checked — a second attempt for an already-published sha is EXPECTED to differ here, and each attempt is written unconditionally as its own durable record rather than contending for one slot.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sha",
+    "run_id",
+    "run_attempt",
+    "built_at",
+    "workflow_run_url",
+    "test_summary"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
+      "const": "release_provenance.v1"
+    },
+    "sha": {
+      "description": "The commit this attempt built. Must match the release.json this attempt accompanies.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "run_id": {
+      "description": "The CI run that produced this attempt (GitHub's GITHUB_RUN_ID). Part of this document's own key.",
+      "type": "string",
+      "minLength": 1
+    },
+    "run_attempt": {
+      "description": "Distinguishes a 're-run failed jobs' retry that reuses the same run_id. Part of this document's own key.",
+      "type": "string",
+      "minLength": 1
+    },
+    "built_at": {
+      "description": "When this attempt ran. Gotcha (I9786): sourced from github.event.repository.updated_at in deploy.yml, which is repository metadata, not the build instant — carried unexamined because a wrong-but-named field beats an absent one, and it is never used for anything but display.",
+      "type": "string",
+      "minLength": 1
+    },
+    "workflow_run_url": {
+      "description": "The specific workflow run this attempt is. Different on every attempt by construction.",
+      "type": "string"
+    },
+    "test_summary": {
+      "description": "The foundation-test line this attempt printed. Free text; not parsed by anything downstream.",
+      "type": "string"
+    }
+  }
+}

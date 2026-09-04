@@ -1,0 +1,30 @@
+# Agent instruction files are SYMLINKS into the private nous-ergon-ops repo.
+# They are never committed to this repo, which flips public at phase-1 exit.
+AGENTS.md
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+.coverage
+.coverage.*
+htmlcov/
+
+# Secrets — never committed (fleet root AGENTS.md, Security section).
+# Config files with real values use the .example pattern.
+.env
+.env.*
+!.env.example
+*.pem
+credentials.json
+
+# Local run artifacts (the local store backend writes here by default)
+runs/
+.crucible-store/

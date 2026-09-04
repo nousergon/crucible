@@ -1,0 +1,340 @@
+name: Deploy
+
+# Plan §4.11 — one artifact, one pointer, one verified flip.
+#
+#   uv build  ->  s3://…/releases/{sha}/{wheel, release.json}
+#             ->  crucible smoke --release {sha}   (a REAL run, live S3 reads)
+#             ->  status: ok  ->  releases/current repointed by conditional PUT
+#                 anything else -> pointer untouched, this workflow FAILS
+#
+# Nothing is installed anywhere by this workflow. A job pulls `releases/current`
+# at start, so there is no box to SSH into, no `git pull` on boot, and none of
+# the fix-boot-pull-netrc bug class. Rollback is `crucible release.pin <sha>`:
+# a pointer move, ~2s, no rebuild.
+#
+# Automated ON merge, from code committed in this repository
+# (pull-request-policy §4.2 form 1). There is deliberately no "run this after
+# merging" step anywhere in a crucible PR body: hitting merge is Brian's LAST
+# action.
+#
+# ── Why the role check reads the identity back, and is not its own job ────
+# The failure mode being designed out is NOT "the workflow errors" — it is
+# acting as an identity other than the v2 deploy role: notably the research
+# role (github-actions-lambda-deploy), which exists and has write access to a
+# DIFFERENT bucket. Measured 2026-09-01: that role's trust policy lists
+# twenty-three repos and `nousergon/crucible` is not among them, so it could
+# not be assumed from here today — but adding one line to that list is a
+# routine change, and a guard whose correctness depends on a list somebody
+# else maintains is not a guard.
+#
+# This was previously a standalone `guard` job that compared
+# ${DEPLOY_ROLE_ARN} against the same literal `env` sets it eleven lines
+# above. Nothing in this workflow can make those two differ — there is no
+# input, no override and no dispatch path that sets DEPLOY_ROLE_ARN, and
+# `role-to-assume` is that same variable, so the "silent fallback" it claimed
+# to prevent was not a thing this file could do. A predicate that can only be
+# false if someone edits one of two adjacent lines is not a check; it is a
+# whole runner spent restating a literal.
+#
+# What IS falsifiable is the identity actually obtained. `sts
+# get-caller-identity` is read back AFTER the credential step and BEFORE
+# anything is written, and the run fails unless the assumed role is
+# crucible-v2-github-deploy. That catches an OIDC subject mapped to the wrong
+# role, a role renamed or recreated under the same ARN shape, a
+# pre-existing credential in the runner environment, and a
+# configure-aws-credentials that silently did not assume what was asked —
+# none of which the literal comparison could see. The message still names the
+# stack that creates the role, because "the v2 stack is not applied yet" is
+# the failure an operator will actually hit.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'docs/**']
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Release sha to re-verify and re-promote (defaults to HEAD)'
+        required: false
+
+permissions: {}
+
+# Deploys are serialised, and a superseded one is NOT cancelled: cancelling a
+# deploy mid-smoke would leave a release published with no verdict, and the
+# next run would have no way to tell that from one that was never attempted.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  # AWS_ACCOUNT_ID and STORE_URI come from repository variables
+  # (alpha-engine-config-I9906) — this repo goes PUBLIC at phase-1 exit
+  # (I9775) and `AGENTS.md` forbids infrastructure identifiers, bucket names
+  # and account numbers in the tree. The role NAME stays a literal below: it
+  # carries no secret on its own, and the account id is the sensitive half.
+  # Asserted in `guard`, and created by
+  # nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml.
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  DEPLOY_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/crucible-v2-github-deploy
+  STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
+
+jobs:
+  build:
+    name: build the wheel and record what it is
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+      wheel_filename: ${{ steps.meta.outputs.wheel_filename }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --frozen
+
+      # The wheel is only worth publishing if the tests that gate it ran
+      # against the same lockfile. Re-run rather than trust ci.yml's result:
+      # a deploy that promoted an artifact on another workflow's green is a
+      # deploy gated on a check it cannot see.
+      - name: Foundation tests
+        id: tests
+        # shell: bash makes GitHub run this as `bash --noprofile --norc -eo
+        # pipefail {0}` instead of the default `bash -e {0}` (no pipefail):
+        # without it, `pytest | tee` reports tee's exit code, not pytest's,
+        # so a red foundation suite could not fail this step and the wheel
+        # it gates would still get published.
+        shell: bash
+        run: |
+          uv run pytest -q --ignore=tests/acceptance | tee pytest.txt
+          echo "summary=$(tail -1 pytest.txt | tr -d '\r')" >> "$GITHUB_OUTPUT"
+
+      # alpha-engine-config-I9908: `pyproject.toml`'s committed version
+      # (0.1.0) never moves — the plan (§4.11) is explicit that no release
+      # gets its own pyproject commit. A 40-hex git sha is not a PEP 440
+      # version, and every wheel this pipeline had published under one
+      # (`crucible-{sha}-py3-none-any.whl`) was refused outright by pip:
+      # `ERROR: crucible.whl is not a valid wheel filename`. This appends a
+      # PEP-440-legal local version segment carrying the sha, IN THE
+      # CHECKOUT ONLY — never committed — so `uv build` names the wheel
+      # something pip will actually install. `crucible.release._BASE_VERSION`
+      # carries the same "0.1.0" literal so a reader that never ran this
+      # build can still name the file a given sha produced; the two are kept
+      # from drifting by `tests/test_release.py::test_base_version_matches_pyproject`.
+      - name: Set the release version
+        run: |
+          sha='${{ inputs.sha || github.sha }}'
+          sed -i "s/^version = .*/version = \"0.1.0+g${sha:0:12}\"/" pyproject.toml
+          grep '^version = ' pyproject.toml
+
+      - name: Build
+        run: uv build --wheel
+
+      # release.json (identity) and provenance.json (this attempt) are two
+      # separate files, per alpha-engine-config-I9786: release.json is a
+      # DETERMINISTIC function of the commit — nothing in it can differ
+      # between two builds of the same sha — so a workflow_dispatch re-run
+      # of an unchanged main is a clean `crucible.deploy publish` no-op
+      # instead of a guaranteed ReleaseImmutabilityError. built_at,
+      # workflow_run_url and test_summary move on every rebuild and go to
+      # provenance.json instead, which is written unconditionally and never
+      # immutable-checked.
+      #
+      # The wheel is published under the EXACT filename `uv build` gave it
+      # above (alpha-engine-config-I9908) — never renamed — so
+      # `wheel_filename` in release.json and the object actually in S3 can
+      # never disagree.
+      - name: Name the artifact by its commit
+        id: meta
+        run: |
+          sha='${{ inputs.sha || github.sha }}'
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          mkdir -p out
+          cp dist/*.whl out/
+          wheel_filename="$(basename out/*.whl)"
+          echo "wheel_filename=${wheel_filename}" >> "$GITHUB_OUTPUT"
+          export WHEEL_FILENAME="${wheel_filename}"
+          python3 - <<'PY' > "out/release.json"
+          import hashlib, json, os, pathlib
+          sha = os.environ["SHA"]
+          wheel_filename = os.environ["WHEEL_FILENAME"]
+          wheel = pathlib.Path(f"out/{wheel_filename}").read_bytes()
+          lock = pathlib.Path("uv.lock").read_bytes()
+          print(json.dumps({
+              "schema_version": "release.v3",
+              "sha": sha,
+              "lockfile_sha256": hashlib.sha256(lock).hexdigest(),
+              "wheel_sha256": hashlib.sha256(wheel).hexdigest(),
+              "wheel_filename": wheel_filename,
+              "python_requires": ">=3.12,<3.13",
+              "extra": {},
+          }, indent=2, sort_keys=True))
+          PY
+          python3 - <<'PY' > "out/provenance.json"
+          import json, os
+          print(json.dumps({
+              "schema_version": "release_provenance.v1",
+              "sha": os.environ["SHA"],
+              "run_id": os.environ["RUN_ID"],
+              "run_attempt": os.environ["RUN_ATTEMPT"],
+              "built_at": os.environ["BUILT_AT"],
+              "workflow_run_url": os.environ["RUN_URL"],
+              "test_summary": os.environ["TEST_SUMMARY"],
+          }, indent=2, sort_keys=True))
+          PY
+        env:
+          SHA: ${{ inputs.sha || github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          BUILT_AT: ${{ github.event.repository.updated_at }}
+          TEST_SUMMARY: ${{ steps.tests.outputs.summary }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: release-${{ steps.meta.outputs.sha }}
+          path: out/
+          retention-days: 7
+
+  release:
+    name: publish, smoke, then flip
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      # First step, before checkout: neither identity nor the store are
+      # reachable without these, and failing here names the exact operator
+      # command rather than dying deep inside `configure-aws-credentials`
+      # with an opaque OIDC/ARN error.
+      - name: Repository variables are set
+        run: |
+          missing=0
+          if [ -z "$AWS_ACCOUNT_ID" ]; then
+            echo "::error::repository variable AWS_ACCOUNT_ID is not set — set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/crucible --body '<12-digit-account-id>'"
+            missing=1
+          fi
+          if [ -z "$STORE_URI" ]; then
+            echo "::error::repository variable CRUCIBLE_STORE_URI is not set — set it with: gh variable set CRUCIBLE_STORE_URI --repo nousergon/crucible --body '<s3-uri-of-the-crucible-v2-store>'"
+            missing=1
+          fi
+          exit "$missing"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --frozen
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: release-${{ needs.build.outputs.sha }}
+          path: out
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The role check, read back from AWS rather than restated from `env`.
+      # Runs after the credential step (there is no identity to read before
+      # it) and before anything is written, so a wrong identity fails the
+      # deploy having touched no bucket.
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${DEPLOY_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. It may act ONLY as crucible-v2-github-deploy: the research role (github-actions-lambda-deploy) writes a DIFFERENT bucket, and publishing v2 releases into the v1 prefix is silent until something installs one. If the v2 roles do not exist yet, apply nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml (stack crucible-v2)."; exit 1 ;; esac
+
+      # Publish the IMMUTABLE half. Safe and repeatable; it promotes nothing.
+      - name: Publish the release artifacts
+        run: |
+          uv run python -m crucible.deploy publish --sha '${{ needs.build.outputs.sha }}' --wheel 'out/${{ needs.build.outputs.wheel_filename }}' --release-json out/release.json --provenance-json out/provenance.json --store "$STORE_URI"
+
+      # alpha-engine-config-I9908: the flip is gated on INSTALLABILITY, not
+      # only on the upload landing. Every wheel this pipeline published
+      # before this fix passed `Publish` and even `Smoke` while being
+      # pip-refused on every box that tried to install it — S3 read paths
+      # prove the bytes are THERE, never that pip accepts them. This
+      # downloads the object this deploy just published (not the local
+      # build artifact — proving what a box will actually fetch) and
+      # installs it into a throwaway venv on the runner, the same operation
+      # `nous-ergon-ops`'s spot-box bootstrap performs. A step failure here
+      # fails the job before `Flip` runs, so an unpip-installable wheel
+      # never reaches `releases/current`.
+      #
+      # The wheel keeps its PUBLISHED filename on disk. The first version of
+      # this step downloaded it as `/tmp/crucible-install-proof.whl`, and pip
+      # refused that name — the same defect I9908 fixed, re-created inside
+      # the step proving the fix (measured 2026-09-03, run 33778251060, on
+      # the first deploy after PR59 merged; the detector held and the pointer
+      # did not flip). pip validates the FILENAME against PEP 427/440, so any
+      # rename of a wheel is a different artifact as far as pip is concerned.
+      - name: Prove the published wheel is pip-installable
+        run: |
+          mkdir -p /tmp/crucible-install-proof
+          aws s3 cp "${STORE_URI}/releases/${{ needs.build.outputs.sha }}/${{ needs.build.outputs.wheel_filename }}" "/tmp/crucible-install-proof/${{ needs.build.outputs.wheel_filename }}"
+          python3 -m venv /tmp/crucible-install-proof-venv
+          /tmp/crucible-install-proof-venv/bin/pip install "/tmp/crucible-install-proof/${{ needs.build.outputs.wheel_filename }}"
+          /tmp/crucible-install-proof-venv/bin/crucible --version
+
+      # The opening half of the pointer compare-and-swap, taken BEFORE the
+      # smoke so the swap covers the whole verification window. Reading the
+      # token after the smoke — as this workflow used to — leaves an interval
+      # microseconds wide, and an operator rollback (`crucible release.pin`)
+      # landing during the smoke is then silently undone by the flip.
+      - name: Capture the releases/current version token before the smoke
+        run: |
+          uv run python -m crucible.deploy capture --sha '${{ needs.build.outputs.sha }}' --store "$STORE_URI" --out pointer.token
+
+      # The gate. A REAL run against live S3 read paths, writing
+      # runs/smoke/{trading_day}/run.json through the ordinary runner — so the
+      # gate produces the same telemetry every other job does, and a smoke that
+      # "ran and had nothing to do" is not expressible (§4.2). It reads the
+      # wheel and release.json for THIS sha out of the store and re-hashes the
+      # wheel against the record, so it cannot pass against a release that was
+      # never published.
+      - name: Smoke
+        id: smoke
+        run: |
+          uv run crucible smoke --run-mode live --release '${{ needs.build.outputs.sha }}' --store "$STORE_URI"
+
+      # Reads the smoke MANIFEST, not this workflow's exit codes. A
+      # caller-supplied "it passed" is the shape that promotes a build whose
+      # smoke quietly did nothing. Swaps against the token captured before the
+      # smoke: if anything moved the pointer in between, this deploy FAILS
+      # rather than overwriting it.
+      - name: Flip releases/current on an ok smoke
+        run: |
+          uv run python -m crucible.deploy flip --sha '${{ needs.build.outputs.sha }}' --store "$STORE_URI" --expect-pointer-file pointer.token
+
+      # Written on BOTH paths, in the run-manifest schema, so §4.5's page shows
+      # deploys beside runs and a failed deploy is as visible as a failed job.
+      - name: Record the deploy manifest
+        if: always()
+        run: |
+          uv run python -m crucible.deploy record --run-mode live --sha '${{ needs.build.outputs.sha }}' --store "$STORE_URI" --outcome '${{ job.status }}' --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+  # A failed DEPLOY on main means live no longer matches main — and unlike a
+  # failed test it blocks nothing and is green to the next author, so nothing
+  # announces it. Measured 2026-08-12: a router config sat undeployed for 16
+  # hours behind exactly this gap (alpha-engine-config-I7169).
+  notify-main-failure:
+    needs: [build, release]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@619de3f32aef2e63329e7270afb87ec6b1e381e3
+    secrets: inherit

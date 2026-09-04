@@ -1,0 +1,48 @@
+# LLM_CALLSITE_REGISTRY — every v2 LLM call site, by id.
+#
+# Normative source: plan §4.8. Every call site the crucible package can reach
+# a model through has a row here, and `tests/test_llm_callsites.py` proves the
+# coverage by ENUMERATING call sites out of the AST — not by reading this file
+# and trusting it. A registry checked against itself measures nothing.
+#
+# EMPTY IS THE CORRECT STATE TODAY, and it is a measured one rather than an
+# unwritten one: phase 1 carries zero LLM arms (the LLM research arms enter in
+# phase 5), and `crucible.llm.audit_call_sites` walks the package on every CI
+# run and fails the moment a call site exists without a row. An empty registry
+# beside a passing enumerator is evidence of no call sites; an empty registry
+# beside no enumerator would be evidence of nothing.
+#
+# Each row:
+#   purpose            what this call site asks a model for, in one sentence.
+#   capability_class   the router GROUP or capability class asked for —
+#                      never a provider model id, a base url or an SDK client
+#                      (principle 8). `crucible.llm.call` refuses anything
+#                      that looks like a vendor model id.
+#   max_usd_per_call   this site's own ceiling, under the per-run cap.
+#   owner              the module that holds the call.
+schema_version: llm_callsite_registry.v1
+
+# The ALLOWLIST of capability classes `crucible.llm.call` will ask for, and
+# the only names a `callsites:` row may declare.
+#
+# It used to be a nine-entry substring DENYLIST inside `llm.py` — `gpt-`,
+# `claude-`, `gemini-`, `llama`, `mistral`, `glm-`, `deepseek`, `o3`, `o4` —
+# and `grok-`, `qwen`, `command-r`, `nova-` and `kimi` all walked through it,
+# as did a bare base url and a bare provider name. Principle 8 is not "refuse
+# the vendors somebody thought of"; it is that a call site addresses a
+# capability, which is a membership question with a positive answer. A
+# denylist is wrong by default and wrong again with every new vendor.
+#
+# `crucible.llm` unions this list with `krepis.router.TIER_GROUPS` — the
+# router's own tier-to-group mapping — so the router's groups are askable
+# without being restated here, and a group removed there stops being askable.
+# This list is for classes THIS deployment's router serves beyond the bare
+# tiers. Adding a name is a deliberate edit in the file where the reason for
+# every name is written down; it is not something a call site can do to
+# itself.
+capability_classes:
+  # The reasoning-tier group the phase-5 research arms ask for, and the class
+  # the §2-row-3 acceptance probe exercises the cap through.
+  - reasoning_high
+
+callsites: {}

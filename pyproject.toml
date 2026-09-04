@@ -1,0 +1,114 @@
+[project]
+name = "crucible"
+version = "0.1.0"
+description = "The experiment harness: one command, one manifest, one verdict."
+readme = "README.md"
+license = { text = "AGPL-3.0-or-later" }
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # First-party, PINNED not floored (fleet §139): the arena engine, the
+    # arena_cycle contract and MetricRecord are consumed here, never
+    # re-implemented (crucible_v2_rebuild_plan §4.4).
+    "nousergon-lib==0.124.106",
+    # Trading calendar, dual-date resolution, structured logging, alerts.
+    "krepis==0.59.45",
+    # Run-manifest schema validation. The schema is the enforcement surface
+    # for `status in {ok, failed}` (plan §4.2), so validation is a runtime
+    # dependency, not a test-only one.
+    "jsonschema>=4.26.0",
+    # Every document this repo READS is parsed into a validated model, never
+    # into dict indexing over `json.loads` output. The difference is where a
+    # malformed document surfaces: as a named field error at the boundary, or
+    # as a KeyError traceback three functions in — which is what the acceptance
+    # ratchet did until an adversarial review hit it (2026-09-02).
+    #
+    # JSON Schema stays the CROSS-REPO contract surface (`schemas/*.json`,
+    # plan §4.2): those are consumed by other repos and must not require a
+    # Python import to read. Pydantic is the in-process reader, not a
+    # replacement for them.
+    "pydantic>=2.9",
+    "PyYAML>=6.0.3",
+    # The M slot's linear estimators and the CPCV grader operate on a
+    # (trading_day x name) panel. Pure-Python normal equations over ~450k
+    # rows is ~20s per fold and 15 folds per cycle, so the arithmetic is
+    # vectorised rather than hand-rolled (principle 4).
+    #
+    # The feature layer (plan §10.4) is a materialized parquet artifact and
+    # the U/R grading path is columnar arithmetic over a price panel, so
+    # pandas and pyarrow join numpy here. Core, not optional: a build that
+    # cannot read `features/{version}/{day}.parquet` cannot run a cycle at
+    # all, and an optional dependency every job needs is a lie about the
+    # install surface. The floor is track B's (>=2.1), not the looser one —
+    # two floors for one package is a lockfile waiting to disagree with a
+    # fresh resolve.
+    "numpy>=2.5.2",
+    "pandas>=2.0",
+    "pyarrow>=25.0.1",
+    # The store's S3 backend and the conditional PUT the release pointer
+    # flips on. Floored, not pinned: boto3 ships daily and the API surface
+    # used here (put_object/head_object/get_paginator, IfMatch/IfNoneMatch)
+    # is stable, so a pin would be a weekly Dependabot PR buying nothing.
+    "boto3>=1.35",
+]
+
+[project.optional-dependencies]
+# ArcticDB is the PRODUCTION price source and nothing else. It is a large
+# compiled wheel, and CI grades this repo against synthetic and fixture
+# panels through the same `PriceSource` adapter the live source implements
+# (principle 8), so a CI job that installed it would pay minutes for a code
+# path it never exercises. `crucible data.daily --source arctic` states the
+# missing extra by name when it is absent — it never falls back to a
+# different source, which would silently change what the run measured.
+arcticdb = ["nousergon-lib[arcticdb]==0.124.106"]
+
+[project.scripts]
+crucible = "crucible.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/nousergon/crucible"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.16.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["crucible"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.coverage.run]
+# repository-baseline-policy.md §4.2 C1: the denominator is the whole source
+# tree, not the files a test happened to import. `source` makes coverage.py
+# report modules the foundation suite never loaded; `omit` stays empty so the
+# scope cannot be narrowed into a flattering number.
+source = ["crucible"]
+omit = []
+
+[tool.coverage.report]
+# §4.2 C3: a ratchet set at the measured value (93%, tests/ --ignore=tests/acceptance,
+# 2026-09-03). Raise it when coverage improves; lowering it is a policy
+# amendment, never a way to make a change pass. tests/acceptance is excluded
+# from the measured run because those clauses fail by design until the phase
+# they gate exits (see ci.yml) and are not part of the PR-path gate.
+fail_under = 93
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]

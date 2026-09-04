@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nousergon/crucible/schemas/cross_section_settled.v2.json",
+  "title": "Crucible shadow.v2 — grade-time settled cross-section",
+  "description": "The produce-time cross-section (cross_section.v2) joined against the realized forward return, written ONLY once the horizon has settled, at experiments/{arm}/{trading_day}/cross_section_settled.json. Never the same key as cross_section.json and never written before produce/grade separate the two acts (mirrors shadow.json/verdict.json). `crucible.report` reduces this artifact, per settled decision date, into the R/M rows' rank IC (alpha-engine-config-I9778).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "arm_id",
+    "trading_day",
+    "horizon_trading_days",
+    "settled_on",
+    "population_size",
+    "n_settled",
+    "ranks"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "cross_section_settled.v2"
+    },
+    "arm_id": {"type": "string", "minLength": 1},
+    "trading_day": {
+      "description": "The anchor session — the day the cross-section was produced.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "horizon_trading_days": {
+      "description": "The count of TRADING sessions between trading_day and settled_on, as measured by crucible.slots.grading.forward_returns — never a calendar unit (§4.12).",
+      "type": "integer",
+      "minimum": 1
+    },
+    "settled_on": {
+      "description": "The session the forward return settled at.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "population_size": {
+      "description": "The number of names in the produce-time cross-section this document joins against.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "n_settled": {
+      "description": "Of population_size, how many carry a non-null realized_forward_return_ratio. A ticker without a settled close at both ends is ABSENT from settlement, never zero.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "ranks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ticker", "score", "rank", "realized_forward_return_ratio"],
+        "properties": {
+          "ticker": {"type": "string", "minLength": 1},
+          "score": {"type": "number"},
+          "rank": {"type": "integer", "minimum": 1},
+          "realized_forward_return_ratio": {
+            "description": "null when this ticker never settled (delisted, halted, no close at both ends) — absent, not zero.",
+            "type": ["number", "null"]
+          }
+        }
+      }
+    }
+  }
+}

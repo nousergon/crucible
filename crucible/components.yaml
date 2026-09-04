@@ -1,0 +1,574 @@
+# The observability registry (plan §9.2).
+#
+# One row per CLI job. Registry coverage is DERIVED from this file against
+# crucible/cli.py's job table, in both directions — never hand-listed, because
+# a hand-written list of things to check is written from the jobs someone
+# remembered. tests/test_components_registry.py is that derivation.
+#
+# A component with no row here is unobserved, not healthy. Its absence cannot
+# page (§4.6 reads `deadline` from this file), its logs have no declared
+# location or retention, and the console has no surface to render it on.
+#
+# Five signal classes per row, always all five (§9.2). A class the job
+# legitimately does not emit is `null` — declared, not omitted, because an
+# omitted class is indistinguishable from a forgotten one.
+#
+# `dispatch` says WHO starts a scheduled row: `arc` (a stage of the weekly
+# driver, `crucible weekly`), `scheduler` (its own EventBridge schedule) or
+# `github-actions` (a cron in this repository's own .github/workflows/).
+# On-demand rows declare `null`. It is a separate field from `schedule`
+# because `schedule` is prose and this is wiring: six rows read
+# "weekly, Saturday" while exactly one of them was dispatched by anything.
+#
+# Each value is verified against the thing it names, in BOTH directions, by
+# nous-ergon-ops/tests/crossrepo/test_crucible_dispatch_lockstep.py:
+# `scheduler` against the AWS::Scheduler::Schedule set in crucible-v2.yaml,
+# `github-actions` against the `on.schedule.cron` workflows in this repo. A
+# value checked in one direction only would let a row name a starter that
+# does not exist — which is exactly what `board` did between
+# 2026-09-02T21:47Z and alpha-engine-config-I9878.
+#
+# A `github-actions` row also carries `dispatch_workflow`: the basename of
+# the workflow that crons it. The link has to be something the workflow
+# DECLARES. The first version of that guard matched `crucible <job>` in each
+# step's `run:` body, and an adversarial review defeated it by commenting the
+# command out - the board rendered nothing and the guard read green. See
+# tests/test_workflow_triggers.py for the general result, from five rounds
+# against a different guard: any predicate over a `run:` body is a partial
+# shell parser, and a partial shell parser is a denylist of the syntax
+# someone thought of, which rule 4 forbids.
+#
+# `deadline` is expressed relative to the TRADING calendar (§4.12): "present
+# by T after the close of trading day d". A Monday holiday therefore raises no
+# page, without anyone muting anything.
+#
+# `log_retention_days` is CALENDAR days — one of §4.12's exhaustive
+# exceptions, because retention is an AWS property billed by calendar time.
+# Manifests are `forever` (retain-archives preference).
+
+version: 1
+
+defaults:
+  # §4.6: exactly two page conditions, and this is the only channel either
+  # reaches. Everything else is a row on a page nobody is paged to.
+  page_channel: telegram:crucible-pages
+  quiet_channel: none
+
+components:
+  data.daily:
+    description: Compile one trading day of market and fundamental data.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs,rows_in,rows_out,rows_rejected
+      outcome: run.json:metrics[data_freshness_trading_days]
+    log_location: /crucible/data.daily
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: weekdays after close
+    dispatch: scheduler
+    deadline:
+      anchor: close_plus
+      offset_hours: 3
+
+  data.weekly:
+    description: Weekly data refresh and coverage pass.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs,rows_in,rows_out,rows_rejected
+      outcome: run.json:metrics[universe_coverage_ratio]
+    log_location: /crucible/data.weekly
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: weekly, Saturday
+    dispatch: arc
+    deadline:
+      anchor: next_calendar_day_at
+      at: "09:00"
+
+  data.heal:
+    description: Repair a named gap in the store, idempotently.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:rows_in,rows_out,rows_rejected
+      # A heal produces no graded outcome; it repairs an input. Declared null
+      # rather than omitted.
+      outcome: null
+    log_location: /crucible/data.heal
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
+  experiment.new:
+    description: Register an immutable arm from a recipe spec.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:outputs[arms/{slot}/{arm_id}.json]
+      outcome: null
+    log_location: /crucible/experiment.new
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/arms
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
+  experiment.run:
+    description: Score one arm for one trading day.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd,llm_calls
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs
+      outcome: run.json:metrics[arm_score]
+    log_location: /crucible/experiment.run
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/arms
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: weekly, Saturday
+    dispatch: arc
+    deadline:
+      anchor: next_calendar_day_at
+      at: "12:00"
+
+  experiment.grade:
+    description: Run one slot's arena cycle — ladder, pairings, pointer, retirements.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs[arena_cycle]
+      outcome: run.json:metrics[slot_leader_bound]
+    log_location: /crucible/experiment.grade
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/slots
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: weekly, Saturday
+    dispatch: arc
+    deadline:
+      anchor: next_calendar_day_at
+      at: "14:00"
+
+  promote:
+    description: Move a slot's champion pointer, evidence-gated.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[arena_cycle],outputs[champions/{slot}/current.json]
+      outcome: run.json:metrics[pointer_moved]
+    log_location: /crucible/promote
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/slots
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
+  report:
+    description: Reduce the week's manifests into the five-row attribution table.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[runs/**],outputs[report/{trading_day}/attribution.json]
+      outcome: run.json:metrics[attribution_rows_complete]
+    log_location: /crucible/report
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/report
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: weekly, Saturday
+    dispatch: arc
+    deadline:
+      anchor: next_calendar_day_at
+      at: "16:00"
+
+  explain:
+    description: Walk a run_id or verdict back to everything that produced it.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[runs/**]
+      # A read-only lineage walk grades nothing.
+      outcome: null
+    log_location: /crucible/explain
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
+  migrate.history:
+    description: Import v1 arm history, flagged with its provenance.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs[arms/**]
+      outcome: run.json:metrics[arms_migrated]
+    log_location: /crucible/migrate.history
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/arms
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
+  release.pin:
+    description: Repoint releases/current, or pin the trader to a release.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:outputs[releases/current]
+      outcome: null
+    log_location: /crucible/release.pin
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/releases
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
+  release.lock:
+    description: >-
+      Apply Object Lock retention to a published release's identity objects
+      (alpha-engine-config-I9898) — the repair for a release published before
+      the write-time fix (I9787).
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:metrics[release_object_retention]
+      outcome: run.json:metrics[release_objects_locked]
+    log_location: /crucible/release.lock
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/releases
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
+  smoke:
+    description: A real end-to-end run against live data that gates a release flip.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs
+      outcome: run.json:metrics[smoke_ok]
+    log_location: /crucible/smoke
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/releases
+    artifact_retention: forever
+    # Runs on every merge to main, which is wall-clock, not scheduled work
+    # whose absence is a fact about the system.
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
+  # ── Track C (alpha-engine-config-I9757) ────────────────────────────────
+  # The four rows below are the observing surfaces themselves. Two of them
+  # cannot be watched by the sweep — one IS the sweep, and the other is what
+  # stands behind it when the sweep is dead — so both name a different
+  # watcher, and tests/test_components_registry.py refuses any row whose
+  # absence is watched by itself.
+
+  alerts.sweep:
+    description: >-
+      Evaluate the two page conditions over every scheduled row, group by
+      cause, page once per group, and write the alerts bus rows.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[runs/**],outputs[alerts/**]
+      outcome: run.json:metrics[pages_emitted]
+    log_location: /crucible/alerts.sweep
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/alerts
+    artifact_retention: forever
+    # The one row the sweep cannot honestly watch: a sweep that never ran
+    # cannot report itself missing. The weekly heartbeat is what stands
+    # behind it.
+    #
+    # An earlier version of this comment added "and a sweep run DOES report
+    # the previous day's sweep, so the self-reference is a lag rather than a
+    # blind spot". That was never true — `heartbeat()` did not read this row's
+    # manifest at all, so the declared watcher watched nothing and the row read
+    # as covered. crucible-PR17 makes the heartbeat actually evaluate it.
+    absence_watched_by: heartbeat
+    schedule: daily 21:00 ET, every calendar day
+    dispatch: scheduler
+    deadline:
+      anchor: close_plus
+      offset_hours: 5.5
+
+  heartbeat:
+    description: >-
+      The weekly proof that the alerting path itself is alive - "v2 alive, N
+      runs ok, $X". Not a third page condition; its ABSENCE is the signal.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[runs/**],outputs[alerts/**]
+      outcome: run.json:metrics[pages_last_28_trading_days]
+    log_location: /crucible/heartbeat
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/alerts
+    artifact_retention: forever
+    # Deliberately a human, and the only row in the file that says so. If
+    # the whole alerting path is dead the sweep is dead too, so a machine
+    # watcher here would be watching from inside the thing that failed. The
+    # operator noticing no Saturday message is the outer loop, and naming it
+    # is what keeps it from being mistaken for coverage that does not exist.
+    absence_watched_by: operator
+    schedule: weekly, Saturday
+    dispatch: scheduler
+    deadline:
+      anchor: next_calendar_day_at
+      at: "18:00"
+
+  drift:
+    description: >-
+      Feature PSI against the training window, prediction-distribution drift,
+      and IC decay by horizon - three MetricRecords with control bands.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[features/**,predictions/**],outputs[drift/**]
+      outcome: run.json:metrics[feature_psi_max_ratio]
+    log_location: /crucible/drift
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/drift
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: weekly, Saturday
+    dispatch: arc
+    deadline:
+      anchor: next_calendar_day_at
+      at: "14:00"
+
+  board:
+    description: >-
+      Render the fully-declared board - every plan §2 objective, every §6 phase
+      gate, every registry component and the four cutover predicates, each in
+      one of seven typed states.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[runs/**,gates/**,report/**,arms/**],outputs[board/index.html,board/current.json]
+      # `schedule_milestones_overdue` added alpha-engine-config-I9914: the
+      # plan §6.1 milestone rows' own outcome signal, so a missed schedule
+      # date is a graded figure on this row rather than only a text detail
+      # inside `board_rows_red`.
+      outcome: run.json:metrics[board_rows_unmeasurable,schedule_milestones_overdue]
+    log_location: /crucible/board
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/board
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    # DAILY, and not `arc`. The weekly driver is phase-2 work
+    # (alpha-engine-config-I9758); a board dispatched by it would go dark for
+    # the whole of phase 0 and phase 1 - which are exactly the phases whose
+    # gaps this instrument exists to render. It is also why `dispatch: arc`
+    # would be wrong even though `console` is: six rows in this file once read
+    # "weekly, Saturday" while exactly one of them was dispatched by anything.
+    #
+    # `github-actions`, not `scheduler`: the starter is the `on.schedule`
+    # cron in .github/workflows/board.yml (`30 21 * * *`), and there is no
+    # AWS::Scheduler::Schedule for this job. This row read `scheduler` from
+    # 2026-09-02T21:47Z until alpha-engine-config-I9878, which is a row
+    # naming a starter that does not exist - the same blindness the field
+    # exists to remove, one layer up. The GHA cron is the RIGHT dispatcher
+    # here: board.yml already holds the narrowly-scoped OIDC BoardRole, and
+    # converting the job to a Lambda to satisfy a field value would be
+    # shaping the system around the guard. GitHub drops scheduled events
+    # under load (measured on this fleet: a `*/30` workflow ran 5-8x/day for
+    # its whole life), which is why `absence_watched_by: alerts.sweep` above
+    # is load-bearing on this row - the page fires on the missing artifact,
+    # never on trusting the cron.
+    schedule: daily
+    dispatch: github-actions
+    dispatch_workflow: board.yml
+    deadline:
+      anchor: close_plus
+      offset_hours: 6
+
+  console:
+    description: >-
+      Render the static console page from the manifests - the plan §6 phase
+      ladder, runs with their 14-state classification, attribution,
+      champions, week cost, deploys.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[runs/**,gates/**],outputs[console/index.html,gates/ladder.json]
+      outcome: run.json:metrics[components_unreported]
+    log_location: /crucible/console
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/index
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: weekly, Saturday
+    dispatch: arc
+    deadline:
+      anchor: next_calendar_day_at
+      at: "17:00"
+
+  # ── Track F (alpha-engine-config-I9757) ────────────────────────────────
+
+  weekly:
+    description: >-
+      Run the declared weekly arc for one trading day, in deadline order,
+      stopping at the first stage that fails.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[runs/**]
+      outcome: run.json:metrics[arc_stages_completed]
+    log_location: /crucible/weekly
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: weekly, Saturday
+    # The one row the arc cannot dispatch: it IS the arc.
+    dispatch: scheduler
+    deadline:
+      # Later than `console`, its own last stage. An arc deadline earlier
+      # than a stage it runs would page for a run that was still working.
+      anchor: next_calendar_day_at
+      at: "17:30"
+
+  gate:
+    description: >-
+      Read the manifests a phase produced and report, clause by clause,
+      whether that phase's exit gate is met.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[runs/**,report/**,arena/**],outputs[gates/**]
+      outcome: run.json:metrics[gate_clauses_met_ratio]
+    log_location: /crucible/gate
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/gates
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    # Run at a phase exit, which is an event and not a cadence. A gate on a
+    # schedule would be a gate whose absence pages between phases.
+    schedule: null
+    dispatch: null
+    deadline: null
+
+  report.morning:
+    description: >-
+      Read the board rendered by board.yml and deliver its reading to the
+      operator channel at 06:00 PT. Reads; never renders and never runs.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[board/current.json,board/**,runs/board/**],outputs[runs/report.morning/**]
+      outcome: run.json:metrics[morning_report_delivered]
+    log_location: /crucible/report.morning
+    log_retention_days: 90
+    # NOT the pages channel, and this is the whole design constraint. Plan
+    # §4.6 admits exactly two page conditions - absence and failure - and a
+    # daily digest is neither; it is "a row on a page nobody is paged to".
+    # It reaches the same Telegram bot on `severity: info` with `silent`
+    # set and SNS off, so it never travels the path a page travels and
+    # cannot buzz a phone at 6am about a board that is red by design.
+    # `alert_channel` here is what pages about THIS ROW - an absent or
+    # failed report - and that is a real page on the real channel.
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: daily 13:00 UTC (06:00 PDT / 05:00 PST)
+    dispatch: github-actions
+    dispatch_workflow: morning-report.yml
+    # `next_calendar_day_at`, not `close_plus`: the report for trading day d
+    # is delivered on the calendar day AFTER d, before that day's session
+    # opens. 13:00 UTC is 09:00 ET in EDT and 08:00 ET in EST, so 10:00 ET
+    # covers both with an hour of slack for the cron drift GitHub is
+    # measured to have on this fleet (a `*/30` workflow ran 5-8x/day for its
+    # whole life). Tighter than that and the absence page fires on GitHub's
+    # scheduling rather than on a report that did not go out.
+    deadline:
+      anchor: next_calendar_day_at
+      at: "10:00"

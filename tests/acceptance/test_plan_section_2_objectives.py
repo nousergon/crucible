@@ -1,0 +1,1062 @@
+"""Plan §2 — "Objectives, made testable", as executable assertions.
+
+Each test below is one row of the §2 table, or one §6 phase gate, or one §10
+component whose absence makes a verdict wrong. **They fail today.** See
+`tests/acceptance/README.md`: no xfail, no skip, no marker — the repository
+carries no suppression collection at all (§11.1), and a gate that was marked
+as expected-to-fail is a gate nobody notices going green.
+
+Every test performs the REAL check. Where the implementation does not exist
+it raises `NotImplementedError`, and `_unmet` converts that into a failure
+naming the clause and the owning track — so a track landing the code turns
+the test green with no marker to remove.
+"""
+
+from __future__ import annotations
+
+import ast
+import datetime as dt
+import inspect
+import json
+import pathlib
+from collections.abc import Callable
+from typing import Any, NoReturn
+
+import pytest
+
+from crucible.gate import PHASES
+from crucible.slots import SLOTS, get_slot
+
+#: Looked up by `phase` id (`"phase0"`, `"phase2"`, …) rather than restated —
+#: `crucible.gate.PHASES` is the single source of truth for which tracker
+#: issue owns which phase (alpha-engine-config-I9839). A clause names its own
+#: phase; `_unmet`/`_attempt` derive the tracker pointer from it, so a phase
+#: renumbering — or a phase closing, as phase 1 did on 2026-09-02 while every
+#: clause here still pointed at it — cannot leave a failure message stale.
+_PHASES_BY_ID = {phase.id: phase for phase in PHASES}
+
+
+def _unmet(
+    clause: str, requirement: str, exc: BaseException | None = None, *, phase: str
+) -> NoReturn:
+    """Fail this acceptance clause with everything needed to act on it.
+
+    `phase` is a `crucible.gate.PHASES` id (e.g. `"phase2"`) naming the phase
+    whose exit gate this clause belongs to — never a literal issue number.
+    """
+    try:
+        owning_phase = _PHASES_BY_ID[phase]
+    except KeyError:
+        raise ValueError(
+            f"{clause!r} names unknown phase {phase!r}; must be one of {sorted(_PHASES_BY_ID)}"
+        ) from None
+    detail = f" Blocked on: {exc}" if exc is not None else ""
+    pytest.fail(
+        f"UNMET — {clause}\n"
+        f"  Required: {requirement}\n"
+        f"  Status:   not yet satisfied (crucible v2 phase {owning_phase.number}, "
+        f"{owning_phase.tracker}).{detail}",
+        pytrace=False,
+    )
+
+
+def _attempt(clause: str, requirement: str, fn: Callable[[], Any], *, phase: str) -> Any:
+    try:
+        return fn()
+    except NotImplementedError as exc:
+        _unmet(clause, requirement, exc, phase=phase)
+
+
+#: The ONLY exception types `_unmeasurable` may be called for — round-2 review
+#: finding 1/2 (alpha-engine-config-I9828): without this, an author can turn
+#: any code bug into a "read failure" by wrapping the call in `except
+#: Exception` and swapping `_unmet` for `_unmeasurable`, and `check_reading.py`
+#: cannot tell the difference from its two inputs alone. `test_acceptance_reading.py`'s
+#: `test_unmeasurable_is_only_called_from_an_allowed_except_handler` enforces
+#: this on every PR (it is in the FOUNDATION suite, which — unlike the
+#: acceptance job — runs on `pull_request`), and
+#: `test_the_except_handler_scanner_fires_on_a_bare_except_and_a_disallowed_type`
+#: is its self-test: it feeds synthetic modules reaching `_unmeasurable` from
+#: a bare `except` and from `except Exception`, and asserts the scanner
+#: reports both as violations. `ClientError` is further gated at the call
+#: site (see `_CLIENT_ERROR_UNMEASURABLE_CODES`) — being in this set only
+#: means the type itself is eligible, not that every instance of it is.
+_UNMEASURABLE_ALLOWED_EXCEPTIONS = frozenset(
+    {
+        "StackNotAppliedError",
+        "NoCredentialsError",
+        "NoRegionError",
+        "EndpointConnectionError",
+        "ClientError",
+    }
+)
+
+#: `ClientError` error codes that mean "the caller could not authenticate or
+#: is not authorized" — an environment problem, not a system property. Any
+#: other `ClientError` code (a real API contract violation, a malformed
+#: request, a throttle) re-raises as an uncaught error: round-2 review finding
+#: 2 named an injected `TypeError` from `audit_stack_tags` reading as
+#: UNMEASURABLE under the old bare `except Exception`, which this closes.
+_CLIENT_ERROR_UNMEASURABLE_CODES = frozenset(
+    {
+        "AccessDenied",
+        "AccessDeniedException",
+        "UnauthorizedOperation",
+        "ExpiredToken",
+        "InvalidClientTokenId",
+    }
+)
+
+
+def _unmeasurable(
+    clause: str,
+    requirement: str,
+    exc: BaseException,
+    *,
+    phase: str,
+    record_property: Callable[[str, object], None],
+) -> NoReturn:
+    """Fail this clause because the READ failed, not because the property was
+    read and found false.
+
+    Normative source: alpha-engine-config-I9828, round 2. A clause that reads
+    live infrastructure can fail two ways that must never render the same:
+    UNMET (the read succeeded and the property does not hold — call `_unmet`
+    or assert directly) and UNMEASURABLE (no credentials, no region,
+    AccessDenied, an unreachable endpoint — the caller could not read at
+    all). Both fail the job, but only UNMET is a statement about the system.
+    Rendering them identically is the exact defect this function exists to
+    end: it made a permanently-uncredentialed CI job indistinguishable from
+    three real plan-clause gaps, forever, with no artifact showing which was
+    which.
+
+    `record_property` (a pytest-core fixture, no plugin needed) writes
+    `outcome=unmeasurable` and `blocked_on_class=<type(exc).__name__>` into
+    the JUnit `<properties>` — `check_reading.py` classifies on THAT, never on
+    message text, because a substring search over `message` and the traceback
+    body is spoofable: round-2 review reproduced both an `AssertionError`
+    quoting the marker word and the marker surviving inside a traceback body,
+    each reclassified as unmeasurable by the round-1 version of this function.
+    The `UNMEASURABLE — ` prefix stays in the `pytest.fail` message for
+    terminal legibility only — a human reading raw `pytest -q` output — and is
+    read by nothing.
+
+    Only callable from an `except` handler whose caught type(s) are in
+    `_UNMEASURABLE_ALLOWED_EXCEPTIONS` — enforced by an AST guard in
+    `tests/test_acceptance_reading.py`, not by anything in this function
+    (there is no reflection trick that makes a call site police its own
+    caller reliably); the type is checked here only as a second, redundant
+    guard against `exc` itself lying about what raised it.
+    """
+    if type(exc).__name__ not in _UNMEASURABLE_ALLOWED_EXCEPTIONS:
+        raise TypeError(
+            f"_unmeasurable called for {type(exc).__name__}, not in the declared "
+            f"allowlist {sorted(_UNMEASURABLE_ALLOWED_EXCEPTIONS)} — this is a code "
+            "bug, not a read failure, and must not be reported as one"
+        )
+    try:
+        owning_phase = _PHASES_BY_ID[phase]
+    except KeyError:
+        raise ValueError(
+            f"{clause!r} names unknown phase {phase!r}; must be one of {sorted(_PHASES_BY_ID)}"
+        ) from None
+    record_property("outcome", "unmeasurable")
+    record_property("blocked_on_class", type(exc).__name__)
+    pytest.fail(
+        f"UNMEASURABLE — {clause}\n"
+        f"  Required: {requirement}\n"
+        f"  Status:   could not be read (crucible v2 phase {owning_phase.number}, "
+        f"{owning_phase.tracker}). Blocked on: {exc}",
+        pytrace=False,
+    )
+
+
+class TestAutonomy:
+    """§2 row 1: 'Runs autonomously, minimal input'."""
+
+    def test_the_ruled_live_gate_two_live_saturdays_plus_five_replayed(self) -> None:
+        """The gate is **2 live + 5 replayed**, not 4 live.
+
+        Plan §2 row 1 and the §6 phase table both still read "4 consecutive
+        Saturdays". §6.1 supersedes them and says so in terms: "Minimum live
+        gate: 2 consecutive first-attempt `ok` Saturdays, **not 4**" — the
+        four-Saturday soak becomes two live plus five replayed, on a path
+        whose inputs are point-in-time addressable, "stated here so the
+        shortcut is a ruling, not a drift". Adopted under the stated
+        assumption recorded on alpha-engine-config-I9751 at
+        2026-09-01T18:16Z — Brian's instruction was "begin work on crucible v2
+        per the plan", and §6.1 is the plan's own text on this gate. The phase-2
+        execution issue, alpha-engine-config-I9758, already carries it as its
+        closes-when: five unattended scheduler runs plus live Saturdays
+        2026-09-12 and 2026-09-19 first-attempt ok, then cutover.
+
+        This clause asserted 4 live Saturdays — two calendar weeks of soak
+        that was never required, and a calendar gate is the one cost no
+        amount of build speed can compress. An acceptance clause overstating
+        the ruled requirement is the same defect as one understating it: it
+        is not measuring what was decided.
+        """
+        clause = "plan §2 row 1 as superseded by §6.1 / §6 phase-2 exit gate"
+        requirement = (
+            "2 consecutive LIVE weekly runs, first attempt, status: ok, plus 5 "
+            "REPLAYED historical Saturdays (2026-08-01 … 08-29) also first-attempt "
+            "ok, each writing runs/weekly/{trading_day}/run.json, with zero "
+            "human-originated mutating calls on v2 resources over the window."
+        )
+        # Deliberately NOT "call the report handler and see whether it raises".
+        # It stopped raising the day track E landed `report`, which would have
+        # turned a phase-2 window clause green on a phase-1 job — a gate
+        # passing because a different feature shipped. The window is read from
+        # the run manifests of the two live plus five replayed Saturdays in
+        # the production store, and that is phase 2 (alpha-engine-config-I9758).
+        _unmet(clause, requirement, phase="phase2")
+
+    def test_zero_human_mutating_calls_is_read_from_the_cloudtrail_archive(
+        self,
+    ) -> None:
+        """§11 risk 8: `lookup-events` truncates its username lookup to ~2
+        days, so a gate querying it reads clean because it could not see the
+        week. The gate must read the S3 CloudTrail archive over the full
+        window.
+
+        MET by track F, and asserted on all three properties that make the
+        count trustworthy: the module has no path to the forbidden API, an
+        absent archive is UNMEASURABLE rather than zero, and an unrecognised
+        principal counts as human. The last one is the whole control — a
+        classifier defaulting to `probably automation` would read clean on
+        the day a new role appears, which is exactly when it must not.
+        """
+        import ast
+        import gzip
+
+        from crucible import autonomy as autonomy_module
+        from crucible.autonomy import MACHINE_PRINCIPALS, ArchiveMissingError
+
+        clause = "plan §2 row 1, closed by §11 risk 8"
+        requirement = (
+            "The operator-action count is computed from the CloudTrail S3 archive "
+            "over the full live-gate window, never from `aws cloudtrail lookup-events`."
+        )
+
+        # 1. No path to the truncating API. AST, not a grep: the module's own
+        #    docstring names `lookup-events` in order to explain why it is not
+        #    used, and a text scan needing an exemption for the explanation is
+        #    a scan nobody can keep honest.
+        tree = ast.parse(inspect.getsource(autonomy_module))
+        reached = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)} | {
+            n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
+        }
+        assert not {name for name in reached if "lookup" in name.lower()}, (
+            f"UNMET — {clause}: {requirement}"
+        )
+
+        # 2. No archive is UNMEASURABLE, never zero. A trail that was never
+        #    created and a perfectly autonomous month produce the same
+        #    artifact set, and the two must not be the same answer.
+        with pytest.raises(ArchiveMissingError):
+            autonomy_module.count_operator_actions(
+                object(),
+                bucket="",
+                prefix="",
+                start=dt.date(2026, 8, 1),
+                end=dt.date(2026, 8, 29),
+            )
+
+        # 3. The window is walked day by day out of the archive, and an
+        #    unknown principal counts as human.
+        record = {
+            "eventTime": "2026-08-03T18:00:00Z",
+            "eventName": "PutRolePolicy",
+            "eventSource": "iam.amazonaws.com",
+            "readOnly": False,
+            "requestID": "req-1",
+            "requestParameters": {"roleName": "crucible-v2-runtime"},
+            "userIdentity": {
+                "type": "AssumedRole",
+                "sessionContext": {"sessionIssuer": {"userName": "a-role-nobody-declared"}},
+            },
+        }
+        assert "a-role-nobody-declared" not in MACHINE_PRINCIPALS
+
+        real_key = "t/2026/08/03/part.json.gz"
+
+        class _Body:
+            def __init__(self, key: str) -> None:
+                self._key = key
+
+            def read(self) -> bytes:
+                records = [record] if self._key == real_key else []
+                return gzip.compress(json.dumps({"Records": records}).encode("utf-8"))
+
+        # A real trail always delivers, even on quiet days (crucible-PR76,
+        # alpha-engine-config-I9928 round 2): `count_operator_actions` now
+        # asserts coverage PER CALENDAR DAY and raises ArchiveMissingError
+        # naming any uncovered day, so the fixture must carry an (empty)
+        # object for every day in the window — not just the one day with a
+        # real record — or it exercises the uncovered-day path instead of
+        # the counting logic under test.
+        window = [
+            dt.date(2026, 8, 1) + dt.timedelta(days=n)
+            for n in range((dt.date(2026, 8, 29) - dt.date(2026, 8, 1)).days + 1)
+        ]
+        keys = {f"t/2026/{d:%m/%d}/part.json.gz" for d in window}
+
+        class _Paginator:
+            def paginate(self, *, Bucket: str, Prefix: str, Delimiter: str | None = None) -> Any:  # noqa: N803
+                # A delimited listing is the region-discovery call in
+                # date_partitions: this fixture's archive names its region
+                # already (the documented single-partition shape), so it has
+                # no child regions to roll up and yields no CommonPrefixes —
+                # date_partitions then falls back to the prefix itself.
+                if Delimiter is not None:
+                    yield {"CommonPrefixes": []}
+                    return
+                matched = [k for k in keys if k.startswith(Prefix)]
+                yield {"Contents": [{"Key": k} for k in matched]}
+
+        class _Client:
+            def get_paginator(self, name: str) -> Any:
+                return _Paginator()
+
+            def get_object(self, *, Bucket: str, Key: str) -> Any:  # noqa: N803
+                return {"Body": _Body(Key)}
+
+        result = autonomy_module.count_operator_actions(
+            _Client(),
+            bucket="trail",
+            prefix="t",
+            start=dt.date(2026, 8, 1),
+            end=dt.date(2026, 8, 29),
+        )
+        assert result.count == 1
+        assert result.actions[0].principal == "a-role-nobody-declared"
+        assert result.start == dt.date(2026, 8, 1) and result.end == dt.date(2026, 8, 29), (
+            "the count must cover the FULL window; a short window is the defect"
+        )
+
+
+class TestOneCommand:
+    """§2 row 2: 'Easy to run experiments'."""
+
+    def test_experiment_run_returns_a_verdict_in_one_command(self, tmp_path) -> None:
+        """MET for U (track A). `experiment.run` produces the arm's selection
+        and `experiment.grade` settles it into
+        `experiments/{arm}/{trading_day}/verdict.json`, both through the
+        store interface and nothing else."""
+        store, _, decision_days = _seeded_slot(tmp_path, dt.date(2026, 8, 28))
+
+        verdicts = [k for k in store.list_keys("experiments/") if k.endswith("verdict.json")]
+        assert verdicts, "a settled shadow must produce a verdict artifact"
+
+        settled = decision_days[0].isoformat()
+        assert any(f"/{settled}/verdict.json" in k for k in verdicts)
+
+        document = json.loads(store.get_bytes(verdicts[0]))
+        assert isinstance(document["score_ratio"], float)
+        assert document["benchmark"] == "population"
+        assert document["horizon_trading_days"] == 21
+
+
+class TestCost:
+    """§2 row 3: 'Low API + AWS cost'."""
+
+    def test_the_llm_spend_cap_is_declared_and_enforced(self, tmp_path) -> None:
+        """MET by track E, and asserted on the path that matters: what the run
+        did NOT do. A cap whose test only checks that the number exists would
+        pass against a ceiling nothing consults."""
+        from krepis.usage_pacing import PaceStatus
+
+        from crucible.config import settings
+        from crucible.llm import CallSite, LlmSpendCapExceeded, SpendCap, call, spend_pace
+        from crucible.manifest import manifest_key
+        from crucible.runner import run_job
+        from crucible.store import LocalStore
+
+        # Declared in config, with the provenance of the value it resolved to.
+        resolved = settings()
+        assert resolved.llm_cap_usd > 0
+        assert resolved.origins["llm_cap_usd"]
+        assert resolved.to_dict()["llm_cap_usd"] == resolved.llm_cap_usd
+
+        # Paced through krepis.usage_pacing, not through a local threshold.
+        anchor = dt.datetime(2026, 8, 24, tzinfo=dt.UTC)
+        pace = spend_pace(4.0, cap_usd=5.0, now=anchor + dt.timedelta(days=2), anchor=anchor)
+        assert isinstance(pace, PaceStatus)
+        assert pace.exceeded, "80% of the cap two days into the week is ahead of pace"
+
+        # And a run that would cross the cap FAILS without reaching a provider.
+        store = LocalStore(tmp_path)
+        site = CallSite(
+            callsite_id="acceptance.cap_probe",
+            purpose="prove the refusal precedes the spend",
+            capability_class="reasoning_high",
+            max_usd_per_call=10.0,
+            owner="tests.acceptance",
+        )
+
+        def provider(*args: Any, **kwargs: Any) -> NoReturn:
+            raise AssertionError("the provider was reached after the cap refused the call")
+
+        def body(ctx: Any) -> None:
+            call(
+                ctx,
+                callsite_id=site.callsite_id,
+                capability_class="reasoning_high",
+                messages=[{"role": "user", "content": "hello"}],
+                cap=SpendCap(cap_usd=resolved.llm_cap_usd, spent_usd=resolved.llm_cap_usd),
+                estimate_usd=0.01,
+                client_factory=provider,
+                registry={site.callsite_id: site},
+            )
+
+        day = dt.date(2026, 8, 28)
+        with pytest.raises(LlmSpendCapExceeded):
+            run_job("report", body, store=store, trading_day=day, transient_retry=False)
+
+        manifest = json.loads(store.get_bytes(manifest_key("report", day.isoformat())))
+        assert manifest["status"] == "failed"
+        assert "cap" in manifest["reason"]
+        assert manifest["cost_usd"] == 0.0, "a refused call spends nothing"
+        assert manifest["llm_calls"] == []
+
+    def test_every_v2_resource_is_tagged_for_cost_attribution(self, record_property) -> None:
+        """The one clause in this file that reads LIVE AWS, because the thing
+        it asserts is a property of the account and not of the code.
+
+        It fails until the operator applies the CloudFormation stack, and that
+        is the design: the tag is applied BY the deploy, so a clause that
+        could pass without it would be asserting the template rather than the
+        account. `crucible.tags` raises `StackNotAppliedError` rather than
+        returning an empty difference, because an empty difference over an
+        empty stack is vacuous truth (principle 7).
+
+        Round 2 (alpha-engine-config-I9828 review finding 2): the exception
+        handling is a NAMED allowlist, not `except Exception`. A bare
+        `except Exception` sent a code bug — an injected `TypeError` from
+        `audit_stack_tags` was the reviewer's reproduction — into
+        `_unmeasurable` exactly like a genuine credential failure would, and
+        nothing here could then tell the two apart. Only the exception types
+        that mean "the read itself could not happen" are caught; a
+        `ClientError` is further gated on its AWS error code, since most
+        `ClientError` codes are not credential/access problems at all. Every
+        other exception — the `TypeError` included — is not caught here and
+        surfaces as a pytest ERROR, not a classified outcome.
+        """
+        from botocore.exceptions import (
+            ClientError,
+            EndpointConnectionError,
+            NoCredentialsError,
+            NoRegionError,
+        )
+
+        from crucible.config import settings as load_settings
+        from crucible.tags import StackNotAppliedError, audit_stack_tags
+
+        clause = "plan §2 row 3 / §6 phase-0"
+        requirement = (
+            "Every v2 AWS resource carries tag system=crucible-v2, so the monthly "
+            "cost row has a denominator and the <= $40/mo ceiling is measurable "
+            "rather than asserted (§11 risk 7)."
+        )
+        stack = load_settings().stack_name
+        try:
+            import boto3
+
+            audit = audit_stack_tags(
+                stack=stack,
+                cfn=boto3.client("cloudformation"),
+                tagging=boto3.client("resourcegroupstaggingapi"),
+                # IAM is not a service `resourcegroupstaggingapi` covers, and
+                # it does not say so — it omits the resource, which reads as
+                # untagged. Measured live 2026-09-01: five correctly tagged
+                # roles reported as untagged.
+                iam=boto3.client("iam"),
+            )
+        except StackNotAppliedError as exc:
+            # crucible.tags's own docstring: an absent stack is UNMEASURABLE,
+            # never a pass — there is nothing to tag yet.
+            _unmeasurable(clause, requirement, exc, phase="phase0", record_property=record_property)
+        except (NoCredentialsError, NoRegionError, EndpointConnectionError) as exc:
+            # No credentials at all, no region configured, or the endpoint
+            # could not be reached — all three are the READ failing, not the
+            # property being read and found false.
+            _unmeasurable(clause, requirement, exc, phase="phase0", record_property=record_property)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code not in _CLIENT_ERROR_UNMEASURABLE_CODES:
+                # A real API error — a malformed request, a throttle, a
+                # not-found — is a code bug or a genuine contract violation,
+                # never a read-failure disguise. Re-raise: this is a pytest
+                # ERROR, not UNMEASURABLE and not UNMET.
+                raise
+            _unmeasurable(clause, requirement, exc, phase="phase0", record_property=record_property)
+        assert audit.met, f"UNMET — {clause}: {audit.detail()}"
+
+
+class TestNoThirdState:
+    """§2 row 4: 'Works flawlessly from day 1'. This row is the one the
+    foundation already satisfies — the schema makes the third state
+    unrepresentable — so it is asserted here rather than deferred."""
+
+    def test_the_manifest_schema_admits_exactly_two_statuses(self) -> None:
+        import json
+
+        from crucible.manifest import SCHEMA_PATH
+
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        assert schema["properties"]["status"]["enum"] == ["ok", "failed"], (
+            "plan §2 row 4: the schema must forbid the third state, not policy."
+        )
+
+    def test_no_job_can_declare_itself_skipped(self) -> None:
+        from crucible.runner import RunContext
+
+        ctx = RunContext(
+            run_id="01JG0000000000000000000000",
+            job="data.daily",
+            trading_day=dt.date(2026, 8, 28),
+            calendar_date=dt.date(2026, 8, 28),
+            store=None,  # type: ignore[arg-type]
+            seed=0,
+            started=dt.datetime(2026, 8, 28, 21, 0, tzinfo=dt.UTC),
+        )
+        with pytest.raises(ValueError):
+            ctx.set_status("skipped")
+
+
+class TestAttribution:
+    """§2 row 5: 'Pinpoint underperformance'."""
+
+    def test_the_attribution_table_has_five_rows(self, tmp_path) -> None:
+        clause = "plan §2 row 5 / §4.5"
+        # R and M's TRUE rank IC, reduced from shadow.v2's settled cross-sections
+        # rather than a plan_row-annotated excess-return stand-in, is what
+        # alpha-engine-config-I9778 landed — a historical citation, not a phase
+        # pointer, so it stays in this comment rather than in the requirement
+        # text below (alpha-engine-config-I9839 forbids a hardcoded tracker
+        # literal in a clause's live failure-message text).
+        requirement = (
+            "`crucible report` writes report/{trading_day}/attribution.json with five "
+            "MetricRecord rows — data freshness/coverage, signal IC (R), prediction IC "
+            "(M), portfolio alpha (S), execution shortfall — each with value, ci, n, "
+            "baseline and status. R and M are a TRUE rank IC reduced from shadow.v2's "
+            "settled cross-sections, not a plan_row-annotated excess-return stand-in "
+            "— plan_row no longer exists."
+        )
+        from crucible.cli import HANDLERS
+        from crucible.report import ROWS
+        from crucible.store import LocalStore
+
+        store = LocalStore(tmp_path)
+        day = dt.date(2026, 8, 28)
+        _attempt(
+            clause,
+            requirement,
+            lambda: HANDLERS["report"](_args(trading_day=day, store=str(store.root))),
+            phase="phase3",
+        )
+
+        document = json.loads(store.get_bytes(f"report/{day.isoformat()}/attribution.json"))
+        rows = document["rows"]
+        assert len(rows) == 5
+        assert [r["name"] for r in rows] == [spec.name for spec in ROWS]
+        assert not any("plan_row" in row for row in rows)
+        for row in rows:
+            for field in ("value", "ci_low", "ci_high", "n_samples", "baseline", "status"):
+                assert field in row, f"{row['name']} carries no {field}"
+            # A row with nothing behind it declares a not-measured state from
+            # MetricRecord's own vocabulary and names what it is waiting on.
+            # `no data` is never rendered as a number (principle 7).
+            assert row["value"] is not None or row["status"].startswith("N/A")
+            assert row["status_reason"]
+
+    def test_alpha_is_factor_neutral_not_raw_excess_return(self) -> None:
+        """§10.3: raw 'alpha vs SPY' is mostly beta and sector tilt, and a
+        champion promoted on it is promoted on exposure."""
+        clause = "plan §10 component 3"
+        requirement = (
+            "Each slot's return is decomposed into market beta, sector, size and "
+            "residual; the attribution table reports RESIDUAL alpha."
+        )
+        _unmet(clause, requirement, phase="phase3")
+
+
+class TestAlerting:
+    """§2 row 6: 'Alerts only when wrong'."""
+
+    def test_there_are_exactly_two_page_conditions(self) -> None:
+        from crucible.alerts import PAGE_CONDITIONS
+
+        assert PAGE_CONDITIONS == ("absence", "failure"), (
+            "plan §2 row 6 / §4.6: exactly two page conditions, no others."
+        )
+
+    def test_the_absence_condition_reads_the_declared_deadline_table(self, tmp_path) -> None:
+        """MET by track C. Asserted by INDUCING the condition, not by reading
+        the code: a market holiday must raise no page, and the only way to
+        know that is to resolve a deadline across one."""
+        import datetime as dt
+
+        from crucible.alerts import evaluate_absence
+        from crucible.calendar import is_trading_day, resolve_trading_day
+        from crucible.components import load_registry
+        from crucible.store import LocalStore
+
+        store = LocalStore(tmp_path)
+        registry = load_registry()
+
+        # Every Saturday deadline for Friday's session has passed and nothing
+        # was written: the condition fires, and it names the deadline it read.
+        late = dt.datetime(2026, 8, 29, 23, 30, tzinfo=dt.UTC)
+        pages = evaluate_absence(store, now=late)
+        assert {p.job for p in pages} <= set(registry)
+        assert pages, "an empty store past every deadline must raise absence pages"
+        assert all("due" in p.reason for p in pages)
+
+        # 2026-07-03 was a half day and 2026-07-04 the observed holiday. A run
+        # on the holiday binds to the 3rd's close, so the deadline moves with
+        # the calendar rather than paging for a day the market never opened.
+        holiday = dt.datetime(2026, 7, 4, 12, 0, tzinfo=dt.UTC)
+        session = resolve_trading_day(holiday)
+        assert not is_trading_day(holiday.date()), (
+            "this probe is only meaningful on a non-session; a weekday holiday "
+            "that the calendar thinks is open would make every assertion below "
+            "true for the wrong reason"
+        )
+        holiday_pages = evaluate_absence(store, now=holiday)
+        assert all(p.trading_day == session for p in holiday_pages), (
+            "every page on a non-session binds to the last SESSION. The earlier "
+            "form of this assertion allowed `weekday() < 5`, which "
+            "`resolve_trading_day` can never violate — a clause that could not "
+            "fail, guarding the one calendar behaviour that matters."
+        )
+        assert all(is_trading_day(p.trading_day) for p in holiday_pages)
+
+    def test_the_weekly_alert_count_is_a_metric_with_a_ceiling(self, tmp_path) -> None:
+        """MET by track C. Pages per window is a MetricRecord with a declared
+        ceiling, counted in GROUPS from the durable bus — one outage is one
+        page — and BREACH when it is exceeded."""
+        import datetime as dt
+
+        from crucible.alerts import (
+            CEILING_WINDOW_TRADING_DAYS,
+            PAGES_PER_MONTH_CEILING,
+            ceiling_metric,
+            emit,
+            group_pages,
+        )
+        from crucible.alerts import Page as _Page
+        from crucible.store import LocalStore
+
+        now = dt.datetime(2026, 8, 29, 23, 30, tzinfo=dt.UTC)
+        assert PAGES_PER_MONTH_CEILING == 2
+        assert ceiling_metric(PAGES_PER_MONTH_CEILING, now=now)["status"] == "OK"
+        breached = ceiling_metric(PAGES_PER_MONTH_CEILING + 1, now=now)
+        assert breached["status"] == "BREACH"
+        assert breached["unit"] == "pages"
+        assert breached["horizon_trading_days"] == CEILING_WINDOW_TRADING_DAYS
+        assert "never a reason to add a suppression" in breached["status_reason"]
+
+        # And the count is reconstructible from artifacts by someone who was
+        # not here: it is read off the bus, not off an in-process counter.
+        store = LocalStore(tmp_path)
+        transport_calls: list[str] = []
+
+        def _capture(message: str, **kwargs: object) -> object:
+            transport_calls.append(message)
+            return type("R", (), {"any_ok": True, "destination": "captured"})()
+
+        pages = [
+            _Page(
+                condition="failure",
+                job=job,
+                trading_day=dt.date(2026, 8, 28),
+                reason="RuntimeError: data source yfinance is unreachable",
+                run_id="01JG000000000000000000000" + job[0].upper(),
+            )
+            for job in ("data.daily", "report", "drift")
+        ]
+        emit(store, group_pages(pages), sweep_run_id="0" * 26, transport=_capture)
+        from crucible.alerts import pages_in_window
+
+        assert pages_in_window(store, now=now) == 1, (
+            "one outage is one page; counting members would blow a two-a-month "
+            "ceiling on a single bad Saturday"
+        )
+
+
+class TestTransparency:
+    """§2 row 7."""
+
+    def test_every_llm_call_site_is_in_the_registry(self, tmp_path) -> None:
+        """MET by track E. Both halves are asserted, and the second is what
+        makes the first evidence: an enumerator that reports nothing over the
+        package must report something over a tree that has a call site in it,
+        or it is dark rather than green."""
+        import crucible
+        from crucible.llm import LLM_CALLSITE_REGISTRY, audit_call_sites
+
+        package = pathlib.Path(crucible.__file__).parent
+        findings = audit_call_sites(package)
+        assert findings == [], "\n".join(f.describe() for f in findings)
+        assert isinstance(LLM_CALLSITE_REGISTRY, dict)
+
+        # The enumerator reads the AST, so a call site added tomorrow is caught
+        # without anyone remembering to list it — proven here rather than
+        # asserted, against a module the registry has never heard of.
+        (tmp_path / "arm.py").write_text(
+            "from crucible.llm import call\n"
+            "def go(ctx, cap):\n"
+            "    return call(ctx, callsite_id='phase5.unregistered', "
+            "capability_class='reasoning_high', messages=[], cap=cap, estimate_usd=0.1)\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "bypass.py").write_text("from krepis.llm import LLMClient\n", encoding="utf-8")
+        kinds = sorted(f.kind for f in audit_call_sites(tmp_path))
+        assert kinds == ["adapter_bypass", "unregistered_callsite"]
+
+    def test_explain_walks_a_verdict_back_to_what_produced_it(self, tmp_path) -> None:
+        """MET. The chain is recovered from manifests alone — a run's
+        `inputs[].key` is some other run's `outputs[].key` — with each hop's
+        code sha, seed, cost and LLM-call count attached."""
+        from crucible.explain import explain, render
+        from crucible.keys import arena_cycle_key
+
+        store, _, _ = _seeded_slot(tmp_path, dt.date(2026, 8, 28))
+        node = explain(store, arena_cycle_key("u", "2026-08-28"))
+
+        assert node.manifest is not None
+        assert node.manifest["job"] == "experiment.grade"
+
+        chain = render(node)
+        assert "code_sha=" in chain
+        assert "cost_usd=" in chain
+        assert "llm_calls=" in chain
+
+        walked = {node.key}
+
+        def collect(current: Any) -> None:
+            for parent in current.parents:
+                walked.add(parent.key)
+                collect(parent)
+
+        collect(node)
+        assert any(k.startswith("data/") and k.endswith("panel.parquet") for k in walked), (
+            "the walk must reach the price panel the forward returns came from"
+        )
+        assert all(p.manifest is not None for p in node.parents), (
+            "an unresolvable hop is reported as UNKNOWN, never elided — and there "
+            "should be none here"
+        )
+
+
+class TestControlArms:
+    """§10 component 1 — a hard precondition for any replay run counting
+    toward a gate. The audit's central finding is a grading loop that ran for
+    months while measuring nothing; a control that can produce a negative
+    result is the only way to know the harness itself works."""
+
+    def test_every_slot_declares_a_planted_and_a_null_control(self) -> None:
+        for slot in SLOTS:
+            kinds = {c.kind for c in get_slot(slot).control_arms}
+            assert kinds == {"planted", "null"}, (
+                f"plan §10 component 1: slot {slot} must declare both controls; got {kinds}."
+            )
+
+    def test_the_grader_ranks_planted_above_real_above_null(self, tmp_path) -> None:
+        """MET for U (track A), on both sides.
+
+        Positive: a real cycle ranks the planted control above the null one,
+        and records the observed margin as a MetricRecord.
+
+        Negative — the half that matters: a grader that does NOT see the
+        planted edge fails the cycle rather than publishing its verdicts.
+        The audit's central finding was a grading loop that ran for months
+        while measuring nothing, and a control that cannot produce a
+        negative result would be the same thing again.
+        """
+        from nousergon_lib.arena.window import ArmSeries
+
+        from crucible.keys import arena_cycle_key
+        from crucible.slots.arms import control_specs
+        from crucible.slots.grading import GraderControlError, assert_controls_ordered
+
+        store, _, _ = _seeded_slot(tmp_path, dt.date(2026, 8, 28))
+        cycle = json.loads(store.get_bytes(arena_cycle_key("u", "2026-08-28")))
+
+        controls = {c.control_kind: c.arm_id for c in control_specs(get_slot("u"))}
+        scores: dict[str, list[float]] = {}
+        for key in store.list_keys("experiments/"):
+            if not key.endswith("verdict.json"):
+                continue
+            document = json.loads(store.get_bytes(key))
+            scores.setdefault(document["arm_id"], []).append(document["score_ratio"])
+
+        planted = sum(scores[controls["planted"]]) / len(scores[controls["planted"]])
+        null = sum(scores[controls["null"]]) / len(scores[controls["null"]])
+        real_ids = [a for a in scores if a not in set(controls.values())]
+        assert real_ids, (
+            "the cycle scored no real arm, so `planted > real > null` degenerates to "
+            "`planted > null` — the two-rung form this clause used to assert while "
+            "carrying a three-rung name"
+        )
+        real = sum(sum(scores[a]) / len(scores[a]) for a in real_ids) / len(real_ids)
+        # §10.1's ordering is `planted > real-or-null > null`, and NULL is the
+        # rung that carries the meaning: the planted control's IC is
+        # calibrated and modest, so a genuinely good real arm outranking it is
+        # the product working, not a broken grader. Asserting `planted > real`
+        # would be a gate that a healthy system fails. What must hold is that
+        # BOTH rungs clear pure noise — a grader that cannot separate a real
+        # arm from noise has measured nothing, which is the audit's central
+        # finding stated as an assertion.
+        assert real > null, (
+            "the real arms did not outrank the null control. A grader that cannot "
+            "separate a real arm from pure noise is the grading loop that ran for "
+            "months while measuring nothing"
+        )
+        assert planted > null, (
+            "the planted arm's ranking signal is constructed with a known IC against "
+            "the realized return; a grader that cannot see it cannot see a real edge"
+        )
+
+        assert set(controls.values()) <= set(cycle["scored_arms"]), (
+            "§10.1: controls are scored EVERY cycle"
+        )
+        assert cycle["decision"]["champion"] not in set(controls.values()), (
+            "a control never takes the pointer; the planted one reads the realized "
+            "forward return and serving it would be a look-ahead in production"
+        )
+
+        inverted = {
+            controls["planted"]: ArmSeries(
+                arm_id=controls["planted"], scores={"2026-08-03": -0.05}
+            ),
+            controls["null"]: ArmSeries(arm_id=controls["null"], scores={"2026-08-03": 0.05}),
+        }
+        with pytest.raises(GraderControlError):
+            assert_controls_ordered(controls, inverted, slot="u")
+
+
+class TestFaultInjection:
+    """§10 component 7 — 'flawless from day 1' is proven on the failure path.
+    The old rehearsal pipeline failed 7 of 7 because nobody had made it fail
+    on purpose first."""
+
+    #: The four faults, and the test class in `tests/faults/` that INDUCES
+    #: each. Named by the class that proves it rather than by prose, so a
+    #: fault whose test is deleted fails this clause instead of silently
+    #: ceasing to be covered — which is how the old rehearsal pipeline came
+    #: to fail 7 of 7 without anyone having made it fail on purpose first.
+    FAULTS = {
+        "spot instance terminated mid-job": "TestFaultOneSpotTerminatedMidJob",
+        "a data source withheld": "TestFaultTwoDataSourceWithheld",
+        "the LLM router returns 500": "TestFaultThreeRouterReturns500",
+        "the S3 release pointer is stale": "TestFaultFourStaleReleasePointer",
+    }
+
+    #: The production entry point each fault must be induced THROUGH, not
+    #: raised inline. alpha-engine-config-I9780: faults 2 and 3 used to
+    #: `raise RuntimeError(...)` directly in the job body and assert the
+    #: manifest carried the string the test itself wrote — neither could
+    #: fail from a defect in the data layer or the LLM path. A fault class
+    #: that never calls its named seam is making the same claim again.
+    SEAMS = {
+        "spot instance terminated mid-job": frozenset({"spot_interruption_guard"}),
+        "a data source withheld": frozenset({"run_daily"}),
+        "the LLM router returns 500": frozenset({"call", "llm_call"}),
+        "the S3 release pointer is stale": frozenset({"resolve_release"}),
+    }
+
+    @pytest.mark.parametrize("fault", sorted(FAULTS))
+    def test_each_scripted_fault_produces_one_failed_run_and_exactly_one_page(
+        self, fault: str
+    ) -> None:
+        """MET by track C. Each fault is scripted in `tests/faults/`, and each
+        asserts the same four properties: status failed, the RIGHT reason,
+        full telemetry, and EXACTLY ONE page against a captured transport —
+        AND is induced through the production module named in `SEAMS`, never
+        raised inline in the test body (alpha-engine-config-I9780)."""
+        import importlib
+
+        module = importlib.import_module("tests.faults.test_four_scripted_faults")
+        cls = getattr(module, self.FAULTS[fault], None)
+        assert cls is not None, (
+            f"no scripted injection for {fault!r}. 'Flawless from day 1' is proven on "
+            "the failure path, and a fault nobody induces is a claim, not a gate."
+        )
+        tree = ast.parse(inspect.getsource(cls))
+        called = {
+            n.func.id
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        }
+        called |= {
+            n.func.attr
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        }
+        assert called & {"run_job", "_run_and_capture"}, (
+            f"{cls.__name__} never drives the job. A fault-injection test that does "
+            "not run the job proves nothing about the failure path — and the earlier "
+            "form of this clause was a substring grep over the class's source text, "
+            "which a class whose whole body was three unused string literals passed."
+        )
+        for required in ("_assert_full_telemetry", "_failure_pages"):
+            assert required in called, (
+                f"{cls.__name__} does not call {required!r}: a fault-injection test "
+                "that omits the page count proves the run failed, not that the "
+                "operator was told once."
+            )
+        seam = self.SEAMS[fault]
+        # The historical issue this shape of defect was found under is cited
+        # on the `SEAMS` comment above and this method's own docstring — not
+        # restated in this assert message, per alpha-engine-config-I9839.
+        assert called & seam, (
+            f"{cls.__name__} never calls into {sorted(seam)}. A fault raised "
+            "directly inside the test body — `raise RuntimeError('...')` — cannot "
+            "fail because of a defect in the production module it claims to "
+            "exercise; SEAMS names exactly that shape, twice."
+        )
+
+
+class TestFeatureLayer:
+    """§10 component 4 — without one materialized, hashed feature layer, R
+    and M recompute features from different code and 'the signal degraded'
+    cannot be separated from 'the feature changed'."""
+
+    def test_r_and_m_read_the_same_versioned_feature_artifact(self, tmp_path) -> None:
+        """MET on the producer side; the M consumer arrives with track B.
+
+        What is asserted here is the property that makes the clause
+        meaningful: there is ONE materialized, hashed artifact per trading
+        day, its registry carries units and lineage for every column, and a
+        consumer records it by CONTENT HASH — so two consumers recording the
+        same hash is a checkable fact rather than a convention. The U
+        consumer exists today and is checked; a second consumer recording a
+        different hash for the same key would fail this test the day it
+        lands.
+        """
+        from crucible.features import CATALOG, DEFAULT_FEATURE_VERSION, feature_version
+        from crucible.keys import feature_registry_key, features_key
+        from crucible.store import sha256_hex
+
+        store, _, decision_days = _seeded_slot(tmp_path, dt.date(2026, 8, 28))
+        day = decision_days[0].isoformat()
+
+        key = features_key(DEFAULT_FEATURE_VERSION, day)
+        assert store.exists(key), "the layer is materialized, not recomputed per consumer"
+
+        registry = json.loads(store.get_bytes(feature_registry_key(DEFAULT_FEATURE_VERSION)))
+        assert registry["feature_version"] == feature_version(CATALOG), (
+            "the version is DERIVED from the catalogue; a hand-written one would let an "
+            "edited recipe overwrite the layer an earlier verdict was computed from"
+        )
+        for entry in registry["features"]:
+            assert entry["unit"], f"{entry['name']} declares no unit"
+            assert entry["inputs"], f"{entry['name']} declares no lineage"
+            assert any(
+                entry["name"].endswith(suffix)
+                for suffix in ("_raw", "_ratio", "_pct", "_zscore", "_log_return")
+            ), f"{entry['name']} carries no units suffix"
+
+        digest = sha256_hex(store.get_bytes(key))
+        recorded = set()
+        for manifest_key in store.list_keys("runs/"):
+            if not manifest_key.endswith("/run.json"):
+                continue
+            manifest = json.loads(store.get_bytes(manifest_key))
+            for entry in manifest["inputs"] + manifest["outputs"]:
+                if entry["key"] == key:
+                    recorded.add(entry["sha256"])
+        assert recorded == {digest}, (
+            "every module touching a given feature key must record the SAME content "
+            f"hash for it; got {sorted(recorded)} against {digest}"
+        )
+
+
+def _seeded_slot(tmp_path: Any, cycle_date: dt.date) -> tuple[Any, Any, list[dt.date]]:
+    """A real U slot with real artifacts: panel, features, shadows, verdicts.
+
+    Built with the SAME job functions production runs — `run_daily` and
+    `universe.produce` through `crucible.runner.run_job` — against a local
+    store and a seeded synthetic market. Plan §2 row 2's clause is "no AWS
+    resource beyond S3 read/write", and the local store is that same
+    interface, so this exercises the clause rather than a stand-in for it.
+    """
+    import sys
+
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+    from conftest import sessions_ending, synthetic_frames
+
+    from crucible.config import Settings
+    from crucible.data import FramePriceSource, run_daily
+    from crucible.runner import run_job
+    from crucible.slots import universe
+    from crucible.store import LocalStore
+
+    horizon = 21
+    decisions = 6
+    store = LocalStore(tmp_path / "store")
+    frames = synthetic_frames(end=cycle_date)
+    source = FramePriceSource(frames)
+    # The coverage DENOMINATOR, passed explicitly. Without it `coverage_ratio`
+    # is None, the metric reports OK, and the 0.90 floor is skipped — which is
+    # the `901 of 903` bug class restored, and is what crucible-PR9 makes a
+    # refusal. Declaring it here is correct on both sides of that merge.
+    strategy = tmp_path / "strategy"
+    arms = strategy / "arms" / "u"
+    arms.mkdir(parents=True)
+    for name, ranker in (
+        ("momentum_sleeve", "momentum_sleeve"),
+        ("tech_score_gate", "tech_score_gate"),
+        ("mom_12_1_sleeve", "mom_12_1_sleeve"),
+    ):
+        (arms / f"{name}.yaml").write_text(
+            f"name: {name}\nslot: u\nranker: {ranker}\n"
+            "registered_at: '2026-06-01'\nparams:\n  top_n: 8\n",
+            encoding="utf-8",
+        )
+    settings = Settings(
+        store_uri=str(tmp_path / "store"),
+        arctic_bucket="not-read-in-this-clause",
+        strategy_dir=strategy,
+        origins={"store_uri": "acceptance", "strategy_dir": "acceptance"},
+    )
+    decision_days = sessions_ending(cycle_date, horizon + decisions + 1)[:decisions]
+    for day in decision_days + [cycle_date]:
+        run_job(
+            "data.daily",
+            lambda c: run_daily(c, source=source, expected_symbols=sorted(frames)),
+            store=store,
+            trading_day=day,
+        )
+    for day in decision_days:
+        run_job(
+            "experiment.run",
+            lambda c: universe.produce(c, settings=settings),
+            store=store,
+            trading_day=day,
+        )
+    run_job(
+        "experiment.grade",
+        lambda c: universe.grade(c, settings=settings),
+        store=store,
+        trading_day=cycle_date,
+    )
+    return store, settings, decision_days
+
+
+def _args(**overrides: Any) -> Any:
+    """A minimal argparse-like namespace for calling a handler directly."""
+    import argparse
+
+    ns = argparse.Namespace(
+        job="report",
+        date=None,
+        trading_day=dt.date(2026, 8, 28),
+        dry_run=False,
+        store=None,
+    )
+    for k, v in overrides.items():
+        setattr(ns, k, v)
+    return ns

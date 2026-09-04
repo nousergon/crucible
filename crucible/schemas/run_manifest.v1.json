@@ -1,0 +1,504 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nousergon/crucible/schemas/run_manifest.v1.json",
+  "title": "Crucible run manifest, v1",
+  "description": "The record every job writes at runs/{job}/{trading_day}/run.json. This schema is the enforcement surface for the plan's central guarantee (\u00a74.2): a run is `ok` or it is `failed`; there is no third state, and it is excluded here rather than by policy. It is also the observability contract (\u00a79.2): one document carries all five signal classes \u2014 execution, cost/tokens, resource, data lineage, and outcome vs baseline \u2014 under one run_id.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "job",
+    "trading_day",
+    "calendar_date",
+    "status",
+    "reason",
+    "started",
+    "finished",
+    "code_sha",
+    "release_sha",
+    "seed",
+    "inputs",
+    "outputs",
+    "rows_in",
+    "rows_out",
+    "rows_rejected",
+    "cost_usd",
+    "llm_calls",
+    "resource",
+    "metrics",
+    "attempts"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
+      "const": "run_manifest.v1"
+    },
+    "run_id": {
+      "description": "The correlation identity (\u00a79.2). Appears on every log line, alert, cost row and S3 object's metadata for this run. ULID: lexically sortable by creation time.",
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "job": {
+      "description": "The CLI job that produced this manifest. Closed set: a job absent from crucible/components.yaml has no declared log location, alert channel or retention, and is therefore unobserved.",
+      "type": "string",
+      "enum": [
+        "data.daily",
+        "data.weekly",
+        "data.heal",
+        "experiment.new",
+        "experiment.run",
+        "experiment.grade",
+        "promote",
+        "report",
+        "explain",
+        "migrate.history",
+        "release.pin",
+        "release.lock",
+        "smoke",
+        "alerts.sweep",
+        "heartbeat",
+        "drift",
+        "console",
+        "board",
+        "deploy",
+        "weekly",
+        "gate",
+        "report.morning"
+      ]
+    },
+    "trading_day": {
+      "description": "THE KEY (\u00a74.12). An NYSE trading day from krepis.trading_calendar. A run launched on a non-trading day binds to the last completed trading day \u2014 a Saturday weekly run is keyed to Friday's close. Never the wall-clock date.",
+      "$ref": "#/$defs/isoDate"
+    },
+    "discriminator": {
+      "description": "Present only for a job that legitimately writes more than one manifest for the same `job`+`trading_day` \u2014 the slot letter (u/r/m/s) for `experiment.run`/`experiment.grade`, or the firing's own `calendar_date` for `alerts.sweep`, which runs every calendar day and can therefore fire more than once against one trading day. Absent for every other job. Never encodes a fact `job` or `trading_day` already carries (alpha-engine-config-I9781); see `crucible.manifest.manifest_key`.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_.-]{1,64}$"
+    },
+    "calendar_date": {
+      "description": "Wall-clock date the run actually executed on, recorded for provenance ONLY. Never used as a key, never an input to a promotion, retirement, freshness or grading decision.",
+      "$ref": "#/$defs/isoDate"
+    },
+    "status": {
+      "description": "Exhaustive. `ok` means a complete manifest with every output written; `failed` means the run did not produce its deliverable and pages. There is deliberately no `partial`, `skipped`, `degraded` or `unknown` \u2014 the v1 system's `cycle_verdict: unknown` (I9729) and its 32-of-33 no-op skip flags (I9721) are unrepresentable here.",
+      "type": "string",
+      "enum": [
+        "ok",
+        "failed"
+      ]
+    },
+    "reason": {
+      "description": "Mandatory. Empty string when `status` is `ok`; a specific, operator-readable cause when `failed` \u2014 the conditional below forbids an empty reason on a failure, because a failure with no cause is indistinguishable from every other failure.",
+      "type": "string",
+      "maxLength": 2000
+    },
+    "started": {
+      "$ref": "#/$defs/utcTimestamp"
+    },
+    "finished": {
+      "description": "Written in the runner's `finally` block, so it is present even when the job raised.",
+      "$ref": "#/$defs/utcTimestamp"
+    },
+    "code_sha": {
+      "description": "Commit sha of the crucible tree that ran. Half of `explain`'s answer to 'why did it do that'.",
+      "$ref": "#/$defs/gitSha"
+    },
+    "release_sha": {
+      "description": "Sha of the immutable release artifact this process was installed from. Differs from code_sha only when running from a working tree, where it is the same value.",
+      "$ref": "#/$defs/gitSha"
+    },
+    "seed": {
+      "description": "The RNG seed. Required, including for jobs that are deterministic today: an unrecorded seed makes a replay diff unattributable.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "inputs": {
+      "description": "\u00a79.2 class 4, upstream half. Every artifact read, content-hashed, with the schema version it was read under. An empty list is legal and means the job read nothing.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/artifactRef"
+      }
+    },
+    "outputs": {
+      "description": "\u00a79.2 class 4, downstream half. Content hashes are what make a rerun idempotent: identical bytes are a no-op.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/artifactRef"
+      }
+    },
+    "rows_in": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rows_out": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rows_rejected": {
+      "description": "Rejections WITH REASON, never a bare count. A count with no reason cannot be acted on, and is how 901 of 903 tickers silently failed a liquidity gate for months.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reason",
+          "count"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    },
+    "cost_usd": {
+      "description": "Total spend attributable to this run: LLM plus metered infrastructure. Must be >= the sum of llm_calls[].usd; the runner asserts that, since a schema cannot.",
+      "type": "number",
+      "minimum": 0
+    },
+    "llm_calls": {
+      "description": "\u00a79.2 class 2. One entry per logical call. Empty for every non-research job \u2014 LLM access is confined to research by standing rule, and an empty list is the evidence of that, not an absence of instrumentation.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/llmCall"
+      }
+    },
+    "resource": {
+      "description": "\u00a79.2 class 3. Present on every manifest including laptop runs, where `spot` is false and the instance type is `local`.",
+      "$ref": "#/$defs/resource"
+    },
+    "metrics": {
+      "description": "\u00a79.2 class 5. MetricRecord-shaped (krepis.metrics.MetricRecord), permissive on extra fields for forward compatibility with a newer producer, but strict about the two that make a number readable: `unit` whenever `value` is set, and `horizon_trading_days` as an integer count of TRADING days.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/metricRecord"
+      }
+    },
+    "attempts": {
+      "description": "\u00a711 risk 2. Every attempt this run made, including the transient-class retry. Never empty: a run that executed once records one attempt, so a retried run cannot be mistaken for a clean first-attempt run.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "n",
+          "reason"
+        ],
+        "properties": {
+          "n": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "reason": {
+            "description": "Why THIS attempt happened. `initial` for the first; otherwise the declared transient class that caused the retry. The class grows only by PR with the failure named.",
+            "type": "string",
+            "enum": [
+              "initial",
+              "spot_interruption",
+              "provider_5xx",
+              "provider_timeout",
+              "s3_throttling"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "description": "A failed run states why. Enforced in the schema so no writer can omit it.",
+      "if": {
+        "properties": {
+          "status": {
+            "const": "failed"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "reason": {
+            "minLength": 1
+          }
+        }
+      }
+    },
+    {
+      "description": "An ok run has nothing to explain; a non-empty reason on success is a degraded-SUCCEEDED in disguise.",
+      "if": {
+        "properties": {
+          "status": {
+            "const": "ok"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "reason": {
+            "const": ""
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "isoDate": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "utcTimestamp": {
+      "description": "RFC 3339, UTC, `Z` suffix. A local-time timestamp in an artifact keyed by trading day is a date bug waiting to happen.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+    },
+    "gitSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "artifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "sha256",
+        "schema_version"
+      ],
+      "properties": {
+        "key": {
+          "description": "Store key, not a URI. The store backend (S3 or local dir) resolves it, so the same manifest is portable between them.",
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "schema_version": {
+          "description": "The version the artifact was read or written under. Required \u2014 an un-versioned cross-module artifact is the M0 contract violation.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "llmCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "callsite_id",
+        "model_requested",
+        "model_served",
+        "tokens_in",
+        "tokens_out",
+        "cache_read",
+        "cache_write",
+        "usd"
+      ],
+      "properties": {
+        "callsite_id": {
+          "description": "Key into LLM_CALLSITE_REGISTRY. Registry coverage of v2 call sites is 100%, and that is a test.",
+          "type": "string",
+          "minLength": 1
+        },
+        "model_requested": {
+          "description": "What the caller asked the router for \u2014 a capability class or registry group, never a provider model id (principle 8).",
+          "type": "string",
+          "minLength": 1
+        },
+        "model_served": {
+          "description": "What the router actually served. Required and separate from `model_requested`: a routed call that silently served a different model is the failure this field exists to make visible.",
+          "type": "string",
+          "minLength": 1
+        },
+        "tokens_in": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tokens_out": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_read": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_write": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "usd": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "instance_type",
+        "spot",
+        "escalated_to_on_demand",
+        "interruptions",
+        "mem_peak_mb",
+        "disk_free_mb"
+      ],
+      "properties": {
+        "instance_type": {
+          "description": "EC2 instance type, `lambda`, or `local` for a laptop run.",
+          "type": "string",
+          "minLength": 1
+        },
+        "spot": {
+          "type": "boolean"
+        },
+        "escalated_to_on_demand": {
+          "description": "I5727: spot-to-on-demand fallback emits a COUNTABLE metric. Required, so a fleet-wide escalation rate is always computable rather than sampled from whichever runs happened to annotate it.",
+          "type": "boolean"
+        },
+        "interruptions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mem_peak_mb": {
+          "type": "number",
+          "minimum": 0
+        },
+        "disk_free_mb": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "metricRecord": {
+      "description": "MetricRecord-shaped. Open (`additionalProperties: true`) to match krepis.metrics.MetricRecord's forward-compat contract, but the required core and the two constrained fields below are enforced here.",
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "name",
+        "module",
+        "metric_type",
+        "n_floor",
+        "status",
+        "status_reason",
+        "source_path",
+        "last_updated_utc"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "module": {
+          "type": "string",
+          "minLength": 1
+        },
+        "metric_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "unit": {
+          "description": "Required whenever `value` is set \u2014 see the dependency below. A numeric field with no declared unit is the defect that emitted avg_volume_20d as a ratio and consumed it as raw shares.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "n_floor": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "status": {
+          "description": "Closed set (alpha-engine-config-I9757, defect #3): a run's own `status` above is `ok`/`failed` by schema so a third state cannot be spelled there, but \u00a72 row 4 ('no degraded-SUCCEEDED') is a claim about every level a human reads, and a metric nested inside an `ok` manifest is one of them \u2014 `migrate.history --allow-missing` once wrote `DEGRADED_BY_OPERATOR_CONSENT` here, inside a manifest whose own `status` said `ok`, which reintroduces exactly the third state the top-level enum exists to forbid. Enumerated rather than left open: `OK`/`FAIL`/`BREACH` are the coverage-and-ceiling vocabulary shared by `crucible.data`, `crucible.alerts`, `crucible.deploy`, `crucible.slots.cycle` and `crucible.track_c`; `unservable`/`bootstrap`/`unmeasurable`/`measured`/`decided`/`held` are `nousergon_lib.arena.engine`'s own champion/challenger decision vocabulary, forwarded verbatim by `crucible.promote`'s `pointer_moved` metric rather than re-encoded into a second vocabulary that could drift from the first. `GREEN`/`WATCH`/`RED` and the four `N/A-*` states are `krepis.metrics.StatusLiteral` \u2014 the vocabulary `krepis.metrics.derive_status` returns and `MetricRecord` carries \u2014 forwarded verbatim by `crucible.report`'s five attribution rows for the same reason the arena's vocabulary is: re-encoding them into a second set is how two spellings of one state drift apart. They were MISSING when the enum was closed, because the audit that built it read the call sites that existed on that branch and `crucible.report` was on another one: two PRs green apart and red together, which is what `main` looked like for eleven minutes on 2026-09-01. `tests/test_manifest_schema.py` now derives the requirement from `typing.get_args(StatusLiteral)` rather than restating it. A producer needing a value outside this set grows the enum by PR, with the new state named here, same discipline as `TRANSIENT_CLASSIFIERS` \u2014 never by writing a word this schema does not know and letting `additionalProperties` wave it through.",
+          "type": "string",
+          "enum": [
+            "OK",
+            "FAIL",
+            "BREACH",
+            "unservable",
+            "bootstrap",
+            "unmeasurable",
+            "measured",
+            "decided",
+            "held",
+            "GREEN",
+            "WATCH",
+            "RED",
+            "N/A-NOT-IMPL",
+            "N/A-NOT-RUN",
+            "N/A-LOW-N",
+            "N/A-MISSING-INPUT"
+          ]
+        },
+        "status_reason": {
+          "description": "One operator-readable sentence, never generic.",
+          "type": "string",
+          "minLength": 1
+        },
+        "source_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "last_updated_utc": {
+          "$ref": "#/$defs/utcTimestamp"
+        },
+        "horizon_trading_days": {
+          "description": "\u00a74.12: a horizon is an INTEGER COUNT OF TRADING DAYS \u2014 21 / 63 / 126 / 252. There is no string form, so `1 month` cannot be expressed and fails validation. Absent when the metric has no forward horizon.",
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "allOf": [
+        {
+          "description": "A number without a unit is refused.",
+          "if": {
+            "required": [
+              "value"
+            ],
+            "properties": {
+              "value": {
+                "type": "number"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "unit"
+            ],
+            "properties": {
+              "unit": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
