@@ -3287,11 +3287,20 @@ def _clause_aws_cost_within_ceiling(
        false-UNMET after a month-boundary lump lands inside the leading
        window over a false-MET during acceleration.
 
-    No render ever grades a COMPLETED calendar month; that is a separate
-    clause (`alpha-engine-config-I9946`).
+    **A completed calendar month is also read, in this same function** — on
+    renders taken the 1st through the 3rd of the following month, against
+    this same ceiling (`alpha-engine-config-I9946`). Cost Explorer finalises
+    a month a few days into the next, so a read taken any later would just
+    restate month-to-date under another name; a render on the 4th or later
+    does not attempt it. A closed month over the ceiling is a hard UNMET,
+    independent of what the new month itself projects — a month that
+    projected under all the way through and then closed over must leave a
+    red row somewhere, and the in-progress readings above can never produce
+    one for a month that has already ended.
     """
     from crucible.cost import (  # noqa: PLC0415
         CostUnreadableError,
+        closed_month_usd,
         month_to_date_usd,
         trailing_daily_usd,
     )
@@ -3300,10 +3309,60 @@ def _clause_aws_cost_within_ceiling(
     requirement = (
         f"AWS spend for {scope} is at most ${ceiling_usd:.2f}/month, read from Cost "
         f"Explorer: UNMET once month-to-date exceeds it, otherwise graded on the total of "
-        f"the trailing {COST_TRAILING_DAYS} complete days, and UNMET when the leading "
-        f"{COST_LEADING_DAYS}-day mean × {COST_TRAILING_DAYS} exceeds the ceiling"
+        f"the trailing {COST_TRAILING_DAYS} complete days, UNMET when the leading "
+        f"{COST_LEADING_DAYS}-day mean × {COST_TRAILING_DAYS} exceeds the ceiling, and UNMET "
+        "when the prior CLOSED calendar month (read on the 1st-3rd) exceeded it"
     )
     evidence = ("ce:GetCostAndUsage",)
+
+    # I9946: evaluated first and prefixed onto every detail below, so a
+    # closed-month-over-ceiling UNMET is not shadowed by a MET in-progress
+    # reading, and a closed-month-under or PROVISIONAL reading is visible
+    # beside whichever in-progress verdict follows.
+    closed_note = ""
+    if window[-1].day <= 3:
+        try:
+            closed = closed_month_usd(_ce_client(), today=window[-1], tagged=tagged)
+        except CostUnreadableError as exc:
+            closed_note = f"prior closed month could not be read: CostUnreadableError: {exc}; "
+        except Exception as exc:
+            closed_note = (
+                f"prior closed month could not be read: {type(exc).__name__}: {exc}. That is "
+                "a statement about our access, not about what was spent; "
+            )
+        else:
+            if closed.amount_usd == 0.0:
+                # The same $0.00 trap as the in-progress readings, one level
+                # up: a correctly-tagged closed month with no resources and an
+                # entirely untagged estate both read $0.00 here.
+                closed_note = (
+                    f"closed month {closed.start.isoformat()}..{closed.end.isoformat()} for "
+                    f"{closed.scope} read exactly $0.00 — not graded (that is what a "
+                    "misfiltered or broken reading returns as well as a free month); "
+                )
+            elif closed.estimated:
+                closed_note = (
+                    f"closed month {closed.start.isoformat()}..{closed.end.isoformat()} "
+                    f"${closed.amount_usd:.2f}: PROVISIONAL, Cost Explorer has not finalised "
+                    "it yet — not graded; "
+                )
+            elif closed.amount_usd > ceiling_usd:
+                return Clause(
+                    name,
+                    requirement,
+                    False,
+                    f"closed month {closed.start.isoformat()}..{closed.end.isoformat()} for "
+                    f"{closed.scope} was ${closed.amount_usd:.2f}, over the "
+                    f"${ceiling_usd:.2f}/month ceiling — UNMET regardless of what the new "
+                    "month itself projects",
+                    evidence,
+                )
+            else:
+                closed_note = (
+                    f"closed month {closed.start.isoformat()}..{closed.end.isoformat()} "
+                    f"${closed.amount_usd:.2f}: under; "
+                )
+
     try:
         reading = month_to_date_usd(_ce_client(), today=window[-1], tagged=tagged)
     except CostUnreadableError as exc:
@@ -3348,8 +3407,9 @@ def _clause_aws_cost_within_ceiling(
     days_elapsed = (reading.end - reading.start).days
     days_in_month = monthrange(reading.start.year, reading.start.month)[1]
     month_to_date = (
-        f"${reading.amount_usd:.2f} month-to-date for {reading.scope} over {days_elapsed} of "
-        f"{days_in_month} days ({reading.start.isoformat()}..{reading.end.isoformat()})"
+        f"{closed_note}${reading.amount_usd:.2f} month-to-date for {reading.scope} over "
+        f"{days_elapsed} of {days_in_month} days "
+        f"({reading.start.isoformat()}..{reading.end.isoformat()})"
     )
     if reading.amount_usd > ceiling_usd:
         return Clause(

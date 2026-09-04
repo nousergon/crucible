@@ -1,0 +1,293 @@
+{
+  "$defs": {
+    "ComponentRow": {
+      "additionalProperties": false,
+      "description": "One CLI job's observability declaration.\n\nA component with no row is unobserved, not healthy: its absence cannot\npage (\u00a74.6 reads `deadline` from this file), its logs have no declared\nlocation or retention, and the console has no surface to render it on.",
+      "properties": {
+        "absence_watched_by": {
+          "default": "alerts.sweep",
+          "title": "Absence Watched By",
+          "type": "string"
+        },
+        "alert_channel": {
+          "minLength": 1,
+          "title": "Alert Channel",
+          "type": "string"
+        },
+        "artifact_retention": {
+          "minLength": 1,
+          "title": "Artifact Retention",
+          "type": "string"
+        },
+        "console_surface": {
+          "minLength": 1,
+          "title": "Console Surface",
+          "type": "string"
+        },
+        "deadline": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeadlineRow"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "dispatch": {
+          "anyOf": [
+            {
+              "enum": [
+                "arc",
+                "scheduler",
+                "github-actions"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Dispatch"
+        },
+        "dispatch_workflow": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dispatch Workflow"
+        },
+        "lifecycle": {
+          "default": "ACTIVE",
+          "enum": [
+            "ACTIVE",
+            "DISABLED",
+            "RETIRED"
+          ],
+          "title": "Lifecycle",
+          "type": "string"
+        },
+        "log_location": {
+          "minLength": 1,
+          "title": "Log Location",
+          "type": "string"
+        },
+        "log_retention_days": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "const": "forever",
+              "type": "string"
+            }
+          ],
+          "title": "Log Retention Days"
+        },
+        "schedule": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Schedule"
+        },
+        "signals": {
+          "$ref": "#/$defs/SignalsRow"
+        }
+      },
+      "required": [
+        "description",
+        "signals",
+        "log_location",
+        "log_retention_days",
+        "alert_channel",
+        "console_surface",
+        "artifact_retention",
+        "schedule",
+        "dispatch",
+        "deadline"
+      ],
+      "title": "ComponentRow",
+      "type": "object"
+    },
+    "DeadlineRow": {
+      "additionalProperties": false,
+      "description": "The structured deadline `crucible.components.Deadline` is built from.\n\nTwo anchors, exhaustively; a third is a design change visible in a diff,\nfor the same reason the two page conditions are a closed set.",
+      "properties": {
+        "anchor": {
+          "enum": [
+            "close_plus",
+            "next_calendar_day_at"
+          ],
+          "title": "Anchor",
+          "type": "string"
+        },
+        "at": {
+          "anyOf": [
+            {
+              "format": "time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "At"
+        },
+        "offset_hours": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Offset Hours"
+        }
+      },
+      "required": [
+        "anchor"
+      ],
+      "title": "DeadlineRow",
+      "type": "object"
+    },
+    "RegistryDefaults": {
+      "additionalProperties": false,
+      "description": "\u00a74.6: exactly two page conditions, and one channel either reaches.",
+      "properties": {
+        "page_channel": {
+          "minLength": 1,
+          "title": "Page Channel",
+          "type": "string"
+        },
+        "quiet_channel": {
+          "minLength": 1,
+          "title": "Quiet Channel",
+          "type": "string"
+        }
+      },
+      "required": [
+        "page_channel",
+        "quiet_channel"
+      ],
+      "title": "RegistryDefaults",
+      "type": "object"
+    },
+    "SignalsRow": {
+      "additionalProperties": false,
+      "description": "\u00a79.2's five signal classes, always all five.\n\nA class the job legitimately does not emit is `null` \u2014 DECLARED, not\nomitted, because an omitted class is indistinguishable from a forgotten\none. That is why every field is required and nullable rather than\noptional with a default: a default would let an omission read as a\ndeclaration.",
+      "properties": {
+        "cost": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cost"
+        },
+        "execution": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Execution"
+        },
+        "lineage": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Lineage"
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Outcome"
+        },
+        "resource": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Resource"
+        }
+      },
+      "required": [
+        "execution",
+        "cost",
+        "resource",
+        "lineage",
+        "outcome"
+      ],
+      "title": "SignalsRow",
+      "type": "object"
+    }
+  },
+  "$id": "components_registry.v1",
+  "additionalProperties": false,
+  "description": "`crucible/components.yaml`, whole.\n\nRead by this package AND, across the repo boundary, by\n`nous-ergon-ops/tests/crossrepo/test_crucible_dispatch_lockstep.py`, which\nis why it is a versioned artifact with a published schema rather than a\nprivate config file: the M0 contract discipline applies to every\ncross-repo artifact, and this is one.",
+  "properties": {
+    "components": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ComponentRow"
+      },
+      "minProperties": 1,
+      "title": "Components",
+      "type": "object"
+    },
+    "defaults": {
+      "$ref": "#/$defs/RegistryDefaults"
+    },
+    "version": {
+      "const": 1,
+      "title": "Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version",
+    "defaults",
+    "components"
+  ],
+  "title": "ComponentsDocument",
+  "type": "object"
+}

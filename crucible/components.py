@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 import yaml
 
 from crucible.calendar import assert_trading_day
+from crucible.models import ComponentsDocument
 
 __all__ = [
     "ANCHORS",
@@ -275,59 +276,46 @@ def load_registry(path: str | None = None) -> dict[str, Component]:
             "makes every absence check vacuously pass; that is a broken build, not a "
             "degraded run."
         )
-    raw = yaml.safe_load(target.read_text(encoding="utf-8"))
-    out: dict[str, Component] = {}
-    for name, row in raw["components"].items():
-        _assert_dispatch_declared(name, row)
-        out[name] = Component(
+    # THE TYPED BOUNDARY (`alpha-engine-config-I9847`). The document is
+    # validated whole, once, before any field is read — so a malformed row
+    # surfaces HERE, naming the row and the field, instead of as a `KeyError`
+    # several functions away that reads in a log like the reader itself being
+    # broken. `ComponentsDocument` also forbids what it does not declare: a
+    # row carrying `consol_surface:` used to be a field somebody wrote and
+    # nothing performed, in the one file whose whole purpose is declaring
+    # what is observed.
+    #
+    # `_assert_dispatch_declared` used to live here and is now
+    # `ComponentRow._a_scheduled_row_names_who_starts_it`. It MOVED, not
+    # diluted: its message still names the incident it prevents. It had to
+    # move, because it read `row["schedule"]` itself — a check that raises
+    # `KeyError` on the malformed input it exists to catch is the same defect
+    # it was written against.
+    document = ComponentsDocument.model_validate(yaml.safe_load(target.read_text(encoding="utf-8")))
+    return {
+        name: Component(
             name=name,
-            description=row["description"],
-            lifecycle=row.get("lifecycle", "ACTIVE"),
-            signals=row["signals"],
-            log_location=row["log_location"],
-            log_retention_days=row["log_retention_days"],
-            alert_channel=row["alert_channel"],
-            console_surface=row["console_surface"],
-            artifact_retention=row["artifact_retention"],
-            schedule=row["schedule"],
-            dispatch=row["dispatch"],
-            dispatch_workflow=row.get("dispatch_workflow"),
-            absence_watched_by=row.get("absence_watched_by", "alerts.sweep"),
-            deadline=Deadline.from_yaml(row["deadline"]),
+            description=row.description,
+            lifecycle=row.lifecycle,
+            signals=row.signals.model_dump(),
+            log_location=row.log_location,
+            log_retention_days=row.log_retention_days,
+            alert_channel=row.alert_channel,
+            console_surface=row.console_surface,
+            artifact_retention=row.artifact_retention,
+            schedule=row.schedule,
+            dispatch=row.dispatch,
+            dispatch_workflow=row.dispatch_workflow,
+            absence_watched_by=row.absence_watched_by,
+            # `mode="json"` so `at` arrives as the ISO string `from_yaml`
+            # parses — the model has already turned it into a `dt.time`, and
+            # handing that to `dt.time.fromisoformat` would raise.
+            deadline=Deadline.from_yaml(
+                row.deadline.model_dump(mode="json") if row.deadline else None
+            ),
         )
-    return out
-
-
-def _assert_dispatch_declared(name: str, row: dict[str, Any]) -> None:
-    """Every scheduled row in the file names who starts it; no other row does.
-
-    Enforced here rather than on the dataclass because this is the only place
-    the FILE is read, and the file is the declaration. The failure it prevents
-    is the one that shipped: six rows read `schedule: weekly, Saturday` while
-    the scheduler dispatched exactly one of them, so five components were
-    deadlined and watched for absence and started by nobody.
-    """
-    if "dispatch" not in row:
-        raise ValueError(
-            f"{name} declares no `dispatch`. Every row states who starts it — `arc` "
-            "(a stage of `crucible weekly`), `scheduler` (its own EventBridge "
-            "schedule), `github-actions` (a cron in this repo's .github/workflows/), "
-            "or `null` for on-demand."
-        )
-    dispatch = row["dispatch"]
-    scheduled = row["schedule"] is not None
-    if scheduled and dispatch is None:
-        raise ValueError(
-            f"{name} is scheduled but its dispatch is null. Something has to start "
-            "it, and a row naming no starter is a job whose absence pages every "
-            "cycle for work nobody was going to run."
-        )
-    if not scheduled and dispatch is not None:
-        raise ValueError(
-            f"{name} is on-demand but declares dispatch {dispatch!r}; an unscheduled "
-            "job is started by a person or another job, and naming a starter here "
-            "would claim a cadence it does not have."
-        )
+        for name, row in document.components.items()
+    }
 
 
 def scheduled_components(registry: dict[str, Component] | None = None) -> dict[str, Component]:
