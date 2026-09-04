@@ -31,7 +31,6 @@ from crucible.slots.inputs import (
     parse_input_ref,
     prediction_column,
     read_arm_predictions,
-    resolve_prediction_inputs,
     stack_prediction_columns,
     write_arm_predictions,
 )
@@ -143,7 +142,9 @@ class TestRegistrationRefusesWhatCannotBeProduced:
             features="[vol_21d_ratio]",
             inputs=("predictions[base]",),
         )
-        recipes = {r.name: r for r in load_model_recipes(tmp_path, feature_columns=_LAYER)}
+        loaded = load_model_recipes(tmp_path, feature_columns=_LAYER)
+        assert loaded.refused == ()
+        recipes = {r.name: r for r in loaded.registered}
         assert recipes["stacked"].design_columns == (
             "vol_21d_ratio",
             prediction_column("base"),
@@ -183,8 +184,9 @@ class TestTheCycleGuard:
         _write(tmp_path, "base", features="[mom_21d_ratio]")
         _write(tmp_path, "left", features="[vol_21d_ratio]", inputs=("predictions[base]",))
         _write(tmp_path, "right", features="[mom_21d_ratio]", inputs=("predictions[base]",))
-        edges = resolve_prediction_inputs(load_model_recipes(tmp_path, feature_columns=_LAYER))
-        assert edges == {"base": (), "left": ("base",), "right": ("base",)}
+        loaded = load_model_recipes(tmp_path, feature_columns=_LAYER)
+        assert [r.name for r in loaded.registered] == ["base", "left", "right"]
+        assert loaded.refused == ()
 
 
 class TestTheArmIdDoesNotMoveForArmsWithNoInputs:

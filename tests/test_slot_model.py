@@ -664,8 +664,9 @@ class TestRecipeLoading:
             encoding="utf-8",
         )
         recipes = load_model_recipes(tmp_path, feature_columns=("mom_21d_ratio",))
-        assert len(recipes) == 1
-        assert recipes[0].arm_id.startswith("m:residual_momentum:")
+        assert recipes.refused == ()
+        assert len(recipes.registered) == 1
+        assert recipes.registered[0].arm_id.startswith("m:residual_momentum:")
 
     def test_feature_version_is_not_a_recipe_field(self, tmp_path) -> None:
         """`alpha-engine-config-I9801`: a hand-written `feature_version` inside
@@ -705,8 +706,9 @@ class TestRecipeLoading:
             encoding="utf-8",
         )
         loaded = load_model_recipes(tmp_path, feature_columns=("mom_21d_ratio",))
-        assert len(loaded) == 1
-        assert "feature_version" not in loaded[0].spec
+        assert loaded.refused == ()
+        assert len(loaded.registered) == 1
+        assert "feature_version" not in loaded.registered[0].spec
 
     def test_arm_id_is_independent_of_which_feature_layer_version_is_resolved(
         self, tmp_path
@@ -750,8 +752,8 @@ class TestRecipeLoading:
 
         first = load_model_recipes(tmp_path, feature_columns=("mom_21d_ratio",))
         second = load_model_recipes(tmp_path, feature_columns=("mom_21d_ratio",))
-        assert first[0].arm_id == second[0].arm_id
-        assert "feature_version" not in first[0].spec
+        assert first.registered[0].arm_id == second.registered[0].arm_id
+        assert "feature_version" not in first.registered[0].spec
 
     def test_a_recipe_missing_a_pre_registration_field_does_not_register(self, tmp_path) -> None:
         """Plan §9.1: 'Missing fields -> the arm does not register.'"""
