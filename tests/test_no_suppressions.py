@@ -558,7 +558,7 @@ def test_ci_pins_the_coverage_config_file() -> None:
 
 
 def test_the_pragma_pattern_catches_every_spelling_coverage_honours() -> None:
-    """coverage.py's own default is `#\s*(pragma|PRAGMA)[:\s]?\s*(no|NO)\s*(cover|COVER)`;
+    r"""coverage.py's own default is `#\s*(pragma|PRAGMA)[:\s]?\s*(no|NO)\s*(cover|COVER)`;
     the scanner must fire on at least everything that default would honour."""
     pattern = next(p for p in FORBIDDEN if "pragma" in p)
     compiled = _PATTERNS[pattern]
@@ -571,3 +571,108 @@ def test_the_pragma_pattern_catches_every_spelling_coverage_honours() -> None:
         "x = 1  #pragma:nocover",
     ):
         assert compiled.search(line), line
+
+
+def _python_files() -> list[Path]:
+    return [p for p in _scanned_files() if p.suffix == ".py"]
+
+
+def test_type_checking_is_never_rebound_so_the_exclusion_stays_structural() -> None:
+    """Round-2 finding (2026-09-05): `if TYPE_CHECKING:` is structural ONLY
+    because `typing.TYPE_CHECKING` is False at runtime. A module that binds
+    the name itself (`TYPE_CHECKING = True`, `from x import y as
+    TYPE_CHECKING`, `TYPE_CHECKING: bool = ...`) makes the guarded block
+    EXECUTE while coverage still excludes it — a whole block of live code out
+    of the denominator, ruff-clean and scanner-clean. So the name may enter a
+    module in exactly one way: `from typing import TYPE_CHECKING`."""
+    offenders: list[str] = []
+    for path in _python_files():
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError as exc:
+            offenders.append(f"{path}: unparseable ({exc})")
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for t in targets:
+                    for leaf in ast.walk(t):
+                        if isinstance(leaf, ast.Name) and leaf.id == "TYPE_CHECKING":
+                            offenders.append(f"{path}:{node.lineno}: assigns TYPE_CHECKING")
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    bound = alias.asname or alias.name
+                    if bound == "TYPE_CHECKING" and not (
+                        node.module == "typing"
+                        and alias.name == "TYPE_CHECKING"
+                        and alias.asname is None
+                    ):
+                        offenders.append(
+                            f"{path}:{node.lineno}: binds TYPE_CHECKING from "
+                            f"{node.module}.{alias.name}"
+                        )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if (alias.asname or alias.name) == "TYPE_CHECKING":
+                        offenders.append(f"{path}:{node.lineno}: imports a module as TYPE_CHECKING")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name == "TYPE_CHECKING":
+                    offenders.append(f"{path}:{node.lineno}: defines TYPE_CHECKING")
+    assert not offenders, (
+        "TYPE_CHECKING may only ever be `from typing import TYPE_CHECKING`; a rebinding "
+        "turns the structural coverage exclusion into a live-code carve-out:\n  - "
+        + "\n  - ".join(offenders)
+    )
+
+
+def test_the_rebinding_detector_is_shown_firing(tmp_path: Path) -> None:
+    """Each rebinding shape the round-2 review named, and the sanctioned import."""
+    samples = {
+        "TYPE_CHECKING = True\n": True,
+        "TYPE_CHECKING: bool = True\n": True,
+        "from os import sep as TYPE_CHECKING\n": True,
+        "import typing as TYPE_CHECKING\n": True,
+        "def TYPE_CHECKING(): ...\n": True,
+        "from typing import TYPE_CHECKING\n": False,
+        "from typing import TYPE_CHECKING, Any\n": False,
+    }
+    for text, is_rebinding in samples.items():
+        tree = ast.parse(text)
+        found = False
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                found |= any(
+                    isinstance(leaf, ast.Name) and leaf.id == "TYPE_CHECKING"
+                    for t in targets
+                    for leaf in ast.walk(t)
+                )
+            elif isinstance(node, ast.ImportFrom):
+                found |= any(
+                    (a.asname or a.name) == "TYPE_CHECKING"
+                    and not (
+                        node.module == "typing" and a.name == "TYPE_CHECKING" and a.asname is None
+                    )
+                    for a in node.names
+                )
+            elif isinstance(node, ast.Import):
+                found |= any((a.asname or a.name) == "TYPE_CHECKING" for a in node.names)
+            elif isinstance(node, ast.FunctionDef):
+                found |= node.name == "TYPE_CHECKING"
+        assert found == is_rebinding, text
+
+
+def test_pytest_addopts_cannot_switch_coverage_off() -> None:
+    """Round-2 note: `--no-cov` in `[tool.pytest.ini_options] addopts` disables
+    the whole ratchet even with `--cov=crucible` on the CI command line. Not
+    the per-line class, but one line away from it, and it is pinned here so
+    the config cannot grow it quietly."""
+    import tomllib
+
+    config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    addopts = config["tool"]["pytest"]["ini_options"].get("addopts", "")
+    for forbidden in ("--no-cov", "--cov-fail-under", "--cov-config", "--cov-report", "--cov="):
+        assert forbidden not in addopts, (
+            f"pytest addopts carries {forbidden!r}; coverage flags belong on ci.yml's "
+            "command line and in [tool.coverage.*], where the tests above pin them"
+        )
