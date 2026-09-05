@@ -123,6 +123,10 @@ _IGNORED_DIRS = {
 # and acceptance README have to be able to NAME what is forbidden. Everything
 # executable or configuration-bearing is scanned.
 _SCANNED_SUFFIXES = {".py", ".yaml", ".yml", ".json", ".toml", ".cfg", ".ini"}
+#: Suffix-less files that are configuration and must be scanned by NAME —
+#: `.coveragerc` has no suffix, so a `pragma: no cover` inside it was
+#: invisible to the suffix filter (independent review, 2026-09-05).
+_SCANNED_NAMES = {".coveragerc"}
 
 #: What a suppression collection looks like, and why each one is refused.
 FORBIDDEN: dict[str, str] = {
@@ -148,7 +152,7 @@ FORBIDDEN: dict[str, str] = {
     r"# *noqa *$": (
         "a bare `# noqa` suppresses every rule, present and future, on that line; name the code"
     ),
-    r"pragma: *no *cover": (
+    r"(?i)pragma[:\s]?\s*no\s*cover": (
         "a `pragma: no cover` narrows the coverage ratchet one line at a time, by the "
         "author, with no reviewer and no expiry — the 93% floor `pyproject.toml` "
         "declares is only a floor if nothing can carve lines out from under it "
@@ -164,12 +168,33 @@ FORBIDDEN: dict[str, str] = {
 #: names a construct whose body cannot execute under pytest BY CONSTRUCTION,
 #: never a free-text marker an author can attach to an arbitrary line. Adding
 #: an entry is a rule change reviewed as one, not a way to make a PR pass.
+#: ANCHORED to the whole line (`^\s*...\s*$`). coverage.py applies each
+#: entry as `re.search` over the raw source line, comments included, so an
+#: unanchored `if TYPE_CHECKING:` was attachable as a trailing comment to any
+#: `def` and excluded its whole body — the same per-line narrowing as the
+#: pragma, and nothing scanned for it (independent review, 2026-09-05).
 _STRUCTURAL_COVERAGE_EXCLUSIONS = frozenset(
     {
-        "if __name__ == .__main__.:",
-        "if TYPE_CHECKING:",
+        "^\\s*if __name__ == [\"']__main__[\"']:\\s*$",
+        r"^\s*if TYPE_CHECKING:\s*$",
     }
 )
+
+#: The ONLY keys `[tool.coverage.report]` and `[tool.coverage.run]` may carry,
+#: and the values the two scope-defining ones must hold. `exclude_also`,
+#: `partial_branches`, a non-empty `omit` or a narrowed `source` each narrow
+#: the ratchet file-by-file or line-by-line with no reviewer — the class the
+#: pragma belonged to (independent review, 2026-09-05, findings 3-5).
+_COVERAGE_REPORT_KEYS = frozenset({"fail_under", "show_missing", "exclude_lines"})
+_COVERAGE_RUN_KEYS = frozenset({"source", "omit"})
+_COVERAGE_SOURCE = ["crucible"]
+_COVERAGE_FLOOR = 93
+
+#: Files coverage.py reads INSTEAD of pyproject.toml when present (its
+#: discovery order: .coveragerc, setup.cfg, tox.ini, pyproject.toml). A
+#: `.coveragerc` carrying `exclude_lines = pragma: no cover` displaced the
+#: whole pinned table, fail_under included, in the reviewer's reproduction.
+_DISPLACING_COVERAGE_FILES = (".coveragerc", "setup.cfg", "tox.ini")
 
 _PATTERNS = {p: re.compile(p) for p in FORBIDDEN}
 
@@ -207,7 +232,7 @@ def _scanned_files() -> list[Path]:
             continue
         if any(part in _IGNORED_DIRS for part in path.parts):
             continue
-        if path.suffix not in _SCANNED_SUFFIXES:
+        if path.suffix not in _SCANNED_SUFFIXES and path.name not in _SCANNED_NAMES:
             continue
         if path.resolve() == SELF:
             continue
@@ -308,7 +333,7 @@ def test_the_scan_can_actually_find_something(tmp_path: Path) -> None:
         r"pytest\.mark\.skip": "@pytest.mark.skip",
         r"# *type: *ignore\[.*\] *# *TODO": "x = y  # type: ignore[arg-type]  # TODO",
         r"# *noqa *$": "import os  # noqa",
-        r"pragma: *no *cover": "def _client():  # pragma: no cover - constructed outside tests",
+        r"(?i)pragma[:\s]?\s*no\s*cover": "def _client():  # pragma: no cover",
     }
     assert set(samples) == set(FORBIDDEN), (
         "every forbidden pattern needs a sample proving the matcher fires on it; "
@@ -441,8 +466,108 @@ def test_the_structural_set_names_no_free_text_marker() -> None:
     """The closed set itself must not smuggle the thing it replaces: every
     entry is a Python construct (an `if` header), not a comment marker."""
     for entry in _STRUCTURAL_COVERAGE_EXCLUSIONS:
-        assert entry.startswith("if "), f"{entry!r} is not a structural construct"
+        construct = entry.removeprefix("^\\s*")
+        assert construct.startswith("if "), f"{entry!r} is not a structural construct"
         assert "pragma" not in entry and "#" not in entry, (
             f"{entry!r} is a comment marker, which is exactly the per-line narrowing the "
             "closed set exists to forbid"
         )
+
+
+def test_each_structural_exclusion_is_anchored_and_cannot_ride_a_comment() -> None:
+    """Finding 1 of the 2026-09-05 independent review: coverage.py matches
+    `exclude_lines` with `re.search` on the raw line, so an unanchored entry
+    is attachable as a trailing comment to any `def` and excludes its whole
+    body. Each entry must match the real construct and NOTHING that carries
+    the construct's text after code."""
+    real = {
+        r"^\s*if TYPE_CHECKING:\s*$": ["if TYPE_CHECKING:", "    if TYPE_CHECKING:  "],
+        "^\\s*if __name__ == [\"']__main__[\"']:\\s*$": [
+            'if __name__ == "__main__":',
+            "if __name__ == '__main__':",
+        ],
+    }
+    assert set(real) == set(_STRUCTURAL_COVERAGE_EXCLUSIONS)
+    smuggled = [
+        "def unused():  # if TYPE_CHECKING:",
+        "x = compute()  # if TYPE_CHECKING:",
+        'def unused2():  # if __name__ == "__main__":',
+        "def unused3():  # comment says if __name__ == q__main__q:",
+    ]
+    for pattern in _STRUCTURAL_COVERAGE_EXCLUSIONS:
+        assert pattern.startswith("^") and pattern.endswith("$"), f"{pattern!r} is not anchored"
+        compiled = re.compile(pattern)
+        for line in real[pattern]:
+            assert compiled.search(line), f"{pattern!r} must match the real construct {line!r}"
+        for line in smuggled:
+            assert not compiled.search(line), (
+                f"{pattern!r} matches {line!r} — a trailing comment would exclude that "
+                "line's whole block, the per-line narrowing this set exists to forbid"
+            )
+
+
+def test_no_other_coverage_narrowing_knob_is_set() -> None:
+    """Findings 3-5: `exclude_also`, `omit`, `source` (and `partial_branches`,
+    `exclude_also`'s sibling) narrow the ratchet with no reviewer. The two
+    coverage tables are CLOSED: exactly these keys, and the two scope keys
+    hold exactly the whole-tree values."""
+    import tomllib
+
+    config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    report = config["tool"]["coverage"]["report"]
+    run = config["tool"]["coverage"]["run"]
+    assert set(report) == set(_COVERAGE_REPORT_KEYS), (
+        f"[tool.coverage.report] carries {sorted(set(report) - _COVERAGE_REPORT_KEYS)}; "
+        "exclude_also / partial_branches / any new key narrows the ratchet without review"
+    )
+    assert set(run) == set(_COVERAGE_RUN_KEYS), (
+        f"[tool.coverage.run] carries {sorted(set(run) ^ _COVERAGE_RUN_KEYS)}"
+    )
+    assert run["source"] == _COVERAGE_SOURCE, "the denominator is the whole package"
+    assert run["omit"] == [], "omit stays empty so the scope cannot be narrowed file-by-file"
+    assert report["fail_under"] >= _COVERAGE_FLOOR, (
+        "lowering the floor is a policy amendment, visible here as well as in the diff"
+    )
+
+
+def test_no_file_displaces_the_pinned_coverage_config() -> None:
+    """Finding 2: coverage.py reads `.coveragerc`, then `setup.cfg`, then
+    `tox.ini`, and only then `pyproject.toml`. A `.coveragerc` with its own
+    `exclude_lines` replaced the WHOLE pinned table, `fail_under` included,
+    and the suffix-filtered scanner never opened it. None may exist carrying
+    coverage config, and the scanner now opens `.coveragerc` by name."""
+    assert not (REPO_ROOT / ".coveragerc").exists(), ".coveragerc displaces pyproject.toml"
+    for name in ("setup.cfg", "tox.ini"):
+        path = REPO_ROOT / name
+        if path.exists():
+            assert "[coverage:" not in path.read_text(encoding="utf-8"), (
+                f"{name} carries a [coverage:*] section, which displaces pyproject.toml"
+            )
+    assert ".coveragerc" in _SCANNED_NAMES
+
+
+def test_ci_pins_the_coverage_config_file() -> None:
+    """Belt to the test above's braces: the CI invocation names the config
+    file, so even a `.coveragerc` that slipped past review is not what CI
+    measures against."""
+    text = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    cov_lines = [ln for ln in text.splitlines() if "--cov=crucible" in ln and "pytest" in ln]
+    assert cov_lines, "ci.yml no longer runs the coverage step"
+    for line in cov_lines:
+        assert "--cov-config=pyproject.toml" in line, line
+
+
+def test_the_pragma_pattern_catches_every_spelling_coverage_honours() -> None:
+    """coverage.py's own default is `#\s*(pragma|PRAGMA)[:\s]?\s*(no|NO)\s*(cover|COVER)`;
+    the scanner must fire on at least everything that default would honour."""
+    pattern = next(p for p in FORBIDDEN if "pragma" in p)
+    compiled = _PATTERNS[pattern]
+    for line in (
+        "x = 1  # pragma: no cover",
+        "x = 1  # pragma:NO COVER",
+        "x = 1  # PRAGMA: no cover",
+        "x = 1  # pragma: no\tcover",
+        "x = 1  # pragma no cover",
+        "x = 1  #pragma:nocover",
+    ):
+        assert compiled.search(line), line

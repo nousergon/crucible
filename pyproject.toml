@@ -108,7 +108,15 @@ omit = []
 # they gate exits (see ci.yml) and are not part of the PR-path gate.
 fail_under = 93
 show_missing = true
+# Anchored to the WHOLE line on purpose: coverage.py applies these as
+# `re.search` over each source line, comments included, so an unanchored
+# `if TYPE_CHECKING:` could be attached as a trailing comment to any `def`
+# and exclude its whole body — the same per-line narrowing the coverage
+# pragma was removed for (independent review of crucible-PR112, 2026-09-05).
+# The closed set, its anchoring and the absence of any other narrowing
+# knob (exclude_also, omit, source, a displacing .coveragerc) are pinned
+# by tests/test_no_suppressions.py.
 exclude_lines = [
-    "if TYPE_CHECKING:",
-    "if __name__ == .__main__.:",
+    "^\\s*if TYPE_CHECKING:\\s*$",
+    "^\\s*if __name__ == [\"']__main__[\"']:\\s*$",
 ]

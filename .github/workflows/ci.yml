@@ -149,7 +149,7 @@ jobs:
       # pyproject.toml automatically once `--cov` is passed, so the ratchet
       # lives in one place. A drop below the measured floor fails this job.
       - name: Foundation tests
-        run: uv run --frozen pytest -q --ignore=tests/acceptance --cov=crucible --cov-report=term-missing
+        run: uv run --frozen pytest -q --ignore=tests/acceptance --cov=crucible --cov-config=pyproject.toml --cov-report=term-missing
 
       # Collection, not execution — and it belongs HERE, on the PR path.
       # Importing a test module grades the TREE: it proves every symbol
