@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from nousergon_lib.arena.engine import ServingPrecondition
@@ -79,7 +80,8 @@ from crucible.slots.grading import (
     write_shadow,
     write_verdict,
 )
-from crucible.slots.rankers import MissingFeatureError
+from crucible.slots.inputs import InputRefusal, SlotUnservableError
+from crucible.slots.rankers import MissingFeatureError, get_ranker
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import pandas as pd
@@ -87,7 +89,14 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from crucible.runner import RunContext
     from crucible.store import Store
 
-__all__ = ["MissingArtifactError", "run_grade", "run_produce"]
+__all__ = ["MissingArtifactError", "partition_by_catalog", "run_grade", "run_produce"]
+
+#: The metric one refused arm files on the producing job's manifest — the
+#: same name the M slot uses (`crucible.slots.model.ARM_REFUSED_METRIC`),
+#: restated here rather than imported because `crucible.slots.model` pulls
+#: the fitting stack in and this module is on the U/R path that must not.
+#: `tests/test_cycle_refuses_by_name.py` pins the two names equal.
+ARM_REFUSED_METRIC = "arm_refused_at_registration"
 
 
 class MissingArtifactError(RuntimeError):
@@ -146,6 +155,74 @@ def _shadow_dates(store: Store, arm_id: str) -> list[str]:
     return sorted(days)
 
 
+def partition_by_catalog(
+    specs: Sequence[Any], *, catalog_columns: Sequence[str]
+) -> tuple[list[Any], list[InputRefusal]]:
+    """Split ``specs`` into the arms this feature layer can rank and those it
+    declares no producer for — PER ARM, as values, never an exception.
+
+    The U/R half of `alpha-engine-config-I9955` (the M slot's
+    :func:`crucible.slots.inputs.partition_producible`). Two absences that
+    must never render alike, and the catalogue is what tells them apart:
+
+    * a ranker column the feature CATALOG **never declared** — `predicted_alpha_ratio`
+      (the M slot materialises it, phase 3) or an LLM-derived rating (phase 5).
+      The arm's own recipe says it "refuses BY NAME until then". That is a
+      refusal at registration: the arm does not register this cycle, its
+      siblings run, and the refusal reaches the manifest as
+      :data:`ARM_REFUSED_METRIC` naming the arm and the column. Measured
+      2026-09-05 on the first phase-1 replay arc (weekly@2026-08-07): the
+      predictor-ranked R arm raised `TrainingIntegrityError` and took the
+      whole R slot — and the arc — down, though the catalogue had never
+      promised the column;
+    * a column the catalogue DOES declare but today's frame lacks — a
+      compromised input. That stays :class:`MissingFeatureError` →
+      `TrainingIntegrityError` inside the produce loop, slot-wide, exactly as
+      plan §4.4 and the 2026-08-29 ruling require.
+
+    An arm naming an unknown ranker still raises from :func:`get_ranker`: a
+    recipe nothing can run is malformed, not refused.
+    """
+    produced = set(catalog_columns)
+    producible: list[Any] = []
+    refused: list[InputRefusal] = []
+    for spec in specs:
+        ranker = get_ranker(spec.ranker)
+        undeclared = tuple(c for c in ranker.reads if c not in produced)
+        if not undeclared:
+            producible.append(spec)
+            continue
+        refused.append(
+            InputRefusal(
+                arm=spec.name,
+                unresolvable=undeclared,
+                reason=(
+                    f"arm {spec.name!r} ranks with {ranker.name!r}, which reads "
+                    f"{list(undeclared)}; the feature catalogue declares no producer for "
+                    "them, so this is not a compromised input but a column another slot "
+                    "materialises later (predictions: the M slot, phase 3; LLM ratings: "
+                    "phase 5). Refused BY NAME at registration; the slot's other arms run."
+                ),
+            )
+        )
+    return producible, refused
+
+
+def _refusal_metric(slot: str, refusal: InputRefusal) -> dict[str, Any]:
+    return {
+        "name": ARM_REFUSED_METRIC,
+        "module": f"crucible.slots.{slot}",
+        "metric_type": "count",
+        "value": float(len(refusal.unresolvable)),
+        "unit": "inputs",
+        "n_floor": 1,
+        "status": "unservable",
+        "status_reason": refusal.reason,
+        "source_path": f"strategy/current/arms/{slot}/{refusal.arm}.yaml",
+        "last_updated_utc": _utc_now(),
+    }
+
+
 def run_produce(
     ctx: RunContext,
     *,
@@ -176,6 +253,16 @@ def run_produce(
                 "exiting 0 would be indistinguishable from an arm that ran and selected "
                 "nothing."
             )
+
+    from crucible.features import CATALOG  # noqa: PLC0415 - one call site, keeps import light
+
+    specs, refused = partition_by_catalog(specs, catalog_columns=[f.name for f in CATALOG])
+    for refusal in refused:
+        ctx.record_metric(_refusal_metric(slot, refusal))
+    if refused and not specs:
+        # Every arm refused: the slot can serve nothing, and that PAGES
+        # through the ordinary failed-manifest path (plan §7 `unservable`).
+        raise SlotUnservableError(tuple(refused))
 
     register = read_register(ctx.store, slot)
     register, _ = register_arms(register, specs + control_specs(slot_spec))
@@ -269,6 +356,7 @@ def run_produce(
         "slot": slot,
         "trading_day": trading_day.isoformat(),
         "arms": [s.arm_id for s in produced],
+        "refused": [{"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in refused],
         "champion": champion,
         "feed_key": feed_written,
         "feature_version": feature_version,
