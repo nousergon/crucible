@@ -285,11 +285,24 @@ _check_total("BOARD_CONSOLE_STATE", BOARD_STATES, BOARD_CONSOLE_STATE, COMPONENT
 _check_total("LADDER_BOARD_STATE", LADDER_STATES, LADDER_BOARD_STATE, BOARD_STATES)
 _check_total("COMPONENT_BOARD_STATE", COMPONENT_STATES, COMPONENT_BOARD_STATE, BOARD_STATES)
 
-if RED_STATES | GREY_STATES | {"MET"} != set(BOARD_STATES):  # pragma: no cover - import guard
-    raise ValueError(
-        "every board state must be red, grey, or MET. A state in none of the three "
-        "is one nobody has decided how to count, and it will be counted as progress."
-    )
+
+def _check_partition(states: Iterable[str], red: Iterable[str], grey: Iterable[str]) -> None:
+    """Refuse a board-state vocabulary that is not exactly red ∪ grey ∪ {MET}.
+
+    A function, not a bare import-time `if`, for the same reason as
+    `_check_total`: a guard that only runs at import can never be shown
+    firing by a test, and a guard nobody has made fail is a guard nobody
+    knows works (`tests/test_board.py` calls it with a state in none of the
+    three).
+    """
+    if set(red) | set(grey) | {"MET"} != set(states):
+        raise ValueError(
+            "every board state must be red, grey, or MET. A state in none of the three "
+            "is one nobody has decided how to count, and it will be counted as progress."
+        )
+
+
+_check_partition(BOARD_STATES, RED_STATES, GREY_STATES)
 
 
 # ── Declarations ──────────────────────────────────────────────────────────
@@ -991,7 +1004,7 @@ def _schedule_rows(ladder: Ladder | None, trading_day: str) -> list[BoardRow]:
     rows: list[BoardRow] = []
     for milestone in MILESTONES:
         phase = phases_by_id.get(milestone.phase_id)
-        if phase is None:  # pragma: no cover - guarded by test_schedule.py
+        if phase is None:
             raise ValueError(
                 f"schedule milestone {milestone.id!r} names phase {milestone.phase_id!r}, "
                 "which is not in crucible.gate.PHASES. A milestone naming a phase that "

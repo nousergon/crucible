@@ -93,7 +93,7 @@ from crucible.slots import SlotSpec
 from crucible.slots.arms import ArmSpec
 from crucible.slots.rankers import MissingFeatureError, rank_with
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:
     import pandas as pd
 
     from crucible.store import Store

@@ -34,7 +34,7 @@ from crucible.documents import load_store_document
 from crucible.keys import RUNS_ROOT, is_manifest_key, manifest_key
 from crucible.manifest import validate
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:
     from crucible.store import Store
 
 __all__ = ["Lineage", "explain", "load_manifests", "render"]

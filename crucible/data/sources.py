@@ -26,7 +26,7 @@ import datetime as dt
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:
     import pandas as pd
 
 __all__ = [
@@ -272,7 +272,7 @@ class ArcticPriceSource(PriceSource):
     ) -> pd.DataFrame:
         try:
             from nousergon_lib.arcticdb import load_universe_ohlcv
-        except ImportError as exc:  # pragma: no cover - depends on the install
+        except ImportError as exc:
             raise MissingSourceError(
                 "the ArcticDB price source needs the `arcticdb` extra: install "
                 "`crucible[arcticdb]`. This run is NOT falling back to another "

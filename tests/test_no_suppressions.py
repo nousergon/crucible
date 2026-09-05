@@ -148,7 +148,28 @@ FORBIDDEN: dict[str, str] = {
     r"# *noqa *$": (
         "a bare `# noqa` suppresses every rule, present and future, on that line; name the code"
     ),
+    r"pragma: *no *cover": (
+        "a `pragma: no cover` narrows the coverage ratchet one line at a time, by the "
+        "author, with no reviewer and no expiry — the 93% floor `pyproject.toml` "
+        "declares is only a floor if nothing can carve lines out from under it "
+        "(independent adversarial review of crucible-PR89, 2026-09-04: eight live "
+        "sites, none scanned). A line that cannot be reached by a test is restructured "
+        "or covered; a STRUCTURAL exclusion (`if TYPE_CHECKING:`, the `__main__` "
+        "guard) is declared once in `[tool.coverage.report].exclude_lines` and that "
+        "list is closed by `test_coverage_exclusions_are_structural_only` below"
+    ),
 }
+
+#: The only coverage exclusions permitted, each structural — a pattern that
+#: names a construct whose body cannot execute under pytest BY CONSTRUCTION,
+#: never a free-text marker an author can attach to an arbitrary line. Adding
+#: an entry is a rule change reviewed as one, not a way to make a PR pass.
+_STRUCTURAL_COVERAGE_EXCLUSIONS = frozenset(
+    {
+        "if __name__ == .__main__.:",
+        "if TYPE_CHECKING:",
+    }
+)
 
 _PATTERNS = {p: re.compile(p) for p in FORBIDDEN}
 
@@ -287,6 +308,7 @@ def test_the_scan_can_actually_find_something(tmp_path: Path) -> None:
         r"pytest\.mark\.skip": "@pytest.mark.skip",
         r"# *type: *ignore\[.*\] *# *TODO": "x = y  # type: ignore[arg-type]  # TODO",
         r"# *noqa *$": "import os  # noqa",
+        r"pragma: *no *cover": "def _client():  # pragma: no cover - constructed outside tests",
     }
     assert set(samples) == set(FORBIDDEN), (
         "every forbidden pattern needs a sample proving the matcher fires on it; "
@@ -389,4 +411,38 @@ class TestTheSanctionedKnownRegistryExemptionIsExactlyAsNarrowAsClaimed:
             "X_KNOWN_ARCHITECTURAL_EXCEPTIONS_EXTRA is one identifier token containing "
             "the sanctioned name as a substring, not equal to it, and must still be "
             "reported."
+        )
+
+
+def test_coverage_exclusions_are_structural_only() -> None:
+    """The coverage floor is only a floor if nothing can carve lines out from
+    under it. `[tool.coverage.report].exclude_lines` must be EXACTLY the
+    structural set above — no `pragma: no cover` (a per-line, author-applied,
+    unreviewed narrowing; the 2026-09-04 independent review's finding against
+    crucible-PR89), and no new pattern that was not reviewed as a rule change.
+
+    Read with `tomllib` from the file, not from coverage's loaded config, so
+    the assertion is about what the repository declares rather than about
+    whichever configuration happened to be active in this process.
+    """
+    import tomllib
+
+    config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = set(config["tool"]["coverage"]["report"]["exclude_lines"])
+    assert declared == set(_STRUCTURAL_COVERAGE_EXCLUSIONS), (
+        f"pyproject.toml exclude_lines is {sorted(declared)}; the permitted structural "
+        f"set is {sorted(_STRUCTURAL_COVERAGE_EXCLUSIONS)}. An exclusion is a construct "
+        "whose body cannot run under pytest by construction, never a marker an author "
+        "attaches to a line; a line a test cannot reach is restructured or covered."
+    )
+
+
+def test_the_structural_set_names_no_free_text_marker() -> None:
+    """The closed set itself must not smuggle the thing it replaces: every
+    entry is a Python construct (an `if` header), not a comment marker."""
+    for entry in _STRUCTURAL_COVERAGE_EXCLUSIONS:
+        assert entry.startswith("if "), f"{entry!r} is not a structural construct"
+        assert "pragma" not in entry and "#" not in entry, (
+            f"{entry!r} is a comment marker, which is exactly the per-line narrowing the "
+            "closed set exists to forbid"
         )

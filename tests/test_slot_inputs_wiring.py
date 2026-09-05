@@ -386,3 +386,17 @@ class _StubRecipe:
     def __init__(self, refs):
         self.name = "stub"
         self.inputs = refs
+
+
+class TestTheImportTimeWiringGuardIsShownFiring:
+    """`_check_every_kind_is_wired` runs at import; it used to be a bare `if`
+    under `pragma: no cover` that no test could reach."""
+
+    def test_a_kind_with_no_resolver_is_refused_by_name(self) -> None:
+        with pytest.raises(RuntimeError, match=r"input kind\(s\) \['ghost'\]"):
+            inputs_module._check_every_kind_is_wired(("features", "ghost"), {"features": object()})
+
+    def test_the_committed_table_passes_its_own_guard(self) -> None:
+        inputs_module._check_every_kind_is_wired(
+            inputs_module.INPUT_KINDS, inputs_module.INPUT_RESOLVERS
+        )

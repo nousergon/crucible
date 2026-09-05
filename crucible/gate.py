@@ -3046,7 +3046,7 @@ def _clause_replays_ok(
     )
 
 
-def _s3_client() -> Any:  # pragma: no cover - constructed only outside tests
+def _s3_client() -> Any:
     """An S3 client for the CloudTrail archive read.
 
     A module-level function so a test can substitute it without reaching for a
@@ -3223,7 +3223,7 @@ COST_TRAILING_DAYS = 30
 COST_LEADING_DAYS = 7
 
 
-def _ce_client() -> Any:  # pragma: no cover - constructed only outside tests
+def _ce_client() -> Any:
     from crucible.cost import default_client  # noqa: PLC0415 - lazy on purpose
 
     return default_client()
@@ -4143,7 +4143,7 @@ def evaluate(
     return result
 
 
-def _unused(_: Iterable[Any]) -> None:  # pragma: no cover - typing shim
+def _unused(_: Iterable[Any]) -> None:
     return None
 
 

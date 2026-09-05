@@ -109,6 +109,6 @@ omit = []
 fail_under = 93
 show_missing = true
 exclude_lines = [
-    "pragma: no cover",
+    "if TYPE_CHECKING:",
     "if __name__ == .__main__.:",
 ]

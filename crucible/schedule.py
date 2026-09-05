@@ -108,12 +108,22 @@ MILESTONES: tuple[Milestone, ...] = (
     ),
 )
 
-if len({m.id for m in MILESTONES}) != len(MILESTONES):  # pragma: no cover - import guard
-    raise ValueError("two §6.1 milestones share an id — the board would render one row twice")
 
-if list(MILESTONES) != sorted(MILESTONES, key=lambda m: m.plan_date):  # pragma: no cover
-    raise ValueError(
-        "MILESTONES is not in plan_date order — the board and the morning report "
-        "both render this table in its declared order, and an out-of-order table "
-        "would render the schedule out of calendar order with no sign why"
-    )
+def _check_milestones(milestones: tuple[Milestone, ...]) -> None:
+    """Refuse a milestone table with a duplicate id or out of plan-date order.
+
+    A function rather than two import-time `if`s so `tests/test_schedule.py`
+    can show each refusal firing; the module still calls it at import, so a
+    bad table fails the process at start-up exactly as before.
+    """
+    if len({m.id for m in milestones}) != len(milestones):
+        raise ValueError("two §6.1 milestones share an id — the board would render one row twice")
+    if list(milestones) != sorted(milestones, key=lambda m: m.plan_date):
+        raise ValueError(
+            "MILESTONES is not in plan_date order — the board and the morning report "
+            "both render this table in its declared order, and an out-of-order table "
+            "would render the schedule out of calendar order with no sign why"
+        )
+
+
+_check_milestones(MILESTONES)

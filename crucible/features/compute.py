@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 
 from crucible.features.registry import CATALOG, FeatureSpec, feature_version
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:
     import pandas as pd
 
 __all__ = [

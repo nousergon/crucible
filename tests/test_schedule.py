@@ -115,3 +115,30 @@ class TestTradingDayAnchoring:
                 phase_id=milestone.phase_id,
             ).trading_day
             assert twice == anchored
+
+
+class TestTheTableGuardsAreShownFiring:
+    """`_check_milestones` runs at import and used to be two bare `if`s that
+    no test could reach (they carried `pragma: no cover`). A guard nobody has
+    made fail is a guard nobody knows works; each refusal is exercised here."""
+
+    def test_a_duplicate_id_is_refused(self) -> None:
+        from crucible.schedule import _check_milestones
+
+        a = Milestone(id="same", plan_date=dt.date(2026, 9, 6), what="a", phase_id="phase1")
+        b = Milestone(id="same", plan_date=dt.date(2026, 9, 12), what="b", phase_id="phase2")
+        with pytest.raises(ValueError, match="share an id"):
+            _check_milestones((a, b))
+
+    def test_an_out_of_order_table_is_refused(self) -> None:
+        from crucible.schedule import _check_milestones
+
+        later = Milestone(id="l", plan_date=dt.date(2026, 9, 12), what="l", phase_id="phase2")
+        earlier = Milestone(id="e", plan_date=dt.date(2026, 9, 6), what="e", phase_id="phase1")
+        with pytest.raises(ValueError, match="plan_date order"):
+            _check_milestones((later, earlier))
+
+    def test_the_committed_table_passes_its_own_guard(self) -> None:
+        from crucible.schedule import _check_milestones
+
+        _check_milestones(MILESTONES)

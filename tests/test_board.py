@@ -1619,3 +1619,30 @@ def _row_fixture(*, source: str = "phase", clauses: Any = None) -> BoardRow:
         means_when_red="r",
         clauses=clauses,
     )
+
+
+class TestTheImportTimeGuardsAreShownFiring:
+    """Two guards that used to be bare import-time `if`s under
+    `pragma: no cover`: the board-state partition and the milestone-names-a-
+    real-phase check in `_schedule_rows`. Each is shown refusing."""
+
+    def test_a_state_in_none_of_red_grey_met_is_refused(self) -> None:
+        from crucible.board import _check_partition
+
+        with pytest.raises(ValueError, match="red, grey, or MET"):
+            _check_partition(("MET", "UNMET", "LIMBO"), red=("UNMET",), grey=())
+
+    def test_the_committed_vocabulary_passes_its_own_guard(self) -> None:
+        from crucible.board import GREY_STATES, RED_STATES, _check_partition
+
+        _check_partition(BOARD_STATES, RED_STATES, GREY_STATES)
+
+    def test_a_milestone_naming_an_unknown_phase_raises(self, monkeypatch) -> None:
+        import crucible.schedule as schedule_module
+        from crucible.board import _schedule_rows
+        from crucible.schedule import Milestone
+
+        ghost = Milestone(id="ghost", plan_date=dt.date(2026, 9, 6), what="x", phase_id="phase9")
+        monkeypatch.setattr(schedule_module, "MILESTONES", (ghost,))
+        with pytest.raises(ValueError, match="not in crucible.gate.PHASES"):
+            _schedule_rows(None, "2026-09-04")
