@@ -36,7 +36,7 @@ formatted cleanly. can we instead have it link to a url that contains the
 full update?"* (`alpha-engine-config-I10123`, superseding I9921's six-section
 shape in the MESSAGE, not in what is said).
 
-**So there are now two documents, not one.** :func:`render_full_update`
+**So there are now three documents, not one.** :func:`render_full_update`
 renders everything the old message rendered — the ladder, the §6.1 schedule,
 moved-since, acceptance, silence, the board link, store key and stamps — as
 GitHub-flavored Markdown, with no character budget: it is posted as a
@@ -44,13 +44,17 @@ comment on the rolling `[v2 board] daily update` issue in the private
 `alpha-engine-config` tracker (`crucible.tracker`, App-minted token — an
 Actions token cannot reach a different, private repository), one comment per
 delivery, and its own filed copy sits at `update.md` beside the manifest.
+:func:`render_history_body` regenerates that SAME issue's own BODY into a
+newest-first table — one row per trading day, its six phase states, its
+acceptance figure and a link to that day's comment (deliverable 7: the
+issue is the history page, not only a stack of daily comments). And
 :func:`render_message` renders the HEADLINE that actually reaches Telegram —
 at most :data:`UPDATE_MESSAGE_MAX_CHARS` characters: a title with the trading
 day, one line per phase (state and N/M only), the acceptance count, the
-moved-since COUNT, the pending operator action when there is one, and two
-links — "Full update" (the comment's own permalink) and "Board" (the
-console, when configured). Everything the six sections used to spell out in
-the message itself is now one click away.
+moved-since COUNT, the pending operator action when there is one, and THREE
+links — "Full update" (today's comment), "History" (the issue itself) and
+"Board" (the console, when configured). Everything the six sections used to
+spell out in the message itself is now one click away.
 
 **Ordering is the whole safety property.** The comment is posted BEFORE the
 headline is rendered, because the headline's one indispensable line is the
@@ -82,6 +86,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -100,10 +105,12 @@ from crucible.keys import (
     acceptance_reading_key,
     board_key,
     manifest_key,
+    morning_history_row_key,
     morning_report_key,
     morning_trigger_key,
     morning_update_key,
     parse_acceptance_reading,
+    runs_prefix,
 )
 from crucible.store import PRESIGN_MAX_S, LocalStore, S3Store, Store, open_store
 
@@ -120,6 +127,7 @@ __all__ = [
     "DELIVERY_SEVERITY",
     "DELIVERY_SOURCE",
     "DELIVERY_TZ",
+    "HISTORY_ROW_BASENAME",
     "MORNING_JOB",
     "MorningInputs",
     "NO_OPERATOR_ACTION",
@@ -133,6 +141,7 @@ __all__ = [
     "morning_handler",
     "read_inputs",
     "render_full_update",
+    "render_history_body",
     "render_message",
     "resolve_trigger",
     "run_report",
@@ -1072,28 +1081,33 @@ def _headline_board_link(inputs: MorningInputs) -> str | None:
     return inputs.board_url
 
 
-def render_message(inputs: MorningInputs, *, now: dt.datetime, update_url: str) -> str:
+def render_message(
+    inputs: MorningInputs, *, now: dt.datetime, update_url: str, history_url: str
+) -> str:
     """The Telegram headline — Brian's 2026-09-06 ruling
     (`alpha-engine-config-I10123`): *"the telegram message is not legible,
     too much information and its not formatted cleanly. can we instead have
     it link to a url that contains the full update?"* Supersedes the
     six-section message this function used to render directly
-    (`alpha-engine-config-I9921`).
+    (`alpha-engine-config-I9921`). Extended the same day (deliverable 7,
+    Brian) with a THIRD link once the rolling issue became a history index.
 
     At most :data:`UPDATE_MESSAGE_MAX_CHARS` characters: a title with the
     trading day, one line per phase (state and N/M only — no holding lists,
     no "out of order" prose), the acceptance line, the moved-since COUNT, the
-    pending operator action when there is one, and two links — "Full update"
-    (``update_url``, the tracker comment's own permalink) and "Board" (the
-    console, when configured).
+    pending operator action when there is one, and three links — "Full
+    update" (``update_url``, today's comment permalink), "History"
+    (``history_url``, the rolling issue itself), and "Board" (the console,
+    when configured).
 
-    ``update_url`` is REQUIRED, not optional, because the comment it points
-    at is posted BEFORE this is ever called (`morning_handler`) — a headline
-    rendered with no link to give would be the illegible shape reappearing,
+    ``update_url`` and ``history_url`` are REQUIRED, not optional, because
+    both the comment and the issue they point at exist BEFORE this is ever
+    called (`morning_handler`) — a headline rendered with a link to give
+    that does not yet resolve would be the illegible shape reappearing,
     just shorter.
 
-    Deterministic in ``now``/``inputs``/``update_url`` alone, so the message
-    a test asserts is the message an operator receives.
+    Deterministic in ``now``/``inputs``/the two URLs alone, so the message a
+    test asserts is the message an operator receives.
     """
     board = inputs.board
     lines: list[str] = []
@@ -1126,6 +1140,7 @@ def render_message(inputs: MorningInputs, *, now: dt.datetime, update_url: str) 
         lines.append(f"pending operator action: {_escape_html(inputs.operator_action)}")
 
     lines.append(f'<a href="{_escape_html(update_url)}">Full update</a>')
+    lines.append(f'<a href="{_escape_html(history_url)}">History</a>')
     board_link = _headline_board_link(inputs)
     if board_link:
         lines.append(f'<a href="{_escape_html(board_link)}">Board</a>')
@@ -1136,7 +1151,7 @@ def render_message(inputs: MorningInputs, *, now: dt.datetime, update_url: str) 
         raise ValueError(
             f"the headline is {wire_length(message)} wire characters, over the "
             f"{budget}-character budget left after the transport prefix. The headline's "
-            "shape is fixed (a title, one line per phase, four more fixed lines, two "
+            "shape is fixed (a title, one line per phase, four more fixed lines, three "
             "links) and should never reach this — a board with more phases than the "
             "plan declares, or an operator action of unbounded length, is the likeliest "
             "cause, and the fix is at the source of that field, not a truncation here: "
@@ -1335,6 +1350,163 @@ def _find_or_create_rolling_issue() -> int:
     return number
 
 
+#: The basename of one delivery's compact history facts
+#: (`crucible.keys.morning_history_row_key`). Declared here, once, so the
+#: writer below and the index reader cannot disagree about what they are
+#: listing for.
+HISTORY_ROW_BASENAME = "history_row.json"
+
+#: Plan §6: phases 0 through 5, six rungs, no more and no fewer. The history
+#: table's phase columns are fixed at this width rather than however many a
+#: given day's board happened to carry, so a day that renders five phases
+#: (a board mid-incident, say) still lines up under the same header as a day
+#: that rendered six.
+_HISTORY_PHASE_IDS: tuple[str, ...] = tuple(f"phase{i}" for i in range(6))
+
+
+def _history_row_payload(
+    inputs: MorningInputs, *, now: dt.datetime, comment_url: str
+) -> dict[str, Any]:
+    """The compact facts one delivery contributes to the history index.
+
+    Built from the SAME `inputs` the full update and the headline render
+    from — never a second read of the board — so the index cannot disagree
+    with the comment it links to about what that day's board said.
+    """
+    phases: list[dict[str, Any]] = []
+    for row in inputs.board.get("rows", []):
+        if row.get("source") != "phase":
+            continue
+        clauses = row.get("clauses")
+        has_clauses = isinstance(clauses, list) and bool(clauses)
+        phases.append(
+            {
+                "id": row.get("id"),
+                "state": row.get("state"),
+                "met": sum(1 for c in clauses if c.get("met")) if has_clauses else None,
+                "total": len(clauses) if has_clauses else None,
+            }
+        )
+    parsed = (
+        None
+        if inputs.acceptance_denied_code is not None
+        else parse_acceptance_reading(inputs.acceptance)
+    )
+    return {
+        "trading_day": str(inputs.board.get("trading_day")),
+        "delivered_pt": now.astimezone(DELIVERY_TZ).strftime("%Y-%m-%d %H:%M %Z"),
+        "phases": phases,
+        "acceptance_met": parsed.met if parsed else None,
+        "acceptance_total": parsed.total if parsed else None,
+        "comment_url": comment_url,
+    }
+
+
+def _read_history_rows(store: Store) -> list[tuple[str, dict[str, Any] | None, str]]:
+    """Every `history_row.json` filed under `report.morning`'s manifest
+    root, read through the guarded parser (`crucible.documents.read_document`
+    — the one module allowed to parse store bytes as JSON, AGENTS.md rule 1).
+
+    SURFACE consumer, like `_read_json` above: a corrupt or vanished row is
+    named in its own returned triple (`document=None`, ``problem`` set),
+    never raised and never silently dropped. The index this feeds is a VIEW
+    over the day's own comment, which is the durable record — a fault in one
+    day's row must not blank the rest of the history, and must not be
+    invisible either.
+
+    Returns `(key, document_or_none, problem)` in ASCENDING key order —
+    `Store.list_keys` sorts, and a key is `runs/report.morning/{trading_day}/
+    {calendar_date}/history_row.json`, so ascending order groups by trading
+    day and, within a day, by firing: the LAST entry for a given trading day
+    is that day's most recent delivery, which is what "a re-delivery for the
+    same day replaces its row" means in practice.
+    """
+    prefix = runs_prefix(MORNING_JOB)
+    rows: list[tuple[str, dict[str, Any] | None, str]] = []
+    for key in sorted(store.list_keys(prefix)):
+        if not key.endswith(f"/{HISTORY_ROW_BASENAME}"):
+            continue
+        try:
+            raw = store.get_bytes(key)
+        except KeyError:
+            rows.append((key, None, "vanished between listing and read"))
+            continue
+        read = read_document(key, lambda raw=raw: raw)
+        if read.problem is not None:
+            rows.append((key, None, read.problem))
+        else:
+            rows.append((key, read.document, ""))
+    return rows
+
+
+def _phase_cell(phases: dict[str, dict[str, Any]], phase_id: str) -> str:
+    phase = phases.get(phase_id)
+    if phase is None:
+        return "—"
+    if phase.get("met") is None or phase.get("total") is None:
+        return str(phase.get("state", "—"))
+    return f"{phase.get('state', '—')} {phase['met']}/{phase['total']}"
+
+
+def render_history_body(store: Store, *, console_url: str | None = None) -> str:
+    """The rolling issue's regenerated BODY: a newest-first history index
+    (`alpha-engine-config-I10123` deliverable 7).
+
+    One row per trading day — the LATEST delivery for that day, so a rerun
+    never grows the table — carrying that day's six phase states, its
+    acceptance figure, and a link to the comment holding the full update.
+    Read errors are named in their own row rather than dropped, for the same
+    reason every other surface in this module never goes silent on a fault.
+    """
+    latest: dict[str, dict[str, Any]] = {}
+    faulted: dict[str, str] = {}
+    for key, document, problem in _read_history_rows(store):
+        # `key` segments: "runs", "report.morning", "{trading_day}", ...
+        trading_day = key.split("/")[2]
+        if document is not None:
+            latest[trading_day] = document
+            faulted.pop(trading_day, None)
+        else:
+            faulted[trading_day] = problem
+            latest.pop(trading_day, None)
+
+    lines: list[str] = ["# Crucible v2 — daily update history", ""]
+    if console_url:
+        lines.append(f"Board: {console_url.rstrip('/')}{BOARD_CONSOLE_PATH}")
+        lines.append("")
+    header = ["trading day", "delivered (PT)", *_HISTORY_PHASE_IDS, "acceptance", "full update"]
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("|" + "---|" * len(header))
+
+    days = sorted(set(latest) | set(faulted), reverse=True)
+    for day in days:
+        if day in faulted:
+            lines.append(
+                f"| {day} | unreadable: {faulted[day]} | "
+                + " | ".join(["—"] * (len(header) - 2))
+                + " |"
+            )
+            continue
+        row = latest[day]
+        phases = {p["id"]: p for p in row.get("phases", []) if isinstance(p, dict)}
+        cells = [_phase_cell(phases, phase_id) for phase_id in _HISTORY_PHASE_IDS]
+        met, total = row.get("acceptance_met"), row.get("acceptance_total")
+        acceptance = f"{met}/{total}" if met is not None and total is not None else "—"
+        link = f"[comment]({row.get('comment_url', '')})" if row.get("comment_url") else "—"
+        lines.append(
+            f"| {day} | {row.get('delivered_pt', '—')} | "
+            + " | ".join(cells)
+            + f" | {acceptance} | {link} |"
+        )
+    if not days:
+        lines.append(
+            "| _no delivery has filed a history row yet_ | "
+            + " | ".join(["—"] * (len(header) - 1))
+            + " |"
+        )
+    return "\n".join(lines)
+
+
 def morning_handler(args: argparse.Namespace) -> int:
     """`crucible report.morning [--date] [--dry-run] [--store]`.
 
@@ -1394,8 +1566,9 @@ def morning_handler(args: argparse.Namespace) -> int:
             print(update)
             return
         issue_number = _find_or_create_rolling_issue()
+        history_url = f"https://github.com/{TRACKER_REPO}/issues/{issue_number}"
         update_url = tracker.post_comment(TRACKER_REPO, issue_number, update)
-        message = render_message(inputs, now=now, update_url=update_url)
+        message = render_message(inputs, now=now, update_url=update_url, history_url=history_url)
         destination = deliver(message)
         payload = message.encode("utf-8")
         artifact = morning_report_key(ctx.trading_day.isoformat(), ctx.calendar_date.isoformat())
@@ -1404,6 +1577,11 @@ def morning_handler(args: argparse.Namespace) -> int:
             ctx.trading_day.isoformat(), ctx.calendar_date.isoformat()
         )
         ctx.record_output(update_artifact, update.encode("utf-8"))
+        history_row = _history_row_payload(inputs, now=now, comment_url=update_url)
+        ctx.record_output(
+            morning_history_row_key(ctx.trading_day.isoformat(), ctx.calendar_date.isoformat()),
+            json.dumps(history_row, sort_keys=True).encode("utf-8"),
+        )
         # WHAT started this delivery, filed as its own object beside the
         # message (alpha-engine-config-I9960). The trigger is the KEY, so an
         # `exists` predicate over
@@ -1462,6 +1640,15 @@ def morning_handler(args: argparse.Namespace) -> int:
                 "last_updated_utc": now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
         )
+        # The index rewrite runs LAST, and its failure fails the run
+        # (`alpha-engine-config-I10123` deliverable 7): the comment posted
+        # above is the durable RECORD of today's update, and this is a VIEW
+        # over every day's comment -- so a failure here must not roll back or
+        # skip anything already delivered, and must still be loud (the
+        # manifest's `reason` names it, and `alerts.sweep`'s failure
+        # condition pages on it) rather than silently leaving a stale index.
+        history_body = render_history_body(store, console_url=console_url)
+        tracker.update_issue_body(TRACKER_REPO, issue_number, history_body)
 
     run_job(
         MORNING_JOB,

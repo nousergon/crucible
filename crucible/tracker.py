@@ -9,16 +9,20 @@ was closed the moment its build PRs merged while its own gate read 1 of 6
 clauses met — and the one a human reads on a backlog board was the wrong one.
 This module is the wire between them, and it is deliberately narrow.
 
-**It may comment, and it may create. It may never close.** Closing or
-reopening a phase issue is Brian's authority (`principles.md` §3.2), and the
-issue's own deliverable 1 says so in as many words. A machine comment is a
-RECORD, not a closure. The only mutating requests this module can construct
-are a `POST` to an issue's `/comments` and a `POST` creating a new issue
-(`alpha-engine-config-I10123`, added for the rolling `[v2 board] daily
-update` issue `crucible.morning` finds-or-creates once and comments on
-daily); `tests/test_phase_closing_record.py` asserts the closing-comment
-shape as a property of the source rather than as a convention, because a
-convention about authority is the thing that failed here already.
+**It may comment, create, and rewrite a body. It may never close.** Closing
+or reopening a phase issue is Brian's authority (`principles.md` §3.2), and
+the issue's own deliverable 1 says so in as many words. A machine comment is
+a RECORD, not a closure. The mutating requests this module can construct are
+a `POST` to an issue's `/comments`, a `POST` creating a new issue, and a
+`PATCH` on `/issues/{n}` whose payload is the LITERAL `{"body": ...}` —
+never a caller-supplied dict, so it cannot carry `state` and cannot close or
+reopen anything (`alpha-engine-config-I10123`: the rolling `[v2 board] daily
+update` issue's body is a regenerated history index, and `crucible.morning`
+finds-or-creates the issue once, comments on it daily, and rewrites its body
+after each comment); `tests/test_phase_closing_record.py` asserts the shape
+of every one of these as a property of the source rather than as a
+convention, because a convention about authority is the thing that failed
+here already.
 
 **Every read is guarded and none of them raises.** The board renders this
 adapter's answer as a row, and a surface that dies on a 403 publishes
@@ -68,6 +72,7 @@ __all__ = [
     "grant_command",
     "post_comment",
     "read_issue",
+    "update_issue_body",
 ]
 
 #: GitHub's REST root. A module-level constant so a test can point the adapter
@@ -587,3 +592,56 @@ def create_issue(
             f"`number`/`html_url`: {document!r}"
         )
     return number, url
+
+
+def update_issue_body(
+    repo: str,
+    issue: int,
+    body: str,
+    *,
+    token: str | None = None,
+    opener: Opener | None = None,
+) -> None:
+    """Replace ``issue``'s BODY. Never its state, title, labels or assignees
+    (`alpha-engine-config-I10123` deliverable 7).
+
+    The rolling `[v2 board] daily update` issue's body is a regenerated
+    newest-first history index; a re-delivery for the same trading day
+    replaces that day's row rather than growing the issue without bound the
+    way a comment-per-delivery would (`post_comment` is still what carries
+    each day's full update — this rewrites only the index sitting above it).
+
+    **The payload is a LITERAL `{"body": body}`, never a caller-supplied
+    dict.** `PATCH /issues/{n}` is the one GitHub request that COULD close or
+    reopen an issue, by carrying a `state` key — this function accepts no
+    argument that could ever reach that key, so it cannot be made to close
+    anything regardless of what a caller passes. `crucible.tracker` may
+    comment, may create, and may now rewrite a body; it may never close
+    (`principles.md` §3.2), and `tests/test_phase_closing_record.py` asserts
+    that as a property of this module's syntax tree, not as a convention.
+    """
+    granted = credential(token)
+    if granted is None:
+        raise TrackerError(
+            f"no tracker credential (${TRACKER_APP_SSM_PREFIX_VAR} and ${TRACKER_TOKEN_VAR} "
+            f"unset): could not rewrite the body of {repo}#{issue}. "
+            f"Grant it with: {grant_command(repo)}"
+        )
+    try:
+        status, raw = _request(
+            repo,
+            f"/issues/{issue}",
+            token=granted,
+            method="PATCH",
+            payload={"body": body},
+            opener=opener,
+        )
+    except OSError as exc:
+        raise TrackerError(
+            f"rewriting the body of {repo}#{issue} failed at the transport: {exc}"
+        ) from exc
+    if status != 200:
+        raise TrackerError(
+            f"GitHub answered {status} rewriting the body of {repo}#{issue}: "
+            f"{raw.decode('utf-8', 'replace')[:200]}"
+        )

@@ -78,6 +78,7 @@ __all__ = [
     "manifest_key",
     "manifest_prefix",
     "migration_key",
+    "morning_history_row_key",
     "morning_report_key",
     "morning_trigger_key",
     "morning_update_key",
@@ -884,6 +885,24 @@ def morning_update_key(trading_day: str, calendar_date: str) -> str:
     record of what was posted, independent of the tracker.
     """
     return f"{manifest_prefix('report.morning', trading_day)}{calendar_date}/update.md"
+
+
+def morning_history_row_key(trading_day: str, calendar_date: str) -> str:
+    """One delivery's compact facts, beside its manifest
+    (`alpha-engine-config-I10123` deliverable 7).
+
+    The rolling tracker issue's BODY is a regenerated history index — a
+    newest-first table of every trading day's phase states and acceptance
+    figure — and rebuilding it from `update.md`'s Markdown on every delivery
+    would make the index a re-parse of prose this module already owns
+    structured data for. This key is that structured data instead: a small
+    JSON object (`trading_day`, `delivered_pt`, `phases`, `acceptance_met`,
+    `acceptance_total`, `comment_url`) the index reader lists and reads
+    through the guarded parser, the same way it reads every other artifact
+    under this job's manifest prefix — never a second, disagreeing
+    computation of what the board said.
+    """
+    return f"{manifest_prefix('report.morning', trading_day)}{calendar_date}/history_row.json"
 
 
 #: What a trigger name may be, before it becomes a key segment. Not a

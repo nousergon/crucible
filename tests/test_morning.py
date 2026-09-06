@@ -48,6 +48,7 @@ from crucible.keys import (
     TRIGGER_UNKNOWN,
     board_key,
     manifest_key,
+    morning_history_row_key,
     morning_report_key,
     morning_trigger_key,
     morning_update_key,
@@ -69,6 +70,7 @@ from crucible.morning import (
     deliver,
     morning_handler,
     read_inputs,
+    render_history_body,
     render_message,
     resolve_trigger,
     run_report,
@@ -118,6 +120,7 @@ STALE_GENERATED = STALE_GENERATED_AT.strftime("%Y-%m-%dT%H:%M:%SZ")
 MEASURED_AT = (GENERATED_AT + dt.timedelta(minutes=24, seconds=56)).strftime("%Y-%m-%dT%H:%M:%SZ")
 SHA = "8fc58b6c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a"
 UPDATE_URL = "https://github.com/nousergon/alpha-engine-config/issues/1#issuecomment-42"
+HISTORY_URL = "https://github.com/nousergon/alpha-engine-config/issues/1"
 
 
 @pytest.fixture(autouse=True)
@@ -307,11 +310,12 @@ def _stub_tracker(
     post_raises: Exception | None = None,
     find_raises: Exception | None = None,
     create_raises: Exception | None = None,
+    update_body_raises: Exception | None = None,
 ) -> dict[str, list[Any]]:
     """Stub every tracker call `morning_handler`'s live path can make, and
     record what each was called with. Returns the call log so a test can
     assert on ORDER and ARGUMENTS without touching the network."""
-    calls: dict[str, list[Any]] = {"find": [], "create": [], "post": []}
+    calls: dict[str, list[Any]] = {"find": [], "create": [], "post": [], "update_body": []}
 
     def _find(repo: str, title: str, **kwargs: Any) -> int | None:
         calls["find"].append((repo, title))
@@ -331,9 +335,15 @@ def _stub_tracker(
             raise post_raises
         return comment_url
 
+    def _update_body(repo: str, issue: int, body: str, **kwargs: Any) -> None:
+        calls["update_body"].append((repo, issue, body))
+        if update_body_raises is not None:
+            raise update_body_raises
+
     monkeypatch.setattr("crucible.morning.tracker.find_issue_by_title", _find)
     monkeypatch.setattr("crucible.morning.tracker.create_issue", _create)
     monkeypatch.setattr("crucible.morning.tracker.post_comment", _post)
+    monkeypatch.setattr("crucible.morning.tracker.update_issue_body", _update_body)
     return calls
 
 
@@ -816,7 +826,9 @@ class TestTheHeadline:
 
     def test_it_is_short_titled_and_links_the_update_and_the_board(self, tmp_path):
         inputs = self._inputs(tmp_path, previous=_board())
-        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
         lines = message.splitlines()
         assert len(lines) <= 12
         assert lines[0] == "<b>CRUCIBLE V2 — 2026-09-02</b>"
@@ -826,7 +838,9 @@ class TestTheHeadline:
 
     def test_no_holding_lists_and_no_out_of_order_prose(self, tmp_path):
         inputs = self._inputs(tmp_path, previous=_board())
-        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
         assert "holding:" not in message
         assert "out of order:" not in message
         assert "b_unmet" not in message
@@ -843,7 +857,9 @@ class TestTheHeadline:
             ]
         )
         inputs = self._inputs(tmp_path, previous=previous)
-        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
         assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT in message
         assert f"moved since {PREVIOUS}: 1" in message
 
@@ -853,25 +869,33 @@ class TestTheHeadline:
             previous=_board(),
             board_run={"status": "failed", "code_sha": SHA, "reason": "AccessDenied"},
         )
-        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
         assert "pending operator action:" in message
         assert NO_OPERATOR_ACTION not in message
 
     def test_no_operator_action_line_when_none_is_pending(self, tmp_path):
         inputs = self._inputs(tmp_path, previous=_board())
-        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
         assert "pending operator action:" not in message
 
     def test_a_stale_board_is_the_headline_first_line(self, tmp_path):
         inputs = self._inputs(
             tmp_path, board=_board(generated_at=STALE_GENERATED), previous=_board()
         )
-        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
         assert message.splitlines()[0].startswith("<b>STALE BOARD:")
 
     def test_a_missing_board_page_omits_the_board_link_rather_than_failing(self, tmp_path):
         inputs = self._inputs(tmp_path, previous=_board(), page=False)
-        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
         assert "Board</a>" not in message
         assert f'<a href="{UPDATE_URL}">Full update</a>' in message
 
@@ -879,7 +903,9 @@ class TestTheHeadline:
         console = "https://console.example.test"
         store = _seed(tmp_path, previous=_board())
         inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT, console_url=console)
-        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
         assert f'<a href="{console}/decision?pipeline=crucible-board">Board</a>' in message
 
     def test_hostile_content_is_html_escaped(self, tmp_path):
@@ -892,7 +918,9 @@ class TestTheHeadline:
                 "reason": "PutObject denied for role <arn> & retried",
             },
         )
-        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
         assert "denied for role <arn>" not in message
         assert "denied for role &lt;arn&gt; &amp; retried" in message
 
@@ -939,7 +967,9 @@ class TestTheHeadline:
             },
         )
         inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT)
-        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
         wire = wire_length(TRANSPORT_PREFIX + message)
         assert wire <= UPDATE_MESSAGE_MAX_CHARS, (
             f"the six-red-phase worst case POSTs at {wire} chars, over the "
@@ -955,7 +985,7 @@ class TestTheHeadline:
         store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
         inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT)
         with pytest.raises(ValueError, match="over the"):
-            render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+            render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL)
 
 
 # ── delivery ──────────────────────────────────────────────────────────────
@@ -1131,6 +1161,7 @@ class TestTheJob:
             message_row["key"],
             update_row["key"],
             morning_trigger_key(DAY.isoformat(), manifest["calendar_date"], TRIGGER_UNKNOWN),
+            morning_history_row_key(DAY.isoformat(), manifest["calendar_date"]),
         }
 
     def test_the_manifest_records_the_comment_url_and_issue_number_as_a_metric(
@@ -1209,6 +1240,214 @@ class TestTheJob:
         assert morning_handler(_args(tmp_path, dry_run=True)) == 0
         keys = [k for k in store.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
         assert keys == []
+
+
+# ── the history index (deliverable 7) ───────────────────────────────────
+
+
+def _put_history_row(
+    store: LocalStore,
+    *,
+    trading_day: str,
+    calendar_date: str,
+    delivered_pt: str = "2026-09-03 06:00 PDT",
+    phases: list[dict[str, Any]] | None = None,
+    acceptance_met: int | None = 10,
+    acceptance_total: int | None = 20,
+    comment_url: str = UPDATE_URL,
+) -> None:
+    payload = {
+        "trading_day": trading_day,
+        "delivered_pt": delivered_pt,
+        "phases": phases
+        if phases is not None
+        else [{"id": "phase0", "state": "MET", "met": 2, "total": 2}],
+        "acceptance_met": acceptance_met,
+        "acceptance_total": acceptance_total,
+        "comment_url": comment_url,
+    }
+    store.put_bytes(
+        morning_history_row_key(trading_day, calendar_date), json.dumps(payload).encode()
+    )
+
+
+class TestTheHistoryIndex:
+    """`alpha-engine-config-I10123` deliverable 7: the rolling issue is the
+    history page — its BODY is a regenerated newest-first table."""
+
+    def test_three_fixture_days_render_newest_first_with_correct_links(self, tmp_path):
+        store = LocalStore(tmp_path)
+        _put_history_row(
+            store,
+            trading_day="2026-08-31",
+            calendar_date="2026-09-01",
+            acceptance_met=1,
+            acceptance_total=10,
+            comment_url="https://x/1",
+        )
+        _put_history_row(
+            store,
+            trading_day="2026-09-01",
+            calendar_date="2026-09-02",
+            acceptance_met=2,
+            acceptance_total=10,
+            comment_url="https://x/2",
+        )
+        _put_history_row(
+            store,
+            trading_day="2026-09-02",
+            calendar_date="2026-09-03",
+            acceptance_met=3,
+            acceptance_total=10,
+            comment_url="https://x/3",
+        )
+        body = render_history_body(store)
+        lines = [ln for ln in body.splitlines() if ln.startswith("| 2026-")]
+        assert [ln.split("|")[1].strip() for ln in lines] == [
+            "2026-09-02",
+            "2026-09-01",
+            "2026-08-31",
+        ]
+        assert "[comment](https://x/3)" in lines[0]
+        assert "[comment](https://x/2)" in lines[1]
+        assert "[comment](https://x/1)" in lines[2]
+        assert "3/10" in lines[0]
+
+    def test_a_repeated_trading_day_replaces_its_row_rather_than_duplicating(self, tmp_path):
+        store = LocalStore(tmp_path)
+        _put_history_row(
+            store,
+            trading_day="2026-09-02",
+            calendar_date="2026-09-03",
+            acceptance_met=1,
+            acceptance_total=10,
+            comment_url="https://x/first",
+        )
+        _put_history_row(
+            store,
+            trading_day="2026-09-02",
+            calendar_date="2026-09-04",
+            acceptance_met=9,
+            acceptance_total=10,
+            comment_url="https://x/rerun",
+        )
+        body = render_history_body(store)
+        rows = [ln for ln in body.splitlines() if ln.startswith("| 2026-09-02")]
+        assert len(rows) == 1
+        assert "9/10" in rows[0]
+        assert "https://x/rerun" in rows[0]
+        assert "https://x/first" not in body
+
+    def test_the_phase_columns_are_fixed_at_six_regardless_of_how_many_a_day_reported(
+        self, tmp_path
+    ):
+        store = LocalStore(tmp_path)
+        _put_history_row(
+            store,
+            trading_day="2026-09-02",
+            calendar_date="2026-09-03",
+            phases=[{"id": "phase0", "state": "MET", "met": 2, "total": 2}],
+        )
+        body = render_history_body(store)
+        header = next(ln for ln in body.splitlines() if ln.startswith("| trading day"))
+        assert header.count("phase") == 6
+        row = next(ln for ln in body.splitlines() if ln.startswith("| 2026-09-02"))
+        assert row.count("—") >= 5
+
+    def test_a_corrupt_row_is_named_rather_than_dropped_or_raised(self, tmp_path):
+        store = LocalStore(tmp_path)
+        _put_history_row(store, trading_day="2026-09-01", calendar_date="2026-09-02")
+        store.put_bytes(morning_history_row_key("2026-09-02", "2026-09-03"), b"{not json")
+        body = render_history_body(store)
+        assert "unreadable" in body
+        assert "2026-09-02" in body
+        assert "2026-09-01" in body
+
+    def test_no_rows_at_all_is_a_named_state_not_an_empty_table(self, tmp_path):
+        store = LocalStore(tmp_path)
+        body = render_history_body(store)
+        assert "no delivery has filed a history row yet" in body
+
+    def test_the_console_link_appears_at_the_top_when_configured(self, tmp_path):
+        store = LocalStore(tmp_path)
+        body = render_history_body(store, console_url="https://console.example.test")
+        assert body.splitlines()[2] == (
+            "Board: https://console.example.test/decision?pipeline=crucible-board"
+        )
+
+
+class TestTheThirdHeadlineLink:
+    def test_the_headline_carries_all_three_links(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT)
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
+        assert f'<a href="{UPDATE_URL}">Full update</a>' in message
+        assert f'<a href="{HISTORY_URL}">History</a>' in message
+        board_uri = (tmp_path / "board" / "index.html").resolve().as_uri()
+        assert f'<a href="{board_uri}">Board</a>' in message
+        wire = wire_length(TRANSPORT_PREFIX + message)
+        assert wire <= UPDATE_MESSAGE_MAX_CHARS
+
+
+class TestTheJobRebuildsTheHistoryIndex:
+    def test_the_index_is_rebuilt_after_the_comment_and_the_message(self, tmp_path, monkeypatch):
+        _seed(tmp_path, previous=_board())
+        calls = _stub_tracker(monkeypatch, existing_issue=7)
+        transport = _Transport()
+        monkeypatch.setattr("crucible.morning._krepis_publish", transport)
+
+        assert morning_handler(_args(tmp_path, dry_run=False)) == 0
+
+        assert len(calls["post"]) == 1
+        assert len(calls["update_body"]) == 1
+        (update_body_call,) = calls["update_body"]
+        assert update_body_call[0] == TRACKER_REPO
+        assert update_body_call[1] == 7
+        assert "daily update history" in update_body_call[2]
+        # The comment and the message were both sent before the index was
+        # rewritten -- ordering asserted via the transport, which only ever
+        # receives the already-linked headline.
+        assert len(transport.calls) == 1
+
+    def test_an_index_rewrite_failure_fails_the_run_after_delivery_already_happened(
+        self, tmp_path, monkeypatch
+    ):
+        store = _seed(tmp_path, previous=_board())
+        _stub_tracker(
+            monkeypatch, existing_issue=7, update_body_raises=TrackerError("rewrite failed")
+        )
+        transport = _Transport()
+        monkeypatch.setattr("crucible.morning._krepis_publish", transport)
+
+        with pytest.raises(TrackerError, match="rewrite failed"):
+            morning_handler(_args(tmp_path, dry_run=False))
+
+        # The comment and the Telegram message ALREADY went out -- an index
+        # rewrite failure must not roll either back, only fail the run loudly.
+        assert len(transport.calls) == 1
+        keys = [k for k in store.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
+        manifest = json.loads(store.get_bytes(keys[0]))
+        assert manifest["status"] == "failed"
+        assert "rewrite failed" in manifest["reason"]
+        # Everything delivered before the failure is still on the manifest.
+        assert _message_output(manifest)
+        assert _update_output(manifest)
+
+    def test_dry_run_never_reaches_update_issue_body(self, tmp_path, monkeypatch):
+        _seed(tmp_path, previous=_board())
+
+        def refuse(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("--dry-run must not reach this")
+
+        monkeypatch.setattr("crucible.morning._krepis_publish", refuse)
+        monkeypatch.setattr("crucible.morning.tracker.find_issue_by_title", refuse)
+        monkeypatch.setattr("crucible.morning.tracker.create_issue", refuse)
+        monkeypatch.setattr("crucible.morning.tracker.post_comment", refuse)
+        monkeypatch.setattr("crucible.morning.tracker.update_issue_body", refuse)
+
+        assert morning_handler(_args(tmp_path, dry_run=True)) == 0
 
 
 # ── declarations that must agree ────────────────────────────────────────
