@@ -108,6 +108,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
     "ARM_RECIPE_REQUIRED_FIELDS",
+    "ArenaCycleDocument",
     "ArmRecipeDocument",
     "ArtifactRef",
     "AttemptRow",
@@ -1043,3 +1044,61 @@ class ArmRecipeDocument(_Strict):
                 "every arm is scored on the same axis (policy §4)."
             )
         return data
+
+
+# ── I10045 row 3: the arena cycle artifact ─────────────────────────────────
+# Additive only, appended after row 2's marker for the same rebase reason.
+
+
+class ArenaCycleDocument(BaseModel):
+    """The `arena_cycle` artifact this package reads back, `champion-
+    challenger-policy.md` §11.
+
+    **Unlike every other model in this module, `extra` is NOT forbidden.**
+    The published contract for this document is
+    `nousergon_lib.contracts.arena_cycle.schema.json` — the LIBRARY's schema,
+    validated by `crucible.arena_io.validate_arena_cycle` on every read and
+    write, unchanged by this PR — not a schema this module owns or
+    generates. A field the library adds tomorrow is a valid `arena_cycle`
+    today's crucible does not yet know the name of; `extra="forbid"` here
+    would make THIS type reject documents the real contract accepts, which
+    is the CloudTrail-payload shape binding constraint 2 carves out (a shape
+    a third party writes), not the `components.yaml` shape (a shape that is
+    ours). `crucible.slots.arena_config_for` already returns the library's
+    own `ArenaConfig` for exactly this reason (repo AGENTS.md, "the arena is
+    called, never re-implemented") — this model does not re-implement the
+    library's `ArenaCycle` either; it exists only so
+    `crucible.arena_io.read_arena_cycle` hands its one caller named, typed
+    top-level access instead of a raw dict indexed by hand, while the
+    library schema stays what decides conformance. Nested substructures
+    (`ladders`, `ranking`, `decision`, `retirements`) are left as `dict`/
+    `list[dict]` rather than re-modelled field-by-field: the library schema
+    already fully validates their shape via `validate_arena_cycle`, and a
+    crucible-local re-typing of library-owned internals is precisely the
+    "second copy that drifts" this migration exists to avoid.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    schema_version: int = Field(description="the library contract's own version, currently 1")
+    slot: str = Field(min_length=1)
+    slot_kind: str = Field(min_length=1)
+    benchmark: str = Field(
+        min_length=1,
+        description="the population an arm is graded against, e.g. 'population'",
+    )
+    as_of: str = Field(
+        pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+        description="the trading day this cycle was scored as of",
+    )
+    scored_arms: list[str] = Field(default_factory=list)
+    active_arms: list[str] = Field(default_factory=list)
+    ladders: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="per-arm score ladders; shape owned and validated by the library schema",
+    )
+    ranking: dict[str, Any] | None = Field(
+        default=None, description="the Condorcet ranking, if the cycle produced one"
+    )
+    decision: dict[str, Any] = Field(description="the pointer decision for this cycle")
+    retirements: list[dict[str, Any]] = Field(default_factory=list)

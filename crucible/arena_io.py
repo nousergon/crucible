@@ -27,6 +27,7 @@ from nousergon_lib.arena import ArenaCycle
 
 from crucible.documents import load_store_document
 from crucible.keys import arena_cycle_key
+from crucible.models import ArenaCycleDocument
 from crucible.store import Store
 
 __all__ = [
@@ -94,13 +95,18 @@ def write_arena_cycle(store: Store, cycle: ArenaCycle) -> str:
     return key
 
 
-def read_arena_cycle(store: Store, slot: str, trading_day: str) -> dict[str, Any]:
+def read_arena_cycle(store: Store, slot: str, trading_day: str) -> ArenaCycleDocument:
     """Read and validate one cycle artifact.
 
     Validated on read as well as on write: an artifact written by an older
     release is still refused if it does not conform, rather than being
-    partially understood.
+    partially understood. `alpha-engine-config-I10045` row 3: the caller now
+    gets `ArenaCycleDocument` — named, typed top-level access — rather than
+    the raw dict a hand-indexed reader would need to know the shape of by
+    heart. The library's schema, not this model, still decides conformance;
+    see `ArenaCycleDocument`'s docstring for why `extra` is not forbidden
+    here the way it is on every other boundary in this migration.
     """
     payload = load_store_document(store, arena_cycle_key(slot, trading_day))
     validate_arena_cycle(payload)
-    return payload
+    return ArenaCycleDocument.model_validate(payload)
