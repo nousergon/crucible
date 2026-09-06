@@ -73,6 +73,7 @@
         "deploy",
         "weekly",
         "gate",
+        "gate.close",
         "report.morning"
       ]
     },

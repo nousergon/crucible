@@ -106,6 +106,13 @@ class TestJobSurface:
             "smoke",
             "weekly",
             "gate",
+            # alpha-engine-config-I10095: the FILING half of the phase-exit
+            # loop, on a cadence. `gate` stays on-demand -- a gate on a
+            # schedule would page between phases -- but the RECORD of a
+            # phase's exit cannot wait for somebody to run one, and the board
+            # that detects the gap is read-only over what it grades on
+            # purpose, so it cannot close it.
+            "gate.close",
             # alpha-engine-config-I9896: the 6am PT accountability delivery.
             # A reporting surface, so it READS the board and never renders
             # one -- the same separation `board` keeps from the artifacts it
@@ -415,6 +422,12 @@ class TestDryRunNeverWrites:
         "experiment.grade",
         "experiment.run",
         "gate",
+        # alpha-engine-config-I10095, verified 2026-09-06 the same way: on a
+        # fresh store every registered gate reads UNMET or UNMEASURABLE, so
+        # the handler reaches its real --dry-run path (no store write, and no
+        # tracker comment -- the `would_file` branch returns BEFORE
+        # `file_closing_record` is reached) and returns 0.
+        "gate.close",
         "heartbeat",
         "release.pin",
         "report",
