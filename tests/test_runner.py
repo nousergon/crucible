@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 
 import pytest
 
@@ -418,3 +419,75 @@ class TestDryRun:
             run_job("board", job, store=store, trading_day=TRADING_DAY, dry_run=True)
 
         assert list(store.list_keys()) == []
+
+
+class TestKrepisRunIdExport:
+    """`alpha-engine-config-I9986` deliverable 1: the fleet cost sink
+    (`krepis.cost_sink.S3JsonlCostSink`) keys every row under
+    `{prefix}/{date}/{run_id}/`, and `resolve_run_id()` reads `KREPIS_RUN_ID`
+    when set or else mints a random id that cannot be joined to any manifest.
+    `run_job` is the one place the harness's own `run_id` is known before a
+    job's body can reach a model, so it exports it there."""
+
+    def test_krepis_run_id_is_set_to_the_manifest_run_id_before_the_body_runs(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("KREPIS_RUN_ID", raising=False)
+        store = LocalStore(tmp_path)
+        seen: list[str | None] = []
+
+        def job(ctx: RunContext) -> None:
+            # Read INSIDE the job body — the export must land before `fn`
+            # runs, not merely by the time `run_job` returns, because a real
+            # job builds its `LLMClient` (and therefore its cost sink) lazily
+            # on its first call.
+            seen.append(os.environ.get("KREPIS_RUN_ID"))
+
+        run_job("smoke", job, store=store, trading_day=TRADING_DAY)
+
+        manifest_run_id = _read_manifest(store, "smoke")["run_id"]
+        assert seen == [manifest_run_id]
+
+    def test_a_retried_attempt_gets_its_own_run_id_exported(self, tmp_path, monkeypatch) -> None:
+        """A retry rebuilds `RunContext` with a fresh `run_id` (`runner.py`'s
+        own while-loop). The export must track that fresh id on the SECOND
+        attempt too, or a retried job's real cost rows would still be keyed
+        to the first attempt's abandoned run_id."""
+        monkeypatch.delenv("KREPIS_RUN_ID", raising=False)
+        store = LocalStore(tmp_path)
+        seen: list[str | None] = []
+        attempt = {"n": 0}
+
+        def job(ctx: RunContext) -> None:
+            seen.append(os.environ.get("KREPIS_RUN_ID"))
+            attempt["n"] += 1
+            if attempt["n"] == 1:
+                raise TimeoutError("read timeout")
+
+        run_job("smoke", job, store=store, trading_day=TRADING_DAY)
+
+        assert len(seen) == 2
+        assert seen[0] != seen[1], "each attempt exports its OWN fresh run_id"
+        manifest_run_id = _read_manifest(store, "smoke")["run_id"]
+        assert seen[1] == manifest_run_id, "the WRITTEN manifest's run_id is the last attempt's"
+
+    def test_an_operator_supplied_krepis_run_id_is_overwritten_by_the_harness(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """`run_job` is the harness's own bootstrap of `KREPIS_RUN_ID` — a
+        stray value left over from a prior process in the same environment
+        must not silently win over the run that is actually happening now."""
+        monkeypatch.setenv("KREPIS_RUN_ID", "stale-from-a-previous-process")
+        store = LocalStore(tmp_path)
+        seen: list[str | None] = []
+
+        run_job(
+            "smoke",
+            lambda ctx: seen.append(os.environ.get("KREPIS_RUN_ID")),
+            store=store,
+            trading_day=TRADING_DAY,
+        )
+
+        manifest_run_id = _read_manifest(store, "smoke")["run_id"]
+        assert seen == [manifest_run_id]
+        assert seen[0] != "stale-from-a-previous-process"
