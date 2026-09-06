@@ -14,16 +14,38 @@ run.json with `status: ok` or it is FAILED and pages. The manifest schema
 forbids the third state." Every assertion below tests that the schema
 refuses something, because a schema that only accepts valid documents has
 not been shown to constrain anything.
+
+**`alpha-engine-config-I10045` row 1**: `run_manifest.v2.json` is now
+GENERATED from `crucible.models.RunManifestV2`
+(`TestTheV2SchemaIsGeneratedFromTheModel` below), and the status<->reason
+cross-field rule moved onto the model as `RunManifestV2._status_and_reason_agree`
+— it is deliberately not in the schema's `allOf` any more (see
+`crucible/models.py`'s docstring), so the one test that rule used to make
+the raw `Draft202012Validator` reject now goes through
+`crucible.manifest.validate` instead, which is the boundary that still
+enforces it.
 """
 
 from __future__ import annotations
 
 import copy
+import json
+import pathlib
 
 import pytest
 from jsonschema import Draft202012Validator, ValidationError
 
-from crucible.manifest import RUN_MANIFEST_SCHEMA_VERSION, load_schema
+from crucible.manifest import (
+    RUN_MANIFEST_SCHEMA_VERSION,
+    ManifestValidationError,
+    load_schema,
+    validate,
+)
+from crucible.models import RunManifestV2
+
+SCHEMA_PATH = (
+    pathlib.Path(__file__).resolve().parents[1] / "crucible" / "schemas" / "run_manifest.v2.json"
+)
 
 # Every state the v1 system produced that v2 excludes BY SCHEMA, not by
 # policy: the audit's `cycle_verdict: "unknown"` (I9729) and the 32-of-33
@@ -163,17 +185,33 @@ def test_only_ok_and_failed_are_representable(
         validator.validate(doc)
 
 
-def test_failed_requires_a_non_empty_reason(validator: Draft202012Validator) -> None:
+def test_failed_requires_a_non_empty_reason() -> None:
     """`reason` is mandatory on failure. A failed run with an empty reason is
-    the shape that made three Saturdays' failures indistinguishable."""
+    the shape that made three Saturdays' failures indistinguishable.
+
+    This rule is `RunManifestV2._status_and_reason_agree`, not the raw
+    schema's `allOf` (dropped, `alpha-engine-config-I10045` row 1 — see
+    `crucible/models.py`'s docstring), so it is checked through
+    `crucible.manifest.validate`, the boundary that still enforces it.
+    """
     doc = _valid_manifest()
     doc["status"] = "failed"
     doc["reason"] = ""
-    with pytest.raises(ValidationError):
-        validator.validate(doc)
+    with pytest.raises(ManifestValidationError):
+        validate(doc)
 
     doc["reason"] = "SpotInterruption: instance reclaimed at 13:02Z"
-    validator.validate(doc)
+    validate(doc)
+
+
+def test_ok_requires_an_empty_reason() -> None:
+    """The other direction of the same rule: an `ok` run with something to
+    explain is a degraded-SUCCEEDED in disguise."""
+    doc = _valid_manifest()
+    doc["status"] = "ok"
+    doc["reason"] = "ran fine, mostly"
+    with pytest.raises(ManifestValidationError):
+        validate(doc)
 
 
 @pytest.mark.parametrize(
@@ -472,3 +510,111 @@ def _status_enum(schema: dict) -> list[str]:
     found = walk(schema)
     assert found is not None, "no metricRecord status enum in the schema"
     return found
+
+
+class TestTheV2SchemaIsGeneratedFromTheModel:
+    """`alpha-engine-config-I10045` row 1: one source of truth, not two that
+    must agree — the same rule `crucible-PR111` established for
+    `components_registry.v1.json`."""
+
+    def test_the_committed_schema_is_byte_identical_to_the_generated_one(self) -> None:
+        generated = json.dumps(RunManifestV2.model_json_schema(), indent=2, sort_keys=True) + "\n"
+        committed = SCHEMA_PATH.read_text(encoding="utf-8")
+        assert committed == generated, (
+            f"{SCHEMA_PATH.name} has drifted from `crucible.models.RunManifestV2`. The "
+            "schema is GENERATED, never hand-edited: regenerate it in the same commit "
+            "as the model change."
+        )
+
+    def test_the_valid_fixture_validates_against_the_committed_schema(self) -> None:
+        """A schema nobody has validated a real document against is a schema
+        nobody knows is right."""
+        Draft202012Validator(json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))).validate(
+            _valid_manifest()
+        )
+
+    def test_the_schema_version_literal_matches_the_module_constant(self) -> None:
+        """`RunManifestV2.schema_version` is a bare `Literal`, restated from
+        `crucible.manifest.RUN_MANIFEST_SCHEMA_VERSION` rather than imported
+        — `crucible.manifest` imports `crucible.models`, so the reverse
+        import would be circular. Pinned here so the two cannot drift
+        silently."""
+        doc = _valid_manifest()
+        assert doc["schema_version"] == RUN_MANIFEST_SCHEMA_VERSION
+        RunManifestV2.model_validate(doc)
+
+    def test_the_attempt_reason_vocabulary_matches_the_transient_retry_set(self) -> None:
+        """`crucible.models.ATTEMPT_REASON_VALUES` is restated, not imported
+        (see `crucible/models.py`'s docstring on the import cycle); this is
+        the drift guard."""
+        from crucible.manifest import TRANSIENT_RETRY_REASONS
+        from crucible.models import ATTEMPT_REASON_VALUES
+
+        assert ATTEMPT_REASON_VALUES == ("initial", *TRANSIENT_RETRY_REASONS)
+
+
+class TestAMalformedV2ManifestNamesTheFieldAtTheBoundary:
+    """`alpha-engine-config-I10045` deliverable 4: a named field error at the
+    boundary, not a `KeyError` several functions in."""
+
+    def test_a_missing_required_field_names_it(self) -> None:
+        doc = _valid_manifest()
+        del doc["run_id"]
+
+        with pytest.raises(ManifestValidationError) as excinfo:
+            validate(doc)
+
+        assert "run_id" in str(excinfo.value)
+
+    def test_a_wrongly_typed_field_names_the_field(self) -> None:
+        doc = _valid_manifest()
+        doc["rows_in"] = "nine hundred three"
+
+        with pytest.raises(ManifestValidationError) as excinfo:
+            validate(doc)
+
+        assert "rows_in" in str(excinfo.value)
+
+    def test_an_UNKNOWN_top_level_key_is_refused(self) -> None:
+        doc = _valid_manifest()
+        doc["skip_reason"] = "no new data"
+
+        with pytest.raises(ManifestValidationError) as excinfo:
+            validate(doc)
+
+        assert "skip_reason" in str(excinfo.value)
+
+    def test_a_metric_value_with_no_unit_is_refused(self) -> None:
+        """`MetricRecordRow._unit_required_when_value_present`: a numeric
+        value with no declared unit is the defect that emitted
+        `avg_volume_20d` as a ratio and consumed it as raw shares."""
+        doc = _valid_manifest()
+        del doc["metrics"][0]["unit"]
+
+        with pytest.raises(ManifestValidationError) as excinfo:
+            validate(doc)
+
+        assert "no unit" in str(excinfo.value)
+
+    def test_a_metric_type_outside_krepis_still_validates(self) -> None:
+        """`MetricRecordRow` is deliberately not `krepis.metrics.MetricRecord`
+        subclassed — a live producer's `metric_type` (`operational`,
+        `coverage`, ...) is outside `krepis.metrics.MetricTypeLiteral` and
+        must keep validating."""
+        doc = _valid_manifest()
+        doc["metrics"][0]["metric_type"] = "operational"
+        validate(doc)
+
+    def test_a_served_deployment_of_null_is_an_answer_not_an_absence(self) -> None:
+        doc = _valid_manifest()
+        doc["llm_calls"][0]["served_deployment"] = None
+        validate(doc)
+
+    def test_a_served_deployment_key_missing_entirely_is_refused(self) -> None:
+        doc = _valid_manifest()
+        del doc["llm_calls"][0]["served_deployment"]
+
+        with pytest.raises(ManifestValidationError) as excinfo:
+            validate(doc)
+
+        assert "served_deployment" in str(excinfo.value)
