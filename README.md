@@ -62,32 +62,96 @@ an absence, and absence is one of the two conditions that page.
 
 ## Runbook
 
-Five verbs. Each is one command; none needs a console.
+Five verbs. Each is one command; none needs a console. Any job that must run
+in-region (`heal`, a replay week) is dispatched to a box rather than run from
+a laptop:
+
+```
+aws lambda invoke --function-name crucible-v2-dispatcher --payload '{"job": "<job>", "args": "<cli args>"}' out.json
+```
 
 ### rerun
-> **Stub.** Re-execute a job for a trading day whose manifest is `failed` or
-> absent. Idempotent by construction: outputs are keyed by trading day and
-> content hash, so a rerun that produces identical bytes is a no-op.
+
+Re-execute one stage for one trading day. Any job takes `--run-mode` (`live`
+or `replay`; no default — an invocation naming neither is refused) and
+`--date`; a non-trading day is refused rather than silently resolved.
+Grading one slot's arena cycle for a past day:
+
+```
+crucible experiment.grade --slot r --date 2026-08-07 --run-mode replay
+```
+
+Idempotent by construction: outputs are keyed by trading day, so a rerun
+that produces identical bytes overwrites in place rather than duplicating.
+`experiment.grade` additionally refuses a cycle with nothing settled inside
+its 21-session horizon.
 
 ### replay
-> **Stub.** Re-execute a past trading day against a pinned release and a
-> pinned data snapshot, and diff the resulting manifest against the original.
-> Deterministic arms must reproduce exactly; LLM arms are gated on live
-> cycles only and are excluded from replay verdicts.
+
+Re-execute a past trading day (or a past week, via `crucible weekly`)
+against pinned code with `--run-mode replay`:
+
+```
+crucible weekly --date 2026-08-07 --run-mode replay
+```
+
+**Replayed weeks must run sequentially, oldest first, never in parallel or
+out of order.** The register, series and champion pointers are whole-object
+rewrites keyed by slot, not append-only logs — a later week's replay
+depends on the state a prior week's replay left behind, and running two out
+of order (or concurrently) races those rewrites. Measured 2026-09-05/06:
+five replay Saturdays run in series on the v2 box path.
 
 ### roll back
-> **Stub.** `crucible release.pin <prior-sha>` repoints `releases/current`.
-> No rebuild, no redeploy. Every release stays in S3.
+
+`crucible release.pin <prior-sha>` repoints `releases/current` (or, with
+`--target trader`, the trader's pointer) to a prior release. No rebuild, no
+redeploy — every release stays in S3.
+
+To revert a slot's champion pointer directly, by operator authority rather
+than by re-running the arena cycle:
+
+```
+crucible promote --slot r --revert-to <arm-id> --reason "<why>"
+```
+
+Recorded as `promotion_source=operator_bootstrap`, never as evidence;
+`--reason` is mandatory — an unexplained override is the one pointer
+movement nobody can reconstruct later.
 
 ### heal
-> **Stub.** `crucible data.heal` repairs a named gap — a missing trading day,
-> a rejected-row class, a stale snapshot — and writes what it repaired into
-> the manifest's `rows_in`/`rows_out`/`rows_rejected` fields.
+
+`crucible data.heal --gap <name> --from YYYY-MM-DD --to YYYY-MM-DD` repairs
+every NYSE session in `[--from, --to]`, idempotently: each session is
+recompiled and reports `repaired` or `already_present`, and a session
+already correct is rewritten with identical bytes. Both bounds must be
+trading days — a Sunday, for example, raises `NonTradingDayKeyError` rather
+than silently snapping to the nearest session.
+
+```
+crucible data.heal --from 2026-06-22 --to 2026-07-31 --gap <name> --i-am-in-region
+```
+
+**In region, or it refuses.** The job reads EC2 instance metadata; off EC2 it
+allows at most 3 sessions as a diagnostic and otherwise refuses, naming the
+in-region command to run instead. `--i-am-in-region` is the only override —
+no environment variable, no config key. Measured 2026-09-05/06: 54 sessions
+healed on a box via this path.
 
 ### unseal
-> **Stub.** Releasing a holdout period for evaluation. Reserved: a human
-> ruling, never an automated action, and the unseal event is recorded
-> permanently against the arms that then see the data.
+
+Reserved: a human ruling, never an automated action (plan §9.4), and the
+unseal event would be recorded permanently against the arms that then see
+the data. **No `unseal` command exists yet** — confirmed against
+`crucible/cli.py`:
+
+```
+$ grep -n unseal crucible/cli.py
+(no output)
+```
+
+Do not invent one; this section documents the reservation, not a CLI
+surface.
 
 ## Development
 
