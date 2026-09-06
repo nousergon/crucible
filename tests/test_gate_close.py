@@ -36,7 +36,7 @@ import crucible.tracker as tracker_module
 from crucible.cli import HANDLERS, JOBS
 from crucible.components import load_registry
 from crucible.documents import UnreadableDocumentError, read_store_document
-from crucible.gate import PHASES, Clause, GateResult
+from crucible.gate import PHASES, Clause, GateResult, Phase
 from crucible.keys import closing_record_key, gate_key, manifest_key
 from crucible.store import LocalStore
 from crucible.track_f import CLOSE_OUTCOMES, GATE_CLOSE_JOB, gate_close_handler
@@ -113,6 +113,11 @@ def _run(
     store = store if store is not None else LocalStore(tmp_path / "store")
     opener = opener if opener is not None else _Opener()
     monkeypatch.setattr(tracker_module, "_default_opener", opener)
+    # `reading_commit` prefers $GITHUB_SHA, which Actions sets on every run --
+    # so a test that only sets CRUCIBLE_COMMIT reads green on a laptop and
+    # fails in CI against the real checkout sha (measured, run 34057597154).
+    # The override is removed, not worked around.
+    monkeypatch.delenv("GITHUB_SHA", raising=False)
     monkeypatch.setenv("CRUCIBLE_COMMIT", COMMIT)
     if granted:
         monkeypatch.setenv(tracker_module.TRACKER_TOKEN_VAR, "a-token")
@@ -333,6 +338,24 @@ class TestAPresentButUnreadableRecordIsNeverOverwritten:
             _run(tmp_path, monkeypatch, _all("phase2"), store=store)
         assert store.get_bytes(closing_record_key("phase2")) == b"{ truncated"
         assert _manifest(store)["status"] == "failed"
+
+
+class TestAPhaseWithNoRegisteredGateIsStatedRatherThanSkipped:
+    def test_it_files_nothing_and_names_the_phase(self, tmp_path, monkeypatch) -> None:
+        """`Phase.gate` is `None`-able so a SIXTH phase added to the plan before
+        its clause list is written renders UNMEASURED rather than failing an
+        import. Every registered phase carries a gate today, and a structural
+        test in `tests/test_gate.py` keeps it that way — so this branch is
+        driven against a registry that has one, which is the only way to know
+        it does something other than raise `KeyError` on `readings[None]`."""
+        gateless = Phase("phase6", 6, "A phase with no gate yet", 9762, None)
+        monkeypatch.setattr("crucible.track_f.PHASES", (*PHASES, gateless))
+        result = _run(tmp_path, monkeypatch, _all())
+        metrics = {m["name"]: m for m in _manifest(result["store"])["metrics"]}
+        reason = metrics["closing_record_state_phase6"]["status_reason"]
+        assert "no_gate_registered" in reason
+        assert metrics["closing_record_state_phase6"]["value"] == 0.0
+        assert result["opener"].seen == []
 
 
 # ── The registry, the CLI table and the schema ────────────────────────────
