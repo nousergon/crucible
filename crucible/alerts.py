@@ -1297,6 +1297,7 @@ def heartbeat(
     run_id: str | None = None,
     dry_run: bool = False,
     sns: Any | None = None,
+    s3: Any | None = None,
 ) -> dict[str, Any]:
     """Emit proof that the alerting path itself ran, and return its summary.
 
@@ -1386,6 +1387,15 @@ def heartbeat(
                 "A statement about this identity's grant, not about who is subscribed.",
                 now=moment,
             )
+    # The two spend ledgers this week's runs wrote must agree
+    # (`alpha-engine-config-I9986` deliverable 2). Read-only against the
+    # sink, so it runs under `dry_run` too; a mismatch FAILS this run after
+    # the proof of life is sent (below), because "the ledgers diverged" is a
+    # failed run and not a footnote.
+    week_manifests, _unreadable = _week_manifests(store, trading_day)
+    cost_reconciliation = _week_cost_reconciliation(
+        week_manifests, now=moment, s3=s3, access_faults=access_faults
+    )
     summary = {
         "trading_day": trading_day.isoformat(),
         "runs_ok": runs_ok,
@@ -1396,6 +1406,7 @@ def heartbeat(
         "bus_keys": bus_keys,
         "metric": ceiling_metric(pages, now=moment),
         "subscribers": subscribers,
+        "cost_reconciliation": cost_reconciliation,
     }
     message = (
         f"[crucible-v2] alive {trading_day.isoformat()}: {runs_ok} run(s) ok, "
@@ -1416,11 +1427,14 @@ def heartbeat(
         # Telegram even when the human leg is gone), because the row on the
         # manifest is read by a console and this is read by a person.
         message += " " + str(subscribers["status_reason"])
+    ledgers_diverged = cost_reconciliation["status"] == "FAIL"
+    if ledgers_diverged:
+        message += " " + str(cost_reconciliation["status_reason"])
     if not dry_run:
         publish = transport if transport is not None else _krepis_publish
         publish(
             message,
-            severity="error" if (unwatched or nobody_listening) else "info",
+            severity="error" if (unwatched or nobody_listening or ledgers_diverged) else "info",
             source="crucible-v2/heartbeat",
             dedup_key=f"heartbeat:{trading_day.isoformat()}",
             dedup_window_min=None,
@@ -1431,6 +1445,14 @@ def heartbeat(
     # still owes the operator the proof that the alerting path is alive, and
     # then fails loudly naming what it could not read (I9960).
     _raise_on_access_faults(access_faults)
+    if ledgers_diverged:
+        # alpha-engine-config-I9986: "a discrepancy is a failed run, not a
+        # note". After the send, like an access fault: the operator still
+        # gets the proof of life, and then the manifest reads `failed` with
+        # the divergence as its reason and the failure condition pages.
+        from crucible.llm import CostSinkReconciliationError  # noqa: PLC0415 - lazy
+
+        raise CostSinkReconciliationError(str(cost_reconciliation["status_reason"]))
     # Always carried, not only under `dry_run`: the caller's own print (under
     # `--dry-run`, `heartbeat_handler`) needs the exact text that either was,
     # or would have been, sent — one string, not two call sites composing it
@@ -1446,13 +1468,28 @@ def _week_summary(store: Store, trading_day: dt.date) -> tuple[int, int, float]:
     same facts live, and the week's manifests are already the durable record
     the console renders from.
     """
+    documents, unreadable = _week_manifests(store, trading_day)
+    ok = sum(1 for m in documents if m.get("status") == "ok")
+    failed = unreadable + sum(1 for m in documents if m.get("status") != "ok")
+    spend = sum(float(m.get("cost_usd", 0.0)) for m in documents)
+    return ok, failed, spend
+
+
+def _week_manifests(store: Store, trading_day: dt.date) -> tuple[list[dict[str, Any]], int]:
+    """Every readable manifest of the trailing trading week, and the count of
+    keys under a manifest prefix that could not be read as one.
+
+    The one walk both :func:`_week_summary` and the cost reconciliation
+    (`alpha-engine-config-I9986`) share, so the runs the heartbeat counts and
+    the runs it reconciles are the same set by construction.
+    """
     days = {trading_day}
     day = trading_day
     for _ in range(TRADING_DAYS_PER_WEEK - 1):
         day = previous_trading_day(day)
         days.add(day)
-    ok = failed = 0
-    spend = 0.0
+    documents: list[dict[str, Any]] = []
+    unreadable = 0
     for key in store.list_keys(RUNS_ROOT):
         parsed = parse_manifest_key(key)
         if parsed is None:
@@ -1469,7 +1506,7 @@ def _week_summary(store: Store, trading_day: dt.date) -> tuple[int, int, float]:
             # keeps this summary from reading healthier than reality the
             # worse the store gets; a silent `continue` here would have done
             # exactly that.
-            failed += 1
+            unreadable += 1
             continue
         read = read_listed_document(store, key)
         if read.problem is not None or read.document is None:
@@ -1479,15 +1516,67 @@ def _week_summary(store: Store, trading_day: dt.date) -> tuple[int, int, float]:
             # Through the one guarded reader, so an array-bodied manifest is
             # counted here rather than raising `AttributeError` two lines
             # down (alpha-engine-config-I9931).
-            failed += 1
+            unreadable += 1
             continue
-        manifest = read.document
-        if manifest.get("status") == "ok":
-            ok += 1
-        else:
-            failed += 1
-        spend += float(manifest.get("cost_usd", 0.0))
-    return ok, failed, spend
+        documents.append(read.document)
+    return documents, unreadable
+
+
+def _week_cost_reconciliation(
+    manifests: list[dict[str, Any]],
+    *,
+    now: dt.datetime,
+    s3: Any,
+    access_faults: list[str],
+) -> dict[str, Any]:
+    """The week's manifest-vs-sink reconciliation row (`alpha-engine-config-I9986`).
+
+    The sink's location arrives from the environment under the names
+    `krepis.cost_sink` itself reads (`BUCKET_ENV_VAR`, `PREFIX_ENV_VAR`) —
+    never a literal here (this tree is public). Neither set: `unmeasurable`
+    naming both variables, which is the laptop and the pre-I9972 box.
+    Exactly one set: the half-configured state `krepis.cost_sink.
+    default_sink_from_env` refuses (I5206) — recorded as an access fault so
+    the run fails after the heartbeat is sent, and `unmeasurable` on the
+    row. Both set: the reconciliation runs; a denied or unreadable sink is an
+    access fault the same way.
+    """
+    from krepis.cost_sink import BUCKET_ENV_VAR, PREFIX_ENV_VAR  # noqa: PLC0415 - lazy
+
+    from crucible.llm import reconcile_manifests_cost, reconciliation_unmeasurable
+
+    bucket = os.environ.get(BUCKET_ENV_VAR, "").strip()
+    prefix = os.environ.get(PREFIX_ENV_VAR, "").strip()
+    if not bucket and not prefix:
+        return reconciliation_unmeasurable(
+            f"{BUCKET_ENV_VAR} and {PREFIX_ENV_VAR} are unset, so there is no fleet "
+            "cost sink to reconcile the manifest ledger against. Not a reading that the "
+            "ledgers agree.",
+            now=now,
+        )
+    if bool(bucket) != bool(prefix):
+        access_faults.append(
+            f"exactly one of {BUCKET_ENV_VAR} / {PREFIX_ENV_VAR} is set; "
+            "krepis.cost_sink refuses this half-configured state (I5206)"
+        )
+        return reconciliation_unmeasurable(
+            f"exactly one of {BUCKET_ENV_VAR} / {PREFIX_ENV_VAR} is set — the sink is "
+            "half-configured and cannot be read.",
+            now=now,
+        )
+    try:
+        return reconcile_manifests_cost(
+            manifests, bucket=bucket, prefix=prefix, s3_client=s3, now=now
+        )
+    except Exception as exc:  # noqa: BLE001 - re-raised via access_faults below
+        access_faults.append(
+            f"cost-sink read under s3://{bucket}/{prefix}: {type(exc).__name__}: {exc}"
+        )
+        return reconciliation_unmeasurable(
+            f"reading s3://{bucket}/{prefix} raised {type(exc).__name__}: {exc}. A statement "
+            "about this identity's grant or the sink's contents, not about the ledgers agreeing.",
+            now=now,
+        )
 
 
 def _raise_on_access_faults(faults: Sequence[str]) -> None:

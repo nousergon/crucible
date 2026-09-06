@@ -462,6 +462,24 @@ def run_job(
         ctx.attempts = [dict(a) for a in attempts]
         ctx.discriminator = discriminator(ctx) if callable(discriminator) else discriminator
 
+        # `alpha-engine-config-I9986` deliverable 1: the fleet cost-sink
+        # partitions every row under `{prefix}/{date}/{run_id}/`
+        # (`krepis.cost_sink.S3JsonlCostSink`), and `resolve_run_id()` reads
+        # `KREPIS_RUN_ID` when set, otherwise minting a random per-process id
+        # that cannot be joined back to this manifest. This is the one place
+        # the harness's own run id is known before a job's body can reach a
+        # model, so it is exported HERE, immediately, and before `fn(ctx)`
+        # runs — never after. `krepis.cost_sink.default_sink_from_env` caches
+        # its sink on `(bucket, prefix, KREPIS_RUN_ID)`, keyed at the sink's
+        # first construction inside the job (an `LLMClient` is built lazily,
+        # on the first call): an export issued after that construction would
+        # already be too late for the sink that call built, so setting it
+        # after `fn(ctx)` starts would be a no-op that looks like a fix. Set
+        # fresh on every attempt, since a retried job gets a fresh `run_id`
+        # too (`ctx` above is rebuilt each iteration) and the two attempts'
+        # cost rows must not be joined to the same key.
+        os.environ["KREPIS_RUN_ID"] = ctx.run_id
+
         status = "ok"
         reason = ""
         transient: str | None = None

@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import ast
 import datetime as dt
+import json
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -66,6 +67,7 @@ __all__ = [
     "EXEC_CONTEXT_ENV",
     "CallSite",
     "CapabilityClassNotRouted",
+    "CostSinkReconciliationError",
     "DEFAULT_LLM_CAP_USD",
     "DEFAULT_LLM_CAP_USD_MEASURED",
     "Finding",
@@ -75,12 +77,17 @@ __all__ = [
     "LlmSpendOverrun",
     "PACING_PERIOD",
     "PROVIDER_MODULES",
+    "RECONCILIATION_METRIC",
+    "RECONCILIATION_TOLERANCE_USD",
     "SpendCap",
     "audit_call_sites",
     "call",
     "capability_group",
     "load_capability_classes",
     "load_registry",
+    "reconcile_manifests_cost",
+    "reconcile_run_cost",
+    "reconciliation_unmeasurable",
     "spend_pace",
     "week_to_date_llm_spend",
 ]
@@ -668,8 +675,344 @@ def cap_metric(cap: SpendCap, *, now: dt.datetime, source_path: str) -> dict[str
 
 
 # --------------------------------------------------------------------------
+# The manifest-vs-sink reconciliation (`alpha-engine-config-I9986`).
+# --------------------------------------------------------------------------
+
+#: A rounding allowance, not a materiality threshold. `krepis.cost.record_llm_call`
+#: and this package's own `cost_usd` both round to six decimal places, but at
+#: different times relative to token-to-price conversion, so two honestly
+#: identical totals can differ in the trailing digits. A cent is generous
+#: enough to absorb that and tight enough that a run actually missing a
+#: cost-sink row (or double-counting one) still fails.
+RECONCILIATION_TOLERANCE_USD = 0.01
+
+
+class CostSinkReconciliationError(RuntimeError):
+    """A cost-sink object under the run's own key exists and could not be read.
+
+    Raised rather than silently excluded from the sum: a row this function
+    cannot parse or price is a row that would otherwise vanish from
+    `sink_usd`, which makes an unreadable object look identical to a quiet
+    run — the same shape `crucible.cost.CostUnreadableError` refuses for
+    Cost Explorer, and the same reasoning `crucible-research/scripts/
+    aggregate_costs.py::_read_jsonl_rows` already applies to this exact key
+    layout in the sibling repo (`policy-shared-code`: mirrored, not
+    reinvented).
+    """
+
+
+def _cost_sink_client() -> Any:
+    """A boto3 S3 client, constructed lazily.
+
+    Mirrors `crucible.cost.default_client`: importing this module — or
+    calling `reconcile_run_cost` in a test that injects its own `s3_client`
+    — must not require `boto3` to be installed or a credential chain to
+    resolve.
+    """
+    import boto3  # noqa: PLC0415 - lazy on purpose; see the docstring
+
+    return boto3.client("s3")
+
+
+def _cost_sink_jsonl_keys(
+    s3_client: Any, *, bucket: str, prefix: str, date: dt.date, run_id: str
+) -> list[str]:
+    """Every `.jsonl` key under `{prefix}/{date}/{run_id}/`.
+
+    `S3JsonlCostSink`'s own key layout (`krepis.cost_sink.S3JsonlCostSink`
+    docstring): `{prefix}/{date}/{run_id}/{callsite_id}.{seq}.jsonl`. Paginated,
+    the same shape `crucible-research/scripts/aggregate_costs.py::_list_jsonl_keys`
+    uses for the identical sink.
+    """
+    key_prefix = f"{prefix.rstrip('/')}/{date.isoformat()}/{run_id}/"
+    keys: list[str] = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=key_prefix):
+        for obj in page.get("Contents") or []:
+            key = obj.get("Key", "")
+            if key.endswith(".jsonl"):
+                keys.append(key)
+    return keys
+
+
+def _cost_sink_row_usd(s3_client: Any, *, bucket: str, key: str) -> float:
+    """The summed `cost_usd` of every row in one cost-sink JSONL object.
+
+    A row with no numeric `cost_usd` RAISES — `krepis.cost.record_llm_call`
+    writes `cost_usd: None` for `cost_source == "usage_unreported"` (a
+    provider that did not report usage), and summing `None` as zero would
+    understate `sink_usd` by exactly the amount a mismatch is supposed to
+    catch.
+    """
+    body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
+    total = 0.0
+    for lineno, line in enumerate(body.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise CostSinkReconciliationError(
+                f"s3://{bucket}/{key} line {lineno} is not valid JSON: {exc}"
+            ) from exc
+        usd = row.get("cost_usd")
+        if not isinstance(usd, (int, float)) or isinstance(usd, bool):
+            raise CostSinkReconciliationError(
+                f"s3://{bucket}/{key} line {lineno} carries no numeric `cost_usd` "
+                f"(got {usd!r}). A row that cannot be priced is not a row that cost "
+                "nothing, and summing it as zero would hide exactly the gap this "
+                "reconciliation exists to catch."
+            )
+        total += float(usd)
+    return total
+
+
+def reconcile_run_cost(
+    manifest: dict[str, Any],
+    *,
+    bucket: str,
+    prefix: str,
+    s3_client: Any = None,
+    dates: list[dt.date] | None = None,
+    now: dt.datetime | None = None,
+) -> dict[str, Any]:
+    """The manifest-vs-sink reconciliation MetricRecord for one run.
+
+    `alpha-engine-config-I9986` deliverable 2 (`I9972` deliverable 3): the
+    two spend ledgers this run wrote — `manifest["llm_calls"][].usd` (this
+    package's own cap ledger, `crucible.llm.week_to_date_llm_spend`'s source
+    of truth, which keeps reading the manifest and never this function) and
+    the fleet cost-sink rows `krepis.cost_sink.S3JsonlCostSink` wrote under
+    `{prefix}/{date}/{manifest['run_id']}/` — must sum to the same figure
+    within :data:`RECONCILIATION_TOLERANCE_USD`, or the two ledgers have
+    silently diverged, which is the shape of `alpha-engine-config-I7407` and
+    `I9694`.
+
+    **A mismatch is a metric with `status: FAIL` and a stated reason on the
+    manifest — never a log line.** This function does not raise on a
+    mismatch and does not write anything itself; it returns a MetricRecord
+    (the §9.2 class 5 shape `cap_metric` also returns) for the caller to
+    hand to `ctx.record_metric(...)`, which is what makes the discrepancy
+    part of the durable, greppable record `crucible explain` reads rather
+    than something only a log aggregator saw. It DOES raise
+    :class:`CostSinkReconciliationError` when a cost-sink object exists and
+    cannot be read — an unreadable row is a defect in the pipeline, not a
+    discrepancy this run's ledgers can disagree about.
+
+    ``dates`` defaults to the run's own `calendar_date` plus the following
+    day: `S3JsonlCostSink` partitions each row by the record's own UTC `ts`
+    (set when the call completes), not by the run's start time, so a job
+    that straddles UTC midnight can file rows one calendar day after the run
+    started. The manifest carries no field for "every date this run's calls
+    landed on" — only `calendar_date`, the run's own start — so the search
+    window is bounded rather than exact; pass ``dates`` explicitly for a job
+    known to run longer than a day.
+
+    ``s3_client`` is the injection point tests use to avoid a real AWS
+    credential; production callers omit it and get a lazily-constructed
+    `boto3.client("s3")` (:func:`_cost_sink_client`), the same pattern
+    `crucible.cost.default_client` uses for Cost Explorer.
+    """
+    run_id = manifest["run_id"]
+    manifest_usd = round(sum(float(c.get("usd", 0.0)) for c in manifest.get("llm_calls", [])), 6)
+    calendar_date = dt.date.fromisoformat(manifest["calendar_date"])
+    search_dates = (
+        dates if dates is not None else [calendar_date, calendar_date + dt.timedelta(days=1)]
+    )
+    client = s3_client if s3_client is not None else _cost_sink_client()
+
+    keys: list[str] = []
+    for date in search_dates:
+        keys.extend(
+            _cost_sink_jsonl_keys(client, bucket=bucket, prefix=prefix, date=date, run_id=run_id)
+        )
+    sink_usd = round(sum(_cost_sink_row_usd(client, bucket=bucket, key=key) for key in keys), 6)
+
+    discrepancy = round(manifest_usd - sink_usd, 6)
+    ok = abs(discrepancy) <= RECONCILIATION_TOLERANCE_USD
+    finished = now or dt.datetime.now(dt.UTC)
+    prefix_display = f"s3://{bucket}/{prefix.rstrip('/')}"
+    if ok:
+        reason = (
+            f"manifest llm_calls[].usd=${manifest_usd:.6f} agrees with "
+            f"{prefix_display}/.../{run_id}/ (${sink_usd:.6f} across {len(keys)} "
+            f"object(s)) within the ${RECONCILIATION_TOLERANCE_USD:.2f} rounding tolerance"
+        )
+    else:
+        reason = (
+            f"MANIFEST-VS-SINK MISMATCH for run {run_id!r}: manifest "
+            f"llm_calls[].usd=${manifest_usd:.6f} vs {prefix_display}/.../{run_id}/ "
+            f"=${sink_usd:.6f} across {len(keys)} object(s) — a ${discrepancy:.6f} "
+            f"discrepancy, past the ${RECONCILIATION_TOLERANCE_USD:.2f} rounding "
+            "tolerance. The two spend ledgers have diverged."
+        )
+    return {
+        "name": "llm_cost_reconciliation_usd",
+        "module": "crucible.llm",
+        "metric_type": "count",
+        "value": manifest_usd,
+        "unit": "usd",
+        "n_floor": 0,
+        "status": "OK" if ok else "FAIL",
+        "status_reason": reason,
+        "source_path": f"{prefix_display}/",
+        "last_updated_utc": finished.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "baseline": manifest_usd,
+        "run_id": run_id,
+        "sink_usd": sink_usd,
+        "sink_objects_read": len(keys),
+        "discrepancy_usd": discrepancy,
+    }
+
+
+#: The aggregate row the weekly heartbeat files (`alpha-engine-config-I9986`
+#: deliverable 2: "for a weekly run ... a discrepancy is a failed run").
+RECONCILIATION_METRIC = "llm_cost_reconciliation_usd"
+
+
+def reconciliation_unmeasurable(reason: str, *, now: dt.datetime) -> dict[str, Any]:
+    """The aggregate row when the sink could not be consulted at all.
+
+    `unmeasurable`, never `OK` and never `$0.00`: no reading of the sink is
+    not a reading that the two ledgers agree.
+    """
+    return {
+        "name": RECONCILIATION_METRIC,
+        "module": "crucible.llm",
+        "metric_type": "count",
+        "value": 0.0,
+        "unit": "usd",
+        "n_floor": 0,
+        "status": "unmeasurable",
+        "status_reason": reason,
+        "source_path": "runs/{job}/{trading_day}/run.json:llm_calls",
+        "last_updated_utc": now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def reconcile_manifests_cost(
+    manifests: list[dict[str, Any]],
+    *,
+    bucket: str,
+    prefix: str,
+    s3_client: Any = None,
+    now: dt.datetime | None = None,
+) -> dict[str, Any]:
+    """One aggregate MetricRecord over a set of run manifests — the week's.
+
+    Every manifest that carries a `run_id` and a `calendar_date` is
+    reconciled through :func:`reconcile_run_cost`, INCLUDING manifests whose
+    `llm_calls` is empty: a run that recorded no call but whose key holds
+    cost-sink rows is the other half of the divergence, and reconciling
+    only the runs that admit to spending would never see it. `FAIL` if any
+    run mismatched, naming the first few; `OK` otherwise, with the count of
+    runs and the total either ledger reports. A manifest missing either
+    field is a malformed manifest and is reported in the reason, never
+    silently skipped — an unreadable run is not a run that spent nothing.
+
+    Raises :class:`CostSinkReconciliationError` from the per-run read when
+    a sink object exists and cannot be read, and lets a denied or failed S3
+    call propagate: both are facts about the pipeline or the grant, and the
+    caller (`crucible.alerts.heartbeat`) records them as access faults and
+    fails the run after its proof of life is sent.
+    """
+    finished = now or dt.datetime.now(dt.UTC)
+    client = s3_client if s3_client is not None else _cost_sink_client()
+    mismatched: list[str] = []
+    malformed: list[str] = []
+    checked = 0
+    manifest_total = 0.0
+    sink_total = 0.0
+    for manifest in manifests:
+        run_id = manifest.get("run_id")
+        calendar_date = manifest.get("calendar_date")
+        if not isinstance(run_id, str) or not isinstance(calendar_date, str):
+            malformed.append(f"{manifest.get('job', '?')}@{manifest.get('trading_day', '?')}")
+            continue
+        row = reconcile_run_cost(
+            manifest, bucket=bucket, prefix=prefix, s3_client=client, now=finished
+        )
+        checked += 1
+        manifest_total += float(row["value"])
+        sink_total += float(row["sink_usd"])
+        if row["status"] != "OK":
+            mismatched.append(f"{run_id}: {row['status_reason']}")
+    prefix_display = f"s3://{bucket}/{prefix.rstrip('/')}"
+    if mismatched:
+        reason = (
+            f"{len(mismatched)} of {checked} run(s) this week disagree between their "
+            f"manifest llm_calls ledger and {prefix_display}: " + " | ".join(mismatched[:3])
+        )
+    else:
+        reason = (
+            f"{checked} run(s) this week reconcile: manifests ${manifest_total:.6f}, "
+            f"{prefix_display} ${sink_total:.6f}, within "
+            f"${RECONCILIATION_TOLERANCE_USD:.2f} per run."
+        )
+    if malformed:
+        reason += (
+            f" {len(malformed)} manifest(s) carried no run_id/calendar_date and could not "
+            f"be reconciled: {', '.join(malformed[:3])}."
+        )
+    return {
+        "name": RECONCILIATION_METRIC,
+        "module": "crucible.llm",
+        "metric_type": "count",
+        "value": round(manifest_total, 6),
+        "unit": "usd",
+        "n_floor": 0,
+        "status": "FAIL" if mismatched or malformed else "OK",
+        "status_reason": reason,
+        "source_path": f"{prefix_display}/",
+        "last_updated_utc": finished.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "baseline": round(sink_total, 6),
+        "runs_reconciled": checked,
+        "runs_mismatched": len(mismatched),
+    }
+
+
+# --------------------------------------------------------------------------
 # The one call.
 # --------------------------------------------------------------------------
+
+
+def _system_and_user_content(messages: list[dict[str, str]]) -> tuple[str, str]:
+    """Translate an OpenAI-style ``messages`` list into the pair the
+    installed `krepis.llm.LLMClient.complete` actually accepts.
+
+    **Found while building `alpha-engine-config-I9986`.** `LLMClient.complete`
+    (krepis 0.59.50, the pinned version) takes ``system: str`` and
+    ``user_content: str`` — it has no ``messages=`` parameter at all. Every
+    existing test in this package stubs `krepis.llm.LLMClient` out entirely
+    (`tests/test_llm_cap.py`, `tests/test_llm_router_route.py`), so a call
+    against the REAL class — which phase 5's first arm will make, and which
+    `alpha-engine-config-I9972` deliverable 4 (this issue's deliverable 3)
+    needs in order to exercise the real DLP/cost-sink preconditions — raised
+    `TypeError: complete() got an unexpected keyword argument 'messages'`
+    before reaching any of them. Fixed here rather than filed, since the
+    reconciliation and precondition tests below are meaningless against a
+    stub that accepts any keyword.
+
+    A single system message (or none) plus exactly one user message is the
+    only shape translated — refused rather than guessed for anything else,
+    since a call site is either OpenAI-chat-shaped by construction (today,
+    every registered site is) or it is a caller that needs a real multi-turn
+    `LLMClient` method this package does not yet expose, and silently
+    flattening a multi-turn conversation into one `user_content` string would
+    be a plausible wrong prompt reaching the provider.
+    """
+    system_parts = [m["content"] for m in messages if m.get("role") == "system"]
+    rest = [m for m in messages if m.get("role") != "system"]
+    if len(rest) != 1 or rest[0].get("role") != "user":
+        raise ValueError(
+            f"crucible.llm.call only translates a single optional system message plus "
+            f"exactly one user message into krepis.llm.LLMClient.complete's "
+            f"(system, user_content) pair; got {len(messages)} message(s) with roles "
+            f"{[m.get('role') for m in messages]!r}. A multi-turn conversation needs a "
+            "translation this adapter does not yet implement, not a silently flattened one."
+        )
+    return "\n\n".join(system_parts), rest[0]["content"]
 
 
 def call(
@@ -770,7 +1113,8 @@ def call(
         wire="openai",
     )
     client = LLMClient(spec, callsite_id=callsite_id, client_factory=client_factory)
-    result = client.complete(messages=messages, **kwargs)
+    system, user_content = _system_and_user_content(messages)
+    result = client.complete(system=system, user_content=user_content, **kwargs)
     usage = result.usage
     usd = float(usage.provider_cost_usd or 0.0)
     # The manifest is written BEFORE the cap re-check, so an overrun that

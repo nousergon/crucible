@@ -485,6 +485,10 @@ def heartbeat_handler(args: argparse.Namespace) -> int:
         # no confirmed human leg or no Lambda leg; `unmeasurable` when the
         # list could not be read (and the run then fails on that fault).
         ctx.record_metric(summary["subscribers"])
+        # alpha-engine-config-I9986: the week's manifest-vs-cost-sink
+        # reconciliation. `heartbeat` has already raised on a FAIL, so a row
+        # recorded here is OK or `unmeasurable`.
+        ctx.record_metric(summary["cost_reconciliation"])
         ctx.record_metric(
             {
                 "name": "pages_last_28_trading_days",
