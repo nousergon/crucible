@@ -33,7 +33,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from jsonschema import Draft202012Validator
 
@@ -67,6 +67,13 @@ from crucible.slots import SLOTS, dispatchable_slots, is_control_arm
 from crucible.store import Store
 from crucible.tags import TAG_KEY, TAG_VALUE
 from crucible.weekly import arc_stages
+
+if TYPE_CHECKING:
+    # Annotation only: the arena package is imported lazily at the one call
+    # site that folds a register (`_register_arms`), so `crucible gate
+    # --help` and every unit test that imports this module stay off the
+    # heavy import path.
+    from nousergon_lib.arena import ArmRegister
 
 __all__ = [
     "ACCEPTANCE_RATCHET_PATH",
@@ -466,7 +473,7 @@ def arm_name(arm_id: str) -> str:
 
 def _register_arms(
     store: Store, slot: str
-) -> tuple[set[str], str, str | None, bool, "ArmRegister | None"]:
+) -> tuple[set[str], str, str | None, bool, ArmRegister | None]:
     """The slot's ACTIVE registered arm ids, the key, the reason if the
     register could not be read (``problem``, ``access_problem``), and the
     :class:`~nousergon_lib.arena.ArmRegister` the ids were folded from.

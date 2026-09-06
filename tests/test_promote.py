@@ -812,9 +812,7 @@ class TestIsControlArmIsRegisterBackedAtPromoteCallSites:
         from crucible.promote import _with_control_vetoes
 
         dates = trading_days(40)
-        spec, reg, ids, collider_name, series_by_arm = self._slot_with_a_filed_name_collision(
-            dates
-        )
+        spec, reg, ids, collider_name, series_by_arm = self._slot_with_a_filed_name_collision(dates)
         collider_id = ids[collider_name]
 
         assert is_control_arm(spec, collider_id), (
@@ -839,9 +837,7 @@ class TestIsControlArmIsRegisterBackedAtPromoteCallSites:
 
         store = LocalStore(tmp_path)
         dates = trading_days(40)
-        spec, reg, ids, collider_name, series_by_arm = self._slot_with_a_filed_name_collision(
-            dates
-        )
+        spec, reg, ids, collider_name, series_by_arm = self._slot_with_a_filed_name_collision(dates)
         collider_id = ids[collider_name]
         seed_register(store, "m", reg)
 
