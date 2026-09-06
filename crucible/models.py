@@ -112,6 +112,9 @@ __all__ = [
     "ArmRecipeDocument",
     "ArtifactRef",
     "AttemptRow",
+    "ChampionAttestation",
+    "ChampionEvidence",
+    "ChampionPointerDocument",
     "ComponentRow",
     "ComponentsDocument",
     "DeadlineRow",
@@ -1323,4 +1326,144 @@ class ReleaseProvenanceDocument(_Strict):
     test_summary: str = Field(
         description="The foundation-test line this attempt printed. Free text; not "
         "parsed by anything downstream."
+    )
+
+
+# ── I10045 row 6: the champion pointer ──────────────────────────────────────
+# Additive only, appended after the prior rows' markers for the same
+# rebase reason.
+
+
+class ChampionEvidence(BaseModel):
+    """`evidence` on the champion pointer — why this arm, plan §3/§9.1.
+
+    Deliberately NOT `_Strict`: the published schema's `evidence` object
+    carries no `additionalProperties: false`, because "a decision's evidence
+    is slot-specific" (schema description) — an operator-revert evidence
+    blob and an evidence-promotion blob share none of these named fields.
+    `extra="allow"` matches that open shape exactly; forbidding extras here
+    would refuse every operator-revert pointer ever written.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    incumbent: str | None = None
+    status: str | None = None
+    reason: str | None = None
+    moved: bool | None = None
+    paired_dates: Annotated[int, Field(ge=0)] | None = None
+    window_start: str | None = None
+    window_end: str | None = None
+    mean_diff: float | None = None
+    confidence_sequence: dict[str, Any] | None = None
+    promote_min_weeks: Annotated[int, Field(ge=1)] | None = None
+    paired_dates_required: Annotated[int, Field(ge=1)] | None = None
+    operator: str | None = None
+    eligible_arms: list[str] | None = None
+
+
+class ChampionAttestation(_Strict):
+    """The contamination attestation, plan §9.1. Mandatory in EFFECT for the
+    S slot (the reader refuses an S champion whose status is not PASS) and
+    null elsewhere — not `required` at the top level because a null
+    attestation on U/R/M is correct, and the refusal belongs to the reader,
+    which can see which slot it is reading.
+    """
+
+    kind: Literal["pit_parity"]
+    status: Literal["PASS", "FAIL", "PARTIAL", "UNKNOWN"]
+    key: str | None = None
+    reason: str | None = None
+
+
+class ChampionPointerDocument(_Strict):
+    """`champions/{slot}/current.json` — the one contract the trader reads,
+    plan §3/§4.4/§9.1; `champion-challenger-policy.md` §11.
+
+    `crucible.champion.ChampionPointer` (a frozen dataclass; unchanged by
+    this PR — its `to_dict()` is domain behaviour this module does not
+    carry, the same reason `crucible.release.ReleaseRecord` stayed a
+    dataclass beside row 5's `ReleaseRecordDocument`) validates a payload
+    against this model in `from_dict`, replacing that method's previous
+    hand-rolled `jsonschema.Draft202012Validator` call, while keeping the
+    same `ChampionUnusableError` type and message text.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://github.com/nousergon/crucible/schemas/champion_pointer.v1.json",
+            "title": "Crucible champion pointer, v1",
+            "description": (
+                "The single artifact coupling the harness to the trader (plan §3). "
+                "Written at champions/{slot}/current.json by `crucible promote`, read "
+                "by the trader before it sizes anything. Versioned because a second "
+                "implementation of the trader must be able to consume it from this "
+                "document alone; additionalProperties: false because a field this "
+                "reader does not understand is a field the producer expected it to "
+                "act on."
+            ),
+        },
+    )
+
+    schema_version: Literal["champion_pointer.v1"] = Field(
+        description="Version of THIS schema. A consumer that cannot read the version "
+        "refuses the document rather than guessing."
+    )
+    slot: Literal["u", "r", "m", "s"] = Field(
+        description="Which decision this pointer governs. Closed set: the four slots "
+        "of champion-challenger-policy.md §2."
+    )
+    arm_id: str = Field(
+        min_length=1,
+        description="The serving arm. Its id encodes its own spec hash (policy §3.1), "
+        "so an edited recipe cannot reuse it and the trader can always tell which "
+        "recipe it is running.",
+    )
+    as_of: str = Field(
+        pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+        description="The NYSE trading day whose cycle produced this decision (§4.12). "
+        "Never a wall-clock date.",
+    )
+    decided_at: str = Field(
+        pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+        description="UTC instant the pointer was written, for provenance only.",
+    )
+    run_id: str = Field(
+        pattern=r"^[0-9A-HJKMNP-TV-Z]{26}$",
+        description="The run that wrote this pointer. Correlates the decision with "
+        "its manifest, its logs and its cost row (§9.2).",
+    )
+    code_sha: GitSha = Field(
+        description="The commit that decided. An all-zero sha is a DECLARED unknown "
+        "(running from a wheel with no repository), never an omitted field."
+    )
+    promotion_source: Literal["evidence", "operator_bootstrap", "bootstrap"] = Field(
+        description="How this pointer came to be. `evidence` = the anytime-valid "
+        "sequence supported the lead; `operator_bootstrap` = a human placed it; "
+        "`bootstrap` = the engine's §9.1 cold start. Carried so that a pointer which "
+        "has never moved on evidence renders as the finding it is (policy §11) "
+        "rather than as a stable system."
+    )
+    manifest_key: str = Field(
+        min_length=1,
+        description="The run manifest of the job that wrote this pointer. The reader "
+        "re-derives that run's status from it and refuses a champion produced by a "
+        "run that did not finish `ok`.",
+    )
+    evidence: ChampionEvidence = Field(
+        description="Why this arm. For an evidence promotion: the incumbent it "
+        "passed, the paired window it passed on, and the confidence-sequence bound. "
+        "For an operator revert: who reverted and why. Free-form beyond the named "
+        "fields because a decision's evidence is slot-specific, but never empty -- "
+        "an unexplained pointer cannot be reviewed (principles.md §2.1)."
+    )
+    attestation: ChampionAttestation | None = Field(
+        default=None,
+        description="The contamination attestation (plan §9.1). Mandatory in EFFECT "
+        "for the S slot -- the reader refuses an S champion whose status is not PASS "
+        "-- and null elsewhere. Not `required` in the schema because a null "
+        "attestation on U/R/M is correct; the refusal is on the reader, where it can "
+        "see which slot it is reading.",
     )
