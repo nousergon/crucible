@@ -114,6 +114,21 @@ PR_REACHABLE_JOBS: dict[str, str] = {
         "allowlist keyed on a job NAME otherwise lets that job be repurposed "
         "into something else entirely."
     ),
+    # alpha-engine-config-I10119.
+    "dispatch-lockstep.yml:crucible-dispatch-lockstep-pr": (
+        "runs on `pull_request_target`, which "
+        "executes THIS workflow's definition from main, never the PR's. It "
+        "checks out no PR ref (the self-checkout takes pull_request_target's "
+        "default base ref), executes no PR-supplied code, and mints a "
+        "GitHub App token narrowed with `repositories=['nous-ergon-ops']` "
+        "(nousergon-lib-PR388) to read only the trusted ops test module. The "
+        "one piece of PR content it reads — `crucible/components.yaml` — "
+        "arrives over the read-only Contents API as data and is parsed as "
+        "YAML by that trusted test, never executed. "
+        "`test_the_lockstep_pr_job_checks_out_no_pr_head_and_executes_no_pr_supplied_code` "
+        "below is the structural guard that a later edit cannot quietly "
+        "reintroduce a PR-head checkout or PR-code execution here."
+    ),
 }
 
 
@@ -338,6 +353,79 @@ def test_the_job_model_accepts_both_legal_needs_forms() -> None:
     assert Job.model_validate({"needs": "build"}).needs == ["build"]
     assert Job.model_validate({"needs": ["build", "test"]}).needs == ["build", "test"]
     assert Job.model_validate({}).needs == []
+
+
+def _lockstep_pr_job() -> Job:
+    return Workflow.load(WORKFLOW_DIR / "dispatch-lockstep.yml").jobs[
+        "crucible-dispatch-lockstep-pr"
+    ]
+
+
+def test_the_lockstep_pr_job_checks_out_no_pr_head_and_executes_no_pr_supplied_code() -> None:
+    """alpha-engine-config-I10119: the one job in this repo that deliberately
+    runs on a PR event with a live-AWS credential in scope. Its safety rests
+    on two structural properties -- no checkout of the PR head, no execution
+    of PR-supplied content -- asserted here rather than left to the
+    allowlist reason in prose, so a later edit that reintroduces either
+    fails this test."""
+    job = _lockstep_pr_job()
+    for step in job.steps:
+        with_block = step.get("with") or {}
+        ref = str(with_block.get("ref", ""))
+        assert "pull_request" not in ref, (
+            "a step checks out a PR-derived ref -- this job may only check "
+            "out the implicit default (pull_request_target's base ref) or "
+            "another trusted repository's own main branch"
+        )
+        body = step.get("run", "")
+        assert "uv run" not in body and "pip install -e" not in body, (
+            "a step executes tree-derived code -- this job must never run "
+            "anything beyond the fixed pytest invocation against "
+            "nous-ergon-ops main"
+        )
+
+
+def test_the_lockstep_pr_job_self_checkout_takes_the_implicit_base_ref() -> None:
+    job = _lockstep_pr_job()
+    self_checkouts = [
+        step
+        for step in job.steps
+        if step.get("uses", "").startswith("actions/checkout@")
+        and "repository" not in (step.get("with") or {})
+    ]
+    assert len(self_checkouts) == 1, self_checkouts
+    assert "ref" not in (self_checkouts[0].get("with") or {}), (
+        "the self-checkout must take the implicit default ref, not an explicit one"
+    )
+
+
+def test_the_lockstep_pr_job_fetches_components_yaml_as_data_not_via_checkout() -> None:
+    job = _lockstep_pr_job()
+    fetch_steps = [s for s in job.steps if "crucible/components.yaml" in s.get("run", "")]
+    assert len(fetch_steps) == 1, fetch_steps
+    body = fetch_steps[0]["run"]
+    assert "repos/nousergon/crucible/contents/crucible/components.yaml" in body, body
+    assert "base64 -d > crucible/components.yaml" in body, (
+        "the fetched content must be decoded straight to a file, never piped "
+        "into a shell or an interpreter"
+    )
+    for forbidden in ("| bash", "| sh", "| python", "eval "):
+        assert forbidden not in body, forbidden
+
+
+def test_the_lockstep_pr_job_mints_a_token_narrowed_to_nous_ergon_ops() -> None:
+    job = _lockstep_pr_job()
+    mint_steps = [s for s in job.steps if "installation_token(" in s.get("run", "")]
+    assert len(mint_steps) == 1, mint_steps
+    assert "repositories=['nous-ergon-ops']" in mint_steps[0]["run"], mint_steps[0]["run"]
+
+
+def test_the_lockstep_pr_job_and_the_push_job_never_both_run() -> None:
+    workflow = Workflow.load(WORKFLOW_DIR / "dispatch-lockstep.yml")
+    push_job = workflow.jobs["crucible-dispatch-lockstep"]
+    pr_job = workflow.jobs["crucible-dispatch-lockstep-pr"]
+    assert push_job.condition.strip() in _exclusions_for(frozenset({"pull_request_target"}))
+    assert pr_job.condition.strip() == "github.event_name == 'pull_request_target'"
 
 
 # ---------------------------------------------------------------------------

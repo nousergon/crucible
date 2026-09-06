@@ -9,7 +9,7 @@ dependencies = [
     # First-party, PINNED not floored (fleet §139): the arena engine, the
     # arena_cycle contract and MetricRecord are consumed here, never
     # re-implemented (crucible_v2_rebuild_plan §4.4).
-    "nousergon-lib[github-app]==0.124.108",
+    "nousergon-lib[github-app]==0.124.110",
     # Trading calendar, dual-date resolution, structured logging, alerts.
     "krepis==0.59.50",
     # Run-manifest schema validation. The schema is the enforcement surface
@@ -59,7 +59,7 @@ dependencies = [
 # path it never exercises. `crucible data.daily --source arctic` states the
 # missing extra by name when it is absent — it never falls back to a
 # different source, which would silently change what the run measured.
-arcticdb = ["nousergon-lib[arcticdb]==0.124.108"]
+arcticdb = ["nousergon-lib[arcticdb]==0.124.110"]
 
 [project.scripts]
 crucible = "crucible.cli:main"
