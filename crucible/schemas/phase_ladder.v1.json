@@ -1,61 +1,172 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/nousergon/crucible/schemas/phase_ladder.v1.json",
-  "title": "Crucible plan §6 phase ladder, v1",
-  "description": "The record at gates/ladder.json, produced by `crucible.gate.build_ladder`/`ladder_payload` and republished by both `crucible gate` (crucible/track_f.py::gate_handler) and `crucible console` (crucible/track_c.py::console_handler, via crucible/console/render.py::write_page). Versioned because the fleet console reads this key through an `s3-records` adapter, a cross-repo consumer; `additionalProperties: false` because a field this reader does not understand is a field the producer expected it to act on (alpha-engine-config-I9825).",
-  "type": "object",
-  "additionalProperties": false,
-  "required": [
-    "schema_version",
-    "trading_day",
-    "generated_utc",
-    "current_phase",
-    "phases_total",
-    "phases_met",
-    "unmeasured",
-    "out_of_order",
-    "phases"
-  ],
-  "properties": {
-    "schema_version": {
-      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
-      "const": "phase_ladder.v1"
-    },
-    "trading_day": {
-      "description": "The NYSE trading day the ladder was built for (§4.12). Never a wall-clock date.",
-      "type": "string",
-      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
-    },
-    "generated_utc": {
-      "description": "When this document was written, UTC, `%Y-%m-%dT%H:%M:%SZ`.",
-      "type": "string",
-      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
-    },
-    "current_phase": {
-      "description": "The lowest phase whose gate is not met, or `complete`. Not the highest phase with work in it.",
-      "type": "string"
-    },
-    "phases_total": { "type": "integer", "minimum": 0 },
-    "phases_met": { "type": "integer", "minimum": 0 },
-    "unmeasured": {
-      "description": "Count of rows whose gate_state is UNMEASURED. Published rather than left for a reader to derive.",
-      "type": "integer",
-      "minimum": 0
-    },
-    "out_of_order": {
-      "description": "Phase ids currently graded ahead of an earlier unmet phase.",
-      "type": "array",
-      "items": { "type": "string" }
-    },
-    "phases": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/phase_row" }
-    }
-  },
   "$defs": {
-    "phase_row": {
-      "type": "object",
+    "PhaseLadderRow": {
       "additionalProperties": false,
+      "description": "One phase row of `gates/ladder.json`'s `phases` array, plan \u00a76.",
+      "properties": {
+        "blocked_by": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The earlier unmet phase id blocking this one, when state is OUT_OF_ORDER; null otherwise.",
+          "title": "Blocked By"
+        },
+        "clauses_met": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "null when the phase has never been graded at all (no registered gate).",
+          "title": "Clauses Met"
+        },
+        "clauses_total": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Clauses Total"
+        },
+        "clauses_unmeasurable": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Count of this phase's clauses that read UNMEASURABLE (a store access failure, distinct from a clause that was read and found unmet). null exactly where clauses_total is null (no registered gate).",
+          "title": "Clauses Unmeasurable"
+        },
+        "console_state": {
+          "description": "crucible.gate.LADDER_CONSOLE_STATE's rendering, in observability-policy \u00a78.3's vocabulary.",
+          "enum": [
+            "HEALTHY",
+            "DEGRADED",
+            "UNREPORTED",
+            "FAILED"
+          ],
+          "title": "Console State",
+          "type": "string"
+        },
+        "decision_id": {
+          "description": "`console-policy` \u00a72.1: the identifier IS the tracker ref, so a `git-host` claim about the same issue merges onto this row.",
+          "pattern": "^alpha-engine-config-I[0-9]+$",
+          "title": "Decision Id",
+          "type": "string"
+        },
+        "detail": {
+          "title": "Detail",
+          "type": "string"
+        },
+        "gate": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The registered gate name, or null when no gate has been written for this phase yet.",
+          "title": "Gate"
+        },
+        "gate_state": {
+          "enum": [
+            "MET",
+            "UNMET",
+            "UNMEASURED",
+            "UNMEASURABLE"
+          ],
+          "title": "Gate State",
+          "type": "string"
+        },
+        "generated_utc": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+          "title": "Generated Utc",
+          "type": "string"
+        },
+        "met_ratio": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "null when nothing was measured (no clauses). Never 0.0 for an unmeasured reading -- 0.0 is a real measurement of zero clauses met out of a nonzero total (principle 7, I9824).",
+          "title": "Met Ratio"
+        },
+        "number": {
+          "maximum": 5,
+          "minimum": 0,
+          "title": "Number",
+          "type": "integer"
+        },
+        "phase": {
+          "pattern": "^phase[0-5]$",
+          "title": "Phase",
+          "type": "string"
+        },
+        "read_on": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last trading day this gate was read, or null when never.",
+          "title": "Read On"
+        },
+        "state": {
+          "description": "crucible.gate.LADDER_STATES: MET | UNMET | UNMEASURED | UNMEASURABLE | OUT_OF_ORDER. Closed set.",
+          "enum": [
+            "MET",
+            "UNMET",
+            "UNMEASURED",
+            "UNMEASURABLE",
+            "OUT_OF_ORDER"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "tracker": {
+          "pattern": "^alpha-engine-config-I[0-9]+$",
+          "title": "Tracker",
+          "type": "string"
+        },
+        "tracker_url": {
+          "title": "Tracker Url",
+          "type": "string"
+        }
+      },
       "required": [
         "decision_id",
         "phase",
@@ -76,70 +187,80 @@
         "blocked_by",
         "generated_utc"
       ],
-      "properties": {
-        "decision_id": {
-          "description": "`console-policy` §2.1: the identifier IS the tracker ref, so a `git-host` claim about the same issue merges onto this row.",
-          "type": "string",
-          "pattern": "^alpha-engine-config-I[0-9]+$"
-        },
-        "phase": { "type": "string", "pattern": "^phase[0-5]$" },
-        "number": { "type": "integer", "minimum": 0, "maximum": 5 },
-        "title": { "type": "string", "minLength": 1 },
-        "tracker": { "type": "string", "pattern": "^alpha-engine-config-I[0-9]+$" },
-        "tracker_url": { "type": "string", "format": "uri" },
-        "gate": {
-          "description": "The registered gate name, or null when no gate has been written for this phase yet.",
-          "type": ["string", "null"]
-        },
-        "state": {
-          "description": "crucible.gate.LADDER_STATES: MET | UNMET | UNMEASURED | UNMEASURABLE | OUT_OF_ORDER. Closed set.",
-          "type": "string",
-          "enum": ["MET", "UNMET", "UNMEASURED", "UNMEASURABLE", "OUT_OF_ORDER"]
-        },
-        "console_state": {
-          "description": "crucible.gate.LADDER_CONSOLE_STATE's rendering, in observability-policy §8.3's vocabulary.",
-          "type": "string",
-          "enum": ["HEALTHY", "DEGRADED", "UNREPORTED", "FAILED"]
-        },
-        "gate_state": {
-          "type": "string",
-          "enum": ["MET", "UNMET", "UNMEASURED", "UNMEASURABLE"]
-        },
-        "detail": { "type": "string" },
-        "clauses_met": {
-          "description": "null when the phase has never been graded at all (no registered gate).",
-          "type": ["integer", "null"],
-          "minimum": 0
-        },
-        "clauses_total": {
-          "type": ["integer", "null"],
-          "minimum": 0
-        },
-        "clauses_unmeasurable": {
-          "description": "Count of this phase's clauses that read UNMEASURABLE (a store access failure, distinct from a clause that was read and found unmet). null exactly where clauses_total is null (no registered gate).",
-          "type": ["integer", "null"],
-          "minimum": 0
-        },
-        "met_ratio": {
-          "description": "null when nothing was measured (no clauses). Never 0.0 for an unmeasured reading — 0.0 is a real measurement of zero clauses met out of a nonzero total (principle 7, alpha-engine-config-I9824).",
-          "type": ["number", "null"],
-          "minimum": 0,
-          "maximum": 1
-        },
-        "read_on": {
-          "description": "The last trading day this gate was read, or null when never.",
-          "type": ["string", "null"],
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
-        },
-        "blocked_by": {
-          "description": "The earlier unmet phase id blocking this one, when state is OUT_OF_ORDER; null otherwise.",
-          "type": ["string", "null"]
-        },
-        "generated_utc": {
-          "type": "string",
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
-        }
-      }
+      "title": "PhaseLadderRow",
+      "type": "object"
     }
-  }
+  },
+  "$id": "https://github.com/nousergon/crucible/schemas/phase_ladder.v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The record at gates/ladder.json, produced by crucible.gate.build_ladder/ladder_payload and republished by both crucible gate (crucible/track_f.py::gate_handler) and crucible console (crucible/track_c.py::console_handler, via crucible/console/render.py::write_page). Versioned because the fleet console reads this key through an s3-records adapter, a cross-repo consumer; additionalProperties: false because a field this reader does not understand is a field the producer expected it to act on (I9825).",
+  "properties": {
+    "current_phase": {
+      "description": "The lowest phase whose gate is not met, or `complete`. Not the highest phase with work in it.",
+      "title": "Current Phase",
+      "type": "string"
+    },
+    "generated_utc": {
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      "title": "Generated Utc",
+      "type": "string"
+    },
+    "out_of_order": {
+      "description": "Phase ids currently graded ahead of an earlier unmet phase.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Out Of Order",
+      "type": "array"
+    },
+    "phases": {
+      "items": {
+        "$ref": "#/$defs/PhaseLadderRow"
+      },
+      "title": "Phases",
+      "type": "array"
+    },
+    "phases_met": {
+      "minimum": 0,
+      "title": "Phases Met",
+      "type": "integer"
+    },
+    "phases_total": {
+      "minimum": 0,
+      "title": "Phases Total",
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": "phase_ladder.v1",
+      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "trading_day": {
+      "description": "The NYSE trading day the ladder was built for (\u00a74.12). Never a wall-clock date.",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "title": "Trading Day",
+      "type": "string"
+    },
+    "unmeasured": {
+      "description": "Count of rows whose gate_state is UNMEASURED. Published rather than left for a reader to derive.",
+      "minimum": 0,
+      "title": "Unmeasured",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "trading_day",
+    "generated_utc",
+    "current_phase",
+    "phases_total",
+    "phases_met",
+    "unmeasured",
+    "out_of_order",
+    "phases"
+  ],
+  "title": "Crucible plan \u00a76 phase ladder, v1",
+  "type": "object"
 }
