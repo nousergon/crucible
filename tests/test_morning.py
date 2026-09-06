@@ -59,6 +59,7 @@ from crucible.morning import (
     BOARD_URL_EXPIRES_S,
     BOARD_URL_UNAVAILABLE,
     DELIVERY_TZ,
+    HEADLINE_TARGET_LINES,
     MORNING_JOB,
     NO_OPERATOR_ACTION,
     ROLLING_ISSUE_TITLE,
@@ -197,14 +198,14 @@ def _board(
         if rows is not None
         else [
             _row(
-                "phase0",
+                "phase:phase0",
                 "phase",
                 "UNMET",
                 "1 of 2 clauses — old_weekly_within_cadence",
                 [_clause("a_met", True), _clause("b_unmet", False)],
             ),
             _row(
-                "phase1",
+                "phase:phase1",
                 "phase",
                 "OUT_OF_ORDER",
                 "1 of 5 clauses — phase0's gate is not met",
@@ -390,7 +391,7 @@ class TestTheFullUpdate:
         store = _seed(tmp_path, previous=_board())
         update = run_report(store, trading_day=DAY, now=FIRED_AT)
         assert "| phase | state | clauses met | holding |" in update
-        assert "| phase0 | UNMET | 1/2 | b_unmet |" in update
+        assert "| phase:phase0 | UNMET | 1/2 | b_unmet |" in update
         assert "a_met" not in update, "a MET clause is not what is holding the phase"
         assert "| | | | out of order: 1 of 5 clauses — phase0's gate is not met |" in update
 
@@ -830,13 +831,26 @@ class TestTheHeadline:
             inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
         )
         lines = message.splitlines()
-        assert len(lines) <= 12
+        assert len(lines) <= HEADLINE_TARGET_LINES
         assert lines[0] == "<b>CRUCIBLE V2 — 2026-09-02</b>"
         assert f'<a href="{UPDATE_URL}">Full update</a>' in message
         board_uri = (tmp_path / "board" / "index.html").resolve().as_uri()
         assert f'<a href="{board_uri}">Board</a>' in message
 
-    def test_no_holding_lists_and_no_out_of_order_prose(self, tmp_path):
+    def test_exactly_one_line_per_plan_phase_never_the_closing_rows(self, tmp_path):
+        """`alpha-engine-config-I10123` follow-up, measured live 2026-09-06:
+        the board carries a SEPARATE `phase:phaseN:closing` row per phase
+        (`source == "phase"` too, state `PLANNED`), and the headline used to
+        print all twelve rows instead of the six real gate readings."""
+        inputs = self._inputs(tmp_path, previous=_board())
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
+        assert message.count("Phase ") == 6
+        assert "closing" not in message
+        assert "PLANNED" not in message
+
+    def test_no_row_id_no_holding_lists_and_no_out_of_order_prose(self, tmp_path):
         inputs = self._inputs(tmp_path, previous=_board())
         message = render_message(
             inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
@@ -844,14 +858,28 @@ class TestTheHeadline:
         assert "holding:" not in message
         assert "out of order:" not in message
         assert "b_unmet" not in message
-        assert "phase0: UNMET 1/2" in message
-        assert "phase1: OUT_OF_ORDER 0/1" in message
+        assert "phase:phase0" not in message
+        assert "Phase 0  UNMET" in message
+        assert "1/2" in message
+        assert "Phase 1  OUT_OF_ORDER" in message
+        assert "0/1" in message
+
+    def test_absent_phases_are_named_not_dropped(self, tmp_path):
+        """The default fixture's board only carries phase0/phase1 -- the
+        headline still names all six plan phases, since the plan's ladder
+        has six rungs regardless of what one day's board happened to grade."""
+        inputs = self._inputs(tmp_path, previous=_board())
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
+        for n in range(2, 6):
+            assert f"Phase {n}  ABSENT" in message
 
     def test_it_carries_the_acceptance_line_and_moved_count(self, tmp_path):
         previous = _board(
             rows=[
-                _row("phase0", "phase", "UNMET", "old"),
-                _row("phase1", "phase", "OUT_OF_ORDER", "old"),
+                _row("phase:phase0", "phase", "UNMET", "old"),
+                _row("phase:phase1", "phase", "OUT_OF_ORDER", "old"),
                 _row("obj:cost", "objective", "PLANNED", "old"),
                 _row("obj:alpha", "objective", "MET", "old"),
             ]
@@ -938,17 +966,18 @@ class TestTheHeadline:
         "acceptance_suite_committed",
     )
 
-    def test_the_wire_fits_the_cap_with_six_red_phases_of_real_clause_names(self, tmp_path):
+    def test_the_wire_fits_the_cap_and_the_target_line_count_with_six_red_phases(self, tmp_path):
         """`alpha-engine-config-I10123` deliverable 2's hard budget test: six
-        phase rows (`phase0`..`phase5`, one per binding-plan phase), every
-        one UNMET/red, holding every real long clause name off `main`'s
-        `crucible/gate.py`, plus a long hostile operator action — the
-        worst-case fixture the old six-section message was proven against,
-        now proving the HEADLINE stays inside its own, much smaller budget.
+        phase rows (`phase:phase0`..`phase:phase5`, one per binding-plan
+        phase), every one UNMET/red, holding every real long clause name off
+        `main`'s `crucible/gate.py`, plus a stale-board headline and a long
+        operator action — the worst-case fixture the old six-section message
+        was proven against, now proving the HEADLINE stays inside its own,
+        much smaller budget AND its target line count.
         """
         rows = [
             _row(
-                f"phase{i}",
+                f"phase:phase{i}",
                 "phase",
                 "UNMET",
                 "blocked by <deploy> & <IAM> gaps",
@@ -958,7 +987,7 @@ class TestTheHeadline:
         ]
         store = _seed(
             tmp_path,
-            board=_board(rows=rows),
+            board=_board(rows=rows, generated_at=STALE_GENERATED),
             previous=_board(rows=rows),
             board_run={
                 "status": "failed",
@@ -975,14 +1004,30 @@ class TestTheHeadline:
             f"the six-red-phase worst case POSTs at {wire} chars, over the "
             f"{UPDATE_MESSAGE_MAX_CHARS}-char budget"
         )
+        # A stale headline AND a pending operator action are the two lines
+        # that can push past the ordinary-case target -- both are present
+        # here, so this is the worst realistic line count, not the common
+        # case `HEADLINE_TARGET_LINES` targets.
+        assert len(message.splitlines()) <= HEADLINE_TARGET_LINES + 2
         for i in range(6):
-            assert f"phase{i}: UNMET 0/{len(self._REAL_CLAUSE_NAMES)}" in message
+            assert f"Phase {i}  UNMET" in message
+            assert f"0/{len(self._REAL_CLAUSE_NAMES)}" in message
 
     def test_an_over_budget_headline_raises_rather_than_truncating_silently(self, tmp_path):
         """A headline that silently shortened itself would be the illegible
-        message reappearing in a new shape — it must fail loudly instead."""
-        rows = [_row(f"phase{i}", "phase", "UNMET", "d", [_clause("x", False)]) for i in range(400)]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        message reappearing in a new shape — it must fail loudly instead.
+
+        The phase table is now fixed at six rows (the plan's own ladder), so
+        an unbounded board can no longer blow the budget through the phase
+        section — an unbounded PENDING OPERATOR ACTION is the field this
+        budget still has to defend, and is named as the likeliest cause in
+        the raised message itself.
+        """
+        store = _seed(
+            tmp_path,
+            previous=_board(),
+            board_run={"status": "failed", "code_sha": SHA, "reason": "x" * 2000},
+        )
         inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT)
         with pytest.raises(ValueError, match="over the"):
             render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL)
@@ -1449,6 +1494,66 @@ class TestTheJobRebuildsTheHistoryIndex:
 
         assert morning_handler(_args(tmp_path, dry_run=True)) == 0
 
+    def test_the_index_shows_real_phase_states_off_a_live_shaped_board(self, tmp_path, monkeypatch):
+        """`alpha-engine-config-I10123` follow-up, measured live 2026-09-06:
+        the first delivered history row showed `—` for every phase column
+        although the manifest graded them (UNMET 4/5, OUT_OF_ORDER 4/6, ...)
+        -- the reader matched bare `phase0` against the board's actual
+        `phase:phase0` ids. This seeds the REAL live shape: six gate rows
+        AND six `:closing` rows, both `source == "phase"`."""
+        gate_rows = [
+            _row(
+                f"phase:phase{i}",
+                "phase",
+                "UNMET" if i == 0 else "OUT_OF_ORDER",
+                "d",
+                [_clause("a", i == 0), _clause("b", False)],
+            )
+            for i in range(6)
+        ]
+        closing_rows = [
+            _row(f"phase:phase{i}:closing", "phase", "PLANNED", "no closing record")
+            for i in range(6)
+        ]
+        rows = [*gate_rows, *closing_rows]
+        _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        calls = _stub_tracker(monkeypatch, existing_issue=7)
+        monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
+
+        assert morning_handler(_args(tmp_path, dry_run=False)) == 0
+
+        (update_body_call,) = calls["update_body"]
+        index = update_body_call[2]
+        assert "unreadable" not in index
+        assert "—*" not in index
+        assert "UNMET 1/2" in index
+        assert "OUT_OF_ORDER 0/2" in index
+        assert "closing" not in index
+
+    def test_a_workflow_dispatch_rerun_for_the_same_day_replaces_its_row(
+        self, tmp_path, monkeypatch
+    ):
+        """A re-run for the SAME trading day (a `workflow_dispatch` retry,
+        same calendar day) must REPLACE the day's row rather than adding a
+        second one -- the discriminator (`ctx.calendar_date`) is unchanged
+        across the two runs, so both deliveries write the same
+        `history_row.json` key."""
+        _seed(tmp_path, previous=_board())
+        _stub_tracker(monkeypatch, existing_issue=7, comment_url="https://x/first")
+        monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
+        assert morning_handler(_args(tmp_path, dry_run=False)) == 0
+
+        calls = _stub_tracker(monkeypatch, existing_issue=7, comment_url="https://x/second")
+        monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
+        assert morning_handler(_args(tmp_path, dry_run=False)) == 0
+
+        (update_body_call,) = calls["update_body"]
+        index = update_body_call[2]
+        day_rows = [ln for ln in index.splitlines() if ln.startswith(f"| {DAY.isoformat()}")]
+        assert len(day_rows) == 1, index
+        assert "https://x/second" in day_rows[0]
+        assert "https://x/first" not in index
+
 
 # ── declarations that must agree ────────────────────────────────────────
 
@@ -1459,6 +1564,12 @@ class TestDeclarations:
         from crucible.cli import is_stub
 
         assert not is_stub(HANDLERS[MORNING_JOB])
+
+    def test_the_state_column_width_matches_the_boards_own_longest_state(self):
+        from crucible.board import BOARD_STATES
+        from crucible.morning import _STATE_COLUMN_WIDTH
+
+        assert _STATE_COLUMN_WIDTH == max(len(s) for s in BOARD_STATES)
 
     def test_the_registry_row_declares_the_workflow_that_crons_it(self):
         row = load_registry()[MORNING_JOB]
