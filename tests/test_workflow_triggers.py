@@ -560,6 +560,35 @@ def _variable_guard_run(workflow_file: str, job_name: str) -> str:
     return matches[0]
 
 
+def test_deploy_smoke_gate_installs_and_imports_the_arcticdb_extra() -> None:
+    """alpha-engine-config-I10069: `releases/current -> e329f205` was smoked
+    green and died on its first replay arc with `No module named
+    'arcticdb'` — the smoke installed and imported the harness without the
+    `[arcticdb]` extra, so the one dependency the data layer cannot run
+    without was outside what "smoked" measured. `deploy.yml`'s install-proof
+    step (the same step `test_the_flip_is_gated_on_a_real_pip_install...` in
+    `tests/test_deploy.py` extracts) must install the extra pyproject.toml
+    declares and actually import it, before the smoke that gates the flip
+    runs — and the extra name must be DERIVED from pyproject.toml, never
+    restated (crucible/AGENTS.md: no suppression collections)."""
+    workflow = Workflow.load(WORKFLOW_DIR / "deploy.yml")
+    steps = workflow.jobs["release"].steps
+    proof = next(s for s in steps if "pip install" in s.get("run", ""))
+    script = proof["run"]
+    assert "tomllib" in script and "optional-dependencies" in script, (
+        "the extra name must be read out of pyproject.toml's own "
+        "[project.optional-dependencies], not hardcoded in the workflow"
+    )
+    assert "import nousergon_lib.arcticdb, arcticdb" in script, (
+        "the proof must actually import the module the data layer needs on this "
+        "x86_64 runner — the box's architecture after nous-ergon-ops-PR1054"
+    )
+    smoke = next(i for i, s in enumerate(steps) if "crucible smoke" in s.get("run", ""))
+    assert steps.index(proof) < smoke, (
+        "the extras must be proven before the smoke that gates the flip runs"
+    )
+
+
 def test_every_variable_guard_job_still_exists() -> None:
     """A stale entry in `VARIABLE_GUARD_JOBS` would silently stop exercising a
     guard the moment its job was renamed — the same shape of hole
