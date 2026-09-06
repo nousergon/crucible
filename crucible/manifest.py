@@ -25,7 +25,8 @@ as a `KeyError` in a consumer several functions away. `run_manifest.v2.json`
 is GENERATED from that model (`tests/test_manifest_schema.py` fails when the
 committed file and the generated one differ); the two status<->reason
 cross-field rules stay in the model as `RunManifestV2._status_and_reason_agree`
-and are deliberately not re-encoded as the schema's `allOf` — see
+AND are mirrored into the published schema's `allOf` by
+`_run_manifest_v2_json_schema_extra` (PR123 review finding 3) — see
 `crucible/models.py`'s module docstring. `run_manifest.v1` stays on the
 original jsonschema-only path below: it is FROZEN and carries no model.
 """
@@ -170,8 +171,8 @@ def validate(manifest: dict[str, Any]) -> None:
     half-conformant producer ships.
 
     **The current version goes through `crucible.models.RunManifestV2`**
-    (`alpha-engine-config-I10045` row 1), which also enforces the
-    status<->reason cross-field rule the published schema no longer carries
+    (`alpha-engine-config-I10045` row 1), which enforces the status<->reason
+    cross-field rule — also mirrored into the published schema's `allOf`
     (see this module's and `crucible.models`' docstrings). `run_manifest.v1`
     is unaffected — it stays on the jsonschema-only path it always used,
     frozen.

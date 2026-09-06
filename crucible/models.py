@@ -56,20 +56,24 @@ reads exactly like healthy. The remaining boundaries are filed as children of
 
 ── THE SECOND BOUNDARY: THE RUN MANIFEST ─────────────────────────────────
 
-`RunManifestV2` (`alpha-engine-config-I10045` row 1) is a partial exception to
-"the schema is generated from the model, full stop": `run_manifest.v2.json`
-IS regenerated from `RunManifestV2.model_json_schema()` — same one-source-of-
-truth test as `components_registry.v1.json` — but the two run-manifest-status
-cross-field rules (`status: ok` implies empty `reason`, `status: failed`
-implies non-empty `reason`) are enforced ONLY by
-`_RunManifestV2._status_and_reason_agree` and are deliberately **not**
-re-encoded as an `allOf` in the generated schema, for the same reason
-`ComponentRow`'s dispatch/deadline rules never appeared in
-`components_registry.v1.json`: a cross-field rule is the model's job, and a
-schema carrying it twice is the two-sources-of-truth shape this migration
-exists to remove. A consumer validating a manifest against the published
-schema alone (no Python import) gets the structural contract; a consumer
-going through `crucible.manifest.validate`/`read_manifest` gets both.
+`RunManifestV2` (`alpha-engine-config-I10045` row 1) is regenerated the same
+way as `components_registry.v1.json`: `run_manifest.v2.json` IS
+`RunManifestV2.model_json_schema()` (`tests/test_manifest_schema.py` fails
+when the committed file and the generated one differ). The two
+run-manifest-status cross-field rules (`status: ok` implies empty `reason`,
+`status: failed` implies non-empty `reason`) stay enforced by
+`RunManifestV2._status_and_reason_agree` as the source of truth — **and are
+also emitted into the published schema's `allOf`**, by
+`_run_manifest_v2_json_schema_extra` mirroring the validator exactly, so a
+consumer with no Python import still gets the rule rather than a weaker
+contract (PR123 review finding 3: the first draft dropped the rule from the
+published schema entirely, the same choice `ComponentRow`'s dispatch/deadline
+rules made for `components_registry.v1.json` — but those rules read a
+sibling field's *presence*, where this one reads a sibling field's *value*
+against a two-branch enum, which is exactly what `allOf`/`if`/`then` can
+state declaratively without duplicating the model's control flow). The model
+stays the enforcement point on every path that imports Python; the schema
+carries the same rule for the one that does not.
 
 `run_manifest.v1.json` is untouched — FROZEN by `alpha-engine-config-I9918`,
 read by `crucible.manifest.load_schema_for("run_manifest.v1")` exactly as
@@ -288,6 +292,7 @@ JOB_VALUES: tuple[str, ...] = (
     "deploy",
     "weekly",
     "gate",
+    "gate.close",
     "report.morning",
 )
 
@@ -334,7 +339,7 @@ _UTC_TIMESTAMP_PATTERN = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2
 _GIT_SHA_PATTERN = r"^[0-9a-f]{40}$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 
-IsoDate = Annotated[str, Field(pattern=_ISO_DATE_PATTERN)]
+IsoDate = Annotated[str, Field(pattern=_ISO_DATE_PATTERN, json_schema_extra={"format": "date"})]
 UtcTimestamp = Annotated[
     str,
     Field(
@@ -356,9 +361,21 @@ class ArtifactRef(_Strict):
     violation.
     """
 
-    key: str = Field(min_length=1)
+    key: str = Field(
+        min_length=1,
+        description=(
+            "Store key, not a URI. The store backend (S3 or local dir) resolves it, so the same "
+            "manifest is portable between them."
+        ),
+    )
     sha256: Sha256
-    schema_version: str = Field(min_length=1)
+    schema_version: str = Field(
+        min_length=1,
+        description=(
+            "The version the artifact was read or written under. Required — an un-versioned "
+            "cross-module artifact is the M0 contract violation."
+        ),
+    )
 
 
 class LlmCallRow(_Strict):
@@ -375,15 +392,76 @@ class LlmCallRow(_Strict):
     (`alpha-engine-config-I9969`, `I10006`).
     """
 
-    callsite_id: str = Field(min_length=1)
-    model_requested: str = Field(min_length=1)
-    model_served: str = Field(min_length=1)
-    route_degraded: bool
-    fallback_used: bool
+    callsite_id: str = Field(
+        min_length=1,
+        description=(
+            "Key into LLM_CALLSITE_REGISTRY. Registry coverage of v2 call sites is 100%, and that "
+            "is a test."
+        ),
+    )
+    model_requested: str = Field(
+        min_length=1,
+        description=(
+            "What the caller asked the router for — a capability class or registry group, never a "
+            "provider model id (principle 8)."
+        ),
+    )
+    model_served: str = Field(
+        min_length=1,
+        description=(
+            "What the router actually served. Required and separate from `model_requested`: a "
+            "routed call that silently served a different model is the failure this field exists "
+            "to make visible."
+        ),
+    )
+    route_degraded: bool = Field(
+        description=(
+            "Whether RESOLUTION had already fallen past the group's primary entry when this call "
+            "was routed (model-router-policy R12: serving from a fallback is an alert, not a log "
+            "line). Required and boolean, so a fallback-served call is distinguishable from a "
+            "primary-served one in the durable record rather than only in a log; `false` is an "
+            "assertion that the primary served, never an absence. Added by I9969 WITHOUT a version "
+            "bump, unlike `run_mode`: the field is on `llmCall`, `crucible.llm.call` is the only "
+            "writer of one, and it could not complete a call at all before this change (the "
+            "registry it admits against is empty and the spec it resolved came from an SSM path "
+            "that does not exist) — so no manifest in the store carries an `llm_calls` row this "
+            "could retroactively invalidate."
+        )
+    )
     #: `null` is the router reporting no deployment — an ANSWER, not an
     #: absence — so the key is required and the value is nullable
     #: (`alpha-engine-config-I10006`, `I9995`).
-    served_deployment: str | None
+    fallback_used: bool = Field(
+        description=(
+            "Whether a fallback entry in the group's chain actually SERVED this call — the "
+            "call-time fact, from `krepis.llm.LLMResult.fallback_used`. Distinct from "
+            "`route_degraded`, which is the resolve-time fact about the route object: on the "
+            "router-edge route the chain is walked by the proxy AFTER resolution, so resolution "
+            "can report a healthy route while the proxy serves from a fallback, and "
+            "`route_degraded` alone would then read `false` beside a call the primary never "
+            "answered. Both are recorded because they answer different questions and neither can "
+            "be derived from the other; a run whose arm was served by a fallback and whose "
+            "manifest says the primary served is a run that grades a model nobody selected. Added "
+            "by I10006 WITHOUT a version bump, on the same reasoning `route_degraded` records: the "
+            "field is on `llmCall`, `crucible.llm.call` is its only writer, and "
+            "`crucible/llm_callsites.yaml` still declares `callsites: {}` so the door has never "
+            "completed a call — no manifest in the store carries an `llm_calls` row this could "
+            "retroactively invalidate."
+        )
+    )
+    served_deployment: str | None = Field(
+        description=(
+            "The deployment name the router reported for this call — `{group}-{mid}` on the router "
+            "edge, the upstream model id elsewhere — from "
+            "`krepis.llm.LLMResult.served_deployment`. `null` when the route reported none, which "
+            "is an absence of the router's own answer and is NOT the same as an absent field. "
+            "Recorded beside `model_served` rather than folded into it: `model_served` is the "
+            "resolved upstream id price cards key on, and two deployments can share one upstream "
+            "model, so the comparison that decides `fallback_used` happens at the deployment layer "
+            "and an artifact reader cannot reconstruct it from `model_served` alone (krepis, "
+            "I9995). Added by I10006 without a version bump, same reasoning as `fallback_used`."
+        )
+    )
     tokens_in: Annotated[int, Field(ge=0)]
     tokens_out: Annotated[int, Field(ge=0)]
     cache_read: Annotated[int, Field(ge=0)]
@@ -395,11 +473,19 @@ class ResourceRow(_Strict):
     """§9.2 class 3. Present on every manifest including laptop runs, where
     `spot` is false and `instance_type` is `local`."""
 
-    instance_type: str = Field(min_length=1)
+    instance_type: str = Field(
+        min_length=1, description="EC2 instance type, `lambda`, or `local` for a laptop run."
+    )
     spot: bool
     #: I5727: spot-to-on-demand fallback is a COUNTABLE metric, so it is
     #: required rather than an optional annotation.
-    escalated_to_on_demand: bool
+    escalated_to_on_demand: bool = Field(
+        description=(
+            "I5727: spot-to-on-demand fallback emits a COUNTABLE metric. Required, so a fleet-wide "
+            "escalation rate is always computable rather than sampled from whichever runs happened "
+            "to annotate it."
+        )
+    )
     interruptions: Annotated[int, Field(ge=0)]
     mem_peak_mb: Annotated[float, Field(ge=0)]
     disk_free_mb: Annotated[float, Field(ge=0)]
@@ -420,7 +506,12 @@ class AttemptRow(_Strict):
     retried run cannot be mistaken for a clean first-attempt run."""
 
     n: Annotated[int, Field(ge=1)]
-    reason: Literal[ATTEMPT_REASON_VALUES]  # type: ignore[valid-type]
+    reason: Literal[ATTEMPT_REASON_VALUES] = Field(
+        description=(
+            "Why THIS attempt happened. `initial` for the first; otherwise the declared transient "
+            "class that caused the retry. The class grows only by PR with the failure named."
+        )
+    )  # type: ignore[valid-type]
 
 
 class MetricRecordRow(BaseModel):
@@ -435,7 +526,16 @@ class MetricRecordRow(BaseModel):
     Card v2. Reusing that model directly would have silently rejected them.
     """
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(
+        extra="allow",
+        json_schema_extra={
+            "description": (
+                "MetricRecord-shaped. Open (`additionalProperties: true`) to match "
+                "krepis.metrics.MetricRecord's forward-compat contract, but the required core and "
+                "the two constrained fields below are enforced here."
+            )
+        },
+    )
 
     name: str = Field(min_length=1)
     module: str = Field(min_length=1)
@@ -444,16 +544,67 @@ class MetricRecordRow(BaseModel):
     #: Required whenever `value` is set — see the validator below. A numeric
     #: field with no declared unit is the defect that emitted
     #: `avg_volume_20d` as a ratio and consumed it as raw shares.
-    unit: str | None = None
+    unit: str | None = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Required whenever `value` is set — see the dependency below. A numeric field with no "
+            "declared unit is the defect that emitted avg_volume_20d as a ratio and consumed it as "
+            "raw shares."
+        ),
+    )
     n_floor: Annotated[int, Field(ge=0)]
-    status: Literal[METRIC_STATUS_VALUES]  # type: ignore[valid-type]
-    status_reason: str = Field(min_length=1)
+    status: Literal[METRIC_STATUS_VALUES] = Field(  # type: ignore[valid-type]
+        description=(
+            "Closed set (I9757, defect #3): a run's own `status` above is `ok`/`failed` by schema "
+            "so a third state cannot be spelled there, but §2 row 4 ('no degraded-SUCCEEDED') is a "
+            "claim about every level a human reads, and a metric nested inside an `ok` manifest is "
+            "one of them — `migrate.history --allow-missing` once wrote "
+            "`DEGRADED_BY_OPERATOR_CONSENT` here, inside a manifest whose own `status` said `ok`, "
+            "which reintroduces exactly the third state the top-level enum exists to forbid. "
+            "Enumerated rather than left open: `OK`/`FAIL`/`BREACH` are the coverage-and-ceiling "
+            "vocabulary shared by `crucible.data`, `crucible.alerts`, `crucible.deploy`, "
+            "`crucible.slots.cycle` and `crucible.track_c`; "
+            "`unservable`/`bootstrap`/`unmeasurable`/`measured`/`decided`/`held` are "
+            "`nousergon_lib.arena.engine`'s own champion/challenger decision vocabulary, forwarded "
+            "verbatim by `crucible.promote`'s `pointer_moved` metric rather than re-encoded into a "
+            "second vocabulary that could drift from the first. `GREEN`/`WATCH`/`RED` and the four "
+            "`N/A-*` states are `krepis.metrics.StatusLiteral` — the vocabulary "
+            "`krepis.metrics.derive_status` returns and `MetricRecord` carries — forwarded "
+            "verbatim by `crucible.report`'s five attribution rows for the same reason the arena's "
+            "vocabulary is: re-encoding them into a second set is how two spellings of one state "
+            "drift apart. They were MISSING when the enum was closed, because the audit that built "
+            "it read the call sites that existed on that branch and `crucible.report` was on "
+            "another one: two PRs green apart and red together, which is what `main` looked like "
+            "for eleven minutes on 2026-09-01. `tests/test_manifest_schema.py` now derives the "
+            "requirement from `typing.get_args(StatusLiteral)` rather than restating it. A "
+            "producer needing a value outside this set grows the enum by PR, with the new state "
+            "named here, same discipline as `TRANSIENT_CLASSIFIERS` — never by writing a word this "
+            "schema does not know and letting `additionalProperties` wave it through. `UNREPORTED` "
+            "is `crucible.drift`'s no-value status (`Band.status`, plan §10 component 5): a drift "
+            "row whose input history has not settled yet renders `UNREPORTED` with its reason, "
+            "never a green, and `crucible.console.classify` already counts a metric in that state "
+            "toward the transparency gap. Added 2026-09-05 when the first arc to reach `drift` "
+            "(weekly@2026-08-07) showed the row could not be filed at all — the word was in the "
+            "console's vocabulary and not in this one."
+        )
+    )
+    status_reason: str = Field(
+        min_length=1, description="One operator-readable sentence, never generic."
+    )
     source_path: str = Field(min_length=1)
     last_updated_utc: UtcTimestamp
     #: §4.12: a horizon is an INTEGER COUNT OF TRADING DAYS — 21/63/126/252.
     #: There is no string form, so `"1 month"` fails validation. Absent when
     #: the metric has no forward horizon.
-    horizon_trading_days: Annotated[int, Field(ge=1)] | None = None
+    horizon_trading_days: Annotated[int, Field(ge=1)] | None = Field(
+        default=None,
+        description=(
+            "§4.12: a horizon is an INTEGER COUNT OF TRADING DAYS — 21 / 63 / 126 / 252. There is "
+            "no string form, so `1 month` cannot be expressed and fails validation. Absent when "
+            "the metric has no forward horizon."
+        ),
+    )
 
     @model_validator(mode="after")
     def _unit_required_when_value_present(self) -> MetricRecordRow:
@@ -464,6 +615,60 @@ class MetricRecordRow(BaseModel):
                 "safely render or compare."
             )
         return self
+
+
+def _run_manifest_v2_json_schema_extra(schema: dict[str, object]) -> None:
+    """Sets `run_manifest.v2.json`'s document-level metadata and mirrors
+    `RunManifestV2._status_and_reason_agree` into the schema's `allOf`
+    (`alpha-engine-config-I10045` row 1, PR123 review finding 3).
+
+    The `allOf` here must stay byte-for-byte what the validator enforces: it
+    exists so a consumer with no Python import — the case the published
+    schema is FOR — gets the same status<->reason rule a
+    `crucible.manifest.validate` caller gets. It is not the source of truth;
+    the model_validator is, and this function is the one place that copies
+    it, so a future change to one and not the other is a diff in one
+    function rather than a silent drift between two independent call sites.
+    """
+    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    schema["$id"] = "https://github.com/nousergon/crucible/schemas/run_manifest.v2.json"
+    schema["title"] = "Crucible run manifest, v2"
+    schema["description"] = (
+        "The record every job writes at runs/{job}/{trading_day}/run.json. This "
+        "schema is the enforcement surface for the plan's central guarantee (§4.2): "
+        "a run is `ok` or it is `failed`; there is no third state, and it is "
+        "excluded here rather than by policy. It is also the observability contract "
+        "(§9.2): one document carries all five signal classes — execution, "
+        "cost/tokens, resource, data lineage, and outcome vs baseline — under one "
+        "run_id. v2 adds one REQUIRED field, `run_mode`, and is otherwise "
+        "byte-for-byte v1's contract. v1 declared `additionalProperties: false` and "
+        "no live/replay field, so no producer could say whether a run was a live "
+        "Saturday or a replay of a historical one, and phase 2's exit gate (plan §6 "
+        "row 2 / §6.1) was permanently UNMEASURABLE — I9918. It "
+        "is a NEW VERSION rather than a v1 addition because a required field added "
+        "to v1 would retroactively invalidate every manifest already in the store: "
+        "`run_manifest.v1.json` stays in this package, frozen, and every object "
+        "written under it stays readable at its own declared version. Nothing "
+        "backfills those objects — a manufactured `run_mode` on a run nobody "
+        "observed is exactly the false liveness claim this field exists to prevent."
+    )
+    schema["allOf"] = [
+        {
+            "description": (
+                "A failed run states why. Enforced in the schema so no writer can omit it."
+            ),
+            "if": {"properties": {"status": {"const": "failed"}}, "required": ["status"]},
+            "then": {"properties": {"reason": {"minLength": 1}}},
+        },
+        {
+            "description": (
+                "An ok run has nothing to explain; a non-empty reason on success is a "
+                "degraded-SUCCEEDED in disguise."
+            ),
+            "if": {"properties": {"status": {"const": "ok"}}, "required": ["status"]},
+            "then": {"properties": {"reason": {"const": ""}}},
+        },
+    ]
 
 
 class RunManifestV2(_Strict):
@@ -488,90 +693,215 @@ class RunManifestV2(_Strict):
 
     model_config = ConfigDict(
         extra="forbid",
-        json_schema_extra={
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "$id": "https://github.com/nousergon/crucible/schemas/run_manifest.v2.json",
-            "title": "Crucible run manifest, v2",
-            "description": (
-                "The record every job writes at runs/{job}/{trading_day}/run.json. "
-                "Generated from crucible.models.RunManifestV2; v1 declared no "
-                "live/replay field and stays frozen at "
-                "crucible/schemas/run_manifest.v1.json. "
-                "The status<->reason cross-field rule is enforced by the model's "
-                "`_status_and_reason_agree`, not restated here as an `allOf` -- "
-                "see crucible/models.py's module docstring."
-            ),
-        },
+        json_schema_extra=_run_manifest_v2_json_schema_extra,
     )
 
-    schema_version: Literal["run_manifest.v2"]
+    schema_version: Literal["run_manifest.v2"] = Field(
+        description=(
+            "Version of THIS schema. A consumer that cannot read the version refuses the document "
+            "rather than guessing."
+        )
+    )
     run_id: str = Field(
         pattern=r"^[0-9A-HJKMNP-TV-Z]{26}$",
-        description="ULID: lexically sortable by creation time. The correlation "
-        "identity (§9.2), on every log line, alert, cost row and S3 object's "
-        "metadata for this run.",
+        description=(
+            "The correlation identity (§9.2). Appears on every log line, alert, cost row and S3 "
+            "object's metadata for this run. ULID: lexically sortable by creation time."
+        ),
     )
-    job: Literal[JOB_VALUES]  # type: ignore[valid-type]
+    job: Literal[JOB_VALUES] = Field(  # type: ignore[valid-type]
+        description=(
+            "The CLI job that produced this manifest. Closed set: a job absent from "
+            "crucible/components.yaml has no declared log location, alert channel or retention, "
+            "and is therefore unobserved."
+        )
+    )
     #: Whether this run was a LIVE execution or a REPLAY of a historical
     #: trading day. Required, closed vocabulary, deliberately NO DEFAULT: a
     #: default is what makes a replay indistinguishable from a live run the
     #: first time a producer forgets to set it (`alpha-engine-config-I9918`).
     #: Set from the invocation (`crucible.runmode.resolve_run_mode`), never
     #: derived from `trading_day`/`calendar_date`.
-    run_mode: Literal["live", "replay"]
+    run_mode: Literal["live", "replay"] = Field(
+        description=(
+            "Whether this run was a LIVE execution or a REPLAY of a historical trading day. "
+            "REQUIRED, closed vocabulary, and deliberately NO DEFAULT: a default is what makes a "
+            "replay indistinguishable from a live run the first time a producer forgets to set it, "
+            "so absence is a schema violation rather than a silent `live`. The value comes from "
+            "the INVOCATION — `crucible --run-mode` or $CRUCIBLE_RUN_MODE, resolved by "
+            "`crucible.runmode.resolve_run_mode`, which refuses when neither says. It is NEVER "
+            "derived from `trading_day` or `calendar_date`: plan §6.1 replays past Saturdays on an "
+            "accelerated schedule, so a date-derived reading would call exactly those replays "
+            "live, which is the `green on replays` failure phase 2's clause list was withheld for "
+            "(I9918). Read by `crucible.gate._clause_live_saturdays_first_attempt_ok`."
+        )
+    )
     #: THE KEY (§4.12). Never the wall-clock date.
-    trading_day: IsoDate
+    trading_day: IsoDate = Field(
+        description=(
+            "THE KEY (§4.12). An NYSE trading day from krepis.trading_calendar. A run launched on "
+            "a non-trading day binds to the last completed trading day — a Saturday weekly run is "
+            "keyed to Friday's close. Never the wall-clock date."
+        )
+    )
     #: Present only for a job that legitimately writes more than one
     #: manifest for the same `job`+`trading_day` (`alpha-engine-config-
     #: I9781`). Absent for every other job.
     discriminator: str | None = Field(
-        default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]{1,64}$"
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.-]{1,64}$",
+        description=(
+            "Present only for a job that legitimately writes more than one manifest for the same "
+            "`job`+`trading_day` — the slot letter (u/r/m/s) for "
+            "`experiment.run`/`experiment.grade`, or the firing's own `calendar_date` for "
+            "`alerts.sweep`, which runs every calendar day and can therefore fire more than once "
+            "against one trading day. Absent for every other job. Never encodes a fact `job` or "
+            "`trading_day` already carries (I9781); see `crucible.manifest.manifest_key`."
+        ),
     )
     #: Wall-clock date the run actually executed on, for PROVENANCE ONLY.
     #: Never a key, never an input to a promotion/retirement/freshness/
     #: grading decision.
-    calendar_date: IsoDate
+    calendar_date: IsoDate = Field(
+        description=(
+            "Wall-clock date the run actually executed on, recorded for provenance ONLY. Never "
+            "used as a key, never an input to a promotion, retirement, freshness or grading "
+            "decision."
+        )
+    )
     #: Exhaustive. There is deliberately no `partial`, `skipped`, `degraded`
     #: or `unknown`.
-    status: Literal["ok", "failed"]
+    status: Literal["ok", "failed"] = Field(
+        description=(
+            "Exhaustive. `ok` means a complete manifest with every output written; `failed` means "
+            "the run did not produce its deliverable and pages. There is deliberately no "
+            "`partial`, `skipped`, `degraded` or `unknown` — the v1 system's `cycle_verdict: "
+            "unknown` (I9729) and its 32-of-33 no-op skip flags (I9721) are unrepresentable here."
+        )
+    )
     #: Empty when `status` is `ok`; a specific, operator-readable cause when
-    #: `failed` — enforced by `_status_and_reason_agree` below, not by the
-    #: published schema (see this module's docstring).
-    reason: str = Field(max_length=2000)
+    #: `failed` — enforced by `_status_and_reason_agree` below AND, for a
+    #: consumer with no Python import, by the published schema's `allOf`
+    #: (see `_run_manifest_v2_json_schema_extra`).
+    reason: str = Field(
+        max_length=2000,
+        description=(
+            "Mandatory. Empty string when `status` is `ok`; a specific, operator-readable cause "
+            "when `failed` — the conditional below forbids an empty reason on a failure, because a "
+            "failure with no cause is indistinguishable from every other failure."
+        ),
+    )
     started: UtcTimestamp
     #: Written in the runner's `finally` block, so it is present even when
     #: the job raised.
-    finished: UtcTimestamp
-    code_sha: GitSha
-    release_sha: GitSha
+    finished: UtcTimestamp = Field(
+        description=(
+            "Written in the runner's `finally` block, so it is present even when the job raised."
+        )
+    )
+    code_sha: GitSha = Field(
+        description=(
+            "Commit sha of the crucible tree that ran. Half of `explain`'s answer to 'why did it "
+            "do that'."
+        )
+    )
+    release_sha: GitSha = Field(
+        description=(
+            "Sha of the immutable release artifact this process was installed from. Differs from "
+            "code_sha only when running from a working tree, where it is the same value."
+        )
+    )
     #: Required, including for jobs that are deterministic today: an
     #: unrecorded seed makes a replay diff unattributable.
-    seed: Annotated[int, Field(ge=0)]
-    inputs: list[ArtifactRef]
-    outputs: list[ArtifactRef]
+    seed: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "The RNG seed. Required, including for jobs that are deterministic today: an "
+                "unrecorded seed makes a replay diff unattributable."
+            ),
+        ),
+    ]
+    inputs: list[ArtifactRef] = Field(
+        description=(
+            "§9.2 class 4, upstream half. Every artifact read, content-hashed, with the schema "
+            "version it was read under. An empty list is legal and means the job read nothing."
+        )
+    )
+    outputs: list[ArtifactRef] = Field(
+        description=(
+            "§9.2 class 4, downstream half. Content hashes are what make a rerun idempotent: "
+            "identical bytes are a no-op."
+        )
+    )
     rows_in: Annotated[int, Field(ge=0)]
     rows_out: Annotated[int, Field(ge=0)]
-    rows_rejected: list[RejectedRow]
+    rows_rejected: list[RejectedRow] = Field(
+        description=(
+            "Rejections WITH REASON, never a bare count. A count with no reason cannot be acted "
+            "on, and is how 901 of 903 tickers silently failed a liquidity gate for months."
+        )
+    )
     #: Must be >= the sum of `llm_calls[].usd`; the runner asserts that,
     #: since a schema cannot.
-    cost_usd: Annotated[float, Field(ge=0)]
+    cost_usd: Annotated[
+        float,
+        Field(
+            ge=0,
+            description=(
+                "Total spend attributable to this run: LLM plus metered infrastructure. Must be >= "
+                "the sum of llm_calls[].usd; the runner asserts that, since a schema cannot."
+            ),
+        ),
+    ]
     #: Empty for every non-research job — LLM access is confined to research
     #: by standing rule.
-    llm_calls: list[LlmCallRow]
-    resource: ResourceRow
-    metrics: list[MetricRecordRow]
+    llm_calls: list[LlmCallRow] = Field(
+        description=(
+            "§9.2 class 2. One entry per logical call. Empty for every non-research job — LLM "
+            "access is confined to research by standing rule, and an empty list is the evidence of "
+            "that, not an absence of instrumentation."
+        )
+    )
+    resource: ResourceRow = Field(
+        description=(
+            "§9.2 class 3. Present on every manifest including laptop runs, where `spot` is false "
+            "and the instance type is `local`."
+        )
+    )
+    metrics: list[MetricRecordRow] = Field(
+        description=(
+            "§9.2 class 5. MetricRecord-shaped (krepis.metrics.MetricRecord), permissive on extra "
+            "fields for forward compatibility with a newer producer, but strict about the two that "
+            "make a number readable: `unit` whenever `value` is set, and `horizon_trading_days` as "
+            "an integer count of TRADING days."
+        )
+    )
     #: Never empty: a run that executed once records one attempt.
-    attempts: list[AttemptRow] = Field(min_length=1)
+    attempts: list[AttemptRow] = Field(
+        min_length=1,
+        description=(
+            "§11 risk 2. Every attempt this run made, including the transient-class retry. Never "
+            "empty: a run that executed once records one attempt, so a retried run cannot be "
+            "mistaken for a clean first-attempt run."
+        ),
+    )
 
     @model_validator(mode="after")
     def _status_and_reason_agree(self) -> RunManifestV2:
         """The plan's central guarantee (§4.2): a failed run states why, and
         an ok run has nothing to explain.
 
-        This is the cross-field rule this module's docstring names — it
-        stays a model_validator and is not re-encoded as the schema's
-        `allOf`, the same choice `ComponentRow`'s dispatch/deadline rules
-        made for `components_registry.v1.json`.
+        This is the cross-field rule this module's docstring names. It stays
+        the model_validator (the enforcement point for every Python-import
+        caller) AND is mirrored into the published schema's `allOf` by
+        `_run_manifest_v2_json_schema_extra`, so the two cannot drift apart
+        silently: a change here that is not also made there is caught by
+        `tests/test_manifest_schema.py`'s plain-`jsonschema` rejection test,
+        which validates against the committed file with no model import.
         """
         if self.status == "failed" and self.reason == "":
             raise ValueError(

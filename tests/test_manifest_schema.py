@@ -17,13 +17,14 @@ not been shown to constrain anything.
 
 **`alpha-engine-config-I10045` row 1**: `run_manifest.v2.json` is now
 GENERATED from `crucible.models.RunManifestV2`
-(`TestTheV2SchemaIsGeneratedFromTheModel` below), and the status<->reason
-cross-field rule moved onto the model as `RunManifestV2._status_and_reason_agree`
-— it is deliberately not in the schema's `allOf` any more (see
-`crucible/models.py`'s docstring), so the one test that rule used to make
-the raw `Draft202012Validator` reject now goes through
-`crucible.manifest.validate` instead, which is the boundary that still
-enforces it.
+(`TestTheV2SchemaIsGeneratedFromTheModel` below). The status<->reason
+cross-field rule stays enforced at the model as
+`RunManifestV2._status_and_reason_agree` (the tests below go through
+`crucible.manifest.validate`) AND is also emitted into the published
+schema's `allOf` by `_run_manifest_v2_json_schema_extra` (PR123 review
+finding 3), so a consumer with no Python import still gets the rule —
+`TestThePublishedSchemaAloneEnforcesStatusAndReason` proves that using plain
+`jsonschema` against the committed file, never importing the model.
 """
 
 from __future__ import annotations
@@ -189,10 +190,11 @@ def test_failed_requires_a_non_empty_reason() -> None:
     """`reason` is mandatory on failure. A failed run with an empty reason is
     the shape that made three Saturdays' failures indistinguishable.
 
-    This rule is `RunManifestV2._status_and_reason_agree`, not the raw
-    schema's `allOf` (dropped, `alpha-engine-config-I10045` row 1 — see
-    `crucible/models.py`'s docstring), so it is checked through
-    `crucible.manifest.validate`, the boundary that still enforces it.
+    The model's `RunManifestV2._status_and_reason_agree` is the enforcement
+    point checked here, through `crucible.manifest.validate` — the same rule
+    is ALSO in the published schema's `allOf`
+    (`TestThePublishedSchemaAloneEnforcesStatusAndReason`), for the
+    no-Python-import consumer.
     """
     doc = _valid_manifest()
     doc["status"] = "failed"
@@ -551,6 +553,42 @@ class TestTheV2SchemaIsGeneratedFromTheModel:
         from crucible.models import ATTEMPT_REASON_VALUES
 
         assert ATTEMPT_REASON_VALUES == ("initial", *TRANSIENT_RETRY_REASONS)
+
+
+class TestThePublishedSchemaAloneEnforcesStatusAndReason:
+    """PR123 review finding 3: the first draft dropped the status<->reason
+    cross-field rule from the published schema entirely, so a consumer
+    validating against the JSON file alone (no `crucible.models` import) no
+    longer got it. `_run_manifest_v2_json_schema_extra` now mirrors
+    `RunManifestV2._status_and_reason_agree` into the schema's `allOf` — this
+    class proves the published FILE enforces the rule on its own, using
+    plain `jsonschema` and never importing the model.
+    """
+
+    def test_status_ok_with_a_non_empty_reason_is_refused_by_the_file_alone(self) -> None:
+        doc = _valid_manifest()
+        doc["status"] = "ok"
+        doc["reason"] = "ran fine, mostly"
+        with pytest.raises(ValidationError):
+            Draft202012Validator(json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))).validate(doc)
+
+    def test_status_failed_with_an_empty_reason_is_refused_by_the_file_alone(self) -> None:
+        doc = _valid_manifest()
+        doc["status"] = "failed"
+        doc["reason"] = ""
+        with pytest.raises(ValidationError):
+            Draft202012Validator(json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))).validate(doc)
+
+    def test_status_ok_with_an_empty_reason_still_validates_against_the_file_alone(self) -> None:
+        Draft202012Validator(json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))).validate(
+            _valid_manifest()
+        )
+
+    def test_status_failed_with_a_reason_still_validates_against_the_file_alone(self) -> None:
+        doc = _valid_manifest()
+        doc["status"] = "failed"
+        doc["reason"] = "SpotInterruption: instance reclaimed at 13:02Z"
+        Draft202012Validator(json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))).validate(doc)
 
 
 class TestAMalformedV2ManifestNamesTheFieldAtTheBoundary:
