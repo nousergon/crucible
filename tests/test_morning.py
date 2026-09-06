@@ -298,28 +298,28 @@ class TestTheMessage:
                 f"generated: {GENERATED}  commit: {SHA}",
                 "delivered: 2026-09-03 06:00 PDT",
                 "",
-                "LADDER",
+                "<b>LADDER</b>",
                 "  phase0  UNMET  1/2",
                 "    holding: b_unmet",
                 "  phase1  OUT_OF_ORDER  0/1",
                 "    holding: c_unmet",
                 "    out of order: 1 of 5 clauses — phase0's gate is not met",
                 "",
-                "SCHEDULE (PLAN §6.1)",
+                "<b>SCHEDULE (PLAN §6.1)</b>",
                 "  no schedule row on the board — the plan §6.1 milestones are not being "
                 "rendered, which is a defect in the board, not an absent plan",
                 "",
-                "ACCEPTANCE",
+                "<b>ACCEPTANCE</b>",
                 f"  {ACCEPTANCE_NOT_ON_ANY_ARTIFACT}",
                 "",
-                "MOVED SINCE 2026-09-01",
+                "<b>MOVED SINCE 2026-09-01</b>",
                 "  obj:cost: PLANNED -> UNMEASURED",
                 "",
-                "SILENCE",
+                "<b>SILENCE</b>",
                 "  silence: 1 UNMEASURED, 0 UNMEASURABLE of 4 rows",
                 f"  {NO_OPERATOR_ACTION}",
                 "",
-                "FULL BOARD",
+                "<b>FULL BOARD</b>",
                 f"  {(tmp_path / 'board' / 'index.html').resolve().as_uri()}",
                 "  presigned GET, expires 2026-09-10T13:00:00Z or when the signing role's "
                 "session ends, whichever is first",
@@ -664,9 +664,9 @@ class TestSchedule:
         store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
         message = run_report(store, trading_day=DAY, now=FIRED_AT)
         lines = message.splitlines()
-        phase_at = lines.index("LADDER")
-        schedule_at = lines.index("SCHEDULE (PLAN §6.1)")
-        moved_at = next(i for i, ln in enumerate(lines) if ln.startswith("MOVED SINCE"))
+        phase_at = lines.index("<b>LADDER</b>")
+        schedule_at = lines.index("<b>SCHEDULE (PLAN §6.1)</b>")
+        moved_at = next(i for i, ln in enumerate(lines) if ln.startswith("<b>MOVED SINCE"))
         assert phase_at < schedule_at < moved_at
 
 
@@ -1216,13 +1216,16 @@ class TestTheTruncationRule:
         assert TRUNCATION_MARKER not in message
         assert "    holding: b_unmet" in message
 
-    def test_the_budget_is_measured_on_the_escaped_body(self, tmp_path):
-        """krepis escapes the body AFTER this module hands it over, so a
-        message that fits before escaping and not after is tail-trimmed by the
-        transport — losing the link, which is the last thing in it."""
-        assert wire_length("a_b") == 4
-        assert wire_length("[x]") == 5
+    def test_the_wire_length_is_plain_length_under_html_mode(self, tmp_path):
+        """`parse_mode="HTML"` (`alpha-engine-config-I9925`) inverts the old
+        Markdown-v1 rule: krepis escapes nothing further for HTML, because the
+        caller owns the markup and already escaped every interpolated value
+        via `_escape_html` before it reached a line — so what this module
+        renders IS the wire body, and `len()` is exact."""
+        assert wire_length("a_b") == 3
+        assert wire_length("[x]") == 3
         assert wire_length("plain") == 5
+        assert wire_length("&lt;script&gt;") == len("&lt;script&gt;")
 
 
 # ── the POSTed body, not the rendered one, is what has to fit (review F1) ──
@@ -1596,6 +1599,130 @@ class TestAReadThatFailedIsNotAPageThatIsAbsent:
         _seed(tmp_path, previous=_board())
         with pytest.raises(ValueError):
             run_report(_Broken(tmp_path), trading_day=DAY, now=FIRED_AT)
+
+
+class TestHtmlParseMode:
+    """`alpha-engine-config-I9925` — krepis 0.59.50 exposes `parse_mode`, and
+    the crucible half closes the gap: `<b>` headings render bold, every
+    interpolated board string is HTML-escaped, and the budget is re-measured
+    on the escaped wire body — six red closing rows, the longest clause names
+    actually on `main` (`crucible/gate.py`), not the old Markdown-v1 rule.
+    """
+
+    #: Real clause identifiers off `main`'s `crucible/gate.py` — the longest
+    #: names any phase gate actually emits, not invented placeholders, so the
+    #: worst case measured here is one this repository can actually produce.
+    _REAL_CLAUSE_NAMES: tuple[str, ...] = (
+        "old_sf_execution_count_zero",
+        "aws_total_within_ceiling",
+        "aws_cost_within_ceiling",
+        "attribution_renders",
+        "explain_walks_a_verdict",
+        "dead_lambdas_deleted",
+        "old_alerts_muted",
+        "acceptance_suite_committed",
+    )
+
+    def test_a_hostile_reason_is_escaped_and_does_not_break_delivery(self, tmp_path):
+        """An unescaped `<` in interpolated board free text must not be able
+        to take the whole message down under `parse_mode="HTML"` — the exact
+        failure mode `krepis.telegram`'s entity parser would 400 on."""
+        hostile = "Tom & Jerry <script>alert(1)</script> ok if 2<3 and 4>1"
+        rows = [_row("phase0", "phase", "UNMET", hostile)]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "<script>" not in message
+        assert "&amp;" in message
+        assert "&lt;script&gt;" in message
+        assert "2&lt;3" in message
+        assert "4&gt;1" in message
+        # The literal heading tags this module itself owns must survive —
+        # escaping applies to INTERPOLATED content, never to the module's own
+        # markup.
+        assert "<b>LADDER</b>" in message
+
+    def test_a_hostile_clause_name_is_escaped(self, tmp_path):
+        rows = [
+            _row(
+                "phase0",
+                "phase",
+                "UNMET",
+                "1/1 clauses met",
+                [_clause("bad<name>&here", False)],
+            )
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "bad<name>&here" not in message
+        assert "bad&lt;name&gt;&amp;here" in message
+
+    def test_a_hostile_operator_action_is_escaped(self, tmp_path):
+        store = _seed(
+            tmp_path,
+            previous=_board(),
+            board_run={
+                "status": "failed",
+                "code_sha": SHA,
+                "reason": "PutObject denied for role <arn> & retried",
+            },
+        )
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "denied for role <arn>" not in message
+        assert "denied for role &lt;arn&gt; &amp; retried" in message
+
+    def test_headings_are_tags_not_caps(self, tmp_path):
+        """The stale CAPS workaround (`alpha-engine-config-I9925`) is gone:
+        every heading is `<b>…</b>`, and the bare CAPS word alone is never a
+        whole line — it renders only inside its tag."""
+        store = _seed(tmp_path, previous=_board())
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        lines = message.splitlines()
+        for heading in [s.format(previous_day=PREVIOUS) for s in SECTIONS]:
+            assert heading in lines
+            bare = heading.removeprefix("<b>").removesuffix("</b>")
+            assert bare not in lines, f"{bare!r} rendered as a bare CAPS line, not a tag"
+
+    def test_the_wire_fits_the_cap_with_six_red_closing_rows_of_real_clause_names(self, tmp_path):
+        """The re-measured worst case: six phase rows (`phase0`..`phase5`,
+        one per binding-plan phase), every one UNMET/red, each holding every
+        real long clause name off `main`'s `crucible/gate.py` — plus an
+        HTML-hostile detail sentence on each, so the budget is proven on the
+        ESCAPED wire body (entity expansion included), not the pre-escape
+        rendered text `TestTheTruncationRule` already covers.
+        """
+        rows = [
+            _row(
+                f"phase{i}",
+                "phase",
+                "UNMET",
+                f"{len(self._REAL_CLAUSE_NAMES) - 1}/{len(self._REAL_CLAUSE_NAMES)} "
+                "clauses met; blocked by <deploy> & <IAM> gaps",
+                [_clause(name, met=False) for name in self._REAL_CLAUSE_NAMES],
+            )
+            for i in range(6)
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        message = run_report(store, trading_day=DAY, now=FIRED_AT)
+        wire = wire_length(TRANSPORT_PREFIX + message)
+        assert wire <= MESSAGE_MAX_CHARS, (
+            f"the six-red-row worst case POSTs at {wire} chars, over the "
+            f"{MESSAGE_MAX_CHARS}-char Telegram cap"
+        )
+        # Every phase's own ladder line survives even when its clause names
+        # were sacrificed to fit — the truncation rule's own guarantee,
+        # re-asserted on the HTML-mode fixture rather than assumed to still
+        # hold once escaping is in the budget.
+        for i in range(6):
+            assert f"  phase{i}  UNMET  0/{len(self._REAL_CLAUSE_NAMES)}" in message
+
+    def test_deliver_sends_with_parse_mode_html(self):
+        """`send_message`/`publish` (krepis 0.59.50) render nothing bold
+        without `parse_mode="HTML"` on the call — mocked here so the
+        assertion is on what this module ASKS FOR, never a live send."""
+        transport = _Transport()
+        deliver("<b>LADDER</b>\nhello", transport=transport)
+        (call,) = transport.calls
+        assert call["parse_mode"] == "HTML"
 
 
 def test_read_inputs_returns_the_declared_shape(tmp_path):
