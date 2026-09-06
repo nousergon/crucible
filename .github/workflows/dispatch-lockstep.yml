@@ -11,156 +11,162 @@ name: Dispatch Lockstep
 # before anyone could see it was bounded by nothing but the next unrelated
 # push to that repo — measured at over two hours that day, unbounded in
 # general. Worse for diagnosis: it surfaced in the repo that did not change,
-# against an author who did not change it (re-measured 2026-09-04: still
-# true — four unrelated `nous-ergon-ops` PRs ran the guard clean in the
-# window, and five `crucible` PRs merged with nothing on this side to run it
-# against them).
+# against an author who did not change it.
 #
-# This job runs THAT SAME test file, against `nous-ergon-ops`'s `main` and
-# THIS PR's own `crucible/components.yaml`, so the change that introduces
-# drift is the change that fails — the missing direction finding 2 names.
+# ── THIS IS DELIBERATELY INTERIM — `push: [main]` ONLY, NO `pull_request` ──
 #
-# ── the credential, and why it is not `CRUCIBLE_DEPLOY_KEY` ─────────────
+# The original design ran this on every `pull_request` too, so the change
+# introducing drift would be the change that fails. It does not, because of
+# what this job's credential is:
 #
-# `nous-ergon-ops` is PRIVATE. No workflow in this repository reads a private
-# repository today (measured: no `checkout` step here names a `repository:`
-# other than this one, and no workflow references any deploy-key-shaped
-# secret) — so there is no existing in-repo pattern to mirror forward. The
-# pattern one hop away, in the OTHER direction, is `nous-ergon-ops`'s own
-# `crucible-dispatch-lockstep` job in `tests.yml`: a read-only GitHub Deploy
-# Key scoped to the single repo being read (`CRUCIBLE_DEPLOY_KEY`, granting
-# `nous-ergon-ops` read of `crucible`), stored as a repository secret, checked
-# for emptiness before use, with a fail-loud guard that turns a withheld
-# secret into a hard failure on every event except a Dependabot one (the one
-# platform-native reason a repo secret legitimately arrives empty).
+# It mints a short-lived GitHub App installation token
+# (`nousergon_lib.github_app.installation_token`, narrowed at mint time to
+# `permissions={"contents": "read"}`) rather than holding a repo-scoped
+# deploy key, so it needs no new long-lived secret
+# (`identity-access-policy.md` §4/§7: the fleet's `ne-groomer` App already
+# suffices; Brian ruling on `alpha-engine-config-I9967` / `crucible-PR125`).
+# But `mint_installation_token`/`installation_token` (nousergon-lib, measured
+# 2026-09-06) narrow only PERMISSIONS, not REPOSITORY — there is no
+# `repositories` kwarg, and the App is installed org-wide. A token minted
+# this way is `contents:read` across every repository the installation
+# covers, not just `nous-ergon-ops`. Trusting a `pull_request` subject for
+# the OIDC role that reads the App's SSM-held credentials would hand that
+# reach to any pull request — exactly the escalation
+# `test_crucible_dispatch_lockstep.py`'s own docstring already rules out for
+# the sibling case: *"Deliberately NOT the `nousergon_lib.github_app`
+# installation-token path `scheduled-identity-check` uses: that job runs
+# `if: github.event_name != 'pull_request'` specifically because its OIDC
+# trust is pinned to this workflow on `main` and PR code must never reach the
+# App's private key."* `iam-drift-check.yml`'s `scheduled-identity-check`
+# carries that identical guard for the identical reason.
 #
-# This job needs the MIRROR of that credential, not that credential itself:
-# a NEW read-only deploy key living on `nous-ergon-ops`, granting `crucible`'s
-# PR-triggered CI read of `nous-ergon-ops` — `identity-access-policy.md` §7
-# mints one credential per authority boundary, and reusing or widening
-# `CRUCIBLE_DEPLOY_KEY` (which grants the opposite read) would be a shared
-# credential crossing two boundaries, not a narrow one. This shape, and the
-# operator procedure to create it, was already specified in the
-# 2026-09-03T00:06:50Z comment on alpha-engine-config-I9878 as
-# `NOUS_ERGON_OPS_DEPLOY_KEY` — mirrored verbatim here rather than reinvented.
+# So this job mirrors `scheduled-identity-check` exactly: `if:
+# github.event_name != 'pull_request'`, even though no `pull_request` trigger
+# is declared below — belt and suspenders, so the guard survives someone
+# later adding one without re-deriving why it can't run there. It runs on
+# every push to `main` (crucible's OWN main going red at the merge that
+# introduces drift, which was the point of finding 1 too) and on
+# `workflow_dispatch` for a manual check. It does NOT run on `pull_request`.
 #
-# **This secret does not exist yet** (measured 2026-09-06: `gh api
-# repos/nousergon/nous-ergon-ops/keys` returns `[]`, no deploy key titled for
-# I9878 exists). Per that ruling and per this session's own instructions,
-# creating it is an operator action, not something this PR does — see the PR
-# body. Until it is created, this job runs, finds the secret empty, and
-# either fails loud (a non-Dependabot event — genuinely missing credential,
-# not silently vacuous) or reports the expected skip (a Dependabot event).
+# **PR-path coverage is tracked, not abandoned**: `alpha-engine-config-I<see
+# PR body>` requests a `repositories` kwarg on the library function so a
+# token can be narrowed to exactly `nous-ergon-ops`, at which point this job
+# moves onto `pull_request` and becomes the change-that-introduces-drift
+# detector finding 2 actually asks for. Until then, this is strictly better
+# than before this PR (crucible's own `main` going red at ITS merge) but not
+# yet as good as `nous-ergon-ops-PR1000`'s side (a PR-triggered check).
 #
-# ── why no `paths:` filter ──────────────────────────────────────────────
+# ── the credential ────────────────────────────────────────────────────────
 #
-# GitHub records a workflow job skipped by a path filter as never having
-# started, so a REQUIRED check gated by a path filter can stay pending
-# forever on a PR that does not touch the named paths. This job is a shallow
-# clone plus a `pip install` plus a two-file pytest run — no `uv sync`, no
-# install of this project — so running it unconditionally on every PR and
-# every push to `main` costs seconds, not minutes, and removes that trap
-# entirely. (Whether this check becomes REQUIRED at all is a branch-protection
-# decision this PR does not make — see the PR body.)
+# `crucible-v2-github-lockstep` (nous-ergon-ops/infrastructure/cloudformation
+# /crucible-v2.yaml, sibling PR): trusted for
+# `repo:nousergon/crucible:ref:refs/heads/main` ONLY (no `pull_request`
+# subject, ever, per the rationale above), granted exactly
+# `ssm:GetParameter` on the three `/alpha-engine/groom/github_app_*`
+# parameters — the same three `BoardRole` already reads
+# (`ReadTheGroomerAppCredentialsToMintATrackerToken`,
+# `alpha-engine-config-I9967`), for the identical reason: no second
+# long-lived credential when the fleet's App already suffices. That role is
+# created by an OPERATOR-GATED stack apply, not by merging the ops PR
+# (`pull-request-policy` §4.2 form 3) — until the apply happens this job
+# fails on the identity-confirmation step below, naming the exact command.
 #
-# ── PR_REACHABLE_JOBS (test_workflow_triggers.py) ────────────────────────
-#
-# This job runs on `pull_request` and is not excluded by an `if:` (it must
-# run there — that is the whole point). Its subject is the cross-repo
-# CONTRACT this PR's own diff to `crucible/components.yaml` or
-# `.github/workflows/*.yml` may have changed, read against `nous-ergon-ops`'s
-# committed template — not live AWS or any other out-of-band state a diff
-# cannot control, so it is the same shape `scm-platform-policy.md` §3.1
-# already accepts for `ci.yml:test`. It is named in `PR_REACHABLE_JOBS` in
-# `tests/test_workflow_triggers.py` for that reason.
+# No `paths:` filter: this job is a token mint, a shallow checkout and a
+# two-file pytest run, seconds against the §4.11 CI budget, and a required
+# check gated by a path filter can stay pending forever on a skip.
 
 on:
-  pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  LOCKSTEP_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/crucible-v2-github-lockstep
 
 jobs:
   crucible-dispatch-lockstep:
     name: crucible-dispatch-lockstep
+    # Mirrored byte-for-byte from iam-drift-check.yml's scheduled-identity-check
+    # (nous-ergon-ops) — see the header comment above for why. No pull_request
+    # trigger is declared, so this is defence in depth against one being added
+    # later without re-deriving the reason it can't run there.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      # Branch on the SECRET being empty, never on `github.actor`: an actor
-      # string is PR-author-controlled input, an empty secret is the
-      # platform's own fact. GitHub withholds repository secrets from
-      # Dependabot-triggered runs, which reads exactly like a missing
-      # credential and is not (mirrors nous-ergon-ops tests.yml's
-      # `crucible-dispatch-lockstep` job and iam-drift-check.yml's
-      # `foreign-writers-check`, per alpha-engine-config-I9793).
-      - name: Check NOUS_ERGON_OPS_DEPLOY_KEY availability
-        id: check_key
-        env:
-          DEPLOY_KEY: ${{ secrets.NOUS_ERGON_OPS_DEPLOY_KEY }}
+      - name: Repository variable AWS_ACCOUNT_ID is set
         run: |
-          set -euo pipefail
-          if [ -z "$DEPLOY_KEY" ]; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      # The fail-loud half. It does NOT gate the skip; it turns a genuinely
-      # missing or misconfigured secret RED instead of letting it join the
-      # skip path, where a dead guard reads identically to a passing one —
-      # the exact defect this whole issue exists to close.
-      - name: Guard — a withheld secret must correlate with a Dependabot event
-        if: steps.check_key.outputs.available == 'false'
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event.pull_request.user.login }}" != "dependabot[bot]" ] && \
-             [ "${{ github.actor }}" != "dependabot[bot]" ]; then
-            echo "::error::NOUS_ERGON_OPS_DEPLOY_KEY is empty on a NON-Dependabot event (actor=${{ github.actor }}, pr_author=${{ github.event.pull_request.user.login }}, event=${{ github.event_name }}) — refusing to silently skip. The secret is genuinely missing or misconfigured (expected until the alpha-engine-config-I9878 operator step creates it — see the PR body), not withheld by GitHub's Dependabot secret policy."
+          if [ -z "$AWS_ACCOUNT_ID" ]; then
+            echo "::error::repository variable AWS_ACCOUNT_ID is not set — set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/crucible --body '<12-digit-account-id>'"
             exit 1
           fi
-          echo "NOUS_ERGON_OPS_DEPLOY_KEY is empty on a Dependabot-authored event (actor=${{ github.actor }}) — expected platform behaviour, not drift."
-
-      - name: Checkout nous-ergon-ops (private) at main
-        if: steps.check_key.outputs.available == 'true'
         env:
-          DEPLOY_KEY: ${{ secrets.NOUS_ERGON_OPS_DEPLOY_KEY }}
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          role-to-assume: ${{ env.LOCKSTEP_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The identity actually obtained, read back from AWS rather than
+      # restated from `env` — same argument board.yml makes. Names the exact
+      # operator command if the role does not exist yet, because the stack
+      # apply that creates it is operator-gated (pull-request-policy §4.2
+      # form 3), not automated by this merge.
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${LOCKSTEP_ROLE_ARN##*/}"
+          case "${assumed}" in
+            *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;;
+            *)
+              echo "::error::this job assumed ${assumed}, not ${expected}. If the role does not exist yet, the crucible-v2 stack has not been applied since the sibling nous-ergon-ops PR (crucible-v2-github-lockstep) merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow."
+              exit 1
+              ;;
+          esac
+
+      - name: Install App-token and test dependencies
+        run: python3 -m pip install --quiet "nousergon-lib[github-app]" pytest pyyaml
+
+      # Narrowed to `contents: read` at mint time — GitHub only permits
+      # NARROWING an App installation token below what the installation
+      # holds, never widening it. No `repositories` narrowing exists yet in
+      # this library function (see the header comment); the OIDC trust above
+      # is what keeps this token off the pull_request path until it does.
+      - name: Mint a read-only ne-groomer token
+        id: token
         run: |
           set -euo pipefail
-          mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
-          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
-          chmod 600 "$HOME/.ssh/id_ed25519"
-          ssh-keyscan -t ed25519 github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
-          git clone --quiet --depth=1 \
-            "git@github.com:nousergon/nous-ergon-ops.git" \
-            "$RUNNER_TEMP/nous-ergon-ops"
+          TOKEN="$(python3 -c "
+          from nousergon_lib.github_app import installation_token
+          print(installation_token(permissions={'contents': 'read'}), end='')
+          ")"
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Python
-        if: steps.check_key.outputs.available == 'true'
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+      - name: Checkout nous-ergon-ops (private) at main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          python-version: '3.12'
+          repository: nousergon/nous-ergon-ops
+          token: ${{ steps.token.outputs.token }}
+          path: nous-ergon-ops-checkout
+          persist-credentials: false
 
-      # CRUCIBLE_ROOT is THIS PR's checkout, not a second clone of `crucible`:
-      # the whole point of finding 2 is that the change introducing drift is
-      # the change that fails the guard.
+      # CRUCIBLE_ROOT is THIS repository's own checkout, not a second clone of
+      # `crucible`: the whole point is that the change introducing drift is
+      # the change that fails, once this job also covers the pull_request
+      # path (tracked, see the header comment).
       - name: Lockstep guard
-        if: steps.check_key.outputs.available == 'true'
         env:
           CRUCIBLE_ROOT: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          test -f "$RUNNER_TEMP/nous-ergon-ops/tests/crossrepo/test_crucible_dispatch_lockstep.py" || {
-            echo "::error::nous-ergon-ops checkout absent — refusing a vacuous lockstep pass"
-            exit 1
-          }
-          python3 -m pip install --quiet pytest pyyaml
-          cd "$RUNNER_TEMP/nous-ergon-ops" && python3 -m pytest tests/crossrepo/test_crucible_dispatch_lockstep.py -q
-
-      - name: Report skip (credential withheld on a Dependabot PR)
-        if: steps.check_key.outputs.available == 'false' && (github.event.pull_request.user.login == 'dependabot[bot]' || github.actor == 'dependabot[bot]')
-        run: |
-          echo "NOUS_ERGON_OPS_DEPLOY_KEY not available (Dependabot PR) — skipping the clone and the lockstep guard."
-          echo "Coverage while this skips: the guard still runs, and still fails on real drift, on every push to main and every human-authored PR here, and on every nous-ergon-ops event."
+          cd nous-ergon-ops-checkout
+          python3 -m pytest tests/crossrepo/test_crucible_dispatch_lockstep.py -q
