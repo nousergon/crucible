@@ -307,7 +307,7 @@ def run_promotion(
         register=register,
         series_by_arm=series_by_arm,
         incumbent=incumbent,
-        preconditions=_with_control_vetoes(spec, series_by_arm, preconditions),
+        preconditions=_with_control_vetoes(spec, series_by_arm, preconditions, register),
         training=training,
     )
 
@@ -343,6 +343,7 @@ def run_promotion(
             code_sha=code_sha,
             attestation=attestation,
             now=now,
+            register=register,
         )
         if pointer is not None:
             written.append(champion_key(spec.slot))
@@ -461,6 +462,7 @@ def _with_control_vetoes(
     spec: SlotSpec,
     series_by_arm: dict[str, ArmSeries],
     preconditions: dict[str, tuple[ServingPrecondition, ...]] | None,
+    register: ArmRegister,
 ) -> dict[str, tuple[ServingPrecondition, ...]] | None:
     """Add a FAILED serving precondition to every control arm being scored.
 
@@ -478,8 +480,14 @@ def _with_control_vetoes(
     Caller-supplied preconditions are preserved and the veto is appended:
     an arm can fail more than one gate, and dropping the caller's would hide
     a behavioural veto behind a control flag.
+
+    ``register`` is the caller's already-loaded :class:`ArmRegister`
+    (`run_promotion`'s own parameter), threaded into :func:`is_control_arm`
+    so the veto is register-backed rather than the name-only fallback
+    (`alpha-engine-config-I10044`) — a filed non-control recipe whose
+    generated name collides with a control's name must not be vetoed here.
     """
-    controls = {arm for arm in series_by_arm if is_control_arm(spec, arm)}
+    controls = {arm for arm in series_by_arm if is_control_arm(spec, arm, register)}
     if not controls:
         return preconditions
     merged: dict[str, tuple[ServingPrecondition, ...]] = {
@@ -513,6 +521,7 @@ def _write_pointer_if_moved(
     code_sha: str | None,
     attestation: dict[str, Any] | None,
     now: dt.datetime | None,
+    register: ArmRegister,
 ) -> ChampionPointer | None:
     decision = cycle.decision
     if decision.champion is None:
@@ -521,7 +530,7 @@ def _write_pointer_if_moved(
         return None
     if not decision.moved:
         return None
-    if is_control_arm(spec, decision.champion):
+    if is_control_arm(spec, decision.champion, register):
         # Unreachable while `_with_control_vetoes` runs ahead of the engine,
         # and kept because it sits on the write to the one contract the
         # trader reads. A RAISE rather than a silent `return None`: if a
