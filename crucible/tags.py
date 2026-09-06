@@ -41,9 +41,12 @@ __all__ = [
     "TAG_READERS",
     "TAG_VALUE",
     "UNTAGGABLE_TYPES",
+    "CostAllocationStatus",
+    "CostAllocationTagUnreadableError",
     "StackNotAppliedError",
     "TagAudit",
     "audit_stack_tags",
+    "cost_allocation_tag_status",
 ]
 
 TAG_KEY = "system"
@@ -193,6 +196,66 @@ def _tagged_identifiers(tagging: Any) -> set[str]:
             found.add(arn.rsplit("/", 1)[-1])
             found.add(arn.rsplit(":", 1)[-1])
     return found
+
+
+class CostAllocationTagUnreadableError(RuntimeError):
+    """`ce:ListCostAllocationTags` could not be read, so activation is unknown.
+
+    Raised rather than reporting `Inactive`: a denied call and a genuinely
+    inactive key are different findings with different remedies, and
+    `crucible.gate` must be able to tell them apart the same way
+    `crucible.cost.CostUnreadableError` does for spend itself.
+    """
+
+
+@dataclass(frozen=True)
+class CostAllocationStatus:
+    """Whether Billing has activated `TAG_KEY` as a cost-allocation tag.
+
+    Distinct question from :func:`audit_stack_tags`: that answers whether the
+    stack's resources carry the tag; this answers whether Cost Explorer
+    indexes spend under it at all. A fully-tagged stack and an `Inactive` key
+    both make a tag-filtered Cost Explorer read return exactly `$0.00` — this
+    is the reading that tells the two apart.
+    """
+
+    status: str  # "Active" | "Inactive" | "absent" (key never seen by Billing)
+    last_updated_date: str | None
+
+    @property
+    def active(self) -> bool:
+        return self.status == "Active"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"status": self.status, "last_updated_date": self.last_updated_date}
+
+
+def cost_allocation_tag_status(ce: Any) -> CostAllocationStatus:
+    """Whether `TAG_KEY` is `Active` as a cost-allocation tag in Billing.
+
+    `ce:ListCostAllocationTags` is a distinct IAM action from
+    `ce:GetCostAndUsage` and from any resource-tagging permission — granting
+    the others does not grant this one. A denial (or any other unreachable
+    read) RAISES rather than reporting `Inactive`: `Inactive` is itself a
+    valid, measured answer with its own remedy, and conflating "denied" with
+    "Inactive" would hide the one case an operator cannot fix by re-running
+    the render.
+    """
+    try:
+        response = ce.list_cost_allocation_tags(TagKeys=[TAG_KEY])
+    except Exception as exc:
+        raise CostAllocationTagUnreadableError(
+            f"ce:ListCostAllocationTags could not be read for {TAG_KEY!r}: "
+            f"{type(exc).__name__}: {exc}. That is a statement about our access, not "
+            "about whether the tag is activated."
+        ) from exc
+    for entry in response.get("CostAllocationTags") or []:
+        if entry.get("TagKey") == TAG_KEY:
+            return CostAllocationStatus(
+                status=entry.get("Status", "Inactive"),
+                last_updated_date=entry.get("LastUpdatedDate"),
+            )
+    return CostAllocationStatus(status="absent", last_updated_date=None)
 
 
 def audit_stack_tags(*, stack: str, cfn: Any, tagging: Any, iam: Any = None) -> TagAudit:

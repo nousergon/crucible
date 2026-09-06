@@ -65,7 +65,12 @@ from crucible.release import POINTER_KEY
 from crucible.report import attribution_key
 from crucible.slots import SLOTS, dispatchable_slots, is_control_arm
 from crucible.store import Store
-from crucible.tags import TAG_KEY, TAG_VALUE
+from crucible.tags import (
+    TAG_KEY,
+    TAG_VALUE,
+    CostAllocationTagUnreadableError,
+    cost_allocation_tag_status,
+)
 from crucible.weekly import arc_stages
 
 __all__ = [
@@ -3382,25 +3387,77 @@ def _clause_aws_cost_within_ceiling(
         # The empty-set trap, one level down from phase 5's, and it applies to
         # BOTH scopes. A TAG-FILTERED total of exactly $0.00 is a property of
         # the FILTER, not of the spend: it is what a correctly-tagged month
-        # with no resources and an entirely UNTAGGED estate both return, and
+        # with no resources, an entirely UNTAGGED estate, and a correctly
+        # tagged estate whose tag key is Inactive in Billing all return, and
         # this account's untagged total was $230.21 on the day this was
         # written. An ACCOUNT total of exactly $0.00 is the same shape one
         # level up: for a live AWS estate it means Cost Explorer answered with
         # nothing chargeable — a broken reading, not a free month. Reading
         # either as "under the ceiling" would put a phase row green on the
-        # evidence that the cost reading is not working. Whether the tag is
-        # actually applied is `crucible.tags.audit_stack_tags`' question, and
-        # phase 0's `v2_resources_tagged_and_versioned` deliverable.
+        # evidence that the cost reading is not working. Whether the RESOURCES
+        # carry the tag is `crucible.tags.audit_stack_tags`' question and
+        # phase 0's `v2_resources_tagged_and_versioned` deliverable; whether
+        # Billing has ACTIVATED the tag key at all is
+        # `crucible.tags.cost_allocation_tag_status`' question, below.
+        if not tagged:
+            return _unmeasurable(
+                name,
+                requirement,
+                f"Cost Explorer returned exactly $0.00 for {reading.scope} over "
+                f"{reading.start.isoformat()}..{reading.end.isoformat()}: no spend "
+                "recorded for the whole account. A total of zero is what a broken "
+                "or misfiltered reading returns as well as a free month",
+                evidence,
+            )
+        # The tag-filtered $0.00 has a second candidate cause one level above
+        # the resources: Cost Explorer only indexes spend under a tag KEY that
+        # Billing has activated as a cost-allocation tag, independent of
+        # whether every resource carries it (`crucible.tags.audit_stack_tags`
+        # answers that, separately). `alpha-engine-config-I10076`: the
+        # `system` key read `Inactive` while the stack was fully tagged, and
+        # this clause pointed the reader at the wrong audit.
+        try:
+            tag_status = cost_allocation_tag_status(_ce_client())
+        except CostAllocationTagUnreadableError as exc:
+            return _unmeasurable(
+                name,
+                requirement,
+                f"Cost Explorer returned exactly $0.00 for {reading.scope} over "
+                f"{reading.start.isoformat()}..{reading.end.isoformat()}, and whether "
+                f"`{TAG_KEY}` is activated as a cost-allocation tag could not be read: "
+                f"{exc}",
+                (*evidence, "ce:ListCostAllocationTags"),
+            )
+        if not tag_status.active:
+            return _unmeasurable(
+                name,
+                requirement,
+                f"Cost Explorer returned exactly $0.00 for {reading.scope} over "
+                f"{reading.start.isoformat()}..{reading.end.isoformat()}: `{TAG_KEY}` is "
+                f"{tag_status.status} as a cost-allocation tag in Billing, so Cost "
+                "Explorer does not index spend under this filter at all, regardless of "
+                "whether the resources carry it — activate it with `aws ce "
+                f"update-cost-allocation-tags-status --cost-allocation-tags-status "
+                f"TagKey={TAG_KEY},Status=Active`",
+                (*evidence, "ce:ListCostAllocationTags"),
+            )
+        since = tag_status.last_updated_date or "an unknown date"
+        age_note = ""
+        if tag_status.last_updated_date:
+            try:
+                activated = dt.date.fromisoformat(tag_status.last_updated_date[:10])
+            except ValueError:
+                age_note = ""
+            else:
+                age_note = f", activated {(window[-1] - activated).days} day(s) ago"
         return _unmeasurable(
             name,
             requirement,
             f"Cost Explorer returned exactly $0.00 for {reading.scope} over "
-            f"{reading.start.isoformat()}..{reading.end.isoformat()}: no spend recorded "
-            "under this filter — the tag or the account read is not evidence of cost "
-            "under the ceiling. A total of zero is what a broken or misfiltered reading "
-            "returns as well as a free month. `crucible.tags.audit_stack_tags` is the "
-            "reading that says whether the tag is applied",
-            evidence,
+            f"{reading.start.isoformat()}..{reading.end.isoformat()}: `{TAG_KEY}` has been "
+            f"Active since {since}{age_note} — Cost Explorer indexes forward from "
+            "activation, so spend recorded is genuinely zero or not yet indexed",
+            (*evidence, "ce:ListCostAllocationTags"),
         )
     # `end` is exclusive in Cost Explorer's grammar, so the day count is the
     # interval length: a reading taken on the 1st covers one day, not zero.
