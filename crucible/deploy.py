@@ -67,6 +67,48 @@ __all__ = ["main"]
 _UNKNOWN_SHA = "0" * 40
 
 
+def _required_smoke_extras() -> frozenset[str]:
+    """The extra names a released wheel must be installed with before the
+    flip may trust its smoke.
+
+    Read from the installed distribution's own metadata (`Provides-Extra`,
+    which the build writes from `pyproject.toml`'s
+    `[project.optional-dependencies]`) rather than hardcoded or read off a
+    `pyproject.toml` path relative to this file: `arcticdb` is declared
+    there because ArcticDB has no Linux aarch64 wheel and the v2 box
+    (r6i.large, x86_64) installs it with `pip install "...[arcticdb]"` — a
+    smoke that never proved the same install on the same architecture
+    proves nothing about a wheel the box can actually run
+    (alpha-engine-config-I10069). Distribution metadata is the one source
+    that is present both in the checkout `deploy.yml` runs from and in an
+    installed wheel; a path walk up from this module is only true of the
+    first.
+    """
+    from importlib.metadata import metadata  # noqa: PLC0415 - lazy, one call site
+
+    return frozenset(metadata("crucible").get_all("Provides-Extra") or ())
+
+
+def _smoked_extras(smoke_manifest: dict[str, Any]) -> frozenset[str]:
+    """The extras `deploy.yml`'s install-proof step actually verified,
+    as recorded on the smoke manifest's `smoke_ok` metric.
+
+    `crucible.track_c.smoke_handler` writes this field from
+    `$CRUCIBLE_SMOKED_EXTRAS`, which the install-proof step exports after
+    installing the published wheel with every required extra and importing
+    each one's module — on the same x86_64 runner the box uses. A manifest
+    from before this field existed, or one whose metric is missing
+    altogether, reads as having smoked nothing: absence must not read as
+    coverage.
+    """
+    for metric in smoke_manifest.get("metrics", []):
+        if metric.get("name") == "smoke_ok":
+            extras = metric.get("smoked_extras")
+            if isinstance(extras, list):
+                return frozenset(extras)
+    return frozenset()
+
+
 def _publish(args: argparse.Namespace, store: Store) -> int:
     """Upload the immutable half. Promotes nothing.
 
@@ -260,6 +302,21 @@ def _flip(args: argparse.Namespace, store: Store) -> int:
     # that is not an object stops the flip with the key named.
     smoke = load_store_document(store, key)
     before = current_release(store)
+    # alpha-engine-config-I10069: same shape as the `release_sha` check
+    # `flip_on_smoke` makes below — a smoke manifest that never proved the
+    # box's required extras install and import is a smoke that passed
+    # against a wheel the box cannot actually run.
+    required_extras = _required_smoke_extras()
+    missing_extras = sorted(required_extras - _smoked_extras(smoke))
+    if missing_extras:
+        raise SystemExit(
+            f"the smoke manifest for {args.sha} does not record installing extra(s) "
+            f"{missing_extras}. pyproject.toml declares them required and "
+            "nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml installs "
+            "them on the box; a smoke that never proved the wheel installs and "
+            "imports what the box needs would flip the pointer on a build the box "
+            f"cannot run. releases/current is untouched at {before or '(unset)'}."
+        )
     try:
         flipped = flip_on_smoke(store, sha=args.sha, smoke_manifest=smoke, expect=expect)
     except PointerConflictError as exc:
