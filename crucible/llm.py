@@ -56,9 +56,11 @@ from typing import Any
 
 import yaml
 from krepis.usage_pacing import PaceStatus, pace_check
+from pydantic import ValidationError
 
 from crucible.documents import load_store_document
 from crucible.keys import RUNS_ROOT, is_manifest_key
+from crucible.models import LlmCallsiteRegistryDocument
 from crucible.store import Store
 
 __all__ = [
@@ -409,6 +411,36 @@ def _exec_context() -> str:
     return declared
 
 
+def _read_registry_document() -> LlmCallsiteRegistryDocument:
+    """Parse and validate `llm_callsites.yaml` as one document.
+
+    `alpha-engine-config-I10045` row 4: `load_registry` and
+    `load_capability_classes` each used to `yaml.safe_load` this file
+    independently and hand-check the piece they needed — a row missing
+    `max_usd_per_call` fell through to `float(row["max_usd_per_call"])`,
+    which raises a bare `KeyError`/`TypeError` naming neither the call site
+    nor the field. Both callers now validate through
+    `crucible.models.LlmCallsiteRegistryDocument`; each still does its own
+    `yaml.safe_load` and its own call into this function (no shared cache
+    between them) so the existing test suite's direct
+    `load_capability_classes.cache_clear()` /
+    `_capability_classes.cache_clear()` calls keep working unchanged.
+    """
+    if not CALLSITE_REGISTRY_PATH.is_file():
+        raise FileNotFoundError(
+            f"the LLM call-site registry is missing at {CALLSITE_REGISTRY_PATH}. It "
+            "ships inside the package; its absence is a broken build, not an empty "
+            "registry."
+        )
+    raw = yaml.safe_load(CALLSITE_REGISTRY_PATH.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{CALLSITE_REGISTRY_PATH} is not a mapping; got {type(raw).__name__}")
+    try:
+        return LlmCallsiteRegistryDocument.model_validate(raw)
+    except ValidationError as exc:
+        raise ValueError(f"{CALLSITE_REGISTRY_PATH}: {exc}") from exc
+
+
 @lru_cache(maxsize=1)
 def load_registry() -> dict[str, CallSite]:
     """``LLM_CALLSITE_REGISTRY``, read from ``llm_callsites.yaml``.
@@ -417,47 +449,23 @@ def load_registry() -> dict[str, CallSite]:
     would make every call site unregistered and every coverage check vacuous
     at the same time — the registry would report 100% coverage of nothing.
     """
-    if not CALLSITE_REGISTRY_PATH.is_file():
-        raise FileNotFoundError(
-            f"the LLM call-site registry is missing at {CALLSITE_REGISTRY_PATH}. It "
-            "ships inside the package; its absence is a broken build, not an empty "
-            "registry."
-        )
-    document = yaml.safe_load(CALLSITE_REGISTRY_PATH.read_text(encoding="utf-8"))
-    if not isinstance(document, dict) or "callsites" not in document:
-        raise ValueError(
-            f"{CALLSITE_REGISTRY_PATH} carries no `callsites` mapping. An empty "
-            "registry is written `callsites: {}`, so that 'no call sites' is a "
-            "recorded fact rather than a parse that fell through."
-        )
-    rows = document["callsites"] or {}
-    if not isinstance(rows, dict):
-        raise ValueError(f"{CALLSITE_REGISTRY_PATH}: `callsites` must be a mapping of id -> row")
+    document = _read_registry_document()
     registry: dict[str, CallSite] = {}
-    for callsite_id, row in rows.items():
-        missing = [
-            f for f in ("purpose", "capability_class", "max_usd_per_call", "owner") if f not in row
-        ]
-        if missing:
-            raise ValueError(
-                f"call site {callsite_id!r} declares no {', '.join(missing)}. Every field "
-                "is required: a row that names no owner or no ceiling records the id and "
-                "nothing anyone can act on."
-            )
-        _require_capability_class(str(row["capability_class"]), callsite_id=str(callsite_id))
+    for callsite_id, row in document.callsites.items():
+        _require_capability_class(row.capability_class, callsite_id=callsite_id)
         # The EARLIEST point an unrouted class is knowable: a row declaring a
         # class that addresses no ruled group is refused when the registry
         # loads, not on the first call in the first weekly run. Offline and
         # pure — no registry document, no network, no credential — so this
         # holds in CI, where none of those exist
         # (`alpha-engine-config-I9969`).
-        capability_group(str(row["capability_class"]))
-        registry[str(callsite_id)] = CallSite(
-            callsite_id=str(callsite_id),
-            purpose=str(row["purpose"]),
-            capability_class=str(row["capability_class"]),
-            max_usd_per_call=float(row["max_usd_per_call"]),
-            owner=str(row["owner"]),
+        capability_group(row.capability_class)
+        registry[callsite_id] = CallSite(
+            callsite_id=callsite_id,
+            purpose=row.purpose,
+            capability_class=row.capability_class,
+            max_usd_per_call=row.max_usd_per_call,
+            owner=row.owner,
         )
     return registry
 
@@ -472,20 +480,7 @@ def load_capability_classes() -> tuple[str, ...]:
     to "anything" would be the denylist this replaced with extra steps. An
     empty allowlist is written ``capability_classes: []``.
     """
-    document = yaml.safe_load(CALLSITE_REGISTRY_PATH.read_text(encoding="utf-8"))
-    if not isinstance(document, dict) or "capability_classes" not in document:
-        raise ValueError(
-            f"{CALLSITE_REGISTRY_PATH} declares no `capability_classes` list. It is the "
-            "allowlist `crucible.llm.call` admits against; its absence is a broken build, "
-            "not an empty allowlist, which is written `capability_classes: []`."
-        )
-    rows = document["capability_classes"] or []
-    if not isinstance(rows, list) or any(not isinstance(r, str) or not r for r in rows):
-        raise ValueError(
-            f"{CALLSITE_REGISTRY_PATH}: `capability_classes` must be a list of non-empty "
-            "strings naming router capability classes."
-        )
-    return tuple(rows)
+    return tuple(_read_registry_document().capability_classes)
 
 
 #: The registry itself. A mapping id -> :class:`CallSite`; empty in phase 1,
