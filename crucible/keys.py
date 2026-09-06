@@ -55,6 +55,7 @@ __all__ = [
     "board_html_key",
     "board_key",
     "champion_key",
+    "closing_record_key",
     "coverage_key",
     "cross_section_key",
     "cross_section_settled_key",
@@ -594,6 +595,31 @@ def attribution_key(trading_day: str) -> str:
 def gate_key(gate: str, trading_day: str) -> str:
     """Where a gate reading is filed. Keyed by trading day like everything else."""
     return f"gates/{gate}/{trading_day}/gate.json"
+
+
+def closing_record_key(phase: str) -> str:
+    """The ONE durable record that a phase's gate was read MET at its exit.
+
+    `alpha-engine-config-I9967` deliverable 2. Deliberately NOT keyed by
+    trading day, and deliberately a sibling of the dated readings under
+    :func:`gate_prefix` rather than one of them: a phase exits once, the
+    record of that exit is written once and never overwritten
+    (`RunContext.record_output_cas` against an absent key), and a second file
+    per day would make "when did this phase exit" a question with as many
+    answers as there are days the gate has been read since.
+
+    Its basename is not `gate.json` and its depth is three segments rather
+    than four, so `crucible.gate.last_read` — which lists this same prefix to
+    find the most recent trading day a gate was read for — does not mistake
+    it for a dated reading.
+    """
+    if not phase:
+        raise ValueError(
+            "phase must be non-empty — a blank phase would file every phase's closing "
+            "record at one key, which is the single-answer-per-phase property this key "
+            "shape exists to guarantee."
+        )
+    return f"gates/{phase}/closing.json"
 
 
 def gate_prefix(gate: str) -> str:
