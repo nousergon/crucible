@@ -70,6 +70,10 @@
         "cross_sectional": {
           "description": "True when the column is computed across one day's cross-section (a z-score or a rank) rather than along one ticker's history.",
           "type": "boolean"
+        },
+        "market_wide": {
+          "description": "True when the column's VALUE is one value repeated identically across every ticker on a day, by construction (e.g. `market_return_1d_log_return`); false when it varies across the cross-section. Declared, never inferred from variance at runtime. ADDITIVE OPTIONAL (alpha-engine-config-I10114): not in `required` because a document written before this field existed (`schema_version: feature_registry.v1`, same as today) lacks it and must keep validating against this schema — the same additive-optional shape as `window_trading_days` joining an earlier revision. The current producer (`crucible.features.registry.FeatureSpec.to_dict`) always emits it for every catalogue column; a reader of an OLDER document falls back to treating an absent `market_wide` as unknown rather than assuming a value.",
+          "type": "boolean"
         }
       },
       "allOf": [
