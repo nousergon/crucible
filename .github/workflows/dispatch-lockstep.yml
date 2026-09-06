@@ -13,71 +13,88 @@ name: Dispatch Lockstep
 # general. Worse for diagnosis: it surfaced in the repo that did not change,
 # against an author who did not change it.
 #
-# ── THIS IS DELIBERATELY INTERIM — `push: [main]` ONLY, NO `pull_request` ──
+# crucible-PR126 closed finding 2 for the `push: main` path only (the change
+# introducing drift fails at ITS OWN merge, in this repo). This file
+# (alpha-engine-config-I10119, re-examined after alpha-engine-config-I10117 /
+# nousergon-lib-PR388 landed) adds the PR path finding 2 actually asked for:
+# the change introducing drift fails BEFORE merge, on the PR itself.
 #
-# The original design ran this on every `pull_request` too, so the change
-# introducing drift would be the change that fails. It does not, because of
-# what this job's credential is:
+# ── why the obvious `pull_request` job was unsafe, and what changed ────────
 #
-# It mints a short-lived GitHub App installation token
-# (`nousergon_lib.github_app.installation_token`, narrowed at mint time to
-# `permissions={"contents": "read"}`) rather than holding a repo-scoped
-# deploy key, so it needs no new long-lived secret
-# (`identity-access-policy.md` §4/§7: the fleet's `ne-groomer` App already
-# suffices; Brian ruling on `alpha-engine-config-I9967` / `crucible-PR125`).
-# But `mint_installation_token`/`installation_token` (nousergon-lib, measured
-# 2026-09-06) narrow only PERMISSIONS, not REPOSITORY — there is no
-# `repositories` kwarg, and the App is installed org-wide. A token minted
-# this way is `contents:read` across every repository the installation
-# covers, not just `nous-ergon-ops`. Trusting a `pull_request` subject for
-# the OIDC role that reads the App's SSM-held credentials would hand that
-# reach to any pull request — exactly the escalation
-# `test_crucible_dispatch_lockstep.py`'s own docstring already rules out for
-# the sibling case: *"Deliberately NOT the `nousergon_lib.github_app`
-# installation-token path `scheduled-identity-check` uses: that job runs
-# `if: github.event_name != 'pull_request'` specifically because its OIDC
-# trust is pinned to this workflow on `main` and PR code must never reach the
-# App's private key."* `iam-drift-check.yml`'s `scheduled-identity-check`
-# carries that identical guard for the identical reason.
+# The naive shape — run the existing job on `pull_request` too — was unsafe
+# because of what the job's credential is, not because of the token's scope.
+# The job mints a short-lived GitHub App installation token
+# (`nousergon_lib.github_app.installation_token`) by reading the App's
+# SSM-held private key. A `pull_request` job executes the PR's OWN workflow
+# file and checks out the PR's OWN code, so PR-supplied code would run WITH
+# that OIDC trust in scope and could mint an unnarrowed token itself — the
+# token's scope at mint time is irrelevant if PR code can ask for a wider one.
+# `nousergon-lib-PR388`'s `repositories` kwarg narrows what gets minted; it
+# does not change who is allowed to ask, so narrowing it alone does not make a
+# `pull_request` job safe. `test_crucible_dispatch_lockstep.py`'s own
+# docstring rule — "PR code must never reach the App's private key" — is
+# about the key, not the token.
 #
-# So this job mirrors `scheduled-identity-check` exactly: `if:
-# github.event_name != 'pull_request'`, even though no `pull_request` trigger
-# is declared below — belt and suspenders, so the guard survives someone
-# later adding one without re-deriving why it can't run there. It runs on
-# every push to `main` (crucible's OWN main going red at the merge that
-# introduces drift, which was the point of finding 1 too) and on
-# `workflow_dispatch` for a manual check. It does NOT run on `pull_request`.
+# The safe shape is `pull_request_target`, which runs the workflow
+# DEFINITION on main (this file, as committed to crucible's own main) and
+# checks out the BASE ref by default — so PR code is never fetched, never
+# executed, and never in a position to ask for anything. The one thing this
+# job needs from the PR is data: `crucible/components.yaml`'s content at the
+# PR's head sha, fetched over the read-only Contents API and parsed as YAML
+# by the ops repo's TRUSTED test module — never executed. See
+# `crucible-dispatch-lockstep-pr` below;
+# `tests/test_workflow_triggers.py::test_the_lockstep_pr_job_checks_out_no_pr_head_and_executes_no_pr_supplied_code`
+# is the structural guard that a later edit cannot quietly undo this.
 #
-# **PR-path coverage is tracked, not abandoned**: `alpha-engine-config-I<see
-# PR body>` requests a `repositories` kwarg on the library function so a
-# token can be narrowed to exactly `nous-ergon-ops`, at which point this job
-# moves onto `pull_request` and becomes the change-that-introduces-drift
-# detector finding 2 actually asks for. Until then, this is strictly better
-# than before this PR (crucible's own `main` going red at ITS merge) but not
-# yet as good as `nous-ergon-ops-PR1000`'s side (a PR-triggered check).
+# The original `crucible-dispatch-lockstep` job (push to `main` +
+# `workflow_dispatch`) is UNCHANGED in what it does and stays as a backstop:
+# it is what catches drift introduced any way other than through this PR
+# path (an admin merge that bypasses review, a direct push if branch
+# protection is ever relaxed). Its `if:` now excludes BOTH `pull_request` and
+# `pull_request_target` — the original excluded only `pull_request`, which
+# would not have stopped this file's own `on:` block gaining
+# `pull_request_target` from also firing that job a second time on every PR.
 #
 # ── the credential ────────────────────────────────────────────────────────
 #
-# `crucible-v2-github-lockstep` (nous-ergon-ops/infrastructure/cloudformation
-# /crucible-v2.yaml, sibling PR): trusted for
-# `repo:nousergon/crucible:ref:refs/heads/main` ONLY (no `pull_request`
-# subject, ever, per the rationale above), granted exactly
-# `ssm:GetParameter` on the three `/alpha-engine/groom/github_app_*`
-# parameters — the same three `BoardRole` already reads
-# (`ReadTheGroomerAppCredentialsToMintATrackerToken`,
-# `alpha-engine-config-I9967`), for the identical reason: no second
-# long-lived credential when the fleet's App already suffices. That role is
-# created by an OPERATOR-GATED stack apply, not by merging the ops PR
-# (`pull-request-policy` §4.2 form 3) — until the apply happens this job
-# fails on the identity-confirmation step below, naming the exact command.
+# Both jobs assume `crucible-v2-github-lockstep` (nous-ergon-ops/
+# infrastructure/cloudformation/crucible-v2.yaml, sibling PR). Its trust now
+# carries exactly two subjects: the immutable-id `ref:refs/heads/main` subject
+# (unchanged — what crucible's push events actually present, measured
+# 2026-09-01) and the NAME-based `pull_request` subject
+# (`repo:nousergon/crucible:pull_request` — the subject GitHub issues for
+# BOTH `pull_request` and `pull_request_target` events). The name-based
+# `ref:refs/heads/main` subject that used to sit alongside the immutable one
+# is dropped to keep the role at exactly two trusted subjects rather than
+# growing to four as the PR path is added — it was never the subject
+# crucible's push events actually present (see
+# `CrucibleImmutableSubjectPrefix`'s own description), so dropping it is not
+# a live-behaviour change, only a narrower role now that it is reachable from
+# PR-triggered CI. See the sibling nous-ergon-ops PR for the CFN comment and
+# the test asserting this exact two-subject shape.
 #
-# No `paths:` filter: this job is a token mint, a shallow checkout and a
-# two-file pytest run, seconds against the §4.11 CI budget, and a required
-# check gated by a path filter can stay pending forever on a skip.
+# Both jobs are granted exactly `ssm:GetParameter` on the three
+# `/alpha-engine/groom/github_app_*` parameters — the same three `BoardRole`
+# already reads (`ReadTheGroomerAppCredentialsToMintALockstepToken`,
+# `alpha-engine-config-I9967`), for the identical reason: no second
+# long-lived credential when the fleet's App already suffices. The role's
+# trust update is applied by an OPERATOR-GATED stack apply, not by merging
+# the ops PR (`pull-request-policy` §4.2 form 3) — until the apply happens
+# both jobs fail on the identity-confirmation step below, naming the exact
+# command.
+#
+# The PR-path job's minted token is additionally narrowed with `repositories:
+# ["nous-ergon-ops"]` (the `nousergon-lib-PR388` kwarg) — `contents: read` on
+# exactly `nous-ergon-ops`, not every repository the App installation covers.
+#
+# No `paths:` filter on either job: this is a token mint, a shallow checkout
+# and a two-file pytest run, seconds against the §4.11 CI budget, and a
+# required check gated by a path filter can stay pending forever on a skip.
 
 on:
   push:
     branches: [main]
+  pull_request_target:
   workflow_dispatch:
 
 env:
@@ -87,11 +104,16 @@ env:
 jobs:
   crucible-dispatch-lockstep:
     name: crucible-dispatch-lockstep
-    # Mirrored byte-for-byte from iam-drift-check.yml's scheduled-identity-check
-    # (nous-ergon-ops) — see the header comment above for why. No pull_request
-    # trigger is declared, so this is defence in depth against one being added
-    # later without re-deriving the reason it can't run there.
-    if: github.event_name != 'pull_request'
+    # Excludes BOTH pull_request and pull_request_target: this job's
+    # checkout has no repository/ref override, so on pull_request_target it
+    # would otherwise check out the base ref and run the PUSH job's own
+    # steps a second, redundant time on every PR. The PR path is
+    # `crucible-dispatch-lockstep-pr` below, which is deliberately a
+    # DIFFERENT job rather than a branch of this one's `if:`, so this job's
+    # own safety argument (mirrors iam-drift-check.yml's
+    # scheduled-identity-check) never has to be re-derived alongside the PR
+    # job's different one.
+    if: ${{ !contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -135,11 +157,6 @@ jobs:
       - name: Install App-token and test dependencies
         run: python3 -m pip install --quiet "nousergon-lib[github-app]" pytest pyyaml
 
-      # Narrowed to `contents: read` at mint time — GitHub only permits
-      # NARROWING an App installation token below what the installation
-      # holds, never widening it. No `repositories` narrowing exists yet in
-      # this library function (see the header comment); the OIDC trust above
-      # is what keeps this token off the pull_request path until it does.
       - name: Mint a read-only ne-groomer token
         id: token
         run: |
@@ -160,10 +177,105 @@ jobs:
           persist-credentials: false
 
       # CRUCIBLE_ROOT is THIS repository's own checkout, not a second clone of
-      # `crucible`: the whole point is that the change introducing drift is
-      # the change that fails, once this job also covers the pull_request
-      # path (tracked, see the header comment).
+      # `crucible`.
       - name: Lockstep guard
+        env:
+          CRUCIBLE_ROOT: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          cd nous-ergon-ops-checkout
+          python3 -m pytest tests/crossrepo/test_crucible_dispatch_lockstep.py -q
+
+  crucible-dispatch-lockstep-pr:
+    name: crucible-dispatch-lockstep-pr
+    # The complement of the job above: runs ONLY on pull_request_target, so
+    # the two jobs never both fire (nor both skip) for the same event.
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read   # read-only GITHUB_TOKEN: this repo's own Contents API only
+      id-token: write  # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      - name: Repository variable AWS_ACCOUNT_ID is set
+        run: |
+          if [ -z "$AWS_ACCOUNT_ID" ]; then
+            echo "::error::repository variable AWS_ACCOUNT_ID is not set — set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/crucible --body '<12-digit-account-id>'"
+            exit 1
+          fi
+        env:
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+
+      # No `with.repository` and no `with.ref`: on `pull_request_target` this
+      # checks out the BASE ref (crucible's own main), which is what
+      # `pull_request_target` runs the workflow definition against in the
+      # first place. PR code is never fetched by this step.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # The one piece of PR-supplied content this job reads, fetched as DATA
+      # over the read-only Contents API — never via actions/checkout of the
+      # PR head, never executed. The base64 payload is decoded straight to a
+      # file; nothing pipes it into a shell or interpreter.
+      - name: Fetch the PR's components.yaml as data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/nousergon/crucible/contents/crucible/components.yaml?ref=${HEAD_SHA}" --jq '.content' | base64 -d > crucible/components.yaml
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          role-to-assume: ${{ env.LOCKSTEP_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${LOCKSTEP_ROLE_ARN##*/}"
+          case "${assumed}" in
+            *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;;
+            *)
+              echo "::error::this job assumed ${assumed}, not ${expected}. If the role does not exist yet, the crucible-v2 stack has not been applied since the sibling nous-ergon-ops PR (crucible-v2-github-lockstep, PR-path trust) merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow."
+              exit 1
+              ;;
+          esac
+
+      - name: Install App-token and test dependencies
+        run: python3 -m pip install --quiet "nousergon-lib[github-app]" pytest pyyaml
+
+      # Narrowed to `contents: read` on exactly `nous-ergon-ops`
+      # (`repositories=["nous-ergon-ops"]`, nousergon-lib-PR388 /
+      # alpha-engine-config-I10117): unlike the push job's token, this one is
+      # reachable from a `pull_request_target` trust and must never be able
+      # to read any OTHER repository the App installation covers.
+      - name: Mint a read-only ne-groomer token narrowed to nous-ergon-ops
+        id: token
+        run: |
+          set -euo pipefail
+          TOKEN="$(python3 -c "
+          from nousergon_lib.github_app import installation_token
+          print(installation_token(permissions={'contents': 'read'}, repositories=['nous-ergon-ops']), end='')
+          ")"
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout nous-ergon-ops (private) at main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: nousergon/nous-ergon-ops
+          token: ${{ steps.token.outputs.token }}
+          path: nous-ergon-ops-checkout
+          persist-credentials: false
+
+      # CRUCIBLE_ROOT is the self-checkout above, with the PR's
+      # components.yaml overlaid onto it. Everything else in that tree
+      # (crucible's own .github/workflows/, used by the `dispatch_workflow`
+      # half of the guard) is main's, unmodified by the PR — the guard grades
+      # the one file this job actually needs to grade as the PR's diff, and
+      # nothing else is trusted from the PR.
+      - name: Lockstep guard against the PR's components.yaml
         env:
           CRUCIBLE_ROOT: ${{ github.workspace }}
         run: |
