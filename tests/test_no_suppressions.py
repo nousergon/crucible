@@ -158,9 +158,8 @@ FORBIDDEN: dict[str, str] = {
         "declares is only a floor if nothing can carve lines out from under it "
         "(independent adversarial review of crucible-PR89, 2026-09-04: eight live "
         "sites, none scanned). A line that cannot be reached by a test is restructured "
-        "or covered; a STRUCTURAL exclusion (`if TYPE_CHECKING:`, the `__main__` "
-        "guard) is declared once in `[tool.coverage.report].exclude_lines` and that "
-        "list is closed by `test_coverage_exclusions_are_structural_only` below"
+        "or covered, or counted as missed; `[tool.coverage.report].exclude_lines` is "
+        "pinned EMPTY by `test_coverage_has_no_line_exclusions_at_all` below"
     ),
 }
 
@@ -168,17 +167,16 @@ FORBIDDEN: dict[str, str] = {
 #: names a construct whose body cannot execute under pytest BY CONSTRUCTION,
 #: never a free-text marker an author can attach to an arbitrary line. Adding
 #: an entry is a rule change reviewed as one, not a way to make a PR pass.
-#: ANCHORED to the whole line (`^\s*...\s*$`). coverage.py applies each
-#: entry as `re.search` over the raw source line, comments included, so an
-#: unanchored `if TYPE_CHECKING:` was attachable as a trailing comment to any
-#: `def` and excluded its whole body — the same per-line narrowing as the
-#: pragma, and nothing scanned for it (independent review, 2026-09-05).
-_STRUCTURAL_COVERAGE_EXCLUSIONS = frozenset(
-    {
-        "^\\s*if __name__ == [\"']__main__[\"']:\\s*$",
-        r"^\s*if TYPE_CHECKING:\s*$",
-    }
-)
+#: The permitted coverage line exclusions: NONE. Three rounds of independent
+#: adversarial review on crucible-PR112 (2026-09-05) each broke the previous
+#: 'structural' exclusion by making its guarded block EXECUTE while coverage
+#: still excluded it — a trailing `# if TYPE_CHECKING:` comment; a module
+#: binding `TYPE_CHECKING = True`; `globals()['TYPE_CHECKING'] = True`;
+#: `typing.TYPE_CHECKING = True` in a conftest. A regex over source text
+#: cannot know whether a block runs, so no regex may remove a line from the
+#: denominator. The ~20 `if TYPE_CHECKING:` / `__main__` lines count as
+#: missed and the floor is measured against the whole tree.
+_COVERAGE_EXCLUSIONS_PERMITTED: frozenset[str] = frozenset()
 
 #: The ONLY keys `[tool.coverage.report]` and `[tool.coverage.run]` may carry,
 #: and the values the two scope-defining ones must hold. `exclude_also`,
@@ -439,71 +437,70 @@ class TestTheSanctionedKnownRegistryExemptionIsExactlyAsNarrowAsClaimed:
         )
 
 
-def test_coverage_exclusions_are_structural_only() -> None:
+def test_coverage_has_no_line_exclusions_at_all() -> None:
     """The coverage floor is only a floor if nothing can carve lines out from
-    under it. `[tool.coverage.report].exclude_lines` must be EXACTLY the
-    structural set above — no `pragma: no cover` (a per-line, author-applied,
-    unreviewed narrowing; the 2026-09-04 independent review's finding against
-    crucible-PR89), and no new pattern that was not reviewed as a rule change.
+    under it. `[tool.coverage.report].exclude_lines` must be EMPTY — see
+    `_COVERAGE_EXCLUSIONS_PERMITTED` for the three demonstrations that made
+    every regex-shaped exclusion inadmissible. Read with `tomllib` from the
+    file, so the assertion is about what the repository declares.
 
-    Read with `tomllib` from the file, not from coverage's loaded config, so
-    the assertion is about what the repository declares rather than about
-    whichever configuration happened to be active in this process.
+    An EMPTY list is also what disables coverage.py's own default
+    (`pragma: no cover`): setting the key REPLACES the default rather than
+    extending it, which `test_the_pragma_is_inert_under_this_config` proves
+    against the real coverage engine rather than asserts from documentation.
     """
     import tomllib
 
     config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    declared = set(config["tool"]["coverage"]["report"]["exclude_lines"])
-    assert declared == set(_STRUCTURAL_COVERAGE_EXCLUSIONS), (
-        f"pyproject.toml exclude_lines is {sorted(declared)}; the permitted structural "
-        f"set is {sorted(_STRUCTURAL_COVERAGE_EXCLUSIONS)}. An exclusion is a construct "
-        "whose body cannot run under pytest by construction, never a marker an author "
-        "attaches to a line; a line a test cannot reach is restructured or covered."
+    declared = config["tool"]["coverage"]["report"]["exclude_lines"]
+    assert declared == sorted(_COVERAGE_EXCLUSIONS_PERMITTED) == [], (
+        f"pyproject.toml exclude_lines is {declared}; no line exclusion is permitted. A "
+        "line a test cannot reach is restructured, covered, or counted as missed."
     )
 
 
-def test_the_structural_set_names_no_free_text_marker() -> None:
-    """The closed set itself must not smuggle the thing it replaces: every
-    entry is a Python construct (an `if` header), not a comment marker."""
-    for entry in _STRUCTURAL_COVERAGE_EXCLUSIONS:
-        construct = entry.removeprefix("^\\s*")
-        assert construct.startswith("if "), f"{entry!r} is not a structural construct"
-        assert "pragma" not in entry and "#" not in entry, (
-            f"{entry!r} is a comment marker, which is exactly the per-line narrowing the "
-            "closed set exists to forbid"
-        )
+def test_the_pragma_is_inert_under_this_config(tmp_path: Path) -> None:
+    """Measured against coverage.py itself: with the repo's `exclude_lines`, a
+    `# pragma: no cover` line is NOT excluded (the empty list replaces the
+    engine's default), and neither is an `if TYPE_CHECKING:` block."""
+    import subprocess
+    import sys
+    import tomllib
 
-
-def test_each_structural_exclusion_is_anchored_and_cannot_ride_a_comment() -> None:
-    """Finding 1 of the 2026-09-05 independent review: coverage.py matches
-    `exclude_lines` with `re.search` on the raw line, so an unanchored entry
-    is attachable as a trailing comment to any `def` and excludes its whole
-    body. Each entry must match the real construct and NOTHING that carries
-    the construct's text after code."""
-    real = {
-        r"^\s*if TYPE_CHECKING:\s*$": ["if TYPE_CHECKING:", "    if TYPE_CHECKING:  "],
-        "^\\s*if __name__ == [\"']__main__[\"']:\\s*$": [
-            'if __name__ == "__main__":',
-            "if __name__ == '__main__':",
-        ],
-    }
-    assert set(real) == set(_STRUCTURAL_COVERAGE_EXCLUSIONS)
-    smuggled = [
-        "def unused():  # if TYPE_CHECKING:",
-        "x = compute()  # if TYPE_CHECKING:",
-        'def unused2():  # if __name__ == "__main__":',
-        "def unused3():  # comment says if __name__ == q__main__q:",
-    ]
-    for pattern in _STRUCTURAL_COVERAGE_EXCLUSIONS:
-        assert pattern.startswith("^") and pattern.endswith("$"), f"{pattern!r} is not anchored"
-        compiled = re.compile(pattern)
-        for line in real[pattern]:
-            assert compiled.search(line), f"{pattern!r} must match the real construct {line!r}"
-        for line in smuggled:
-            assert not compiled.search(line), (
-                f"{pattern!r} matches {line!r} — a trailing comment would exclude that "
-                "line's whole block, the per-line narrowing this set exists to forbid"
-            )
+    config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = config["tool"]["coverage"]["report"]["exclude_lines"]
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.coverage.report]\nexclude_lines = " + repr(list(declared)) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "m.py").write_text(
+        "from typing import TYPE_CHECKING\n"
+        "def unused():  # pragma: no cover\n"
+        "    return 1\n"
+        "if TYPE_CHECKING:\n"
+        "    import os\n"
+        "x = 2\n",
+        encoding="utf-8",
+    )
+    subenv = {"PATH": "/usr/bin:/bin", "COVERAGE_RCFILE": str(tmp_path / "pyproject.toml")}
+    subprocess.run(
+        [sys.executable, "-m", "coverage", "run", "--include=m.py", "m.py"],
+        cwd=tmp_path,
+        env=subenv,
+        check=True,
+        capture_output=True,
+    )
+    report = subprocess.run(
+        [sys.executable, "-m", "coverage", "report", "-m"],
+        cwd=tmp_path,
+        env=subenv,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    line = next(ln for ln in report.splitlines() if ln.startswith("m.py"))
+    statements = int(line.split()[1])
+    assert statements == 6, report + " -- every statement counts; none was excluded"
 
 
 def test_no_other_coverage_narrowing_knob_is_set() -> None:
@@ -537,12 +534,18 @@ def test_no_file_displaces_the_pinned_coverage_config() -> None:
     and the suffix-filtered scanner never opened it. None may exist carrying
     coverage config, and the scanner now opens `.coveragerc` by name."""
     assert not (REPO_ROOT / ".coveragerc").exists(), ".coveragerc displaces pyproject.toml"
+    # pytest's own discovery prefers pytest.ini, then pyproject.toml, tox.ini,
+    # setup.cfg (round-3 finding: a `pytest.ini` carrying `addopts = --no-cov`
+    # disabled the ratchet wholesale under the CI command line).
+    assert not (REPO_ROOT / "pytest.ini").exists(), "pytest.ini displaces pyproject.toml"
     for name in ("setup.cfg", "tox.ini"):
         path = REPO_ROOT / name
         if path.exists():
-            assert "[coverage:" not in path.read_text(encoding="utf-8"), (
-                f"{name} carries a [coverage:*] section, which displaces pyproject.toml"
-            )
+            text = path.read_text(encoding="utf-8")
+            for section in ("[coverage:", "[pytest]", "[tool:pytest]"):
+                assert section not in text, (
+                    f"{name} carries {section}, which displaces pyproject.toml"
+                )
     assert ".coveragerc" in _SCANNED_NAMES
 
 
@@ -555,6 +558,10 @@ def test_ci_pins_the_coverage_config_file() -> None:
     assert cov_lines, "ci.yml no longer runs the coverage step"
     for line in cov_lines:
         assert "--cov-config=pyproject.toml" in line, line
+        assert " -c pyproject.toml" in line, (
+            "pytest itself must be pinned to pyproject.toml (`-c`), or a pytest.ini "
+            "planted beside it supplies addopts the command line never sees"
+        )
 
 
 def test_the_pragma_pattern_catches_every_spelling_coverage_honours() -> None:
@@ -571,95 +578,6 @@ def test_the_pragma_pattern_catches_every_spelling_coverage_honours() -> None:
         "x = 1  #pragma:nocover",
     ):
         assert compiled.search(line), line
-
-
-def _python_files() -> list[Path]:
-    return [p for p in _scanned_files() if p.suffix == ".py"]
-
-
-def test_type_checking_is_never_rebound_so_the_exclusion_stays_structural() -> None:
-    """Round-2 finding (2026-09-05): `if TYPE_CHECKING:` is structural ONLY
-    because `typing.TYPE_CHECKING` is False at runtime. A module that binds
-    the name itself (`TYPE_CHECKING = True`, `from x import y as
-    TYPE_CHECKING`, `TYPE_CHECKING: bool = ...`) makes the guarded block
-    EXECUTE while coverage still excludes it — a whole block of live code out
-    of the denominator, ruff-clean and scanner-clean. So the name may enter a
-    module in exactly one way: `from typing import TYPE_CHECKING`."""
-    offenders: list[str] = []
-    for path in _python_files():
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except SyntaxError as exc:
-            offenders.append(f"{path}: unparseable ({exc})")
-            continue
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                for t in targets:
-                    for leaf in ast.walk(t):
-                        if isinstance(leaf, ast.Name) and leaf.id == "TYPE_CHECKING":
-                            offenders.append(f"{path}:{node.lineno}: assigns TYPE_CHECKING")
-            elif isinstance(node, ast.ImportFrom):
-                for alias in node.names:
-                    bound = alias.asname or alias.name
-                    if bound == "TYPE_CHECKING" and not (
-                        node.module == "typing"
-                        and alias.name == "TYPE_CHECKING"
-                        and alias.asname is None
-                    ):
-                        offenders.append(
-                            f"{path}:{node.lineno}: binds TYPE_CHECKING from "
-                            f"{node.module}.{alias.name}"
-                        )
-            elif isinstance(node, ast.Import):
-                for alias in node.names:
-                    if (alias.asname or alias.name) == "TYPE_CHECKING":
-                        offenders.append(f"{path}:{node.lineno}: imports a module as TYPE_CHECKING")
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if node.name == "TYPE_CHECKING":
-                    offenders.append(f"{path}:{node.lineno}: defines TYPE_CHECKING")
-    assert not offenders, (
-        "TYPE_CHECKING may only ever be `from typing import TYPE_CHECKING`; a rebinding "
-        "turns the structural coverage exclusion into a live-code carve-out:\n  - "
-        + "\n  - ".join(offenders)
-    )
-
-
-def test_the_rebinding_detector_is_shown_firing(tmp_path: Path) -> None:
-    """Each rebinding shape the round-2 review named, and the sanctioned import."""
-    samples = {
-        "TYPE_CHECKING = True\n": True,
-        "TYPE_CHECKING: bool = True\n": True,
-        "from os import sep as TYPE_CHECKING\n": True,
-        "import typing as TYPE_CHECKING\n": True,
-        "def TYPE_CHECKING(): ...\n": True,
-        "from typing import TYPE_CHECKING\n": False,
-        "from typing import TYPE_CHECKING, Any\n": False,
-    }
-    for text, is_rebinding in samples.items():
-        tree = ast.parse(text)
-        found = False
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                found |= any(
-                    isinstance(leaf, ast.Name) and leaf.id == "TYPE_CHECKING"
-                    for t in targets
-                    for leaf in ast.walk(t)
-                )
-            elif isinstance(node, ast.ImportFrom):
-                found |= any(
-                    (a.asname or a.name) == "TYPE_CHECKING"
-                    and not (
-                        node.module == "typing" and a.name == "TYPE_CHECKING" and a.asname is None
-                    )
-                    for a in node.names
-                )
-            elif isinstance(node, ast.Import):
-                found |= any((a.asname or a.name) == "TYPE_CHECKING" for a in node.names)
-            elif isinstance(node, ast.FunctionDef):
-                found |= node.name == "TYPE_CHECKING"
-        assert found == is_rebinding, text
 
 
 def test_pytest_addopts_cannot_switch_coverage_off() -> None:

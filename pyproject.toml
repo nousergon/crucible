@@ -108,15 +108,15 @@ omit = []
 # they gate exits (see ci.yml) and are not part of the PR-path gate.
 fail_under = 93
 show_missing = true
-# Anchored to the WHOLE line on purpose: coverage.py applies these as
-# `re.search` over each source line, comments included, so an unanchored
-# `if TYPE_CHECKING:` could be attached as a trailing comment to any `def`
-# and exclude its whole body — the same per-line narrowing the coverage
-# pragma was removed for (independent review of crucible-PR112, 2026-09-05).
-# The closed set, its anchoring and the absence of any other narrowing
-# knob (exclude_also, omit, source, a displacing .coveragerc) are pinned
-# by tests/test_no_suppressions.py.
-exclude_lines = [
-    "^\\s*if TYPE_CHECKING:\\s*$",
-    "^\\s*if __name__ == [\"']__main__[\"']:\\s*$",
-]
+# NO line exclusions. Three rounds of independent adversarial review
+# (2026-09-05, crucible-PR112) showed that every regex-shaped exclusion —
+# the coverage pragma, then an anchored `if TYPE_CHECKING:`, then the same
+# with a rebinding guard — can be made to exclude EXECUTING code by an
+# author (trailing comment; `TYPE_CHECKING = True`; `globals()[...]`;
+# `typing.TYPE_CHECKING = True` in a conftest). A regex over source text
+# cannot know whether a block runs. So the denominator is every statement
+# in `crucible/`, the ~20 `if TYPE_CHECKING:` / `__main__` lines simply
+# count as missed, and the floor below is measured against that.
+# `tests/test_no_suppressions.py` pins this list EMPTY and the two coverage
+# tables closed.
+exclude_lines = []
