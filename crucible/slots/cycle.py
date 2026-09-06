@@ -508,7 +508,14 @@ def run_grade(
                 produced_under = shadow.get("feature_version")
                 if produced_under:
                     lineage_by_arm.setdefault(arm_id, set()).add(str(produced_under))
-                write_verdict(
+                # Claimed as an OUTPUT, not only written: `crucible explain
+                # <verdict key>` resolves a key through the manifest that
+                # claims it, and until 2026-09-05 no manifest claimed a
+                # verdict — the first `explain` against a real verdict on the
+                # box read "neither a run_id nor a key any run claims" while
+                # the verdict sat in the store (alpha-engine-config-I9757,
+                # `explain_walks_a_verdict`).
+                verdict_payload = write_verdict(
                     ctx.store,
                     arm_id=arm_id,
                     trading_day=day,
@@ -518,6 +525,9 @@ def run_grade(
                     benchmark=slot_spec.benchmark,
                     detail=detail,
                     control=False,
+                )
+                ctx.record_output(
+                    verdict_key(arm_id, day), verdict_payload, schema_version="verdict.v1"
                 )
                 # shadow.v2 settlement (alpha-engine-config-I9778): join the
                 # produce-time cross-section against the SAME `window.returns`
@@ -575,7 +585,7 @@ def run_grade(
             score, detail = score_selection(selection, tuple(sorted(returns)), returns)
             verdicts[control.arm_id][day] = score
             detail["control_kind"] = control.control_kind
-            write_verdict(
+            control_payload = write_verdict(
                 ctx.store,
                 arm_id=control.arm_id,
                 trading_day=day,
@@ -585,6 +595,9 @@ def run_grade(
                 benchmark=slot_spec.benchmark,
                 detail=detail,
                 control=True,
+            )
+            ctx.record_output(
+                verdict_key(control.arm_id, day), control_payload, schema_version="verdict.v1"
             )
 
     series_by_arm: dict[str, ArmSeries] = {

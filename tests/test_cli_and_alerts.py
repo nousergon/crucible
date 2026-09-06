@@ -382,9 +382,8 @@ class TestDryRunNeverWrites:
     relying on the store guard alone keep passing. Any exception at all is a
     test failure, not a swallowed pass.
 
-    Six jobs are excluded, each for a stated reason rather than silently:
-    `explain` has no dry-run semantics at all (always read-only, the flag is
-    never read); `experiment.new` needs a synced strategy tree with real arm
+    Five jobs are excluded, each for a stated reason rather than silently:
+    `experiment.new` needs a synced strategy tree with real arm
     recipes; `migrate.history` needs seeded v1 sources; `smoke` needs a
     published release publishing through `crucible.deploy`'s own flow;
     `release.lock` is S3-only (`apply_release_retention` refuses a
@@ -392,7 +391,7 @@ class TestDryRunNeverWrites:
     by `tests/test_release_retention.py::TestReleaseLockHandler::
     test_dry_run_writes_no_manifest_at_all`.
 
-    `weekly` is excluded here for a DIFFERENT reason than the other five: the
+    `weekly` is excluded here for a DIFFERENT reason than the other four: the
     rows above each invoke one job directly, through its own argv — none of
     them exercises `weekly`'s OWN responsibility, which is handing
     `--dry-run` DOWN onto each of its twelve stages' own argv
@@ -428,7 +427,7 @@ class TestDryRunNeverWrites:
     #: jobs, drift's three input keys, promote's empty register, morning's
     #: seeded board).
     _COVERED_BY_A_SEEDED_ROW = frozenset(
-        {"data.daily", "data.heal", "data.weekly", "drift", "promote", "report.morning"}
+        {"data.daily", "data.heal", "data.weekly", "drift", "explain", "promote", "report.morning"}
     )
 
     #: Every job in `JOBS` NOT covered by a row above, each with the reason
@@ -436,7 +435,6 @@ class TestDryRunNeverWrites:
     #: docstring, which states the reason but never asserted it against
     #: `JOBS` itself.
     _EXCLUDED_WITH_REASON = {
-        "explain": "no dry-run semantics at all -- always read-only, the flag is never read",
         "experiment.new": "needs a synced strategy tree with real arm recipes",
         "migrate.history": "needs seeded v1 sources",
         "smoke": "needs a published release publishing through crucible.deploy's own flow",
@@ -577,6 +575,39 @@ class TestDryRunNeverWrites:
         argv = ["drift", "--date", FRIDAY.isoformat(), "--store", str(tmp_path), "--dry-run"]
 
         main(argv)  # must not raise at all -- the feature layer is present
+
+        assert sorted(store.list_keys()) == before  # nothing NEW landed
+
+    def test_dry_run_explain_walks_and_writes_nothing(self, tmp_path, monkeypatch, source) -> None:
+        """`explain` runs through `run_job` since 2026-09-05 (it used to write
+        no manifest at all, which left the phase-1 `explain_walks_a_verdict`
+        clause with nothing to read). Under `--dry-run` it walks, prints, and
+        files neither inputs nor a manifest. Seeded with one `data.daily` run
+        so there is a run_id to walk."""
+        from crucible.data.daily import run_daily
+        from crucible.runner import run_job
+        from crucible.store import LocalStore
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        store = LocalStore(tmp_path)
+        ctx = run_job(
+            "data.daily",
+            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            store=store,
+            trading_day=FRIDAY,
+        )
+        before = sorted(store.list_keys())
+        argv = [
+            "explain",
+            "--date",
+            FRIDAY.isoformat(),
+            "--store",
+            str(tmp_path),
+            "--dry-run",
+            ctx.run_id,
+        ]
+
+        main(argv)  # must not raise at all -- the run id is walkable
 
         assert sorted(store.list_keys()) == before  # nothing NEW landed
 

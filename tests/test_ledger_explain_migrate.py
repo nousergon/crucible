@@ -496,3 +496,151 @@ class TestMigrate:
         _run_migrate(store, cycle_date, **kwargs)
         pointer_after = json.loads(store.get_bytes("champions/r/current.json"))
         assert pointer_after == pointer_before
+
+
+class TestExplainWalksAVerdict:
+    """Plan §10.8, as the phase-1 gate measures it (`explain_walks_a_verdict`):
+    an `explain` RUN whose manifest records a verdict.json as an input.
+
+    Measured 2026-09-05 on the first replay arc: `crucible explain
+    <verdict key>` on the box read "neither a run_id nor a key any run claims
+    as an output" while the verdict sat in the store — `experiment.grade`
+    wrote verdicts but claimed only the arena cycle as an output — and the
+    handler wrote no manifest at all, so the clause had nothing to read
+    either way.
+    """
+
+    def _graded_cycle(self, store, source, strategy_dir, cycle_date, tmp_path):
+        from conftest import sessions_ending
+
+        from crucible.config import Settings
+        from crucible.slots import universe
+        from crucible.slots.grading import DEFAULT_HORIZON_TRADING_DAYS
+
+        settings = Settings(
+            store_uri=str(tmp_path / "store"),
+            arctic_bucket="unused",
+            strategy_dir=strategy_dir,
+            origins={},
+        )
+        sessions = sessions_ending(cycle_date, DEFAULT_HORIZON_TRADING_DAYS + 4)
+        decision_days = sessions[:3]
+        for day in [*decision_days, cycle_date]:
+            run_job(
+                "data.daily",
+                lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+                store=store,
+                trading_day=day,
+            )
+        for day in decision_days:
+            run_job(
+                "experiment.run",
+                lambda c: universe.produce(c, settings=settings),
+                store=store,
+                trading_day=day,
+                discriminator="u",
+            )
+        grade = run_job(
+            "experiment.grade",
+            lambda c: universe.grade(c, settings=settings),
+            store=store,
+            trading_day=cycle_date,
+            discriminator="u",
+        )
+        return grade, decision_days
+
+    def test_the_grade_claims_every_verdict_it_writes_as_an_output(
+        self, store, source, strategy_dir, cycle_date, tmp_path
+    ) -> None:
+        grade, _days = self._graded_cycle(store, source, strategy_dir, cycle_date, tmp_path)
+        verdicts = [o["key"] for o in grade.outputs if o["key"].endswith("/verdict.json")]
+        assert verdicts, "a graded cycle wrote verdicts and claimed none of them"
+        for key in verdicts:
+            assert store.exists(key), key
+        node = explain(store, verdicts[0])
+        assert node.manifest is not None
+        assert node.manifest["run_id"] == grade.run_id
+
+    def test_explain_runs_through_run_job_and_records_the_verdict_it_walked(
+        self, store, source, strategy_dir, cycle_date, tmp_path, monkeypatch
+    ) -> None:
+        import json
+
+        from crucible.cli import main
+        from crucible.keys import manifest_key
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        grade, _days = self._graded_cycle(store, source, strategy_dir, cycle_date, tmp_path)
+        verdict = next(o["key"] for o in grade.outputs if o["key"].endswith("/verdict.json"))
+        day = cycle_date.isoformat()
+
+        rc = main(
+            ["explain", "--date", day, "--run-mode", "replay", "--store", str(store.root), verdict]
+        )
+
+        assert rc == 0
+        manifest = json.loads(store.get_bytes(manifest_key("explain", day)))
+        assert manifest["status"] == "ok"
+        assert manifest["outputs"] == [], "explain changes nothing; it records what it walked"
+        walked = [i["key"] for i in manifest["inputs"]]
+        assert verdict in walked, walked
+        assert any("verdict.json" in k for k in walked)
+
+    def test_dry_run_explain_prints_the_walk_and_files_nothing(
+        self, store, source, strategy_dir, cycle_date, tmp_path, monkeypatch, capsys
+    ) -> None:
+        from crucible.cli import main
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        grade, _days = self._graded_cycle(store, source, strategy_dir, cycle_date, tmp_path)
+        verdict = next(o["key"] for o in grade.outputs if o["key"].endswith("/verdict.json"))
+        before = sorted(store.list_keys())
+        rc = main(
+            [
+                "explain",
+                "--date",
+                cycle_date.isoformat(),
+                "--run-mode",
+                "replay",
+                "--store",
+                str(store.root),
+                "--dry-run",
+                verdict,
+            ]
+        )
+        assert rc == 0
+        assert sorted(store.list_keys()) == before
+        assert verdict in capsys.readouterr().out
+
+    def test_an_unclaimed_key_still_fails_loud_with_a_failed_manifest(
+        self, store, source, cycle_date, tmp_path, monkeypatch
+    ) -> None:
+        import json
+
+        from crucible.cli import main
+        from crucible.keys import manifest_key
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        run_job(
+            "data.daily",
+            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            store=store,
+            trading_day=cycle_date,
+        )
+        day = cycle_date.isoformat()
+        with pytest.raises(KeyError, match="neither a run_id nor a key"):
+            main(
+                [
+                    "explain",
+                    "--date",
+                    day,
+                    "--run-mode",
+                    "replay",
+                    "--store",
+                    str(store.root),
+                    "nobody/wrote/this.json",
+                ]
+            )
+        manifest = json.loads(store.get_bytes(manifest_key("explain", day)))
+        assert manifest["status"] == "failed"
+        assert "neither a run_id" in manifest["reason"]
