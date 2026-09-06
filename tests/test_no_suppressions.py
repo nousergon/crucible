@@ -185,6 +185,7 @@ _COVERAGE_EXCLUSIONS_PERMITTED: frozenset[str] = frozenset()
 #: pragma belonged to (independent review, 2026-09-05, findings 3-5).
 _COVERAGE_REPORT_KEYS = frozenset({"fail_under", "show_missing", "exclude_lines"})
 _COVERAGE_RUN_KEYS = frozenset({"source", "omit"})
+_COVERAGE_TABLES = frozenset({"run", "report"})
 _COVERAGE_SOURCE = ["crucible"]
 _COVERAGE_FLOOR = 93
 
@@ -520,6 +521,16 @@ def test_no_other_coverage_narrowing_knob_is_set() -> None:
     assert set(run) == set(_COVERAGE_RUN_KEYS), (
         f"[tool.coverage.run] carries {sorted(set(run) ^ _COVERAGE_RUN_KEYS)}"
     )
+    # Round-4 finding: `[tool.coverage.paths]` remaps the measured tree onto
+    # any other directory (a committed stub read 11 -> 2 statements, 100%)
+    # with every other guard green. The table SET is closed, not only the
+    # two tables' keys.
+    extra_tables = sorted(set(config["tool"]["coverage"]) - _COVERAGE_TABLES)
+    assert set(config["tool"]["coverage"]) == set(_COVERAGE_TABLES), (
+        f"[tool.coverage] carries tables {extra_tables}; "
+        "`paths` remaps the measured tree, `html`/`xml`/`json` are unused here, and any new "
+        "table is a rule change reviewed as one"
+    )
     assert run["source"] == _COVERAGE_SOURCE, "the denominator is the whole package"
     assert run["omit"] == [], "omit stays empty so the scope cannot be narrowed file-by-file"
     assert report["fail_under"] >= _COVERAGE_FLOOR, (
@@ -550,17 +561,40 @@ def test_no_file_displaces_the_pinned_coverage_config() -> None:
 
 
 def test_ci_pins_the_coverage_config_file() -> None:
-    """Belt to the test above's braces: the CI invocation names the config
-    file, so even a `.coveragerc` that slipped past review is not what CI
-    measures against."""
+    """Belt to the displacement test's braces: the CI invocation names the
+    config file for BOTH pytest (`-c`) and coverage (`--cov-config`), so a
+    planted ini or rc is not what CI measures against.
+
+    Token-exact and exactly-once (round-4 finding): a substring check passed
+    a line carrying `--cov-config=pyproject.toml --cov-config=evil.rc`, and
+    the LAST occurrence is the one both tools honour. So each flag must
+    appear exactly once with exactly this value, and `--no-cov` must not
+    appear at all. The workflow must also set no coverage environment
+    variable (`COVERAGE_RCFILE`, `COVERAGE_PROCESS_START`, `COVERAGE_CORE`),
+    which override the config file from outside the command line.
+    """
+    import shlex
+
     text = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     cov_lines = [ln for ln in text.splitlines() if "--cov=crucible" in ln and "pytest" in ln]
     assert cov_lines, "ci.yml no longer runs the coverage step"
     for line in cov_lines:
-        assert "--cov-config=pyproject.toml" in line, line
-        assert " -c pyproject.toml" in line, (
-            "pytest itself must be pinned to pyproject.toml (`-c`), or a pytest.ini "
-            "planted beside it supplies addopts the command line never sees"
+        tokens = shlex.split(line.split("run:", 1)[1])
+        assert tokens.count("--cov=crucible") == 1, tokens
+        assert tokens.count("--cov-config=pyproject.toml") == 1, tokens
+        assert not [
+            t for t in tokens if t.startswith("--cov-config") and t != "--cov-config=pyproject.toml"
+        ], tokens
+        c_positions = [i for i, t in enumerate(tokens) if t == "-c"]
+        assert len(c_positions) == 1 and tokens[c_positions[0] + 1] == "pyproject.toml", tokens
+        assert not [
+            t for t in tokens if t.startswith("-c") and t != "-c" and not t.startswith("--")
+        ], tokens
+        assert "--no-cov" not in tokens, tokens
+        assert not [t for t in tokens if t.startswith("--cov-fail-under")], tokens
+    for var in ("COVERAGE_RCFILE", "COVERAGE_PROCESS_START", "COVERAGE_CORE", "COVERAGE_FILE"):
+        assert var not in text, (
+            f"ci.yml sets {var}, which overrides the pinned config from outside the command line"
         )
 
 
