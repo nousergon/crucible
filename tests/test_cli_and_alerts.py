@@ -547,36 +547,36 @@ class TestDryRunNeverWrites:
 
         self._assert_no_new_keys(tmp_path, [])
 
-    def test_dry_run_drift_completes_cleanly_with_its_inputs_seeded(
-        self, tmp_path, monkeypatch
+    def test_dry_run_drift_computes_its_inputs_and_writes_nothing(
+        self, tmp_path, monkeypatch, source
     ) -> None:
-        """`drift` deliberately raises `FileNotFoundError` on missing inputs
-        REGARDLESS of `--dry-run` (`track_c.py::drift_handler`'s own
-        docstring) — that is correct behaviour unrelated to this class, so
-        the three input keys are seeded to reach the actual dry-run path
-        (the print-instead-of-`record_output` branch, R2-1)."""
-        import json
+        """`drift` computes its three inputs from the store (a compiled feature
+        layer is the one thing it cannot do without — `crucible.drift_inputs`);
+        under `--dry-run` it computes, prints the three records, and files
+        neither the inputs nor a manifest. One compiled day is enough to reach
+        the dry-run path: the feature row reads UNREPORTED (no earlier day to
+        drift from), which is a legitimate reading, not an absent input."""
+        from conftest import sessions_ending
 
-        from crucible.keys import drift_input_key
+        from crucible.data.daily import run_daily
+        from crucible.runner import run_job
         from crucible.store import LocalStore
 
         monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
         store = LocalStore(tmp_path)
-        store.put_bytes(
-            drift_input_key("features", FRIDAY.isoformat()),
-            json.dumps({"psi_by_feature": {"f1": 0.01}}).encode(),
-        )
-        store.put_bytes(
-            drift_input_key("predictions", FRIDAY.isoformat()), json.dumps({"psi": 0.02}).encode()
-        )
-        store.put_bytes(
-            drift_input_key("ic", FRIDAY.isoformat()),
-            json.dumps({"decay_by_horizon": {"21": 0.1}}).encode(),
-        )
+        # two compiled days: with only one, every row is UNREPORTED and
+        # `drift_metrics` correctly refuses the cycle (nothing at all measured)
+        for day in sessions_ending(FRIDAY, 2):
+            run_job(
+                "data.daily",
+                lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+                store=store,
+                trading_day=day,
+            )
         before = sorted(store.list_keys())
         argv = ["drift", "--date", FRIDAY.isoformat(), "--store", str(tmp_path), "--dry-run"]
 
-        main(argv)  # must not raise at all -- inputs are present
+        main(argv)  # must not raise at all -- the feature layer is present
 
         assert sorted(store.list_keys()) == before  # nothing NEW landed
 

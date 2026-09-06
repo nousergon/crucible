@@ -40,8 +40,9 @@ from crucible.console.render import (
     classify_registry,
     write_page,
 )
-from crucible.documents import load_document_bytes, load_store_document, read_store_document
+from crucible.documents import load_document_bytes, read_store_document
 from crucible.drift import drift_metrics
+from crucible.drift_inputs import DRIFT_INPUT_SCHEMA_VERSION, compute_drift_inputs
 from crucible.gate import (
     GATES,
     LADDER_KEY,
@@ -497,37 +498,50 @@ def heartbeat_handler(args: argparse.Namespace) -> int:
 
 
 def drift_handler(args: argparse.Namespace) -> int:
-    """Three drift MetricRecords per cycle, from the feature and prediction
-    artifacts track A and track B write.
+    """Three drift MetricRecords per cycle, computed from the feature layer,
+    the arms' cross-sections and their settled IC (`crucible.drift_inputs`).
 
-    **It raises when those artifacts are absent**, rather than emitting three
-    rows of `UNREPORTED` and exiting 0. A drift job that runs successfully
-    against no data is exactly the shape of a monitor that was green for
-    months while measuring nothing, and this repository's whole reason for
-    existing is that that happened.
+    **The inputs are computed here, then filed as this job's outputs.** Until
+    2026-09-05 this handler READ `drift/{day}/input_*.json` "from the
+    artifacts track A and track B write" and raised when they were absent —
+    and no job had ever written them, so the first arc to reach `drift`
+    (weekly@2026-08-07) died at it. The three documents are still written,
+    so `crucible explain` walks a drift row back to the frames and
+    cross-sections it was derived from, but they are derived by this job
+    from artifacts that exist.
+
+    **It still raises when there is nothing to measure** — an absent feature
+    layer for the day — rather than emitting three rows of `UNREPORTED` and
+    exiting 0. A prediction or IC row whose history has not settled yet is
+    `UNREPORTED` WITH its reason on the row, which is the honest reading of
+    a young store, and `drift_metrics` refuses a cycle in which all three
+    are.
     """
     dry_run = bool(getattr(args, "dry_run", False))
     store = _store(args)
 
     def body(ctx: RunContext) -> None:
         day = ctx.trading_day.isoformat()
+        computed = compute_drift_inputs(store, ctx.trading_day)
+        for source in computed.sources:
+            ctx.record_input(source, store.get_bytes(source))
+        payloads = computed.as_dict()
         inputs = {name: drift_input_key(name, day) for name in DRIFT_INPUTS}
-        missing = [k for k, key in inputs.items() if not store.exists(key)]
-        if missing:
-            raise FileNotFoundError(
-                f"drift inputs absent for {day}: {sorted(missing)}. Three rows of "
-                "UNREPORTED and an exit code of 0 is what a monitor looks like when it "
-                "has been measuring nothing for months."
-            )
-        payloads = {k: load_store_document(store, key) for k, key in inputs.items()}
-        for key in inputs.values():
-            ctx.record_input(key, store.get_bytes(key), schema_version="drift_input.v1")
+        for name, key in inputs.items():
+            body_bytes = json.dumps(payloads[name], indent=2, sort_keys=True).encode("utf-8")
+            if not dry_run:
+                ctx.record_output(key, body_bytes, schema_version=DRIFT_INPUT_SCHEMA_VERSION)
 
         records = drift_metrics(
             trading_day=ctx.trading_day,
             feature_psi_by_name=payloads["features"]["psi_by_feature"],
             prediction_psi=payloads["predictions"]["psi"],
             ic_decay_by_horizon={int(h): v for h, v in payloads["ic"]["decay_by_horizon"].items()},
+            unmeasured_reasons={
+                name: doc["unmeasured_reason"]
+                for name, doc in payloads.items()
+                if doc.get("unmeasured_reason")
+            },
         )
         for record in records:
             ctx.record_metric(record)

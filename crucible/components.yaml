@@ -408,7 +408,7 @@ components:
     dispatch: arc
     deadline:
       anchor: next_calendar_day_at
-      at: "14:00"
+      at: "15:00"
 
   board:
     description: >-
