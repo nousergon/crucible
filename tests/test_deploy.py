@@ -645,6 +645,76 @@ class TestRecord:
         assert "releases/current" in manifest["reason"]
         assert "unreadable" in manifest["reason"]
 
+    def test_a_corrupt_smoke_manifest_still_writes_a_failed_deploy_manifest(self, tmp_path) -> None:
+        """alpha-engine-config-I9945: the same absence-instead-of-failure gap
+        applies to the smoke manifest, not only the pointer — the issue's own
+        deliverable names both. Before the fix, `_record` never read the
+        smoke manifest at all, so a `--outcome success` invocation (the shape
+        a corrupted-just-before-record race, or a future caller relying on
+        `_record` alone to catch it, would produce) reported `ok` against a
+        smoke manifest that cannot actually be trusted. Planting a corrupt
+        smoke manifest here must produce the same shape as the corrupt
+        pointer above: a `status: failed` manifest naming the unreadable key,
+        never a raise that leaves this always()-run step with nothing
+        written."""
+        from crucible.calendar import resolve_trading_day
+
+        store = LocalStore(tmp_path)
+        day = resolve_trading_day().isoformat()
+        store.put_bytes(manifest_key("smoke", day), b"not json at all")
+        assert (
+            deploy_main(
+                [
+                    "record",
+                    "--sha",
+                    SHA,
+                    "--store",
+                    str(tmp_path),
+                    "--outcome",
+                    "success",
+                    "--run-url",
+                    "https://x",
+                ]
+            )
+            == 0
+        )
+        manifest = json.loads(store.get_bytes(manifest_key("deploy", day)))
+        validate(manifest)
+        assert manifest["status"] == "failed"
+        assert manifest_key("smoke", day) in manifest["reason"]
+        assert "unreadable" in manifest["reason"]
+
+    def test_an_absent_smoke_manifest_is_not_a_fault(self, tmp_path) -> None:
+        """An earlier step (build, publish) can fail before the smoke ever
+        runs — that leaves no smoke manifest at all, which is ABSENT, not
+        UNREADABLE, and must not be conflated with the corrupt-manifest case
+        above. The existing pointer-derived failure reason still applies."""
+        store = LocalStore(tmp_path)
+        assert (
+            deploy_main(
+                [
+                    "record",
+                    "--sha",
+                    SHA,
+                    "--store",
+                    str(tmp_path),
+                    "--outcome",
+                    "failure",
+                    "--run-url",
+                    "https://x",
+                ]
+            )
+            == 0
+        )
+        from crucible.calendar import resolve_trading_day
+
+        manifest = json.loads(
+            store.get_bytes(manifest_key("deploy", resolve_trading_day().isoformat()))
+        )
+        validate(manifest)
+        assert manifest["status"] == "failed"
+        assert "outcome='failure'" in manifest["reason"]
+
 
 class TestTheWorkflowItself:
     @pytest.fixture
