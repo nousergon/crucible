@@ -123,6 +123,10 @@ _IGNORED_DIRS = {
 # and acceptance README have to be able to NAME what is forbidden. Everything
 # executable or configuration-bearing is scanned.
 _SCANNED_SUFFIXES = {".py", ".yaml", ".yml", ".json", ".toml", ".cfg", ".ini"}
+#: Suffix-less files that are configuration and must be scanned by NAME —
+#: `.coveragerc` has no suffix, so a `pragma: no cover` inside it was
+#: invisible to the suffix filter (independent review, 2026-09-05).
+_SCANNED_NAMES = {".coveragerc"}
 
 #: What a suppression collection looks like, and why each one is refused.
 FORBIDDEN: dict[str, str] = {
@@ -148,7 +152,48 @@ FORBIDDEN: dict[str, str] = {
     r"# *noqa *$": (
         "a bare `# noqa` suppresses every rule, present and future, on that line; name the code"
     ),
+    r"(?i)pragma[:\s]?\s*no\s*cover": (
+        "a `pragma: no cover` narrows the coverage ratchet one line at a time, by the "
+        "author, with no reviewer and no expiry — the 93% floor `pyproject.toml` "
+        "declares is only a floor if nothing can carve lines out from under it "
+        "(independent adversarial review of crucible-PR89, 2026-09-04: eight live "
+        "sites, none scanned). A line that cannot be reached by a test is restructured "
+        "or covered, or counted as missed; `[tool.coverage.report].exclude_lines` is "
+        "pinned EMPTY by `test_coverage_has_no_line_exclusions_at_all` below"
+    ),
 }
+
+#: The only coverage exclusions permitted, each structural — a pattern that
+#: names a construct whose body cannot execute under pytest BY CONSTRUCTION,
+#: never a free-text marker an author can attach to an arbitrary line. Adding
+#: an entry is a rule change reviewed as one, not a way to make a PR pass.
+#: The permitted coverage line exclusions: NONE. Three rounds of independent
+#: adversarial review on crucible-PR112 (2026-09-05) each broke the previous
+#: 'structural' exclusion by making its guarded block EXECUTE while coverage
+#: still excluded it — a trailing `# if TYPE_CHECKING:` comment; a module
+#: binding `TYPE_CHECKING = True`; `globals()['TYPE_CHECKING'] = True`;
+#: `typing.TYPE_CHECKING = True` in a conftest. A regex over source text
+#: cannot know whether a block runs, so no regex may remove a line from the
+#: denominator. The ~20 `if TYPE_CHECKING:` / `__main__` lines count as
+#: missed and the floor is measured against the whole tree.
+_COVERAGE_EXCLUSIONS_PERMITTED: frozenset[str] = frozenset()
+
+#: The ONLY keys `[tool.coverage.report]` and `[tool.coverage.run]` may carry,
+#: and the values the two scope-defining ones must hold. `exclude_also`,
+#: `partial_branches`, a non-empty `omit` or a narrowed `source` each narrow
+#: the ratchet file-by-file or line-by-line with no reviewer — the class the
+#: pragma belonged to (independent review, 2026-09-05, findings 3-5).
+_COVERAGE_REPORT_KEYS = frozenset({"fail_under", "show_missing", "exclude_lines"})
+_COVERAGE_RUN_KEYS = frozenset({"source", "omit"})
+_COVERAGE_TABLES = frozenset({"run", "report"})
+_COVERAGE_SOURCE = ["crucible"]
+_COVERAGE_FLOOR = 93
+
+#: Files coverage.py reads INSTEAD of pyproject.toml when present (its
+#: discovery order: .coveragerc, setup.cfg, tox.ini, pyproject.toml). A
+#: `.coveragerc` carrying `exclude_lines = pragma: no cover` displaced the
+#: whole pinned table, fail_under included, in the reviewer's reproduction.
+_DISPLACING_COVERAGE_FILES = (".coveragerc", "setup.cfg", "tox.ini")
 
 _PATTERNS = {p: re.compile(p) for p in FORBIDDEN}
 
@@ -186,7 +231,7 @@ def _scanned_files() -> list[Path]:
             continue
         if any(part in _IGNORED_DIRS for part in path.parts):
             continue
-        if path.suffix not in _SCANNED_SUFFIXES:
+        if path.suffix not in _SCANNED_SUFFIXES and path.name not in _SCANNED_NAMES:
             continue
         if path.resolve() == SELF:
             continue
@@ -287,6 +332,7 @@ def test_the_scan_can_actually_find_something(tmp_path: Path) -> None:
         r"pytest\.mark\.skip": "@pytest.mark.skip",
         r"# *type: *ignore\[.*\] *# *TODO": "x = y  # type: ignore[arg-type]  # TODO",
         r"# *noqa *$": "import os  # noqa",
+        r"(?i)pragma[:\s]?\s*no\s*cover": "def _client():  # pragma: no cover",
     }
     assert set(samples) == set(FORBIDDEN), (
         "every forbidden pattern needs a sample proving the matcher fires on it; "
@@ -389,4 +435,196 @@ class TestTheSanctionedKnownRegistryExemptionIsExactlyAsNarrowAsClaimed:
             "X_KNOWN_ARCHITECTURAL_EXCEPTIONS_EXTRA is one identifier token containing "
             "the sanctioned name as a substring, not equal to it, and must still be "
             "reported."
+        )
+
+
+def test_coverage_has_no_line_exclusions_at_all() -> None:
+    """The coverage floor is only a floor if nothing can carve lines out from
+    under it. `[tool.coverage.report].exclude_lines` must be EMPTY — see
+    `_COVERAGE_EXCLUSIONS_PERMITTED` for the three demonstrations that made
+    every regex-shaped exclusion inadmissible. Read with `tomllib` from the
+    file, so the assertion is about what the repository declares.
+
+    An EMPTY list is also what disables coverage.py's own default
+    (`pragma: no cover`): setting the key REPLACES the default rather than
+    extending it, which `test_the_pragma_is_inert_under_this_config` proves
+    against the real coverage engine rather than asserts from documentation.
+    """
+    import tomllib
+
+    config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = config["tool"]["coverage"]["report"]["exclude_lines"]
+    assert declared == sorted(_COVERAGE_EXCLUSIONS_PERMITTED) == [], (
+        f"pyproject.toml exclude_lines is {declared}; no line exclusion is permitted. A "
+        "line a test cannot reach is restructured, covered, or counted as missed."
+    )
+
+
+def test_the_pragma_is_inert_under_this_config(tmp_path: Path) -> None:
+    """Measured against coverage.py itself: with the repo's `exclude_lines`, a
+    `# pragma: no cover` line is NOT excluded (the empty list replaces the
+    engine's default), and neither is an `if TYPE_CHECKING:` block."""
+    import subprocess
+    import sys
+    import tomllib
+
+    config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = config["tool"]["coverage"]["report"]["exclude_lines"]
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.coverage.report]\nexclude_lines = " + repr(list(declared)) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "m.py").write_text(
+        "from typing import TYPE_CHECKING\n"
+        "def unused():  # pragma: no cover\n"
+        "    return 1\n"
+        "if TYPE_CHECKING:\n"
+        "    import os\n"
+        "x = 2\n",
+        encoding="utf-8",
+    )
+    subenv = {"PATH": "/usr/bin:/bin", "COVERAGE_RCFILE": str(tmp_path / "pyproject.toml")}
+    subprocess.run(
+        [sys.executable, "-m", "coverage", "run", "--include=m.py", "m.py"],
+        cwd=tmp_path,
+        env=subenv,
+        check=True,
+        capture_output=True,
+    )
+    report = subprocess.run(
+        [sys.executable, "-m", "coverage", "report", "-m"],
+        cwd=tmp_path,
+        env=subenv,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    line = next(ln for ln in report.splitlines() if ln.startswith("m.py"))
+    statements = int(line.split()[1])
+    assert statements == 6, report + " -- every statement counts; none was excluded"
+
+
+def test_no_other_coverage_narrowing_knob_is_set() -> None:
+    """Findings 3-5: `exclude_also`, `omit`, `source` (and `partial_branches`,
+    `exclude_also`'s sibling) narrow the ratchet with no reviewer. The two
+    coverage tables are CLOSED: exactly these keys, and the two scope keys
+    hold exactly the whole-tree values."""
+    import tomllib
+
+    config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    report = config["tool"]["coverage"]["report"]
+    run = config["tool"]["coverage"]["run"]
+    assert set(report) == set(_COVERAGE_REPORT_KEYS), (
+        f"[tool.coverage.report] carries {sorted(set(report) - _COVERAGE_REPORT_KEYS)}; "
+        "exclude_also / partial_branches / any new key narrows the ratchet without review"
+    )
+    assert set(run) == set(_COVERAGE_RUN_KEYS), (
+        f"[tool.coverage.run] carries {sorted(set(run) ^ _COVERAGE_RUN_KEYS)}"
+    )
+    # Round-4 finding: `[tool.coverage.paths]` remaps the measured tree onto
+    # any other directory (a committed stub read 11 -> 2 statements, 100%)
+    # with every other guard green. The table SET is closed, not only the
+    # two tables' keys.
+    extra_tables = sorted(set(config["tool"]["coverage"]) - _COVERAGE_TABLES)
+    assert set(config["tool"]["coverage"]) == set(_COVERAGE_TABLES), (
+        f"[tool.coverage] carries tables {extra_tables}; "
+        "`paths` remaps the measured tree, `html`/`xml`/`json` are unused here, and any new "
+        "table is a rule change reviewed as one"
+    )
+    assert run["source"] == _COVERAGE_SOURCE, "the denominator is the whole package"
+    assert run["omit"] == [], "omit stays empty so the scope cannot be narrowed file-by-file"
+    assert report["fail_under"] >= _COVERAGE_FLOOR, (
+        "lowering the floor is a policy amendment, visible here as well as in the diff"
+    )
+
+
+def test_no_file_displaces_the_pinned_coverage_config() -> None:
+    """Finding 2: coverage.py reads `.coveragerc`, then `setup.cfg`, then
+    `tox.ini`, and only then `pyproject.toml`. A `.coveragerc` with its own
+    `exclude_lines` replaced the WHOLE pinned table, `fail_under` included,
+    and the suffix-filtered scanner never opened it. None may exist carrying
+    coverage config, and the scanner now opens `.coveragerc` by name."""
+    assert not (REPO_ROOT / ".coveragerc").exists(), ".coveragerc displaces pyproject.toml"
+    # pytest's own discovery prefers pytest.ini, then pyproject.toml, tox.ini,
+    # setup.cfg (round-3 finding: a `pytest.ini` carrying `addopts = --no-cov`
+    # disabled the ratchet wholesale under the CI command line).
+    assert not (REPO_ROOT / "pytest.ini").exists(), "pytest.ini displaces pyproject.toml"
+    for name in ("setup.cfg", "tox.ini"):
+        path = REPO_ROOT / name
+        if path.exists():
+            text = path.read_text(encoding="utf-8")
+            for section in ("[coverage:", "[pytest]", "[tool:pytest]"):
+                assert section not in text, (
+                    f"{name} carries {section}, which displaces pyproject.toml"
+                )
+    assert ".coveragerc" in _SCANNED_NAMES
+
+
+def test_ci_pins_the_coverage_config_file() -> None:
+    """Belt to the displacement test's braces: the CI invocation names the
+    config file for BOTH pytest (`-c`) and coverage (`--cov-config`), so a
+    planted ini or rc is not what CI measures against.
+
+    Token-exact and exactly-once (round-4 finding): a substring check passed
+    a line carrying `--cov-config=pyproject.toml --cov-config=evil.rc`, and
+    the LAST occurrence is the one both tools honour. So each flag must
+    appear exactly once with exactly this value, and `--no-cov` must not
+    appear at all. The workflow must also set no coverage environment
+    variable (`COVERAGE_RCFILE`, `COVERAGE_PROCESS_START`, `COVERAGE_CORE`),
+    which override the config file from outside the command line.
+    """
+    import shlex
+
+    text = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    cov_lines = [ln for ln in text.splitlines() if "--cov=crucible" in ln and "pytest" in ln]
+    assert cov_lines, "ci.yml no longer runs the coverage step"
+    for line in cov_lines:
+        tokens = shlex.split(line.split("run:", 1)[1])
+        assert tokens.count("--cov=crucible") == 1, tokens
+        assert tokens.count("--cov-config=pyproject.toml") == 1, tokens
+        assert not [
+            t for t in tokens if t.startswith("--cov-config") and t != "--cov-config=pyproject.toml"
+        ], tokens
+        c_positions = [i for i, t in enumerate(tokens) if t == "-c"]
+        assert len(c_positions) == 1 and tokens[c_positions[0] + 1] == "pyproject.toml", tokens
+        assert not [
+            t for t in tokens if t.startswith("-c") and t != "-c" and not t.startswith("--")
+        ], tokens
+        assert "--no-cov" not in tokens, tokens
+        assert not [t for t in tokens if t.startswith("--cov-fail-under")], tokens
+    for var in ("COVERAGE_RCFILE", "COVERAGE_PROCESS_START", "COVERAGE_CORE", "COVERAGE_FILE"):
+        assert var not in text, (
+            f"ci.yml sets {var}, which overrides the pinned config from outside the command line"
+        )
+
+
+def test_the_pragma_pattern_catches_every_spelling_coverage_honours() -> None:
+    r"""coverage.py's own default is `#\s*(pragma|PRAGMA)[:\s]?\s*(no|NO)\s*(cover|COVER)`;
+    the scanner must fire on at least everything that default would honour."""
+    pattern = next(p for p in FORBIDDEN if "pragma" in p)
+    compiled = _PATTERNS[pattern]
+    for line in (
+        "x = 1  # pragma: no cover",
+        "x = 1  # pragma:NO COVER",
+        "x = 1  # PRAGMA: no cover",
+        "x = 1  # pragma: no\tcover",
+        "x = 1  # pragma no cover",
+        "x = 1  #pragma:nocover",
+    ):
+        assert compiled.search(line), line
+
+
+def test_pytest_addopts_cannot_switch_coverage_off() -> None:
+    """Round-2 note: `--no-cov` in `[tool.pytest.ini_options] addopts` disables
+    the whole ratchet even with `--cov=crucible` on the CI command line. Not
+    the per-line class, but one line away from it, and it is pinned here so
+    the config cannot grow it quietly."""
+    import tomllib
+
+    config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    addopts = config["tool"]["pytest"]["ini_options"].get("addopts", "")
+    for forbidden in ("--no-cov", "--cov-fail-under", "--cov-config", "--cov-report", "--cov="):
+        assert forbidden not in addopts, (
+            f"pytest addopts carries {forbidden!r}; coverage flags belong on ci.yml's "
+            "command line and in [tool.coverage.*], where the tests above pin them"
         )

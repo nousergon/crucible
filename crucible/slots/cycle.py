@@ -83,7 +83,7 @@ from crucible.slots.grading import (
 from crucible.slots.inputs import InputRefusal, SlotUnservableError
 from crucible.slots.rankers import MissingFeatureError, get_ranker
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:
     import pandas as pd
 
     from crucible.runner import RunContext

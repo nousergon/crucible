@@ -39,7 +39,7 @@ from crucible.documents import load_store_document
 from crucible.keys import champion_key, migration_key
 from crucible.slots.arms import ArmSpec, read_register, register_arms, write_register
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:
     from crucible.store import Store
 
 __all__ = [

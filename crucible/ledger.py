@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 
 from crucible.keys import ledger_key
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:
     from nousergon_lib.arena.engine import ArenaCycle
     from nousergon_lib.arena.window import ArmSeries
 

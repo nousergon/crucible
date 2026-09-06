@@ -39,7 +39,7 @@ from crucible.data.daily import DEFAULT_LOOKBACK_DAYS, run_daily
 from crucible.data.sources import PriceSource
 from crucible.keys import data_panel_key
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:
     from crucible.runner import RunContext
 
 __all__ = ["DataGapError", "run_weekly", "week_sessions"]

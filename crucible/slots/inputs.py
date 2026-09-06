@@ -90,7 +90,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -101,7 +101,7 @@ from jsonschema import Draft202012Validator
 from crucible.documents import load_document_bytes
 from crucible.keys import arm_predictions_key
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:
     from crucible.slots.model import FeaturePanel
     from crucible.store import Store
 
@@ -801,14 +801,26 @@ INPUT_RESOLVERS: dict[str, Any] = {
     "predictions": stack_prediction_columns,
 }
 
-_UNWIRED = tuple(k for k in INPUT_KINDS if k not in INPUT_RESOLVERS)
-if _UNWIRED:  # pragma: no cover - an import-time structural guard
-    raise RuntimeError(
-        f"input kind(s) {list(_UNWIRED)} are declarable under `spec.inputs` but have no "
-        "entry in INPUT_RESOLVERS, so an arm declaring one would register and then die "
-        "when its design matrix was built. Wire the producer or remove the kind from "
-        "INPUT_KINDS; there is no third option."
-    )
+
+def _check_every_kind_is_wired(kinds: Iterable[str], resolvers: dict[str, Any]) -> None:
+    """Refuse a grammar that admits an input kind nothing resolves.
+
+    A function rather than a bare import-time `if` so
+    `tests/test_slot_inputs_wiring.py` can show the refusal firing on a kind
+    with no resolver; the module still calls it at import, so the process
+    fails to start on exactly the shape it did before.
+    """
+    unwired = tuple(k for k in kinds if k not in resolvers)
+    if unwired:
+        raise RuntimeError(
+            f"input kind(s) {list(unwired)} are declarable under `spec.inputs` but have no "
+            "entry in INPUT_RESOLVERS, so an arm declaring one would register and then die "
+            "when its design matrix was built. Wire the producer or remove the kind from "
+            "INPUT_KINDS; there is no third option."
+        )
+
+
+_check_every_kind_is_wired(INPUT_KINDS, INPUT_RESOLVERS)
 
 
 def resolve_declared_inputs(

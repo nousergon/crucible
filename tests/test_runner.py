@@ -181,7 +181,7 @@ class TestNoThirdState:
 
         try:
             validate(_read_manifest(store, "data.daily"))
-        except ManifestValidationError as exc:  # pragma: no cover - failure detail
+        except ManifestValidationError as exc:
             pytest.fail(f"runner wrote a non-conformant manifest: {exc}")
 
 

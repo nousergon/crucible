@@ -29,7 +29,7 @@ from crucible.config import Settings
 from crucible.keys import universe_members_key
 from crucible.slots.cycle import run_grade, run_produce
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:
     from crucible.runner import RunContext
 
 __all__ = ["SLOT", "grade", "produce"]
