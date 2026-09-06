@@ -259,57 +259,61 @@ class TestDriftHandlerKeyShape:
     under.
     """
 
-    def _write_inputs(self, store: LocalStore, day: str) -> None:
-        store.put_bytes(
-            drift_input_key("features", day),
-            json.dumps({"psi_by_feature": {"mom_21d": 0.05}}).encode("utf-8"),
-        )
-        store.put_bytes(
-            drift_input_key("predictions", day),
-            json.dumps({"psi": 0.03}).encode("utf-8"),
-        )
-        store.put_bytes(
-            drift_input_key("ic", day),
-            json.dumps({"decay_by_horizon": {"21": 0.1}}).encode("utf-8"),
-        )
+    def _compile_two_days(self, store: LocalStore) -> None:
+        """`drift` computes its inputs from the feature layer (2026-09-05,
+        `crucible.drift_inputs`); two compiled days give the feature row a
+        reference to drift from."""
+        from conftest import sessions_ending, synthetic_frames
 
-    def test_it_reads_the_keys_crucible_keys_writes_and_writes_its_own_output_there(
+        from crucible.data import FramePriceSource
+        from crucible.data.daily import run_daily
+        from crucible.runner import run_job
+
+        source = FramePriceSource(synthetic_frames(end=FRIDAY), snapshot="frames:keys-test")
+        for day in sessions_ending(FRIDAY, 2):
+            run_job(
+                "data.daily",
+                lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+                store=store,
+                trading_day=day,
+            )
+
+    def test_it_writes_its_inputs_and_output_under_the_keys_crucible_keys_declares(
         self, tmp_path
     ) -> None:
         store = LocalStore(tmp_path / "store")
         day = FRIDAY.isoformat()
-        self._write_inputs(store, day)
+        self._compile_two_days(store)
 
         drift_handler(argparse.Namespace(trading_day=FRIDAY, store=str(tmp_path / "store")))
 
         manifest = json.loads(store.get_bytes(manifest_key("drift", day)).decode("utf-8"))
         assert manifest["status"] == "ok", manifest.get("reason")
+        for name in ("features", "predictions", "ic"):
+            assert store.exists(drift_input_key(name, day)), name
+        outputs = {o["key"] for o in manifest["outputs"]}
+        assert {drift_input_key(n, day) for n in ("features", "predictions", "ic")} <= outputs
         assert store.exists(drift_metrics_key(day))
         records = json.loads(store.get_bytes(drift_metrics_key(day)).decode("utf-8"))
         assert len(records) == 3
 
-    def test_a_missing_input_fails_the_manifest_rather_than_scoring_from_nothing(
+    def test_an_absent_feature_layer_fails_the_manifest_rather_than_scoring_from_nothing(
         self, tmp_path
     ) -> None:
+        from crucible.features import DEFAULT_FEATURE_VERSION
+        from crucible.keys import features_key
+
         store = LocalStore(tmp_path / "store")
         day = FRIDAY.isoformat()
-        # Only two of three inputs present.
-        store.put_bytes(
-            drift_input_key("features", day),
-            json.dumps({"psi_by_feature": {"mom_21d": 0.05}}).encode("utf-8"),
-        )
-        store.put_bytes(
-            drift_input_key("predictions", day),
-            json.dumps({"psi": 0.03}).encode("utf-8"),
-        )
 
         # `crucible.runner.run_job` writes the failed manifest in a
         # try/finally and then lets the exception propagate (`AGENTS.md`
         # rule 1: "the exception continues to propagate so the process exits
-        # non-zero") — so the handler call itself raises here.
-        with pytest.raises(FileNotFoundError, match="ic"):
+        # non-zero") — so the handler call itself raises here, naming the
+        # feature-layer key it could not read.
+        with pytest.raises(FileNotFoundError, match="nothing to measure"):
             drift_handler(argparse.Namespace(trading_day=FRIDAY, store=str(tmp_path / "store")))
 
         manifest = json.loads(store.get_bytes(manifest_key("drift", day)).decode("utf-8"))
         assert manifest["status"] == "failed"
-        assert "ic" in manifest["reason"]
+        assert features_key(DEFAULT_FEATURE_VERSION, day) in manifest["reason"]

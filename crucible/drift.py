@@ -349,8 +349,14 @@ def drift_metrics(
     prediction_psi: float | None,
     ic_decay_by_horizon: dict[int, float],
     now: dt.datetime | None = None,
+    unmeasured_reasons: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """The three MetricRecords, one per cycle. §10 component 5.
+
+    ``unmeasured_reasons`` — per input (`features` / `predictions` / `ic`),
+    the producer's own statement of WHY a value is absent, carried onto the
+    `UNREPORTED` row's `status_reason` so the console shows "no settled
+    horizon yet" rather than the generic "nothing was measured".
 
     Three and exactly three: the plan names them, and a drift module that
     grows a row per feature is the 185-rule fleet again with a different
@@ -367,6 +373,7 @@ def drift_metrics(
     """
     moment = now or dt.datetime.now(dt.UTC)
     day = trading_day.isoformat()
+    reasons = unmeasured_reasons or {}
 
     worst_feature, worst_value = (
         max(feature_psi_by_name.items(), key=lambda kv: kv[1])
@@ -397,7 +404,7 @@ def drift_metrics(
                 f"Worst of {len(feature_psi_by_name)} feature(s): "
                 f"{worst_feature} at {worst_value:.4f}."
                 if worst_feature is not None
-                else "No features were compared, so nothing was measured."
+                else reasons.get("features", "No features were compared, so nothing was measured.")
             ),
         ),
         _record(
@@ -412,7 +419,7 @@ def drift_metrics(
             detail=(
                 f"Prediction distribution against the training window: {prediction_psi:.4f}."
                 if prediction_psi is not None and not math.isnan(prediction_psi)
-                else "The prediction distribution was not measured."
+                else reasons.get("predictions", "The prediction distribution was not measured.")
             ),
         ),
         _record(
@@ -428,7 +435,7 @@ def drift_metrics(
                 f"Worst horizon: {worst_horizon} trading days, "
                 f"{worst_decay:.4f} of baseline IC lost."
                 if worst_horizon is not None
-                else "No horizons were compared, so nothing was measured."
+                else reasons.get("ic", "No horizons were compared, so nothing was measured.")
             ),
             horizon=worst_horizon,
         ),
