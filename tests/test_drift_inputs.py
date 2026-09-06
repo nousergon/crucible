@@ -227,6 +227,76 @@ class TestMarketWideVsCrossSectional:
         assert doc["reference_rows_by_feature"]["close_raw"] > len(days) * len(self._TICKERS) / 2
         assert doc["reference_rows_by_feature"]["market_return_1d_log_return"] == len(days) - 1
 
+    def test_a_single_reference_session_is_unscored_not_breach(self, tmp_path) -> None:
+        """`alpha-engine-config-I10071` review finding: `_along_time_ratio`
+        with n=1 has zero sample variance by definition, so ANY differing
+        current value would read an infinite z-score — BREACH by
+        construction on the first replay day after a fresh feature layer,
+        the exact desensitisation this issue exists to remove. A market-wide
+        column below `ALONG_TIME_MIN_REFERENCE_SESSIONS` is reported
+        unscored, with a reason, and excluded from `psi_by_feature`
+        entirely — never a fabricated 0.0 and never a breach."""
+        store = LocalStore(tmp_path)
+        from conftest import sessions_ending
+
+        days = sessions_ending(FRIDAY, 2)
+        self._write_day(
+            store,
+            days[0],
+            market_return=0.0003,
+            close_by_ticker=[100.0, 101.0, 102.0, 103.0, 104.0],
+        )
+        # A current value far from the single reference session — if this
+        # were scored via z-score-against-zero-variance, it would read the
+        # breach band regardless of how far away it actually is.
+        self._write_day(
+            store, days[1], market_return=0.05, close_by_ticker=[103.0, 104.0, 105.0, 106.0, 107.0]
+        )
+        doc = compute_drift_inputs(store, days[1]).features
+        assert "market_return_1d_log_return" not in doc["psi_by_feature"]
+        assert "market_return_1d_log_return" not in doc["method_by_feature"]
+        reason = doc["columns_awaiting_reference"]["market_return_1d_log_return"]
+        assert "1 of 5 sessions" in reason, doc
+        # The cross-sectional column is unaffected by the floor: it is
+        # scored off one reference session same as before this fix.
+        assert "close_raw" in doc["psi_by_feature"]
+
+    def test_five_reference_sessions_is_the_floor_and_scores(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        from conftest import sessions_ending
+
+        days = sessions_ending(FRIDAY, 6)
+        rng = random.Random(17)
+        for i, day in enumerate(days[:-1]):
+            self._write_day(
+                store,
+                day,
+                market_return=rng.gauss(0.0003, 0.0009),
+                close_by_ticker=[100.0 + i + t for t in range(len(self._TICKERS))],
+            )
+        self._write_day(
+            store,
+            days[-1],
+            market_return=0.0004,
+            close_by_ticker=[103.0, 104.0, 105.0, 106.0, 107.0],
+        )
+        doc = compute_drift_inputs(store, days[-1]).features
+        assert "market_return_1d_log_return" not in doc["columns_awaiting_reference"]
+        assert doc["method_by_feature"]["market_return_1d_log_return"].startswith("along-time")
+        assert isinstance(doc["psi_by_feature"]["market_return_1d_log_return"], float)
+        assert doc["reference_rows_by_feature"]["market_return_1d_log_return"] == 5
+
+    def test_along_time_ratio_itself_refuses_below_the_floor(self) -> None:
+        """`_features_input` never calls `_along_time_ratio` below
+        `ALONG_TIME_MIN_REFERENCE_SESSIONS` (it routes to
+        `columns_awaiting_reference` instead), but the function enforces its
+        own contract too — a guard nobody has made fire is a guard nobody
+        knows works."""
+        import crucible.drift_inputs as drift_inputs_module
+
+        with pytest.raises(ValueError, match="ALONG_TIME_MIN_REFERENCE_SESSIONS"):
+            drift_inputs_module._along_time_ratio([0.1, 0.2, 0.3], 0.5)
+
 
 class TestPredictionsInput:
     def test_no_cross_sections_is_unmeasured_with_a_reason(self, store, source, cycle_date):

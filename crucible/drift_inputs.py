@@ -35,11 +35,18 @@ component 5 exists to remove, wearing the monitor's own name.
   (measured ~8.3, matching the original defect's own reported value)
   regardless of where that value actually sits, so `_along_time_ratio`'s
   z-score is not a style choice, it is the only one of the two that is
-  actually meaningful for a single observation. ``method_by_feature`` on the
-  returned document names which comparison each column used. The trailing
-  window is the phase-1 proxy for "the training window"; when the M slot
-  ships (phase 3) its declared training window replaces the proxy and this
-  module's ``reference`` selection is the one place that changes.
+  actually meaningful for a single observation. A market-wide column is
+  only SCORED once its reference reaches
+  :data:`ALONG_TIME_MIN_REFERENCE_SESSIONS` sessions — below that, a sample
+  standard deviation is undefined at n=1 (any differing value would read an
+  infinite z-score, i.e. BREACH by construction, the same defect this issue
+  closes) and is mostly noise at n=2-4; a column below the floor is
+  reported unscored in ``columns_awaiting_reference`` rather than scored at
+  a fabricated value. ``method_by_feature`` on the returned document names
+  which comparison each SCORED column used. The trailing window is the
+  phase-1 proxy for "the training window"; when the M slot ships (phase 3)
+  its declared training window replaces the proxy and this module's
+  ``reference`` selection is the one place that changes.
 * ``predictions`` — PSI of each produced arm's scored cross-section
   (`cross_section.v2`, the whole ranked population) against that same arm's
   earlier cross-sections. Reported as the WORST arm, with every arm named in
@@ -193,6 +200,22 @@ _METHOD_ALONG_TIME = (
 #: sample's mean and spread).
 ALONG_TIME_BREACH_SIGMA = 3.0
 
+#: Minimum trailing daily observations before a market-wide column's
+#: along-time comparison is SCORED at all. At `n=1` the sample variance is
+#: zero by definition (one point has no spread), so `_along_time_ratio`
+#: would read ANY differing current value as an infinite z-score and
+#: BREACH — on the first replay day after a fresh feature layer, or the day
+#: after any gap, whatever the market did. That is the exact
+#: desensitisation `alpha-engine-config-I10071` exists to close, reproduced
+#: on the reference-size axis instead of the ticker-count axis. At `n=2..4`
+#: a sample standard deviation is itself mostly sampling noise, not a
+#: measurement of the column's real spread. Five is one trading week
+#: (`AGENTS.md` §3: "a trading week is 5 trading days") — the smallest
+#: window this repo already treats as a real sample rather than a handful
+#: of points, so a market-wide column below it is reported unscored with a
+#: reason, never scored at a fabricated 0.0 or a manufactured breach.
+ALONG_TIME_MIN_REFERENCE_SESSIONS = 5
+
 
 def _daily_representative(frame: Any, column: str) -> float | None:
     """The single value a market-wide column carries on this trading day.
@@ -221,10 +244,27 @@ def _along_time_ratio(reference: Sequence[float], current: float) -> float:
     at the three-sigma control limit and a cross-sectional column at a
     "different population" PSI both read the same number, by declared
     convention, not by claiming the two arithmetics are the same thing.
+
+    Raises rather than scoring below :data:`ALONG_TIME_MIN_REFERENCE_SESSIONS`:
+    the caller is the one place that decides whether a column is scored at
+    all (`_features_input` routes a too-short reference to
+    ``columns_awaiting_reference`` instead of calling this), so reaching
+    this function with too few points is a caller defect, not a value this
+    function should paper over with an invented number.
     """
     n = len(reference)
+    if n < ALONG_TIME_MIN_REFERENCE_SESSIONS:
+        raise ValueError(
+            f"{n} reference session(s), fewer than "
+            f"ALONG_TIME_MIN_REFERENCE_SESSIONS={ALONG_TIME_MIN_REFERENCE_SESSIONS}; the "
+            "caller must route this column to columns_awaiting_reference instead of "
+            "scoring it — a sample of this size has no real standard deviation to "
+            "measure a z-score against"
+        )
     mean = sum(reference) / n
-    variance = sum((v - mean) ** 2 for v in reference) / (n - 1) if n > 1 else 0.0
+    # n >= ALONG_TIME_MIN_REFERENCE_SESSIONS (checked above) is always > 1,
+    # so the sample-variance denominator never divides by zero.
+    variance = sum((v - mean) ** 2 for v in reference) / (n - 1)
     std = math.sqrt(variance)
     breach = BANDS["feature_psi_max_ratio"].breach
     if std == 0.0:
@@ -275,8 +315,10 @@ def _features_input(
             "per catalogue column, one of two comparisons chosen from the column's "
             "DECLARED `FeatureSpec.market_wide` (never inferred from variance): a "
             f"cross-sectional column reads '{_METHOD_CROSS_SECTIONAL}'; a market-wide "
-            f"column (identical across every ticker on a day) reads '{_METHOD_ALONG_TIME}'. "
-            "See method_by_feature for the per-column choice actually used. The trailing "
+            f"column (identical across every ticker on a day) reads '{_METHOD_ALONG_TIME}', "
+            f"once its trailing reference reaches {ALONG_TIME_MIN_REFERENCE_SESSIONS} "
+            "sessions — see columns_awaiting_reference for one that has not. See "
+            "method_by_feature for the per-column choice actually used. The trailing "
             "window is the phase-1 proxy for the training window; the M slot's declared "
             "training window replaces it in phase 3."
         ),
@@ -315,9 +357,25 @@ def _features_input(
     not_comparable = sorted(
         (set(cs_training) - set(cs_comparable)) | (set(mw_training) - set(mw_comparable))
     )
+    # A market-wide column with SOME reference but fewer than
+    # ALONG_TIME_MIN_REFERENCE_SESSIONS sessions of it is not "not
+    # comparable" (that means zero reference, a brand-new column) — it has
+    # a reference, just too short a one to measure a real standard
+    # deviation against. Reported with its own honest-absence reason
+    # (mirroring how the predictions input reports an arm with no earlier
+    # cross-section) rather than scored at n=1's fabricated zero-variance
+    # breach.
+    mw_scoreable = {
+        c: v for c, v in mw_comparable.items() if len(v) >= ALONG_TIME_MIN_REFERENCE_SESSIONS
+    }
+    columns_awaiting_reference = {
+        c: f"no reference yet: {len(v)} of {ALONG_TIME_MIN_REFERENCE_SESSIONS} sessions"
+        for c, v in mw_comparable.items()
+        if c not in mw_scoreable
+    }
     cs_live = {c: _finite(current[c].tolist()) for c in cs_comparable}
     mw_live: dict[str, list[float]] = {}
-    for c in mw_comparable:
+    for c in mw_scoreable:
         value = _daily_representative(current, c)
         mw_live[c] = [] if value is None else [value]
     empty_live = sorted(
@@ -331,16 +389,28 @@ def _features_input(
         )
     psi_by_feature = feature_psi(cs_comparable, cs_live)
     method_by_feature = {c: _METHOD_CROSS_SECTIONAL for c in psi_by_feature}
-    for c in sorted(mw_comparable):
-        psi_by_feature[c] = _along_time_ratio(mw_comparable[c], mw_live[c][0])
+    for c in sorted(mw_scoreable):
+        psi_by_feature[c] = _along_time_ratio(mw_scoreable[c], mw_live[c][0])
         method_by_feature[c] = _METHOD_ALONG_TIME
     document["psi_by_feature"] = psi_by_feature
     document["method_by_feature"] = method_by_feature
     document["columns_not_comparable"] = not_comparable
+    document["columns_awaiting_reference"] = columns_awaiting_reference
     document["reference_rows_by_feature"] = {
         **{c: len(v) for c, v in cs_comparable.items()},
-        **{c: len(v) for c, v in mw_comparable.items()},
+        **{c: len(v) for c, v in mw_scoreable.items()},
     }
+    if not psi_by_feature:
+        # Every catalogue column present today is either brand new
+        # (`columns_not_comparable`) or a market-wide column whose reference
+        # has not reached ALONG_TIME_MIN_REFERENCE_SESSIONS yet
+        # (`columns_awaiting_reference`) — the same honest-absence shape as
+        # an empty `prior` above, reached one step later.
+        document["unmeasured_reason"] = (
+            "no catalogue column could be scored this cycle: "
+            f"not comparable (no reference at all): {not_comparable or 'none'}; "
+            f"awaiting a longer reference: {columns_awaiting_reference or 'none'}"
+        )
     return document
 
 
