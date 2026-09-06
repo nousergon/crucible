@@ -53,12 +53,13 @@ from typing import Any
 
 import yaml
 from nousergon_lib.arena.arms import ArmEvent, ArmRegister, derive_arm_id
+from pydantic import ValidationError
 
 from crucible.calendar import assert_trading_day
 from crucible.keys import arm_register_key, strategy_arms_prefix
+from crucible.models import ArmRecipeDocument
 from crucible.slots import ControlArm, SlotSpec
 from crucible.slots.rankers import get_ranker, ranker_identity
-from crucible.slots.vocab import refuse_unknown_keys
 from crucible.store import Store
 
 __all__ = [
@@ -148,28 +149,6 @@ class InapplicableArmError(ValueError):
     """Two arms that are not two arms. Policy §4's vacuity refusal."""
 
 
-#: Every top-level key a filed U/R recipe may declare (`alpha-engine-config-
-#: I9944`) — exactly :class:`ArmSpec`'s fields, minus `source_key`, which is
-#: set from the recipe's own path and never read out of the YAML document.
-#: `params` is a MEMBER of this set (the key itself, not its contents): what
-#: it may contain stays an open mapping, hashed as-is.
-_ARM_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
-    {
-        "name",
-        "slot",
-        "ranker",
-        "params",
-        "registered_at",
-        "supersedes",
-        "control",
-        "control_kind",
-        "bootstrap",
-        "promotion_source",
-        "notes",
-    }
-)
-
-
 @dataclass(frozen=True)
 class ArmSpec:
     """One recipe, as loaded. Immutable; its hash is its identity."""
@@ -245,48 +224,39 @@ class ArmSpec:
 
 
 def _parse(payload: bytes, origin: str) -> ArmSpec:
-    document = yaml.safe_load(payload.decode("utf-8"))
-    if not isinstance(document, dict):
-        raise ValueError(
-            f"{origin}: an arm recipe is a YAML mapping; got {type(document).__name__}"
-        )
-    missing = [f for f in REQUIRED_ARM_FIELDS if not document.get(f)]
-    if missing:
-        raise ValueError(
-            f"{origin}: arm recipe is missing required field(s) {missing}. §9.1 "
-            "pre-registration: an arm declares its slot, recipe and registration date "
-            "before its first score, and a recipe that leaves one blank produces a "
-            "verdict that cannot answer for itself. Note that `metric`, `horizon` and "
-            "`benchmark` are deliberately NOT arm fields — they are the SLOT's, so "
-            "every arm is scored on the same axis (policy §4)."
-        )
-    # Top-level keys only (`alpha-engine-config-I9944`) — `params` is the
-    # ranker's own open argument mapping and is hashed as-is, by design.
-    refuse_unknown_keys(
-        path=origin,
-        keys=set(document),
-        vocabulary=_ARM_TOP_LEVEL_KEYS,
-        level="top-level recipe",
-        slot_label="U/R",
-    )
-    params = document.get("params") or {}
-    if not isinstance(params, dict):
-        raise ValueError(f"{origin}: `params` must be a mapping; got {type(params).__name__}")
-    get_ranker(str(document["ranker"]))  # raises by name on an unknown ranker
-    if LLM_CALLSITE_PARAM in params:
-        _require_registered_callsite(params[LLM_CALLSITE_PARAM], origin=origin)
+    """Validate the recipe as a document, then perform the two checks that
+    need a live runtime registry rather than the document alone.
+
+    `alpha-engine-config-I10045` row 2: the document-shape checks (required
+    fields, the top-level key vocabulary, `params` typed as a mapping) are
+    `crucible.models.ArmRecipeDocument`'s job now — one boundary, one place a
+    malformed recipe is reported, naming the field that is wrong. `get_ranker`
+    and the LLM call-site check stay here because each is a lookup against a
+    registry that changes independently of the document schema and raises
+    its own distinct exception (`KeyError` for an unknown ranker).
+    """
+    raw = yaml.safe_load(payload.decode("utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{origin}: an arm recipe is a YAML mapping; got {type(raw).__name__}")
+    try:
+        document = ArmRecipeDocument.model_validate(raw)
+    except ValidationError as exc:
+        raise ValueError(f"{origin}: {exc}") from exc
+    get_ranker(document.ranker)  # raises by name on an unknown ranker
+    if LLM_CALLSITE_PARAM in document.params:
+        _require_registered_callsite(document.params[LLM_CALLSITE_PARAM], origin=origin)
     return ArmSpec(
-        name=str(document["name"]),
-        slot=str(document["slot"]),
-        ranker=str(document["ranker"]),
-        params=params,
-        registered_at=str(document["registered_at"]),
-        supersedes=document.get("supersedes"),
-        control=bool(document.get("control", False)),
-        control_kind=document.get("control_kind"),
-        bootstrap=bool(document.get("bootstrap", False)),
-        promotion_source=str(document.get("promotion_source", "")),
-        notes=str(document.get("notes", "")),
+        name=document.name,
+        slot=document.slot,
+        ranker=document.ranker,
+        params=dict(document.params),
+        registered_at=document.registered_at,
+        supersedes=document.supersedes,
+        control=document.control,
+        control_kind=document.control_kind,
+        bootstrap=document.bootstrap,
+        promotion_source=document.promotion_source,
+        notes=document.notes,
         source_key=origin,
     )
 
