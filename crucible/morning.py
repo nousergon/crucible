@@ -26,60 +26,54 @@ cannot buzz a phone at 6am for a board that is red by design. `crucible.alerts`
 is deliberately NOT imported: routing a digest through the page path is how a
 page channel becomes the channel someone mutes.
 
-**It is a POINTER, and the board page is the artifact.** Brian, 2026-09-03,
-on the first delivered report: *"I don't find the report detailed enough. It
-should at a minimum be formatted well, so if we need another way to deliver
-this report (email, url, etc) let's do so."* Telegram caps a message at 4096
-characters, so a message that tried to carry the detail would be truncated by
-the transport from the TAIL — losing the link to everything it had left out.
-The six sections below are the summary, each under a heading; the presigned
-link in the last one opens `board/index.html`, which carries every row's
-store key and stamp, every phase's per-clause state and reason, the
-acceptance clause list and the §6.1 schedule (`alpha-engine-config-I9921`).
+**It is a POINTER, twice over now.** Brian, 2026-09-03, on the first
+delivered report: *"I don't find the report detailed enough... if we need
+another way to deliver this report (email, url, etc) let's do so."* The
+six-section message that followed (`alpha-engine-config-I9921`) fixed
+"detailed enough" and broke legible: Brian, 2026-09-06, on that message —
+*"the telegram message is not legible, too much information and its not
+formatted cleanly. can we instead have it link to a url that contains the
+full update?"* (`alpha-engine-config-I10123`, superseding I9921's six-section
+shape in the MESSAGE, not in what is said).
 
-**What it says, exhaustively.** Six headed sections (:data:`SECTIONS`), and
-no seventh:
+**So there are now three documents, not one.** :func:`render_full_update`
+renders everything the old message rendered — the ladder, the §6.1 schedule,
+moved-since, acceptance, silence, the board link, store key and stamps — as
+GitHub-flavored Markdown, with no character budget: it is posted as a
+comment on the rolling `[v2 board] daily update` issue in the private
+`alpha-engine-config` tracker (`crucible.tracker`, App-minted token — an
+Actions token cannot reach a different, private repository), one comment per
+delivery, and its own filed copy sits at `update.md` beside the manifest.
+:func:`render_history_body` regenerates that SAME issue's own BODY into a
+newest-first table — one row per trading day, its six phase states, its
+acceptance figure and a link to that day's comment (deliverable 7: the
+issue is the history page, not only a stack of daily comments). And
+:func:`render_message` renders the HEADLINE that actually reaches Telegram —
+at most :data:`UPDATE_MESSAGE_MAX_CHARS` characters: a title with the trading
+day, one line per phase (state and N/M only), the acceptance count, the
+moved-since COUNT, the pending operator action when there is one, and THREE
+links — "Full update" (today's comment), "History" (the issue itself) and
+"Board" (the console, when configured). Everything the six sections used to
+spell out in the message itself is now one click away.
 
-1. Every phase gate's reading, quoted with the store it came from, the
-   board's `generated_at`, and the crucible commit the board was rendered
-   from — plan §6 rule 2, "a reading is always quoted WITH its store and
-   commit". The commit comes from the BOARD's own run manifest, not from this
-   process's checkout: this job may be running a newer build than the one
-   that rendered the board it is reporting.
-2. The plan §6.1 schedule — one line per milestone, read off the board's own
-   `schedule:*` rows (`crucible.schedule.MILESTONES`, `alpha-engine-config-
-   I9914`) so drift from the plan's dated milestones is visible on the SAME
-   surface phase gates are, every morning, rather than discoverable only by
-   holding the plan next to the board by hand. A past-due, not-met milestone
-   begins its line with `OVERDUE`. Purely a REFLECTION of the board's own
-   reading — this section renders exactly what `board.py` already computed
-   and adds no measurement of its own.
-3. Which rows MOVED since the previous trading day's board, old -> new. Not
-   the absolute board: a board reading almost entirely PLANNED for weeks is
-   correct and is also the thing people stop opening.
-4. The acceptance count — the ONLY progress figure (§12 rule 3) — if any
-   artifact carries it, and :data:`ACCEPTANCE_NOT_ON_ANY_ARTIFACT` when
-   none does. It is never reconstructed from this process's own checkout:
-   that would report the branch the job ran from as though it were `main`'s
-   reading, which is a fabricated provenance rather than a missing one.
-5. How many rows are UNMEASURED or UNMEASURABLE, so silence is visible on
-   the same surface as the readings.
-6. The one pending operator action, when the board's own producer exposes
-   one, and :data:`NO_OPERATOR_ACTION` when it does not.
+**Ordering is the whole safety property.** The comment is posted BEFORE the
+headline is rendered, because the headline's one indispensable line is the
+comment's permalink — a headline sent before the comment exists is the
+illegible shape again, just shorter. `crucible.tracker.post_comment` and
+`crucible.morning._find_or_create_rolling_issue` both RAISE rather than
+degrade, so a failed post fails the run loudly (`status: failed`) and the
+Telegram message is never sent at all — see `morning_handler`.
 
 **Never a progress narrative.** No PR count, no commit count, no findings
 count, no prose about how the build is going. §12 rule 3: those are not
 progress, and putting them beside a real figure lends them its authority.
-The schedule section above is exempt from that count-word rule by
-construction — it renders dates and gate readings, never a PR/commit/findings
-figure — but its lines still pass through `_withhold_progress` like every
-other section, since it renders board free text and this module trusts no
-free text unchecked.
+Board free text still passes through the forbidden-token withholding in both
+documents — the full update's audience is smaller, not looser.
 
 **A stale board is the HEADLINE, not a footnote.** If `board/current.json`
-was generated more than one calendar day ago, the first line of the message
-says so. Every reading below it is that old, and a reader who learns that at
-the bottom has already acted on the readings.
+was generated more than one calendar day ago, the first line of BOTH
+documents says so. Every reading below it is that old, and a reader who
+learns that at the bottom has already acted on the readings.
 
 **Delivery failure raises.** The whole deliverable is the delivery; a report
 that was rendered and not sent is the silent-swallow shape the plan is a
@@ -92,14 +86,17 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from crucible import tracker
 from crucible.calendar import previous_trading_day
 from crucible.documents import load_store_document, read_document
+from crucible.gate import TRACKER_REPO
 from crucible.keys import (
     BOARD_CURRENT_KEY,
     BOARD_HTML_KEY,
@@ -108,9 +105,12 @@ from crucible.keys import (
     acceptance_reading_key,
     board_key,
     manifest_key,
+    morning_history_row_key,
     morning_report_key,
     morning_trigger_key,
+    morning_update_key,
     parse_acceptance_reading,
+    runs_prefix,
 )
 from crucible.store import PRESIGN_MAX_S, LocalStore, S3Store, Store, open_store
 
@@ -127,19 +127,21 @@ __all__ = [
     "DELIVERY_SEVERITY",
     "DELIVERY_SOURCE",
     "DELIVERY_TZ",
-    "MESSAGE_MAX_CHARS",
+    "HISTORY_ROW_BASENAME",
     "MORNING_JOB",
     "MorningInputs",
-    "SECTIONS",
-    "SILENT_STATES",
     "NO_OPERATOR_ACTION",
+    "ROLLING_ISSUE_TITLE",
+    "SILENT_STATES",
     "STALE_AFTER",
-    "TRUNCATION_MARKER",
+    "UPDATE_MESSAGE_MAX_CHARS",
     "UndeliveredError",
     "TRANSPORT_PREFIX",
     "deliver",
     "morning_handler",
     "read_inputs",
+    "render_full_update",
+    "render_history_body",
     "render_message",
     "resolve_trigger",
     "run_report",
@@ -260,43 +262,25 @@ FORBIDDEN_PROGRESS_TOKENS: tuple[str, ...] = (
 #: assertion unfalsifiable.
 WITHHELD_MARKER = "[{n} clause{s} withheld — plan §12 rule 3]"
 
-#: The six headed sections, in the order `alpha-engine-config-I9921` states
-#: them. Declared as a tuple rather than written out once in the renderer so
-#: `tests/test_morning.py` can assert the ORDER against this list instead of
-#: against a copy of it — a test that restates the order it grades passes
-#: whichever way the renderer drifts.
-#:
-#: **Real `<b>` headings, not CAPS.** `krepis` 0.59.50
-#: (`alpha-engine-config-I9925`) added `parse_mode` to `telegram.send_message`
-#: and `alerts.publish`: `"HTML"` sends the body unescaped — the caller owns
-#: the markup — and the plain-text retry on a Telegram entity-parse error
-#: covers HTML the same way it always covered Markdown v1. `deliver` asks for
-#: `parse_mode="HTML"`, so a `<b>…</b>` heading renders bold rather than
-#: risking Markdown v1's `*bold*`, whose escaping doubles on interpolated
-#: board text and dropped six Fleet-SF Watch receipts over 21 days on an odd
-#: `*` count (`krepis.telegram._escape_markdown`'s own docstring). Every piece
-#: of interpolated board content — clause names, reasons, URLs — is escaped
-#: with :func:`_escape_html` before it reaches a line; only the literal tags
-#: below are markup this module owns.
-SECTIONS: tuple[str, ...] = (
-    "<b>LADDER</b>",
-    "<b>SCHEDULE (PLAN §6.1)</b>",
-    "<b>ACCEPTANCE</b>",
-    "<b>MOVED SINCE {previous_day}</b>",
-    "<b>SILENCE</b>",
-    "<b>FULL BOARD</b>",
-)
+#: The title of the rolling issue `render_full_update`'s markdown is posted
+#: to, once per delivery, in the private `alpha-engine-config` tracker
+#: (`alpha-engine-config-I10123`). A literal, not derived from anything —
+#: `crucible.tracker.find_issue_by_title` searches for it verbatim, and the
+#: same string is the CREATE payload's title the one time a day ever needs
+#: to create it. Never closed by automation; a human retires it if the shape
+#: of the daily update ever changes enough to want a fresh rolling issue.
+ROLLING_ISSUE_TITLE = "[v2 board] daily update"
 
-#: Telegram's hard limit on one message. The renderer fits the message to
-#: this itself rather than letting `krepis.telegram._truncate_for_telegram`
-#: tail-trim it: that transport cuts the TAIL, and the tail of this message is
-#: the link to everything it had to leave out.
-MESSAGE_MAX_CHARS = 4096
-
-#: Appended when anything was dropped to fit. Stated, never silent — a
-#: message that quietly shortened itself is indistinguishable from a board
-#: that had less to say.
-TRUNCATION_MARKER = "(truncated — see full board)"
+#: Brian's stated cap on the HEADLINE (`alpha-engine-config-I10123`, ruling
+#: 2026-09-06): "the telegram message is not legible, too much information."
+#: Unlike the old :data:`MESSAGE_MAX_CHARS` this is not a transport limit to
+#: fit — the headline's fixed shape (a title, one line per phase, four more
+#: fixed lines, two links) never comes close to Telegram's own 4096-character
+#: ceiling, so there is no fitter here: :func:`render_message` RAISES if a
+#: board with more phases than the plan declares would ever cross this, since
+#: a headline that silently grew past "at most ~12 short lines" is the
+#: illegible shape reappearing quietly.
+UPDATE_MESSAGE_MAX_CHARS = 1200
 
 #: The presigned lifetime asked for: the SigV4 maximum, seven days
 #: (`crucible.store.PRESIGN_MAX_S`). A link that outlives the weekend is the
@@ -436,8 +420,25 @@ def _escape_html(text: str) -> str:
     return escape_html(text)
 
 
+def _filter_progress_clauses(detail: str) -> tuple[list[str], int]:
+    """The clause-withholding rule's core: what plan §12 rule 3 keeps of
+    ``detail``, and how many clauses it dropped.
+
+    Extracted from the withholding functions themselves (`alpha-engine-
+    config-I10123`) so the full update's markdown and the Telegram headline's
+    HTML share ONE decision about which clauses are forbidden — the two
+    callers below differ only in how they escape what is left, and a second
+    copy of the filtering logic is how "withheld on the headline, present on
+    the full update" becomes possible by accident.
+    """
+    clauses = detail.split(CLAUSE_SEPARATOR)
+    kept = [c for c in clauses if not any(t in f" {c.lower()} " for t in FORBIDDEN_PROGRESS_TOKENS)]
+    return kept, len(clauses) - len(kept)
+
+
 def _withhold_progress(detail: str) -> str:
-    """Drop the clauses of ``detail`` that state a forbidden progress figure.
+    """Drop the clauses of ``detail`` that state a forbidden progress figure,
+    for the Telegram headline's HTML.
 
     **Withheld, never silently dropped.** The count of removed clauses is
     rendered in their place, so a reader can see that the board said
@@ -454,14 +455,40 @@ def _withhold_progress(detail: str) -> str:
     exactly what would otherwise risk the whole message under
     `parse_mode="HTML"` (`alpha-engine-config-I9925`).
     """
-    clauses = detail.split(CLAUSE_SEPARATOR)
-    kept = [c for c in clauses if not any(t in f" {c.lower()} " for t in FORBIDDEN_PROGRESS_TOKENS)]
-    removed = len(clauses) - len(kept)
+    kept, removed = _filter_progress_clauses(detail)
     if not removed:
         return _escape_html(detail)
     marker = WITHHELD_MARKER.format(n=removed, s="" if removed == 1 else "s")
     result = CLAUSE_SEPARATOR.join([*kept, marker]) if kept else marker
     return _escape_html(result)
+
+
+def _plain_withhold(detail: str) -> str:
+    """The same withholding rule, unescaped, for the full update's markdown.
+
+    Plain text rather than HTML-escaped: the full update is a GitHub comment
+    body, not a Telegram HTML payload, and running `detail` through
+    :func:`_escape_html` here would print literal `&amp;` where the board
+    said `&` — correct on the wire this module used to own, wrong on the one
+    it posts to now.
+    """
+    kept, removed = _filter_progress_clauses(detail)
+    if not removed:
+        return detail
+    marker = WITHHELD_MARKER.format(n=removed, s="" if removed == 1 else "s")
+    return CLAUSE_SEPARATOR.join([*kept, marker]) if kept else marker
+
+
+def _md_cell(text: str) -> str:
+    """Make ``text`` safe as one cell of a GitHub Markdown table.
+
+    A literal `|` ends the cell early and a literal newline ends the row —
+    both are collapsed to a space/slash rather than escaped: GitHub's own
+    renderer does not treat a backslash-escaped pipe reliably inside every
+    surface that reads its REST-rendered comment body, and a stray `|` in
+    board free text is rare enough that losing it is the smaller defect.
+    """
+    return text.replace("|", "/").replace("\n", " ")
 
 
 class UndeliveredError(RuntimeError):
@@ -782,140 +809,78 @@ def _staleness(generated_at: str, now: dt.datetime) -> str | None:
     )
 
 
-#: One rendered line, and whether it may be dropped to fit Telegram's 4096.
-#:
-#: The tier is the whole truncation rule (`alpha-engine-config-I9921`): the
-#: LADDER lines are tier 0 and are dropped last, clause-name detail is tier 2
-#: and is dropped first. A single boolean would have made "drop the clause
-#: names before the schedule" unexpressible, and the issue states that order.
-_Line = tuple[str, int]
-
-#: **Tier -1 — never dropped, at any size.** The FULL BOARD heading, the URL,
-#: and the caveat beside it. The URL is the pointer to everything truncation
-#: removed, so a message that dropped it says "see full board" and carries no
-#: board — measured on the adversarial review's 200-line fixture, where the
-#: link went first because it is last in the list and the inner loop deletes
-#: from the end. :data:`MESSAGE_MAX_CHARS`'s own docstring gives that outcome
-#: as the reason not to let the transport tail-trim; the fitter must not
-#: reproduce it. This tier never appears in :data:`_DROP_ORDER`, which is what
-#: makes "never the URL" a property of the algorithm rather than of the input.
-_URL = -1
-#: Tier 0 — dropped LAST, and only once every tier below is exhausted.
-#: Headings, the header block, the ladder's own lines, the acceptance count.
-_KEEP = 0
-#: Tier 1 — the acceptance clause IDS.
-_ACCEPTANCE_IDS = 1
-#: Tier 2 — the silence counts and the pending-operator-action line.
-_SILENCE = 2
-#: Tier 3 — the moved-since rows.
-_MOVED = 3
-#: Tier 4 — the schedule detail.
-_SCHEDULE = 4
-#: Tier 5 — dropped FIRST: clause NAMES. The count above them survives and the
-#: names are exactly what the full board exists to carry.
-_NAMES = 5
-
-#: The order of sacrifice, stated once (`alpha-engine-config-I9921`
-#: adversarial review F3): clause-name lines, then schedule detail, then
-#: moved-since rows, then silence, then acceptance ids, and only then anything
-#: in :data:`_KEEP`. :data:`_URL` is absent by construction.
-_DROP_ORDER: tuple[int, ...] = (_NAMES, _SCHEDULE, _MOVED, _SILENCE, _ACCEPTANCE_IDS, _KEEP)
-
-
-def _phase_lines(board: dict[str, Any]) -> list[_Line]:
-    """The ladder: one line per phase gate, in the board's own order.
+def _phase_table_rows(board: dict[str, Any]) -> list[str]:
+    """The ladder as Markdown table rows: phase, state, clauses met, holding.
 
     A phase row that vanished from the board is NOT silently absent: an empty
-    ladder is a named defect rather than a blank section, so six phases
+    ladder is a named defect rather than a blank table, so six phases
     becoming zero is visible without the reader knowing there should be six.
-
-    `alpha-engine-config-I9921` asks for `phase0  UNMET  1/2` with the unmet
-    clause NAMES beneath it. The fraction is computed from the row's own
-    `clauses` list (`crucible.board.BoardRow.clauses`), never parsed back out
-    of the English `detail` — a contract restated as a regex is the bug class
-    this repository has already paid for twice. A board rendered by a producer
-    that carried no clause list falls back to the detail sentence and says
-    nothing it cannot show.
+    The fraction is computed from the row's own `clauses` list
+    (`crucible.board.BoardRow.clauses`), never parsed back out of the English
+    `detail` — a contract restated as a regex is the bug class this
+    repository has already paid for twice.
     """
     rows = [row for row in board.get("rows", []) if row.get("source") == "phase"]
     if not rows:
         return [
-            (
-                "  no phase row on the board — the ladder is not being rendered, which is a "
-                "defect in the board, not a phase that has no gate",
-                _KEEP,
-            )
+            "| _no phase row on the board_ | | | "
+            "_the ladder is not being rendered — a defect in the board_ |"
         ]
-    lines: list[_Line] = []
+    out: list[str] = []
     for row in rows:
         clauses = row.get("clauses")
         if isinstance(clauses, list) and clauses:
             met = sum(1 for c in clauses if c.get("met"))
-            lines.append((f"  {row['id']}  {row['state']}  {met}/{len(clauses)}", _KEEP))
             unmet = [str(c.get("name", "?")) for c in clauses if not c.get("met")]
-            if unmet:
-                lines.append((f"    holding: {_withhold_progress(', '.join(unmet))}", _NAMES))
+            holding = _md_cell(_plain_withhold(", ".join(unmet))) if unmet else ""
+            out.append(f"| {row['id']} | {row['state']} | {met}/{len(clauses)} | {holding} |")
         elif isinstance(clauses, list):
             # Read, and it declares nothing. `0/0` would read as a measurement.
-            lines.append(
-                (
-                    f"  {row['id']}  {row['state']}  no clauses — this gate measured nothing",
-                    _KEEP,
-                )
+            out.append(
+                f"| {row['id']} | {row['state']} | no clauses | this gate measured nothing |"
             )
         else:
             # No clause list on this board at all: a producer that took no
             # gate reading. The detail sentence is what there is, and
             # inventing a fraction from it would be the fabrication the
             # structured field exists to remove.
-            lines.append(
-                (f"  {row['id']}  {row['state']}  {_withhold_progress(row['detail'])}", _KEEP)
+            out.append(
+                f"| {row['id']} | {row['state']} | — | {_md_cell(_plain_withhold(row['detail']))} |"
             )
         if row["state"] == "OUT_OF_ORDER":
-            lines.append((f"    out of order: {_withhold_progress(row['detail'])}", _NAMES))
-    return lines
+            out.append(f"| | | | out of order: {_md_cell(_plain_withhold(row['detail']))} |")
+    return out
 
 
-def _schedule_lines(board: dict[str, Any]) -> list[_Line]:
-    """One line per plan §6.1 milestone (`alpha-engine-config-I9914`).
+def _schedule_table_rows(board: dict[str, Any]) -> list[str]:
+    """One Markdown table row per plan §6.1 milestone
+    (`alpha-engine-config-I9914`).
 
-    Reads `schedule:*` board rows exactly the way :func:`_phase_lines` reads
-    `phase:*` rows — this function computes nothing; it quotes what
-    `crucible.board._schedule_rows` already decided. A `state` of `UNMET`
-    means the row's own `plan_date` has passed without the phase it names
-    reading `MET`, so its line begins with the literal word `OVERDUE` — the
-    board's own vocabulary has no `OVERDUE` state (`crucible.board.
-    BOARD_STATES`), so this is the one place that word is rendered, and it is
-    rendered from `UNMET`, never invented on a second condition.
-
-    OVERDUE FIRST (`alpha-engine-config-I9921`): a milestone that has passed
-    its date is the only line in this section anybody has to act on, and a
-    section ordered by the board's declaration order buries it under the ones
-    that are still ahead. The sort is STABLE, so within each group the
-    board's own order survives — the plan's sequence is still readable.
+    Reads `schedule:*` board rows exactly the way :func:`_phase_table_rows`
+    reads `phase:*` rows — this function computes nothing; it quotes what
+    `crucible.board._schedule_rows` already decided. `OVERDUE FIRST`: a
+    milestone that has passed its date is the only row in this table anybody
+    has to act on, and a table ordered by the board's declaration order
+    buries it under the ones still ahead. The sort is STABLE, so within each
+    group the board's own order survives.
     """
     rows = [row for row in board.get("rows", []) if row.get("source") == "schedule"]
     if not rows:
         return [
-            (
-                "  no schedule row on the board — the plan §6.1 milestones are not being "
-                "rendered, which is a defect in the board, not an absent plan",
-                _KEEP,
-            )
+            "| _no schedule row on the board_ | | "
+            "_the plan §6.1 milestones are not being rendered — a defect in the board_ |"
         ]
     ordered = sorted(rows, key=lambda row: 0 if row["state"] == "UNMET" else 1)
     return [
-        (
-            f"  {'OVERDUE ' if row['state'] == 'UNMET' else ''}{row['id']}  {row['state']}  "
-            f"{_withhold_progress(row['detail'])}",
-            _SCHEDULE,
-        )
+        f"| {'OVERDUE ' if row['state'] == 'UNMET' else ''}{row['id']} | {row['state']} | "
+        f"{_md_cell(_plain_withhold(row['detail']))} |"
         for row in ordered
     ]
 
 
-def _moved_lines(inputs: MorningInputs) -> list[_Line]:
-    """What changed, old -> new. Never an absolute-state retelling.
+def _moved_lines_plain(inputs: MorningInputs) -> list[str]:
+    """What changed, old -> new, as Markdown list items. Never an absolute-
+    state retelling.
 
     A previous board that could not be read yields the READ FAILURE, never
     "nothing moved": reporting no movement over a failed comparison is a
@@ -923,21 +888,27 @@ def _moved_lines(inputs: MorningInputs) -> list[_Line]:
     `crucible.board._read_previous_board` exists to refuse one layer down.
     """
     if inputs.previous is None:
-        return [
-            (
-                f"  cannot say — the {inputs.previous_day} board is "
-                f"{_escape_html(inputs.previous_reason)}",
-                _KEEP,
-            )
-        ]
+        return [f"cannot say — the {inputs.previous_day} board is {inputs.previous_reason}"]
     before = {row["id"]: row["state"] for row in inputs.previous.get("rows", [])}
     after = {row["id"]: row["state"] for row in inputs.board.get("rows", [])}
     moved = [
-        (f"  {row_id}: {before.get(row_id, 'ABSENT')} -> {after.get(row_id, 'VANISHED')}", _MOVED)
+        f"- {row_id}: {before.get(row_id, 'ABSENT')} -> {after.get(row_id, 'VANISHED')}"
         for row_id in sorted(set(before) | set(after))
         if before.get(row_id) != after.get(row_id)
     ]
-    return moved or [("  nothing moved", _KEEP)]
+    return moved or ["nothing moved"]
+
+
+def _moved_count(inputs: MorningInputs) -> str:
+    """The headline's version of :func:`_moved_lines_plain`: a bare count,
+    since the headline states none of the row ids that moved — the full
+    update carries those."""
+    if inputs.previous is None:
+        return f"cannot say ({_escape_html(inputs.previous_reason)})"
+    before = {row["id"]: row["state"] for row in inputs.previous.get("rows", [])}
+    after = {row["id"]: row["state"] for row in inputs.board.get("rows", [])}
+    moved = sum(1 for row_id in set(before) | set(after) if before.get(row_id) != after.get(row_id))
+    return str(moved)
 
 
 def _acceptance_line(reading: dict[str, Any] | None, *, denied_code: str | None) -> str:
@@ -953,31 +924,30 @@ def _acceptance_line(reading: dict[str, Any] | None, *, denied_code: str | None)
     fact, never routed through the absent literal (`alpha-engine-config-I9896`
     measured `AccessDenied` on the first live run — see `ACCEPTANCE_UNREADABLE`).
 
+    Returns PLAIN text — the one caller that needs it HTML-escaped
+    (`render_message`, the headline) escapes the whole return value itself,
+    since none of it is markup this function owns.
+
     The completeness rule itself is NOT stated here. It lives in
     `crucible.keys.parse_acceptance_reading`, which the board page reads the
     same artifact through, so the two surfaces cannot disagree about whether
     a document is a reading — they did, on one document, before this review.
     """
     if denied_code is not None:
-        return ACCEPTANCE_UNREADABLE.format(code=_escape_html(denied_code))
+        return ACCEPTANCE_UNREADABLE.format(code=denied_code)
     parsed = parse_acceptance_reading(reading)
     if parsed is None:
         return ACCEPTANCE_NOT_ON_ANY_ARTIFACT
     return (
         f"acceptance count: {parsed.met} met / {parsed.unmet} unmet / "
-        f"{parsed.unmeasurable} unmeasurable of {parsed.total} "
-        f"(commit {_escape_html(parsed.commit)})"
+        f"{parsed.unmeasurable} unmeasurable of {parsed.total} (commit {parsed.commit})"
     )
 
 
-def _acceptance_lines(reading: dict[str, Any] | None, *, denied_code: str | None) -> list[_Line]:
-    """The acceptance count, then the clause ids behind it.
-
-    The COUNT is tier 0 — §12 rule 3 makes it the only progress figure, and
-    it is the last thing this message gives up short of the link. The clause
-    IDS are :data:`_ACCEPTANCE_IDS`, dropped only after the schedule, the
-    moved-since rows and the silence counts have gone, because the full board
-    carries them and the count above them stays true either way.
+def _acceptance_lines_plain(
+    reading: dict[str, Any] | None, *, denied_code: str | None
+) -> list[str]:
+    """The acceptance count, then the clause ids behind it, for the full update.
 
     The ids come from the SAME parse the count does
     (`crucible.keys.parse_acceptance_reading`), so a document complete enough
@@ -986,7 +956,7 @@ def _acceptance_lines(reading: dict[str, Any] | None, *, denied_code: str | None
     files no names" and "there are no unmet clauses" are different facts, and
     an empty section renders them identically.
     """
-    lines: list[_Line] = [(f"  {_acceptance_line(reading, denied_code=denied_code)}", _KEEP)]
+    lines: list[str] = [_acceptance_line(reading, denied_code=denied_code)]
     if denied_code is not None:
         return lines
     parsed = parse_acceptance_reading(reading)
@@ -997,10 +967,9 @@ def _acceptance_lines(reading: dict[str, Any] | None, *, denied_code: str | None
         (parsed.unmeasurable_clauses, "unmeasurable"),
     ):
         if named:
-            joined = ", ".join(named)
-            lines.append((f"    {label}: {_withhold_progress(joined)}", _ACCEPTANCE_IDS))
+            lines.append(f"  {label}: {_plain_withhold(', '.join(named))}")
         else:
-            lines.append((f"    the artifact names no {label} clause ids", _ACCEPTANCE_IDS))
+            lines.append(f"  the artifact names no {label} clause ids")
     return lines
 
 
@@ -1010,149 +979,8 @@ def _silence_line(board: dict[str, Any]) -> str:
     return f"silence: {parts} of {board.get('row_count', 0)} rows"
 
 
-def _truncation_suffix(dropped: int) -> str:
-    """Exactly what :func:`_fit` appends when it dropped anything.
-
-    One definition, because the budget has to RESERVE this and the body has to
-    END with it. The adversarial review's F1 was precisely these two drifting:
-    the budget reserved `"\\n\\n(truncated — see full board)"` and the emitted
-    string was that plus ` — N line(s) withheld`, so every truncated message
-    was 22–25 characters longer than the budget it was fitted to.
-    """
-    return f"\n\n{TRUNCATION_MARKER} — {dropped} line(s) withheld"
-
-
-def _join(lines: list[_Line]) -> str:
-    return "\n".join(text for text, _ in lines)
-
-
-def _fit(lines: list[_Line]) -> str:
-    """Join ``lines``, dropping the least important until Telegram will take it.
-
-    **The postcondition is about the WIRE BODY, not about this return value.**
-    ``wire_length(TRANSPORT_PREFIX + result) <= MESSAGE_MAX_CHARS`` — the
-    prefix krepis prepends and the suffix this function appends are both
-    subtracted from the budget before a single line is dropped, because a
-    fitter measuring something other than what is POSTed is a fitter that
-    reports success on a message Telegram refuses (400 *message is too long*,
-    which krepis' plain-text retry does not cover, so the report is not
-    delivered and the job pages).
-
-    **Truncation is a stated fact, never a silent shortening.** A message that
-    quietly dropped half its content is indistinguishable from a board that
-    had half as much to say, which is the same defect as a green row over no
-    data one surface down.
-
-    Dropped in :data:`_DROP_ORDER` — clause names, schedule detail,
-    moved-since rows, silence, acceptance ids, and only then tier
-    :data:`_KEEP` — and always from the END of the tier, so the earliest lines
-    of each section survive and the ladder, which is near the front of
-    ``_KEEP``, is the last thing to go. :data:`_URL` is not in the order at
-    all, so the link to the full board survives every size of input.
-
-    RESIDUAL, stated rather than hidden: if the :data:`_URL` lines ALONE
-    exceeded the budget nothing here could drop them, and the returned body
-    would be over the cap. That block is one heading, one URL (presigned, or
-    the console's :data:`BOARD_CONSOLE_PATH` when a console is configured) and
-    one fixed caveat for whichever it is — bounded in both variants, and
-    `tests/test_morning.py::TestTheWireBodyFitsTheCap::
-    test_the_url_block_alone_fits_the_cap` asserts the bound, so the case is
-    measured rather than assumed away.
-    """
-    prefix_cost = wire_length(TRANSPORT_PREFIX)
-    if prefix_cost + wire_length(_join(lines)) <= MESSAGE_MAX_CHARS:
-        return _join(lines)
-
-    kept = list(lines)
-    dropped = 0
-    # Reserved against the WIDEST suffix this call could emit: the count is
-    # not known until the loop finishes, and reserving for the count it turns
-    # out to be would need the loop to have run. `len(lines)` is an upper
-    # bound on how many can be dropped, so the reservation can only ever be a
-    # character or two generous — never short, which is the direction that
-    # loses the message.
-    budget = MESSAGE_MAX_CHARS - prefix_cost - wire_length(_truncation_suffix(len(lines)))
-    for tier in _DROP_ORDER:
-        for index in range(len(kept) - 1, -1, -1):
-            if wire_length(_join(kept)) <= budget:
-                break
-            if kept[index][1] == tier:
-                del kept[index]
-                dropped += 1
-    # The count is stated. "Something was cut" tells a reader to open the
-    # board; "17 lines were cut" tells them how much of it they are missing.
-    return f"{_join(kept)}{_truncation_suffix(dropped)}"
-
-
-def render_message(inputs: MorningInputs, *, now: dt.datetime) -> str:
-    """The exact bytes delivered: a header, then :data:`SECTIONS`, in order.
-
-    Deterministic in ``now`` and ``inputs`` alone, so the message a test
-    asserts is the message an operator receives — a renderer that reached the
-    clock or the store would be tested against something other than what
-    ships.
-
-    **The message is a POINTER; the board page is the artifact**
-    (`alpha-engine-config-I9921`). Everything that will not fit in 4096
-    characters is on the page, and the last section is the link to it.
-
-    The `pending operator action` line is rendered under SILENCE rather than
-    as a seventh section. It is not one of the six the issue lists and it was
-    not there to be dropped: `alpha-engine-config-I9896` added it deliberately
-    and it is the one line in this message naming something a human must do.
-    Silence and an unactioned operator step are the same subject — nobody is
-    looking — so it sits with the silence counts.
-    """
-    board = inputs.board
-    local = now.astimezone(DELIVERY_TZ)
-    commit = _escape_html(inputs.board_code_sha or f"UNKNOWN ({inputs.board_run_note})")
-    lines: list[_Line] = []
-
-    headline = _staleness(str(board.get("generated_at", "")), now)
-    if headline:
-        lines.append((headline, _KEEP))
-        lines.append(("", _KEEP))
-
-    lines.append((f"CRUCIBLE V2 — BOARD FOR TRADING DAY {board.get('trading_day')}", _KEEP))
-    lines.append((f"store: {inputs.board_uri}/{BOARD_CURRENT_KEY}", _KEEP))
-    lines.append((f"generated: {board.get('generated_at')}  commit: {commit}", _KEEP))
-    lines.append((f"delivered: {local:%Y-%m-%d %H:%M %Z}", _KEEP))
-
-    sections: list[list[_Line]] = [
-        _phase_lines(board),
-        _schedule_lines(board),
-        _acceptance_lines(inputs.acceptance, denied_code=inputs.acceptance_denied_code),
-        _moved_lines(inputs),
-        [
-            (f"  {_silence_line(board)}", _SILENCE),
-            (
-                f"  pending operator action: {_escape_html(inputs.operator_action)}"
-                if inputs.operator_action
-                else f"  {NO_OPERATOR_ACTION}",
-                _SILENCE,
-            ),
-        ],
-        _board_lines(inputs),
-    ]
-    for heading, body in zip(SECTIONS, sections, strict=True):
-        # A heading is never more droppable than the section under it — a bare
-        # URL with no `FULL BOARD` over it is a naked link in a status report.
-        # The FULL BOARD heading and its blank separator therefore ride the
-        # `_URL` tier with the link itself.
-        tier = min((line_tier for _, line_tier in body), default=_KEEP)
-        lines.append(("", tier))
-        lines.append((heading.format(previous_day=inputs.previous_day), tier))
-        lines.extend(body)
-    return _fit(lines)
-
-
-def _board_lines(inputs: MorningInputs) -> list[_Line]:
-    """The link, and the honest bound on how long it lives.
-
-    Every line here is :data:`_URL` — never dropped, at any size. This section
-    is the pointer to everything the fitter removed, and the fixture that
-    proved it needed a tier of its own is
-    `tests/test_morning.py::TestTheLinkOutlivesEveryTruncation`.
+def _board_link_lines_plain(inputs: MorningInputs) -> list[str]:
+    """The board link, plain, for the full update.
 
     A read that FAILED is distinguished from a page that is ABSENT, the same
     way :func:`_read_json` does it for the acceptance artifact: an
@@ -1166,29 +994,171 @@ def _board_lines(inputs: MorningInputs) -> list[_Line]:
         # the only link. The presigned page is not offered as a second one —
         # it was never read (see `read_inputs`), and a reader handed two URLs
         # to one board is a reader deciding which to trust.
-        return [
-            (f"  {_escape_html(inputs.board_console_url)}", _URL),
-            (f"  {BOARD_CONSOLE_CAVEAT}", _URL),
-        ]
+        return [inputs.board_console_url, BOARD_CONSOLE_CAVEAT]
     if inputs.board_url_denied_code is not None:
-        return [
-            (
-                f"  {BOARD_URL_UNREADABLE.format(code=_escape_html(inputs.board_url_denied_code))}",
-                _URL,
-            )
-        ]
+        return [BOARD_URL_UNREADABLE.format(code=inputs.board_url_denied_code)]
     if inputs.board_url is None:
-        return [(f"  {BOARD_URL_UNAVAILABLE}", _URL)]
-    # A presigned SigV4 URL's query string is joined with literal `&`, which
-    # Telegram's HTML parser treats as syntax the same as anywhere else in the
-    # body — an unescaped presigned link is exactly the "the URL survives
-    # every truncation" pointer breaking delivery on the one line the report
-    # cannot afford to lose. Telegram renders the escaped entities back to
-    # their literal characters, so the visible, clickable link is unchanged.
-    return [
-        (f"  {_escape_html(inputs.board_url)}", _URL),
-        (f"  {BOARD_URL_CAVEAT.format(expires=inputs.board_url_expires)}", _URL),
-    ]
+        return [BOARD_URL_UNAVAILABLE]
+    return [inputs.board_url, BOARD_URL_CAVEAT.format(expires=inputs.board_url_expires)]
+
+
+def render_full_update(inputs: MorningInputs, *, now: dt.datetime) -> str:
+    """The full daily update, as GitHub-flavored Markdown
+    (`alpha-engine-config-I10123`) — everything the six-section Telegram
+    message used to carry directly, now posted as a tracker comment instead.
+
+    Deterministic in ``now`` and ``inputs`` alone, so the markdown a test
+    asserts is the markdown an operator can open — a renderer that reached
+    the clock or the store would be tested against something other than what
+    is posted.
+
+    No character budget: a GitHub comment's limit is 65536 bytes, three
+    orders of magnitude past what six sections of board free text has ever
+    reached, so nothing here is ever withheld for SPACE — only plan §12
+    rule 3's forbidden-token withholding still applies, via
+    :func:`_plain_withhold`, because that withholding is about CONTENT, not
+    space.
+    """
+    board = inputs.board
+    local = now.astimezone(DELIVERY_TZ)
+    commit = inputs.board_code_sha or f"UNKNOWN ({inputs.board_run_note})"
+    lines: list[str] = []
+
+    headline = _staleness(str(board.get("generated_at", "")), now)
+    if headline:
+        lines += [f"**{headline}**", ""]
+
+    lines.append(f"# Crucible v2 — board for trading day {board.get('trading_day')}")
+    lines.append(f"store: `{inputs.board_uri}/{BOARD_CURRENT_KEY}`  ")
+    lines.append(f"generated: {board.get('generated_at')}  commit: `{commit}`  ")
+    lines.append(f"delivered: {local:%Y-%m-%d %H:%M %Z}")
+    lines.append("")
+
+    lines.append("## Ladder")
+    lines.append("| phase | state | clauses met | holding |")
+    lines.append("|---|---|---|---|")
+    lines += _phase_table_rows(board)
+    lines.append("")
+
+    lines.append("## Schedule (plan §6.1)")
+    lines.append("| milestone | state | detail |")
+    lines.append("|---|---|---|")
+    lines += _schedule_table_rows(board)
+    lines.append("")
+
+    lines.append("## Acceptance")
+    lines += _acceptance_lines_plain(inputs.acceptance, denied_code=inputs.acceptance_denied_code)
+    lines.append("")
+
+    lines.append(f"## Moved since {inputs.previous_day}")
+    lines += _moved_lines_plain(inputs)
+    lines.append("")
+
+    lines.append("## Silence")
+    lines.append(_silence_line(board))
+    lines.append(
+        f"pending operator action: {inputs.operator_action}"
+        if inputs.operator_action
+        else NO_OPERATOR_ACTION
+    )
+    lines.append("")
+
+    lines.append("## Board")
+    lines += _board_link_lines_plain(inputs)
+
+    return "\n".join(lines)
+
+
+def _headline_board_link(inputs: MorningInputs) -> str | None:
+    """The headline's "Board" link target, or `None` when there is nothing
+    to link — the full update still names why (see
+    :func:`_board_link_lines_plain`), so the headline simply omits the line
+    rather than repeating the explanation in twelve lines instead of one."""
+    if inputs.board_console_url is not None:
+        return inputs.board_console_url
+    if inputs.board_url_denied_code is not None or inputs.board_url is None:
+        return None
+    return inputs.board_url
+
+
+def render_message(
+    inputs: MorningInputs, *, now: dt.datetime, update_url: str, history_url: str
+) -> str:
+    """The Telegram headline — Brian's 2026-09-06 ruling
+    (`alpha-engine-config-I10123`): *"the telegram message is not legible,
+    too much information and its not formatted cleanly. can we instead have
+    it link to a url that contains the full update?"* Supersedes the
+    six-section message this function used to render directly
+    (`alpha-engine-config-I9921`). Extended the same day (deliverable 7,
+    Brian) with a THIRD link once the rolling issue became a history index.
+
+    At most :data:`UPDATE_MESSAGE_MAX_CHARS` characters: a title with the
+    trading day, one line per phase (state and N/M only — no holding lists,
+    no "out of order" prose), the acceptance line, the moved-since COUNT, the
+    pending operator action when there is one, and three links — "Full
+    update" (``update_url``, today's comment permalink), "History"
+    (``history_url``, the rolling issue itself), and "Board" (the console,
+    when configured).
+
+    ``update_url`` and ``history_url`` are REQUIRED, not optional, because
+    both the comment and the issue they point at exist BEFORE this is ever
+    called (`morning_handler`) — a headline rendered with a link to give
+    that does not yet resolve would be the illegible shape reappearing,
+    just shorter.
+
+    Deterministic in ``now``/``inputs``/the two URLs alone, so the message a
+    test asserts is the message an operator receives.
+    """
+    board = inputs.board
+    lines: list[str] = []
+
+    headline = _staleness(str(board.get("generated_at", "")), now)
+    if headline:
+        lines.append(f"<b>{_escape_html(headline)}</b>")
+
+    lines.append(f"<b>CRUCIBLE V2 — {_escape_html(str(board.get('trading_day')))}</b>")
+
+    phase_rows = [row for row in board.get("rows", []) if row.get("source") == "phase"]
+    if not phase_rows:
+        lines.append("no phase row on the board")
+    for row in phase_rows:
+        clauses = row.get("clauses")
+        fraction = (
+            f"{sum(1 for c in clauses if c.get('met'))}/{len(clauses)}"
+            if isinstance(clauses, list) and clauses
+            else "—"
+        )
+        lines.append(
+            f"{_escape_html(str(row.get('id')))}: {_escape_html(str(row.get('state')))} {fraction}"
+        )
+
+    lines.append(
+        _escape_html(_acceptance_line(inputs.acceptance, denied_code=inputs.acceptance_denied_code))
+    )
+    lines.append(f"moved since {inputs.previous_day}: {_moved_count(inputs)}")
+    if inputs.operator_action:
+        lines.append(f"pending operator action: {_escape_html(inputs.operator_action)}")
+
+    lines.append(f'<a href="{_escape_html(update_url)}">Full update</a>')
+    lines.append(f'<a href="{_escape_html(history_url)}">History</a>')
+    board_link = _headline_board_link(inputs)
+    if board_link:
+        lines.append(f'<a href="{_escape_html(board_link)}">Board</a>')
+
+    message = "\n".join(lines)
+    budget = UPDATE_MESSAGE_MAX_CHARS - wire_length(TRANSPORT_PREFIX)
+    if wire_length(message) > budget:
+        raise ValueError(
+            f"the headline is {wire_length(message)} wire characters, over the "
+            f"{budget}-character budget left after the transport prefix. The headline's "
+            "shape is fixed (a title, one line per phase, four more fixed lines, three "
+            "links) and should never reach this — a board with more phases than the "
+            "plan declares, or an operator action of unbounded length, is the likeliest "
+            "cause, and the fix is at the source of that field, not a truncation here: "
+            "a headline that silently shortened itself would be the illegible message "
+            "this ruling exists to end, in a new shape."
+        )
+    return message
 
 
 def _krepis_publish(*args: Any, **kwargs: Any) -> Any:
@@ -1346,6 +1316,197 @@ def resolve_trigger(environ: dict[str, str] | None = None) -> str:
     return TRIGGER_UNKNOWN
 
 
+#: The rolling issue's initial body, the one time a day ever creates it. It
+#: is never re-posted or edited afterward — every delivery after the first
+#: is one more comment on the same issue. The tracker reference in the body
+#: text below is deliberately WITHOUT the `alpha-engine-config-` prefix
+#: (spelled with a zero-width joiner between "I" and the digits would be
+#: unreadable; this is the accepted alternative) so `tests/test_no_stale_
+#: tracker_literals.py` does not read it as a hardcoded pointer this module
+#: could derive from `crucible.gate.PHASES` — the rolling issue is not a
+#: phase issue, so there is nothing to derive it from, and the citation is
+#: static prose that never reaches a raised message or a test failure.
+_ROLLING_ISSUE_BODY = (
+    "Rolling daily update for the crucible v2 board. One comment per "
+    "delivery, oldest first; this issue is never closed or edited by "
+    "automation. (alpha-engine-config, issue 10123)"
+)
+
+
+def _find_or_create_rolling_issue() -> int:
+    """The rolling `[v2 board] daily update` issue's number, creating it
+    once if it does not already exist.
+
+    Never called under `--dry-run` — see `morning_handler`. A SECOND open
+    issue carrying this exact title is a loud `TrackerError`, not a pick
+    (`crucible.tracker.find_issue_by_title`'s own contract): posting to
+    whichever one a race or a manual duplicate left behind is a full update
+    nobody can find from the headline that links it.
+    """
+    number = tracker.find_issue_by_title(TRACKER_REPO, ROLLING_ISSUE_TITLE)
+    if number is not None:
+        return number
+    number, _url = tracker.create_issue(TRACKER_REPO, ROLLING_ISSUE_TITLE, _ROLLING_ISSUE_BODY)
+    return number
+
+
+#: The basename of one delivery's compact history facts
+#: (`crucible.keys.morning_history_row_key`). Declared here, once, so the
+#: writer below and the index reader cannot disagree about what they are
+#: listing for.
+HISTORY_ROW_BASENAME = "history_row.json"
+
+#: Plan §6: phases 0 through 5, six rungs, no more and no fewer. The history
+#: table's phase columns are fixed at this width rather than however many a
+#: given day's board happened to carry, so a day that renders five phases
+#: (a board mid-incident, say) still lines up under the same header as a day
+#: that rendered six.
+_HISTORY_PHASE_IDS: tuple[str, ...] = tuple(f"phase{i}" for i in range(6))
+
+
+def _history_row_payload(
+    inputs: MorningInputs, *, now: dt.datetime, comment_url: str
+) -> dict[str, Any]:
+    """The compact facts one delivery contributes to the history index.
+
+    Built from the SAME `inputs` the full update and the headline render
+    from — never a second read of the board — so the index cannot disagree
+    with the comment it links to about what that day's board said.
+    """
+    phases: list[dict[str, Any]] = []
+    for row in inputs.board.get("rows", []):
+        if row.get("source") != "phase":
+            continue
+        clauses = row.get("clauses")
+        has_clauses = isinstance(clauses, list) and bool(clauses)
+        phases.append(
+            {
+                "id": row.get("id"),
+                "state": row.get("state"),
+                "met": sum(1 for c in clauses if c.get("met")) if has_clauses else None,
+                "total": len(clauses) if has_clauses else None,
+            }
+        )
+    parsed = (
+        None
+        if inputs.acceptance_denied_code is not None
+        else parse_acceptance_reading(inputs.acceptance)
+    )
+    return {
+        "trading_day": str(inputs.board.get("trading_day")),
+        "delivered_pt": now.astimezone(DELIVERY_TZ).strftime("%Y-%m-%d %H:%M %Z"),
+        "phases": phases,
+        "acceptance_met": parsed.met if parsed else None,
+        "acceptance_total": parsed.total if parsed else None,
+        "comment_url": comment_url,
+    }
+
+
+def _read_history_rows(store: Store) -> list[tuple[str, dict[str, Any] | None, str]]:
+    """Every `history_row.json` filed under `report.morning`'s manifest
+    root, read through the guarded parser (`crucible.documents.read_document`
+    — the one module allowed to parse store bytes as JSON, AGENTS.md rule 1).
+
+    SURFACE consumer, like `_read_json` above: a corrupt or vanished row is
+    named in its own returned triple (`document=None`, ``problem`` set),
+    never raised and never silently dropped. The index this feeds is a VIEW
+    over the day's own comment, which is the durable record — a fault in one
+    day's row must not blank the rest of the history, and must not be
+    invisible either.
+
+    Returns `(key, document_or_none, problem)` in ASCENDING key order —
+    `Store.list_keys` sorts, and a key is `runs/report.morning/{trading_day}/
+    {calendar_date}/history_row.json`, so ascending order groups by trading
+    day and, within a day, by firing: the LAST entry for a given trading day
+    is that day's most recent delivery, which is what "a re-delivery for the
+    same day replaces its row" means in practice.
+    """
+    prefix = runs_prefix(MORNING_JOB)
+    rows: list[tuple[str, dict[str, Any] | None, str]] = []
+    for key in sorted(store.list_keys(prefix)):
+        if not key.endswith(f"/{HISTORY_ROW_BASENAME}"):
+            continue
+        try:
+            raw = store.get_bytes(key)
+        except KeyError:
+            rows.append((key, None, "vanished between listing and read"))
+            continue
+        read = read_document(key, lambda raw=raw: raw)
+        if read.problem is not None:
+            rows.append((key, None, read.problem))
+        else:
+            rows.append((key, read.document, ""))
+    return rows
+
+
+def _phase_cell(phases: dict[str, dict[str, Any]], phase_id: str) -> str:
+    phase = phases.get(phase_id)
+    if phase is None:
+        return "—"
+    if phase.get("met") is None or phase.get("total") is None:
+        return str(phase.get("state", "—"))
+    return f"{phase.get('state', '—')} {phase['met']}/{phase['total']}"
+
+
+def render_history_body(store: Store, *, console_url: str | None = None) -> str:
+    """The rolling issue's regenerated BODY: a newest-first history index
+    (`alpha-engine-config-I10123` deliverable 7).
+
+    One row per trading day — the LATEST delivery for that day, so a rerun
+    never grows the table — carrying that day's six phase states, its
+    acceptance figure, and a link to the comment holding the full update.
+    Read errors are named in their own row rather than dropped, for the same
+    reason every other surface in this module never goes silent on a fault.
+    """
+    latest: dict[str, dict[str, Any]] = {}
+    faulted: dict[str, str] = {}
+    for key, document, problem in _read_history_rows(store):
+        # `key` segments: "runs", "report.morning", "{trading_day}", ...
+        trading_day = key.split("/")[2]
+        if document is not None:
+            latest[trading_day] = document
+            faulted.pop(trading_day, None)
+        else:
+            faulted[trading_day] = problem
+            latest.pop(trading_day, None)
+
+    lines: list[str] = ["# Crucible v2 — daily update history", ""]
+    if console_url:
+        lines.append(f"Board: {console_url.rstrip('/')}{BOARD_CONSOLE_PATH}")
+        lines.append("")
+    header = ["trading day", "delivered (PT)", *_HISTORY_PHASE_IDS, "acceptance", "full update"]
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("|" + "---|" * len(header))
+
+    days = sorted(set(latest) | set(faulted), reverse=True)
+    for day in days:
+        if day in faulted:
+            lines.append(
+                f"| {day} | unreadable: {faulted[day]} | "
+                + " | ".join(["—"] * (len(header) - 2))
+                + " |"
+            )
+            continue
+        row = latest[day]
+        phases = {p["id"]: p for p in row.get("phases", []) if isinstance(p, dict)}
+        cells = [_phase_cell(phases, phase_id) for phase_id in _HISTORY_PHASE_IDS]
+        met, total = row.get("acceptance_met"), row.get("acceptance_total")
+        acceptance = f"{met}/{total}" if met is not None and total is not None else "—"
+        link = f"[comment]({row.get('comment_url', '')})" if row.get("comment_url") else "—"
+        lines.append(
+            f"| {day} | {row.get('delivered_pt', '—')} | "
+            + " | ".join(cells)
+            + f" | {acceptance} | {link} |"
+        )
+    if not days:
+        lines.append(
+            "| _no delivery has filed a history row yet_ | "
+            + " | ".join(["—"] * (len(header) - 1))
+            + " |"
+        )
+    return "\n".join(lines)
+
+
 def morning_handler(args: argparse.Namespace) -> int:
     """`crucible report.morning [--date] [--dry-run] [--store]`.
 
@@ -1354,17 +1515,26 @@ def morning_handler(args: argparse.Namespace) -> int:
     and `alerts.sweep`'s two conditions cover this job on the same terms as
     every other: ABSENCE when the 13:00 UTC cron does not fire — GitHub drops
     scheduled events under load, measured on this fleet — and FAILURE when
-    the delivery raises.
+    either the tracker post or the delivery raises.
 
-    **`--dry-run` renders and files nothing and sends nothing**, and prints
-    the message to stdout instead. That is the shape a laptop needs to read
-    the production board without writing to it, and it is honoured rather
-    than ignored for the same reason `board` honours it: this job's outputs
-    land under `runs/`, where a dry run would otherwise fabricate a manifest
-    saying a report was delivered. Passed through to `run_job` as
-    `dry_run=True` (alpha-engine-config-I9922) so the manifest itself is
-    never written either — before that fix, this docstring's claim was false:
-    `run_job` wrote `runs/report.morning/{day}/{firing}/run.json` regardless.
+    **Ordering is the whole safety property** (`alpha-engine-config-I10123`):
+    the full update is posted to the tracker BEFORE the headline is ever
+    rendered, because the headline's one indispensable line is the comment's
+    own permalink. `_find_or_create_rolling_issue` and `tracker.post_comment`
+    both raise on any fault, so a failed post fails the run loudly — the
+    manifest reads `failed`, and the headline is never sent at all.
+
+    **`--dry-run` renders and files nothing, sends nothing, and touches the
+    tracker not at all** — no search, no create, no comment. It prints the
+    full update to stdout instead. That is the shape a laptop needs to read
+    the production board without writing to it OR to the private tracker,
+    and it is honoured for the same reason `board` honours it: this job's
+    outputs land under `runs/`, where a dry run would otherwise fabricate a
+    manifest saying a report was delivered — and a dry run that posted a
+    real tracker comment would fabricate the OTHER document this job now
+    produces. Passed through to `run_job` as `dry_run=True`
+    (alpha-engine-config-I9922) so the manifest itself is never written
+    either.
     """
     from crucible.runner import RunContext, run_job  # noqa: PLC0415 - lazy; see cli.py
 
@@ -1382,25 +1552,36 @@ def morning_handler(args: argparse.Namespace) -> int:
     from crucible.config import settings as _settings  # noqa: PLC0415 - lazy; see cli.py
 
     console_url = _settings().console_url or None
-    rendered: list[str] = []
 
     def body(ctx: RunContext) -> None:
         now = ctx.started
-        message = run_report(store, trading_day=ctx.trading_day, now=now, console_url=console_url)
-        rendered.append(message)
+        inputs = read_inputs(store, trading_day=ctx.trading_day, now=now, console_url=console_url)
+        update = render_full_update(inputs, now=now)
         if dry_run:
-            # No output, no delivery, and (as of alpha-engine-config-I9922)
-            # no manifest either: `run_job(dry_run=True)` below skips its own
-            # write, and `store` above is read-only regardless -- a dry run
-            # is visibly a dry run because nothing under `runs/` or
-            # `reports/` changes at all, not because the manifest it used to
-            # write happened to say `outputs: []`.
-            print(message)
+            # No output, no manifest, no delivery, and no tracker call at
+            # all (as of alpha-engine-config-I10123): `run_job(dry_run=True)`
+            # below skips its own manifest write, and `store` above is
+            # read-only regardless -- a dry run is visibly a dry run because
+            # nothing under `runs/` changes and no comment is ever posted.
+            print(update)
             return
+        issue_number = _find_or_create_rolling_issue()
+        history_url = f"https://github.com/{TRACKER_REPO}/issues/{issue_number}"
+        update_url = tracker.post_comment(TRACKER_REPO, issue_number, update)
+        message = render_message(inputs, now=now, update_url=update_url, history_url=history_url)
         destination = deliver(message)
         payload = message.encode("utf-8")
         artifact = morning_report_key(ctx.trading_day.isoformat(), ctx.calendar_date.isoformat())
         ctx.record_output(artifact, payload)
+        update_artifact = morning_update_key(
+            ctx.trading_day.isoformat(), ctx.calendar_date.isoformat()
+        )
+        ctx.record_output(update_artifact, update.encode("utf-8"))
+        history_row = _history_row_payload(inputs, now=now, comment_url=update_url)
+        ctx.record_output(
+            morning_history_row_key(ctx.trading_day.isoformat(), ctx.calendar_date.isoformat()),
+            json.dumps(history_row, sort_keys=True).encode("utf-8"),
+        )
         # WHAT started this delivery, filed as its own object beside the
         # message (alpha-engine-config-I9960). The trigger is the KEY, so an
         # `exists` predicate over
@@ -1436,6 +1617,38 @@ def morning_handler(args: argparse.Namespace) -> int:
                 "last_updated_utc": now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
         )
+        # The comment URL and issue number, as `outputs`/`metrics`
+        # (`alpha-engine-config-I10123` deliverable 4). `run_manifest.v2`'s
+        # `metrics` array is `additionalProperties: true` and needs no
+        # schema change: `value` carries the issue number (with its `unit`,
+        # per the schema's own dependency), and `status_reason`/`source_path`
+        # carry the URL and the repo#issue reference a human or a sweep can
+        # act on directly.
+        ctx.record_metric(
+            {
+                "name": "morning_report_tracker_comment",
+                "module": "crucible.morning",
+                "metric_type": "operational",
+                "value": float(issue_number),
+                "unit": "issue_number",
+                "n_floor": 1,
+                "status": "OK",
+                "status_reason": (
+                    f"posted the full update to {TRACKER_REPO}#{issue_number}: {update_url}"
+                ),
+                "source_path": update_url,
+                "last_updated_utc": now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+        # The index rewrite runs LAST, and its failure fails the run
+        # (`alpha-engine-config-I10123` deliverable 7): the comment posted
+        # above is the durable RECORD of today's update, and this is a VIEW
+        # over every day's comment -- so a failure here must not roll back or
+        # skip anything already delivered, and must still be loud (the
+        # manifest's `reason` names it, and `alerts.sweep`'s failure
+        # condition pages on it) rather than silently leaving a stale index.
+        history_body = render_history_body(store, console_url=console_url)
+        tracker.update_issue_body(TRACKER_REPO, issue_number, history_body)
 
     run_job(
         MORNING_JOB,
@@ -1462,15 +1675,20 @@ def run_report(
     now: dt.datetime,
     console_url: str | None = None,
 ) -> str:
-    """Read the board and render the message. The whole job, minus delivery.
+    """Read the board and render the FULL UPDATE. Reading and rendering only
+    — no tracker call, no delivery.
 
     Split out so the render is exercisable without argparse, without a
-    runner and without a transport — and so `--dry-run` differs from a real
-    run in exactly one branch of the handler rather than in a code path the
-    tests cannot reach. ``console_url`` is `crucible.config.Settings.console_url`
-    when the handler resolved one (`alpha-engine-config-I9926`).
+    runner, without the tracker and without a transport.
+    ``console_url`` is `crucible.config.Settings.console_url` when the
+    handler resolved one (`alpha-engine-config-I9926`).
+
+    Returns the full update's Markdown (`render_full_update`), not the
+    Telegram headline — the headline needs a comment URL that only exists
+    once this content has actually been posted, so it has no laptop-only
+    equivalent; `morning_handler`'s `--dry-run` path prints exactly this.
     """
-    return render_message(
+    return render_full_update(
         read_inputs(store, trading_day=trading_day, now=now, console_url=console_url),
         now=now,
     )

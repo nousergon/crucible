@@ -10,7 +10,8 @@ twice, so what is tested here is the machinery that replaces it:
 * `crucible.track_f.file_closing_record` — written once, from a MET reading on
   a LIVE run, by compare-and-swap against an absent key, and only after the
   same reading has been posted to the tracker;
-* `crucible.tracker` — the one adapter, which may comment and may never close;
+* `crucible.tracker` — the one adapter, which may comment, create, and rewrite a
+  body, and may never close;
 * `crucible.board._closing_rows` — the detector: a phase issue CLOSED with no
   closing record beside it renders UNMET on every daily board.
 
@@ -145,10 +146,20 @@ class TestTheTrackerMayCommentAndMayNeverClose:
         one protection reserved for him (`gate-taxonomy-policy` §6 makes a
         human's own act permanent, and a machine claiming it is indelible).
 
-        Two facts are asserted over the module's syntax tree: the only
-        non-default HTTP method it can name is `POST`, and every path it can
-        hand `_request` is one of three literals. `PATCH /issues/{n}` — the
-        request that closes an issue — is unreachable from either.
+        Facts asserted over the module's syntax tree: the only non-default
+        HTTP methods it can name are `POST` and `PATCH`, every path it can
+        hand `_request` is one of a small closed set, and every `PATCH`
+        call's payload is the LITERAL `{"body": ...}` — never a dict that
+        could carry `state`, which is the one field of a PATCH to
+        `/issues/{n}` that could close or reopen it.
+
+        `'/issues'` joined the path set in `alpha-engine-config-I10123`
+        (`create_issue`, for the rolling `[v2 board] daily update` issue):
+        still `POST`, and still not `/issues/{n}` — a CREATE cannot close
+        anything, since it names no existing issue at all. `PATCH` joined
+        the method set in the same PR (`update_issue_body`, rewriting that
+        issue's body to the regenerated history index) — restricted to a
+        payload the AST proves can never carry a second key.
         """
         tree = ast.parse(pathlib.Path(tracker_module.__file__).read_text(encoding="utf-8"))
         methods = {
@@ -158,7 +169,7 @@ class TestTheTrackerMayCommentAndMayNeverClose:
             and node.arg == "method"
             and isinstance(node.value, ast.Constant)
         }
-        assert methods == {"POST"}, methods
+        assert methods == {"POST", "PATCH"}, methods
         paths = {
             ast.unparse(node.args[1])
             for node in ast.walk(tree)
@@ -171,7 +182,31 @@ class TestTheTrackerMayCommentAndMayNeverClose:
             "f'/issues/{issue}'",
             "f'/issues/{issue}/comments?per_page=100&page={page}'",
             "f'/issues/{issue}/comments'",
+            "'/issues'",
         }, paths
+
+        def _is_patch_call(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_request"
+                and any(
+                    kw.arg == "method"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value == "PATCH"
+                    for kw in node.keywords
+                )
+            )
+
+        patch_calls = [node for node in ast.walk(tree) if _is_patch_call(node)]
+        assert len(patch_calls) == 1, "exactly one call site may PATCH at all"
+        (patch_call,) = patch_calls
+        (payload_kw,) = [kw for kw in patch_call.keywords if kw.arg == "payload"]
+        assert isinstance(payload_kw.value, ast.Dict), (
+            "a PATCH payload built from anything but a literal dict could be made to carry `state`"
+        )
+        keys = {ast.literal_eval(k) for k in payload_kw.value.keys}
+        assert keys == {"body"}, keys
 
     def test_the_post_targets_the_comments_endpoint_with_the_declared_headers(
         self, monkeypatch

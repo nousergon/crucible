@@ -78,8 +78,10 @@ __all__ = [
     "manifest_key",
     "manifest_prefix",
     "migration_key",
+    "morning_history_row_key",
     "morning_report_key",
     "morning_trigger_key",
+    "morning_update_key",
     "parse_acceptance_reading",
     "parse_bus_key",
     "parse_manifest_key",
@@ -867,6 +869,40 @@ def morning_report_key(trading_day: str, calendar_date: str) -> str:
     `crucible.alerts.sweep` already carries for the same reason.
     """
     return f"{manifest_prefix('report.morning', trading_day)}{calendar_date}/message.txt"
+
+
+def morning_update_key(trading_day: str, calendar_date: str) -> str:
+    """Where `report.morning` files the FULL daily update it also posts to
+    the tracker (`alpha-engine-config-I10123`).
+
+    Since Brian's 2026-09-06 ruling the delivered Telegram message is a
+    headline that LINKS to the full update, and the full update is a GitHub
+    comment — this is the durable filed copy of exactly that markdown,
+    beside `message.txt` under the job's OWN manifest prefix, so the writer
+    needs no second grant to file it. `principle 1` (transparency): the
+    comment lives in a different repository's tracker and could in
+    principle be edited or deleted there; this key is the store's own
+    record of what was posted, independent of the tracker.
+    """
+    return f"{manifest_prefix('report.morning', trading_day)}{calendar_date}/update.md"
+
+
+def morning_history_row_key(trading_day: str, calendar_date: str) -> str:
+    """One delivery's compact facts, beside its manifest
+    (`alpha-engine-config-I10123` deliverable 7).
+
+    The rolling tracker issue's BODY is a regenerated history index — a
+    newest-first table of every trading day's phase states and acceptance
+    figure — and rebuilding it from `update.md`'s Markdown on every delivery
+    would make the index a re-parse of prose this module already owns
+    structured data for. This key is that structured data instead: a small
+    JSON object (`trading_day`, `delivered_pt`, `phases`, `acceptance_met`,
+    `acceptance_total`, `comment_url`) the index reader lists and reads
+    through the guarded parser, the same way it reads every other artifact
+    under this job's manifest prefix — never a second, disagreeing
+    computation of what the board said.
+    """
+    return f"{manifest_prefix('report.morning', trading_day)}{calendar_date}/history_row.json"
 
 
 #: What a trigger name may be, before it becomes a key segment. Not a
