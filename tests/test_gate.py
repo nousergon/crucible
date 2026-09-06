@@ -43,6 +43,8 @@ from crucible.keys import (
     review_key,
     review_prefix,
     runs_prefix,
+    strategy_arm_key,
+    verdict_key,
 )
 from crucible.manifest import manifest_key
 from crucible.report import attribution_key
@@ -2195,3 +2197,128 @@ class TestARerunIsGradedAgainstTheWeekItRetries:
         source = inspect.getsource(gate_module._clause_old_alerts_muted)
         assert "rerun_names_another_week(" in source
         assert "LEGACY_WEEKLY_RERUN_NAME_RE" not in source
+
+
+class TestEveryLlmArmClauseIsControlArmIsRegisterBacked:
+    """`alpha-engine-config-I10044`: `_clause_every_llm_arm_has_a_verdict`'s
+    `is_control_arm(SLOTS[slot], a, register)` call must prefer the
+    REGISTERED control flag over the NAME match — mirroring
+    `tests/test_slots.py::TestIsControlArmIsRegisterBacked` at this call
+    site. A filed, real recipe whose generated name happens to collide with
+    the slot's planted-control name (``control_planted_r``) must not be
+    excluded from the LLM-arm join once it is registered ``control=False``.
+
+    Before threading the register through, `_register_arms` folded `active`
+    off the register and then discarded it, so this clause's exclusion ran
+    the bare name match and would have skipped the collider entirely — the
+    slot would have contributed no filed arms and the clause would have read
+    UNMEASURABLE instead of MET on real, verdicted evidence.
+    """
+
+    def _seed_collision(self, store: LocalStore, *, real_control: bool) -> str:
+        """Register slot r's real planted control (``control=real_control``)
+        beside a FILED, non-control recipe whose NAME is that same control's
+        bare name — the collision `is_control_arm`'s docstring names as the
+        case a register must resolve. Syncs only the filed recipe into the
+        strategy tree and returns its arm id.
+        """
+        from nousergon_lib.arena.arms import ArmRegister
+
+        from crucible.slots import get_slot
+        from crucible.slots.arms import ArmSpec, write_register
+
+        spec = get_slot("r")
+        collider_name = spec.control_arms[0].arm_id  # "control_planted_r"
+
+        register = ArmRegister()
+        # The slot's real planted control, registered under its usual name —
+        # `control=True`, the way `crucible.slots.arms.register_arms` records
+        # a real control in production.
+        register, _ = register.register(
+            slot="r",
+            name="control_planted_r_actual",
+            spec={"kind": "planted"},
+            created_date="2026-01-02",
+            control=True,
+        )
+        # The FILED collider: a real, non-control recipe whose generated NAME
+        # happens to equal the control's bare name. Registered `control=False`
+        # — the record a fleeting name collision must not override.
+        filed = ArmSpec(
+            name=collider_name,
+            slot="r",
+            ranker="momentum_sleeve",
+            params={"top_n": 8, "llm_callsite": "research.rank"},
+            registered_at="2026-01-02",
+            control=real_control,
+        )
+        register, _ = register.register(
+            slot="r",
+            name=filed.name,
+            spec=filed.spec,
+            created_date=filed.registered_at,
+            control=real_control,
+        )
+        write_register(store, "r", register)
+        lines = [
+            f"name: {filed.name}",
+            "slot: r",
+            "ranker: momentum_sleeve",
+            "registered_at: '2026-01-02'",
+            "params:",
+            "  top_n: 8",
+            "  llm_callsite: research.rank",
+        ]
+        store.put_bytes(
+            strategy_arm_key("r", filed.name), ("\n".join(lines) + "\n").encode("utf-8")
+        )
+        return filed.arm_id
+
+    def test_a_filed_collider_registered_non_control_is_joined_not_excluded(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import crucible.llm as llm_module
+        from crucible import gate as gate_module
+
+        class _CallSite:
+            pass
+
+        monkeypatch.setattr(llm_module, "LLM_CALLSITE_REGISTRY", {"research.rank": _CallSite()})
+
+        store = LocalStore(tmp_path)
+        arm_id = self._seed_collision(store, real_control=False)
+        _put(store, verdict_key(arm_id, FRIDAY.isoformat()), {"status": "ok"})
+
+        clause = gate_module._clause_every_llm_arm_has_a_verdict(store, WINDOW)
+
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert any(verdict_key(arm_id, FRIDAY.isoformat()) == e for e in clause.evidence), (
+            "the collider's own verdict key should be part of the reading, proving it "
+            f"was joined rather than excluded as a control; got {clause.evidence}"
+        )
+
+    def test_a_real_control_registered_control_true_is_still_excluded(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The opposite direction: a control's OWN record still excludes it
+        even though its bare name is the one `SlotSpec.control_arms` names —
+        so the fix is register-preferred, not register-only-when-it-frees-an-
+        arm."""
+        import crucible.llm as llm_module
+        from crucible import gate as gate_module
+
+        class _CallSite:
+            pass
+
+        monkeypatch.setattr(llm_module, "LLM_CALLSITE_REGISTRY", {"research.rank": _CallSite()})
+
+        store = LocalStore(tmp_path)
+        arm_id = self._seed_collision(store, real_control=True)
+        _put(store, verdict_key(arm_id, FRIDAY.isoformat()), {"status": "ok"})
+
+        clause = gate_module._clause_every_llm_arm_has_a_verdict(store, WINDOW)
+
+        # The collider is a real control now (control=True): excluded from
+        # the LLM-arm join, so the only registered arm is itself and there is
+        # nothing left to grade — the empty-set trap, never a pass.
+        assert clause.unmeasurable and not clause.met, clause.detail

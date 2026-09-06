@@ -33,14 +33,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from jsonschema import Draft202012Validator
 
-from crucible.alerts import pages_in_range
+from crucible.alerts import PAGE_CONDITIONS, pages_in_range
 from crucible.calendar import TRADING_DAYS_PER_WEEK, is_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
-from crucible.documents import DocumentRead
+from crucible.documents import DocumentRead, read_manifests_under
 from crucible.documents import read_path_document as _read_path_document
 from crucible.documents import read_store_document as _read_store_document
 from crucible.keys import (
@@ -53,7 +53,9 @@ from crucible.keys import (
     gate_prefix,
     legacy_dead_lambdas_key,
     legacy_weekly_executions_key,
+    manifest_prefix,
     parse_acceptance_reading,
+    parse_bus_key,
     review_key,
     review_prefix,
     runs_prefix,
@@ -65,8 +67,20 @@ from crucible.release import POINTER_KEY
 from crucible.report import attribution_key
 from crucible.slots import SLOTS, dispatchable_slots, is_control_arm
 from crucible.store import Store
-from crucible.tags import TAG_KEY, TAG_VALUE
+from crucible.tags import (
+    TAG_KEY,
+    TAG_VALUE,
+    CostAllocationTagUnreadableError,
+    cost_allocation_tag_status,
+)
 from crucible.weekly import arc_stages
+
+if TYPE_CHECKING:
+    # Annotation only: the arena package is imported lazily at the one call
+    # site that folds a register (`_register_arms`), so `crucible gate
+    # --help` and every unit test that imports this module stay off the
+    # heavy import path.
+    from nousergon_lib.arena import ArmRegister
 
 __all__ = [
     "ACCEPTANCE_RATCHET_PATH",
@@ -464,24 +478,34 @@ def arm_name(arm_id: str) -> str:
     return parts[1] if len(parts) == 3 else arm_id
 
 
-def _register_arms(store: Store, slot: str) -> tuple[set[str], str, str | None, bool]:
-    """The slot's ACTIVE registered arm ids, the key, and the reason if the
-    register could not be read (``problem``, ``access_problem``).
+def _register_arms(
+    store: Store, slot: str
+) -> tuple[set[str], str, str | None, bool, ArmRegister | None]:
+    """The slot's ACTIVE registered arm ids, the key, the reason if the
+    register could not be read (``problem``, ``access_problem``), and the
+    :class:`~nousergon_lib.arena.ArmRegister` the ids were folded from.
 
     Guarded through :func:`_read_store_lines` rather than the bare
     `json.loads` per line this used to run: an unreadable register is a red
     `arms_all_scored` reading naming the key, never an exception out of
     `evaluate` (`alpha-engine-config-I9869` round 2).
+
+    The register is returned alongside the folded id set (rather than
+    discarded once `active_arms()` is taken) so a caller needing register-
+    backed control classification (`crucible.slots.is_control_arm`,
+    `alpha-engine-config-I10044`) threads the register this function already
+    loaded instead of re-reading the same key a second time.
     """
     key = arm_register_key(slot)
     read = _read_store_lines(store, key)
     if read.problem is not None:
-        return set(), key, read.problem, read.access_problem
+        return set(), key, read.problem, read.access_problem, None
     if read.absent:
-        return set(), key, None, False
+        return set(), key, None, False, None
     from nousergon_lib.arena import ArmRegister  # noqa: PLC0415 - heavy import, one call site
 
-    return set(ArmRegister.from_dicts(read.lines or []).active_arms()), key, None, False
+    register = ArmRegister.from_dicts(read.lines or [])
+    return set(register.active_arms()), key, None, False, register
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +667,9 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
     # phase-1 clauses agree about which slots a week must have scored.
     slots = {slot: SLOTS[slot] for slot in SLOTS if slot in dispatchable_slots()}
     for slot in slots:
-        registered, register_key, register_problem, register_access = _register_arms(store, slot)
+        registered, register_key, register_problem, register_access, _register_unused = (
+            _register_arms(store, slot)
+        )
         registers[slot] = (registered, register_key, register_problem, register_access)
         if register_key is not None:
             evidence.append(register_key)
@@ -3209,6 +3235,170 @@ def _clause_pages_within_ceiling(store: Store, window: list[dt.date]) -> Clause:
     )
 
 
+def _job_stood_down(store: Store, job: str, trading_day: str) -> tuple[bool, str | None]:
+    """Whether ``job``'s manifests for ``trading_day`` now include an `ok` one.
+
+    Returns ``(stood_down, problem)``. A prefix that could not be listed is a
+    problem naming the prefix, never "not stood down": the difference between
+    "the rerun did not happen" and "we could not see whether it did" is the
+    whole of this clause's honesty.
+    """
+    prefix = manifest_prefix(job, trading_day)
+    listed = read_manifests_under(store, prefix)
+    if listed.listing_problem is not None:
+        return False, f"{prefix}: {listed.listing_problem}"
+    for _key, manifest in listed.documents:
+        if manifest.get("status") == "ok":
+            return True, None
+    return False, None
+
+
+def _clause_pages_commissioned(store: Store) -> Clause:
+    """Plan §9.3 "Commissioning" (a phase-2 exit-gate row): each page condition
+    induced for real before it is trusted — fired, DELIVERED, and STOOD DOWN.
+
+    The plan names the inducing means ("a forced failure and a withheld
+    manifest"). This clause grades the OUTCOME those means exist to produce,
+    read from the alert bus and the manifests, so a condition that fired on a
+    genuine defect counts — and counts for more, since nothing about the
+    condition was arranged. Measured 2026-09-06 on the production store:
+    `failure.weekly@2026-09-04` (the first scheduled Saturday died on a
+    missing IAM prefix) was delivered to `operator_chat` and stood down when
+    the replay wrote an `ok` manifest; `absence@2026-09-04` (five arc stages
+    past deadline) was delivered and stood down when the five manifests were
+    written. Both conditions had therefore been commissioned by the real
+    system a day before anyone forced them, and a clause that only counted a
+    forced one would have read UNMET over that evidence.
+
+    Three facts per condition, each from a durable artifact and none from a
+    test double:
+
+    1. **Fired** — a bus row under `alerts/{day}/{incident}.json` whose
+       `condition` is this one. The bus is the machine-readable record §9.3
+       requires; the transport's own log is not read.
+    2. **Delivered** — that row's `sent` is `True`. `sent` records what the
+       transport actually did, dedup- and mute-suppression subtracted
+       (`crucible.alerts._transport_outcome`); a row with `sent: false` is a
+       page that never left and proves the condition, not the path.
+    3. **Stood down** — every member job named on the row now has an `ok`
+       manifest for that trading day. Absence stands down when the manifest
+       appears; failure stands down when a rerun overwrites the failed one.
+       A condition that fired and was never cleared is an open incident, not
+       a commissioned detector: the plan's row ends "and stood down".
+
+    UNMEASURABLE when the sweep has never run (an empty bus beside no sweep
+    is no data) or a listing could not be read. A row that is not an object,
+    or names a condition this module does not know, is a malformed artifact
+    and is reported in the detail rather than silently skipped; it never
+    counts toward MET.
+
+    Not windowed. Commissioning happens once per condition and stays true;
+    re-reading it every render is what makes a later deletion of the bus
+    visible, but the trailing window the other phase-2 clauses use would
+    make a detector commissioned three weeks ago read as never commissioned.
+    """
+    name = "pages_commissioned"
+    requirement = (
+        "each page condition ("
+        + ", ".join(PAGE_CONDITIONS)
+        + ") has fired for real, been delivered (bus row `sent: true`) and stood down "
+        "(every member job's manifest for that trading day now reads ok)"
+    )
+    sweeps = _list_store_keys(store, runs_prefix("alerts.sweep"))
+    if sweeps.problem is not None:
+        return _unmeasurable(name, requirement, sweeps.problem, (runs_prefix("alerts.sweep"),))
+    if not sweeps.keys:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"no `alerts.sweep` manifest exists under {runs_prefix('alerts.sweep')}, so "
+            "nothing has ever evaluated either page condition. Nothing to commission",
+            (runs_prefix("alerts.sweep"),),
+        )
+    rows = _list_store_keys(store, ALERTS_ROOT)
+    if rows.problem is not None:
+        return _unmeasurable(name, requirement, rows.problem, (ALERTS_ROOT,))
+
+    stood_down: dict[str, list[str]] = {c: [] for c in PAGE_CONDITIONS}
+    still_open: dict[str, list[str]] = {c: [] for c in PAGE_CONDITIONS}
+    undelivered: dict[str, list[str]] = {c: [] for c in PAGE_CONDITIONS}
+    problems: list[str] = []
+    access: list[str] = []
+    for key in rows.keys:
+        parsed = parse_bus_key(key)
+        if parsed is None:
+            continue
+        day = parsed[0]
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            (access if read.access_problem else problems).append(read.problem)
+            continue
+        row = read.document or {}
+        condition = row.get("condition")
+        if condition not in PAGE_CONDITIONS:
+            problems.append(f"{key}: condition {condition!r} is not one of {PAGE_CONDITIONS}")
+            continue
+        if row.get("sent") is not True:
+            undelivered[condition].append(key)
+            continue
+        problem = _field(key, row, "members", list)
+        if problem is not None:
+            problems.append(problem)
+            continue
+        jobs = sorted({str(m.get("job")) for m in row["members"] if isinstance(m, dict)})
+        if not jobs:
+            problems.append(f"{key}: `members` names no job")
+            continue
+        open_jobs: list[str] = []
+        for job in jobs:
+            down, why = _job_stood_down(store, job, day)
+            if why is not None:
+                access.append(why)
+            if not down:
+                open_jobs.append(job)
+        if open_jobs:
+            still_open[condition].append(f"{key} ({', '.join(open_jobs)} not yet ok)")
+        else:
+            stood_down[condition].append(key)
+
+    met = all(stood_down[c] for c in PAGE_CONDITIONS)
+    if not met and access:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"{len(access)} read(s) could not be made, so at least one condition's standing-"
+            "down could not be graded: " + " | ".join(sorted(access)[:3]),
+            tuple(sorted(a.split(":")[0] for a in access)),
+        )
+    parts: list[str] = []
+    for condition in PAGE_CONDITIONS:
+        if stood_down[condition]:
+            parts.append(
+                f"{condition}: commissioned by {sorted(stood_down[condition])[0]}"
+                + (
+                    f" (+{len(stood_down[condition]) - 1} more)"
+                    if len(stood_down[condition]) > 1
+                    else ""
+                )
+            )
+        elif still_open[condition]:
+            parts.append(
+                f"{condition}: delivered but not stood down: "
+                + "; ".join(sorted(still_open[condition])[:2])
+            )
+        elif undelivered[condition]:
+            parts.append(
+                f"{condition}: fired but never delivered (`sent: false`): "
+                + ", ".join(sorted(undelivered[condition])[:2])
+            )
+        else:
+            parts.append(f"{condition}: has never fired")
+    if problems:
+        parts.append(f"{len(problems)} malformed bus row(s) ignored: {sorted(problems)[0]}")
+    evidence = tuple(sorted(k for c in PAGE_CONDITIONS for k in stood_down[c]))
+    return Clause(name, requirement, met, "; ".join(parts), evidence)
+
+
 #: Complete days whose TOTAL is graded against the monthly ceiling
 #: (`alpha-engine-config-I9927`): the ceiling's own period, so a weekly batch
 #: lands in the window four or five times and a month-boundary accrual once,
@@ -3382,25 +3572,77 @@ def _clause_aws_cost_within_ceiling(
         # The empty-set trap, one level down from phase 5's, and it applies to
         # BOTH scopes. A TAG-FILTERED total of exactly $0.00 is a property of
         # the FILTER, not of the spend: it is what a correctly-tagged month
-        # with no resources and an entirely UNTAGGED estate both return, and
+        # with no resources, an entirely UNTAGGED estate, and a correctly
+        # tagged estate whose tag key is Inactive in Billing all return, and
         # this account's untagged total was $230.21 on the day this was
         # written. An ACCOUNT total of exactly $0.00 is the same shape one
         # level up: for a live AWS estate it means Cost Explorer answered with
         # nothing chargeable — a broken reading, not a free month. Reading
         # either as "under the ceiling" would put a phase row green on the
-        # evidence that the cost reading is not working. Whether the tag is
-        # actually applied is `crucible.tags.audit_stack_tags`' question, and
-        # phase 0's `v2_resources_tagged_and_versioned` deliverable.
+        # evidence that the cost reading is not working. Whether the RESOURCES
+        # carry the tag is `crucible.tags.audit_stack_tags`' question and
+        # phase 0's `v2_resources_tagged_and_versioned` deliverable; whether
+        # Billing has ACTIVATED the tag key at all is
+        # `crucible.tags.cost_allocation_tag_status`' question, below.
+        if not tagged:
+            return _unmeasurable(
+                name,
+                requirement,
+                f"Cost Explorer returned exactly $0.00 for {reading.scope} over "
+                f"{reading.start.isoformat()}..{reading.end.isoformat()}: no spend "
+                "recorded for the whole account. A total of zero is what a broken "
+                "or misfiltered reading returns as well as a free month",
+                evidence,
+            )
+        # The tag-filtered $0.00 has a second candidate cause one level above
+        # the resources: Cost Explorer only indexes spend under a tag KEY that
+        # Billing has activated as a cost-allocation tag, independent of
+        # whether every resource carries it (`crucible.tags.audit_stack_tags`
+        # answers that, separately). `alpha-engine-config-I10076`: the
+        # `system` key read `Inactive` while the stack was fully tagged, and
+        # this clause pointed the reader at the wrong audit.
+        try:
+            tag_status = cost_allocation_tag_status(_ce_client())
+        except CostAllocationTagUnreadableError as exc:
+            return _unmeasurable(
+                name,
+                requirement,
+                f"Cost Explorer returned exactly $0.00 for {reading.scope} over "
+                f"{reading.start.isoformat()}..{reading.end.isoformat()}, and whether "
+                f"`{TAG_KEY}` is activated as a cost-allocation tag could not be read: "
+                f"{exc}",
+                (*evidence, "ce:ListCostAllocationTags"),
+            )
+        if not tag_status.active:
+            return _unmeasurable(
+                name,
+                requirement,
+                f"Cost Explorer returned exactly $0.00 for {reading.scope} over "
+                f"{reading.start.isoformat()}..{reading.end.isoformat()}: `{TAG_KEY}` is "
+                f"{tag_status.status} as a cost-allocation tag in Billing, so Cost "
+                "Explorer does not index spend under this filter at all, regardless of "
+                "whether the resources carry it — activate it with `aws ce "
+                f"update-cost-allocation-tags-status --cost-allocation-tags-status "
+                f"TagKey={TAG_KEY},Status=Active`",
+                (*evidence, "ce:ListCostAllocationTags"),
+            )
+        since = tag_status.last_updated_date or "an unknown date"
+        age_note = ""
+        if tag_status.last_updated_date:
+            try:
+                activated = dt.date.fromisoformat(tag_status.last_updated_date[:10])
+            except ValueError:
+                age_note = ""
+            else:
+                age_note = f", activated {(window[-1] - activated).days} day(s) ago"
         return _unmeasurable(
             name,
             requirement,
             f"Cost Explorer returned exactly $0.00 for {reading.scope} over "
-            f"{reading.start.isoformat()}..{reading.end.isoformat()}: no spend recorded "
-            "under this filter — the tag or the account read is not evidence of cost "
-            "under the ceiling. A total of zero is what a broken or misfiltered reading "
-            "returns as well as a free month. `crucible.tags.audit_stack_tags` is the "
-            "reading that says whether the tag is applied",
-            evidence,
+            f"{reading.start.isoformat()}..{reading.end.isoformat()}: `{TAG_KEY}` has been "
+            f"Active since {since}{age_note} — Cost Explorer indexes forward from "
+            "activation, so spend recorded is genuinely zero or not yet indexed",
+            (*evidence, "ce:ListCostAllocationTags"),
         )
     # `end` is exclusive in Cost Explorer's grammar, so the day count is the
     # interval length: a reading taken on the 1st covers one day, not zero.
@@ -3490,6 +3732,7 @@ def _phase2(
         _clause_replays_ok(store, window, registry),
         _clause_zero_human_mutating_calls(window),
         _clause_pages_within_ceiling(store, window),
+        _clause_pages_commissioned(store),
         _clause_aws_cost_within_ceiling(
             window, name="aws_cost_within_ceiling", ceiling_usd=PHASE2_MAX_TAGGED_USD, tagged=True
         ),
@@ -3873,14 +4116,14 @@ def _clause_every_llm_arm_has_a_verdict(store: Store, window: list[dt.date]) -> 
     for slot in LLM_ARM_RECIPE_SLOTS:
         key = arm_register_key(slot)
         evidence.append(key)
-        active, _, problem, access_problem = _register_arms(store, slot)
+        active, _, problem, access_problem, register = _register_arms(store, slot)
         if problem is not None:
             (access if access_problem else missing).append(problem)
             continue
         # Controls are generated by the harness and never filed in the strategy
         # tree, so they are excluded before the join — through the one helper
         # that matches on the NAME component (I9757 F4), not a local set.
-        filed = sorted(a for a in active if not is_control_arm(SLOTS[slot], a))
+        filed = sorted(a for a in active if not is_control_arm(SLOTS[slot], a, register))
         if not filed:
             continue
         prefix = strategy_arms_prefix(slot)

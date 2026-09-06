@@ -447,10 +447,21 @@ class _CostClient:
     pre-existing month-to-date cases keep grading the month-to-date half.
     """
 
-    def __init__(self, amount: str, daily: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        amount: str,
+        daily: list[str] | None = None,
+        allocation_tags: list[dict] | Exception | None = None,
+    ) -> None:
         self.amount = amount
         self.daily = daily or ["1.00"]
         self.requests: list[dict] = []
+        self._allocation_tags = allocation_tags
+
+    def list_cost_allocation_tags(self, **request) -> dict:
+        if isinstance(self._allocation_tags, Exception):
+            raise self._allocation_tags
+        return {"CostAllocationTags": self._allocation_tags or []}
 
     def get_cost_and_usage(self, **request) -> dict:
         self.requests.append(request)
@@ -479,11 +490,15 @@ class TestACostCeilingIsNeverMetByAnUnreadableApi:
         )
         assert clause.unmeasurable and not clause.met
 
-    def test_a_tag_filtered_zero_is_unmeasurable_not_met(
+    def test_a_tag_filtered_zero_with_the_key_never_activated_names_the_command(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An untagged estate and a free month return the same `$0.00`, so the
-        figure measures the FILTER rather than the spend."""
+        """An untagged estate and an estate whose key was never activated as
+        a cost-allocation tag return the same `$0.00`, so the figure alone
+        measures the FILTER rather than the spend. `alpha-engine-config-I10076`:
+        the reason must name the activation state and, when it is not Active,
+        the exact command to fix it — never point the reader at
+        `audit_stack_tags`, which cannot answer this question."""
         monkeypatch.setattr(gate_module, "_ce_client", lambda: _CostClient("0"))
         clause = gate_module._clause_aws_cost_within_ceiling(
             PHASE2_WINDOW,
@@ -492,6 +507,74 @@ class TestACostCeilingIsNeverMetByAnUnreadableApi:
             tagged=True,
         )
         assert clause.unmeasurable and not clause.met
+        assert "absent as a cost-allocation tag" in clause.detail
+        assert (
+            "aws ce update-cost-allocation-tags-status "
+            "--cost-allocation-tags-status TagKey=system,Status=Active" in clause.detail
+        )
+
+    def test_a_tag_filtered_zero_with_the_key_inactive_names_the_command(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _CostClient(
+            "0",
+            allocation_tags=[
+                {"TagKey": "system", "Status": "Inactive", "LastUpdatedDate": "2026-09-01"}
+            ],
+        )
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: client)
+        clause = gate_module._clause_aws_cost_within_ceiling(
+            PHASE2_WINDOW,
+            name="aws_cost_within_ceiling",
+            ceiling_usd=PHASE2_MAX_TAGGED_USD,
+            tagged=True,
+        )
+        assert clause.unmeasurable and not clause.met
+        assert "Inactive as a cost-allocation tag" in clause.detail
+        assert "TagKey=system,Status=Active" in clause.detail
+
+    def test_a_tag_filtered_zero_with_the_key_active_reads_forward_indexing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`Active since <date>` is not a failure state — Cost Explorer
+        indexes forward from activation, so a genuinely quiet window right
+        after activation reads $0.00 for a while. The reason must say so
+        rather than imply something is still broken."""
+        client = _CostClient(
+            "0",
+            allocation_tags=[
+                {"TagKey": "system", "Status": "Active", "LastUpdatedDate": "2026-09-06"}
+            ],
+        )
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: client)
+        clause = gate_module._clause_aws_cost_within_ceiling(
+            PHASE2_WINDOW,
+            name="aws_cost_within_ceiling",
+            ceiling_usd=PHASE2_MAX_TAGGED_USD,
+            tagged=True,
+        )
+        assert clause.unmeasurable and not clause.met
+        assert "Active since 2026-09-06" in clause.detail
+        assert "indexes forward from activation" in clause.detail
+        assert "genuinely zero or not yet indexed" in clause.detail
+
+    def test_a_denied_list_cost_allocation_tags_is_unmeasurable_naming_the_action(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A denied `ce:ListCostAllocationTags` must never be read as
+        `Inactive` — that is a different finding with a different remedy."""
+        error = RuntimeError("User is not authorized to perform ce:ListCostAllocationTags")
+        client = _CostClient("0", allocation_tags=error)
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: client)
+        clause = gate_module._clause_aws_cost_within_ceiling(
+            PHASE2_WINDOW,
+            name="aws_cost_within_ceiling",
+            ceiling_usd=PHASE2_MAX_TAGGED_USD,
+            tagged=True,
+        )
+        assert clause.unmeasurable and not clause.met
+        assert "ce:ListCostAllocationTags" in clause.detail
+        assert "ce:ListCostAllocationTags" in clause.evidence
 
     def test_an_untagged_zero_is_unmeasurable_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The same trap one level up, and the half that shipped untracked.
@@ -509,7 +592,7 @@ class TestACostCeilingIsNeverMetByAnUnreadableApi:
             tagged=False,
         )
         assert clause.unmeasurable and not clause.met
-        assert "no spend recorded under this filter" in clause.detail.lower()
+        assert "no spend recorded for the whole account" in clause.detail.lower()
 
     def test_met_under_the_tagged_ceiling(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Read on the 28th. `month_to_date_usd` asks for [1st, today) —
@@ -1294,11 +1377,18 @@ class TestAnEmptyArmSetIsNeverAPass:
         # the strategy tree — so the fixture carries them too, or the join
         # below is proven only on a register production never writes.
         for control in control_specs(get_slot(slot)):
+            # `control=True` (`alpha-engine-config-I10044`): the gate's own
+            # `is_control_arm(SLOTS[slot], a, register)` call is now
+            # register-backed, so a fixture that wants the register's record
+            # to say "control" — the way `register_arms` does in production —
+            # has to register it that way, not rely on the name colliding
+            # with `SlotSpec.control_arms`.
             register, _ = register.register(
                 slot=slot,
                 name=control.name,
                 spec=control.spec,
                 created_date=control.registered_at,
+                control=True,
             )
         arm_id = ""
         for name, params in arms:

@@ -13,8 +13,10 @@ from crucible.tags import (
     TAG_KEY,
     TAG_VALUE,
     UNTAGGABLE_TYPES,
+    CostAllocationTagUnreadableError,
     StackNotAppliedError,
     audit_stack_tags,
+    cost_allocation_tag_status,
 )
 
 
@@ -283,3 +285,63 @@ class TestEveryChannelIsRead:
             iam=_FakeIam(set()),
         )
         assert not untagged_topic.met
+
+
+class _FakeCe:
+    """`ce:ListCostAllocationTags`'s own shape — distinct from Cost Explorer's
+    `get_cost_and_usage`, and asserted on the request to catch a caller
+    filtering on the wrong key."""
+
+    def __init__(self, tags: list[dict] | Exception) -> None:
+        self._tags = tags
+
+    def list_cost_allocation_tags(self, *, TagKeys: list[str]):  # noqa: N803
+        assert TagKeys == [TAG_KEY]
+        if isinstance(self._tags, Exception):
+            raise self._tags
+        return {"CostAllocationTags": self._tags}
+
+
+class TestCostAllocationTagStatus:
+    """`alpha-engine-config-I10076`: the `system` key was `Inactive` in
+    Billing while every resource carried it, and Cost Explorer's tag filter
+    read a genuine `$0.00` forever. This is the reading that names the
+    activation state `audit_stack_tags` cannot answer."""
+
+    def test_active_is_reported_with_its_date(self) -> None:
+        status = cost_allocation_tag_status(
+            _FakeCe([{"TagKey": TAG_KEY, "Status": "Active", "LastUpdatedDate": "2026-09-06"}])
+        )
+        assert status.active
+        assert status.status == "Active"
+        assert status.last_updated_date == "2026-09-06"
+
+    def test_inactive_is_reported_not_active(self) -> None:
+        status = cost_allocation_tag_status(
+            _FakeCe([{"TagKey": TAG_KEY, "Status": "Inactive", "LastUpdatedDate": "2026-09-01"}])
+        )
+        assert not status.active
+        assert status.status == "Inactive"
+
+    def test_a_key_billing_has_never_seen_is_absent_not_inactive(self) -> None:
+        """`Inactive` and `absent` share a remedy (activate it) but are
+        different observations — a key present with a status and a key never
+        returned at all are not the same finding."""
+        status = cost_allocation_tag_status(_FakeCe([]))
+        assert not status.active
+        assert status.status == "absent"
+        assert status.last_updated_date is None
+
+    def test_a_denied_call_raises_naming_the_action_not_inactive(self) -> None:
+        """The whole reason this raises rather than returning `Inactive`: a
+        denied `ce:ListCostAllocationTags` and a genuinely deactivated key are
+        different findings with different remedies."""
+        error = RuntimeError("User is not authorized to perform ce:ListCostAllocationTags")
+        with pytest.raises(CostAllocationTagUnreadableError, match="ce:ListCostAllocationTags"):
+            cost_allocation_tag_status(_FakeCe(error))
+
+    def test_serializes_with_status_and_date(self) -> None:
+        status = cost_allocation_tag_status(
+            _FakeCe([{"TagKey": TAG_KEY, "Status": "Active", "LastUpdatedDate": "2026-09-06"}])
+        )
+        assert status.to_dict() == {"status": "Active", "last_updated_date": "2026-09-06"}
