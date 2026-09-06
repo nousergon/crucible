@@ -538,6 +538,7 @@ def test_a_verdict_write_is_never_cancelled_by_an_in_flight_dispatch() -> None:
 # variable set` remedy) and once with them set (must succeed).
 VARIABLE_GUARD_JOBS: dict[str, str] = {
     "board.yml": "board",
+    "gate-close.yml": "gate-close",
     "ci.yml": "acceptance",
     "deploy.yml": "release",
     "morning-report.yml": "report",

@@ -1,16 +1,30 @@
-"""Track F's handlers: `crucible weekly` and `crucible gate`.
+"""Track F's handlers: `crucible weekly`, `crucible gate` and `crucible gate.close`.
 
 Its own module rather than a branch inside another track's, so tracks land
 code in the same release without editing one another's lines. `cli.py` carries
 one line naming each.
 
-Two jobs, and they are the two halves of one claim. `weekly` RUNS the declared
-arc — the six components `components.yaml` marks `dispatch: arc`, in the order
-their own deadlines imply. `gate` READS what the arc produced and reports,
-clause by clause, whether a phase may exit. Neither does the other's work: a
-gate that ran the thing it grades could not distinguish a run made under gate
-conditions from a run made in production, and a driver that graded itself is
-the shape that closed phase 1 on 2026-09-01 with zero replays performed.
+Two of them are the two halves of one claim. `weekly` RUNS the declared arc —
+the six components `components.yaml` marks `dispatch: arc`, in the order their
+own deadlines imply. `gate` READS what the arc produced and reports, clause by
+clause, whether a phase may exit. Neither does the other's work: a gate that
+ran the thing it grades could not distinguish a run made under gate conditions
+from a run made in production, and a driver that graded itself is the shape
+that closed phase 1 on 2026-09-01 with zero replays performed.
+
+`gate.close` is the third, and it exists because the FILING half of that loop
+had no cadence (`alpha-engine-config-I10095`). `crucible-PR121` made a phase's
+exit a durable record — the first live gate reading that reads MET posts the
+reading to the phase's tracker issue and files `gates/{phase}/closing.json`,
+once, by compare-and-swap — but nothing ran `crucible gate` on a schedule, so
+the record was written only when a human or an agent happened to run it. The
+daily board DETECTS the gap (a phase issue closed with no record renders red)
+and deliberately cannot close it: `crucible-v2-github-board` is read-only over
+everything it grades, because a grading surface that could satisfy the clauses
+it grades is not a measurement. So the filing runs as its own daily job under
+its own writer identity, `crucible-v2-github-gate-close`, which may write
+exactly the closing records and its own manifest and may write no gate reading
+at all.
 """
 
 from __future__ import annotations
@@ -33,6 +47,7 @@ from crucible.gate import (
     GATES,
     LADDER_KEY,
     LADDER_SCHEMA_VERSION,
+    PHASES,
     TRACKER_REPO,
     Phase,
     build_ladder,
@@ -52,8 +67,11 @@ from crucible.store import ETAG_ABSENT, Store, open_store, resolve_store_uri
 from crucible.weekly import arc_stages, run_arc
 
 __all__ = [
+    "CLOSE_OUTCOMES",
+    "GATE_CLOSE_JOB",
     "closing_record_line",
     "file_closing_record",
+    "gate_close_handler",
     "gate_handler",
     "post_closing_comment",
     "reading_commit",
@@ -444,6 +462,232 @@ def gate_handler(args: argparse.Namespace) -> int:
             )
         )
     return 0 if reading.met else 1
+
+
+#: The job name, in one place. `cli.py`, `components.yaml`'s row and the
+#: manifest schema's `job` enum are the three files
+#: `tests/test_components_registry.py` holds in lockstep, and the CLI table
+#: takes this constant rather than restating the string.
+GATE_CLOSE_JOB = "gate.close"
+
+#: What `gate.close` did about one phase, as a CLOSED vocabulary. Every
+#: registered phase gets exactly one of these on every run, so "this phase was
+#: not touched" is a stated outcome carrying its reason rather than a line
+#: nobody wrote. A seventh value is a design change, not a config value.
+CLOSE_OUTCOMES: tuple[str, ...] = (
+    "filed",
+    "already_filed",
+    "not_met",
+    "unmeasurable",
+    "replay",
+    "would_file",
+    "no_gate_registered",
+)
+
+#: The two outcomes that mean a durable record exists for the phase after this
+#: run — the value `closing_record_state_{phase}` reads 1.0 for.
+_RECORD_PRESENT = frozenset({"filed", "already_filed"})
+
+
+def _close_one_phase(
+    ctx: RunContext,
+    store: Store,
+    phase: Phase,
+    *,
+    store_uri: str,
+    dry_run: bool,
+) -> tuple[str, str]:
+    """Read ``phase``'s gate and file its closing record if one is due.
+
+    Returns ``(outcome, detail)`` — one member of :data:`CLOSE_OUTCOMES` and
+    the sentence a reader needs to act on it. It never returns a bare boolean:
+    "nothing was filed" has five distinct causes here and they call for
+    different actions, which is the whole reason the vocabulary is closed.
+
+    :func:`file_closing_record` remains the ONE writer. This function decides
+    nothing about MET-ness, liveness or the compare-and-swap — it re-derives
+    the outcome from the same three facts so the manifest can name which one
+    applied, and hands the write to the function `crucible gate` already uses.
+    A second implementation of the filing rule here is exactly the drift the
+    single-writer shape exists to prevent.
+    """
+    if phase.gate is None:
+        return (
+            "no_gate_registered",
+            f"{phase.tracker} has no registered gate, so there is no reading to file. "
+            "It renders UNMEASURED on the ladder; a gate is written for it, never "
+            "inferred.",
+        )
+    reading = evaluate(store, gate=phase.gate, trading_day=ctx.trading_day)
+    state = gate_state_for(reading)
+    key = closing_record_key(phase.id)
+    if state == "UNMEASURABLE":
+        names = ", ".join(c.name for c in reading.clauses if c.unmeasurable)
+        return (
+            "unmeasurable",
+            f"gate {phase.gate} could not be read: {names}. An unreadable clause is not "
+            "a phase falling short, and nothing is filed on one.",
+        )
+    if state != "MET":
+        met = sum(1 for c in reading.clauses if c.met)
+        return (
+            "not_met",
+            f"gate {phase.gate} reads {met}/{len(reading.clauses)} clauses met; "
+            f"{phase.tracker} has not exited.",
+        )
+    if ctx.run_mode != RUN_MODE_LIVE:
+        return (
+            "replay",
+            f"gate {phase.gate} reads MET on a {ctx.run_mode} of trading day "
+            f"{ctx.trading_day.isoformat()}. A replay of a historical day does not exit "
+            "a phase, so nothing is filed and nothing is posted to the tracker.",
+        )
+    if dry_run:
+        # Returned BEFORE the record is read, and before `file_closing_record`
+        # is reached at all. The store's read-only guard would refuse the
+        # write, but the tracker comment is posted FIRST and travels over a
+        # different wire — a run asked to change nothing would have left a real
+        # comment on a real issue before the guard ever fired.
+        return (
+            "would_file",
+            f"gate {phase.gate} reads MET. Re-run without --dry-run to post the reading "
+            f"to {phase.tracker} and file its closing record at {key}; --dry-run neither "
+            "writes nor comments, so this run says only that one is due.",
+        )
+    already = read_store_document(store, key)
+    # `already.problem` is deliberately NOT branched on here: a present but
+    # unreadable record is `file_closing_record`'s refusal to make, and it
+    # raises `UnreadableDocumentError` on the very next line rather than being
+    # overwritten. Reading it twice is cheap; owning the refusal twice is how
+    # the two copies drift.
+    file_closing_record(ctx, store, reading, store_uri=store_uri)
+    if already.absent:
+        return ("filed", f"closing record filed at {key} and the reading posted to {phase.tracker}")
+    return (
+        "already_filed",
+        f"closing record already at {key}; a phase exits once and this run left it "
+        "exactly as it was.",
+    )
+
+
+def gate_close_handler(args: argparse.Namespace) -> int:
+    """`crucible gate.close [--date YYYY-MM-DD]` — file every closing record due.
+
+    `alpha-engine-config-I10095`. The DETECTION half of the phase-exit loop was
+    closed by the daily board and the FILING half was not: a phase could read
+    MET for days with the record written only when somebody happened to run
+    `crucible gate`. This is that filing on a cadence — every registered phase,
+    every day, one manifest.
+
+    **It writes closing records and nothing else.** It does not write the dated
+    gate readings `crucible gate` writes, it does not render the ladder, and
+    its identity cannot: `crucible-v2-github-gate-close` grants
+    `crucible/gates/*/closing.json` and its own manifest prefix, so a bug that
+    tried to publish a gate reading from this job is an AccessDenied rather
+    than a grading surface quietly authoring what it grades.
+
+    **It exits 0 whenever the MEASUREMENT succeeded**, exactly as `gate` does,
+    and for the same reason one layer along: a phase that has not exited is not
+    a failed run, and a non-zero exit here would page daily on a working
+    producer until the channel was muted. What went wrong reaches a reader
+    through `status: failed` on the manifest — a store outage, a denied
+    tracker, an unreadable record all raise.
+    """
+    dry_run = bool(getattr(args, "dry_run", False))
+    store = open_store(getattr(args, "store", None), dry_run=dry_run)
+    store_uri = resolve_store_uri(getattr(args, "store", None))
+    lines: list[str] = []
+
+    def body(ctx: RunContext) -> None:
+        outcomes: dict[str, tuple[str, str]] = {}
+        for phase in PHASES:
+            outcomes[phase.id] = _close_one_phase(
+                ctx, store, phase, store_uri=store_uri, dry_run=dry_run
+            )
+        now = ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        source = manifest_key(GATE_CLOSE_JOB, ctx.trading_day.isoformat())
+        filed = [p for p, (outcome, _) in outcomes.items() if outcome == "filed"]
+        # A phase reading MET whose record is still absent AFTER this run. On a
+        # live run that is zero by construction; it is non-zero on a replay and
+        # under --dry-run, and those are the cases the number exists to name.
+        # Principle 7: the figure that says this job is working, on the surface
+        # it appears on, with `no data` never rendered as green.
+        pending = ("replay", "would_file")
+        unclosed = [p for p, (outcome, _) in outcomes.items() if outcome in pending]
+        for phase in PHASES:
+            outcome, detail = outcomes[phase.id]
+            lines.append(f"{phase.id} ({phase.tracker}): {outcome} — {detail}")
+            ctx.record_metric(
+                {
+                    "name": f"closing_record_state_{phase.id}",
+                    "module": "crucible.track_f",
+                    "metric_type": "gauge",
+                    "value": 1.0 if outcome in _RECORD_PRESENT else 0.0,
+                    "unit": "count",
+                    "n_floor": 1,
+                    "n_samples": 1,
+                    "status": "OK",
+                    "status_reason": f"{phase.tracker}: {outcome} — {detail}",
+                    "source_path": closing_record_key(phase.id),
+                    "last_updated_utc": now,
+                }
+            )
+        ctx.record_metric(
+            {
+                "name": "closing_records_filed",
+                "module": "crucible.track_f",
+                "metric_type": "gauge",
+                "value": float(len(filed)),
+                "unit": "count",
+                "n_floor": 1,
+                "n_samples": len(PHASES),
+                "status": "OK",
+                "status_reason": (
+                    f"{len(filed)} of {len(PHASES)} registered phases had a closing record "
+                    f"filed by this run: "
+                    + "; ".join(f"{p}={outcomes[p][0]}" for p in sorted(outcomes))
+                ),
+                "source_path": source,
+                "last_updated_utc": now,
+            }
+        )
+        ctx.record_metric(
+            {
+                "name": "phases_met_without_a_record",
+                "module": "crucible.track_f",
+                "metric_type": "gauge",
+                "value": float(len(unclosed)),
+                "unit": "count",
+                "n_floor": 1,
+                "n_samples": len(PHASES),
+                "status": "OK" if not unclosed else "FAIL",
+                "status_reason": (
+                    "every phase reading MET has a closing record"
+                    if not unclosed
+                    else f"{sorted(unclosed)} read MET with no record filed: "
+                    + "; ".join(f"{p}={outcomes[p][1]}" for p in sorted(unclosed))
+                ),
+                "source_path": source,
+                "last_updated_utc": now,
+            }
+        )
+        ctx.record_rows(rows_in=len(PHASES), rows_out=len(filed))
+
+    # `transient_retry` left at its default. A re-run of this job is safe by
+    # construction — the compare-and-swap and `post_closing_comment`'s read of
+    # the issue's existing comments make a second attempt file nothing and post
+    # nothing — which is the property that lets it run daily at all.
+    run_job(
+        GATE_CLOSE_JOB,
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        dry_run=dry_run,
+        run_mode=getattr(args, "run_mode", None),
+    )
+    for line in lines:
+        print(line)
+    return 0
 
 
 def gate_names() -> list[str]:
