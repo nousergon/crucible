@@ -166,6 +166,43 @@ def _clause(store: LocalStore, name: str):
     return next(c for c in result.clauses if c.name == name)
 
 
+class _CostExplorer:
+    """`list_cost_allocation_tags` speaking the real response shape.
+
+    `alpha-engine-config-I10076` deliverable 4: the tag clause reads Billing's
+    activation state live, so every test in this module that expects the
+    clause MET needs a Cost Explorer that says `Active` -- the module's autouse
+    fixture below supplies one, and the class at the bottom swaps in the
+    other answers.
+    """
+
+    def __init__(self, status: str | None = "Active", *, fail: Exception | None = None) -> None:
+        self.status = status
+        self.fail = fail
+
+    def list_cost_allocation_tags(self, **_request: Any) -> dict[str, Any]:
+        if self.fail is not None:
+            raise self.fail
+        if self.status is None:
+            return {"CostAllocationTags": []}
+        return {
+            "CostAllocationTags": [
+                {
+                    "TagKey": "system",
+                    "Status": self.status,
+                    "LastUpdatedDate": "2026-09-06T14:56:34Z",
+                }
+            ]
+        }
+
+
+@pytest.fixture(autouse=True)
+def _billing_has_the_key_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    import crucible.gate as gate_module  # noqa: PLC0415 - local to the fixture
+
+    monkeypatch.setattr(gate_module, "_ce_client", lambda: _CostExplorer("Active"))
+
+
 class _AccessDenied(LocalStore):
     """A store that refuses one key the way S3 refuses an unauthorised read."""
 
@@ -460,3 +497,57 @@ class TestV2ResourcesTaggedAndVersioned:
         clause = _clause(store, "v2_resources_tagged_and_versioned")
         assert clause.unmeasurable and not clause.met
         assert "about our access" in clause.detail
+
+
+class TestTheTagKeyMustBeActiveInBilling:
+    """`alpha-engine-config-I10076` deliverable 4. Measured 2026-09-06: every
+    resource carried `system=crucible-v2`, the store was versioned, this clause
+    read MET -- and Billing had never activated `system` as a cost-allocation
+    tag, so every tag-filtered dollar read `$0.00`. A tagged estate under an
+    inactive key has no denominator; the clause now reads the key's state."""
+
+    def _patch(self, monkeypatch: pytest.MonkeyPatch, ce: _CostExplorer) -> None:
+        import crucible.gate as gate_module  # noqa: PLC0415 - local to the test
+
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: ce)
+
+    def test_an_inactive_key_is_unmet_naming_the_activation_command(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        self._patch(monkeypatch, _CostExplorer("Inactive"))
+        clause = _clause(_seed(tmp_path, reading=_reading()), "v2_resources_tagged_and_versioned")
+        assert not clause.met and not clause.unmeasurable
+        assert "Inactive as a cost-allocation tag" in clause.detail
+        assert "update-cost-allocation-tags-status" in clause.detail
+
+    def test_a_key_billing_has_never_seen_is_unmet_too(self, tmp_path, monkeypatch) -> None:
+        self._patch(monkeypatch, _CostExplorer(None))
+        clause = _clause(_seed(tmp_path, reading=_reading()), "v2_resources_tagged_and_versioned")
+        assert not clause.met and not clause.unmeasurable
+        assert "absent as a cost-allocation tag" in clause.detail
+
+    def test_a_denied_activation_read_is_unmeasurable_naming_the_action(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        self._patch(monkeypatch, _CostExplorer(fail=PermissionError("AccessDenied")))
+        clause = _clause(_seed(tmp_path, reading=_reading()), "v2_resources_tagged_and_versioned")
+        assert clause.unmeasurable and not clause.met
+        assert "ce:ListCostAllocationTags" in clause.detail
+        assert "ce:ListCostAllocationTags" in clause.evidence
+
+    def test_an_active_key_reads_met_and_says_since_when(self, tmp_path) -> None:
+        clause = _clause(_seed(tmp_path, reading=_reading()), "v2_resources_tagged_and_versioned")
+        assert clause.met
+        assert "Active as a cost-allocation tag since 2026-09-06" in clause.detail
+
+    def test_the_activation_read_happens_only_after_the_filed_reading_passes(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """An unmet acceptance reading is reported as such; Billing is not
+        consulted for a deliverable the filed document already fails."""
+        self._patch(monkeypatch, _CostExplorer(fail=AssertionError("must not be called")))
+        clause = _clause(
+            _seed(tmp_path, reading=_reading(met=False)), "v2_resources_tagged_and_versioned"
+        )
+        assert not clause.met and not clause.unmeasurable
+        assert "not met" in clause.detail

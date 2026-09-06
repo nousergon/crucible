@@ -1344,7 +1344,12 @@ class TestPhaseZeroOldWeeklyCadence:
         assert legacy_weekly_executions_key(weekly_anchor(FRIDAY).isoformat()) in clause.detail
         assert not result.met
 
-    def test_two_quiet_weeks_meet_the_clause_and_the_gate(self, tmp_path) -> None:
+    def test_two_quiet_weeks_meet_the_clause_and_the_gate(self, tmp_path, monkeypatch) -> None:
+        from conftest import ActiveCostAllocationTag  # noqa: PLC0415 - local to the test
+
+        import crucible.gate as gate_module  # noqa: PLC0415 - local to the test
+
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: ActiveCostAllocationTag())
         result = evaluate(_seed_phase0_met(tmp_path), gate="phase0", trading_day=FRIDAY)
         assert _clause(result, "old_weekly_within_cadence").met
         assert result.met, result.render()
@@ -1804,10 +1809,17 @@ class TestPhaseZeroSaysWhatItDoesNotGrade:
         assert None not in graded
         assert graded <= {c.name for c in result.clauses}
 
-    def test_the_ladder_row_detail_carries_the_full_coverage_claim(self, tmp_path) -> None:
+    def test_the_ladder_row_detail_carries_the_full_coverage_claim(
+        self, tmp_path, monkeypatch
+    ) -> None:
         """A phase whose gate grades a SUBSET renders MET on the ladder and on
         the board with nothing saying so unless the row itself carries it. The
         subset is now the whole set, and the row still has to say which."""
+        from conftest import ActiveCostAllocationTag  # noqa: PLC0415 - local to the test
+
+        import crucible.gate as gate_module  # noqa: PLC0415 - local to the test
+
+        monkeypatch.setattr(gate_module, "_ce_client", lambda: ActiveCostAllocationTag())
         store = _seed_phase0_met(tmp_path)
         rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
         assert rows["phase0"]["state"] == "MET", rows["phase0"]["detail"]
