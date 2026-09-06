@@ -9,7 +9,7 @@ dependencies = [
     # First-party, PINNED not floored (fleet §139): the arena engine, the
     # arena_cycle contract and MetricRecord are consumed here, never
     # re-implemented (crucible_v2_rebuild_plan §4.4).
-    "nousergon-lib==0.124.108",
+    "nousergon-lib[github-app]==0.124.108",
     # Trading calendar, dual-date resolution, structured logging, alerts.
     "krepis==0.59.50",
     # Run-manifest schema validation. The schema is the enforcement surface

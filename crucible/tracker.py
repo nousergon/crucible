@@ -50,8 +50,11 @@ __all__ = [
     "API_ROOT",
     "HTTP_TIMEOUT_S",
     "ISSUE_STATES",
+    "TRACKER_APP_PERMISSIONS",
+    "TRACKER_APP_SSM_PREFIX_VAR",
     "TRACKER_TOKEN_VAR",
     "IssueRead",
+    "TrackerCredentialError",
     "TrackerError",
     "comment_bodies",
     "credential",
@@ -71,6 +74,23 @@ API_ROOT = "https://api.github.com"
 #: workflows means "the Actions token for `nousergon/crucible`" and cannot
 #: read the tracker at all.
 TRACKER_TOKEN_VAR = "CRUCIBLE_TRACKER_TOKEN"
+
+#: The variable naming the SSM prefix under which the fleet's GitHub App
+#: credentials live (`{prefix}github_app_id`, `_installation_id`,
+#: `_private_key`). When set, the adapter mints a SHORT-LIVED installation
+#: token narrowed to `issues: write` through `nousergon_lib.github_app`
+#: rather than reading a long-lived personal token from the environment. The
+#: App is the fleet's existing `ne-groomer`, installed org-wide with Issues:
+#: write — no second credential is minted or stored anywhere for this. An
+#: explicit `CRUCIBLE_TRACKER_TOKEN` still wins when both are set (a laptop
+#: run with a token in hand), and the prefix is a repository VARIABLE, not a
+#: secret: it names where the credentials are, never what they are, and this
+#: tree carries no infrastructure identifier of its own.
+TRACKER_APP_SSM_PREFIX_VAR = "CRUCIBLE_TRACKER_APP_SSM_PREFIX"
+
+#: The narrowing requested at mint time. The installation holds more; the
+#: token this adapter uses holds exactly what its two calls need.
+TRACKER_APP_PERMISSIONS: dict[str, str] = {"issues": "write"}
 
 #: Seconds. A daily render blocked forever on a hung socket is an absence
 #: page on a working producer.
@@ -97,31 +117,81 @@ class TrackerError(RuntimeError):
     """
 
 
-def grant_command(repo: str) -> str:
-    """The exact operator command that grants this adapter its credential.
+class TrackerCredentialError(TrackerError):
+    """The App-minted credential was CONFIGURED and could not be produced.
 
-    One sentence of shell, emitted verbatim onto every surface that is red for
-    want of it. An operator step recorded in an issue and nowhere else is
-    `alpha-engine-config-I1906`, closed as *fixed* on a PR whose command was
-    never run.
+    Distinct from "no credential" (:func:`credential` returning ``None``):
+    a prefix that is set and an SSM read or a GitHub mint that then fails is
+    a statement about this identity's grant or the App's health, and it is
+    reported with its cause rather than rendered as the same absence an
+    unconfigured laptop shows.
     """
+
+
+def grant_command(repo: str) -> str:
+    """The exact operator step that grants this adapter its credential.
+
+    Emitted verbatim onto every surface that is red for want of it. An
+    operator step recorded in an issue and nowhere else is
+    `alpha-engine-config-I1906`, closed as *fixed* on a PR whose command was
+    never run. The grant is the crucible-v2 stack's BoardRole reading the
+    fleet App's three SSM parameters (nous-ergon-ops, `Crucible v2 Stack`
+    workflow) plus the repository variable that names their prefix; a
+    long-lived token in `CRUCIBLE_TRACKER_TOKEN` is the laptop override, not
+    the grant.
+    """
+    # Short on purpose: it is rendered on six board rows and inside a
+    # Telegram message that truncates.
     return (
-        f"gh secret set {TRACKER_TOKEN_VAR} --repo nousergon/crucible --body '<token>', "
-        f"where <token> is a fine-grained personal access token scoped to {repo} "
-        "with Issues: read and write and no other permission"
+        f"set repo variable {TRACKER_APP_SSM_PREFIX_VAR} to the fleet GitHub App's SSM "
+        "prefix and apply the crucible-v2 stack (BoardRole reads {prefix}github_app_*; "
+        f"the App holds Issues: write on {repo}); laptop: export {TRACKER_TOKEN_VAR}"
     )
 
 
 def credential(explicit: str | None = None) -> str | None:
     """The tracker credential, or ``None`` when none is granted.
 
-    ``None`` is a first-class answer and every caller renders it as a named
-    absence. It is never defaulted to the Actions token: `GITHUB_TOKEN` is
-    scoped to the repository the workflow runs in, so falling back to it would
-    turn "no grant" into a 404 that reads like a deleted issue.
+    Resolution, in order: an explicit argument; `CRUCIBLE_TRACKER_TOKEN` in
+    the environment; a short-lived installation token minted from the fleet
+    GitHub App when `CRUCIBLE_TRACKER_APP_SSM_PREFIX` is set. ``None`` is a
+    first-class answer and every caller renders it as a named absence. It is
+    never defaulted to the Actions token: `GITHUB_TOKEN` is scoped to the
+    repository the workflow runs in, so falling back to it would turn "no
+    grant" into a 404 that reads like a deleted issue.
+
+    Raises :class:`TrackerCredentialError` when the prefix is set and the
+    mint fails — configured-and-broken is not the same fact as absent.
     """
     value = (explicit if explicit is not None else os.environ.get(TRACKER_TOKEN_VAR)) or ""
-    return value.strip() or None
+    if value.strip():
+        return value.strip()
+    prefix = (os.environ.get(TRACKER_APP_SSM_PREFIX_VAR) or "").strip()
+    if not prefix:
+        return None
+    return _mint_from_app(prefix)
+
+
+def _mint_from_app(prefix: str) -> str:
+    """A short-lived installation token narrowed to this adapter's two calls."""
+    from nousergon_lib.github_app import (  # noqa: PLC0415 - lazy: boto3 + SSM, one call site
+        GitHubAppTokenError,
+        installation_token,
+    )
+
+    try:
+        return installation_token(ssm_prefix=prefix, permissions=dict(TRACKER_APP_PERMISSIONS))
+    except GitHubAppTokenError as exc:
+        raise TrackerCredentialError(
+            f"{TRACKER_APP_SSM_PREFIX_VAR}={prefix!r} is set but no installation token could "
+            f"be minted from the App credentials there: {exc}. A statement about this "
+            "identity's SSM grant or the App, not an absent credential."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - re-raised with the cause named
+        raise TrackerCredentialError(
+            f"{TRACKER_APP_SSM_PREFIX_VAR}={prefix!r} is set but minting raised "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -188,13 +258,19 @@ def read_issue(
     opener: Opener | None = None,
 ) -> IssueRead:
     """Whether tracker issue ``issue`` is open or closed. Never raises."""
-    granted = credential(token)
+    try:
+        granted = credential(token)
+    except TrackerCredentialError as exc:
+        return IssueRead(None, str(exc), access_problem=True)
     if granted is None:
+        # Compact on purpose: rendered on six board rows inside a 4096-char
+        # Telegram budget (`crucible.morning`), where a longer sentence here
+        # pushes another row's line out of the message. The grant itself is
+        # carried once, on each row's `means_when_red`, not repeated here.
         return IssueRead(
             None,
-            f"no tracker credential: ${TRACKER_TOKEN_VAR} is unset, so this render could "
-            f"not ask {repo} whether the issue is open or closed. Grant it with: "
-            f"{grant_command(repo)}",
+            f"no tracker credential (${TRACKER_APP_SSM_PREFIX_VAR} and ${TRACKER_TOKEN_VAR} "
+            f"unset): could not ask {repo} whether the issue is open or closed",
             access_problem=True,
         )
     try:
@@ -242,10 +318,11 @@ def comment_bodies(
     need more pages raises rather than truncating — a phase issue with over a
     thousand comments is a fact worth failing on, not one worth guessing past.
     """
-    granted = credential(token)
+    granted = credential(token)  # a configured-and-broken mint raises TrackerCredentialError
     if granted is None:
         raise TrackerError(
-            f"no tracker credential: ${TRACKER_TOKEN_VAR} is unset, so this run cannot read "
+            f"no tracker credential: neither ${TRACKER_APP_SSM_PREFIX_VAR} nor "
+            f"${TRACKER_TOKEN_VAR} is set, so this run cannot read "
             f"the comments already on {repo}#{issue} and cannot tell whether the closing "
             f"reading has been posted. Grant it with: {grant_command(repo)}"
         )
@@ -296,10 +373,11 @@ def post_comment(
     close, reopen, label, assign or edit: a machine comment is a record, and
     the state of a phase issue is Brian's to set.
     """
-    granted = credential(token)
+    granted = credential(token)  # a configured-and-broken mint raises TrackerCredentialError
     if granted is None:
         raise TrackerError(
-            f"no tracker credential: ${TRACKER_TOKEN_VAR} is unset, so the closing reading "
+            f"no tracker credential: neither ${TRACKER_APP_SSM_PREFIX_VAR} nor "
+            f"${TRACKER_TOKEN_VAR} is set, so the closing reading "
             f"for {repo}#{issue} cannot be posted. It is not filed to the store either — "
             "a record in one place and not the other is the two-instruments-disagreeing "
             f"defect this mechanism removes. Grant it with: {grant_command(repo)}"

@@ -198,7 +198,7 @@ class TestTheTrackerReadNeverRaises:
         read = tracker_module.read_issue(TRACKER_REPO, 9757)
         assert read.state is None
         assert read.access_problem is True
-        assert "gh secret set" in read.problem
+        assert tracker_module.TRACKER_APP_SSM_PREFIX_VAR in read.problem
         assert TRACKER_REPO in read.problem
 
     @pytest.mark.parametrize(
@@ -288,7 +288,7 @@ class TestTheCommentListingIsStrict:
 
     def test_a_missing_credential_raises_on_the_write_path(self, monkeypatch) -> None:
         _revoked(monkeypatch)
-        with pytest.raises(TrackerError, match="gh secret set"):
+        with pytest.raises(TrackerError, match="CRUCIBLE_TRACKER_APP_SSM_PREFIX"):
             tracker_module.comment_bodies(TRACKER_REPO, 9757)
 
 
@@ -489,7 +489,7 @@ class TestTheRecordIsWrittenOnceFromAMetLiveReading:
         nothing would ever correct."""
         _revoked(monkeypatch)
         store = LocalStore(tmp_path)
-        with pytest.raises(TrackerError, match="gh secret set"):
+        with pytest.raises(TrackerError, match="CRUCIBLE_TRACKER_APP_SSM_PREFIX"):
             _file(store, _reading(met=True), monkeypatch, responses=())
         assert not store.exists(closing_record_key("phase1"))
 
@@ -560,7 +560,7 @@ class TestTheBoardRendersAPhaseClosedWithNoRecord:
         row = rows["phase:phase1:closing"]
         assert row.state == "UNMEASURABLE"
         assert row.red is True
-        assert "gh secret set" in row.detail
+        assert tracker_module.TRACKER_APP_SSM_PREFIX_VAR in row.detail
 
     def test_a_filed_record_on_a_closed_issue_is_met(self, tmp_path, monkeypatch) -> None:
         _granted(monkeypatch)
