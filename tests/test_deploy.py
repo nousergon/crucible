@@ -402,9 +402,7 @@ class TestFlip:
             )
         assert current_release(store) is None
 
-    def test_a_smoke_manifest_with_no_smoked_extras_field_refuses_the_flip(
-        self, tmp_path
-    ) -> None:
+    def test_a_smoke_manifest_with_no_smoked_extras_field_refuses_the_flip(self, tmp_path) -> None:
         """Absence must not read as coverage: a manifest from before this
         field existed at all — no `smoked_extras` key anywhere — must refuse
         exactly like one that names an incomplete set."""
@@ -851,8 +849,7 @@ class TestTheWorkflowItself:
         smoke = next(i for i, s in enumerate(names) if "crucible smoke" in s)
         script = self._release_steps(workflow)[install_proof]["run"]
         assert "tomllib" in script and "optional-dependencies" in script, (
-            "the extras must be DERIVED from pyproject.toml, not hardcoded as a "
-            "restated literal"
+            "the extras must be DERIVED from pyproject.toml, not hardcoded as a restated literal"
         )
         assert '"[arcticdb]"' not in script and "[arcticdb]" not in script, (
             "the extra name must never be restated as a literal in the workflow — "

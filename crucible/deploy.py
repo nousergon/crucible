@@ -66,6 +66,7 @@ __all__ = ["main"]
 
 _UNKNOWN_SHA = "0" * 40
 
+
 def _required_smoke_extras() -> frozenset[str]:
     """The extra names a released wheel must be installed with before the
     flip may trust its smoke.
