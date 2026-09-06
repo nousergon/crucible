@@ -37,10 +37,10 @@ from typing import TYPE_CHECKING, Any
 
 from jsonschema import Draft202012Validator
 
-from crucible.alerts import pages_in_range
+from crucible.alerts import PAGE_CONDITIONS, pages_in_range
 from crucible.calendar import TRADING_DAYS_PER_WEEK, is_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
-from crucible.documents import DocumentRead
+from crucible.documents import DocumentRead, read_manifests_under
 from crucible.documents import read_path_document as _read_path_document
 from crucible.documents import read_store_document as _read_store_document
 from crucible.keys import (
@@ -53,7 +53,9 @@ from crucible.keys import (
     gate_prefix,
     legacy_dead_lambdas_key,
     legacy_weekly_executions_key,
+    manifest_prefix,
     parse_acceptance_reading,
+    parse_bus_key,
     review_key,
     review_prefix,
     runs_prefix,
@@ -3233,6 +3235,170 @@ def _clause_pages_within_ceiling(store: Store, window: list[dt.date]) -> Clause:
     )
 
 
+def _job_stood_down(store: Store, job: str, trading_day: str) -> tuple[bool, str | None]:
+    """Whether ``job``'s manifests for ``trading_day`` now include an `ok` one.
+
+    Returns ``(stood_down, problem)``. A prefix that could not be listed is a
+    problem naming the prefix, never "not stood down": the difference between
+    "the rerun did not happen" and "we could not see whether it did" is the
+    whole of this clause's honesty.
+    """
+    prefix = manifest_prefix(job, trading_day)
+    listed = read_manifests_under(store, prefix)
+    if listed.listing_problem is not None:
+        return False, f"{prefix}: {listed.listing_problem}"
+    for _key, manifest in listed.documents:
+        if manifest.get("status") == "ok":
+            return True, None
+    return False, None
+
+
+def _clause_pages_commissioned(store: Store) -> Clause:
+    """Plan §9.3 "Commissioning" (a phase-2 exit-gate row): each page condition
+    induced for real before it is trusted — fired, DELIVERED, and STOOD DOWN.
+
+    The plan names the inducing means ("a forced failure and a withheld
+    manifest"). This clause grades the OUTCOME those means exist to produce,
+    read from the alert bus and the manifests, so a condition that fired on a
+    genuine defect counts — and counts for more, since nothing about the
+    condition was arranged. Measured 2026-09-06 on the production store:
+    `failure.weekly@2026-09-04` (the first scheduled Saturday died on a
+    missing IAM prefix) was delivered to `operator_chat` and stood down when
+    the replay wrote an `ok` manifest; `absence@2026-09-04` (five arc stages
+    past deadline) was delivered and stood down when the five manifests were
+    written. Both conditions had therefore been commissioned by the real
+    system a day before anyone forced them, and a clause that only counted a
+    forced one would have read UNMET over that evidence.
+
+    Three facts per condition, each from a durable artifact and none from a
+    test double:
+
+    1. **Fired** — a bus row under `alerts/{day}/{incident}.json` whose
+       `condition` is this one. The bus is the machine-readable record §9.3
+       requires; the transport's own log is not read.
+    2. **Delivered** — that row's `sent` is `True`. `sent` records what the
+       transport actually did, dedup- and mute-suppression subtracted
+       (`crucible.alerts._transport_outcome`); a row with `sent: false` is a
+       page that never left and proves the condition, not the path.
+    3. **Stood down** — every member job named on the row now has an `ok`
+       manifest for that trading day. Absence stands down when the manifest
+       appears; failure stands down when a rerun overwrites the failed one.
+       A condition that fired and was never cleared is an open incident, not
+       a commissioned detector: the plan's row ends "and stood down".
+
+    UNMEASURABLE when the sweep has never run (an empty bus beside no sweep
+    is no data) or a listing could not be read. A row that is not an object,
+    or names a condition this module does not know, is a malformed artifact
+    and is reported in the detail rather than silently skipped; it never
+    counts toward MET.
+
+    Not windowed. Commissioning happens once per condition and stays true;
+    re-reading it every render is what makes a later deletion of the bus
+    visible, but the trailing window the other phase-2 clauses use would
+    make a detector commissioned three weeks ago read as never commissioned.
+    """
+    name = "pages_commissioned"
+    requirement = (
+        "each page condition ("
+        + ", ".join(PAGE_CONDITIONS)
+        + ") has fired for real, been delivered (bus row `sent: true`) and stood down "
+        "(every member job's manifest for that trading day now reads ok)"
+    )
+    sweeps = _list_store_keys(store, runs_prefix("alerts.sweep"))
+    if sweeps.problem is not None:
+        return _unmeasurable(name, requirement, sweeps.problem, (runs_prefix("alerts.sweep"),))
+    if not sweeps.keys:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"no `alerts.sweep` manifest exists under {runs_prefix('alerts.sweep')}, so "
+            "nothing has ever evaluated either page condition. Nothing to commission",
+            (runs_prefix("alerts.sweep"),),
+        )
+    rows = _list_store_keys(store, ALERTS_ROOT)
+    if rows.problem is not None:
+        return _unmeasurable(name, requirement, rows.problem, (ALERTS_ROOT,))
+
+    stood_down: dict[str, list[str]] = {c: [] for c in PAGE_CONDITIONS}
+    still_open: dict[str, list[str]] = {c: [] for c in PAGE_CONDITIONS}
+    undelivered: dict[str, list[str]] = {c: [] for c in PAGE_CONDITIONS}
+    problems: list[str] = []
+    access: list[str] = []
+    for key in rows.keys:
+        parsed = parse_bus_key(key)
+        if parsed is None:
+            continue
+        day = parsed[0]
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            (access if read.access_problem else problems).append(read.problem)
+            continue
+        row = read.document or {}
+        condition = row.get("condition")
+        if condition not in PAGE_CONDITIONS:
+            problems.append(f"{key}: condition {condition!r} is not one of {PAGE_CONDITIONS}")
+            continue
+        if row.get("sent") is not True:
+            undelivered[condition].append(key)
+            continue
+        problem = _field(key, row, "members", list)
+        if problem is not None:
+            problems.append(problem)
+            continue
+        jobs = sorted({str(m.get("job")) for m in row["members"] if isinstance(m, dict)})
+        if not jobs:
+            problems.append(f"{key}: `members` names no job")
+            continue
+        open_jobs: list[str] = []
+        for job in jobs:
+            down, why = _job_stood_down(store, job, day)
+            if why is not None:
+                access.append(why)
+            if not down:
+                open_jobs.append(job)
+        if open_jobs:
+            still_open[condition].append(f"{key} ({', '.join(open_jobs)} not yet ok)")
+        else:
+            stood_down[condition].append(key)
+
+    met = all(stood_down[c] for c in PAGE_CONDITIONS)
+    if not met and access:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"{len(access)} read(s) could not be made, so at least one condition's standing-"
+            "down could not be graded: " + " | ".join(sorted(access)[:3]),
+            tuple(sorted(a.split(":")[0] for a in access)),
+        )
+    parts: list[str] = []
+    for condition in PAGE_CONDITIONS:
+        if stood_down[condition]:
+            parts.append(
+                f"{condition}: commissioned by {sorted(stood_down[condition])[0]}"
+                + (
+                    f" (+{len(stood_down[condition]) - 1} more)"
+                    if len(stood_down[condition]) > 1
+                    else ""
+                )
+            )
+        elif still_open[condition]:
+            parts.append(
+                f"{condition}: delivered but not stood down: "
+                + "; ".join(sorted(still_open[condition])[:2])
+            )
+        elif undelivered[condition]:
+            parts.append(
+                f"{condition}: fired but never delivered (`sent: false`): "
+                + ", ".join(sorted(undelivered[condition])[:2])
+            )
+        else:
+            parts.append(f"{condition}: has never fired")
+    if problems:
+        parts.append(f"{len(problems)} malformed bus row(s) ignored: {sorted(problems)[0]}")
+    evidence = tuple(sorted(k for c in PAGE_CONDITIONS for k in stood_down[c]))
+    return Clause(name, requirement, met, "; ".join(parts), evidence)
+
+
 #: Complete days whose TOTAL is graded against the monthly ceiling
 #: (`alpha-engine-config-I9927`): the ceiling's own period, so a weekly batch
 #: lands in the window four or five times and a month-boundary accrual once,
@@ -3566,6 +3732,7 @@ def _phase2(
         _clause_replays_ok(store, window, registry),
         _clause_zero_human_mutating_calls(window),
         _clause_pages_within_ceiling(store, window),
+        _clause_pages_commissioned(store),
         _clause_aws_cost_within_ceiling(
             window, name="aws_cost_within_ceiling", ceiling_usd=PHASE2_MAX_TAGGED_USD, tagged=True
         ),
