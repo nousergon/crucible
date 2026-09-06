@@ -346,12 +346,17 @@ def _record(args: argparse.Namespace, store: Store) -> int:
     declared: a deploy that reported itself ok while the pointer had not moved
     would be the degraded-SUCCEEDED this whole system refuses.
 
-    Reads the pointer through the GUARDED face (`read_store_document`), not
-    `current_release`/`load_store_document`'s STRICT one
-    (alpha-engine-config-I9945): this step is the one job designed to always
-    record, under `if: always()`, so a corrupt `releases/current` must become
-    a `status: failed` manifest naming the fault — never a raise that leaves
-    the deploy that observed the corruption with no manifest at all.
+    Reads BOTH the pointer and the smoke manifest through the GUARDED face
+    (`read_store_document`), never `current_release`/`load_store_document`'s
+    STRICT one (alpha-engine-config-I9945): this step is the one job
+    designed to always record, under `if: always()`, so a corrupt
+    `releases/current` OR a corrupt smoke manifest must become a
+    `status: failed` manifest naming the fault — never a raise that leaves
+    the deploy that observed the corruption with no manifest at all. A
+    document that is simply ABSENT (no smoke ever ran because an earlier
+    step failed first) is not a fault here — only a present-but-unreadable
+    one is: that is the one case a raise would have propagated instead of
+    being recorded.
     """
     now = dt.datetime.now(dt.UTC)
     trading_day = resolve_trading_day(now)
@@ -362,11 +367,23 @@ def _record(args: argparse.Namespace, store: Store) -> int:
         if pointer_fault is None and pointer_read.document is not None
         else None
     )
-    ok = args.outcome == "success" and pointer_fault is None and promoted == args.sha
+    smoke_key = manifest_key("smoke", trading_day.isoformat())
+    smoke_read = read_store_document(store, smoke_key)
+    smoke_fault = (
+        smoke_read.problem if smoke_read.document is None and not smoke_read.absent else None
+    )
+    ok = (
+        args.outcome == "success"
+        and pointer_fault is None
+        and smoke_fault is None
+        and promoted == args.sha
+    )
     reason = ""
     if not ok:
         if pointer_fault is not None:
             reason = f"releases/current is unreadable: {pointer_fault}. See {args.run_url}"
+        elif smoke_fault is not None:
+            reason = f"{smoke_key} is unreadable: {smoke_fault}. See {args.run_url}"
         else:
             reason = (
                 f"deploy outcome={args.outcome!r}; releases/current is "
