@@ -26,8 +26,11 @@ def test_the_s3_client_is_an_s3_client() -> None:
     assert client.meta.service_model.service_name == "s3"
 
 
-def test_the_cost_explorer_client_is_a_cost_explorer_client() -> None:
-    client = gate_module._ce_client()
+def test_the_cost_explorer_client_is_a_cost_explorer_client(no_live_cost_explorer) -> None:
+    # The autouse fixture replaces `_ce_client` with a refusal so no test
+    # reaches Cost Explorer by accident; it hands back the real constructor
+    # for exactly this assertion, which builds a client and calls nothing.
+    client = no_live_cost_explorer()
     assert client.meta.service_model.service_name == "ce"
 
 

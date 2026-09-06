@@ -2435,8 +2435,10 @@ def _clause_v2_resources_tagged_and_versioned(
     """
     requirement = (
         f"the most recent §2 acceptance reading in the window reports "
-        f"`{V2_TAG_ACCEPTANCE_CLAUSE_ID}` MET by name, and reports the store bucket's S3 "
-        f"versioning status as `{V2_STORE_VERSIONING_ENABLED}`"
+        f"`{V2_TAG_ACCEPTANCE_CLAUSE_ID}` MET by name, reports the store bucket's S3 "
+        f"versioning status as `{V2_STORE_VERSIONING_ENABLED}`, and Billing has `{TAG_KEY}` "
+        "Active as a cost-allocation tag (a tagged estate under an inactive key has a $0.00 "
+        "denominator)"
     )
     sessions = _session_span(_weekly_anchors(window), trading_day)
     if not sessions:
@@ -2512,13 +2514,53 @@ def _clause_v2_resources_tagged_and_versioned(
                 f"{key} (commit {reading.commit}): " + "; ".join(failures),
                 tuple(evidence),
             )
+        # The third half (`alpha-engine-config-I10076` deliverable 4): a fully
+        # tagged, versioned estate whose tag KEY Billing has not activated as
+        # a cost-allocation tag has a denominator of exactly $0.00 for every
+        # dollar clause above it -- measured 2026-09-06, when `system` read
+        # `Inactive` while every resource carried it and phase 2's cost row
+        # read UNMEASURABLE for a week. Read live from Cost Explorer, the same
+        # identity and the same `_ce_client` the dollar clauses use, so a
+        # later deactivation reads RED here rather than as a $0.00 elsewhere.
+        try:
+            activation = cost_allocation_tag_status(_ce_client())
+        except Exception as exc:  # noqa: BLE001 - a reading; the cause is the detail
+            # `CostAllocationTagUnreadableError` from the read itself, or
+            # whatever constructing the client raised (no credentials, no
+            # region) -- both are statements about our side of the boundary
+            # and both render UNMEASURABLE with the cause, never `Inactive`.
+            return Clause(
+                "v2_resources_tagged_and_versioned",
+                requirement,
+                False,
+                f"{key} (commit {reading.commit}): `{V2_TAG_ACCEPTANCE_CLAUSE_ID}` met and "
+                f"store versioning {reading.store_versioning}; whether `{TAG_KEY}` is "
+                f"activated as a cost-allocation tag could not be read "
+                f"(ce:ListCostAllocationTags): {type(exc).__name__}: {exc}",
+                (*evidence, "ce:ListCostAllocationTags"),
+                unmeasurable=True,
+            )
+        if not activation.active:
+            return Clause(
+                "v2_resources_tagged_and_versioned",
+                requirement,
+                False,
+                f"{key} (commit {reading.commit}): `{V2_TAG_ACCEPTANCE_CLAUSE_ID}` met and "
+                f"store versioning {reading.store_versioning}, but `{TAG_KEY}` is "
+                f"{activation.status} as a cost-allocation tag in Billing -- every resource "
+                "carries the tag and Cost Explorer indexes none of it. Activate it with "
+                "`aws ce update-cost-allocation-tags-status --cost-allocation-tags-status "
+                f"TagKey={TAG_KEY},Status=Active`",
+                (*evidence, "ce:ListCostAllocationTags"),
+            )
         return Clause(
             "v2_resources_tagged_and_versioned",
             requirement,
             True,
-            f"{key} (commit {reading.commit}): `{V2_TAG_ACCEPTANCE_CLAUSE_ID}` met and "
-            f"store versioning {reading.store_versioning}",
-            tuple(evidence),
+            f"{key} (commit {reading.commit}): `{V2_TAG_ACCEPTANCE_CLAUSE_ID}` met, "
+            f"store versioning {reading.store_versioning}, `{TAG_KEY}` Active as a "
+            f"cost-allocation tag since {activation.last_updated_date or 'an unknown date'}",
+            (*evidence, "ce:ListCostAllocationTags"),
         )
     detail = (
         f"no §2 acceptance reading in {sessions[0].isoformat()}..{trading_day.isoformat()} "

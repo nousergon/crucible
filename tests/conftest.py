@@ -102,6 +102,49 @@ def declared_run_mode(monkeypatch):
     monkeypatch.setenv(RUN_MODE_ENV, RUN_MODE_LIVE)
 
 
+class ActiveCostAllocationTag:
+    """A Cost Explorer stand-in whose `system` key reads `Active`.
+
+    The phase-0 tag clause reads Billing's activation state live
+    (`alpha-engine-config-I10076` deliverable 4); a test that expects phase 0
+    MET supplies this through `crucible.gate._ce_client`. The autouse fixture
+    below makes the default REFUSE, so no test constructs a real client.
+    """
+
+    def list_cost_allocation_tags(self, **_request) -> dict:
+        return {
+            "CostAllocationTags": [
+                {"TagKey": "system", "Status": "Active", "LastUpdatedDate": "2026-09-06T14:56:34Z"}
+            ]
+        }
+
+
+@pytest.fixture(autouse=True)
+def no_live_cost_explorer(monkeypatch):
+    """No test reaches Cost Explorer by accident.
+
+    Measured 2026-09-06: two phase-0 tests reached the real API through the
+    laptop's default identity and read `AccessDeniedException` -- a suite
+    whose result depends on the developer's AWS credentials is not a suite.
+    `crucible.gate._ce_client` refuses here; a test that needs a reading
+    patches it with `ActiveCostAllocationTag()` or its own stand-in.
+    """
+    import crucible.gate as gate_module  # noqa: PLC0415 - local to the fixture
+
+    def _refuse():
+        raise RuntimeError(
+            "tests must not construct a real Cost Explorer client; patch "
+            "crucible.gate._ce_client (tests/conftest.py::ActiveCostAllocationTag is "
+            "the Active stand-in)"
+        )
+
+    original = gate_module._ce_client
+    monkeypatch.setattr(gate_module, "_ce_client", _refuse)
+    # The real constructor, for the one test that asserts what it builds
+    # (`tests/test_gate_lazy_clients.py`) without calling the API.
+    return original
+
+
 @pytest.fixture(autouse=True)
 def no_tracker_credential(monkeypatch):
     """No test reaches GitHub by accident.
