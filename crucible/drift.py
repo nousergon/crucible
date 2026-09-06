@@ -350,6 +350,7 @@ def drift_metrics(
     ic_decay_by_horizon: dict[int, float],
     now: dt.datetime | None = None,
     unmeasured_reasons: dict[str, str] | None = None,
+    feature_method_by_name: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """The three MetricRecords, one per cycle. §10 component 5.
 
@@ -357,6 +358,15 @@ def drift_metrics(
     the producer's own statement of WHY a value is absent, carried onto the
     `UNREPORTED` row's `status_reason` so the console shows "no settled
     horizon yet" rather than the generic "nothing was measured".
+
+    ``feature_method_by_name`` — per feature, which of `drift_inputs`'s two
+    comparisons produced its PSI (cross-sectional vs along-time,
+    `alpha-engine-config-I10071`). Named on the worst feature's `detail` so a
+    reader of the row alone — not just the input document — can tell a
+    genuine cross-sectional shift from a market-wide column read along time.
+    Optional and defaulted to `{}` rather than required: a caller against an
+    older `drift_inputs` document that predates `method_by_feature` still
+    gets three valid records, with the method simply unnamed.
 
     Three and exactly three: the plan names them, and a drift module that
     grows a row per feature is the 185-rule fleet again with a different
@@ -374,6 +384,7 @@ def drift_metrics(
     moment = now or dt.datetime.now(dt.UTC)
     day = trading_day.isoformat()
     reasons = unmeasured_reasons or {}
+    methods = feature_method_by_name or {}
 
     worst_feature, worst_value = (
         max(feature_psi_by_name.items(), key=lambda kv: kv[1])
@@ -385,6 +396,7 @@ def drift_metrics(
         if ic_decay_by_horizon
         else (None, None)
     )
+    worst_feature_method = methods.get(worst_feature) if worst_feature is not None else None
 
     records = [
         _record(
@@ -402,7 +414,8 @@ def drift_metrics(
             source_path=f"drift/{day}/features.json",
             detail=(
                 f"Worst of {len(feature_psi_by_name)} feature(s): "
-                f"{worst_feature} at {worst_value:.4f}."
+                f"{worst_feature} at {worst_value:.4f}"
+                + (f" ({worst_feature_method})." if worst_feature_method else ".")
                 if worst_feature is not None
                 else reasons.get("features", "No features were compared, so nothing was measured.")
             ),

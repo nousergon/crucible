@@ -17,6 +17,7 @@ import random
 import pytest
 
 from crucible.data.daily import run_daily
+from crucible.drift import BANDS
 from crucible.drift_inputs import (
     DRIFT_INPUT_SCHEMA_VERSION,
     compute_drift_inputs,
@@ -112,6 +113,119 @@ class TestFeaturesInput:
         assert features_key(DEFAULT_FEATURE_VERSION, cycle_date.isoformat()) in computed.sources
         for day in days[:-1]:
             assert features_key(DEFAULT_FEATURE_VERSION, day.isoformat()) in computed.sources
+
+
+class TestMarketWideVsCrossSectional:
+    """`alpha-engine-config-I10071`: a market-wide column (one value repeated
+    across every ticker on a day, by declared construction) is compared
+    ALONG TIME against the trailing window's daily values, never as a
+    cross-section against pooled cross-sections — the latter reads a point
+    mass against 1-20 pooled point masses and BREACHES whatever the market
+    did. A synthetic fixture panel, not the real catalogue, so the reference
+    and current values are exact numbers this test controls."""
+
+    #: A tiny catalogue: one market-wide column, one cross-sectional column,
+    #: both real names from `crucible.features.CATALOG` (so `market_wide` is
+    #: read off the SAME declaration production reads) but with the rest of
+    #: the catalogue absent from the fixture frames on purpose — a smaller,
+    #: exact fixture rather than the full synthetic price panel.
+    _TICKERS = ("T000", "T001", "T002", "T003", "T004")
+
+    def _write_day(
+        self, store, day: dt.date, *, market_return: float, close_by_ticker: list[float]
+    ) -> None:
+        import pandas as pd
+
+        frame = pd.DataFrame(
+            {
+                "ticker": list(self._TICKERS),
+                "close_raw": close_by_ticker,
+                # Identical for every ticker, by construction — the market-wide
+                # shape this fixture exists to exercise.
+                "market_return_1d_log_return": [market_return] * len(self._TICKERS),
+            }
+        )
+        store.put_bytes(features_key(DEFAULT_FEATURE_VERSION, day.isoformat()), frame.to_parquet())
+
+    def test_a_market_wide_column_at_an_ordinary_value_reads_ok(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        from conftest import sessions_ending
+
+        days = sessions_ending(FRIDAY, 21)
+        # Small daily returns clustered near zero, and today's value sits
+        # inside that same cluster — an ordinary trading day, not a regime
+        # shift.
+        rng = random.Random(11)
+        for i, day in enumerate(days[:-1]):
+            self._write_day(
+                store,
+                day,
+                market_return=rng.gauss(0.0003, 0.0009),
+                close_by_ticker=[100.0 + i + t for t in range(len(self._TICKERS))],
+            )
+        self._write_day(
+            store,
+            days[-1],
+            market_return=0.0004,
+            close_by_ticker=[103.0, 104.0, 105.0, 106.0, 107.0],
+        )
+        doc = compute_drift_inputs(store, days[-1]).features
+        assert doc["method_by_feature"]["market_return_1d_log_return"].startswith("along-time")
+        assert (
+            doc["psi_by_feature"]["market_return_1d_log_return"]
+            < BANDS["feature_psi_max_ratio"].watch
+        ), doc
+
+    def test_a_market_wide_column_with_a_regime_jump_reads_breach(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        from conftest import sessions_ending
+
+        days = sessions_ending(FRIDAY, 21)
+        rng = random.Random(11)
+        for i, day in enumerate(days[:-1]):
+            self._write_day(
+                store,
+                day,
+                market_return=rng.gauss(0.0003, 0.0009),
+                close_by_ticker=[100.0 + i + t for t in range(len(self._TICKERS))],
+            )
+        # Today: a genuine regime jump, an order of magnitude past anything
+        # in the trailing window.
+        self._write_day(
+            store, days[-1], market_return=0.08, close_by_ticker=[103.0, 104.0, 105.0, 106.0, 107.0]
+        )
+        doc = compute_drift_inputs(store, days[-1]).features
+        assert doc["method_by_feature"]["market_return_1d_log_return"].startswith("along-time")
+        assert (
+            doc["psi_by_feature"]["market_return_1d_log_return"]
+            >= BANDS["feature_psi_max_ratio"].breach
+        ), doc
+
+    def test_a_cross_sectional_column_is_unaffected(self, tmp_path) -> None:
+        """`close_raw` varies per ticker; it must still read the
+        cross-sectional comparison and be unmoved by the market-wide fix."""
+        store = LocalStore(tmp_path)
+        from conftest import sessions_ending
+
+        days = sessions_ending(FRIDAY, 21)
+        rng = random.Random(13)
+        for day in days[:-1]:
+            self._write_day(
+                store,
+                day,
+                market_return=rng.gauss(0.0003, 0.0009),
+                close_by_ticker=[100.0 + rng.gauss(0.0, 2.0) for _ in self._TICKERS],
+            )
+        self._write_day(
+            store, days[-1], market_return=0.0002, close_by_ticker=[99.0, 101.0, 100.0, 102.0, 98.0]
+        )
+        doc = compute_drift_inputs(store, days[-1]).features
+        assert doc["method_by_feature"]["close_raw"].startswith("cross-sectional")
+        # A cross-sectional column's reference is pooled ACROSS tickers and
+        # days, not one point per day — orders of magnitude more reference
+        # rows than the market-wide column's trailing-session count.
+        assert doc["reference_rows_by_feature"]["close_raw"] > len(days) * len(self._TICKERS) / 2
+        assert doc["reference_rows_by_feature"]["market_return_1d_log_return"] == len(days) - 1
 
 
 class TestPredictionsInput:
