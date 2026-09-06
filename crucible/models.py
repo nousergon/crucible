@@ -118,6 +118,8 @@ __all__ = [
     "ComponentRow",
     "ComponentsDocument",
     "DeadlineRow",
+    "FeatureRegistryDocument",
+    "FeatureRow",
     "LlmCallRow",
     "LlmCallSiteRow",
     "LlmCallsiteRegistryDocument",
@@ -1466,4 +1468,238 @@ class ChampionPointerDocument(_Strict):
         "-- and null elsewhere. Not `required` in the schema because a null "
         "attestation on U/R/M is correct; the refusal is on the reader, where it can "
         "see which slot it is reading.",
+    )
+
+
+# ── I10045 row 7: the feature registry ─────────────────────────────────────
+# Additive only, appended after the prior rows' markers for the same
+# rebase reason.
+
+_FEATURE_NAME_PATTERN = r"^[a-z0-9]+(_[a-z0-9]+)*(_raw|_ratio|_pct|_zscore|_log_return)$"
+
+#: Suffix -> the ONE unit that suffix may declare. Mirrors
+#: `crucible.features.registry._NORMALIZED_UNIT_BY_SUFFIX` exactly; restated
+#: rather than imported so this module carries no import-time dependency on
+#: the reader it types (the `ArmRecipeDocument`/row 2 precedent).
+_NORMALIZED_UNIT_BY_SUFFIX: dict[str, str] = {
+    "_ratio": "ratio",
+    "_pct": "pct",
+    "_zscore": "zscore",
+    "_log_return": "log_return",
+}
+
+
+def _feature_row_json_schema_extra(schema: dict[str, object]) -> None:
+    """Mirrors `FeatureRow._suffix_and_unit_agree` into the published
+    schema's `allOf`, one `if`/`then` per normalized suffix plus the `_raw`
+    exclusion — byte-for-byte what `feature_registry.v1.json` carried before
+    this PR, so a consumer with no Python import still gets the rule
+    (`RunManifestV2`/row 1 precedent: `_run_manifest_v2_json_schema_extra`).
+    """
+    schema["allOf"] = [
+        {
+            "if": {"properties": {"name": {"pattern": "_ratio$"}}, "required": ["name"]},
+            "then": {"properties": {"unit": {"const": "ratio"}}},
+        },
+        {
+            "if": {"properties": {"name": {"pattern": "_pct$"}}, "required": ["name"]},
+            "then": {"properties": {"unit": {"const": "pct"}}},
+        },
+        {
+            "if": {"properties": {"name": {"pattern": "_zscore$"}}, "required": ["name"]},
+            "then": {"properties": {"unit": {"const": "zscore"}}},
+        },
+        {
+            "if": {"properties": {"name": {"pattern": "_log_return$"}}, "required": ["name"]},
+            "then": {"properties": {"unit": {"const": "log_return"}}},
+        },
+        {
+            "if": {"properties": {"name": {"pattern": "_raw$"}}, "required": ["name"]},
+            "then": {
+                "properties": {
+                    "unit": {
+                        "description": (
+                            "A `_raw` column may not claim a NORMALIZED unit: the name "
+                            "promises the consumer an unnormalized value and the declared "
+                            "unit would say otherwise. That is the avg_volume_20d defect "
+                            "in the other direction."
+                        ),
+                        "not": {"enum": ["ratio", "pct", "zscore", "log_return"]},
+                    }
+                }
+            },
+        },
+    ]
+
+
+class FeatureRow(_Strict):
+    """One column of `features/{version}/registry.json`'s `features` array —
+    plan §10 component 4.
+
+    `crucible.features.registry.FeatureSpec` (a frozen dataclass; unchanged
+    by this PR — its `to_dict()` is domain behaviour this module does not
+    carry) keeps its own `__post_init__` cross-field checks, exercised on
+    every `CATALOG` entry at IMPORT time. This model validates the same
+    rules a second time, at the DOCUMENT boundary — `crucible.features.
+    registry.validate_registry_payload` — the way `RunManifestV2._status_and_
+    reason_agree` and its schema `allOf` twin both enforce one rule rather
+    than the model deferring to `FeatureSpec`'s check.
+    """
+
+    model_config = ConfigDict(extra="forbid", json_schema_extra=_feature_row_json_schema_extra)
+
+    name: str = Field(
+        pattern=_FEATURE_NAME_PATTERN,
+        description="The column name. The units suffix is MANDATORY and is enforced by "
+        "the pattern: avg_volume_20d was emitted as a normalized ratio and consumed as "
+        "raw shares, and 901 of 903 tickers silently failed the scanner liquidity gate "
+        "for months. There is no grandfather list -- this layer has no history to "
+        "grandfather.",
+    )
+    unit: Literal["USD", "beta", "indicator", "log_return", "pct", "ratio", "zscore"] = Field(
+        description="The concrete unit, from a CLOSED vocabulary. Pinned by the suffix "
+        "for every NORMALIZED suffix (see the allOf below: ratio, pct, zscore, "
+        "log_return); the _raw set is open in MEANING but still enumerated rather than "
+        "a free string, so a variant spelling of a normalized word (Ratio, RATIO, "
+        "'ratio ') cannot pass the allOf not/enum check below by evading exact-string "
+        'matching (I9815 -- avg_volume_20d_raw declaring unit: "Ratio" validated '
+        "before this enum existed, the exact defect the suffix-unit agreement check "
+        "exists to catch). Extend deliberately, by adding both the enum member here "
+        "and a FeatureSpec in registry.py::CATALOG that uses it -- never widen this to "
+        "a free string again.",
+    )
+    expression: str = Field(
+        min_length=1,
+        description="How the column is computed, as the registry states it. Lineage "
+        "is a field, not a comment.",
+    )
+    description: str = Field(
+        min_length=1,
+        description="What the column means and why it is shaped that way. Empty is "
+        "refused: a column nobody can read the intent of rots without anyone noticing "
+        "it stopped being computed correctly.",
+    )
+    inputs: list[Annotated[str, Field(min_length=1)]] = Field(
+        min_length=1,
+        description="The panel or feature columns this feature reads. At least one, "
+        "always: a column with no lineage cannot be traced back to the data that "
+        "produced it (principle 1), which is what explain answers 'the signal "
+        "degraded or the feature changed' from.",
+    )
+    window_trading_days: Annotated[int, Field(ge=1)] | None = Field(
+        description="A count of SESSIONS (§4.12), never calendar days. Null for a "
+        "point-in-time column reading only the current row. Zero and negative are "
+        "refused -- a window is at least one session."
+    )
+    cross_sectional: bool = Field(
+        description="True when the column is computed across one day's cross-section "
+        "(a z-score or a rank) rather than along one ticker's history."
+    )
+    #: ADDITIVE OPTIONAL (I10114): not required, because a document written
+    #: before this field existed still validates against `feature_registry.v1`
+    #: unchanged. `bool | None = None` is the row-1 (`RunManifestV2`)
+    #: accepted-difference shape: pydantic necessarily renders an optional
+    #: field as `anyOf: [boolean, null]` rather than "boolean, or absent" --
+    #: the two are semantically distinct in JSON Schema and this migration's
+    #: own design note (row 1) already names forcing a non-nullable optional
+    #: as requiring a hand-edit of the generated output, which it exists to
+    #: prohibit.
+    market_wide: bool | None = Field(
+        default=None,
+        description="True when the column's VALUE is one value repeated identically "
+        "across every ticker on a day, by construction (e.g. "
+        "market_return_1d_log_return); false when it varies across the "
+        "cross-section. Declared, never inferred from variance at runtime. ADDITIVE "
+        "OPTIONAL (I10114): not in required because a document written before this "
+        "field existed (schema_version: feature_registry.v1, same as today) lacks it "
+        "and must keep validating against this schema -- the same additive-optional "
+        "shape as window_trading_days joining an earlier revision. The current "
+        "producer (crucible.features.registry.FeatureSpec.to_dict) always emits it "
+        "for every catalogue column; a reader of an OLDER document falls back to "
+        "treating an absent market_wide as unknown rather than assuming a value.",
+    )
+
+    @model_validator(mode="after")
+    def _suffix_and_unit_agree(self) -> FeatureRow:
+        """The `avg_volume_20d` defect, both directions — mirrors
+        `FeatureSpec.__post_init__` exactly, and is also emitted into the
+        published schema's `allOf` by `_feature_row_json_schema_extra`."""
+        matched = [
+            suffix
+            for suffix in ("_raw", "_ratio", "_pct", "_zscore", "_log_return")
+            if self.name.endswith(suffix)
+        ]
+        suffix = max(matched, key=len)
+        if suffix in _NORMALIZED_UNIT_BY_SUFFIX:
+            expected_unit = _NORMALIZED_UNIT_BY_SUFFIX[suffix]
+            if self.unit != expected_unit:
+                raise ValueError(
+                    f"feature {self.name!r} carries suffix {suffix!r} but declares "
+                    f"unit={self.unit!r}; suffix {suffix!r} means unit={expected_unit!r} "
+                    "and nothing else. A suffix that disagrees with the declared unit is "
+                    "the `avg_volume_20d` defect: emitted as a ratio, consumed as raw "
+                    "shares, and 901 of 903 tickers silently failed the liquidity gate "
+                    "for months."
+                )
+        elif self.unit in _NORMALIZED_UNIT_BY_SUFFIX.values():
+            raise ValueError(
+                f"feature {self.name!r} carries suffix '_raw' but declares "
+                f"unit={self.unit!r}, which is a NORMALIZED unit. '_raw' means "
+                "unnormalized — a raw column claiming a normalized unit is the same "
+                "defect in the other direction: the name promises the consumer an "
+                "unnormalized value and the declared unit says otherwise."
+            )
+        return self
+
+
+class FeatureRegistryDocument(_Strict):
+    """`features/{version}/registry.json` — the feature layer's producer/
+    consumer contract, plan §10 component 4.
+
+    `crucible.features.registry.validate_registry_payload` routes through
+    this model instead of a hand-rolled `jsonschema.Draft202012Validator`;
+    `crucible.features.registry.load_registry_schema` is unchanged (it only
+    reads whichever file is committed, and this PR's only change to that
+    file is regenerating it from this model).
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://github.com/nousergon/crucible/schemas/feature_registry.v1.json",
+            "title": "Crucible feature registry, v1",
+            "description": (
+                "The document written to features/{version}/registry.json beside "
+                "every day's feature parquet (plan §10 component 4). It is the "
+                "PRODUCER/CONSUMER CONTRACT of the feature layer: the producer "
+                "(crucible.features) may not emit a payload this schema refuses, and "
+                "the consumer (crucible.slots.model.FeatureLayerSource) resolves a "
+                "recipe's declared columns against exactly the names listed here. "
+                "Interfaces reconciled by I9772 / -I9765; the schema exists so the "
+                "next disagreement between the two tracks is a validation failure "
+                "rather than two correct readings of an undeclared interface."
+            ),
+        },
+    )
+
+    schema_version: Literal["feature_registry.v1"] = Field(
+        description="Version of THIS schema. A consumer that cannot read the version "
+        "refuses the document rather than guessing."
+    )
+    feature_version: str = Field(
+        pattern=r"^v[0-9a-f]{12}$",
+        description="The layer version, DERIVED by hashing this catalogue "
+        "(crucible.features.feature_version) and never hand-written. A hand-written "
+        "string lets an edited recipe overwrite the layer an earlier verdict was "
+        "computed from, and nothing would show it; the pattern makes a hand-written "
+        "'v1' a validation failure rather than a convention someone remembers "
+        "(I9772, disagreement 2).",
+    )
+    features: list[FeatureRow] = Field(
+        min_length=1,
+        description="Every column this version produces, in catalogue order. A "
+        "consumer naming a column absent from this list must fail at load, never "
+        "train on a silently substituted zero (the 2026-08-28 "
+        "seven-hard-zeroed-features condition).",
     )

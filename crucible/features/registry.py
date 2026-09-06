@@ -30,6 +30,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
+from crucible.models import FeatureRegistryDocument
+
 __all__ = [
     "CATALOG",
     "FEATURE_REGISTRY_SCHEMA_PATH",
@@ -529,16 +533,21 @@ def validate_registry_payload(payload: dict[str, Any]) -> dict[str, Any]:
     Raises rather than warning: this is the producer side of the contract,
     and a producer that emits a document its own consumer will refuse has
     failed, not degraded (`AGENTS.md`, fail loud).
-    """
-    from jsonschema import Draft202012Validator  # noqa: PLC0415
 
-    errors = sorted(
-        Draft202012Validator(load_registry_schema()).iter_errors(payload),
-        key=lambda e: list(e.absolute_path),
-    )
-    if errors:
+    `alpha-engine-config-I10045` row 7: validated through
+    `crucible.models.FeatureRegistryDocument` instead of a hand-rolled
+    `jsonschema.Draft202012Validator` — `feature_registry.v1.json` is now
+    GENERATED from that model. Error paths are still `/`-joined (not
+    `.`-joined, unlike this migration's other rows) to match
+    `tests/test_feature_registry_contract.py::
+    test_validate_registry_payload_names_the_offending_path`'s existing
+    `features/0/inputs`-style assertion, unchanged by this PR.
+    """
+    try:
+        FeatureRegistryDocument.model_validate(payload)
+    except ValidationError as exc:
         detail = "; ".join(
-            f"{'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors
+            f"{'/'.join(str(p) for p in e['loc']) or '<root>'}: {e['msg']}" for e in exc.errors()
         )
         raise FeatureRegistryValidationError(
             f"the feature registry does not conform to {FEATURE_REGISTRY_SCHEMA_VERSION}: "
@@ -546,7 +555,7 @@ def validate_registry_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "layer — a document the consumer would refuse must never be written beside a "
             "day's parquet, because the parquet would then be read against a registry "
             "nothing validated."
-        )
+        ) from exc
     return payload
 
 
