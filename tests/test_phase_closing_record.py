@@ -147,8 +147,13 @@ class TestTheTrackerMayCommentAndMayNeverClose:
 
         Two facts are asserted over the module's syntax tree: the only
         non-default HTTP method it can name is `POST`, and every path it can
-        hand `_request` is one of three literals. `PATCH /issues/{n}` — the
-        request that closes an issue — is unreachable from either.
+        hand `_request` is one of a small closed set. `PATCH /issues/{n}` —
+        the request that closes an issue — is unreachable from either.
+
+        `'/issues'` joined this set in `alpha-engine-config-I10123`
+        (`create_issue`, for the rolling `[v2 board] daily update` issue):
+        still `POST`, never `PATCH`, and still not `/issues/{n}` — a CREATE
+        cannot close anything, since it names no existing issue at all.
         """
         tree = ast.parse(pathlib.Path(tracker_module.__file__).read_text(encoding="utf-8"))
         methods = {
@@ -171,6 +176,7 @@ class TestTheTrackerMayCommentAndMayNeverClose:
             "f'/issues/{issue}'",
             "f'/issues/{issue}/comments?per_page=100&page={page}'",
             "f'/issues/{issue}/comments'",
+            "'/issues'",
         }, paths
 
     def test_the_post_targets_the_comments_endpoint_with_the_declared_headers(

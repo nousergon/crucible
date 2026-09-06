@@ -80,6 +80,7 @@ __all__ = [
     "migration_key",
     "morning_report_key",
     "morning_trigger_key",
+    "morning_update_key",
     "parse_acceptance_reading",
     "parse_bus_key",
     "parse_manifest_key",
@@ -867,6 +868,22 @@ def morning_report_key(trading_day: str, calendar_date: str) -> str:
     `crucible.alerts.sweep` already carries for the same reason.
     """
     return f"{manifest_prefix('report.morning', trading_day)}{calendar_date}/message.txt"
+
+
+def morning_update_key(trading_day: str, calendar_date: str) -> str:
+    """Where `report.morning` files the FULL daily update it also posts to
+    the tracker (`alpha-engine-config-I10123`).
+
+    Since Brian's 2026-09-06 ruling the delivered Telegram message is a
+    headline that LINKS to the full update, and the full update is a GitHub
+    comment — this is the durable filed copy of exactly that markdown,
+    beside `message.txt` under the job's OWN manifest prefix, so the writer
+    needs no second grant to file it. `principle 1` (transparency): the
+    comment lives in a different repository's tracker and could in
+    principle be edited or deleted there; this key is the store's own
+    record of what was posted, independent of the tracker.
+    """
+    return f"{manifest_prefix('report.morning', trading_day)}{calendar_date}/update.md"
 
 
 #: What a trigger name may be, before it becomes a key segment. Not a

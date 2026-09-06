@@ -1,23 +1,27 @@
-"""The morning report's guards — `alpha-engine-config-I9896`.
+"""The morning report's guards — `alpha-engine-config-I9896`, `-I9921`,
+`-I10123`.
 
 What is asserted here is what would make the report WORSE THAN NOTHING,
 which is the state it replaces: Brian believed a 6am PT report existed for
-weeks while nothing sent one.
+weeks while nothing sent one (I9896), then that the six-section message it
+grew into was legible (I9921 — it was not, per Brian 2026-09-06: "the
+telegram message is not legible, too much information and its not formatted
+cleanly"). Since I10123 there are two documents:
 
-* **A stale board reported as current.** The readings are only as good as the
-  render they came from, and a reader who learns the board is three days old
-  after acting on it has been misled by a surface built to prevent exactly
-  that.
-* **"Nothing moved" over a comparison that failed.** A positive claim of no
-  movement asserted on no evidence is the shape `crucible.board` already
-  refuses one layer down.
-* **A delivery that did not happen, recorded as one.** The delivery IS the
-  deliverable; a rendered report nobody received is the silent swallow the
-  whole plan is a reaction to.
-* **An invented acceptance count.** §12 rule 3 makes it the only progress
-  figure, which is exactly why reading it out of the running checkout and
-  printing it as `main`'s reading would be worse than saying nothing.
-* **A progress narrative.** No PR count, no commit count, no findings count.
+* `render_full_update` — everything the old six sections carried, now as
+  Markdown posted to the rolling `[v2 board] daily update` tracker issue;
+* `render_message` — the short Telegram headline that links to it.
+
+Failure modes asserted:
+
+* **A stale board reported as current**, in EITHER document.
+* **"Nothing moved" over a comparison that failed.**
+* **A delivery that did not happen, recorded as one.**
+* **An invented acceptance count.**
+* **A progress narrative.**
+* **The headline sent before its link exists**, or sent at all when the
+  tracker post failed.
+* **A second rolling issue picked silently**, or the wrong one commented on.
 
 Fixed date literals throughout (`crucible/AGENTS.md`, "a test whose subject
 moves with the clock stops testing the same thing").
@@ -29,7 +33,6 @@ import argparse
 import datetime as dt
 import json
 import pathlib
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,44 +50,48 @@ from crucible.keys import (
     manifest_key,
     morning_report_key,
     morning_trigger_key,
+    morning_update_key,
 )
 from crucible.morning import (
     ACCEPTANCE_NOT_ON_ANY_ARTIFACT,
     ACCEPTANCE_UNREADABLE,
     BOARD_URL_EXPIRES_S,
     BOARD_URL_UNAVAILABLE,
-    DELIVERY_SEVERITY,
-    DELIVERY_SOURCE,
     DELIVERY_TZ,
-    MESSAGE_MAX_CHARS,
     MORNING_JOB,
     NO_OPERATOR_ACTION,
-    SECTIONS,
+    ROLLING_ISSUE_TITLE,
     STALE_AFTER,
     TRANSPORT_PREFIX,
-    TRUNCATION_MARKER,
+    UPDATE_MESSAGE_MAX_CHARS,
     MorningInputs,
     UndeliveredError,
     deliver,
     morning_handler,
     read_inputs,
     render_message,
+    resolve_trigger,
     run_report,
     store_uri,
     wire_length,
 )
 from crucible.store import LocalStore
+from crucible.tracker import TrackerError
+
+TRACKER_REPO = "nousergon/alpha-engine-config"
 
 
 def _message_output(manifest: dict) -> dict:
-    """The delivered MESSAGE's output row.
-
-    The job files two outputs (alpha-engine-config-I9960): the message it
-    delivered, and what started the delivery. Selected by suffix rather than
-    by position so a third artifact cannot silently change which one a test
-    is asserting about.
-    """
+    """The delivered HEADLINE's output row (`message.txt`), by suffix rather
+    than by position so a third artifact (`update.md`, the trigger evidence)
+    cannot silently change which one a test is asserting about."""
     (row,) = [o for o in manifest["outputs"] if o["key"].endswith("message.txt")]
+    return row
+
+
+def _update_output(manifest: dict) -> dict:
+    """The filed copy of the full update (`update.md`)."""
+    (row,) = [o for o in manifest["outputs"] if o["key"].endswith("update.md")]
     return row
 
 
@@ -110,6 +117,7 @@ STALE_GENERATED = STALE_GENERATED_AT.strftime("%Y-%m-%dT%H:%M:%SZ")
 #: Acceptance reading stamp — also relative to the frozen board clock.
 MEASURED_AT = (GENERATED_AT + dt.timedelta(minutes=24, seconds=56)).strftime("%Y-%m-%dT%H:%M:%SZ")
 SHA = "8fc58b6c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a"
+UPDATE_URL = "https://github.com/nousergon/alpha-engine-config/issues/1#issuecomment-42"
 
 
 @pytest.fixture(autouse=True)
@@ -118,7 +126,7 @@ def _freeze_morning_now(monkeypatch: pytest.MonkeyPatch) -> None:
 
     Lock that clock to FIRED_AT so fixtures whose `generated_at` is relative
     to FIRED_AT stay fresh without depending on the day CI runs. Tests that
-    pass an explicit `now=` to `run_report` are unaffected.
+    pass an explicit `now=` to `run_report`/`render_message` are unaffected.
     """
     import crucible.runner as runner
 
@@ -129,6 +137,21 @@ def _freeze_morning_now(monkeypatch: pytest.MonkeyPatch) -> None:
         return real_run_job(*args, **kwargs)
 
     monkeypatch.setattr(runner, "run_job", _run_job_at_fired_at)
+
+
+@pytest.fixture(autouse=True)
+def _refuse_real_tracker_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test in this module may reach the network. Every test that drives
+    `morning_handler` down the live path stubs `crucible.morning.tracker`
+    explicitly (`_stub_tracker`); anything that reaches the real HTTP opener
+    without doing so fails loudly rather than trying a real socket."""
+
+    def _refuse(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a test reached crucible.tracker's real HTTP opener")
+
+    import crucible.tracker as tracker_module
+
+    monkeypatch.setattr(tracker_module, "_default_opener", _refuse)
 
 
 def _clause(name: str, met: bool) -> dict[str, Any]:
@@ -214,7 +237,7 @@ def _seed(
     store = LocalStore(tmp_path)
     store.put_bytes(BOARD_CURRENT_KEY, json.dumps(board or _board()).encode())
     if page:
-        # The page the message links to. Seeded by default because the real
+        # The page the update links to. Seeded by default because the real
         # `board` job writes it in the same run as `board/current.json`; the
         # `page=False` case is a board render that published one and not the
         # other, which the report must survive rather than die on.
@@ -276,102 +299,149 @@ class _Transport:
         return self.result
 
 
-# ── the message ───────────────────────────────────────────────────────────
+def _stub_tracker(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    existing_issue: int | None = None,
+    comment_url: str = UPDATE_URL,
+    post_raises: Exception | None = None,
+    find_raises: Exception | None = None,
+    create_raises: Exception | None = None,
+) -> dict[str, list[Any]]:
+    """Stub every tracker call `morning_handler`'s live path can make, and
+    record what each was called with. Returns the call log so a test can
+    assert on ORDER and ARGUMENTS without touching the network."""
+    calls: dict[str, list[Any]] = {"find": [], "create": [], "post": []}
+
+    def _find(repo: str, title: str, **kwargs: Any) -> int | None:
+        calls["find"].append((repo, title))
+        if find_raises is not None:
+            raise find_raises
+        return existing_issue
+
+    def _create(repo: str, title: str, body: str, **kwargs: Any) -> tuple[int, str]:
+        calls["create"].append((repo, title, body))
+        if create_raises is not None:
+            raise create_raises
+        return 1, f"https://github.com/{repo}/issues/1"
+
+    def _post(repo: str, issue: int, body: str, **kwargs: Any) -> str:
+        calls["post"].append((repo, issue, body))
+        if post_raises is not None:
+            raise post_raises
+        return comment_url
+
+    monkeypatch.setattr("crucible.morning.tracker.find_issue_by_title", _find)
+    monkeypatch.setattr("crucible.morning.tracker.create_issue", _create)
+    monkeypatch.setattr("crucible.morning.tracker.post_comment", _post)
+    return calls
 
 
-class TestTheMessage:
-    def test_the_exact_message_for_a_fresh_board_with_one_row_moved(self, tmp_path):
-        previous = _board(
-            rows=[
-                _row("phase0", "phase", "UNMET", "old"),
-                _row("phase1", "phase", "OUT_OF_ORDER", "old"),
-                _row("obj:cost", "objective", "PLANNED", "old"),
-                _row("obj:alpha", "objective", "MET", "old"),
-            ]
-        )
-        store = _seed(tmp_path, previous=previous)
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert message == "\n".join(
-            [
-                "CRUCIBLE V2 — BOARD FOR TRADING DAY 2026-09-02",
-                f"store: {tmp_path}/board/current.json",
-                f"generated: {GENERATED}  commit: {SHA}",
-                "delivered: 2026-09-03 06:00 PDT",
-                "",
-                "<b>LADDER</b>",
-                "  phase0  UNMET  1/2",
-                "    holding: b_unmet",
-                "  phase1  OUT_OF_ORDER  0/1",
-                "    holding: c_unmet",
-                "    out of order: 1 of 5 clauses — phase0's gate is not met",
-                "",
-                "<b>SCHEDULE (PLAN §6.1)</b>",
-                "  no schedule row on the board — the plan §6.1 milestones are not being "
-                "rendered, which is a defect in the board, not an absent plan",
-                "",
-                "<b>ACCEPTANCE</b>",
-                f"  {ACCEPTANCE_NOT_ON_ANY_ARTIFACT}",
-                "",
-                "<b>MOVED SINCE 2026-09-01</b>",
-                "  obj:cost: PLANNED -> UNMEASURED",
-                "",
-                "<b>SILENCE</b>",
-                "  silence: 1 UNMEASURED, 0 UNMEASURABLE of 4 rows",
-                f"  {NO_OPERATOR_ACTION}",
-                "",
-                "<b>FULL BOARD</b>",
-                f"  {(tmp_path / 'board' / 'index.html').resolve().as_uri()}",
-                "  presigned GET, expires 2026-09-10T13:00:00Z or when the signing role's "
-                "session ends, whichever is first",
-            ]
-        )
+# ── the full update (the rolling issue comment) ────────────────────────────
 
-    def test_a_stale_board_is_the_first_line_and_not_a_footnote(self, tmp_path):
-        store = _seed(
-            tmp_path,
-            board=_board(generated_at=STALE_GENERATED),
-            previous=_board(),
-        )
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert message.splitlines()[0].startswith("STALE BOARD:")
-        assert STALE_GENERATED in message.splitlines()[0]
 
-    def test_a_board_generated_within_the_day_carries_no_stale_headline(self, tmp_path):
+class TestTheFullUpdate:
+    def test_it_carries_every_section_the_old_message_did(self, tmp_path):
+        """`alpha-engine-config-I10123` deliverable 6: the update markdown
+        contains every section the old six-headed message did."""
+        rows = [
+            *_board()["rows"],
+            _row("schedule:day5", "schedule", "MET", "met — due 2026-09-04"),
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        for heading in (
+            "## Ladder",
+            "## Schedule (plan §6.1)",
+            "## Acceptance",
+            f"## Moved since {PREVIOUS}",
+            "## Silence",
+            "## Board",
+        ):
+            assert heading in update, heading
+        at = [
+            update.index(h)
+            for h in (
+                "## Ladder",
+                "## Schedule (plan §6.1)",
+                "## Acceptance",
+                f"## Moved since {PREVIOUS}",
+                "## Silence",
+                "## Board",
+            )
+        ]
+        assert at == sorted(at)
+        assert f"# Crucible v2 — board for trading day {DAY.isoformat()}" in update
+        assert f"store: `{tmp_path}/{BOARD_CURRENT_KEY}`" in update
+        assert f"generated: {GENERATED}  commit: `{SHA}`" in update
+        assert "delivered: 2026-09-03 06:00 PDT" in update
+
+    def test_the_ladder_is_a_markdown_table_with_clause_names_in_holding(self, tmp_path):
         store = _seed(tmp_path, previous=_board())
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "STALE BOARD" not in message
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "| phase | state | clauses met | holding |" in update
+        assert "| phase0 | UNMET | 1/2 | b_unmet |" in update
+        assert "a_met" not in update, "a MET clause is not what is holding the phase"
+        assert "| | | | out of order: 1 of 5 clauses — phase0's gate is not met |" in update
 
-    def test_an_unparseable_generated_at_is_stale_rather_than_assumed_fresh(self, tmp_path):
-        store = _seed(tmp_path, board=_board(generated_at="yesterday"), previous=_board())
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert message.splitlines()[0].startswith("STALE BOARD:")
+    def test_a_row_whose_board_carried_no_clause_list_invents_no_fraction(self, tmp_path):
+        rows = [_row("phase0", "phase", "UNMET", "1 of 2 clauses — a sentence, not a list")]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "| phase0 | UNMET | — | 1 of 2 clauses — a sentence, not a list |" in update
+        assert "0/0" not in update
 
-    def test_an_unreadable_previous_board_is_never_reported_as_nothing_moved(self, tmp_path):
-        store = _seed(tmp_path)  # no previous board at all
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "nothing moved" not in message
-        assert "cannot say" in message
-        assert board_key(PREVIOUS.isoformat()) in message
+    def test_a_gate_with_no_clauses_is_not_zero_of_zero(self, tmp_path):
+        rows = [_row("phase0", "phase", "UNMEASURED", "gate phase0 has no clauses", [])]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "no clauses | this gate measured nothing" in update
+        assert "0/0" not in update
 
-    def test_a_corrupt_previous_board_names_the_corruption(self, tmp_path):
-        store = _seed(tmp_path)
-        store.put_bytes(board_key(PREVIOUS.isoformat()), b"{not json")
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "unreadable at" in message
+    def test_a_board_with_no_phase_row_is_a_finding_not_an_empty_table(self, tmp_path):
+        rows = [_row("obj:alpha", "objective", "MET", "d")]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "no phase row on the board" in update
 
-    def test_an_identical_board_reports_nothing_moved(self, tmp_path):
-        store = _seed(tmp_path, previous=_board())
-        assert "  nothing moved" in run_report(store, trading_day=DAY, now=FIRED_AT)
+    def test_a_met_milestone_carries_no_overdue_word(self, tmp_path):
+        rows = [_row("schedule:day5_replays", "schedule", "MET", "met — due 2026-09-04")]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "| schedule:day5_replays | MET | met — due 2026-09-04 |" in update
+        assert "OVERDUE" not in update
 
-    def test_a_vanished_row_is_reported_rather_than_silently_dropped(self, tmp_path):
-        previous = _board(rows=[*_board()["rows"], _row("obj:gone", "objective", "MET", "was")])
-        store = _seed(tmp_path, previous=previous)
-        assert "obj:gone: MET -> VANISHED" in run_report(store, trading_day=DAY, now=FIRED_AT)
+    def test_an_unmet_past_due_milestone_row_begins_with_overdue(self, tmp_path):
+        rows = [
+            _row(
+                "schedule:day5_replays",
+                "schedule",
+                "UNMET",
+                "reads: phase1 1/6",
+            )
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "| OVERDUE schedule:day5_replays | UNMET |" in update
+
+    def test_overdue_schedule_rows_sort_ahead_of_the_rest(self, tmp_path):
+        rows = [
+            *_board()["rows"],
+            _row("schedule:ahead", "schedule", "PLANNED", "due 2026-10-01, waiting"),
+            _row("schedule:late", "schedule", "UNMET", "since 2026-08-01"),
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        late = update.index("schedule:late")
+        ahead = update.index("schedule:ahead")
+        assert late < ahead
+
+    def test_no_schedule_rows_is_a_named_defect_not_an_empty_table(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())  # default fixture carries no schedule rows
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "no schedule row on the board" in update
 
     def test_a_filed_acceptance_reading_is_quoted_with_its_commit(self, tmp_path):
-        """§12 rule 3's one progress figure, READ rather than asserted. The
-        producer contract is `crucible.keys.acceptance_reading_key`'s
-        docstring; `alpha-engine-config-I9902` implements it."""
         from crucible.keys import acceptance_reading_key
 
         store = _seed(tmp_path, previous=_board())
@@ -387,29 +457,37 @@ class TestTheMessage:
                 }
             ).encode(),
         )
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert (
-            f"acceptance count: 21 met / 3 unmet / 0 unmeasurable of 24 (commit {SHA})" in message
-        )
-        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT not in message
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert f"acceptance count: 21 met / 3 unmet / 0 unmeasurable of 24 (commit {SHA})" in update
+        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT not in update
 
-    def test_a_corrupt_acceptance_reading_is_absent_rather_than_guessed(self, tmp_path):
-        """A malformed reading is not a number. Rendering a partial parse of
-        the only progress figure is exactly the fabrication the literal
-        exists to avoid."""
+    def test_the_acceptance_count_is_never_invented(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT in run_report(store, trading_day=DAY, now=FIRED_AT)
+
+    def test_the_acceptance_section_names_the_unmet_clause_ids(self, tmp_path):
         from crucible.keys import acceptance_reading_key
 
         store = _seed(tmp_path, previous=_board())
-        store.put_bytes(acceptance_reading_key(DAY.isoformat()), b"{not json")
-        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT in run_report(store, trading_day=DAY, now=FIRED_AT)
+        store.put_bytes(
+            acceptance_reading_key(DAY.isoformat()),
+            json.dumps(
+                {
+                    "met": 21,
+                    "unmet": 2,
+                    "unmeasurable": 1,
+                    "commit": SHA,
+                    "measured_at": MEASURED_AT,
+                    "unmet_clauses": ["c_replays", "c_cost"],
+                    "unmeasurable_clauses": ["c_spend"],
+                }
+            ).encode(),
+        )
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "unmet: c_replays, c_cost" in update
+        assert "unmeasurable: c_spend" in update
 
-    def test_an_access_denied_acceptance_read_is_unreadable_not_absent(self, tmp_path, monkeypatch):
-        """§6 rule 1: an ACCESS FAILURE reported as absence conflates a
-        permissions gap with the artifact never having been filed —
-        `alpha-engine-config-I9896` measured this exact `AccessDenied` on the
-        first live `report.morning` run. The run manifest must still read
-        `ok`: this artifact is OPTIONAL, and a report that cannot read it
-        still has four other things to say."""
+    def test_an_access_denied_acceptance_read_is_unreadable_not_absent(self, tmp_path):
         from crucible.keys import acceptance_reading_key
 
         denied = _DeniedKeyStore(
@@ -421,25 +499,11 @@ class TestTheMessage:
             manifest_key("board", DAY.isoformat()),
             json.dumps({"status": "ok", "code_sha": SHA, "reason": ""}).encode(),
         )
-        # `dry_run=` accepted and ignored: this test exercises the real
-        # (`dry_run=False`) path — `morning.py`'s `open_store` call now
-        # passes the kwarg unconditionally (alpha-engine-config-I9922 N1).
-        monkeypatch.setattr("crucible.morning.open_store", lambda uri, dry_run=False: denied)
-        monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
-
-        assert morning_handler(_args(tmp_path, dry_run=False)) == 0
-
-        keys = [k for k in denied.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
-        manifest = json.loads(denied.get_bytes(keys[0]))
-        assert manifest["status"] == "ok"
-        message = denied.get_bytes(_message_output(manifest)["key"]).decode()
-        assert ACCEPTANCE_UNREADABLE.format(code="AccessDenied") in message
-        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT not in message
+        update = run_report(denied, trading_day=DAY, now=FIRED_AT)
+        assert ACCEPTANCE_UNREADABLE.format(code="AccessDenied") in update
+        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT not in update
 
     def test_a_not_found_acceptance_read_is_still_the_absent_literal(self, tmp_path):
-        """The same `_DeniedKeyStore` shape, a `NoSuchKey` code instead of
-        `AccessDenied` — proving the new access-failure branch does not
-        swallow the ordinary not-found case it sits beside."""
         from crucible.keys import acceptance_reading_key
 
         store = _DeniedKeyStore(
@@ -451,40 +515,47 @@ class TestTheMessage:
             manifest_key("board", DAY.isoformat()),
             json.dumps({"status": "ok", "code_sha": SHA, "reason": ""}).encode(),
         )
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT in message
-        assert "unreadable" not in message.lower()
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT in update
+        assert "unreadable" not in update.lower()
+
+    def test_an_identical_board_reports_nothing_moved(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        assert "nothing moved" in run_report(store, trading_day=DAY, now=FIRED_AT)
+
+    def test_a_vanished_row_is_reported_rather_than_silently_dropped(self, tmp_path):
+        previous = _board(rows=[*_board()["rows"], _row("obj:gone", "objective", "MET", "was")])
+        store = _seed(tmp_path, previous=previous)
+        assert "obj:gone: MET -> VANISHED" in run_report(store, trading_day=DAY, now=FIRED_AT)
+
+    def test_an_unreadable_previous_board_is_never_reported_as_nothing_moved(self, tmp_path):
+        store = _seed(tmp_path)  # no previous board at all
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "nothing moved" not in update
+        assert "cannot say" in update
+        assert board_key(PREVIOUS.isoformat()) in update
 
     def test_an_access_denied_previous_board_is_unreadable_not_absent_or_a_crash(self, tmp_path):
-        """Same three-way handling on the previous-day board read (it goes
-        through the same `_read_json` helper as acceptance): denied is named,
-        never rendered as `nothing moved` and never crashes the report."""
         store = _DeniedKeyStore(tmp_path, denied={board_key(PREVIOUS.isoformat()): "AccessDenied"})
         store.put_bytes(BOARD_CURRENT_KEY, json.dumps(_board()).encode())
         store.put_bytes(
             manifest_key("board", DAY.isoformat()),
             json.dumps({"status": "ok", "code_sha": SHA, "reason": ""}).encode(),
         )
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "nothing moved" not in message
-        assert "cannot say" in message
-        assert "AccessDenied" in message
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "nothing moved" not in update
+        assert "cannot say" in update
+        assert "AccessDenied" in update
 
     def test_an_access_denied_current_board_still_raises(self, tmp_path):
-        """`board/current.json` is read directly, not through `_read_json` —
-        the current board is not optional, so a denied read must still fail
-        the manifest rather than being absorbed like the optional reads."""
         store = _DeniedKeyStore(tmp_path, denied={BOARD_CURRENT_KEY: "AccessDenied"})
         with pytest.raises(ClientError):
             run_report(store, trading_day=DAY, now=FIRED_AT)
 
-    def test_the_acceptance_count_is_never_invented(self, tmp_path):
-        """§12 rule 3 makes it the only progress figure — which is exactly why
-        a fabricated one is worse than an absent one. `tests/acceptance/
-        ratchet.json` is committed to git and no store artifact republishes it,
-        so this line is the honest reading until a producer files one."""
-        store = _seed(tmp_path, previous=_board())
-        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT in run_report(store, trading_day=DAY, now=FIRED_AT)
+    def test_an_absent_current_board_raises_rather_than_reporting_on_nothing(self, tmp_path):
+        store = LocalStore(tmp_path)
+        with pytest.raises(KeyError):
+            run_report(store, trading_day=DAY, now=FIRED_AT)
 
     def test_silence_is_reported_as_its_own_figure(self, tmp_path):
         rows = [
@@ -493,12 +564,9 @@ class TestTheMessage:
             _row("b", "objective", "UNMEASURABLE", "d"),
         ]
         store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        line = [
-            ln
-            for ln in run_report(store, trading_day=DAY, now=FIRED_AT).splitlines()
-            if ln.strip().startswith("silence:")
-        ]
-        assert line == ["  silence: 1 UNMEASURED, 1 UNMEASURABLE of 3 rows"]
+        assert "silence: 1 UNMEASURED, 1 UNMEASURABLE of 3 rows" in run_report(
+            store, trading_day=DAY, now=FIRED_AT
+        )
 
     def test_a_failed_board_render_becomes_the_pending_operator_action(self, tmp_path):
         store = _seed(
@@ -506,34 +574,43 @@ class TestTheMessage:
             previous=_board(),
             board_run={"status": "failed", "code_sha": SHA, "reason": "AccessDenied on PutObject"},
         )
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "pending operator action: the board render for 2026-09-02 failed" in message
-        assert "AccessDenied on PutObject" in message
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "pending operator action: the board render for 2026-09-02 failed" in update
+        assert "AccessDenied on PutObject" in update
 
     def test_a_missing_board_manifest_is_named_rather_than_a_blank_commit(self, tmp_path):
         store = _seed(tmp_path, previous=_board(), board_run=None)
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "commit: UNKNOWN" in message
-        assert "filed no manifest" in message
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "commit: `UNKNOWN" in update
+        assert "filed no manifest" in update
 
-    def test_a_board_with_no_phase_row_is_a_finding_not_an_empty_section(self, tmp_path):
-        rows = [_row("obj:alpha", "objective", "MET", "d")]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        assert "no phase row on the board" in run_report(store, trading_day=DAY, now=FIRED_AT)
+    def test_a_stale_board_is_the_first_line_and_not_a_footnote(self, tmp_path):
+        store = _seed(tmp_path, board=_board(generated_at=STALE_GENERATED), previous=_board())
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert update.splitlines()[0].startswith("**STALE BOARD:")
+        assert STALE_GENERATED in update.splitlines()[0]
+
+    def test_a_board_generated_within_the_day_carries_no_stale_headline(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        assert "STALE BOARD" not in run_report(store, trading_day=DAY, now=FIRED_AT)
+
+    def test_an_unparseable_generated_at_is_stale_rather_than_assumed_fresh(self, tmp_path):
+        store = _seed(tmp_path, board=_board(generated_at="yesterday"), previous=_board())
+        assert run_report(store, trading_day=DAY, now=FIRED_AT).startswith("**STALE BOARD:")
+
+    def test_the_reading_is_quoted_with_its_store(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        assert f"store: `{tmp_path}/{BOARD_CURRENT_KEY}`" in run_report(
+            store, trading_day=DAY, now=FIRED_AT
+        )
 
     def test_the_message_carries_no_progress_narrative(self, tmp_path):
-        """Plan §12 rule 3: PRs merged, findings and commits are NOT progress,
-        and putting them beside a real figure lends them its authority."""
         store = _seed(tmp_path, previous=_board())
-        message = run_report(store, trading_day=DAY, now=FIRED_AT).lower()
+        update = run_report(store, trading_day=DAY, now=FIRED_AT).lower()
         for forbidden in ("pull request", " prs ", "merged", "progress", "findings", "commits"):
-            assert forbidden not in message
+            assert forbidden not in update
 
     def test_a_board_detail_carrying_a_progress_figure_is_withheld(self, tmp_path):
-        """The guard above grades the TEMPLATE unless the fixture's details
-        contain the phrasing. `row['detail']` is the board's free text and is
-        rendered verbatim, so a detail reading "3 of 5 PRs merged" ships
-        straight onto the one surface §12 rule 3 exists for."""
         rows = [
             _row(
                 "phase0",
@@ -543,131 +620,169 @@ class TestTheMessage:
             )
         ]
         store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "PRs merged" not in message
-        # The surviving clauses are kept, and the withholding is DECLARED --
-        # a clause silently dropped is indistinguishable from a board that
-        # never carried it.
-        assert "1/2 clauses met" in message
-        assert "holding: old_weekly" in message
-        assert "[1 clause withheld — plan §12 rule 3]" in message
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "PRs merged" not in update
+        assert "1/2 clauses met" in update
+        assert "holding: old_weekly" in update
+        assert "[1 clause withheld — plan §12 rule 3]" in update
 
     def test_a_detail_with_no_progress_figure_is_rendered_verbatim(self, tmp_path):
-        """A scrubber that rewrites clean text would make the report an
-        unfaithful copy of the board, which is worse than the defect."""
         detail = "1/2 clauses met; holding: old_weekly_within_cadence; grades 2 of 5 deliverables"
         rows = [_row("phase0", "phase", "UNMET", detail)]
         store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert f"  phase0  UNMET  {detail}" in message
-        assert "withheld" not in message
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert f"| phase0 | UNMET | — | {detail} |" in update
+        assert "withheld" not in update
 
-    def test_a_detail_that_is_entirely_a_progress_figure_leaves_the_marker(self, tmp_path):
-        """The row never vanishes. A phase row missing from the report is the
-        one thing the board's own guards refuse one layer down."""
-        rows = [_row("phase0", "phase", "UNMET", "6 findings this week")]
+    def test_hostile_content_is_passed_through_unescaped_because_this_is_markdown_not_html(
+        self, tmp_path
+    ):
+        """The full update is a GitHub comment body, not a Telegram HTML
+        payload — running board free text through `_escape_html` here would
+        print literal `&amp;` where the board said `&`."""
+        hostile = "Tom & Jerry <ok> if 2<3"
+        rows = [_row("phase0", "phase", "UNMET", hostile)]
         store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "  phase0  UNMET  [1 clause withheld — plan §12 rule 3]" in message
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert hostile in update
+        assert "&amp;" not in update
 
-    def test_the_reading_is_quoted_with_its_store(self, tmp_path):
-        """Plan §6 rule 2. Derived from the live store, never a literal."""
+    def test_a_pipe_in_board_free_text_does_not_break_the_table(self, tmp_path):
+        rows = [_row("phase0", "phase", "UNMET", "reads a|b sentinel")]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "a/b sentinel" in update
+        assert "a|b" not in update
+
+    def test_no_character_budget_a_large_board_is_never_truncated(self, tmp_path):
+        rows = [
+            _row(
+                f"phase{i}",
+                "phase",
+                "UNMET",
+                "d",
+                [_clause(f"clause_number_{i}_{j}_with_a_long_name", False) for j in range(12)],
+            )
+            for i in range(60)
+        ]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "truncated" not in update
+        for i in range(60):
+            assert f"phase{i}" in update
+
+
+class TestTheBoardLinkInTheFullUpdate:
+    def test_the_full_update_carries_a_url_for_the_board_page(self, tmp_path):
         store = _seed(tmp_path, previous=_board())
-        assert f"store: {tmp_path}/{BOARD_CURRENT_KEY}" in run_report(
-            store, trading_day=DAY, now=FIRED_AT
-        )
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert (tmp_path / "board" / "index.html").resolve().as_uri() in update
 
-    def test_an_absent_current_board_raises_rather_than_reporting_on_nothing(self, tmp_path):
-        store = LocalStore(tmp_path)
-        with pytest.raises(KeyError):
-            run_report(store, trading_day=DAY, now=FIRED_AT)
+    def test_the_expiry_is_quoted_as_a_bound_and_not_as_a_promise(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "when the signing role's session ends, whichever is first" in update
+        assert BOARD_URL_EXPIRES_S == 7 * 24 * 3600
+
+    def test_a_missing_page_is_stated_rather_than_killing_the_whole_report(self, tmp_path):
+        store = _seed(tmp_path, previous=_board(), page=False)
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert BOARD_URL_UNAVAILABLE in update
+        assert "Ladder" in update, "the rest of the report must still be there"
+
+    def test_a_configuration_failure_still_raises(self, tmp_path):
+        class _Broken(LocalStore):
+            def presigned_url(self, key: str, expires_s: int) -> str:
+                raise ValueError("expires_s out of range")
+
+        _seed(tmp_path, previous=_board())
+        with pytest.raises(ValueError):
+            run_report(_Broken(tmp_path), trading_day=DAY, now=FIRED_AT)
 
 
-# ── the schedule section (alpha-engine-config-I9914) ──────────────────────
+class TestTheConsoleLinkReplacesThePresignedOneInTheFullUpdate:
+    """`alpha-engine-config-I9926`: when a console is configured, the Board
+    section carries its stable Decision-list address and nothing presigned."""
+
+    CONSOLE = "https://console.example.test"
+
+    def test_the_console_url_is_the_link(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        update = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
+        assert f"{self.CONSOLE}/decision?pipeline=crucible-board" in update
+
+    def test_no_expiry_is_reported_when_nothing_was_presigned(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
+        assert inputs.board_url is None
+        assert inputs.board_url_expires == ""
+        assert inputs.board_console_url == f"{self.CONSOLE}/decision?pipeline=crucible-board"
+
+    def test_the_presigned_link_and_its_caveat_are_absent(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        update = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
+        assert (tmp_path / "board" / "index.html").resolve().as_uri() not in update
+        assert "presigned GET" not in update
+
+    def test_a_trailing_slash_on_the_base_url_does_not_double_up(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        update = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE + "/")
+        assert f"{self.CONSOLE}/decision?pipeline=crucible-board" in update
+        assert f"{self.CONSOLE}//decision" not in update
+
+    def test_no_console_means_the_presigned_path_is_unchanged(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        with_none = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=None)
+        default = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert with_none == default
+        assert "presigned GET" in default
 
 
-class TestSchedule:
-    """Plan §6.1's milestone table, as its own report section.
-
-    This section renders `schedule:*` board rows exactly the way `phase
-    gates` renders `phase:*` rows -- it computes nothing new, it quotes what
-    `crucible.board._schedule_rows` already decided (`test_board.py` grades
-    that decision). What is graded here is that the section exists, sits
-    between `phase gates` and `moved since` (the exact-message test above),
-    and that a past-due row's line begins with the word `OVERDUE`.
+class TestAReadThatFailedIsNotAPageThatIsAbsent:
+    """`_board_url` swallowed only `KeyError`, but `S3Store.presigned_url`
+    reaches absence through `exists()` → `head_object`, which re-raises every
+    non-404 `ClientError`. `alpha-engine-config-I9896` measured the shape live:
+    S3 answers **403 for a missing key** when the caller also lacks
+    `s3:ListBucket` on the prefix — and `board/index.html` is written only
+    under `if may_move:`, so its absence is a live possibility.
     """
 
-    def test_a_met_milestone_carries_no_overdue_word(self, tmp_path):
-        rows = [_row("schedule:day5_replays", "schedule", "MET", "met — due 2026-09-04")]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "  schedule:day5_replays  MET  met — due 2026-09-04" in message
-        assert "OVERDUE" not in message
+    class _Store(LocalStore):
+        def __init__(self, root, *, code: str) -> None:
+            super().__init__(root)
+            self._code = code
 
-    def test_an_unmet_past_due_milestone_line_begins_with_overdue(self, tmp_path):
-        rows = [
-            _row(
-                "schedule:day5_replays",
-                "schedule",
-                "UNMET",
-                "OVERDUE since 2026-09-04 — reads: phase1 1/6",
-            )
-        ]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        line = next(ln for ln in message.splitlines() if "schedule:day5_replays" in ln)
-        assert line.strip().split()[0] == "OVERDUE", (
-            f"the first word of a past-due schedule line must be OVERDUE, got: {line!r}"
-        )
+        def presigned_url(self, key: str, expires_s: int) -> str:
+            if key == BOARD_HTML_KEY:
+                raise ClientError(
+                    {"Error": {"Code": self._code, "Message": "s3:ListBucket denied"}},
+                    "HeadObject",
+                )
+            return super().presigned_url(key, expires_s)
 
-    def test_a_planned_milestone_carries_no_overdue_word(self, tmp_path):
-        rows = [
-            _row(
-                "schedule:live1",
-                "schedule",
-                "PLANNED",
-                "due 2026-09-12, waiting on phase2 UNMEASURED",
-            )
-        ]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "  schedule:live1  PLANNED  due 2026-09-12" in message
-        assert "OVERDUE" not in message
+    def _update(self, tmp_path, code: str) -> str:
+        _seed(tmp_path, previous=_board())
+        store = self._Store(tmp_path, code=code)
+        return run_report(store, trading_day=DAY, now=FIRED_AT)
 
-    def test_a_schedule_detail_carrying_a_progress_figure_is_withheld(self, tmp_path):
-        """Schedule details are ours to write, but this section still passes
-        through `_withhold_progress` like every other section — this module
-        trusts no board free text unchecked."""
-        rows = [
-            _row(
-                "schedule:live1",
-                "schedule",
-                "UNMET",
-                "OVERDUE since 2026-09-04; 3 PRs merged this week",
-            )
-        ]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "PRs merged" not in message
-        assert "[1 clause withheld — plan §12 rule 3]" in message
+    def test_an_access_denied_page_read_does_not_kill_the_report(self, tmp_path):
+        update = self._update(tmp_path, "AccessDenied")
+        assert update.startswith("# Crucible v2 —")
 
-    def test_no_schedule_rows_is_a_named_defect_not_an_empty_section(self, tmp_path):
-        store = _seed(tmp_path, previous=_board())  # default fixture carries no schedule rows
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "no schedule row on the board" in message
+    def test_an_access_denied_page_read_is_named_as_an_access_failure(self, tmp_path):
+        update = self._update(tmp_path, "AccessDenied")
+        assert "AccessDenied" in update
+        assert "access failure" in update
+        assert BOARD_URL_UNAVAILABLE not in update
 
-    def test_the_schedule_section_sits_between_phase_gates_and_moved_since(self, tmp_path):
-        rows = [
-            *_board()["rows"],
-            _row("schedule:day5_replays", "schedule", "MET", "met — due 2026-09-04"),
-        ]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        lines = message.splitlines()
-        phase_at = lines.index("<b>LADDER</b>")
-        schedule_at = lines.index("<b>SCHEDULE (PLAN §6.1)</b>")
-        moved_at = next(i for i, ln in enumerate(lines) if ln.startswith("<b>MOVED SINCE"))
-        assert phase_at < schedule_at < moved_at
+    def test_a_not_found_page_read_is_still_absent_not_denied(self, tmp_path):
+        update = self._update(tmp_path, "NoSuchKey")
+        assert BOARD_URL_UNAVAILABLE in update
+        assert "access failure" not in update
+
+    def test_an_absent_page_is_still_the_unavailable_line(self, tmp_path):
+        store = _seed(tmp_path, previous=_board(), page=False)
+        assert BOARD_URL_UNAVAILABLE in run_report(store, trading_day=DAY, now=FIRED_AT)
 
 
 # ── the store it quotes ───────────────────────────────────────────────────
@@ -684,14 +799,163 @@ class TestStoreUri:
         assert store_uri(S3Store("b")) == "s3://b"
 
     def test_a_backend_that_cannot_name_itself_raises(self):
-        """A repr() fallback would put an object address on the operator's
-        phone in the place plan §6 rule 2 requires the store."""
-
         class Nameless:
             pass
 
         with pytest.raises(TypeError, match="cannot name itself"):
             store_uri(Nameless())  # type: ignore[arg-type]
+
+
+# ── the headline (the Telegram message) ────────────────────────────────────
+
+
+class TestTheHeadline:
+    def _inputs(self, tmp_path, **seed_kwargs) -> MorningInputs:
+        store = _seed(tmp_path, **seed_kwargs)
+        return read_inputs(store, trading_day=DAY, now=FIRED_AT)
+
+    def test_it_is_short_titled_and_links_the_update_and_the_board(self, tmp_path):
+        inputs = self._inputs(tmp_path, previous=_board())
+        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        lines = message.splitlines()
+        assert len(lines) <= 12
+        assert lines[0] == "<b>CRUCIBLE V2 — 2026-09-02</b>"
+        assert f'<a href="{UPDATE_URL}">Full update</a>' in message
+        board_uri = (tmp_path / "board" / "index.html").resolve().as_uri()
+        assert f'<a href="{board_uri}">Board</a>' in message
+
+    def test_no_holding_lists_and_no_out_of_order_prose(self, tmp_path):
+        inputs = self._inputs(tmp_path, previous=_board())
+        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        assert "holding:" not in message
+        assert "out of order:" not in message
+        assert "b_unmet" not in message
+        assert "phase0: UNMET 1/2" in message
+        assert "phase1: OUT_OF_ORDER 0/1" in message
+
+    def test_it_carries_the_acceptance_line_and_moved_count(self, tmp_path):
+        previous = _board(
+            rows=[
+                _row("phase0", "phase", "UNMET", "old"),
+                _row("phase1", "phase", "OUT_OF_ORDER", "old"),
+                _row("obj:cost", "objective", "PLANNED", "old"),
+                _row("obj:alpha", "objective", "MET", "old"),
+            ]
+        )
+        inputs = self._inputs(tmp_path, previous=previous)
+        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT in message
+        assert f"moved since {PREVIOUS}: 1" in message
+
+    def test_pending_operator_action_appears_when_present(self, tmp_path):
+        inputs = self._inputs(
+            tmp_path,
+            previous=_board(),
+            board_run={"status": "failed", "code_sha": SHA, "reason": "AccessDenied"},
+        )
+        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        assert "pending operator action:" in message
+        assert NO_OPERATOR_ACTION not in message
+
+    def test_no_operator_action_line_when_none_is_pending(self, tmp_path):
+        inputs = self._inputs(tmp_path, previous=_board())
+        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        assert "pending operator action:" not in message
+
+    def test_a_stale_board_is_the_headline_first_line(self, tmp_path):
+        inputs = self._inputs(
+            tmp_path, board=_board(generated_at=STALE_GENERATED), previous=_board()
+        )
+        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        assert message.splitlines()[0].startswith("<b>STALE BOARD:")
+
+    def test_a_missing_board_page_omits_the_board_link_rather_than_failing(self, tmp_path):
+        inputs = self._inputs(tmp_path, previous=_board(), page=False)
+        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        assert "Board</a>" not in message
+        assert f'<a href="{UPDATE_URL}">Full update</a>' in message
+
+    def test_the_console_link_is_used_when_configured(self, tmp_path):
+        console = "https://console.example.test"
+        store = _seed(tmp_path, previous=_board())
+        inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT, console_url=console)
+        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        assert f'<a href="{console}/decision?pipeline=crucible-board">Board</a>' in message
+
+    def test_hostile_content_is_html_escaped(self, tmp_path):
+        inputs = self._inputs(
+            tmp_path,
+            previous=_board(),
+            board_run={
+                "status": "failed",
+                "code_sha": SHA,
+                "reason": "PutObject denied for role <arn> & retried",
+            },
+        )
+        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        assert "denied for role <arn>" not in message
+        assert "denied for role &lt;arn&gt; &amp; retried" in message
+
+    #: Real clause identifiers off `main`'s `crucible/gate.py` — the longest
+    #: names any phase gate actually emits, so the worst case measured here
+    #: is one this repository can actually produce.
+    _REAL_CLAUSE_NAMES: tuple[str, ...] = (
+        "old_sf_execution_count_zero",
+        "aws_total_within_ceiling",
+        "aws_cost_within_ceiling",
+        "attribution_renders",
+        "explain_walks_a_verdict",
+        "dead_lambdas_deleted",
+        "old_alerts_muted",
+        "acceptance_suite_committed",
+    )
+
+    def test_the_wire_fits_the_cap_with_six_red_phases_of_real_clause_names(self, tmp_path):
+        """`alpha-engine-config-I10123` deliverable 2's hard budget test: six
+        phase rows (`phase0`..`phase5`, one per binding-plan phase), every
+        one UNMET/red, holding every real long clause name off `main`'s
+        `crucible/gate.py`, plus a long hostile operator action — the
+        worst-case fixture the old six-section message was proven against,
+        now proving the HEADLINE stays inside its own, much smaller budget.
+        """
+        rows = [
+            _row(
+                f"phase{i}",
+                "phase",
+                "UNMET",
+                "blocked by <deploy> & <IAM> gaps",
+                [_clause(name, met=False) for name in self._REAL_CLAUSE_NAMES],
+            )
+            for i in range(6)
+        ]
+        store = _seed(
+            tmp_path,
+            board=_board(rows=rows),
+            previous=_board(rows=rows),
+            board_run={
+                "status": "failed",
+                "code_sha": SHA,
+                "reason": "AccessDenied on PutObject for role arn:aws:iam::111111111111:role/x",
+            },
+        )
+        inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT)
+        message = render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
+        wire = wire_length(TRANSPORT_PREFIX + message)
+        assert wire <= UPDATE_MESSAGE_MAX_CHARS, (
+            f"the six-red-phase worst case POSTs at {wire} chars, over the "
+            f"{UPDATE_MESSAGE_MAX_CHARS}-char budget"
+        )
+        for i in range(6):
+            assert f"phase{i}: UNMET 0/{len(self._REAL_CLAUSE_NAMES)}" in message
+
+    def test_an_over_budget_headline_raises_rather_than_truncating_silently(self, tmp_path):
+        """A headline that silently shortened itself would be the illegible
+        message reappearing in a new shape — it must fail loudly instead."""
+        rows = [_row(f"phase{i}", "phase", "UNMET", "d", [_clause("x", False)]) for i in range(400)]
+        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
+        inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT)
+        with pytest.raises(ValueError, match="over the"):
+            render_message(inputs, now=FIRED_AT, update_url=UPDATE_URL)
 
 
 # ── delivery ──────────────────────────────────────────────────────────────
@@ -705,21 +969,11 @@ class TestDelivery:
         assert call["sns"] is False
         assert call["telegram"] is True
         assert call["severity"] == "info"
-        # NOT silent: the 2026-09-03 delivery went out silent and was not
-        # seen (alpha-engine-config-I9916). A notification is not a page.
         assert call["silent"] is False
         assert call["raise_on_total_failure"] is True
-        # Explicit, never left to `krepis.alerts.resolve_destination`'s
-        # fallback: an `info` severity reaches the operator chat TODAY only
-        # because no log chat is configured, so configuring
-        # TELEGRAM_LOG_CHAT_ID fleet-wide would silently move this report off
-        # Brian's chat with the manifest still reading `ok`.
         assert call["destination"] == "operator_chat"
 
     def test_it_carries_no_dedup_key(self):
-        """An identical report must still arrive tomorrow: a digest that stops
-        arriving when nothing changed is indistinguishable from one that
-        stopped arriving."""
         transport = _Transport()
         deliver("hello", transport=transport)
         assert transport.calls[0]["dedup_key"] is None
@@ -740,6 +994,12 @@ class TestDelivery:
         with pytest.raises(TypeError, match="any_ok"):
             deliver("hello", transport=lambda *a, **k: object())
 
+    def test_deliver_sends_with_parse_mode_html(self):
+        transport = _Transport()
+        deliver("<b>CRUCIBLE V2</b>\nhello", transport=transport)
+        (call,) = transport.calls
+        assert call["parse_mode"] == "HTML"
+
 
 # ── the job ───────────────────────────────────────────────────────────────
 
@@ -755,8 +1015,81 @@ def _args(tmp_path: pathlib.Path, *, dry_run: bool) -> argparse.Namespace:
 
 
 class TestTheJob:
+    def test_a_delivered_report_posts_the_comment_before_sending_the_message(
+        self, tmp_path, monkeypatch
+    ):
+        """`alpha-engine-config-I10123`: ordering is the whole safety
+        property — the comment exists before the headline that links it is
+        ever rendered."""
+        _seed(tmp_path, previous=_board())
+        calls = _stub_tracker(monkeypatch, existing_issue=7)
+        transport = _Transport()
+        monkeypatch.setattr("crucible.morning._krepis_publish", transport)
+        monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+        monkeypatch.delenv("CRUCIBLE_TRIGGER", raising=False)
+
+        assert morning_handler(_args(tmp_path, dry_run=False)) == 0
+
+        assert calls["find"] == [(TRACKER_REPO, ROLLING_ISSUE_TITLE)]
+        assert calls["create"] == []
+        (post_call,) = calls["post"]
+        assert post_call[0] == TRACKER_REPO
+        assert post_call[1] == 7
+        # The comment carries the full update, not the headline.
+        assert "## Ladder" in post_call[2]
+        # The message actually sent carries the comment's OWN permalink.
+        (sent,) = transport.calls
+        assert UPDATE_URL in sent["message"]
+
+    def test_the_rolling_issue_is_created_when_absent(self, tmp_path, monkeypatch):
+        _seed(tmp_path, previous=_board())
+        calls = _stub_tracker(monkeypatch, existing_issue=None)
+        monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
+
+        assert morning_handler(_args(tmp_path, dry_run=False)) == 0
+
+        assert calls["find"] == [(TRACKER_REPO, ROLLING_ISSUE_TITLE)]
+        (create_call,) = calls["create"]
+        assert create_call[0] == TRACKER_REPO
+        assert create_call[1] == ROLLING_ISSUE_TITLE
+        (post_call,) = calls["post"]
+        assert post_call[1] == 1  # the number `_create` returned above
+
+    def test_a_second_open_rolling_issue_is_a_loud_failure_not_a_pick(self, tmp_path, monkeypatch):
+        store = _seed(tmp_path, previous=_board())
+        _stub_tracker(
+            monkeypatch,
+            find_raises=TrackerError("2 open issues titled '[v2 board] daily update'"),
+        )
+        monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
+
+        with pytest.raises(TrackerError, match="2 open issues"):
+            morning_handler(_args(tmp_path, dry_run=False))
+
+        keys = [k for k in store.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
+        manifest = json.loads(store.get_bytes(keys[0]))
+        assert manifest["status"] == "failed"
+
+    def test_a_failed_post_fails_the_run_and_never_sends_the_message(self, tmp_path, monkeypatch):
+        """A failed post → run fails, no message sent
+        (`alpha-engine-config-I10123` ordering rule)."""
+        store = _seed(tmp_path, previous=_board())
+        _stub_tracker(monkeypatch, existing_issue=7, post_raises=TrackerError("posting failed"))
+        transport = _Transport()
+        monkeypatch.setattr("crucible.morning._krepis_publish", transport)
+
+        with pytest.raises(TrackerError, match="posting failed"):
+            morning_handler(_args(tmp_path, dry_run=False))
+
+        assert transport.calls == [], "an unlinked headline must never be sent"
+        keys = [k for k in store.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
+        manifest = json.loads(store.get_bytes(keys[0]))
+        assert manifest["status"] == "failed"
+        assert manifest["outputs"] == []
+
     def test_a_failed_delivery_raises_and_the_manifest_reads_failed(self, tmp_path, monkeypatch):
         store = _seed(tmp_path, previous=_board())
+        _stub_tracker(monkeypatch, existing_issue=7)
         monkeypatch.setattr(
             "crucible.morning._krepis_publish", lambda *a, **k: _Result(any_ok=False)
         )
@@ -769,46 +1102,67 @@ class TestTheJob:
         assert "reached nobody" in manifest["reason"]
         assert manifest["outputs"] == []
 
-    def test_a_delivered_report_is_filed_beside_its_manifest(self, tmp_path, monkeypatch):
+    def test_a_delivered_report_files_the_message_the_update_and_the_trigger(
+        self, tmp_path, monkeypatch
+    ):
         store = _seed(tmp_path, previous=_board())
+        _stub_tracker(monkeypatch, existing_issue=7)
         monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
-        # The trigger environment is CONTROLLED, not inherited. CI runs this
-        # suite with `GITHUB_EVENT_NAME=pull_request` set by the platform, so
-        # a test asserting the declared default read green on a laptop and
-        # red in CI — the ambient-environment shape, caught on the first CI
-        # run of alpha-engine-config-I9960.
         monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
         monkeypatch.delenv("CRUCIBLE_TRIGGER", raising=False)
+
         assert morning_handler(_args(tmp_path, dry_run=False)) == 0
+
         keys = [k for k in store.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
         manifest = json.loads(store.get_bytes(keys[0]))
         assert manifest["status"] == "ok"
-        output = _message_output(manifest)
-        message = store.get_bytes(output["key"]).decode()
-        assert message.startswith("CRUCIBLE V2 — BOARD FOR TRADING DAY")
-        assert output["key"] == morning_report_key(DAY.isoformat(), manifest["calendar_date"])
-        # And the SECOND output: what started this delivery
-        # (alpha-engine-config-I9960). A test asserting exactly one output
-        # here is what would silently drop the trigger evidence the three
-        # blocked tracker issues close on, so it asserts BOTH by name.
+
+        message_row = _message_output(manifest)
+        message = store.get_bytes(message_row["key"]).decode()
+        assert message.startswith("<b>CRUCIBLE V2 —")
+        assert message_row["key"] == morning_report_key(DAY.isoformat(), manifest["calendar_date"])
+
+        update_row = _update_output(manifest)
+        update = store.get_bytes(update_row["key"]).decode()
+        assert "## Ladder" in update
+        assert update_row["key"] == morning_update_key(DAY.isoformat(), manifest["calendar_date"])
+
         assert {o["key"] for o in manifest["outputs"]} == {
-            output["key"],
+            message_row["key"],
+            update_row["key"],
             morning_trigger_key(DAY.isoformat(), manifest["calendar_date"], TRIGGER_UNKNOWN),
         }
+
+    def test_the_manifest_records_the_comment_url_and_issue_number_as_a_metric(
+        self, tmp_path, monkeypatch
+    ):
+        """`alpha-engine-config-I10123` deliverable 4: the comment URL and
+        issue number are recorded on the manifest's `metrics`, not `outputs`
+        (`run_manifest.v2.json`'s `outputs` array is content-hashed file
+        references — a metric is the right slot for a fact that is not a
+        file this job wrote)."""
+        store = _seed(tmp_path, previous=_board())
+        _stub_tracker(monkeypatch, existing_issue=42, comment_url=UPDATE_URL)
+        monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
+
+        assert morning_handler(_args(tmp_path, dry_run=False)) == 0
+
+        keys = [k for k in store.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
+        manifest = json.loads(store.get_bytes(keys[0]))
+        (metric,) = [
+            m for m in manifest["metrics"] if m["name"] == "morning_report_tracker_comment"
+        ]
+        assert metric["value"] == 42.0
+        assert metric["source_path"] == UPDATE_URL
+        assert TRACKER_REPO in metric["status_reason"]
+        assert "42" in metric["status_reason"]
+        assert UPDATE_URL in metric["status_reason"]
 
     def test_a_scheduled_firing_files_evidence_that_no_human_started_it(
         self, tmp_path, monkeypatch
     ):
-        """alpha-engine-config-I9960, and the thing I9896 / I9914 / I9921 each
-        close on: "at least one delivery without a human dispatching it".
-
-        Nothing in `run_manifest.v2` could carry that — `run_mode` is
-        live-vs-replay and a dispatched run is just as live — so the three
-        issues sat open on a `closes-when` no artifact could satisfy. The
-        trigger is the KEY, so the closing sweep's S3 `exists` op answers it
-        with no body parse.
-        """
         store = _seed(tmp_path, previous=_board())
+        _stub_tracker(monkeypatch, existing_issue=7)
         monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
         monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
         assert morning_handler(_args(tmp_path, dry_run=False)) == 0
@@ -819,12 +1173,8 @@ class TestTheJob:
         assert store.get_bytes(expected).decode().strip() == "schedule"
 
     def test_a_dispatched_firing_cannot_file_evidence_of_a_schedule(self, tmp_path, monkeypatch):
-        """The half that makes the other half mean anything. `GITHUB_*` is a
-        reserved prefix a workflow `env:` block cannot override, so a human
-        dispatch is recorded as one even when `CRUCIBLE_TRIGGER` says
-        otherwise — and the `trigger.schedule` predicate stays unsatisfied.
-        """
         store = _seed(tmp_path, previous=_board())
+        _stub_tracker(monkeypatch, existing_issue=7)
         monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
         monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
         monkeypatch.setenv("CRUCIBLE_TRIGGER", "schedule")
@@ -832,37 +1182,36 @@ class TestTheJob:
         assert not [k for k in store.list_keys(f"runs/{MORNING_JOB}/") if k.endswith(".schedule")]
 
     def test_the_manifest_key_is_discriminated_by_the_firing(self, tmp_path, monkeypatch):
-        """A 13:00 UTC cron fires every calendar day while three of them
-        resolve to Friday's close. Without the discriminator the weekend
-        deliveries overwrite one another."""
         store = _seed(tmp_path, previous=_board())
+        _stub_tracker(monkeypatch, existing_issue=7)
         monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
         morning_handler(_args(tmp_path, dry_run=False))
         keys = [k for k in store.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
         assert keys[0] != manifest_key(MORNING_JOB, DAY.isoformat())
         assert keys[0].startswith(f"runs/{MORNING_JOB}/{DAY.isoformat()}/")
 
-    def test_a_dry_run_delivers_nothing_and_files_no_manifest(self, tmp_path, monkeypatch):
-        """alpha-engine-config-I9922. Before this fix, `run_job` wrote a
-        manifest regardless of `--dry-run` — this test itself asserted that
-        as correct (`manifest["outputs"] == []`), which is exactly the
-        documented-but-false claim the issue names: `--dry-run` "renders and
-        files nothing", and a manifest at `runs/report.morning/{day}/{firing}/
-        run.json` is a real firing that `alerts.sweep` and the board read as
-        genuine. A dry run against production must leave the store
-        completely untouched under this job's own `runs/` prefix."""
+    def test_a_dry_run_delivers_nothing_touches_no_tracker_and_files_no_manifest(
+        self, tmp_path, monkeypatch
+    ):
+        """`alpha-engine-config-I9922`/`-I10123`: `--dry-run` renders and
+        files nothing, sends nothing, and touches the private tracker not at
+        all — no search, no create, no comment."""
         store = _seed(tmp_path, previous=_board())
 
         def refuse(*args: Any, **kwargs: Any) -> Any:
-            raise AssertionError("--dry-run must not reach the transport")
+            raise AssertionError("--dry-run must not reach this")
 
         monkeypatch.setattr("crucible.morning._krepis_publish", refuse)
+        monkeypatch.setattr("crucible.morning.tracker.find_issue_by_title", refuse)
+        monkeypatch.setattr("crucible.morning.tracker.create_issue", refuse)
+        monkeypatch.setattr("crucible.morning.tracker.post_comment", refuse)
+
         assert morning_handler(_args(tmp_path, dry_run=True)) == 0
         keys = [k for k in store.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
         assert keys == []
 
 
-# ── the three declarations that must agree ────────────────────────────────
+# ── declarations that must agree ────────────────────────────────────────
 
 
 class TestDeclarations:
@@ -879,9 +1228,6 @@ class TestDeclarations:
         assert row.absence_watched_by == "alerts.sweep"
 
     def test_the_workflow_cron_is_0600_pdt_and_0500_pst(self):
-        """The DST fact, committed. GitHub crons are UTC and have no timezone,
-        so November's shift is a fact a reader can look up here rather than a
-        surprise on the morning it happens."""
         spec = yaml.safe_load(WORKFLOW.read_text())
         crons = [entry["cron"] for entry in spec[True]["schedule"]]
         assert crons == ["0 13 * * *"]
@@ -891,11 +1237,6 @@ class TestDeclarations:
         assert (winter.hour, winter.tzname()) == (5, "PST")
 
     def test_a_failed_run_notifies_because_alerts_sweep_has_never_produced(self):
-        """MEASURED 2026-09-03 (`alpha-engine-config-I9905`): `alerts.sweep`
-        has NEVER written a manifest — its dispatcher fails `RunInstances` on
-        every invocation since the stack existed. The declared page path is
-        therefore dark, so a 06:00 failure would tell nobody at all. This job
-        carries `board.yml`'s notify block until that is measurably false."""
         spec = yaml.safe_load(WORKFLOW.read_text())
         assert list(spec["jobs"]) == ["report", "notify-failure"]
         notify = spec["jobs"]["notify-failure"]
@@ -907,559 +1248,39 @@ class TestDeclarations:
         )
         assert notify["secrets"] == "inherit"
 
-    def test_the_notify_block_names_what_would_let_it_be_removed(self):
-        """A stopgap with no stated removal condition is permanent. The
-        comment must name the artifact whose existence retires it, so the
-        next reader can check rather than guess."""
-        text = WORKFLOW.read_text()
-        assert "REMOVE THIS JOB WHEN" in text
-        # The artifact whose existence retires the stopgap, named so the next
-        # reader can CHECK the condition rather than re-derive it.
-        assert "runs/alerts.sweep/" in text
-        # A tracker reference, matched by SHAPE rather than by number:
-        # `tests/test_no_stale_tracker_literals.py` forbids an issue literal
-        # in code, and a guard that pinned one would go stale the way the
-        # thing it guards does.
-        assert re.search(r"alpha-engine-config-I\d+", text)
+    def test_the_workflow_passes_the_tracker_app_ssm_prefix_like_board_yml(self):
+        """`alpha-engine-config-I10123`: `morning-report.yml` passes
+        `CRUCIBLE_TRACKER_APP_SSM_PREFIX` the same way `board.yml` does."""
+        spec = yaml.safe_load(WORKFLOW.read_text())
+        assert spec["env"]["CRUCIBLE_TRACKER_APP_SSM_PREFIX"] == (
+            "${{ vars.CRUCIBLE_TRACKER_APP_SSM_PREFIX }}"
+        )
 
     def test_the_workflow_is_not_reachable_on_a_pull_request(self):
-        """A live-state job on a PR reports the author's own change as drift,
-        or someone else's change the author cannot clear."""
         spec = yaml.safe_load(WORKFLOW.read_text())
         assert set(spec[True]) == {"schedule", "workflow_dispatch"}
 
     def test_the_report_writes_only_under_its_own_manifest_prefix(self):
-        """The identity that writes the manifest needs no second grant to
-        write the message. A report whose evidence needed a wider IAM scope
-        than its own manifest would be a reason to widen the scope."""
         assert morning_report_key(DAY.isoformat(), "2026-09-03").startswith(
+            f"runs/{MORNING_JOB}/{DAY.isoformat()}/"
+        )
+        assert morning_update_key(DAY.isoformat(), "2026-09-03").startswith(
             f"runs/{MORNING_JOB}/{DAY.isoformat()}/"
         )
 
     def test_the_silent_states_do_not_shadow_the_boards_grey_states(self):
-        """Two constants with one name and two meanings is how a reader
-        imports the wrong one and is never told."""
         from crucible.board import GREY_STATES as BOARD_GREY
         from crucible.morning import SILENT_STATES
 
         assert set(SILENT_STATES).isdisjoint(BOARD_GREY)
 
 
-class TestTheSixHeadedSections:
-    """`alpha-engine-config-I9921` — Brian: *"I don't find the report detailed
-    enough. It should at a minimum be formatted well."*
-
-    Asserted here: the six headings exist and are in the issue's order, the
-    ladder carries the clause NAMES rather than a sentence about them, and
-    the message points at a page rather than trying to be one.
-    """
-
-    def test_the_six_headings_appear_in_the_order_the_issue_states(self, tmp_path):
-        rows = [
-            *_board()["rows"],
-            _row("schedule:day5", "schedule", "MET", "met — due 2026-09-04"),
-        ]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        lines = run_report(store, trading_day=DAY, now=FIRED_AT).splitlines()
-        expected = [s.format(previous_day=PREVIOUS) for s in SECTIONS]
-        at = [lines.index(heading) for heading in expected]
-        assert at == sorted(at), (
-            f"the sections are out of order: {list(zip(expected, at, strict=True))}"
-        )
-
-    def test_the_ladder_names_the_unmet_clauses_rather_than_summarising_them(self, tmp_path):
-        """A fraction with no names is a number the reader cannot act on, and
-        the names are the thing the previous report left out entirely."""
-        store = _seed(tmp_path, previous=_board())
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "  phase0  UNMET  1/2" in message
-        assert "    holding: b_unmet" in message
-        assert "a_met" not in message, "a MET clause is not what is holding the phase"
-
-    def test_a_row_whose_board_carried_no_clause_list_invents_no_fraction(self, tmp_path):
-        """A board rendered before this change carries `clauses: null`.
-        Printing `0/0` over it would be a measurement nobody took."""
-        rows = [_row("phase0", "phase", "UNMET", "1 of 2 clauses — a sentence, not a list")]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "  phase0  UNMET  1 of 2 clauses — a sentence, not a list" in message
-        assert "0/0" not in message
-
-    def test_a_gate_that_declares_no_clauses_is_not_rendered_as_zero_of_zero(self, tmp_path):
-        rows = [_row("phase0", "phase", "UNMEASURED", "gate phase0 has no clauses", [])]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "no clauses — this gate measured nothing" in message
-        assert "0/0" not in message
-
-    def test_the_out_of_order_reason_is_rendered_when_set(self, tmp_path):
-        store = _seed(tmp_path, previous=_board())
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "    out of order: 1 of 5 clauses — phase0's gate is not met" in message
-
-    def test_overdue_schedule_rows_sort_ahead_of_the_rest(self, tmp_path):
-        """The only line in that section anybody has to act on."""
-        rows = [
-            *_board()["rows"],
-            _row("schedule:ahead", "schedule", "PLANNED", "due 2026-10-01, waiting"),
-            _row("schedule:late", "schedule", "UNMET", "OVERDUE since 2026-08-01"),
-        ]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        lines = run_report(store, trading_day=DAY, now=FIRED_AT).splitlines()
-        late = lines.index("  OVERDUE schedule:late  UNMET  OVERDUE since 2026-08-01")
-        ahead = lines.index("  schedule:ahead  PLANNED  due 2026-10-01, waiting")
-        assert late < ahead
-
-    def test_the_acceptance_section_names_the_unmet_clause_ids(self, tmp_path):
-        from crucible.keys import acceptance_reading_key
-
-        store = _seed(tmp_path, previous=_board())
-        store.put_bytes(
-            acceptance_reading_key(DAY.isoformat()),
-            json.dumps(
-                {
-                    "met": 21,
-                    "unmet": 2,
-                    "unmeasurable": 1,
-                    "commit": SHA,
-                    "measured_at": MEASURED_AT,
-                    "unmet_clauses": ["c_replays", "c_cost"],
-                    "unmeasurable_clauses": ["c_spend"],
-                }
-            ).encode(),
-        )
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "    unmet: c_replays, c_cost" in message
-        assert "    unmeasurable: c_spend" in message
-
-    def test_an_acceptance_artifact_with_no_clause_ids_says_so_rather_than_nothing(self, tmp_path):
-        """ "the producer files no names" and "there are no unmet clauses" are
-        different facts; an omitted line renders them identically."""
-        from crucible.keys import acceptance_reading_key
-
-        store = _seed(tmp_path, previous=_board())
-        store.put_bytes(
-            acceptance_reading_key(DAY.isoformat()),
-            json.dumps(
-                {"met": 21, "unmet": 2, "unmeasurable": 1, "commit": SHA, "measured_at": "x"}
-            ).encode(),
-        )
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "    the artifact names no unmet clause ids" in message
-
-
-class TestTheLinkToTheFullBoard:
-    def test_the_message_carries_a_url_for_the_board_page(self, tmp_path):
-        store = _seed(tmp_path, previous=_board())
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert (tmp_path / "board" / "index.html").resolve().as_uri() in message
-
-    def test_the_expiry_is_quoted_as_a_bound_and_not_as_a_promise(self, tmp_path):
-        """A presigned URL signed with temporary credentials dies with the
-        credential. Quoting seven days flat would be a promise the signing
-        role cannot keep, and a reader who finds a dead link having been told
-        it had days left concludes the board is broken."""
-        store = _seed(tmp_path, previous=_board())
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "when the signing role's session ends, whichever is first" in message
-        assert BOARD_URL_EXPIRES_S == 7 * 24 * 3600
-
-    def test_a_missing_page_is_stated_rather_than_killing_the_whole_report(self, tmp_path):
-        """The report is the surface that would tell anybody the page is
-        missing, so it must survive the page being missing."""
-        store = _seed(tmp_path, previous=_board(), page=False)
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert BOARD_URL_UNAVAILABLE in message
-        assert "LADDER" in message, "the rest of the report must still be there"
-
-
-class TestTheConsoleLinkReplacesThePresignedOne:
-    """`alpha-engine-config-I9926`: when a console is configured, the FULL
-    BOARD section carries its stable Decision-list address and nothing
-    presigned — one link to one board, with a caveat that says it does not
-    expire. When none is configured, the presigned path is untouched.
-    """
-
-    CONSOLE = "https://console.example.test"
-
-    def test_the_console_url_is_the_link(self, tmp_path):
-        store = _seed(tmp_path, previous=_board())
-        message = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
-        assert f"  {self.CONSOLE}/decision?pipeline=crucible-board\n" in message
-
-    def test_the_link_is_the_decision_list_filtered_to_this_board(self):
-        # The console fragment stamps a LITERAL `pipeline: crucible-board`
-        # facet on every row it mints; the filter is what makes the address
-        # THIS board's rather than every Decision in the fleet, and a literal
-        # is what makes it every row of this board rather than a subset.
-        from crucible.morning import BOARD_CONSOLE_PATH
-
-        assert BOARD_CONSOLE_PATH == "/decision?pipeline=crucible-board"
-
-    def test_the_filter_is_not_a_field_the_board_rows_disagree_on(self):
-        # Review B3: `surface` is per-row provenance — a real board carries
-        # ~10 distinct values across its rows — so a filter keyed on it hides
-        # the rows whose provenance is elsewhere, including the UNREPORTED
-        # component rows. The path must not filter on any row field.
-        from crucible.morning import BOARD_CONSOLE_PATH
-
-        assert "surface" not in BOARD_CONSOLE_PATH
-        assert "crucible/board" not in BOARD_CONSOLE_PATH
-
-    def test_no_expiry_is_reported_when_nothing_was_presigned(self, tmp_path):
-        store = _seed(tmp_path, previous=_board())
-        inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
-        assert inputs.board_url is None
-        assert inputs.board_url_expires == ""
-        assert inputs.board_console_url == f"{self.CONSOLE}/decision?pipeline=crucible-board"
-
-    def test_the_presigned_link_and_its_caveat_are_absent(self, tmp_path):
-        store = _seed(tmp_path, previous=_board())
-        message = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
-        assert (tmp_path / "board" / "index.html").resolve().as_uri() not in message
-        assert "presigned GET" not in message
-
-    def test_the_caveat_says_the_address_does_not_expire(self, tmp_path):
-        from crucible.morning import BOARD_CONSOLE_CAVEAT
-
-        store = _seed(tmp_path, previous=_board())
-        message = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
-        assert BOARD_CONSOLE_CAVEAT in message
-        assert "no expiry" in BOARD_CONSOLE_CAVEAT
-
-    def test_a_trailing_slash_on_the_base_url_does_not_double_up(self, tmp_path):
-        store = _seed(tmp_path, previous=_board())
-        message = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE + "/")
-        assert f"{self.CONSOLE}/decision?pipeline=crucible-board" in message
-        assert f"{self.CONSOLE}//decision" not in message
-
-    def test_the_page_is_not_read_when_a_console_is_configured(self, tmp_path):
-        # No presign, no `exists()` on the page: a console-linked report must
-        # not fail on — or pay for — a page it does not link.
-        store = _seed(tmp_path, previous=_board(), page=False)
-        message = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
-        assert BOARD_URL_UNAVAILABLE not in message
-        assert f"{self.CONSOLE}/decision" in message
-
-    def test_no_console_means_the_presigned_path_is_unchanged(self, tmp_path):
-        store = _seed(tmp_path, previous=_board())
-        with_none = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=None)
-        default = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert with_none == default
-        assert "presigned GET" in default
-
-    def test_the_console_link_rides_the_never_dropped_tier(self, tmp_path):
-        rows = [
-            _row(
-                f"phase{i}",
-                "phase",
-                "UNMET",
-                "d",
-                [_clause(f"clause_number_{i}_{j}_with_a_long_name", False) for j in range(12)],
-            )
-            for i in range(60)
-        ]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        message = run_report(store, trading_day=DAY, now=FIRED_AT, console_url=self.CONSOLE)
-        assert f"{self.CONSOLE}/decision" in message
-        assert "(truncated" in message
-
-
-class TestTheTruncationRule:
-    """Telegram takes 4096 characters. What gets dropped is a decision, and
-    dropping it silently is the same defect as a green row over no data.
-    """
-
-    @staticmethod
-    def _huge(tmp_path) -> str:
-        # 60 phases, each holding 12 clauses with long names — far past the cap.
-        rows = [
-            _row(
-                f"phase{i}",
-                "phase",
-                "UNMET",
-                "d",
-                [_clause(f"clause_number_{i}_{j}_with_a_long_name", False) for j in range(12)],
-            )
-            for i in range(60)
-        ]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        return run_report(store, trading_day=DAY, now=FIRED_AT)
-
-    def test_a_message_over_the_cap_is_cut_to_fit(self, tmp_path):
-        assert wire_length(self._huge(tmp_path)) <= MESSAGE_MAX_CHARS
-
-    def test_the_cut_is_declared_with_a_count(self, tmp_path):
-        message = self._huge(tmp_path)
-        assert TRUNCATION_MARKER in message
-        assert "line(s) withheld" in message
-
-    def test_every_ladder_line_survives_while_clause_names_are_dropped(self, tmp_path):
-        """The issue's rule, and the one that decides what a reader is left
-        with: every phase's fraction survives; the names go to the page.
-
-        Dropped from the END of the tier, so the earliest phases keep their
-        names — a truncation that cut from the front would leave a reader
-        with the tail of a ladder and no idea where it started.
-        """
-        message = self._huge(tmp_path)
-        for i in range(60):
-            assert f"  phase{i}  UNMET  0/12" in message, f"phase{i}'s ladder line was dropped"
-        holding = [ln for ln in message.splitlines() if ln.startswith("    holding:")]
-        assert holding, "dropping every name when only some were needed is over-truncation"
-        assert len(holding) < 60, "no clause-name line was dropped, so nothing was truncated"
-        assert message.splitlines().index(f"    holding: {holding[0].split(': ')[1]}") < 10
-
-    def test_a_message_under_the_cap_is_untouched(self, tmp_path):
-        store = _seed(tmp_path, previous=_board())
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert TRUNCATION_MARKER not in message
-        assert "    holding: b_unmet" in message
-
-    def test_the_wire_length_is_plain_length_under_html_mode(self, tmp_path):
-        """`parse_mode="HTML"` (`alpha-engine-config-I9925`) inverts the old
-        Markdown-v1 rule: krepis escapes nothing further for HTML, because the
-        caller owns the markup and already escaped every interpolated value
-        via `_escape_html` before it reached a line — so what this module
-        renders IS the wire body, and `len()` is exact."""
-        assert wire_length("a_b") == 3
-        assert wire_length("[x]") == 3
-        assert wire_length("plain") == 5
-        assert wire_length("&lt;script&gt;") == len("&lt;script&gt;")
-
-
-# ── the POSTed body, not the rendered one, is what has to fit (review F1) ──
-
-
-class TestTheWireBodyFitsTheCap:
-    """`_fit`'s ONE postcondition, asserted on what Telegram actually receives.
-
-    The adversarial review on `alpha-engine-config-I9921` measured the gap:
-    the 60-phase fixture rendered a body of wire length **4117** against a
-    budget that reserved only `"\\n\\n(truncated — see full board)"` — not the
-    ` — N line(s) withheld` it also emits, and not the 35-character
-    `[INFO] crucible-v2/report.morning: ` prefix `krepis.alerts.publish`
-    prepends. 4117 + 35 = 4152 was POSTed; Telegram returned 400 *message is
-    too long*, which is not an entity-parse error, so krepis' plain-text retry
-    never fired, `send_message` returned False, `deliver` raised
-    `UndeliveredError`, the manifest read `failed` and `alerts.sweep` paged.
-
-    `TestTheTruncationRule` above asserted the ladder survived and that
-    `wire_length` was the unit of measure. It never asserted the result was
-    under the cap — the one property the whole function exists to deliver.
-    This class asserts exactly that, at the cap and over it.
-    """
-
-    @staticmethod
-    def _wire(message: str) -> int:
-        """What krepis escapes and POSTs: the prefix plus this body."""
-        return wire_length(TRANSPORT_PREFIX + message)
-
-    def test_the_prefix_matches_the_one_krepis_actually_prepends(self):
-        """PINNED against krepis' own formatter, not restated from its source.
-
-        `TRANSPORT_PREFIX` is composed here from `DELIVERY_SEVERITY` and
-        `DELIVERY_SOURCE` because krepis exposes no public formatter. That is
-        a budget term derived from another package's behaviour, so it is
-        pinned by CALLING that behaviour: the day krepis changes its envelope
-        this fails, instead of the report silently going over the cap.
-        """
-        from krepis.alerts import _format_message
-
-        formatted = _format_message("BODY", DELIVERY_SEVERITY, DELIVERY_SOURCE)
-        assert formatted == f"{TRANSPORT_PREFIX}BODY"
-        assert TRANSPORT_PREFIX.endswith(": ")
-
-    def test_the_reviews_own_fixture_now_fits_the_wire(self, tmp_path):
-        """The exact fixture that measured 4117 and was refused."""
-        message = TestTheTruncationRule._huge(tmp_path)
-        assert self._wire(message) <= MESSAGE_MAX_CHARS
-        assert TRUNCATION_MARKER in message
-
-    def test_a_body_at_exactly_the_cap_is_not_truncated(self):
-        """The boundary is inclusive: 4096 is a message Telegram takes."""
-        from crucible.morning import _KEEP, _fit
-
-        lines = self._lines_of_wire_length(MESSAGE_MAX_CHARS - wire_length(TRANSPORT_PREFIX))
-        rendered = _fit(lines)
-        assert self._wire(rendered) == MESSAGE_MAX_CHARS
-        assert TRUNCATION_MARKER not in rendered
-        assert rendered == "\n".join(text for text, _ in lines)
-        assert all(tier == _KEEP for _, tier in lines)
-
-    def test_a_body_one_character_over_the_cap_is_truncated_and_fits(self):
-        """One character over, and the result is under — including the suffix
-        the truncation itself adds, which is what F1 was."""
-        from crucible.morning import _fit
-
-        lines = self._lines_of_wire_length(MESSAGE_MAX_CHARS - wire_length(TRANSPORT_PREFIX) + 1)
-        rendered = _fit(lines)
-        assert TRUNCATION_MARKER in rendered
-        assert self._wire(rendered) <= MESSAGE_MAX_CHARS
-
-    def test_the_suffix_the_budget_reserved_is_the_suffix_emitted(self):
-        """F1 restated as a property: the reserved string and the emitted
-        string are one function, so they cannot drift again."""
-        from crucible.morning import _fit, _truncation_suffix
-
-        lines = self._lines_of_wire_length(MESSAGE_MAX_CHARS * 2)
-        rendered = _fit(lines)
-        dropped = len(lines) - len(rendered.split(TRUNCATION_MARKER)[0].rstrip("\n").splitlines())
-        assert rendered.endswith(_truncation_suffix(dropped))
-        assert self._wire(rendered) <= MESSAGE_MAX_CHARS
-
-    @pytest.mark.parametrize("phases", [1, 6, 60, 400])
-    def test_the_wire_fits_at_every_board_size(self, tmp_path, phases):
-        """The postcondition is not a property of one fixture."""
-        rows = [
-            _row(
-                f"phase{i}",
-                "phase",
-                "UNMET",
-                "d",
-                [_clause(f"clause_number_{i}_{j}_with_a_long_name", False) for j in range(12)],
-            )
-            for i in range(phases)
-        ]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert self._wire(message) <= MESSAGE_MAX_CHARS
-
-    def test_the_console_url_block_alone_fits_the_cap(self, tmp_path):
-        """The console variant of the residual below (`alpha-engine-config-
-        I9926`): one heading, the console address and its fixed caveat. The
-        caveat is the longer of the two, so this is the bound that matters
-        once `CRUCIBLE_CONSOLE_URL` is set."""
-        from crucible.morning import _URL, _board_lines, wire_length
-
-        inputs = read_inputs(
-            _seed(tmp_path, previous=_board()),
-            trading_day=DAY,
-            now=FIRED_AT,
-            console_url="https://console.example.test",
-        )
-        block = _board_lines(inputs)
-        assert block and all(tier == _URL for _, tier in block)
-        pinned = "\n".join(["", SECTIONS[-1], *(text for text, _ in block)])
-        assert wire_length(pinned) < MESSAGE_MAX_CHARS // 4
-
-    def test_the_url_block_alone_fits_the_cap(self, tmp_path):
-        """`_fit`'s stated residual, measured rather than assumed away.
-
-        The `_URL` tier is never dropped, so if it alone exceeded the budget
-        nothing could bring the message under the cap. It is one heading, one
-        URL (presigned here; the console variant is the test above) and one
-        fixed caveat — this asserts that bound holds on a real render rather
-        than trusting that it is obviously small.
-        """
-        from crucible.morning import _URL, _board_lines
-
-        inputs = read_inputs(_seed(tmp_path, previous=_board()), trading_day=DAY, now=FIRED_AT)
-        block = _board_lines(inputs)
-        assert block and all(tier == _URL for _, tier in block)
-        heading = SECTIONS[-1]
-        pinned = "\n".join(["", heading, *(text for text, _ in block)])
-        assert wire_length(TRANSPORT_PREFIX + pinned) < MESSAGE_MAX_CHARS
-
-    @staticmethod
-    def _lines_of_wire_length(target: int) -> list[tuple[str, int]]:
-        """`_KEEP` lines of plain text joining to exactly ``target`` wire chars.
-
-        Plain `a`s, so `wire_length` is `len` and the arithmetic under test is
-        the fitter's rather than the escaper's.
-        """
-        from crucible.morning import _KEEP
-
-        lines = [("a" * 100, _KEEP) for _ in range(target // 101)]
-        remainder = target - (len(lines) * 101 - 1) - 1
-        if remainder > 0:
-            lines.append(("a" * remainder, _KEEP))
-        built = "\n".join(text for text, _ in lines)
-        assert wire_length(built) == target, "the fixture does not hit its own target length"
-        return lines
-
-
-# ── the link is the pointer to everything cut, so it is never cut (F3) ─────
-
-
-class TestTheLinkOutlivesEveryTruncation:
-    """`alpha-engine-config-I9921`: "never the ladder lines", and the review's
-    corollary — never the URL either.
-
-    Measured before this fix, on a 200-line `_KEEP` ladder: the FULL BOARD
-    heading, the URL and the caveat were the first three lines dropped, purely
-    because the inner loop deletes from the END of the list and they are last.
-    The message then said "(truncated — see full board)" and carried no board,
-    which is the outcome `MESSAGE_MAX_CHARS`'s own docstring names as the
-    reason not to let the transport tail-trim.
-
-    The fixture is a board whose phase rows carry NO clause list, so
-    `_phase_lines` falls back to the board's unbounded free text at `_KEEP` —
-    the path the review named as unbounded, reached without inventing a
-    private call.
-    """
-
-    @staticmethod
-    def _message(tmp_path, *, phases: int) -> str:
-        rows = [
-            _row(f"phase{i}", "phase", "UNMET", "unbounded board free text " * 12)
-            for i in range(phases)
-        ]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        return run_report(store, trading_day=DAY, now=FIRED_AT)
-
-    @pytest.mark.parametrize("phases", [200, 2000])
-    def test_the_url_survives_a_keep_tier_body_far_over_budget(self, tmp_path, phases):
-        message = self._message(tmp_path, phases=phases)
-        assert TRUNCATION_MARKER in message, "the fixture must actually truncate"
-        assert "file://" in message, "the link to the full board was dropped"
-        assert SECTIONS[-1] in message, "the FULL BOARD heading was dropped"
-
-    def test_the_caveat_stays_with_the_url(self, tmp_path):
-        """A presigned link with no expiry beside it is a promise the
-        credential cannot keep — the caveat is part of the pointer."""
-        message = self._message(tmp_path, phases=200)
-        assert "presigned GET, expires" in message
-
-    def test_the_ladder_is_sacrificed_before_the_link(self, tmp_path):
-        """The inverse of the defect: at extreme sizes ladder lines go and the
-        link stays, never the other way round."""
-        message = self._message(tmp_path, phases=2000)
-        ladder = [ln for ln in message.splitlines() if ln.startswith("  phase")]
-        assert len(ladder) < 2000, "nothing was dropped, so the fixture proves nothing"
-        assert "file://" in message
-
-    def test_the_order_of_sacrifice_is_the_one_the_issue_states(self):
-        """Clause names, schedule, moved-since, silence, acceptance ids, then
-        whatever is left — and the URL is not in the order at all."""
-        from crucible.morning import (
-            _ACCEPTANCE_IDS,
-            _DROP_ORDER,
-            _KEEP,
-            _MOVED,
-            _NAMES,
-            _SCHEDULE,
-            _SILENCE,
-            _URL,
-        )
-
-        assert _DROP_ORDER == (_NAMES, _SCHEDULE, _MOVED, _SILENCE, _ACCEPTANCE_IDS, _KEEP)
-        assert _URL not in _DROP_ORDER
-
-
 # ── one artifact, one parse, two surfaces (review F2) ─────────────────────
 
 
 class TestOneAcceptanceReaderForBothSurfaces:
-    """The message and the page it links to read the SAME document with the
-    SAME rule, or one of them is lying about the other.
-
-    Measured before this fix, on one document missing only `commit`: the
-    message rendered `acceptance count: not on any artifact` while the page it
-    pointed at rendered `21 met / 2 unmet / 1 unmeasurable ... at commit
-    UNKNOWN`. `board.py`'s own docstring claimed the distinction was "made
-    once here so the page and the message cannot disagree". It was made twice.
-    """
+    """The full update and the board page it links to read the SAME document
+    with the SAME rule, or one of them is lying about the other."""
 
     COMPLETE: dict[str, Any] = {
         "met": 21,
@@ -1473,7 +1294,6 @@ class TestOneAcceptanceReaderForBothSurfaces:
 
     @staticmethod
     def _both(tmp_path, document: dict[str, Any]) -> tuple[str, str]:
-        """One document, rendered by both surfaces from one store."""
         import argparse
 
         from crucible.keys import acceptance_reading_key
@@ -1482,24 +1302,23 @@ class TestOneAcceptanceReaderForBothSurfaces:
         store = _seed(tmp_path, previous=_board())
         store.put_bytes(acceptance_reading_key(DAY.isoformat()), json.dumps(document).encode())
         board_handler(argparse.Namespace(trading_day=DAY, store=str(tmp_path)))
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        return message, store.get_bytes(BOARD_HTML_KEY).decode()
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        return update, store.get_bytes(BOARD_HTML_KEY).decode()
 
     def test_a_document_with_no_commit_is_refused_by_both(self, tmp_path):
-        """The exact disagreement the review measured, as one assertion."""
-        message, page = self._both(tmp_path, self.NO_COMMIT)
-        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT in message
+        update, page = self._both(tmp_path, self.NO_COMMIT)
+        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT in update
         assert "answers a different question" in page
-        assert "21 met" not in page, "the page quotes a figure the message says does not exist"
+        assert "21 met" not in page
         assert "UNKNOWN" not in page.split("<h2>objective")[0]
 
     def test_a_complete_document_renders_the_same_figures_on_both(self, tmp_path):
-        message, page = self._both(tmp_path, self.COMPLETE)
-        assert "acceptance count: 21 met / 2 unmet / 1 unmeasurable of 24" in message
+        update, page = self._both(tmp_path, self.COMPLETE)
+        assert "acceptance count: 21 met / 2 unmet / 1 unmeasurable of 24" in update
         assert "21 met / 2 unmet / 1 unmeasurable</strong> of 24 clauses" in page
-        assert SHA in message
+        assert SHA in update
         assert SHA in page
-        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT not in message
+        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT not in update
 
     @pytest.mark.parametrize(
         "document",
@@ -1512,16 +1331,11 @@ class TestOneAcceptanceReaderForBothSurfaces:
         ],
     )
     def test_every_incomplete_shape_is_refused_by_both(self, tmp_path, document):
-        """One completeness rule, exercised on every way a document can miss
-        it — including `True`, which Python calls an `int` and no reader
-        should call a count."""
-        message, page = self._both(tmp_path, document)
-        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT in message
+        update, page = self._both(tmp_path, document)
+        assert ACCEPTANCE_NOT_ON_ANY_ARTIFACT in update
         assert "answers a different question" in page
 
     def test_the_shared_parser_is_the_only_completeness_rule(self):
-        """Neither renderer restates it. A rule stated in two places has
-        already drifted; this one had."""
         from crucible.keys import ACCEPTANCE_REQUIRED_FIELDS, parse_acceptance_reading
 
         assert ACCEPTANCE_REQUIRED_FIELDS == ("met", "unmet", "unmeasurable", "commit")
@@ -1532,203 +1346,18 @@ class TestOneAcceptanceReaderForBothSurfaces:
         assert parsed.unmet_clauses is None, "an absent list is 'not filed', never 'there are none'"
 
 
-# ── the page link: denied is not absent (review F4) ───────────────────────
-
-
-class TestAReadThatFailedIsNotAPageThatIsAbsent:
-    """`_board_url` swallowed only `KeyError`, but `S3Store.presigned_url`
-    reaches absence through `exists()` → `head_object`, which re-raises every
-    non-404 `ClientError`. `alpha-engine-config-I9896` measured the shape live:
-    S3 answers **403 for a missing key** when the caller also lacks
-    `s3:ListBucket` on the prefix — and `board/index.html` is written only
-    under `if may_move:`, so its absence is a live possibility. The whole
-    report would have died over a missing optional link.
-    """
-
-    class _Store(LocalStore):
-        def __init__(self, root, *, code: str) -> None:
-            super().__init__(root)
-            self._code = code
-
-        def presigned_url(self, key: str, expires_s: int) -> str:
-            if key == BOARD_HTML_KEY:
-                raise ClientError(
-                    {"Error": {"Code": self._code, "Message": "s3:ListBucket denied"}},
-                    "HeadObject",
-                )
-            return super().presigned_url(key, expires_s)
-
-    def _message(self, tmp_path, code: str) -> str:
-        _seed(tmp_path, previous=_board())
-        store = self._Store(tmp_path, code=code)
-        return run_report(store, trading_day=DAY, now=FIRED_AT)
-
-    def test_an_access_denied_page_read_does_not_kill_the_report(self, tmp_path):
-        message = self._message(tmp_path, "AccessDenied")
-        assert message.startswith("CRUCIBLE V2 —")
-
-    def test_an_access_denied_page_read_is_named_as_an_access_failure(self, tmp_path):
-        message = self._message(tmp_path, "AccessDenied")
-        assert "AccessDenied" in message
-        assert "access failure" in message
-        assert BOARD_URL_UNAVAILABLE not in message, (
-            "a denied read reported as 'the board render published none' blames the wrong job"
-        )
-
-    def test_a_not_found_page_read_is_still_absent_not_denied(self, tmp_path):
-        """A `ClientError` carrying a 404 code is the ABSENT case, matched for
-        the same reason `_read_json` matches it: a mock or a future backend
-        that raises it directly must degrade to the honest answer."""
-        message = self._message(tmp_path, "NoSuchKey")
-        assert BOARD_URL_UNAVAILABLE in message
-        assert "access failure" not in message
-
-    def test_an_absent_page_is_still_the_unavailable_line(self, tmp_path):
-        store = _seed(tmp_path, previous=_board(), page=False)
-        assert BOARD_URL_UNAVAILABLE in run_report(store, trading_day=DAY, now=FIRED_AT)
-
-    def test_a_configuration_failure_still_raises(self, tmp_path):
-        """Nothing widened. A `ValueError` from an out-of-range lifetime is a
-        defect in this job's own configuration and must not be swallowed into
-        a slightly shorter message."""
-
-        class _Broken(LocalStore):
-            def presigned_url(self, key: str, expires_s: int) -> str:
-                raise ValueError("expires_s out of range")
-
-        _seed(tmp_path, previous=_board())
-        with pytest.raises(ValueError):
-            run_report(_Broken(tmp_path), trading_day=DAY, now=FIRED_AT)
-
-
-class TestHtmlParseMode:
-    """`alpha-engine-config-I9925` — krepis 0.59.50 exposes `parse_mode`, and
-    the crucible half closes the gap: `<b>` headings render bold, every
-    interpolated board string is HTML-escaped, and the budget is re-measured
-    on the escaped wire body — six red closing rows, the longest clause names
-    actually on `main` (`crucible/gate.py`), not the old Markdown-v1 rule.
-    """
-
-    #: Real clause identifiers off `main`'s `crucible/gate.py` — the longest
-    #: names any phase gate actually emits, not invented placeholders, so the
-    #: worst case measured here is one this repository can actually produce.
-    _REAL_CLAUSE_NAMES: tuple[str, ...] = (
-        "old_sf_execution_count_zero",
-        "aws_total_within_ceiling",
-        "aws_cost_within_ceiling",
-        "attribution_renders",
-        "explain_walks_a_verdict",
-        "dead_lambdas_deleted",
-        "old_alerts_muted",
-        "acceptance_suite_committed",
-    )
-
-    def test_a_hostile_reason_is_escaped_and_does_not_break_delivery(self, tmp_path):
-        """An unescaped `<` in interpolated board free text must not be able
-        to take the whole message down under `parse_mode="HTML"` — the exact
-        failure mode `krepis.telegram`'s entity parser would 400 on."""
-        hostile = "Tom & Jerry <script>alert(1)</script> ok if 2<3 and 4>1"
-        rows = [_row("phase0", "phase", "UNMET", hostile)]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "<script>" not in message
-        assert "&amp;" in message
-        assert "&lt;script&gt;" in message
-        assert "2&lt;3" in message
-        assert "4&gt;1" in message
-        # The literal heading tags this module itself owns must survive —
-        # escaping applies to INTERPOLATED content, never to the module's own
-        # markup.
-        assert "<b>LADDER</b>" in message
-
-    def test_a_hostile_clause_name_is_escaped(self, tmp_path):
-        rows = [
-            _row(
-                "phase0",
-                "phase",
-                "UNMET",
-                "1/1 clauses met",
-                [_clause("bad<name>&here", False)],
-            )
-        ]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "bad<name>&here" not in message
-        assert "bad&lt;name&gt;&amp;here" in message
-
-    def test_a_hostile_operator_action_is_escaped(self, tmp_path):
-        store = _seed(
-            tmp_path,
-            previous=_board(),
-            board_run={
-                "status": "failed",
-                "code_sha": SHA,
-                "reason": "PutObject denied for role <arn> & retried",
-            },
-        )
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        assert "denied for role <arn>" not in message
-        assert "denied for role &lt;arn&gt; &amp; retried" in message
-
-    def test_headings_are_tags_not_caps(self, tmp_path):
-        """The stale CAPS workaround (`alpha-engine-config-I9925`) is gone:
-        every heading is `<b>…</b>`, and the bare CAPS word alone is never a
-        whole line — it renders only inside its tag."""
-        store = _seed(tmp_path, previous=_board())
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        lines = message.splitlines()
-        for heading in [s.format(previous_day=PREVIOUS) for s in SECTIONS]:
-            assert heading in lines
-            bare = heading.removeprefix("<b>").removesuffix("</b>")
-            assert bare not in lines, f"{bare!r} rendered as a bare CAPS line, not a tag"
-
-    def test_the_wire_fits_the_cap_with_six_red_closing_rows_of_real_clause_names(self, tmp_path):
-        """The re-measured worst case: six phase rows (`phase0`..`phase5`,
-        one per binding-plan phase), every one UNMET/red, each holding every
-        real long clause name off `main`'s `crucible/gate.py` — plus an
-        HTML-hostile detail sentence on each, so the budget is proven on the
-        ESCAPED wire body (entity expansion included), not the pre-escape
-        rendered text `TestTheTruncationRule` already covers.
-        """
-        rows = [
-            _row(
-                f"phase{i}",
-                "phase",
-                "UNMET",
-                f"{len(self._REAL_CLAUSE_NAMES) - 1}/{len(self._REAL_CLAUSE_NAMES)} "
-                "clauses met; blocked by <deploy> & <IAM> gaps",
-                [_clause(name, met=False) for name in self._REAL_CLAUSE_NAMES],
-            )
-            for i in range(6)
-        ]
-        store = _seed(tmp_path, board=_board(rows=rows), previous=_board(rows=rows))
-        message = run_report(store, trading_day=DAY, now=FIRED_AT)
-        wire = wire_length(TRANSPORT_PREFIX + message)
-        assert wire <= MESSAGE_MAX_CHARS, (
-            f"the six-red-row worst case POSTs at {wire} chars, over the "
-            f"{MESSAGE_MAX_CHARS}-char Telegram cap"
-        )
-        # Every phase's own ladder line survives even when its clause names
-        # were sacrificed to fit — the truncation rule's own guarantee,
-        # re-asserted on the HTML-mode fixture rather than assumed to still
-        # hold once escaping is in the budget.
-        for i in range(6):
-            assert f"  phase{i}  UNMET  0/{len(self._REAL_CLAUSE_NAMES)}" in message
-
-    def test_deliver_sends_with_parse_mode_html(self):
-        """`send_message`/`publish` (krepis 0.59.50) render nothing bold
-        without `parse_mode="HTML"` on the call — mocked here so the
-        assertion is on what this module ASKS FOR, never a live send."""
-        transport = _Transport()
-        deliver("<b>LADDER</b>\nhello", transport=transport)
-        (call,) = transport.calls
-        assert call["parse_mode"] == "HTML"
-
-
 def test_read_inputs_returns_the_declared_shape(tmp_path):
     store = _seed(tmp_path, previous=_board())
-    inputs = read_inputs(store, trading_day=DAY)
+    inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT)
     assert isinstance(inputs, MorningInputs)
+    assert inputs.board["trading_day"] == DAY.isoformat()
+    assert inputs.previous is not None
     assert inputs.previous_day == PREVIOUS
-    assert inputs.board_code_sha == SHA
-    assert render_message(inputs, now=FIRED_AT).startswith("CRUCIBLE V2 —")
+
+
+def test_resolve_trigger_is_unaffected_by_the_rewrite(monkeypatch):
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    assert resolve_trigger() == "schedule"
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    monkeypatch.delenv("CRUCIBLE_TRIGGER", raising=False)
+    assert resolve_trigger({}) == TRIGGER_UNKNOWN

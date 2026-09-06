@@ -9,13 +9,16 @@ was closed the moment its build PRs merged while its own gate read 1 of 6
 clauses met — and the one a human reads on a backlog board was the wrong one.
 This module is the wire between them, and it is deliberately narrow.
 
-**It may comment. It may never close.** Closing or reopening a phase issue is
-Brian's authority (`principles.md` §3.2), and the issue's own deliverable 1
-says so in as many words. A machine comment is a RECORD, not a closure. The
-only mutating request this module can construct is a `POST` to an issue's
-`/comments`; `tests/test_phase_closing_record.py` asserts that as a property
-of the source rather than as a convention, because a convention about
-authority is the thing that failed here already.
+**It may comment, and it may create. It may never close.** Closing or
+reopening a phase issue is Brian's authority (`principles.md` §3.2), and the
+issue's own deliverable 1 says so in as many words. A machine comment is a
+RECORD, not a closure. The only mutating requests this module can construct
+are a `POST` to an issue's `/comments` and a `POST` creating a new issue
+(`alpha-engine-config-I10123`, added for the rolling `[v2 board] daily
+update` issue `crucible.morning` finds-or-creates once and comments on
+daily); `tests/test_phase_closing_record.py` asserts the closing-comment
+shape as a property of the source rather than as a convention, because a
+convention about authority is the thing that failed here already.
 
 **Every read is guarded and none of them raises.** The board renders this
 adapter's answer as a row, and a surface that dies on a 403 publishes
@@ -41,6 +44,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -50,6 +54,7 @@ __all__ = [
     "API_ROOT",
     "HTTP_TIMEOUT_S",
     "ISSUE_STATES",
+    "SEARCH_API_ROOT",
     "TRACKER_APP_PERMISSIONS",
     "TRACKER_APP_SSM_PREFIX_VAR",
     "TRACKER_TOKEN_VAR",
@@ -57,7 +62,9 @@ __all__ = [
     "TrackerCredentialError",
     "TrackerError",
     "comment_bodies",
+    "create_issue",
     "credential",
+    "find_issue_by_title",
     "grant_command",
     "post_comment",
     "read_issue",
@@ -67,6 +74,11 @@ __all__ = [
 #: at nothing at all and so the one hostname this package talks to outside AWS
 #: is greppable in one line.
 API_ROOT = "https://api.github.com"
+
+#: GitHub's search endpoint, off the repo-scoped `/repos/{repo}/...` shape
+#: every other call in this module uses — :func:`find_issue_by_title` is the
+#: one caller.
+SEARCH_API_ROOT = f"{API_ROOT}/search/issues"
 
 #: The variable carrying the tracker credential. Named for crucible rather
 #: than for GitHub because it is scoped to ONE repository's issues and is not
@@ -226,6 +238,32 @@ def _default_opener(request: urllib.request.Request) -> tuple[int, bytes]:
         return int(exc.code), exc.read()
 
 
+def _send(
+    url: str,
+    *,
+    token: str,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    opener: Opener | None = None,
+) -> tuple[int, bytes]:
+    """The one request builder every call in this module goes through.
+
+    Split out from :func:`_request` (`alpha-engine-config-I10123`) so a
+    caller addressing something other than `/repos/{repo}/...` — the search
+    API, which lives at `/search/issues` — still gets the same headers and
+    the same injectable :data:`Opener`, rather than a second, divergent
+    request construction.
+    """
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=data, method=method)
+    request.add_header("Authorization", f"Bearer {token}")
+    request.add_header("Accept", "application/vnd.github+json")
+    request.add_header("X-GitHub-Api-Version", "2022-11-28")
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
+    return (opener or _default_opener)(request)
+
+
 def _request(
     repo: str,
     path: str,
@@ -235,15 +273,13 @@ def _request(
     payload: dict[str, Any] | None = None,
     opener: Opener | None = None,
 ) -> tuple[int, bytes]:
-    url = f"{API_ROOT}/repos/{repo}{path}"
-    data = None if payload is None else json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(url, data=data, method=method)
-    request.add_header("Authorization", f"Bearer {token}")
-    request.add_header("Accept", "application/vnd.github+json")
-    request.add_header("X-GitHub-Api-Version", "2022-11-28")
-    if data is not None:
-        request.add_header("Content-Type", "application/json")
-    return (opener or _default_opener)(request)
+    return _send(
+        f"{API_ROOT}/repos/{repo}{path}",
+        token=token,
+        method=method,
+        payload=payload,
+        opener=opener,
+    )
 
 
 def _decode(body: bytes) -> Any:
@@ -417,3 +453,137 @@ def post_comment(
             "record cannot name where it landed"
         )
     return url
+
+
+def find_issue_by_title(
+    repo: str,
+    title: str,
+    *,
+    token: str | None = None,
+    opener: Opener | None = None,
+) -> int | None:
+    """The number of the OPEN issue in ``repo`` titled exactly ``title``.
+
+    ``None`` when no open issue carries it — the caller (`crucible.morning`,
+    for the rolling `[v2 board] daily update` issue) creates one in that
+    case. RAISES :class:`TrackerError` when MORE than one does: a second
+    open issue with this title is a loud failure, never a pick
+    (`alpha-engine-config-I10123`) — posting to whichever one a race or a
+    manual duplicate left behind is a full update nobody can find from the
+    headline that links it.
+
+    GitHub's search API does PHRASE matching over the whole document, not an
+    exact-field match, so every candidate it returns is re-checked against
+    ``title`` byte for byte (and against ``state == "open"``, which the
+    query already asks for) before it counts — a substring or fuzzy match
+    would silently pick a differently named issue.
+    """
+    granted = credential(token)
+    if granted is None:
+        raise TrackerError(
+            f"no tracker credential (${TRACKER_APP_SSM_PREFIX_VAR} and ${TRACKER_TOKEN_VAR} "
+            f"unset): could not search {repo} for an issue titled {title!r}. "
+            f"Grant it with: {grant_command(repo)}"
+        )
+    query = f'repo:{repo} is:issue is:open in:title "{title}"'
+    url = f"{SEARCH_API_ROOT}?q={urllib.parse.quote(query)}"
+    try:
+        status, body = _send(url, token=granted, opener=opener)
+    except OSError as exc:
+        raise TrackerError(
+            f"searching {repo} for {title!r} failed at the transport: {exc}"
+        ) from exc
+    if status != 200:
+        raise TrackerError(
+            f"GitHub answered {status} searching {repo} for {title!r}: "
+            f"{body.decode('utf-8', 'replace')[:200]}"
+        )
+    try:
+        document = _decode(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise TrackerError(
+            f"the search for {title!r} in {repo} did not answer with JSON: {exc}"
+        ) from exc
+    items = document.get("items") if isinstance(document, dict) else None
+    if not isinstance(items, list):
+        raise TrackerError(
+            f"the search for {title!r} in {repo} answered with no `items` list: {document!r}"
+        )
+    numbers = sorted(
+        {
+            item["number"]
+            for item in items
+            if isinstance(item, dict)
+            and item.get("title") == title
+            and item.get("state") == "open"
+            and isinstance(item.get("number"), int)
+        }
+    )
+    if not numbers:
+        return None
+    if len(numbers) > 1:
+        raise TrackerError(
+            f"{repo} carries {len(numbers)} open issues titled {title!r} ({numbers}); "
+            "refusing to pick one — a second copy of the rolling issue is a defect to "
+            "fix by hand, not by choosing"
+        )
+    return numbers[0]
+
+
+def create_issue(
+    repo: str,
+    title: str,
+    body: str,
+    *,
+    token: str | None = None,
+    opener: Opener | None = None,
+) -> tuple[int, str]:
+    """Create an issue titled ``title`` in ``repo``. Returns ``(number, html_url)``.
+
+    The other mutating request this module can construct, beside
+    :func:`post_comment` — an issue CREATE, never a close, reopen, label,
+    assign or edit (`alpha-engine-config-I10123`). Reached exactly once per
+    rolling issue's lifetime: `crucible.morning` calls this only after
+    :func:`find_issue_by_title` returns ``None``, so a normal day never
+    reaches it.
+    """
+    granted = credential(token)
+    if granted is None:
+        raise TrackerError(
+            f"no tracker credential (${TRACKER_APP_SSM_PREFIX_VAR} and ${TRACKER_TOKEN_VAR} "
+            f"unset): could not create the issue {title!r} in {repo}. "
+            f"Grant it with: {grant_command(repo)}"
+        )
+    if not title.strip():
+        raise TrackerError(f"refusing to create an issue with an empty title in {repo}")
+    try:
+        status, raw = _request(
+            repo,
+            "/issues",
+            token=granted,
+            method="POST",
+            payload={"title": title, "body": body},
+            opener=opener,
+        )
+    except OSError as exc:
+        raise TrackerError(f"creating {title!r} in {repo} failed at the transport: {exc}") from exc
+    if status != 201:
+        raise TrackerError(
+            f"GitHub answered {status} creating {title!r} in {repo}: "
+            f"{raw.decode('utf-8', 'replace')[:200]}"
+        )
+    try:
+        document = _decode(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise TrackerError(
+            f"the issue {title!r} was created in {repo} but GitHub's answer was not JSON, "
+            f"so its number and URL cannot be recorded: {exc}"
+        ) from exc
+    number = document.get("number") if isinstance(document, dict) else None
+    url = document.get("html_url") if isinstance(document, dict) else None
+    if not isinstance(number, int) or not isinstance(url, str) or not url:
+        raise TrackerError(
+            f"the issue {title!r} was created in {repo} but the answer carries no usable "
+            f"`number`/`html_url`: {document!r}"
+        )
+    return number, url

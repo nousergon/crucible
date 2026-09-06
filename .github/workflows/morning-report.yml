@@ -165,6 +165,17 @@ env:
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   REPORT_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/crucible-v2-github-morning-report
   STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
+  # alpha-engine-config-I10123. The full update is now posted as a comment on
+  # the rolling `[v2 board] daily update` issue in the private
+  # alpha-engine-config repository, and an Actions token cannot reach a
+  # different, private repository at all. Same grant, same mechanism as
+  # `board.yml`'s statement of this name: the fleet's existing `ne-groomer`
+  # GitHub App, installed org-wide with Issues: write, mints a short-lived
+  # installation token from three SSM parameters MorningReportRole reads
+  # (`ReadTheGroomerAppCredentialsToMintATrackerToken`, nous-ergon-ops
+  # crucible-v2.yaml). A repository VARIABLE, like STORE_URI above: it names
+  # where the credentials are, never what they are.
+  CRUCIBLE_TRACKER_APP_SSM_PREFIX: ${{ vars.CRUCIBLE_TRACKER_APP_SSM_PREFIX }}
 
 jobs:
   report:
@@ -185,6 +196,15 @@ jobs:
           if [ -z "$STORE_URI" ]; then
             echo "::error::repository variable CRUCIBLE_STORE_URI is not set — set it with: gh variable set CRUCIBLE_STORE_URI --repo nousergon/crucible --body '<s3-uri-of-the-crucible-v2-store>'"
             missing=1
+          fi
+          # alpha-engine-config-I10123. A WARNING, not an error: this repo's
+          # `Repository variables are set` steps fail the JOB, and a hard
+          # failure here would page ABSENCE for a scheduling artefact over a
+          # credential gap that `crucible report.morning` itself already
+          # reports as a named, loud `TrackerError` — the same reasoning
+          # `board.yml`'s own warning for this variable states.
+          if [ -z "$CRUCIBLE_TRACKER_APP_SSM_PREFIX" ]; then
+            echo "::warning::repository variable CRUCIBLE_TRACKER_APP_SSM_PREFIX is not set, so posting the full update to the private tracker will fail and report.morning will fail loudly with no Telegram message sent — set it to the fleet GitHub App's SSM credential prefix (gh variable set CRUCIBLE_TRACKER_APP_SSM_PREFIX --repo nousergon/crucible --body '<prefix>') and apply the crucible-v2 stack so MorningReportRole may read {prefix}github_app_id, _installation_id and _private_key"
           fi
           exit "$missing"
 
