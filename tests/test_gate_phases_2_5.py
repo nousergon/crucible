@@ -1294,11 +1294,18 @@ class TestAnEmptyArmSetIsNeverAPass:
         # the strategy tree — so the fixture carries them too, or the join
         # below is proven only on a register production never writes.
         for control in control_specs(get_slot(slot)):
+            # `control=True` (`alpha-engine-config-I10044`): the gate's own
+            # `is_control_arm(SLOTS[slot], a, register)` call is now
+            # register-backed, so a fixture that wants the register's record
+            # to say "control" — the way `register_arms` does in production —
+            # has to register it that way, not rely on the name colliding
+            # with `SlotSpec.control_arms`.
             register, _ = register.register(
                 slot=slot,
                 name=control.name,
                 spec=control.spec,
                 created_date=control.registered_at,
+                control=True,
             )
         arm_id = ""
         for name, params in arms:
