@@ -22,7 +22,7 @@ import pytest
 from crucible.calendar import is_trading_day
 from crucible.runmode import RUN_MODE_ENV, RUN_MODE_LIVE
 from crucible.store import LocalStore
-from crucible.tracker import TRACKER_TOKEN_VAR
+from crucible.tracker import TRACKER_APP_SSM_PREFIX_VAR, TRACKER_TOKEN_VAR
 
 #: Enough sessions for the 252-session feature window plus a 21-session
 #: horizon plus the dates a ladder needs. Shorter panels make `mom_12_1`
@@ -162,6 +162,9 @@ def no_tracker_credential(monkeypatch):
     socket).
     """
     monkeypatch.delenv(TRACKER_TOKEN_VAR, raising=False)
+    # And the App path: with the prefix unset the adapter never imports the
+    # minting helper, so no test reaches SSM or GitHub's App endpoint either.
+    monkeypatch.delenv(TRACKER_APP_SSM_PREFIX_VAR, raising=False)
 
 
 @pytest.fixture

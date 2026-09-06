@@ -118,6 +118,17 @@ env:
   # command has been run. Nothing else in this workflow depends on it: the
   # other ~50 rows render exactly as before.
   CRUCIBLE_TRACKER_TOKEN: ${{ secrets.CRUCIBLE_TRACKER_TOKEN }}
+  # The GRANT (alpha-engine-config-I9967, revised 2026-09-06): no second
+  # long-lived credential. The fleet's existing `ne-groomer` GitHub App is
+  # installed org-wide with Issues: write, and its credentials live in SSM;
+  # `crucible.tracker` mints a short-lived installation token narrowed to
+  # `issues: write` from them under the board role, whose crucible-v2 stack
+  # statement `ReadTheGroomerAppCredentialsToMintATrackerToken` reads exactly
+  # the three parameters. A repository VARIABLE, like STORE_URI above: it
+  # names where the credentials are, never what they are, and the tree stays
+  # free of the SSM path. The secret above remains the laptop override and
+  # wins when both are set.
+  CRUCIBLE_TRACKER_APP_SSM_PREFIX: ${{ vars.CRUCIBLE_TRACKER_APP_SSM_PREFIX }}
 
 jobs:
   board:
@@ -174,8 +185,8 @@ jobs:
           # their own detail — while every other row renders normally.
           # Failing the whole render here would take the board down over a
           # credential six of its rows need.
-          if [ -z "$CRUCIBLE_TRACKER_TOKEN" ]; then
-            echo "::warning::secret CRUCIBLE_TRACKER_TOKEN is not set, so the six phase-exit rows will render UNMEASURABLE and a phase issue closed with no closing record cannot be detected — set it with: gh secret set CRUCIBLE_TRACKER_TOKEN --repo nousergon/crucible --body '<token>', where <token> is a fine-grained personal access token scoped to nousergon/alpha-engine-config with Issues: read and write and no other permission"
+          if [ -z "$CRUCIBLE_TRACKER_APP_SSM_PREFIX" ] && [ -z "$CRUCIBLE_TRACKER_TOKEN" ]; then
+            echo "::warning::neither repository variable CRUCIBLE_TRACKER_APP_SSM_PREFIX nor secret CRUCIBLE_TRACKER_TOKEN is set, so the six phase-exit rows will render UNMEASURABLE and a phase issue closed with no closing record cannot be detected — set the variable to the fleet GitHub App's SSM credential prefix (gh variable set CRUCIBLE_TRACKER_APP_SSM_PREFIX --repo nousergon/crucible --body '<prefix>') and apply the crucible-v2 stack so the board role may read {prefix}github_app_id, _installation_id and _private_key"
           fi
           exit "$missing"
 
