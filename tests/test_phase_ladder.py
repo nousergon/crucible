@@ -481,8 +481,13 @@ class TestThePhaseLadderSchemaContract:
         from crucible.store import LocalStore
         from crucible.track_f import gate_handler
 
+        # UNMET, deliberately. The subject of this test is the schema version
+        # stamped on `gates/ladder.json`, which is written either way — and a
+        # MET phase-1 reading on a live run is no longer an incidental
+        # fixture value: `alpha-engine-config-I9967` makes it the event that
+        # files the phase's closing record and posts it to the tracker.
         monkeypatch.setitem(
-            GATES, "phase1", (5, lambda *_a, **_k: [Clause("c", "req", True, "met", ())])
+            GATES, "phase1", (5, lambda *_a, **_k: [Clause("c", "req", False, "unmet", ())])
         )
         args = argparse.Namespace(
             gate="phase1", trading_day=FRIDAY, weeks=None, store=str(tmp_path)

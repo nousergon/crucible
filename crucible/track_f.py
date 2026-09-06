@@ -26,23 +26,39 @@ from typing import Any
 from krepis.metrics import derive_status
 
 from crucible import gate as gate_module
+from crucible import tracker
+from crucible.documents import UnreadableDocumentError, read_store_document
 from crucible.gate import (
+    CLOSING_READING_SCHEMA_VERSION,
     GATES,
     LADDER_KEY,
     LADDER_SCHEMA_VERSION,
+    TRACKER_REPO,
+    Phase,
     build_ladder,
     closing_reading,
     evaluate,
     gate_key,
+    gate_state_for,
     ladder_payload,
+    parse_closing_comment,
+    phase_for_gate,
     render_closing_comment,
 )
-from crucible.keys import manifest_key
+from crucible.keys import closing_record_key, manifest_key
+from crucible.runmode import RUN_MODE_LIVE
 from crucible.runner import RunContext, run_job
-from crucible.store import open_store, resolve_store_uri
+from crucible.store import ETAG_ABSENT, Store, open_store, resolve_store_uri
 from crucible.weekly import arc_stages, run_arc
 
-__all__ = ["gate_handler", "reading_commit", "weekly_handler"]
+__all__ = [
+    "closing_record_line",
+    "file_closing_record",
+    "gate_handler",
+    "post_closing_comment",
+    "reading_commit",
+    "weekly_handler",
+]
 
 
 def reading_commit() -> str:
@@ -86,6 +102,125 @@ def reading_commit() -> str:
         "this build came from. A closing reading with no commit cannot be re-run "
         "against the clause definitions that produced it."
     )
+
+
+def post_closing_comment(phase: Phase, body: str) -> str:
+    """Post ``body`` to ``phase``'s tracker issue, at most once, ever.
+
+    Idempotent AT THE TRACKER, not only in this process: the comments already
+    on the issue are read first, and a comment already carrying a
+    `crucible-gate-reading` block rendered for THIS phase means the record has
+    been posted and its URL is returned unchanged. That check is what makes
+    the pair of writes safe in either order — the store record can be lost, a
+    race can be lost, this job can be re-run by hand, and the issue still ends
+    up with exactly one closing reading on it.
+
+    It comments and it stops. Closing the issue is Brian's authority
+    (`alpha-engine-config-I9967` deliverable 1 says so in as many words), and
+    `crucible.tracker` cannot construct any other mutating request.
+
+    Raises `crucible.tracker.TrackerError` when the tracker cannot be reached
+    or the credential is not granted. Deliberately loud: this function is
+    reached only when a phase gate reads MET for the first time on a live run,
+    which happens six times in the life of the rebuild, and a record filed to
+    the store while the tracker was never told is the same two-instruments
+    defect one instrument along.
+    """
+    for existing in tracker.comment_bodies(TRACKER_REPO, phase.issue):
+        block = parse_closing_comment(existing)
+        if block is not None and block.get("phase") == phase.id:
+            return phase.tracker_url
+    return tracker.post_comment(TRACKER_REPO, phase.issue, body)
+
+
+def file_closing_record(
+    ctx: RunContext,
+    store: Store,
+    reading: Any,
+    *,
+    store_uri: str,
+) -> str | None:
+    """File the ONE durable record of a phase's exit, or ``None`` if not due.
+
+    `alpha-engine-config-I9967` deliverable 2, and the whole design constraint
+    in one function: **the phase's recorded state is DERIVED from the gate
+    reading**, written where a later reader can fetch it, and it is not a
+    convention anybody has to remember.
+
+    Three conditions, all of them facts rather than judgements:
+
+    1. the gate reads `MET` — `gate_state_for`, the same derivation the ladder
+       row and the closing block use, so the three cannot disagree;
+    2. the run is LIVE — a replay of a historical day may legitimately read
+       MET and does not exit a phase (`crucible.runmode`, plan §6 row 2);
+    3. nothing is filed at the key yet — compare-and-swap against
+       :data:`~crucible.store.ETAG_ABSENT`, so the first write wins and every
+       later reading leaves it exactly as it was. A phase exits once.
+
+    A record that is PRESENT and unreadable raises rather than being
+    overwritten: "the record is corrupt" and "there is no record" call for
+    opposite actions, and quietly replacing the first with a fresh reading
+    would destroy the only evidence of what was actually filed.
+
+    The tracker comment is posted BEFORE the store write, on purpose. If the
+    post fails the record is not written, the job fails loud, and re-running
+    files both; if the write fails the comment is already on the issue and
+    :func:`post_closing_comment` will not repeat it. The reverse order has a
+    state — recorded but never announced — that nothing would ever correct.
+    """
+    if gate_state_for(reading) != "MET":
+        return None
+    if ctx.run_mode != RUN_MODE_LIVE:
+        return None
+    phase = phase_for_gate(reading.gate)
+    key = closing_record_key(phase.id)
+    filed = read_store_document(store, key)
+    if filed.problem is not None:
+        raise UnreadableDocumentError(
+            f"{filed.problem}. A closing record that is present and unreadable is not an "
+            "absent one, and this run will not overwrite it with a fresh reading — that "
+            "would destroy the only evidence of what was filed when the phase exited."
+        )
+    if not filed.absent:
+        return key
+    document = closing_reading(reading, store_uri=store_uri, commit=reading_commit())
+    post_closing_comment(phase, render_closing_comment(document))
+    ctx.record_output_cas(
+        key,
+        ETAG_ABSENT,
+        json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
+        schema_version=CLOSING_READING_SCHEMA_VERSION,
+    )
+    return key
+
+
+def closing_record_line(store: Store, reading: Any) -> str:
+    """The one line a `crucible gate` reader gets about the closing record.
+
+    Always a line, never silence. `alpha-engine-config-I9967` deliverable 2
+    asks the gate to render "closing record filed at <key>" once the record
+    exists; the other three answers are printed with equal prominence, because
+    a surface that prints something only in the good case teaches its reader
+    that no line means nothing to see.
+    """
+    phase = phase_for_gate(reading.gate)
+    key = closing_record_key(phase.id)
+    filed = read_store_document(store, key)
+    if filed.document is not None:
+        return (
+            f"closing record filed at {key} — {phase.tracker} exited on trading day "
+            f"{filed.document.get('trading_day')}, {filed.document.get('gate_state')} at "
+            f"commit {filed.document.get('commit')}"
+        )
+    if filed.problem is not None:
+        return f"closing record at {key} could not be read: {filed.problem}"
+    if gate_state_for(reading) == "MET":
+        return (
+            f"no closing record at {key}, and this gate reads MET. Re-run this command "
+            f"with --run-mode {RUN_MODE_LIVE} and without --dry-run to file it and post "
+            f"the reading to {phase.tracker}."
+        )
+    return f"no closing record at {key} — {phase.tracker} has not exited"
 
 
 def weekly_handler(args: argparse.Namespace) -> int:
@@ -167,6 +302,7 @@ def gate_handler(args: argparse.Namespace) -> int:
     """
     dry_run = bool(getattr(args, "dry_run", False))
     store = open_store(getattr(args, "store", None), dry_run=dry_run)
+    store_uri = resolve_store_uri(getattr(args, "store", None))
     result: dict[str, Any] = {}
 
     def body(ctx: RunContext) -> None:
@@ -221,6 +357,14 @@ def gate_handler(args: argparse.Namespace) -> int:
                 LADDER_KEY, ladder_payload(ladder), schema_version=LADDER_SCHEMA_VERSION
             )
         result["ladder"] = ladder
+        # The closing record, derived from the reading above and written at
+        # most once (`alpha-engine-config-I9967` deliverable 2). Inside the
+        # job body, so the record enters `outputs[]` as lineage and
+        # `crucible explain` can name the run that filed it; skipped under
+        # `--dry-run` for the same reason the gate artifact is, and the
+        # printed line below still reports whether one exists.
+        if not dry_run:
+            file_closing_record(ctx, store, reading, store_uri=store_uri)
         ctx.record_rows(rows_in=len(reading.window), rows_out=len(reading.clauses))
         n_clauses = len(reading.clauses)
         met_count = sum(1 for c in reading.clauses if c.met)
@@ -285,6 +429,7 @@ def gate_handler(args: argparse.Namespace) -> int:
     reading = result["reading"]
     print(reading.render())
     print(result["ladder"].render())
+    print(closing_record_line(store, reading))
     # `alpha-engine-config-I9967` deliverable 3. Printed AFTER the reading and
     # the ladder, and only when asked for: the block is a paste target, not a
     # second rendering everyone reads past. It is emitted for an UNMET gate as
@@ -295,11 +440,7 @@ def gate_handler(args: argparse.Namespace) -> int:
         print()
         print(
             render_closing_comment(
-                closing_reading(
-                    reading,
-                    store_uri=resolve_store_uri(getattr(args, "store", None)),
-                    commit=reading_commit(),
-                )
+                closing_reading(reading, store_uri=store_uri, commit=reading_commit())
             )
         )
     return 0 if reading.met else 1
