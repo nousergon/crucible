@@ -122,6 +122,8 @@ __all__ = [
     "MetricRecordRow",
     "RegistryDefaults",
     "RejectedRow",
+    "ReleaseProvenanceDocument",
+    "ReleaseRecordDocument",
     "ResourceRow",
     "RunManifestV2",
     "SignalsRow",
@@ -1167,3 +1169,158 @@ class LlmCallsiteRegistryDocument(_Strict):
                 f"`capability_classes` must be a list of non-empty strings; found {bad!r}"
             )
         return self
+
+
+# ── I10045 row 5: the release pointer + provenance ─────────────────────────
+# Additive only, appended after the prior rows' markers for the same
+# rebase reason.
+
+
+class ReleaseRecordDocument(_Strict):
+    """`release.json`, at `releases/{sha}/release.json` — plan §4.11.
+
+    `crucible.release.ReleaseRecord` (a frozen dataclass; unchanged by this
+    PR — its `.wheel_key` property and `.to_json()` method are domain
+    behaviour this module does not carry, the same reason
+    `crucible.slots.arms.ArmSpec` stayed a dataclass beside row 2's
+    `ArmRecipeDocument`) validates its own constructed payload against THIS
+    model in `__post_init__`, via `crucible.release._validate_release_artifact`
+    — replacing that function's previous hand-rolled `jsonschema`
+    `Draft202012Validator` machinery with this model, while keeping its
+    public signature, its "does not conform" message text, and both of its
+    existing direct tests (`tests/test_release.py`) unchanged.
+
+    Deterministic across every rebuild of the same commit
+    (`alpha-engine-config-I9786`) — nothing here can differ between two
+    builds of the same sha, which is what makes
+    `crucible.release.assert_immutable_write`'s byte comparison a
+    correctness check rather than a false-alarm generator. `extra="forbid"`:
+    a field a reader does not understand is a field the producer expected it
+    to act on.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://github.com/nousergon/crucible/schemas/release.v3.json",
+            "title": "Crucible release identity, v3",
+            "description": (
+                "What release.json carries at releases/{sha}/release.json. "
+                "Deterministic across every rebuild of the same commit "
+                "(I9786) -- nothing in this document can differ "
+                "between two builds of the same sha, which is what makes "
+                "assert_immutable_write's byte comparison a correctness check rather "
+                "than a false-alarm generator. v3 replaces v2 (I9908): "
+                "adds wheel_filename, the PEP-440-legal name the wheel was actually "
+                "published under. Every release published before I9908 was named "
+                "crucible-{sha}-py3-none-any.whl, which pip refuses outright (a 40-hex "
+                "git sha is not a PEP 440 version) -- no wheel this pipeline ever "
+                "published was installable. v3's wheel_filename lets a bash bootstrap on "
+                "a spot box download the exact object by name without reimplementing "
+                "crucible.release.wheel_filename_for's version derivation. "
+                "additionalProperties: false because a field a reader does not "
+                "understand is a field the producer expected it to act on."
+            ),
+        },
+    )
+
+    schema_version: Literal["release.v3"] = Field(
+        description="Version of THIS schema. A consumer that cannot read the version "
+        "refuses the document rather than guessing."
+    )
+    sha: GitSha = Field(
+        description="The commit this release is built from. Content-addresses the release prefix."
+    )
+    lockfile_sha256: Sha256 = Field(
+        description="The resolved dependency tree's hash. The wheel does not pin its "
+        "own transitive tree, so two wheels from one commit against two lockfiles are "
+        "two different artifacts, and only this says which."
+    )
+    wheel_sha256: Sha256 = Field(
+        description="The wheel's own hash, checked against the bytes actually uploaded "
+        "by both the publisher and the smoke."
+    )
+    wheel_filename: str = Field(
+        pattern=r"^crucible-.+-py3-none-any\.whl$",
+        description="The exact object name the wheel is published under, at "
+        "releases/{sha}/{wheel_filename}. PEP-440-legal "
+        "(crucible-{version}-py3-none-any.whl), so pip can install it by name -- "
+        "unlike every release published before I9908, which pip "
+        "refused under both the download name and the store's own filename.",
+    )
+    python_requires: str = Field(
+        min_length=1, description="The interpreter constraint this wheel was built against."
+    )
+    extra: dict[str, Any] = Field(
+        description="Reserved for future identity-bearing fields. Empty on every "
+        "release today -- anything that would vary per run belongs in "
+        "release_provenance.v1, not here."
+    )
+
+
+class ReleaseProvenanceDocument(_Strict):
+    """`releases/{sha}/provenance/{run_id}-{run_attempt}.json` — plan §4.11.
+
+    `crucible.release.ReleaseProvenance` validates against this model the
+    same way `ReleaseRecord` validates against `ReleaseRecordDocument` —
+    see that model's docstring. Never immutable-checked: a second attempt
+    for an already-published sha is EXPECTED to differ here, and each
+    attempt is written unconditionally as its own durable record rather than
+    contending for one slot.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://github.com/nousergon/crucible/schemas/release_provenance.v1.json",
+            "title": "Crucible release provenance, v1",
+            "description": (
+                "One publish ATTEMPT for a release, at "
+                "releases/{sha}/provenance/{run_id}-{run_attempt}.json. Split out of "
+                "release.json by I9786: these three fields move on "
+                "every rebuild of the same commit, so keeping them in the immutable "
+                "identity record made a re-run of an unchanged commit an unconditional "
+                "ReleaseImmutabilityError. Never immutable-checked -- a second attempt "
+                "for an already-published sha is EXPECTED to differ here, and each "
+                "attempt is written unconditionally as its own durable record rather "
+                "than contending for one slot."
+            ),
+        },
+    )
+
+    schema_version: Literal["release_provenance.v1"] = Field(
+        description="Version of THIS schema. A consumer that cannot read the version "
+        "refuses the document rather than guessing."
+    )
+    sha: GitSha = Field(
+        description="The commit this attempt built. Must match the release.json this "
+        "attempt accompanies."
+    )
+    run_id: str = Field(
+        min_length=1,
+        description="The CI run that produced this attempt (GitHub's GITHUB_RUN_ID). "
+        "Part of this document's own key.",
+    )
+    run_attempt: str = Field(
+        min_length=1,
+        description="Distinguishes a 're-run failed jobs' retry that reuses the same "
+        "run_id. Part of this document's own key.",
+    )
+    built_at: str = Field(
+        min_length=1,
+        description="When this attempt ran. Gotcha (I9786): sourced from "
+        "github.event.repository.updated_at in deploy.yml, which is repository "
+        "metadata, not the build instant -- carried unexamined because a "
+        "wrong-but-named field beats an absent one, and it is never used for anything "
+        "but display.",
+    )
+    workflow_run_url: str = Field(
+        description="The specific workflow run this attempt is. Different on every "
+        "attempt by construction."
+    )
+    test_summary: str = Field(
+        description="The foundation-test line this attempt printed. Free text; not "
+        "parsed by anything downstream."
+    )
