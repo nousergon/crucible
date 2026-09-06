@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 from typing import Any
 
 from crucible import alerts, release
@@ -340,6 +341,23 @@ def smoke_handler(args: argparse.Namespace) -> int:
                     )
 
         attempted = 2 + len(SMOKE_READS)  # the two release artifacts, plus the ambient paths
+        # alpha-engine-config-I10069: the smoke job runs `uv sync --frozen`
+        # against this checkout, which never installs an optional extra —
+        # this process cannot `import arcticdb` itself and prove anything.
+        # What CAN prove it is `deploy.yml`'s install-proof step, which
+        # installs the just-published WHEEL with every extra
+        # `pyproject.toml` declares and imports each one's module, on the
+        # same x86_64 runner the box now uses, BEFORE this job starts. It
+        # hands the verified set forward as `$CRUCIBLE_SMOKED_EXTRAS`
+        # (comma-separated) via `$GITHUB_ENV`, and it is recorded here on the
+        # `smoke_ok` metric so `crucible.deploy._flip` can refuse a manifest
+        # that never proved the extras the box actually installs — the same
+        # read the flip already does for `release_sha`.
+        smoked_extras = sorted(
+            extra.strip()
+            for extra in os.environ.get("CRUCIBLE_SMOKED_EXTRAS", "").split(",")
+            if extra.strip()
+        )
         ctx.record_metric(
             {
                 "name": "smoke_ok",
@@ -356,6 +374,7 @@ def smoke_handler(args: argparse.Namespace) -> int:
                 ),
                 "source_path": "runs/smoke/{trading_day}/run.json",
                 "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "smoked_extras": smoked_extras,
             }
         )
 

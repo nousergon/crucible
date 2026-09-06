@@ -29,7 +29,7 @@ from crucible.promote import (
     paired_days_required,
     run_promotion,
 )
-from crucible.slots import get_slot
+from crucible.slots import get_slot, is_control_arm
 from crucible.store import LocalStore
 
 # --------------------------------------------------------------------------
@@ -69,11 +69,31 @@ def narrow(spec, clip: float = 0.01):
     return replace(spec, diff_clip=clip)
 
 
-def register_with(slot: str, names: list[str], created: str) -> tuple[ArmRegister, dict[str, str]]:
+def register_with(
+    slot: str,
+    names: list[str],
+    created: str,
+    *,
+    control_names: frozenset[str] = frozenset(),
+) -> tuple[ArmRegister, dict[str, str]]:
+    """Register ``names`` under ``slot``, each as ``control=False`` unless it
+    appears in ``control_names`` (`alpha-engine-config-I10044`: once
+    `is_control_arm` is register-backed, a fixture that wants the register's
+    own record to say "control" has to register it that way rather than
+    relying on the arm's NAME happening to collide with
+    `SlotSpec.control_arms` — the fallback the register-backed path now
+    overrides).
+    """
     reg = ArmRegister()
     ids: dict[str, str] = {}
     for name in names:
-        reg, record = reg.register(slot=slot, name=name, spec={"name": name}, created_date=created)
+        reg, record = reg.register(
+            slot=slot,
+            name=name,
+            spec={"name": name},
+            created_date=created,
+            control=name in control_names,
+        )
         ids[name] = record.arm_id
     return reg, ids
 
@@ -607,7 +627,9 @@ class TestControlArmsNeverServe:
         """
         spec = get_slot("m")
         control = spec.control_arms[0].arm_id  # control_planted_m
-        reg, ids = register_with("m", ["real_a", "real_b", control], dates[0])
+        reg, ids = register_with(
+            "m", ["real_a", "real_b", control], dates[0], control_names=frozenset({control})
+        )
         series_by_arm = {
             ids["real_a"]: series(ids["real_a"], dates, 0.0),
             ids["real_b"]: series(ids["real_b"], dates, 0.04),
@@ -750,7 +772,101 @@ class TestControlArmsNeverServe:
                 code_sha=None,
                 attestation=None,
                 now=None,
+                register=reg,
             )
+
+
+# --------------------------------------------------------------------------
+# `alpha-engine-config-I10044`: `_with_control_vetoes` and
+# `_write_pointer_if_moved` thread the already-loaded register into
+# `is_control_arm`, mirroring `tests/test_slots.py::TestIsControlArmIsRegisterBacked`
+# at both promote.py call sites.
+# --------------------------------------------------------------------------
+
+
+class TestIsControlArmIsRegisterBackedAtPromoteCallSites:
+    """A filed, non-control recipe whose generated name COLLIDES with a
+    slot's control-arm name (``control_planted_m``) must not be treated as a
+    control once it is registered with ``control=False`` — at either call
+    site. Before threading the register through, both fell back to the NAME
+    match and would have vetoed / refused a real arm that only happened to
+    share a control's name.
+    """
+
+    def _slot_with_a_filed_name_collision(self, dates: list[str]):
+        """A real, filed arm named identically to slot m's planted control,
+        registered ``control=False`` — plus one uncontested real arm so the
+        collider has something to be compared against."""
+        spec = get_slot("m")
+        collider_name = spec.control_arms[0].arm_id  # "control_planted_m"
+        reg, ids = register_with("m", ["real_a", collider_name], dates[0])
+        series_by_arm = {
+            ids["real_a"]: series(ids["real_a"], dates, 0.0),
+            ids[collider_name]: series(ids[collider_name], dates, 0.045),
+        }
+        return spec, reg, ids, collider_name, series_by_arm
+
+    def test_with_control_vetoes_does_not_veto_a_name_collision_once_registered(
+        self, tmp_path
+    ) -> None:
+        from crucible.promote import _with_control_vetoes
+
+        dates = trading_days(40)
+        spec, reg, ids, collider_name, series_by_arm = self._slot_with_a_filed_name_collision(dates)
+        collider_id = ids[collider_name]
+
+        assert is_control_arm(spec, collider_id), (
+            "sanity: the NAME-ONLY fallback (no register) still matches the colliding name"
+        )
+        vetoed = _with_control_vetoes(spec, series_by_arm, None, reg)
+        assert vetoed is None or collider_id not in vetoed, (
+            "the record says control=False; a name collision must not be vetoed once "
+            "the arm is registered, once the register is threaded through"
+        )
+
+    def test_write_pointer_if_moved_does_not_refuse_a_name_collision_as_champion(
+        self, tmp_path
+    ) -> None:
+        """Without the register, this champion's NAME matches a control and
+        the write would raise `PromotionRefused` against a real, promotable
+        arm — the false-positive twin of `TestControlArmsNeverServe`'s
+        guard, which is checking the opposite direction (a REAL control must
+        still be refused)."""
+        from crucible.promote import _write_pointer_if_moved
+        from crucible.store import ETAG_ABSENT
+
+        store = LocalStore(tmp_path)
+        dates = trading_days(40)
+        spec, reg, ids, collider_name, series_by_arm = self._slot_with_a_filed_name_collision(dates)
+        collider_id = ids[collider_name]
+        seed_register(store, "m", reg)
+
+        cycle = run_promotion(
+            spec=spec,
+            as_of=dates[-1],
+            register=reg,
+            series_by_arm=series_by_arm,
+            incumbent=ids["real_a"],
+        ).cycle
+        forged = replace(
+            cycle,
+            decision=replace(cycle.decision, champion=collider_id, moved=True, status="decided"),
+        )
+
+        pointer = _write_pointer_if_moved(
+            store=store,
+            spec=spec,
+            cycle=forged,
+            expected=ETAG_ABSENT,
+            manifest_key=None,
+            run_id=None,
+            code_sha=None,
+            attestation=None,
+            now=None,
+            register=reg,
+        )
+        assert pointer is not None
+        assert pointer.arm_id == collider_id
 
 
 # --------------------------------------------------------------------------

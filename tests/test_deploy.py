@@ -122,22 +122,25 @@ def _token(tmp_path, store, name="pointer.token") -> str:
     return str(path)
 
 
-def _write_smoke(store, sha=SHA, status="ok", *, trading_day=None):
+def _write_smoke(store, sha=SHA, status="ok", *, trading_day=None, smoked_extras=("arcticdb",)):
     from crucible.calendar import resolve_trading_day
 
     day = (trading_day or resolve_trading_day()).isoformat()
-    store.put_bytes(
-        manifest_key("smoke", day),
-        json.dumps(
-            {
-                "job": "smoke",
-                "release_sha": sha,
-                "status": status,
-                "reason": "" if status == "ok" else "RuntimeError: live read failed",
-                "trading_day": day,
-            }
-        ).encode(),
-    )
+    manifest: dict = {
+        "job": "smoke",
+        "release_sha": sha,
+        "status": status,
+        "reason": "" if status == "ok" else "RuntimeError: live read failed",
+        "trading_day": day,
+    }
+    # alpha-engine-config-I10069: every flip test writes a manifest that
+    # already covers the required extras (pyproject.toml declares
+    # `arcticdb` today) unless a test deliberately asks for a different set
+    # — a fixture that omitted this by default would make every existing
+    # flip test pass by accident rather than by testing what it claims to.
+    if smoked_extras is not None:
+        manifest["metrics"] = [{"name": "smoke_ok", "smoked_extras": list(smoked_extras)}]
+    store.put_bytes(manifest_key("smoke", day), json.dumps(manifest).encode())
 
 
 class TestPublish:
@@ -375,6 +378,48 @@ class TestFlip:
     def test_an_ok_smoke_flips_the_pointer(self, tmp_path) -> None:
         store = self._published(tmp_path)
         _write_smoke(store)
+        token = _token(tmp_path, store)
+        assert (
+            deploy_main(
+                ["flip", "--sha", SHA, "--store", str(tmp_path), "--expect-pointer-file", token]
+            )
+            == 0
+        )
+        assert current_release(store) == SHA
+
+    def test_a_smoke_missing_a_required_extra_refuses_the_flip(self, tmp_path) -> None:
+        """alpha-engine-config-I10069: a smoke that reports `ok` without ever
+        proving the box's required extra installs and imports is a smoke
+        that passed against a wheel the box cannot run — the defect that
+        shipped e329f205 and died on its first replay arc,
+        `No module named 'arcticdb'`."""
+        store = self._published(tmp_path)
+        _write_smoke(store, smoked_extras=())
+        token = _token(tmp_path, store)
+        with pytest.raises(SystemExit, match=r"arcticdb"):
+            deploy_main(
+                ["flip", "--sha", SHA, "--store", str(tmp_path), "--expect-pointer-file", token]
+            )
+        assert current_release(store) is None
+
+    def test_a_smoke_manifest_with_no_smoked_extras_field_refuses_the_flip(self, tmp_path) -> None:
+        """Absence must not read as coverage: a manifest from before this
+        field existed at all — no `smoked_extras` key anywhere — must refuse
+        exactly like one that names an incomplete set."""
+        store = self._published(tmp_path)
+        _write_smoke(store, smoked_extras=None)
+        token = _token(tmp_path, store)
+        with pytest.raises(SystemExit, match=r"arcticdb"):
+            deploy_main(
+                ["flip", "--sha", SHA, "--store", str(tmp_path), "--expect-pointer-file", token]
+            )
+        assert current_release(store) is None
+
+    def test_a_smoke_that_smoked_more_than_required_is_not_refused(self, tmp_path) -> None:
+        """A superset of the required extras is not a defect — only a missing
+        required extra is."""
+        store = self._published(tmp_path)
+        _write_smoke(store, smoked_extras=("arcticdb", "something-else"))
         token = _token(tmp_path, store)
         assert (
             deploy_main(
@@ -775,8 +820,13 @@ class TestTheWorkflowItself:
         pip_lines = [ln for ln in script.splitlines() if "pip install" in ln]
         assert pip_lines, "the proof must call pip install"
         for line in pip_lines:
-            assert line.rstrip().rstrip('"').endswith(f"{wheel_ref}"), (
-                f"pip install must target the wheel under its PUBLISHED filename, got: {line!r}"
+            # alpha-engine-config-I10069: the target now carries the required
+            # extra(s) in brackets right after the published filename — e.g.
+            # `.../{wheel_ref}[${EXTRAS}]"` — so the wheel_ref itself must sit
+            # immediately before that bracket, not be the line's tail.
+            assert f"{wheel_ref}[${{EXTRAS}}]" in line, (
+                f"pip install must target the wheel under its PUBLISHED filename, with "
+                f"the required extra(s) appended, got: {line!r}"
             )
         cp_lines = [ln for ln in script.splitlines() if "aws s3 cp" in ln]
         assert cp_lines and all(ln.rstrip().rstrip('"').endswith(wheel_ref) for ln in cp_lines), (
@@ -784,6 +834,37 @@ class TestTheWorkflowItself:
         )
         assert "crucible-install-proof.whl" not in script, (
             "a renamed wheel is what pip refused on 2026-09-03"
+        )
+
+    def test_the_install_proof_smokes_the_extras_pyproject_declares(self, workflow) -> None:
+        """alpha-engine-config-I10069: the smoke greened a wheel whose data
+        layer could not import — `No module named 'arcticdb'` — because
+        nothing installed the `[arcticdb]` extra before verifying the wheel.
+        The extra NAME must be derived from `pyproject.toml`'s own
+        `[project.optional-dependencies]`, never restated as a literal
+        (crucible/AGENTS.md: no suppression collections), and the import
+        must actually be exercised before the flip can trust it."""
+        names = [json.dumps(s) for s in self._release_steps(workflow)]
+        install_proof = next(i for i, s in enumerate(names) if "pip install" in s)
+        smoke = next(i for i, s in enumerate(names) if "crucible smoke" in s)
+        script = self._release_steps(workflow)[install_proof]["run"]
+        assert "tomllib" in script and "optional-dependencies" in script, (
+            "the extras must be DERIVED from pyproject.toml, not hardcoded as a restated literal"
+        )
+        assert '"[arcticdb]"' not in script and "[arcticdb]" not in script, (
+            "the extra name must never be restated as a literal in the workflow — "
+            "it belongs in exactly one place, pyproject.toml"
+        )
+        assert "import nousergon_lib.arcticdb, arcticdb" in script, (
+            "the proof must actually import the module the data layer needs, not "
+            "just install the extra's dependency"
+        )
+        assert install_proof < smoke, (
+            "the extras must be proven before the smoke that gates the flip runs"
+        )
+        assert "CRUCIBLE_SMOKED_EXTRAS" in script and "GITHUB_ENV" in script, (
+            "the verified extras must be handed to the Smoke step so its manifest "
+            "can record what was actually proven"
         )
 
 
@@ -936,6 +1017,39 @@ class TestTheSmokeGate:
         self._run(tmp_path)
         populated = self._metric(self._manifest(tmp_path))["value"]
         assert populated > bootstrap, (bootstrap, populated)
+
+    def test_smoke_ok_records_the_extras_the_environment_says_were_smoked(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """alpha-engine-config-I10069: `deploy.yml`'s install-proof step
+        installs the published wheel with the required extra(s), imports
+        each one's module, and hands the verified set forward as
+        `$CRUCIBLE_SMOKED_EXTRAS` via `$GITHUB_ENV` — this is that handoff's
+        other end, recorded on the manifest `crucible.deploy._flip` reads."""
+        monkeypatch.setenv("CRUCIBLE_SMOKED_EXTRAS", "arcticdb")
+        store = LocalStore(tmp_path)
+        publish_release(
+            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
+        )
+        assert self._run(tmp_path) == 0
+        metric = self._metric(self._manifest(tmp_path))
+        assert metric["smoked_extras"] == ["arcticdb"]
+
+    def test_smoke_ok_records_no_extras_when_the_environment_says_nothing(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Absence must not read as coverage: an unset (or blank)
+        `$CRUCIBLE_SMOKED_EXTRAS` records an EMPTY list, never a guess, so a
+        smoke run outside `deploy.yml`'s install-proof step cannot silently
+        pass the flip's extras check."""
+        monkeypatch.delenv("CRUCIBLE_SMOKED_EXTRAS", raising=False)
+        store = LocalStore(tmp_path)
+        publish_release(
+            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
+        )
+        assert self._run(tmp_path) == 0
+        metric = self._metric(self._manifest(tmp_path))
+        assert metric["smoked_extras"] == []
 
     def test_no_read_path_is_declared_required_and_then_never_enforced(self) -> None:
         """`SMOKE_READS` carried a `required` column that was False on every
