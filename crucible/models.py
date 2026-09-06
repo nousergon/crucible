@@ -101,12 +101,14 @@ still holds because that derivation happens here, not in a second copy.
 from __future__ import annotations
 
 import datetime as dt
-from typing import Annotated, Literal, get_args
+from typing import Annotated, Any, Literal, get_args
 
 from krepis.metrics import StatusLiteral
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
+    "ARM_RECIPE_REQUIRED_FIELDS",
+    "ArmRecipeDocument",
     "ArtifactRef",
     "AttemptRow",
     "ComponentRow",
@@ -915,3 +917,129 @@ class RunManifestV2(_Strict):
                 "degraded-SUCCEEDED in disguise."
             )
         return self
+
+
+# ── I10045 row 2: the arm register ─────────────────────────────────────────
+# Additive only. New boundaries land as new classes appended below this
+# marker so a rebase across concurrent rows stays a pure append-append.
+
+#: §9.1 pre-registration, restated here (not imported from
+#: `crucible.slots.arms`) so the model has no import-time dependency on the
+#: reader it types. `crucible.slots.arms.REQUIRED_ARM_FIELDS` stays the
+#: public name other modules import; `tests/test_public_surface.py` pins
+#: that the two tuples are equal so they cannot drift silently.
+ARM_RECIPE_REQUIRED_FIELDS: tuple[str, ...] = ("name", "slot", "ranker", "params", "registered_at")
+
+
+class ArmRecipeDocument(_Strict):
+    """One filed U/R arm recipe, `arms/{slot}/{name}.yaml`.
+
+    Normative source: `champion-challenger-policy.md` §3, §3.1, §4; plan
+    §4.4; §9.1 pre-registration. `crucible.slots.arms._parse` used to build
+    this by hand: a missing field raised a `KeyError` on the field it forgot
+    to check for, not the one that was actually missing, and an unknown
+    top-level key registered cleanly and did nothing — the same silent-typo
+    failure `alpha-engine-config-I9944` named for `components.yaml`.
+
+    Three checks stay in the READER rather than moving onto this model,
+    because each needs something a document-shape model cannot carry:
+
+    * `ranker` naming a real ranking callable — checked against
+      `crucible.slots.rankers.get_ranker`'s live registry, and raised as
+      `KeyError` (`"unknown ranker"`), a distinct failure mode from a
+      malformed document.
+    * `params.llm_callsite` naming a registered LLM call site — checked
+      against `crucible.llm.LLM_CALLSITE_REGISTRY`, imported lazily because
+      it is a heavy module with one caller.
+    * `registered_at` naming an actual NYSE trading day — asserted on
+      `ArmSpec.__post_init__` via `crucible.calendar.assert_trading_day`,
+      which needs the trading calendar rather than the document alone. It is
+      a validity check against an external oracle, not a rule relating this
+      document's fields to each other, so it is not the kind of cross-field
+      rule binding constraint 3 asks to move onto the model.
+
+    `params` is required and non-empty, matching the reader's existing
+    falsy-field check (`not document.get("params")`) exactly: this PR types
+    the boundary, it does not decide whether a ranker with zero parameters
+    should be legal — that is a separate, un-filed question about the
+    reader's own semantics.
+    """
+
+    model_config = ConfigDict(extra="forbid", json_schema_extra={"$id": "arm_recipe.v1"})
+
+    #: Defaulted, not required (unlike `RunManifestV2.schema_version`): this is a
+    #: NEW published contract for a document class that has never declared a
+    #: version, so every already-filed recipe omits the key. Requiring it would
+    #: fail every recipe filed before this PR on its next load.
+    schema_version: Literal["arm_recipe.v1"] = Field(
+        default="arm_recipe.v1",
+        description="Version of THIS schema. Defaulted for recipes filed before this "
+        "boundary existed; a future incompatible version makes this field required.",
+    )
+    name: str = Field(min_length=1, description="the arm's name, unique within its slot")
+    slot: str = Field(min_length=1, description="the slot this recipe belongs to (u/r/m/s)")
+    ranker: str = Field(
+        min_length=1,
+        description="the ranking callable's registered name; existence is checked at "
+        "load time against the live ranker registry, not by this schema",
+    )
+    params: dict[str, Any] = Field(
+        description="the ranker's own open argument mapping, hashed as-is into the "
+        "arm's spec (`ArmSpec.spec`). Membership of this KEY is closed by the "
+        "top-level vocabulary; its CONTENTS are an open mapping. Required and "
+        "non-empty, matching the reader's existing behaviour."
+    )
+    registered_at: IsoDate = Field(
+        description="the NYSE trading day the arm's out-of-sample clock starts on. "
+        "Every ladder rung is counted in trading weeks from this date; validity as "
+        "an actual session is asserted at construction (`crucible.calendar."
+        "assert_trading_day`), not by this schema."
+    )
+    supersedes: str | None = Field(
+        default=None, description="the arm id this recipe replaces, if any (§3.1 lineage)"
+    )
+    control: bool = Field(
+        default=False,
+        description="whether this is a control arm. Filed recipes normally leave this "
+        "false; the harness sets it on the two control arms it generates itself "
+        "(`crucible.slots.arms.control_specs`).",
+    )
+    control_kind: str | None = Field(default=None, description="the control's kind, if any")
+    bootstrap: bool = Field(
+        default=False, description="whether this arm bootstraps its own promotion, per policy"
+    )
+    promotion_source: str = Field(
+        default="",
+        description="where this recipe was promoted from, for provenance only — "
+        "never hashed into the spec (`ArmSpec.spec` excludes it, per §3.1)",
+    )
+    notes: str = Field(
+        default="",
+        description="a free-text clarifying comment, provenance only, never hashed "
+        "into the spec — an edited note must not orphan the arm's score series",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _the_five_pre_registration_fields_are_present(cls, data: object) -> object:
+        """§9.1: an arm declares slot, recipe and registration date before its
+        first score. Restated as a `mode="before"` check (rather than relying
+        on pydantic's own per-field "field required" errors) so a recipe
+        missing several fields at once names ALL of them in one message, and
+        so `params: {}` — present but empty, hence falsy — is refused with
+        the same text as `params` being absent entirely, matching the
+        reader's pre-existing behaviour exactly.
+        """
+        if not isinstance(data, dict):
+            return data
+        missing = [f for f in ARM_RECIPE_REQUIRED_FIELDS if not data.get(f)]
+        if missing:
+            raise ValueError(
+                f"arm recipe is missing required field(s) {missing}. §9.1 "
+                "pre-registration: an arm declares its slot, recipe and registration date "
+                "before its first score, and a recipe that leaves one blank produces a "
+                "verdict that cannot answer for itself. Note that `metric`, `horizon` and "
+                "`benchmark` are deliberately NOT arm fields — they are the SLOT's, so "
+                "every arm is scored on the same axis (policy §4)."
+            )
+        return data
