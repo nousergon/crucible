@@ -436,16 +436,55 @@ def handle_experiment_grade(args: argparse.Namespace) -> int:
 # -- transparency and migration --------------------------------------------
 
 
-def handle_explain(args: argparse.Namespace) -> int:
-    """Read-only lineage walk. Writes no manifest, because it changes nothing.
+def _lineage_keys(node: Any) -> list[str]:
+    """Every key the walk touched, root first, depth-first, de-duplicated."""
+    out: list[str] = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.key not in out:
+            out.append(current.key)
+        stack.extend(reversed(current.parents))
+    return out
 
-    Every other job writes one; this one deliberately does not. A manifest
-    per `explain` invocation would put a run row on the console for an
-    operator reading a page, and absence-of-`explain` is not a fact about
-    the system.
+
+def handle_explain(args: argparse.Namespace) -> int:
+    """Lineage walk, through `run_job` like every other job (AGENTS.md rule 1).
+
+    It changes nothing in the store — no outputs — but it records every key
+    it WALKED as an input, and that record is what plan §10.8 is measured
+    by: `crucible.gate._clause_explain_walks_a_verdict` reads
+    `runs/explain/{day}/run.json` for a manifest whose inputs include a
+    `verdict.json`. Until 2026-09-05 this handler deliberately wrote no
+    manifest ("absence-of-explain is not a fact about the system"), which was
+    true and also left the clause with nothing it could ever read: the
+    registry row (`components.yaml`, `lineage: run.json:inputs[runs/**]`) and
+    the gate both expected the manifest the handler refused to write. The
+    console-row concern the old docstring raised is answered by the row's
+    own `deadline: null` — an on-demand job with no deadline never pages for
+    absence, and a run row for a walk an operator asked for is the walk's
+    receipt, not noise.
+
+    `--dry-run` prints the walk and files nothing (`run_job(dry_run=True)`).
     """
     config = _settings(args)
-    print(render_lineage(explain_lineage(config.store(), args.target)))
+    store = config.store()
+
+    def job(ctx: Any) -> None:
+        lineage = explain_lineage(store, args.target)
+        for key in _lineage_keys(lineage):
+            if store.exists(key):
+                ctx.record_input(key, store.get_bytes(key))
+        print(render_lineage(lineage))
+
+    run_job(
+        "explain",
+        job,
+        store=store,
+        trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
     return 0
 
 
