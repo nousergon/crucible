@@ -266,22 +266,25 @@ WITHHELD_MARKER = "[{n} clause{s} withheld — plan §12 rule 3]"
 #: against a copy of it — a test that restates the order it grades passes
 #: whichever way the renderer drifts.
 #:
-#: **CAPS, not bold.** The issue asks for a bold heading per section, and
-#: `krepis.telegram.send_message` (0.124.x) exposes no `parse_mode` argument:
-#: it always sends Markdown v1 and escapes the body itself. Emitting `*bold*`
-#: would work until a board detail interpolated an odd asterisk, at which
-#: point Telegram drops the whole message and krepis retries it as plain text
-#: with the asterisks visible. A heading that is legible in BOTH renderings is
-#: worth more than one that is bold in the common case, so the headings are
-#: capitalised and the formatting request is filed as
-#: `alpha-engine-config-I9925` (add `parse_mode` to krepis' transport).
+#: **Real `<b>` headings, not CAPS.** `krepis` 0.59.50
+#: (`alpha-engine-config-I9925`) added `parse_mode` to `telegram.send_message`
+#: and `alerts.publish`: `"HTML"` sends the body unescaped — the caller owns
+#: the markup — and the plain-text retry on a Telegram entity-parse error
+#: covers HTML the same way it always covered Markdown v1. `deliver` asks for
+#: `parse_mode="HTML"`, so a `<b>…</b>` heading renders bold rather than
+#: risking Markdown v1's `*bold*`, whose escaping doubles on interpolated
+#: board text and dropped six Fleet-SF Watch receipts over 21 days on an odd
+#: `*` count (`krepis.telegram._escape_markdown`'s own docstring). Every piece
+#: of interpolated board content — clause names, reasons, URLs — is escaped
+#: with :func:`_escape_html` before it reaches a line; only the literal tags
+#: below are markup this module owns.
 SECTIONS: tuple[str, ...] = (
-    "LADDER",
-    "SCHEDULE (PLAN §6.1)",
-    "ACCEPTANCE",
-    "MOVED SINCE {previous_day}",
-    "SILENCE",
-    "FULL BOARD",
+    "<b>LADDER</b>",
+    "<b>SCHEDULE (PLAN §6.1)</b>",
+    "<b>ACCEPTANCE</b>",
+    "<b>MOVED SINCE {previous_day}</b>",
+    "<b>SILENCE</b>",
+    "<b>FULL BOARD</b>",
 )
 
 #: Telegram's hard limit on one message. The renderer fits the message to
@@ -365,25 +368,22 @@ BOARD_URL_UNREADABLE = (
     "the board job."
 )
 
-#: The characters `krepis.telegram._escape_markdown` doubles on the wire.
-#: Counted, not guessed: the renderer's 4096-character budget is spent on the
-#: ESCAPED body, and a message that fits before escaping and not after is
-#: tail-trimmed by the transport — losing the link this whole change adds.
-_ESCAPED_CHARS = "\\_`[]"
-
 
 def wire_length(text: str) -> int:
-    """How many characters ``text`` occupies after krepis escapes it.
+    """How many characters ``text`` occupies on the wire, under `parse_mode="HTML"`.
 
-    `krepis.telegram.send_message` escapes the body for Markdown v1 AFTER the
-    caller hands it over, so `len(message)` is not what Telegram measures.
-    Computed from :data:`_ESCAPED_CHARS` rather than by calling krepis'
-    private `_escape_markdown`: importing a private function would make this
-    module's budget silently wrong the day krepis renames it, whereas a
-    disagreement about WHICH characters are escaped shows up as a slightly
-    conservative budget rather than a dropped message.
+    Under Markdown v1, `krepis.telegram.send_message` escaped the body AFTER
+    the caller handed it over, so `len(message)` understated what Telegram
+    measured. HTML mode inverts that (`alpha-engine-config-I9925`): the
+    caller owns the markup and `send_message` escapes nothing for it — every
+    piece of interpolated content already went through :func:`_escape_html`
+    by the time it reaches a line, so what this module renders IS the wire
+    body, and `len()` is exact rather than a lower bound. Kept as a named
+    function, not inlined as `len()` at every call site, so the budget's unit
+    of measure stays one declared thing if a future parse mode needs a
+    different rule again.
     """
-    return len(text) + sum(text.count(c) for c in _ESCAPED_CHARS)
+    return len(text)
 
 
 #: What `krepis.alerts.publish` puts in FRONT of this body, unescaped.
@@ -412,6 +412,30 @@ def wire_length(text: str) -> int:
 TRANSPORT_PREFIX = f"[{DELIVERY_SEVERITY.upper()}] {DELIVERY_SOURCE}: "
 
 
+def _escape_html(text: str) -> str:
+    """Escape ``& < >`` so ``text`` renders literally under `parse_mode="HTML"`.
+
+    `krepis.telegram.escape_html` is the ONE escaper (`alpha-engine-config-
+    I9925`): a second implementation here would let this module's idea of
+    "escaped" drift from what `send_message` assumes the caller already did.
+    Imported lazily, like every krepis reference in this tree
+    (`_krepis_publish`'s precedent): `crucible --help` and every unit test
+    that renders a message without sending one should not need `requests` —
+    `krepis.telegram` pulls it in at module scope — on the import path.
+
+    Every piece of board free text (a clause name, a `detail` sentence, a
+    failure `reason`) and every URL this module interpolates goes through
+    this before it reaches a line — an unescaped `<` in a board reason must
+    not be able to break delivery of the whole report, which is exactly the
+    HTML-entity-parse-error shape `send_message`'s plain-text retry exists
+    to catch, but a message that never needed the retry is the one that
+    reaches Brian on the first try.
+    """
+    from krepis.telegram import escape_html  # noqa: PLC0415 - lazy on purpose
+
+    return escape_html(text)
+
+
 def _withhold_progress(detail: str) -> str:
     """Drop the clauses of ``detail`` that state a forbidden progress figure.
 
@@ -422,17 +446,22 @@ def _withhold_progress(detail: str) -> str:
     never carried it, which is the defect this whole instrument exists to
     remove one layer down.
 
-    **Clean text is passed through byte for byte.** A scrubber that rewrote
-    detail it had no objection to would make the report an unfaithful copy of
-    the board, which is worse than the defect it fixes.
+    **Clean text is passed through byte for byte, modulo HTML-escaping.** A
+    scrubber that rewrote detail it had no objection to would make the report
+    an unfaithful copy of the board, which is worse than the defect it fixes
+    — :func:`_escape_html` is not that: it changes nothing Telegram would
+    render differently, and everything it does change (`<`, `>`, `&`) is
+    exactly what would otherwise risk the whole message under
+    `parse_mode="HTML"` (`alpha-engine-config-I9925`).
     """
     clauses = detail.split(CLAUSE_SEPARATOR)
     kept = [c for c in clauses if not any(t in f" {c.lower()} " for t in FORBIDDEN_PROGRESS_TOKENS)]
     removed = len(clauses) - len(kept)
     if not removed:
-        return detail
+        return _escape_html(detail)
     marker = WITHHELD_MARKER.format(n=removed, s="" if removed == 1 else "s")
-    return CLAUSE_SEPARATOR.join([*kept, marker]) if kept else marker
+    result = CLAUSE_SEPARATOR.join([*kept, marker]) if kept else marker
+    return _escape_html(result)
 
 
 class UndeliveredError(RuntimeError):
@@ -895,7 +924,11 @@ def _moved_lines(inputs: MorningInputs) -> list[_Line]:
     """
     if inputs.previous is None:
         return [
-            (f"  cannot say — the {inputs.previous_day} board is {inputs.previous_reason}", _KEEP)
+            (
+                f"  cannot say — the {inputs.previous_day} board is "
+                f"{_escape_html(inputs.previous_reason)}",
+                _KEEP,
+            )
         ]
     before = {row["id"]: row["state"] for row in inputs.previous.get("rows", [])}
     after = {row["id"]: row["state"] for row in inputs.board.get("rows", [])}
@@ -926,13 +959,14 @@ def _acceptance_line(reading: dict[str, Any] | None, *, denied_code: str | None)
     a document is a reading — they did, on one document, before this review.
     """
     if denied_code is not None:
-        return ACCEPTANCE_UNREADABLE.format(code=denied_code)
+        return ACCEPTANCE_UNREADABLE.format(code=_escape_html(denied_code))
     parsed = parse_acceptance_reading(reading)
     if parsed is None:
         return ACCEPTANCE_NOT_ON_ANY_ARTIFACT
     return (
         f"acceptance count: {parsed.met} met / {parsed.unmet} unmet / "
-        f"{parsed.unmeasurable} unmeasurable of {parsed.total} (commit {parsed.commit})"
+        f"{parsed.unmeasurable} unmeasurable of {parsed.total} "
+        f"(commit {_escape_html(parsed.commit)})"
     )
 
 
@@ -1071,7 +1105,7 @@ def render_message(inputs: MorningInputs, *, now: dt.datetime) -> str:
     """
     board = inputs.board
     local = now.astimezone(DELIVERY_TZ)
-    commit = inputs.board_code_sha or f"UNKNOWN ({inputs.board_run_note})"
+    commit = _escape_html(inputs.board_code_sha or f"UNKNOWN ({inputs.board_run_note})")
     lines: list[_Line] = []
 
     headline = _staleness(str(board.get("generated_at", "")), now)
@@ -1092,7 +1126,7 @@ def render_message(inputs: MorningInputs, *, now: dt.datetime) -> str:
         [
             (f"  {_silence_line(board)}", _SILENCE),
             (
-                f"  pending operator action: {inputs.operator_action}"
+                f"  pending operator action: {_escape_html(inputs.operator_action)}"
                 if inputs.operator_action
                 else f"  {NO_OPERATOR_ACTION}",
                 _SILENCE,
@@ -1133,15 +1167,26 @@ def _board_lines(inputs: MorningInputs) -> list[_Line]:
         # it was never read (see `read_inputs`), and a reader handed two URLs
         # to one board is a reader deciding which to trust.
         return [
-            (f"  {inputs.board_console_url}", _URL),
+            (f"  {_escape_html(inputs.board_console_url)}", _URL),
             (f"  {BOARD_CONSOLE_CAVEAT}", _URL),
         ]
     if inputs.board_url_denied_code is not None:
-        return [(f"  {BOARD_URL_UNREADABLE.format(code=inputs.board_url_denied_code)}", _URL)]
+        return [
+            (
+                f"  {BOARD_URL_UNREADABLE.format(code=_escape_html(inputs.board_url_denied_code))}",
+                _URL,
+            )
+        ]
     if inputs.board_url is None:
         return [(f"  {BOARD_URL_UNAVAILABLE}", _URL)]
+    # A presigned SigV4 URL's query string is joined with literal `&`, which
+    # Telegram's HTML parser treats as syntax the same as anywhere else in the
+    # body — an unescaped presigned link is exactly the "the URL survives
+    # every truncation" pointer breaking delivery on the one line the report
+    # cannot afford to lose. Telegram renders the escaped entities back to
+    # their literal characters, so the visible, clickable link is unchanged.
     return [
-        (f"  {inputs.board_url}", _URL),
+        (f"  {_escape_html(inputs.board_url)}", _URL),
         (f"  {BOARD_URL_CAVEAT.format(expires=inputs.board_url_expires)}", _URL),
     ]
 
@@ -1221,6 +1266,14 @@ def deliver(message: str, *, transport: Callable[..., Any] | None = None) -> str
     on the operator's phone, never a missing one. Filed by the parent session;
     the failure direction is deliberate, since a delivery skipped to avoid a
     duplicate is the silence this job exists to end.
+
+    **`parse_mode="HTML"`** (`alpha-engine-config-I9925`, krepis 0.59.50):
+    `message` already carries `<b>` headings and every interpolated board
+    string already went through :func:`_escape_html` — this call site is
+    where that contract is discharged, not where escaping happens. Passed
+    explicitly rather than left to krepis' Markdown-v1 default so a heading
+    written as `<b>…</b>` is not sent to a transport that would render the
+    literal angle brackets.
     """
     publish = transport if transport is not None else _krepis_publish
     result = publish(
@@ -1233,6 +1286,7 @@ def deliver(message: str, *, transport: Callable[..., Any] | None = None) -> str
         dedup_key=None,
         destination=_operator_chat(),
         raise_on_total_failure=True,
+        parse_mode="HTML",
     )
     if not hasattr(result, "any_ok"):
         raise TypeError(
