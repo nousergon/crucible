@@ -22,6 +22,7 @@ import pytest
 from crucible.calendar import is_trading_day
 from crucible.runmode import RUN_MODE_ENV, RUN_MODE_LIVE
 from crucible.store import LocalStore
+from crucible.tracker import TRACKER_TOKEN_VAR
 
 #: Enough sessions for the 252-session feature window plus a 21-session
 #: horizon plus the dates a ladder needs. Shorter panels make `mom_12_1`
@@ -99,6 +100,25 @@ def declared_run_mode(monkeypatch):
     `monkeypatch.setenv` unwinds per test, so nothing leaks between them.
     """
     monkeypatch.setenv(RUN_MODE_ENV, RUN_MODE_LIVE)
+
+
+@pytest.fixture(autouse=True)
+def no_tracker_credential(monkeypatch):
+    """No test reaches GitHub by accident.
+
+    `crucible.tracker` is the one adapter in this package that talks to
+    something other than the store, and it reads its credential from the
+    environment. A developer whose shell exports a real token would otherwise
+    have the suite post comments to `nousergon/alpha-engine-config` — the
+    private tracker — on any test that files a closing record.
+
+    Clearing it here makes the ABSENT case the default everywhere, which is
+    also the case every surface must render honestly
+    (`tests/test_phase_closing_record.py` grants it explicitly, per test, and
+    substitutes the HTTP opener, so the adapter is exercised without a
+    socket).
+    """
+    monkeypatch.delenv(TRACKER_TOKEN_VAR, raising=False)
 
 
 @pytest.fixture

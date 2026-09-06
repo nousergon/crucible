@@ -778,6 +778,7 @@ def build_board(
     ladder: Ladder | None = None,
     declarations: Declarations | None = None,
     readings: dict[str, Any] | None = None,
+    tracker_reader: Callable[[str, int], Any] | None = None,
 ) -> Board:
     """Assemble every declared row and read each one. Reads; never runs.
 
@@ -798,6 +799,14 @@ def build_board(
     "a gate reads; it never runs" the moment the two evaluations disagreed.
     `None` leaves every phase row's `clauses` `None`, which renders as "this
     build took no reading" rather than as an empty clause list.
+
+    ``tracker_reader`` is `crucible.tracker.read_issue` unless a caller
+    substitutes one — the ONE outbound call this render makes that is not to
+    the store, and the only injectable seam in this function, because the
+    phase-exit rows (:func:`_closing_rows`) grade the tracker's own
+    open/closed state against the closing records in the store. It never
+    raises: with no credential granted every one of those rows reads
+    `UNMEASURABLE` carrying the command that grants it.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     # The RUN's trading day when the caller has one, never the wall clock.
@@ -815,6 +824,7 @@ def build_board(
         rows.append(_declared_row(store, f"objective:{row_id}", declaration, day))
 
     rows.extend(_phase_rows(ladder, day, readings or {}))
+    rows.extend(_closing_rows(store, tracker_reader))
     rows.extend(_schedule_rows(ladder, day))
 
     for name in sorted(reg):
@@ -951,6 +961,120 @@ def _phase_rows(
             )
         )
     return rows
+
+
+def _closing_rows(store: Store, tracker_reader: Callable[[str, int], Any] | None) -> list[BoardRow]:
+    """One row per §6 phase: do the tracker and the store agree it exited?
+
+    `alpha-engine-config-I9967` deliverable 2's teeth. The phase rows above
+    read the GATE; these rows read the two records of a phase's EXIT — the
+    durable `gates/{phase}/closing.json` this repository writes, and the
+    open/closed state of the phase issue a human sets — and render every way
+    they can disagree.
+
+    The state that matters, and the one that has already happened: a phase
+    issue CLOSED with no closing record beside it. That is
+    `alpha-engine-config-I9757` exactly, and it renders `UNMET` here on every
+    daily board until somebody either files the record or reopens the issue.
+
+    An unreadable tracker is `UNMEASURABLE`, never green and never quietly
+    `PLANNED`: until the credential is granted this row's detail carries the
+    operator command that grants it, which is the detector standing behind
+    that grant (`pull-request-policy` §4.2 form 3).
+    """
+    from crucible.gate import (  # noqa: PLC0415 - avoids a module import cycle
+        PHASES,
+        TRACKER_REPO,
+        closing_reading_refusals,
+    )
+    from crucible.keys import closing_record_key  # noqa: PLC0415 - symmetry with the above
+    from crucible.tracker import read_issue  # noqa: PLC0415 - symmetry with the above
+
+    reader = tracker_reader if tracker_reader is not None else read_issue
+    return [
+        _closing_row(
+            phase,
+            closing_record_key(phase.id),
+            read_store_document(store, closing_record_key(phase.id)),
+            reader(TRACKER_REPO, phase.issue),
+            closing_reading_refusals,
+        )
+        for phase in PHASES
+    ]
+
+
+def _closing_row(
+    phase: Any,
+    key: str,
+    record: Any,
+    issue: Any,
+    refusals: Callable[..., list[str]],
+) -> BoardRow:
+    """The reading for one phase's exit record. Four inputs, one closed state."""
+    means_when_red = (
+        f"{phase.tracker} and `{key}` disagree about whether phase {phase.number} has "
+        f"exited. The gate is the instrument; the issue state is a human's claim about "
+        f"it. Reconcile by filing the record (`crucible gate --gate {phase.id} "
+        f"--run-mode live --store <uri>`, which posts the reading to the issue) or by "
+        f"reopening {phase.tracker}. Never by editing this row. Tracker: "
+        f"{phase.tracker_url}."
+    )
+
+    def row(state: str, detail: str) -> BoardRow:
+        return BoardRow(
+            id=f"phase:{phase.id}:closing",
+            source="phase",
+            section=f"§6 phase {phase.number}",
+            title=f"{phase.title} — exit is recorded, not asserted",
+            state=state,
+            detail=detail,
+            surface="crucible/board",
+            artifact=key,
+            means_when_red=means_when_red,
+        )
+
+    if record.problem is not None:
+        return row("UNMEASURABLE", f"the closing record could not be read: {record.problem}")
+    if issue.problem is not None:
+        # The tracker half is unreadable, so this row CANNOT be graded — even
+        # when the record is present, because "filed and the issue is closed"
+        # and "filed and the issue is still open" are different rows and this
+        # render cannot tell them apart. UNMEASURABLE, with the remedy.
+        return row("UNMEASURABLE", f"the tracker could not be read: {issue.problem}")
+    if record.absent:
+        if issue.closed:
+            return row(
+                "UNMET",
+                f"{phase.tracker} is CLOSED and there is no closing record at {key}. The "
+                "backlog asserts a completion no instrument supports — this is the exact "
+                "state that closed phase 1 on 2026-09-02 with its gate reading 1 of 6.",
+            )
+        return row(
+            "PLANNED",
+            f"{phase.tracker} is open and no closing record has been filed. That is the "
+            "expected state of a phase that has not exited; the record is written by the "
+            "first live `crucible gate` reading that reads MET.",
+        )
+    document = record.document or {}
+    problems = refusals(document, phase_id=phase.id)
+    if problems:
+        return row(
+            "UNMET",
+            f"the closing record at {key} does not justify an exit: {'; '.join(problems)}",
+        )
+    if issue.closed:
+        return row(
+            "MET",
+            f"{phase.tracker} is closed and {key} records the reading that justified it: "
+            f"{document.get('clauses_met')}/{document.get('clauses_total')} clauses met on "
+            f"trading day {document.get('trading_day')}, at commit {document.get('commit')}.",
+        )
+    return row(
+        "MET",
+        f"{key} records a MET reading on trading day {document.get('trading_day')} and it "
+        f"has been posted to {phase.tracker}, which is still open. Closing a phase issue "
+        "is Brian's authority and no machine does it.",
+    )
 
 
 def _ladder_detail(ladder_row: PhaseRow) -> str:

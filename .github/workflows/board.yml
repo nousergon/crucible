@@ -101,6 +101,23 @@ env:
   # multi-region trail stays fully counted. Pinning a region here would
   # silently narrow a gate that asserts a count of ZERO.
   CRUCIBLE_CLOUDTRAIL_ARCHIVE: ${{ vars.CRUCIBLE_CLOUDTRAIL_ARCHIVE }}
+  # alpha-engine-config-I9967 deliverable 2. The board grades each phase's
+  # tracker issue state against the closing record in the store, and the
+  # tracker is `nousergon/alpha-engine-config` — a DIFFERENT, private
+  # repository. An Actions `GITHUB_TOKEN` is scoped to the repository the
+  # workflow runs in and cannot read another one's issues at all, so this is
+  # the one credential in this workflow that OIDC cannot supply.
+  #
+  # A SECRET, not a repository variable, and unset until an operator grants
+  # it: minting a token that can write to the private tracker is a security
+  # boundary, so it takes the same form the crucible-v2 stack apply does
+  # (`pull-request-policy` §4.2 form 3). The merge emits the exact command —
+  # the warning in the guard step below, and every affected board row's own
+  # `means_when_red` — and the detector is those rows, which read
+  # UNMEASURABLE (red, and never green) on every daily render until the
+  # command has been run. Nothing else in this workflow depends on it: the
+  # other ~50 rows render exactly as before.
+  CRUCIBLE_TRACKER_TOKEN: ${{ secrets.CRUCIBLE_TRACKER_TOKEN }}
 
 jobs:
   board:
@@ -149,6 +166,16 @@ jobs:
           # render here would take 40-odd readable rows down over one.
           if [ -z "$CRUCIBLE_CLOUDTRAIL_ARCHIVE" ]; then
             echo "::warning::repository variable CRUCIBLE_CLOUDTRAIL_ARCHIVE is not set, so phase 2's zero_human_mutating_calls will render UNMEASURABLE — set it with: gh variable set CRUCIBLE_CLOUDTRAIL_ARCHIVE --repo nousergon/crucible --body \"\$(AWS_PROFILE=ne-admin aws cloudformation list-exports --query \"Exports[?Name=='fleet-cloudtrail-archive-uri'].Value\" --output text)\""
+          fi
+          # A WARNING for the same reason the archive check above is one, and
+          # the operator-gated grant this board is waiting on
+          # (alpha-engine-config-I9967). Without it the six phase-exit rows
+          # read UNMEASURABLE — red, named, and carrying this same command in
+          # their own detail — while every other row renders normally.
+          # Failing the whole render here would take the board down over a
+          # credential six of its rows need.
+          if [ -z "$CRUCIBLE_TRACKER_TOKEN" ]; then
+            echo "::warning::secret CRUCIBLE_TRACKER_TOKEN is not set, so the six phase-exit rows will render UNMEASURABLE and a phase issue closed with no closing record cannot be detected — set it with: gh secret set CRUCIBLE_TRACKER_TOKEN --repo nousergon/crucible --body '<token>', where <token> is a fine-grained personal access token scoped to nousergon/alpha-engine-config with Issues: read and write and no other permission"
           fi
           exit "$missing"
 
