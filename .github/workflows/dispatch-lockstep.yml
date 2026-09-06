@@ -1,0 +1,166 @@
+name: Dispatch Lockstep
+
+# alpha-engine-config-I9878 finding 2: the cross-repo dispatch-lockstep
+# contract between `nousergon/crucible`'s `crucible/components.yaml` and
+# `nousergon/nous-ergon-ops`'s `infrastructure/cloudformation/crucible-v2.yaml`
+# is guarded by ONE test file
+# (`nous-ergon-ops/tests/crossrepo/test_crucible_dispatch_lockstep.py`) that
+# used to fire only on `nous-ergon-ops` events. Both repositories can break
+# the contract; only one ran the guard. On 2026-09-02 a change HERE (crucible
+# PR44, the `board` row) turned `nous-ergon-ops` `main` red, and the delay
+# before anyone could see it was bounded by nothing but the next unrelated
+# push to that repo — measured at over two hours that day, unbounded in
+# general. Worse for diagnosis: it surfaced in the repo that did not change,
+# against an author who did not change it (re-measured 2026-09-04: still
+# true — four unrelated `nous-ergon-ops` PRs ran the guard clean in the
+# window, and five `crucible` PRs merged with nothing on this side to run it
+# against them).
+#
+# This job runs THAT SAME test file, against `nous-ergon-ops`'s `main` and
+# THIS PR's own `crucible/components.yaml`, so the change that introduces
+# drift is the change that fails — the missing direction finding 2 names.
+#
+# ── the credential, and why it is not `CRUCIBLE_DEPLOY_KEY` ─────────────
+#
+# `nous-ergon-ops` is PRIVATE. No workflow in this repository reads a private
+# repository today (measured: no `checkout` step here names a `repository:`
+# other than this one, and no workflow references any deploy-key-shaped
+# secret) — so there is no existing in-repo pattern to mirror forward. The
+# pattern one hop away, in the OTHER direction, is `nous-ergon-ops`'s own
+# `crucible-dispatch-lockstep` job in `tests.yml`: a read-only GitHub Deploy
+# Key scoped to the single repo being read (`CRUCIBLE_DEPLOY_KEY`, granting
+# `nous-ergon-ops` read of `crucible`), stored as a repository secret, checked
+# for emptiness before use, with a fail-loud guard that turns a withheld
+# secret into a hard failure on every event except a Dependabot one (the one
+# platform-native reason a repo secret legitimately arrives empty).
+#
+# This job needs the MIRROR of that credential, not that credential itself:
+# a NEW read-only deploy key living on `nous-ergon-ops`, granting `crucible`'s
+# PR-triggered CI read of `nous-ergon-ops` — `identity-access-policy.md` §7
+# mints one credential per authority boundary, and reusing or widening
+# `CRUCIBLE_DEPLOY_KEY` (which grants the opposite read) would be a shared
+# credential crossing two boundaries, not a narrow one. This shape, and the
+# operator procedure to create it, was already specified in the
+# 2026-09-03T00:06:50Z comment on alpha-engine-config-I9878 as
+# `NOUS_ERGON_OPS_DEPLOY_KEY` — mirrored verbatim here rather than reinvented.
+#
+# **This secret does not exist yet** (measured 2026-09-06: `gh api
+# repos/nousergon/nous-ergon-ops/keys` returns `[]`, no deploy key titled for
+# I9878 exists). Per that ruling and per this session's own instructions,
+# creating it is an operator action, not something this PR does — see the PR
+# body. Until it is created, this job runs, finds the secret empty, and
+# either fails loud (a non-Dependabot event — genuinely missing credential,
+# not silently vacuous) or reports the expected skip (a Dependabot event).
+#
+# ── why no `paths:` filter ──────────────────────────────────────────────
+#
+# GitHub records a workflow job skipped by a path filter as never having
+# started, so a REQUIRED check gated by a path filter can stay pending
+# forever on a PR that does not touch the named paths. This job is a shallow
+# clone plus a `pip install` plus a two-file pytest run — no `uv sync`, no
+# install of this project — so running it unconditionally on every PR and
+# every push to `main` costs seconds, not minutes, and removes that trap
+# entirely. (Whether this check becomes REQUIRED at all is a branch-protection
+# decision this PR does not make — see the PR body.)
+#
+# ── PR_REACHABLE_JOBS (test_workflow_triggers.py) ────────────────────────
+#
+# This job runs on `pull_request` and is not excluded by an `if:` (it must
+# run there — that is the whole point). Its subject is the cross-repo
+# CONTRACT this PR's own diff to `crucible/components.yaml` or
+# `.github/workflows/*.yml` may have changed, read against `nous-ergon-ops`'s
+# committed template — not live AWS or any other out-of-band state a diff
+# cannot control, so it is the same shape `scm-platform-policy.md` §3.1
+# already accepts for `ci.yml:test`. It is named in `PR_REACHABLE_JOBS` in
+# `tests/test_workflow_triggers.py` for that reason.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  crucible-dispatch-lockstep:
+    name: crucible-dispatch-lockstep
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # Branch on the SECRET being empty, never on `github.actor`: an actor
+      # string is PR-author-controlled input, an empty secret is the
+      # platform's own fact. GitHub withholds repository secrets from
+      # Dependabot-triggered runs, which reads exactly like a missing
+      # credential and is not (mirrors nous-ergon-ops tests.yml's
+      # `crucible-dispatch-lockstep` job and iam-drift-check.yml's
+      # `foreign-writers-check`, per alpha-engine-config-I9793).
+      - name: Check NOUS_ERGON_OPS_DEPLOY_KEY availability
+        id: check_key
+        env:
+          DEPLOY_KEY: ${{ secrets.NOUS_ERGON_OPS_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The fail-loud half. It does NOT gate the skip; it turns a genuinely
+      # missing or misconfigured secret RED instead of letting it join the
+      # skip path, where a dead guard reads identically to a passing one —
+      # the exact defect this whole issue exists to close.
+      - name: Guard — a withheld secret must correlate with a Dependabot event
+        if: steps.check_key.outputs.available == 'false'
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.pull_request.user.login }}" != "dependabot[bot]" ] && \
+             [ "${{ github.actor }}" != "dependabot[bot]" ]; then
+            echo "::error::NOUS_ERGON_OPS_DEPLOY_KEY is empty on a NON-Dependabot event (actor=${{ github.actor }}, pr_author=${{ github.event.pull_request.user.login }}, event=${{ github.event_name }}) — refusing to silently skip. The secret is genuinely missing or misconfigured (expected until the alpha-engine-config-I9878 operator step creates it — see the PR body), not withheld by GitHub's Dependabot secret policy."
+            exit 1
+          fi
+          echo "NOUS_ERGON_OPS_DEPLOY_KEY is empty on a Dependabot-authored event (actor=${{ github.actor }}) — expected platform behaviour, not drift."
+
+      - name: Checkout nous-ergon-ops (private) at main
+        if: steps.check_key.outputs.available == 'true'
+        env:
+          DEPLOY_KEY: ${{ secrets.NOUS_ERGON_OPS_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          ssh-keyscan -t ed25519 github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          git clone --quiet --depth=1 \
+            "git@github.com:nousergon/nous-ergon-ops.git" \
+            "$RUNNER_TEMP/nous-ergon-ops"
+
+      - name: Set up Python
+        if: steps.check_key.outputs.available == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: '3.12'
+
+      # CRUCIBLE_ROOT is THIS PR's checkout, not a second clone of `crucible`:
+      # the whole point of finding 2 is that the change introducing drift is
+      # the change that fails the guard.
+      - name: Lockstep guard
+        if: steps.check_key.outputs.available == 'true'
+        env:
+          CRUCIBLE_ROOT: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          test -f "$RUNNER_TEMP/nous-ergon-ops/tests/crossrepo/test_crucible_dispatch_lockstep.py" || {
+            echo "::error::nous-ergon-ops checkout absent — refusing a vacuous lockstep pass"
+            exit 1
+          }
+          python3 -m pip install --quiet pytest pyyaml
+          cd "$RUNNER_TEMP/nous-ergon-ops" && python3 -m pytest tests/crossrepo/test_crucible_dispatch_lockstep.py -q
+
+      - name: Report skip (credential withheld on a Dependabot PR)
+        if: steps.check_key.outputs.available == 'false' && (github.event.pull_request.user.login == 'dependabot[bot]' || github.actor == 'dependabot[bot]')
+        run: |
+          echo "NOUS_ERGON_OPS_DEPLOY_KEY not available (Dependabot PR) — skipping the clone and the lockstep guard."
+          echo "Coverage while this skips: the guard still runs, and still fails on real drift, on every push to main and every human-authored PR here, and on every nous-ergon-ops event."
