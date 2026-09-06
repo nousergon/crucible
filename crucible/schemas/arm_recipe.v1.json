@@ -1,0 +1,104 @@
+{
+  "$id": "arm_recipe.v1",
+  "additionalProperties": false,
+  "description": "One filed U/R arm recipe, `arms/{slot}/{name}.yaml`.\n\nNormative source: `champion-challenger-policy.md` \u00a73, \u00a73.1, \u00a74; plan\n\u00a74.4; \u00a79.1 pre-registration. `crucible.slots.arms._parse` used to build\nthis by hand: a missing field raised a `KeyError` on the field it forgot\nto check for, not the one that was actually missing, and an unknown\ntop-level key registered cleanly and did nothing \u2014 the same silent-typo\nfailure `alpha-engine-config-I9944` named for `components.yaml`.\n\nThree checks stay in the READER rather than moving onto this model,\nbecause each needs something a document-shape model cannot carry:\n\n* `ranker` naming a real ranking callable \u2014 checked against\n  `crucible.slots.rankers.get_ranker`'s live registry, and raised as\n  `KeyError` (`\"unknown ranker\"`), a distinct failure mode from a\n  malformed document.\n* `params.llm_callsite` naming a registered LLM call site \u2014 checked\n  against `crucible.llm.LLM_CALLSITE_REGISTRY`, imported lazily because\n  it is a heavy module with one caller.\n* `registered_at` naming an actual NYSE trading day \u2014 asserted on\n  `ArmSpec.__post_init__` via `crucible.calendar.assert_trading_day`,\n  which needs the trading calendar rather than the document alone. It is\n  a validity check against an external oracle, not a rule relating this\n  document's fields to each other, so it is not the kind of cross-field\n  rule binding constraint 3 asks to move onto the model.\n\n`params` is required and non-empty, matching the reader's existing\nfalsy-field check (`not document.get(\"params\")`) exactly: this PR types\nthe boundary, it does not decide whether a ranker with zero parameters\nshould be legal \u2014 that is a separate, un-filed question about the\nreader's own semantics.",
+  "properties": {
+    "bootstrap": {
+      "default": false,
+      "description": "whether this arm bootstraps its own promotion, per policy",
+      "title": "Bootstrap",
+      "type": "boolean"
+    },
+    "control": {
+      "default": false,
+      "description": "whether this is a control arm. Filed recipes normally leave this false; the harness sets it on the two control arms it generates itself (`crucible.slots.arms.control_specs`).",
+      "title": "Control",
+      "type": "boolean"
+    },
+    "control_kind": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "the control's kind, if any",
+      "title": "Control Kind"
+    },
+    "name": {
+      "description": "the arm's name, unique within its slot",
+      "minLength": 1,
+      "title": "Name",
+      "type": "string"
+    },
+    "notes": {
+      "default": "",
+      "description": "a free-text clarifying comment, provenance only, never hashed into the spec \u2014 an edited note must not orphan the arm's score series",
+      "title": "Notes",
+      "type": "string"
+    },
+    "params": {
+      "additionalProperties": true,
+      "description": "the ranker's own open argument mapping, hashed as-is into the arm's spec (`ArmSpec.spec`). Membership of this KEY is closed by the top-level vocabulary; its CONTENTS are an open mapping. Required and non-empty, matching the reader's existing behaviour.",
+      "title": "Params",
+      "type": "object"
+    },
+    "promotion_source": {
+      "default": "",
+      "description": "where this recipe was promoted from, for provenance only \u2014 never hashed into the spec (`ArmSpec.spec` excludes it, per \u00a73.1)",
+      "title": "Promotion Source",
+      "type": "string"
+    },
+    "ranker": {
+      "description": "the ranking callable's registered name; existence is checked at load time against the live ranker registry, not by this schema",
+      "minLength": 1,
+      "title": "Ranker",
+      "type": "string"
+    },
+    "registered_at": {
+      "description": "the NYSE trading day the arm's out-of-sample clock starts on. Every ladder rung is counted in trading weeks from this date; validity as an actual session is asserted at construction (`crucible.calendar.assert_trading_day`), not by this schema.",
+      "format": "date",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "title": "Registered At",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "arm_recipe.v1",
+      "default": "arm_recipe.v1",
+      "description": "Version of THIS schema. Defaulted for recipes filed before this boundary existed; a future incompatible version makes this field required.",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "slot": {
+      "description": "the slot this recipe belongs to (u/r/m/s)",
+      "minLength": 1,
+      "title": "Slot",
+      "type": "string"
+    },
+    "supersedes": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "the arm id this recipe replaces, if any (\u00a73.1 lineage)",
+      "title": "Supersedes"
+    }
+  },
+  "required": [
+    "name",
+    "slot",
+    "ranker",
+    "params",
+    "registered_at"
+  ],
+  "title": "ArmRecipeDocument",
+  "type": "object"
+}
