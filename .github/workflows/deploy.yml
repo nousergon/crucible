@@ -284,13 +284,29 @@ jobs:
       # the first deploy after PR59 merged; the detector held and the pointer
       # did not flip). pip validates the FILENAME against PEP 427/440, so any
       # rename of a wheel is a different artifact as far as pip is concerned.
+      #
+      # alpha-engine-config-I10069: this step also proves the ONE dependency
+      # the data layer cannot run without — ArcticDB has no Linux aarch64
+      # wheel, so the smoke must prove the install and the import on the SAME
+      # architecture the box now uses (r6i.large, x86_64 — `ubuntu-latest` is
+      # x86_64 too, per `nous-ergon-ops-PR1054`). The extra name is read out
+      # of `pyproject.toml`'s own `[project.optional-dependencies]` rather
+      # than restated here (crucible/AGENTS.md: no suppression collections;
+      # the extra list belongs in ONE place), and the verified set is handed
+      # to the Smoke step below via `$GITHUB_ENV` so its manifest can record
+      # what was actually proven — `crucible.deploy._flip` refuses a smoke
+      # manifest that does not name every extra required here.
       - name: Prove the published wheel is pip-installable
         run: |
           mkdir -p /tmp/crucible-install-proof
           aws s3 cp "${STORE_URI}/releases/${{ needs.build.outputs.sha }}/${{ needs.build.outputs.wheel_filename }}" "/tmp/crucible-install-proof/${{ needs.build.outputs.wheel_filename }}"
           python3 -m venv /tmp/crucible-install-proof-venv
-          /tmp/crucible-install-proof-venv/bin/pip install "/tmp/crucible-install-proof/${{ needs.build.outputs.wheel_filename }}"
+          EXTRAS="$(python3 -c 'import tomllib; d = tomllib.load(open("pyproject.toml", "rb")); print(",".join(sorted(d["project"]["optional-dependencies"])))')"
+          echo "smoking extras (from pyproject.toml): ${EXTRAS}"
+          /tmp/crucible-install-proof-venv/bin/pip install "/tmp/crucible-install-proof/${{ needs.build.outputs.wheel_filename }}[${EXTRAS}]"
           /tmp/crucible-install-proof-venv/bin/crucible --version
+          /tmp/crucible-install-proof-venv/bin/python -c "import nousergon_lib.arcticdb, arcticdb"
+          echo "CRUCIBLE_SMOKED_EXTRAS=${EXTRAS}" >> "$GITHUB_ENV"
 
       # The opening half of the pointer compare-and-swap, taken BEFORE the
       # smoke so the swap covers the whole verification window. Reading the
