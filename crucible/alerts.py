@@ -65,9 +65,12 @@ __all__ = [
     "PAGES_TOPIC",
     "PAGES_TOPIC_ARN_VAR",
     "PAGE_CONDITIONS",
+    "PENDING_CONFIRMATION",
+    "SUBSCRIBERS_METRIC",
     "SWEEP_JOB",
     "Page",
     "PageGroup",
+    "SubscriberReading",
     "StoreAccessError",
     "TopicUnresolvedError",
     "bus_key",
@@ -85,6 +88,7 @@ __all__ = [
     "incident_key",
     "pages_in_range",
     "pages_in_window",
+    "pages_topic_subscribers",
     "send",
     "sweep",
     "topic_arn",
@@ -1145,6 +1149,146 @@ def ceiling_metric(count: int, *, now: dt.datetime) -> dict[str, Any]:
     }
 
 
+#: The heartbeat's reading of who would actually receive a page
+#: (alpha-engine-config-I10024). Filed on `runs/heartbeat/{day}/run.json`.
+SUBSCRIBERS_METRIC = "pages_topic_confirmed_subscribers"
+
+#: The literal SNS returns as `SubscriptionArn` for a leg nobody has confirmed.
+#: Not a real ARN, and the only way the API says "pending".
+PENDING_CONFIRMATION = "PendingConfirmation"
+
+#: A Lambda leg is a machine reader (the Telegram backstop forwarder), not a
+#: human one. Everything else — email, sms, https — is a leg a person reads.
+_MACHINE_PROTOCOLS = frozenset({"lambda", "sqs", "firehose", "application"})
+
+
+@dataclass(frozen=True)
+class SubscriberReading:
+    """Who is subscribed to the pages topic, by leg, as SNS reports it.
+
+    ``confirmed_human_legs`` and ``pending_legs`` hold PROTOCOL names so the
+    metric can say "email pending" rather than a count a reader has to go
+    and resolve. No endpoint addresses are kept: an email address is not a
+    fact a manifest needs.
+    """
+
+    topic: str
+    confirmed_human_legs: tuple[str, ...]
+    pending_legs: tuple[str, ...]
+    lambda_legs: int
+
+    @property
+    def met(self) -> bool:
+        """At least one confirmed human leg AND the machine leg.
+
+        Both, deliberately. The Lambda leg alone proves a page reaches a
+        forwarder; the human leg alone proves it reaches a person only while
+        the forwarder is the thing that noticed the forwarder died.
+        """
+        return bool(self.confirmed_human_legs) and self.lambda_legs >= 1
+
+    def metric(self, *, now: dt.datetime) -> dict[str, Any]:
+        if self.met:
+            reason = (
+                f"{len(self.confirmed_human_legs)} confirmed human leg(s) "
+                f"({', '.join(self.confirmed_human_legs)}) and {self.lambda_legs} lambda "
+                f"leg(s) on {PAGES_TOPIC}."
+            )
+        else:
+            missing = []
+            if not self.confirmed_human_legs:
+                missing.append(
+                    "no CONFIRMED human leg"
+                    + (
+                        f" ({', '.join(self.pending_legs)} still {PENDING_CONFIRMATION})"
+                        if self.pending_legs
+                        else " (none subscribed)"
+                    )
+                )
+            if self.lambda_legs < 1:
+                missing.append("no lambda leg (the Telegram backstop forwarder is not subscribed)")
+            reason = (
+                f"{PAGES_TOPIC}: " + "; ".join(missing) + ". A page published here reaches "
+                "nobody who can act on it. Subscribe and confirm the leg; never soften this row."
+            )
+        return _subscribers_metric(
+            value=float(len(self.confirmed_human_legs)),
+            status="OK" if self.met else "FAIL",
+            reason=reason,
+            now=now,
+        )
+
+
+def _subscribers_metric(
+    *, value: float, status: str, reason: str, now: dt.datetime
+) -> dict[str, Any]:
+    return {
+        "name": SUBSCRIBERS_METRIC,
+        "module": "crucible.alerts",
+        "metric_type": "operational",
+        "value": value,
+        "unit": "confirmed_human_legs",
+        "n_floor": 0,
+        "status": status,
+        "status_reason": reason,
+        "source_path": f"sns:ListSubscriptionsByTopic on ${PAGES_TOPIC_ARN_VAR}",
+        "last_updated_utc": now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def _subscribers_unmeasurable(reason: str, *, now: dt.datetime) -> dict[str, Any]:
+    """The row when the list could not be read. `unmeasurable`, never `OK`
+    and never a zero: no data about subscribers is not "no subscribers"."""
+    return _subscribers_metric(value=0.0, status="unmeasurable", reason=reason, now=now)
+
+
+def _default_sns() -> Any:
+    """An SNS client, constructed lazily — same reason as `crucible.cost.default_client`."""
+    import boto3  # noqa: PLC0415 - lazy on purpose
+
+    return boto3.client("sns")
+
+
+def pages_topic_subscribers(topic: str, *, sns: Any) -> SubscriberReading:
+    """Read every subscription on ``topic`` and sort it into legs.
+
+    Raises whatever the client raises. A denied `ListSubscriptionsByTopic` is
+    a fact about OUR grant, and the caller (:func:`heartbeat`) records it as
+    an access fault and fails the run after the heartbeat message is sent —
+    the same shape as an unlistable manifest prefix (I9960). It is never
+    read as "no subscribers".
+    """
+    confirmed: list[str] = []
+    pending: list[str] = []
+    lambdas = 0
+    token: str | None = None
+    while True:
+        request: dict[str, Any] = {"TopicArn": topic}
+        if token:
+            request["NextToken"] = token
+        response = sns.list_subscriptions_by_topic(**request)
+        for sub in response.get("Subscriptions", []):
+            protocol = str(sub.get("Protocol", "")).lower()
+            arn = str(sub.get("SubscriptionArn", ""))
+            if protocol in _MACHINE_PROTOCOLS:
+                if arn.startswith("arn:aws:sns:"):
+                    lambdas += 1
+                continue
+            if arn == PENDING_CONFIRMATION or not arn.startswith("arn:aws:sns:"):
+                pending.append(protocol)
+            else:
+                confirmed.append(protocol)
+        token = response.get("NextToken")
+        if not token:
+            break
+    return SubscriberReading(
+        topic=topic,
+        confirmed_human_legs=tuple(sorted(confirmed)),
+        pending_legs=tuple(sorted(pending)),
+        lambda_legs=lambdas,
+    )
+
+
 def heartbeat(
     store: Store,
     *,
@@ -1152,6 +1296,7 @@ def heartbeat(
     transport: Callable[..., Any] | None = None,
     run_id: str | None = None,
     dry_run: bool = False,
+    sns: Any | None = None,
 ) -> dict[str, Any]:
     """Emit proof that the alerting path itself ran, and return its summary.
 
@@ -1213,6 +1358,34 @@ def heartbeat(
     pages = pages_in_window(store, now=moment)
     runs_ok, runs_failed, spend = _week_summary(store, trading_day)
     unwatched = sorted({page.job for page in watched})
+    # Who would receive the page this heartbeat is about to send
+    # (alpha-engine-config-I10024). Read-only, so it runs under `dry_run`
+    # too. With no topic configured there is nothing to list: the row reads
+    # `unmeasurable` naming the variable, and on a real box the publish
+    # below refuses for the same reason. A DENIED list is recorded as an
+    # access fault and raised after the heartbeat is sent — the reading's
+    # absence must never look like a confirmed subscriber.
+    topic = topic_arn()
+    if topic is None:
+        subscribers = _subscribers_unmeasurable(
+            f"{PAGES_TOPIC_ARN_VAR} is unset, so there is no topic whose subscriptions "
+            "could be listed. Not a reading of zero subscribers.",
+            now=moment,
+        )
+    else:
+        try:
+            subscribers = pages_topic_subscribers(
+                topic, sns=sns if sns is not None else _default_sns()
+            ).metric(now=moment)
+        except Exception as exc:  # noqa: BLE001 - re-raised via access_faults below
+            access_faults.append(
+                f"sns:ListSubscriptionsByTopic on {topic}: {type(exc).__name__}: {exc}"
+            )
+            subscribers = _subscribers_unmeasurable(
+                f"sns:ListSubscriptionsByTopic on {topic} raised {type(exc).__name__}: {exc}. "
+                "A statement about this identity's grant, not about who is subscribed.",
+                now=moment,
+            )
     summary = {
         "trading_day": trading_day.isoformat(),
         "runs_ok": runs_ok,
@@ -1222,6 +1395,7 @@ def heartbeat(
         "watched_absences": unwatched,
         "bus_keys": bus_keys,
         "metric": ceiling_metric(pages, now=moment),
+        "subscribers": subscribers,
     }
     message = (
         f"[crucible-v2] alive {trading_day.isoformat()}: {runs_ok} run(s) ok, "
@@ -1236,11 +1410,17 @@ def heartbeat(
             + ". The alerting path did not run; neither page condition was evaluated "
             "on the day(s) named in the bus row."
         )
+    nobody_listening = subscribers["status"] == "FAIL"
+    if nobody_listening:
+        # Said on the channel that still works (the Lambda leg forwards to
+        # Telegram even when the human leg is gone), because the row on the
+        # manifest is read by a console and this is read by a person.
+        message += " " + str(subscribers["status_reason"])
     if not dry_run:
         publish = transport if transport is not None else _krepis_publish
         publish(
             message,
-            severity="error" if unwatched else "info",
+            severity="error" if (unwatched or nobody_listening) else "info",
             source="crucible-v2/heartbeat",
             dedup_key=f"heartbeat:{trading_day.isoformat()}",
             dedup_window_min=None,
