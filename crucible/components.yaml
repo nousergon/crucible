@@ -530,9 +530,69 @@ components:
     absence_watched_by: alerts.sweep
     # Run at a phase exit, which is an event and not a cadence. A gate on a
     # schedule would be a gate whose absence pages between phases.
+    #
+    # That argument is about the READING and it still holds. It never covered
+    # the FILING (alpha-engine-config-I10095) - see `gate.close` below, which
+    # is scheduled precisely because a phase's exit RECORD cannot wait for
+    # somebody to happen to run this command.
     schedule: null
     dispatch: null
     deadline: null
+
+  gate.close:
+    description: >-
+      Read every registered phase's exit gate and file the one durable closing
+      record for each phase that reads MET and has none.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      # `outputs[gates/*/closing.json]` and nothing wider, deliberately: this
+      # job writes closing records and its own manifest, never a dated gate
+      # reading. The IAM grant says the same thing
+      # (nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml,
+      # GateCloseRole), so a bug that tried to publish a reading from here is
+      # an AccessDenied rather than a grading surface authoring what it grades.
+      lineage: run.json:inputs[runs/**,report/**,arena/**,gates/**],outputs[gates/*/closing.json]
+      outcome: run.json:metrics[closing_records_filed,phases_met_without_a_record]
+    log_location: /crucible/gate.close
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/gates
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    # DAILY, and not `arc`, for the same reason `board` is daily: the weekly
+    # driver is phase-2 work (alpha-engine-config-I9758), and a filing job
+    # dispatched by it would go dark for phases 0 and 1 - the two phases whose
+    # exits this job exists to record. It is also why it is a job of its own
+    # rather than a stage of `board`: the board is rendered by a READ-ONLY
+    # identity on purpose, and a grading surface that could file the record
+    # satisfying the clause it grades is not a measurement.
+    #
+    # `github-actions`, like `board`: the starter is the `on.schedule` cron in
+    # .github/workflows/gate-close.yml, and no AWS::Scheduler::Schedule
+    # dispatches it. `nous-ergon-ops/tests/crossrepo/test_crucible_dispatch_lockstep.py`
+    # checks that naming in BOTH directions - this row may not name a workflow
+    # that carries no cron, and a cron workflow may not go unnamed here.
+    # GitHub drops scheduled events under load, which is what makes
+    # `absence_watched_by: alerts.sweep` load-bearing: the page fires on the
+    # missing manifest, never on trusting the cron.
+    schedule: daily
+    dispatch: github-actions
+    dispatch_workflow: gate-close.yml
+    deadline:
+      # `close_plus 10` = 02:00 ET the following morning (06:00 UTC in EDT,
+      # 07:00 in EST), from the cron at 23:00 UTC plus this ACCOUNT's measured
+      # GitHub Actions delivery envelope - chronically +240 to +304 minutes,
+      # the four-workflow measurement recorded on `report.morning`'s deadline
+      # below (alpha-engine-config-I9960, -I9966). 23:00Z + 304 min is 04:04Z,
+      # so this clears the worst measured delay with ~2h of headroom while
+      # still paging the same morning on a genuine no-show. A tighter deadline
+      # here would page on a run that was merely late, which is how a channel
+      # gets muted.
+      anchor: close_plus
+      offset_hours: 10
 
   report.morning:
     description: >-

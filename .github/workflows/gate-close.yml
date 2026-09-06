@@ -1,0 +1,207 @@
+name: Gate close
+
+# The FILING half of the phase-exit loop, on a cadence —
+# `alpha-engine-config-I10095`.
+#
+# `crucible-PR121` made a phase's exit a durable record: the first LIVE
+# `crucible gate` reading that reads MET posts the reading to the phase's
+# tracker issue and files `gates/{phase}/closing.json`, once, by
+# compare-and-swap. Nothing ran `crucible gate` on a schedule, so the record
+# was written only when a human or an agent happened to run one. The daily
+# board already DETECTS the gap — a phase issue closed with no record beside it
+# renders red — and `principles.md` §2.3 counts "detected and paged" as partial
+# coverage. This workflow closes the loop.
+#
+# ── Why this is not a step of board.yml ───────────────────────────────────
+#
+# Because `crucible-v2-github-board` is READ-ONLY over everything it grades, on
+# purpose: an identity that cannot write a run manifest cannot be used to
+# satisfy a clause it is grading, whatever the code does. Filing the closing
+# record IS a write into the prefix the board grades, so it needs a different
+# identity — `crucible-v2-github-gate-close` — and an identity is attached to a
+# workflow, not to a step. Adding the write to the board would have deleted the
+# one property the board's separate role exists to guarantee.
+#
+# ── What this role may and may not do ─────────────────────────────────────
+#
+# `crucible-v2-github-gate-close` (nous-ergon-ops/infrastructure/cloudformation/
+# crucible-v2.yaml, `GateCloseRole`) reads `crucible/*` and writes exactly
+# `crucible/gates/*/closing.json` and `crucible/runs/gate.close/*`.
+#
+# `gates/*/closing.json`, NOT `gates/*`. The dated gate readings
+# (`gates/{gate}/{trading_day}/gate.json`) and the ladder (`gates/ladder.json`)
+# sit under the same prefix and are the artifacts a phase is graded from; a
+# grant over `gates/*` would let this job publish a reading saying whatever it
+# liked and then file the record of it. It writes the CONSEQUENCE of a reading
+# and can never write a reading.
+#
+# That role is created by an OPERATOR-GATED apply, not by merging the ops PR,
+# for the same reason board.yml's is: a named-IAM apply is a security boundary
+# (`pull-request-policy` §4.2 form 3 — the merge emits the exact command AND a
+# detector stays red until it runs). Until the apply happens this workflow
+# fails daily on the identity check below, naming the exact command. That is
+# the detector working, not a defect.
+#
+# ── Why a phase that has not exited is not a failure ──────────────────────
+#
+# Most days this job files nothing, and that is the correct result: it read
+# every registered phase's gate and none had turned MET. `crucible gate.close`
+# exits 0 whenever the MEASUREMENT succeeded, exactly as `crucible gate` does,
+# and the manifest carries the per-phase outcome. A non-zero exit on "no phase
+# exited today" would be a daily failure alert on a working producer, which is
+# how a channel gets muted.
+
+on:
+  schedule:
+    # 23:00 UTC — after board.yml's 21:30 UTC render, and on CALENDAR time.
+    # §4.12's first exhaustive exception: the SCHEDULER runs on calendar time
+    # and the JOB resolves the trading day. A cron that tried to skip holidays
+    # would diverge from the calendar the artifacts are keyed by, and nothing
+    # would say so.
+    #
+    # After the board rather than before it for a reader's benefit, not a
+    # data dependency: this job reads no board artifact. Ordering them means
+    # the morning report's board and the closing records it references were
+    # taken from the same evening.
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+# Serialised, and a superseded run is NOT cancelled. This job's whole purpose
+# is to create a durable record other things read, and the record is written by
+# compare-and-swap against an absent key — a run cancelled between posting the
+# tracker comment and winning the CAS leaves the comment posted and the record
+# absent, which the next run repairs (`post_closing_comment` will not repeat a
+# comment already on the issue) but which nothing should be arranging on
+# purpose.
+concurrency:
+  group: gate-close
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  # AWS_ACCOUNT_ID and STORE_URI come from repository variables
+  # (alpha-engine-config-I9906) — this repo goes PUBLIC at phase-1 exit
+  # (I9775) and `AGENTS.md` forbids infrastructure identifiers, bucket names
+  # and account numbers in the tree. The role NAME stays a literal below: it
+  # carries no secret on its own, and the account id is the sensitive half.
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  GATE_CLOSE_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/crucible-v2-github-gate-close
+  STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
+  # alpha-engine-config-I9928, and the same variable board.yml reads. This job
+  # evaluates every registered phase's gate, so phase 2's
+  # `zero_human_mutating_calls` clause is one of the clauses it reads — and an
+  # UNMEASURABLE clause makes the whole gate UNMEASURABLE, which is never MET,
+  # so an unset archive here does not file a wrong record: it files nothing and
+  # the manifest says which clause could not be read.
+  CRUCIBLE_CLOUDTRAIL_ARCHIVE: ${{ vars.CRUCIBLE_CLOUDTRAIL_ARCHIVE }}
+  # alpha-engine-config-I9967. The closing reading is POSTED to the phase's
+  # tracker issue before it is filed, and the tracker is
+  # `nousergon/alpha-engine-config` — a different, private repository an
+  # Actions `GITHUB_TOKEN` cannot reach at all. `crucible.tracker` mints a
+  # short-lived installation token narrowed to `issues: write` from the fleet's
+  # existing `ne-groomer` GitHub App, whose three SSM parameters this role
+  # reads by exact name. The secret is the laptop override and wins when both
+  # are set.
+  CRUCIBLE_TRACKER_TOKEN: ${{ secrets.CRUCIBLE_TRACKER_TOKEN }}
+  CRUCIBLE_TRACKER_APP_SSM_PREFIX: ${{ vars.CRUCIBLE_TRACKER_APP_SSM_PREFIX }}
+
+jobs:
+  gate-close:
+    name: file every closing record that is due
+    runs-on: ubuntu-latest
+    # 30, from board.yml's MEASURED 25 plus headroom for the tracker
+    # round-trips this job makes and the board does not. Both evaluate every
+    # registered gate — `crucible board` through `crucible.gate.build_ladder`,
+    # this job one gate at a time — so phase 2's CloudTrail archive read
+    # dominates both, and board.yml's comment carries that measurement
+    # (~1,123 objects / ~36 MB / ~181k records per calendar day, fetched
+    # 32-at-a-time). Raise this only with a new measurement: if the archive
+    # read grows past it the fix is the reader, not a larger number.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      # First step, before checkout: neither identity nor the store are
+      # reachable without these, and failing here names the exact operator
+      # command rather than dying deep inside `configure-aws-credentials`
+      # with an opaque OIDC/ARN error.
+      - name: Repository variables are set
+        run: |
+          missing=0
+          if [ -z "$AWS_ACCOUNT_ID" ]; then
+            echo "::error::repository variable AWS_ACCOUNT_ID is not set — set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/crucible --body '<12-digit-account-id>'"
+            missing=1
+          fi
+          if [ -z "$STORE_URI" ]; then
+            echo "::error::repository variable CRUCIBLE_STORE_URI is not set — set it with: gh variable set CRUCIBLE_STORE_URI --repo nousergon/crucible --body '<s3-uri-of-the-crucible-v2-store>'"
+            missing=1
+          fi
+          # A WARNING, not an error: an unset archive makes phase 2's
+          # zero_human_mutating_calls clause UNMEASURABLE, which makes that
+          # gate UNMEASURABLE, which is never MET — so this job files nothing
+          # for phase 2 and says why on its manifest. Failing the whole run
+          # here would stop it filing the OTHER five phases' records over a
+          # variable only one of them needs.
+          if [ -z "$CRUCIBLE_CLOUDTRAIL_ARCHIVE" ]; then
+            echo "::warning::repository variable CRUCIBLE_CLOUDTRAIL_ARCHIVE is not set, so phase 2's gate reads UNMEASURABLE and no phase-2 closing record can be filed — set it with: gh variable set CRUCIBLE_CLOUDTRAIL_ARCHIVE --repo nousergon/crucible --body \"\$(AWS_PROFILE=ne-admin aws cloudformation list-exports --query \"Exports[?Name=='fleet-cloudtrail-archive-uri'].Value\" --output text)\""
+          fi
+          # A WARNING for a different reason than the archive above, and the
+          # distinction is the point: without the tracker credential this job
+          # still runs correctly on every day that no phase has turned MET,
+          # which is almost every day. It fails LOUDLY on the day one has —
+          # `crucible.tracker` raises TrackerError, run_job writes a `failed`
+          # manifest naming it, and the process exits non-zero — so the
+          # credential is enforced exactly when it is load-bearing rather than
+          # by a daily red run nobody can act on.
+          if [ -z "$CRUCIBLE_TRACKER_APP_SSM_PREFIX" ] && [ -z "$CRUCIBLE_TRACKER_TOKEN" ]; then
+            echo "::warning::neither repository variable CRUCIBLE_TRACKER_APP_SSM_PREFIX nor secret CRUCIBLE_TRACKER_TOKEN is set, so this job will FAIL on the first day a phase gate reads MET rather than filing its closing record — set the variable to the fleet GitHub App's SSM credential prefix (gh variable set CRUCIBLE_TRACKER_APP_SSM_PREFIX --repo nousergon/crucible --body '<prefix>') and apply the crucible-v2 stack so the gate-close role may read {prefix}github_app_id, _installation_id and _private_key"
+          fi
+          exit "$missing"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          role-to-assume: ${{ env.GATE_CLOSE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The identity actually obtained, read back from AWS rather than
+      # restated from `env`. Same argument board.yml and deploy.yml make: what
+      # is falsifiable is the identity, not the literal. The extra assertion
+      # here is the NEGATIVE one — this job must not be running as the board.
+      # If somebody ever "simplified" this workflow onto BOARD_ROLE_ARN it
+      # would work, right up until the board's read-only grant refused the
+      # write; the board would then be an identity that writes into the prefix
+      # it grades, and the separation would be a convention again.
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${GATE_CLOSE_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/crucible-v2-github-board/"*) echo "::error::this job assumed the BOARD role. The board renders the grading surface and is read-only over everything it grades; filing a closing record from it would make a grading surface able to satisfy the clause it grades. Point role-to-assume at ${expected}."; exit 1 ;; esac
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. If the role does not exist yet the crucible-v2 stack has not been applied since the nous-ergon-ops PR for alpha-engine-config-I10095 merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until that happens is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+
+      - name: File every closing record that is due
+        # `--run-mode live`: a scheduled run is a live run, and
+        # `run_manifest.v2` requires the field with no default. It is also the
+        # load-bearing half of the filing rule — `file_closing_record` files
+        # nothing on a replay, because a replay of a historical day may
+        # legitimately read MET and does not exit a phase.
+        run: uv run crucible gate.close --run-mode live --store "$STORE_URI"
+
+  notify-failure:
+    needs: [gate-close]
+    if: ${{ failure() }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@619de3f32aef2e63329e7270afb87ec6b1e381e3
+    secrets: inherit

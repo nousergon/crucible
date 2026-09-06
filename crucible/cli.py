@@ -299,6 +299,17 @@ JOBS: dict[str, JobSpec] = {
     # is a MEASUREMENT cannot be satisfied by a merge.
     "weekly": JobSpec("weekly", "Run the declared weekly arc for one trading day", True),
     "gate": JobSpec("gate", "Read a phase's artifacts and report its exit gate", False),
+    # alpha-engine-config-I10095. `gate` stays on-demand — a gate on a schedule
+    # would be a gate whose absence pages between phases — but the RECORD of a
+    # phase's exit cannot wait for somebody to run one. This job reads every
+    # registered phase's gate daily and files the closing record for each that
+    # reads MET and has none, under a writer identity the board deliberately
+    # is not.
+    track_f.GATE_CLOSE_JOB: JobSpec(
+        track_f.GATE_CLOSE_JOB,
+        "File the closing record of every phase whose exit gate reads MET",
+        True,
+    ),
     # alpha-engine-config-I9896. The daily accountability delivery Brian
     # believed existed on 2026-09-02 and did not: the board was rendered into
     # the store every day and handed to nobody. It READS that board -- it does
@@ -362,6 +373,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     # track-F
     "weekly": track_f.weekly_handler,
     "gate": track_f.gate_handler,
+    track_f.GATE_CLOSE_JOB: track_f.gate_close_handler,
     morning.MORNING_JOB: morning.morning_handler,
 }
 
