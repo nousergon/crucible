@@ -89,6 +89,66 @@ class TestTheProducerConforms:
         """`crucible/data/daily.py` writes it with `json.dumps(..., sort_keys=True)`."""
         assert json.loads(json.dumps(_valid(), sort_keys=True)) == _valid()
 
+    def test_every_feature_carries_market_wide(self) -> None:
+        """`alpha-engine-config-I10114`: `market_wide` is ADDITIVE OPTIONAL on
+        the schema (older documents may omit it) but the current producer
+        always emits it — a reader of `features/{version}/registry.json`
+        alone must be able to tell a market-wide column from a
+        cross-sectional one without also importing `CATALOG`."""
+        payload = _valid()
+        assert payload["features"], "the fixture must be non-empty for this to assert anything"
+        for feature in payload["features"]:
+            assert isinstance(feature["market_wide"], bool), feature["name"]
+
+    def test_market_wide_is_excluded_from_the_feature_version_hash(self) -> None:
+        """`market_wide` joined `to_dict()` after `feature_version()` was
+        already hashing catalogue dicts for every existing
+        `features/{version}/` prefix. Had it been folded into the hash
+        input, every column's version would have changed the moment this
+        field was added, orphaning every `run.json`/verdict written under
+        the old version — for a purely descriptive field, not a changed
+        computation. Plants the naive (pre-fix) hash — computed directly
+        over `to_dict()`, which now carries `market_wide` — and asserts it
+        disagrees with `feature_version()`."""
+        import hashlib
+        import json as _json
+
+        from crucible.features.registry import feature_version
+
+        naive_input = _json.dumps(
+            [spec.to_dict() for spec in CATALOG], sort_keys=True, separators=(",", ":")
+        )
+        assert '"market_wide"' in naive_input, (
+            "to_dict() must carry market_wide for this test to plant the right defect"
+        )
+        naive_version = "v" + hashlib.sha256(naive_input.encode("utf-8")).hexdigest()[:12]
+        assert feature_version(CATALOG) != naive_version, (
+            "feature_version() must exclude market_wide from its hash input, or a "
+            "purely descriptive schema field silently orphans every existing "
+            "features/{version}/ prefix"
+        )
+
+
+class TestAnOlderDocumentStillValidates:
+    """`alpha-engine-config-I10114`: `market_wide` is additive OPTIONAL, not
+    required — a document written before this field existed (produced under
+    the same `schema_version: feature_registry.v1`) must keep validating
+    against today's schema. `required` never grows for a field a document
+    written yesterday cannot carry."""
+
+    def test_a_document_missing_market_wide_on_every_feature_still_validates(self) -> None:
+        payload = _valid()
+        for feature in payload["features"]:
+            del feature["market_wide"]
+        assert not _errors(payload), (
+            "market_wide must be additive-optional: a pre-existing registry document "
+            "that predates this field must not be refused by the updated schema"
+        )
+
+    def test_market_wide_is_not_in_the_required_list(self) -> None:
+        schema = load_registry_schema()
+        assert "market_wide" not in schema["$defs"]["feature"]["required"]
+
 
 class TestTheSchemaRefuses:
     def test_a_hand_written_feature_version(self) -> None:

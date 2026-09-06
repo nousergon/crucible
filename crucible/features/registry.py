@@ -180,16 +180,28 @@ class FeatureSpec:
             )
 
     def to_dict(self) -> dict[str, Any]:
-        # `market_wide` is deliberately NOT written here. `to_dict()` feeds
-        # `registry_payload()`, which is validated against
-        # `schemas/feature_registry.v1.json` (`additionalProperties: false`)
-        # before it is written beside a day's parquet — that schema is out
-        # of scope for `alpha-engine-config-I10071` (agent dispatch: "Do not
-        # touch ... schemas/"). `crucible.drift_inputs` reads `market_wide`
-        # by importing `CATALOG` directly, in-process, so the property does
-        # the drift-comparison job it exists for without widening the
-        # feature-registry wire contract. Filed for the schema itself:
-        # `alpha-engine-config-I10114`.
+        # `market_wide` IS written here (`alpha-engine-config-I10114`): the
+        # document at `features/{version}/registry.json` is the declared
+        # producer/consumer contract for the feature layer, and a reader of
+        # that document alone previously could not tell a market-wide column
+        # from a cross-sectional one without also importing `CATALOG`. The
+        # schema (`feature_registry.v1.json`) declares `market_wide` as an
+        # ADDITIVE OPTIONAL property rather than required, because a
+        # document already written under the old schema (before this field
+        # existed) lacks it and must keep validating — the same shape as
+        # `window_trading_days` joining the schema in an earlier revision.
+        # This dataclass still declares `market_wide` with no default, so
+        # every catalogue column carries a real value here; "optional" is a
+        # property of the WIRE SCHEMA (old documents may omit it), not of
+        # what this producer emits (it never omits it).
+        #
+        # Deliberately EXCLUDED from `feature_version()`'s hash input (see
+        # `_hashed_dict` below): `market_wide` is descriptive of an existing
+        # constant, not a change to what any column computes, and folding it
+        # into the hash the moment the schema changed would flip
+        # `feature_version()` for the whole `CATALOG`, writing every column
+        # to a new `features/{version}/` prefix and orphaning every
+        # `run.json`/verdict that pointed at the old one.
         return {
             "name": self.name,
             "unit": self.unit,
@@ -198,6 +210,7 @@ class FeatureSpec:
             "inputs": list(self.inputs),
             "window_trading_days": self.window_trading_days,
             "cross_sectional": self.cross_sectional,
+            "market_wide": self.market_wide,
         }
 
 
@@ -554,6 +567,28 @@ def registry_payload(catalog: tuple[FeatureSpec, ...] = CATALOG) -> dict[str, An
     )
 
 
+def _hashed_dict(spec: FeatureSpec) -> dict[str, Any]:
+    """The fields `feature_version()` hashes: `to_dict()` minus `market_wide`.
+
+    `market_wide` joined `to_dict()` after `feature_version()` had already
+    been hashing catalogue dicts for every existing `features/{version}/`
+    prefix (`alpha-engine-config-I10114`). It is excluded here on purpose:
+    it is a declared fact about an EXISTING constant's distributional shape,
+    not a change to what a column computes, and folding it into the hash
+    input would change `feature_version()` for the whole `CATALOG` the
+    instant the schema gained the field — writing every column to a new
+    prefix and orphaning every `run.json`/verdict that pointed at the old
+    one, even though no expression, input or computed value changed. A
+    future edit that changes what `market_wide` means for an EXISTING
+    column already changes the hash through `expression`/`inputs` below,
+    since a value's distributional shape does not change without its
+    computation changing too.
+    """
+    d = spec.to_dict()
+    del d["market_wide"]
+    return d
+
+
 def feature_version(catalog: tuple[FeatureSpec, ...] = CATALOG) -> str:
     """A stable 12-hex digest of the whole catalogue.
 
@@ -562,7 +597,7 @@ def feature_version(catalog: tuple[FeatureSpec, ...] = CATALOG) -> str:
     layer an earlier verdict was computed from, and nothing would show it.
     """
     canonical = json.dumps(
-        [spec.to_dict() for spec in catalog], sort_keys=True, separators=(",", ":")
+        [_hashed_dict(spec) for spec in catalog], sort_keys=True, separators=(",", ":")
     )
     return "v" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
 

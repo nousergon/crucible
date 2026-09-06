@@ -16,6 +16,19 @@ enforced here rather than requested:
 
 Validation is a runtime dependency, not a test-only one: a writer that could
 emit an invalid manifest would defeat the schema entirely.
+
+**THE TYPED BOUNDARY (`alpha-engine-config-I10045` row 1).** A
+`run_manifest.v2` document is validated whole, once, through
+`crucible.models.RunManifestV2` — never by hand-walking `dict` keys — so a
+malformed manifest surfaces here, naming the row and the field, rather than
+as a `KeyError` in a consumer several functions away. `run_manifest.v2.json`
+is GENERATED from that model (`tests/test_manifest_schema.py` fails when the
+committed file and the generated one differ); the two status<->reason
+cross-field rules stay in the model as `RunManifestV2._status_and_reason_agree`
+AND are mirrored into the published schema's `allOf` by
+`_run_manifest_v2_json_schema_extra` (PR123 review finding 3) — see
+`crucible/models.py`'s module docstring. `run_manifest.v1` stays on the
+original jsonschema-only path below: it is FROZEN and carries no model.
 """
 
 from __future__ import annotations
@@ -26,9 +39,11 @@ from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator
+from pydantic import ValidationError as PydanticValidationError
 
 from crucible.documents import load_store_document
 from crucible.keys import manifest_key, manifest_prefix  # noqa: F401 - re-exported
+from crucible.models import RunManifestV2
 
 #: The version every producer writes TODAY. Bumped to v2 by
 #: alpha-engine-config-I9918: v1 declared no live/replay field and set
@@ -154,6 +169,13 @@ def validate(manifest: dict[str, Any]) -> None:
     Every error is reported, not just the first: a writer fixing one field at
     a time against a validator that reports one error at a time is how a
     half-conformant producer ships.
+
+    **The current version goes through `crucible.models.RunManifestV2`**
+    (`alpha-engine-config-I10045` row 1), which enforces the status<->reason
+    cross-field rule — also mirrored into the published schema's `allOf`
+    (see this module's and `crucible.models`' docstrings). `run_manifest.v1`
+    is unaffected — it stays on the jsonschema-only path it always used,
+    frozen.
     """
     declared = manifest.get("schema_version")
     if not isinstance(declared, str):
@@ -162,6 +184,18 @@ def validate(manifest: dict[str, Any]) -> None:
             "is what says which contract the document was written to; a consumer that "
             "cannot read it refuses the document rather than guessing."
         )
+    if declared == RUN_MANIFEST_SCHEMA_VERSION:
+        try:
+            RunManifestV2.model_validate(manifest)
+        except PydanticValidationError as exc:
+            detail = "\n".join(
+                f"  - {'/'.join(str(p) for p in e['loc']) or '<root>'}: {e['msg']}"
+                for e in exc.errors()
+            )
+            raise ManifestValidationError(
+                f"run manifest does not conform to {declared}:\n{detail}"
+            ) from exc
+        return
     errors = sorted(_validator(declared).iter_errors(manifest), key=lambda e: list(e.absolute_path))
     if not errors:
         return
