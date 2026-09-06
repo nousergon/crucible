@@ -53,7 +53,11 @@ def _row(store: LocalStore, condition: str, jobs: list[str], *, sent: bool = Tru
 
 
 def _manifest(store: LocalStore, job: str, status: str) -> None:
-    _put(store, manifest_key(job, DAY), {"status": status, "reason": "" if status == "ok" else "boom"})
+    _put(
+        store,
+        manifest_key(job, DAY),
+        {"status": status, "reason": "" if status == "ok" else "boom"},
+    )
 
 
 class TestUnmeasurableBeforeAnythingSwept:

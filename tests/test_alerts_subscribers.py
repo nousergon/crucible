@@ -53,9 +53,7 @@ def _sub(protocol: str, *, confirmed: bool = True) -> dict:
     return {
         "Protocol": protocol,
         "SubscriptionArn": (
-            f"{TOPIC}:00000000-0000-0000-0000-000000000001"
-            if confirmed
-            else PENDING_CONFIRMATION
+            f"{TOPIC}:00000000-0000-0000-0000-000000000001" if confirmed else PENDING_CONFIRMATION
         ),
         "TopicArn": TOPIC,
     }
@@ -187,7 +185,9 @@ class TestTheHeartbeatCarriesIt:
         assert summary["subscribers"]["status"] == "unmeasurable"
         assert PAGES_TOPIC_ARN_VAR in summary["subscribers"]["status_reason"]
 
-    def test_a_dry_run_still_reads_but_sends_nothing(self, tmp_path, transport, monkeypatch) -> None:
+    def test_a_dry_run_still_reads_but_sends_nothing(
+        self, tmp_path, transport, monkeypatch
+    ) -> None:
         monkeypatch.setenv(PAGES_TOPIC_ARN_VAR, TOPIC)
         store = LocalStore(tmp_path)
         _sweep_ran(store)
