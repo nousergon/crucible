@@ -16,11 +16,37 @@ component 5 exists to remove, wearing the monitor's own name.
 
 **What each input is, in phase 1, and what it becomes.**
 
-* ``features`` — PSI per catalogue column, the current day's compiled feature
-  layer against the trailing :data:`REFERENCE_SESSIONS` compiled days. The
-  trailing window is the phase-1 proxy for "the training window"; when the M
-  slot ships (phase 3) its declared training window replaces the proxy and
-  this module's ``reference`` selection is the one place that changes.
+* ``features`` — current day against the trailing :data:`REFERENCE_SESSIONS`
+  compiled days, per catalogue column. **Two comparisons, chosen per column
+  from `FeatureSpec.market_wide`** (never inferred from the live data's
+  variance): a **cross-sectional** column (varies across tickers on a day)
+  keeps the PSI reading — today's whole cross-section against the pooled
+  trailing cross-sections, as before. A **market-wide** column (one value
+  repeated across every ticker on a day, by construction —
+  ``market_return_1d_log_return`` is the phase-1 example) is compared
+  **along time** instead, as a z-score against the trailing window's daily
+  values (one observation per session), scaled onto the same numeric range
+  `psi()` reports (`_along_time_ratio`). A market-wide column fed the
+  cross-sectional PSI reads a point mass (today) against 1-20 pooled point
+  masses (the reference), which is BREACH by construction whatever the
+  market did (`alpha-engine-config-I10071`); PSI ALSO breaks the other
+  direction — a length-1 "current" sample concentrates all of its mass in
+  one equal-mass bin against the reference's ~10, which reads a large PSI
+  (measured ~8.3, matching the original defect's own reported value)
+  regardless of where that value actually sits, so `_along_time_ratio`'s
+  z-score is not a style choice, it is the only one of the two that is
+  actually meaningful for a single observation. A market-wide column is
+  only SCORED once its reference reaches
+  :data:`ALONG_TIME_MIN_REFERENCE_SESSIONS` sessions — below that, a sample
+  standard deviation is undefined at n=1 (any differing value would read an
+  infinite z-score, i.e. BREACH by construction, the same defect this issue
+  closes) and is mostly noise at n=2-4; a column below the floor is
+  reported unscored in ``columns_awaiting_reference`` rather than scored at
+  a fabricated value. ``method_by_feature`` on the returned document names
+  which comparison each SCORED column used. The trailing window is the
+  phase-1 proxy for "the training window"; when the M slot ships (phase 3)
+  its declared training window replaces the proxy and this module's
+  ``reference`` selection is the one place that changes.
 * ``predictions`` — PSI of each produced arm's scored cross-section
   (`cross_section.v2`, the whole ranked population) against that same arm's
   earlier cross-sections. Reported as the WORST arm, with every arm named in
@@ -55,8 +81,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from crucible.documents import load_store_document
-from crucible.drift import DEFAULT_BINS, feature_psi, ic_decay, psi
-from crucible.features import DEFAULT_FEATURE_VERSION, read_features
+from crucible.drift import BANDS, DEFAULT_BINS, feature_psi, ic_decay, psi
+from crucible.features import DEFAULT_FEATURE_VERSION, FeatureSpec, read_features
 from crucible.keys import experiments_prefix, features_key, features_prefix
 from crucible.slots.arms import read_register
 from crucible.slots.grading import RankICSkip, spearman_ic
@@ -143,15 +169,129 @@ def _numeric_columns(frame: Any, catalog_columns: Sequence[str]) -> list[str]:
     return [c for c in catalog_columns if c in frame.columns]
 
 
+#: `psi_by_feature[name]`'s comparison, carried verbatim onto
+#: `method_by_feature[name]` and into `drift.drift_metrics`'s detail string
+#: for the worst feature, so a reader of the row (not just the input
+#: document) can tell a genuine cross-sectional shift from an along-time one
+#: (`alpha-engine-config-I10071`).
+_METHOD_CROSS_SECTIONAL = (
+    f"cross-sectional PSI ({DEFAULT_BINS} bins): today's whole cross-section against the "
+    "pooled trailing cross-sections"
+)
+_METHOD_ALONG_TIME = (
+    "along-time z-score ratio: today's single value against the mean and standard "
+    "deviation of the trailing window's daily values, one observation per session — "
+    "the market-wide comparison"
+)
+
+#: Standard deviations from the trailing window's mean that reads BREACH on
+#: the along-time ratio — the conventional statistical-process-control
+#: threshold (Western Electric rule 1: three sigma from the center line is
+#: an out-of-control signal). NOT `psi()`: equal-mass histogram PSI needs a
+#: multi-observation CURRENT sample to bin against the reference, and a
+#: market-wide column's current sample is exactly one value (today's). Fed
+#: to `psi()` anyway, a single observation concentrates 100% of its mass in
+#: one bin against a reference spread over `DEFAULT_BINS`, which reads a
+#: large PSI (measured ~8.3, matching the ORIGINAL cross-sectional defect's
+#: reported value) REGARDLESS of where that value sits in the reference —
+#: the same "point mass reads BREACH by construction" failure this issue
+#: exists to close, reproduced one axis over. A z-score has no such failure
+#: mode: it is defined for exactly this shape (one observation against a
+#: sample's mean and spread).
+ALONG_TIME_BREACH_SIGMA = 3.0
+
+#: Minimum trailing daily observations before a market-wide column's
+#: along-time comparison is SCORED at all. At `n=1` the sample variance is
+#: zero by definition (one point has no spread), so `_along_time_ratio`
+#: would read ANY differing current value as an infinite z-score and
+#: BREACH — on the first replay day after a fresh feature layer, or the day
+#: after any gap, whatever the market did. That is the exact
+#: desensitisation `alpha-engine-config-I10071` exists to close, reproduced
+#: on the reference-size axis instead of the ticker-count axis. At `n=2..4`
+#: a sample standard deviation is itself mostly sampling noise, not a
+#: measurement of the column's real spread. Five is one trading week
+#: (`AGENTS.md` §3: "a trading week is 5 trading days") — the smallest
+#: window this repo already treats as a real sample rather than a handful
+#: of points, so a market-wide column below it is reported unscored with a
+#: reason, never scored at a fabricated 0.0 or a manufactured breach.
+ALONG_TIME_MIN_REFERENCE_SESSIONS = 5
+
+
+def _daily_representative(frame: Any, column: str) -> float | None:
+    """The single value a market-wide column carries on this trading day.
+
+    A market-wide column is identical across the whole cross-section by
+    DECLARED construction (`FeatureSpec.market_wide`), so the mean of its
+    finite values on the day is that shared value — and is robust to the
+    rare row whose other columns are null while this one still carries the
+    day's value. `None` when the column has no finite value at all that day.
+    """
+    values = _finite(frame[column].tolist())
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _along_time_ratio(reference: Sequence[float], current: float) -> float:
+    """A market-wide column's drift, on the SAME numeric scale `psi()`
+    reports for a cross-sectional column, so both can share one row's
+    "worst of N" without unit confusion.
+
+    Built from a z-score of ``current`` against ``reference``'s mean and
+    sample standard deviation, scaled so exactly
+    :data:`ALONG_TIME_BREACH_SIGMA` reads the existing
+    ``feature_psi_max_ratio`` band's `breach` value — a market-wide column
+    at the three-sigma control limit and a cross-sectional column at a
+    "different population" PSI both read the same number, by declared
+    convention, not by claiming the two arithmetics are the same thing.
+
+    Raises rather than scoring below :data:`ALONG_TIME_MIN_REFERENCE_SESSIONS`:
+    the caller is the one place that decides whether a column is scored at
+    all (`_features_input` routes a too-short reference to
+    ``columns_awaiting_reference`` instead of calling this), so reaching
+    this function with too few points is a caller defect, not a value this
+    function should paper over with an invented number.
+    """
+    n = len(reference)
+    if n < ALONG_TIME_MIN_REFERENCE_SESSIONS:
+        raise ValueError(
+            f"{n} reference session(s), fewer than "
+            f"ALONG_TIME_MIN_REFERENCE_SESSIONS={ALONG_TIME_MIN_REFERENCE_SESSIONS}; the "
+            "caller must route this column to columns_awaiting_reference instead of "
+            "scoring it — a sample of this size has no real standard deviation to "
+            "measure a z-score against"
+        )
+    mean = sum(reference) / n
+    # n >= ALONG_TIME_MIN_REFERENCE_SESSIONS (checked above) is always > 1,
+    # so the sample-variance denominator never divides by zero.
+    variance = sum((v - mean) ** 2 for v in reference) / (n - 1)
+    std = math.sqrt(variance)
+    breach = BANDS["feature_psi_max_ratio"].breach
+    if std == 0.0:
+        # A trailing window with zero variance (every prior day carried the
+        # identical value) has no scale to measure against. A current value
+        # equal to that constant is DEFINED as no drift; the market-wide
+        # column's whole point is that its value CAN be flat across a quiet
+        # stretch, so this is a legitimate reading, not a producer defect.
+        return 0.0 if current == mean else breach
+    z = abs(current - mean) / std
+    # Not capped at 1.0: `psi()` is unbounded too (a total population
+    # replacement reads well past 1.0), and capping here would make an
+    # order-of-magnitude regime jump read identically to a marginal breach.
+    return z / ALONG_TIME_BREACH_SIGMA * breach
+
+
 def _features_input(
     store: Store,
     trading_day: dt.date,
     *,
     version: str,
     reference_sessions: int,
-    catalog_columns: Sequence[str],
+    catalog: Sequence[FeatureSpec],
     sources: list[str],
 ) -> dict[str, Any]:
+    catalog_columns = tuple(spec.name for spec in catalog)
+    market_wide_names = frozenset(spec.name for spec in catalog if spec.market_wide)
     current_key = features_key(version, trading_day.isoformat())
     if not store.exists(current_key):
         raise FileNotFoundError(
@@ -172,12 +312,18 @@ def _features_input(
         "reference_sessions_requested": reference_sessions,
         "feature_version": version,
         "method": (
-            f"equal-mass PSI ({DEFAULT_BINS} bins cut on the reference), per catalogue "
-            "column, current day against the pooled trailing compiled days. The trailing "
+            "per catalogue column, one of two comparisons chosen from the column's "
+            "DECLARED `FeatureSpec.market_wide` (never inferred from variance): a "
+            f"cross-sectional column reads '{_METHOD_CROSS_SECTIONAL}'; a market-wide "
+            f"column (identical across every ticker on a day) reads '{_METHOD_ALONG_TIME}', "
+            f"once its trailing reference reaches {ALONG_TIME_MIN_REFERENCE_SESSIONS} "
+            "sessions — see columns_awaiting_reference for one that has not. See "
+            "method_by_feature for the per-column choice actually used. The trailing "
             "window is the phase-1 proxy for the training window; the M slot's declared "
             "training window replaces it in phase 3."
         ),
         "psi_by_feature": {},
+        "method_by_feature": {},
     }
     if not prior:
         document["unmeasured_reason"] = (
@@ -185,32 +331,86 @@ def _features_input(
             f"{features_prefix(version)}; a first day has nothing to drift from"
         )
         return document
-    training: dict[str, list[float]] = {c: [] for c in columns}
+    cross_sectional_columns = [c for c in columns if c not in market_wide_names]
+    market_wide_columns = [c for c in columns if c in market_wide_names]
+    cs_training: dict[str, list[float]] = {c: [] for c in cross_sectional_columns}
+    mw_training: dict[str, list[float]] = {c: [] for c in market_wide_columns}
     for day in prior:
         key = features_key(version, day.isoformat())
         frame = read_features(store.get_bytes(key))
         sources.append(key)
-        for c in columns:
+        for c in cross_sectional_columns:
             if c in frame.columns:
-                training[c].extend(_finite(frame[c].tolist()))
+                cs_training[c].extend(_finite(frame[c].tolist()))
+        for c in market_wide_columns:
+            if c in frame.columns:
+                value = _daily_representative(frame, c)
+                if value is not None:
+                    mw_training[c].append(value)
     # A column with no finite reference value anywhere in the window is a
     # NEW feature, not a vanished one: it is reported as not comparable
     # rather than fed to `psi`, which would (correctly) refuse the empty
     # reference and take the whole row down over a column that only just
     # appeared.
-    comparable = {c: v for c, v in training.items() if v}
-    not_comparable = sorted(set(columns) - set(comparable))
-    live = {c: _finite(current[c].tolist()) for c in comparable}
-    empty_live = sorted(c for c, v in live.items() if not v)
+    cs_comparable = {c: v for c, v in cs_training.items() if v}
+    mw_comparable = {c: v for c, v in mw_training.items() if v}
+    not_comparable = sorted(
+        (set(cs_training) - set(cs_comparable)) | (set(mw_training) - set(mw_comparable))
+    )
+    # A market-wide column with SOME reference but fewer than
+    # ALONG_TIME_MIN_REFERENCE_SESSIONS sessions of it is not "not
+    # comparable" (that means zero reference, a brand-new column) — it has
+    # a reference, just too short a one to measure a real standard
+    # deviation against. Reported with its own honest-absence reason
+    # (mirroring how the predictions input reports an arm with no earlier
+    # cross-section) rather than scored at n=1's fabricated zero-variance
+    # breach.
+    mw_scoreable = {
+        c: v for c, v in mw_comparable.items() if len(v) >= ALONG_TIME_MIN_REFERENCE_SESSIONS
+    }
+    columns_awaiting_reference = {
+        c: f"no reference yet: {len(v)} of {ALONG_TIME_MIN_REFERENCE_SESSIONS} sessions"
+        for c, v in mw_comparable.items()
+        if c not in mw_scoreable
+    }
+    cs_live = {c: _finite(current[c].tolist()) for c in cs_comparable}
+    mw_live: dict[str, list[float]] = {}
+    for c in mw_scoreable:
+        value = _daily_representative(current, c)
+        mw_live[c] = [] if value is None else [value]
+    empty_live = sorted(
+        [c for c, v in cs_live.items() if not v] + [c for c, v in mw_live.items() if not v]
+    )
     if empty_live:
         raise ValueError(
             f"feature(s) {empty_live} have no finite value on {trading_day.isoformat()} "
             "while the reference window carries them: a column that emptied is a "
             "lineage failure, reported as one rather than as a stable distribution"
         )
-    document["psi_by_feature"] = feature_psi(comparable, live)
+    psi_by_feature = feature_psi(cs_comparable, cs_live)
+    method_by_feature = {c: _METHOD_CROSS_SECTIONAL for c in psi_by_feature}
+    for c in sorted(mw_scoreable):
+        psi_by_feature[c] = _along_time_ratio(mw_scoreable[c], mw_live[c][0])
+        method_by_feature[c] = _METHOD_ALONG_TIME
+    document["psi_by_feature"] = psi_by_feature
+    document["method_by_feature"] = method_by_feature
     document["columns_not_comparable"] = not_comparable
-    document["reference_rows_by_feature"] = {c: len(v) for c, v in comparable.items()}
+    document["columns_awaiting_reference"] = columns_awaiting_reference
+    document["reference_rows_by_feature"] = {
+        **{c: len(v) for c, v in cs_comparable.items()},
+        **{c: len(v) for c, v in mw_scoreable.items()},
+    }
+    if not psi_by_feature:
+        # Every catalogue column present today is either brand new
+        # (`columns_not_comparable`) or a market-wide column whose reference
+        # has not reached ALONG_TIME_MIN_REFERENCE_SESSIONS yet
+        # (`columns_awaiting_reference`) — the same honest-absence shape as
+        # an empty `prior` above, reached one step later.
+        document["unmeasured_reason"] = (
+            "no catalogue column could be scored this cycle: "
+            f"not comparable (no reference at all): {not_comparable or 'none'}; "
+            f"awaiting a longer reference: {columns_awaiting_reference or 'none'}"
+        )
     return document
 
 
@@ -391,20 +591,27 @@ def compute_drift_inputs(
     feature_version: str = DEFAULT_FEATURE_VERSION,
     slots: Sequence[str] = DRIFT_SLOTS,
     reference_sessions: int = REFERENCE_SESSIONS,
-    catalog_columns: Sequence[str] | None = None,
+    catalog: Sequence[FeatureSpec] | None = None,
 ) -> DriftInputs:
-    """The three drift input documents for ``trading_day``, from the store."""
-    if catalog_columns is None:
+    """The three drift input documents for ``trading_day``, from the store.
+
+    ``catalog`` carries each column's DECLARED `market_wide` property
+    (`alpha-engine-config-I10071`), which is why this takes the
+    `FeatureSpec` sequence rather than bare column names as it did before —
+    a name alone cannot say which of the two drift comparisons a column
+    wants.
+    """
+    if catalog is None:
         from crucible.features import CATALOG  # noqa: PLC0415 - one call site
 
-        catalog_columns = tuple(f.name for f in CATALOG)
+        catalog = CATALOG
     sources: list[str] = []
     features = _features_input(
         store,
         trading_day,
         version=feature_version,
         reference_sessions=reference_sessions,
-        catalog_columns=catalog_columns,
+        catalog=catalog,
         sources=sources,
     )
     predictions = _predictions_input(

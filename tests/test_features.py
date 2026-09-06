@@ -33,6 +33,7 @@ class TestUnits:
                 expression="mean(volume, 20)",
                 description="the column that caused the rule",
                 inputs=("volume_raw",),
+                market_wide=False,
             )
 
     def test_a_feature_with_no_lineage_is_refused(self) -> None:
@@ -43,6 +44,7 @@ class TestUnits:
                 expression="?",
                 description="no lineage",
                 inputs=(),
+                market_wide=False,
             )
 
     def test_a_ratio_suffix_with_a_raw_unit_is_refused(self) -> None:
@@ -61,6 +63,7 @@ class TestUnits:
                 expression="mean(volume, 20) / something",
                 description="the exact defect this registry exists to catch",
                 inputs=("volume_raw",),
+                market_wide=False,
             )
 
     def test_a_zscore_suffix_with_a_non_zscore_unit_is_refused(self) -> None:
@@ -71,6 +74,7 @@ class TestUnits:
                 expression="zscore(foo)",
                 description="a z-score claiming a currency unit",
                 inputs=("close_raw",),
+                market_wide=False,
                 cross_sectional=True,
             )
 
@@ -83,6 +87,7 @@ class TestUnits:
                 expression="foo",
                 description="a raw column claiming to already be normalized",
                 inputs=("close_raw",),
+                market_wide=False,
             )
 
     def test_every_catalogue_column_agrees_with_its_suffix(self) -> None:
@@ -100,6 +105,7 @@ class TestUnits:
                 expression=spec.expression,
                 description=spec.description,
                 inputs=spec.inputs,
+                market_wide=spec.market_wide,
                 window_trading_days=spec.window_trading_days,
                 cross_sectional=spec.cross_sectional,
             )
@@ -112,8 +118,43 @@ class TestUnits:
                 expression="log(close / close.shift(30))",
                 description="a calendar month",
                 inputs=("close_raw",),
+                market_wide=False,
                 window_trading_days=0,
             )
+
+
+class TestMarketWideDeclaration:
+    """`alpha-engine-config-I10071`: whether a column varies across the day's
+    cross-section, or is one value repeated identically across every
+    ticker by construction, is a DECLARED property — never inferred from
+    the live data's variance — and it has no default."""
+
+    def test_every_catalogue_column_declares_market_wide(self) -> None:
+        """`market_wide` has no default, so this is really asserting the
+        catalogue still imports: a `FeatureSpec` call site missing the
+        keyword raises `TypeError` at construction, before this test (or any
+        other) runs at all — an undeclared column is a collection failure,
+        not a runtime check that a new column could quietly skip."""
+        for spec in CATALOG:
+            assert isinstance(spec.market_wide, bool), spec.name
+
+    def test_omitting_market_wide_is_a_construction_failure(self) -> None:
+        with pytest.raises(TypeError, match="market_wide"):
+            FeatureSpec(
+                name="new_column_ratio",
+                unit="ratio",
+                expression="?",
+                description="a column that forgot to declare its distribution",
+                inputs=("close_raw",),
+            )
+
+    def test_exactly_one_phase_1_column_is_market_wide(self) -> None:
+        """`market_return_1d_log_return` is identical across every ticker on
+        a day by construction (the equal-weighted cross-sectional mean); the
+        rest of the phase-1 catalogue varies per ticker. A future column
+        that IS constant across tickers must say so explicitly here."""
+        market_wide = {spec.name for spec in CATALOG if spec.market_wide}
+        assert market_wide == {"market_return_1d_log_return"}
 
 
 class TestVersion:
@@ -128,6 +169,7 @@ class TestVersion:
                 expression="zscore(mom_12_1_log_return)  # window changed",
                 description="a different recipe under the same name",
                 inputs=("mom_12_1_log_return",),
+                market_wide=False,
                 cross_sectional=True,
             ),
         )

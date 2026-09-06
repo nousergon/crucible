@@ -569,6 +569,10 @@ def drift_handler(args: argparse.Namespace) -> int:
                 for name, doc in payloads.items()
                 if doc.get("unmeasured_reason")
             },
+            # `alpha-engine-config-I10071`: names which of the two drift
+            # comparisons (cross-sectional vs along-time) produced the worst
+            # feature's ratio, on the row itself.
+            feature_method_by_name=payloads["features"].get("method_by_feature", {}),
         )
         for record in records:
             ctx.record_metric(record)

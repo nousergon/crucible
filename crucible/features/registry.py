@@ -107,11 +107,32 @@ class FeatureSpec:
     expression: str
     description: str
     inputs: tuple[str, ...]
+    #: Whether the column's VALUE varies across the day's cross-section
+    #: (`False`) or is one value repeated identically across every ticker on
+    #: a day, by construction (`True`) — `market_return_1d_log_return` is
+    #: the phase-1 example. **Declared, never inferred from variance at
+    #: runtime**: a column that happens to be constant on one quiet day is
+    #: not market-wide, and a market-wide column's whole point is that it is
+    #: constant on EVERY day. No default on purpose — a new catalogue entry
+    #: that omits this argument fails at construction (`TypeError`, before
+    #: any test runs), so a column cannot silently inherit a guess about its
+    #: own distributional shape. `crucible.drift_inputs` reads this to
+    #: choose the comparison a PSI-style drift check runs: a cross-sectional
+    #: column keeps the cross-section-vs-cross-section reading, a
+    #: market-wide one is compared ALONG TIME instead, because a point mass
+    #: measured against pooled point masses reads BREACH by construction
+    #: (`alpha-engine-config-I10071`) regardless of what the market did.
+    market_wide: bool
     #: SESSIONS, not calendar days. `None` for a point-in-time column that
     #: reads only the current row.
     window_trading_days: int | None = None
-    #: Whether the column is computed across the cross-section of one day
-    #: (a z-score) rather than along one ticker's history.
+    #: Whether the column is COMPUTED across the cross-section of one day
+    #: (a z-score or a cross-sectional mean) rather than along one ticker's
+    #: history. Orthogonal to `market_wide`: `tech_score_ratio` is computed
+    #: cross-sectionally (`cross_sectional=True`) but its VALUE still varies
+    #: per ticker (`market_wide=False`); `market_return_1d_log_return` is
+    #: both (computed as a cross-sectional mean, and its value is identical
+    #: for every ticker that day).
     cross_sectional: bool = False
 
     def __post_init__(self) -> None:
@@ -159,6 +180,16 @@ class FeatureSpec:
             )
 
     def to_dict(self) -> dict[str, Any]:
+        # `market_wide` is deliberately NOT written here. `to_dict()` feeds
+        # `registry_payload()`, which is validated against
+        # `schemas/feature_registry.v1.json` (`additionalProperties: false`)
+        # before it is written beside a day's parquet — that schema is out
+        # of scope for `alpha-engine-config-I10071` (agent dispatch: "Do not
+        # touch ... schemas/"). `crucible.drift_inputs` reads `market_wide`
+        # by importing `CATALOG` directly, in-process, so the property does
+        # the drift-comparison job it exists for without widening the
+        # feature-registry wire contract. Filed for the schema itself:
+        # `alpha-engine-config-I10114`.
         return {
             "name": self.name,
             "unit": self.unit,
@@ -176,6 +207,7 @@ class FeatureSpec:
 CATALOG: tuple[FeatureSpec, ...] = (
     FeatureSpec(
         name="close_raw",
+        market_wide=False,
         unit="USD",
         expression="close",
         description="Settled close for the trading day, unadjusted by this layer.",
@@ -183,6 +215,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="dollar_volume_20d_raw",
+        market_wide=False,
         unit="USD",
         expression="mean(close * volume, 20)",
         description=(
@@ -195,6 +228,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="return_1d_log_return",
+        market_wide=False,
         unit="log_return",
         expression="log(close / close.shift(1))",
         description="One-session log return.",
@@ -203,6 +237,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="momentum_20d_log_return",
+        market_wide=False,
         unit="log_return",
         expression="log(close / close.shift(20))",
         description="Trailing 20-session log return.",
@@ -211,6 +246,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="return_60d_log_return",
+        market_wide=False,
         unit="log_return",
         expression="log(close / close.shift(60))",
         description="Trailing 60-session log return.",
@@ -219,6 +255,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="mom_12_1_log_return",
+        market_wide=False,
         unit="log_return",
         expression="log(close.shift(21) / close.shift(252))",
         description=(
@@ -231,6 +268,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="volatility_20d_ratio",
+        market_wide=False,
         unit="ratio",
         expression="std(log_return_1d, 20)",
         description="Standard deviation of 20 sessions of daily log returns. Not annualized.",
@@ -239,6 +277,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="close_to_sma50_ratio",
+        market_wide=False,
         unit="ratio",
         expression="close / mean(close, 50)",
         description="Close over its 50-session mean. 1.0 is at the average.",
@@ -247,6 +286,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="close_to_sma200_ratio",
+        market_wide=False,
         unit="ratio",
         expression="close / mean(close, 200)",
         description="Close over its 200-session mean.",
@@ -255,6 +295,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="rsi_14_ratio",
+        market_wide=False,
         unit="ratio",
         expression="wilder_rsi(close, 14) / 100",
         description=(
@@ -266,6 +307,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="liquidity_pass_raw",
+        market_wide=False,
         unit="indicator",
         expression="dollar_volume_20d_raw >= 5_000_000",
         description=(
@@ -277,6 +319,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="tech_score_ratio",
+        market_wide=False,
         unit="ratio",
         expression=(
             "mean(rank01(rsi_14_ratio), rank01(close_to_sma50_ratio), "
@@ -297,6 +340,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="momentum_20d_zscore",
+        market_wide=False,
         unit="zscore",
         expression="zscore(momentum_20d_log_return)",
         description="Cross-sectional z-score of 20-session momentum, over the liquid set.",
@@ -305,6 +349,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="return_60d_zscore",
+        market_wide=False,
         unit="zscore",
         expression="zscore(return_60d_log_return)",
         description="Cross-sectional z-score of 60-session return, over the liquid set.",
@@ -313,6 +358,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="mom_12_1_zscore",
+        market_wide=False,
         unit="zscore",
         expression="zscore(mom_12_1_log_return)",
         description="Cross-sectional z-score of 12-1 momentum, over the liquid set.",
@@ -334,6 +380,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     # is a sum rather than an approximation of one.
     FeatureSpec(
         name="market_return_1d_log_return",
+        market_wide=True,
         unit="log_return",
         expression="mean(return_1d_log_return) over the day's cross-section",
         description=(
@@ -350,6 +397,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="beta_60d_raw",
+        market_wide=False,
         unit="beta",
         expression=(
             "cov(return_1d_log_return, market_return_1d_log_return, 60) / "
@@ -366,6 +414,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="residual_return_1d_log_return",
+        market_wide=False,
         unit="log_return",
         expression="return_1d_log_return - beta_60d_raw * market_return_1d_log_return",
         description=(
@@ -381,6 +430,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="residual_vol_20d_ratio",
+        market_wide=False,
         unit="ratio",
         expression="std(residual_return_1d_log_return, 20)",
         description=(
@@ -393,6 +443,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="residual_momentum_252d_skip21d_ratio",
+        market_wide=False,
         unit="ratio",
         expression=(
             "sum(residual_return_1d_log_return, 231).shift(21) / "
@@ -411,6 +462,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="residual_momentum_252d_skip21d_zscore",
+        market_wide=False,
         unit="zscore",
         expression="zscore(residual_momentum_252d_skip21d_ratio)",
         description=(
@@ -422,6 +474,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="momentum_change_21d_log_return",
+        market_wide=False,
         unit="log_return",
         expression=("sum(return_1d_log_return, 21) - sum(return_1d_log_return, 21).shift(21)"),
         description=(
@@ -433,6 +486,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
     ),
     FeatureSpec(
         name="momentum_change_21d_zscore",
+        market_wide=False,
         unit="zscore",
         expression="zscore(momentum_change_21d_log_return)",
         description=("Cross-sectional z-score of momentum acceleration, over the liquid set."),
