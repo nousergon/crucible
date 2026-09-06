@@ -462,6 +462,10 @@ def heartbeat_handler(args: argparse.Namespace) -> int:
         summary = alerts.heartbeat(store, dry_run=dry_run)
         result.update(summary)
         ctx.record_metric(summary["metric"])
+        # alpha-engine-config-I10024: who would receive the page. FAIL when
+        # no confirmed human leg or no Lambda leg; `unmeasurable` when the
+        # list could not be read (and the run then fails on that fault).
+        ctx.record_metric(summary["subscribers"])
         ctx.record_metric(
             {
                 "name": "pages_last_28_trading_days",
