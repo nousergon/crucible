@@ -58,7 +58,7 @@ below changes, and is recorded here as an illustration rather than a pin.
 | `close_to_sma50_ratio` | ratio | 50 | no | `close / mean(close, 50)` | `close_raw` |
 | `close_to_sma200_ratio` | ratio | 200 | no | `close / mean(close, 200)` | `close_raw` |
 | `rsi_14_ratio` | ratio | 14 | no | `wilder_rsi(close, 14) / 100` | `close_raw` |
-| `liquidity_pass_raw` | indicator | 20 | no | `dollar_volume_20d_raw >= 5_000_000` | `dollar_volume_20d_raw` |
+| `liquidity_pass_raw` | indicator | 20 | no | `dollar_volume_20d_raw >= liquidity_floor_usd()` | `dollar_volume_20d_raw` |
 | `tech_score_ratio` | ratio | — | yes | `mean(rank01(rsi_14_ratio), rank01(close_to_sma50_ratio), rank01(close_to_sma200_ratio), rank01(momentum_20d_log_return))` | `rsi_14_ratio`, `close_to_sma50_ratio`, `close_to_sma200_ratio`, `momentum_20d_log_return` |
 | `momentum_20d_zscore` | zscore | — | yes | `zscore(momentum_20d_log_return)` | `momentum_20d_log_return`, `liquidity_pass_raw` |
 | `return_60d_zscore` | zscore | — | yes | `zscore(return_60d_log_return)` | `return_60d_log_return`, `liquidity_pass_raw` |

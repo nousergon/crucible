@@ -326,7 +326,7 @@ CATALOG: tuple[FeatureSpec, ...] = (
         name="liquidity_pass_raw",
         market_wide=False,
         unit="indicator",
-        expression="dollar_volume_20d_raw >= 5_000_000",
+        expression="dollar_volume_20d_raw >= liquidity_floor_usd()",
         description=(
             "The liquidity gate as a 0/1 indicator, computed HERE so every arm "
             "reads the same gate rather than each re-deriving a threshold."

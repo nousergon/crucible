@@ -150,6 +150,17 @@ BUCKET_STEM_PATTERN = r"\balpha-engine-(data|research|crucible-v2)(?![\w-])"
 #: `crucible-v2-github` catches `crucible-v2-github-deploy` and its six
 #: siblings, which is the whole point — the PREFIX is the identity, the
 #: suffix (`-deploy`, `-board`) is a purpose word that may stay.
+#: The liquidity floor's VALUE, in any spelling Python or a doc would use.
+#: Added 2026-09-07, and found the hard way: after `alpha-engine-config-I10156`
+#: moved `LIQUIDITY_FLOOR_USD` behind an accessor, this scan reported the tree
+#: clean while `registry.py`'s `liquidity_pass_raw` entry still carried
+#: `expression="dollar_volume_20d_raw >= 5_000_000"` and a docstring still said
+#: what the constant "was". Both survived because every pattern here matched a
+#: NAME and the leak was a NUMBER — the scan graded the identifier and the
+#: value walked past it. A tuned threshold is exactly as published in an
+#: expression string as it is in an assignment.
+LIQUIDITY_FLOOR_VALUE_PATTERN = r"\b5[_,]?000[_,]?000(?:\.0+)?\b|\b5e6\b"
+
 IDENTITY_NAME_PATTERN = (
     r"\b(?:crucible-v2-(?:github|runtime|dispatcher|scheduler|stack-check|pages)"
     r"|alpha-engine-alerts(?:-muted)?)\b"
@@ -192,6 +203,13 @@ FORBIDDEN: dict[str, str] = {
     # `alpha-engine-research`, `--s3-bucket alpha-engine-research`,
     # `alpha-engine-crucible-v2/crucible` (a `/` is not `[\w-]`) — and stops
     # matching a longer identifier that merely starts with one.
+    LIQUIDITY_FLOOR_VALUE_PATTERN: (
+        "the liquidity floor's literal VALUE — a tuned threshold, and as "
+        "published in an expression string or a docstring as in an "
+        "assignment. Read it through crucible.features.compute."
+        "liquidity_floor_usd(); the value is recorded in "
+        "alpha-engine-config/strategy/UNIVERSE_GATES.md"
+    ),
     IDENTITY_NAME_PATTERN: (
         "a literal IAM role, Lambda function or SNS topic name — an outside "
         "reader of this public tree can use none of them, and publishing one "
@@ -293,6 +311,7 @@ def test_the_scan_can_actually_find_something() -> None:
         ACCOUNT_ID_PATTERN: "role/x  # arn:aws:iam::711398986525:role/x",
         r"s3://alpha-engine-": "STORE_URI: s3://alpha-engine-crucible-v2/crucible",
         IDENTITY_NAME_PATTERN: "role-to-assume: crucible-v2-github-deploy",
+        LIQUIDITY_FLOOR_VALUE_PATTERN: "LIQUIDITY_FLOOR_USD = 5_000_000.0",
         BUCKET_STEM_PATTERN: 'BUCKET = "alpha-engine-data"',
     }
     assert set(samples) == set(FORBIDDEN), (
