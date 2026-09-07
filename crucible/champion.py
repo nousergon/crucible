@@ -40,14 +40,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from functools import lru_cache
-from pathlib import Path
 from typing import Any
 
-from jsonschema import Draft202012Validator
+from pydantic import ValidationError
 
 from crucible.documents import UnreadableDocumentError, load_store_document
 from crucible.keys import champion_key
+from crucible.models import ChampionPointerDocument
 from crucible.store import Store
 
 __all__ = [
@@ -63,8 +62,6 @@ __all__ = [
 ]
 
 CHAMPION_SCHEMA_VERSION = "champion_pointer.v1"
-
-SCHEMA_PATH = Path(__file__).parent / "schemas" / "champion_pointer.v1.json"
 
 #: How this pointer came to be, exhaustively.
 #:
@@ -95,23 +92,6 @@ class ChampionUnusableError(RuntimeError):
     collapsed them would fall back to trading nothing in a case that should
     page.
     """
-
-
-@lru_cache(maxsize=1)
-def load_schema() -> dict[str, Any]:
-    if not SCHEMA_PATH.is_file():
-        raise FileNotFoundError(
-            f"champion pointer schema missing at {SCHEMA_PATH}. It ships inside the "
-            "package; a missing schema means a broken build, not a degraded read."
-        )
-    return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
-
-
-@lru_cache(maxsize=1)
-def _validator() -> Draft202012Validator:
-    schema = load_schema()
-    Draft202012Validator.check_schema(schema)
-    return Draft202012Validator(schema)
 
 
 @dataclass(frozen=True)
@@ -165,6 +145,12 @@ class ChampionPointer:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> ChampionPointer:
+        """`alpha-engine-config-I10045` row 6: validated once, whole, against
+        `crucible.models.ChampionPointerDocument` — replacing the previous
+        hand-rolled `jsonschema.Draft202012Validator` call, with the same
+        `ChampionUnusableError` type and message shape a caller already
+        catches (`read_champion` below).
+        """
         version = payload.get("schema_version")
         if version != CHAMPION_SCHEMA_VERSION:
             raise ChampionUnusableError(
@@ -172,26 +158,38 @@ class ChampionPointer:
                 f"speaks {CHAMPION_SCHEMA_VERSION!r} only. A consumer that guessed at "
                 "an unknown version would trade on fields it does not understand."
             )
-        errors = sorted(_validator().iter_errors(payload), key=lambda e: list(e.absolute_path))
-        if errors:
+        try:
+            document = ChampionPointerDocument.model_validate(payload)
+        except ValidationError as exc:
             detail = "\n".join(
-                f"  - {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}"
-                for e in errors
+                f"  - {'.'.join(str(p) for p in e['loc']) or '<root>'}: {e['msg']}"
+                for e in exc.errors()
             )
             raise ChampionUnusableError(
                 f"champion pointer does not conform to {CHAMPION_SCHEMA_VERSION}:\n{detail}"
-            )
+            ) from exc
         return cls(
-            slot=payload["slot"],
-            arm_id=payload["arm_id"],
-            as_of=payload["as_of"],
-            decided_at=payload["decided_at"],
-            run_id=payload["run_id"],
-            code_sha=payload["code_sha"],
-            promotion_source=payload["promotion_source"],
-            manifest_key=payload["manifest_key"],
-            evidence=payload.get("evidence") or {},
-            attestation=payload.get("attestation"),
+            slot=document.slot,
+            arm_id=document.arm_id,
+            as_of=document.as_of,
+            decided_at=document.decided_at,
+            run_id=document.run_id,
+            code_sha=document.code_sha,
+            promotion_source=document.promotion_source,
+            manifest_key=document.manifest_key,
+            # `exclude_unset=True`: `evidence`/`attestation` are open, slot-specific
+            # documents (an operator revert and an evidence promotion share none of
+            # `ChampionEvidence`'s named fields) — dumping every declared field would
+            # materialize a `None` for each one the ORIGINAL payload never mentioned,
+            # which changes `pointer.evidence`'s shape and breaks the round-trip
+            # equality `tests/test_champion.py::test_a_written_pointer_round_trips`
+            # already asserts.
+            evidence=document.evidence.model_dump(exclude_unset=True),
+            attestation=(
+                document.attestation.model_dump(exclude_unset=True)
+                if document.attestation
+                else None
+            ),
         )
 
 
@@ -243,13 +241,14 @@ def write_champion(store: Store, pointer: ChampionPointer, *, expected: str) -> 
     reason to write anyway.
     """
     payload = pointer.to_dict()
-    errors = sorted(_validator().iter_errors(payload), key=lambda e: list(e.absolute_path))
-    if errors:
+    try:
+        ChampionPointerDocument.model_validate(payload)
+    except ValidationError as exc:
         detail = "\n".join(
-            f"  - {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}"
-            for e in errors
+            f"  - {'.'.join(str(p) for p in e['loc']) or '<root>'}: {e['msg']}"
+            for e in exc.errors()
         )
-        raise ValueError(f"refusing to write a non-conformant champion pointer:\n{detail}")
+        raise ValueError(f"refusing to write a non-conformant champion pointer:\n{detail}") from exc
     return store.compare_and_swap(
         champion_key(pointer.slot),
         expected,

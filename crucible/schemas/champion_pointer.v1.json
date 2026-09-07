@@ -1,10 +1,313 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "ChampionAttestation": {
+      "additionalProperties": false,
+      "description": "The contamination attestation, plan \u00a79.1. Mandatory in EFFECT for the\nS slot (the reader refuses an S champion whose status is not PASS) and\nnull elsewhere \u2014 not `required` at the top level because a null\nattestation on U/R/M is correct, and the refusal belongs to the reader,\nwhich can see which slot it is reading.",
+      "properties": {
+        "key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Key"
+        },
+        "kind": {
+          "const": "pit_parity",
+          "title": "Kind",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "status": {
+          "enum": [
+            "PASS",
+            "FAIL",
+            "PARTIAL",
+            "UNKNOWN"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "status"
+      ],
+      "title": "ChampionAttestation",
+      "type": "object"
+    },
+    "ChampionEvidence": {
+      "additionalProperties": true,
+      "description": "`evidence` on the champion pointer \u2014 why this arm, plan \u00a73/\u00a79.1.\n\nDeliberately NOT `_Strict`: the published schema's `evidence` object\ncarries no `additionalProperties: false`, because \"a decision's evidence\nis slot-specific\" (schema description) \u2014 an operator-revert evidence\nblob and an evidence-promotion blob share none of these named fields.\n`extra=\"allow\"` matches that open shape exactly; forbidding extras here\nwould refuse every operator-revert pointer ever written.",
+      "properties": {
+        "confidence_sequence": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Confidence Sequence"
+        },
+        "eligible_arms": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Eligible Arms"
+        },
+        "incumbent": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Incumbent"
+        },
+        "mean_diff": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mean Diff"
+        },
+        "moved": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Moved"
+        },
+        "operator": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Operator"
+        },
+        "paired_dates": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Paired Dates"
+        },
+        "paired_dates_required": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Paired Dates Required"
+        },
+        "promote_min_weeks": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Promote Min Weeks"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
+        },
+        "window_end": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Window End"
+        },
+        "window_start": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Window Start"
+        }
+      },
+      "title": "ChampionEvidence",
+      "type": "object"
+    }
+  },
   "$id": "https://github.com/nousergon/crucible/schemas/champion_pointer.v1.json",
-  "title": "Crucible champion pointer, v1",
-  "description": "The single artifact coupling the harness to the trader (plan §3). Written at champions/{slot}/current.json by `crucible promote`, read by the trader before it sizes anything. Versioned because a second implementation of the trader must be able to consume it from this document alone; `additionalProperties: false` because a field this reader does not understand is a field the producer expected it to act on.",
-  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "description": "The single artifact coupling the harness to the trader (plan \u00a73). Written at champions/{slot}/current.json by `crucible promote`, read by the trader before it sizes anything. Versioned because a second implementation of the trader must be able to consume it from this document alone; additionalProperties: false because a field this reader does not understand is a field the producer expected it to act on.",
+  "properties": {
+    "arm_id": {
+      "description": "The serving arm. Its id encodes its own spec hash (policy \u00a73.1), so an edited recipe cannot reuse it and the trader can always tell which recipe it is running.",
+      "minLength": 1,
+      "title": "Arm Id",
+      "type": "string"
+    },
+    "as_of": {
+      "description": "The NYSE trading day whose cycle produced this decision (\u00a74.12). Never a wall-clock date.",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "title": "As Of",
+      "type": "string"
+    },
+    "attestation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ChampionAttestation"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The contamination attestation (plan \u00a79.1). Mandatory in EFFECT for the S slot -- the reader refuses an S champion whose status is not PASS -- and null elsewhere. Not `required` in the schema because a null attestation on U/R/M is correct; the refusal is on the reader, where it can see which slot it is reading."
+    },
+    "code_sha": {
+      "description": "The commit that decided. An all-zero sha is a DECLARED unknown (running from a wheel with no repository), never an omitted field.",
+      "pattern": "^[0-9a-f]{40}$",
+      "title": "Code Sha",
+      "type": "string"
+    },
+    "decided_at": {
+      "description": "UTC instant the pointer was written, for provenance only.",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      "title": "Decided At",
+      "type": "string"
+    },
+    "evidence": {
+      "$ref": "#/$defs/ChampionEvidence",
+      "description": "Why this arm. For an evidence promotion: the incumbent it passed, the paired window it passed on, and the confidence-sequence bound. For an operator revert: who reverted and why. Free-form beyond the named fields because a decision's evidence is slot-specific, but never empty -- an unexplained pointer cannot be reviewed (principles.md \u00a72.1)."
+    },
+    "manifest_key": {
+      "description": "The run manifest of the job that wrote this pointer. The reader re-derives that run's status from it and refuses a champion produced by a run that did not finish `ok`.",
+      "minLength": 1,
+      "title": "Manifest Key",
+      "type": "string"
+    },
+    "promotion_source": {
+      "description": "How this pointer came to be. `evidence` = the anytime-valid sequence supported the lead; `operator_bootstrap` = a human placed it; `bootstrap` = the engine's \u00a79.1 cold start. Carried so that a pointer which has never moved on evidence renders as the finding it is (policy \u00a711) rather than as a stable system.",
+      "enum": [
+        "evidence",
+        "operator_bootstrap",
+        "bootstrap"
+      ],
+      "title": "Promotion Source",
+      "type": "string"
+    },
+    "run_id": {
+      "description": "The run that wrote this pointer. Correlates the decision with its manifest, its logs and its cost row (\u00a79.2).",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "champion_pointer.v1",
+      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "slot": {
+      "description": "Which decision this pointer governs. Closed set: the four slots of champion-challenger-policy.md \u00a72.",
+      "enum": [
+        "u",
+        "r",
+        "m",
+        "s"
+      ],
+      "title": "Slot",
+      "type": "string"
+    }
+  },
   "required": [
     "schema_version",
     "slot",
@@ -17,81 +320,6 @@
     "manifest_key",
     "evidence"
   ],
-  "properties": {
-    "schema_version": {
-      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
-      "const": "champion_pointer.v1"
-    },
-    "slot": {
-      "description": "Which decision this pointer governs. Closed set: the four slots of champion-challenger-policy.md §2.",
-      "type": "string",
-      "enum": ["u", "r", "m", "s"]
-    },
-    "arm_id": {
-      "description": "The serving arm. Its id encodes its own spec hash (policy §3.1), so an edited recipe cannot reuse it and the trader can always tell which recipe it is running.",
-      "type": "string",
-      "minLength": 1
-    },
-    "as_of": {
-      "description": "The NYSE trading day whose cycle produced this decision (§4.12). Never a wall-clock date.",
-      "type": "string",
-      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
-    },
-    "decided_at": {
-      "description": "UTC instant the pointer was written, for provenance only.",
-      "type": "string",
-      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
-    },
-    "run_id": {
-      "description": "The run that wrote this pointer. Correlates the decision with its manifest, its logs and its cost row (§9.2).",
-      "type": "string",
-      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
-    },
-    "code_sha": {
-      "description": "The commit that decided. An all-zero sha is a DECLARED unknown (running from a wheel with no repository), never an omitted field.",
-      "type": "string",
-      "pattern": "^[0-9a-f]{40}$"
-    },
-    "promotion_source": {
-      "description": "How this pointer came to be. `evidence` = the anytime-valid sequence supported the lead; `operator_bootstrap` = a human placed it; `bootstrap` = the engine's §9.1 cold start. Carried so that a pointer which has never moved on evidence renders as the finding it is (policy §11) rather than as a stable system.",
-      "type": "string",
-      "enum": ["evidence", "operator_bootstrap", "bootstrap"]
-    },
-    "manifest_key": {
-      "description": "The run manifest of the job that wrote this pointer. The reader re-derives that run's status from it and refuses a champion produced by a run that did not finish `ok`.",
-      "type": "string",
-      "minLength": 1
-    },
-    "evidence": {
-      "description": "Why this arm. For an evidence promotion: the incumbent it passed, the paired window it passed on, and the confidence-sequence bound. For an operator revert: who reverted and why. Free-form beyond the named fields because a decision's evidence is slot-specific, but never empty — an unexplained pointer cannot be reviewed (principles.md §2.1).",
-      "type": "object",
-      "properties": {
-        "incumbent": { "type": ["string", "null"] },
-        "status": { "type": "string" },
-        "reason": { "type": "string" },
-        "moved": { "type": "boolean" },
-        "paired_dates": { "type": "integer", "minimum": 0 },
-        "window_start": { "type": ["string", "null"] },
-        "window_end": { "type": ["string", "null"] },
-        "mean_diff": { "type": ["number", "null"] },
-        "confidence_sequence": { "type": ["object", "null"] },
-        "promote_min_weeks": { "type": "integer", "minimum": 1 },
-        "paired_dates_required": { "type": "integer", "minimum": 1 },
-        "operator": { "type": "string" },
-        "eligible_arms": { "type": "array", "items": { "type": "string" } }
-      }
-    },
-    "attestation": {
-      "description": "The contamination attestation (plan §9.1). Mandatory in EFFECT for the S slot — the reader refuses an S champion whose status is not PASS — and null elsewhere. Not `required` in the schema because a null attestation on U/R/M is correct; the refusal is on the reader, where it can see which slot it is reading.",
-      "type": ["object", "null"],
-      "additionalProperties": false,
-      "required": ["kind", "status"],
-      "properties": {
-        "kind": { "type": "string", "enum": ["pit_parity"] },
-        "status": { "type": "string", "enum": ["PASS", "FAIL", "PARTIAL", "UNKNOWN"] },
-        "key": { "type": ["string", "null"] },
-        "reason": { "type": ["string", "null"] }
-      }
-    }
-  }
+  "title": "Crucible champion pointer, v1",
+  "type": "object"
 }
