@@ -44,6 +44,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
+from crucible.models import CloudTrailRecord
+
 __all__ = [
     "MACHINE_PRINCIPALS",
     "ArchiveMissingError",
@@ -167,20 +169,23 @@ class OperatorActionCount:
         }
 
 
-def _principal(record: dict[str, Any]) -> tuple[str, str]:
+def _principal(record: CloudTrailRecord) -> tuple[str, str]:
     """The acting principal's NAME and CloudTrail identity type.
 
     The name is taken from `sessionIssuer.userName` for an assumed role — the
     role, not the session — because the session name is the caller's and
     would make every automation run look like a different principal.
+
+    `alpha-engine-config-I10045` row 12: `record` is now a validated
+    `crucible.models.CloudTrailRecord` rather than a raw dict walked three
+    levels deep by hand with `.get(..., {})` at each level — a typo'd key
+    at any level used to resolve silently to "no issuer" instead of
+    surfacing.
     """
-    identity = record.get("userIdentity", {}) or {}
-    kind = identity.get("type", "Unknown")
-    issuer = (identity.get("sessionContext", {}) or {}).get("sessionIssuer", {}) or {}
-    name = (
-        issuer.get("userName") or identity.get("userName") or identity.get("arn", "") or "unknown"
-    )
-    return str(name), str(kind)
+    identity = record.userIdentity
+    issuer = identity.sessionContext.sessionIssuer if identity.sessionContext else None
+    name = (issuer.userName if issuer else None) or identity.userName or identity.arn or "unknown"
+    return str(name), str(identity.type)
 
 
 def _is_machine(name: str) -> bool:
@@ -367,18 +372,24 @@ def count_operator_actions(
             "UNMEASURABLE, not zero."
         )
     actions: list[OperatorAction] = []
-    for record in read.records:
+    for raw_record in read.records:
+        # `alpha-engine-config-I10045` row 12: validated only HERE, on the
+        # already-filtered KEPT records (a handful) — not on every scanned
+        # record, which stays a raw dict on the memory/throughput-critical
+        # hot path `_is_candidate`/`_touches` walk (`CloudTrailRecord`'s
+        # own docstring names the measured cost of doing otherwise).
+        record = CloudTrailRecord.model_validate(raw_record)
         name, kind = _principal(record)
         if _is_machine(name):
             continue
         actions.append(
             OperatorAction(
-                event_time=record.get("eventTime", ""),
-                event_name=record.get("eventName", ""),
-                event_source=record.get("eventSource", ""),
+                event_time=record.eventTime,
+                event_name=record.eventName,
+                event_source=record.eventSource,
                 principal=name,
                 principal_type=kind,
-                request_id=record.get("requestID", ""),
+                request_id=record.requestID,
             )
         )
     return OperatorActionCount(
