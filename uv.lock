@@ -211,7 +211,7 @@ dev = [
 requires-dist = [
     { name = "boto3", specifier = ">=1.35" },
     { name = "jsonschema", specifier = ">=4.26.0" },
-    { name = "krepis", specifier = "==0.59.50" },
+    { name = "krepis", specifier = "==0.59.53" },
     { name = "nousergon-lib", extras = ["arcticdb"], marker = "extra == 'arcticdb'", specifier = "==0.124.110" },
     { name = "nousergon-lib", extras = ["github-app"], specifier = "==0.124.110" },
     { name = "numpy", specifier = ">=2.5.2" },
@@ -322,7 +322,7 @@ wheels = [
 
 [[package]]
 name = "krepis"
-version = "0.59.50"
+version = "0.59.53"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -330,9 +330,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/04/c8/c6d52283c8112676995c3ce56c134efad10d99f13b20170012739fa74b69/krepis-0.59.50.tar.gz", hash = "sha256:bea0e3589e59b54fd9cba9b17daf9c2a88fc14966037d87e631b3384a9dc366b", size = 652090, upload-time = "2026-09-04T20:14:38.558Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/fb/42/309d1faff52f49d93fed0752f443cfa329d76dc969f2405b20fc2b6a7332/krepis-0.59.53.tar.gz", hash = "sha256:e137f556409bb4cf032c56932430f37be30f936368b77e208c37efd67a38845f", size = 658176, upload-time = "2026-09-07T15:00:22.726Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/95/64/c367bca713ae85338f52949c2693faf84d833fefc264b873a8b796fd513c/krepis-0.59.50-py3-none-any.whl", hash = "sha256:49e99113b371e9ff4aff2e00744240732c27684242f25cd89f5086c6994198d5", size = 410220, upload-time = "2026-09-04T20:14:36.808Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/f7/173598b34f785fb963f47fc0237ca9aeaf23b9b021befbacec3d9651873f/krepis-0.59.53-py3-none-any.whl", hash = "sha256:d09784faa4fdef221f27f9027f2cd07c732045c86a79be4c7db15f1e28689d51", size = 413643, upload-time = "2026-09-07T15:00:20.762Z" },
 ]
 
 [[package]]
