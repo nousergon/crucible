@@ -35,6 +35,7 @@ __all__ = [
     "BOARD_HTML_KEY",
     "CONSOLE_JSON_KEY",
     "CONSOLE_KEY",
+    "DISPATCH_ROOT",
     "DRIFT_INPUTS",
     "MANIFEST_BASENAME",
     "POINTER_KEY",
@@ -61,6 +62,8 @@ __all__ = [
     "cross_section_settled_key",
     "data_panel_key",
     "declared_universe_key",
+    "dispatch_key",
+    "dispatch_prefix",
     "drift_input_key",
     "drift_metrics_key",
     "experiments_key",
@@ -84,6 +87,7 @@ __all__ = [
     "morning_update_key",
     "parse_acceptance_reading",
     "parse_bus_key",
+    "parse_dispatch_key",
     "parse_manifest_key",
     "retirement_log_key",
     "review_key",
@@ -161,6 +165,72 @@ def parse_bus_key(key: str) -> tuple[str, str] | None:
         return None
     _, trading_day, filename = parts
     return trading_day, filename[: -len(".json")]
+
+
+#: `alpha-engine-config-I10134` deliverable 1/2: proof that a job was
+#: EXPLICITLY dispatched, written by `crucible-v2-dispatcher` before
+#: `RunInstances` returns, so a later sweep can grade "requested but never
+#: completed" — a state a *scheduled* job's `components.yaml` deadline
+#: cannot represent for an on-demand job (`data.heal`'s row carries
+#: `deadline: null`). Deliberately a sibling of `RUNS_ROOT` rather than
+#: nested under it: a dispatch record is not a manifest and must never be
+#: mistaken for one by a `runs/{job}/` listing — `parse_manifest_key`'s own
+#: suffix check (`/run.json`) already excludes it, but a *second*, syntactic
+#: separation is what makes that true by construction rather than by one
+#: function agreeing to filter it out.
+DISPATCH_ROOT = "runs/_dispatch/"
+
+
+def dispatch_prefix(job: str) -> str:
+    """Every dispatch record ever written for ``job``, across every attempt.
+
+    `crucible.alerts.evaluate_dispatch_absence` lists this prefix — it has no
+    trading day to key on ahead of time (that is resolved from the record's
+    own `dispatched_at_utc`, the same way :func:`crucible.calendar.
+    resolve_trading_day` resolves every other wall-clock firing), so it reads
+    every dispatch for the job rather than guessing a day.
+    """
+    if not job:
+        raise ValueError(
+            "job must be non-empty — a blank job would list every job's dispatch "
+            "records under one empty-segment prefix, and `store.list_keys("
+            "'runs/_dispatch//')` returning nothing reads as 'no data' rather than "
+            "the caller's own bug."
+        )
+    return f"{DISPATCH_ROOT}{job}/"
+
+
+def dispatch_key(job: str, dispatch_id: str) -> str:
+    """`runs/_dispatch/{job}/{dispatch_id}.json` — one record per attempt.
+
+    ``dispatch_id`` is a path segment (the dispatcher's own random token, not
+    a ULID library this Lambda would have to vendor), validated against the
+    same charset a manifest discriminator is, for the same reason: it is
+    about to become a key component no path-shaped tool may choke on.
+    """
+    if not _DISCRIMINATOR_RE.match(dispatch_id):
+        raise ValueError(
+            f"dispatch_id {dispatch_id!r} must be 1-64 characters of [A-Za-z0-9_.-] "
+            "— it is a path segment, and this is the one place that is enforced."
+        )
+    return f"{dispatch_prefix(job)}{dispatch_id}.json"
+
+
+def parse_dispatch_key(key: str) -> tuple[str, str] | None:
+    """The inverse of :func:`dispatch_key`: ``(job, dispatch_id)``.
+
+    Returns ``None`` for anything not under :data:`DISPATCH_ROOT` in this
+    exact three-segment-under-the-root shape, so a caller listing the whole
+    root decides what an unrecognised key means rather than this function
+    guessing.
+    """
+    if not key.startswith(DISPATCH_ROOT) or not key.endswith(".json"):
+        return None
+    parts = key.split("/")
+    if len(parts) != 4:
+        return None
+    _, _, job, filename = parts
+    return job, filename[: -len(".json")]
 
 
 def arm_key_segment(arm_id: str) -> str:

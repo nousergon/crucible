@@ -46,9 +46,11 @@ from crucible.components import Component, load_registry, scheduled_components
 from crucible.documents import load_store_document, read_listed_document, read_manifests_under
 from crucible.keys import (
     ALERTS_ROOT,
+    DISPATCH_ROOT,
     RUNS_ROOT,
     is_manifest_key,
     parse_bus_key,
+    parse_dispatch_key,
     parse_manifest_key,
 )
 from crucible.manifest import manifest_prefix
@@ -59,6 +61,7 @@ __all__ = [
     "CATCH_UP_TRADING_DAYS",
     "CAUSE_MATCHERS",
     "CEILING_WINDOW_TRADING_DAYS",
+    "DISPATCH_ABSENCE_HORIZON",
     "MUTED_TOPIC",
     "MUTED_TOPIC_ARN_VAR",
     "PAGES_PER_MONTH_CEILING",
@@ -81,6 +84,7 @@ __all__ = [
     "dedup_key",
     "emit",
     "evaluate_absence",
+    "evaluate_dispatch_absence",
     "evaluate_failure",
     "group_pages",
     "heartbeat",
@@ -549,6 +553,144 @@ def evaluate_absence(
                 )
             )
     return pages
+
+
+#: alpha-engine-config-I10134 deliverable 2: how long a dispatch is given to
+#: land a manifest before its absence pages. Stated, not implied — a job
+#: this dispatcher launches boots a spot box, installs a venv and runs a
+#: handful of trading-day sessions in well under an hour on every measured
+#: firing (`data.heal`'s four re-dispatches wrote manifests within ~30s per
+#: session once they actually started); three hours is generous headroom
+#: over that for a slow box or a spot interruption's own retry, without
+#: coming anywhere near the ten-hour gap this issue was filed over. A
+#: per-job override is not built: on-demand dispatch is deliberately the
+#: uniform, minimal case (§4.6's "≈6 rows" argument against a second
+#: per-job table applies here too), and this constant is the one place a
+#: measured firing that legitimately needs longer would argue for widening
+#: it.
+DISPATCH_ABSENCE_HORIZON = dt.timedelta(hours=3)
+
+
+def evaluate_dispatch_absence(
+    store: Store,
+    *,
+    now: dt.datetime | None = None,
+    horizon: dt.timedelta = DISPATCH_ABSENCE_HORIZON,
+    access_faults: list[str] | None = None,
+) -> list[Page]:
+    """Page for every ON-DEMAND dispatch whose manifest never appeared.
+
+    `alpha-engine-config-I10134`. This is the third *input* to the absence
+    condition, not a third page condition (§4.6's two conditions stand): a
+    dispatch record older than :data:`DISPATCH_ABSENCE_HORIZON` with no
+    manifest at its expected key is exactly the ABSENCE condition
+    (:func:`evaluate_absence`) applied to a job `components.yaml` cannot
+    grade at all, because an on-demand job (`data.heal`: `deadline: null`)
+    carries no schedule and no deadline for that function to read.
+
+    Every dispatch made by `crucible-v2-dispatcher` writes a record at
+    `runs/_dispatch/{job}/{dispatch_id}.json` before `RunInstances` returns
+    (`crucible.keys.dispatch_key`) — job, args, instance id, requester,
+    dispatch time. This function lists every one of them, resolves the
+    trading day the SAME way every other wall-clock firing does
+    (`crucible.calendar.resolve_trading_day` — rule 3's exhaustive exception
+    for wall-clock scheduling), and pages when the resolved trading day's
+    manifest prefix is still empty past the horizon.
+
+    A dispatch inside the horizon is not yet due and is silently skipped —
+    the same "only past deadlines are evaluated" rule :func:`evaluate_absence`
+    states for scheduled jobs, so a box mid-run does not page for being slow.
+
+    Grouped by :func:`cause_key` exactly like a scheduled absence: an
+    on-demand dispatch that never lands and a scheduled job absent on the
+    same trading day share `cause_key` `"absence:{trading_day}"`, so an
+    operator reading one incident sees both — the point of §9.3's "one page
+    naming every member", not two pages for one bad day.
+
+    ``access_faults``: the same split :func:`evaluate_absence` uses — pass a
+    list to keep evaluating past an unreadable prefix and let the caller
+    raise after paging what it found; leave it ``None`` for the loud default.
+    """
+    moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
+    pages: list[Page] = []
+    listed = _list_manifest_keys(store, DISPATCH_ROOT)
+    if listed.problem is not None:
+        if access_faults is None:
+            raise StoreAccessError(listed.problem)
+        access_faults.append(listed.problem)
+        return pages
+    for key in sorted(listed.keys or ()):
+        parsed = parse_dispatch_key(key)
+        if parsed is None:
+            continue
+        job, _dispatch_id = parsed
+        read = read_listed_document(store, key)
+        if read.problem is not None or read.document is None:
+            problem = f"dispatch record {key!r} is unreadable: {read.problem}"
+            if access_faults is None:
+                raise StoreAccessError(problem)
+            access_faults.append(problem)
+            continue
+        document = read.document
+        dispatched_at = _parse_dispatch_time(document.get("dispatched_at_utc"))
+        if dispatched_at is None:
+            pages.append(
+                Page(
+                    condition="absence",
+                    job=job,
+                    trading_day=resolve_trading_day(moment),
+                    reason=(
+                        f"dispatch record {key} carries an unreadable "
+                        f"dispatched_at_utc ({document.get('dispatched_at_utc')!r}); it "
+                        "cannot be graded against the absence horizon and is treated as "
+                        "one — a record this module cannot age is a record it cannot "
+                        "clear"
+                    ),
+                )
+            )
+            continue
+        if moment - dispatched_at < horizon:
+            continue
+        trading_day = resolve_trading_day(dispatched_at)
+        prefix = manifest_prefix(job, trading_day.isoformat())
+        manifest_listed = _list_manifest_keys(store, prefix)
+        if manifest_listed.problem is not None:
+            if access_faults is None:
+                raise StoreAccessError(manifest_listed.problem)
+            access_faults.append(manifest_listed.problem)
+            continue
+        if any(is_manifest_key(k) for k in manifest_listed.keys or ()):
+            continue
+        args = document.get("args", "")
+        instance_id = document.get("instance_id", "unknown")
+        pages.append(
+            Page(
+                condition="absence",
+                job=job,
+                trading_day=trading_day,
+                reason=(
+                    f"dispatched {dispatched_at.strftime('%Y-%m-%dT%H:%M:%SZ')} "
+                    f"(instance {instance_id}, args {args!r}, dispatch record {key}); "
+                    f"no manifest under {prefix} after "
+                    f"{horizon.total_seconds() / 3600:.0f}h, now "
+                    f"{moment.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+                ),
+            )
+        )
+    return pages
+
+
+def _parse_dispatch_time(raw: Any) -> dt.datetime | None:
+    """`dispatched_at_utc` as a timezone-aware datetime, or ``None`` if it
+    is not one — never a raise here, since a corrupt field is exactly the
+    "cannot be graded" case :func:`evaluate_dispatch_absence` folds into a
+    page rather than aborting the whole sweep for one bad record."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return dt.datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.UTC)
+    except ValueError:
+        return None
 
 
 def evaluate_failure(
@@ -1612,9 +1754,11 @@ def sweep(
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     access_faults: list[str] = []
-    pages = evaluate_absence(
-        store, now=moment, registry=registry, access_faults=access_faults
-    ) + evaluate_failure(store, now=moment, registry=registry, access_faults=access_faults)
+    pages = (
+        evaluate_absence(store, now=moment, registry=registry, access_faults=access_faults)
+        + evaluate_dispatch_absence(store, now=moment, access_faults=access_faults)
+        + evaluate_failure(store, now=moment, registry=registry, access_faults=access_faults)
+    )
     groups = group_pages(pages)
     if dry_run:
         _raise_on_access_faults(access_faults)
