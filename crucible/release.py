@@ -39,52 +39,58 @@ import datetime as dt
 import json
 import re
 from dataclasses import asdict, dataclass, field
-from functools import cache
-from pathlib import Path
 from typing import Any
 
-from jsonschema import Draft202012Validator
+from pydantic import BaseModel, ValidationError
 
 from crucible.documents import load_document_bytes, load_store_document
 from crucible.keys import POINTER_KEY, TRADER_PIN_KEY, manifest_key
+from crucible.models import ReleaseProvenanceDocument, ReleaseRecordDocument
 from crucible.store import ETAG_ABSENT, PointerConflictError, S3Store, Store, sha256_hex
 
-_SCHEMA_DIR = Path(__file__).parent / "schemas"
-
-
-@cache
-def _validator_for(schema_filename: str) -> Draft202012Validator:
-    """A cached validator for one of this module's own schema files.
-
-    Mirrors `crucible.manifest.load_schema` / `crucible.champion.load_schema`:
-    the schema ships inside the package, so a missing file means a broken
-    build, not a degraded write.
-    """
-    path = _SCHEMA_DIR / schema_filename
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"{schema_filename} missing at {path}. It ships inside the package; a "
-            "missing schema means a broken build, not a degraded write."
-        )
-    schema = json.loads(path.read_text(encoding="utf-8"))
-    Draft202012Validator.check_schema(schema)
-    return Draft202012Validator(schema)
+#: `alpha-engine-config-I10045` row 5: `_validate_release_artifact` used to
+#: hand-roll a `jsonschema.Draft202012Validator` per schema FILE, loaded off
+#: disk on every distinct `schema_filename`. Both schemas are now GENERATED
+#: from `crucible.models.ReleaseRecordDocument` /
+#: `crucible.models.ReleaseProvenanceDocument` — this maps the same
+#: filenames straight to the model that generates them, so there is one
+#: source of truth for both "does this payload conform" and "what does the
+#: published schema say" (`tests/test_typed_boundary_release.py`'s byte-identity
+#: test is what keeps the committed `.json` files honest about it).
+_RELEASE_ARTIFACT_MODELS: dict[str, type[BaseModel]] = {
+    "release.v3.json": ReleaseRecordDocument,
+    "release_provenance.v1.json": ReleaseProvenanceDocument,
+}
 
 
 def _validate_release_artifact(schema_filename: str, payload: dict[str, Any]) -> None:
     """Raise with every error, never just the first, against one of this
     module's own artifact schemas. A writer that could emit a non-conformant
     document would defeat the schema entirely — validated on the way OUT,
-    not only wherever something later reads it back."""
-    errors = sorted(
-        _validator_for(schema_filename).iter_errors(payload), key=lambda e: list(e.absolute_path)
-    )
-    if not errors:
-        return
-    detail = "\n".join(
-        f"  - {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors
-    )
-    raise ValueError(f"{schema_filename}: document does not conform:\n{detail}")
+    not only wherever something later reads it back.
+
+    Public signature and message shape (`"{schema_filename}: document does
+    not conform:\\n..."`) are UNCHANGED from before this PR: both
+    `tests/test_release.py::test_publish_validates_the_identity_record_against_its_own_schema`
+    and its provenance counterpart call this function directly and match on
+    "does not conform", as does `ReleaseRecord.__post_init__` /
+    `ReleaseProvenance.__post_init__`'s own construction-time guard.
+    """
+    model = _RELEASE_ARTIFACT_MODELS.get(schema_filename)
+    if model is None:
+        raise FileNotFoundError(
+            f"{schema_filename} is not one of this module's generated artifact schemas "
+            f"({sorted(_RELEASE_ARTIFACT_MODELS)}). A missing entry means a broken build, "
+            "not a degraded write."
+        )
+    try:
+        model.model_validate(payload)
+    except ValidationError as exc:
+        detail = "\n".join(
+            f"  - {'.'.join(str(p) for p in e['loc']) or '<root>'}: {e['msg']}"
+            for e in exc.errors()
+        )
+        raise ValueError(f"{schema_filename}: document does not conform:\n{detail}") from exc
 
 
 __all__ = [
