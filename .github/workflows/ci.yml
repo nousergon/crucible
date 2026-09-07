@@ -151,6 +151,44 @@ jobs:
       - name: Foundation tests
         run: uv run --frozen pytest -c pyproject.toml -q --ignore=tests/acceptance --cov=crucible --cov-config=pyproject.toml --cov-report=term-missing
 
+      # The percentage the step above just measured, handed to
+      # coverage-badge.yml instead of measured a second time
+      # (alpha-engine-config-I9938). `coverage report` re-reads the .coverage
+      # data file the run already wrote -- it executes no test and takes about
+      # a second, where the old coverage-badge.yml re-ran `uv sync --frozen`
+      # plus the entire suite to arrive at this identical number.
+      #
+      # THE INVOCATION ABOVE IS UNTOUCHED, deliberately. It is pinned
+      # token-exact by tests/test_no_suppressions.py::
+      # test_ci_pins_the_coverage_config_file, so that a planted ini or rc
+      # cannot become what CI measures against. Reading the result out in a
+      # SEPARATE step keeps that guard reading the single line it was written
+      # to read; folding a `| tee` into it turned the line into a block scalar
+      # and broke the guard (measured while writing this change).
+      #
+      # Main pushes only: a PR has no badge to publish, and uploading on the
+      # PR path would bill an artifact step on every one of this repository's
+      # ~65 weekly PR runs to no end.
+      - name: Hand the measured coverage to the badge publisher
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          PCT=$(uv run --frozen coverage report --precision=0 2>/dev/null | grep -oE '^TOTAL[[:space:]].*[0-9]+%' | grep -oE '[0-9]+%$' | tr -d '%' || true)
+          if [ -z "$PCT" ]; then
+            echo "::warning title=coverage-percentage::the suite passed but no TOTAL line could be parsed from the coverage data file, so this run publishes no percentage. coverage-badge.yml refuses to publish rather than publish a stale or invented one."
+            exit 0
+          fi
+          echo "Measured line coverage: $PCT%"
+          printf '%s' "$PCT" > coverage-pct.txt
+
+      - name: Upload the coverage reading
+        if: github.event_name == 'push' && hashFiles('coverage-pct.txt') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: coverage-pct
+          path: coverage-pct.txt
+          retention-days: 1
+
       # Collection, not execution — and it belongs HERE, on the PR path.
       # Importing a test module grades the TREE: it proves every symbol
       # tests/acceptance references still exists. Running the clauses grades
