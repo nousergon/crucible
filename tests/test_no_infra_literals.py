@@ -90,13 +90,22 @@ hole than the narrower one this trades for.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-#: The whole shipped tree. `tests/` was exempt until 2026-09-07 on an argument
-#: that was false the moment this repo went public — see the module docstring.
-SCAN_ROOTS = (REPO_ROOT / ".github", REPO_ROOT / "crucible", REPO_ROOT / "tests")
+#: The whole shipped tree, and it MEANS the whole tree (corrected 2026-09-07,
+#: second pass). `tests/` was exempt until earlier today on an argument that
+#: was false the moment this repo went public. The replacement listed three
+#: directories — `.github/`, `crucible/`, `tests/` — while the docstring above
+#: it said "the whole tree", and `README.md` was carrying a live Lambda
+#: function name the entire time, in the runbook, which is the single most-read
+#: file a public repository has. A scan whose scope is an enumerated list of
+#: directories grows a hole every time the repo grows a directory, so the
+#: scope is now REPO_ROOT with an explicit skip list — the same inversion the
+#: `tests/` exemption needed, applied one level up.
+SCAN_ROOTS = (REPO_ROOT,)
 
 #: This file, and nothing else — it must contain the patterns in order to
 #: search for and document them. Same exemption shape as
@@ -104,9 +113,31 @@ SCAN_ROOTS = (REPO_ROOT / ".github", REPO_ROOT / "crucible", REPO_ROOT / "tests"
 #: never a collection.
 SELF = Path(__file__).resolve()
 
-_IGNORED_DIRS = {".git", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache"}
+#: The agent-instruction files, which are SYMLINKS into the private
+#: `nous-ergon-ops` repo and are gitignored here — they are never committed and
+#: never ship, so a literal in them is not published by this repository.
+#: `test_the_agent_instruction_files_are_not_committed` below is what makes
+#: that claim checkable rather than assumed; without it this skip would be the
+#: same shape as the `tests/` exemption this file spent the morning removing —
+#: a carve-out resting on an unverified sentence.
+NOT_SHIPPED = {"AGENTS.md", "CLAUDE.md"}
 
-_SCANNED_SUFFIXES = {".py", ".yaml", ".yml", ".json", ".toml", ".cfg", ".ini"}
+_IGNORED_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".ropeproject",
+    "node_modules",
+    "htmlcov",
+    ".mypy_cache",
+}
+
+#: `.md` is in the set and is the reason this correction exists: the leak that
+#: survived two passes of this guard was in `README.md`, not in code.
+_SCANNED_SUFFIXES = {".py", ".yaml", ".yml", ".json", ".toml", ".cfg", ".ini", ".md", ".sh"}
 
 #: A 12-digit account id, but ONLY when it sits immediately after
 #: `arn:aws:iam::`, a bare `::`, or an `--account`/`account` token — see the
@@ -239,8 +270,34 @@ def _scanned_files() -> list[Path]:
                 continue
             if path.resolve() == SELF:
                 continue
+            if path.name in NOT_SHIPPED and path.is_symlink():
+                continue
             files.append(path)
     return files
+
+
+def test_the_agent_instruction_files_are_not_committed() -> None:
+    """The skip above is only sound while these files are genuinely unshipped.
+
+    They are symlinks into the private `nous-ergon-ops` repo and are gitignored
+    here, so a literal inside them is not published BY THIS REPOSITORY. That is
+    a claim about git state, not about the filesystem, so it is checked rather
+    than asserted in a comment — the `tests/` exemption removed earlier today
+    was exactly a plausible sentence nobody had tested.
+    """
+    tracked = subprocess.run(
+        ["git", "ls-files", "--", *sorted(NOT_SHIPPED)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    assert not tracked, (
+        f"{tracked} is COMMITTED to this public repository. The infra-literal scan "
+        "skips these files on the grounds that they never ship; that is now false, "
+        "so either gitignore them again (bash nous-ergon-ops/scripts/"
+        "link_agent_instructions.sh) or remove them from NOT_SHIPPED and scan them."
+    )
 
 
 def test_the_scan_actually_reads_files() -> None:
@@ -260,6 +317,11 @@ def test_the_scan_actually_reads_files() -> None:
     )
     # The tracker reference for this widening lives in the module docstring,
     # never in this runtime string — `tests/test_no_stale_tracker_literals.py`.
+    assert any(f.name == "README.md" for f in files), (
+        "the scan did not reach README.md — the repository's most-read file, "
+        "and where a live Lambda function name survived two passes of this "
+        "guard because the scope was an enumerated list of directories"
+    )
     assert any(f.suffix == ".py" and "tests" in f.parts for f in files), (
         "the scan did not reach tests/ — the directory whose exemption was "
         "removed once this repo went public, and the one that carried the "

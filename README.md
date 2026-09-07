@@ -64,10 +64,12 @@ an absence, and absence is one of the two conditions that page.
 
 Five verbs. Each is one command; none needs a console. Any job that must run
 in-region (`heal`, a replay week) is dispatched to a box rather than run from
-a laptop:
+a laptop. The dispatcher's function name is deployment configuration, not part
+of the framework, so it is read from the environment rather than published
+here (`alpha-engine-config-I10156`):
 
 ```
-aws lambda invoke --function-name crucible-v2-dispatcher --payload '{"job": "<job>", "args": "<cli args>"}' out.json
+aws lambda invoke --function-name "$CRUCIBLE_DISPATCHER_FUNCTION" --payload '{"job": "<job>", "args": "<cli args>"}' out.json
 ```
 
 ### rerun
