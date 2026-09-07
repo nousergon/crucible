@@ -146,8 +146,14 @@ class TestAnOlderDocumentStillValidates:
         )
 
     def test_market_wide_is_not_in_the_required_list(self) -> None:
+        # `$defs` key naming is not a semantic property (I10045 row 1's own
+        # schema_compare.py makes the same call): the feature row's def is
+        # looked up by its `required` shape, not by an assumed key name —
+        # `crucible.models.FeatureRow` is the def's class name today, but
+        # renaming the model must not make this test start passing vacuously.
         schema = load_registry_schema()
-        assert "market_wide" not in schema["$defs"]["feature"]["required"]
+        [feature_def] = [d for d in schema["$defs"].values() if "name" in d.get("required", ())]
+        assert "market_wide" not in feature_def["required"]
 
 
 class TestTheSchemaRefuses:
@@ -292,3 +298,27 @@ class TestTheDocumentationIsTheCatalogue:
         current = DOC_PATH.read_text(encoding="utf-8")
         for name in feature_names(CATALOG):
             assert f"`{name}`" in current, f"{name} has no row in {DOC_PATH}"
+
+
+class TestTheCommittedSchemaIsGeneratedFromTheModel:
+    """`alpha-engine-config-I10045` row 7: `feature_registry.v1.json` is now
+    generated from `crucible.models.FeatureRegistryDocument`/`FeatureRow`
+    instead of hand-maintained beside `validate_registry_payload`'s previous
+    hand-rolled `jsonschema.Draft202012Validator`. One source of truth, not
+    two that must agree."""
+
+    def test_the_committed_schema_is_byte_identical_to_the_generated_one(self) -> None:
+        import json
+
+        from crucible.features.registry import FEATURE_REGISTRY_SCHEMA_PATH
+        from crucible.models import FeatureRegistryDocument
+
+        generated = (
+            json.dumps(FeatureRegistryDocument.model_json_schema(), indent=2, sort_keys=True) + "\n"
+        )
+        committed = FEATURE_REGISTRY_SCHEMA_PATH.read_text(encoding="utf-8")
+        assert committed == generated, (
+            f"{FEATURE_REGISTRY_SCHEMA_PATH.name} has drifted from FeatureRegistryDocument. "
+            "The schema is GENERATED, never hand-edited: regenerate it in the same commit "
+            "as the model change."
+        )
