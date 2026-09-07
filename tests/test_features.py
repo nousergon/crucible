@@ -14,7 +14,7 @@ from crucible.features import (
     feature_version,
     registry_payload,
 )
-from crucible.features.compute import LIQUIDITY_FLOOR_USD
+from crucible.features.compute import LIQUIDITY_FLOOR_VAR, liquidity_floor_usd
 
 
 class TestUnits:
@@ -208,9 +208,9 @@ class TestValues:
         panel = source.load_panel(end=cycle_date, lookback_days=1200)
         features, _ = build_features(panel)
         liquid = features[features["liquidity_pass_raw"] == 1.0]
-        assert (liquid["dollar_volume_20d_raw"] >= LIQUIDITY_FLOOR_USD).all()
+        assert (liquid["dollar_volume_20d_raw"] >= liquidity_floor_usd()).all()
         illiquid = features[features["liquidity_pass_raw"] == 0.0]
-        assert (illiquid["dollar_volume_20d_raw"] < LIQUIDITY_FLOOR_USD).all()
+        assert (illiquid["dollar_volume_20d_raw"] < liquidity_floor_usd()).all()
 
     def test_nothing_is_forward_filled(self, source, cycle_date) -> None:
         """A short-history ticker gets a null, not a carried value."""
@@ -227,3 +227,30 @@ class TestValues:
         panel = source.load_panel(end=cycle_date, lookback_days=1200)
         features, _ = build_features(panel)
         assert set(features["trading_day"].unique()) == {cycle_date}
+
+
+class TestTheLiquidityFloorRefusesRatherThanGuessing:
+    """The gate is a tuned value with no default in this public tree. Every
+    way of not having it must raise, because a `liquidity_pass_raw` column
+    computed against a guessed floor looks exactly like a correct one."""
+
+    def test_unset_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(LIQUIDITY_FLOOR_VAR, raising=False)
+        with pytest.raises(RuntimeError, match=LIQUIDITY_FLOOR_VAR):
+            liquidity_floor_usd()
+
+    def test_empty_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(LIQUIDITY_FLOOR_VAR, "")
+        with pytest.raises(RuntimeError, match=LIQUIDITY_FLOOR_VAR):
+            liquidity_floor_usd()
+
+    def test_non_numeric_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(LIQUIDITY_FLOOR_VAR, "five million")
+        with pytest.raises(RuntimeError, match="not a number"):
+            liquidity_floor_usd()
+
+    def test_zero_or_negative_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for value in ("0", "-1"):
+            monkeypatch.setenv(LIQUIDITY_FLOOR_VAR, value)
+            with pytest.raises(RuntimeError, match="not positive"):
+                liquidity_floor_usd()

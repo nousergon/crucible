@@ -391,3 +391,14 @@ class _Paginator:
 @pytest.fixture
 def fake_s3() -> FakeS3:
     return FakeS3()
+
+
+@pytest.fixture(autouse=True)
+def _declared_liquidity_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The liquidity gate has no default in this public tree
+    (`crucible.features.compute.liquidity_floor_usd` raises without it), so the
+    suite declares a synthetic one. Deliberately NOT the production value: a
+    test that would still pass against the real number is a test that would
+    also pass if the number leaked back into the tree.
+    """
+    monkeypatch.setenv("CRUCIBLE_LIQUIDITY_FLOOR_USD", "1000000")

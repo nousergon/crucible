@@ -30,7 +30,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BETA_WINDOW_TRADING_DAYS",
-    "LIQUIDITY_FLOOR_USD",
+    "LIQUIDITY_FLOOR_VAR",
+    "liquidity_floor_usd",
     "MOMENTUM_CHANGE_WINDOW_TRADING_DAYS",
     "RESIDUAL_MOMENTUM_CUM_TRADING_DAYS",
     "RESIDUAL_MOMENTUM_SKIP_TRADING_DAYS",
@@ -39,10 +40,52 @@ __all__ = [
     "build_features",
 ]
 
-#: The liquidity gate, in USD of mean 20-session traded notional. A single
-#: declared constant read by the one feature that expresses the gate, so no
-#: arm re-derives a threshold of its own.
-LIQUIDITY_FLOOR_USD = 5_000_000.0
+#: The environment variable carrying the liquidity gate, in USD of mean
+#: 20-session traded notional.
+LIQUIDITY_FLOOR_VAR = "CRUCIBLE_LIQUIDITY_FLOOR_USD"
+
+
+def liquidity_floor_usd() -> float:
+    """The liquidity gate, read from the environment.
+
+    Was the literal `5_000_000.0` until 2026-09-07. It moved because it is the
+    one genuinely TUNED number in this module: a belief about what is tradeable,
+    which `repository-tiering-policy.md` test 3 sends to the private tree, and
+    which `alpha-engine-config/strategy/README.md` calls strategy edge in as
+    many words. Its neighbours below did NOT move, and the distinction is the
+    point — a 252-session window with a 21-session skip is the textbook 12-1
+    residual-momentum construction, published in the literature long before
+    this system existed, while a five-million-dollar floor is a position.
+
+    Still a SINGLE declared value read by the one feature that expresses the
+    gate, so no arm re-derives a threshold of its own; only its home changed.
+
+    RAISES rather than defaulting. A floor of zero passes every name and a
+    floor guessed high passes none, and both produce a `liquidity_pass_raw`
+    column that looks computed — the exact shape of the `avg_volume_20d`
+    defect this layer's units contract exists to prevent, where 901 of 903
+    tickers failed the gate silently for months.
+    """
+    import os
+
+    raw = os.environ.get(LIQUIDITY_FLOOR_VAR, "")
+    if not raw:
+        raise RuntimeError(
+            f"{LIQUIDITY_FLOOR_VAR} is unset. The liquidity gate is a tuned value and "
+            "this public tree carries no default for it; refusing to compute "
+            "liquidity_pass_raw against a guessed threshold."
+        )
+    try:
+        floor = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{LIQUIDITY_FLOOR_VAR}={raw!r} is not a number") from exc
+    if floor <= 0:
+        raise RuntimeError(
+            f"{LIQUIDITY_FLOOR_VAR}={raw!r} is not positive; a floor of zero or less "
+            "passes every name and is indistinguishable from no gate at all."
+        )
+    return floor
+
 
 #: The residual-momentum window set, lifted verbatim from the v1 recipe this
 #: layer reproduces (`crucible-predictor/config/predictor.sample.yaml::
@@ -235,7 +278,7 @@ def build_features(
             "trading day and there is nothing to cut"
         )
 
-    cross["liquidity_pass_raw"] = (cross["dollar_volume_20d_raw"] >= LIQUIDITY_FLOOR_USD).astype(
+    cross["liquidity_pass_raw"] = (cross["dollar_volume_20d_raw"] >= liquidity_floor_usd()).astype(
         "float64"
     )
     # A null liquidity input is not a failed gate — it is an unmeasured one.
