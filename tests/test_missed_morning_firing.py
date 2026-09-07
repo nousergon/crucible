@@ -17,6 +17,14 @@ absence-checked by no sweep, ever.
 Measured 2026-09-04 against the live store:
 ``runs/report.morning/2026-09-03/`` was empty and
 ``runs/alerts.sweep/2026-09-03/2026-09-04/run.json`` existed.
+
+The cron itself was `0 13 * * *` (13:00 UTC) at measurement time and was
+recalibrated to `0 10 * * *` (10:00 UTC) on 2026-09-06
+(`alpha-engine-config-I9966`) — GitHub was delivering it 3-5h after its
+declared instant, so `06:00 PT` cron text was landing near 09:07 PT.
+:data:`OCCURRENCE` below tracks the CURRENT cron
+(`crucible.morning.DELIVERY_CRON_UTC`), not the literal in effect when this
+incident was measured.
 """
 
 from __future__ import annotations
@@ -30,7 +38,7 @@ from crucible.alerts import StoreAccessError, days_to_evaluate, evaluate_absence
 from crucible.components import load_registry
 from crucible.keys import TRIGGER_UNKNOWN, morning_trigger_key
 from crucible.manifest import manifest_key
-from crucible.morning import resolve_trigger
+from crucible.morning import DELIVERY_CRON_UTC_HOUR, resolve_trigger
 from crucible.store import LocalStore
 
 #: Fixed literals, never `today` arithmetic (AGENTS.md test discipline). Both
@@ -42,9 +50,13 @@ FRIDAY = dt.date(2026, 9, 4)
 #: after Thursday's report was due to be delivered.
 FRIDAY_SWEEP = dt.datetime(2026, 9, 5, 1, 0, tzinfo=dt.UTC)
 
-#: The occurrence `morning-report.yml`'s `0 13 * * *` names for THURSDAY's
-#: report: 13:00 UTC on the following calendar day.
-OCCURRENCE = dt.datetime(2026, 9, 4, 13, 0, tzinfo=dt.UTC)
+#: The occurrence `morning-report.yml`'s cron
+#: (`crucible.morning.DELIVERY_CRON_UTC`) names for THURSDAY's report: its
+#: declared UTC hour on the following calendar day. Recalibrated
+#: 2026-09-06 (alpha-engine-config-I9966): the cron moved from 13:00 UTC to
+#: 10:00 UTC, three hours earlier, so it delivers near 06:00 PT instead of
+#: three hours after it.
+OCCURRENCE = dt.datetime(2026, 9, 4, DELIVERY_CRON_UTC_HOUR, 0, tzinfo=dt.UTC)
 
 #: The floor I9960/I9966 set for the deadline, from the worst of four
 #: measured `nous-ergon-ops` GitHub Actions cron delays on 2026-09-04
@@ -155,8 +167,11 @@ class TestTheCalibratedThresholdChangesTheReading:
     after its occurrence is inside the account's measured worst cron delay
     (304 minutes, `authority-surface`, 2026-09-04) — the recalibrated
     360-minute deadline reads it as on time, and the original 210-minute one
-    (12:30 ET, set from the single 113-minute `board.yml` sample) would have
-    read it as absent.
+    (9:30 ET, set from the single 113-minute `board.yml` sample, and shifted
+    three hours earlier here alongside `OCCURRENCE` by the 2026-09-06
+    `alpha-engine-config-I9966` cron recalibration — it was 12:30 ET against
+    the pre-recalibration 13:00 UTC/09:00 ET occurrence) would have read it
+    as absent.
     """
 
     ARRIVAL = OCCURRENCE + dt.timedelta(minutes=300)
@@ -169,7 +184,7 @@ class TestTheCalibratedThresholdChangesTheReading:
     def test_the_original_210_minute_deadline_would_have_read_it_as_absent(self) -> None:
         from crucible.components import Deadline
 
-        old_deadline = Deadline(anchor="next_calendar_day_at", at=dt.time(12, 30))
+        old_deadline = Deadline(anchor="next_calendar_day_at", at=dt.time(9, 30))
         assert self.ARRIVAL > old_deadline.due_at(THURSDAY)
 
     def test_the_two_readings_differ(self) -> None:
@@ -180,7 +195,7 @@ class TestTheCalibratedThresholdChangesTheReading:
 
         new_deadline = load_registry()[MORNING].deadline
         assert new_deadline is not None
-        old_deadline = Deadline(anchor="next_calendar_day_at", at=dt.time(12, 30))
+        old_deadline = Deadline(anchor="next_calendar_day_at", at=dt.time(9, 30))
 
         new_reads_on_time = self.ARRIVAL <= new_deadline.due_at(THURSDAY)
         old_reads_on_time = self.ARRIVAL <= old_deadline.due_at(THURSDAY)

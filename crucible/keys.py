@@ -861,7 +861,7 @@ def morning_report_key(trading_day: str, calendar_date: str) -> str:
     widen the scope.
 
     ``calendar_date`` is the FIRING, and it is the same discriminator the job's
-    manifest carries. A 13:00 UTC cron fires every calendar day while
+    manifest carries. `crucible.morning.DELIVERY_CRON_UTC` fires every calendar day while
     `resolve_trading_day` collapses Saturday, Sunday and Monday onto Friday's
     close (§4.12), so three genuinely different deliveries would otherwise
     overwrite one another at one key and the store's answer to "what was Brian
