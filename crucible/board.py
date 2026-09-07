@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic import ValidationError
 
 from crucible.calendar import resolve_trading_day
 from crucible.components import Component, load_registry
@@ -59,6 +60,7 @@ from crucible.console.classify import STATES as COMPONENT_STATES
 from crucible.console.classify import Classification
 from crucible.documents import read_store_document
 from crucible.gate import LADDER_STATES, Ladder, PhaseRow
+from crucible.models import BoardDeclarationRow
 from crucible.store import Store
 
 __all__ = [
@@ -379,37 +381,42 @@ class Declarations:
 
 
 def _declaration(row_id: str, source: str, body: dict[str, Any]) -> Declaration:
-    known = {
-        "section",
-        "statement",
-        "clause_class",
-        "surface",
-        "reader",
-        "artifact",
-        "planned_because",
-        "means_when_red",
-    }
-    unknown = set(body) - known
-    if unknown:
-        raise ValueError(
-            f"{row_id}: unknown field(s) {sorted(unknown)}. The declaration schema is "
-            "closed — a typo'd key would otherwise be silently ignored, which on a "
-            "board means a row measuring nothing while looking configured."
-        )
-    missing = {"statement", "surface", "artifact", "means_when_red"} - set(body)
-    if missing:
-        raise ValueError(f"{row_id}: missing required field(s) {sorted(missing)}")
+    """`alpha-engine-config-I10045` row 11: the raw YAML body is validated
+    once, whole, through `crucible.models.BoardDeclarationRow` — replacing
+    the previous hand-rolled `known`/`missing` set-difference checks. The
+    two error MESSAGES those checks produced are preserved exactly
+    (`tests/test_board.py::test_an_unknown_yaml_field_is_refused` matches
+    "unknown field" literally), by translating pydantic's `extra_forbidden`/
+    `missing` error kinds back into them; every other validation error is
+    re-raised with the row id prefixed. `crucible.board.Declaration`'s own
+    `__post_init__` still enforces every cross-field rule, unchanged.
+    """
+    try:
+        row = BoardDeclarationRow.model_validate(body)
+    except ValidationError as exc:
+        errors = exc.errors()
+        unknown = sorted(e["loc"][0] for e in errors if e["type"] == "extra_forbidden")
+        if unknown:
+            raise ValueError(
+                f"{row_id}: unknown field(s) {unknown}. The declaration schema is "
+                "closed — a typo'd key would otherwise be silently ignored, which on a "
+                "board means a row measuring nothing while looking configured."
+            ) from exc
+        missing = sorted(e["loc"][0] for e in errors if e["type"] == "missing")
+        if missing:
+            raise ValueError(f"{row_id}: missing required field(s) {missing}") from exc
+        raise ValueError(f"{row_id}: {exc}") from exc
     return Declaration(
         id=row_id,
         source=source,
-        title=str(body["statement"]).strip(),
-        surface=str(body["surface"]),
-        reader=body.get("reader"),
-        artifact=str(body["artifact"]).strip(),
-        means_when_red=str(body.get("means_when_red", "")),
-        section=str(body.get("section", "")),
-        clause_class=str(body.get("clause_class", "")),
-        planned_because=str(body.get("planned_because", "")),
+        title=row.statement.strip(),
+        surface=row.surface,
+        reader=row.reader,
+        artifact=row.artifact.strip(),
+        means_when_red=row.means_when_red,
+        section=row.section,
+        clause_class=row.clause_class,
+        planned_because=row.planned_because,
     )
 
 
