@@ -136,6 +136,7 @@ __all__ = [
     "ResourceRow",
     "RunManifestV2",
     "SignalsRow",
+    "TrialRow",
 ]
 
 
@@ -1925,3 +1926,51 @@ class PhaseClosingReadingDocument(_Strict):
         "original.",
     )
     clauses: list[ClosingReadingClauseRow]
+
+
+# ── I10045 row 9: the trial ledger ─────────────────────────────────────────
+# Additive only, appended after the prior rows' markers for the same
+# rebase reason.
+
+
+class TrialRow(BaseModel):
+    """One row of `trials/ledger.jsonl` — plan §9.1 row 2, the DSR
+    multiplicity denominator.
+
+    **Unlike most models in this module, `extra` is NOT forbidden.**
+    `crucible.ledger`'s own module docstring states the design directly:
+    "Additive on `trial.v1`: the row has no JSON Schema, every reader
+    ignores unknown keys, and an OLDER row that predates the field carries
+    no `lineage` key at all". This is the `ArenaCycleDocument` (row 3)
+    shape, not the `components.yaml` shape: there is no published contract
+    file for this document, by design, so there is nothing to generate a
+    schema from and no byte-identity test.
+
+    Used only by `crucible.ledger.trial_rows` — the WRITER — to validate a
+    row's own core fields before it is appended, the producer-validates-on-
+    the-way-out pattern every other boundary in this migration also takes.
+    `crucible.ledger.read_trials`/`append_trials`/`n_trials` are UNCHANGED:
+    they still read and compare plain dicts, because the append-only race
+    guard in `append_trials` (`current != existing`, both built from
+    `read_trials`) is exactly the kind of load-bearing, already-correct
+    logic this migration's own row 2/5/6 precedent says to leave alone
+    rather than touch for its own sake.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    schema_version: Literal["trial.v1"] = "trial.v1"
+    slot: str = Field(min_length=1)
+    arm_id: str = Field(min_length=1)
+    as_of: IsoDate
+    control: bool
+    active: bool
+    benchmark: str = Field(min_length=1)
+    n_dates_scored: Annotated[int, Field(ge=0)]
+    first_date: str | None = None
+    last_date: str | None = None
+    mean_score_ratio: float | None = None
+    lineage: dict[str, list[str]] = Field(default_factory=dict)
+    run_id: str = Field(min_length=1)
+    arena_cycle_key: str = Field(min_length=1)
+    written_at_utc: str = Field(pattern=_UTC_TIMESTAMP_PATTERN)

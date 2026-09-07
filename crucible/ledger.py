@@ -30,7 +30,10 @@ import datetime as dt
 import json
 from typing import TYPE_CHECKING, Any
 
+from pydantic import ValidationError
+
 from crucible.keys import ledger_key
+from crucible.models import TrialRow
 
 if TYPE_CHECKING:
     from nousergon_lib.arena.engine import ArenaCycle
@@ -103,6 +106,22 @@ def trial_rows(
                 "written_at_utc": written,
             }
         )
+    # `alpha-engine-config-I10045` row 9: each row validated against
+    # `crucible.models.TrialRow` before being handed to the caller — the
+    # producer-validates-on-the-way-out pattern every other boundary in
+    # this migration takes. No schema is generated or published (the module
+    # docstring's "the row has no JSON Schema" is a design decision, not a
+    # gap): `TrialRow` is `extra="allow"`, exists only to catch a malformed
+    # CORE field here, at construction, rather than downstream in
+    # `n_trials`. The dicts returned are UNCHANGED — `append_trials`/
+    # `read_trials`'s append-only race guard still compares plain dicts.
+    for row in rows:
+        try:
+            TrialRow.model_validate(row)
+        except ValidationError as exc:
+            raise ValueError(
+                f"trial row for arm {row['arm_id']!r} does not conform: {exc}"
+            ) from exc
     return rows
 
 
