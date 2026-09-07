@@ -117,6 +117,10 @@ __all__ = [
     "ClosingReadingClauseRow",
     "ChampionEvidence",
     "ChampionPointerDocument",
+    "CloudTrailRecord",
+    "CloudTrailSessionContext",
+    "CloudTrailSessionIssuer",
+    "CloudTrailUserIdentity",
     "ComponentRow",
     "ComponentsDocument",
     "DeadlineRow",
@@ -2087,3 +2091,64 @@ class BoardDeclarationRow(_Strict):
     section: str = ""
     clause_class: str = ""
     planned_because: str = ""
+
+
+# ── I10045 row 12: the CloudTrail partition payload ────────────────────────
+# Additive only, appended after the prior rows' markers for the same
+# rebase reason.
+
+
+class CloudTrailSessionIssuer(BaseModel):
+    """`userIdentity.sessionContext.sessionIssuer` — the assumed ROLE, not
+    the session. `extra="allow"` throughout this boundary: AWS owns this
+    shape, not us, and forbidding a field AWS adds tomorrow is the defect
+    binding constraint 2 names for a third-party payload."""
+
+    model_config = ConfigDict(extra="allow")
+
+    userName: str | None = None
+
+
+class CloudTrailSessionContext(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    sessionIssuer: CloudTrailSessionIssuer | None = None
+
+
+class CloudTrailUserIdentity(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: str = "Unknown"
+    userName: str | None = None
+    arn: str | None = None
+    sessionContext: CloudTrailSessionContext | None = None
+
+
+class CloudTrailRecord(BaseModel):
+    """One CloudTrail event record — plan §2 row 1 / §11 risk 8, the
+    autonomy gate's own "0 human mutating calls" measurement.
+
+    `crucible.autonomy._principal` used to walk `record.get("userIdentity",
+    {}) or {}` three levels deep by hand; a typo'd key at any level (`Sessi
+    onIssuer`, `userame`) would resolve to `{}` and silently read as "no
+    issuer" rather than raising, which is invisible in exactly the way this
+    whole migration exists to prevent EXCEPT that this document is a
+    third-party shape: `extra="allow"` at every level, because CloudTrail's
+    schema varies by event source and this reader must not refuse a field
+    it does not yet know the name of. Scoped to the KEPT records only
+    (`crucible.autonomy.count_operator_actions`'s `read.records`, already
+    filtered down from the full scanned archive by `_is_candidate`) — the
+    per-object hot path (`_touches`, `_is_candidate`) stays on raw dicts,
+    unchanged, for the memory/throughput reason
+    `crucible.autonomy.iter_archive_records`'s own docstring measures:
+    ~181k records/day, 6-7 GB resident if every one were held or validated.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    userIdentity: CloudTrailUserIdentity = Field(default_factory=CloudTrailUserIdentity)
+    eventTime: str = ""
+    eventName: str = ""
+    eventSource: str = ""
+    requestID: str = ""
+    readOnly: bool | None = None
