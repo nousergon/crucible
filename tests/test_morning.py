@@ -58,6 +58,8 @@ from crucible.morning import (
     ACCEPTANCE_UNREADABLE,
     BOARD_URL_EXPIRES_S,
     BOARD_URL_UNAVAILABLE,
+    DELIVERY_CRON_UTC,
+    DELIVERY_CRON_UTC_HOUR,
     DELIVERY_TZ,
     HEADLINE_TARGET_LINES,
     MORNING_JOB,
@@ -104,11 +106,13 @@ WORKFLOW = REPO_ROOT / ".github" / "workflows" / "morning-report.yml"
 #: A Wednesday session, and the Tuesday before it. Both real NYSE sessions.
 DAY = dt.date(2026, 9, 2)
 PREVIOUS = dt.date(2026, 9, 1)
-#: 13:00 UTC on the calendar day after DAY — the cron's own firing instant.
-#: Every board `generated_at` fixture and every handler path that reads wall
-#: clock is locked to this instant (see `_freeze_morning_now`) so the
-#: 24h staleness check cannot go red on a later calendar day (I9948).
-FIRED_AT = dt.datetime(2026, 9, 3, 13, 0, tzinfo=dt.UTC)
+#: `DELIVERY_CRON_UTC`'s hour, UTC, on the calendar day after DAY — the
+#: cron's own firing instant (recalibrated 2026-09-06, alpha-engine-config-
+#: I9966: was 13:00 UTC, now 10:00 UTC). Every board `generated_at` fixture
+#: and every handler path that reads wall clock is locked to this instant
+#: (see `_freeze_morning_now`) so the 24h staleness check cannot go red on a
+#: later calendar day (I9948).
+FIRED_AT = dt.datetime(2026, 9, 3, DELIVERY_CRON_UTC_HOUR, 0, tzinfo=dt.UTC)
 #: Render time relative to FIRED_AT, inside STALE_AFTER — never a naked
 #: absolute pin against wall clock.
 GENERATED_AT = FIRED_AT - dt.timedelta(hours=15, minutes=24, seconds=56)
@@ -385,7 +389,7 @@ class TestTheFullUpdate:
         assert f"# Crucible v2 — board for trading day {DAY.isoformat()}" in update
         assert f"store: `{tmp_path}/{BOARD_CURRENT_KEY}`" in update
         assert f"generated: {GENERATED}  commit: `{SHA}`" in update
-        assert "delivered: 2026-09-03 06:00 PDT" in update
+        assert "delivered: 2026-09-03 03:00 PDT" in update
 
     def test_the_ladder_is_a_markdown_table_with_clause_names_in_holding(self, tmp_path):
         store = _seed(tmp_path, previous=_board())
@@ -1577,14 +1581,21 @@ class TestDeclarations:
         assert row.dispatch_workflow == WORKFLOW.name
         assert row.absence_watched_by == "alerts.sweep"
 
-    def test_the_workflow_cron_is_0600_pdt_and_0500_pst(self):
+    def test_the_workflow_cron_matches_the_declared_delivery_instant(self):
+        """`DELIVERY_CRON_UTC` is the one source of truth — read back from
+        the committed workflow file so cron and code cannot silently
+        disagree (alpha-engine-config-I9966 recalibration, 2026-09-06)."""
         spec = yaml.safe_load(WORKFLOW.read_text())
         crons = [entry["cron"] for entry in spec[True]["schedule"]]
-        assert crons == ["0 13 * * *"]
-        summer = dt.datetime(2026, 9, 3, 13, 0, tzinfo=dt.UTC).astimezone(DELIVERY_TZ)
-        winter = dt.datetime(2026, 11, 4, 13, 0, tzinfo=dt.UTC).astimezone(DELIVERY_TZ)
-        assert (summer.hour, summer.tzname()) == (6, "PDT")
-        assert (winter.hour, winter.tzname()) == (5, "PST")
+        assert crons == [DELIVERY_CRON_UTC]
+        summer = dt.datetime(2026, 9, 3, DELIVERY_CRON_UTC_HOUR, 0, tzinfo=dt.UTC).astimezone(
+            DELIVERY_TZ
+        )
+        winter = dt.datetime(2026, 11, 4, DELIVERY_CRON_UTC_HOUR, 0, tzinfo=dt.UTC).astimezone(
+            DELIVERY_TZ
+        )
+        assert (summer.hour, summer.tzname()) == (3, "PDT")
+        assert (winter.hour, winter.tzname()) == (2, "PST")
 
     def test_a_failed_run_notifies_because_alerts_sweep_has_never_produced(self):
         spec = yaml.safe_load(WORKFLOW.read_text())

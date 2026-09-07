@@ -124,6 +124,8 @@ __all__ = [
     "CLAUSE_SEPARATOR",
     "FORBIDDEN_PROGRESS_TOKENS",
     "BOARD_JOB",
+    "DELIVERY_CRON_UTC",
+    "DELIVERY_CRON_UTC_HOUR",
     "DELIVERY_SEVERITY",
     "DELIVERY_SOURCE",
     "DELIVERY_TZ",
@@ -186,12 +188,40 @@ SILENT_STATES: tuple[str, ...] = ("UNMEASURED", "UNMEASURABLE")
 #: to know that whatever the market did.
 STALE_AFTER = dt.timedelta(days=1)
 
-#: Where 06:00 is measured. The cron is UTC (GitHub Actions has no other
+#: Where 03:00 is measured. The cron is UTC (GitHub Actions has no other
 #: option), so the LOCAL time the message actually lands at is computed and
 #: printed rather than assumed — see `.github/workflows/morning-report.yml`
 #: for the DST argument, and `tests/test_morning.py` for the assertion that
-#: the committed cron lands at 06:00 PDT and 05:00 PST.
+#: the committed cron lands at 03:00 PDT and 02:00 PST.
 DELIVERY_TZ = ZoneInfo("America/Los_Angeles")
+
+#: The single declared instant this job's cron fires at, UTC. This is the
+#: ONE source of truth for "when does report.morning start" — every other
+#: place that used to carry the literal (the workflow's own `on.schedule`
+#: cron, its header comment, `components.yaml`'s `report.morning` schedule
+#: and deadline prose, and this module's own ABSENCE-condition docstring)
+#: either quotes this constant's value in prose or is asserted equal to it
+#: by `tests/test_morning.py`'s workflow-shape test, which parses
+#: `.github/workflows/morning-report.yml` and reads its cron back against
+#: this string — so the workflow file and this constant cannot silently
+#: disagree.
+#:
+#: `0 10 * * *`, not `0 13 * * *` (alpha-engine-config-I9966, corrected
+#: 2026-09-06): every scheduled workflow on this account fires 3-5h after
+#: its declared cron (MEASURED — `authority-surface`/`llm-callsite-surface`/
+#: `observability-registry`/`cloudwatch-alarm-drift`, see
+#: `components.yaml`'s `report.morning.deadline` comment for the table), so
+#: a cron declaring 06:00 PT was actually landing ~09:00-09:07 PT. Moving
+#: the declared instant three hours earlier — 03:00 PDT / 02:00 PST — is
+#: what makes the DELIVERED message land near the intended 06:00 PT; the
+#: declared cron itself is no longer "the delivery time", only the input to
+#: it.
+DELIVERY_CRON_UTC = "0 10 * * *"
+
+#: The UTC hour :data:`DELIVERY_CRON_UTC` names, parsed rather than
+#: retyped — a second literal here could drift from the cron string above
+#: the moment either one was edited alone.
+DELIVERY_CRON_UTC_HOUR = int(DELIVERY_CRON_UTC.split()[1])
 
 #: The literal line emitted when NO artifact carries the acceptance count.
 #: A literal rather than a formatted string: `tests/test_morning.py` asserts
@@ -1583,9 +1613,9 @@ def morning_handler(args: argparse.Namespace) -> int:
     Runs through `run_job` like every other job (AGENTS.md rule 1), so a
     morning that never reached Brian leaves a `failed` manifest naming why,
     and `alerts.sweep`'s two conditions cover this job on the same terms as
-    every other: ABSENCE when the 13:00 UTC cron does not fire — GitHub drops
-    scheduled events under load, measured on this fleet — and FAILURE when
-    either the tracker post or the delivery raises.
+    every other: ABSENCE when the `DELIVERY_CRON_UTC` cron does not fire —
+    GitHub drops scheduled events under load, measured on this fleet — and
+    FAILURE when either the tracker post or the delivery raises.
 
     **Ordering is the whole safety property** (`alpha-engine-config-I10123`):
     the full update is posted to the tracker BEFORE the headline is ever
@@ -1726,7 +1756,7 @@ def morning_handler(args: argparse.Namespace) -> int:
         store=store,
         trading_day=args.trading_day,
         run_mode=getattr(args, "run_mode", None),
-        # The FIRING, not the trading day. A 13:00 UTC cron fires every
+        # The FIRING, not the trading day. `DELIVERY_CRON_UTC` fires every
         # calendar day and `resolve_trading_day` collapses Saturday, Sunday
         # and Monday onto Friday's close (§4.12), so without this the weekend
         # deliveries overwrite one another and the store's answer to "did the

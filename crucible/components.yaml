@@ -597,7 +597,10 @@ components:
   report.morning:
     description: >-
       Read the board rendered by board.yml and deliver its reading to the
-      operator channel at 06:00 PT. Reads; never renders and never runs.
+      operator channel near 06:00 PT (delivered instant; the cron below
+      declares 03:00 PT so the account's measured GitHub Actions delivery
+      lag lands it near 06:00 PT — alpha-engine-config-I9966). Reads; never
+      renders and never runs.
     lifecycle: ACTIVE
     signals:
       execution: run.json
@@ -619,20 +622,32 @@ components:
     console_surface: crucible/runs
     artifact_retention: forever
     absence_watched_by: alerts.sweep
-    schedule: daily 13:00 UTC (06:00 PDT / 05:00 PST)
+    schedule: daily 10:00 UTC (03:00 PDT / 02:00 PST)
     dispatch: github-actions
     dispatch_workflow: morning-report.yml
     # `next_calendar_day_at`, not `close_plus`: the report for trading day d
     # is delivered on the calendar day AFTER d, before that day's session
-    # opens. 13:00 UTC is 09:00 ET in EDT and 08:00 ET in EST.
+    # opens. 10:00 UTC is 06:00 ET in EDT and 05:00 ET in EST.
     #
-    # 15:00 ET, from this ACCOUNT's measured cron-delivery envelope
+    # Corrected 2026-09-06 (alpha-engine-config-I9966, recalibration noted on
+    # that issue): the cron moved from `0 13 * * *` (09:00 ET) to
+    # `0 10 * * *` (06:00 ET) — `crucible.morning.DELIVERY_CRON_UTC`, the one
+    # source of truth the workflow-shape test in `tests/test_morning.py`
+    # reads back against `.github/workflows/morning-report.yml` — because
+    # GitHub was delivering the OLD cron 3-5h after its declared instant, so
+    # a cron declaring 06:00 PT was landing near 09:07 PT. The DEADLINE below
+    # moves by the same three hours, so the margin it gives the account's
+    # measured delivery lag is unchanged; only the two ends of the window
+    # shifted.
+    #
+    # 12:00 ET, from this ACCOUNT's measured cron-delivery envelope
     # (alpha-engine-config-I9960, -I9966), not from crucible's own single
-    # sample. The first cut of this deadline (12:30 ET / 210 minutes) was set
-    # from `board.yml`'s one recorded firing — cron `30 21 * * *`, due
-    # 2026-09-03T21:30Z, ran at 2026-09-03T23:23:13Z, 113 minutes late — and
-    # that sample is this account's *best* case, not a representative one.
-    # Four `nous-ergon-ops` GitHub Actions crons, each declaring exactly one
+    # sample. The first cut of this deadline (12:30 ET / 210 minutes, against
+    # the OLD 09:00 ET occurrence) was set from `board.yml`'s one recorded
+    # firing — cron `30 21 * * *`, due 2026-09-03T21:30Z, ran at
+    # 2026-09-03T23:23:13Z, 113 minutes late — and that sample is this
+    # account's *best* case, not a representative one. Four
+    # `nous-ergon-ops` GitHub Actions crons, each declaring exactly one
     # schedule, measured on 2026-09-04:
     #
     #   workflow                   declared      actual        delay
@@ -643,13 +658,15 @@ components:
     #
     # and it is chronic, not a bad day: `0 7 * * *` landed at 12:02-12:05Z on
     # each of 2026-09-02, -03 and -04. Three of those four delays exceed
-    # 210 minutes, so the 12:30 ET deadline would have paged on a report that
+    # 210 minutes, so a 210-minute deadline would have paged on a report that
     # was merely late, not absent — a false alarm on most days trains the
     # reader to ignore the one true page, which is the exact failure this
     # detector exists to prevent.
     #
-    # 15:00 ET (19:00Z) is 360 minutes after the EDT occurrence (09:00 ET)
-    # and 420 after the EST one (08:00 ET) — clearing the worst measured
+    # 12:00 ET (16:00Z in EDT, 17:00Z in EST) is 360 minutes after the EDT
+    # occurrence (06:00 ET) and 420 after the EST one (05:00 ET) — the SAME
+    # 360/420-minute margin the pre-recalibration 15:00 ET deadline gave the
+    # OLD 09:00/08:00 ET occurrence, so this still clears the worst measured
     # delay (304 min) with ~56 minutes of headroom, while still paging the
     # same calendar day on a genuine no-show.
     #
@@ -657,7 +674,9 @@ components:
     # behaviour, not a universal or vendor-documented figure. If that
     # envelope moves, re-measuring it — not adjusting this number on
     # preference — is the maintenance action; re-run the four-workflow
-    # measurement above and update both the table and `at:`.
+    # measurement above and update both the table and `at:`. If the cron
+    # (`DELIVERY_CRON_UTC`) ever moves again, shift this `at:` by the same
+    # number of hours so the margin stays 360/420 minutes.
     deadline:
       anchor: next_calendar_day_at
-      at: "15:00"
+      at: "12:00"

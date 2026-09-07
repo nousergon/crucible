@@ -13,14 +13,15 @@ name: Morning report
 #
 # A workflow carries ONE schedule set, and this job's cadence is not the
 # board's: the board renders at 21:30 UTC (after the close plus the
-# registry's 6h window) and this reads that render at 13:00 UTC the next
-# morning. Putting both in one file means both jobs fire at both times unless
-# each is gated on `github.event.schedule` — a string comparison against a
-# cron literal, which fails open the moment either cron is edited and reads
-# green while doing so. It would also make `components.yaml`'s
-# `dispatch_workflow` name a workflow whose declared cadence is not this
-# row's, which is the exact blindness that field exists to remove
-# (`alpha-engine-config-I9878`).
+# registry's 6h window) and this reads that render at 10:00 UTC the next
+# morning — 12.5h later, so the report always reads a render from that
+# night's close, never a stale one. Putting both in one file means both jobs
+# fire at both times unless each is gated on `github.event.schedule` — a
+# string comparison against a cron literal, which fails open the moment
+# either cron is edited and reads green while doing so. It would also make
+# `components.yaml`'s `dispatch_workflow` name a workflow whose declared
+# cadence is not this row's, which is the exact blindness that field exists
+# to remove (`alpha-engine-config-I9878`).
 #
 # `crucible/AGENTS.md` says "deploy.yml is the only other workflow this repo
 # will ever have". That sentence is already stale — `board.yml` and
@@ -28,17 +29,37 @@ name: Morning report
 # (`alpha-engine-config-I9887` owns the correction) — so it is not a
 # constraint on this file.
 #
+# ── The cron declares 03:00 PT, not 06:00 PT (alpha-engine-config-I9966) ──
+#
+# Corrected 2026-09-06. The cron was `0 13 * * *` (06:00 PDT / 05:00 PST) on
+# the belief that a declared cron fires at its declared instant. It does
+# not: every scheduled GitHub Actions workflow on this account fires 3-5h
+# after its cron, MEASURED and chronic, not a bad day
+# (`alpha-engine-config-I9966`; the four-workflow table lives on
+# `components.yaml`'s `report.morning.deadline` comment). A `0 13` cron was
+# therefore DELIVERING near 09:07 PT, three hours later than the accountability
+# report this workflow exists to provide.
+#
+# `crucible.morning.DELIVERY_CRON_UTC` is the one declared constant for the
+# cron below, and `tests/test_morning.py`'s workflow-shape test parses this
+# file's `on.schedule` cron and asserts it equals that constant — so this
+# literal and the code cannot silently disagree. It is set three hours
+# earlier than a naive 06:00 PT literal, `0 10 * * *`, specifically so the
+# DELIVERED message lands near the intended 06:00 PT once the account's
+# measured 3-5h delivery lag is added back. The declared cron is now an
+# input to delivery time, not a statement of it.
+#
 # ── UTC, and what it drifts to in November ────────────────────────────────
 #
-# GitHub Actions crons are UTC and have no timezone. `0 13 * * *` is
-# **06:00 PDT** today and becomes **05:00 PST** on 2026-11-01, when the US
+# GitHub Actions crons are UTC and have no timezone. `0 10 * * *` is
+# **03:00 PDT** today and becomes **02:00 PST** on 2026-11-01, when the US
 # leaves daylight time. That drift is DECLARED rather than discovered: the
 # message itself prints the local time it was delivered at
 # (`crucible.morning.DELIVERY_TZ`), and `tests/test_morning.py` asserts this
-# exact cron resolves to 06:00 PDT and 05:00 PST, so the November change is a
+# exact cron resolves to 03:00 PDT and 02:00 PST, so the November change is a
 # committed fact a reader can look up rather than a surprise.
 #
-# The rejected alternative was two crons (`0 13` and `0 14`) with a job-level
+# The rejected alternative was two crons (`0 10` and `0 11`) with a job-level
 # `if: github.event.schedule == '...'` picking the right one per season. That
 # is a partial parser over a cron literal deciding whether the day's report
 # goes out at all, and `tests/test_workflow_triggers.py` records five rounds
@@ -142,8 +163,9 @@ name: Morning report
 # casualty of it.
 on:
   schedule:
-    # 06:00 PDT / 05:00 PST. See the DST section above.
-    - cron: '0 13 * * *'
+    # 03:00 PDT / 02:00 PST — `crucible.morning.DELIVERY_CRON_UTC`. See the
+    # DST section above and I9966 recalibration section above that.
+    - cron: '0 10 * * *'
   workflow_dispatch:
 
 permissions: {}
