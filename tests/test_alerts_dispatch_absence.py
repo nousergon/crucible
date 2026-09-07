@@ -59,7 +59,7 @@ def _write_dispatch(
                 "job": job,
                 "args": args,
                 "instance_id": instance_id,
-                "requested_by": "crucible-v2-dispatcher",
+                "requested_by": "test-dispatcher",
                 "dispatched_at_utc": dispatched_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
         ).encode(),

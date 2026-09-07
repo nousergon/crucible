@@ -86,14 +86,17 @@ env:
   # AWS_ACCOUNT_ID and STORE_URI come from repository variables
   # (alpha-engine-config-I9906) — this repo goes PUBLIC at phase-1 exit
   # (I9775) and `AGENTS.md` forbids infrastructure identifiers, bucket names
-  # and account numbers in the tree. The role NAME stays a literal below: it
-  # carries no secret on its own, and the account id is the sensitive half.
+  # and account numbers in the tree. The role name is built from
+  # `vars.CRUCIBLE_ROLE_PREFIX` below, same as the account id: this is a
+  # public repo, its run logs are public, and GitHub does not mask
+  # repository variables — only the `::add-mask::` step ahead of the
+  # credential step keeps the account id out of a printed ARN.
   # Created by nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml
   # (`nous-ergon-ops-PR997`). Read-only over everything it does not write, and
   # write-scoped to `crucible/reviews/*` with no `DeleteObject` — so a recorded
   # finding cannot be removed by the party it was recorded against.
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
-  REVIEW_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/crucible-v2-github-review
+  REVIEW_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.CRUCIBLE_ROLE_PREFIX }}-review
   STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
 
 jobs:
@@ -200,6 +203,14 @@ jobs:
           uv run python -m crucible.review check --commits commits.json --reviewer "$REVIEWER"
 
           echo "REVIEW_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
+
+      # This repo is public and its run logs are public; GitHub masks
+      # SECRETS, not repository VARIABLES. The credential step below assumes
+      # a role whose ARN embeds the account id, and the SDK/CLI it configures
+      # can print that ARN in its own diagnostics — mask it before that step
+      # runs so nothing downstream can leak it.
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
 
       - name: Assume the review-writer identity
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3

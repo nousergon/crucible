@@ -11,13 +11,16 @@ the store bucket as literals: `arn:aws:iam::711398986525:role/...` and
 `alpha-engine-config-I9906` named — `adversarial-review-record.yml` is a
 fifth instance the issue's own survey missed.
 
-**Scope is `.github/` and `crucible/` only, mirroring `test_no_suppressions.py`'s
-shape but not its tree-wide reach.** `tests/` deliberately carries the real
-account id as literal test fixtures (`test_autonomy.py`, `test_tags.py`)
-asserting behaviour against the account this fleet actually runs in — that is
-a different concern (a test fixture, never shipped, never read by a public
-clone of this repo) from a literal baked into a workflow or a package module
-that ships with the tree.
+**Scope is the whole tree: `.github/`, `crucible/` AND `tests/`
+(corrected 2026-09-07, `alpha-engine-config-I10156`).** This file previously
+exempted `tests/` on the written argument that a fixture is "never shipped,
+never read by a public clone of this repo". That argument is false on its
+face and was load-bearing: `tests/` IS in the tree, a public clone reads it,
+and it carried the real account id fifteen times plus the real runtime,
+dispatcher, scheduler and deploy role names. The exemption was written while
+the repo was private, when the claim was harmless and untestable; the flip
+made it wrong without anything editing it. A carve-out whose justification
+stops being true is the failure mode this file exists to catch.
 
 **What is forbidden, and why the boundary sits where it does.** Two patterns:
 a bare 12-digit AWS account id, and the `s3://alpha-engine-` bucket-name
@@ -26,17 +29,33 @@ account id names the AWS account this fleet writes to, and the bucket name
 narrows an attacker straight to the one store worth reading. Neither can be
 reconstructed from public information.
 
-**Deliberately NOT forbidden: the literal `arn:aws:` prefix on its own.**
-`alpha-engine-config-I9906`'s own dispatch decided — and this file documents
-the decision — that a role NAME (`crucible-v2-github-deploy`, ...) may stay a
-literal, because a role name alone grants no access and is not a secret; only
-the account id is. Constructing a role ARN from a var-substituted account id
-still requires writing the literal syntax `arn:aws:iam::` — banning that
-string outright would make the very form this PR ships (`arn:aws:iam::${{
-vars.AWS_ACCOUNT_ID }}:role/crucible-v2-github-deploy`) fail its own guard.
-The 12-digit pattern already catches a FULLY literal ARN (one with the
-account id inlined); a prefix with no digit run inlined carries nothing this
-guard needs to refuse.
+**Role, function and topic NAMES are now forbidden too
+(reversed 2026-09-07 by Brian's ruling, `alpha-engine-config-I10156`).**
+`alpha-engine-config-I9906` had decided the opposite — that a role name may
+stay a literal "because a role name alone grants no access and is not a
+secret". Brian's ruling replaced the secrecy test with the tiering policy's
+actual test, which is PURPOSE: "if someone else picks up the repo they won't
+be able to use the account so it doesn't belong there." An outside reader of
+this AGPL tree can use none of these names; publishing them only removes the
+guessing step from an `AssumeRole` enumeration against a named account.
+`repository-tiering-policy.md` says the same thing directly — "it isn't
+harmful" is explicitly NOT a public job.
+
+**Still deliberately NOT forbidden: the literal `arn:aws:` prefix on its
+own.** Constructing an ARN from var-substituted parts requires writing the
+syntax `arn:aws:iam::`, so banning that string would make the very form this
+tree ships (`arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{
+vars.CRUCIBLE_ROLE_PREFIX }}-deploy`) fail its own guard. The 12-digit
+pattern already catches a fully-literal ARN; a prefix with nothing inlined
+carries nothing to refuse.
+
+**And the account id is masked in the logs as well as absent from the tree.**
+Seven workflows print an assumed-role ARN (`echo "identity: ${assumed}"`),
+and on a public repository run logs are public. GitHub masks SECRETS but
+never VARIABLES, so `${{ vars.AWS_ACCOUNT_ID }}` alone would have put the
+account id in a public log on every run — the tree-clean reading would have
+been true and useless. Each such job now runs `::add-mask::` on the account
+id before it can be printed.
 
 **Why the account-id pattern requires an adjacent marker, and not a bare
 12-digit run (corrected 2026-09-03 — Finding 4, adversarial review of
@@ -75,10 +94,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-#: `.github/` and `crucible/` only — the two directories `crucible/AGENTS.md`
-#: binds, and the two the deliverable named. Not `tests/`, which carries the
-#: real account id as fixture data on purpose (see module docstring).
-SCAN_ROOTS = (REPO_ROOT / ".github", REPO_ROOT / "crucible")
+#: The whole shipped tree. `tests/` was exempt until 2026-09-07 on an argument
+#: that was false the moment this repo went public — see the module docstring.
+SCAN_ROOTS = (REPO_ROOT / ".github", REPO_ROOT / "crucible", REPO_ROOT / "tests")
 
 #: This file, and nothing else — it must contain the patterns in order to
 #: search for and document them. Same exemption shape as
@@ -100,6 +118,18 @@ _SCANNED_SUFFIXES = {".py", ".yaml", ".yml", ".json", ".toml", ".cfg", ".ini"}
 #: between the table and its own tests.
 ACCOUNT_ID_PATTERN = r"(?:arn:aws:iam::|::|--account[ =]|\baccount[ :=])\d{12}\b"
 
+#: The canonical AWS-documentation placeholder account ids, and the all-zero
+#: one. Exempt because they name NO account: AWS publishes `123456789012` in
+#: its own examples precisely so a fixture can carry an ARN-shaped string
+#: without carrying an account. Needed only since 2026-09-07, when the scan
+#: was extended over `tests/` (`alpha-engine-config-I10156`) and started
+#: reading a suite that has always built ARNs out of these.
+#:
+#: An ENUMERATED set, never a heuristic. "Looks like a placeholder" is the
+#: shape that lets a real id through the day someone picks a memorable one;
+#: three literals that can be checked by eye cannot.
+PLACEHOLDER_ACCOUNT_IDS = ("123456789012", "111111111111", "000000000000")
+
 #: A bare `alpha-engine-*` BUCKET stem, with no `s3://` scheme. A module
 #: constant for the same reason :data:`ACCOUNT_ID_PATTERN` is one: it was
 #: written out four times below, and the correction of 2026-09-04 had to be
@@ -107,6 +137,23 @@ ACCOUNT_ID_PATTERN = r"(?:arn:aws:iam::|::|--account[ =]|\baccount[ :=])\d{12}\b
 #: pattern's behaviour while the scan ran the new one — a self-test that
 #: grades a string nothing uses.
 BUCKET_STEM_PATTERN = r"\balpha-engine-(data|research|crucible-v2)(?![\w-])"
+
+#: A live IDENTITY, FUNCTION or TOPIC name. Added 2026-09-07 with Brian's
+#: ruling (`alpha-engine-config-I10156`), which reversed I9906's decision that
+#: role names may stay literals.
+#:
+#: The alternation is enumerated rather than a bare `crucible-v2-` prefix, and
+#: deliberately so: `crucible/config.py`'s `DEFAULT_STACK_NAME = "crucible-v2"`
+#: is a CloudFormation stack name that legitimately stays, and a pattern broad
+#: enough to catch it would be deleted by the first person it blocked. `\b`
+#: after each alternative, never `(?![\w-])`: `\b` matches before a hyphen, so
+#: `crucible-v2-github` catches `crucible-v2-github-deploy` and its six
+#: siblings, which is the whole point — the PREFIX is the identity, the
+#: suffix (`-deploy`, `-board`) is a purpose word that may stay.
+IDENTITY_NAME_PATTERN = (
+    r"\b(?:crucible-v2-(?:github|runtime|dispatcher|scheduler|stack-check|pages)"
+    r"|alpha-engine-alerts(?:-muted)?)\b"
+)
 
 #: What is forbidden, and why. See the module docstring for why `arn:aws:` on
 #: its own is deliberately absent from this table.
@@ -145,6 +192,14 @@ FORBIDDEN: dict[str, str] = {
     # `alpha-engine-research`, `--s3-bucket alpha-engine-research`,
     # `alpha-engine-crucible-v2/crucible` (a `/` is not `[\w-]`) — and stops
     # matching a longer identifier that merely starts with one.
+    IDENTITY_NAME_PATTERN: (
+        "a literal IAM role, Lambda function or SNS topic name — an outside "
+        "reader of this public tree can use none of them, and publishing one "
+        "removes the guessing step from an AssumeRole enumeration. Resolve it "
+        "through a repository variable (${{ vars.CRUCIBLE_ROLE_PREFIX }}, "
+        "CRUCIBLE_PAGES_TOPIC, CRUCIBLE_MUTED_TOPIC, "
+        "CRUCIBLE_MACHINE_PRINCIPALS), or use a synthetic name in a fixture"
+    ),
     BUCKET_STEM_PATTERN: (
         "a literal alpha-engine-* bucket name (no s3:// scheme) — resolve it "
         "through a repository variable instead, per crucible/AGENTS.md"
@@ -185,13 +240,24 @@ def test_the_scan_actually_reads_files() -> None:
     assert any(f.suffix == ".py" and f.parent.name == "crucible" for f in files), (
         "the scan did not reach the crucible/ package source"
     )
+    # The tracker reference for this widening lives in the module docstring,
+    # never in this runtime string — `tests/test_no_stale_tracker_literals.py`.
+    assert any(f.suffix == ".py" and "tests" in f.parts for f in files), (
+        "the scan did not reach tests/ — the directory whose exemption was "
+        "removed once this repo went public, and the one that carried the "
+        "real account id fifteen times while reporting clean"
+    )
 
 
 def _findings_for_file(path: Path, text: str) -> list[str]:
     findings: list[str] = []
     for lineno, line in enumerate(text.splitlines(), start=1):
         for pattern, compiled in _PATTERNS.items():
-            if compiled.search(line):
+            match = compiled.search(line)
+            if match and pattern is ACCOUNT_ID_PATTERN:
+                if any(p in match.group(0) for p in PLACEHOLDER_ACCOUNT_IDS):
+                    continue
+            if match:
                 findings.append(
                     f"{path}:{lineno}: matches {pattern!r} — {FORBIDDEN[pattern]}\n"
                     f"      {line.strip()[:160]}"
@@ -213,8 +279,9 @@ def test_no_infra_identifier_literal_in_github_or_crucible() -> None:
     # Tracker reference lives only above, in the module docstring — never in
     # this runtime string — per `tests/test_no_stale_tracker_literals.py`.
     assert not findings, (
-        "no infrastructure identifier literal (bare account id, alpha-engine bucket "
-        "name) may appear under .github/ or crucible/ (see crucible/AGENTS.md). "
+        "no infrastructure identifier literal (account id, alpha-engine bucket name, "
+        "IAM role / Lambda function / SNS topic name) may appear anywhere in the "
+        "tree (see crucible/AGENTS.md). "
         f"{len(findings)} finding(s):\n" + "\n".join(f"  - {f}" for f in findings)
     )
 
@@ -225,6 +292,7 @@ def test_the_scan_can_actually_find_something() -> None:
     samples = {
         ACCOUNT_ID_PATTERN: "role/x  # arn:aws:iam::711398986525:role/x",
         r"s3://alpha-engine-": "STORE_URI: s3://alpha-engine-crucible-v2/crucible",
+        IDENTITY_NAME_PATTERN: "role-to-assume: crucible-v2-github-deploy",
         BUCKET_STEM_PATTERN: 'BUCKET = "alpha-engine-data"',
     }
     assert set(samples) == set(FORBIDDEN), (

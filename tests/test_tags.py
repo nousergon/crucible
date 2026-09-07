@@ -33,8 +33,8 @@ class _FakeIam:
 
 
 STACK = "crucible-v2"
-ROLE = "arn:aws:iam::711398986525:role/crucible-v2-runtime"
-FUNCTION = "arn:aws:lambda:us-east-1:711398986525:function:crucible-v2-dispatcher"
+ROLE = "arn:aws:iam::123456789012:role/test-runtime"
+FUNCTION = "arn:aws:lambda:us-east-1:123456789012:function:test-dispatcher"
 
 
 class _FakeCfn:
@@ -108,12 +108,12 @@ class TestTheDifference:
             stack=STACK,
             cfn=_FakeCfn(
                 [
-                    _summary("RuntimeRole", "AWS::IAM::Role", "crucible-v2-runtime"),
-                    _summary("Dispatcher", "AWS::Lambda::Function", "crucible-v2-dispatcher"),
+                    _summary("RuntimeRole", "AWS::IAM::Role", "test-runtime"),
+                    _summary("Dispatcher", "AWS::Lambda::Function", "test-dispatcher"),
                 ]
             ),
             tagging=_FakeTagging([ROLE, FUNCTION]),
-            iam=_FakeIam({"crucible-v2-runtime"}),
+            iam=_FakeIam({"test-runtime"}),
         )
         assert audit.met
         assert len(audit.resources) == 2
@@ -124,12 +124,12 @@ class TestTheDifference:
             stack=STACK,
             cfn=_FakeCfn(
                 [
-                    _summary("RuntimeRole", "AWS::IAM::Role", "crucible-v2-runtime"),
-                    _summary("Dispatcher", "AWS::Lambda::Function", "crucible-v2-dispatcher"),
+                    _summary("RuntimeRole", "AWS::IAM::Role", "test-runtime"),
+                    _summary("Dispatcher", "AWS::Lambda::Function", "test-dispatcher"),
                 ]
             ),
             tagging=_FakeTagging([ROLE]),
-            iam=_FakeIam({"crucible-v2-runtime"}),
+            iam=_FakeIam({"test-runtime"}),
         )
         assert not audit.met
         assert [lid for lid, _, _ in audit.untagged] == ["Dispatcher"]
@@ -143,13 +143,13 @@ class TestTheDifference:
             stack=STACK,
             cfn=_FakeCfn(
                 [
-                    _summary("RuntimeRole", "AWS::IAM::Role", "crucible-v2-runtime"),
-                    _summary("Dispatcher", "AWS::Lambda::Function", "crucible-v2-dispatcher"),
-                    _summary("Bucket", "AWS::S3::Bucket", "crucible-v2-releases"),
+                    _summary("RuntimeRole", "AWS::IAM::Role", "test-runtime"),
+                    _summary("Dispatcher", "AWS::Lambda::Function", "test-dispatcher"),
+                    _summary("Bucket", "AWS::S3::Bucket", "test-releases-bucket"),
                 ]
             ),
             tagging=_FakeTagging([ROLE, FUNCTION]),
-            iam=_FakeIam({"crucible-v2-runtime"}),
+            iam=_FakeIam({"test-runtime"}),
         )
         assert not audit.met
         assert [lid for lid, _, _ in audit.untagged] == ["Bucket"]
@@ -161,12 +161,12 @@ class TestTheDifference:
             stack=STACK,
             cfn=_FakeCfn(
                 [
-                    _summary("RuntimeRole", "AWS::IAM::Role", "crucible-v2-runtime"),
+                    _summary("RuntimeRole", "AWS::IAM::Role", "test-runtime"),
                     _summary("Profile", "AWS::IAM::InstanceProfile", "crucible-v2-profile"),
                 ]
             ),
             tagging=_FakeTagging([ROLE]),
-            iam=_FakeIam({"crucible-v2-runtime"}),
+            iam=_FakeIam({"test-runtime"}),
         )
         assert audit.met
         assert audit.skipped == (("Profile", UNTAGGABLE_TYPES["AWS::IAM::InstanceProfile"]),)
@@ -178,8 +178,8 @@ class TestTheDifference:
         stale the first time a resource type is added."""
         audit = audit_stack_tags(
             stack=STACK,
-            cfn=_FakeCfn([_summary("Topic", "AWS::SNS::Topic", "crucible-v2-pages")]),
-            tagging=_FakeTagging(["arn:aws:sns:us-east-1:711398986525:crucible-v2-pages"]),
+            cfn=_FakeCfn([_summary("Topic", "AWS::SNS::Topic", "test-pages-topic")]),
+            tagging=_FakeTagging(["arn:aws:sns:us-east-1:123456789012:test-pages-topic"]),
             iam=_FakeIam(set()),
         )
         assert audit.met
@@ -187,7 +187,7 @@ class TestTheDifference:
     def test_the_reading_serializes_with_what_is_missing(self) -> None:
         document = audit_stack_tags(
             stack=STACK,
-            cfn=_FakeCfn([_summary("Bucket", "AWS::S3::Bucket", "crucible-v2-releases")]),
+            cfn=_FakeCfn([_summary("Bucket", "AWS::S3::Bucket", "test-releases-bucket")]),
             tagging=_FakeTagging([]),
             iam=_FakeIam(set()),
         ).to_dict()
@@ -209,10 +209,10 @@ class TestEveryChannelIsRead:
     def test_a_role_tagged_in_iam_is_not_reported_untagged(self) -> None:
         audit = audit_stack_tags(
             stack=STACK,
-            cfn=_FakeCfn([_summary("RuntimeRole", "AWS::IAM::Role", "crucible-v2-runtime")]),
+            cfn=_FakeCfn([_summary("RuntimeRole", "AWS::IAM::Role", "test-runtime")]),
             # The tagging API returns NOTHING for IAM — exactly as it does live.
             tagging=_FakeTagging([]),
-            iam=_FakeIam({"crucible-v2-runtime"}),
+            iam=_FakeIam({"test-runtime"}),
         )
         assert audit.met, audit.detail()
 
@@ -221,7 +221,7 @@ class TestEveryChannelIsRead:
         finding nothing is a finding; reading the wrong one is not."""
         audit = audit_stack_tags(
             stack=STACK,
-            cfn=_FakeCfn([_summary("RuntimeRole", "AWS::IAM::Role", "crucible-v2-runtime")]),
+            cfn=_FakeCfn([_summary("RuntimeRole", "AWS::IAM::Role", "test-runtime")]),
             tagging=_FakeTagging([]),
             iam=_FakeIam(set()),
         )
@@ -235,7 +235,7 @@ class TestEveryChannelIsRead:
         with pytest.raises(ValueError, match="does not cover IAM"):
             audit_stack_tags(
                 stack=STACK,
-                cfn=_FakeCfn([_summary("RuntimeRole", "AWS::IAM::Role", "crucible-v2-runtime")]),
+                cfn=_FakeCfn([_summary("RuntimeRole", "AWS::IAM::Role", "test-runtime")]),
                 tagging=_FakeTagging([]),
             )
 
@@ -247,7 +247,7 @@ class TestEveryChannelIsRead:
         audit = audit_stack_tags(
             stack=STACK,
             cfn=_FakeCfn(
-                [_summary("WeeklySchedule", "AWS::Scheduler::Schedule", "crucible-v2-weekly")]
+                [_summary("WeeklySchedule", "AWS::Scheduler::Schedule", "test-weekly-schedule")]
             ),
             tagging=_FakeTagging([]),
             iam=_FakeIam(set()),
@@ -262,7 +262,7 @@ class TestEveryChannelIsRead:
         new legs (`nous-ergon-ops-PR1036`) read UNTAGGED under this audit and
         took the phase-0 clause down with them. A subscription is skipped
         with its reason; the TOPIC is still graded."""
-        topic = "arn:aws:sns:us-east-1:000000000000:crucible-v2-pages"
+        topic = "arn:aws:sns:us-east-1:000000000000:test-pages-topic"
         audit = audit_stack_tags(
             stack=STACK,
             cfn=_FakeCfn(

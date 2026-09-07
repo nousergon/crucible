@@ -95,7 +95,7 @@ __all__ = [
     "LEGACY_WEEKLY_MIN_RUNS_PER_WEEK",
     "LEGACY_WEEKLY_RERUN_NAME_PREFIX",
     "LEGACY_WEEKLY_TOPIC_FIELD",
-    "MUTED_ALERTS_TOPIC_NAME",
+    "muted_alerts_topic_name",
     "V2_STORE_VERSIONING_ENABLED",
     "V2_TAG_ACCEPTANCE_CLAUSE_ID",
     "WEEKLY_RUN_DAY_GATE_SKIP_MAX_SECONDS",
@@ -1400,13 +1400,24 @@ LEGACY_DEAD_LAMBDA_NAMES: tuple[str, ...] = (
     "alpha-engine-sf-watch-reclaim-sweep-handler",
 )
 
+
 #: The SNS topic the v1 weekly pipeline's alerts must land in for
 #: `alpha-engine-config-I9756`'s third deliverable to hold. Matched on the
 #: ARN's last segment, never on the whole ARN: the account id is an
 #: infrastructure identifier this repo forbids (`tests/test_no_infra_literals.py`),
 #: and the topic NAME is the part that carries the meaning. The same literal
 #: already lives in `crucible/alerts.py`.
-MUTED_ALERTS_TOPIC_NAME = "alpha-engine-alerts-muted"
+def muted_alerts_topic_name() -> str:
+    """The v1 muted topic's NAME, read from the environment.
+
+    Was a literal until Brian's 2026-09-07 ruling (`alpha-engine-config-I10156`);
+    delegates to `crucible.alerts` so the two cannot drift, which is what the
+    old comment here promised and a second literal could not deliver.
+    """
+    from crucible.alerts import muted_topic
+
+    return muted_topic()
+
 
 #: The per-execution field carrying the topic that execution's INPUT named.
 #: Presence of the FIELD, not the document's `schema_version`, is what
@@ -2241,7 +2252,7 @@ def _clause_old_alerts_muted(store: Store, window: list[dt.date]) -> Clause:
 
     `alpha-engine-config-I9756`'s third deliverable, and the fact Brian
     measured it on: the 2026-09-03 execution's INPUT carries
-    ``"sns_topic_arn": "...:alpha-engine-alerts-muted"``, so all 28 of the
+    ``"sns_topic_arn": "...:<the muted topic>"``, so all 28 of the
     weekly state machine's `sns:publish` states land in a topic with no
     subscribers. The deliverable's prior "not gate-readable" reason called the
     evidence "an observation about a notification channel, which leaves no
@@ -2274,7 +2285,7 @@ def _clause_old_alerts_muted(store: Store, window: list[dt.date]) -> Clause:
     """
     requirement = (
         "every execution of the v1 weekly state machine in the window declared "
-        f"`{LEGACY_WEEKLY_TOPIC_FIELD}` = `{MUTED_ALERTS_TOPIC_NAME}` in its input, so the "
+        f"`{LEGACY_WEEKLY_TOPIC_FIELD}` = `{muted_alerts_topic_name()}` in its input, so the "
         "state machine's own publish states page nobody. The pipeline's native "
         "CloudWatch alarm is a separate path and is not read here"
     )
@@ -2353,7 +2364,7 @@ def _clause_old_alerts_muted(store: Store, window: list[dt.date]) -> Clause:
                 )
                 malformed = True
                 break
-            if arn.rsplit(":", 1)[-1] != MUTED_ALERTS_TOPIC_NAME:
+            if arn.rsplit(":", 1)[-1] != muted_alerts_topic_name():
                 unrouted.append(f"{name}: {arn.rsplit(':', 1)[-1]}")
         if malformed:
             continue
@@ -2365,7 +2376,7 @@ def _clause_old_alerts_muted(store: Store, window: list[dt.date]) -> Clause:
         if unrouted:
             paging.append(
                 f"{key}: {len(unrouted)} execution(s) not routed to "
-                f"`{MUTED_ALERTS_TOPIC_NAME}`: {'; '.join(unrouted)}"
+                f"`{muted_alerts_topic_name()}`: {'; '.join(unrouted)}"
             )
             continue
         if foreign == len(entries):
@@ -2400,7 +2411,7 @@ def _clause_old_alerts_muted(store: Store, window: list[dt.date]) -> Clause:
         requirement,
         True,
         f"{routed_total} execution(s) across {len(evidence)} week(s), every input naming "
-        f"`{MUTED_ALERTS_TOPIC_NAME}`" + ("; " + "; ".join(elsewhere) if elsewhere else ""),
+        f"`{muted_alerts_topic_name()}`" + ("; " + "; ".join(elsewhere) if elsewhere else ""),
         tuple(evidence),
     )
 
@@ -2413,7 +2424,7 @@ def _clause_v2_resources_tagged_and_versioned(
     `alpha-engine-config-I9756`'s fourth deliverable, and the one whose prior
     "not gate-readable" reason already named the condition that would close
     it: *"it becomes a gate clause the day that audit files its result to the
-    store."* That day is now — `crucible-v2-github-acceptance` runs the §2
+    store."* That day is now — the acceptance identity runs the §2
     suite on every push to `main` and files
     :func:`crucible.keys.acceptance_reading_key`. What the filed document
     lacked was per-clause detail: `{"met": 22, "unmet": 2}` cannot say whether

@@ -3,7 +3,7 @@
 Normative source: `alpha-engine-config-I10095`. `crucible-PR121` made a phase's
 exit a durable record and nothing ran `crucible gate` on a schedule, so the
 record existed only when somebody happened to take a reading. The board
-DETECTS that gap and deliberately cannot close it — `crucible-v2-github-board`
+DETECTS that gap and deliberately cannot close it — the board's identity
 is read-only over everything it grades — so the filing is its own daily job
 under its own writer identity.
 
@@ -43,8 +43,12 @@ from crucible.track_f import CLOSE_OUTCOMES, GATE_CLOSE_JOB, gate_close_handler
 
 DAY = dt.date(2026, 8, 28)
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
-BOARD_ROLE = "crucible-v2-github-board"
-GATE_CLOSE_ROLE = "crucible-v2-github-gate-close"
+#: The real role names live only in the `vars.CRUCIBLE_ROLE_PREFIX` repository
+#: variable the workflow reads (`alpha-engine-config-I10156`) — these are
+#: synthetic stand-ins the identity-guard tests below inject as env, not the
+#: values the live workflow uses.
+BOARD_ROLE = "test-board"
+GATE_CLOSE_ROLE = "test-gate-close"
 
 WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / ".github" / "workflows" / "gate-close.yml"
 
@@ -429,11 +433,17 @@ class TestTheWorkflowRunsAsAWriterThatIsNotTheBoard:
     def test_the_declared_role_is_not_the_boards(self) -> None:
         """The board renders the grading surface and is read-only over
         everything it grades. `alpha-engine-config-I10095`'s closes-when says
-        it in as many words: the identity that files the record is not
-        `crucible-v2-github-board`."""
-        arn = _workflow()["env"]["GATE_CLOSE_ROLE_ARN"]
-        assert arn.endswith(f"role/{GATE_CLOSE_ROLE}")
-        assert BOARD_ROLE not in arn
+        it in as many words: the identity that files the record is not the
+        board's. Both names are now built from the same
+        `vars.CRUCIBLE_ROLE_PREFIX` repository variable
+        (`alpha-engine-config-I10156`), so the assertion is on the two
+        declared SUFFIXES rather than a literal role name."""
+        env = _workflow()["env"]
+        gate_close_arn = env["GATE_CLOSE_ROLE_ARN"]
+        board_role_name = env["BOARD_ROLE_NAME"]
+        assert gate_close_arn.endswith("-gate-close")
+        assert board_role_name.endswith("-board")
+        assert board_role_name not in gate_close_arn
         steps = _workflow()["jobs"]["gate-close"]["steps"]
         credentials = [s for s in steps if "configure-aws-credentials" in s.get("uses", "")]
         assert len(credentials) == 1
@@ -472,6 +482,7 @@ def _identity_result(tmp_path: pathlib.Path, assumed: str) -> subprocess.Complet
         env={
             "PATH": f"{bin_dir}{os.pathsep}/usr/bin:/bin",
             "GATE_CLOSE_ROLE_ARN": f"arn:aws:iam::111111111111:role/{GATE_CLOSE_ROLE}",
+            "BOARD_ROLE_NAME": BOARD_ROLE,
         },
     )
 
@@ -486,11 +497,11 @@ class TestTheIdentityGuardActuallyFires:
             tmp_path, f"arn:aws:sts::111111111111:assumed-role/{BOARD_ROLE}/session"
         )
         assert result.returncode != 0, result.stdout
-        assert "BOARD role" in result.stdout
+        assert "board identity" in result.stdout
 
     def test_it_refuses_any_other_identity(self, tmp_path: pathlib.Path) -> None:
         result = _identity_result(
-            tmp_path, "arn:aws:sts::111111111111:assumed-role/crucible-v2-github-deploy/session"
+            tmp_path, "arn:aws:sts::111111111111:assumed-role/test-deploy/session"
         )
         assert result.returncode != 0, result.stdout
         assert "cloudformation deploy" in result.stdout

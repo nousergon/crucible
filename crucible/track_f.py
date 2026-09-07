@@ -19,10 +19,10 @@ reading to the phase's tracker issue and files `gates/{phase}/closing.json`,
 once, by compare-and-swap — but nothing ran `crucible gate` on a schedule, so
 the record was written only when a human or an agent happened to run it. The
 daily board DETECTS the gap (a phase issue closed with no record renders red)
-and deliberately cannot close it: `crucible-v2-github-board` is read-only over
+and deliberately cannot close it: the board identity is read-only over
 everything it grades, because a grading surface that could satisfy the clauses
 it grades is not a measurement. So the filing runs as its own daily job under
-its own writer identity, `crucible-v2-github-gate-close`, which may write
+its own writer identity, the gate-close role, which may write
 exactly the closing records and its own manifest and may write no gate reading
 at all.
 """
@@ -581,7 +581,7 @@ def gate_close_handler(args: argparse.Namespace) -> int:
 
     **It writes closing records and nothing else.** It does not write the dated
     gate readings `crucible gate` writes, it does not render the ladder, and
-    its identity cannot: `crucible-v2-github-gate-close` grants
+    its identity cannot: the gate-close role grants
     `crucible/gates/*/closing.json` and its own manifest prefix, so a bug that
     tried to publish a gate reading from this job is an AccessDenied rather
     than a grading surface quietly authoring what it grades.

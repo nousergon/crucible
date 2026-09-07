@@ -225,6 +225,68 @@ def _excluded(job: Job, pr_events: frozenset[str]) -> bool:
     return job.condition.strip() in _exclusions_for(pr_events)
 
 
+def test_no_pull_request_target_job_checks_out_pr_authored_code() -> None:
+    """`pull_request_target` is safe here ONLY because nothing fetches PR code.
+
+    The footgun is not the trigger, it is the trigger COMBINED with a checkout
+    of the PR HEAD: `pull_request_target` runs the workflow definition with
+    base-repo permissions and secrets in scope, so an `actions/checkout` with
+    `ref: github.event.pull_request.head.sha` executes fork-authored code with
+    those secrets in reach. `dispatch-lockstep.yml`'s PR job deliberately
+    overrides neither `ref` nor `repository` for its own checkout, and reads
+    the one piece of PR-supplied content it needs as DATA over the read-only
+    Contents API.
+
+    **What this does NOT forbid:** checking out a DIFFERENT, TRUSTED repo. The
+    push-path job clones `nousergon/nous-ergon-ops` with a minted token, which
+    is not PR-authored content and is not the risk. An earlier draft of this
+    test asserted on `repository`/`ref` being present at all and failed on
+    exactly that job — and it reached it only because the job's `if:` NAMES
+    `pull_request_target` in order to EXCLUDE it. A guard that cannot tell an
+    include from an exclusion grades the wrong jobs.
+
+    The argument lived only in a comment until 2026-09-07
+    (`alpha-engine-config-I10156`), when the trigger was deleted outright on
+    the reasoning that a comment plus an `if:` is not a control — right about
+    the comment, wrong about the fix: deleting it made the PR job's `if:`
+    unsatisfiable, so a required check silently stopped running while still
+    appearing in the file. This test is the control that comment stood in for.
+    """
+    checked = 0
+    for path in WORKFLOWS:
+        document = yaml.safe_load(path.read_text())
+        triggers = document.get(True) or document.get("on") or {}
+        if "pull_request_target" not in triggers:
+            continue
+        for name, job in (document.get("jobs") or {}).items():
+            condition = str(job.get("if", ""))
+            # A job that names the event only to exclude itself from it does
+            # not run on it. `!contains(...)` and `!=` are the two exclusion
+            # shapes this repo uses.
+            excluded = "!contains" in condition or "!=" in condition
+            affirmative = "pull_request_target" in condition and not excluded
+            if condition and not affirmative:
+                continue
+            checked += 1
+            for step in job.get("steps") or []:
+                if "actions/checkout" not in str(step.get("uses", "")):
+                    continue
+                with_block = step.get("with") or {}
+                supplied = " ".join(str(v) for v in with_block.values())
+                assert "pull_request.head" not in supplied, (
+                    f"{path.name}:{name} runs on pull_request_target AND checks out "
+                    f"the PR head ({with_block}). That combination executes "
+                    "fork-authored code with base-repo permissions and secrets in "
+                    "scope. Read PR content as data over the Contents API instead, "
+                    "as this job already does for components.yaml."
+                )
+    assert checked, (
+        "no pull_request_target job was graded — the guard walked nothing, so its "
+        "clean result means nothing. If the trigger was removed, remove this test "
+        "deliberately rather than letting it pass vacuously."
+    )
+
+
 def test_at_least_one_workflow_is_scanned() -> None:
     # A guard that scanned nothing is dark, not green (principle 7).
     assert WORKFLOWS, "no workflows found — this guard is not measuring anything"

@@ -57,7 +57,7 @@ name: Dispatch Lockstep
 #
 # ── the credential ────────────────────────────────────────────────────────
 #
-# Both jobs assume `crucible-v2-github-lockstep` (nous-ergon-ops/
+# Both jobs assume the lockstep identity (nous-ergon-ops/
 # infrastructure/cloudformation/crucible-v2.yaml, sibling PR). Its trust now
 # carries exactly two subjects: the immutable-id `ref:refs/heads/main` subject
 # (unchanged — what crucible's push events actually present, measured
@@ -94,12 +94,35 @@ name: Dispatch Lockstep
 on:
   push:
     branches: [main]
+  # `pull_request_target:` STAYS, and the reasoning is worth stating because
+  # the instinct on a public repo is to delete it (this trigger was deleted
+  # on 2026-09-07 and reinstated the same hour, alpha-engine-config-I10156).
+  #
+  # The footgun is not the trigger. It is `pull_request_target` COMBINED with
+  # a checkout of the PR head — `with: ref: github.event.pull_request.head.sha`
+  # — which runs fork-authored code with base-repo permissions and secrets in
+  # scope. `crucible-dispatch-lockstep-pr` below does the opposite and says so
+  # at its checkout step: no `with.repository`, no `with.ref`, so it checks out
+  # this repo's own base ref, and the one piece of PR-supplied content it
+  # reads is fetched as DATA over the read-only Contents API and decoded to a
+  # file that nothing executes. That is the documented-safe shape.
+  #
+  # Deleting the trigger does NOT leave that job harmlessly guarded: its
+  # `if: github.event_name == 'pull_request_target'` can then never be true,
+  # so the job silently never runs and the PR-path half of the lockstep drift
+  # guard — the half that catches contract drift BEFORE merge — is gone while
+  # still appearing in the file. A required check that cannot fire is worse
+  # than the risk it was deleted to avoid.
+  #
+  # The safety argument is ENFORCED, not just written down:
+  # `tests/test_workflow_triggers.py::test_the_pull_request_target_job_never_checks_out_pr_code`
+  # fails if this job's checkout ever gains a `ref:` or `repository:` override.
   pull_request_target:
   workflow_dispatch:
 
 env:
   AWS_REGION: us-east-1
-  LOCKSTEP_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/crucible-v2-github-lockstep
+  LOCKSTEP_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.CRUCIBLE_ROLE_PREFIX }}-lockstep
 
 jobs:
   crucible-dispatch-lockstep:
@@ -131,6 +154,16 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
+      # This repo is public and its run logs are public; GitHub masks
+      # SECRETS, not repository VARIABLES. The identity assertion below
+      # prints an assumed-role ARN that embeds the account id — mask it
+      # before the credential step runs so nothing downstream can leak it.
+      # The assertion still works with masking on: it compares only the
+      # role-name segment (`*":assumed-role/${expected}/"*`), which the mask
+      # does not touch.
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
         with:
@@ -149,7 +182,7 @@ jobs:
           case "${assumed}" in
             *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;;
             *)
-              echo "::error::this job assumed ${assumed}, not ${expected}. If the role does not exist yet, the crucible-v2 stack has not been applied since the sibling nous-ergon-ops PR (crucible-v2-github-lockstep) merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow."
+              echo "::error::this job assumed ${assumed}, not ${expected}. If the role does not exist yet, the crucible-v2 stack has not been applied since the sibling nous-ergon-ops PR (the lockstep identity) merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow."
               exit 1
               ;;
           esac
@@ -224,6 +257,16 @@ jobs:
           set -euo pipefail
           gh api "repos/nousergon/crucible/contents/crucible/components.yaml?ref=${HEAD_SHA}" --jq '.content' | base64 -d > crucible/components.yaml
 
+      # This repo is public and its run logs are public; GitHub masks
+      # SECRETS, not repository VARIABLES. The identity assertion below
+      # prints an assumed-role ARN that embeds the account id — mask it
+      # before the credential step runs so nothing downstream can leak it.
+      # The assertion still works with masking on: it compares only the
+      # role-name segment (`*":assumed-role/${expected}/"*`), which the mask
+      # does not touch.
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
         with:
@@ -237,7 +280,7 @@ jobs:
           case "${assumed}" in
             *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;;
             *)
-              echo "::error::this job assumed ${assumed}, not ${expected}. If the role does not exist yet, the crucible-v2 stack has not been applied since the sibling nous-ergon-ops PR (crucible-v2-github-lockstep, PR-path trust) merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow."
+              echo "::error::this job assumed ${assumed}, not ${expected}. If the role does not exist yet, the crucible-v2 stack has not been applied since the sibling nous-ergon-ops PR (the lockstep identity, PR-path trust) merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow."
               exit 1
               ;;
           esac

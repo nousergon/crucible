@@ -28,10 +28,10 @@ def _record(**overrides: object) -> dict[str, object]:
         "eventSource": "lambda.amazonaws.com",
         "readOnly": False,
         "requestID": "req-1",
-        "requestParameters": {"functionName": "crucible-v2-dispatcher"},
+        "requestParameters": {"functionName": "test-dispatcher"},
         "userIdentity": {
             "type": "AssumedRole",
-            "arn": "arn:aws:sts::711398986525:assumed-role/AWSReservedSSO_admin/brian",
+            "arn": "arn:aws:sts::123456789012:assumed-role/AWSReservedSSO_admin/a-human",
             "sessionContext": {"sessionIssuer": {"userName": "AWSReservedSSO_admin"}},
         },
     }
@@ -57,13 +57,13 @@ class TestCloudTrailRecordTypesTheRealShape:
             _record(
                 userIdentity={
                     "type": "IAMUser",
-                    "userName": "brian",
-                    "arn": "arn:aws:iam::711398986525:user/brian",
+                    "userName": "a-human",
+                    "arn": "arn:aws:iam::123456789012:user/a-human",
                 }
             )
         )
         name, kind = _principal(record)
-        assert name == "brian"
+        assert name == "a-human"
         assert kind == "IAMUser"
 
     def test_no_identity_at_all_falls_back_to_unknown(self) -> None:
@@ -86,7 +86,7 @@ class TestASilentThreeLevelTypoIsNowVisible:
             _record(
                 userIdentity={
                     "type": "AssumedRole",
-                    "arn": "arn:aws:sts::711398986525:assumed-role/some-role/brian",
+                    "arn": "arn:aws:sts::123456789012:assumed-role/some-role/a-human",
                     "sessionContext": {"sessionIsser": {"userName": "some-role"}},
                 }
             )

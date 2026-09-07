@@ -47,7 +47,7 @@ def test_the_acceptance_job_holds_id_token_write() -> None:
     (alpha-engine-config-I9895)."""
     job = _acceptance_job()
     assert job["permissions"].get("id-token") == "write", (
-        "ci.yml's acceptance job must hold id-token: write to assume crucible-v2-github-acceptance"
+        "ci.yml's acceptance job must hold id-token: write to assume its OIDC role"
     )
     assert job["permissions"].get("contents") == "read"
 

@@ -62,10 +62,12 @@ __all__ = [
     "CAUSE_MATCHERS",
     "CEILING_WINDOW_TRADING_DAYS",
     "DISPATCH_ABSENCE_HORIZON",
-    "MUTED_TOPIC",
+    "MUTED_TOPIC_VAR",
+    "muted_topic",
     "MUTED_TOPIC_ARN_VAR",
     "PAGES_PER_MONTH_CEILING",
-    "PAGES_TOPIC",
+    "PAGES_TOPIC_VAR",
+    "pages_topic",
     "PAGES_TOPIC_ARN_VAR",
     "PAGE_CONDITIONS",
     "PENDING_CONFIRMATION",
@@ -647,7 +649,7 @@ def evaluate_dispatch_absence(
     grade at all, because an on-demand job (`data.heal`: `deadline: null`)
     carries no schedule and no deadline for that function to read.
 
-    Every dispatch made by `crucible-v2-dispatcher` writes a record at
+    Every dispatch made by the v2 dispatcher writes a record at
     `runs/_dispatch/{job}/{dispatch_id}.json` before `RunInstances` returns
     (`crucible.keys.dispatch_key`) — job, args, instance id, requester,
     dispatch time. This function lists every one of them, resolves the
@@ -982,12 +984,44 @@ CEILING_WINDOW_TRADING_DAYS = 20
 #: explicit value VERBATIM — so the legacy path would have handed SNS a bare
 #: name where an ARN is required and taken an `InvalidParameter`. Resolved
 #: through :func:`topic_arn` now, like every other topic.
-MUTED_TOPIC = "alpha-engine-alerts-muted"
+#: The environment variables carrying the two topic NAMES. Distinct from the
+#: `*_ARN_VAR` pair below, which carry the full ARNs the stack exports: the
+#: name is what a grading assertion matches on, the ARN is what SNS is handed.
+MUTED_TOPIC_VAR = "CRUCIBLE_MUTED_TOPIC"
+PAGES_TOPIC_VAR = "CRUCIBLE_PAGES_TOPIC"
+
+
+def _required_name(variable: str) -> str:
+    value = os.environ.get(variable, "")
+    if not value:
+        raise RuntimeError(
+            f"{variable} is unset. This repository is public and carries no topic "
+            "name as a literal; refusing to guess one "
+            "rather than publishing a page to a topic nobody is watching."
+        )
+    return value
+
+
+def muted_topic() -> str:
+    """The muted topic's NAME, read from the environment.
+
+    Was a literal until Brian's 2026-09-07 ruling made the account and every
+    role and topic name it reaches unpublishable in this now-public tree
+    (`alpha-engine-config-I10156`). RAISES on an empty value rather than
+    falling back: a page sent nowhere and a page sent to the wrong topic are
+    both silent, so neither may be what an unset variable produces.
+    """
+    return _required_name(MUTED_TOPIC_VAR)
+
 
 #: The topic v2 pages go to. Created, tagged and exported by the `crucible-v2`
-#: CloudFormation stack, and the ONLY topic besides :data:`MUTED_TOPIC` the
+#: CloudFormation stack, and the ONLY topic besides :func:`muted_topic` the
 #: v2 RuntimeRole is granted `sns:Publish` on.
-PAGES_TOPIC = "crucible-v2-pages"
+def pages_topic() -> str:
+    """The v2 pages topic's NAME, read from the environment. See
+    :func:`muted_topic` for why it is not a literal and why it raises."""
+    return _required_name(PAGES_TOPIC_VAR)
+
 
 #: The declared adapter's inputs (principle 8): the topic ARN is read from
 #: the environment, never composed from a literal here and never left to a
@@ -1002,7 +1036,7 @@ class TopicUnresolvedError(RuntimeError):
     """The SNS half of a page has no topic it is allowed to publish to.
 
     Raised rather than falling through to `krepis.alerts`' own default. That
-    default is `alpha-engine-alerts`, which the v2 RuntimeRole is NOT granted
+    default is the v1 fleet topic, which the v2 RuntimeRole is NOT granted
     — so every page's SNS half would have been `AccessDenied` on the day the
     stack was applied, while Telegram succeeded, `any_ok` stayed True and
     nothing failed loudly. A page delivered on one of its two channels, with
@@ -1031,7 +1065,7 @@ def topic_arn(*, legacy: bool = False) -> str | None:
     everywhere, not only on the send path.
     """
     variable = MUTED_TOPIC_ARN_VAR if legacy else PAGES_TOPIC_ARN_VAR
-    expected_name = MUTED_TOPIC if legacy else PAGES_TOPIC
+    expected_name = muted_topic() if legacy else pages_topic()
     raw = os.environ.get(variable, "").strip()
     if not raw:
         return None
@@ -1045,7 +1079,7 @@ def topic_arn(*, legacy: bool = False) -> str | None:
         raise TopicUnresolvedError(
             f"{variable}={raw!r} names topic {raw.rsplit(':', 1)[-1]!r}, not "
             f"{expected_name!r}. The v2 RuntimeRole is granted sns:Publish on "
-            f"{PAGES_TOPIC} and {MUTED_TOPIC} only; publishing anywhere else is an "
+            f"{pages_topic()} and {muted_topic()} only; publishing anywhere else is an "
             "AccessDenied that Telegram's success would hide."
         )
     return raw
@@ -1151,7 +1185,7 @@ def _krepis_publish(*args: Any, **kwargs: Any) -> Any:
     path.
 
     Refuses a publish with no topic. `krepis.alerts._resolve_sns_topic_arn`
-    composes `alpha-engine-alerts` when it is handed None, and the v2
+    composes the v1 fleet topic when it is handed None, and the v2
     RuntimeRole holds no grant on that topic — the publish would be
     AccessDenied, Telegram would succeed, `any_ok` would be True, and the
     only symptom would be an SNS subscriber that never heard from v2.
@@ -1161,7 +1195,7 @@ def _krepis_publish(*args: Any, **kwargs: Any) -> Any:
             f"{PAGES_TOPIC_ARN_VAR} (or {MUTED_TOPIC_ARN_VAR} for the legacy path) is "
             f"unset, so this page has no topic. Set it to the `crucible-v2` stack's "
             f"PagesTopicArn output. Falling through would publish to "
-            f"alpha-engine-alerts, where this role has no grant."
+            f"the v1 fleet topic, where this role has no grant."
         )
     from krepis.alerts import publish  # noqa: PLC0415
 
@@ -1413,7 +1447,7 @@ class SubscriberReading:
             reason = (
                 f"{len(self.confirmed_human_legs)} confirmed human leg(s) "
                 f"({', '.join(self.confirmed_human_legs)}) and {self.lambda_legs} lambda "
-                f"leg(s) on {PAGES_TOPIC}."
+                f"leg(s) on {pages_topic()}."
             )
         else:
             missing = []
@@ -1429,7 +1463,7 @@ class SubscriberReading:
             if self.lambda_legs < 1:
                 missing.append("no lambda leg (the Telegram backstop forwarder is not subscribed)")
             reason = (
-                f"{PAGES_TOPIC}: " + "; ".join(missing) + ". A page published here reaches "
+                f"{pages_topic()}: " + "; ".join(missing) + ". A page published here reaches "
                 "nobody who can act on it. Subscribe and confirm the leg; never soften this row."
             )
         return _subscribers_metric(
