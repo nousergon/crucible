@@ -571,12 +571,71 @@ def evaluate_absence(
 DISPATCH_ABSENCE_HORIZON = dt.timedelta(hours=3)
 
 
+def _default_describe_instance_state_reason(instance_id: str) -> str | None:
+    """`ec2:DescribeInstances`'s `StateReason.Message` for ``instance_id``, or
+    ``None`` if the instance describes with no reason (still running, or
+    terminated with nothing recorded). Constructed lazily — same reason as
+    `_default_sns` — and this is the ONLY place in this module that touches
+    EC2."""
+    import boto3  # noqa: PLC0415 - lazy on purpose
+
+    ec2 = boto3.client("ec2")
+    response = ec2.describe_instances(InstanceIds=[instance_id])
+    for reservation in response.get("Reservations", ()):
+        for instance in reservation.get("Instances", ()):
+            message = instance.get("StateReason", {}).get("Message")
+            if message:
+                return message
+    return None
+
+
+#: `ec2:DescribeInstances`' own `StateReason.Message` for a spot-reclaimed
+#: box (measured 2026-09-07 on five of eleven backfill boxes, e.g.
+#: `i-096d52ca7a0c2ff21` and `i-09e13a7f2cb51dd36` at 14:35:41Z, 17 minutes
+#: into a ~2-hour job). A reclaimed box ships no log stream — it never
+#: reaches its EXIT trap — and writes no manifest, so before this it read as
+#: an unclassified absence identical to a box that never started or one that
+#: died mid-run, though the remediation differs (re-dispatch vs. investigate).
+_SPOT_RECLAMATION_MARKER = "Server.SpotInstanceTermination"
+
+
+def _classify_dispatch_absence(
+    instance_id: str, describe_instance_state_reason: Callable[[str], str | None]
+) -> str:
+    """The text folded into an absence page's ``reason`` naming WHICH kind of
+    gone the dispatched instance is.
+
+    Deliberately a **string**, not a new field or a third page condition:
+    §4.6's two conditions stand, and this only adds words to the existing
+    ABSENCE page. Never raises — `ec2:DescribeInstances` denied, throttled,
+    or the instance already gone from the API entirely all fold into the
+    "could not classify" branch, because a classifier that can also silence
+    the page it enriches is worse than no classifier at all (`crucible/AGENTS.md`
+    rule 5: this is a deliberate swallow, and it is recorded here — the
+    failure mode swallowed is "the describe-instances call itself failed",
+    and the page still fires, with this exact text as its recording surface).
+    """
+    try:
+        reason = describe_instance_state_reason(instance_id)
+    except Exception as exc:  # noqa: BLE001 - see docstring: enrichment, not detection
+        return (
+            f"termination cause unknown ({instance_id}): ec2:DescribeInstances failed "
+            f"({exc!r}); classify by hand"
+        )
+    if reason and _SPOT_RECLAMATION_MARKER in reason:
+        return f"reclaimed by AWS ({reason}) — re-dispatch is the fix, not investigation"
+    if reason:
+        return f"instance state reason: {reason} — investigate the box directly"
+    return f"no termination reason available for {instance_id} — investigate the box directly"
+
+
 def evaluate_dispatch_absence(
     store: Store,
     *,
     now: dt.datetime | None = None,
     horizon: dt.timedelta = DISPATCH_ABSENCE_HORIZON,
     access_faults: list[str] | None = None,
+    describe_instance_state_reason: Callable[[str], str | None] | None = None,
 ) -> list[Page]:
     """Page for every ON-DEMAND dispatch whose manifest never appeared.
 
@@ -610,6 +669,19 @@ def evaluate_dispatch_absence(
     ``access_faults``: the same split :func:`evaluate_absence` uses — pass a
     list to keep evaluating past an unreadable prefix and let the caller
     raise after paging what it found; leave it ``None`` for the loud default.
+
+    `alpha-engine-config-I10149` part B: the page's ``reason`` also says
+    WHICH kind of gone the instance is — a spot reclamation
+    (`ec2:DescribeInstances`' `StateReason.Message` naming
+    `Server.SpotInstanceTermination`, measured on five of eleven backfill
+    boxes on 2026-09-07) calls for a re-dispatch, where a box that died
+    mid-run or never started calls for investigation. This is text added to
+    the existing ABSENCE condition, never a third condition (§4.6's two
+    stand), and it never suppresses the page: a `describe_instance_state_reason`
+    failure folds into an "unclassified, investigate by hand" reason rather
+    than swallowing the page itself (see :func:`_classify_dispatch_absence`).
+    ``describe_instance_state_reason`` is the injection point for tests —
+    leave it ``None`` for the real `ec2:DescribeInstances` call.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     pages: list[Page] = []
@@ -663,6 +735,13 @@ def evaluate_dispatch_absence(
             continue
         args = document.get("args", "")
         instance_id = document.get("instance_id", "unknown")
+        if instance_id == "unknown":
+            classification = "no instance_id recorded — investigate the box directly"
+        else:
+            classification = _classify_dispatch_absence(
+                instance_id,
+                describe_instance_state_reason or _default_describe_instance_state_reason,
+            )
         pages.append(
             Page(
                 condition="absence",
@@ -673,7 +752,7 @@ def evaluate_dispatch_absence(
                     f"(instance {instance_id}, args {args!r}, dispatch record {key}); "
                     f"no manifest under {prefix} after "
                     f"{horizon.total_seconds() / 3600:.0f}h, now "
-                    f"{moment.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+                    f"{moment.strftime('%Y-%m-%dT%H:%M:%SZ')}; {classification}"
                 ),
             )
         )
@@ -1738,6 +1817,7 @@ def sweep(
     transport: Callable[..., Any] | None = None,
     sweep_run_id: str,
     dry_run: bool = False,
+    describe_instance_state_reason: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:
     """Evaluate both conditions, group by cause, page once per group.
 
@@ -1756,7 +1836,12 @@ def sweep(
     access_faults: list[str] = []
     pages = (
         evaluate_absence(store, now=moment, registry=registry, access_faults=access_faults)
-        + evaluate_dispatch_absence(store, now=moment, access_faults=access_faults)
+        + evaluate_dispatch_absence(
+            store,
+            now=moment,
+            access_faults=access_faults,
+            describe_instance_state_reason=describe_instance_state_reason,
+        )
         + evaluate_failure(store, now=moment, registry=registry, access_faults=access_faults)
     )
     groups = group_pages(pages)

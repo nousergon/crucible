@@ -35,6 +35,13 @@ PAST_HORIZON = DISPATCHED_AT + dt.timedelta(hours=10)
 WITHIN_HORIZON = DISPATCHED_AT + dt.timedelta(hours=1)
 
 
+def _no_reason(instance_id: str) -> None:
+    """A fake `describe_instance_state_reason` that finds nothing — the
+    default for every test that is not exercising classification itself, so
+    a unit test never makes a real `ec2:DescribeInstances` call."""
+    return None
+
+
 def _write_dispatch(
     store: LocalStore,
     *,
@@ -63,7 +70,9 @@ class TestDispatchAbsence:
     def test_a_dispatch_past_horizon_with_no_manifest_pages_absence(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
         _write_dispatch(store)
-        pages = evaluate_dispatch_absence(store, now=PAST_HORIZON)
+        pages = evaluate_dispatch_absence(
+            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+        )
         assert pages == [
             Page(
                 condition="absence",
@@ -81,7 +90,12 @@ class TestDispatchAbsence:
         page for being slow."""
         store = LocalStore(tmp_path)
         _write_dispatch(store)
-        assert evaluate_dispatch_absence(store, now=WITHIN_HORIZON) == []
+        assert (
+            evaluate_dispatch_absence(
+                store, now=WITHIN_HORIZON, describe_instance_state_reason=_no_reason
+            )
+            == []
+        )
 
     def test_a_manifest_at_the_expected_key_clears_the_dispatch(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
@@ -90,7 +104,12 @@ class TestDispatchAbsence:
             manifest_key("data.heal", DISPATCH_TRADING_DAY.isoformat()),
             json.dumps({"status": "ok"}).encode(),
         )
-        assert evaluate_dispatch_absence(store, now=PAST_HORIZON) == []
+        assert (
+            evaluate_dispatch_absence(
+                store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+            )
+            == []
+        )
 
     def test_a_discriminated_manifest_also_clears_the_dispatch(self, tmp_path) -> None:
         """Same rule `evaluate_absence` follows: a discriminated manifest
@@ -101,7 +120,12 @@ class TestDispatchAbsence:
             manifest_key("data.heal", DISPATCH_TRADING_DAY.isoformat(), discriminator="r1of4"),
             json.dumps({"status": "ok"}).encode(),
         )
-        assert evaluate_dispatch_absence(store, now=PAST_HORIZON) == []
+        assert (
+            evaluate_dispatch_absence(
+                store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+            )
+            == []
+        )
 
     def test_a_dispatch_record_with_an_unparseable_time_pages_rather_than_vanishing(
         self, tmp_path
@@ -118,7 +142,9 @@ class TestDispatchAbsence:
                 }
             ).encode(),
         )
-        pages = evaluate_dispatch_absence(store, now=PAST_HORIZON)
+        pages = evaluate_dispatch_absence(
+            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+        )
         assert len(pages) == 1
         assert "cannot be graded against the absence horizon" in pages[0].reason
 
@@ -130,7 +156,9 @@ class TestDispatchAbsence:
 
         store = LocalStore(tmp_path)
         _write_dispatch(store)
-        [dispatch_page] = evaluate_dispatch_absence(store, now=PAST_HORIZON)
+        [dispatch_page] = evaluate_dispatch_absence(
+            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+        )
         scheduled_page = Page(
             condition="absence",
             job="data.daily",
@@ -144,7 +172,13 @@ class TestDispatchAbsence:
         already gives scheduled absences: reading, never emitting."""
         store = LocalStore(tmp_path)
         _write_dispatch(store)
-        summary = sweep(store, now=PAST_HORIZON, sweep_run_id="run1", dry_run=True)
+        summary = sweep(
+            store,
+            now=PAST_HORIZON,
+            sweep_run_id="run1",
+            dry_run=True,
+            describe_instance_state_reason=_no_reason,
+        )
         assert summary["pages_emitted"] == 0
         assert summary["incidents_open"] == 1
         assert list(store.list_keys("alerts/")) == []
@@ -153,3 +187,126 @@ class TestDispatchAbsence:
 def test_the_horizon_is_stated_and_bounded() -> None:
     """Deliverable 2: 'a horizon that is stated, not implied.'"""
     assert DISPATCH_ABSENCE_HORIZON == dt.timedelta(hours=3)
+
+
+class TestDispatchAbsenceClassification:
+    """alpha-engine-config-I10149 part B. `evaluate_dispatch_absence` must
+    say WHICH kind of gone the dispatched instance is — a spot reclamation
+    calls for a re-dispatch, a box that died mid-run or never started calls
+    for investigation — rather than reporting a bare, unclassified absence
+    identically for both.
+    """
+
+    def test_a_spot_reclaimed_instance_is_named_as_such(self, tmp_path) -> None:
+        """Measured 2026-09-07: `StateReason.Message` on a spot-reclaimed
+        box names `Server.SpotInstanceTermination`."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(store, instance_id="i-096d52ca7a0c2ff21")
+
+        def reclaimed(instance_id: str) -> str:
+            assert instance_id == "i-096d52ca7a0c2ff21"
+            return "Server.SpotInstanceTermination: Spot instance termination"
+
+        [page] = evaluate_dispatch_absence(
+            store, now=PAST_HORIZON, describe_instance_state_reason=reclaimed
+        )
+        assert "reclaimed by AWS" in page.reason
+        assert "Server.SpotInstanceTermination" in page.reason
+        assert "re-dispatch" in page.reason
+
+    def test_a_box_that_died_mid_run_is_named_as_unreclaimed(self, tmp_path) -> None:
+        """A `StateReason.Message` that is present and NOT the spot marker —
+        e.g. a manual terminate, or a normal shutdown the box never reached
+        its EXIT trap to log — reads as "investigate", not "reclaimed"."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(store, instance_id="i-0deadbox00000000")
+
+        def user_terminated(instance_id: str) -> str:
+            return "Client.UserInitiatedShutdown: User initiated shutdown"
+
+        [page] = evaluate_dispatch_absence(
+            store, now=PAST_HORIZON, describe_instance_state_reason=user_terminated
+        )
+        assert "reclaimed" not in page.reason
+        assert "Client.UserInitiatedShutdown" in page.reason
+        assert "investigate" in page.reason
+
+    def test_a_describe_instances_failure_still_pages_unclassified(self, tmp_path) -> None:
+        """The load-bearing case: a classifier that CANNOT determine the
+        cause must never silence the page it enriches — the page fires with
+        an unclassified reason naming the lookup failure, not a swallowed
+        absence."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(store, instance_id="i-0accessdenied0000")
+
+        def denied(instance_id: str) -> str:
+            raise Exception("AccessDenied: not authorized to perform ec2:DescribeInstances")
+
+        pages = evaluate_dispatch_absence(
+            store, now=PAST_HORIZON, describe_instance_state_reason=denied
+        )
+        assert len(pages) == 1
+        assert pages[0].condition == "absence"
+        assert "termination cause unknown" in pages[0].reason
+        assert "AccessDenied" in pages[0].reason
+        assert "classify by hand" in pages[0].reason
+
+    def test_no_recorded_instance_id_is_named_rather_than_looked_up(self, tmp_path) -> None:
+        """A record with no `instance_id` at all (an even older/malformed
+        record) must not be handed to `ec2:DescribeInstances` as the literal
+        string `"unknown"` — it is named as unrecorded instead."""
+        store = LocalStore(tmp_path)
+        store.put_bytes(
+            dispatch_key("data.heal", "noinstance"),
+            json.dumps(
+                {
+                    "job": "data.heal",
+                    "args": "--from x",
+                    "dispatched_at_utc": DISPATCHED_AT.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+            ).encode(),
+        )
+
+        def fail_if_called(instance_id: str) -> str:
+            raise AssertionError("must not be called for a record with no instance_id")
+
+        [page] = evaluate_dispatch_absence(
+            store, now=PAST_HORIZON, describe_instance_state_reason=fail_if_called
+        )
+        assert "no instance_id recorded" in page.reason
+
+
+def test_classify_dispatch_absence_never_raises_on_a_lookup_failure() -> None:
+    """Self-test of the classifier's own fail-safety, at the unit under it:
+    `_classify_dispatch_absence` is the one place a describe-instances
+    failure is folded into text rather than propagated."""
+    from crucible.alerts import _classify_dispatch_absence
+
+    def boom(instance_id: str) -> str:
+        raise RuntimeError("boom")
+
+    text = _classify_dispatch_absence("i-0x", boom)
+    assert "termination cause unknown" in text
+    assert "boom" in text
+
+
+def test_classify_dispatch_absence_names_a_reclamation() -> None:
+    from crucible.alerts import _classify_dispatch_absence
+
+    text = _classify_dispatch_absence(
+        "i-0x", lambda _: "Server.SpotInstanceTermination: Spot instance termination"
+    )
+    assert "reclaimed by AWS" in text
+    assert "re-dispatch" in text
+
+
+def test_classify_dispatch_absence_with_no_reason_at_all() -> None:
+    """The instance describes cleanly but carries no `StateReason.Message`
+    — still running under a different lifecycle state, or terminated with
+    nothing recorded. Neither "reclaimed" nor a swallowed lookup failure."""
+    from crucible.alerts import _classify_dispatch_absence
+
+    text = _classify_dispatch_absence("i-0x", lambda _: None)
+    assert "reclaimed" not in text
+    assert "no termination reason available" in text
+    assert "investigate" in text
