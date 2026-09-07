@@ -96,7 +96,7 @@ from zoneinfo import ZoneInfo
 from crucible import tracker
 from crucible.calendar import previous_trading_day
 from crucible.documents import load_store_document, read_document
-from crucible.gate import TRACKER_REPO
+from crucible.gate import PHASES, TRACKER_REPO
 from crucible.keys import (
     BOARD_CURRENT_KEY,
     BOARD_HTML_KEY,
@@ -127,6 +127,7 @@ __all__ = [
     "DELIVERY_SEVERITY",
     "DELIVERY_SOURCE",
     "DELIVERY_TZ",
+    "HEADLINE_TARGET_LINES",
     "HISTORY_ROW_BASENAME",
     "MORNING_JOB",
     "MorningInputs",
@@ -274,13 +275,31 @@ ROLLING_ISSUE_TITLE = "[v2 board] daily update"
 #: Brian's stated cap on the HEADLINE (`alpha-engine-config-I10123`, ruling
 #: 2026-09-06): "the telegram message is not legible, too much information."
 #: Unlike the old :data:`MESSAGE_MAX_CHARS` this is not a transport limit to
-#: fit — the headline's fixed shape (a title, one line per phase, four more
-#: fixed lines, two links) never comes close to Telegram's own 4096-character
-#: ceiling, so there is no fitter here: :func:`render_message` RAISES if a
-#: board with more phases than the plan declares would ever cross this, since
-#: a headline that silently grew past "at most ~12 short lines" is the
-#: illegible shape reappearing quietly.
+#: fit — the headline's fixed shape (a title, one line per plan phase, three
+#: more fixed lines, one links line) never comes close to Telegram's own
+#: 4096-character ceiling, so there is no fitter here: :func:`render_message`
+#: RAISES if an unbounded field (an operator action, most likely) would ever
+#: cross this, since a headline that silently grew past
+#: :data:`HEADLINE_TARGET_LINES` is the illegible shape reappearing quietly.
 UPDATE_MESSAGE_MAX_CHARS = 1200
+
+#: Brian's "at most ~12 short lines" restated as a number after the
+#: deliverable-7 follow-up dropped the headline to a title, six phase lines,
+#: three fixed lines and ONE links line — ten in the common case (no stale
+#: headline, no pending operator action). `tests/test_morning.py` asserts
+#: the common-case fixture against this exactly; the two optional lines
+#: (stale, operator action) may push a genuinely exceptional morning past
+#: it, which is a target on the ordinary case, not a second hard cap
+#: alongside :data:`UPDATE_MESSAGE_MAX_CHARS`.
+HEADLINE_TARGET_LINES = 10
+
+#: Padding width for the phase state column in the headline
+#: (`Phase 0  UNMET       4/5`) -- the longest of `crucible.board.
+#: BOARD_STATES` (`OUT_OF_ORDER`/`DECLARED_OFF`, both 12). A literal rather
+#: than importing `crucible.board` (a heavier module this one otherwise
+#: never needs): `tests/test_morning.py` pins it against the live tuple so
+#: the two cannot drift apart unnoticed.
+_STATE_COLUMN_WIDTH = 12
 
 #: The presigned lifetime asked for: the SigV4 maximum, seven days
 #: (`crucible.store.PRESIGN_MAX_S`). A link that outlives the weekend is the
@@ -1092,13 +1111,18 @@ def render_message(
     (`alpha-engine-config-I9921`). Extended the same day (deliverable 7,
     Brian) with a THIRD link once the rolling issue became a history index.
 
-    At most :data:`UPDATE_MESSAGE_MAX_CHARS` characters: a title with the
-    trading day, one line per phase (state and N/M only — no holding lists,
-    no "out of order" prose), the acceptance line, the moved-since COUNT, the
-    pending operator action when there is one, and three links — "Full
-    update" (``update_url``, today's comment permalink), "History"
+    Target at most :data:`HEADLINE_TARGET_LINES` lines, and hard-capped at
+    :data:`UPDATE_MESSAGE_MAX_CHARS` characters: a title with the trading
+    day, exactly one line per plan §6 phase (`Phase N  STATE  N/M` — no row
+    id, no holding lists, no "out of order" prose, and never the six
+    `...:closing` rows the board carries alongside the real gate readings —
+    `alpha-engine-config-I10123` follow-up, measured live 2026-09-06: those
+    six extra PLANNED lines were the second thing making the first delivery
+    too long), the acceptance line, the moved-since COUNT, the pending
+    operator action when there is one, and ONE line carrying all three links
+    — "Full update" (``update_url``, today's comment permalink), "History"
     (``history_url``, the rolling issue itself), and "Board" (the console,
-    when configured).
+    when configured) — separated by " · " rather than one link per line.
 
     ``update_url`` and ``history_url`` are REQUIRED, not optional, because
     both the comment and the issue they point at exist BEFORE this is ever
@@ -1118,19 +1142,20 @@ def render_message(
 
     lines.append(f"<b>CRUCIBLE V2 — {_escape_html(str(board.get('trading_day')))}</b>")
 
-    phase_rows = [row for row in board.get("rows", []) if row.get("source") == "phase"]
-    if not phase_rows:
-        lines.append("no phase row on the board")
-    for row in phase_rows:
+    rows_by_id = {row.get("id"): row for row in board.get("rows", [])}
+    for phase in PHASES:
+        row = rows_by_id.get(_PHASE_ROW_ID[phase.id])
+        if row is None:
+            lines.append(f"Phase {phase.number}  ABSENT — no reading on this board")
+            continue
         clauses = row.get("clauses")
         fraction = (
             f"{sum(1 for c in clauses if c.get('met'))}/{len(clauses)}"
             if isinstance(clauses, list) and clauses
             else "—"
         )
-        lines.append(
-            f"{_escape_html(str(row.get('id')))}: {_escape_html(str(row.get('state')))} {fraction}"
-        )
+        state = _escape_html(str(row.get("state")))
+        lines.append(f"Phase {phase.number}  {state:<{_STATE_COLUMN_WIDTH}} {fraction}")
 
     lines.append(
         _escape_html(_acceptance_line(inputs.acceptance, denied_code=inputs.acceptance_denied_code))
@@ -1139,11 +1164,14 @@ def render_message(
     if inputs.operator_action:
         lines.append(f"pending operator action: {_escape_html(inputs.operator_action)}")
 
-    lines.append(f'<a href="{_escape_html(update_url)}">Full update</a>')
-    lines.append(f'<a href="{_escape_html(history_url)}">History</a>')
+    link_parts = [
+        f'<a href="{_escape_html(update_url)}">Full update</a>',
+        f'<a href="{_escape_html(history_url)}">History</a>',
+    ]
     board_link = _headline_board_link(inputs)
     if board_link:
-        lines.append(f'<a href="{_escape_html(board_link)}">Board</a>')
+        link_parts.append(f'<a href="{_escape_html(board_link)}">Board</a>')
+    lines.append(" · ".join(link_parts))
 
     message = "\n".join(lines)
     budget = UPDATE_MESSAGE_MAX_CHARS - wire_length(TRANSPORT_PREFIX)
@@ -1151,12 +1179,12 @@ def render_message(
         raise ValueError(
             f"the headline is {wire_length(message)} wire characters, over the "
             f"{budget}-character budget left after the transport prefix. The headline's "
-            "shape is fixed (a title, one line per phase, four more fixed lines, three "
-            "links) and should never reach this — a board with more phases than the "
-            "plan declares, or an operator action of unbounded length, is the likeliest "
-            "cause, and the fix is at the source of that field, not a truncation here: "
-            "a headline that silently shortened itself would be the illegible message "
-            "this ruling exists to end, in a new shape."
+            "shape is fixed (a title, one line per plan phase, three more fixed lines, "
+            "one links line) and should never reach this — a board with more phases than "
+            "the plan declares, or an operator action of unbounded length, is the "
+            "likeliest cause, and the fix is at the source of that field, not a "
+            "truncation here: a headline that silently shortened itself would be the "
+            "illegible message this ruling exists to end, in a new shape."
         )
     return message
 
@@ -1356,12 +1384,27 @@ def _find_or_create_rolling_issue() -> int:
 #: listing for.
 HISTORY_ROW_BASENAME = "history_row.json"
 
+#: The board's own row shape for a phase GATE (`crucible.board.py`:
+#: `id=f"phase:{phase.id}"`, `source="phase"`) -- DERIVED from
+#: `crucible.gate.PHASES` rather than restated, because a board row with
+#: `source == "phase"` is NOT always a gate reading: the same source also
+#: carries one CLOSING row per phase (`id=f"phase:{phase.id}:closing"`,
+#: state `PLANNED` until a live gate reads MET), and a filter on `source`
+#: alone catches both. Measured live 2026-09-06 on the first delivered
+#: history index (`alpha-engine-config-I10123` follow-up): every phase
+#: column read `—` because the reader matched bare `phase0`..`phase5`
+#: against the board's actual `phase:phase0`..`phase:phase5` ids, and the
+#: headline printed twelve lines -- six real gate lines plus six
+#: `phase:phaseN:closing: PLANNED —` lines it never meant to include.
+_PHASE_ROW_ID: dict[str, str] = {p.id: f"phase:{p.id}" for p in PHASES}
+
 #: Plan §6: phases 0 through 5, six rungs, no more and no fewer. The history
 #: table's phase columns are fixed at this width rather than however many a
 #: given day's board happened to carry, so a day that renders five phases
 #: (a board mid-incident, say) still lines up under the same header as a day
-#: that rendered six.
-_HISTORY_PHASE_IDS: tuple[str, ...] = tuple(f"phase{i}" for i in range(6))
+#: that rendered six. Header labels are the bare `Phase.id` ("phase0", ...);
+#: matching against a board row uses :data:`_PHASE_ROW_ID`.
+_HISTORY_PHASE_IDS: tuple[str, ...] = tuple(p.id for p in PHASES)
 
 
 def _history_row_payload(
@@ -1373,15 +1416,21 @@ def _history_row_payload(
     from — never a second read of the board — so the index cannot disagree
     with the comment it links to about what that day's board said.
     """
+    rows_by_id = {row.get("id"): row for row in inputs.board.get("rows", [])}
     phases: list[dict[str, Any]] = []
-    for row in inputs.board.get("rows", []):
-        if row.get("source") != "phase":
+    for phase in PHASES:
+        row = rows_by_id.get(_PHASE_ROW_ID[phase.id])
+        if row is None:
             continue
         clauses = row.get("clauses")
         has_clauses = isinstance(clauses, list) and bool(clauses)
         phases.append(
             {
-                "id": row.get("id"),
+                # The BARE phase id ("phase0"), never the board's own
+                # `phase:phase0` row id -- a stable contract between this
+                # writer and the index reader that does not travel with
+                # whatever board.py happens to spell its row ids as.
+                "id": phase.id,
                 "state": row.get("state"),
                 "met": sum(1 for c in clauses if c.get("met")) if has_clauses else None,
                 "total": len(clauses) if has_clauses else None,
@@ -1479,6 +1528,7 @@ def render_history_body(store: Store, *, console_url: str | None = None) -> str:
     lines.append("|" + "---|" * len(header))
 
     days = sorted(set(latest) | set(faulted), reverse=True)
+    legacy_days: list[str] = []
     for day in days:
         if day in faulted:
             lines.append(
@@ -1488,8 +1538,20 @@ def render_history_body(store: Store, *, console_url: str | None = None) -> str:
             )
             continue
         row = latest[day]
-        phases = {p["id"]: p for p in row.get("phases", []) if isinstance(p, dict)}
-        cells = [_phase_cell(phases, phase_id) for phase_id in _HISTORY_PHASE_IDS]
+        raw_phases = row.get("phases", [])
+        phases = {p["id"]: p for p in raw_phases if isinstance(p, dict)}
+        # A day whose delivery recorded SOME phase facts, none of which match
+        # a known phase id, is a LEGACY row -- written before this reader's
+        # id-matching bug was fixed (`alpha-engine-config-I10123` follow-up:
+        # the first live delivery stored the board's own `phase:phase0`
+        # shape, which nothing here ever matched). Its dashes are not "the
+        # manifest genuinely lacks the field"; they are a known gap, and get
+        # a footnote rather than passing for the honest case silently.
+        if raw_phases and not (phases.keys() & set(_HISTORY_PHASE_IDS)):
+            legacy_days.append(day)
+            cells = ["—*"] * len(_HISTORY_PHASE_IDS)
+        else:
+            cells = [_phase_cell(phases, phase_id) for phase_id in _HISTORY_PHASE_IDS]
         met, total = row.get("acceptance_met"), row.get("acceptance_total")
         acceptance = f"{met}/{total}" if met is not None and total is not None else "—"
         link = f"[comment]({row.get('comment_url', '')})" if row.get("comment_url") else "—"
@@ -1503,6 +1565,14 @@ def render_history_body(store: Store, *, console_url: str | None = None) -> str:
             "| _no delivery has filed a history row yet_ | "
             + " | ".join(["—"] * (len(header) - 1))
             + " |"
+        )
+    if legacy_days:
+        lines.append("")
+        lines.append(
+            "\\* phase state unavailable: this delivery's history row predates a fix to "
+            "how phase ids are matched ("
+            + ", ".join(legacy_days)
+            + "). Re-running `report.morning` for that trading day backfills it."
         )
     return "\n".join(lines)
 
