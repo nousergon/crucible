@@ -127,6 +127,10 @@ __all__ = [
     "DeclaredUniverseDocument",
     "FeatureRegistryDocument",
     "FeatureRow",
+    "GitHubCommit",
+    "GitHubCommitDetail",
+    "GitHubCommitIdentity",
+    "GitHubUser",
     "LlmCallRow",
     "LlmCallSiteRow",
     "LlmCallsiteRegistryDocument",
@@ -140,6 +144,7 @@ __all__ = [
     "ReleaseProvenanceDocument",
     "ReleaseRecordDocument",
     "ResourceRow",
+    "ReviewDocument",
     "RunManifestV2",
     "SignalsRow",
     "TrialRow",
@@ -2152,3 +2157,100 @@ class CloudTrailRecord(BaseModel):
     eventSource: str = ""
     requestID: str = ""
     readOnly: bool | None = None
+
+
+# ── I10045 row 13: the review artifact ─────────────────────────────────────
+# Additive only, appended after the prior rows' markers for the same
+# rebase reason.
+
+
+class GitHubCommitIdentity(BaseModel):
+    """`commit.author`/`commit.committer` on one `GET /pulls/{n}/commits`
+    row — the git identity, not the GitHub account. `extra="allow"`: GitHub
+    owns this shape, not us (the CloudTrail-record carve-out, row 12)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    email: str | None = None
+
+
+class GitHubCommitDetail(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    message: str = ""
+    author: GitHubCommitIdentity | None = None
+    committer: GitHubCommitIdentity | None = None
+
+
+class GitHubUser(BaseModel):
+    """The top-level `author`/`committer` on one commit row — the GitHub
+    ACCOUNT, distinct from `GitHubCommitDetail`'s git identity. `None` for a
+    commit GitHub cannot associate with an account, which
+    `crucible.review.author_identities` must still read without raising."""
+
+    model_config = ConfigDict(extra="allow")
+
+    login: str | None = None
+
+
+class GitHubCommit(BaseModel):
+    """One row of `GET /pulls/{n}/commits` — plan §11 risk 1,
+    `crucible.review.author_identities`'s independence derivation.
+
+    `author_identities` used to walk `commit.get("commit") or {}`, then
+    `(payload.get("author") or {}).get("email")`, by hand, for both the git
+    identity and the GitHub account, plus the `Claude-Session:` trailer scan
+    over the message. A typo'd key at any level resolved silently to `{}`/
+    `None` rather than surfacing — the same defect class row 12 fixes for
+    CloudTrail. `extra="allow"` throughout: a real commits-API response
+    carries dozens of fields this reader never looks at (`sha`, `url`,
+    `stats`, `files`, `parents`...), and none of them should be refused.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    commit: GitHubCommitDetail = Field(default_factory=GitHubCommitDetail)
+    author: GitHubUser | None = None
+    committer: GitHubUser | None = None
+
+
+class ReviewDocument(_Strict):
+    """`review.v1` — `crucible.review.review_document`'s output, at
+    `reviews/{phase}/{trading_day}/{reviewer}/{verdict}.json`, plan §11
+    risk 1.
+
+    A FINAL, defense-in-depth check inside `review_document` — added AFTER
+    that function's own pre-existing checks (a non-'pass'/'fail' `verdict`
+    and a malformed `head_sha` each already raise `ReviewError` with their
+    own tested message text, `tests/test_review.py::
+    test_a_third_verdict_is_refused`/`test_a_review_that_names_no_commit_
+    is_refused`, both unchanged and both firing before this model is ever
+    reached). This model additionally catches what those two checks do
+    not: an empty/blank `phase`, a non-`session_*` `reviewer`, a non-list
+    or empty `authors`, a wrong-typed `pr_number`, or an unknown extra key.
+
+    `crucible.gate._review_problem` — the READ side, cited alongside this
+    module in the parent issue — is DELIBERATELY UNCHANGED. It already
+    performs the equivalent checks by hand (`schema_version`, `authors`
+    shape, `head_sha` pattern) with specific, already-tested message text
+    (`tests/test_gate_independent_review.py`:
+    `"non-empty list of identities"`, `"40-hex commit sha"`) AND a control-
+    flow shape no other boundary in this migration shares: every branch
+    returns a `(problem, review)` tuple rather than raising, because a gate
+    clause must render UNMEASURABLE, never throw. Routing that function's
+    checks through a raise-based model without changing its tested
+    behaviour is a real refactor for the read side alone, and this row
+    scopes to the WRITE side plus `author_identities`'s commits-API
+    boundary; the read side's own migration is a separate, better-isolated
+    follow-up if one is wanted.
+    """
+
+    schema_version: Literal["review.v1"]
+    phase: str = Field(min_length=1)
+    verdict: Literal["pass", "fail"]
+    reviewer: str = Field(pattern=r"^session_[A-Za-z0-9]{8,}$")
+    authors: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
+    pr_number: int
+    head_sha: GitSha
+    summary: str
+    reviewed_at: str = Field(min_length=1)

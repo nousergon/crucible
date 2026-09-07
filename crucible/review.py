@@ -71,9 +71,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from crucible.calendar import resolve_trading_day
 from crucible.gate import REVIEW_SCHEMA_VERSION
 from crucible.keys import REVIEWER_PATTERN, review_key
+from crucible.models import GitHubCommit, ReviewDocument
 from crucible.store import Store, open_store
 
 __all__ = [
@@ -143,16 +146,19 @@ def author_identities(commits: list[dict[str, Any]]) -> list[str]:
             "that pages past the cap"
         )
     identities: set[str] = set()
-    for commit in commits:
-        payload = commit.get("commit") or {}
-        message = payload.get("message") or ""
-        identities.update(m.lower() for m in SESSION_TRAILER_RE.findall(message))
-        for holder in (payload.get("author"), payload.get("committer")):
-            email = ((holder or {}).get("email") or "").strip()
+    for raw in commits:
+        # `alpha-engine-config-I10045` row 13: validated through
+        # `crucible.models.GitHubCommit` instead of `.get(..., {}) or {}`
+        # walked by hand at three levels — a typo'd key at any level used
+        # to resolve silently to "no identity" instead of surfacing.
+        parsed = GitHubCommit.model_validate(raw)
+        identities.update(m.lower() for m in SESSION_TRAILER_RE.findall(parsed.commit.message))
+        for git_identity in (parsed.commit.author, parsed.commit.committer):
+            email = ((git_identity.email if git_identity else None) or "").strip()
             if email:
                 identities.add(email.lower())
-        for holder in (commit.get("author"), commit.get("committer")):
-            login = ((holder or {}).get("login") or "").strip()
+        for account in (parsed.author, parsed.committer):
+            login = ((account.login if account else None) or "").strip()
             if login:
                 identities.add(login.lower())
     if not identities:
@@ -213,7 +219,7 @@ def review_document(
             "not name what it reviewed grades nothing"
         )
     authors = author_identities(commits)
-    return {
+    document = {
         "schema_version": REVIEW_SCHEMA_VERSION,
         "phase": phase,
         "verdict": verdict,
@@ -224,6 +230,20 @@ def review_document(
         "summary": summary,
         "reviewed_at": reviewed_at.isoformat(),
     }
+    # `alpha-engine-config-I10045` row 13: a final, defense-in-depth check
+    # against `crucible.models.ReviewDocument`, ADDED AFTER the two checks
+    # above rather than replacing them — both already raise `ReviewError`
+    # with their own tested message text
+    # (`tests/test_review.py::test_a_third_verdict_is_refused`/
+    # `test_a_review_that_names_no_commit_is_refused`) and fire first for
+    # the cases they cover. This catches what those two do not: an empty
+    # `phase`, a malformed `reviewer`, an empty `authors` list, a
+    # wrong-typed `pr_number`.
+    try:
+        ReviewDocument.model_validate(document)
+    except ValidationError as exc:
+        raise ReviewError(f"the constructed review document does not conform: {exc}") from exc
+    return document
 
 
 def record(
