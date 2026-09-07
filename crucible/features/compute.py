@@ -48,7 +48,7 @@ LIQUIDITY_FLOOR_VAR = "CRUCIBLE_LIQUIDITY_FLOOR_USD"
 def liquidity_floor_usd() -> float:
     """The liquidity gate, read from the environment.
 
-    Was the literal `5_000_000.0` until 2026-09-07. It moved because it is the
+    Was a literal in this file until 2026-09-07. It moved because it is the
     one genuinely TUNED number in this module: a belief about what is tradeable,
     which `repository-tiering-policy.md` test 3 sends to the private tree, and
     which `alpha-engine-config/strategy/README.md` calls strategy edge in as
