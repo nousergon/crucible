@@ -41,7 +41,7 @@ over two totals, and not all of them measurements:
 Measured 2026-09-02 on `main`, the disagreement resolved into **two
 instruments**: this suite read **21 of 24**, while the phase-1 gate read
 **NOT MET, 1 of 5 clauses** — `pointer_flipped_on_smoke` only — against the
-store `s3://alpha-engine-crucible-v2/crucible`
+store `s3://test-store-bucket/crucible`
 (`gates/phase1/2026-09-01/gate.json`, `met_ratio: 0.2`). Zero replay Saturdays
 had run. The issue was reopened.
 

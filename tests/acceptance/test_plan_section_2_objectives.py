@@ -230,7 +230,7 @@ class TestAutonomy:
         import gzip
 
         from crucible import autonomy as autonomy_module
-        from crucible.autonomy import MACHINE_PRINCIPALS, ArchiveMissingError
+        from crucible.autonomy import ArchiveMissingError, machine_principals
 
         clause = "plan §2 row 1, closed by §11 risk 8"
         requirement = (
@@ -270,13 +270,17 @@ class TestAutonomy:
             "eventSource": "iam.amazonaws.com",
             "readOnly": False,
             "requestID": "req-1",
-            "requestParameters": {"roleName": "crucible-v2-runtime"},
+            # "crucible-v2" is the marker `count_operator_actions` matches on
+            # by default (the stack name, which legitimately stays a literal
+            # — `crucible/config.py`'s own `DEFAULT_STACK_NAME`); the suffix
+            # is a synthetic fixture role, never a real IAM role name.
+            "requestParameters": {"roleName": "crucible-v2-fixture-role"},
             "userIdentity": {
                 "type": "AssumedRole",
                 "sessionContext": {"sessionIssuer": {"userName": "a-role-nobody-declared"}},
             },
         }
-        assert "a-role-nobody-declared" not in MACHINE_PRINCIPALS
+        assert "a-role-nobody-declared" not in machine_principals()
 
         real_key = "t/2026/08/03/part.json.gz"
 

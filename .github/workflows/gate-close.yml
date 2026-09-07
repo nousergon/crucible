@@ -14,17 +14,17 @@ name: Gate close
 #
 # ── Why this is not a step of board.yml ───────────────────────────────────
 #
-# Because `crucible-v2-github-board` is READ-ONLY over everything it grades, on
+# Because the board identity is READ-ONLY over everything it grades, on
 # purpose: an identity that cannot write a run manifest cannot be used to
 # satisfy a clause it is grading, whatever the code does. Filing the closing
 # record IS a write into the prefix the board grades, so it needs a different
-# identity — `crucible-v2-github-gate-close` — and an identity is attached to a
+# identity — the gate-close identity — and an identity is attached to a
 # workflow, not to a step. Adding the write to the board would have deleted the
 # one property the board's separate role exists to guarantee.
 #
 # ── What this role may and may not do ─────────────────────────────────────
 #
-# `crucible-v2-github-gate-close` (nous-ergon-ops/infrastructure/cloudformation/
+# The gate-close identity (nous-ergon-ops/infrastructure/cloudformation/
 # crucible-v2.yaml, `GateCloseRole`) reads `crucible/*` and writes exactly
 # `crucible/gates/*/closing.json` and `crucible/runs/gate.close/*`.
 #
@@ -84,10 +84,14 @@ env:
   # AWS_ACCOUNT_ID and STORE_URI come from repository variables
   # (alpha-engine-config-I9906) — this repo goes PUBLIC at phase-1 exit
   # (I9775) and `AGENTS.md` forbids infrastructure identifiers, bucket names
-  # and account numbers in the tree. The role NAME stays a literal below: it
-  # carries no secret on its own, and the account id is the sensitive half.
+  # and account numbers in the tree. The role name is built from
+  # `vars.CRUCIBLE_ROLE_PREFIX` below, same as the account id: this is a
+  # public repo, its run logs are public, and GitHub does not mask
+  # repository variables — only the `::add-mask::` step ahead of the
+  # credential step keeps the account id out of a printed ARN.
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
-  GATE_CLOSE_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/crucible-v2-github-gate-close
+  GATE_CLOSE_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.CRUCIBLE_ROLE_PREFIX }}-gate-close
+  BOARD_ROLE_NAME: ${{ vars.CRUCIBLE_ROLE_PREFIX }}-board
   STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
   # alpha-engine-config-I9928, and the same variable board.yml reads. This job
   # evaluates every registered phase's gate, so phase 2's
@@ -171,6 +175,16 @@ jobs:
       - name: Install
         run: uv sync --frozen
 
+      # This repo is public and its run logs are public; GitHub masks
+      # SECRETS, not repository VARIABLES. The identity assertion below
+      # prints an assumed-role ARN that embeds the account id — mask it
+      # before the credential step runs so nothing downstream can leak it.
+      # The assertion still works with masking on: it compares only the
+      # role-name segment (`*":assumed-role/${expected}/"*`), which the mask
+      # does not touch.
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
         with:
@@ -189,7 +203,7 @@ jobs:
         run: |
           assumed="$(aws sts get-caller-identity --query Arn --output text)"
           expected="${GATE_CLOSE_ROLE_ARN##*/}"
-          case "${assumed}" in *":assumed-role/crucible-v2-github-board/"*) echo "::error::this job assumed the BOARD role. The board renders the grading surface and is read-only over everything it grades; filing a closing record from it would make a grading surface able to satisfy the clause it grades. Point role-to-assume at ${expected}."; exit 1 ;; esac
+          case "${assumed}" in *":assumed-role/${BOARD_ROLE_NAME}/"*) echo "::error::this job assumed the board identity. The board renders the grading surface and is read-only over everything it grades; filing a closing record from it would make a grading surface able to satisfy the clause it grades. Point role-to-assume at ${expected}."; exit 1 ;; esac
           case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. If the role does not exist yet the crucible-v2 stack has not been applied since the nous-ergon-ops PR for alpha-engine-config-I10095 merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name crucible-v2 --template-file infrastructure/cloudformation/crucible-v2.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 --tags system=crucible-v2 from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until that happens is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
 
       - name: File every closing record that is due

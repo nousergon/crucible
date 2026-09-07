@@ -13,9 +13,9 @@ written to pass"*.
 
 **Every one of the three deliverables is already TRUE**, measured
 2026-09-04: all six functions absent from `lambda:ListFunctions`; the
-2026-09-03 weekly execution's input carrying
-`"sns_topic_arn": "...:alpha-engine-alerts-muted"`; `get-bucket-versioning`
-returning `Enabled` and the `crucible-v2` stack carrying `system=crucible-v2`.
+2026-09-03 weekly execution's input carrying the muted topic's ARN as its
+`sns_topic_arn`; `get-bucket-versioning` returning `Enabled` and the
+`crucible-v2` stack carrying `system=crucible-v2`.
 So all three clauses read MET on their first run — **and a clause that always
 returns MET is indistinguishable from a correct one until the day it
 matters**. Plan §11 row 1 / policy §7.4 therefore governs this file: every
@@ -46,7 +46,6 @@ from crucible.gate import (
     LEGACY_DEAD_LAMBDA_NAMES,
     LEGACY_DEAD_LAMBDAS_SCHEMA_VERSION,
     LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
-    MUTED_ALERTS_TOPIC_NAME,
     PHASE0_DELIVERABLES,
     V2_STORE_VERSIONING_ENABLED,
     V2_TAG_ACCEPTANCE_CLAUSE_ID,
@@ -54,6 +53,7 @@ from crucible.gate import (
     expected_legacy_weekly_window,
     legacy_dead_lambdas_key,
     legacy_weekly_executions_key,
+    muted_alerts_topic_name,
     weekly_anchor,
 )
 from crucible.keys import acceptance_reading_key
@@ -72,8 +72,15 @@ ANCHOR = weekly_anchor(FRIDAY)
 #: and this deliverable UNMET forever against a system that satisfies it.
 LIVE_SIBLING = "alpha-engine-research-eval-judge-process"
 
-MUTED_TOPIC_ARN = f"arn:aws:sns:us-east-1:acct:{MUTED_ALERTS_TOPIC_NAME}"
-PAGING_TOPIC_ARN = "arn:aws:sns:us-east-1:acct:alpha-engine-alerts"
+PAGING_TOPIC_ARN = "arn:aws:sns:us-east-1:acct:test-unwatched-topic"
+
+
+def _muted_topic_arn() -> str:
+    """Built lazily, never at import time: `muted_alerts_topic_name()` reads
+    an environment variable the autouse `conftest.py` fixture sets per test
+    (`alpha-engine-config-I10156`), so a module-level constant would raise
+    during collection, before any fixture has run."""
+    return f"arn:aws:sns:us-east-1:acct:{muted_alerts_topic_name()}"
 
 
 def _put(store: LocalStore, key: str, document: Any) -> None:
@@ -93,7 +100,16 @@ def _mutated(before: Any, after: Any, what: str) -> Any:
     return after
 
 
-def _executions(*, topic: str | None = MUTED_TOPIC_ARN, with_field: bool = True) -> dict:
+#: `_executions(topic=None)` is a deliberate call below (the "null topic"
+#: mutation) and must stay distinguishable from "caller did not pass one" —
+#: `None` cannot be the not-passed sentinel here, or the null-topic case
+#: would silently resolve to the real default instead.
+_DEFAULT_TOPIC = object()
+
+
+def _executions(*, topic: str | None = _DEFAULT_TOPIC, with_field: bool = True) -> dict:  # type: ignore[assignment]
+    if topic is _DEFAULT_TOPIC:
+        topic = _muted_topic_arn()
     day = ANCHOR.isoformat()
     executions = [
         {
@@ -322,15 +338,16 @@ class TestOldAlertsMuted:
         unmet = _clause(_seed(tmp_path / "b", executions=paging), "old_alerts_muted")
         assert met.met and not unmet.met, "the two readings did not differ"
         assert not unmet.unmeasurable
-        assert "alpha-engine-alerts" in unmet.detail
+        assert "test-unwatched-topic" in unmet.detail
 
     def test_a_topic_whose_name_merely_contains_the_muted_one_does_not_pass(self, tmp_path) -> None:
-        """The match is on the ARN's last segment, whole. A topic named
-        `alpha-engine-alerts-muted-shadow` is a different topic."""
+        """The match is on the ARN's last segment, whole. A topic named with
+        the muted topic's name plus a `-shadow` suffix is a different
+        topic."""
         muted = _executions()
         lookalike = _mutated(
             muted,
-            _executions(topic=f"{MUTED_TOPIC_ARN}-shadow"),
+            _executions(topic=f"{_muted_topic_arn()}-shadow"),
             "look-alike topic",
         )
         clause = _clause(_seed(tmp_path, executions=lookalike), "old_alerts_muted")

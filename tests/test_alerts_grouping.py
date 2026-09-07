@@ -13,11 +13,11 @@ import pytest
 from crucible.alerts import (
     ALERT_BUS_SCHEMA_VERSION,
     CEILING_WINDOW_TRADING_DAYS,
-    MUTED_TOPIC,
     MUTED_TOPIC_ARN_VAR,
+    MUTED_TOPIC_VAR,
     PAGES_PER_MONTH_CEILING,
-    PAGES_TOPIC,
     PAGES_TOPIC_ARN_VAR,
+    PAGES_TOPIC_VAR,
     Page,
     PageGroup,
     TopicUnresolvedError,
@@ -30,7 +30,9 @@ from crucible.alerts import (
     group_pages,
     heartbeat,
     incident_key,
+    muted_topic,
     pages_in_window,
+    pages_topic,
     sweep,
     topic_arn,
 )
@@ -46,10 +48,10 @@ WEDNESDAY = dt.date(2026, 8, 26)
 TUESDAY = dt.date(2026, 8, 25)
 MONDAY = dt.date(2026, 8, 24)
 
-#: The one real ARN shape. `crucible-v2-pages` is the topic the stack's
-#: RuntimeRole is actually granted `sns:Publish` on.
-PAGES_ARN = f"arn:aws:sns:us-east-1:123456789012:{PAGES_TOPIC}"
-MUTED_ARN = f"arn:aws:sns:us-east-1:123456789012:{MUTED_TOPIC}"
+#: The two topic NAMES are read from the environment (`alpha-engine-config-
+#: I10156`), which the autouse `declared_topics` fixture in `conftest.py`
+#: sets to a synthetic value before every test — so the two ARNs below are
+#: built inside each test that needs them, never at import time.
 
 
 def _failed(job: str, reason: str, run_id: str = "01JG0000000000000000000001") -> Page:
@@ -438,12 +440,13 @@ class TestMutedRouting:
         would have refused it with InvalidParameter. The previous test
         asserted the kwarg equalled the same bare constant — true for any
         implementation, including the broken one."""
-        monkeypatch.setenv(MUTED_TOPIC_ARN_VAR, MUTED_ARN)
+        muted_arn = f"arn:aws:sns:us-east-1:123456789012:{muted_topic()}"
+        monkeypatch.setenv(MUTED_TOPIC_ARN_VAR, muted_arn)
         store = LocalStore(tmp_path)
         group = group_pages([_failed("data.daily", "boom")])[0]
         emit(store, [group], sweep_run_id="0" * 26, legacy=True, transport=transport)
         arn = transport.calls[0].kwargs["sns_topic_arn"]
-        assert arn == MUTED_ARN
+        assert arn == muted_arn
         assert arn.startswith("arn:aws:sns:"), "SNS refuses a bare topic name"
 
 
@@ -451,26 +454,27 @@ class TestTopicResolution:
     """C8. One adapter, and it names the topic the stack grants."""
 
     def test_pages_resolve_to_the_topic_the_stack_grants(self, monkeypatch) -> None:
-        """The stack creates, tags and exports `crucible-v2-pages` and grants
+        """The stack creates, tags and exports the pages topic and grants
         `sns:Publish` on that topic and the muted one ONLY. Passing None let
-        krepis resolve its own default, `alpha-engine-alerts`, where the v2
+        krepis resolve its own default, an unwatched topic, where the v2
         RuntimeRole has no grant: every page's SNS half would have been
         AccessDenied on the day the stack was applied, while Telegram
         succeeded and `any_ok` stayed True."""
-        monkeypatch.setenv(PAGES_TOPIC_ARN_VAR, PAGES_ARN)
-        assert topic_arn() == PAGES_ARN
-        assert topic_arn().rsplit(":", 1)[-1] == PAGES_TOPIC
+        pages_arn = f"arn:aws:sns:us-east-1:123456789012:{pages_topic()}"
+        monkeypatch.setenv(PAGES_TOPIC_ARN_VAR, pages_arn)
+        assert topic_arn() == pages_arn
+        assert topic_arn().rsplit(":", 1)[-1] == pages_topic()
 
     def test_a_bare_topic_name_is_refused(self, monkeypatch) -> None:
-        monkeypatch.setenv(PAGES_TOPIC_ARN_VAR, PAGES_TOPIC)
+        monkeypatch.setenv(PAGES_TOPIC_ARN_VAR, pages_topic())
         with pytest.raises(TopicUnresolvedError, match="not an SNS topic ARN"):
             topic_arn()
 
     def test_a_topic_the_role_is_not_granted_is_refused(self, monkeypatch) -> None:
         monkeypatch.setenv(
-            PAGES_TOPIC_ARN_VAR, "arn:aws:sns:us-east-1:123456789012:alpha-engine-alerts"
+            PAGES_TOPIC_ARN_VAR, "arn:aws:sns:us-east-1:123456789012:test-unwatched-topic"
         )
-        with pytest.raises(TopicUnresolvedError, match="alpha-engine-alerts"):
+        with pytest.raises(TopicUnresolvedError, match="test-unwatched-topic"):
             topic_arn()
 
     def test_the_real_transport_refuses_to_publish_with_no_topic(self, monkeypatch) -> None:
@@ -677,3 +681,30 @@ class TestSweep:
         assert again["pages_emitted"] == 0
         assert again["incidents_open"] == 2
         assert transport.pages == 2
+
+
+class TestTopicNamesRaiseOnUnset:
+    """`alpha-engine-config-I10156`: the topic NAMES are no longer literals,
+    so the raise-on-unset path is the only thing standing between a
+    forgotten environment variable and a page silently sent nowhere (or
+    the muted topic, which is the same failure with a delay)."""
+
+    def test_muted_topic_raises_when_unset(self, monkeypatch) -> None:
+        monkeypatch.delenv(MUTED_TOPIC_VAR, raising=False)
+        with pytest.raises(RuntimeError, match=MUTED_TOPIC_VAR):
+            muted_topic()
+
+    def test_muted_topic_raises_when_empty(self, monkeypatch) -> None:
+        monkeypatch.setenv(MUTED_TOPIC_VAR, "")
+        with pytest.raises(RuntimeError, match=MUTED_TOPIC_VAR):
+            muted_topic()
+
+    def test_pages_topic_raises_when_unset(self, monkeypatch) -> None:
+        monkeypatch.delenv(PAGES_TOPIC_VAR, raising=False)
+        with pytest.raises(RuntimeError, match=PAGES_TOPIC_VAR):
+            pages_topic()
+
+    def test_pages_topic_raises_when_empty(self, monkeypatch) -> None:
+        monkeypatch.setenv(PAGES_TOPIC_VAR, "")
+        with pytest.raises(RuntimeError, match=PAGES_TOPIC_VAR):
+            pages_topic()

@@ -742,7 +742,11 @@ class TestTheWorkflowItself:
             "env var against the literal that sets it checks nothing"
         )
         body = json.dumps(check[0])
-        assert "crucible-v2-github-deploy" in body
+        # The deploy role's own name is no longer a literal anywhere in this
+        # public tree (`alpha-engine-config-I10156`) — it is built from
+        # `vars.CRUCIBLE_ROLE_PREFIX` in `DEPLOY_ROLE_ARN` and the message
+        # below names it only via `${expected}`.
+        assert "deploy identity" in body
         assert "github-actions-lambda-deploy" in body, (
             "the check must name the role it is refusing to be, or the message does "
             "not tell an operator what nearly happened"

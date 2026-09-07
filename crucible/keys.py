@@ -168,7 +168,7 @@ def parse_bus_key(key: str) -> tuple[str, str] | None:
 
 
 #: `alpha-engine-config-I10134` deliverable 1/2: proof that a job was
-#: EXPLICITLY dispatched, written by `crucible-v2-dispatcher` before
+#: EXPLICITLY dispatched, written by the v2 dispatcher before
 #: `RunInstances` returns, so a later sweep can grade "requested but never
 #: completed" — a state a *scheduled* job's `components.yaml` deadline
 #: cannot represent for an on-demand job (`data.heal`'s row carries
