@@ -119,6 +119,7 @@ __all__ = [
     "ComponentRow",
     "ComponentsDocument",
     "DeadlineRow",
+    "DeclaredUniverseDocument",
     "FeatureRegistryDocument",
     "FeatureRow",
     "LlmCallRow",
@@ -1974,3 +1975,73 @@ class TrialRow(BaseModel):
     run_id: str = Field(min_length=1)
     arena_cycle_key: str = Field(min_length=1)
     written_at_utc: str = Field(pattern=_UTC_TIMESTAMP_PATTERN)
+
+
+# ── I10045 row 10: the declared universe ───────────────────────────────────
+# Additive only, appended after the prior rows' markers for the same
+# rebase reason.
+
+
+class DeclaredUniverseDocument(_Strict):
+    """`declared_universe.v1`, written at `declared/{trading_day}/universe.json`
+    by `crucible.data.universe.DeclaredUniverse.record`.
+
+    The document this repo WRITES (an OWN artifact, `extra="forbid"`) —
+    distinct from the document it READS to build a `DeclaredUniverse` in
+    the first place (`crucible.data.universe.load_declared_universe`'s
+    membership/pointer document), which is a THIRD-PARTY artifact (the
+    fleet's live constituents artifact, written by the v1 trading path) and
+    stays untyped by this PR, the same carve-out row 12 states explicitly
+    for the CloudTrail partition payload: model what we read only when the
+    shape is ours to declare, never forbid extras on a document someone
+    else's system writes. No schema existed for this write-side document
+    before this PR; it is new, per the parent issue's own instruction for a
+    "no schema today" row.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "$id": "declared_universe.v1",
+            "title": "Crucible declared universe, v1",
+            "description": (
+                "The resolved membership a data job's coverage floor was measured "
+                "against, written beside the run so crucible explain can name the "
+                "exact denominator. Plan §12 rule 5."
+            ),
+        },
+    )
+
+    schema_version: Literal["declared_universe.v1"] = Field(
+        description="Version of THIS schema. A consumer that cannot read the version "
+        "refuses the document rather than guessing."
+    )
+    trading_day: IsoDate
+    source_uri: str = Field(
+        min_length=1,
+        description="Where the membership came from: a URI or path, or argv:--symbols.",
+    )
+    source_sha256: Sha256 = Field(
+        description="sha256 of the source document's bytes (or of the argv literal)."
+    )
+    origin: str = Field(
+        min_length=1,
+        description="Settings.origins-style provenance: argument / environ:....",
+    )
+    count: Annotated[int, Field(ge=0)]
+    symbols: list[Annotated[str, Field(min_length=1)]]
+
+    @model_validator(mode="after")
+    def _count_matches_the_symbol_list(self) -> DeclaredUniverseDocument:
+        """A measured-incident cross-field rule: `count` and `len(symbols)`
+        disagreeing is exactly the "denominator nobody can trust" shape this
+        whole module exists to prevent, and it is cheap enough to catch at
+        the boundary that there is no reason not to.
+        """
+        if self.count != len(self.symbols):
+            raise ValueError(
+                f"count={self.count} does not match len(symbols)={len(self.symbols)}. "
+                "A declared universe whose own count disagrees with its own list is "
+                "not a denominator anyone can trust."
+            )
+        return self

@@ -1,0 +1,61 @@
+{
+  "$id": "declared_universe.v1",
+  "additionalProperties": false,
+  "description": "The resolved membership a data job's coverage floor was measured against, written beside the run so crucible explain can name the exact denominator. Plan \u00a712 rule 5.",
+  "properties": {
+    "count": {
+      "minimum": 0,
+      "title": "Count",
+      "type": "integer"
+    },
+    "origin": {
+      "description": "Settings.origins-style provenance: argument / environ:....",
+      "minLength": 1,
+      "title": "Origin",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "declared_universe.v1",
+      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "source_sha256": {
+      "description": "sha256 of the source document's bytes (or of the argv literal).",
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Source Sha256",
+      "type": "string"
+    },
+    "source_uri": {
+      "description": "Where the membership came from: a URI or path, or argv:--symbols.",
+      "minLength": 1,
+      "title": "Source Uri",
+      "type": "string"
+    },
+    "symbols": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": "Symbols",
+      "type": "array"
+    },
+    "trading_day": {
+      "format": "date",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "title": "Trading Day",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "trading_day",
+    "source_uri",
+    "source_sha256",
+    "origin",
+    "count",
+    "symbols"
+  ],
+  "title": "Crucible declared universe, v1",
+  "type": "object"
+}

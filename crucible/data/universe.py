@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any
 
 from crucible.keys import declared_universe_key
+from crucible.models import DeclaredUniverseDocument
 from crucible.runner import RunContext
 from crucible.store import sha256_hex
 
@@ -114,6 +115,11 @@ class DeclaredUniverse:
             "count": len(self.symbols),
             "symbols": list(self.symbols),
         }
+        # `alpha-engine-config-I10045` row 10: validated against
+        # `crucible.models.DeclaredUniverseDocument` before it is written — a
+        # producer that could emit a `count`/`symbols` mismatch would defeat
+        # the whole point of a declared denominator.
+        DeclaredUniverseDocument.model_validate(document)
         payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
         ctx.record_output(key, payload, schema_version=DECLARED_UNIVERSE_SCHEMA_VERSION)
         return key
