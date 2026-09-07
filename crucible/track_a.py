@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+from pathlib import Path
 from typing import Any
 
 from crucible import migrate as migrate_module
@@ -299,6 +300,41 @@ def _slot_module(slot: str) -> Any:
         ) from exc
 
 
+def _recipes_for_registration(slot: str, *, config: Any, store: Any) -> list[Any]:
+    """The slot's loaded recipes, in the shape `register_arms` reads.
+
+    One entry point over two recipe SCHEMAS (`alpha-engine-config-I9957`).
+    U and R recipes are `ArmSpec`s; an M recipe is a `ModelRecipe`, wrapped in
+    `crucible.slots.model.RegisteredModelArm` so its own id — the hash of its
+    own spec — is what registers. Re-deriving an id here from an `ArmSpec`
+    view would give one arm two identities, and the register, the shadows and
+    the series would each speak about a different one.
+
+    S is not here: `load_arm_specs` raises `ForeignRecipeSchemaError` for it
+    and the caller converts that into the exit that names the phase.
+    """
+    if slot != "m":
+        return list(load_arm_specs(slot, store=store, strategy_dir=config.strategy_dir))
+    from crucible.slots.model import (  # noqa: PLC0415 - heavy import, one call site
+        load_model_recipes,
+        registration_specs,
+    )
+
+    directory = Path(config.strategy_dir) / "arms" / slot if config.strategy_dir else None
+    loaded = load_model_recipes(directory, store=None if directory is not None else store)
+    print(
+        json.dumps(
+            {
+                "refused": [
+                    {"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused
+                ]
+            },
+            indent=2,
+        )
+    )
+    return registration_specs(loaded)
+
+
 def handle_experiment_new(args: argparse.Namespace) -> int:
     """Register the slot's recipes, appending only what is new.
 
@@ -310,23 +346,29 @@ def handle_experiment_new(args: argparse.Namespace) -> int:
     own help text is "report what would be written; write nothing", and
     this handler wrote the register regardless of it).
 
-    **M and S are refused here in the same shape :func:`_slot_module` uses**
-    (`alpha-engine-config-I9961`). `--slot` admits all four, and for M and S
-    this command used to reach `load_arm_specs`, fail on a missing `ranker`,
-    and present as a malformed recipe tree — for recipes that are well-formed
-    under the schema their own slot declares. The loader now refuses the slot
-    by name; this converts that into the same exit `experiment.run --slot m`
-    already produces, so the two commands give one answer about when M and S
-    arrive rather than two unrelated failures.
+    **M is no longer refused by name** (`alpha-engine-config-I9957`). Its
+    recipes are `ModelRecipe` documents, not `ArmSpec`s, so `load_arm_specs`
+    still refuses slot `m` — that refusal is correct and stays — and this
+    handler now resolves the M loader instead of converting the refusal into
+    an exit. `crucible.slots.model.load_model_recipes` reads the same tree
+    from the same two sources, and its refused arms are reported here rather
+    than silently dropped: an arm that will not register is the fact an
+    operator running `experiment.new` most needs.
+
+    **S is still refused by name**, in the same shape :func:`_slot_module`
+    uses (`alpha-engine-config-I9961`): its recipes are `StrategyRecipe`
+    documents and its produce/grade entry points arrive with the S slot's own
+    phase-3 deliverable. Registering nothing and exiting 0 would be
+    indistinguishable from a slot whose arms were all already present.
     """
     config = _settings(args)
     store = config.store()
     try:
-        specs = load_arm_specs(args.slot, store=store, strategy_dir=config.strategy_dir)
+        specs = _recipes_for_registration(args.slot, config=config, store=store)
     except ForeignRecipeSchemaError as exc:
         raise SystemExit(
-            f"{exc} U and R are here; M and S arrive with track B "
-            f"({_ALL_SLOTS_PHASE.tracker}), which is when their recipes gain a register "
+            f"{exc} U, R and M are here; S arrives with track B "
+            f"({_ALL_SLOTS_PHASE.tracker}), which is when its recipes gain a register "
             "writer. Registering nothing and exiting 0 would be indistinguishable from a "
             "slot whose arms were all already present."
         ) from exc

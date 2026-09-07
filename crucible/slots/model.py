@@ -65,6 +65,7 @@ make the cutover impossible to finish.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
@@ -78,8 +79,17 @@ from nousergon_lib.arena import ArmSeries, ServingPrecondition, derive_arm_id
 from nousergon_lib.arena.engine import TrainingIntegrityError, TrainingStatus
 
 from crucible.features.registry import UNIT_SUFFIXES
-from crucible.keys import features_key, features_prefix
+from crucible.keys import (
+    arena_cycle_key,
+    arm_predictions_key,
+    cross_section_key,
+    features_key,
+    features_prefix,
+    shadow_key,
+    strategy_arms_prefix,
+)
 from crucible.slots.inputs import (
+    BasePredictionsUnavailableError,
     InputRef,
     InputRefusal,
     SlotUnservableError,
@@ -92,10 +102,13 @@ from crucible.slots.inputs import (
 from crucible.slots.vocab import refuse_unknown_keys
 
 __all__ = [
+    "CPCV_OOS_IC_METRIC",
     "DISPERSION_METRICS",
     "FLOOR_VETO_METRICS",
     "MIN_DISPERSION_RATIO",
+    "M_SELECTION_TOP_N",
     "OOS_METHOD",
+    "SLOT",
     "PROPORTION_METRICS",
     "UNITS_SUFFIXES",
     "ZERO_VETO_METRICS",
@@ -111,6 +124,8 @@ __all__ = [
     "InputRef",
     "InputRefusal",
     "ModelRecipe",
+    "RegisteredModelArm",
+    "SupersededArmUndeclaredError",
     "SlotRecipes",
     "SlotUnservableError",
     "UnresolvedInputError",
@@ -123,8 +138,11 @@ __all__ = [
     "cpcv_oos_ic",
     "evaluate_behavioural_veto",
     "evaluate_input_completeness",
+    "grade",
     "grade_arm",
     "load_model_recipes",
+    "produce",
+    "registration_specs",
     "settled_training_days",
     "train_arm",
 ]
@@ -784,6 +802,11 @@ class ModelRecipe:
     inputs: tuple[InputRef, ...] = ()
     supersedes: str | None = None
     slot: str = "m"
+    #: Where these bytes were read from — a checkout path or a store key.
+    #: Provenance, exactly as `crucible.slots.arms.ArmSpec.source_key` is, and
+    #: deliberately outside :attr:`spec`: which tree a recipe was read from is
+    #: not what it computes, and hashing it would give one recipe two ids.
+    source_key: str = ""
 
     def __post_init__(self) -> None:
         if not self.features:
@@ -990,10 +1013,77 @@ class SlotRecipes:
         ]
 
 
+def _parse_model_recipe(payload: bytes, origin: str) -> ModelRecipe:
+    """One recipe document, from wherever its bytes came from.
+
+    Split out of :func:`load_model_recipes` so a checkout and the strategy
+    tree synced into the store are read by ONE parser: two parsers is how a
+    recipe that loads on a laptop refuses on the box, and the box is where
+    the scheduled M cycle runs.
+    """
+    document = yaml.safe_load(payload.decode("utf-8")) or {}
+    spec = document.get("spec") or {}
+    missing = [f for f in REQUIRED_RECIPE_FIELDS if f not in spec]
+    if "registered_at" not in document:
+        # Top-level, beside `name` and `slot` and outside the hashed
+        # `spec`, mirroring `crucible.slots.arms`. One shape for one fact.
+        missing = [*missing, "registered_at"]
+    if missing:
+        raise ValueError(
+            f"{origin}: recipe is missing pre-registration field(s) {missing}. Plan §9.1: "
+            "an arm declares its slot, recipe and lineage BEFORE its first score, and "
+            "missing fields mean the arm does not register — a half-declared arm's "
+            "verdicts cannot be interpreted later."
+        )
+    refuse_unknown_keys(
+        path=origin,
+        keys=set(document),
+        vocabulary=M_TOP_LEVEL_KEYS,
+        level="top-level recipe",
+        slot_label="M",
+    )
+    refuse_unknown_keys(
+        path=origin,
+        keys=set(spec),
+        vocabulary=M_SPEC_KEYS,
+        level="spec",
+        slot_label="M",
+    )
+    return ModelRecipe(
+        slot=document.get("slot", "m"),
+        name=document["name"],
+        features=tuple(spec["features"]),
+        estimator=EstimatorSpec(
+            kind=spec["estimator"]["kind"],
+            params={k: v for k, v in spec["estimator"].items() if k != "kind"},
+        ),
+        label_horizon_trading_days=int(spec["label_horizon_trading_days"]),
+        refit_cadence_trading_days=int(spec["refit_cadence_trading_days"]),
+        training_window=TrainingWindowSpec(**spec["training_window"]),
+        cpcv=CPCVSpec(**spec["cpcv"]),
+        registered_at=str(document["registered_at"]),
+        inputs=tuple(parse_input_ref(t) for t in (spec.get("inputs") or ())),
+        supersedes=document.get("supersedes"),
+        source_key=origin,
+    )
+
+
 def load_model_recipes(
-    directory: Path | str, *, feature_columns: tuple[str, ...] | None = None
+    directory: Path | str | None = None,
+    *,
+    store: Any = None,
+    feature_columns: tuple[str, ...] | None = None,
 ) -> SlotRecipes:
     """Load every `*.yaml` M recipe under ``directory``, sorted by name.
+
+    **Either a checkout or the store, exactly as `load_arm_specs` resolves
+    U and R** (`alpha-engine-config-I9957`, blocker 3 of the 2026-09-04
+    re-scope). Until this parameter existed the loader accepted a filesystem
+    `Path` and nothing else, so the M cycle job — which runs on a spot box
+    with no `alpha-engine-config` checkout — could not have read its own
+    recipes from where they actually are. ``store`` reads
+    `strategy/current/arms/m/*.yaml` (`crucible.keys.strategy_arms_prefix`),
+    the same synced tree `load_arm_specs` reads for U and R.
 
     The directory is `alpha-engine-config/strategy/arms/m/` in production —
     recipes are strategy content and live in the private repository
@@ -1047,55 +1137,22 @@ def load_model_recipes(
     catalogue explicitly — never so a caller can opt out, which is why there
     is no value of it that disables the check.
     """
-    root = Path(directory)
+    if (directory is None) == (store is None):
+        raise ValueError(
+            "load_model_recipes reads EITHER a checkout (`directory`) or the strategy "
+            "tree synced into the store (`store`), and needs exactly one of them. "
+            "Neither is a caller that resolved no source and would register nothing; "
+            "both is two trees that can disagree about what the slot declares."
+        )
     recipes: list[ModelRecipe] = []
-    for path in sorted(root.glob("*.yaml")):
-        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        spec = payload.get("spec") or {}
-        missing = [f for f in REQUIRED_RECIPE_FIELDS if f not in spec]
-        if "registered_at" not in payload:
-            # Top-level, beside `name` and `slot` and outside the hashed
-            # `spec`, mirroring `crucible.slots.arms`. One shape for one fact.
-            missing = [*missing, "registered_at"]
-        if missing:
-            raise ValueError(
-                f"{path}: recipe is missing pre-registration field(s) {missing}. Plan §9.1: "
-                "an arm declares its slot, recipe and lineage BEFORE its first score, and "
-                "missing fields mean the arm does not register — a half-declared arm's "
-                "verdicts cannot be interpreted later."
-            )
-        refuse_unknown_keys(
-            path=path,
-            keys=set(payload),
-            vocabulary=M_TOP_LEVEL_KEYS,
-            level="top-level recipe",
-            slot_label="M",
-        )
-        refuse_unknown_keys(
-            path=path,
-            keys=set(spec),
-            vocabulary=M_SPEC_KEYS,
-            level="spec",
-            slot_label="M",
-        )
-        recipes.append(
-            ModelRecipe(
-                slot=payload.get("slot", "m"),
-                name=payload["name"],
-                features=tuple(spec["features"]),
-                estimator=EstimatorSpec(
-                    kind=spec["estimator"]["kind"],
-                    params={k: v for k, v in spec["estimator"].items() if k != "kind"},
-                ),
-                label_horizon_trading_days=int(spec["label_horizon_trading_days"]),
-                refit_cadence_trading_days=int(spec["refit_cadence_trading_days"]),
-                training_window=TrainingWindowSpec(**spec["training_window"]),
-                cpcv=CPCVSpec(**spec["cpcv"]),
-                registered_at=str(payload["registered_at"]),
-                inputs=tuple(parse_input_ref(t) for t in (spec.get("inputs") or ())),
-                supersedes=payload.get("supersedes"),
-            )
-        )
+    if directory is not None:
+        for path in sorted(Path(directory).glob("*.yaml")):
+            recipes.append(_parse_model_recipe(path.read_bytes(), str(path)))
+    else:
+        prefix = strategy_arms_prefix("m")
+        for key in sorted(store.list_keys(prefix)):
+            if key.endswith(".yaml"):
+                recipes.append(_parse_model_recipe(store.get_bytes(key), key))
 
     if feature_columns is None:
         from crucible.features import CATALOG  # noqa: PLC0415
@@ -1887,3 +1944,650 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
         in_sample_n=in_sample_n,
         unrankable_dates=tuple(unrankable),
     )
+
+
+# ---------------------------------------------------------------------------
+# The M cycle job — `experiment.run --slot m` and `experiment.grade --slot m`.
+#
+# `alpha-engine-config-I9957` deliverables 1 and 2. Everything above this line
+# was reachable only from `tests/` until this section existed: the loader had
+# no production caller, so `SlotRecipes.refusal_metrics` — one `unservable`
+# row per refused arm — landed on no manifest a scheduled run ever wrote, and
+# a standing refusal was a fact nobody was shown.
+#
+# The shape is the one every other slot already has (plan §4.4, "four slots,
+# one engine"): `produce` and `grade` with `crucible.slots.research`'s
+# signature, read off the module by `crucible.slots.dispatchable_slots`.
+# M differs from U and R in exactly one place — how its cross-section is
+# produced. A recipe is FITTED (`design_panel` -> `train_arm` ->
+# `predict_cross_section`) rather than ranked by a pure function, and the
+# fitted cross-section is written twice: once as the `arm_predictions.v1`
+# artifact a stacked arm consumes, and once as the `ShadowSelection` +
+# `ScoredCrossSection` pair `crucible.slots.cycle.run_grade` scores. The
+# grading half is `run_grade` UNCHANGED — a second copy of the grader for one
+# slot is the four-drifting-implementations shape v2 exists to remove.
+# ---------------------------------------------------------------------------
+
+#: This module's slot key, read by `crucible.slots.dispatchable_slots` through
+#: :func:`produce` / :func:`grade` rather than from this constant.
+SLOT = "m"
+
+#: How many names an M arm's shadow SELECTS out of the cross-section it
+#: scored. The M recipe declares no `top_n` — it predicts an alpha for every
+#: name and expresses no view about portfolio size, which is the S slot's
+#: decision — so the count is the harness's, and it is the same default
+#: `crucible.slots.grading._top_n` applies to a U/R recipe that omits one.
+#: Identical across every M arm on purpose: policy §4 grades a slot's arms on
+#: one axis, and two arms selecting different counts have different dispersion
+#: before either has any skill.
+M_SELECTION_TOP_N = 10
+
+#: The metric one arm's out-of-sample CPCV rank IC files on the grading job's
+#: manifest. Named rather than spelled at the call site so a console adapter
+#: and a test read the same literal.
+CPCV_OOS_IC_METRIC = "model_cpcv_oos_ic"
+
+
+@dataclass(frozen=True)
+class RegisteredModelArm:
+    """A loaded :class:`ModelRecipe` in the shape the register and grader read.
+
+    `crucible.slots.arms.register_arms` and `crucible.slots.cycle.run_grade`
+    are written against `ArmSpec` — `arm_id`, `spec`, `registered_at`,
+    `supersedes`, `control`, `params`. An M recipe carries the same facts
+    under a different document schema (it has no `ranker` and no `params`),
+    which is exactly why `load_arm_specs` refuses slot `m` by name
+    (`crucible.slots.arms.FOREIGN_RECIPE_LOADERS`).
+
+    **The id is the RECIPE's, never re-derived here.** Wrapping a
+    `ModelRecipe` in a real `ArmSpec` would hash `ranker`/`params` into
+    `derive_arm_id` and produce a second id for one arm — the register, the
+    shadows, the predictions artifact and the series would then each speak
+    about a different arm, and every surface would render it as healthy.
+    This adapter forwards :attr:`ModelRecipe.arm_id` and
+    :attr:`ModelRecipe.spec` untouched, so there is one identity.
+
+    ``params`` exists for one reader: `run_grade`'s `_control_top_n`, which
+    count-matches the slot's controls to the arms they are checking.
+    """
+
+    recipe: ModelRecipe
+    top_n: int = M_SELECTION_TOP_N
+
+    def __post_init__(self) -> None:
+        """§4.12: the OOS clock starts on a SESSION, or it starts nowhere.
+
+        The same assertion `ArmSpec.__post_init__` makes, made here for the
+        same reason: `registered_at` is what every ladder rung, eligibility
+        rung and grace rung is counted from, so a recipe naming a Saturday
+        starts its whole eligibility clock on a day the market never traded.
+        :class:`ModelRecipe` validates the field is an ISO date and stops
+        there — a date and a session are two different claims.
+        """
+        from crucible.calendar import assert_trading_day  # noqa: PLC0415 - avoids a cycle
+
+        assert_trading_day(
+            self.recipe.registered_at,
+            context=(
+                f"M arm {self.recipe.slot}:{self.recipe.name} `registered_at` "
+                f"(source: {self.recipe.source_key or 'constructed in code'})"
+            ),
+        )
+
+    @property
+    def name(self) -> str:
+        return self.recipe.name
+
+    @property
+    def slot(self) -> str:
+        return self.recipe.slot
+
+    @property
+    def arm_id(self) -> str:
+        return self.recipe.arm_id
+
+    @property
+    def spec(self) -> dict[str, Any]:
+        return self.recipe.spec
+
+    @property
+    def registered_at(self) -> str:
+        return self.recipe.registered_at
+
+    @property
+    def params(self) -> dict[str, Any]:
+        return {"top_n": self.top_n}
+
+    #: The register LINK, which is not the same fact as the recipe's declared
+    #: `supersedes` — see :func:`registration_specs`. Set there, never here.
+    supersedes: str | None = None
+    #: Provenance the register row carries verbatim: the declared lineage,
+    #: including a parent this slot refuses and therefore never registers.
+    notes: str = ""
+    #: An M recipe is never a control: controls are GENERATED by
+    #: `crucible.slots.arms.control_specs` and never filed, precisely so a
+    #: planted-edge arm cannot sit in the strategy tree where an operator
+    #: could clear the flag (§10.1).
+    control: bool = False
+    control_kind: str | None = None
+    bootstrap: bool = False
+
+
+class SupersededArmUndeclaredError(ValueError):
+    """A recipe's `supersedes` names an arm this slot does not declare at all.
+
+    Distinct from "the parent is refused", which is legitimate. The check the
+    register performs — a lineage pointer must not point at nothing — is kept
+    here, moved from "is the parent REGISTERED" to "does the slot DECLARE the
+    parent", because those two stopped being the same question the moment a
+    refusal became a per-arm value (`alpha-engine-config-I9955`).
+    """
+
+
+def registration_specs(loaded: SlotRecipes) -> list[RegisteredModelArm]:
+    """The slot's registered recipes, with their declared lineage resolved.
+
+    **A recipe's `supersedes` and a register row's `supersedes` are two
+    different facts, and conflating them broke the M slot outright**
+    (`alpha-engine-config-I9957`, measured 2026-09-06 against the live
+    strategy tree). `crucible.slots.arms.register_arms` refuses a pointer to
+    an arm it cannot find in the register — correctly, "a lineage pointer to
+    nothing reads as history that was checked". But Brian's
+    `alpha-engine-config-I9808` ruling (b) deliberately created an M arm that
+    supersedes a sibling which is REFUSED at registration and stays refused
+    until phase 5, so the parent has no register row and never will. The two
+    rulings collide and the whole M slot failed to register on the first real
+    call, with a message about a lineage pointer that in fact names a real,
+    declared, visibly-refused arm.
+
+    The recipe file itself already says which fact it is stating: "Provenance
+    and a stated lineage — NOT a series link and NOT an inheritance of any
+    record." So the declared string is carried as PROVENANCE on the register
+    row's notes, and the register LINK is set only when the parent actually
+    has a row to link to.
+
+    What is NOT softened is the guard's purpose. A `supersedes` naming an arm
+    this slot does not declare at all — a typo, a deleted file, another
+    slot's arm — still raises, as :class:`SupersededArmUndeclaredError`. The
+    check moved from "registered" to "declared"; it did not go away.
+    """
+    from crucible.slots.inputs import arm_name_from_id  # noqa: PLC0415 - avoids a cycle
+
+    registered_ids = {recipe.arm_id for recipe in loaded.registered}
+    declared = {recipe.name for recipe in loaded.registered} | {r.arm for r in loaded.refused}
+    specs: list[RegisteredModelArm] = []
+    for recipe in loaded.registered:
+        link: str | None = None
+        notes = ""
+        if recipe.supersedes:
+            parent = arm_name_from_id(recipe.supersedes)
+            if parent not in declared:
+                raise SupersededArmUndeclaredError(
+                    f"arm {recipe.name!r} declares supersedes={recipe.supersedes!r}, whose "
+                    f"name {parent!r} is not an arm this slot declares. The slot registers "
+                    f"{sorted(r.name for r in loaded.registered)} and refuses "
+                    f"{sorted(r.arm for r in loaded.refused)}. A lineage pointer to nothing "
+                    "reads as history that was checked; a pointer to a REFUSED sibling is "
+                    "checked history and is accepted, carried as provenance rather than as "
+                    "a register link."
+                )
+            if recipe.supersedes in registered_ids:
+                link = recipe.supersedes
+            else:
+                notes = (
+                    f"Supersedes {recipe.supersedes} — declared lineage, carried as "
+                    "provenance because that arm is refused at registration in this slot "
+                    "and has no register row to link to. Not a series link and not an "
+                    "inheritance of any record."
+                )
+        specs.append(RegisteredModelArm(recipe, supersedes=link, notes=notes))
+    return specs
+
+
+def _in_dependency_order(specs: Sequence[RegisteredModelArm]) -> list[RegisteredModelArm]:
+    """Base arms before the arms that stack on them, name-ordered within a rank.
+
+    A stacked arm's design matrix reads `predictions/{base}/{day}.json`, which
+    the base arm's own produce writes THIS cycle. Producing in file-name order
+    would therefore refuse the stack on the one session it could have been
+    satisfied — the base's artifact for today does not exist until the base
+    has run. The cycle is already impossible: `partition_producible` runs
+    `_assert_acyclic` at load and refuses the whole slot on one, so a rank
+    always exists here.
+    """
+    by_name = {s.name: s for s in specs}
+    rank: dict[str, int] = {}
+
+    def _rank(name: str, seen: frozenset[str]) -> int:
+        if name in rank:
+            return rank[name]
+        spec = by_name[name]
+        bases = [r.ref for r in spec.recipe.inputs if r.kind == "predictions" and r.ref in by_name]
+        rank[name] = 1 + max((_rank(b, seen | {name}) for b in bases), default=-1)
+        return rank[name]
+
+    for spec in specs:
+        _rank(spec.name, frozenset())
+    return sorted(specs, key=lambda s: (rank[s.name], s.name))
+
+
+def _load_slot(ctx: Any, *, settings: Any) -> SlotRecipes:
+    """Load the M slot and put every refusal on THIS run's manifest, first.
+
+    Deliverables 1 and 2 of `alpha-engine-config-I9957` in one place, and the
+    order matters in both directions:
+
+    * a refused arm's `unservable` row is recorded BEFORE any fitting work,
+      so it reaches the manifest whether the rest of the run succeeds or
+      raises — `crucible.runner.run_job` writes the manifest in a `finally`,
+      and metrics recorded before the raise are on it;
+    * when NOTHING registers, :class:`SlotUnservableError` is re-raised after
+      the rows are recorded rather than propagating straight out of the
+      loader. Without this the whole-slot case would page with a `reason` and
+      no per-arm rows — the least informative manifest of the three possible
+      outcomes, on the worst of them.
+
+    The source is the checkout when one is configured and the store otherwise,
+    the same resolution order `crucible.slots.arms.load_arm_specs` uses: a
+    developer editing `alpha-engine-config/strategy/` expects the edit to take
+    effect, and a spot box has no checkout at all.
+    """
+    strategy_dir = getattr(settings, "strategy_dir", None)
+    directory = Path(strategy_dir) / "arms" / SLOT if strategy_dir is not None else None
+    try:
+        loaded = load_model_recipes(directory, store=None if directory is not None else ctx.store)
+    except SlotUnservableError as exc:
+        for metric in SlotRecipes(registered=(), refused=exc.refusals).refusal_metrics(slot=SLOT):
+            ctx.record_metric(metric)
+        raise
+    for metric in loaded.refusal_metrics(slot=SLOT):
+        ctx.record_metric(metric)
+    return loaded
+
+
+def _registered_arms(ctx: Any, *, settings: Any) -> tuple[SlotRecipes, list[RegisteredModelArm]]:
+    loaded = _load_slot(ctx, settings=settings)
+    return loaded, registration_specs(loaded)
+
+
+def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
+    """Fit every registered M arm for one trading day and write its cross-section.
+
+    The M half of `experiment.run`. Same signature as
+    `crucible.slots.research.produce`, because `crucible.track_a` dispatches
+    both through one call and `crucible.slots.dispatchable_slots` reads this
+    name off the module.
+
+    Per arm, in base-before-stack order: :func:`design_panel` (the ONE seam
+    that materialises a declared `predictions[...]` input),
+    :func:`train_arm`, :func:`predict_cross_section`, then two writes of the
+    same numbers —
+
+    * :func:`produce_arm_predictions`, the `arm_predictions.v1` artifact a
+      stacked arm consumes and `crucible explain` walks;
+    * a :class:`~crucible.slots.grading.ShadowSelection` and
+      :class:`~crucible.slots.grading.ScoredCrossSection` through
+      `write_shadow` / `write_cross_section`, exactly as
+      `crucible.slots.cycle.run_produce` writes them for R — which is what
+      lets `run_grade` score M with no M-specific grading code at all.
+
+    Both are derived from ONE :func:`predict_cross_section` call, so the
+    artifact a stacked arm trains on and the shadow the arena scores can
+    never be two different rankings of one session.
+
+    **A `TrainingIntegrityError` fails the whole slot run** (plan §4.4, Brian
+    ruling 2026-08-29). It is not caught here and must not be: arms in a slot
+    share a training substrate, so a defect that spoils one fit is evidence
+    the cycle's inputs are compromised, and "this arm had nothing to say" and
+    "this arm's inputs were broken" must never render alike.
+    """
+    from crucible.calendar import assert_trading_day  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots import get_slot  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots.arms import (  # noqa: PLC0415 - avoids a cycle
+        control_specs,
+        read_register,
+        register_arms,
+        write_register,
+    )
+    from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots.grading import (  # noqa: PLC0415 - avoids a cycle
+        ScoredCrossSection,
+        ShadowSelection,
+        write_cross_section,
+        write_shadow,
+    )
+
+    arm_name: str | None = kwargs.get("arm_name")
+    feature_version: str | None = kwargs.get("feature_version")
+    slot_spec = get_slot(SLOT)
+    trading_day = ctx.trading_day.isoformat()
+    assert_trading_day(
+        ctx.trading_day, context=f"experiment.run --slot {SLOT} --date {trading_day}"
+    )
+
+    loaded, specs = _registered_arms(ctx, settings=settings)
+    if arm_name is not None:
+        specs = [s for s in specs if s.name == arm_name]
+        if not specs:
+            raise MissingArtifactError(
+                f"no arm named {arm_name!r} registered in slot {SLOT!r}; the slot "
+                f"registered {[r.name for r in loaded.registered]} and refused "
+                f"{[r.arm for r in loaded.refused]}. Producing nothing and exiting 0 "
+                "would be indistinguishable from an arm that ran and predicted nothing."
+            )
+
+    register = read_register(ctx.store, SLOT)
+    register, _ = register_arms(register, [*specs, *control_specs(slot_spec)])
+    write_register(ctx.store, SLOT, register)
+
+    source = FeatureLayerSource(store=ctx.store, version=feature_version)
+    # The WHOLE registered set, never the `--arm` filtered one: `design_panel`
+    # derives a stacked arm's base id from the recipe set it is given, so a
+    # filtered set makes `experiment.run --slot m --arm <a stack>` refuse its
+    # own base as an arm the slot does not declare. Which arms PRODUCE is a
+    # different question from which arms the slot DECLARES.
+    recipes = list(loaded.registered)
+    produced: list[str] = []
+    warming: list[InputRefusal] = []
+    for spec in _in_dependency_order(specs):
+        recipe = spec.recipe
+        try:
+            panel = design_panel(
+                recipe,
+                source=source,
+                trading_day=trading_day,
+                recipes=recipes,
+                store=ctx.store,
+                # The whole declared training window, plus the label horizon
+                # whose final rows `settled_training_days` purges. Asking for
+                # fewer sessions than the recipe's own `min_trading_days` would
+                # make `train_arm` refuse a window the store could have
+                # supplied.
+                lookback_trading_days=(
+                    recipe.training_window.min_trading_days + recipe.label_horizon_trading_days
+                ),
+                ctx=ctx,
+            )
+        except BasePredictionsUnavailableError as exc:
+            # A DELIBERATE per-arm refusal, and the only swallow in this loop.
+            #
+            # Failure mode absorbed: a stacked arm's base has not produced a
+            # prediction for every session of the stack's training window yet.
+            # That is a WARM-UP, not a broken input — the base is registered,
+            # producible, and filling its own history one cycle at a time —
+            # and it is unsatisfiable by construction on the base arm's first
+            # `min_trading_days` cycles. Left slot-wide it makes the whole M
+            # slot unproducible for as long as any stacked arm is filed, which
+            # is exactly the blast radius `alpha-engine-config-I9955` removed
+            # one layer in, at registration; the arm Brian's I9808 ruling (b)
+            # added is a stack, so the condition is live from the first cycle.
+            #
+            # Why the deliverable survives: the base arm and every unstacked
+            # sibling produce normally, so the slot serves and accumulates
+            # evidence. Recording surface: `ARM_REFUSED_METRIC` on THIS run's
+            # manifest with `status: unservable`, the same row and the same
+            # vocabulary a registration refusal files, naming the arm, the
+            # input and the missing sessions.
+            #
+            # What is NOT absorbed: a defective feature layer, a non-finite
+            # prediction, or a training window the layer cannot supply. Those
+            # are `TrainingIntegrityError` and still fail the whole slot.
+            warming.append(
+                InputRefusal(
+                    arm=recipe.name,
+                    unresolvable=tuple(r.text for r in recipe.inputs if r.kind == "predictions"),
+                    reason=str(exc),
+                )
+            )
+            continue
+        fit = train_arm(recipe, panel, as_of=trading_day)
+        predicted = predict_cross_section(fit, panel, trading_day=trading_day)
+        produce_arm_predictions(ctx, fit=fit, panel=panel, trading_day=trading_day)
+        ranked = sorted(predicted.items(), key=lambda item: (-item[1], item[0]))
+        shadow = ShadowSelection(
+            arm_id=fit.arm_id,
+            trading_day=trading_day,
+            selection=tuple(ticker for ticker, _ in ranked[: spec.top_n]),
+            population=tuple(sorted(predicted)),
+            # Provenance, not a lookup: the M slot resolves no `crucible.slots.
+            # rankers` callable, and naming one here would claim a ranking
+            # function this arm never ran. The estimator IS what ranked it.
+            ranker=f"model:{recipe.estimator.kind}",
+            params=dict(spec.params),
+            feature_version=panel.feature_version,
+        )
+        write_shadow(ctx.store, shadow)
+        ctx.record_output(
+            shadow_key(shadow.arm_id, shadow.trading_day),
+            json.dumps(shadow.to_dict(), indent=2, sort_keys=True).encode("utf-8"),
+            schema_version="shadow.v1",
+        )
+        cross_section = ScoredCrossSection(
+            arm_id=fit.arm_id,
+            trading_day=trading_day,
+            ranks=tuple(
+                (ticker, score, position)
+                for position, (ticker, score) in enumerate(ranked, start=1)
+            ),
+        )
+        write_cross_section(ctx.store, cross_section)
+        ctx.record_output(
+            cross_section_key(cross_section.arm_id, cross_section.trading_day),
+            json.dumps(cross_section.to_dict(), indent=2, sort_keys=True).encode("utf-8"),
+            schema_version="cross_section.v2",
+        )
+        produced.append(fit.arm_id)
+
+    for refusal in warming:
+        ctx.record_metric(
+            SlotRecipes(registered=(), refused=(refusal,)).refusal_metrics(slot=SLOT)[0]
+        )
+    if warming and not produced:
+        # Every arm that registered is waiting on a base that has not run
+        # enough sessions: the slot can serve nothing this cycle, which is the
+        # same `unservable` reading an all-refused registration produces and
+        # pages through the same failed manifest. It is NOT `ok` — a slot that
+        # produced no cross-section did not have nothing to do.
+        raise SlotUnservableError(tuple(warming))
+
+    ctx.record_rows(rows_in=len(specs), rows_out=len(produced))
+    ctx.record_metric(
+        {
+            "name": "arms_produced",
+            "module": f"crucible.slots.{SLOT}",
+            "metric_type": "count",
+            "value": float(len(produced)),
+            "unit": "arms",
+            "n_floor": 1,
+            "status": "OK",
+            "status_reason": (
+                f"slot {SLOT}: {len(produced)} registered arm(s) fitted and predicted a "
+                f"cross-section for {trading_day}; {len(loaded.refused)} arm(s) refused "
+                "at registration"
+            ),
+            "source_path": f"predictions/*/{trading_day}.json",
+            "last_updated_utc": _utc_now(),
+        }
+    )
+    return {
+        "slot": SLOT,
+        "trading_day": trading_day,
+        "arms": produced,
+        "refused": [{"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused],
+        "feature_version": str(source.version),
+    }
+
+
+def _serving_metrics(predicted: dict[str, float]) -> dict[str, Any]:
+    """The §5.3 veto inputs one predicted cross-section can actually supply.
+
+    `alpha_stdev` and nothing else, deliberately. `stdev_p_up`,
+    `n_high_confidence` and `model_hit_rate_30d` each need a producer this
+    harness does not have — a calibrated up-probability, a confidence
+    threshold, and a realized 30-day hit rate — and inventing a stand-in for
+    any of them is the exact failure mode :func:`evaluate_behavioural_veto`
+    documents: a gate that reports a pass for a statistic nobody measured
+    (`champion-challenger-policy.md` §5.1). Absent metrics make the veto read
+    `insufficient`, which FAILS the serving precondition, so an M arm cannot
+    take the pointer until those producers exist. That is the honest reading
+    and it is visible on the cycle artifact rather than assumed.
+
+    Raw, never standardized (policy §5.3): dividing by the spread is the
+    transformation that made 2026-08-28's collapse read as healthy.
+    """
+    values = np.array(sorted(predicted.values()), dtype="float64")
+    return {"alpha_stdev": float(values.std())}
+
+
+def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
+    """Score every settled M shadow and run the slot's arena cycle.
+
+    `crucible.slots.cycle.run_grade`, unchanged, with two M-specific facts
+    supplied to it as evaluated RESULTS rather than as computations the
+    engine performs (policy §5.3):
+
+    * the per-arm **CPCV out-of-sample rank IC** from :func:`grade_arm`,
+      recorded as a metric on this run's manifest. It is the battery §3
+      requires, and it is a reading, not a second verdict path — the series
+      the pointer is decided on is still the one the arena pairs;
+    * a **behavioural-veto serving precondition** per arm, from
+      :func:`evaluate_behavioural_veto` over the arm's own predicted
+      cross-section against the incumbent's. With no incumbent and no
+      producer for three of the four metrics the veto reads, it returns
+      `insufficient` — which fails the precondition and keeps the M pointer
+      where it is. See :func:`_serving_metrics`.
+
+    The refusal rows are recorded here too, on this manifest, for the same
+    reason they are recorded on the produce manifest: a slot that became
+    unservable between the two jobs must page from whichever one ran.
+    """
+    from crucible.slots.cycle import run_grade  # noqa: PLC0415 - avoids a cycle
+
+    loaded, specs = _registered_arms(ctx, settings=settings)
+    as_of = ctx.trading_day.isoformat()
+    source = FeatureLayerSource(store=ctx.store, version=kwargs.get("feature_version"))
+    incumbent = _incumbent_serving_metrics(ctx.store, as_of=as_of)
+
+    preconditions: dict[str, list[ServingPrecondition]] = {}
+    grades: dict[str, dict[str, Any]] = {}
+    for spec in _in_dependency_order(specs):
+        recipe = spec.recipe
+        try:
+            panel = design_panel(
+                recipe,
+                source=source,
+                trading_day=as_of,
+                recipes=list(loaded.registered),
+                store=ctx.store,
+                lookback_trading_days=(
+                    recipe.training_window.min_trading_days + recipe.label_horizon_trading_days
+                ),
+                ctx=ctx,
+            )
+        except BasePredictionsUnavailableError as exc:
+            # The produce-side warm-up, seen again here. Same failure mode,
+            # same reason it is per-arm rather than slot-wide (see `produce`),
+            # and the same recording surface: an `unservable` row on this
+            # run's manifest naming the arm and its unresolvable input. An
+            # arm with no panel has no CPCV reading and no serving
+            # precondition to evaluate; `run_grade` below still supplies its
+            # score series, which is empty, so it cannot null another arm's
+            # figure. What is NOT absorbed is anything about the feature layer
+            # or the fit — those still fail the whole slot.
+            ctx.record_metric(
+                SlotRecipes(
+                    registered=(),
+                    refused=(
+                        InputRefusal(
+                            arm=recipe.name,
+                            unresolvable=tuple(
+                                r.text for r in recipe.inputs if r.kind == "predictions"
+                            ),
+                            reason=str(exc),
+                        ),
+                    ),
+                ).refusal_metrics(slot=SLOT)[0]
+            )
+            continue
+        model_grade = grade_arm(recipe, panel, as_of=as_of)
+        measurable = bool(model_grade.cpcv.ics)
+        row: dict[str, Any] = {
+            "name": CPCV_OOS_IC_METRIC,
+            "module": f"crucible.slots.{SLOT}",
+            "metric_type": "gauge",
+            "n_floor": 1,
+            "status": "OK" if measurable else "unmeasurable",
+            "status_reason": (
+                f"arm {recipe.name!r}: combinatorial purged CV over "
+                f"{len(model_grade.cpcv.folds)} fold(s) at a "
+                f"{recipe.label_horizon_trading_days}-session label horizon; the "
+                f"walk-forward series carries {model_grade.oos_n} out-of-sample "
+                f"date(s). {model_grade.cpcv.reason} {model_grade.reason}"
+            ).strip(),
+            "source_path": arena_cycle_key(SLOT, as_of),
+            "last_updated_utc": _utc_now(),
+            "horizon_trading_days": recipe.label_horizon_trading_days,
+        }
+        if measurable:
+            row["value"] = float(model_grade.cpcv.mean_ic)
+            row["unit"] = "rank_ic"
+        # An unmeasurable battery carries NO value and NO unit. Not a zero and
+        # not a carried-forward figure: `unmeasurable` is a first-class status
+        # (plan §7) and a number beside it would be read as a measurement
+        # nobody made. `CPCVResult.mean_ic` refuses to be read at all in that
+        # state, which is what surfaced this.
+        ctx.record_metric(row)
+        veto = evaluate_behavioural_veto(
+            _serving_metrics(predict_cross_section(model_grade.fit, panel, trading_day=as_of)),
+            incumbent,
+        )
+        preconditions[spec.arm_id] = [veto.as_precondition()]
+        grades[spec.arm_id] = {
+            "cpcv_mean_ic": model_grade.cpcv.mean_ic if measurable else None,
+            "oos_n": model_grade.oos_n,
+            "status": model_grade.status,
+            "veto": veto.status,
+        }
+
+    result = run_grade(
+        ctx,
+        slot=SLOT,
+        settings=settings,
+        specs=specs,
+        preconditions=preconditions,
+        **{k: v for k, v in kwargs.items() if k != "feature_version"},
+    )
+    result["model_grades"] = grades
+    result["refused"] = [
+        {"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused
+    ]
+    return result
+
+
+def _incumbent_serving_metrics(store: Any, *, as_of: str) -> dict[str, Any]:
+    """The champion M arm's own cross-section metrics, or `{}` when there is none.
+
+    `{}` is not a neutral default and is not treated as one: every
+    dispersion rule in :func:`evaluate_behavioural_veto` is a RATIO against
+    the incumbent's value for the same metric, so an absent incumbent makes
+    every one of them uncomputable and the veto reads `insufficient`. A slot
+    with no champion cannot veto a candidate on dispersion, and pretending
+    otherwise is the direction a veto may never fail.
+    """
+    from crucible.documents import load_store_document  # noqa: PLC0415 - avoids a cycle
+    from crucible.keys import champion_key  # noqa: PLC0415 - one call site
+    from crucible.slots.inputs import read_arm_predictions  # noqa: PLC0415 - avoids a cycle
+
+    key = champion_key(SLOT)
+    if not store.exists(key):
+        return {}
+    champion = load_store_document(store, key).get("champion")
+    if not champion:
+        return {}
+    if not store.exists(arm_predictions_key(champion, as_of)):
+        return {}
+    return _serving_metrics(read_arm_predictions(store, arm_id=champion, trading_day=as_of))
+
+
+def _utc_now() -> str:
+    return dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
