@@ -71,6 +71,7 @@ from crucible.keys import (
     retirement_log_key,
 )
 from crucible.keys import manifest_key as _promote_manifest_key
+from crucible.models import EXPERIMENT_EVENT_ROW_ADAPTER, RetirementLogRow
 from crucible.slots import SlotSpec, is_control_arm
 from crucible.store import ETAG_ABSENT, Store
 
@@ -683,8 +684,15 @@ def _append_retirement_events(store: Store, slot: str, as_of: str, cycle: ArenaC
     re-written ahead of the new lines rather than overwritten — so the
     history of a slot's retirement decisions is reconstructible even when the
     register itself is rebuilt.
+
+    `alpha-engine-config-I10045` row 14: each row validated against
+    `crucible.models.RetirementLogRow` before `_append_events` stamps its
+    `event_id` — a producer-validates-on-the-way-out check, the same
+    pattern row 9's `trial_rows` takes.
     """
     rows = [{"as_of": as_of, "slot": slot, **verdict.to_dict()} for verdict in cycle.retirements]
+    for row in rows:
+        RetirementLogRow.model_validate(row)
     return _append_events(store, retirement_log_key(slot), rows)
 
 
@@ -768,6 +776,13 @@ def _append_experiment_events(
                 "reason": decision.reason,
             }
         )
+    # `alpha-engine-config-I10045` row 14: each row validated against the
+    # closed `kind` union (`crucible.models.ExperimentEventRow`) before
+    # `_append_events` stamps its `event_id` — an unrecognized or malformed
+    # `kind` is refused here, at construction, rather than by whatever
+    # reads the feed back.
+    for row in rows:
+        EXPERIMENT_EVENT_ROW_ADAPTER.validate_python(row)
     return _append_events(store, experiments_key(as_of), rows)
 
 
