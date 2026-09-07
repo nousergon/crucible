@@ -116,6 +116,8 @@ __all__ = [
     "ComponentsDocument",
     "DeadlineRow",
     "LlmCallRow",
+    "LlmCallSiteRow",
+    "LlmCallsiteRegistryDocument",
     "METRIC_STATUS_VALUES",
     "MetricRecordRow",
     "RegistryDefaults",
@@ -1102,3 +1104,66 @@ class ArenaCycleDocument(BaseModel):
     )
     decision: dict[str, Any] = Field(description="the pointer decision for this cycle")
     retirements: list[dict[str, Any]] = Field(default_factory=list)
+
+
+# ── I10045 row 4: the LLM call-site registry ───────────────────────────────
+# Additive only, appended after the prior rows' markers for the same
+# rebase reason.
+
+
+class LlmCallSiteRow(_Strict):
+    """One row of ``callsites:`` in `llm_callsites.yaml`, plan §4.8.
+
+    `crucible.llm.load_registry` used to build this by hand: `missing = [f
+    for f in (...) if f not in row]` named every absent field in one message,
+    but a WRONGLY TYPED field (a string `max_usd_per_call`) fell through to
+    `float(row["max_usd_per_call"])`, which either coerces silently or raises
+    a bare `ValueError` naming neither the call site nor the field.
+    """
+
+    purpose: str = Field(min_length=1, description="what this call site asks a model for")
+    capability_class: str = Field(
+        min_length=1,
+        description="the router GROUP or capability class asked for — never a provider "
+        "model id, a base url or an SDK client (principle 8). Membership against the "
+        "live router+allowlist union is checked at load time, not by this schema, because "
+        "the router's own groups are not knowable from this document alone.",
+    )
+    max_usd_per_call: float = Field(gt=0, description="this site's own ceiling, under the cap")
+    owner: str = Field(min_length=1, description="the module that holds the call")
+
+
+class LlmCallsiteRegistryDocument(_Strict):
+    """``llm_callsites.yaml`` — plan §4.8, `crucible.llm`'s module docstring.
+
+    Two checks stay in the reader (`crucible.llm._require_capability_class`,
+    `crucible.llm.capability_group`) rather than moving onto this model,
+    because each is a membership check against `krepis.router`'s LIVE tier
+    groups plus this same document's own `capability_classes` allowlist — a
+    document-shape model cannot know the router's groups without importing
+    it, and this module (like `ArmRecipeDocument`'s) stays free of a
+    dependency on the thing it types.
+    """
+
+    schema_version: Literal["llm_callsite_registry.v1"] = Field(
+        description="Version of THIS schema. The real file already declares it "
+        "(unlike the arm recipe boundary, this is not a migration default)."
+    )
+    capability_classes: list[str] = Field(
+        description="the allowlist `crucible.llm.call` admits against, beyond the router's "
+        "bare tiers. An empty registry still declares this key, as `[]` — its absence is a "
+        "broken build, not an empty allowlist."
+    )
+    callsites: dict[str, LlmCallSiteRow] = Field(
+        description="every LLM call site this package can reach a model from, by id. "
+        "Empty is the correct state before any LLM arm exists, and is written `{}`."
+    )
+
+    @model_validator(mode="after")
+    def _capability_classes_are_non_empty_strings(self) -> LlmCallsiteRegistryDocument:
+        bad = [c for c in self.capability_classes if not isinstance(c, str) or not c]
+        if bad:
+            raise ValueError(
+                f"`capability_classes` must be a list of non-empty strings; found {bad!r}"
+            )
+        return self
