@@ -113,6 +113,7 @@ __all__ = [
     "ArtifactRef",
     "AttemptRow",
     "ChampionAttestation",
+    "ClosingReadingClauseRow",
     "ChampionEvidence",
     "ChampionPointerDocument",
     "ComponentRow",
@@ -125,6 +126,9 @@ __all__ = [
     "LlmCallsiteRegistryDocument",
     "METRIC_STATUS_VALUES",
     "MetricRecordRow",
+    "PhaseClosingReadingDocument",
+    "PhaseLadderDocument",
+    "PhaseLadderRow",
     "RegistryDefaults",
     "RejectedRow",
     "ReleaseProvenanceDocument",
@@ -1703,3 +1707,221 @@ class FeatureRegistryDocument(_Strict):
         "train on a silently substituted zero (the 2026-08-28 "
         "seven-hard-zeroed-features condition).",
     )
+
+
+# ── I10045 row 8: the phase ladder + closing reading ───────────────────────
+# Additive only, appended after the prior rows' markers for the same
+# rebase reason.
+
+_TRACKER_ISSUE_PATTERN = r"^alpha-engine-config-I[0-9]+$"
+_PHASE_ID_PATTERN = r"^phase[0-5]$"
+
+
+class PhaseLadderRow(_Strict):
+    """One phase row of `gates/ladder.json`'s `phases` array, plan §6."""
+
+    decision_id: str = Field(
+        pattern=_TRACKER_ISSUE_PATTERN,
+        description="`console-policy` §2.1: the identifier IS the tracker ref, so a "
+        "`git-host` claim about the same issue merges onto this row.",
+    )
+    phase: str = Field(pattern=_PHASE_ID_PATTERN)
+    number: Annotated[int, Field(ge=0, le=5)]
+    title: str = Field(min_length=1)
+    tracker: str = Field(pattern=_TRACKER_ISSUE_PATTERN)
+    tracker_url: str
+    gate: str | None = Field(
+        description="The registered gate name, or null when no gate has been written "
+        "for this phase yet."
+    )
+    state: Literal["MET", "UNMET", "UNMEASURED", "UNMEASURABLE", "OUT_OF_ORDER"] = Field(
+        description="crucible.gate.LADDER_STATES: MET | UNMET | UNMEASURED | "
+        "UNMEASURABLE | OUT_OF_ORDER. Closed set."
+    )
+    console_state: Literal["HEALTHY", "DEGRADED", "UNREPORTED", "FAILED"] = Field(
+        description="crucible.gate.LADDER_CONSOLE_STATE's rendering, in "
+        "observability-policy §8.3's vocabulary."
+    )
+    gate_state: Literal["MET", "UNMET", "UNMEASURED", "UNMEASURABLE"]
+    detail: str
+    clauses_met: Annotated[int, Field(ge=0)] | None = Field(
+        description="null when the phase has never been graded at all (no registered gate)."
+    )
+    clauses_total: Annotated[int, Field(ge=0)] | None
+    clauses_unmeasurable: Annotated[int, Field(ge=0)] | None = Field(
+        description="Count of this phase's clauses that read UNMEASURABLE (a store "
+        "access failure, distinct from a clause that was read and found unmet). null "
+        "exactly where clauses_total is null (no registered gate)."
+    )
+    met_ratio: Annotated[float, Field(ge=0, le=1)] | None = Field(
+        description="null when nothing was measured (no clauses). Never 0.0 for an "
+        "unmeasured reading -- 0.0 is a real measurement of zero clauses met out of a "
+        "nonzero total (principle 7, I9824)."
+    )
+    read_on: str | None = Field(
+        pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+        description="The last trading day this gate was read, or null when never.",
+    )
+    blocked_by: str | None = Field(
+        description="The earlier unmet phase id blocking this one, when state is "
+        "OUT_OF_ORDER; null otherwise.",
+    )
+    generated_utc: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+
+
+class PhaseLadderDocument(_Strict):
+    """`gates/ladder.json` — plan §6's phase ladder.
+
+    `crucible.gate.Ladder`/`PhaseRow` (frozen dataclasses with `.to_dict()`/
+    `.render()`; unchanged by this PR) validate through this model in
+    `crucible.gate.validate_ladder_document`, replacing that function's
+    previous hand-rolled `jsonschema.Draft202012Validator` call.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://github.com/nousergon/crucible/schemas/phase_ladder.v1.json",
+            "title": "Crucible plan §6 phase ladder, v1",
+            "description": (
+                "The record at gates/ladder.json, produced by "
+                "crucible.gate.build_ladder/ladder_payload and republished by both "
+                "crucible gate (crucible/track_f.py::gate_handler) and crucible console "
+                "(crucible/track_c.py::console_handler, via "
+                "crucible/console/render.py::write_page). Versioned because the fleet "
+                "console reads this key through an s3-records adapter, a cross-repo "
+                "consumer; additionalProperties: false because a field this reader does "
+                "not understand is a field the producer expected it to act on (I9825)."
+            ),
+        },
+    )
+
+    schema_version: Literal["phase_ladder.v1"] = Field(
+        description="Version of THIS schema. A consumer that cannot read the version "
+        "refuses the document rather than guessing."
+    )
+    trading_day: str = Field(
+        pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+        description="The NYSE trading day the ladder was built for (§4.12). Never a "
+        "wall-clock date.",
+    )
+    generated_utc: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+    current_phase: str = Field(
+        description="The lowest phase whose gate is not met, or `complete`. Not the "
+        "highest phase with work in it."
+    )
+    phases_total: Annotated[int, Field(ge=0)]
+    phases_met: Annotated[int, Field(ge=0)]
+    unmeasured: Annotated[int, Field(ge=0)] = Field(
+        description="Count of rows whose gate_state is UNMEASURED. Published rather "
+        "than left for a reader to derive."
+    )
+    out_of_order: list[str] = Field(
+        description="Phase ids currently graded ahead of an earlier unmet phase."
+    )
+    phases: list[PhaseLadderRow]
+
+
+class ClosingReadingClauseRow(_Strict):
+    """One clause verdict inside a `phase_closing_reading.v1` block."""
+
+    name: str = Field(min_length=1)
+    met: bool
+    unmeasurable: bool
+    detail: str
+
+
+class PhaseClosingReadingDocument(_Strict):
+    """The `phase_closing_reading.v1` block pasted into a phase-closing
+    comment, plan §6 rule 2.
+
+    `crucible.gate.closing_reading` builds the dict this validates via
+    `crucible.gate.validate_closing_reading_document`, replacing that
+    function's previous hand-rolled `jsonschema.Draft202012Validator` call.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://nousergon.ai/crucible/schemas/phase_closing_reading.v1.json",
+            "title": "phase_closing_reading.v1",
+            "description": (
+                "The gate reading that justifies CLOSING a phase issue, pasted into "
+                "the closing comment on the tracker (plan §6 rule 2; I9967 deliverable "
+                "3). It is a TRANSCRIPT of one crucible gate --gate phaseN reading, not "
+                "a claim: it carries the store it was read from, the commit of the "
+                "code that read it, the trading day it was keyed to, the durable gate "
+                "artifact the same run wrote, and every clause with its own verdict. A "
+                "reader who doubts it can fetch gate_artifact from store and compare. "
+                "Its consumer is alpha-engine-config's phase-tracker consistency "
+                "sweep, which refuses a CLOSED phase issue that carries no such block "
+                "or one that does not read MET -- so the fields below are a contract, "
+                "not a rendering convenience, and additionalProperties is false in "
+                "both directions."
+            ),
+        },
+    )
+
+    schema_version: Literal["phase_closing_reading.v1"] = Field(
+        description="Version of THIS schema. A consumer that cannot read the version "
+        "refuses the document rather than guessing."
+    )
+    phase: str = Field(
+        pattern=r"^phase[0-9]+$",
+        description="The plan §6 rung this reading closes, as crucible.gate.Phase.id.",
+    )
+    tracker: str = Field(
+        pattern=_TRACKER_ISSUE_PATTERN,
+        description="The phase issue this block belongs on, derived from "
+        "crucible.gate.PHASES -- never typed. A block pasted onto a different issue "
+        "is detectable because this field names the one it was rendered for.",
+    )
+    tracker_url: str = Field(min_length=1)
+    gate: str = Field(min_length=1, description="The registered gate name that was read.")
+    gate_state: Literal["MET", "UNMET", "UNMEASURABLE"] = Field(
+        description="MET, UNMET or UNMEASURABLE -- crucible.gate.gate_state_for, the "
+        "same function the ladder row uses, so a block and the ladder beside it cannot "
+        "disagree. OUT_OF_ORDER is deliberately absent: it is a fact about the LADDER "
+        "(a later phase graded ahead of an earlier one), not about this gate's own "
+        "clauses, and the sweep that reads this block checks phase ordering from the "
+        "tracker states it already holds.",
+    )
+    clauses_met: Annotated[int, Field(ge=0)]
+    clauses_total: Annotated[int, Field(ge=0)]
+    clauses_unmeasurable: Annotated[int, Field(ge=0)]
+    met_ratio: Annotated[float, Field(ge=0, le=1)] | None = Field(
+        description="Met clauses over total, or null when nothing was measured or any "
+        "clause was unmeasurable -- GateResult.met_ratio, not re-derived. null, never "
+        "0.0: zero is a measurement and absence is not."
+    )
+    coverage: str | None = Field(
+        description="How much of the phase issue's declared deliverable list this "
+        "gate grades, or null when the gate declares no deliverable list. Carried "
+        "onto the block on purpose: a phase whose gate grades a SUBSET of its "
+        "deliverables reads MET, and the closing comment is the last surface where "
+        "that can still be seen."
+    )
+    trading_day: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+    generated_utc: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+    store: str = Field(
+        min_length=1,
+        description="The store URI this reading was taken against. Provenance, and "
+        "the half that makes the block falsifiable: without it gate_artifact names a "
+        "key in no particular bucket.",
+    )
+    commit: str = Field(
+        pattern=r"^[0-9a-f]{12,40}$",
+        description="The commit of the crucible tree whose clause list produced this "
+        "reading. At least 12 lowercase hex characters. A reading with no commit "
+        "cannot be re-run against the same clause definitions, which is the whole "
+        "point of recording it.",
+    )
+    gate_artifact: str = Field(
+        min_length=1,
+        description="The durable, never-overwritten key the same run wrote under "
+        "gates/{gate}/{trading_day}/gate.json. The block is a copy; this is the "
+        "original.",
+    )
+    clauses: list[ClosingReadingClauseRow]

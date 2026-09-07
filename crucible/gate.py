@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from jsonschema import Draft202012Validator
+from pydantic import ValidationError
 
 from crucible.alerts import PAGE_CONDITIONS, pages_in_range
 from crucible.calendar import TRADING_DAYS_PER_WEEK, is_trading_day, resolve_trading_day
@@ -63,6 +64,7 @@ from crucible.keys import (
     verdict_key,
 )  # noqa: F401 - re-exported
 from crucible.manifest import load_schema, manifest_key
+from crucible.models import PhaseClosingReadingDocument, PhaseLadderDocument
 from crucible.release import POINTER_KEY
 from crucible.report import attribution_key
 from crucible.slots import SLOTS, dispatchable_slots, is_control_arm
@@ -4917,14 +4919,24 @@ def validate_ladder_document(document: dict[str, Any]) -> None:
     Producer-side validation, the shape `crucible/slots/inputs.py::write_arm_
     predictions` uses — a malformed ladder is refused before it reaches the
     store, not discovered by whatever reads it next.
+
+    `alpha-engine-config-I10045` row 8: validated through
+    `crucible.models.PhaseLadderDocument` instead of the hand-rolled
+    `_ladder_validator()`; `phase_ladder.v1.json` is now GENERATED from that
+    model. `ladder_schema()`/`_ladder_validator()` stay unchanged (both are
+    tested directly in `tests/test_phase_ladder.py`) and still read whichever
+    file is committed.
     """
-    errors = sorted(_ladder_validator().iter_errors(document), key=lambda e: list(e.absolute_path))
-    if errors:
+    try:
+        PhaseLadderDocument.model_validate(document)
+    except ValidationError as exc:
         detail = "\n".join(
-            f"  - {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}"
-            for e in errors
+            f"  - {'/'.join(str(p) for p in e['loc']) or '<root>'}: {e['msg']}"
+            for e in exc.errors()
         )
-        raise ValueError(f"ladder document does not conform to {LADDER_SCHEMA_VERSION}:\n{detail}")
+        raise ValueError(
+            f"ladder document does not conform to {LADDER_SCHEMA_VERSION}:\n{detail}"
+        ) from exc
 
 
 def ladder_payload(ladder: Ladder) -> bytes:
@@ -5114,19 +5126,25 @@ def _closing_reading_validator() -> Draft202012Validator:
 
 
 def validate_closing_reading_document(document: dict[str, Any]) -> None:
-    """Refuse a closing reading that does not conform to `phase_closing_reading.v1`."""
-    errors = sorted(
-        _closing_reading_validator().iter_errors(document),
-        key=lambda e: list(e.absolute_path),
-    )
-    if errors:
+    """Refuse a closing reading that does not conform to `phase_closing_reading.v1`.
+
+    `alpha-engine-config-I10045` row 8: validated through
+    `crucible.models.PhaseClosingReadingDocument` instead of the hand-rolled
+    `_closing_reading_validator()`; `phase_closing_reading.v1.json` is now
+    GENERATED from that model. `closing_reading_schema()`/
+    `_closing_reading_validator()` stay unchanged and still read whichever
+    file is committed.
+    """
+    try:
+        PhaseClosingReadingDocument.model_validate(document)
+    except ValidationError as exc:
         detail = "\n".join(
-            f"  - {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}"
-            for e in errors
+            f"  - {'/'.join(str(p) for p in e['loc']) or '<root>'}: {e['msg']}"
+            for e in exc.errors()
         )
         raise ValueError(
             f"closing reading does not conform to {CLOSING_READING_SCHEMA_VERSION}:\n{detail}"
-        )
+        ) from exc
 
 
 def render_closing_comment(document: dict[str, Any]) -> str:

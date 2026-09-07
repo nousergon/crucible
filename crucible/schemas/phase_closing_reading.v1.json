@@ -1,10 +1,158 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "ClosingReadingClauseRow": {
+      "additionalProperties": false,
+      "description": "One clause verdict inside a `phase_closing_reading.v1` block.",
+      "properties": {
+        "detail": {
+          "title": "Detail",
+          "type": "string"
+        },
+        "met": {
+          "title": "Met",
+          "type": "boolean"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "unmeasurable": {
+          "title": "Unmeasurable",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "met",
+        "unmeasurable",
+        "detail"
+      ],
+      "title": "ClosingReadingClauseRow",
+      "type": "object"
+    }
+  },
   "$id": "https://nousergon.ai/crucible/schemas/phase_closing_reading.v1.json",
-  "title": "phase_closing_reading.v1",
-  "description": "The gate reading that justifies CLOSING a phase issue, pasted into the closing comment on the tracker (plan §6 rule 2; alpha-engine-config-I9967 deliverable 3). It is a TRANSCRIPT of one `crucible gate --gate phaseN` reading, not a claim: it carries the store it was read from, the commit of the code that read it, the trading day it was keyed to, the durable gate artifact the same run wrote, and every clause with its own verdict. A reader who doubts it can fetch `gate_artifact` from `store` and compare. Its consumer is `alpha-engine-config`'s phase-tracker consistency sweep, which refuses a CLOSED phase issue that carries no such block or one that does not read MET — so the fields below are a contract, not a rendering convenience, and `additionalProperties` is false in both directions.",
-  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "description": "The gate reading that justifies CLOSING a phase issue, pasted into the closing comment on the tracker (plan \u00a76 rule 2; I9967 deliverable 3). It is a TRANSCRIPT of one crucible gate --gate phaseN reading, not a claim: it carries the store it was read from, the commit of the code that read it, the trading day it was keyed to, the durable gate artifact the same run wrote, and every clause with its own verdict. A reader who doubts it can fetch gate_artifact from store and compare. Its consumer is alpha-engine-config's phase-tracker consistency sweep, which refuses a CLOSED phase issue that carries no such block or one that does not read MET -- so the fields below are a contract, not a rendering convenience, and additionalProperties is false in both directions.",
+  "properties": {
+    "clauses": {
+      "items": {
+        "$ref": "#/$defs/ClosingReadingClauseRow"
+      },
+      "title": "Clauses",
+      "type": "array"
+    },
+    "clauses_met": {
+      "minimum": 0,
+      "title": "Clauses Met",
+      "type": "integer"
+    },
+    "clauses_total": {
+      "minimum": 0,
+      "title": "Clauses Total",
+      "type": "integer"
+    },
+    "clauses_unmeasurable": {
+      "minimum": 0,
+      "title": "Clauses Unmeasurable",
+      "type": "integer"
+    },
+    "commit": {
+      "description": "The commit of the crucible tree whose clause list produced this reading. At least 12 lowercase hex characters. A reading with no commit cannot be re-run against the same clause definitions, which is the whole point of recording it.",
+      "pattern": "^[0-9a-f]{12,40}$",
+      "title": "Commit",
+      "type": "string"
+    },
+    "coverage": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "How much of the phase issue's declared deliverable list this gate grades, or null when the gate declares no deliverable list. Carried onto the block on purpose: a phase whose gate grades a SUBSET of its deliverables reads MET, and the closing comment is the last surface where that can still be seen.",
+      "title": "Coverage"
+    },
+    "gate": {
+      "description": "The registered gate name that was read.",
+      "minLength": 1,
+      "title": "Gate",
+      "type": "string"
+    },
+    "gate_artifact": {
+      "description": "The durable, never-overwritten key the same run wrote under gates/{gate}/{trading_day}/gate.json. The block is a copy; this is the original.",
+      "minLength": 1,
+      "title": "Gate Artifact",
+      "type": "string"
+    },
+    "gate_state": {
+      "description": "MET, UNMET or UNMEASURABLE -- crucible.gate.gate_state_for, the same function the ladder row uses, so a block and the ladder beside it cannot disagree. OUT_OF_ORDER is deliberately absent: it is a fact about the LADDER (a later phase graded ahead of an earlier one), not about this gate's own clauses, and the sweep that reads this block checks phase ordering from the tracker states it already holds.",
+      "enum": [
+        "MET",
+        "UNMET",
+        "UNMEASURABLE"
+      ],
+      "title": "Gate State",
+      "type": "string"
+    },
+    "generated_utc": {
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      "title": "Generated Utc",
+      "type": "string"
+    },
+    "met_ratio": {
+      "anyOf": [
+        {
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Met clauses over total, or null when nothing was measured or any clause was unmeasurable -- GateResult.met_ratio, not re-derived. null, never 0.0: zero is a measurement and absence is not.",
+      "title": "Met Ratio"
+    },
+    "phase": {
+      "description": "The plan \u00a76 rung this reading closes, as crucible.gate.Phase.id.",
+      "pattern": "^phase[0-9]+$",
+      "title": "Phase",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "phase_closing_reading.v1",
+      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "store": {
+      "description": "The store URI this reading was taken against. Provenance, and the half that makes the block falsifiable: without it gate_artifact names a key in no particular bucket.",
+      "minLength": 1,
+      "title": "Store",
+      "type": "string"
+    },
+    "tracker": {
+      "description": "The phase issue this block belongs on, derived from crucible.gate.PHASES -- never typed. A block pasted onto a different issue is detectable because this field names the one it was rendered for.",
+      "pattern": "^alpha-engine-config-I[0-9]+$",
+      "title": "Tracker",
+      "type": "string"
+    },
+    "tracker_url": {
+      "minLength": 1,
+      "title": "Tracker Url",
+      "type": "string"
+    },
+    "trading_day": {
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "title": "Trading Day",
+      "type": "string"
+    }
+  },
   "required": [
     "schema_version",
     "phase",
@@ -24,83 +172,6 @@
     "gate_artifact",
     "clauses"
   ],
-  "properties": {
-    "schema_version": {
-      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
-      "const": "phase_closing_reading.v1"
-    },
-    "phase": {
-      "description": "The plan §6 rung this reading closes, as `crucible.gate.Phase.id`.",
-      "type": "string",
-      "pattern": "^phase[0-9]+$"
-    },
-    "tracker": {
-      "description": "The phase issue this block belongs on, derived from `crucible.gate.PHASES` — never typed. A block pasted onto a different issue is detectable because this field names the one it was rendered for.",
-      "type": "string",
-      "pattern": "^alpha-engine-config-I[0-9]+$"
-    },
-    "tracker_url": {
-      "type": "string",
-      "minLength": 1
-    },
-    "gate": {
-      "description": "The registered gate name that was read.",
-      "type": "string",
-      "minLength": 1
-    },
-    "gate_state": {
-      "description": "MET, UNMET or UNMEASURABLE — `crucible.gate.gate_state_for`, the same function the ladder row uses, so a block and the ladder beside it cannot disagree. OUT_OF_ORDER is deliberately absent: it is a fact about the LADDER (a later phase graded ahead of an earlier one), not about this gate's own clauses, and the sweep that reads this block checks phase ordering from the tracker states it already holds.",
-      "enum": ["MET", "UNMET", "UNMEASURABLE"]
-    },
-    "clauses_met": {"type": "integer", "minimum": 0},
-    "clauses_total": {"type": "integer", "minimum": 0},
-    "clauses_unmeasurable": {"type": "integer", "minimum": 0},
-    "met_ratio": {
-      "description": "Met clauses over total, or `null` when nothing was measured or any clause was unmeasurable — `GateResult.met_ratio`, not re-derived. `null`, never 0.0: zero is a measurement and absence is not.",
-      "type": ["number", "null"],
-      "minimum": 0,
-      "maximum": 1
-    },
-    "coverage": {
-      "description": "How much of the phase issue's declared deliverable list this gate grades, or `null` when the gate declares no deliverable list. Carried onto the block on purpose: a phase whose gate grades a SUBSET of its deliverables reads MET, and the closing comment is the last surface where that can still be seen.",
-      "type": ["string", "null"]
-    },
-    "trading_day": {
-      "type": "string",
-      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
-    },
-    "generated_utc": {
-      "type": "string",
-      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
-    },
-    "store": {
-      "description": "The store URI this reading was taken against. Provenance, and the half that makes the block falsifiable: without it `gate_artifact` names a key in no particular bucket.",
-      "type": "string",
-      "minLength": 1
-    },
-    "commit": {
-      "description": "The commit of the crucible tree whose clause list produced this reading. At least 12 lowercase hex characters. A reading with no commit cannot be re-run against the same clause definitions, which is the whole point of recording it.",
-      "type": "string",
-      "pattern": "^[0-9a-f]{12,40}$"
-    },
-    "gate_artifact": {
-      "description": "The durable, never-overwritten key the same run wrote under `gates/{gate}/{trading_day}/gate.json`. The block is a copy; this is the original.",
-      "type": "string",
-      "minLength": 1
-    },
-    "clauses": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["name", "met", "unmeasurable", "detail"],
-        "properties": {
-          "name": {"type": "string", "minLength": 1},
-          "met": {"type": "boolean"},
-          "unmeasurable": {"type": "boolean"},
-          "detail": {"type": "string"}
-        }
-      }
-    }
-  }
+  "title": "phase_closing_reading.v1",
+  "type": "object"
 }
