@@ -112,6 +112,7 @@ __all__ = [
     "ArmRecipeDocument",
     "ArtifactRef",
     "AttemptRow",
+    "BoardDeclarationRow",
     "ChampionAttestation",
     "ClosingReadingClauseRow",
     "ChampionEvidence",
@@ -2045,3 +2046,44 @@ class DeclaredUniverseDocument(_Strict):
                 "not a denominator anyone can trust."
             )
         return self
+
+
+# ── I10045 row 11: the board declaration ───────────────────────────────────
+# Additive only, appended after the prior rows' markers for the same
+# rebase reason.
+
+
+class BoardDeclarationRow(_Strict):
+    """One row body of `board.yaml`'s `objectives`/`cutover` sections,
+    `alpha-engine-config-I9837`.
+
+    Types the RAW document shape only — presence, absence and type of the
+    body's own keys. `crucible.board.Declaration` (a frozen dataclass with
+    its own `__post_init__`; UNCHANGED by this PR) keeps every cross-field
+    rule this migration would otherwise move onto the model: `reader` XOR
+    `planned_because`, a non-empty `artifact`/`means_when_red`, and `source`
+    membership in `crucible.board.SOURCES`. `Declaration` is constructed
+    from EVERY code path already (`crucible.board._declaration` is not the
+    only caller `tests/test_board.py` constructs it directly to prove
+    validation is structural, not per-caller — the same property row 5/6's
+    `TestValidationIsStructuralNotPerCaller` proves for `ReleaseRecord`/
+    `ChampionPointer`), so duplicating those rules here would be two
+    enforcement points for one contract.
+
+    `reader` membership in `crucible.board.READERS` also stays in the
+    reader (`crucible.board._declaration`), not here, for the same reason
+    row 2's `ArmRecipeDocument` leaves `get_ranker` membership to
+    `crucible.slots.arms._parse`: it is a live-registry membership check,
+    not a document-shape fact, and importing `crucible.board` here would
+    invert this module's own import direction (`crucible.board` imports
+    `crucible.models`, not the reverse).
+    """
+
+    statement: str
+    surface: str
+    reader: str | None = None
+    artifact: str
+    means_when_red: str
+    section: str = ""
+    clause_class: str = ""
+    planned_because: str = ""
