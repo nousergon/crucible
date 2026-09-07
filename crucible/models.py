@@ -104,7 +104,7 @@ import datetime as dt
 from typing import Annotated, Any, Literal, get_args
 
 from krepis.metrics import StatusLiteral
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 __all__ = [
     "ARM_RECIPE_REQUIRED_FIELDS",
@@ -125,6 +125,9 @@ __all__ = [
     "ComponentsDocument",
     "DeadlineRow",
     "DeclaredUniverseDocument",
+    "EXPERIMENT_EVENT_ROW_ADAPTER",
+    "EligibilityHoldEventRow",
+    "ExperimentEventRow",
     "FeatureRegistryDocument",
     "FeatureRow",
     "GitHubCommit",
@@ -136,14 +139,19 @@ __all__ = [
     "LlmCallsiteRegistryDocument",
     "METRIC_STATUS_VALUES",
     "MetricRecordRow",
+    "NegativeResultEventRow",
+    "NoComparisonEventRow",
     "PhaseClosingReadingDocument",
     "PhaseLadderDocument",
     "PhaseLadderRow",
+    "PromotionEventRow",
     "RegistryDefaults",
     "RejectedRow",
     "ReleaseProvenanceDocument",
     "ReleaseRecordDocument",
     "ResourceRow",
+    "RetirementEventRow",
+    "RetirementLogRow",
     "ReviewDocument",
     "RunManifestV2",
     "SignalsRow",
@@ -2254,3 +2262,109 @@ class ReviewDocument(_Strict):
     head_sha: GitSha
     summary: str
     reviewed_at: str = Field(min_length=1)
+
+
+# ── I10045 row 14: promote.py's event logs ─────────────────────────────────
+# Additive only, appended after the prior rows' markers for the same
+# rebase reason.
+
+
+class RetirementLogRow(_Strict):
+    """One row of `retirements/{slot}.jsonl`, written by
+    `crucible.promote._append_retirement_events`, policy §6.1: "a
+    retirement list containing only retirements cannot be audited" — so
+    every active arm gets a row, survivors included, not only the retired
+    ones.
+
+    `as_of`/`slot` are this writer's own; the rest is
+    `nousergon_lib.arena.RetirementVerdict.to_dict()` verbatim — the
+    library's shape, restated here as required fields (not re-imported,
+    per the row-2/row-3 precedent: this module carries no import-time
+    dependency on the library type it mirrors). `event_id` is stamped
+    AFTER this validation, by `crucible.promote._append_events`, and is
+    therefore not part of this model — validating it here would validate a
+    field that does not exist yet at the point this model is used.
+    """
+
+    as_of: IsoDate
+    slot: str = Field(min_length=1)
+    arm_id: str = Field(min_length=1)
+    retire: bool
+    reason: str
+    age_weeks: Annotated[int, Field(ge=0)]
+    pairwise_losses: Annotated[int, Field(ge=0)]
+    is_champion: bool
+
+
+class _ExperimentEventBase(_Strict):
+    slot: str = Field(min_length=1)
+    as_of: IsoDate
+
+
+class PromotionEventRow(_ExperimentEventBase):
+    """One `experiments/{as_of}.jsonl` row: a challenger moved the pointer."""
+
+    kind: Literal["promotion"]
+    arm_id: str = Field(min_length=1)
+    incumbent: str | None
+    status: str
+    reason: str
+    window: dict[str, Any]
+
+
+class NegativeResultEventRow(_ExperimentEventBase):
+    """A challenger that was measured and did not win — plan §9.1's
+    negative result, durable rather than a private doc somebody remembers
+    to edit."""
+
+    kind: Literal["negative_result"]
+    arm_id: str = Field(min_length=1)
+    incumbent: str | None
+    status: str
+    reason: str
+    window: dict[str, Any]
+    confidence_sequence: dict[str, Any] | None
+
+
+class EligibilityHoldEventRow(_ExperimentEventBase):
+    kind: Literal["eligibility_hold"]
+    reason: str
+    promote_min_weeks: Annotated[int, Field(ge=1)]
+    paired_dates_required: Annotated[int, Field(ge=1)]
+
+
+class RetirementEventRow(_ExperimentEventBase):
+    """The RETIRED subset of a cycle's verdicts, also mirrored onto the
+    experiments feed so "why did nothing happen this week" is answerable
+    from one place."""
+
+    kind: Literal["retirement"]
+    arm_id: str = Field(min_length=1)
+    reason: str
+
+
+class NoComparisonEventRow(_ExperimentEventBase):
+    """A cycle with no comparisons at all (a single-arm slot, an
+    unservable slot) still emits its shape, because a feed silent on a
+    cycle is indistinguishable from a cycle that never ran."""
+
+    kind: Literal["no_comparison"]
+    status: str
+    reason: str
+
+
+ExperimentEventRow = Annotated[
+    PromotionEventRow
+    | NegativeResultEventRow
+    | EligibilityHoldEventRow
+    | RetirementEventRow
+    | NoComparisonEventRow,
+    Field(discriminator="kind"),
+]
+
+#: The one adapter for the closed `kind` union above. A `TypeAdapter`
+#: rather than five separate `model_validate` call sites, so a row with an
+#: unrecognized `kind` is refused BY THE UNION'S OWN DISCRIMINATOR, naming
+#: the five legal values, instead of failing against whichever branch a
+#: caller happened to try first.
+EXPERIMENT_EVENT_ROW_ADAPTER: TypeAdapter[ExperimentEventRow] = TypeAdapter(ExperimentEventRow)
