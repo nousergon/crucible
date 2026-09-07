@@ -38,6 +38,7 @@ from __future__ import annotations
 import datetime as dt
 import gzip
 import json
+import os
 import re
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -47,7 +48,8 @@ from typing import Any
 from crucible.models import CloudTrailRecord
 
 __all__ = [
-    "MACHINE_PRINCIPALS",
+    "MACHINE_PRINCIPALS_VAR",
+    "machine_principals",
     "ArchiveMissingError",
     "ArchiveRead",
     "OperatorAction",
@@ -79,13 +81,29 @@ _YEAR = re.compile(r"^\d{4}$")
 #: **This tuple grows only by PR, with the automation named.** An allowlist
 #: that can be widened at read time is an allowlist that eventually contains
 #: whoever ran the query.
-MACHINE_PRINCIPALS: tuple[str, ...] = (
-    "crucible-v2-runtime",
-    "crucible-v2-dispatcher",
-    "crucible-v2-scheduler",
-    "crucible-v2-github-deploy",
-    "crucible-v2-stack-check",
-)
+MACHINE_PRINCIPALS_VAR = "CRUCIBLE_MACHINE_PRINCIPALS"
+
+
+def machine_principals() -> tuple[str, ...]:
+    """The allowlist, read from the environment as a comma-separated list.
+
+    Was five literals until Brian's 2026-09-07 ruling made role names
+    unpublishable in this now-public tree (`alpha-engine-config-I10156`).
+    RAISES on an empty value rather than returning an empty tuple: an empty
+    allowlist scores every machine action as a human touch, which renders a
+    fully autonomous month as a fully manual one and reads as a finding rather
+    than as the missing configuration it actually is.
+    """
+    raw = os.environ.get(MACHINE_PRINCIPALS_VAR, "")
+    names = tuple(part.strip() for part in raw.split(",") if part.strip())
+    if not names:
+        raise RuntimeError(
+            f"{MACHINE_PRINCIPALS_VAR} is unset or empty. This repository is public "
+            "and carries no role name as a literal; "
+            "refusing to grade against an empty allowlist, which would report every "
+            "machine action as a human touch."
+        )
+    return names
 
 
 class ArchiveMissingError(RuntimeError):
@@ -189,7 +207,7 @@ def _principal(record: CloudTrailRecord) -> tuple[str, str]:
 
 
 def _is_machine(name: str) -> bool:
-    return name in MACHINE_PRINCIPALS
+    return name in machine_principals()
 
 
 def _touches(record: dict[str, Any], marker: str) -> bool:

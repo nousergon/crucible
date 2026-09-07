@@ -21,7 +21,6 @@ from crucible.gate import (
     LEGACY_DEAD_LAMBDA_NAMES,
     LEGACY_DEAD_LAMBDAS_SCHEMA_VERSION,
     LEGACY_WEEKLY_EXECUTIONS_SCHEMA_VERSION,
-    MUTED_ALERTS_TOPIC_NAME,
     PHASE0_DELIVERABLES,
     PHASES,
     SOURCE_SCAN_SCOPE,
@@ -33,6 +32,7 @@ from crucible.gate import (
     gate_key,
     legacy_dead_lambdas_key,
     legacy_weekly_executions_key,
+    muted_alerts_topic_name,
     weekly_anchor,
 )
 from crucible.keys import (
@@ -1158,7 +1158,7 @@ def _legacy_week(
     *,
     runs: int = 1,
     skips: int = 2,
-    topic: str | None = f"arn:aws:sns:us-east-1:acct:{MUTED_ALERTS_TOPIC_NAME}",
+    topic: str | None = None,
     with_topic_field: bool = True,
     reruns: tuple[str, ...] = (),
     run_status: str = "SUCCEEDED",
@@ -1177,6 +1177,8 @@ def _legacy_week(
     document filed between `alpha-engine-config-I9962` and `I9964`, which
     answers the cadence question and not the routing one.
     """
+    if topic is None:
+        topic = f"arn:aws:sns:us-east-1:acct:{muted_alerts_topic_name()}"
     day = anchor.isoformat()
     executions = (
         [
@@ -1209,7 +1211,7 @@ def _legacy_week(
                 "stop": f"{day}T09:35:00+00:00",
                 "duration_seconds": 2100.0,
                 "status": "FAILED",
-                "sns_topic_arn": "arn:aws:sns:us-east-1:acct:alpha-engine-alerts",
+                "sns_topic_arn": "arn:aws:sns:us-east-1:acct:test-unwatched-topic",
             }
             for name in reruns
         ]
@@ -1385,7 +1387,7 @@ class TestPhaseZeroOldWeeklyCadence:
                 "stop": f"{anchor.isoformat()}T23:00:00+00:00",
                 "duration_seconds": 18000.0,
                 "status": "SUCCEEDED",
-                "sns_topic_arn": f"arn:aws:sns:us-east-1:acct:{MUTED_ALERTS_TOPIC_NAME}",
+                "sns_topic_arn": f"arn:aws:sns:us-east-1:acct:{muted_alerts_topic_name()}",
             }
         )
         document["executions_started"] = len(document["executions"])
@@ -1410,7 +1412,7 @@ class TestPhaseZeroOldWeeklyCadence:
                 "stop": None,
                 "duration_seconds": None,
                 "status": "RUNNING",
-                "sns_topic_arn": f"arn:aws:sns:us-east-1:acct:{MUTED_ALERTS_TOPIC_NAME}",
+                "sns_topic_arn": f"arn:aws:sns:us-east-1:acct:{muted_alerts_topic_name()}",
             }
         )
         document["executions_started"] = len(document["executions"])
@@ -2179,7 +2181,7 @@ class TestARerunIsGradedAgainstTheWeekItRetries:
         result = evaluate(store, gate="phase0", trading_day=FRIDAY)
         clause = _clause(result, "old_alerts_muted")
         assert not clause.met
-        assert "alpha-engine-alerts" in clause.detail
+        assert "test-unwatched-topic" in clause.detail
 
     def test_a_week_of_nothing_but_other_weeks_reruns_is_unmeasurable_for_routing(
         self, tmp_path

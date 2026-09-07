@@ -109,6 +109,27 @@ DEFAULT_STACK_NAME = "crucible-v2"
 #: raises `ArchiveMissingError` on an empty value.
 DEFAULT_CLOUDTRAIL_ARCHIVE = ""
 
+#: The SNS topic v2 pages are published to, and the topic the SUPERSEDED v1
+#: system's alerts are routed to during the overlap. **No default,
+#: deliberately**, for the same reason as `DEFAULT_ARCTIC_BUCKET`: a topic
+#: name is an infrastructure identifier `crucible/AGENTS.md` (Visibility)
+#: forbids in this tree, and Brian's 2026-09-07 ruling made that binding for
+#: the account and every role and topic name it reaches
+#: (`alpha-engine-config-I10156`). `crucible.alerts` raises on an empty value
+#: rather than publishing to a guessed topic — a page sent nowhere and a page
+#: sent to the wrong place are both silent, and neither may be the default.
+DEFAULT_PAGES_TOPIC = ""
+DEFAULT_MUTED_TOPIC = ""
+
+#: The principals whose mutating calls are the system working rather than a
+#: human touching it, comma-separated. **No default, deliberately**: these are
+#: role names, and an allowlist with a built-in default is an allowlist that
+#: grades a second account against the first account's roles. `crucible.autonomy`
+#: raises on an empty value rather than grading against an empty allowlist,
+#: which would score every machine action as a human touch and read as a
+#: perfectly manual month.
+DEFAULT_MACHINE_PRINCIPALS = ""
+
 #: The fleet console's base URL (`policy-console`), where the board's rows are
 #: rendered as Decision entities at a STABLE address — the durable replacement
 #: for the presigned board link the morning report otherwise carries

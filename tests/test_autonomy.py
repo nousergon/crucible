@@ -20,9 +20,10 @@ import pytest
 
 from crucible import autonomy
 from crucible.autonomy import (
-    MACHINE_PRINCIPALS,
+    MACHINE_PRINCIPALS_VAR,
     ArchiveMissingError,
     count_operator_actions,
+    machine_principals,
 )
 
 START = dt.date(2026, 8, 3)
@@ -113,10 +114,14 @@ def _record(**over) -> dict:
         "eventSource": "lambda.amazonaws.com",
         "readOnly": False,
         "requestID": "req-1",
-        "requestParameters": {"functionName": "crucible-v2-dispatcher"},
+        # "crucible-v2" is the marker `count_operator_actions` matches on by
+        # default (the stack name, which legitimately stays a literal —
+        # `crucible/config.py`'s own `DEFAULT_STACK_NAME`); the suffix here
+        # is a synthetic fixture function, never a real Lambda name.
+        "requestParameters": {"functionName": "crucible-v2-fixture-function"},
         "userIdentity": {
             "type": "AssumedRole",
-            "arn": "arn:aws:sts::711398986525:assumed-role/AWSReservedSSO_admin/brian",
+            "arn": "arn:aws:sts::123456789012:assumed-role/AWSReservedSSO_admin/a-human",
             "sessionContext": {"sessionIssuer": {"userName": "AWSReservedSSO_admin"}},
         },
     }
@@ -125,7 +130,7 @@ def _record(**over) -> dict:
 
 
 #: The prefix `fleet-cloudtrail.yaml` exports — it stops ABOVE the region.
-ARCHIVE_PREFIX = "AWSLogs/711398986525/CloudTrail"
+ARCHIVE_PREFIX = "AWSLogs/123456789012/CloudTrail"
 
 
 #: Every calendar day the default fixture archive delivers an object for.
@@ -254,8 +259,8 @@ class TestCounting:
         machine = _record(
             userIdentity={
                 "type": "AssumedRole",
-                "arn": "arn:aws:sts::711398986525:assumed-role/crucible-v2-runtime/i-1",
-                "sessionContext": {"sessionIssuer": {"userName": "crucible-v2-runtime"}},
+                "arn": "arn:aws:sts::123456789012:assumed-role/test-runtime/i-1",
+                "sessionContext": {"sessionIssuer": {"userName": "test-runtime"}},
             }
         )
         assert _count(_archive({START: [machine]})).count == 0
@@ -267,11 +272,11 @@ class TestCounting:
         stranger = _record(
             userIdentity={
                 "type": "AssumedRole",
-                "arn": "arn:aws:sts::711398986525:assumed-role/some-new-role/x",
+                "arn": "arn:aws:sts::123456789012:assumed-role/some-new-role/x",
                 "sessionContext": {"sessionIssuer": {"userName": "some-new-role"}},
             }
         )
-        assert "some-new-role" not in MACHINE_PRINCIPALS
+        assert "some-new-role" not in machine_principals()
         assert _count(_archive({START: [stranger]})).count == 1
 
     def test_a_read_only_call_does_not_count(self) -> None:
@@ -464,3 +469,28 @@ class TestTheReadIsStreamedNotAccumulated:
         )
         assert read.records_scanned == 16
         assert {r["requestID"] for r in read.records} == {f"req-{i}" for i in range(16)}
+
+
+class TestMachinePrincipalsRaisesOnUnset:
+    """`alpha-engine-config-I10156`: the allowlist is no longer a literal, so
+    the raise-on-unset path is the only thing standing between a forgotten
+    environment variable and a fully autonomous month graded as fully
+    manual (every action falls through to "human")."""
+
+    def test_unset_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(MACHINE_PRINCIPALS_VAR, raising=False)
+        with pytest.raises(RuntimeError, match=MACHINE_PRINCIPALS_VAR):
+            machine_principals()
+
+    def test_empty_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(MACHINE_PRINCIPALS_VAR, "")
+        with pytest.raises(RuntimeError, match=MACHINE_PRINCIPALS_VAR):
+            machine_principals()
+
+    def test_blank_entries_alone_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A value of only commas and whitespace strips to nothing, and must
+        raise the same as an unset variable rather than returning an empty
+        tuple silently."""
+        monkeypatch.setenv(MACHINE_PRINCIPALS_VAR, " , , ")
+        with pytest.raises(RuntimeError, match=MACHINE_PRINCIPALS_VAR):
+            machine_principals()

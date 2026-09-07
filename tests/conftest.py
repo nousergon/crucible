@@ -19,6 +19,8 @@ import random
 
 import pytest
 
+from crucible.alerts import MUTED_TOPIC_VAR, PAGES_TOPIC_VAR
+from crucible.autonomy import MACHINE_PRINCIPALS_VAR
 from crucible.calendar import is_trading_day
 from crucible.runmode import RUN_MODE_ENV, RUN_MODE_LIVE
 from crucible.store import LocalStore
@@ -100,6 +102,27 @@ def declared_run_mode(monkeypatch):
     `monkeypatch.setenv` unwinds per test, so nothing leaks between them.
     """
     monkeypatch.setenv(RUN_MODE_ENV, RUN_MODE_LIVE)
+
+
+@pytest.fixture(autouse=True)
+def declared_topics_and_principals(monkeypatch):
+    """The account id and every role/topic name this suite used to carry as
+    literals are gone (`alpha-engine-config-I10156`): this repo is public and
+    `crucible.alerts.muted_topic`/`pages_topic` and
+    `crucible.autonomy.machine_principals` now RAISE unless their environment
+    variable is set. These values are SYNTHETIC — they name no real AWS
+    resource — and exist only so every test declares them exactly as a
+    workflow or an operator would, in one place rather than at each call
+    site. A test proving the raise-on-unset behaviour itself clears the
+    relevant variable with `monkeypatch.delenv`, which unwinds this fixture's
+    `setenv` for that one test only.
+    """
+    monkeypatch.setenv(MUTED_TOPIC_VAR, "test-muted-topic")
+    monkeypatch.setenv(PAGES_TOPIC_VAR, "test-pages-topic")
+    monkeypatch.setenv(
+        MACHINE_PRINCIPALS_VAR,
+        "test-runtime,test-dispatcher,test-scheduler,test-deploy,test-stack-check",
+    )
 
 
 class ActiveCostAllocationTag:

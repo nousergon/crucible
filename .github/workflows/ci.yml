@@ -58,9 +58,12 @@ env:
   # AWS_ACCOUNT_ID and STORE_URI come from repository variables
   # (alpha-engine-config-I9906) — this repo goes PUBLIC at phase-1 exit
   # (I9775) and `AGENTS.md` forbids infrastructure identifiers, bucket names
-  # and account numbers in the tree. The role NAME stays a literal below: it
-  # carries no secret on its own, and the account id is the sensitive half.
-  # crucible-v2-github-acceptance, created by nous-ergon-ops/infrastructure/
+  # and account numbers in the tree. The role name is built from
+  # `vars.CRUCIBLE_ROLE_PREFIX` below, same as the account id: this is a
+  # public repo, its run logs are public, and GitHub does not mask
+  # repository variables — only the `::add-mask::` step ahead of the
+  # credential step keeps the account id out of a printed ARN.
+  # The acceptance identity, created by nous-ergon-ops/infrastructure/
   # cloudformation/crucible-v2.yaml (alpha-engine-config-I9895, I9902). Read
   # only: cloudformation:ListStackResources + tag:GetResources +
   # iam:ListRoleTags on the crucible-v2 stack's own resources (TestCost's
@@ -69,7 +72,7 @@ env:
   # board, a run manifest, or anything else in the store — same separation
   # argument board.yml's own comment makes about BoardRole.
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
-  ACCEPTANCE_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/crucible-v2-github-acceptance
+  ACCEPTANCE_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.CRUCIBLE_ROLE_PREFIX }}-acceptance
   STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
   # The CloudFormation TEMPLATE upload bucket the operator remedy below
   # prints — a separate bucket from CRUCIBLE_STORE_URI's store, and a bucket
@@ -290,6 +293,16 @@ jobs:
 
       - name: Install
         run: uv sync --frozen
+
+      # This repo is public and its run logs are public; GitHub masks
+      # SECRETS, not repository VARIABLES. The identity assertion below
+      # prints an assumed-role ARN that embeds the account id — mask it
+      # before the credential step runs so nothing downstream can leak it.
+      # The assertion still works with masking on: it compares only the
+      # role-name segment (`*":assumed-role/${expected}/"*`), which the mask
+      # does not touch.
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
