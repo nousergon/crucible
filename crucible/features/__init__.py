@@ -15,7 +15,7 @@ a lookup a `read_parquet` already answers.
 
 from __future__ import annotations
 
-from crucible.features.compute import LIQUIDITY_FLOOR_USD, build_features, read_features
+from crucible.features.compute import build_features, liquidity_floor_usd, read_features
 from crucible.features.registry import (
     CATALOG,
     FEATURE_REGISTRY_SCHEMA_PATH,
@@ -39,7 +39,7 @@ __all__ = [
     "DEFAULT_FEATURE_VERSION",
     "FEATURE_REGISTRY_SCHEMA_PATH",
     "FEATURE_REGISTRY_SCHEMA_VERSION",
-    "LIQUIDITY_FLOOR_USD",
+    "liquidity_floor_usd",
     "UNIT_SUFFIXES",
     "FeatureRegistryValidationError",
     "FeatureSpec",
