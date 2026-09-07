@@ -18,6 +18,29 @@ artifact containing nothing, and every downstream gate passes on it.
 **The panel's columns carry units suffixes** (fleet rule; root cause:
 `avg_volume_20d` emitted as a ratio and consumed as raw shares). Raw prices
 and share counts are `_raw`; nothing here is normalized.
+
+**An absent symbol is two different facts, and only one of them is an
+outage** (`alpha-engine-config-I10127`). Four `data.heal` backfills for the
+window ending 2024-08-07 all raised `MissingSourceError` on ``['FDXF',
+'HONA', 'Q', 'SARO', 'SNDK', 'SOLS']`` — six 2025-26 listings that simply
+did not exist yet in that 2024 window, surfaced only because today's
+903-name universe was applied to a historical session. Before this, any
+symbol a source's windowed read dropped was treated as a partial outage,
+which made `COVERAGE_FLOOR_RATIO` unreachable for any historical session —
+a threshold nothing could ever enforce, since the run failed before the
+floor got a chance to fire. Every :class:`PriceSource` that drops a symbol
+now asks the store what it actually knows about that symbol's stored
+history before raising: a symbol not in the store at all, or whose stored
+history OVERLAPS the requested window yet still came back empty, or whose
+history could not be read, stays exactly the outage it always was
+(`MissingSourceError`, unchanged). A symbol whose entire stored history
+lies outside the window is a fact about the market, not the source — it is
+returned alongside the panel, in ``panel.attrs["unlisted_in_window"]``,
+rather than failing the run. This is never guessed from an empty frame
+alone: both implementations resolve real bounds before choosing either
+branch. Survivorship (a delisted symbol dropped from *today's* universe
+list before ever reaching this module) is unaffected and stays phase-5 work
+— see the binding plan §10.4 and `alpha-engine-config-I9761`.
 """
 
 from __future__ import annotations
@@ -64,6 +87,68 @@ _OHLCV_RENAME = {
 }
 
 
+def _classify_absent_symbols(
+    absent: list[str],
+    bounds: dict[str, tuple[dt.date, dt.date] | None],
+    *,
+    window_start: dt.date,
+    window_end: dt.date,
+) -> tuple[list[str], list[str]]:
+    """Split ``absent`` into ``(missing, unlisted_in_window)``.
+
+    ``bounds[sym]`` is the symbol's FULL stored-history ``(first, last)``
+    date pair, or ``None`` when the symbol could not be resolved at all —
+    not in the store, or its description could not be read. A symbol whose
+    bounds fall entirely outside ``(window_start, window_end]`` is a fact
+    about the market: the window predates the listing, or postdates the
+    delisting. Everything else — unresolved, or bounds that DO overlap the
+    window yet the source still returned nothing for it — stays a
+    :class:`MissingSourceError`: an overlapping window with no data is a
+    partial outage, and the two must never be told apart by guessing from
+    an empty frame alone.
+    """
+    missing: list[str] = []
+    unlisted: list[str] = []
+    for sym in absent:
+        b = bounds.get(sym)
+        if b is None:
+            missing.append(sym)
+            continue
+        b_start, b_end = b
+        if b_end < window_start or b_start > window_end:
+            unlisted.append(sym)
+        else:
+            missing.append(sym)
+    return sorted(missing), sorted(unlisted)
+
+
+def _frame_dates(frame: Any):
+    """Every date a source frame carries, as a numpy array of `dt.date`.
+
+    Mirrors `normalize_panel`'s own index handling exactly (``trading_day``
+    column if present, else the index; tz-stripped) so a value computed here
+    can never disagree with what `normalize_panel` would have read from the
+    same frame.
+    """
+    import pandas as pd
+
+    values = frame["trading_day"] if "trading_day" in frame.columns else frame.index
+    index = pd.to_datetime(values)
+    try:
+        index = index.tz_localize(None)
+    except TypeError:
+        index = index.tz_convert(None)
+    return index.date
+
+
+def _frame_date_bounds(frame: Any) -> tuple[dt.date, dt.date] | None:
+    """The ``(first, last)`` date carried by a source frame, or ``None`` if empty."""
+    if frame is None or len(frame) == 0:
+        return None
+    dates = _frame_dates(frame)
+    return (min(dates), max(dates))
+
+
 class MissingSourceError(RuntimeError):
     """A required input could not be read. The run fails; it does not degrade.
 
@@ -92,6 +177,13 @@ class PriceSource(ABC):
         Raises :class:`MissingSourceError` when the source cannot be reached
         or returns nothing. Returning an empty frame is NOT an option: an
         empty panel is the well-formed-artifact-containing-nothing shape.
+
+        The returned frame carries ``attrs["unlisted_in_window"]``: a sorted
+        list of requested symbols whose entire stored history falls outside
+        ``(end - lookback_days, end]`` — never a source failure, and never a
+        reason to shrink the panel's expected-universe denominator. Always
+        present (``[]`` when empty), so its absence is never mistaken for
+        "not measured".
         """
 
     @abstractmethod
@@ -200,17 +292,43 @@ class FramePriceSource(PriceSource):
         symbols: list[str] | None = None,
     ) -> pd.DataFrame:
         frames = self._frames
+        unlisted: list[str] = []
         if symbols is not None:
             wanted = set(symbols)
-            absent = sorted(wanted - set(frames))
+            window_start = end - dt.timedelta(days=lookback_days)
+            # Mirror `ArcticPriceSource`'s windowed `read_batch`, which drops a
+            # ticker's key entirely (rather than returning an empty frame) when
+            # its stored history has zero rows inside the requested date range —
+            # so this fixture source classifies the SAME two ways: `present` if
+            # the ticker's own stored history has any row in the window, else
+            # its full-history bounds decide `missing` vs `unlisted_in_window`
+            # via `_classify_absent_symbols`.
+            bounds: dict[str, tuple[dt.date, dt.date] | None] = {}
+            present: set[str] = set()
+            for ticker in wanted:
+                frame = frames.get(ticker)
+                b = _frame_date_bounds(frame)
+                bounds[ticker] = b
+                if b is None:
+                    continue
+                dates = _frame_dates(frame)
+                if ((dates > window_start) & (dates <= end)).any():
+                    present.add(ticker)
+            absent = sorted(wanted - present)
             if absent:
-                raise MissingSourceError(
-                    f"requested symbol(s) absent from the source: {absent}. A requested "
-                    "symbol that silently drops out of the panel is survivorship bias "
-                    "introduced by the loader."
+                missing, unlisted = _classify_absent_symbols(
+                    absent, bounds, window_start=window_start, window_end=end
                 )
-            frames = {t: f for t, f in frames.items() if t in wanted}
-        return normalize_panel(frames, end=end, lookback_days=lookback_days)
+                if missing:
+                    raise MissingSourceError(
+                        f"requested symbol(s) absent from the source: {missing}. A "
+                        "requested symbol that silently drops out of the panel is "
+                        "survivorship bias introduced by the loader."
+                    )
+            frames = {t: f for t, f in frames.items() if t in present}
+        panel = normalize_panel(frames, end=end, lookback_days=lookback_days)
+        panel.attrs["unlisted_in_window"] = unlisted
+        return panel
 
     def snapshot_id(self) -> str:
         return self._snapshot
@@ -300,27 +418,82 @@ class ArcticPriceSource(PriceSource):
                 "per-ticker read failures at WARNING and returns what it got, so an "
                 "empty result is an outage or a wrong bucket, not an empty market."
             )
+        unlisted: list[str] = []
         if symbols is not None:
             # `load_universe_ohlcv` "drops per-ticker read failures at WARNING and
             # returns what it got" (its own docstring) — a PARTIAL outage returns a
             # non-empty `frames` dict that is simply missing the failed tickers'
-            # keys. Checked here, the same way `FramePriceSource` checks it, so a
-            # dropped ticker is loud instead of invisible: a caller who asked for
-            # 903 names and got 850 back with no error is exactly the 901-of-903
-            # bug class the coverage floor exists to catch, and it must not be
-            # able to happen upstream of that floor by way of a source that never
-            # names what it silently lost.
+            # keys. It ALSO returns a dict missing a ticker's key when that
+            # ticker's windowed `read_batch` call legitimately found zero rows —
+            # e.g. its stored history starts after `end` (a 2025-26 listing read
+            # against a 2024 window, `alpha-engine-config-I10127`). Both shapes
+            # look identical here: an absent key. Resolved below by asking the
+            # library what it actually knows about each absent symbol's stored
+            # history, never by guessing from the empty read alone.
             absent = sorted(set(symbols) - set(frames))
             if absent:
-                raise MissingSourceError(
-                    f"ArcticDB universe library on bucket {self.bucket!r} dropped "
-                    f"{len(absent)} of {len(symbols)} requested symbol(s) for the window "
-                    f"ending {end}: {absent[:20]}{'…' if len(absent) > 20 else ''}. A "
-                    "requested symbol that silently drops out of the panel is "
-                    "survivorship bias introduced by the source — a partial outage must "
-                    "fail the run, not thin the panel."
+                window_start = end - dt.timedelta(days=lookback_days)
+                bounds = self._symbol_bounds(absent)
+                missing, unlisted = _classify_absent_symbols(
+                    absent, bounds, window_start=window_start, window_end=end
                 )
-        return normalize_panel(frames, end=end, lookback_days=lookback_days)
+                if missing:
+                    raise MissingSourceError(
+                        f"ArcticDB universe library on bucket {self.bucket!r} dropped "
+                        f"{len(missing)} of {len(symbols)} requested symbol(s) for the "
+                        f"window ending {end}: "
+                        f"{missing[:20]}{'…' if len(missing) > 20 else ''}. A requested "
+                        "symbol that silently drops out of the panel is survivorship "
+                        "bias introduced by the source — a partial outage must fail the "
+                        "run, not thin the panel."
+                    )
+        panel = normalize_panel(frames, end=end, lookback_days=lookback_days)
+        panel.attrs["unlisted_in_window"] = unlisted
+        return panel
+
+    def _symbol_bounds(self, symbols: list[str]) -> dict[str, tuple[dt.date, dt.date] | None]:
+        """Each symbol's FULL stored-history ``(first, last)`` date, or ``None``.
+
+        ``None`` covers every way a symbol's history cannot be resolved: not
+        present in the library (``has_symbol`` False), a description read that
+        raises, or a description whose own ``date_range`` is unset (``NaT`` —
+        an unsorted or non-timestamp-indexed symbol, per `SymbolDescription`'s
+        own contract). Every one of those stays classified as a genuine
+        `MissingSourceError` by `_classify_absent_symbols` — resolving to
+        ``None`` here never itself decides "unlisted", only "unresolved".
+        """
+        import pandas as pd
+        from nousergon_lib.arcticdb import open_universe_lib
+
+        try:
+            lib = open_universe_lib(self.bucket, region=self.region)
+        except Exception:
+            # The library itself could not be opened: every symbol is equally
+            # unresolved (`None`), so `_classify_absent_symbols` classifies all
+            # of them `missing` and the caller's `MissingSourceError` fires,
+            # naming the bucket and window — this is not a second failure path,
+            # only the input to the one that already exists.
+            return dict.fromkeys(symbols, None)
+
+        bounds: dict[str, tuple[dt.date, dt.date] | None] = {}
+        for sym in symbols:
+            try:
+                if not lib.has_symbol(sym):
+                    bounds[sym] = None
+                    continue
+                start_ts, end_ts = lib.get_description(sym).date_range
+                if pd.isna(start_ts) or pd.isna(end_ts):
+                    bounds[sym] = None
+                    continue
+                bounds[sym] = (pd.Timestamp(start_ts).date(), pd.Timestamp(end_ts).date())
+            except Exception:
+                # A `has_symbol`/`get_description` failure for THIS symbol is not
+                # swallowed: it resolves to `None` (unresolved), and
+                # `_classify_absent_symbols` treats every unresolved symbol as
+                # `missing` — the caller's `MissingSourceError` still fires and
+                # still names it. This is the strict default, never a silent skip.
+                bounds[sym] = None
+        return bounds
 
     def snapshot_id(self) -> str:
         """`arcticdb:{bucket}` — the library is versioned, this read is not.

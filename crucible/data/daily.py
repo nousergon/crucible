@@ -166,6 +166,38 @@ def run_daily(
         symbols=expected_symbols,
     )
 
+    # `PriceSource.load_panel` names, rather than fails on, an expected symbol
+    # whose entire stored history falls outside this window — 2025-26 listings
+    # read against a 2024 heal window is the measured case
+    # (`alpha-engine-config-I10127`). Recorded unconditionally (0 is still a
+    # value, never a missing metric) so the absence of listings-in-window is
+    # never mistaken for "not measured" — the same discipline `crucible.data`
+    # already applies to `universe_coverage_ratio` below.
+    unlisted_in_window = sorted(getattr(panel, "attrs", {}).get("unlisted_in_window", []))
+    ctx.record_metric(
+        {
+            "name": "symbols_unlisted_in_window",
+            "module": "crucible.data.daily",
+            "metric_type": "coverage",
+            "value": float(len(unlisted_in_window)),
+            "unit": "symbols",
+            "n_floor": 0,
+            "status": "OK",
+            "status_reason": (
+                f"{len(unlisted_in_window)} of {len(set(expected_symbols))} expected "
+                f"symbol(s) have no stored history overlapping the window ending "
+                f"{trading_day}"
+                + (
+                    f": {unlisted_in_window[:20]}{'…' if len(unlisted_in_window) > 20 else ''}"
+                    if unlisted_in_window
+                    else ""
+                )
+            ),
+            "source_path": coverage_key(trading_day.isoformat()),
+            "last_updated_utc": _utc_now(),
+        }
+    )
+
     day_rows = panel[panel["trading_day"] == trading_day]
     if day_rows.empty:
         raise MissingSourceError(
