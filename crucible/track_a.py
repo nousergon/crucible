@@ -33,6 +33,7 @@ from crucible.gate import PHASES
 from crucible.keys import arm_register_key
 from crucible.manifest import manifest_key
 from crucible.runner import run_job
+from crucible.slots import arm_name as name_component
 from crucible.slots import dispatchable_slots
 from crucible.slots.arms import (
     ForeignRecipeSchemaError,
@@ -332,10 +333,14 @@ def handle_experiment_new(args: argparse.Namespace) -> int:
         ) from exc
     arm = getattr(args, "arm", None)
     if arm:
-        specs = [s for s in specs if s.name == arm]
+        # Bare name or registered id, both resolved by `name_component` — see
+        # `crucible.slots.cycle.run_produce` for why the id form has to work:
+        # this command is the one that PRINTS the ids.
+        selector = name_component(arm)
+        specs = [s for s in specs if s.name == selector]
         if not specs:
             raise KeyError(
-                f"no arm named {arm!r} in slot {args.slot!r}; registering nothing and "
+                f"no arm named {selector!r} in slot {args.slot!r}; registering nothing and "
                 "exiting 0 would look exactly like registering it"
             )
     register = read_register(store, args.slot)
