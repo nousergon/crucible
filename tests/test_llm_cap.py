@@ -26,6 +26,7 @@ import pytest
 
 from crucible.config import DEFAULT_LLM_CAP_USD, settings
 from crucible.llm import (
+    PACE_OVERRUN_MARGIN,
     PACING_PERIOD,
     CallSite,
     LlmCallCeilingExceeded,
@@ -489,3 +490,151 @@ class TestWindow:
         )
         assert measured["cap_usd_measured"] is True
         assert "declared, not measured" not in measured["status_reason"]
+
+
+class TestPaceAtCallTime:
+    """`alpha-engine-config-I9977`: the reading `spend_pace`'s own docstring
+    promises ("we were ahead of pace on Tuesday") consulted where it can still
+    change an outcome — inside `call`, on the same `SpendCap` admission just
+    used — not only after every call of the week has already billed.
+    """
+
+    #: A tight per-call ceiling so `cap.spent_usd + reserved_usd` (the
+    #: worst-case reading `call` evaluates pace against) is easy to compute
+    #: by hand in each test below.
+    _PACE_SITE = CallSite(
+        callsite_id="test.pace_probe",
+        purpose="exercise the call-time pace reading without a provider",
+        capability_class="high",
+        max_usd_per_call=0.01,
+        owner="tests.test_llm_cap",
+    )
+    _ANCHOR = dt.datetime(2026, 8, 24, tzinfo=dt.UTC)  # a Monday, the window start
+
+    @staticmethod
+    def _free_client_factory(*_args, **_kwargs):
+        """A stub `LLMClient` that bills $0.00 — isolates the pace reading
+        from cap enforcement, which `TestEnforcement` already covers."""
+
+        class _Usage:
+            input_tokens = 10
+            output_tokens = 5
+            cache_read_tokens = 0
+            cache_create_tokens = 0
+            provider_cost_usd = 0.0
+
+        class _Result:
+            model = "router:high:primary"
+            usage = _Usage()
+            fallback_used = False
+            served_deployment = "router:high:primary"
+
+        class _Client:
+            def complete(self, **_kw):
+                return _Result()
+
+        return _Client()
+
+    def _call_once(self, *, cap: SpendCap, now: dt.datetime, tmp_path, monkeypatch) -> list[dict]:
+        store = LocalStore(tmp_path)
+        # The router edge is stubbed at the adapter's own two imports, same
+        # as `TestEnforcement.test_a_bill_above_the_admitted_ceiling_...`:
+        # this is a test of the pace reading, not of a real router or
+        # provider.
+        monkeypatch.setattr("krepis.router.resolve_group_spec", lambda *a, **k: (object(), {}))
+        monkeypatch.setattr("krepis.router.route_is_degraded", lambda _route: False)
+        monkeypatch.setattr("krepis.llm.LLMClient", lambda *a, **k: self._free_client_factory())
+
+        def body(ctx):
+            call(
+                ctx,
+                callsite_id=self._PACE_SITE.callsite_id,
+                capability_class="high",
+                messages=[{"role": "user", "content": "hello"}],
+                cap=cap,
+                estimate_usd=0.0,
+                client_factory=self._free_client_factory,
+                registry={self._PACE_SITE.callsite_id: self._PACE_SITE},
+                now=now,
+            )
+
+        run_job("report", body, store=store, trading_day=DAY, now=NOW, transient_retry=False)
+        manifest = json.loads(store.get_bytes(manifest_key("report", DAY.isoformat())).decode())
+        return manifest["metrics"]
+
+    def test_a_front_loaded_burst_is_flagged_early_in_the_window(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # spent 3.49 + this call's 0.01 ceiling = 3.50 worst-case against a
+        # $5.00 cap -> used_frac=0.70; one day into a 7-day window ->
+        # elapsed_frac~=0.143; overrun~=0.557, well past PACE_OVERRUN_MARGIN.
+        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "ci")
+        cap = SpendCap(cap_usd=5.0, spent_usd=3.49, anchor=self._ANCHOR)
+        metrics = self._call_once(
+            cap=cap,
+            now=self._ANCHOR + dt.timedelta(days=1),
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+        )
+        pace_rows = [m for m in metrics if m["name"] == "llm_spend_pace_overrun_ratio"]
+        assert len(pace_rows) == 1, "an ahead-of-pace reading writes a durable artifact"
+        row = pace_rows[0]
+        assert row["status"] == "WATCH"
+        assert row["value"] > PACE_OVERRUN_MARGIN
+        assert row["source_path"] == f"runs/report/{DAY.isoformat()}/run.json"
+
+    def test_the_identical_spend_late_in_the_window_is_not_flagged(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # Same $3.50 worst-case spend, same $5.00 cap (used_frac=0.70), but
+        # now 6.5 of the 7 days have elapsed -> elapsed_frac~=0.929 >
+        # used_frac, so the run is BEHIND pace, not ahead of it.
+        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "ci")
+        cap = SpendCap(cap_usd=5.0, spent_usd=3.49, anchor=self._ANCHOR)
+        metrics = self._call_once(
+            cap=cap,
+            now=self._ANCHOR + dt.timedelta(days=6, hours=12),
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+        )
+        pace_rows = [m for m in metrics if m["name"] == "llm_spend_pace_overrun_ratio"]
+        assert pace_rows == [], "the same spend late in the window is not ahead of pace"
+
+    def test_a_trivial_spend_seconds_into_the_window_is_not_flagged(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The early-window case `PACE_OVERRUN_MARGIN` exists for: a naive
+        `pace.exceeded` (`overrun > 0`) is TRUE here too — spending anything
+        at all one minute into a 7-day window is, by the raw linear-pace
+        arithmetic, "ahead of pace" — but it is not a materially ahead-of-pace
+        reading, and writing an artifact for it every week would be exactly
+        the fixed-threshold noise `spend_pace`'s own docstring exists to
+        replace. Deliberate handling: `call` only writes the artifact once
+        `pace.overrun` clears `PACE_OVERRUN_MARGIN`.
+        """
+        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "ci")
+        cap = SpendCap(cap_usd=5.0, spent_usd=0.0, anchor=self._ANCHOR)
+        now = self._ANCHOR + dt.timedelta(minutes=1)
+        raw = spend_pace(0.01, cap_usd=5.0, now=now, anchor=self._ANCHOR)
+        assert raw.exceeded and 0 < raw.overrun < PACE_OVERRUN_MARGIN, (
+            "the naive reading is technically ahead of pace, and not materially so — "
+            "exactly the case this test guards"
+        )
+        metrics = self._call_once(cap=cap, now=now, tmp_path=tmp_path, monkeypatch=monkeypatch)
+        pace_rows = [m for m in metrics if m["name"] == "llm_spend_pace_overrun_ratio"]
+        assert pace_rows == [], "a trivial early reading does not clear the materiality margin"
+
+    def test_a_cap_with_no_anchor_gets_no_pace_reading(self, tmp_path, monkeypatch) -> None:
+        """An opt-out, not a failure: `SpendCap.anchor` is `None` by default,
+        and `call` does not fabricate a pace reading for a cap that never
+        declared a weekly window to pace against. Cap enforcement itself is
+        unaffected — this only concerns the pace artifact."""
+        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "ci")
+        cap = SpendCap(cap_usd=5.0, spent_usd=3.49)
+        metrics = self._call_once(
+            cap=cap,
+            now=self._ANCHOR + dt.timedelta(days=1),
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+        )
+        assert [m for m in metrics if m["name"] == "llm_spend_pace_overrun_ratio"] == []

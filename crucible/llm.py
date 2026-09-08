@@ -77,6 +77,7 @@ __all__ = [
     "LlmCallCeilingExceeded",
     "LlmSpendCapExceeded",
     "LlmSpendOverrun",
+    "PACE_OVERRUN_MARGIN",
     "PACING_PERIOD",
     "PROVIDER_MODULES",
     "RECONCILIATION_METRIC",
@@ -87,6 +88,7 @@ __all__ = [
     "capability_group",
     "load_capability_classes",
     "load_registry",
+    "pace_metric",
     "reconcile_manifests_cost",
     "reconcile_run_cost",
     "reconciliation_unmeasurable",
@@ -536,6 +538,62 @@ def spend_pace(
             "registering no call sites, not by a ceiling no call can clear."
         )
     return pace_check(used_frac=spent_usd / cap_usd, now=now, anchor=anchor, period=PACING_PERIOD)
+
+
+#: The materiality margin an ahead-of-pace reading must clear before `call`
+#: writes a durable artifact about it (`alpha-engine-config-I9977`).
+#:
+#: **The early-window case, handled deliberately.** `PaceStatus.exceeded` is
+#: `overrun > 0`, which is trivially true for almost any nonzero spend in the
+#: first moments of the window: at `elapsed_frac == 0.001` (a few minutes
+#: after the weekly anchor), a single $0.05 call against a $5.00 cap reads
+#: `used_frac=0.01 > elapsed_frac=0.001` — technically ahead of a
+#: straight-line pace, and not actionable about anything. Acting on `exceeded`
+#: alone would write the "ahead of pace" artifact on the first call of every
+#: week, every week, which is exactly the fixed-threshold noise this module's
+#: own docstring says the linear-pace comparison exists to avoid, and this
+#: repo's alerting rule caps pages per month for the same reason. The margin
+#: is a materiality floor on `pace.overrun`, not a change to the math:
+#: `spend_pace`/`pace_check` keep reporting the honest, unfiltered sign — a
+#: front-loaded burst still clears 0.05 easily (see
+#: `tests/test_llm_cap.py::TestPaceAtCallTime`) — this constant only decides
+#: whether writing an artifact about a given reading is worth doing.
+PACE_OVERRUN_MARGIN = 0.05
+
+
+def pace_metric(
+    pace: PaceStatus, *, cap: SpendCap, now: dt.datetime, source_path: str
+) -> dict[str, Any]:
+    """The MetricRecord an ahead-of-pace reading writes AT CALL TIME.
+
+    Same metric name and shape the terminal `report` job already publishes
+    (`crucible.track_e.report_handler`) — this is the same quantity, read
+    earlier: `report` still runs the weekly summary reading unchanged, and
+    this is the reading the module's own docstring promised ("we were ahead
+    of pace on Tuesday") and that nothing took until now
+    (`alpha-engine-config-I9977`). `status` is always `"WATCH"`: this
+    function is only called once :data:`PACE_OVERRUN_MARGIN` is cleared, so
+    every call of it is, by construction, a reading worth recording.
+    """
+    return {
+        "name": "llm_spend_pace_overrun_ratio",
+        "module": "crucible.llm",
+        "metric_type": "ratio",
+        "value": round(pace.overrun, 6),
+        "unit": "ratio",
+        "n_floor": 1,
+        "status": "WATCH",
+        "status_reason": (
+            f"{pace.used_frac:.1%} of the ${cap.cap_usd:.2f} weekly LLM cap spent "
+            f"(worst case, including this call's own ceiling) against {pace.elapsed_frac:.1%} "
+            f"of the window elapsed — {pace.overrun:.1%} past the {PACE_OVERRUN_MARGIN:.0%} "
+            "materiality margin, ahead of a straight-line pace at call time, days before "
+            "the terminal report job would otherwise have taken this reading first"
+        ),
+        "source_path": source_path,
+        "last_updated_utc": now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "baseline": 0.0,
+    }
 
 
 @dataclass
@@ -1020,6 +1078,7 @@ def call(
     estimate_usd: float,
     client_factory: Any = None,
     registry: dict[str, CallSite] | None = None,
+    now: dt.datetime | None = None,
     **kwargs: Any,
 ) -> Any:
     """Reach a model, once, through the router — the only door in this package.
@@ -1058,6 +1117,27 @@ def call(
     weakens the audit, which reads the code rather than this function's
     arguments — a call site injecting its own registry is still a call site,
     and :func:`audit_call_sites` still demands a literal registered id.
+
+    ``now`` is the same kind of injection point, for the pace reading below —
+    production omits it and gets ``dt.datetime.now(dt.UTC)``; a test wanting
+    a fixed reading against a fixed anchor passes it explicitly, per this
+    repo's "fixed date literals, never `today` arithmetic" test-discipline
+    rule.
+
+    **Pace, on the same cap admission just used (`alpha-engine-config-I9977`).**
+    Once :meth:`SpendCap.reserve` admits the call, the worst-case spend this
+    call could produce — ``cap.spent_usd + reserved_usd`` — is read against a
+    straight-line pace through the week via :func:`spend_pace`, using
+    ``cap.anchor``: the same instance the admission check just used, never a
+    fresh read of the store (that would put an S3 list on the hot path of
+    every LLM call). A cap constructed with no ``anchor`` — a test cap, or a
+    caller outside the weekly cadence — gets no pace reading; that is a
+    distinct opt-in from cap enforcement, which stays unconditional above. An
+    ahead-of-pace reading past :data:`PACE_OVERRUN_MARGIN` lands on the
+    *calling job's own* manifest as a metric (:func:`pace_metric`), before
+    the provider is reached — not only in the terminal `report` job's weekly
+    summary, which still runs unchanged and still reads the pace as of the
+    week's last manifest.
     """
     known = load_registry() if registry is None else registry
     site = known.get(callsite_id)
@@ -1081,6 +1161,37 @@ def call(
             "ask for less."
         )
     reserved_usd = cap.reserve(site.max_usd_per_call, callsite_id=callsite_id)
+
+    # Pace, on the same cap the admission check above just used, before the
+    # provider is reached (`alpha-engine-config-I9977` deliverable 1). Worst
+    # case — already-spent plus this call's own admitted ceiling — is the
+    # same pessimism `reserve` itself applies, for the same reason: pacing on
+    # an optimistic estimate is pacing that is behind every time the estimate
+    # is low. `cap.anchor is None` is an opt-out (no weekly anchor wired),
+    # not a failure — pace enforcement above stays unconditional either way.
+    if cap.anchor is not None:
+        pace_now = now if now is not None else dt.datetime.now(dt.UTC)
+        pace = spend_pace(
+            cap.spent_usd + reserved_usd,
+            cap_usd=cap.cap_usd,
+            now=pace_now,
+            anchor=cap.anchor,
+        )
+        # PACE_OVERRUN_MARGIN's docstring: the early-window case, handled
+        # deliberately — a raw `pace.exceeded` fires on nearly any nonzero
+        # spend in the first moments of the window, so the durable artifact
+        # is written only once the reading clears the materiality margin, a
+        # front-loaded burst does (see TestPaceAtCallTime), a trivial early
+        # call does not.
+        if pace.overrun > PACE_OVERRUN_MARGIN:
+            ctx.record_metric(
+                pace_metric(
+                    pace,
+                    cap=cap,
+                    now=pace_now,
+                    source_path=f"runs/{ctx.job}/{ctx.trading_day.isoformat()}/run.json",
+                )
+            )
 
     # THE ROUTER, and nothing beside it (`alpha-engine-config-I9969`).
     #
