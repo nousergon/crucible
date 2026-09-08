@@ -47,6 +47,7 @@ from crucible.keys import (
     verdict_key,
 )
 from crucible.ledger import append_trials, trial_rows
+from crucible.slots import arm_name as name_component
 from crucible.slots import get_slot, promotable_arms
 from crucible.slots.arms import (
     control_specs,
@@ -246,10 +247,20 @@ def run_produce(
 
     specs = load_arm_specs(slot, store=ctx.store, strategy_dir=settings.strategy_dir)
     if arm_name is not None:
-        specs = [s for s in specs if s.name == arm_name]
+        # A bare name or a registered `{slot}:{name}:{spec_hash}` id, resolved
+        # through the one parser that knows both shapes. `experiment.new`
+        # PRINTS ids, so the id is what an operator has in the terminal when
+        # they narrow the next command to the arm they just registered; a
+        # matcher that compared it to `spec.name` refused every one of them
+        # with "no arm named" — a selector that only accepts the form nobody
+        # is holding. `name_component` RAISES on a string that is neither
+        # shape, so a malformed selector is still a refusal, not a silent
+        # no-match.
+        selector = name_component(arm_name)
+        specs = [s for s in specs if s.name == selector]
         if not specs:
             raise MissingArtifactError(
-                f"no arm named {arm_name!r} in slot {slot!r}. Producing nothing and "
+                f"no arm named {selector!r} in slot {slot!r}. Producing nothing and "
                 "exiting 0 would be indistinguishable from an arm that ran and selected "
                 "nothing."
             )

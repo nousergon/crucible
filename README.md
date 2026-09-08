@@ -20,7 +20,7 @@ Every job is one command, with identical behaviour on a laptop, in a Lambda
 and on a spot instance. The scheduler does not know anything the CLI does not.
 
 ```
-crucible experiment.run --slot r --arm <arm-id> --date 2026-09-01
+crucible experiment.run --slot r --arm <name-or-arm-id> --date 2026-09-01
 ```
 
 Exit 0 means a verdict exists. There is no third outcome: a run either writes
@@ -62,7 +62,7 @@ an absence, and absence is one of the two conditions that page.
 
 ## Runbook
 
-Five verbs. Each is one command; none needs a console. Any job that must run
+Six verbs. Each is one command; none needs a console. Any job that must run
 in-region (`heal`, a replay week) is dispatched to a box rather than run from
 a laptop. The dispatcher's function name is deployment configuration, not part
 of the framework, so it is read from the environment rather than published
@@ -71,6 +71,21 @@ here (`alpha-engine-config-I10156`):
 ```
 aws lambda invoke --function-name "$CRUCIBLE_DISPATCHER_FUNCTION" --payload '{"job": "<job>", "args": "<cli args>"}' out.json
 ```
+
+### add an experiment
+
+An arm is one recipe file in the strategy tree, registered before it can
+score anything:
+
+```
+crucible experiment.new --slot r --arm <name> --run-mode live
+```
+
+Its id is the hash of its spec, so an edited recipe is a NEW arm carrying
+`supersedes` and cannot inherit the old one's score series. The recipe
+schema, the ranker registry, how to supersede or retire an arm, and every
+refusal the loader raises are in
+[docs/NEW_EXPERIMENT.md](docs/NEW_EXPERIMENT.md).
 
 ### rerun
 
@@ -171,6 +186,7 @@ marked — this repository carries no suppression collections at all, and
 
 ## Documentation
 
+- [docs/NEW_EXPERIMENT.md](docs/NEW_EXPERIMENT.md) — the runbook for adding, superseding and retiring an arm
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to propose a change, run the suite, what review to expect
 - [SECURITY.md](SECURITY.md) — how to report a vulnerability
 - `crucible/components.yaml` — the observability registry: every job's signals, log location, alert channel and deadline

@@ -471,12 +471,14 @@ def build_parser() -> argparse.ArgumentParser:
             # deliberate act.
             sub.add_argument(
                 "--arm",
-                metavar="ARM_ID",
+                metavar="NAME|ARM_ID",
                 required=spec.name == "experiment.new",
                 help=(
-                    "Restrict to one arm by name. Omitted, every registered arm in the "
-                    "slot is produced — an arm that skipped a cycle records a MISS, and "
-                    "a miss is data."
+                    "Restrict to one arm, by bare name or by registered "
+                    "`{slot}:{name}:{spec_hash}` id — `experiment.new` prints ids, so "
+                    "the id is the form an operator is holding. Omitted, every "
+                    "registered arm in the slot is produced — an arm that skipped a "
+                    "cycle records a MISS, and a miss is data."
                 ),
             )
         if spec.name == "explain":
