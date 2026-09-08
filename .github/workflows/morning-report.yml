@@ -190,6 +190,22 @@ env:
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   REPORT_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.CRUCIBLE_ROLE_PREFIX }}-morning-report
   STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
+  # ── the topic names the alerting layer refuses to guess ────────────────
+  # `crucible.alerts._required_name` raises unless these are set. They are
+  # repository VARIABLES for the same reason `AWS_ACCOUNT_ID` is: this repo
+  # went public on 2026-09-07 and `AGENTS.md` forbids infrastructure
+  # identifiers in the tree, so the scrub (alpha-engine-config-I10156) removed
+  # the literals and made the names required env.
+  #
+  # Nothing then declared them to a workflow. `Board` failed
+  # 2026-09-07T23:37Z and `Gate close` failed 2026-09-08T00:56Z, both on
+  # `RuntimeError: CRUCIBLE_MUTED_TOPIC is unset`, raised from
+  # `_clause_old_alerts_muted` while it formatted its own UNMET detail — a
+  # branch no CI job reaches, because CI does not grade the live store. So the
+  # v2 board and the phase-exit filer were both dark from the moment the repo
+  # went public, on the two days phase 0 and phase 1 turned MET.
+  CRUCIBLE_MUTED_TOPIC: ${{ vars.CRUCIBLE_MUTED_TOPIC }}
+  CRUCIBLE_PAGES_TOPIC: ${{ vars.CRUCIBLE_PAGES_TOPIC }}
   # alpha-engine-config-I10123. The full update is now posted as a comment on
   # the rolling `[v2 board] daily update` issue in the private
   # alpha-engine-config repository, and an Actions token cannot reach a
