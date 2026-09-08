@@ -99,6 +99,19 @@ def test_every_ranker_the_runbook_names_is_registered() -> None:
     )
 
 
+def test_every_example_registered_at_is_a_real_session() -> None:
+    """The doc's own examples obey the rule the doc states two paragraphs
+    later. A copy-pasted Saturday would raise `NonTradingDayKeyError` on the
+    operator's first load — which is exactly the failure §2 warns about, shipped
+    inside the warning."""
+    from crucible.calendar import assert_trading_day
+
+    dates = re.findall(r"^registered_at: '(\d{4}-\d{2}-\d{2})'$", _text(), re.MULTILINE)
+    assert dates, "no example declares `registered_at` — the examples moved"
+    for date in dates:
+        assert_trading_day(date, context=f"docs/NEW_EXPERIMENT.md example {date}")
+
+
 def test_the_llm_callsite_key_is_named_by_its_constant_value() -> None:
     assert f"params.{LLM_CALLSITE_PARAM}" in _text()
 
