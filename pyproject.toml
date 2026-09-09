@@ -26,7 +26,7 @@ dependencies = [
     # plan §4.2): those are consumed by other repos and must not require a
     # Python import to read. Pydantic is the in-process reader, not a
     # replacement for them.
-    "pydantic>=2.9",
+    "pydantic>=2.13.5",
     "PyYAML>=6.0.3",
     # The M slot's linear estimators and the CPCV grader operate on a
     # (trading_day x name) panel. Pure-Python normal equations over ~450k
