@@ -206,23 +206,6 @@ env:
   # went public, on the two days phase 0 and phase 1 turned MET.
   CRUCIBLE_MUTED_TOPIC: ${{ vars.CRUCIBLE_MUTED_TOPIC }}
   CRUCIBLE_PAGES_TOPIC: ${{ vars.CRUCIBLE_PAGES_TOPIC }}
-  # alpha-engine-config-I10156 extracted this in the SAME commit as the two
-  # topic names above, and the repair that declared them here missed it. Phase
-  # 2's `zero_human_mutating_calls` clause therefore read UNMEASURABLE in every
-  # context from that day on -- including board.yml, the only scheduled
-  # identity that evaluates the phase ladder -- while every job still exited 0.
-  #
-  # The allowlist of principals whose mutating calls are the SYSTEM working
-  # rather than a human touching it, comma-separated role names. A repository
-  # variable for the same reason the role prefix is: the names are
-  # infrastructure identifiers and this tree is public (I9775). It grows only
-  # by an explicit variable edit with the automation named -- never at read
-  # time, which is how an allowlist ends up containing whoever ran the query.
-  #
-  # `tests/test_workflow_required_env.py` now derives this requirement from
-  # `crucible.required.require_env` call sites and fails when a `--run-mode
-  # live` workflow omits one, so a seventh extraction is caught on its commit.
-  CRUCIBLE_MACHINE_PRINCIPALS: ${{ vars.CRUCIBLE_MACHINE_PRINCIPALS }}
   # alpha-engine-config-I10123. The full update is now posted as a comment on
   # the rolling `[v2 board] daily update` issue in the private
   # alpha-engine-config repository, and an Actions token cannot reach a

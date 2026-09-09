@@ -280,7 +280,31 @@ class TestAutonomy:
                 "sessionContext": {"sessionIssuer": {"userName": "a-role-nobody-declared"}},
             },
         }
-        assert "a-role-nobody-declared" not in machine_principals()
+
+        class _FakeCfn:
+            """A minimal stand-in for the `crucible-v2` stack description
+            `machine_principals` derives its allowlist from
+            (`alpha-engine-config-I10307`) — see `tests/test_autonomy.py`'s
+            fuller `_FakeCfn` for the shape this mirrors."""
+
+            def get_paginator(self, name: str):
+                assert name == "list_stack_resources"
+
+                class _Paginator:
+                    def paginate(self, *, StackName: str):  # noqa: N803
+                        yield {
+                            "StackResourceSummaries": [
+                                {
+                                    "LogicalResourceId": "Runtime",
+                                    "ResourceType": "AWS::IAM::Role",
+                                    "PhysicalResourceId": "a-declared-machine-role",
+                                }
+                            ]
+                        }
+
+                return _Paginator()
+
+        assert "a-role-nobody-declared" not in machine_principals(_FakeCfn())
 
         real_key = "t/2026/08/03/part.json.gz"
 
@@ -331,6 +355,7 @@ class TestAutonomy:
             prefix="t",
             start=dt.date(2026, 8, 1),
             end=dt.date(2026, 8, 29),
+            cfn=_FakeCfn(),
         )
         assert result.count == 1
         assert result.actions[0].principal == "a-role-nobody-declared"

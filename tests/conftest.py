@@ -20,7 +20,6 @@ import random
 import pytest
 
 from crucible.alerts import MUTED_TOPIC_VAR, PAGES_TOPIC_VAR
-from crucible.autonomy import MACHINE_PRINCIPALS_VAR
 from crucible.calendar import is_trading_day
 from crucible.runmode import RUN_MODE_ENV, RUN_MODE_LIVE
 from crucible.store import LocalStore
@@ -105,24 +104,28 @@ def declared_run_mode(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def declared_topics_and_principals(monkeypatch):
-    """The account id and every role/topic name this suite used to carry as
+def declared_topics(monkeypatch):
+    """The account id and every topic name this suite used to carry as
     literals are gone (`alpha-engine-config-I10156`): this repo is public and
-    `crucible.alerts.muted_topic`/`pages_topic` and
-    `crucible.autonomy.machine_principals` now RAISE unless their environment
-    variable is set. These values are SYNTHETIC — they name no real AWS
-    resource — and exist only so every test declares them exactly as a
-    workflow or an operator would, in one place rather than at each call
+    `crucible.alerts.muted_topic`/`pages_topic` now RAISE unless their
+    environment variable is set. These values are SYNTHETIC — they name no
+    real AWS resource — and exist only so every test declares them exactly as
+    a workflow or an operator would, in one place rather than at each call
     site. A test proving the raise-on-unset behaviour itself clears the
     relevant variable with `monkeypatch.delenv`, which unwinds this fixture's
     `setenv` for that one test only.
+
+    `crucible.autonomy.machine_principals` is NOT declared here
+    (`alpha-engine-config-I10307`, corrected 2026-09-09): it no longer reads
+    an environment variable at all, having been the hand-kept-twin defect
+    `alpha-engine-config-I10156` itself introduced. It derives the allowlist
+    from a CloudFormation client instead, and `tests/test_autonomy.py`
+    supplies a fake one per test rather than through this autouse fixture,
+    since (unlike a topic name) the interesting cases are about WHAT the
+    stack contains, not merely that a value is present.
     """
     monkeypatch.setenv(MUTED_TOPIC_VAR, "test-muted-topic")
     monkeypatch.setenv(PAGES_TOPIC_VAR, "test-pages-topic")
-    monkeypatch.setenv(
-        MACHINE_PRINCIPALS_VAR,
-        "test-runtime,test-dispatcher,test-scheduler,test-deploy,test-stack-check",
-    )
 
 
 class ActiveCostAllocationTag:

@@ -241,13 +241,17 @@ FORBIDDEN: dict[str, str] = {
         "liquidity_floor_usd(); the value is recorded in "
         "alpha-engine-config/strategy/UNIVERSE_GATES.md"
     ),
+    # The machine-principal allowlist used to be a fourth repository-variable
+    # example here (`CRUCIBLE_MACHINE_PRINCIPALS`); it is now a live stack
+    # derivation instead (`crucible.autonomy.machine_principals`), not a
+    # variable to set — see alpha-engine-config-I10307.
     IDENTITY_NAME_PATTERN: (
         "a literal IAM role, Lambda function or SNS topic name — an outside "
         "reader of this public tree can use none of them, and publishing one "
         "removes the guessing step from an AssumeRole enumeration. Resolve it "
         "through a repository variable (${{ vars.CRUCIBLE_ROLE_PREFIX }}, "
-        "CRUCIBLE_PAGES_TOPIC, CRUCIBLE_MUTED_TOPIC, "
-        "CRUCIBLE_MACHINE_PRINCIPALS), or use a synthetic name in a fixture"
+        "CRUCIBLE_PAGES_TOPIC, CRUCIBLE_MUTED_TOPIC), a live derivation off "
+        "the crucible-v2 stack, or a synthetic name in a fixture"
     ),
     BUCKET_STEM_PATTERN: (
         "a literal alpha-engine-* bucket name (no s3:// scheme) — resolve it "
