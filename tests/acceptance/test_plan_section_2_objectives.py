@@ -414,11 +414,17 @@ class TestCost:
         assert pace.exceeded, "80% of the cap two days into the week is ahead of pace"
 
         # And a run that would cross the cap FAILS without reaching a provider.
+        # `capability_class="high"`, not the retired `reasoning_high`: Brian's
+        # ruling on `alpha-engine-config-I9970` (2026-09-08, option (a)) settled
+        # that the LLM research arms address the registry's `high` group and
+        # `reasoning_high` is not resurrected — see `crucible.llm.
+        # CAPABILITY_CLASS_GROUPS`'s docstring. This probe only needs a class the
+        # router actually declares; which one is immaterial to what it proves.
         store = LocalStore(tmp_path)
         site = CallSite(
             callsite_id="acceptance.cap_probe",
             purpose="prove the refusal precedes the spend",
-            capability_class="reasoning_high",
+            capability_class="high",
             max_usd_per_call=10.0,
             owner="tests.acceptance",
         )
@@ -430,7 +436,7 @@ class TestCost:
             call(
                 ctx,
                 callsite_id=site.callsite_id,
-                capability_class="reasoning_high",
+                capability_class="high",
                 messages=[{"role": "user", "content": "hello"}],
                 cap=SpendCap(cap_usd=resolved.llm_cap_usd, spent_usd=resolved.llm_cap_usd),
                 estimate_usd=0.01,
@@ -458,6 +464,20 @@ class TestCost:
         account. `crucible.tags` raises `StackNotAppliedError` rather than
         returning an empty difference, because an empty difference over an
         empty stack is vacuous truth (principle 7).
+
+        **This clause's reading is credentials-dependent, and that is not a
+        regression** (`alpha-engine-config-I10329`): the fleet's default
+        laptop identity (`ne-laptop-agent`) is not granted
+        `cloudformation:ListStackResources` on `crucible-v2` and reads
+        UNMEASURABLE (AccessDenied), matching this repo's own AGENTS.md
+        ("Reading a gate from the laptop" — `AWS_PROFILE=ne-admin` is what
+        makes the two dollar clauses readable at all). Measured 2026-09-09:
+        UNMEASURABLE under the default profile, PASSES under
+        `AWS_PROFILE=ne-admin`. `ratchet.json` records this clause MET
+        because that is the correct reading under the granted profile; a
+        clean-checkout run with no `AWS_PROFILE` set will report it failed
+        and that failure is the credential gap, not a property of the
+        account or the code.
 
         Round 2 (alpha-engine-config-I9828 review finding 2): the exception
         handling is a NAMED allowlist, not `except Exception`. A bare

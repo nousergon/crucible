@@ -30,8 +30,11 @@ import datetime as dt
 import json
 import os
 import random
+import resource as posix_resource
+import shutil
 import signal
 import subprocess
+import sys
 import traceback
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -221,6 +224,91 @@ def _utc(now: dt.datetime) -> str:
     return now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+#: The closed vocabulary EC2's own `instance-life-cycle` metadata answers.
+_LIFECYCLE_VALUES = ("spot", "on-demand")
+
+
+def _spot_lifecycle() -> tuple[bool, bool]:
+    """Read `$CRUCIBLE_LIFECYCLE`, exported by the box shell from
+    `/latest/meta-data/instance-life-cycle` via the same IMDSv2 token dance
+    as `CRUCIBLE_INSTANCE_TYPE` (alpha-engine-config-I10328, second half).
+    Returns `(spot, escalated_to_on_demand)`.
+
+    Every crucible-v2 dispatch requests spot first and only falls back to
+    on-demand on a declared capacity error (`crucible-v2.yaml`'s
+    `CAPACITY_ERRORS`), so on this substrate `on-demand` always means an
+    escalation happened — there is no code path that launches on-demand for
+    any other reason.
+
+    Before this, `resource.spot` came from an unconditionally exported
+    `CRUCIBLE_SPOT=true`, so it was structurally `true` on every run
+    including the two that escalated on 2026-09-09 — the CloudWatch
+    `SpotEscalation` metric and the run manifest disagreed about the same
+    launch.
+
+    **Fail loud (repo rule 5), not a third default.** Unset means no box
+    shell ran this process at all — a laptop or CI run — and reads as
+    `(False, False)`, the same as `instance_type`'s own `local` default. Any
+    other value (`unknown`, if the box's IMDS curl itself failed, or
+    anything outside the closed EC2 vocabulary) RAISES rather than guess:
+    `spot`/`escalated_to_on_demand` are required booleans in the schema, so
+    there is no "absent" to fall back to that isn't also a fabricated
+    measurement, and the run fails loudly instead of filing a manifest that
+    asserts a resource fact nobody actually observed.
+    """
+    lifecycle = os.environ.get("CRUCIBLE_LIFECYCLE")
+    if lifecycle is None:
+        return False, False
+    if lifecycle not in _LIFECYCLE_VALUES:
+        raise RuntimeError(
+            f"CRUCIBLE_LIFECYCLE={lifecycle!r} is not one of {_LIFECYCLE_VALUES}. The box "
+            "shell's IMDS read for /latest/meta-data/instance-life-cycle failed or returned "
+            "something crucible.runner does not recognise, and resource.spot/"
+            "resource.escalated_to_on_demand cannot be defaulted without asserting a "
+            "measurement nobody took (repo rule 5) — the run fails rather than files a "
+            "manifest that claims to know."
+        )
+    return lifecycle == "spot", lifecycle == "on-demand"
+
+
+def _measured_mem_peak_mb() -> float:
+    """Peak resident set size of this process so far, in MB.
+
+    `ru_maxrss` is a running maximum the kernel tracks for the life of the
+    process, so reading it at manifest-write time (after `fn(ctx)` ran)
+    reports the true peak of the whole run, not a point sample. POSIX
+    leaves the unit unspecified: Linux (every crucible-v2 box, and CI)
+    reports kilobytes; Darwin (a laptop dev run) reports bytes.
+    """
+    peak = posix_resource.getrusage(posix_resource.RUSAGE_SELF).ru_maxrss
+    divisor = 1024.0 * 1024.0 if sys.platform == "darwin" else 1024.0
+    return round(peak / divisor, 3)
+
+
+def _measured_disk_free_mb(path: str = "/") -> float:
+    """Free space on the filesystem `path` lives on, in MB. `/` on every
+    substrate this runs on today — every crucible-v2 box is a fresh EC2
+    root volume with no separate data mount, and a laptop or CI run reads
+    its own root filesystem's headroom the same way."""
+    return round(shutil.disk_usage(path).free / (1024.0 * 1024.0), 3)
+
+
+def _initial_resource() -> dict[str, Any]:
+    """The `resource` block's starting values, computed once per
+    `RunContext`. `mem_peak_mb`/`disk_free_mb` are placeholders here —
+    `_write_manifest` overwrites both at write time, when they mean
+    something."""
+    spot, escalated = _spot_lifecycle()
+    return {
+        "instance_type": os.environ.get("CRUCIBLE_INSTANCE_TYPE", "local"),
+        "spot": spot,
+        "escalated_to_on_demand": escalated,
+        "interruptions": 0,
+        "mem_peak_mb": 0.0,
+        "disk_free_mb": 0.0,
+    }
+
+
 @dataclass
 class RunContext:
     """What a job is handed, and the only way it contributes to its manifest.
@@ -275,16 +363,15 @@ class RunContext:
     llm_calls: list[dict[str, Any]] = field(default_factory=list)
     metrics: list[dict[str, Any]] = field(default_factory=list)
     attempts: list[dict[str, Any]] = field(default_factory=lambda: [{"n": 1, "reason": "initial"}])
-    resource: dict[str, Any] = field(
-        default_factory=lambda: {
-            "instance_type": os.environ.get("CRUCIBLE_INSTANCE_TYPE", "local"),
-            "spot": os.environ.get("CRUCIBLE_SPOT", "").lower() == "true",
-            "escalated_to_on_demand": False,
-            "interruptions": 0,
-            "mem_peak_mb": 0.0,
-            "disk_free_mb": 0.0,
-        }
-    )
+    #: `spot`/`escalated_to_on_demand` are measured once, here, at RunContext
+    #: construction — the box's lifecycle is a property of how the process
+    #: was launched and does not change mid-run. `mem_peak_mb`/`disk_free_mb`
+    #: start as placeholders and are OVERWRITTEN at write time
+    #: (`_write_manifest`), which is when a peak-so-far and a free-space
+    #: reading are actually meaningful — never left at these zeros in a
+    #: written manifest. See `_spot_lifecycle`, `_measured_mem_peak_mb`,
+    #: `_measured_disk_free_mb` (alpha-engine-config-I10328, second half).
+    resource: dict[str, Any] = field(default_factory=_initial_resource)
 
     def set_status(self, status: str) -> None:
         """Always raises. Present so the attempt is a loud, findable error.
@@ -622,6 +709,15 @@ def _write_manifest(
     morning.
     """
     finished = dt.datetime.now(dt.UTC) if now is None else now
+    # Measured here, not at RunContext construction: `ru_maxrss` is a
+    # running peak, so reading it now reports the peak of the whole run
+    # rather than a point sample taken before `fn(ctx)` did any work, and
+    # disk headroom is only meaningful after whatever the job wrote.
+    # alpha-engine-config-I10328, second half: these were an unconditional
+    # `0.0` on every manifest ever written, worse than absent because they
+    # read as a measurement nobody took.
+    ctx.resource["mem_peak_mb"] = _measured_mem_peak_mb()
+    ctx.resource["disk_free_mb"] = _measured_disk_free_mb()
     manifest = {
         "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
         "run_id": ctx.run_id,
