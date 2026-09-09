@@ -97,6 +97,14 @@ env:
   # went public, on the two days phase 0 and phase 1 turned MET.
   CRUCIBLE_MUTED_TOPIC: ${{ vars.CRUCIBLE_MUTED_TOPIC }}
   CRUCIBLE_PAGES_TOPIC: ${{ vars.CRUCIBLE_PAGES_TOPIC }}
+  # alpha-engine-config-I10156's fourth instance. The liquidity floor was
+  # extracted from `crucible/features/compute.py` on 2026-09-07 and raised
+  # through a hand-rolled RuntimeError, so the derived-requirement guards could
+  # not see it and nothing declared it. Measured 2026-09-09 on box
+  # i-04afbe045e0ca7354: every full-universe `data.weekly` died on
+  # `CRUCIBLE_LIQUIDITY_FLOOR_USD is unset`. It now resolves through
+  # `crucible.required.require_env`, which is what puts it in this list.
+  CRUCIBLE_LIQUIDITY_FLOOR_USD: ${{ vars.CRUCIBLE_LIQUIDITY_FLOOR_USD }}
 
 jobs:
   build:
