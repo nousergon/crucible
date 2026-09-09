@@ -38,7 +38,6 @@ from __future__ import annotations
 import datetime as dt
 import gzip
 import json
-import os
 import re
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -46,6 +45,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from crucible.models import CloudTrailRecord
+from crucible.required import require_env
 
 __all__ = [
     "MACHINE_PRINCIPALS_VAR",
@@ -94,14 +94,17 @@ def machine_principals() -> tuple[str, ...]:
     fully autonomous month as a fully manual one and reads as a finding rather
     than as the missing configuration it actually is.
     """
-    raw = os.environ.get(MACHINE_PRINCIPALS_VAR, "")
+    raw = require_env(
+        MACHINE_PRINCIPALS_VAR,
+        refusing_to="grade against an empty allowlist, which would report every "
+        "machine action as a human touch",
+    )
     names = tuple(part.strip() for part in raw.split(",") if part.strip())
     if not names:
         raise RuntimeError(
-            f"{MACHINE_PRINCIPALS_VAR} is unset or empty. This repository is public "
-            "and carries no role name as a literal; "
-            "refusing to grade against an empty allowlist, which would report every "
-            "machine action as a human touch."
+            f"{MACHINE_PRINCIPALS_VAR} is set but names no principal. An allowlist of "
+            "separators only scores every machine action as a human touch, exactly as "
+            "an unset one does."
         )
     return names
 

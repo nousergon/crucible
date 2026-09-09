@@ -54,6 +54,7 @@ from crucible.keys import (
     parse_manifest_key,
 )
 from crucible.manifest import manifest_prefix
+from crucible.required import require_env
 from crucible.store import Store
 
 __all__ = [
@@ -991,15 +992,15 @@ MUTED_TOPIC_VAR = "CRUCIBLE_MUTED_TOPIC"
 PAGES_TOPIC_VAR = "CRUCIBLE_PAGES_TOPIC"
 
 
-def _required_name(variable: str) -> str:
-    value = os.environ.get(variable, "")
-    if not value:
-        raise RuntimeError(
-            f"{variable} is unset. This repository is public and carries no topic "
-            "name as a literal; refusing to guess one "
-            "rather than publishing a page to a topic nobody is watching."
-        )
-    return value
+#: What both topic resolvers below refuse to do. Shared as a constant rather
+#: than through a `_required_name(variable)` wrapper: a wrapper takes the
+#: variable NAME as a parameter, which makes the required set underivable from
+#: the call site, and deriving it is the whole mechanism
+#: `tests/test_workflow_required_env.py` uses to catch the next extraction
+#: (`alpha-engine-config-I10156`).
+_REFUSING_TO_GUESS_A_TOPIC = (
+    "guess a topic name rather than publishing a page to a topic nobody is watching"
+)
 
 
 def muted_topic() -> str:
@@ -1011,7 +1012,7 @@ def muted_topic() -> str:
     falling back: a page sent nowhere and a page sent to the wrong topic are
     both silent, so neither may be what an unset variable produces.
     """
-    return _required_name(MUTED_TOPIC_VAR)
+    return require_env(MUTED_TOPIC_VAR, refusing_to=_REFUSING_TO_GUESS_A_TOPIC)
 
 
 #: The topic v2 pages go to. Created, tagged and exported by the `crucible-v2`
@@ -1020,7 +1021,7 @@ def muted_topic() -> str:
 def pages_topic() -> str:
     """The v2 pages topic's NAME, read from the environment. See
     :func:`muted_topic` for why it is not a literal and why it raises."""
-    return _required_name(PAGES_TOPIC_VAR)
+    return require_env(PAGES_TOPIC_VAR, refusing_to=_REFUSING_TO_GUESS_A_TOPIC)
 
 
 #: The declared adapter's inputs (principle 8): the topic ARN is read from
