@@ -31,10 +31,10 @@ import json
 import re
 import shlex
 from calendar import monthrange
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import redirect_stderr
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -70,12 +70,16 @@ from crucible.keys import (
     verdict_key,
 )  # noqa: F401 - re-exported
 from crucible.manifest import load_schema, manifest_key
-from crucible.models import PhaseClosingReadingDocument, PhaseLadderDocument
+from crucible.models import (
+    FaultRecordDocument,
+    PhaseClosingReadingDocument,
+    PhaseLadderDocument,
+)
 from crucible.release import POINTER_KEY
 from crucible.report import attribution_key
 from crucible.runner import TRANSIENT_CLASSIFIERS
 from crucible.slots import SLOTS, dispatchable_slots, is_control_arm
-from crucible.store import Store
+from crucible.store import S3Store, Store
 from crucible.tags import (
     TAG_KEY,
     TAG_VALUE,
@@ -110,6 +114,7 @@ __all__ = [
     "LADDER_KEY",
     "LADDER_SCHEMA_VERSION",
     "LADDER_STATES",
+    "ClauseMisconfiguredError",
     "GATE_DELIVERABLES",
     "LLM_ARM_CALLSITE_FIELD",
     "LLM_ARM_RECIPE_SLOTS",
@@ -122,7 +127,11 @@ __all__ = [
     "PHASE3_DELIVERABLES",
     "PHASE4_DELIVERABLES",
     "PHASE5_DELIVERABLES",
+    "PHASE2_AUTONOMY_MIN_DAILY_CYCLES",
+    "autonomy_daily_cycles_in_span",
+    "autonomy_earliest_satisfiable_render_day",
     "PHASE2_LIVE_SATURDAYS",
+    "PHASE2_WINDOW_WEEKS",
     "PHASE2_MAX_PAGES",
     "PHASE2_MAX_TAGGED_USD",
     "PHASE2_REPLAY_SATURDAYS",
@@ -602,18 +611,72 @@ def _status(key: str, document: dict[str, Any]) -> tuple[str | None, str | None]
     return status, None
 
 
+def _fault_excused_run_ids(store: Store) -> tuple[frozenset[str] | None, str | None]:
+    """Every `run_id` a fault-injection record (`faults/{day}/{fault}.json`,
+    `alpha-engine-config-I10320`/`-I10322`) claims to excuse, across every
+    trading day.
+
+    Matched on `run_id` alone, never on the trading day: a failed manifest is
+    excused from `arc_runs_ok`/`replays_ok` only when SOME fault record names
+    its exact `run_id`, so a genuine failure on a day a fault was once
+    induced still fails those clauses — `-I10322`'s whole design constraint.
+
+    **And only an `induced` record excuses anything** (`-I10327`). The record
+    grew two more outcome kinds, and neither may reach this set: `absorbed`
+    names a manifest reading `ok`, which these clauses were never going to
+    count against anyone, and `unreachable` names no run at all. Keying the
+    exclusion on `run_id` AND narrowing it by `outcome` is what keeps the
+    two new kinds from being a second route to the excusal the `run_id`
+    refusal guards — a record filed for a fault the system survived must not
+    be able to excuse a failure it did not cause.
+
+    Returns ``(None, problem)`` when the listing itself could not be read —
+    an access failure, not "no faults filed" — so the caller folds it into
+    `unmeasurable` rather than silently grading with zero exclusions. A
+    record that fails to parse, or names no `run_id`, is skipped rather than
+    raised: a malformed or hand-broken record excuses nothing, which is the
+    only safe default for a mechanism whose entire point is that it must
+    never be able to turn an arbitrary red clause green.
+    """
+    listed = _list_store_keys(store, FAULT_INJECTION_ROOT)
+    if listed.problem is not None:
+        return None, listed.problem
+    run_ids: set[str] = set()
+    for key in listed.keys or []:
+        if parse_fault_injection_key(key) is None:
+            continue
+        read = _read_store_document(store, key)
+        if read.problem is not None or read.absent:
+            continue
+        document = read.document or {}
+        if document.get("outcome") != FAULT_OUTCOME_INDUCED:
+            continue
+        run_id = str(document.get("run_id") or "").strip()
+        if run_id:
+            run_ids.add(run_id)
+    return frozenset(run_ids), None
+
+
 def _clause_arc_runs_ok(
     store: Store, window: list[dt.date], registry: dict[str, Component]
 ) -> Clause:
+    # A failure excused by a matching fault-injection record's run_id is not
+    # counted against this clause (alpha-engine-config-I10322) -- see
+    # `_fault_excused_run_ids` below.
     requirement = (
         "every stage of the weekly arc wrote a manifest with status `ok` for each "
-        "trading day in the window"
+        "trading day in the window, or its failure is excused by a fault-injection "
+        "record naming that exact run_id"
     )
     missing: list[str] = []
     malformed: list[str] = []
     unmeasurable: list[str] = []
     failed: list[str] = []
+    excused: list[str] = []
     evidence: list[str] = []
+    excused_run_ids, excused_problem = _fault_excused_run_ids(store)
+    if excused_problem is not None:
+        unmeasurable.append(excused_problem)
     for day in window:
         for stage in arc_stages(day, registry):
             key = manifest_key(stage.job, day.isoformat(), discriminator=stage.slot)
@@ -631,6 +694,10 @@ def _clause_arc_runs_ok(
                 malformed.append(problem)
                 continue
             if status != "ok":
+                run_id = str(document.get("run_id") or "")
+                if run_id and excused_run_ids is not None and run_id in excused_run_ids:
+                    excused.append(f"{stage.label}@{day.isoformat()} (run_id {run_id})")
+                    continue
                 failed.append(f"{stage.label}@{day.isoformat()}: {document['reason']}")
     if missing or malformed or unmeasurable or failed:
         parts = []
@@ -642,6 +709,8 @@ def _clause_arc_runs_ok(
             parts.append(f"{len(malformed)} malformed: {'; '.join(malformed[:4])}")
         if failed:
             parts.append(f"{len(failed)} failed ({'; '.join(failed[:2])})")
+        if excused:
+            parts.append(f"{len(excused)} excused by a fault record: {'; '.join(excused[:2])}")
         content_gap = bool(missing or malformed or failed)
         return Clause(
             "arc_runs_ok",
@@ -654,13 +723,10 @@ def _clause_arc_runs_ok(
             # access failure also occurred (round 3, finding 6).
             unmeasurable=bool(unmeasurable) and not content_gap,
         )
-    return Clause(
-        "arc_runs_ok",
-        requirement,
-        True,
-        f"{len(evidence)} stage manifests over {len(window)} trading days, all ok",
-        tuple(evidence),
-    )
+    detail = f"{len(evidence)} stage manifests over {len(window)} trading days, all ok"
+    if excused:
+        detail += f" ({len(excused)} excused by a matching fault record: {'; '.join(excused[:2])})"
+    return Clause("arc_runs_ok", requirement, True, detail, tuple(evidence))
 
 
 def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
@@ -1914,7 +1980,7 @@ def _clause_old_weekly_within_cadence(
         # A bound pair that can never be satisfied would read UNMET on every
         # week forever with a reason that looks like a finding about the
         # pipeline. Refuse at the call site instead.
-        raise ValueError(
+        raise ClauseMisconfiguredError(
             f"minimum {minimum} exceeds maximum {maximum}; no week can satisfy this clause"
         )
     if minimum_succeeded > minimum:
@@ -3267,6 +3333,118 @@ def _unmeasurable(name: str, requirement: str, detail: str, evidence: Iterable[s
     return Clause(name, requirement, False, detail, tuple(evidence), unmeasurable=True)
 
 
+#: The prefix every clause function in this module carries. The containment
+#: wrapper below is applied by walking this module's globals for it, so a clause
+#: added tomorrow is contained without anybody remembering to decorate it — the
+#: difference between a rule and a habit.
+CLAUSE_FUNCTION_PREFIX = "_clause_"
+
+
+class ClauseMisconfiguredError(ValueError):
+    """A clause was CALLED wrongly — the arguments cannot describe any system.
+
+    The one thing :func:`_contained` re-raises, and the distinction is between
+    a fact about the environment and a bug in this package. Every other
+    exception a clause can raise is a failed READING: a client that would not
+    build, a bucket that would not list, a document that would not parse. Those
+    are UNMEASURABLE, because the system was not observed.
+
+    This one is different in kind. `_clause_old_weekly_within_cadence` with
+    `minimum > maximum` is a clause list that asks an unanswerable question, and
+    the only place such a call can come from is this module's own phase
+    assemblers — never from an operator, a box, or a credential. Rendering it as
+    an UNMEASURABLE row would put a bug in our clause list behind a message that
+    reads like an AWS problem, and it would render that way every week forever.
+
+    Not a suppression list (AGENTS.md rule 4): one declared type, raised only by
+    argument validation, with the reason stated here. Adding a second type to
+    escape containment would be exactly the collection that rule forbids.
+    """
+
+
+def _contained(fn: Callable[..., Clause]) -> Callable[..., Clause]:
+    """``fn``, with any escaped exception turned into an UNMEASURABLE clause.
+
+    **No gate clause may raise into its caller** (`alpha-engine-config-I10328`,
+    and `-I9869`'s class recurring). A clause is one reading among dozens; a
+    reading that could not be taken is that clause's UNMEASURABLE, never the
+    death of the whole ladder. Measured 2026-09-09: `_clause_zero_human_
+    mutating_calls` gained a `DescribeStacks` call whose CLIENT CONSTRUCTION
+    raised `NoRegionError` on a box that exports no region — outside the try
+    block the read itself had — and every `weekly` arc failed at the `console`
+    stage that renders `gates/ladder.json`, which then regressed phase 1's
+    `arc_runs_ok`. One unguarded line in one clause darkened every phase gate
+    in the system and turned a gate READ into a system FAILURE.
+
+    Guarding each clause individually is what failed: `-I9869` fixed exactly
+    this for manifest reads, clause by clause, and the next clause to reach a
+    new AWS service reintroduced it. So the containment lives HERE, applied to
+    every `_clause_*` function by :func:`_contain_clause_exceptions`, and a
+    clause author cannot forget it.
+
+    **This is a deliberate swallow** (AGENTS.md rule 5), so, explicitly: the
+    failure mode swallowed is "a clause raised instead of returning a reading";
+    the primary deliverable — a gate result carrying every other clause —
+    survives; and the recording surface is the returned clause's own
+    UNMEASURABLE detail, which names the exception type and message and is
+    rendered on the ladder, the board and `crucible gate`'s output. `met=False`
+    always, via :func:`_unmeasurable`, so an uncontainable clause can never be
+    counted as passing. `Exception`, not `BaseException`: a KeyboardInterrupt or
+    a spot reclamation must still stop the process.
+    """
+
+    @wraps(fn)
+    def _guarded(*args: Any, **kwargs: Any) -> Clause:
+        try:
+            return fn(*args, **kwargs)
+        except ClauseMisconfiguredError:
+            # Re-raised, not contained: a clause called with arguments that
+            # cannot describe any system is a bug in this module's own clause
+            # list, and containing it would render our defect as an
+            # environment reading, every week, forever. See the class.
+            raise
+        except Exception as exc:
+            name = fn.__name__.removeprefix(CLAUSE_FUNCTION_PREFIX)
+            return _unmeasurable(
+                name,
+                f"{name} could be evaluated at all",
+                f"the clause raised {type(exc).__name__}: {exc}. A clause that raises has "
+                "learned nothing about the system, so this is UNMEASURABLE — it is not a "
+                "finding about the system, and it does not darken the other clauses",
+            )
+
+    _guarded._contained = True  # type: ignore[attr-defined]
+    return _guarded
+
+
+def _contain_clause_exceptions() -> None:
+    """Wrap every `_clause_*` function in this module with :func:`_contained`.
+
+    Called once at import, below every clause definition and above
+    :data:`GATES`. Rebinding the module global is what makes it reach the
+    `_phaseN` assemblers too: they look their clauses up by name at call time,
+    so they get the contained version without being edited.
+
+    Raises if it wraps nothing — a containment pass that silently matched no
+    clause is the shape of a guard that grades an empty set.
+    """
+    wrapped = 0
+    for name, value in list(globals().items()):
+        if not name.startswith(CLAUSE_FUNCTION_PREFIX) or not callable(value):
+            continue
+        if getattr(value, "_contained", False):
+            continue
+        globals()[name] = _contained(value)
+        wrapped += 1
+    if not wrapped:
+        raise RuntimeError(
+            "the clause containment pass wrapped 0 functions. Either the "
+            f"{CLAUSE_FUNCTION_PREFIX!r} convention changed or this ran before the "
+            "clause definitions; both leave every clause able to raise into the ladder "
+            "again."
+        )
+
+
 @lru_cache(maxsize=1)
 def _manifest_property_names() -> frozenset[str]:
     """Every field the CURRENT run manifest schema declares, read from it.
@@ -3313,10 +3491,150 @@ MANIFEST_RUN_MODE_LIVE = "live"
 MANIFEST_RUN_MODE_GAP_ISSUE = 9918
 LLM_ARM_CALLSITE_GAP_ISSUE = 9920
 
-#: How many first-attempt `ok` LIVE Saturdays phase 2 requires. §6.1's ruled
-#: minimum — "2 consecutive first-attempt `ok` Saturdays, not 4", the other
-#: two soak weeks traded for the five replays.
-PHASE2_LIVE_SATURDAYS = 2
+#: How many first-attempt `ok` LIVE Saturdays phase 2 requires, and NOTHING
+#: else. Read by `_clause_live_saturdays_first_attempt_ok` alone.
+#:
+#: **One, per Brian's ruling 2026-09-09** (`alpha-engine-config-I10324`),
+#: narrowed from §6.1's "2 consecutive first-attempt `ok` Saturdays, not 4" so
+#: phase 2 is completable by the 2026-09-12 weekly Step Function. A lowered bar
+#: carries its rationale or it is drift, so:
+#:
+#: * the evidence loss is bounded, not waived — nine other phase-2 clauses
+#:   carry the unattended claim (`zero_human_mutating_calls`, `replays_ok` over
+#:   five replay Saturdays, the two page clauses, the retry class, the fault
+#:   injection, the runbook, the commissioned-pages clause and the cost
+#:   ceiling), so one live Saturday is the only piece of evidence that shrinks;
+#: * phase 4's `trader_one_week_on_v2_champion` collects a further week of live
+#:   operation regardless, on the same infrastructure, before the old system is
+#:   gone — the soak is deferred, not deleted;
+#: * §6.1 already priced the trade this extends ("replay in place of two of the
+#:   four soak weeks, on a path whose inputs are point-in-time addressable"),
+#:   and named its residual as a live-only failure mode surfacing on Saturday
+#:   #3 or #4 — unchanged by this narrowing, because 09-19 and 09-26 still run.
+#:
+#: **This was ONE constant doing two unrelated jobs until
+#: `alpha-engine-config-I10324`.** It was `GATES["phase2"]`'s window width in
+#: weeks as well as the Saturday count, so narrowing the Saturday count would
+#: silently have narrowed the window `zero_human_mutating_calls`,
+#: `pages_within_ceiling` and `replays_ok` read — a ceiling of two pages over
+#: one week asserting almost nothing, with nothing in the edit saying so. The
+#: window width is now :data:`PHASE2_WINDOW_WEEKS`, and
+#: `tests/test_gate_phases_2_5.py` asserts neither name is reachable from the
+#: other's call site.
+PHASE2_LIVE_SATURDAYS = 1
+
+#: How many weeks wide phase 2's gate WINDOW is, and nothing else. Read by
+#: `GATES["phase2"]` alone, whence `evaluate` builds the window every phase-2
+#: clause is handed.
+#:
+#: TWO, which is what the pre-split constant happened to hold — so this split
+#: changes no window, deliberately: the Saturday count moved and the window did
+#: not, which is the whole point of there being two names. Two weeks is what
+#: makes `pages_within_ceiling`'s ceiling of :data:`PHASE2_MAX_PAGES` a
+#: statement about a period rather than about a day, and it is the shortest
+#: window that can contain a full weekly cycle plus the cycle it is compared
+#: against.
+#:
+#: NOT the same question as :data:`PHASE2_LIVE_SATURDAYS` and not derivable
+#: from it: how many live Saturdays must have gone perfectly is a claim about
+#: evidence, how much history a ceiling is counted over is a claim about a
+#: denominator, and the two moved together only by accident of one assignment.
+PHASE2_WINDOW_WEEKS = 2
+
+#: How many complete DAILY cycles — trading days, strictly after the system's
+#: last change and no later than the render day — must fall inside the autonomy
+#: window, alongside the one complete weekly cycle.
+#:
+#: One. The daily half exists because the weekly half alone is a claim about a
+#: single artifact: a window can contain a weekly close and still not have
+#: carried the daily path — the preopen/postclose axis — past the change. One is
+#: the floor at which "the daily cycles falling in that span" is a non-empty
+#: statement; a larger number would be a second, undeclared waiting period, and
+#: the waiting period is the weekly cycle's job.
+PHASE2_AUTONOMY_MIN_DAILY_CYCLES = 1
+
+#: The furthest ahead :func:`autonomy_earliest_satisfiable_render_day` will
+#: search before refusing. Twenty-one calendar days is three weeks: a span no
+#: sequence of NYSE holidays can fill without a weekly close, so exhausting it
+#: means the calendar itself is unreadable and the honest answer is to raise
+#: rather than return a date nothing verified.
+_AUTONOMY_SEARCH_HORIZON_DAYS = 21
+
+
+def autonomy_earliest_satisfiable_render_day(change: dt.date) -> dt.date:
+    """The first render day on which `zero_human_mutating_calls` can read MET
+    for a system last changed on ``change``.
+
+    **The minimum span is DERIVED here, not declared** (`alpha-engine-config-
+    I10327`). `alpha-engine-config-I10324` shipped this guard as a
+    `PHASE2_AUTONOMY_MIN_SPAN = 7 days` constant AND a "the weekly cycle must
+    close after the change" requirement, and for the attack the floor was
+    written against — an operator apply an hour before the read leaving a
+    one-hour window containing nothing — the two are redundant: one hour cannot
+    contain a complete weekly cycle, so the cycle requirement already refuses
+    it. What the independent constant added was a second, arithmetically
+    separate waiting period, and it put the earliest satisfiable render day
+    four days past the weekly Step Function that phase 2 must exit on.
+
+    **Brian's 2026-09-04 phase-0 ruling is the precedent and the same trade:**
+    *"we can't wait a week on phase 0, it should clear after this week's
+    weekly"* — where the second week's protection was replaced by a daily
+    guard rather than deleted. Same here: the calendar floor is replaced by
+    the two cycle requirements it was standing in for, so the bar is now
+    stated in the unit the claim is denominated in (cycles) rather than in an
+    unrelated one (calendar days), and it moves with the calendar instead of
+    being wrong on a holiday week.
+
+    Both requirements, and both are load-bearing:
+
+    * `weekly_anchor(day) > change` — a COMPLETE weekly cycle whose close falls
+      after the change. This is what makes the anti-gaming property survive: a
+      change one hour before the read still yields an unsatisfiable window,
+      because `weekly_anchor` resolves to the Friday STRICTLY BEFORE the render
+      day and a change on or after that Friday cannot have a completed weekly
+      cycle behind it.
+    * at least :data:`PHASE2_AUTONOMY_MIN_DAILY_CYCLES` complete daily cycles
+      in `(change, day]`. The weekly close is one artifact; the daily path is
+      the one that runs four more times a week, and a window that graded a
+      weekly cycle without one daily cycle in it would be asserting unattended
+      operation from a single Saturday.
+
+    Raises :class:`LastChangeUnreadableError` if no day inside
+    :data:`_AUTONOMY_SEARCH_HORIZON_DAYS` satisfies both — fail loud, never a
+    silently-clamped date the clause would then grade against.
+    """
+    day = change + dt.timedelta(days=1)
+    for _ in range(_AUTONOMY_SEARCH_HORIZON_DAYS):
+        if (
+            weekly_anchor(day) > change
+            and autonomy_daily_cycles_in_span(change, day) >= PHASE2_AUTONOMY_MIN_DAILY_CYCLES
+        ):
+            return day
+        day += dt.timedelta(days=1)
+    raise LastChangeUnreadableError(
+        f"no render day within {_AUTONOMY_SEARCH_HORIZON_DAYS} days of {change.isoformat()} "
+        "contains both a complete weekly cycle closing after it and "
+        f"{PHASE2_AUTONOMY_MIN_DAILY_CYCLES} complete daily cycle(s). Three weeks of "
+        "calendar with no weekly close is not a holiday pattern, it is an unreadable "
+        "calendar, and a clamped date would be graded as though it had been verified."
+    )
+
+
+def autonomy_daily_cycles_in_span(change: dt.date, render_day: dt.date) -> int:
+    """How many complete daily cycles fall in ``(change, render_day]``.
+
+    Trading days, counted through `crucible.calendar` — a holiday week
+    legitimately contributes fewer, which is the whole reason this is counted
+    rather than derived from a calendar-day span. Strictly after the change: a
+    daily cycle that ran on the change's own day may have run BEFORE it, and
+    `_clause_zero_human_mutating_calls` already filters that day's operator
+    actions by `eventTime` for the same reason.
+    """
+    if render_day <= change:
+        return 0
+    days = (render_day - change).days
+    return sum(1 for n in range(1, days + 1) if is_trading_day(change + dt.timedelta(days=n)))
+
 
 #: How many replay Saturdays phase 2 re-grades through the phase-1 predicate.
 PHASE2_REPLAY_SATURDAYS = 5
@@ -3382,13 +3700,32 @@ SCRIPTED_FAULTS: tuple[str, ...] = (
     "stale_release_pointer",
 )
 
-#: The two fields a fault-injection record must carry: the manifest the
-#: induced fault produced, and the bus row it produced. Both, because either
-#: alone is half the §10.7 exercise — a manifest with no bus row is a job
-#: that failed and paged nobody, and a bus row with no manifest is a page
-#: about a run whose cause was discarded.
+#: The two fields an INDUCED fault-injection record must carry: the manifest
+#: the fault produced, and the bus row it produced. Both, because either alone
+#: is half the §10.7 exercise — a manifest with no bus row is a job that failed
+#: and paged nobody, and a bus row with no manifest is a page about a run whose
+#: cause was discarded.
+#:
+#: Only for `induced`. `alpha-engine-config-I10327`: two of plan §10.7's four
+#: faults never produce a failed run, so requiring these two of every record
+#: made the clause unsatisfiable for exactly the faults whose point is that the
+#: system survived them. See :data:`FAULT_RECORD_OUTCOME_FIELD`.
 FAULT_RECORD_MANIFEST_FIELD = "manifest_key"
 FAULT_RECORD_BUS_FIELD = "bus_key"
+
+#: The field saying HOW a fault ended, and therefore which evidence fields are
+#: legal on the record (`alpha-engine-config-I10327`). The vocabulary lives in
+#: `crucible.models.FAULT_OUTCOME_VALUES`, with the field-by-outcome matrix
+#: enforced by `crucible.models.FaultRecordDocument`; this clause reads that
+#: model rather than re-deriving the matrix, so a record shape the producer
+#: could not write is also a record shape this reader refuses.
+FAULT_RECORD_OUTCOME_FIELD = "outcome"
+
+#: The one outcome whose `run_id` excuses a failed manifest from
+#: `arc_runs_ok`/`replays_ok`. Named, because `_fault_excused_run_ids` filters
+#: on it and a string literal there would be the kind of unexplained
+#: comparison that gets "simplified" away.
+FAULT_OUTCOME_INDUCED = "induced"
 
 #: The README the phase-2 runbook deliverable lives in. Not a store artifact,
 #: for the reason :data:`ACCEPTANCE_RATCHET_PATH` is not: the runbook's
@@ -3624,29 +3961,266 @@ def _s3_client() -> Any:
     return boto3.client("s3")
 
 
-def _clause_zero_human_mutating_calls(window: list[dt.date]) -> Clause:
-    """Plan §6 row 2 and §11 risk 8: zero human-originated mutating calls.
+class LastChangeUnreadableError(RuntimeError):
+    """One of the two inputs to the autonomy window's START could not be read.
+
+    Raised rather than falling back to a window that starts earlier (or at
+    zero). A window whose start defaulted when an input was unreadable would
+    grade a span nobody established, and it fails in the direction that looks
+    like diligence: the earlier the start, the more history, the more
+    authoritative the reading appears. `alpha-engine-config-I10324` requires
+    the opposite — either input unreadable is UNMEASURABLE.
+    """
+
+
+@dataclass(frozen=True)
+class _SystemChange:
+    """When the graded system last changed, and which input said so."""
+
+    at: dt.datetime
+    source: str
+    pointer_at: dt.datetime
+    stack_at: dt.datetime
+
+    def provenance(self) -> str:
+        return (
+            f"window starts {self.at.isoformat()} ({self.source}); release pointer "
+            f"{POINTER_KEY} flipped {self.pointer_at.isoformat()}, stack last updated "
+            f"{self.stack_at.isoformat()}"
+        )
+
+
+def _pointer_flip_time(store: Store) -> dt.datetime:
+    """When `releases/current` last moved, as an instant.
+
+    The pointer is the ONE mutable object in the release layout
+    (`crucible.release`), moved only by a conditional PUT on a green smoke, so
+    its object modification time IS the flip time — there is no separate flip
+    record to read, and `release.json` is deterministic across rebuilds by
+    design (`alpha-engine-config-I9786`) so it carries no instant at all.
+
+    `HeadObject` off the store's own client, mirroring
+    `crucible.release_lock_sweep._read_one` rather than inventing a second
+    way to reach the same header — that module already established the
+    pattern (and the rule that ONLY `LastModified` is trusted out of the
+    response).
+
+    A non-S3 backend raises: a `LocalStore` directory's mtime is a fact about
+    a laptop's filesystem, not a deploy record, and grading a live autonomy
+    window off it would be an answer about the workbench — the defect this
+    whole clause was rewritten to stop.
+    """
+    if not isinstance(store, S3Store):
+        raise LastChangeUnreadableError(
+            f"the store backend is {type(store).__name__}, not S3, so the release "
+            f"pointer {POINTER_KEY} has no flip instant to read. A local directory's "
+            "mtime is a fact about a filesystem, not a deploy"
+        )
+    try:
+        head = store.client.head_object(Bucket=store.bucket, Key=store._s3_key(POINTER_KEY))
+    except Exception as exc:
+        # Broader than `ClientError` on purpose, and NOT a swallow: the caller
+        # renders every branch of this function as UNMEASURABLE, and the
+        # failures that actually happen here are as often `NoCredentialsError`
+        # or an endpoint resolution error as they are a 403 or a 404. Catching
+        # only `ClientError` would take `crucible gate`, `build_ladder` and the
+        # board render down together over an expired credential — the same
+        # reasoning `_clause_zero_human_mutating_calls`'s archive read carries,
+        # and the exception class is named in the message either way.
+        code = getattr(exc, "response", None) and store._error_code(exc)
+        raise LastChangeUnreadableError(
+            f"head_object({POINTER_KEY}) failed: {code or type(exc).__name__}: {exc}. That "
+            "is a statement about our access or about the pointer being unset, not about "
+            "the system being measured"
+        ) from exc
+    last_modified = head.get("LastModified")
+    if last_modified is None:
+        raise LastChangeUnreadableError(
+            f"head_object({POINTER_KEY}) returned no LastModified, so the flip instant is unknown"
+        )
+    return _as_utc(last_modified)
+
+
+def _stack_last_updated(cfn: Any | None = None, *, stack: str | None = None) -> dt.datetime:
+    """When the graded stack was last applied, as an instant.
+
+    `DescribeStacks` rather than the drift or event APIs: `LastUpdatedTime` is
+    the one field that moves on every `aws cloudformation deploy` that changed
+    anything, and it is present on a stack nobody has updated since creation
+    only as `CreationTime` — which is why the fallback below is a fallback and
+    not an error. A never-updated stack HAS a last change; it is the day it
+    was created.
+
+    ``stack`` defaults to `crucible.config.settings().stack_name`, the same
+    `CRUCIBLE_STACK`-resolved name `crucible.autonomy.machine_principals` and
+    `crucible.tags.audit_stack_tags` read — a second account or a renamed
+    stack stays one variable.
+    """
+    from crucible.autonomy import _cfn_client  # noqa: PLC0415 - lazy, one call site
+    from crucible.config import settings  # noqa: PLC0415 - one call site
+
+    stack_name = stack or settings().stack_name
+    # CONSTRUCTION is inside the guard, not above it (`alpha-engine-config-
+    # I10328`). `boto3.client("cloudformation")` raises `NoRegionError` where no
+    # region is configured, and the v2 box shell exports none — so with the
+    # construction outside this try, every `weekly` arc on a box died at the
+    # `console` stage rendering `gates/ladder.json`, which regressed phase 1's
+    # `arc_runs_ok` from a gate READ. A clause that cannot build its client has
+    # learned nothing about the system, which is UNMEASURABLE; it has not
+    # learned that the system is broken.
+    try:
+        client = cfn if cfn is not None else _cfn_client()
+        described = client.describe_stacks(StackName=stack_name)
+    except Exception as exc:
+        raise LastChangeUnreadableError(
+            f"describe_stacks({stack_name!r}) failed: {type(exc).__name__}: {exc}. An "
+            "undescribable stack — including one whose client could not be built at all, "
+            "for want of a configured region — is UNMEASURABLE, never a window starting "
+            "at zero"
+        ) from exc
+    stacks = described.get("Stacks") or []
+    if not stacks:
+        raise LastChangeUnreadableError(
+            f"describe_stacks({stack_name!r}) returned no stack. The v2 environment is "
+            "applied by CloudFormation, so no stack means there is nothing whose last "
+            "change could bound a window"
+        )
+    when = stacks[0].get("LastUpdatedTime") or stacks[0].get("CreationTime")
+    if when is None:
+        raise LastChangeUnreadableError(
+            f"stack {stack_name!r} reports neither LastUpdatedTime nor CreationTime, so "
+            "the instant it last changed is unknown"
+        )
+    return _as_utc(when)
+
+
+def _as_utc(value: dt.datetime) -> dt.datetime:
+    """A tz-aware UTC instant. A naive datetime is REFUSED, not assumed UTC.
+
+    Both producers here (`HeadObject`, `DescribeStacks`) return aware
+    datetimes; a naive one means something substituted a value, and silently
+    labelling it UTC would shift a window by up to a day in whichever
+    direction the local zone happens to sit — a window boundary error that
+    reads as a clean number.
+    """
+    if value.tzinfo is None:
+        raise LastChangeUnreadableError(
+            f"a change instant arrived without a timezone ({value.isoformat()}); "
+            "assuming UTC would move the window boundary by the local offset"
+        )
+    return value.astimezone(dt.UTC)
+
+
+def _last_system_change(store: Store, *, cfn: Any | None = None) -> _SystemChange:
+    """`max(release pointer flip, stack last applied)`, with its provenance.
+
+    **BOTH inputs, and neither substitutes for the other** (`alpha-engine-
+    config-I10324`). A wheel flip changes what the box RUNS and leaves the
+    stack untouched; a stack apply changes the box's ENVIRONMENT — its roles,
+    schedules, topics, env vars — with no release flip at all, and the two
+    fixes that made the v2 box able to page and able to run a full-universe
+    weekly on 2026-09-09 were both the latter. Reading either alone would put
+    the window's start before a change it could not see.
+    """
+    pointer_at = _pointer_flip_time(store)
+    stack_at = _stack_last_updated(cfn)
+    if stack_at > pointer_at:
+        return _SystemChange(stack_at, "stack last applied", pointer_at, stack_at)
+    if pointer_at > stack_at:
+        return _SystemChange(pointer_at, "release pointer flip", pointer_at, stack_at)
+    return _SystemChange(
+        pointer_at, "release pointer flip and stack apply, same instant", pointer_at, stack_at
+    )
+
+
+def _event_instant(event_time: str) -> dt.datetime | None:
+    """A CloudTrail `eventTime` as an instant, or None when it will not parse."""
+    try:
+        return _as_utc(dt.datetime.fromisoformat(event_time.replace("Z", "+00:00")))
+    except (ValueError, TypeError, LastChangeUnreadableError):
+        return None
+
+
+def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Clause:
+    """Plan §6 row 2 and §11 risk 8: zero human-originated mutating calls, over
+    a window that starts at the system's LAST CHANGE.
 
     Read through `crucible.autonomy`, which walks the CloudTrail **S3
-    archive** over the whole window. `aws cloudtrail lookup-events` is
-    forbidden there and the acceptance suite asserts the module has no path to
-    it: the username lookup silently truncates to ~2 days, so a gate built on
-    it reports zero because it looked at two days.
+    archive**. `aws cloudtrail lookup-events` is forbidden there and the
+    acceptance suite asserts the module has no path to it: the username lookup
+    silently truncates to ~2 days, so a gate built on it reports zero because
+    it looked at two days.
+
+    **The window used to be the phase's rolling calendar window, and that
+    measured the workbench** (`alpha-engine-config-I10324`). Measured
+    2026-09-09 it read 167 human mutating calls over 2026-09-01..09-08 —
+    dominated by the operator-gated CloudFormation applies and dispatches that
+    MADE THE SYSTEM WORK. The v2 box could not page at all until 2026-09-09
+    (`alpha-engine-config-I10156`) and could not run a full-universe
+    `data.weekly` until the same day (the liquidity floor), so a window
+    spanning the repair cannot tell the repair from an intervention. Brian's
+    2026-09-04 ruling on phase 0 is the governing precedent: a phase completes
+    on "fix and rerun until it is successful", not on a span nobody touched.
+
+    So the window is `[last change, render day]`, and both halves of that
+    construction are load-bearing:
+
+    * `last change = max(release pointer flip, stack last applied)` —
+      :func:`_last_system_change`, which documents why neither input covers the
+      other. A pleasant consequence, and the reason there is NO carve-out here
+      for operator-gated applies: an apply now DEFINES the window's start
+      rather than violating it. A carve-out would be a second mechanism for the
+      same thing, and the one that fails open the day an operator does
+      something the allowlist did not anticipate.
+    * the window must ALSO contain one complete weekly cycle whose close falls
+      after the change, plus the daily cycles falling in that span
+      (:func:`autonomy_earliest_satisfiable_render_day`). Without that, every
+      change SHORTENS the window and makes this clause EASIER — an apply one
+      minute before the read would leave a one-minute window containing nothing
+      and read MET, which is the precise inverse of what the clause grades. Too
+      short is UNMET, not unmeasurable: the input was perfectly readable and it
+      said the system has not yet run a cycle unattended.
+
+      **The minimum span is DERIVED from that cycle requirement, not declared
+      beside it** (`alpha-engine-config-I10327`). It shipped as a
+      `PHASE2_AUTONOMY_MIN_SPAN = 7 days` constant AND the cycle requirement,
+      and for the attack the constant was written against the two are
+      redundant: one hour cannot contain a complete weekly cycle. What the
+      constant added was a second, arithmetically separate waiting period —
+      four days past the weekly Step Function phase 2 has to exit on. Brian's
+      2026-09-04 phase-0 ruling is the precedent and the same trade: *"we
+      can't wait a week on phase 0, it should clear after this week's
+      weekly"*, where the second week's protection was replaced by a daily
+      guard rather than deleted. The anti-gaming property is unchanged and
+      still tested.
+
+    Actions are counted from the change instant, not from midnight of the
+    change's day. `count_operator_actions` covers whole calendar days (the
+    archive is day-partitioned), so the day of the change arrives carrying the
+    operator's own applies; those are filtered here by `eventTime`. An
+    `eventTime` that will not parse is COUNTED rather than dropped — for a
+    clause asserting a count of zero, over-counting is investigated and
+    under-counting is a gate that reads clean because it could not read, the
+    same direction `crucible.autonomy._touches` chose.
     """
-    name = "zero_human_mutating_calls"
-    requirement = (
-        "zero human-originated mutating calls touched a v2 resource over the window, "
-        "counted from the CloudTrail S3 archive (never `lookup-events`, which truncates "
-        "its username lookup to ~2 days — §11 risk 8)"
-    )
     from crucible.autonomy import (  # noqa: PLC0415 - heavy import, one call site
         ArchiveMissingError,
         count_operator_actions,
     )
     from crucible.config import settings  # noqa: PLC0415 - one call site
 
+    name = "zero_human_mutating_calls"
+    requirement = (
+        "zero human-originated mutating calls touched a v2 resource between the "
+        "system's last change (the later of the release pointer flip and the "
+        f"{settings().stack_name} stack's last apply) and the render day, over a span "
+        "containing one complete unattended weekly cycle closing after the change plus "
+        f"at least {PHASE2_AUTONOMY_MIN_DAILY_CYCLES} complete daily cycle(s) in it, "
+        "counted from the CloudTrail S3 archive (never `lookup-events`, which truncates "
+        "its username lookup to ~2 days — §11 risk 8)"
+    )
     archive = settings().cloudtrail_archive
-    evidence = (archive,) if archive else ()
+    evidence = (archive, POINTER_KEY) if archive else (POINTER_KEY,)
     if not archive:
         return _unmeasurable(
             name,
@@ -3658,14 +4232,72 @@ def _clause_zero_human_mutating_calls(window: list[dt.date]) -> Clause:
             "answer",
             evidence,
         )
-    bucket, _, prefix = archive.removeprefix("s3://").partition("/")
+    try:
+        change = _last_system_change(store)
+    except LastChangeUnreadableError as exc:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"the system's last change could not be established: {exc}",
+            evidence,
+        )
+    render_day = window[-1]
+    change_day = change.at.date()
+    span = render_day - change_day
+    cycle_close = weekly_anchor(render_day)
+    daily_cycles = autonomy_daily_cycles_in_span(change_day, render_day)
+    if cycle_close <= change_day:
+        try:
+            satisfiable_on = autonomy_earliest_satisfiable_render_day(change_day)
+        except LastChangeUnreadableError as exc:
+            return _unmeasurable(
+                name,
+                requirement,
+                f"the earliest satisfiable render day could not be derived: {exc}",
+                evidence,
+            )
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"the most recent weekly close in the window, {cycle_close.isoformat()}, is "
+            f"not after the system's last change ({change.at.isoformat()}, "
+            f"{change.source}), so no complete weekly cycle has run unattended since "
+            f"it — {span.days} day(s) to the render day {render_day.isoformat()}. This "
+            f"reads UNMET until {satisfiable_on.isoformat()}, the first render day whose "
+            "window contains a complete weekly cycle closing after the change plus "
+            f"{PHASE2_AUTONOMY_MIN_DAILY_CYCLES} daily cycle(s). A window that shrank "
+            "with every change would make this clause easier the more the system was "
+            f"touched. {change.provenance()}",
+            evidence,
+        )
+    if daily_cycles < PHASE2_AUTONOMY_MIN_DAILY_CYCLES:
+        # UNMEASURABLE, not UNMET, and deliberately so: under the NYSE calendar
+        # this branch is unreachable, because `weekly_anchor(render_day)` IS a
+        # trading day in `(change_day, render_day]` whenever the guard above
+        # passed, so a cycle closing after the change implies at least one daily
+        # cycle. It is a self-check on that implication rather than a second
+        # bar, and the honest reading when an implication the derivation rests
+        # on fails is "the calendar contradicted itself", never a quiet UNMET
+        # that would look like a system finding.
+        return _unmeasurable(
+            name,
+            requirement,
+            f"the window {change_day.isoformat()}..{render_day.isoformat()} carries a "
+            f"weekly cycle closing {cycle_close.isoformat()}, after the change, and yet "
+            f"counts {daily_cycles} complete daily cycle(s) — short of the "
+            f"{PHASE2_AUTONOMY_MIN_DAILY_CYCLES} that close implies. The trading "
+            "calendar contradicted itself, which is a statement about the calendar and "
+            f"not about the system being measured. {change.provenance()}",
+            evidence,
+        )
     try:
         counted = count_operator_actions(
             _s3_client(),
-            bucket=bucket,
-            prefix=prefix,
-            start=window[0],
-            end=window[-1],
+            bucket=archive.removeprefix("s3://").partition("/")[0],
+            prefix=archive.removeprefix("s3://").partition("/")[2],
+            start=change.at.date(),
+            end=render_day,
         )
     except ArchiveMissingError as exc:
         return _unmeasurable(name, requirement, f"ArchiveMissingError: {exc}", evidence)
@@ -3683,24 +4315,34 @@ def _clause_zero_human_mutating_calls(window: list[dt.date]) -> Clause:
             "That is a statement about our access, not about the system being measured",
             evidence,
         )
-    if counted.count:
+    after_change = tuple(
+        action
+        for action in counted.actions
+        if (instant := _event_instant(action.event_time)) is None or instant >= change.at
+    )
+    if after_change:
         offenders = ", ".join(
-            f"{a.principal} {a.event_name}@{a.event_time}" for a in counted.actions[:4]
+            f"{a.principal} {a.event_name}@{a.event_time}" for a in after_change[:4]
         )
         return Clause(
             name,
             requirement,
             False,
-            f"{counted.count} human mutating call(s) over "
-            f"{window[0].isoformat()}..{window[-1].isoformat()}: {offenders}",
+            f"{len(after_change)} human mutating call(s) over "
+            f"{change.at.isoformat()}..{render_day.isoformat()}: {offenders}. "
+            f"{change.provenance()}",
             evidence,
         )
     return Clause(
         name,
         requirement,
         True,
-        f"0 human mutating calls over {counted.records_scanned} records in "
-        f"{counted.objects_read} archive objects",
+        f"0 human mutating calls over {span.days} days "
+        f"({change.at.isoformat()}..{render_day.isoformat()}), spanning the weekly cycle "
+        f"closing {cycle_close.isoformat()} and {daily_cycles} daily cycle(s), "
+        f"{counted.records_scanned} records in {counted.objects_read} archive objects; "
+        f"{len(counted.actions) - len(after_change)} call(s) on the change day itself "
+        f"predate the change and are excluded. {change.provenance()}",
         evidence,
     )
 
@@ -4207,35 +4849,63 @@ def _clause_fault_injection_against_scheduled_path(store: Store) -> Clause:
     was run against the live scheduled path — graded from a durable record
     per scripted fault, each naming the manifest and the bus row it produced.
 
-    §10.7's exercise leaves two artifacts behind on the real path: the
-    manifest the failed job wrote, and the bus row the sweep filed for it. A
-    record that merely says "fault 2 was induced" is a sentence; a record
-    naming both keys is checkable, and this clause checks it — both keys must
-    exist on the store, and both must be of the right shape. A record whose
-    named manifest is absent is a claim the store contradicts, and that is
-    the reading this clause exists to make possible: today the exercise is
-    written up in a runbook nothing parses, so "we ran fault injection" and
-    "we did not" render identically on every surface.
+    §10.7's exercise leaves artifacts behind on the real path, and WHICH
+    artifacts depends on how the fault ended. A record that merely says
+    "fault 2 was induced" is a sentence; a record naming keys is checkable,
+    and this clause checks them — every key it names must exist on the store
+    and be of the right shape. A record whose named manifest is absent is a
+    claim the store contradicts, and that is the reading this clause exists to
+    make possible: the exercise used to be written up in a runbook nothing
+    parses, so "we ran fault injection" and "we did not" rendered identically
+    on every surface.
 
-    **Three outcomes, deliberately distinct.**
+    **The record carries three OUTCOME KINDS and this clause grades each on
+    its own evidence** (`alpha-engine-config-I10327`). It required
+    `manifest_key` AND `bus_key` of every record, which made it unsatisfiable
+    for the two faults that never produce a failed run — fault 1's designed
+    outcome is a spot interruption the runner's declared transient class
+    ABSORBS (the manifest reads `ok`), and fault 4's state cannot be entered
+    at all:
 
-    * A record naming keys the store does not hold, or keys of the wrong
-      shape — UNMET. That is evidence, positively read.
+    * `induced` — the fault fired and the job failed. Both keys required, both
+      read off the store.
+    * `absorbed` — the fault fired and the system handled it. `manifest_key`
+      required; `bus_key` must be ABSENT, and a record carrying one is
+      CONTRADICTED, not tolerated — a page here would mean the retry did not
+      work, so the absence is part of the claim.
+    * `unreachable` — the state cannot be entered. No `run_id` and no keys at
+      all; the evidence is `closed_paths`, one machine-executed probe per
+      closed path, which `crucible.faults` refused to file unless every probe
+      observed what it required.
+
+    The per-outcome matrix is NOT re-derived here: every record is validated
+    against `crucible.models.FaultRecordDocument`, the same model the producer
+    validates before writing, so a record shape the producer could not have
+    written is a record this reader refuses. A second copy of the matrix in
+    this function would be the half that drifts.
+
+    **Three readings, deliberately distinct.**
+
+    * A record that does not conform, or names keys the store does not hold,
+      or keys of the wrong shape — UNMET. That is evidence, positively read.
     * No record for a fault — UNMEASURABLE, naming the exact key that is
-      missing. Nothing files one today (there is no producer of
-      `faults/{trading_day}/{fault}.json` anywhere in this package), and the
-      two halves that would are open on the tracker; an absent record means
-      the exercise is unrecorded, never that it did not happen.
-    * Every scripted fault has a record whose two keys are present — MET.
+      missing. An absent record means the exercise is unrecorded, never that
+      it did not happen.
+    * Every scripted fault has a conforming record whose named keys are
+      present — MET.
 
-    Not windowed: an induced fault is a one-time exercise whose record stays
+    Not windowed: a fault exercise is a one-time event whose record stays
     true, the same reason `pages_commissioned` is not windowed.
     """
     name = "fault_injection_against_scheduled_path"
     requirement = (
-        f"each of the {len(SCRIPTED_FAULTS)} scripted faults (plan §10.7) has a record "
-        f"under {FAULT_INJECTION_ROOT} naming a `{FAULT_RECORD_MANIFEST_FIELD}` and a "
-        f"`{FAULT_RECORD_BUS_FIELD}` that both exist on the store"
+        f"each of the {len(SCRIPTED_FAULTS)} scripted faults (plan §10.7) has a "
+        f"conforming record under {FAULT_INJECTION_ROOT} declaring an "
+        f"`{FAULT_RECORD_OUTCOME_FIELD}` and carrying exactly that outcome's evidence — "
+        f"`{FAULT_RECORD_MANIFEST_FIELD}` plus `{FAULT_RECORD_BUS_FIELD}` for `induced`, "
+        f"`{FAULT_RECORD_MANIFEST_FIELD}` with NO `{FAULT_RECORD_BUS_FIELD}` for "
+        "`absorbed`, machine-checked `closed_paths` and no run for `unreachable` — with "
+        "every key it names present on the store"
     )
     listed = _list_store_keys(store, FAULT_INJECTION_ROOT)
     if listed.problem is not None:
@@ -4275,10 +4945,45 @@ def _clause_fault_injection_against_scheduled_path(store: Store) -> Clause:
         key, document = sorted(filed)[-1]
         named: list[str] = []
         bad: list[str] = []
-        for field_name, shape_ok, shape in (
-            (FAULT_RECORD_MANIFEST_FIELD, is_manifest_key, "a run manifest key"),
-            (FAULT_RECORD_BUS_FIELD, lambda k: parse_bus_key(k) is not None, "an alert bus key"),
-        ):
+        # Conformance FIRST, through the producer's own model: the
+        # field-by-outcome matrix (which evidence each kind requires and which
+        # it forbids) is enforced in ONE place, and a record shape the producer
+        # could not have written is a record this reader refuses rather than
+        # grades on whichever fields happen to be populated. This is also what
+        # catches an `absorbed` record carrying a `bus_key`, and an
+        # `unreachable` one carrying a `run_id` it could excuse a manifest
+        # with.
+        try:
+            FaultRecordDocument.model_validate(document)
+        except ValidationError as exc:
+            contradicted.append(fault)
+            first = exc.errors()[0]
+            where = ".".join(str(part) for part in first["loc"]) or "<root>"
+            parts.append(
+                f"{fault}: {key} does not conform to fault_record.v1 "
+                f"({len(exc.errors())} error(s), first at {where}: {first['msg']})"
+            )
+            continue
+        outcome = str(document.get(FAULT_RECORD_OUTCOME_FIELD))
+        # Which keys this outcome names on the store. `unreachable` names
+        # none: its evidence is `closed_paths`, already validated above, and a
+        # reader that demanded a store key of it would be the defect I10327
+        # removed.
+        expected_keys = (
+            ((FAULT_RECORD_MANIFEST_FIELD, is_manifest_key, "a run manifest key"),)
+            if outcome == "absorbed"
+            else ()
+            if outcome != FAULT_OUTCOME_INDUCED
+            else (
+                (FAULT_RECORD_MANIFEST_FIELD, is_manifest_key, "a run manifest key"),
+                (
+                    FAULT_RECORD_BUS_FIELD,
+                    lambda k: parse_bus_key(k) is not None,
+                    "an alert bus key",
+                ),
+            )
+        )
+        for field_name, shape_ok, shape in expected_keys:
             value = str(document.get(field_name) or "").strip()
             if not value:
                 bad.append(f"names no `{field_name}`")
@@ -4296,11 +5001,15 @@ def _clause_fault_injection_against_scheduled_path(store: Store) -> Clause:
             named.append(value)
         if bad:
             contradicted.append(fault)
-            parts.append(f"{fault}: {key} " + "; ".join(bad))
+            parts.append(f"{fault}: {key} ({outcome}) " + "; ".join(bad))
         else:
             evidence.append(key)
             evidence.extend(named)
-            parts.append(f"{fault}: {key} -> {', '.join(named)}")
+            probes = document.get("closed_paths") or []
+            shown = (
+                ", ".join(str(row.get("probe")) for row in probes) if probes else ", ".join(named)
+            )
+            parts.append(f"{fault}: {key} ({outcome}) -> {shown}")
     if problems:
         parts.append(f"{len(problems)} malformed record(s) ignored: {sorted(problems)[0]}")
     if access:
@@ -4816,7 +5525,7 @@ def _phase2(
     return [
         _clause_live_saturdays_first_attempt_ok(store, window),
         _clause_replays_ok(store, window, registry),
-        _clause_zero_human_mutating_calls(window),
+        _clause_zero_human_mutating_calls(store, window),
         _clause_pages_within_ceiling(store, window),
         _clause_pages_commissioned(store),
         _clause_two_page_conditions_on_real_channel(store),
@@ -5344,10 +6053,15 @@ def _phase5(
 #:   check now also watches continuously; phase 4 asks whether it is GONE, and
 #:   nothing else grades that.
 #: * phase 5 — ONE, §6 row 5's "verdict within one weekly cycle".
+# Every clause is contained before any gate can reach one — below every
+# `_clause_*` definition and above the registry that calls them
+# (`alpha-engine-config-I10328`).
+_contain_clause_exceptions()
+
 GATES: dict[str, tuple[int, Any]] = {
     "phase0": (1, _phase0),
     "phase1": (5, _phase1),
-    "phase2": (PHASE2_LIVE_SATURDAYS, _phase2),
+    "phase2": (PHASE2_WINDOW_WEEKS, _phase2),
     "phase3": (4, _phase3),
     "phase4": (2, _phase4),
     "phase5": (1, _phase5),

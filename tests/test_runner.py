@@ -32,6 +32,12 @@ def _read_manifest(store: LocalStore, job: str) -> dict:
     return json.loads(store.get_bytes(manifest_key(job, TRADING_DAY.isoformat())))
 
 
+def _read_manifest_discriminated(store: LocalStore, job: str, discriminator: str) -> dict:
+    return json.loads(
+        store.get_bytes(manifest_key(job, TRADING_DAY.isoformat(), discriminator=discriminator))
+    )
+
+
 class TestSuccessPath:
     def test_a_clean_job_writes_an_ok_manifest(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
@@ -71,6 +77,87 @@ class TestSuccessPath:
         run_job("smoke", lambda ctx: seen.append(ctx.run_id), store=store, trading_day=TRADING_DAY)
 
         assert _read_manifest(store, "smoke")["run_id"] == seen[0]
+
+
+class TestResourceBlockIsMeasured:
+    """`alpha-engine-config-I10328`, second half. Before this,
+    `resource.spot` came from an unconditionally exported
+    `CRUCIBLE_SPOT=true` and `resource.escalated_to_on_demand` was a bare
+    `False` default -- both were the same value on every manifest ever
+    written, spot or on-demand, escalated or not. `mem_peak_mb`/
+    `disk_free_mb` were an unconditional `0.0`. None of the four is
+    permitted to be a constant any more; each must vary with what this
+    specific run actually did."""
+
+    def test_no_field_is_the_old_unconditional_constant(self, tmp_path, monkeypatch) -> None:
+        """The literal defect this fixes: run the SAME job twice, once as a
+        measured spot launch and once as a measured on-demand escalation,
+        and every `resource` field that used to be a constant differs."""
+        store = LocalStore(tmp_path)
+
+        monkeypatch.setenv("CRUCIBLE_LIFECYCLE", "spot")
+        run_job("smoke", lambda ctx: None, store=store, trading_day=TRADING_DAY, discriminator="a")
+        spot_doc = _read_manifest_discriminated(store, "smoke", "a")
+
+        monkeypatch.setenv("CRUCIBLE_LIFECYCLE", "on-demand")
+        run_job("smoke", lambda ctx: None, store=store, trading_day=TRADING_DAY, discriminator="b")
+        escalated_doc = _read_manifest_discriminated(store, "smoke", "b")
+
+        assert spot_doc["resource"]["spot"] is True
+        assert spot_doc["resource"]["escalated_to_on_demand"] is False
+        assert escalated_doc["resource"]["spot"] is False
+        assert escalated_doc["resource"]["escalated_to_on_demand"] is True
+        # Not the old CRUCIBLE_SPOT=true / False constants regardless of
+        # which run: the two runs must actually disagree.
+        assert spot_doc["resource"]["spot"] != escalated_doc["resource"]["spot"]
+        assert (
+            spot_doc["resource"]["escalated_to_on_demand"]
+            != escalated_doc["resource"]["escalated_to_on_demand"]
+        )
+
+    def test_local_run_with_no_lifecycle_env_is_neither_spot_nor_escalated(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A laptop/CI run, where no box shell ever ran, is the one
+        legitimate absence -- not a fabricated `unknown`."""
+        store = LocalStore(tmp_path)
+        monkeypatch.delenv("CRUCIBLE_LIFECYCLE", raising=False)
+
+        run_job("smoke", lambda ctx: None, store=store, trading_day=TRADING_DAY)
+
+        doc = _read_manifest(store, "smoke")
+        assert doc["resource"]["spot"] is False
+        assert doc["resource"]["escalated_to_on_demand"] is False
+
+    def test_an_unreadable_lifecycle_fails_the_run_rather_than_defaulting(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """`unknown` (the box shell's own IMDS curl failed) is not a value
+        crucible.runner may turn into `False` -- that would be exactly the
+        fabricated-measurement defect this fixes, wearing a new name. The
+        run fails and writes NO manifest, per repo rule 5 and rule 1: there
+        is no `resource.spot`/`escalated_to_on_demand` that isn't either
+        real or absent, and these two fields cannot be schema-omitted."""
+        store = LocalStore(tmp_path)
+        monkeypatch.setenv("CRUCIBLE_LIFECYCLE", "unknown")
+
+        with pytest.raises(RuntimeError, match="CRUCIBLE_LIFECYCLE"):
+            run_job("smoke", lambda ctx: None, store=store, trading_day=TRADING_DAY)
+
+        assert not store.exists(manifest_key("smoke", TRADING_DAY.isoformat()))
+
+    def test_mem_and_disk_are_real_measurements_not_zero(self, tmp_path, monkeypatch) -> None:
+        """Every real machine this runs on has nonzero peak RSS and nonzero
+        free disk; `0.0` on both, on every manifest ever inspected, was the
+        signature of an unconditional constant rather than a reading."""
+        store = LocalStore(tmp_path)
+        monkeypatch.delenv("CRUCIBLE_LIFECYCLE", raising=False)
+
+        run_job("smoke", lambda ctx: None, store=store, trading_day=TRADING_DAY)
+
+        doc = _read_manifest(store, "smoke")
+        assert doc["resource"]["mem_peak_mb"] > 0.0
+        assert doc["resource"]["disk_free_mb"] > 0.0
 
 
 class TestFailurePath:
