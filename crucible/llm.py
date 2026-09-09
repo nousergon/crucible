@@ -85,6 +85,7 @@ __all__ = [
     "PROVIDER_MODULES",
     "RECONCILIATION_METRIC",
     "RECONCILIATION_TOLERANCE_USD",
+    "RegistryPreflightFailed",
     "SpendCap",
     "audit_call_sites",
     "call",
@@ -97,6 +98,7 @@ __all__ = [
     "reconcile_manifests_cost",
     "reconcile_run_cost",
     "reconciliation_unmeasurable",
+    "registry_preflight",
     "spend_pace",
     "week_to_date_llm_spend",
 ]
@@ -353,16 +355,42 @@ def capability_group(capability_class: str) -> str:
     """The router model group *capability_class* addresses.
 
     Pure, offline and total: it reads :data:`CAPABILITY_CLASS_GROUPS` and
-    nothing else, so it can be called at registry-load time — the earliest
-    point at which an unrouted class is knowable — without a registry file,
-    a network, or an AWS credential.
+    `krepis.router.TIER_GROUPS` — two dicts, no registry file, no network and
+    no AWS credential — so it can be called at registry-load time, the
+    earliest point at which an unrouted class is knowable.
+
+    Three sources, in order, and none of them a restatement of another:
+
+    :data:`CAPABILITY_CLASS_GROUPS`
+        this package's own ruled mappings, and its explicit refusals.
+
+    ``krepis.router.TIER_GROUPS``
+        the ROUTER's tier-to-group mapping, read rather than copied — the same
+        source :func:`_capability_classes` reads to decide which tier names are
+        askable at all. `alpha-engine-config-I10346`: reading it for
+        membership and NOT for resolution is what left `mid` askable and
+        unroutable. `TIER_GROUPS` maps `mid` to the group `med`, the registry
+        declares `med` and has never declared `mid`, and identity resolution
+        below sent `mid` to a group that does not exist — a call site
+        declaring the tier krepis itself names would have passed
+        :func:`_require_capability_class` and then failed at the router.
+        Restating `mid: med` in :data:`CAPABILITY_CLASS_GROUPS` was the wrong
+        fix for it: that is a second copy of a mapping krepis owns, and the
+        copy would be the one deciding what a box routes to.
+
+    identity
+        a class whose name IS a group name (`low`, `high`, `ultra`,
+        `chaos_probe`) needs no entry anywhere and cannot drift.
 
     Whether the returned name is a group the registry actually declares is
     the ROUTER's question, answered by `krepis.router` against the registry
-    document with a `ValueError` naming every available group. Restating the
-    group set here would be the copied list `alpha-engine-config-I9971`
-    already records against this package's capability-class allowlist.
+    document with a `ValueError` naming every available group — and, before a
+    job runs, by :func:`registry_preflight`. Restating the group set here
+    would be the copied list `alpha-engine-config-I9971` already records
+    against this package's capability-class allowlist.
     """
+    from krepis.router import TIER_GROUPS
+
     if capability_class in CAPABILITY_CLASS_GROUPS:
         group = CAPABILITY_CLASS_GROUPS[capability_class]
         if group is None:
@@ -380,7 +408,7 @@ def capability_group(capability_class: str) -> str:
                 f"beside {capability_class!r} in `crucible.llm.CAPABILITY_CLASS_GROUPS`."
             )
         return group
-    return capability_class
+    return TIER_GROUPS.get(capability_class, capability_class)
 
 
 # --------------------------------------------------------------------------
@@ -538,6 +566,170 @@ def _exec_context() -> str:
             f"{list(EXEC_CONTEXTS)} in this job's launcher or deploy config."
         )
     return declared
+
+
+# --------------------------------------------------------------------------
+# The model registry reaches this process, or the process says so up front.
+# --------------------------------------------------------------------------
+
+
+class RegistryPreflightFailed(RuntimeError):
+    """The model registry is absent, or declares nothing this process can route to.
+
+    Raised by :func:`registry_preflight`, which exists because the failure it
+    names was discovered on a billed spot box instead of at boot.
+    `alpha-engine-config-I10346`: `crucible fault.probe` dispatched to a real
+    v2 box on release `7a526e5b` failed with
+
+        FileNotFoundError: LLM_MODEL_REGISTRY.yaml not found — set
+        LLM_MODEL_REGISTRY_PATH or run from within a repo whose private-docs/
+        directory contains the file.  (krepis router.py:1691)
+
+    raised from `krepis.router` at the first LLM call, deep inside a job,
+    minutes after the bootstrap had finished and disarmed its own error trap.
+    Every capability class was affected equally: a v2 box checks out no
+    repository, so the walk-up `krepis.model_registry.find_registry` performs
+    can never succeed there, and nothing exported
+    ``LLM_MODEL_REGISTRY_PATH``.
+
+    The class exists so the same condition is provable in the BOOTSTRAP
+    phase, whose failures page as bootstrap failures and shut the box down,
+    rather than being discovered by whichever job spends the first dollar.
+    """
+
+
+def registry_preflight() -> str:
+    """Prove the router's registry is reachable and routable. No LLM call.
+
+    **What it proves.** Three things, all offline:
+
+    1. This process has DECLARED its execution context (:func:`_exec_context`).
+    2. `LLM_MODEL_REGISTRY.yaml` resolves and parses, through
+       `krepis.model_registry` — the same discovery `krepis.router` performs,
+       called rather than re-implemented, so a preflight cannot pass against a
+       file the router would not find.
+    3. Every capability class this package can ADDRESS today maps to a
+       registry group with at least one live member declaring itself reachable
+       from this execution context.
+
+    **What it does NOT prove, exactly.** It makes no LLM call, opens no
+    socket, and reaches no provider, no router edge and no credential: a model
+    that is declared, live and reachable can still be down, and this function
+    would not know. It is the honest half — the half that is knowable without
+    spending anything — and the paragraph in `crucible-v2.yaml`'s bootstrap
+    that says the box asserts no live end-to-end scan stays true with this
+    running.
+
+    **Why point 3 rather than "the file exists".** The registry a consumer
+    reads is a published copy, and a stale copy is worse than an absent one:
+    `alpha-engine-config-I6183` is the measured precedent — the Director
+    Lambda's published copy predated the `reachable_from` migration, krepis
+    treats an entry with no `reachable_from` as reachable from EVERYWHERE, and
+    the `ultra` chain resolved a model at a provider the Lambda reached
+    unscanned while every surface read healthy. A presence check passes
+    against that file. Resolving the group does not.
+
+    **Why the class set is derived, never listed.** :func:`_capability_classes`
+    already unions `krepis.router.TIER_GROUPS` with `llm_callsites.yaml`'s
+    declared classes, so a class this package gains tomorrow is covered here
+    without an edit, and a class it loses stops being asserted.
+    :data:`FAULT_INJECTION_CAPABILITY_CLASSES` is subtracted because those
+    groups are CONTRACTED never to serve. `chaos_probe` would in fact PASS
+    today — its two members are real, currently-configured upstream hosts
+    carrying model strings the hosts will never serve — so asserting it proves
+    nothing about any serving path, and would turn a legitimate future edit of
+    that group into a red box.
+
+    Returns
+    -------
+    str
+        One line naming the registry path, the execution context, and each
+        group with its reachable member count — the string the box bootstrap
+        prints, so "which registry did this box route on" is answerable from
+        the console log alone rather than from a re-derivation.
+
+    Raises
+    ------
+    RegistryPreflightFailed
+        The registry could not be found or parsed, or a group this package can
+        address has no live member reachable from here. The message names the
+        rejections `krepis.model_registry` recorded, so the reader is not left
+        to re-derive which member was dropped and why.
+    ValueError
+        ``KREPIS_EXEC_CONTEXT`` is not set (from :func:`_exec_context`).
+        Re-raised unchanged: an undeclared context is a launcher defect with
+        its own message, and wrapping it would bury the one sentence that says
+        what to set.
+    """
+    from krepis import model_registry as _mr
+
+    # `_entry_reachable_from` is krepis' SINGLE implementation of R28,
+    # including the load-bearing rule that an entry declaring no
+    # `reachable_from` is reachable from NOWHERE. Copying that rule into this
+    # package would be a second implementation of the thing whose first
+    # implementation drifting is the whole failure above, and it would be the
+    # copy that decided whether a box routes. It is private, which is the
+    # honest cost of reading it here; `alpha-engine-config-I10349` tracks
+    # exposing it publicly in krepis, and
+    # `tests/test_registry_preflight.py::TestTheKrepisSeamsExist` fails if it
+    # is renamed rather than letting a box discover it.
+    from krepis.router import _entry_reachable_from
+
+    exec_context = _exec_context()
+
+    try:
+        registry = _mr.load_registry()
+    except FileNotFoundError as exc:
+        raise RegistryPreflightFailed(
+            "the LLM model registry is not reachable from this process: "
+            f"{exc}. A crucible-v2 box checks out no repository, so the "
+            "walk-up for `private-docs/LLM_MODEL_REGISTRY.yaml` cannot "
+            "succeed there — `LLM_MODEL_REGISTRY_PATH` must name the copy "
+            "the bootstrap fetched from the store."
+        ) from exc
+
+    classes = sorted(_capability_classes() - FAULT_INJECTION_CAPABILITY_CLASSES)
+    if not classes:
+        raise RegistryPreflightFailed(
+            "this package declares no capability class outside "
+            f"{sorted(FAULT_INJECTION_CAPABILITY_CLASSES)}, so the preflight "
+            "would assert nothing at all. A check that passes vacuously is "
+            "worse than an absent one: it reports coverage of nothing."
+        )
+
+    summary: list[str] = []
+    for capability_class in classes:
+        group = capability_group(capability_class)
+        live = registry.live_group_ids(group)
+        reachable = [
+            member
+            for member in live
+            if _entry_reachable_from(registry.models[member], exec_context)
+        ]
+        if not reachable:
+            rejections = registry.capability_rejections(group)
+            unreachable = [
+                f"{member}: not reachable from {exec_context!r} "
+                f"(reachable_from={registry.models[member].get('reachable_from')!r})"
+                for member in live
+            ]
+            raise RegistryPreflightFailed(
+                f"capability class {capability_class!r} addresses registry group "
+                f"{group!r}, which has no live member reachable from "
+                f"{exec_context!r}. Registry: {registry.path}. Declared members: "
+                f"{registry.groups.get(group)}. "
+                + "; ".join([f"{mid}: {why}" for mid, why in rejections] + unreachable)
+                + ". A published registry that has fallen behind the repository "
+                "is the likeliest cause, and it is the failure this runs before "
+                "the job to catch."
+            )
+        summary.append(f"{capability_class}->{group} ({len(reachable)} reachable)")
+
+    return (
+        f"registry preflight: {registry.path} loaded, exec_context={exec_context!r}, "
+        + ", ".join(summary)
+        + " — no LLM call was made."
+    )
 
 
 def _read_registry_document() -> LlmCallsiteRegistryDocument:
