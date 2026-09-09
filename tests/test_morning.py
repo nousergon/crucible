@@ -37,6 +37,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
+import re
+
 import yaml
 from botocore.exceptions import ClientError
 
@@ -1603,9 +1605,24 @@ class TestDeclarations:
         notify = spec["jobs"]["notify-failure"]
         assert notify["needs"] == ["report"]
         assert "failure()" in notify["if"]
-        assert notify["uses"] == (
-            "nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml"
-            "@619de3f32aef2e63329e7270afb87ec6b1e381e3"
+        # The PATH is this test's business; WHICH sha it is pinned to is not.
+        # Restating the sha here made it a hand-kept twin of a value the
+        # workflow owns: every legitimate Dependabot `github-actions` bump
+        # became a two-file edit, and since Dependabot only edits the
+        # workflow, none of them could ever go green. Measured 2026-09-09:
+        # six open bump PRs (crucible-PR174..179) all failed on this one
+        # assertion and nothing else, while `main` was green.
+        #
+        # The security property — that the ref is a full sha and not a
+        # moving `@main` or `@v4` — is owned by
+        # `tests/test_workflow_pins.py::test_every_uses_in_every_workflow_is_pinned_by_full_sha`,
+        # which checks every `uses:` in every workflow rather than one job of
+        # one file. Asserting it a second time here bought nothing and cost
+        # the bumps.
+        path, _, ref = notify["uses"].partition("@")
+        assert path == "nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml"
+        assert re.fullmatch(r"[0-9a-f]{40}", ref), (
+            f"notify-failure is pinned to {ref!r}, which is not a full commit sha"
         )
         assert notify["secrets"] == "inherit"
 
