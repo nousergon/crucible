@@ -31,7 +31,10 @@ explicit argument, then environment variable, then the declared default:
   ``s3://bucket/prefix`` URI the autonomy gate reads human-originated mutating
   calls from (§11 risk 8);
 * the **stack name** (``CRUCIBLE_STACK``), the CloudFormation stack whose
-  resources must all carry `system=crucible-v2` (§11 risk 7).
+  resources must all carry `system=crucible-v2` (§11 risk 7). The same name
+  is what `crucible.autonomy.machine_principals` lists `AWS::IAM::Role`
+  resources from to derive the §11 risk 8 allowlist
+  (`alpha-engine-config-I10307`) — one resolved name, read by both.
 
 A resolution that fell through to a default says so in
 :attr:`Settings.origins`, so `explain` can report *why* a run read what it
@@ -120,15 +123,6 @@ DEFAULT_CLOUDTRAIL_ARCHIVE = ""
 #: sent to the wrong place are both silent, and neither may be the default.
 DEFAULT_PAGES_TOPIC = ""
 DEFAULT_MUTED_TOPIC = ""
-
-#: The principals whose mutating calls are the system working rather than a
-#: human touching it, comma-separated. **No default, deliberately**: these are
-#: role names, and an allowlist with a built-in default is an allowlist that
-#: grades a second account against the first account's roles. `crucible.autonomy`
-#: raises on an empty value rather than grading against an empty allowlist,
-#: which would score every machine action as a human touch and read as a
-#: perfectly manual month.
-DEFAULT_MACHINE_PRINCIPALS = ""
 
 #: The fleet console's base URL (`policy-console`), where the board's rows are
 #: rendered as Decision entities at a STABLE address — the durable replacement

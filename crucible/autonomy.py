@@ -18,8 +18,54 @@ output, and only the wrong one is easy.
 
 **Unknown principals count as HUMAN.** A classifier whose fall-through was
 "probably automation" would make the autonomy gate read clean the day a new
-role appears, which is exactly when it should not. The declared machine
-principals are the exhaustive allowlist; everything else that mutates counts.
+role appears, which is exactly when it should not. The machine allowlist is
+:func:`machine_principals`, and everything else that mutates counts.
+
+**The allowlist is DERIVED from the `crucible-v2` stack's own IAM::Role
+resources, never hand-kept (`alpha-engine-config-I10307`).** It was a
+five-literal tuple until `alpha-engine-config-I10156` (2026-09-07) made role
+names unpublishable in this now-public tree and moved it to
+`CRUCIBLE_MACHINE_PRINCIPALS`, a hand-kept comma-separated environment
+variable. That variable went stale the moment the stack grew past the five
+roles it was extracted from: measured 2026-09-09, the stack creates fourteen
+roles, and nine machine identities — including `gate-close`, which writes
+phase closing records, and `strategy-publish`, `morning-report` and `review`,
+which all write — scored as human touches on the one clause that must read
+zero. This is the bug class recorded 2026-09-06 (`ops-PR1087`,
+`alpha-engine-config-I10121`): a checker needing a hand-written twin of a
+source it could read. Nothing failed loud when the twin drifted; it produced
+a false UNMET nobody could see the cause of. `crucible-v2.yaml`'s own
+`system=crucible-v2` tag is asserted exhaustive over the stack's resources by
+phase 0's `v2_resources_tagged_and_versioned` clause, so
+`cloudformation:ListStackResources` is an equally exhaustive source and one
+this module can read directly rather than trust an operator to keep in sync.
+
+**Deriving from the stack does not weaken the "grows only by PR" invariant —
+it makes the PR mandatory instead of advisory.** The prior docstring's
+concern was that "an allowlist that can be widened at read time eventually
+contains whoever ran the query." An environment variable is exactly that: an
+operator sets it with one `gh variable set` command, no review, no template
+change. Widening a stack-derived allowlist requires creating a role in
+`nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml` — a template
+PR plus an operator-gated `aws cloudformation deploy` — which is strictly
+stronger than the mechanism it replaces, not weaker. Leaving the old
+rationale in place beside the new mechanism is how a carve-out outlives its
+justification; `tests/test_no_infra_literals.py`'s preamble records that
+exact failure happening in this repo once already, over the `tests/`
+exemption.
+
+**Why `list_stack_resources` rather than `iam:list-role-tags`
+(`system=crucible-v2`) directly**, though phase 0 asserts the two sets equal:
+one CloudFormation call already returns every resource's logical id, type and
+physical id in one paginated read, `crucible.tags._stack_resources` already
+implements exactly that read with the "stack does not exist" / "stack has no
+resources" refusals this module needs verbatim, and IAM tag reads are a
+second API surface, a second permission
+(`iam:ListRoleTags`, distinct from `cloudformation:ListStackResources`) and a
+second network round trip per role for no additional exhaustiveness — the tag
+audit exists to prove the two answers agree, not because either is more
+authoritative. Filtering the stack's own `AWS::IAM::Role` resources is the
+narrower, single-call read.
 
 **No archive is UNMEASURABLE, never zero.** A missing trail is the loudest
 possible way to have no human calls, and rendering it as `0` would be *no
@@ -45,15 +91,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from crucible.models import CloudTrailRecord
-from crucible.required import require_env
 
 __all__ = [
-    "MACHINE_PRINCIPALS_VAR",
     "machine_principals",
     "ArchiveMissingError",
     "ArchiveRead",
     "OperatorAction",
     "OperatorActionCount",
+    "StackUnmeasurableError",
     "count_operator_actions",
     "date_partitions",
     "iter_archive_records",
@@ -73,40 +118,78 @@ _ARCHIVE_WORKERS = 32
 #: is the region LEVEL" is whether its immediate children are years.
 _YEAR = re.compile(r"^\d{4}$")
 
-#: The exhaustive set of principals whose mutating calls are the system
-#: working rather than a human touching it. Matched against the role or user
-#: NAME, not an ARN, because the account id is environment and would make the
-#: allowlist wrong in a second account.
-#:
-#: **This tuple grows only by PR, with the automation named.** An allowlist
-#: that can be widened at read time is an allowlist that eventually contains
-#: whoever ran the query.
-MACHINE_PRINCIPALS_VAR = "CRUCIBLE_MACHINE_PRINCIPALS"
 
+def _cfn_client() -> Any:
+    """A CloudFormation client for the stack-resource read.
 
-def machine_principals() -> tuple[str, ...]:
-    """The allowlist, read from the environment as a comma-separated list.
-
-    Was five literals until Brian's 2026-09-07 ruling made role names
-    unpublishable in this now-public tree (`alpha-engine-config-I10156`).
-    RAISES on an empty value rather than returning an empty tuple: an empty
-    allowlist scores every machine action as a human touch, which renders a
-    fully autonomous month as a fully manual one and reads as a finding rather
-    than as the missing configuration it actually is.
+    A module-level function, lazy and substitutable, for the same reason
+    `crucible.gate._s3_client` is: importing this module must not require an
+    AWS SDK, and a test replaces this rather than reaching for a credential
+    chain.
     """
-    raw = require_env(
-        MACHINE_PRINCIPALS_VAR,
-        refusing_to="grade against an empty allowlist, which would report every "
-        "machine action as a human touch",
+    import boto3  # noqa: PLC0415 - lazy on purpose
+
+    return boto3.client("cloudformation")
+
+
+class StackUnmeasurableError(RuntimeError):
+    """The `crucible-v2` stack could not be described, or names no role.
+
+    Raised rather than returning an empty tuple. A stack that does not exist,
+    cannot be reached, or (having been edited some other way) genuinely lists
+    no `AWS::IAM::Role` resource is the loudest possible way to have no
+    machine principals — and grading against an empty allowlist would score
+    every machine action as a human touch, rendering a fully autonomous month
+    as a fully manual one. That is the same UNMEASURABLE-never-zero shape
+    :class:`ArchiveMissingError` enforces for the archive read this allowlist
+    feeds; the two are kept as separate exception types because the caller
+    (`crucible.gate._clause_zero_human_mutating_calls`) needs one story
+    either way — both are caught by its existing broad `except Exception`
+    and rendered UNMEASURABLE with the exception's own detail.
+    """
+
+
+def machine_principals(cfn: Any | None = None, *, stack: str | None = None) -> tuple[str, ...]:
+    """The exhaustive machine allowlist, derived from the `crucible-v2`
+    stack's own `AWS::IAM::Role` resources.
+
+    See the module docstring ("The allowlist is DERIVED...") for why this
+    reads the stack rather than a hand-kept environment variable, and why
+    `cloudformation:ListStackResources` rather than an IAM tag read.
+
+    ``cfn`` defaults to a lazily-constructed boto3 client (substituted in
+    tests); ``stack`` defaults to `crucible.config.settings().stack_name` —
+    the same `CRUCIBLE_STACK`-resolved name `crucible.tags.audit_stack_tags`
+    reads, so a second account or a renamed stack is one variable, not two.
+
+    Matched against the role NAME (CloudFormation's `PhysicalResourceId` for
+    an `AWS::IAM::Role`), not an ARN, because the account id is environment
+    and would make the allowlist wrong in a second account — the same
+    invariant the prior environment-variable form stated.
+    """
+    from crucible.config import settings  # noqa: PLC0415 - avoid an import cycle at module load
+    from crucible.tags import StackNotAppliedError, _stack_resources  # noqa: PLC0415
+
+    stack_name = stack or settings().stack_name
+    client = cfn if cfn is not None else _cfn_client()
+    try:
+        resources = _stack_resources(client, stack_name)
+    except StackNotAppliedError as exc:
+        raise StackUnmeasurableError(str(exc)) from exc
+    names = sorted(
+        {
+            r["PhysicalResourceId"]
+            for r in resources
+            if r["ResourceType"] == "AWS::IAM::Role" and r.get("PhysicalResourceId")
+        }
     )
-    names = tuple(part.strip() for part in raw.split(",") if part.strip())
     if not names:
-        raise RuntimeError(
-            f"{MACHINE_PRINCIPALS_VAR} is set but names no principal. An allowlist of "
-            "separators only scores every machine action as a human touch, exactly as "
-            "an unset one does."
+        raise StackUnmeasurableError(
+            f"stack {stack_name!r} lists no AWS::IAM::Role resource. An empty derived "
+            "allowlist would score every machine action as a human touch, exactly as an "
+            "unreadable stack does — this must never be reported as zero principals."
         )
-    return names
+    return tuple(names)
 
 
 class ArchiveMissingError(RuntimeError):
@@ -207,10 +290,6 @@ def _principal(record: CloudTrailRecord) -> tuple[str, str]:
     issuer = identity.sessionContext.sessionIssuer if identity.sessionContext else None
     name = (issuer.userName if issuer else None) or identity.userName or identity.arn or "unknown"
     return str(name), str(identity.type)
-
-
-def _is_machine(name: str) -> bool:
-    return name in machine_principals()
 
 
 def _touches(record: dict[str, Any], marker: str) -> bool:
@@ -344,12 +423,18 @@ def count_operator_actions(
     start: dt.date,
     end: dt.date,
     marker: str = "crucible-v2",
+    cfn: Any | None = None,
 ) -> OperatorActionCount:
     """Count human-originated mutating calls against v2 over the window.
 
     ``client`` is an S3 client. There is no CloudTrail client here and there
     is not meant to be one: the API this gate is forbidden to use is the only
-    thing a CloudTrail client would be for.
+    thing a CloudTrail client would be for. ``cfn`` is a SEPARATE, optional
+    CloudFormation client — forwarded to :func:`machine_principals` for the
+    allowlist derivation, substitutable in tests the same way ``client`` is;
+    it defaults to `machine_principals`'s own lazily-constructed client, so a
+    production caller (`crucible.gate._clause_zero_human_mutating_calls`)
+    passes none.
 
     **Coverage is asserted PER CALENDAR DAY.** A window total greater than
     zero says only that the trail existed for SOME of it, and a count read
@@ -392,6 +477,12 @@ def count_operator_actions(
             "would report a fraction of the window as if it were the whole. "
             "UNMEASURABLE, not zero."
         )
+    # Derived ONCE per call, after the archive-coverage checks above rather
+    # than per candidate record: a bad bucket or an uncovered window must
+    # raise on the archive alone, with no CloudFormation call in between, and
+    # the read.records this loop walks is already the "a handful" set
+    # `_is_candidate` filtered down to — one stack read for all of them.
+    principals = machine_principals(cfn)
     actions: list[OperatorAction] = []
     for raw_record in read.records:
         # `alpha-engine-config-I10045` row 12: validated only HERE, on the
@@ -401,7 +492,7 @@ def count_operator_actions(
         # own docstring names the measured cost of doing otherwise).
         record = CloudTrailRecord.model_validate(raw_record)
         name, kind = _principal(record)
-        if _is_machine(name):
+        if name in principals:
             continue
         actions.append(
             OperatorAction(

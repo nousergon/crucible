@@ -20,14 +20,83 @@ import pytest
 
 from crucible import autonomy
 from crucible.autonomy import (
-    MACHINE_PRINCIPALS_VAR,
     ArchiveMissingError,
+    StackUnmeasurableError,
     count_operator_actions,
     machine_principals,
 )
+from crucible.tags import StackNotAppliedError
 
 START = dt.date(2026, 8, 3)
 END = dt.date(2026, 8, 4)
+
+#: The default machine roles a fake stack carries in this suite — synthetic
+#: names, matching the shape (not the value) of the five-literal tuple this
+#: allowlist used to be before `alpha-engine-config-I10156`. Not
+#: `crucible-v2-*`: `tests/test_no_infra_literals.py`'s `IDENTITY_NAME_PATTERN`
+#: forbids that prefix anywhere in this public tree, fixtures included.
+DEFAULT_MACHINE_ROLES = (
+    "test-runtime",
+    "test-dispatcher",
+    "test-scheduler",
+    "test-deploy",
+    "test-stack-check",
+)
+
+
+class _FakeCfn:
+    """A CloudFormation stand-in over an in-memory list of IAM::Role names.
+
+    Mirrors `crucible.tags._stack_resources`'s own reading of
+    `list_stack_resources`: one paginator, one page, `StackResourceSummaries`
+    entries carrying `LogicalResourceId`/`ResourceType`/`PhysicalResourceId`.
+    `extra` lets a test add non-role resources to prove the filter excludes
+    them, and `missing=True` models a stack that does not exist at all.
+    """
+
+    def __init__(
+        self,
+        roles: tuple[str, ...] = DEFAULT_MACHINE_ROLES,
+        *,
+        extra: tuple[tuple[str, str, str], ...] = (),
+        missing: bool = False,
+    ) -> None:
+        self._roles = roles
+        self._extra = extra
+        self._missing = missing
+
+    def get_paginator(self, name: str):
+        assert name == "list_stack_resources"
+        roles, extra, missing = self._roles, self._extra, self._missing
+
+        class _Paginator:
+            def paginate(self, *, StackName: str):  # noqa: N803 - boto3's shape
+                if missing:
+                    raise _validation_error(StackName)
+                summaries = [
+                    {
+                        "LogicalResourceId": f"Role{i}",
+                        "ResourceType": "AWS::IAM::Role",
+                        "PhysicalResourceId": role,
+                    }
+                    for i, role in enumerate(roles)
+                ]
+                summaries.extend(
+                    {"LogicalResourceId": lid, "ResourceType": kind, "PhysicalResourceId": pid}
+                    for lid, kind, pid in extra
+                )
+                yield {"StackResourceSummaries": summaries}
+
+        return _Paginator()
+
+
+def _validation_error(stack: str) -> Exception:
+    class _ClientError(Exception):
+        response = {
+            "Error": {"Code": "ValidationError", "Message": f"Stack [{stack}] does not exist"}
+        }
+
+    return _ClientError(f"Stack [{stack}] does not exist")
 
 
 class _FakeS3:
@@ -172,6 +241,12 @@ def _count(client, **over):
         "prefix": f"{ARCHIVE_PREFIX}/us-east-1",
         "start": START,
         "end": END,
+        # A default fake stack, standing in for `machine_principals`'s own
+        # CloudFormation read. Every test below that reaches the classify-a-
+        # record path exercises the derivation through this, never through a
+        # real boto3 client — a test proving the archive-only refusals
+        # (empty bucket, uncovered window) never reaches it at all.
+        "cfn": _FakeCfn(),
     }
     kwargs.update(over)
     return count_operator_actions(client, **kwargs)
@@ -276,7 +351,7 @@ class TestCounting:
                 "sessionContext": {"sessionIssuer": {"userName": "some-new-role"}},
             }
         )
-        assert "some-new-role" not in machine_principals()
+        assert "some-new-role" not in machine_principals(_FakeCfn())
         assert _count(_archive({START: [stranger]})).count == 1
 
     def test_a_read_only_call_does_not_count(self) -> None:
@@ -471,26 +546,103 @@ class TestTheReadIsStreamedNotAccumulated:
         assert {r["requestID"] for r in read.records} == {f"req-{i}" for i in range(16)}
 
 
-class TestMachinePrincipalsRaisesOnUnset:
-    """`alpha-engine-config-I10156`: the allowlist is no longer a literal, so
-    the raise-on-unset path is the only thing standing between a forgotten
-    environment variable and a fully autonomous month graded as fully
-    manual (every action falls through to "human")."""
+class TestMachinePrincipalsIsDerivedFromTheStack:
+    """`alpha-engine-config-I10307`: the allowlist is no longer a hand-kept
+    environment variable — it is read from the `crucible-v2` stack's own
+    `AWS::IAM::Role` resources, so it cannot drift the way
+    `CRUCIBLE_MACHINE_PRINCIPALS` did (nine of fourteen real roles silently
+    absent, discovered only by hand on 2026-09-09). `_FakeCfn` mirrors
+    `crucible.tags._stack_resources`'s own `list_stack_resources` reading."""
 
-    def test_unset_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv(MACHINE_PRINCIPALS_VAR, raising=False)
-        with pytest.raises(RuntimeError, match=MACHINE_PRINCIPALS_VAR):
-            machine_principals()
+    def test_derives_role_names_from_the_stack(self) -> None:
+        assert machine_principals(_FakeCfn(("role-a", "role-b"))) == ("role-a", "role-b")
 
-    def test_empty_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv(MACHINE_PRINCIPALS_VAR, "")
-        with pytest.raises(RuntimeError, match=MACHINE_PRINCIPALS_VAR):
-            machine_principals()
+    def test_the_result_is_sorted_and_deduplicated(self) -> None:
+        assert machine_principals(_FakeCfn(("role-b", "role-a", "role-a"))) == (
+            "role-a",
+            "role-b",
+        )
 
-    def test_blank_entries_alone_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A value of only commas and whitespace strips to nothing, and must
-        raise the same as an unset variable rather than returning an empty
-        tuple silently."""
-        monkeypatch.setenv(MACHINE_PRINCIPALS_VAR, " , , ")
-        with pytest.raises(RuntimeError, match=MACHINE_PRINCIPALS_VAR):
-            machine_principals()
+    def test_non_role_resources_are_excluded(self) -> None:
+        """A stack lists Lambdas, buckets, schedules — only `AWS::IAM::Role`
+        resources are principals a CloudTrail record can name as an actor."""
+        cfn = _FakeCfn(
+            ("role-a",),
+            extra=(
+                ("Bucket", "AWS::S3::Bucket", "some-bucket"),
+                ("Fn", "AWS::Lambda::Function", "fn"),
+            ),
+        )
+        assert machine_principals(cfn) == ("role-a",)
+
+    def test_adding_a_role_to_the_stack_grows_the_derived_set_with_no_other_edit(self) -> None:
+        """Policy §7.4 — the closes-when proof for `alpha-engine-config-
+        I10307`, and the exact shape the mechanism it replaces would have
+        FAILED: the prior `CRUCIBLE_MACHINE_PRINCIPALS` was a hand-kept
+        environment tuple, so adding a role to the stack (this fixture) would
+        not have changed it at all — that silent non-growth is precisely how
+        nine of fourteen real machine identities went missing. Against the
+        derivation this fixture feeds, growing the fixture growing the
+        answer is the whole point; against the old code, this call would not
+        even type-check (`machine_principals()` took no arguments) — verified
+        by inspection of `crucible/autonomy.py` on `main` prior to this
+        change (`git show main:crucible/autonomy.py`).
+        """
+        before = machine_principals(_FakeCfn(DEFAULT_MACHINE_ROLES))
+        grown = (*DEFAULT_MACHINE_ROLES, "a-newly-added-role")
+        after = machine_principals(_FakeCfn(grown))
+        assert "a-newly-added-role" not in before
+        assert "a-newly-added-role" in after
+        assert len(after) == len(before) + 1
+
+    def test_an_undescribable_stack_is_unmeasurable_never_zero(self) -> None:
+        """An empty derived allowlist would score every machine action as a
+        human touch, rendering a fully autonomous month as a fully manual
+        one — the same UNMEASURABLE-never-zero shape the archive read
+        enforces. A stack that cannot be described RAISES rather than
+        returning an empty tuple."""
+        with pytest.raises(StackUnmeasurableError, match="does not exist"):
+            machine_principals(_FakeCfn(missing=True))
+
+    def test_a_stack_with_no_iam_roles_raises_rather_than_returning_empty(self) -> None:
+        """A non-empty stack that happens to carry no `AWS::IAM::Role` at all
+        — distinct from `test_an_undescribable_stack_is_unmeasurable_never_
+        zero` (which is `_stack_resources`'s own "empty stack" refusal): this
+        one has resources, none of them roles, and must still refuse rather
+        than return `()`."""
+        cfn = _FakeCfn((), extra=(("Bucket", "AWS::S3::Bucket", "some-bucket"),))
+        with pytest.raises(StackUnmeasurableError, match="no AWS::IAM::Role"):
+            machine_principals(cfn)
+
+    def test_the_prior_stack_not_applied_error_is_translated(self) -> None:
+        """`crucible.tags._stack_resources` raises its own
+        `StackNotAppliedError` for both "does not exist" and "lists no
+        resources at all"; both are re-raised here as
+        `StackUnmeasurableError` so a caller grading this allowlist does not
+        also need to know about a tags-module exception type."""
+        with pytest.raises(StackUnmeasurableError):
+            machine_principals(_FakeCfn(missing=True))
+        assert not issubclass(StackUnmeasurableError, StackNotAppliedError)
+
+    def test_count_operator_actions_derives_principals_only_once_per_call(self) -> None:
+        """The derivation must not run per-record: `read.records` can be a
+        handful of already-filtered candidates, but the stack read itself is
+        one call regardless of how many of them there are."""
+        calls = {"n": 0}
+
+        class _CountingCfn(_FakeCfn):
+            def get_paginator(self, name: str):
+                calls["n"] += 1
+                return super().get_paginator(name)
+
+        two_humans = _archive(
+            {
+                START: [
+                    _record(requestID="req-a"),
+                    _record(requestID="req-b", eventTime="2026-08-03T19:00:00Z"),
+                ]
+            }
+        )
+        result = _count(two_humans, cfn=_CountingCfn())
+        assert result.count == 2
+        assert calls["n"] == 1
