@@ -60,21 +60,32 @@ def liquidity_floor_usd() -> float:
     Still a SINGLE declared value read by the one feature that expresses the
     gate, so no arm re-derives a threshold of its own; only its home changed.
 
+    **Resolved through :func:`crucible.required.require_env`, not by reading
+    the environment here.** That is what enrols this variable in the two
+    guards that derive the required set from `require_env` call sites --
+    `crucible`'s `tests/test_workflow_required_env.py` and
+    `nous-ergon-ops`' `tests/crossrepo/test_crucible_box_shell_required_env.py`.
+    It previously raised through a hand-rolled `RuntimeError`, so neither
+    guard could see it, and the dispatched box never declared it: measured
+    2026-09-09 on `i-04afbe045e0ca7354`, every full-universe `data.weekly` on
+    the box died on `CRUCIBLE_LIQUIDITY_FLOOR_USD is unset` after this value
+    was extracted on 2026-09-07. A second raising path outside the shared
+    resolver is a fourth instance of `alpha-engine-config-I10156`'s class, and
+    the resolver is the only thing that makes the guards exhaustive rather
+    than merely populated.
+
     RAISES rather than defaulting. A floor of zero passes every name and a
     floor guessed high passes none, and both produce a `liquidity_pass_raw`
     column that looks computed — the exact shape of the `avg_volume_20d`
     defect this layer's units contract exists to prevent, where 901 of 903
     tickers failed the gate silently for months.
     """
-    import os
+    from crucible.required import require_env  # noqa: PLC0415 - one call site
 
-    raw = os.environ.get(LIQUIDITY_FLOOR_VAR, "")
-    if not raw:
-        raise RuntimeError(
-            f"{LIQUIDITY_FLOOR_VAR} is unset. The liquidity gate is a tuned value and "
-            "this public tree carries no default for it; refusing to compute "
-            "liquidity_pass_raw against a guessed threshold."
-        )
+    raw = require_env(
+        LIQUIDITY_FLOOR_VAR,
+        refusing_to="compute liquidity_pass_raw against a guessed threshold",
+    )
     try:
         floor = float(raw)
     except ValueError as exc:
