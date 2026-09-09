@@ -54,9 +54,15 @@ def _minimal_argv(job: str) -> list[str]:
         # another build, so the sha the smoke is verifying is required.
         argv += ["--release", "a" * 40]
     if job == "fault.record":
+        # `--outcome` is required, and which of the remaining flags are legal
+        # is decided by it — inside `crucible.faults.record_fault`, not the
+        # parser, since argparse cannot express "one of these three field
+        # sets" and a second copy of the matrix would be the half that drifts.
         argv += [
             "--fault",
             "data_source_withheld",
+            "--outcome",
+            "induced",
             "--target-job",
             "data.weekly",
             "--run-id",

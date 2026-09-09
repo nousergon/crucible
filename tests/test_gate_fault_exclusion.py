@@ -79,17 +79,56 @@ def _seed_failed(store: LocalStore, day: dt.date, run_id: str) -> None:
     )
 
 
-def _seed_fault_record(store: LocalStore, day: dt.date, fault_id: str, run_id: str) -> None:
+def _seed_fault_record(
+    store: LocalStore,
+    day: dt.date,
+    fault_id: str,
+    run_id: str | None,
+    *,
+    outcome: str = "induced",
+) -> None:
+    """A conforming record, per outcome kind.
+
+    `induced` is the ONLY kind whose `run_id` reaches the excusal
+    (`alpha-engine-config-I10327`), so the other two are seeded here too and
+    asserted NOT to excuse anything.
+    """
     store.put_bytes(
         fault_injection_key(fault_id, day.isoformat()),
         json.dumps(
             {
                 "schema_version": "fault_record.v1",
                 "fault_id": fault_id,
+                "outcome": outcome,
                 "trading_day": day.isoformat(),
                 "run_id": run_id,
-                "manifest_key": manifest_key("data.weekly", day.isoformat()),
-                "bus_key": None,
+                "manifest_key": (
+                    manifest_key("data.weekly", day.isoformat())
+                    if outcome != "unreachable"
+                    else None
+                ),
+                "bus_key": (
+                    f"alerts/{day.isoformat()}/failure.data.weekly.json"
+                    if outcome == "induced"
+                    else None
+                ),
+                "attempt": (
+                    {"n": 2, "reason": "spot_interruption"} if outcome == "absorbed" else None
+                ),
+                "closed_paths": (
+                    [
+                        {
+                            "path": "the pointer comes to name an unpublished sha",
+                            "mechanism": "crucible.release.pin",
+                            "probe": "pin_refuses_an_unpublished_sha",
+                            "expected": "StaleReleasePointerError, raised before any write",
+                            "observed": "StaleReleasePointerError: was never published",
+                            "checked_at_utc": "2026-09-09T12:00:00Z",
+                        }
+                    ]
+                    if outcome == "unreachable"
+                    else None
+                ),
                 "recorded_at_utc": "2026-09-09T12:00:00Z",
             }
         ).encode("utf-8"),
@@ -121,6 +160,52 @@ class TestAGenuineFailureWithNoFaultRecordStillFails:
 
         assert not clause.met
         assert "1 failed" in clause.detail
+
+
+class TestOnlyAnInducedRecordExcusesAnything:
+    """`alpha-engine-config-I10327`. The record grew two more outcome kinds and
+    neither may reach the excusal: `absorbed` names a manifest reading `ok` and
+    `unreachable` names no run at all. Keying the exclusion on `run_id` AND
+    narrowing it by `outcome` is what stops a record filed for a fault the
+    system SURVIVED from excusing a failure it did not cause.
+    """
+
+    def test_an_absorbed_record_naming_the_failed_run_does_not_excuse_it(self, tmp_path) -> None:
+        """The attack this closes: an `absorbed` record whose `run_id` happens
+        to name a FAILED manifest. The record is well-formed for its own kind,
+        and it still excuses nothing."""
+        store = LocalStore(tmp_path)
+        _seed_failed(store, FRIDAY, RUN_ID)
+        _seed_fault_record(store, FRIDAY, "spot_terminated_mid_job", RUN_ID, outcome="absorbed")
+
+        clause = _clause_arc_runs_ok(store, [FRIDAY], _registry())
+
+        assert not clause.met
+        assert "1 failed" in clause.detail
+        assert "excused" not in clause.detail
+
+    def test_an_unreachable_record_excuses_nothing(self, tmp_path) -> None:
+        """Structurally, not by policy: it carries no `run_id` to match."""
+        store = LocalStore(tmp_path)
+        _seed_failed(store, FRIDAY, RUN_ID)
+        _seed_fault_record(store, FRIDAY, "stale_release_pointer", None, outcome="unreachable")
+
+        clause = _clause_arc_runs_ok(store, [FRIDAY], _registry())
+
+        assert not clause.met
+        assert "1 failed" in clause.detail
+
+    def test_an_induced_record_still_excuses(self, tmp_path) -> None:
+        """The other direction, so the narrowing is shown not to have broken
+        the mechanism it narrows."""
+        store = LocalStore(tmp_path)
+        _seed_failed(store, FRIDAY, RUN_ID)
+        _seed_fault_record(store, FRIDAY, "data_source_withheld", RUN_ID, outcome="induced")
+
+        clause = _clause_arc_runs_ok(store, [FRIDAY], _registry())
+
+        assert clause.met, clause.detail
+        assert "excused" in clause.detail
 
 
 class TestAFaultRecordNamingADifferentRunIdNeverExcuses:

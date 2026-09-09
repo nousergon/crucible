@@ -682,11 +682,13 @@ components:
       at: "12:00"
 
   fault.record:
-    # alpha-engine-config-I10320/-I10322: files the durable record of one
-    # scripted fault (plan §10.7) induced against the real scheduled path.
-    # On-demand, like data.heal and experiment.new — an operator/procedure
-    # runs it once per induced fault, never on a schedule.
-    description: File the durable record of one induced scripted fault, or refuse.
+    # alpha-engine-config-I10320/-I10322/-I10327: files the durable record of
+    # one scripted fault (plan §10.7) exercised against the real scheduled
+    # path — induced (the job failed), absorbed (the declared transient class
+    # handled it) or unreachable (the state cannot be entered). On-demand,
+    # like data.heal and experiment.new — an operator/procedure runs it once
+    # per fault exercised, never on a schedule.
+    description: File the durable record of one exercised scripted fault, or refuse.
     lifecycle: ACTIVE
     signals:
       execution: run.json
