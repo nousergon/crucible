@@ -23,8 +23,10 @@ is the point:
 
 from __future__ import annotations
 
+import ast
 import datetime as dt
 import json
+import pathlib
 
 import pytest
 
@@ -37,12 +39,16 @@ from crucible.gate import (
     GATES,
     MANIFEST_RUN_MODE_FIELD,
     MANIFEST_RUN_MODE_LIVE,
+    PHASE2_AUTONOMY_MIN_DAILY_CYCLES,
     PHASE2_LIVE_SATURDAYS,
     PHASE2_MAX_PAGES,
     PHASE2_MAX_TAGGED_USD,
+    PHASE2_WINDOW_WEEKS,
     PHASE4_MAX_TOTAL_USD,
     PHASES,
     REPOSITORY_GRADED_CLAUSES,
+    autonomy_daily_cycles_in_span,
+    autonomy_earliest_satisfiable_render_day,
     evaluate,
     weekly_anchor,
 )
@@ -55,8 +61,9 @@ from crucible.keys import (
     verdict_key,
 )
 from crucible.manifest import PREDECESSOR_SCHEMA_VERSION, RUN_MANIFEST_SCHEMA_VERSION
+from crucible.release import POINTER_KEY
 from crucible.slots import SLOTS
-from crucible.store import LocalStore
+from crucible.store import LocalStore, S3Store
 
 FRIDAY = dt.date(2026, 8, 28)
 SHA = "a" * 40
@@ -66,7 +73,11 @@ def _window(weeks: int) -> list[dt.date]:
     return [FRIDAY - dt.timedelta(weeks=n) for n in reversed(range(weeks))]
 
 
-PHASE2_WINDOW = _window(PHASE2_LIVE_SATURDAYS)
+#: The window `evaluate` hands every phase-2 clause — `PHASE2_WINDOW_WEEKS`
+#: wide, NOT `PHASE2_LIVE_SATURDAYS` wide. The two were one constant until
+#: `alpha-engine-config-I10324`, so a fixture built off the Saturday count read
+#: identically and could not have caught the substitution.
+PHASE2_WINDOW = _window(PHASE2_WINDOW_WEEKS)
 
 #: A render day that is NOT a weekly anchor, and the window `_window` builds
 #: off it. Weekly work binds to a Friday close while the ladder renders DAILY,
@@ -75,12 +86,15 @@ PHASE2_WINDOW = _window(PHASE2_LIVE_SATURDAYS)
 #: `alpha-engine-config-I9904` from this suite (PR68 adversarial review, F1).
 WEDNESDAY = dt.date(2026, 9, 9)
 PHASE2_RENDER_WINDOW = [
-    WEDNESDAY - dt.timedelta(weeks=n) for n in reversed(range(PHASE2_LIVE_SATURDAYS))
+    WEDNESDAY - dt.timedelta(weeks=n) for n in reversed(range(PHASE2_WINDOW_WEEKS))
 ]
 
-#: Where a weekly run's manifest is actually filed for those render days: the
-#: Friday close strictly before each, resolved through the trading calendar.
-PHASE2_ANCHORS = [weekly_anchor(day) for day in PHASE2_RENDER_WINDOW]
+#: Where a weekly run's manifest is actually filed for the render days the live
+#: clause GRADES: the Friday close strictly before each, resolved through the
+#: trading calendar. The tail slice mirrors the clause's own
+#: `window[-PHASE2_LIVE_SATURDAYS:]` — the window is `PHASE2_WINDOW_WEEKS` wide
+#: and only its last `PHASE2_LIVE_SATURDAYS` weeks are live-Saturday evidence.
+PHASE2_ANCHORS = [weekly_anchor(day) for day in PHASE2_RENDER_WINDOW[-PHASE2_LIVE_SATURDAYS:]]
 
 
 @pytest.fixture
@@ -237,18 +251,20 @@ class TestLiveSaturdaysAreReadFromTheManifestNeverTheDate:
         assert not clause.unmeasurable and not clause.met
         assert "never ran" in clause.detail
 
-    def test_met_when_both_saturdays_are_live_and_first_attempt_ok(self, store: LocalStore) -> None:
+    def test_met_when_every_live_saturday_is_live_and_first_attempt_ok(
+        self, store: LocalStore
+    ) -> None:
         for day in PHASE2_ANCHORS:
             _put(store, manifest_key("weekly", day.isoformat()), _weekly(day))
         clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_RENDER_WINDOW)
         assert clause.met and not clause.unmeasurable
 
-    def test_the_same_two_saturdays_read_met_on_every_render_weekday(
+    def test_the_same_live_saturdays_read_met_on_every_render_weekday(
         self, store: LocalStore
     ) -> None:
         """The regression that closes the class rather than the instance.
 
-        Two flawless live Saturdays are filed at their Friday closes and left
+        The flawless live Saturdays are filed at their Friday closes and left
         alone; only the day somebody rendered the ladder moves. A clause
         windowed on the render weekday reads MET on the Friday and `never ran`
         on the other four — the board renders DAILY, so that is a contract
@@ -262,9 +278,7 @@ class TestLiveSaturdaysAreReadFromTheManifestNeverTheDate:
             dt.date(2026, 9, 10),
             dt.date(2026, 9, 11),
         ):
-            window = [
-                render - dt.timedelta(weeks=n) for n in reversed(range(PHASE2_LIVE_SATURDAYS))
-            ]
+            window = [render - dt.timedelta(weeks=n) for n in reversed(range(PHASE2_WINDOW_WEEKS))]
             clause = gate_module._clause_live_saturdays_first_attempt_ok(store, window)
             assert clause.met, f"{render.isoformat()}: {clause.detail}"
 
@@ -358,23 +372,315 @@ def _archive(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CRUCIBLE_CLOUDTRAIL_ARCHIVE", "s3://a-test-archive/trail")
 
 
+#: A store bucket and a CloudTrail archive that name nothing real. No
+#: infrastructure identifier is written into this tree, tests included
+#: (`tests/test_no_infra_literals.py`, `alpha-engine-config-I10156`).
+TEST_BUCKET = "a-test-store"
+
+#: The instant the graded system last changed, in every case that wants a
+#: window long enough to grade: eighteen days before the render day, so the
+#: minimum span clears and the render window's weekly close (2026-08-21) falls
+#: after it. A fixed literal, never `today` arithmetic — a fixture whose
+#: subject moves with the clock stops testing the same thing.
+CHANGE_LONG_BEFORE = dt.datetime(2026, 8, 10, 9, 0, tzinfo=dt.UTC)
+
+#: A change on the render day itself, an hour before the read. The case
+#: `alpha-engine-config-I10324` requires to be unsatisfiable: without a
+#: declared minimum span this leaves a one-hour window containing nothing and
+#: the clause reads MET — a change making the clause EASIER.
+CHANGE_AN_HOUR_BEFORE_THE_READ = dt.datetime(2026, 8, 28, 13, 0, tzinfo=dt.UTC)
+
+#: A change seven calendar days before the render day, landing ON the window's
+#: only weekly close. This is the case the deleted `PHASE2_AUTONOMY_MIN_SPAN =
+#: 7 days` floor let through to the day and the CYCLE guard caught — the reason
+#: `alpha-engine-config-I10327` could derive the span from the cycle
+#: requirement instead of declaring it: the cycle guard was already the
+#: binding one.
+CHANGE_ON_THE_CYCLE_CLOSE = dt.datetime(2026, 8, 21, 0, 0, tzinfo=dt.UTC)
+
+
 class _Counted:
-    def __init__(self, count: int) -> None:
-        self.count = count
-        self.actions = []
+    def __init__(self, count: int = 0, actions: tuple = ()) -> None:
+        self.actions = actions
+        self.count = count or len(actions)
         self.objects_read = 3
         self.records_scanned = 40
 
 
-class TestHumanMutatingCallsAreCountedOrNotAnswered:
-    def test_unmeasurable_when_no_archive_is_configured(
+def _action(when: str, event_name: str = "UpdateStack") -> autonomy_module.OperatorAction:
+    return autonomy_module.OperatorAction(
+        event_time=when,
+        event_name=event_name,
+        event_source="cloudformation.amazonaws.com",
+        principal="a-human",
+        principal_type="IAMUser",
+        request_id="r-1",
+    )
+
+
+class _HeadOnlyS3:
+    """An S3 client that answers `head_object` and nothing else."""
+
+    def __init__(self, response: dict | Exception) -> None:
+        self._response = response
+
+    def head_object(self, **_: object) -> dict:
+        if isinstance(self._response, Exception):
+            raise self._response
+        return self._response
+
+
+def _store_whose_pointer_flipped(at: dt.datetime | None, *, raises: Exception | None = None):
+    """An `S3Store` whose pointer HeadObject reports ``at``.
+
+    A real `S3Store` with a substituted client, not a stub of the store: the
+    key the head is taken against (`store._s3_key(POINTER_KEY)`) is part of
+    what is being tested, and a store stub would assert the reader's own
+    idea of it.
+    """
+    response: dict | Exception = raises if raises is not None else {"LastModified": at}
+    return S3Store(TEST_BUCKET, "crucible", client=_HeadOnlyS3(response))
+
+
+class _DescribeOnlyCfn:
+    def __init__(self, response: dict | Exception) -> None:
+        self._response = response
+
+    def describe_stacks(self, **_: object) -> dict:
+        if isinstance(self._response, Exception):
+            raise self._response
+        return self._response
+
+
+def _stack_applied(monkeypatch: pytest.MonkeyPatch, at: dt.datetime | None, **extra) -> None:
+    stack: dict = {"LastUpdatedTime": at} if at is not None else {}
+    stack.update(extra)
+    monkeypatch.setattr(
+        autonomy_module, "_cfn_client", lambda: _DescribeOnlyCfn({"Stacks": [stack]})
+    )
+
+
+def _cfn_unreadable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        autonomy_module,
+        "_cfn_client",
+        lambda: _DescribeOnlyCfn(RuntimeError("ExpiredToken")),
+    )
+
+
+def _counting(monkeypatch: pytest.MonkeyPatch, counted: _Counted) -> None:
+    monkeypatch.setattr(gate_module, "_s3_client", lambda: object())
+    monkeypatch.setattr(autonomy_module, "count_operator_actions", lambda *a, **k: counted)
+
+
+class TestTheAutonomyWindowStartsAtTheSystemsLastChange:
+    """`alpha-engine-config-I10324`. The clause used to read the phase's
+    rolling calendar window, which straddled its own fixes: measured 2026-09-09
+    it read 167 human mutating calls over 2026-09-01..09-08, dominated by the
+    operator-gated applies that MADE THE SYSTEM WORK. Every case here is about
+    where the window starts and what makes it refuse to be graded at all.
+    """
+
+    def test_the_later_of_the_two_inputs_starts_the_window(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Today's reading, and `0` and `no trail` must never be the same
-        answer. There is no default archive on purpose: a guessed bucket name
-        produces a `NoSuchBucket` that reads like a permissions problem."""
+        """A stack apply changes the box's environment with no release flip —
+        today's two fixes were exactly that shape — so the stack's instant must
+        be able to win."""
+        _archive(monkeypatch)
+        _stack_applied(monkeypatch, CHANGE_LONG_BEFORE)
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE - dt.timedelta(days=30))
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.met and not clause.unmeasurable
+        assert CHANGE_LONG_BEFORE.isoformat() in clause.detail
+        assert "stack last applied" in clause.detail
+
+    def test_a_release_flip_with_no_stack_apply_also_starts_the_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other direction, and the reason both inputs are read: a wheel
+        flip changes what the box RUNS while the stack is untouched."""
+        _archive(monkeypatch)
+        _stack_applied(monkeypatch, CHANGE_LONG_BEFORE - dt.timedelta(days=30))
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.met
+        assert "release pointer flip" in clause.detail
+        assert CHANGE_LONG_BEFORE.isoformat() in clause.detail
+
+    def test_the_reading_prints_both_inputs_whichever_won(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A window start nobody can reconstruct is a number, not a reading
+        (principle 1). Both instants and the pointer key appear."""
+        _archive(monkeypatch)
+        earlier = CHANGE_LONG_BEFORE - dt.timedelta(days=3)
+        _stack_applied(monkeypatch, earlier)
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert earlier.isoformat() in clause.detail
+        assert CHANGE_LONG_BEFORE.isoformat() in clause.detail
+        assert POINTER_KEY in clause.evidence
+
+    def test_a_change_an_hour_before_the_read_is_not_a_satisfiable_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guard that keeps the rewrite from making the clause EASIER.
+
+        With the window starting at the last change and no floor, an operator
+        apply an hour before the read leaves an hour-long window containing
+        nothing, and the clause reads MET — a change satisfying the clause it
+        should reset. UNMET, not unmeasurable: the inputs read perfectly and
+        what they said is that no cycle has run since.
+        """
+        _archive(monkeypatch)
+        _stack_applied(monkeypatch, CHANGE_AN_HOUR_BEFORE_THE_READ)
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(CHANGE_AN_HOUR_BEFORE_THE_READ)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert not clause.met and not clause.unmeasurable
+        assert "no complete weekly cycle has run unattended" in clause.detail
+        satisfiable_on = autonomy_earliest_satisfiable_render_day(
+            CHANGE_AN_HOUR_BEFORE_THE_READ.date()
+        )
+        assert satisfiable_on.isoformat() in clause.detail
+        assert satisfiable_on > PHASE2_WINDOW[-1]
+
+    def test_a_seven_day_span_is_not_enough_the_cycle_must_close_after_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guard that made the deleted seven-day constant redundant. A
+        change landing exactly on the window's weekly close cleared that floor
+        to the day and still has no COMPLETE unattended cycle behind it, so the
+        cycle requirement was always the binding one — which is why
+        `alpha-engine-config-I10327` could derive the span from it."""
+        _archive(monkeypatch)
+        _stack_applied(monkeypatch, CHANGE_ON_THE_CYCLE_CLOSE)
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(CHANGE_ON_THE_CYCLE_CLOSE)
+        assert PHASE2_WINDOW[-1] - CHANGE_ON_THE_CYCLE_CLOSE.date() == dt.timedelta(days=7)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert not clause.met and not clause.unmeasurable
+        assert "no complete weekly cycle has run unattended" in clause.detail
+
+    def test_an_operator_apply_after_the_change_is_still_a_violation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """There is deliberately NO carve-out for operator-gated applies. Under
+        this construction an apply DEFINES the window's start; one that happens
+        after it is an intervention inside a window that was supposed to be
+        hands-off, and it counts."""
+        _archive(monkeypatch)
+        _stack_applied(monkeypatch, CHANGE_LONG_BEFORE)
+        _counting(monkeypatch, _Counted(actions=(_action("2026-08-20T12:00:00Z"),)))
+        store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert not clause.met and not clause.unmeasurable
+        assert "1 human mutating call" in clause.detail
+        assert "UpdateStack" in clause.detail
+
+    def test_calls_on_the_change_day_that_predate_the_change_are_excluded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The archive is day-partitioned, so the change's own day arrives
+        carrying the operator's applies. They are before the start instant and
+        are not in the window."""
+        _archive(monkeypatch)
+        _stack_applied(monkeypatch, CHANGE_LONG_BEFORE)
+        before = CHANGE_LONG_BEFORE - dt.timedelta(hours=2)
+        _counting(monkeypatch, _Counted(actions=(_action(before.isoformat()),)))
+        store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.met and not clause.unmeasurable
+        assert "1 call(s) on the change day itself predate the change" in clause.detail
+
+    def test_an_unparseable_event_time_is_counted_not_dropped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Over-counting is investigated; under-counting is a gate that reads
+        clean because it could not read. Same direction
+        `crucible.autonomy._touches` chose."""
+        _archive(monkeypatch)
+        _stack_applied(monkeypatch, CHANGE_LONG_BEFORE)
+        _counting(monkeypatch, _Counted(actions=(_action("not-a-timestamp"),)))
+        store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert not clause.met and not clause.unmeasurable
+
+    def test_unmeasurable_when_the_pointer_cannot_be_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Never a window starting at zero: an unreadable pointer would give the
+        widest possible window, which is the reading that looks most
+        authoritative and is least established."""
+        _archive(monkeypatch)
+        _stack_applied(monkeypatch, CHANGE_LONG_BEFORE)
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(None, raises=RuntimeError("Denied"))
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.unmeasurable and not clause.met
+        assert "last change could not be established" in clause.detail
+
+    def test_unmeasurable_when_the_stack_cannot_be_described(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _archive(monkeypatch)
+        _cfn_unreadable(monkeypatch)
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.unmeasurable and not clause.met
+        assert "describe_stacks" in clause.detail
+
+    def test_a_never_updated_stack_falls_back_to_its_creation_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stack nobody has updated since creation still HAS a last change,
+        and it is the day it was created — not an error, and not zero."""
+        _archive(monkeypatch)
+        _stack_applied(monkeypatch, None, CreationTime=CHANGE_LONG_BEFORE)
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE - dt.timedelta(days=1))
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.met
+        assert CHANGE_LONG_BEFORE.isoformat() in clause.detail
+
+    def test_a_naive_change_instant_is_refused_rather_than_assumed_utc(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Assuming UTC would move the window boundary by the local offset — a
+        boundary error that reads as a clean number."""
+        _archive(monkeypatch)
+        _stack_applied(monkeypatch, dt.datetime(2026, 8, 10, 9, 0))
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.unmeasurable and not clause.met
+        assert "without a timezone" in clause.detail
+
+    def test_a_local_store_cannot_establish_a_flip_instant(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `LocalStore` directory's mtime is a fact about a laptop, not a
+        deploy. Grading a live autonomy window off it would be an answer about
+        the workbench — the defect this clause was rewritten to stop."""
+        _archive(monkeypatch)
+        _stack_applied(monkeypatch, CHANGE_LONG_BEFORE)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.unmeasurable and not clause.met
+        assert "not S3" in clause.detail
+
+    def test_unmeasurable_when_no_archive_is_configured(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`0` and `no trail` must never be the same answer. There is no
+        default archive on purpose: a guessed bucket name produces a
+        `NoSuchBucket` that reads like a permissions problem."""
         monkeypatch.delenv("CRUCIBLE_CLOUDTRAIL_ARCHIVE", raising=False)
-        clause = gate_module._clause_zero_human_mutating_calls(PHASE2_WINDOW)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
         assert clause.unmeasurable and not clause.met
         assert "no CloudTrail archive is configured" in clause.detail
 
@@ -382,25 +688,166 @@ class TestHumanMutatingCallsAreCountedOrNotAnswered:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _archive(monkeypatch)
+        _stack_applied(monkeypatch, CHANGE_LONG_BEFORE)
         monkeypatch.setattr(gate_module, "_s3_client", _raising_client)
-        clause = gate_module._clause_zero_human_mutating_calls(PHASE2_WINDOW)
+        store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
         assert clause.unmeasurable and not clause.met
         assert "RuntimeError" in clause.detail
 
-    def test_met_on_a_clean_archive(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _archive(monkeypatch)
-        monkeypatch.setattr(gate_module, "_s3_client", lambda: object())
-        monkeypatch.setattr(autonomy_module, "count_operator_actions", lambda *a, **k: _Counted(0))
-        clause = gate_module._clause_zero_human_mutating_calls(PHASE2_WINDOW)
-        assert clause.met and not clause.unmeasurable
 
-    def test_unmet_when_a_human_mutated_something(self, monkeypatch: pytest.MonkeyPatch) -> None:
+class TestTheMinimumSpanIsDerivedFromTheCycleRequirement:
+    """`alpha-engine-config-I10327`. `-I10324` shipped BOTH a
+    `PHASE2_AUTONOMY_MIN_SPAN = 7 days` constant and a "one complete weekly
+    cycle after the change" requirement. For the attack the constant was
+    written against they are redundant — one hour cannot contain a weekly
+    cycle — and the independent constant put the earliest satisfiable render
+    day four days past the weekly Step Function phase 2 must exit on.
+
+    Brian's 2026-09-04 phase-0 ruling is the precedent: *"we can't wait a week
+    on phase 0, it should clear after this week's weekly"*, where the second
+    week's protection was replaced by a daily guard rather than deleted.
+    """
+
+    def test_no_independent_span_constant_survives(self) -> None:
+        """The point of the change: the bar is stated in cycles, the unit the
+        claim is denominated in, and not also in calendar days."""
+        assert not hasattr(gate_module, "PHASE2_AUTONOMY_MIN_SPAN")
+
+    def test_a_wednesday_change_is_satisfiable_on_that_weeks_saturday(self) -> None:
+        """The arithmetic that matters. 2026-09-09 is the Wednesday the
+        crucible-v2 stack was last applied; under the deleted seven-day floor
+        the earliest satisfiable render day was 2026-09-16, four days past the
+        2026-09-12 weekly."""
+        change = dt.date(2026, 9, 9)
+        assert autonomy_earliest_satisfiable_render_day(change) == dt.date(2026, 9, 12)
+        assert change + dt.timedelta(days=7) > dt.date(2026, 9, 12)
+
+    def test_the_derived_day_carries_a_weekly_close_after_the_change(self) -> None:
+        change = dt.date(2026, 9, 9)
+        day = autonomy_earliest_satisfiable_render_day(change)
+        assert weekly_anchor(day) > change
+
+    def test_the_derived_day_carries_the_required_daily_cycles(self) -> None:
+        change = dt.date(2026, 9, 9)
+        day = autonomy_earliest_satisfiable_render_day(change)
+        assert autonomy_daily_cycles_in_span(change, day) >= PHASE2_AUTONOMY_MIN_DAILY_CYCLES
+
+    def test_the_day_before_the_derived_day_satisfies_neither_requirement(self) -> None:
+        """Derived means TIGHT: the day before is genuinely unsatisfiable, so
+        this is the earliest and not merely a day that happens to work."""
+        change = dt.date(2026, 9, 9)
+        day = autonomy_earliest_satisfiable_render_day(change) - dt.timedelta(days=1)
+        assert weekly_anchor(day) <= change
+
+    def test_a_change_an_hour_before_the_read_is_still_unsatisfiable(self) -> None:
+        """The anti-gaming property, asserted on the derivation itself and not
+        only through the clause: a change on the render day cannot be graded on
+        that day, whatever the constant was."""
+        change = CHANGE_AN_HOUR_BEFORE_THE_READ.date()
+        assert autonomy_earliest_satisfiable_render_day(change) > change
+
+    def test_the_daily_cycle_count_skips_a_holiday(self) -> None:
+        """Counted through the trading calendar, never derived from a
+        calendar-day span — 2026-07-03 is an observed Independence Day, a
+        CLOSED weekday, and a `weekday() < 5` count would score it."""
+        assert autonomy_daily_cycles_in_span(dt.date(2026, 7, 2), dt.date(2026, 7, 3)) == 0
+
+    def test_a_render_day_on_or_before_the_change_counts_no_daily_cycles(self) -> None:
+        assert autonomy_daily_cycles_in_span(dt.date(2026, 9, 9), dt.date(2026, 9, 9)) == 0
+
+    def test_the_daily_implication_is_self_checked_and_fails_loud(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The daily half is an IMPLICATION of the weekly one under the NYSE
+        calendar — `weekly_anchor(render_day)` is itself a trading day in the
+        span — so it is checked rather than assumed, and a violation reads
+        UNMEASURABLE naming the contradiction. Never a quiet UNMET: that would
+        render a calendar defect as a system finding."""
         _archive(monkeypatch)
-        monkeypatch.setattr(gate_module, "_s3_client", lambda: object())
-        monkeypatch.setattr(autonomy_module, "count_operator_actions", lambda *a, **k: _Counted(3))
-        clause = gate_module._clause_zero_human_mutating_calls(PHASE2_WINDOW)
-        assert not clause.met and not clause.unmeasurable
-        assert "3 human mutating call" in clause.detail
+        _stack_applied(monkeypatch, CHANGE_LONG_BEFORE)
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE)
+        monkeypatch.setattr(gate_module, "autonomy_daily_cycles_in_span", lambda *_: 0)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.unmeasurable and not clause.met
+        assert "trading calendar contradicted itself" in clause.detail
+
+    def test_a_met_reading_names_both_cycles_it_spanned(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A window start nobody can reconstruct is a number, not a reading
+        (principle 1) — and the same is true of the bar it cleared."""
+        _archive(monkeypatch)
+        _stack_applied(monkeypatch, CHANGE_LONG_BEFORE)
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.met
+        assert "spanning the weekly cycle closing" in clause.detail
+        assert "daily cycle(s)" in clause.detail
+
+
+class TestTheSaturdayCountAndTheWindowWidthAreSeparateConstants:
+    """`alpha-engine-config-I10324` defect 2. `PHASE2_LIVE_SATURDAYS` was read
+    BOTH as the number of consecutive live Saturdays and, in `GATES["phase2"]`,
+    as phase 2's window width in weeks — so narrowing the Saturday count would
+    silently have narrowed the window `zero_human_mutating_calls`,
+    `pages_within_ceiling` and `replays_ok` are counted over.
+    """
+
+    @staticmethod
+    def _names_in_function(name: str) -> set[str]:
+        tree = ast.parse(pathlib.Path(gate_module.__file__).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+        raise AssertionError(f"{name} is not a function in crucible.gate")
+
+    @staticmethod
+    def _names_in_gates_assignment() -> set[str]:
+        tree = ast.parse(pathlib.Path(gate_module.__file__).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            targets = getattr(node, "targets", []) or (
+                [node.target] if isinstance(node, ast.AnnAssign) else []
+            )
+            if any(isinstance(t, ast.Name) and t.id == "GATES" for t in targets):
+                return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+        raise AssertionError("GATES is not assigned in crucible.gate")
+
+    def test_the_window_width_is_not_reachable_from_the_live_saturday_clause(self) -> None:
+        """Structural, and value-independent: the day the two numbers happen to
+        be equal again, an assertion comparing them would pass while the
+        substitution was back."""
+        names = self._names_in_function("_clause_live_saturdays_first_attempt_ok")
+        assert "PHASE2_LIVE_SATURDAYS" in names
+        assert "PHASE2_WINDOW_WEEKS" not in names
+
+    def test_the_saturday_count_is_not_reachable_from_the_window_registration(self) -> None:
+        names = self._names_in_gates_assignment()
+        assert "PHASE2_WINDOW_WEEKS" in names
+        assert "PHASE2_LIVE_SATURDAYS" not in names
+
+    def test_the_gate_window_is_the_window_constant_and_the_clause_grades_the_other(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Behavioural counterpart: the window `evaluate` builds is
+        `PHASE2_WINDOW_WEEKS` wide while the live clause names exactly
+        `PHASE2_LIVE_SATURDAYS` manifest keys."""
+        monkeypatch.setattr(gate_module, "_ce_client", _raising_client)
+        monkeypatch.setattr(gate_module, "_s3_client", _raising_client)
+        result = evaluate(store, gate="phase2", trading_day=FRIDAY)
+        assert len(result.window) == PHASE2_WINDOW_WEEKS
+        live = next(c for c in result.clauses if c.name == "live_saturdays_first_attempt_ok")
+        assert len(live.evidence) == PHASE2_LIVE_SATURDAYS
+
+    def test_the_page_ceiling_window_still_excludes_the_week_before(self) -> None:
+        """What the split PROTECTS: `pages_within_ceiling` counts over the
+        window, and a ceiling of two pages over one week asserts almost
+        nothing. The window stayed two weeks while the Saturday count moved to
+        one."""
+        assert len(PHASE2_WINDOW) == PHASE2_WINDOW_WEEKS
+        assert PHASE2_WINDOW[-1] - PHASE2_WINDOW[0] == dt.timedelta(weeks=PHASE2_WINDOW_WEEKS - 1)
 
 
 class TestPagesAreCountedOnlyOnceSomethingHasSwept:

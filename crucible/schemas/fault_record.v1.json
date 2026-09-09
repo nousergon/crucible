@@ -1,0 +1,205 @@
+{
+  "$defs": {
+    "AttemptRow": {
+      "additionalProperties": false,
+      "description": "\u00a711 risk 2: one attempt this run made, including the declared\ntransient-class retry. A run that executed once records one attempt, so a\nretried run cannot be mistaken for a clean first-attempt run.",
+      "properties": {
+        "n": {
+          "minimum": 1,
+          "title": "N",
+          "type": "integer"
+        },
+        "reason": {
+          "description": "Why THIS attempt happened. `initial` for the first; otherwise the declared transient class that caused the retry. The class grows only by PR with the failure named.",
+          "enum": [
+            "initial",
+            "spot_interruption",
+            "provider_5xx",
+            "provider_timeout",
+            "s3_throttling"
+          ],
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "n",
+        "reason"
+      ],
+      "title": "AttemptRow",
+      "type": "object"
+    },
+    "ClosedPathRow": {
+      "additionalProperties": false,
+      "description": "One machine-executed probe showing one path into an `unreachable`\nfault's state is closed (`alpha-engine-config-I10327`).\n\n**This row is the reason `unreachable` is the HARDER record to write,\nnot the easier one.** A fault whose state cannot arise has no failed run\nto name, so the `run_id` refusal that guards `induced` cannot guard it;\nwithout positive evidence, `unreachable` would degrade into an\nattestation a human types, which is precisely the\nassertion-by-having-looked plan \u00a710.7 exists to remove. So the producer\nRUNS a probe per closed path against the real store and records what it\nobserved: `crucible.faults` refuses the record unless every declared\nprobe actually observed its `expected` outcome.\n\n`expected` and `observed` are separate fields on purpose. A single\n\"result\" field collapses \"we required a refusal and got one\" into \"it\nsaid no\", and a reader cannot then tell a probe that verified something\nfrom a probe whose failure was recorded as prose.",
+      "properties": {
+        "checked_at_utc": {
+          "description": "RFC 3339, UTC, `Z` suffix. When the probe ran \u2014 a probe result with no instant cannot be told from one copied out of an older record.",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+          "title": "Checked At Utc",
+          "type": "string"
+        },
+        "expected": {
+          "description": "What the probe REQUIRED to observe for the path to count as closed.",
+          "minLength": 1,
+          "title": "Expected",
+          "type": "string"
+        },
+        "mechanism": {
+          "description": "The code that closes it \u2014 a dotted symbol, so a reader can go and read the refusal rather than trust this sentence.",
+          "minLength": 1,
+          "title": "Mechanism",
+          "type": "string"
+        },
+        "observed": {
+          "description": "What the probe actually observed. Recorded verbatim: a record whose observation is missing is not evidence of anything.",
+          "minLength": 1,
+          "title": "Observed",
+          "type": "string"
+        },
+        "path": {
+          "description": "The path into the fault's state that this probe shows is closed.",
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "probe": {
+          "description": "The machine check `crucible.faults` executed. A named probe, registered in `crucible.faults.UNREACHABLE_PROBES` \u2014 never free text a caller supplies, which would make the evidence an assertion again.",
+          "minLength": 1,
+          "title": "Probe",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "mechanism",
+        "probe",
+        "expected",
+        "observed",
+        "checked_at_utc"
+      ],
+      "title": "ClosedPathRow",
+      "type": "object"
+    }
+  },
+  "$id": "fault_record.v1",
+  "additionalProperties": false,
+  "description": "One durable record per scripted fault exercised against the real scheduled path (plan \u00a710.7). `outcome` says how the fault ended and decides which evidence fields are legal: an induced fault names the failed manifest and the page it produced, an absorbed one names the ok manifest and the transient-class retry that made it ok, and an unreachable one names neither and carries a machine-executed probe per closed path \u2014 so 'we ran fault injection' is a reading rather than a sentence in a session transcript.",
+  "properties": {
+    "attempt": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AttemptRow"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "For `absorbed`, the `attempts[]` row from the named manifest that records the declared-transient-class retry \u2014 copied out of the manifest the producer verified, so the record says WHICH transient class absorbed the fault rather than merely that one did. NULL for every other outcome."
+    },
+    "bus_key": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The alert bus row this fault produced (alerts/{day}/{incident}.json). REQUIRED for `induced` \u2014 a fault that paged nobody is half of \u00a710.7's exercise. FORBIDDEN for `absorbed` and `unreachable`: a page on an absorbed fault would mean the retry did not work, and there is no run to page about at all when the state is unreachable.",
+      "title": "Bus Key"
+    },
+    "closed_paths": {
+      "anyOf": [
+        {
+          "items": {
+            "$ref": "#/$defs/ClosedPathRow"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "For `unreachable`, one machine-executed probe per closed path, never empty. NULL for every other outcome \u2014 a record that both excuses a run and claims the state is unreachable is claiming two contradictory things.",
+      "title": "Closed Paths"
+    },
+    "fault_id": {
+      "description": "One of `crucible.gate.SCRIPTED_FAULTS`, enforced at write time by `crucible.faults.record_fault` rather than here (see class docstring).",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_.-]{1,64}$",
+      "title": "Fault Id",
+      "type": "string"
+    },
+    "manifest_key": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The store key of the manifest named by run_id, which `crucible.faults.record_fault` looked up and verified reads the status this `outcome` requires before this record could be written. NULL for `unreachable`.",
+      "title": "Manifest Key"
+    },
+    "outcome": {
+      "description": "How the fault ended: `induced` (the job failed), `absorbed` (the declared transient class handled it and the run succeeded) or `unreachable` (the state cannot be entered). Decides which other fields are legal \u2014 see the class docstring's table.",
+      "enum": [
+        "induced",
+        "absorbed",
+        "unreachable"
+      ],
+      "title": "Outcome",
+      "type": "string"
+    },
+    "recorded_at_utc": {
+      "description": "RFC 3339, UTC, `Z` suffix. When the injection procedure filed this record, distinct from trading_day \u2014 a fault is exercised against a trading day's scheduled path, but the record is filed at the wall-clock instant of the exercise.",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+      "title": "Recorded At Utc",
+      "type": "string"
+    },
+    "run_id": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The run_id of the manifest this record describes. ULID. Required for `induced` and `absorbed`; NULL for `unreachable`, which has no run and must therefore be structurally incapable of excusing one. Required and nullable rather than optional: an omitted field is indistinguishable from a forgotten one.",
+      "title": "Run Id"
+    },
+    "schema_version": {
+      "const": "fault_record.v1",
+      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "trading_day": {
+      "format": "date",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "title": "Trading Day",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "fault_id",
+    "outcome",
+    "trading_day",
+    "run_id",
+    "manifest_key",
+    "bus_key",
+    "attempt",
+    "closed_paths",
+    "recorded_at_utc"
+  ],
+  "title": "Crucible fault-injection record, v1",
+  "type": "object"
+}

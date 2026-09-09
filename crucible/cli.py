@@ -27,14 +27,18 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from crucible import __version__, morning, track_c, track_e, track_f  # track-C, track-E, track-F
 from crucible.calendar import resolve_trading_day
+from crucible.faults import FAULT_RECORD_JOB, record_fault
+from crucible.gate import SCRIPTED_FAULTS
 from crucible.keys import arena_cycle_key, champion_key
 from crucible.keys import manifest_key as _promote_manifest_key
+from crucible.models import FAULT_OUTCOME_VALUES
 from crucible.release_retention import RELEASE_LOCK_JOB, release_lock_handler
 from crucible.runmode import RUN_MODES, resolve_run_mode
 from crucible.track_a import HANDLERS as TRACK_A_HANDLERS
@@ -244,6 +248,67 @@ def _promote(args: argparse.Namespace) -> int:
     return 0
 
 
+def _fault_record(args: argparse.Namespace) -> int:
+    """`crucible fault.record --fault <id> --outcome <kind> [--target-job <job>
+    --run-id <ulid> --bus-key <key>] --date <trading-day>`.
+
+    Files the durable record `crucible.gate._clause_fault_injection_against_
+    scheduled_path` reads (`alpha-engine-config-I10320`/`-I10322`/`-I10327`).
+    Runs through `run_job` like every other job (AGENTS.md rule 1), so a
+    refusal — no matching manifest, one whose status the outcome forbids, an
+    `ok` manifest with no transient-class retry, a bus key the store does not
+    hold, a bus key on an `absorbed` record, or a probe that did not observe
+    what it required — is itself a fully-telemetered `status: failed` run of
+    THIS job, not a bare traceback.
+
+    **Which flags are legal is decided by `--outcome`, in
+    `crucible.faults.record_fault`, not here.** argparse cannot express "one
+    of these three field sets", and a second copy of the matrix in the parser
+    would be the half that drifts; the CLI passes what it was given and the
+    producer refuses. The refusal messages name the flag.
+
+    `--date` is required explicitly rather than defaulting to "the last
+    completed trading day" the way every other job's does: this record must
+    name the EXACT day the fault was induced against, and a wall-clock
+    default would silently file it under the wrong key the first time this
+    command is run on a different day than the exercise it describes.
+    """
+    if not getattr(args, "date", None):
+        raise SystemExit(
+            "crucible fault.record requires --date YYYY-MM-DD naming the trading day the "
+            "fault was induced against. The default every other job uses (the last "
+            "completed trading day) is a wall-clock guess, and this record must name the "
+            "exact day its excused manifest lives under."
+        )
+    store = _resolve_store(args)
+    trading_day = args.trading_day.isoformat()
+
+    def job(ctx) -> None:
+        record_fault(
+            ctx,
+            store,
+            fault_id=args.fault,
+            outcome=args.outcome,
+            target_job=getattr(args, "target_job", None),
+            trading_day=trading_day,
+            run_id=getattr(args, "run_id", None),
+            bus_key=getattr(args, "bus_key", None),
+        )
+
+    from crucible.runner import run_job
+
+    ctx = run_job(
+        FAULT_RECORD_JOB,
+        job,
+        store=store,
+        trading_day=args.trading_day,
+        dry_run=bool(args.dry_run),
+        run_mode=getattr(args, "run_mode", None),
+    )
+    print(json.dumps({"run_id": ctx.run_id, "outputs": [o["key"] for o in ctx.outputs]}, indent=2))
+    return 0
+
+
 def _record_written(ctx, store, keys) -> None:
     """Record artifacts the job wrote through the store directly.
 
@@ -320,6 +385,14 @@ JOBS: dict[str, JobSpec] = {
         "Deliver the board's reading to the operator channel at 06:00 PT",
         True,
     ),
+    # alpha-engine-config-I10320/-I10322. On-demand, like data.heal and
+    # experiment.new: an operator/procedure runs it once per fault induced,
+    # never on a schedule.
+    FAULT_RECORD_JOB: JobSpec(
+        FAULT_RECORD_JOB,
+        "File the durable record of one exercised scripted fault, or refuse",
+        False,
+    ),
 }
 
 HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
@@ -375,6 +448,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     "gate": track_f.gate_handler,
     track_f.GATE_CLOSE_JOB: track_f.gate_close_handler,
     morning.MORNING_JOB: morning.morning_handler,
+    FAULT_RECORD_JOB: _fault_record,
 }
 
 
@@ -533,6 +607,65 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if spec.name == "data.heal":
             sub.add_argument("--gap", required=True, help="The named gap to repair.")
+        if spec.name == FAULT_RECORD_JOB:
+            sub.add_argument(
+                "--fault",
+                required=True,
+                choices=SCRIPTED_FAULTS,
+                help="Which scripted fault (plan §10.7) this record is for.",
+            )
+            sub.add_argument(
+                "--outcome",
+                required=True,
+                choices=FAULT_OUTCOME_VALUES,
+                help=(
+                    "How the fault ended. induced: it fired and the job FAILED "
+                    "(--target-job, --run-id and --bus-key all required). absorbed: it "
+                    "fired and the declared transient class handled it, so the manifest "
+                    "reads ok and records the retry (--target-job and --run-id required, "
+                    "--bus-key REFUSED — a page would mean the retry did not work). "
+                    "unreachable: the state cannot be entered, evidenced by an executed "
+                    "probe per closed path (no --target-job, --run-id or --bus-key, so "
+                    "the record cannot excuse any manifest)."
+                ),
+            )
+            sub.add_argument(
+                "--target-job",
+                dest="target_job",
+                default=None,
+                help=(
+                    "The CLI job whose manifest this record describes — e.g. data.weekly. "
+                    "Required for induced and absorbed, refused for unreachable. "
+                    "Not `--job`: that positional slot is this command's own name."
+                ),
+            )
+            sub.add_argument(
+                "--run-id",
+                dest="run_id",
+                default=None,
+                help=(
+                    "The run_id of the manifest this record describes. Required for "
+                    "induced (which needs it to read status: failed) and absorbed (status: "
+                    "ok with a transient-class retry in attempts[]); REFUSED for "
+                    "unreachable, which names no run and so cannot excuse one. This "
+                    "command never invents a run_id."
+                ),
+            )
+            sub.add_argument(
+                "--bus-key",
+                dest="bus_key",
+                default=None,
+                metavar="alerts/{day}/{incident}.json",
+                help=(
+                    "The alert bus row this fault produced. REQUIRED for induced and "
+                    "refused unless the store holds it — a failed job that paged nobody "
+                    "is half of plan §10.7's exercise. REFUSED for absorbed and "
+                    "unreachable: on an absorbed fault a page would mean the retry did "
+                    "not work, so the row's ABSENCE is part of what the record asserts, "
+                    "and it is never a field borrowed from an unrelated incident to make "
+                    "a clause read better."
+                ),
+            )
         if spec.name == "alerts.sweep":
             sub.add_argument(
                 "--now",
