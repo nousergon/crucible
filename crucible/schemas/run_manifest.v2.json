@@ -464,7 +464,8 @@
         "weekly",
         "gate",
         "gate.close",
-        "report.morning"
+        "report.morning",
+        "fault.record"
       ],
       "title": "Job",
       "type": "string"
