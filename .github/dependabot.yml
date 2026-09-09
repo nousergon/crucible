@@ -3,7 +3,24 @@
 # auto-merge-policy.md's Dependabot lane, not by hand.
 version: 2
 updates:
-  - package-ecosystem: pip
+  # `uv`, NOT `pip` — this repository's dependencies are locked in `uv.lock`,
+  # and `ci.yml`'s "The lockfile agrees with pyproject.toml" step runs
+  # `uv lock --check`. The `pip` ecosystem edits `pyproject.toml` and leaves
+  # the lockfile alone, so every version-update PR it opened failed that step
+  # and NONE could ever merge, however green the tests were.
+  #
+  # Measured 2026-09-09: five open bump PRs (crucible-PR175..179) all failed
+  # with `error: The lockfile at uv.lock needs to be updated, but --check was
+  # provided.` and nothing else. `AGENTS.md` already states the rule the
+  # ecosystem was violating — "a `pyproject.toml` change lands with the
+  # regenerated `uv.lock` in the same commit" — so the config, not the guard,
+  # was the thing out of step.
+  #
+  # The `uv` ecosystem understands `uv.lock` and regenerates it in the same
+  # commit. Chosen over adding a workflow that re-locks on a Dependabot PR:
+  # that would be a second mechanism maintaining a file the tool can maintain
+  # itself, and it would need write access on a Dependabot-triggered run.
+  - package-ecosystem: uv
     directory: "/"
     schedule:
       interval: weekly
