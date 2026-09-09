@@ -278,7 +278,7 @@ jobs:
         run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
 
       - name: Configure AWS credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c  # v6.2.4
         with:
           role-to-assume: ${{ env.REPORT_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -314,5 +314,5 @@ jobs:
   notify-failure:
     needs: [report]
     if: ${{ failure() }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@619de3f32aef2e63329e7270afb87ec6b1e381e3
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@c115e75840c5e210f857107118428beb4a6fdaa8
     secrets: inherit
