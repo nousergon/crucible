@@ -33,6 +33,7 @@ import datetime as dt
 import json
 import os
 import re
+import shlex
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -57,6 +58,11 @@ from crucible.keys import (
 from crucible.manifest import manifest_prefix
 from crucible.required import require_env
 from crucible.store import Store
+from crucible.synthetic import (
+    SYNTHETIC_SUBJECT_PREFIX,
+    args_synthetic_marker,
+    manifest_synthetic_marker,
+)
 
 __all__ = [
     "ALERT_BUS_SCHEMA_VERSION",
@@ -125,6 +131,14 @@ class Page:
     trading_day: dt.date
     reason: str
     run_id: str | None = None
+
+    #: Non-None when the RUN this page is about declared itself synthetic —
+    #: a replay, a fault-injection, or both (`crucible.synthetic`). It is the
+    #: descriptor, not a flag, because "replay" and "fault-injected:
+    #: chaos_probe" call for different amounts of not-worrying. Derived from
+    #: what the invocation declared, never from recognising a sentinel
+    #: ticker or a job name — see `crucible/synthetic.py`.
+    synthetic: str | None = None
 
     def __post_init__(self) -> None:
         if self.condition not in PAGE_CONDITIONS:
@@ -203,13 +217,41 @@ class PageGroup:
         """
         return "error"
 
+    @property
+    def synthetic(self) -> str | None:
+        """The synthetic descriptor this incident's members share, or None.
+
+        `cause_key` carries `SYNTHETIC_SUBJECT_PREFIX`, so a group is either
+        wholly synthetic or wholly real and this can never be a mixture. The
+        distinct member descriptors are joined rather than taking the first:
+        an incident whose members are one replay and one fault-injection
+        should say both.
+        """
+        markers = sorted({m.synthetic for m in self.members if m.synthetic})
+        return "; ".join(markers) if markers else None
+
     def render(self) -> str:
         jobs = ", ".join(sorted({m.job for m in self.members}))
+        # The banner leads. A reader who is going to decide "this is an
+        # exercise, go back to sleep" must be able to decide it from the
+        # first six characters of the notification, before any subject line
+        # is truncated by a transport — measured 2026-09-09, when a
+        # deliberately-induced `data.weekly` replay paged `operator_chat` in
+        # a form byte-identical to a real production data outage.
+        banner = f"SYNTHETIC ({self.synthetic}) " if self.synthetic else ""
         head = (
-            f"[crucible-v2] {self.condition.upper()} on {self.trading_day.isoformat()} "
+            f"[crucible-v2] {banner}{self.condition.upper()} on "
+            f"{self.trading_day.isoformat()} "
             f"({len(self.members)} member{'s' if len(self.members) > 1 else ''}): {jobs}"
         )
         lines = [head, f"cause: {self.cause_key}"]
+        if self.synthetic:
+            lines.append(
+                "synthetic: this run declared itself "
+                f"{self.synthetic} on its own invocation — it is a deliberate exercise, "
+                "not an observed production failure. Nothing about the live system is "
+                "known to be wrong from this page alone."
+            )
         for m in sorted(self.members, key=lambda x: x.job):
             run = f" run_id={m.run_id}" if m.run_id else ""
             lines.append(f"  - {m.job}:{run} {m.reason}")
@@ -244,14 +286,23 @@ def cause_key(page: Page) -> str:
     absent manifest for one trading day is the same operator action — go and
     find out why nothing ran — and paging separately for six of them on a
     morning when the scheduler was down is the noise that buries the signal.
+
+    A SYNTHETIC page (`crucible.synthetic`) carries
+    :data:`~crucible.synthetic.SYNTHETIC_SUBJECT_PREFIX` on its subject, so a
+    deliberate probe and a real failure on the same trading day, for the same
+    cause, are two incidents with two dedup keys and two bus rows. Grouping
+    them would produce a page banner-marked SYNTHETIC that also carried a real
+    production failure as a member — an incident an operator has just been
+    taught to skim past.
     """
+    prefix = SYNTHETIC_SUBJECT_PREFIX if page.synthetic else ""
     if page.condition == "absence":
-        return f"absence:{page.trading_day.isoformat()}"
+        return f"{prefix}absence:{page.trading_day.isoformat()}"
     haystack = page.reason.lower()
     for key, needle in CAUSE_MATCHERS:
         if needle.lower() in haystack:
-            return f"{key}:{page.trading_day.isoformat()}"
-    return f"{page.job}:{page.trading_day.isoformat()}"
+            return f"{prefix}{key}:{page.trading_day.isoformat()}"
+    return f"{prefix}{page.job}:{page.trading_day.isoformat()}"
 
 
 def group_pages(pages: Sequence[Page]) -> list[PageGroup]:
@@ -771,6 +822,11 @@ def evaluate_dispatch_absence(
             access_faults.append(problem)
             continue
         document = read.document
+        args = document.get("args", "")
+        # The dispatch record's argv is the operator statement one layer
+        # above the manifest, and it is all there is: an absence page exists
+        # precisely because no manifest was written to read `run_mode` off.
+        synthetic = args_synthetic_marker(args)
         dispatched_at = _parse_dispatch_time(document.get("dispatched_at_utc"))
         if dispatched_at is None:
             pages.append(
@@ -785,12 +841,13 @@ def evaluate_dispatch_absence(
                         "one — a record this module cannot age is a record it cannot "
                         "clear"
                     ),
+                    synthetic=synthetic,
                 )
             )
             continue
         if moment - dispatched_at < horizon:
             continue
-        trading_day = resolve_trading_day(dispatched_at)
+        trading_day = _dispatch_target_trading_day(args, dispatched_at)
         prefix = manifest_prefix(job, trading_day.isoformat())
         manifest_listed = _list_manifest_keys(store, prefix)
         if manifest_listed.problem is not None:
@@ -800,7 +857,6 @@ def evaluate_dispatch_absence(
             continue
         if any(is_manifest_key(k) for k in manifest_listed.keys or ()):
             continue
-        args = document.get("args", "")
         instance_id = document.get("instance_id", "unknown")
         if instance_id == "unknown":
             classification = "no instance_id recorded — investigate the box directly"
@@ -821,9 +877,65 @@ def evaluate_dispatch_absence(
                     f"{horizon.total_seconds() / 3600:.0f}h, now "
                     f"{moment.strftime('%Y-%m-%dT%H:%M:%SZ')}; {classification}"
                 ),
+                synthetic=synthetic,
             )
         )
     return pages
+
+
+def _dispatch_target_trading_day(args: Any, dispatched_at: dt.datetime) -> dt.date:
+    """The trading day a dispatch's manifest will actually be keyed under.
+
+    `alpha-engine-config-I10134` resolved this from the dispatch's WALL CLOCK
+    (`resolve_trading_day(dispatched_at)`), which is right for the on-demand
+    jobs it was written for and wrong for every dispatch carrying `--date`.
+    `crucible.cli.resolve_date` returns an explicit `--date` verbatim, so the
+    manifest lands under THAT day — and this function looked for it under a
+    different one.
+
+    Measured 2026-09-09: `fault.probe` was dispatched twice with
+    `--date 2026-09-11 --run-mode replay --fault-capability-class chaos_probe`
+    at 18:55Z and 20:45Z; the manifest was written to
+    `runs/fault.probe/2026-09-11/run.json`, while this detector would have
+    listed `runs/fault.probe/<the day it was dispatched>/`, found it empty and
+    paged an ABSENCE for a run whose artifact exists. Both directions of that
+    are wrong and the second is the one that matters: a probe that really did
+    die without an artifact would have been reported against a trading day
+    nobody could go and look at.
+
+    Falls back to the wall clock when `--date` is absent or unparseable — the
+    original behaviour, which is correct for a dispatch that named no day.
+    A `--date` that is not a date is not silently substituted with a guess
+    here; it is a malformed dispatch, and `crucible.cli` refuses it at the box
+    with the usage exit code the wrapper reports as one.
+    """
+    explicit = _flag_value(args, "--date")
+    if explicit is not None:
+        try:
+            return dt.date.fromisoformat(explicit)
+        except ValueError:
+            return resolve_trading_day(dispatched_at)
+    return resolve_trading_day(dispatched_at)
+
+
+def _flag_value(args: Any, flag: str) -> str | None:
+    """``--flag value`` or ``--flag=value`` out of a dispatch record's argv.
+
+    Positional, via :mod:`shlex`, never a substring test — same rule and same
+    reason as `crucible.synthetic.args_synthetic_marker`.
+    """
+    if not isinstance(args, str) or not args.strip():
+        return None
+    try:
+        tokens = shlex.split(args)
+    except ValueError:
+        return None
+    for index, token in enumerate(tokens):
+        if token == flag and index + 1 < len(tokens):
+            return tokens[index + 1]
+        if token.startswith(f"{flag}="):
+            return token.split("=", 1)[1]
+    return None
 
 
 def _parse_dispatch_time(raw: Any) -> dt.datetime | None:
@@ -901,6 +1013,12 @@ def evaluate_failure(
                         trading_day=trading_day,
                         reason=f"manifest at {key} is unreadable: {problem}",
                         run_id=_UNPARSEABLE_RUN_ID,
+                        # No marker: the document could not be read, so
+                        # nothing declared this run synthetic. Erring toward
+                        # "real" is the safe direction — the alternative is a
+                        # corrupt manifest that pages with a "go back to
+                        # sleep" banner on it.
+                        synthetic=None,
                     )
                 )
             for _key, manifest in listed.documents:
@@ -912,6 +1030,7 @@ def evaluate_failure(
                             trading_day=trading_day,
                             reason=manifest.get("reason") or "(the manifest recorded no reason)",
                             run_id=manifest.get("run_id") or _UNPARSEABLE_RUN_ID,
+                            synthetic=manifest_synthetic_marker(manifest),
                         )
                     )
     return pages
@@ -975,6 +1094,12 @@ def bus_row(
         "alert_id_is_run_id": _alert_id_joins_to_a_manifest(group, alert_id),
         "condition": group.condition,
         "cause_key": group.cause_key,
+        # Machine-readable half of the banner. Every downstream reader — the
+        # console, `crucible.gate`'s page clauses, the response plane — can
+        # now tell a deliberate exercise from an observed failure WITHOUT
+        # recognising a sentinel ticker or a job name, which is the only form
+        # of that test that survives the next fault being induced differently.
+        "synthetic": group.synthetic,
         "trading_day": group.trading_day.isoformat(),
         "dedup_key": incident_key(group),
         "incident_key": incident_key(group),
@@ -996,7 +1121,7 @@ def bus_row(
 
 def _members(group: PageGroup) -> list[dict[str, Any]]:
     return [
-        {"job": m.job, "run_id": m.run_id, "reason": m.reason}
+        {"job": m.job, "run_id": m.run_id, "reason": m.reason, "synthetic": m.synthetic}
         for m in sorted(group.members, key=lambda x: x.job)
     ]
 
@@ -1184,7 +1309,13 @@ def send(
     result = publish(
         group.render(),
         severity=group.severity,
-        source=f"crucible-v2/{group.condition}",
+        # The transport's `source` is what a subscriber filters and routes
+        # on, so the synthetic-ness has to be IN it and not only in the body.
+        source=(
+            f"crucible-v2/synthetic/{group.condition}"
+            if group.synthetic
+            else f"crucible-v2/{group.condition}"
+        ),
         dedup_key=incident_key(group),
         dedup_window_min=None,
         sns_topic_arn=topic_arn(legacy=legacy),

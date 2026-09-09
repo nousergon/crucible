@@ -433,7 +433,16 @@ class TestTheProbeJob:
 
         sweep(store, now=AFTER_EVERY_DEADLINE, transport=transport, sweep_run_id="0" * 26)
         failures = sum(
-            1 for call in transport.calls if call.kwargs.get("source") == "crucible-v2/failure"
+            # `crucible-v2/synthetic/failure`, not `crucible-v2/failure`: this
+            # probe declared `--fault-capability-class`, so `crucible.synthetic`
+            # marks its page as the deliberate exercise it is. Asserting the
+            # SYNTHETIC source rather than widening the count to both is the
+            # point — a probe whose page were indistinguishable from a real
+            # data outage is the defect measured on 2026-09-09, and this
+            # assertion is what would catch its return.
+            1
+            for call in transport.calls
+            if call.kwargs.get("source") == "crucible-v2/synthetic/failure"
         )
         assert failures == 1
 
