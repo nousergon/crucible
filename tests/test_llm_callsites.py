@@ -82,16 +82,26 @@ class TestTheRegistry:
         call refused in the other.
 
         `load_capability_classes()` — the file's OWN extra list, beyond the
-        bare router tiers — is legitimately empty since
-        `alpha-engine-config-I9970` (2026-09-08): the phase-5 arms address
+        bare router tiers — carries exactly the FAULT-INJECTION classes and
+        nothing else (`alpha-engine-config-I10343`). The phase-5 arms address
         `high` and the judge addresses `ultra`, both already router TIER
-        GROUPS, so neither needs a row here. The union
-        `_capability_classes()` is still non-empty because it always carries
-        the router's own tiers regardless of what this file adds."""
-        from crucible.llm import _capability_classes, load_capability_classes
+        GROUPS, so neither needs a row (`-I9970`, 2026-09-08); what does need
+        one is a class no tier group makes askable, which is what a
+        deliberately-broken group is. Pinned as an EQUALITY rather than a
+        non-emptiness check: this list is the surface a call site must not be
+        able to extend for itself, so a name appearing here without the
+        reasoning beside it in the file — and without a row in
+        `crucible.llm.FAULT_INJECTION_CAPABILITY_CLASSES` — is the drift worth
+        catching."""
+        from crucible.llm import (
+            FAULT_INJECTION_CAPABILITY_CLASSES,
+            _capability_classes,
+            load_capability_classes,
+        )
 
-        assert load_capability_classes() == (), (
-            "the file declares no capability beyond the bare router tiers today"
+        assert set(load_capability_classes()) == FAULT_INJECTION_CAPABILITY_CLASSES, (
+            "the file declares exactly the fault-injection classes beyond the bare router "
+            "tiers; anything else is a class askable with no reason written down"
         )
         assert len(_capability_classes()) >= 4
 
