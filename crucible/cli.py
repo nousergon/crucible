@@ -27,12 +27,15 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from crucible import __version__, morning, track_c, track_e, track_f  # track-C, track-E, track-F
 from crucible.calendar import resolve_trading_day
+from crucible.faults import FAULT_RECORD_JOB, record_fault
+from crucible.gate import SCRIPTED_FAULTS
 from crucible.keys import arena_cycle_key, champion_key
 from crucible.keys import manifest_key as _promote_manifest_key
 from crucible.release_retention import RELEASE_LOCK_JOB, release_lock_handler
@@ -244,6 +247,58 @@ def _promote(args: argparse.Namespace) -> int:
     return 0
 
 
+def _fault_record(args: argparse.Namespace) -> int:
+    """`crucible fault.record --fault <id> --target-job <job> --run-id <ulid>
+    [--bus-key <key>] --date <trading-day>`.
+
+    Files the durable record `crucible.gate._clause_fault_injection_against_
+    scheduled_path` reads (`alpha-engine-config-I10320`/`-I10322`). Runs
+    through `run_job` like every other job (AGENTS.md rule 1), so a refusal
+    — no matching failed manifest, or one that succeeded, or a bus key the
+    store does not hold — is itself a fully-telemetered `status: failed` run
+    of THIS job, not a bare traceback.
+
+    `--date` is required explicitly rather than defaulting to "the last
+    completed trading day" the way every other job's does: this record must
+    name the EXACT day the fault was induced against, and a wall-clock
+    default would silently file it under the wrong key the first time this
+    command is run on a different day than the exercise it describes.
+    """
+    if not getattr(args, "date", None):
+        raise SystemExit(
+            "crucible fault.record requires --date YYYY-MM-DD naming the trading day the "
+            "fault was induced against. The default every other job uses (the last "
+            "completed trading day) is a wall-clock guess, and this record must name the "
+            "exact day its excused manifest lives under."
+        )
+    store = _resolve_store(args)
+    trading_day = args.trading_day.isoformat()
+
+    def job(ctx) -> None:
+        record_fault(
+            ctx,
+            store,
+            fault_id=args.fault,
+            target_job=args.target_job,
+            trading_day=trading_day,
+            run_id=args.run_id,
+            bus_key=getattr(args, "bus_key", None),
+        )
+
+    from crucible.runner import run_job
+
+    ctx = run_job(
+        FAULT_RECORD_JOB,
+        job,
+        store=store,
+        trading_day=args.trading_day,
+        dry_run=bool(args.dry_run),
+        run_mode=getattr(args, "run_mode", None),
+    )
+    print(json.dumps({"run_id": ctx.run_id, "outputs": [o["key"] for o in ctx.outputs]}, indent=2))
+    return 0
+
+
 def _record_written(ctx, store, keys) -> None:
     """Record artifacts the job wrote through the store directly.
 
@@ -320,6 +375,14 @@ JOBS: dict[str, JobSpec] = {
         "Deliver the board's reading to the operator channel at 06:00 PT",
         True,
     ),
+    # alpha-engine-config-I10320/-I10322. On-demand, like data.heal and
+    # experiment.new: an operator/procedure runs it once per fault induced,
+    # never on a schedule.
+    FAULT_RECORD_JOB: JobSpec(
+        FAULT_RECORD_JOB,
+        "File the durable record of one induced scripted fault, or refuse",
+        False,
+    ),
 }
 
 HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
@@ -375,6 +438,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     "gate": track_f.gate_handler,
     track_f.GATE_CLOSE_JOB: track_f.gate_close_handler,
     morning.MORNING_JOB: morning.morning_handler,
+    FAULT_RECORD_JOB: _fault_record,
 }
 
 
@@ -533,6 +597,51 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if spec.name == "data.heal":
             sub.add_argument("--gap", required=True, help="The named gap to repair.")
+        if spec.name == FAULT_RECORD_JOB:
+            sub.add_argument(
+                "--fault",
+                required=True,
+                choices=SCRIPTED_FAULTS,
+                help="Which scripted fault (plan §10.7) this record is for.",
+            )
+            sub.add_argument(
+                "--target-job",
+                dest="target_job",
+                required=True,
+                help=(
+                    "The CLI job whose manifest this record excuses — e.g. data.weekly. "
+                    "Not `--job`: that positional slot is this command's own name."
+                ),
+            )
+            sub.add_argument(
+                "--run-id",
+                dest="run_id",
+                required=True,
+                help=(
+                    "The run_id of the FAILED manifest this record excuses. Refused "
+                    "unless a manifest under runs/{target-job}/{date}/ carries this "
+                    "exact run_id and reads status: failed — this command never invents "
+                    "a run_id to excuse."
+                ),
+            )
+            sub.add_argument(
+                "--bus-key",
+                dest="bus_key",
+                default=None,
+                metavar="alerts/{day}/{incident}.json",
+                # Omitted when the induction's live-sweep half has not
+                # produced a page yet (a finding filed on the tracker) — the
+                # record is then filed with bus_key: null, and
+                # fault_injection_against_scheduled_path reads that fault
+                # UNMET, not refused.
+                help=(
+                    "The alert bus row this fault produced. Refused unless the store "
+                    "holds it. Omit when the induction's live-sweep half has not "
+                    "produced one yet — the record is then filed with bus_key: null, "
+                    "and fault_injection_against_scheduled_path reads that fault UNMET, "
+                    "not refused."
+                ),
+            )
         if spec.name == "alerts.sweep":
             sub.add_argument(
                 "--now",

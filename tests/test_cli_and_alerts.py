@@ -53,6 +53,15 @@ def _minimal_argv(job: str) -> list[str]:
         # track-C: the pointer flip refuses a smoke manifest belonging to
         # another build, so the sha the smoke is verifying is required.
         argv += ["--release", "a" * 40]
+    if job == "fault.record":
+        argv += [
+            "--fault",
+            "data_source_withheld",
+            "--target-job",
+            "data.weekly",
+            "--run-id",
+            "01" + "A" * 24,
+        ]
     return argv
 
 
@@ -118,6 +127,12 @@ class TestJobSurface:
             # one -- the same separation `board` keeps from the artifacts it
             # grades, one layer further out.
             "report.morning",
+            # alpha-engine-config-I10320/-I10322: the producer of
+            # faults/{trading_day}/{fault}.json -- the record phase 2's
+            # fault_injection_against_scheduled_path clause reads. On-demand,
+            # like data.heal and experiment.new: filed once per induced
+            # fault, never on a schedule.
+            "fault.record",
         }
 
     @pytest.mark.parametrize("job", sorted(JOBS))
@@ -462,6 +477,15 @@ class TestDryRunNeverWrites:
             "by tests/test_weekly.py::TestRunsTheRealCommand::"
             "test_a_dry_run_arc_puts_dry_run_on_every_stage and "
             "test_a_real_arc_puts_dry_run_on_no_stage"
+        ),
+        "fault.record": (
+            "always refuses on a fresh store -- crucible.faults.record_fault looks for a "
+            "manifest naming --run-id BEFORE it ever writes, so a fresh store raises "
+            "FaultRecordRefusedError, not a clean dry-run print; --dry-run then never "
+            "reaches the write path at all (the property this class exists to check) "
+            "regardless of seeding. The refusal-before-write property itself is asserted "
+            "directly by tests/faults/test_fault_record_producer.py::"
+            "TestRefusals::test_refuses_before_writing_anything"
         ),
     }
 

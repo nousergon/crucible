@@ -602,18 +602,60 @@ def _status(key: str, document: dict[str, Any]) -> tuple[str | None, str | None]
     return status, None
 
 
+def _fault_excused_run_ids(store: Store) -> tuple[frozenset[str] | None, str | None]:
+    """Every `run_id` a fault-injection record (`faults/{day}/{fault}.json`,
+    `alpha-engine-config-I10320`/`-I10322`) claims to excuse, across every
+    trading day.
+
+    Matched on `run_id` alone, never on the trading day: a failed manifest is
+    excused from `arc_runs_ok`/`replays_ok` only when SOME fault record names
+    its exact `run_id`, so a genuine failure on a day a fault was once
+    induced still fails those clauses — `-I10322`'s whole design constraint.
+
+    Returns ``(None, problem)`` when the listing itself could not be read —
+    an access failure, not "no faults filed" — so the caller folds it into
+    `unmeasurable` rather than silently grading with zero exclusions. A
+    record that fails to parse, or names no `run_id`, is skipped rather than
+    raised: a malformed or hand-broken record excuses nothing, which is the
+    only safe default for a mechanism whose entire point is that it must
+    never be able to turn an arbitrary red clause green.
+    """
+    listed = _list_store_keys(store, FAULT_INJECTION_ROOT)
+    if listed.problem is not None:
+        return None, listed.problem
+    run_ids: set[str] = set()
+    for key in listed.keys or []:
+        if parse_fault_injection_key(key) is None:
+            continue
+        read = _read_store_document(store, key)
+        if read.problem is not None or read.absent:
+            continue
+        run_id = str((read.document or {}).get("run_id") or "").strip()
+        if run_id:
+            run_ids.add(run_id)
+    return frozenset(run_ids), None
+
+
 def _clause_arc_runs_ok(
     store: Store, window: list[dt.date], registry: dict[str, Component]
 ) -> Clause:
+    # A failure excused by a matching fault-injection record's run_id is not
+    # counted against this clause (alpha-engine-config-I10322) -- see
+    # `_fault_excused_run_ids` below.
     requirement = (
         "every stage of the weekly arc wrote a manifest with status `ok` for each "
-        "trading day in the window"
+        "trading day in the window, or its failure is excused by a fault-injection "
+        "record naming that exact run_id"
     )
     missing: list[str] = []
     malformed: list[str] = []
     unmeasurable: list[str] = []
     failed: list[str] = []
+    excused: list[str] = []
     evidence: list[str] = []
+    excused_run_ids, excused_problem = _fault_excused_run_ids(store)
+    if excused_problem is not None:
+        unmeasurable.append(excused_problem)
     for day in window:
         for stage in arc_stages(day, registry):
             key = manifest_key(stage.job, day.isoformat(), discriminator=stage.slot)
@@ -631,6 +673,10 @@ def _clause_arc_runs_ok(
                 malformed.append(problem)
                 continue
             if status != "ok":
+                run_id = str(document.get("run_id") or "")
+                if run_id and excused_run_ids is not None and run_id in excused_run_ids:
+                    excused.append(f"{stage.label}@{day.isoformat()} (run_id {run_id})")
+                    continue
                 failed.append(f"{stage.label}@{day.isoformat()}: {document['reason']}")
     if missing or malformed or unmeasurable or failed:
         parts = []
@@ -642,6 +688,8 @@ def _clause_arc_runs_ok(
             parts.append(f"{len(malformed)} malformed: {'; '.join(malformed[:4])}")
         if failed:
             parts.append(f"{len(failed)} failed ({'; '.join(failed[:2])})")
+        if excused:
+            parts.append(f"{len(excused)} excused by a fault record: {'; '.join(excused[:2])}")
         content_gap = bool(missing or malformed or failed)
         return Clause(
             "arc_runs_ok",
@@ -654,13 +702,10 @@ def _clause_arc_runs_ok(
             # access failure also occurred (round 3, finding 6).
             unmeasurable=bool(unmeasurable) and not content_gap,
         )
-    return Clause(
-        "arc_runs_ok",
-        requirement,
-        True,
-        f"{len(evidence)} stage manifests over {len(window)} trading days, all ok",
-        tuple(evidence),
-    )
+    detail = f"{len(evidence)} stage manifests over {len(window)} trading days, all ok"
+    if excused:
+        detail += f" ({len(excused)} excused by a matching fault record: {'; '.join(excused[:2])})"
+    return Clause("arc_runs_ok", requirement, True, detail, tuple(evidence))
 
 
 def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:

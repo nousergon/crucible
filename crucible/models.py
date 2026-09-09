@@ -128,6 +128,7 @@ __all__ = [
     "EXPERIMENT_EVENT_ROW_ADAPTER",
     "EligibilityHoldEventRow",
     "ExperimentEventRow",
+    "FaultRecordDocument",
     "FeatureRegistryDocument",
     "FeatureRow",
     "GitHubCommit",
@@ -330,6 +331,7 @@ JOB_VALUES: tuple[str, ...] = (
     "gate",
     "gate.close",
     "report.morning",
+    "fault.record",
 )
 
 #: The exhaustive `attempts[].reason` vocabulary: `initial` for the first
@@ -2386,3 +2388,86 @@ ExperimentEventRow = Annotated[
 #: the five legal values, instead of failing against whichever branch a
 #: caller happened to try first.
 EXPERIMENT_EVENT_ROW_ADAPTER: TypeAdapter[ExperimentEventRow] = TypeAdapter(ExperimentEventRow)
+
+
+# ── The fault-injection record (`alpha-engine-config-I10320`/`-I10322`) ────
+# Additive only, appended after the prior rows for the same rebase reason.
+
+
+class FaultRecordDocument(_Strict):
+    """`fault_record.v1`, written at `faults/{trading_day}/{fault_id}.json`
+    by `crucible.faults.record_fault` (`crucible fault.record`).
+
+    The document this repo WRITES (an OWN artifact, `extra="forbid"`), per
+    plan §10.7 and `crucible.gate._clause_fault_injection_against_scheduled_
+    path`, which declared the key shape and the two required fields
+    (`manifest_key`, `bus_key`) first and found no producer
+    (`alpha-engine-config-I10320`). This model conforms to that contract
+    rather than restating it — `fault_id` is deliberately a pattern-
+    constrained string, not a `Literal` over `crucible.gate.SCRIPTED_FAULTS`,
+    because `crucible.gate` already imports this module and a reverse import
+    would be circular; `crucible.faults.record_fault` is where membership in
+    `SCRIPTED_FAULTS` is actually enforced, at write time.
+
+    **`run_id` is the whole design constraint from `-I10322`.** A fault
+    record names the run it excuses; `crucible.gate._clause_arc_runs_ok`
+    (and `_clause_replays_ok`, which reads the same predicate) excludes a
+    failed manifest from those clauses ONLY when some record's `run_id`
+    matches that manifest's own `run_id` — never the trading day alone, so a
+    genuine failure on a day a fault was once induced still fails the
+    clause. `bus_key` is nullable: the live-sweep half of §10.7 is
+    structurally unreachable for some induced days
+    (`alpha-engine-config-I10125`), so a record may exist naming a real
+    excused run with no bus row yet — `fault_injection_against_scheduled_
+    path` reads that as UNMET, correctly, rather than refusing the record
+    outright.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "$id": "fault_record.v1",
+            "title": "Crucible fault-injection record, v1",
+            "description": (
+                "One durable record per scripted fault induced against the real "
+                "scheduled path (plan §10.7): the manifest the induced fault produced "
+                "and the bus row the sweep filed for it, so 'we ran fault injection' is "
+                "a reading rather than a sentence in a session transcript."
+            ),
+        },
+    )
+
+    schema_version: Literal["fault_record.v1"] = Field(
+        description="Version of THIS schema. A consumer that cannot read the version "
+        "refuses the document rather than guessing."
+    )
+    fault_id: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.-]{1,64}$",
+        description="One of `crucible.gate.SCRIPTED_FAULTS`, enforced at write time by "
+        "`crucible.faults.record_fault` rather than here (see class docstring).",
+    )
+    trading_day: IsoDate
+    run_id: str = Field(
+        pattern=r"^[0-9A-HJKMNP-TV-Z]{26}$",
+        description="The run_id of the manifest this record excuses. ULID. The clause "
+        "that reads this record matches on this field alone, never on trading_day.",
+    )
+    manifest_key: str = Field(
+        min_length=1,
+        description="The store key of the manifest named by run_id, which "
+        "`crucible.faults.record_fault` looked up and verified reads status: failed "
+        "before this record could be written.",
+    )
+    bus_key: str | None = Field(
+        default=None,
+        min_length=1,
+        description="The alert bus row this fault produced (alerts/{day}/{incident}.json), "
+        "or null when the induction's live-sweep half has not produced one yet.",
+    )
+    recorded_at_utc: UtcTimestamp = Field(
+        description="RFC 3339, UTC, `Z` suffix. When the injection procedure filed this "
+        "record, distinct from trading_day — a fault is induced against a trading day's "
+        "scheduled path, but the record is filed at the wall-clock instant of induction."
+    )
