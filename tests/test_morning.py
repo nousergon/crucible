@@ -33,12 +33,11 @@ import argparse
 import datetime as dt
 import json
 import pathlib
+import re
 from dataclasses import dataclass
 from typing import Any
 
 import pytest
-import re
-
 import yaml
 from botocore.exceptions import ClientError
 
