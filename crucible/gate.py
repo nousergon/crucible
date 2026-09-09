@@ -75,7 +75,7 @@ from crucible.release import POINTER_KEY
 from crucible.report import attribution_key
 from crucible.runner import TRANSIENT_CLASSIFIERS
 from crucible.slots import SLOTS, dispatchable_slots, is_control_arm
-from crucible.store import Store
+from crucible.store import S3Store, Store
 from crucible.tags import (
     TAG_KEY,
     TAG_VALUE,
@@ -122,7 +122,9 @@ __all__ = [
     "PHASE3_DELIVERABLES",
     "PHASE4_DELIVERABLES",
     "PHASE5_DELIVERABLES",
+    "PHASE2_AUTONOMY_MIN_SPAN",
     "PHASE2_LIVE_SATURDAYS",
+    "PHASE2_WINDOW_WEEKS",
     "PHASE2_MAX_PAGES",
     "PHASE2_MAX_TAGGED_USD",
     "PHASE2_REPLAY_SATURDAYS",
@@ -3313,10 +3315,74 @@ MANIFEST_RUN_MODE_LIVE = "live"
 MANIFEST_RUN_MODE_GAP_ISSUE = 9918
 LLM_ARM_CALLSITE_GAP_ISSUE = 9920
 
-#: How many first-attempt `ok` LIVE Saturdays phase 2 requires. §6.1's ruled
-#: minimum — "2 consecutive first-attempt `ok` Saturdays, not 4", the other
-#: two soak weeks traded for the five replays.
-PHASE2_LIVE_SATURDAYS = 2
+#: How many first-attempt `ok` LIVE Saturdays phase 2 requires, and NOTHING
+#: else. Read by `_clause_live_saturdays_first_attempt_ok` alone.
+#:
+#: **One, per Brian's ruling 2026-09-09** (`alpha-engine-config-I10324`),
+#: narrowed from §6.1's "2 consecutive first-attempt `ok` Saturdays, not 4" so
+#: phase 2 is completable by the 2026-09-12 weekly Step Function. A lowered bar
+#: carries its rationale or it is drift, so:
+#:
+#: * the evidence loss is bounded, not waived — nine other phase-2 clauses
+#:   carry the unattended claim (`zero_human_mutating_calls`, `replays_ok` over
+#:   five replay Saturdays, the two page clauses, the retry class, the fault
+#:   injection, the runbook, the commissioned-pages clause and the cost
+#:   ceiling), so one live Saturday is the only piece of evidence that shrinks;
+#: * phase 4's `trader_one_week_on_v2_champion` collects a further week of live
+#:   operation regardless, on the same infrastructure, before the old system is
+#:   gone — the soak is deferred, not deleted;
+#: * §6.1 already priced the trade this extends ("replay in place of two of the
+#:   four soak weeks, on a path whose inputs are point-in-time addressable"),
+#:   and named its residual as a live-only failure mode surfacing on Saturday
+#:   #3 or #4 — unchanged by this narrowing, because 09-19 and 09-26 still run.
+#:
+#: **This was ONE constant doing two unrelated jobs until
+#: `alpha-engine-config-I10324`.** It was `GATES["phase2"]`'s window width in
+#: weeks as well as the Saturday count, so narrowing the Saturday count would
+#: silently have narrowed the window `zero_human_mutating_calls`,
+#: `pages_within_ceiling` and `replays_ok` read — a ceiling of two pages over
+#: one week asserting almost nothing, with nothing in the edit saying so. The
+#: window width is now :data:`PHASE2_WINDOW_WEEKS`, and
+#: `tests/test_gate_phases_2_5.py` asserts neither name is reachable from the
+#: other's call site.
+PHASE2_LIVE_SATURDAYS = 1
+
+#: How many weeks wide phase 2's gate WINDOW is, and nothing else. Read by
+#: `GATES["phase2"]` alone, whence `evaluate` builds the window every phase-2
+#: clause is handed.
+#:
+#: TWO, which is what the pre-split constant happened to hold — so this split
+#: changes no window, deliberately: the Saturday count moved and the window did
+#: not, which is the whole point of there being two names. Two weeks is what
+#: makes `pages_within_ceiling`'s ceiling of :data:`PHASE2_MAX_PAGES` a
+#: statement about a period rather than about a day, and it is the shortest
+#: window that can contain a full weekly cycle plus the cycle it is compared
+#: against.
+#:
+#: NOT the same question as :data:`PHASE2_LIVE_SATURDAYS` and not derivable
+#: from it: how many live Saturdays must have gone perfectly is a claim about
+#: evidence, how much history a ceiling is counted over is a claim about a
+#: denominator, and the two moved together only by accident of one assignment.
+PHASE2_WINDOW_WEEKS = 2
+
+#: The shortest span `zero_human_mutating_calls` will grade at all, measured
+#: from the system's last change to the render day.
+#:
+#: **Declared, because the window now starts at the last change
+#: (`alpha-engine-config-I10324`), and a window that starts at the last change
+#: gets SHORTER every time the system changes.** Without a floor, an operator
+#: apply one minute before the read would leave a one-minute window with
+#: nothing in it and the clause would read MET — the change making the clause
+#: easier, which is the exact inverse of what it grades. With the floor, a
+#: change resets the clock and the clause reads UNMET until a full cycle has
+#: run past it.
+#:
+#: Seven calendar days: one complete weekly cycle, the unit phase 2's whole
+#: claim is denominated in (§6.1's "the only clock that cannot be faked is a
+#: live Saturday"). Calendar days rather than trading days on purpose — this is
+#: a CloudTrail window, one of rule 3's four exhaustive wall-clock exceptions,
+#: and a human touch on a Sunday counts.
+PHASE2_AUTONOMY_MIN_SPAN = dt.timedelta(days=7)
 
 #: How many replay Saturdays phase 2 re-grades through the phase-1 predicate.
 PHASE2_REPLAY_SATURDAYS = 5
@@ -3624,29 +3690,242 @@ def _s3_client() -> Any:
     return boto3.client("s3")
 
 
-def _clause_zero_human_mutating_calls(window: list[dt.date]) -> Clause:
-    """Plan §6 row 2 and §11 risk 8: zero human-originated mutating calls.
+class LastChangeUnreadableError(RuntimeError):
+    """One of the two inputs to the autonomy window's START could not be read.
+
+    Raised rather than falling back to a window that starts earlier (or at
+    zero). A window whose start defaulted when an input was unreadable would
+    grade a span nobody established, and it fails in the direction that looks
+    like diligence: the earlier the start, the more history, the more
+    authoritative the reading appears. `alpha-engine-config-I10324` requires
+    the opposite — either input unreadable is UNMEASURABLE.
+    """
+
+
+@dataclass(frozen=True)
+class _SystemChange:
+    """When the graded system last changed, and which input said so."""
+
+    at: dt.datetime
+    source: str
+    pointer_at: dt.datetime
+    stack_at: dt.datetime
+
+    def provenance(self) -> str:
+        return (
+            f"window starts {self.at.isoformat()} ({self.source}); release pointer "
+            f"{POINTER_KEY} flipped {self.pointer_at.isoformat()}, stack last updated "
+            f"{self.stack_at.isoformat()}"
+        )
+
+
+def _pointer_flip_time(store: Store) -> dt.datetime:
+    """When `releases/current` last moved, as an instant.
+
+    The pointer is the ONE mutable object in the release layout
+    (`crucible.release`), moved only by a conditional PUT on a green smoke, so
+    its object modification time IS the flip time — there is no separate flip
+    record to read, and `release.json` is deterministic across rebuilds by
+    design (`alpha-engine-config-I9786`) so it carries no instant at all.
+
+    `HeadObject` off the store's own client, mirroring
+    `crucible.release_lock_sweep._read_one` rather than inventing a second
+    way to reach the same header — that module already established the
+    pattern (and the rule that ONLY `LastModified` is trusted out of the
+    response).
+
+    A non-S3 backend raises: a `LocalStore` directory's mtime is a fact about
+    a laptop's filesystem, not a deploy record, and grading a live autonomy
+    window off it would be an answer about the workbench — the defect this
+    whole clause was rewritten to stop.
+    """
+    if not isinstance(store, S3Store):
+        raise LastChangeUnreadableError(
+            f"the store backend is {type(store).__name__}, not S3, so the release "
+            f"pointer {POINTER_KEY} has no flip instant to read. A local directory's "
+            "mtime is a fact about a filesystem, not a deploy"
+        )
+    try:
+        head = store.client.head_object(Bucket=store.bucket, Key=store._s3_key(POINTER_KEY))
+    except Exception as exc:
+        # Broader than `ClientError` on purpose, and NOT a swallow: the caller
+        # renders every branch of this function as UNMEASURABLE, and the
+        # failures that actually happen here are as often `NoCredentialsError`
+        # or an endpoint resolution error as they are a 403 or a 404. Catching
+        # only `ClientError` would take `crucible gate`, `build_ladder` and the
+        # board render down together over an expired credential — the same
+        # reasoning `_clause_zero_human_mutating_calls`'s archive read carries,
+        # and the exception class is named in the message either way.
+        code = getattr(exc, "response", None) and store._error_code(exc)
+        raise LastChangeUnreadableError(
+            f"head_object({POINTER_KEY}) failed: {code or type(exc).__name__}: {exc}. That "
+            "is a statement about our access or about the pointer being unset, not about "
+            "the system being measured"
+        ) from exc
+    last_modified = head.get("LastModified")
+    if last_modified is None:
+        raise LastChangeUnreadableError(
+            f"head_object({POINTER_KEY}) returned no LastModified, so the flip instant is unknown"
+        )
+    return _as_utc(last_modified)
+
+
+def _stack_last_updated(cfn: Any | None = None, *, stack: str | None = None) -> dt.datetime:
+    """When the graded stack was last applied, as an instant.
+
+    `DescribeStacks` rather than the drift or event APIs: `LastUpdatedTime` is
+    the one field that moves on every `aws cloudformation deploy` that changed
+    anything, and it is present on a stack nobody has updated since creation
+    only as `CreationTime` — which is why the fallback below is a fallback and
+    not an error. A never-updated stack HAS a last change; it is the day it
+    was created.
+
+    ``stack`` defaults to `crucible.config.settings().stack_name`, the same
+    `CRUCIBLE_STACK`-resolved name `crucible.autonomy.machine_principals` and
+    `crucible.tags.audit_stack_tags` read — a second account or a renamed
+    stack stays one variable.
+    """
+    from crucible.autonomy import _cfn_client  # noqa: PLC0415 - lazy, one call site
+    from crucible.config import settings  # noqa: PLC0415 - one call site
+
+    stack_name = stack or settings().stack_name
+    client = cfn if cfn is not None else _cfn_client()
+    try:
+        described = client.describe_stacks(StackName=stack_name)
+    except Exception as exc:
+        raise LastChangeUnreadableError(
+            f"describe_stacks({stack_name!r}) failed: {type(exc).__name__}: {exc}. An "
+            "undescribable stack is UNMEASURABLE, never a window starting at zero"
+        ) from exc
+    stacks = described.get("Stacks") or []
+    if not stacks:
+        raise LastChangeUnreadableError(
+            f"describe_stacks({stack_name!r}) returned no stack. The v2 environment is "
+            "applied by CloudFormation, so no stack means there is nothing whose last "
+            "change could bound a window"
+        )
+    when = stacks[0].get("LastUpdatedTime") or stacks[0].get("CreationTime")
+    if when is None:
+        raise LastChangeUnreadableError(
+            f"stack {stack_name!r} reports neither LastUpdatedTime nor CreationTime, so "
+            "the instant it last changed is unknown"
+        )
+    return _as_utc(when)
+
+
+def _as_utc(value: dt.datetime) -> dt.datetime:
+    """A tz-aware UTC instant. A naive datetime is REFUSED, not assumed UTC.
+
+    Both producers here (`HeadObject`, `DescribeStacks`) return aware
+    datetimes; a naive one means something substituted a value, and silently
+    labelling it UTC would shift a window by up to a day in whichever
+    direction the local zone happens to sit — a window boundary error that
+    reads as a clean number.
+    """
+    if value.tzinfo is None:
+        raise LastChangeUnreadableError(
+            f"a change instant arrived without a timezone ({value.isoformat()}); "
+            "assuming UTC would move the window boundary by the local offset"
+        )
+    return value.astimezone(dt.UTC)
+
+
+def _last_system_change(store: Store, *, cfn: Any | None = None) -> _SystemChange:
+    """`max(release pointer flip, stack last applied)`, with its provenance.
+
+    **BOTH inputs, and neither substitutes for the other** (`alpha-engine-
+    config-I10324`). A wheel flip changes what the box RUNS and leaves the
+    stack untouched; a stack apply changes the box's ENVIRONMENT — its roles,
+    schedules, topics, env vars — with no release flip at all, and the two
+    fixes that made the v2 box able to page and able to run a full-universe
+    weekly on 2026-09-09 were both the latter. Reading either alone would put
+    the window's start before a change it could not see.
+    """
+    pointer_at = _pointer_flip_time(store)
+    stack_at = _stack_last_updated(cfn)
+    if stack_at > pointer_at:
+        return _SystemChange(stack_at, "stack last applied", pointer_at, stack_at)
+    if pointer_at > stack_at:
+        return _SystemChange(pointer_at, "release pointer flip", pointer_at, stack_at)
+    return _SystemChange(
+        pointer_at, "release pointer flip and stack apply, same instant", pointer_at, stack_at
+    )
+
+
+def _event_instant(event_time: str) -> dt.datetime | None:
+    """A CloudTrail `eventTime` as an instant, or None when it will not parse."""
+    try:
+        return _as_utc(dt.datetime.fromisoformat(event_time.replace("Z", "+00:00")))
+    except (ValueError, TypeError, LastChangeUnreadableError):
+        return None
+
+
+def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Clause:
+    """Plan §6 row 2 and §11 risk 8: zero human-originated mutating calls, over
+    a window that starts at the system's LAST CHANGE.
 
     Read through `crucible.autonomy`, which walks the CloudTrail **S3
-    archive** over the whole window. `aws cloudtrail lookup-events` is
-    forbidden there and the acceptance suite asserts the module has no path to
-    it: the username lookup silently truncates to ~2 days, so a gate built on
-    it reports zero because it looked at two days.
+    archive**. `aws cloudtrail lookup-events` is forbidden there and the
+    acceptance suite asserts the module has no path to it: the username lookup
+    silently truncates to ~2 days, so a gate built on it reports zero because
+    it looked at two days.
+
+    **The window used to be the phase's rolling calendar window, and that
+    measured the workbench** (`alpha-engine-config-I10324`). Measured
+    2026-09-09 it read 167 human mutating calls over 2026-09-01..09-08 —
+    dominated by the operator-gated CloudFormation applies and dispatches that
+    MADE THE SYSTEM WORK. The v2 box could not page at all until 2026-09-09
+    (`alpha-engine-config-I10156`) and could not run a full-universe
+    `data.weekly` until the same day (the liquidity floor), so a window
+    spanning the repair cannot tell the repair from an intervention. Brian's
+    2026-09-04 ruling on phase 0 is the governing precedent: a phase completes
+    on "fix and rerun until it is successful", not on a span nobody touched.
+
+    So the window is `[last change, render day]`, and both halves of that
+    construction are load-bearing:
+
+    * `last change = max(release pointer flip, stack last applied)` —
+      :func:`_last_system_change`, which documents why neither input covers the
+      other. A pleasant consequence, and the reason there is NO carve-out here
+      for operator-gated applies: an apply now DEFINES the window's start
+      rather than violating it. A carve-out would be a second mechanism for the
+      same thing, and the one that fails open the day an operator does
+      something the allowlist did not anticipate.
+    * the window must ALSO be at least :data:`PHASE2_AUTONOMY_MIN_SPAN` long
+      and contain one complete weekly cycle whose close falls after the change.
+      Without that floor every change SHORTENS the window and makes this clause
+      EASIER — an apply one minute before the read would leave a one-minute
+      window containing nothing and read MET, which is the precise inverse of
+      what the clause grades. Too short is UNMET, not unmeasurable: the input
+      was perfectly readable and it said the system has not yet run a cycle
+      unattended.
+
+    Actions are counted from the change instant, not from midnight of the
+    change's day. `count_operator_actions` covers whole calendar days (the
+    archive is day-partitioned), so the day of the change arrives carrying the
+    operator's own applies; those are filtered here by `eventTime`. An
+    `eventTime` that will not parse is COUNTED rather than dropped — for a
+    clause asserting a count of zero, over-counting is investigated and
+    under-counting is a gate that reads clean because it could not read, the
+    same direction `crucible.autonomy._touches` chose.
     """
-    name = "zero_human_mutating_calls"
-    requirement = (
-        "zero human-originated mutating calls touched a v2 resource over the window, "
-        "counted from the CloudTrail S3 archive (never `lookup-events`, which truncates "
-        "its username lookup to ~2 days — §11 risk 8)"
-    )
     from crucible.autonomy import (  # noqa: PLC0415 - heavy import, one call site
         ArchiveMissingError,
         count_operator_actions,
     )
     from crucible.config import settings  # noqa: PLC0415 - one call site
 
+    name = "zero_human_mutating_calls"
+    requirement = (
+        "zero human-originated mutating calls touched a v2 resource between the "
+        "system's last change (the later of the release pointer flip and the "
+        f"{settings().stack_name} stack's last apply) and the render day, over a span "
+        f"of at least {PHASE2_AUTONOMY_MIN_SPAN.days} days containing one complete "
+        "weekly cycle, counted from the CloudTrail S3 archive (never `lookup-events`, "
+        "which truncates its username lookup to ~2 days — §11 risk 8)"
+    )
     archive = settings().cloudtrail_archive
-    evidence = (archive,) if archive else ()
+    evidence = (archive, POINTER_KEY) if archive else (POINTER_KEY,)
     if not archive:
         return _unmeasurable(
             name,
@@ -3658,14 +3937,50 @@ def _clause_zero_human_mutating_calls(window: list[dt.date]) -> Clause:
             "answer",
             evidence,
         )
-    bucket, _, prefix = archive.removeprefix("s3://").partition("/")
+    try:
+        change = _last_system_change(store)
+    except LastChangeUnreadableError as exc:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"the system's last change could not be established: {exc}",
+            evidence,
+        )
+    render_day = window[-1]
+    span = render_day - change.at.date()
+    if span < PHASE2_AUTONOMY_MIN_SPAN:
+        satisfiable_on = change.at.date() + PHASE2_AUTONOMY_MIN_SPAN
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"the system changed {change.at.isoformat()} ({change.source}), "
+            f"{span.days} day(s) before the render day {render_day.isoformat()}; the "
+            f"declared minimum span is {PHASE2_AUTONOMY_MIN_SPAN.days} days, so this "
+            f"reads UNMET until {satisfiable_on.isoformat()}. A window that shrank with "
+            "every change would make this clause easier the more the system was "
+            f"touched. {change.provenance()}",
+            evidence,
+        )
+    cycle_close = weekly_anchor(render_day)
+    if cycle_close <= change.at.date():
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"the most recent weekly close in the window, {cycle_close.isoformat()}, is "
+            f"not after the system's last change ({change.at.isoformat()}, "
+            f"{change.source}), so no complete weekly cycle has run unattended since "
+            f"it. {change.provenance()}",
+            evidence,
+        )
     try:
         counted = count_operator_actions(
             _s3_client(),
-            bucket=bucket,
-            prefix=prefix,
-            start=window[0],
-            end=window[-1],
+            bucket=archive.removeprefix("s3://").partition("/")[0],
+            prefix=archive.removeprefix("s3://").partition("/")[2],
+            start=change.at.date(),
+            end=render_day,
         )
     except ArchiveMissingError as exc:
         return _unmeasurable(name, requirement, f"ArchiveMissingError: {exc}", evidence)
@@ -3683,24 +3998,33 @@ def _clause_zero_human_mutating_calls(window: list[dt.date]) -> Clause:
             "That is a statement about our access, not about the system being measured",
             evidence,
         )
-    if counted.count:
+    after_change = tuple(
+        action
+        for action in counted.actions
+        if (instant := _event_instant(action.event_time)) is None or instant >= change.at
+    )
+    if after_change:
         offenders = ", ".join(
-            f"{a.principal} {a.event_name}@{a.event_time}" for a in counted.actions[:4]
+            f"{a.principal} {a.event_name}@{a.event_time}" for a in after_change[:4]
         )
         return Clause(
             name,
             requirement,
             False,
-            f"{counted.count} human mutating call(s) over "
-            f"{window[0].isoformat()}..{window[-1].isoformat()}: {offenders}",
+            f"{len(after_change)} human mutating call(s) over "
+            f"{change.at.isoformat()}..{render_day.isoformat()}: {offenders}. "
+            f"{change.provenance()}",
             evidence,
         )
     return Clause(
         name,
         requirement,
         True,
-        f"0 human mutating calls over {counted.records_scanned} records in "
-        f"{counted.objects_read} archive objects",
+        f"0 human mutating calls over {span.days} days "
+        f"({change.at.isoformat()}..{render_day.isoformat()}), "
+        f"{counted.records_scanned} records in {counted.objects_read} archive objects; "
+        f"{len(counted.actions) - len(after_change)} call(s) on the change day itself "
+        f"predate the change and are excluded. {change.provenance()}",
         evidence,
     )
 
@@ -4816,7 +5140,7 @@ def _phase2(
     return [
         _clause_live_saturdays_first_attempt_ok(store, window),
         _clause_replays_ok(store, window, registry),
-        _clause_zero_human_mutating_calls(window),
+        _clause_zero_human_mutating_calls(store, window),
         _clause_pages_within_ceiling(store, window),
         _clause_pages_commissioned(store),
         _clause_two_page_conditions_on_real_channel(store),
@@ -5347,7 +5671,7 @@ def _phase5(
 GATES: dict[str, tuple[int, Any]] = {
     "phase0": (1, _phase0),
     "phase1": (5, _phase1),
-    "phase2": (PHASE2_LIVE_SATURDAYS, _phase2),
+    "phase2": (PHASE2_WINDOW_WEEKS, _phase2),
     "phase3": (4, _phase3),
     "phase4": (2, _phase4),
     "phase5": (1, _phase5),
