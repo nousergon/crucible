@@ -266,16 +266,67 @@ class TestTransientRetryClassInRunner:
 # ── deliverable 4: fault injection against the scheduled path ───────────────
 
 
-def _fault_record(store: LocalStore, fault: str, *, manifest: str, bus: str) -> str:
+#: A conforming `fault_record.v1` body per outcome, before the store keys are
+#: substituted in. The reader validates every record against the producer's own
+#: model (`alpha-engine-config-I10327`), so a fixture that wrote a partial
+#: document would only ever exercise the conformance refusal.
+_RUN_ID = "01M23BQV1C6EPDR8DEA5WS59M4"
+
+
+def _record_body(fault: str, outcome: str, **overrides: object) -> dict:
+    body: dict = {
+        "schema_version": "fault_record.v1",
+        "fault_id": fault,
+        "outcome": outcome,
+        "trading_day": DAY,
+        "run_id": _RUN_ID if outcome != "unreachable" else None,
+        FAULT_RECORD_MANIFEST_FIELD: None,
+        FAULT_RECORD_BUS_FIELD: None,
+        "attempt": {"n": 2, "reason": "spot_interruption"} if outcome == "absorbed" else None,
+        "closed_paths": (
+            [
+                {
+                    "path": "the pointer comes to name an unpublished sha",
+                    "mechanism": "crucible.release.pin",
+                    "probe": "pin_refuses_an_unpublished_sha",
+                    "expected": "StaleReleasePointerError, raised before any write",
+                    "observed": "StaleReleasePointerError: was never published",
+                    "checked_at_utc": "2026-09-09T12:00:00Z",
+                }
+            ]
+            if outcome == "unreachable"
+            else None
+        ),
+        "recorded_at_utc": "2026-09-09T12:00:00Z",
+    }
+    body.update(overrides)
+    return body
+
+
+def _fault_record(store: LocalStore, fault: str, *, outcome: str = "induced", **overrides) -> str:
     key = fault_injection_key(fault, DAY)
-    _put(store, key, {FAULT_RECORD_MANIFEST_FIELD: manifest, FAULT_RECORD_BUS_FIELD: bus})
+    _put(store, key, _record_body(fault, outcome, **overrides))
     return key
 
 
 def _induced(store: LocalStore, fault: str, discriminator: str) -> str:
     manifest = _manifest(store, "weekly")
     bus = _row(store, "failure", discriminator=discriminator)
-    return _fault_record(store, fault, manifest=manifest, bus=bus)
+    return _fault_record(
+        store,
+        fault,
+        **{FAULT_RECORD_MANIFEST_FIELD: manifest, FAULT_RECORD_BUS_FIELD: bus},
+    )
+
+
+def _absorbed(store: LocalStore, fault: str) -> str:
+    """A record for a fault the system HANDLED: an `ok` manifest and NO bus
+    row. The kind that used to be unrecordable, since the shipped reader
+    required a bus key of every record."""
+    manifest = _manifest(store, "weekly")
+    return _fault_record(
+        store, fault, outcome="absorbed", **{FAULT_RECORD_MANIFEST_FIELD: manifest}
+    )
 
 
 class TestFaultInjectionAgainstScheduledPath:
@@ -314,8 +365,10 @@ class TestFaultInjectionAgainstScheduledPath:
         _fault_record(
             store,
             SCRIPTED_FAULTS[0],
-            manifest=manifest_key("weekly", "2026-08-07"),
-            bus=_bus_key("failure", "f0"),
+            **{
+                FAULT_RECORD_MANIFEST_FIELD: manifest_key("weekly", "2026-08-07"),
+                FAULT_RECORD_BUS_FIELD: _bus_key("failure", "f0"),
+            },
         )
         clause = gate_module._clause_fault_injection_against_scheduled_path(store)
         assert not clause.met and not clause.unmeasurable
@@ -327,20 +380,87 @@ class TestFaultInjectionAgainstScheduledPath:
         _fault_record(
             store,
             SCRIPTED_FAULTS[1],
-            manifest=manifest_key("weekly", DAY),
-            bus=manifest_key("weekly", DAY),
+            **{
+                FAULT_RECORD_MANIFEST_FIELD: manifest_key("weekly", DAY),
+                FAULT_RECORD_BUS_FIELD: manifest_key("weekly", DAY),
+            },
         )
         clause = gate_module._clause_fault_injection_against_scheduled_path(store)
         assert not clause.met and not clause.unmeasurable
         assert "is not an alert bus key" in clause.detail
 
     def test_a_record_missing_a_field_is_unmet(self, store: LocalStore) -> None:
+        """A non-conforming record is UNMET naming the field, never graded on
+        whichever fields happen to be populated."""
         for index, fault in enumerate(SCRIPTED_FAULTS):
             _induced(store, fault, discriminator=f"f{index}")
         _put(store, fault_injection_key(SCRIPTED_FAULTS[2], DAY), {FAULT_RECORD_BUS_FIELD: ""})
         clause = gate_module._clause_fault_injection_against_scheduled_path(store)
         assert not clause.met
-        assert f"names no `{FAULT_RECORD_MANIFEST_FIELD}`" in clause.detail
+        assert "does not conform to fault_record.v1" in clause.detail
+
+    def test_met_for_an_absorbed_fault_with_no_bus_row(self, store: LocalStore) -> None:
+        """`alpha-engine-config-I10327`. Fault 1's designed outcome is a spot
+        interruption the runner ABSORBS, so its manifest reads `ok` and no page
+        fires. This clause required a `bus_key` of every record, which made it
+        unsatisfiable for exactly the fault whose point is that the system
+        survived."""
+        for index, fault in enumerate(SCRIPTED_FAULTS[1:], start=1):
+            _induced(store, fault, discriminator=f"f{index}")
+        _absorbed(store, SCRIPTED_FAULTS[0])
+        clause = gate_module._clause_fault_injection_against_scheduled_path(store)
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert "(absorbed)" in clause.detail
+
+    def test_an_absorbed_record_carrying_a_bus_row_is_unmet(self, store: LocalStore) -> None:
+        """The refusal `-I10327` names: a page on an absorbed fault would mean
+        the retry did NOT work, so a `bus_key` here is a contradiction the
+        reader reports rather than tolerates — and it is the route by which a
+        bus row borrowed from an unrelated incident would have satisfied this
+        clause."""
+        for index, fault in enumerate(SCRIPTED_FAULTS[1:], start=1):
+            _induced(store, fault, discriminator=f"f{index}")
+        manifest = _manifest(store, "weekly")
+        bus = _row(store, "failure", discriminator="borrowed")
+        _fault_record(
+            store,
+            SCRIPTED_FAULTS[0],
+            outcome="absorbed",
+            **{FAULT_RECORD_MANIFEST_FIELD: manifest, FAULT_RECORD_BUS_FIELD: bus},
+        )
+        clause = gate_module._clause_fault_injection_against_scheduled_path(store)
+        assert not clause.met and not clause.unmeasurable
+        assert "must not carry `bus_key`" in clause.detail
+
+    def test_met_for_an_unreachable_fault_naming_no_store_key(self, store: LocalStore) -> None:
+        """Fault 4's state cannot be entered, so there is no manifest and no
+        page. The evidence is the executed probes, and the reading names them."""
+        for index, fault in enumerate(SCRIPTED_FAULTS[:-1]):
+            _induced(store, fault, discriminator=f"f{index}")
+        _fault_record(store, SCRIPTED_FAULTS[-1], outcome="unreachable")
+        clause = gate_module._clause_fault_injection_against_scheduled_path(store)
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert "pin_refuses_an_unpublished_sha" in clause.detail
+
+    def test_an_unreachable_record_with_no_closed_paths_is_unmet(self, store: LocalStore) -> None:
+        """The evidence cannot be empty: a record claiming a state is
+        unreachable while naming not one closed path is an attestation."""
+        for index, fault in enumerate(SCRIPTED_FAULTS[:-1]):
+            _induced(store, fault, discriminator=f"f{index}")
+        _fault_record(store, SCRIPTED_FAULTS[-1], outcome="unreachable", closed_paths=[])
+        clause = gate_module._clause_fault_injection_against_scheduled_path(store)
+        assert not clause.met and not clause.unmeasurable
+        assert "does not conform to fault_record.v1" in clause.detail
+
+    def test_an_unreachable_record_carrying_a_run_id_is_unmet(self, store: LocalStore) -> None:
+        """It must be STRUCTURALLY incapable of excusing a manifest, and the
+        reader refuses the shape rather than trusting the producer to have."""
+        for index, fault in enumerate(SCRIPTED_FAULTS[:-1]):
+            _induced(store, fault, discriminator=f"f{index}")
+        _fault_record(store, SCRIPTED_FAULTS[-1], outcome="unreachable", run_id=_RUN_ID)
+        clause = gate_module._clause_fault_injection_against_scheduled_path(store)
+        assert not clause.met and not clause.unmeasurable
+        assert "must not carry `run_id`" in clause.detail
 
     def test_the_declared_fault_list_matches_the_suite_that_exercises_them(self) -> None:
         """`SCRIPTED_FAULTS` is the plan's list, not a scan of the suite — so
