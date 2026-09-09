@@ -485,6 +485,21 @@
       "title": "Metrics",
       "type": "array"
     },
+    "now_override_utc": {
+      "anyOf": [
+        {
+          "description": "RFC 3339, UTC, `Z` suffix. A local-time timestamp in an artifact keyed by trading day is a date bug waiting to happen.",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "I10125: present only when the run's own evaluation logic reasoned from an OPERATOR-OVERRIDDEN instant rather than the real wall clock at `started`/`finished`. Today only `alerts.sweep --now` sets it, to sweep a historical trading day's catch-up and ceiling windows without landing inside `crucible.gate._clause_pages_within_ceiling`'s live grading window, which is anchored to the real wall clock and unaffected by this field. Absent for every natural run \u2014 never encodes a fact `started`/`finished` already carry, and its presence is what makes a hand-chosen historical sweep structurally distinguishable from one that actually happened live.",
+      "title": "Now Override Utc"
+    },
     "outputs": {
       "description": "\u00a79.2 class 4, downstream half. Content hashes are what make a rerun idempotent: identical bytes are a no-op.",
       "items": {

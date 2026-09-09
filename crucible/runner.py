@@ -255,6 +255,17 @@ class RunContext:
     #: that writes at most one manifest per trading day (alpha-engine-config-I9781).
     discriminator: str | None = None
 
+    #: Set by `run_job` from its own `now_override` argument — never by the
+    #: job body. `alpha-engine-config-I10125`: an OPERATOR OVERRIDE of the
+    #: wall-clock instant a job's own evaluation logic reasons from (today,
+    #: only `alerts.sweep`'s catch-up/ceiling windows), distinct from
+    #: `started`/`finished`, which stay the REAL wall clock this process ran
+    #: at. Mirrors `discriminator`'s shape: `None` for every job that never
+    #: passes it, and omitted from the manifest entirely rather than written
+    #: as null (see `_write_manifest`) — a natural run's manifest stays
+    #: byte-identical to one from before this field existed.
+    now_override: dt.datetime | None = None
+
     inputs: list[dict[str, Any]] = field(default_factory=list)
     outputs: list[dict[str, Any]] = field(default_factory=list)
     rows_in: int = 0
@@ -364,6 +375,7 @@ def run_job(
     discriminator: str | Callable[[RunContext], str] | None = None,
     dry_run: bool = False,
     run_mode: str | None = None,
+    now_override: dt.datetime | None = None,
 ) -> RunContext:
     """Run ``fn`` as job ``job`` and write its manifest, whatever happens.
 
@@ -431,6 +443,23 @@ def run_job(
     `run_mode`, but a caller that cannot say whether it is live or a replay
     has the same bug whether or not `--dry-run` is also set.
 
+    ``now_override`` records an operator override of the wall-clock instant a
+    job's OWN evaluation logic reasons from — distinct from ``now`` above,
+    which is when this process actually ran and stays real regardless.
+    Today only `alerts.sweep` passes this (`alpha-engine-config-I10125`): its
+    catch-up horizon and ceiling window are anchored to wall-clock `now` by
+    construction, which makes them structurally coincident with
+    `crucible.gate._clause_pages_within_ceiling`'s live grading window — a
+    fault could not be swept for real without landing inside a window
+    already being graded. This parameter is the honesty half of that fix: it
+    is never read to decide what the job body does (the CLI resolves the
+    override and passes it separately into `alerts.sweep(now=...)` itself);
+    it exists so `_write_manifest` can record `now_override_utc` on the
+    manifest whether or not the job body remembered to say so, making an
+    overridden run structurally distinguishable from a natural one rather
+    than relying on the body's own bookkeeping. `None` (the default) writes
+    nothing, so every other job's manifest is unaffected.
+
     Returns the :class:`RunContext` on success. Re-raises on failure, after
     the manifest is on disk (or, on ``dry_run=True``, after the one line is
     printed in its place).
@@ -461,6 +490,7 @@ def run_job(
         )
         ctx.attempts = [dict(a) for a in attempts]
         ctx.discriminator = discriminator(ctx) if callable(discriminator) else discriminator
+        ctx.now_override = now_override
 
         # `alpha-engine-config-I9986` deliverable 1: the fleet cost-sink
         # partitions every row under `{prefix}/{date}/{run_id}/`
@@ -594,6 +624,14 @@ def _write_manifest(
         # it optional, not nullable, so a job with one writer per trading day
         # produces a manifest byte-identical to one from before I9781.
         manifest["discriminator"] = ctx.discriminator
+    if ctx.now_override is not None:
+        # Same "omitted entirely" shape as discriminator, same reason: a run
+        # that never overrode `now` produces a manifest byte-identical to one
+        # from before this field existed. `alpha-engine-config-I10125`: this
+        # is the field that makes an overridden sweep structurally
+        # distinguishable from a natural one — a hand-chosen historical
+        # window must never read as though it were observed live.
+        manifest["now_override_utc"] = _utc(ctx.now_override)
     # cost_usd must be >= the sum of llm_calls[].usd (schemas/run_manifest.v1.json,
     # `cost_usd` description) — a schema cannot cross-reference two fields of
     # the same document, so the runner asserts it here, before the write, per
