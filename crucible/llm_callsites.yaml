@@ -54,6 +54,71 @@ schema_version: llm_callsite_registry.v1
 # `crucible.llm._capability_classes` with no row here — this list exists
 # only for a class whose name is NOT already a group name, and there is none
 # today.
-capability_classes: []
+#
+# ONE NAME NOW CARRIES A REASON (`alpha-engine-config-I10343`):
+#
+#   chaos_probe
+#     A FAULT-INJECTION TARGET, and the reason it is listed is that it must
+#     never be reachable by a production arm. It is a real model group in the
+#     fleet's private model registry whose contract is "never serves": every
+#     member routes to a real, already-configured upstream host with a model
+#     string that host will never answer, so a call always fails at the
+#     provider rather than at the router edge. Plan §10.7 fault 3 ("the LLM
+#     router returns 500") is not inducible against the real scheduled path
+#     without it — and it was not inducible WITH it either, because the group
+#     was declared on the registry side of the boundary while
+#     `crucible.llm._require_capability_class` refused the name here, so no
+#     crucible call site could ask for it (`alpha-engine-config-I10343`, the
+#     same "seam with no reachable consumer" shape as -I10156, -I10317 and
+#     -I10327).
+#     It is NOT a tier group, so listing it here is the only way to make it
+#     askable at all — which is the property that makes this a deliberate
+#     edit rather than something a call site could arrange for itself. What
+#     stops it becoming reachable by accident, in both directions:
+#       * a `chaos_probe` member may not join any other group's fallback
+#         chain, and no ordinary model may join this group — enforced
+#         structurally, per group, on every registry PR
+#         (`alpha-engine-config/scripts/validate_llm_model_registry.py`
+#         invariant 21, a blocking error);
+#       * an arm recipe whose `llm_callsite` names a call site declaring a
+#         fault-injection class is REFUSED at parse time
+#         (`crucible.slots.arms`), so no U/R arm can select it;
+#       * the per-run override that redirects an ordinary call site to it
+#         admits nothing else, and is recorded on the manifest
+#         (`crucible.llm.parse_fault_capability_class`,
+#         `fault_capability_class`).
+#     `crucible.llm.FAULT_INJECTION_CAPABILITY_CLASSES` is the machine-
+#     checkable half of this paragraph; `tests/test_chaos_probe_containment.py`
+#     holds the two lists equal and every refusal above firing.
+capability_classes:
+  - chaos_probe
 
-callsites: {}
+# NO LONGER EMPTY, and the one row is not an LLM arm.
+#
+# `faults.router_probe` exists to be broken. It is the call site
+# `crucible.fault_probe` reaches the router through so that plan §10.7 fault
+# 3 can be induced against the real dispatched path — a job that reaches a
+# model, fails on the transport, writes `status: failed` with the cause, and
+# pages exactly once. Its `capability_class` is the fault-injection group
+# itself, so this row cannot address a serving model even by accident: there
+# is no invocation of it that spends money at a real provider, and its
+# ceiling is nominal for that reason (a call that never completes is never
+# billed; the field's schema forbids 0).
+#
+# It is deliberately NOT registered in the fleet-wide
+# `alpha-engine-config` `LLM_CALLSITE_REGISTRY.yaml`: that register's row
+# shape is about provider linkage, prompt-cache buckets and model pinning —
+# every field of which is a statement about a call that serves. Filing a
+# never-serving probe there would put a fabricated cache floor and a
+# fabricated provider beside real rows. Recorded as a deliberate omission
+# rather than an oversight; if a phase-5 call site lands here, THAT one needs
+# its fleet row.
+callsites:
+  faults.router_probe:
+    purpose: >-
+      Reach the router once through the declared door so a transport failure
+      can be induced on the real dispatched path (plan §10.7 fault 3); it asks
+      for a group contracted never to serve, so it always fails.
+    capability_class: chaos_probe
+    max_usd_per_call: 0.01
+    owner: crucible.fault_probe

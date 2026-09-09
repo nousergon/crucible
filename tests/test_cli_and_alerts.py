@@ -53,6 +53,12 @@ def _minimal_argv(job: str) -> list[str]:
         # track-C: the pointer flip refuses a smoke manifest belonging to
         # another build, so the sha the smoke is verifying is required.
         argv += ["--release", "a" * 40]
+    if job == "fault.probe":
+        # alpha-engine-config-I10343: the request is the whole job, so the
+        # class is required rather than defaulted -- a `fault.probe` that
+        # picked its own fault-injection class would be a job that could
+        # induce a fault nobody asked for.
+        argv += ["--fault-capability-class", "chaos_probe"]
     if job == "fault.record":
         # `--outcome` is required, and which of the remaining flags are legal
         # is decided by it — inside `crucible.faults.record_fault`, not the
@@ -139,6 +145,10 @@ class TestJobSurface:
             # like data.heal and experiment.new: filed once per induced
             # fault, never on a schedule.
             "fault.record",
+            # alpha-engine-config-I10343: the INDUCER for §10.7 fault 3, kept
+            # separate from `fault.record` (the attester). On-demand -- a job
+            # that can only ever fail would page every cycle on a schedule.
+            "fault.probe",
         }
 
     @pytest.mark.parametrize("job", sorted(JOBS))
@@ -492,6 +502,14 @@ class TestDryRunNeverWrites:
             "regardless of seeding. The refusal-before-write property itself is asserted "
             "directly by tests/faults/test_fault_record_producer.py::"
             "TestRefusals::test_refuses_before_writing_anything"
+        ),
+        "fault.probe": (
+            "reaches a real provider on every invocation by design -- its registered call "
+            "site asks for a capability class contracted never to serve, so there is no "
+            "clean dry-run print, only a transport failure. Its --dry-run property (the "
+            "run raises AND no manifest is written) is asserted directly, against a fake "
+            "transport, by tests/test_chaos_probe_containment.py::"
+            "TestTheProbeJob::test_a_dry_run_probe_still_fails_and_writes_no_manifest"
         ),
     }
 

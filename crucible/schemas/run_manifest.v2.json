@@ -425,6 +425,20 @@
       "description": "Present only for a job that legitimately writes more than one manifest for the same `job`+`trading_day` \u2014 the slot letter (u/r/m/s) for `experiment.run`/`experiment.grade`, or the firing's own `calendar_date` for `alerts.sweep`, which runs every calendar day and can therefore fire more than once against one trading day. Absent for every other job. Never encodes a fact `job` or `trading_day` already carries (I9781); see `crucible.manifest.manifest_key`.",
       "title": "Discriminator"
     },
+    "fault_capability_class": {
+      "anyOf": [
+        {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "I10343: present only when an operator deliberately redirected this run's LLM routing to a capability class contracted NEVER to serve, to induce plan \u00a710.7 fault 3 (the router returns an error) against the real dispatched path. Set from `crucible fault.probe --fault-capability-class`, never by a job body, and only ever one of `crucible.llm.FAULT_INJECTION_CAPABILITY_CLASSES`. Absent for every natural run \u2014 its presence is what makes an ARRANGED transport failure structurally distinguishable from a real one, which a fault record naming this manifest as `induced` evidence depends on.",
+      "title": "Fault Capability Class"
+    },
     "finished": {
       "description": "Written in the runner's `finally` block, so it is present even when the job raised.",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
@@ -465,7 +479,8 @@
         "gate",
         "gate.close",
         "report.morning",
-        "fault.record"
+        "fault.record",
+        "fault.probe"
       ],
       "title": "Job",
       "type": "string"

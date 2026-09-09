@@ -34,17 +34,27 @@ from dataclasses import dataclass
 
 from crucible import __version__, morning, track_c, track_e, track_f  # track-C, track-E, track-F
 from crucible.calendar import resolve_trading_day
+from crucible.fault_probe import FAULT_PROBE_JOB, fault_probe_handler
 from crucible.faults import FAULT_RECORD_JOB, record_fault
 from crucible.gate import SCRIPTED_FAULTS
 from crucible.keys import arena_cycle_key, champion_key
 from crucible.keys import manifest_key as _promote_manifest_key
+from crucible.llm import FAULT_INJECTION_CAPABILITY_CLASSES
 from crucible.models import FAULT_OUTCOME_VALUES
 from crucible.release_retention import RELEASE_LOCK_JOB, release_lock_handler
 from crucible.runmode import RUN_MODES, resolve_run_mode
 from crucible.track_a import HANDLERS as TRACK_A_HANDLERS
 from crucible.track_a import add_track_a_arguments
 
-__all__ = ["HANDLERS", "JOBS", "JobSpec", "build_parser", "is_stub", "main"]
+__all__ = [
+    "FAULT_CAPABILITY_CLASS_JOBS",
+    "HANDLERS",
+    "JOBS",
+    "JobSpec",
+    "build_parser",
+    "is_stub",
+    "main",
+]
 
 
 @dataclass(frozen=True)
@@ -393,7 +403,36 @@ JOBS: dict[str, JobSpec] = {
         "File the durable record of one exercised scripted fault, or refuse",
         False,
     ),
+    # alpha-engine-config-I10343. The INDUCER for plan §10.7 fault 3, kept
+    # separate from `fault.record` (the attester) on purpose: a job that both
+    # induced a fault and attested to it is the rubber stamp
+    # `crucible.faults`' refusals exist to prevent. On-demand — a permanently
+    # failing job on a schedule would page every cycle forever.
+    FAULT_PROBE_JOB: JobSpec(
+        FAULT_PROBE_JOB,
+        "Induce a router transport failure on the real dispatched path (§10.7 fault 3)",
+        False,
+    ),
 }
+
+#: The jobs that carry `--fault-capability-class`, exhaustively.
+#:
+#: **A closed set rather than every job, because the alternative is a silent
+#: no-op** (rule 5). The flag only does anything for a job that reaches a
+#: model: `crucible.llm.call` is what reads the override off the run context,
+#: so passing it to `board` or `heartbeat` would be accepted, recorded on the
+#: manifest and change nothing — an operator would have "induced" a fault that
+#: never had a call site to fire in. A job absent from this set refuses the
+#: flag as an unknown argument instead.
+#:
+#: `fault.probe` is the only member today, and the flag is REQUIRED there: the
+#: job exists for no other purpose. Phase 5 adds `experiment.run` — which is
+#: the point of building the override rather than hard-wiring the probe's
+#: class, since faulting a real arm run is what proves a job that knows
+#: nothing about fault injection fails correctly. That addition is a
+#: deliberate edit here, on the day such an arm exists.
+FAULT_CAPABILITY_CLASS_JOBS: frozenset[str] = frozenset({FAULT_PROBE_JOB})
+
 
 HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     "data.daily": _todo("data.daily", "track A", "Lifts the ingest core from nousergon-data."),
@@ -449,6 +488,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     track_f.GATE_CLOSE_JOB: track_f.gate_close_handler,
     morning.MORNING_JOB: morning.morning_handler,
     FAULT_RECORD_JOB: _fault_record,
+    FAULT_PROBE_JOB: fault_probe_handler,
 }
 
 
@@ -664,6 +704,26 @@ def build_parser() -> argparse.ArgumentParser:
                     "not work, so the row's ABSENCE is part of what the record asserts, "
                     "and it is never a field borrowed from an unrelated incident to make "
                     "a clause read better."
+                ),
+            )
+        if spec.name in FAULT_CAPABILITY_CLASS_JOBS:
+            sub.add_argument(
+                "--fault-capability-class",
+                dest="fault_capability_class",
+                required=spec.name == FAULT_PROBE_JOB,
+                choices=sorted(FAULT_INJECTION_CAPABILITY_CLASSES),
+                default=None,
+                help=(
+                    "FAULT INJECTION, not the normal path: route every LLM call this run "
+                    "makes to a capability class whose router group is contracted NEVER to "
+                    "serve, so plan §10.7 fault 3 (the router returns an error) is induced "
+                    "against the real dispatched path. Only a fault-injection class is "
+                    "accepted — a real router group is refused, because a flag that could "
+                    "choose which model serves a graded run is a second routing plane. "
+                    "Recorded verbatim as `fault_capability_class` on the manifest, so an "
+                    "arranged transport failure is never mistakable for a real one. No "
+                    "other consumer's routing is touched: the redirect is this run's "
+                    "context and nothing else."
                 ),
             )
         if spec.name == "alerts.sweep":

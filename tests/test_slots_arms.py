@@ -90,8 +90,12 @@ class TestAnArmDeclaresItsLlmCallSite:
     register answers by itself, never a heuristic over ranker names."""
 
     def test_an_unregistered_call_site_is_refused_at_load(self, tmp_path) -> None:
-        """The registry is empty until phase 5, so ANY declared site is
-        unregistered today — and the arm must not register-and-be-ignored."""
+        """The only registered site today is the fault-injection probe
+        (`alpha-engine-config-I10343`), so any OTHER declared site is
+        unregistered — and the arm must not register-and-be-ignored. Naming
+        the probe itself is refused too, by a different rule and with a
+        different message: `tests/test_chaos_probe_containment.py::
+        TestNoArmCanSelectIt`."""
         arms = tmp_path / "arms" / "u"
         arms.mkdir(parents=True)
         _write_llm_arm(arms, "thesis", "research.thesis")
@@ -114,7 +118,21 @@ class TestAnArmDeclaresItsLlmCallSite:
         two arms."""
         import crucible.llm as llm
 
-        monkeypatch.setattr(llm, "LLM_CALLSITE_REGISTRY", {"research.thesis": object()})
+        monkeypatch.setattr(
+            llm,
+            "LLM_CALLSITE_REGISTRY",
+            # A real `CallSite`: the loader reads `capability_class` off the row
+            # to refuse a fault-injection target (`alpha-engine-config-I10343`).
+            {
+                "research.thesis": llm.CallSite(
+                    callsite_id="research.thesis",
+                    purpose="draft one arm's thesis",
+                    capability_class="high",
+                    max_usd_per_call=0.25,
+                    owner="tests.test_slots_arms",
+                )
+            },
+        )
         arms = tmp_path / "arms" / "u"
         arms.mkdir(parents=True)
         _write_llm_arm(arms, "thesis", "research.thesis")

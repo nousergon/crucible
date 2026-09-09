@@ -272,6 +272,7 @@ def _require_registered_callsite(value: Any, *, origin: str) -> None:
     """
     from crucible.llm import (  # noqa: PLC0415 - one call site, heavy import
         CALLSITE_REGISTRY_PATH,
+        FAULT_INJECTION_CAPABILITY_CLASSES,
         LLM_CALLSITE_REGISTRY,
     )
 
@@ -287,6 +288,45 @@ def _require_registered_callsite(value: Any, *, origin: str) -> None:
             f"of LLM_CALLSITE_REGISTRY ({CALLSITE_REGISTRY_PATH.name}: {registered}). An "
             "arm reaches a model only through a registered call site — register the "
             "site first, in the same change as the code that calls it."
+        )
+    # FAULT-INJECTION CONTAINMENT (`alpha-engine-config-I10343`).
+    #
+    # Some registered call sites exist in order to FAIL: `faults.router_probe`
+    # asks for a capability class whose router group is contracted never to
+    # serve, so plan §10.7 fault 3 can be induced against the real dispatched
+    # path. Registration is what makes it reachable by the door at all, and it
+    # is exactly what would also make it selectable by an arm — `params
+    # .llm_callsite` accepts any key of the registry, and a fault-injection
+    # target a production arm could select is worse than no seam, because the
+    # arm would then be graded on a model that never answered.
+    #
+    # Refused at PARSE time, so it cannot be registered rather than merely not
+    # promoted: an arm id is the hash of this spec, so a recipe that got as far
+    # as a register row would have a durable id nobody can retract. The
+    # capability class is read off the registry row rather than out of the
+    # recipe because a recipe never names a class — it names a call site — so
+    # the recipe cannot be inspected for this on its own, which is why the
+    # cheap "no arm names chaos_probe" test is not the guard.
+    site = LLM_CALLSITE_REGISTRY[value]
+    if site.capability_class in FAULT_INJECTION_CAPABILITY_CLASSES:
+        raise ValueError(
+            f"{origin}: `params.{LLM_CALLSITE_PARAM}` names {value!r}, whose registered "
+            f"capability class {site.capability_class!r} is a FAULT-INJECTION target — a "
+            "router group contracted never to serve, registered so plan §10.7 fault 3 can "
+            "be induced on the real dispatched path. No arm may select it: an arm routed "
+            "there would be graded on a model that never answered, and the fault-injection "
+            f"seam would be indistinguishable from a broken arm. Registered call sites an "
+            f"arm may name: "
+            + (
+                ", ".join(
+                    sorted(
+                        callsite_id
+                        for callsite_id, row in LLM_CALLSITE_REGISTRY.items()
+                        if row.capability_class not in FAULT_INJECTION_CAPABILITY_CLASSES
+                    )
+                )
+                or "(none — every registered site is a fault-injection target)"
+            )
         )
 
 

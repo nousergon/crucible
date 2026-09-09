@@ -334,6 +334,7 @@ JOB_VALUES: tuple[str, ...] = (
     "gate.close",
     "report.morning",
     "fault.record",
+    "fault.probe",
 )
 
 #: The exhaustive `attempts[].reason` vocabulary: `initial` for the first
@@ -843,6 +844,23 @@ class RunManifestV2(_Strict):
             "natural run — never encodes a fact `started`/`finished` already carry, and its "
             "presence is what makes a hand-chosen historical sweep structurally distinguishable "
             "from one that actually happened live."
+        ),
+    )
+    #: `alpha-engine-config-I10343`: present only when this run's LLM routing
+    #: was deliberately redirected to a fault-injection capability class.
+    #: Absent for every natural run.
+    fault_capability_class: str | None = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_]{0,63}$",
+        description=(
+            "I10343: present only when an operator deliberately redirected this run's LLM "
+            "routing to a capability class contracted NEVER to serve, to induce plan §10.7 "
+            "fault 3 (the router returns an error) against the real dispatched path. Set from "
+            "`crucible fault.probe --fault-capability-class`, never by a job body, and only "
+            "ever one of `crucible.llm.FAULT_INJECTION_CAPABILITY_CLASSES`. Absent for every "
+            "natural run — its presence is what makes an ARRANGED transport failure "
+            "structurally distinguishable from a real one, which a fault record naming this "
+            "manifest as `induced` evidence depends on."
         ),
     )
     #: Wall-clock date the run actually executed on, for PROVENANCE ONLY.
