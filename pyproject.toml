@@ -48,7 +48,7 @@ dependencies = [
     # flips on. Floored, not pinned: boto3 ships daily and the API surface
     # used here (put_object/head_object/get_paginator, IfMatch/IfNoneMatch)
     # is stable, so a pin would be a weekly Dependabot PR buying nothing.
-    "boto3>=1.35",
+    "boto3>=1.43.89",
 ]
 
 [project.optional-dependencies]
