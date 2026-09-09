@@ -33,7 +33,7 @@ REGISTERED = {
     "research.thesis": CallSite(
         callsite_id="research.thesis",
         purpose="draft one arm's thesis from the day's features",
-        capability_class="reasoning_high",
+        capability_class="high",
         max_usd_per_call=0.25,
         owner="crucible.slots.research",
     )
@@ -79,10 +79,20 @@ class TestTheRegistry:
         """The guard on the test above: an allowlist read as empty, or a
         registry file with no `capability_classes` key at all, would make
         every membership assertion here vacuous in one direction and every
-        call refused in the other."""
+        call refused in the other.
+
+        `load_capability_classes()` — the file's OWN extra list, beyond the
+        bare router tiers — is legitimately empty since
+        `alpha-engine-config-I9970` (2026-09-08): the phase-5 arms address
+        `high` and the judge addresses `ultra`, both already router TIER
+        GROUPS, so neither needs a row here. The union
+        `_capability_classes()` is still non-empty because it always carries
+        the router's own tiers regardless of what this file adds."""
         from crucible.llm import _capability_classes, load_capability_classes
 
-        assert load_capability_classes(), "phase 1 declares at least one class"
+        assert load_capability_classes() == (), (
+            "the file declares no capability beyond the bare router tiers today"
+        )
         assert len(_capability_classes()) >= 4
 
     def test_a_registry_file_with_no_allowlist_raises(self, tmp_path) -> None:
@@ -128,7 +138,7 @@ class TestTheEnumeratorCatchesWhatItMustCatch:
             "from crucible.llm import call\n"
             "def go(ctx, cap):\n"
             "    return call(ctx, callsite_id='research.unregistered', "
-            "capability_class='reasoning_high', messages=[], cap=cap, estimate_usd=0.1)\n",
+            "capability_class='high', messages=[], cap=cap, estimate_usd=0.1)\n",
         )
         findings = audit_call_sites(tmp_path, registry=REGISTERED)
         assert [f.kind for f in findings] == ["unregistered_callsite"]
@@ -141,7 +151,7 @@ class TestTheEnumeratorCatchesWhatItMustCatch:
             "from crucible.llm import call\n"
             "def go(ctx, cap):\n"
             "    return call(ctx, callsite_id='research.thesis', "
-            "capability_class='reasoning_high', messages=[], cap=cap, estimate_usd=0.1)\n",
+            "capability_class='high', messages=[], cap=cap, estimate_usd=0.1)\n",
         )
         assert audit_call_sites(tmp_path, registry=REGISTERED) == []
 
@@ -154,7 +164,7 @@ class TestTheEnumeratorCatchesWhatItMustCatch:
             "from crucible.llm import call\n"
             "def go(ctx, cap, slot):\n"
             "    return call(ctx, callsite_id='research.' + slot, "
-            "capability_class='reasoning_high', messages=[], cap=cap, estimate_usd=0.1)\n",
+            "capability_class='high', messages=[], cap=cap, estimate_usd=0.1)\n",
         )
         findings = audit_call_sites(tmp_path, registry=REGISTERED)
         assert [f.kind for f in findings] == ["unregistered_callsite"]

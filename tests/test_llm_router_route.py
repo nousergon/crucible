@@ -52,7 +52,6 @@ import pathlib
 import pytest
 
 from crucible.llm import (
-    CAPABILITY_CLASS_GROUPS,
     EXEC_CONTEXT_ENV,
     CallSite,
     CapabilityClassNotRouted,
@@ -382,23 +381,32 @@ class TestTheCallTimeFactsComeFromTheResult:
 
 
 class TestAnUnroutedCapabilityClass:
-    """The group a class addresses is a MAPPING, and an unmade one refuses."""
+    """The group a class addresses is a MAPPING, and an unmade one refuses.
 
-    def test_a_class_with_no_ruled_group_refuses_and_says_what_is_missing(self) -> None:
-        unrouted = sorted(k for k, v in CAPABILITY_CLASS_GROUPS.items() if v is None)
-        assert unrouted, (
-            "this test is vacuous with no unrouted class declared; if the ruling has "
-            "landed, assert the mapping instead of deleting the guard"
+    `CAPABILITY_CLASS_GROUPS` carries no unrouted entry today
+    (`alpha-engine-config-I9970`, 2026-09-08 — `reasoning_high` is retired
+    and both `high` and `ultra` resolve by identity). These tests exercise
+    the REFUSAL MECHANISM itself, not a specific production mapping, so they
+    monkeypatch a synthetic unrouted class onto the module rather than
+    reading a real one that no longer exists — the mechanism is what must
+    keep working the next time some class needs a ruling, not any one
+    instance of it.
+    """
+
+    UNROUTED = "synthetic_unrouted_class"
+
+    def test_a_class_with_no_ruled_group_refuses_and_says_what_is_missing(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr("crucible.llm.CAPABILITY_CLASS_GROUPS", {self.UNROUTED: None})
+        with pytest.raises(CapabilityClassNotRouted) as excinfo:
+            capability_group(self.UNROUTED)
+        message = str(excinfo.value)
+        assert self.UNROUTED in message
+        assert "RULING" in message
+        assert "CAPABILITY_CLASS_GROUPS" in message, (
+            "the refusal names where the mapping is written down"
         )
-        for capability_class in unrouted:
-            with pytest.raises(CapabilityClassNotRouted) as excinfo:
-                capability_group(capability_class)
-            message = str(excinfo.value)
-            assert capability_class in message
-            assert "RULING" in message
-            assert "CAPABILITY_CLASS_GROUPS" in message, (
-                "the refusal names where the mapping is written down"
-            )
 
     def test_a_class_that_IS_a_group_name_passes_through_unchanged(self) -> None:
         assert capability_group("high") == "high"
@@ -410,7 +418,14 @@ class TestAnUnroutedCapabilityClass:
     def test_the_door_refuses_it_BEFORE_the_router_or_a_provider_is_reached(
         self, tmp_path, monkeypatch
     ) -> None:
-        unrouted = sorted(k for k, v in CAPABILITY_CLASS_GROUPS.items() if v is None)
+        monkeypatch.setattr("crucible.llm.CAPABILITY_CLASS_GROUPS", {self.UNROUTED: None})
+        # The allowlist check in `call()` runs BEFORE the group mapping, and
+        # the synthetic class is declared nowhere real — mirror the shape a
+        # real unrouted class would have had (declared in `llm_callsites.yaml`
+        # so it clears the allowlist, then refused by the mapping) by
+        # widening the allowlist directly rather than writing a throwaway
+        # registry file this test does not otherwise need.
+        monkeypatch.setattr("crucible.llm._capability_classes", lambda: frozenset({self.UNROUTED}))
         monkeypatch.setenv(EXEC_CONTEXT_ENV, "ci")
         monkeypatch.setattr(
             "krepis.router.resolve_group_spec",
@@ -424,7 +439,7 @@ class TestAnUnroutedCapabilityClass:
         with pytest.raises(CapabilityClassNotRouted):
             run_job(
                 "report",
-                _body(unrouted[0]),
+                _body(self.UNROUTED),
                 store=store,
                 trading_day=DAY,
                 now=NOW,
@@ -443,26 +458,32 @@ class TestAnUnroutedCapabilityClass:
         refused at import, with the mapping named — not on the first call of
         the first weekly run, after the job has already been scheduled.
         """
-        unrouted = sorted(k for k, v in CAPABILITY_CLASS_GROUPS.items() if v is None)[0]
+        monkeypatch.setattr("crucible.llm.CAPABILITY_CLASS_GROUPS", {self.UNROUTED: None})
         registry_file = tmp_path / "llm_callsites.yaml"
         registry_file.write_text(
             "schema_version: llm_callsite_registry.v1\n"
-            f"capability_classes:\n  - {unrouted}\n"
+            f"capability_classes:\n  - {self.UNROUTED}\n"
             "callsites:\n"
             "  phase5.arm:\n"
             "    purpose: draft one arm's thesis\n"
-            f"    capability_class: {unrouted}\n"
+            f"    capability_class: {self.UNROUTED}\n"
             "    max_usd_per_call: 0.25\n"
             "    owner: crucible.slots.research\n",
             encoding="utf-8",
         )
         monkeypatch.setattr("crucible.llm.CALLSITE_REGISTRY_PATH", registry_file)
+        import crucible.llm as llm
+
         load_registry.cache_clear()
+        llm.load_capability_classes.cache_clear()
+        llm._capability_classes.cache_clear()
         try:
             with pytest.raises(CapabilityClassNotRouted):
                 load_registry()
         finally:
             load_registry.cache_clear()
+            llm.load_capability_classes.cache_clear()
+            llm._capability_classes.cache_clear()
 
 
 class TestAnUnregisteredGroupFailsByName:

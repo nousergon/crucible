@@ -40,9 +40,20 @@ schema_version: llm_callsite_registry.v1
 # tiers. Adding a name is a deliberate edit in the file where the reason for
 # every name is written down; it is not something a call site can do to
 # itself.
-capability_classes:
-  # The reasoning-tier group the phase-5 research arms ask for, and the class
-  # the §2-row-3 acceptance probe exercises the cap through.
-  - reasoning_high
+# EMPTY IS THE CORRECT STATE, same reasoning as `callsites: {}` below.
+#
+# This list used to carry `reasoning_high` — a string that read as a router
+# group and never was one: the registry declares exactly `low`, `med`,
+# `high`, `ultra`, and `reasoning_high` mapped to nothing until
+# `crucible.llm.CAPABILITY_CLASS_GROUPS` refused it with
+# `CapabilityClassNotRouted`. Brian's ruling on `alpha-engine-config-I9970`
+# (2026-09-08, option (a)) settled which real groups the phase-5 call sites
+# address: the LLM research arms ask for `high`, the phase-5 judge asks for
+# `ultra`. Both are already router TIER GROUPS (`krepis.router.TIER_GROUPS`),
+# so both are askable by IDENTITY through the union in
+# `crucible.llm._capability_classes` with no row here — this list exists
+# only for a class whose name is NOT already a group name, and there is none
+# today.
+capability_classes: []
 
 callsites: {}
