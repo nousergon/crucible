@@ -16,24 +16,76 @@ import pathlib
 import pytest
 from pydantic import ValidationError
 
-from crucible.gate import FAULT_RECORD_BUS_FIELD, FAULT_RECORD_MANIFEST_FIELD, SCRIPTED_FAULTS
-from crucible.models import FaultRecordDocument
+from crucible.gate import (
+    FAULT_OUTCOME_INDUCED,
+    FAULT_RECORD_BUS_FIELD,
+    FAULT_RECORD_MANIFEST_FIELD,
+    FAULT_RECORD_OUTCOME_FIELD,
+    SCRIPTED_FAULTS,
+)
+from crucible.models import FAULT_OUTCOME_VALUES, FaultRecordDocument
 
 SCHEMA_PATH = (
     pathlib.Path(__file__).resolve().parents[1] / "crucible" / "schemas" / "fault_record.v1.json"
 )
 
 
-def _valid_document(**overrides: object) -> dict:
-    document = {
+#: One conforming record per outcome kind. Written out per kind rather than
+#: derived from one template by deletion: the whole point of
+#: `alpha-engine-config-I10327` is that the three shapes are DIFFERENT, and a
+#: fixture that built them by removing fields from `induced` would encode
+#: exactly the one-shape assumption the change removes.
+_BY_OUTCOME: dict[str, dict] = {
+    "induced": {
         "schema_version": "fault_record.v1",
         "fault_id": "data_source_withheld",
+        "outcome": "induced",
+        "trading_day": "2026-08-07",
+        "run_id": "01M23BQV1C6EPDR8DEA5WS59M4",
+        "manifest_key": "runs/data.weekly/2026-08-07/run.json",
+        "bus_key": "alerts/2026-08-07/failure.data.weekly.json",
+        "attempt": None,
+        "closed_paths": None,
+        "recorded_at_utc": "2026-09-09T12:00:00Z",
+    },
+    "absorbed": {
+        "schema_version": "fault_record.v1",
+        "fault_id": "spot_terminated_mid_job",
+        "outcome": "absorbed",
         "trading_day": "2026-08-07",
         "run_id": "01M23BQV1C6EPDR8DEA5WS59M4",
         "manifest_key": "runs/data.weekly/2026-08-07/run.json",
         "bus_key": None,
+        "attempt": {"n": 2, "reason": "spot_interruption"},
+        "closed_paths": None,
         "recorded_at_utc": "2026-09-09T12:00:00Z",
-    }
+    },
+    "unreachable": {
+        "schema_version": "fault_record.v1",
+        "fault_id": "stale_release_pointer",
+        "outcome": "unreachable",
+        "trading_day": "2026-08-07",
+        "run_id": None,
+        "manifest_key": None,
+        "bus_key": None,
+        "attempt": None,
+        "closed_paths": [
+            {
+                "path": "the pointer comes to name an unpublished sha",
+                "mechanism": "crucible.release.pin",
+                "probe": "pin_refuses_an_unpublished_sha",
+                "expected": "StaleReleasePointerError, raised before any write",
+                "observed": "StaleReleasePointerError: was never published",
+                "checked_at_utc": "2026-09-09T12:00:00Z",
+            }
+        ],
+        "recorded_at_utc": "2026-09-09T12:00:00Z",
+    },
+}
+
+
+def _valid_document(outcome: str = "induced", **overrides: object) -> dict:
+    document = dict(_BY_OUTCOME[outcome])
     document.update(overrides)
     return document
 
@@ -72,35 +124,169 @@ class TestTheFieldNamesMatchTheReaderTheGateAlreadyShipped:
         with pytest.raises(ValidationError, match=FAULT_RECORD_MANIFEST_FIELD):
             FaultRecordDocument.model_validate(document)
 
+    def test_an_induced_document_with_a_null_manifest_field_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match=f"requires `{FAULT_RECORD_MANIFEST_FIELD}`"):
+            FaultRecordDocument.model_validate(
+                _valid_document(**{FAULT_RECORD_MANIFEST_FIELD: None})
+            )
+
 
 class TestRunIdIsTheMatchKeyNeverTradingDayAlone:
     """`alpha-engine-config-I10322`'s whole design constraint, pinned at the
-    schema level: `run_id` is required and ULID-shaped."""
+    schema level: `run_id` is ULID-shaped, and required for exactly the two
+    outcomes that describe a run."""
 
-    def test_run_id_is_required(self) -> None:
-        document = _valid_document()
-        del document["run_id"]
+    def test_run_id_is_required_for_induced(self) -> None:
         with pytest.raises(ValidationError, match="run_id"):
-            FaultRecordDocument.model_validate(document)
+            FaultRecordDocument.model_validate(_valid_document(run_id=None))
+
+    def test_run_id_is_required_for_absorbed(self) -> None:
+        with pytest.raises(ValidationError, match="run_id"):
+            FaultRecordDocument.model_validate(_valid_document("absorbed", run_id=None))
 
     def test_a_malformed_run_id_is_refused(self) -> None:
         with pytest.raises(ValidationError, match="run_id"):
             FaultRecordDocument.model_validate(_valid_document(run_id="not-a-ulid"))
 
+    def test_an_unreachable_record_carrying_a_run_id_is_refused(self) -> None:
+        """`alpha-engine-config-I10327`: an `unreachable` record must be
+        STRUCTURALLY incapable of excusing a manifest, and the field the
+        exclusion is keyed on is the one it must not carry."""
+        with pytest.raises(ValidationError, match="must not carry `run_id`"):
+            FaultRecordDocument.model_validate(
+                _valid_document("unreachable", run_id="01M23BQV1C6EPDR8DEA5WS59M4")
+            )
 
-class TestBusKeyIsOptional:
-    """The live-sweep half of §10.7 is structurally unreachable for some
-    induced days (`alpha-engine-config-I10125`) — a record may legitimately
-    exist with no bus row yet."""
-
-    def test_bus_key_defaults_to_null(self) -> None:
+    def test_a_field_omitted_entirely_is_refused_not_defaulted(self) -> None:
+        """Every evidence field is required AND nullable, never optional with a
+        default: an omitted field is indistinguishable from a forgotten one, so
+        a record must DECLARE the evidence it does not carry."""
         document = _valid_document()
-        del document["bus_key"]
-        FaultRecordDocument.model_validate(document)
+        del document["closed_paths"]
+        with pytest.raises(ValidationError, match="closed_paths"):
+            FaultRecordDocument.model_validate(document)
+
+
+class TestBusKeyIsRequiredForInducedAndForbiddenForAbsorbed:
+    """`alpha-engine-config-I10327`. `bus_key` was nullable for any record, and
+    `-I10317`'s agent proposed satisfying §10.7 by naming an existing bus row —
+    the rubber stamp the `run_id` refusal exists to prevent, arriving through
+    the other field. Never optional, and never borrowable."""
+
+    def test_an_induced_record_without_a_bus_key_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="requires `bus_key`"):
+            FaultRecordDocument.model_validate(_valid_document(bus_key=None))
+
+    def test_an_absorbed_record_carrying_a_bus_key_is_refused(self) -> None:
+        """The refusal `-I10327` names explicitly: a page here would mean the
+        retry did not work, so the row's ABSENCE is part of the claim."""
+        with pytest.raises(ValidationError, match="must not carry `bus_key`"):
+            FaultRecordDocument.model_validate(
+                _valid_document("absorbed", bus_key="alerts/2026-08-07/x.json")
+            )
+
+    def test_an_unreachable_record_carrying_a_bus_key_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="must not carry `bus_key`"):
+            FaultRecordDocument.model_validate(
+                _valid_document("unreachable", bus_key="alerts/2026-08-07/x.json")
+            )
 
     def test_an_empty_bus_key_is_refused(self) -> None:
         with pytest.raises(ValidationError, match="bus_key"):
             FaultRecordDocument.model_validate(_valid_document(bus_key=""))
+
+
+class TestTheOutcomeMatrixIsEnforcedInEveryCell:
+    """The table in `FaultRecordDocument`'s docstring, walked rather than
+    sampled: for each outcome, every field it requires is refused when null and
+    every field it forbids is refused when present. A matrix asserted in the
+    three cells somebody remembered is a matrix with cells nobody checks."""
+
+    def test_every_outcome_has_a_conforming_fixture(self) -> None:
+        assert set(_BY_OUTCOME) == set(FAULT_OUTCOME_VALUES)
+        for outcome in FAULT_OUTCOME_VALUES:
+            assert FaultRecordDocument.model_validate(_valid_document(outcome)).outcome == outcome
+
+    def test_every_required_field_is_refused_when_null(self) -> None:
+        for outcome in FAULT_OUTCOME_VALUES:
+            required = FaultRecordDocument._REQUIRED_BY_OUTCOME[outcome]
+            assert required, f"{outcome} requires nothing, which cannot be evidence"
+            for field in required:
+                with pytest.raises(ValidationError, match=f"requires `{field}`"):
+                    FaultRecordDocument.model_validate(_valid_document(outcome, **{field: None}))
+
+    def test_every_forbidden_field_is_refused_when_present(self) -> None:
+        populated = {
+            "run_id": "01M23BQV1C6EPDR8DEA5WS59M4",
+            "manifest_key": "runs/data.weekly/2026-08-07/run.json",
+            "bus_key": "alerts/2026-08-07/failure.data.weekly.json",
+            "attempt": {"n": 2, "reason": "spot_interruption"},
+            "closed_paths": _BY_OUTCOME["unreachable"]["closed_paths"],
+        }
+        for outcome in FAULT_OUTCOME_VALUES:
+            required = set(FaultRecordDocument._REQUIRED_BY_OUTCOME[outcome])
+            for field in FaultRecordDocument._EVIDENCE_FIELDS:
+                if field in required:
+                    continue
+                with pytest.raises(ValidationError, match=f"must not carry `{field}`"):
+                    FaultRecordDocument.model_validate(
+                        _valid_document(outcome, **{field: populated[field]})
+                    )
+
+    def test_an_unknown_outcome_is_refused(self) -> None:
+        document = _valid_document()
+        document["outcome"] = "mostly_fine"
+        with pytest.raises(ValidationError, match="outcome"):
+            FaultRecordDocument.model_validate(document)
+
+    def test_the_outcome_field_name_matches_the_reader(self) -> None:
+        assert "outcome" == FAULT_RECORD_OUTCOME_FIELD
+        assert FAULT_OUTCOME_INDUCED in FAULT_OUTCOME_VALUES
+
+
+class TestAnAbsorbedRecordsAttemptIsTheRetryNotTheFirstTry:
+    """An `ok` manifest's FIRST attempt says nothing about a fault being
+    handled — every clean run has one."""
+
+    def test_the_initial_attempt_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="must be the RETRY"):
+            FaultRecordDocument.model_validate(
+                _valid_document("absorbed", attempt={"n": 1, "reason": "initial"})
+            )
+
+    def test_an_attempt_numbered_one_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="at least 2"):
+            FaultRecordDocument.model_validate(
+                _valid_document("absorbed", attempt={"n": 1, "reason": "spot_interruption"})
+            )
+
+    def test_a_reason_outside_the_declared_transient_class_is_refused(self) -> None:
+        """`AttemptRow.reason` is the manifest schema's own enum, so a retry
+        reason the runner could never have recorded cannot be recorded here."""
+        with pytest.raises(ValidationError, match="reason"):
+            FaultRecordDocument.model_validate(
+                _valid_document("absorbed", attempt={"n": 2, "reason": "felt_like_it"})
+            )
+
+
+class TestAnUnreachableRecordsEvidenceCannotBeEmpty:
+    def test_an_empty_closed_paths_list_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="EMPTY `closed_paths`"):
+            FaultRecordDocument.model_validate(_valid_document("unreachable", closed_paths=[]))
+
+    def test_a_closed_path_with_no_observation_is_refused(self) -> None:
+        """`expected` and `observed` are separate fields on purpose: a probe
+        whose observation is missing is not evidence of anything."""
+        row = dict(_BY_OUTCOME["unreachable"]["closed_paths"][0])
+        row["observed"] = ""
+        with pytest.raises(ValidationError, match="observed"):
+            FaultRecordDocument.model_validate(_valid_document("unreachable", closed_paths=[row]))
+
+    def test_a_closed_path_missing_a_field_is_refused(self) -> None:
+        row = dict(_BY_OUTCOME["unreachable"]["closed_paths"][0])
+        del row["probe"]
+        with pytest.raises(ValidationError, match="probe"):
+            FaultRecordDocument.model_validate(_valid_document("unreachable", closed_paths=[row]))
 
 
 class TestUnknownFieldsAreRefused:

@@ -39,7 +39,7 @@ from crucible.gate import (
     GATES,
     MANIFEST_RUN_MODE_FIELD,
     MANIFEST_RUN_MODE_LIVE,
-    PHASE2_AUTONOMY_MIN_SPAN,
+    PHASE2_AUTONOMY_MIN_DAILY_CYCLES,
     PHASE2_LIVE_SATURDAYS,
     PHASE2_MAX_PAGES,
     PHASE2_MAX_TAGGED_USD,
@@ -47,6 +47,8 @@ from crucible.gate import (
     PHASE4_MAX_TOTAL_USD,
     PHASES,
     REPOSITORY_GRADED_CLAUSES,
+    autonomy_daily_cycles_in_span,
+    autonomy_earliest_satisfiable_render_day,
     evaluate,
     weekly_anchor,
 )
@@ -388,10 +390,12 @@ CHANGE_LONG_BEFORE = dt.datetime(2026, 8, 10, 9, 0, tzinfo=dt.UTC)
 #: the clause reads MET — a change making the clause EASIER.
 CHANGE_AN_HOUR_BEFORE_THE_READ = dt.datetime(2026, 8, 28, 13, 0, tzinfo=dt.UTC)
 
-#: A change exactly `PHASE2_AUTONOMY_MIN_SPAN` before the render day, landing
-#: ON the window's only weekly close. The minimum span clears and the
-#: full-cycle guard is the one that must fire — the second half of the
-#: construction, which a span check alone would let through.
+#: A change seven calendar days before the render day, landing ON the window's
+#: only weekly close. This is the case the deleted `PHASE2_AUTONOMY_MIN_SPAN =
+#: 7 days` floor let through to the day and the CYCLE guard caught — the reason
+#: `alpha-engine-config-I10327` could derive the span from the cycle
+#: requirement instead of declaring it: the cycle guard was already the
+#: binding one.
 CHANGE_ON_THE_CYCLE_CLOSE = dt.datetime(2026, 8, 21, 0, 0, tzinfo=dt.UTC)
 
 
@@ -538,22 +542,26 @@ class TestTheAutonomyWindowStartsAtTheSystemsLastChange:
         store = _store_whose_pointer_flipped(CHANGE_AN_HOUR_BEFORE_THE_READ)
         clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
         assert not clause.met and not clause.unmeasurable
-        assert f"minimum span is {PHASE2_AUTONOMY_MIN_SPAN.days} days" in clause.detail
-        satisfiable_on = CHANGE_AN_HOUR_BEFORE_THE_READ.date() + PHASE2_AUTONOMY_MIN_SPAN
+        assert "no complete weekly cycle has run unattended" in clause.detail
+        satisfiable_on = autonomy_earliest_satisfiable_render_day(
+            CHANGE_AN_HOUR_BEFORE_THE_READ.date()
+        )
         assert satisfiable_on.isoformat() in clause.detail
+        assert satisfiable_on > PHASE2_WINDOW[-1]
 
-    def test_the_minimum_span_alone_is_not_enough_the_cycle_must_close_after_it(
+    def test_a_seven_day_span_is_not_enough_the_cycle_must_close_after_it(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The second half of the construction. A change landing exactly on the
-        window's weekly close clears the span floor to the day and still has no
-        COMPLETE unattended cycle behind it, so a span check alone would pass
-        it."""
+        """The guard that made the deleted seven-day constant redundant. A
+        change landing exactly on the window's weekly close cleared that floor
+        to the day and still has no COMPLETE unattended cycle behind it, so the
+        cycle requirement was always the binding one — which is why
+        `alpha-engine-config-I10327` could derive the span from it."""
         _archive(monkeypatch)
         _stack_applied(monkeypatch, CHANGE_ON_THE_CYCLE_CLOSE)
         _counting(monkeypatch, _Counted(0))
         store = _store_whose_pointer_flipped(CHANGE_ON_THE_CYCLE_CLOSE)
-        assert PHASE2_WINDOW[-1] - CHANGE_ON_THE_CYCLE_CLOSE.date() == PHASE2_AUTONOMY_MIN_SPAN
+        assert PHASE2_WINDOW[-1] - CHANGE_ON_THE_CYCLE_CLOSE.date() == dt.timedelta(days=7)
         clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
         assert not clause.met and not clause.unmeasurable
         assert "no complete weekly cycle has run unattended" in clause.detail
@@ -686,6 +694,98 @@ class TestTheAutonomyWindowStartsAtTheSystemsLastChange:
         clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
         assert clause.unmeasurable and not clause.met
         assert "RuntimeError" in clause.detail
+
+
+class TestTheMinimumSpanIsDerivedFromTheCycleRequirement:
+    """`alpha-engine-config-I10327`. `-I10324` shipped BOTH a
+    `PHASE2_AUTONOMY_MIN_SPAN = 7 days` constant and a "one complete weekly
+    cycle after the change" requirement. For the attack the constant was
+    written against they are redundant — one hour cannot contain a weekly
+    cycle — and the independent constant put the earliest satisfiable render
+    day four days past the weekly Step Function phase 2 must exit on.
+
+    Brian's 2026-09-04 phase-0 ruling is the precedent: *"we can't wait a week
+    on phase 0, it should clear after this week's weekly"*, where the second
+    week's protection was replaced by a daily guard rather than deleted.
+    """
+
+    def test_no_independent_span_constant_survives(self) -> None:
+        """The point of the change: the bar is stated in cycles, the unit the
+        claim is denominated in, and not also in calendar days."""
+        assert not hasattr(gate_module, "PHASE2_AUTONOMY_MIN_SPAN")
+
+    def test_a_wednesday_change_is_satisfiable_on_that_weeks_saturday(self) -> None:
+        """The arithmetic that matters. 2026-09-09 is the Wednesday the
+        crucible-v2 stack was last applied; under the deleted seven-day floor
+        the earliest satisfiable render day was 2026-09-16, four days past the
+        2026-09-12 weekly."""
+        change = dt.date(2026, 9, 9)
+        assert autonomy_earliest_satisfiable_render_day(change) == dt.date(2026, 9, 12)
+        assert change + dt.timedelta(days=7) > dt.date(2026, 9, 12)
+
+    def test_the_derived_day_carries_a_weekly_close_after_the_change(self) -> None:
+        change = dt.date(2026, 9, 9)
+        day = autonomy_earliest_satisfiable_render_day(change)
+        assert weekly_anchor(day) > change
+
+    def test_the_derived_day_carries_the_required_daily_cycles(self) -> None:
+        change = dt.date(2026, 9, 9)
+        day = autonomy_earliest_satisfiable_render_day(change)
+        assert autonomy_daily_cycles_in_span(change, day) >= PHASE2_AUTONOMY_MIN_DAILY_CYCLES
+
+    def test_the_day_before_the_derived_day_satisfies_neither_requirement(self) -> None:
+        """Derived means TIGHT: the day before is genuinely unsatisfiable, so
+        this is the earliest and not merely a day that happens to work."""
+        change = dt.date(2026, 9, 9)
+        day = autonomy_earliest_satisfiable_render_day(change) - dt.timedelta(days=1)
+        assert weekly_anchor(day) <= change
+
+    def test_a_change_an_hour_before_the_read_is_still_unsatisfiable(self) -> None:
+        """The anti-gaming property, asserted on the derivation itself and not
+        only through the clause: a change on the render day cannot be graded on
+        that day, whatever the constant was."""
+        change = CHANGE_AN_HOUR_BEFORE_THE_READ.date()
+        assert autonomy_earliest_satisfiable_render_day(change) > change
+
+    def test_the_daily_cycle_count_skips_a_holiday(self) -> None:
+        """Counted through the trading calendar, never derived from a
+        calendar-day span — 2026-07-03 is an observed Independence Day, a
+        CLOSED weekday, and a `weekday() < 5` count would score it."""
+        assert autonomy_daily_cycles_in_span(dt.date(2026, 7, 2), dt.date(2026, 7, 3)) == 0
+
+    def test_a_render_day_on_or_before_the_change_counts_no_daily_cycles(self) -> None:
+        assert autonomy_daily_cycles_in_span(dt.date(2026, 9, 9), dt.date(2026, 9, 9)) == 0
+
+    def test_the_daily_implication_is_self_checked_and_fails_loud(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The daily half is an IMPLICATION of the weekly one under the NYSE
+        calendar — `weekly_anchor(render_day)` is itself a trading day in the
+        span — so it is checked rather than assumed, and a violation reads
+        UNMEASURABLE naming the contradiction. Never a quiet UNMET: that would
+        render a calendar defect as a system finding."""
+        _archive(monkeypatch)
+        _stack_applied(monkeypatch, CHANGE_LONG_BEFORE)
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE)
+        monkeypatch.setattr(gate_module, "autonomy_daily_cycles_in_span", lambda *_: 0)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.unmeasurable and not clause.met
+        assert "trading calendar contradicted itself" in clause.detail
+
+    def test_a_met_reading_names_both_cycles_it_spanned(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A window start nobody can reconstruct is a number, not a reading
+        (principle 1) — and the same is true of the bar it cleared."""
+        _archive(monkeypatch)
+        _stack_applied(monkeypatch, CHANGE_LONG_BEFORE)
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.met
+        assert "spanning the weekly cycle closing" in clause.detail
+        assert "daily cycle(s)" in clause.detail
 
 
 class TestTheSaturdayCountAndTheWindowWidthAreSeparateConstants:

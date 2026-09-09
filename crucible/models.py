@@ -101,7 +101,7 @@ still holds because that derivation happens here, not in a second copy.
 from __future__ import annotations
 
 import datetime as dt
-from typing import Annotated, Any, Literal, get_args
+from typing import Annotated, Any, ClassVar, Literal, get_args
 
 from krepis.metrics import StatusLiteral
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
@@ -121,11 +121,13 @@ __all__ = [
     "CloudTrailSessionContext",
     "CloudTrailSessionIssuer",
     "CloudTrailUserIdentity",
+    "ClosedPathRow",
     "ComponentRow",
     "ComponentsDocument",
     "DeadlineRow",
     "DeclaredUniverseDocument",
     "EXPERIMENT_EVENT_ROW_ADAPTER",
+    "FAULT_OUTCOME_VALUES",
     "EligibilityHoldEventRow",
     "ExperimentEventRow",
     "FaultRecordDocument",
@@ -346,6 +348,32 @@ ATTEMPT_REASON_VALUES: tuple[str, ...] = (
     "provider_timeout",
     "s3_throttling",
 )
+
+#: The exhaustive `fault_record.outcome` vocabulary — THREE kinds, because
+#: plan §10.7's four scripted faults do not all end the same way and a
+#: producer that accepts only one shape can record only the faults that
+#: happen to take it (`alpha-engine-config-I10327`).
+#:
+#: * `induced` — the fault fired and the job FAILED. The shape
+#:   `alpha-engine-config-I10320`/`-I10322` shipped: it names the `run_id` of
+#:   a manifest reading `status: failed`, and it is the ONLY kind whose
+#:   `run_id` excuses that manifest from `arc_runs_ok`/`replays_ok`.
+#: * `absorbed` — the fault fired and the system HANDLED it: the manifest
+#:   reads `ok` and its `attempts[]` records the declared-transient-class
+#:   retry that made it so. A STRONGER result than `induced`, not a weaker
+#:   one, and the outcome fault 1 (`spot_terminated_mid_job`) is designed to
+#:   produce — a spot interruption is the first row of
+#:   `crucible.runner.TRANSIENT_CLASSIFIERS`, so the runner retries it on a
+#:   fresh instance and the run succeeds. `bus_key` is FORBIDDEN here: a page
+#:   would mean the retry did not work.
+#: * `unreachable` — the state cannot be entered at all, evidenced by a
+#:   machine-executed probe per closed path and NO `run_id`, so it is
+#:   structurally incapable of excusing any manifest.
+#:
+#: An outcome outside this set cannot be recorded, for the same reason
+#: `crucible.runner`'s two statuses are a closed set: a fourth kind is a
+#: design change that must be visible in a diff.
+FAULT_OUTCOME_VALUES: tuple[str, ...] = ("induced", "absorbed", "unreachable")
 
 #: `metricRecord.status`, DERIVED rather than restated (the defect this
 #: guards against: `main` was red for eleven minutes on 2026-09-01 because
@@ -2394,13 +2422,63 @@ EXPERIMENT_EVENT_ROW_ADAPTER: TypeAdapter[ExperimentEventRow] = TypeAdapter(Expe
 # Additive only, appended after the prior rows for the same rebase reason.
 
 
+class ClosedPathRow(_Strict):
+    """One machine-executed probe showing one path into an `unreachable`
+    fault's state is closed (`alpha-engine-config-I10327`).
+
+    **This row is the reason `unreachable` is the HARDER record to write,
+    not the easier one.** A fault whose state cannot arise has no failed run
+    to name, so the `run_id` refusal that guards `induced` cannot guard it;
+    without positive evidence, `unreachable` would degrade into an
+    attestation a human types, which is precisely the
+    assertion-by-having-looked plan §10.7 exists to remove. So the producer
+    RUNS a probe per closed path against the real store and records what it
+    observed: `crucible.faults` refuses the record unless every declared
+    probe actually observed its `expected` outcome.
+
+    `expected` and `observed` are separate fields on purpose. A single
+    "result" field collapses "we required a refusal and got one" into "it
+    said no", and a reader cannot then tell a probe that verified something
+    from a probe whose failure was recorded as prose.
+    """
+
+    path: str = Field(
+        min_length=1,
+        description="The path into the fault's state that this probe shows is closed.",
+    )
+    mechanism: str = Field(
+        min_length=1,
+        description="The code that closes it — a dotted symbol, so a reader can go and "
+        "read the refusal rather than trust this sentence.",
+    )
+    probe: str = Field(
+        min_length=1,
+        description="The machine check `crucible.faults` executed. A named probe, "
+        "registered in `crucible.faults.UNREACHABLE_PROBES` — never free text a "
+        "caller supplies, which would make the evidence an assertion again.",
+    )
+    expected: str = Field(
+        min_length=1,
+        description="What the probe REQUIRED to observe for the path to count as closed.",
+    )
+    observed: str = Field(
+        min_length=1,
+        description="What the probe actually observed. Recorded verbatim: a record "
+        "whose observation is missing is not evidence of anything.",
+    )
+    checked_at_utc: UtcTimestamp = Field(
+        description="RFC 3339, UTC, `Z` suffix. When the probe ran — a probe result "
+        "with no instant cannot be told from one copied out of an older record."
+    )
+
+
 class FaultRecordDocument(_Strict):
     """`fault_record.v1`, written at `faults/{trading_day}/{fault_id}.json`
     by `crucible.faults.record_fault` (`crucible fault.record`).
 
     The document this repo WRITES (an OWN artifact, `extra="forbid"`), per
     plan §10.7 and `crucible.gate._clause_fault_injection_against_scheduled_
-    path`, which declared the key shape and the two required fields
+    path`, which declared the key shape and the two field names
     (`manifest_key`, `bus_key`) first and found no producer
     (`alpha-engine-config-I10320`). This model conforms to that contract
     rather than restating it — `fault_id` is deliberately a pattern-
@@ -2409,18 +2487,45 @@ class FaultRecordDocument(_Strict):
     would be circular; `crucible.faults.record_fault` is where membership in
     `SCRIPTED_FAULTS` is actually enforced, at write time.
 
-    **`run_id` is the whole design constraint from `-I10322`.** A fault
-    record names the run it excuses; `crucible.gate._clause_arc_runs_ok`
-    (and `_clause_replays_ok`, which reads the same predicate) excludes a
-    failed manifest from those clauses ONLY when some record's `run_id`
-    matches that manifest's own `run_id` — never the trading day alone, so a
-    genuine failure on a day a fault was once induced still fails the
-    clause. `bus_key` is nullable: the live-sweep half of §10.7 is
-    structurally unreachable for some induced days
-    (`alpha-engine-config-I10125`), so a record may exist naming a real
-    excused run with no bus row yet — `fault_injection_against_scheduled_
-    path` reads that as UNMET, correctly, rather than refusing the record
-    outright.
+    **`outcome` decides which other fields are legal, and none of them is
+    optional** (`alpha-engine-config-I10327`). The producer shipped with ONE
+    shape — a `run_id` naming a manifest reading `status: failed` — and two of
+    plan §10.7's four faults never produce one: fault 1 is ABSORBED by the
+    declared transient class (the manifest reads `ok`) and fault 4's state
+    cannot be entered at all. A vocabulary of one kind cannot record them.
+
+    +----------------+-----------+-----------+---------------+
+    | field          | induced   | absorbed  | unreachable   |
+    +================+===========+===========+===============+
+    | `run_id`       | required  | required  | **null**      |
+    | `manifest_key` | required  | required  | **null**      |
+    | `bus_key`      | required  | **null**  | **null**      |
+    | `attempt`      | **null**  | required  | **null**      |
+    | `closed_paths` | **null**  | **null**  | required      |
+    +----------------+-----------+-----------+---------------+
+
+    **`bus_key` is required for `induced`, FORBIDDEN for `absorbed`, absent
+    for `unreachable` — never optional, and never borrowable from an
+    unrelated incident.** It was nullable-for-any-outcome when this shipped,
+    and `alpha-engine-config-I10317`'s agent proposed satisfying §10.7 by
+    naming an existing bus row: that is the rubber stamp the `run_id` refusal
+    exists to prevent, arriving through the other field. A page on an
+    `absorbed` record would mean the retry did NOT work, so its absence is
+    required rather than tolerated; and an `induced` fault that paged nobody
+    is half the §10.7 exercise, so its presence is required rather than
+    deferred.
+
+    **`run_id` is the whole design constraint from `-I10322`, and only
+    `induced` carries the excusal.** A fault record names the run it excuses;
+    `crucible.gate._clause_arc_runs_ok` (and `_clause_replays_ok`, which reads
+    the same predicate) excludes a failed manifest from those clauses ONLY
+    when an **`induced`** record's `run_id` matches that manifest's own
+    `run_id` — never the trading day alone, so a genuine failure on a day a
+    fault was once induced still fails the clause. `absorbed` names an `ok`
+    manifest and `unreachable` names none, so neither can excuse anything: the
+    exclusion is keyed on `run_id` and narrowed by `outcome`, and widening
+    either would make a fault record a way to turn an arbitrary red clause
+    green.
     """
 
     model_config = ConfigDict(
@@ -2429,10 +2534,14 @@ class FaultRecordDocument(_Strict):
             "$id": "fault_record.v1",
             "title": "Crucible fault-injection record, v1",
             "description": (
-                "One durable record per scripted fault induced against the real "
-                "scheduled path (plan §10.7): the manifest the induced fault produced "
-                "and the bus row the sweep filed for it, so 'we ran fault injection' is "
-                "a reading rather than a sentence in a session transcript."
+                "One durable record per scripted fault exercised against the real "
+                "scheduled path (plan §10.7). `outcome` says how the fault ended and "
+                "decides which evidence fields are legal: an induced fault names the "
+                "failed manifest and the page it produced, an absorbed one names the "
+                "ok manifest and the transient-class retry that made it ok, and an "
+                "unreachable one names neither and carries a machine-executed probe "
+                "per closed path — so 'we ran fault injection' is a reading rather "
+                "than a sentence in a session transcript."
             ),
         },
     )
@@ -2448,26 +2557,104 @@ class FaultRecordDocument(_Strict):
         description="One of `crucible.gate.SCRIPTED_FAULTS`, enforced at write time by "
         "`crucible.faults.record_fault` rather than here (see class docstring).",
     )
-    trading_day: IsoDate
-    run_id: str = Field(
-        pattern=r"^[0-9A-HJKMNP-TV-Z]{26}$",
-        description="The run_id of the manifest this record excuses. ULID. The clause "
-        "that reads this record matches on this field alone, never on trading_day.",
+    outcome: Literal[FAULT_OUTCOME_VALUES] = Field(  # type: ignore[valid-type]
+        description="How the fault ended: `induced` (the job failed), `absorbed` (the "
+        "declared transient class handled it and the run succeeded) or `unreachable` "
+        "(the state cannot be entered). Decides which other fields are legal — see the "
+        "class docstring's table."
     )
-    manifest_key: str = Field(
+    trading_day: IsoDate
+    run_id: str | None = Field(
+        pattern=r"^[0-9A-HJKMNP-TV-Z]{26}$",
+        description="The run_id of the manifest this record describes. ULID. Required "
+        "for `induced` and `absorbed`; NULL for `unreachable`, which has no run and "
+        "must therefore be structurally incapable of excusing one. Required and "
+        "nullable rather than optional: an omitted field is indistinguishable from a "
+        "forgotten one.",
+    )
+    manifest_key: str | None = Field(
         min_length=1,
         description="The store key of the manifest named by run_id, which "
-        "`crucible.faults.record_fault` looked up and verified reads status: failed "
-        "before this record could be written.",
+        "`crucible.faults.record_fault` looked up and verified reads the status this "
+        "`outcome` requires before this record could be written. NULL for "
+        "`unreachable`.",
     )
     bus_key: str | None = Field(
-        default=None,
         min_length=1,
-        description="The alert bus row this fault produced (alerts/{day}/{incident}.json), "
-        "or null when the induction's live-sweep half has not produced one yet.",
+        description="The alert bus row this fault produced (alerts/{day}/{incident}.json). "
+        "REQUIRED for `induced` — a fault that paged nobody is half of §10.7's exercise. "
+        "FORBIDDEN for `absorbed` and `unreachable`: a page on an absorbed fault would "
+        "mean the retry did not work, and there is no run to page about at all when the "
+        "state is unreachable.",
+    )
+    attempt: AttemptRow | None = Field(
+        description="For `absorbed`, the `attempts[]` row from the named manifest that "
+        "records the declared-transient-class retry — copied out of the manifest the "
+        "producer verified, so the record says WHICH transient class absorbed the fault "
+        "rather than merely that one did. NULL for every other outcome.",
+    )
+    closed_paths: list[ClosedPathRow] | None = Field(
+        description="For `unreachable`, one machine-executed probe per closed path, "
+        "never empty. NULL for every other outcome — a record that both excuses a run "
+        "and claims the state is unreachable is claiming two contradictory things.",
     )
     recorded_at_utc: UtcTimestamp = Field(
         description="RFC 3339, UTC, `Z` suffix. When the injection procedure filed this "
-        "record, distinct from trading_day — a fault is induced against a trading day's "
-        "scheduled path, but the record is filed at the wall-clock instant of induction."
+        "record, distinct from trading_day — a fault is exercised against a trading "
+        "day's scheduled path, but the record is filed at the wall-clock instant of the "
+        "exercise."
     )
+
+    #: Per outcome, the fields that MUST be non-null and the fields that MUST
+    #: be null. Declared as data rather than written out as a chain of `if`s
+    #: so the table in the class docstring and the enforcement cannot drift,
+    #: and so `tests/test_typed_boundary_fault_record.py` can walk every cell
+    #: of it instead of asserting the handful somebody remembered.
+    _REQUIRED_BY_OUTCOME: ClassVar[dict[str, tuple[str, ...]]] = {
+        "induced": ("run_id", "manifest_key", "bus_key"),
+        "absorbed": ("run_id", "manifest_key", "attempt"),
+        "unreachable": ("closed_paths",),
+    }
+    _EVIDENCE_FIELDS: ClassVar[tuple[str, ...]] = (
+        "run_id",
+        "manifest_key",
+        "bus_key",
+        "attempt",
+        "closed_paths",
+    )
+
+    @model_validator(mode="after")
+    def _the_outcome_carries_exactly_its_own_evidence(self) -> FaultRecordDocument:
+        required = self._REQUIRED_BY_OUTCOME[self.outcome]
+        for field in self._EVIDENCE_FIELDS:
+            value = getattr(self, field)
+            if field in required and value is None:
+                raise ValueError(
+                    f"a {self.outcome!r} fault record requires `{field}` and this one "
+                    f"has none. Required for {self.outcome!r}: {list(required)}."
+                )
+            if field not in required and value is not None:
+                raise ValueError(
+                    f"a {self.outcome!r} fault record must not carry `{field}`, and this "
+                    f"one names {value!r}. Only {list(required)} are legal evidence for "
+                    f"{self.outcome!r}; a field borrowed from another outcome's shape is "
+                    "how a record stops being evidence of what it claims."
+                )
+        if self.closed_paths is not None and not self.closed_paths:
+            raise ValueError(
+                "an `unreachable` fault record with an EMPTY `closed_paths` claims a "
+                "state cannot be entered and names not one closed path — the shape this "
+                "outcome exists to forbid."
+            )
+        if self.attempt is not None and self.attempt.reason == "initial":
+            raise ValueError(
+                "an `absorbed` fault record's `attempt` must be the RETRY that absorbed "
+                "the fault, not the initial attempt: `reason: initial` is every run's "
+                "first attempt and says nothing about a fault being handled."
+            )
+        if self.attempt is not None and self.attempt.n < 2:
+            raise ValueError(
+                f"an `absorbed` fault record's `attempt` is the retry, so its `n` is at "
+                f"least 2; this one reads {self.attempt.n}."
+            )
+        return self
