@@ -2329,10 +2329,24 @@ class TestEveryLlmArmClauseIsControlArmIsRegisterBacked:
         import crucible.llm as llm_module
         from crucible import gate as gate_module
 
-        class _CallSite:
-            pass
-
-        monkeypatch.setattr(llm_module, "LLM_CALLSITE_REGISTRY", {"research.rank": _CallSite()})
+        monkeypatch.setattr(
+            llm_module,
+            "LLM_CALLSITE_REGISTRY",
+            # A real `CallSite`, not a bare stand-in: `crucible.slots.arms`
+            # reads the row's `capability_class` to refuse a fault-injection
+            # target (`alpha-engine-config-I10343`), so a fake without that
+            # field would make this test pass over a registry shape no
+            # production reader accepts.
+            {
+                "research.rank": llm_module.CallSite(
+                    callsite_id="research.rank",
+                    purpose="rank the day's candidates",
+                    capability_class="high",
+                    max_usd_per_call=0.25,
+                    owner="tests.test_gate",
+                )
+            },
+        )
 
         store = LocalStore(tmp_path)
         arm_id = self._seed_collision(store, real_control=False)
@@ -2356,10 +2370,24 @@ class TestEveryLlmArmClauseIsControlArmIsRegisterBacked:
         import crucible.llm as llm_module
         from crucible import gate as gate_module
 
-        class _CallSite:
-            pass
-
-        monkeypatch.setattr(llm_module, "LLM_CALLSITE_REGISTRY", {"research.rank": _CallSite()})
+        monkeypatch.setattr(
+            llm_module,
+            "LLM_CALLSITE_REGISTRY",
+            # A real `CallSite`, not a bare stand-in: `crucible.slots.arms`
+            # reads the row's `capability_class` to refuse a fault-injection
+            # target (`alpha-engine-config-I10343`), so a fake without that
+            # field would make this test pass over a registry shape no
+            # production reader accepts.
+            {
+                "research.rank": llm_module.CallSite(
+                    callsite_id="research.rank",
+                    purpose="rank the day's candidates",
+                    capability_class="high",
+                    max_usd_per_call=0.25,
+                    owner="tests.test_gate",
+                )
+            },
+        )
 
         store = LocalStore(tmp_path)
         arm_id = self._seed_collision(store, real_control=True)

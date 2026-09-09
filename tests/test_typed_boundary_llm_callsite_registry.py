@@ -55,12 +55,18 @@ class TestTheRealFileValidates:
         raw = yaml.safe_load(CALLSITE_REGISTRY_PATH.read_text(encoding="utf-8"))
         document = LlmCallsiteRegistryDocument.model_validate(raw)
         assert document.schema_version == "llm_callsite_registry.v1"
-        assert document.callsites == {}
+        # ONE row (`alpha-engine-config-I10343`): the fault-injection probe,
+        # whose declared class is a group contracted never to serve. Not an
+        # LLM arm and not a serving call site -- see the file's own comment.
+        assert set(document.callsites) == {"faults.router_probe"}
         # `reasoning_high` addressed no registry group and is retired
         # (`alpha-engine-config-I9970`, 2026-09-08): the phase-5 arms address
         # `high` and the judge `ultra` directly, both already router TIER
-        # GROUPS, so the file's own extra allowlist is empty.
-        assert document.capability_classes == []
+        # GROUPS, so the only names this file's own allowlist carries are the
+        # fault-injection classes no tier group makes askable.
+        from crucible.llm import FAULT_INJECTION_CAPABILITY_CLASSES
+
+        assert set(document.capability_classes) == FAULT_INJECTION_CAPABILITY_CLASSES
 
 
 class TestALoadedRegistryStillWorksTheSameWay:
@@ -70,15 +76,16 @@ class TestALoadedRegistryStillWorksTheSameWay:
         assert load_registry() == LLM_CALLSITE_REGISTRY
 
     def test_load_capability_classes_is_declared_and_typed(self) -> None:
-        """Empty is the correct state today (`alpha-engine-config-I9970`,
-        2026-09-08): `high` and `ultra` resolve by identity through the
-        router's own tiers and need no row in this file's extra allowlist.
+        """The extra allowlist carries exactly the fault-injection classes
+        (`alpha-engine-config-I10343`): `high` and `ultra` resolve by identity
+        through the router's own tiers and need no row here (`-I9970`), while a
+        deliberately-broken group is askable only because of one.
         What this asserts is that the reader still runs end to end against
         the real file and returns the declared type, not that it is
         non-empty — see `TestTheRealFileValidates` for the file's content."""
-        from crucible.llm import load_capability_classes
+        from crucible.llm import FAULT_INJECTION_CAPABILITY_CLASSES, load_capability_classes
 
-        assert load_capability_classes() == ()
+        assert set(load_capability_classes()) == FAULT_INJECTION_CAPABILITY_CLASSES
 
 
 class TestAMalformedRegistryNamesTheRowAndTheField:

@@ -354,6 +354,19 @@ class RunContext:
     #: byte-identical to one from before this field existed.
     now_override: dt.datetime | None = None
 
+    #: Set by `run_job` from its own `fault_capability_class` argument —
+    #: never by the job body. `alpha-engine-config-I10343`: the capability
+    #: class every LLM call this run makes is REDIRECTED to, so plan §10.7
+    #: fault 3 can be induced against the real dispatched path. `crucible.llm
+    #: .call` reads it (`effective_capability_class`) and the value may only
+    #: be one of `crucible.llm.FAULT_INJECTION_CAPABILITY_CLASSES`. Same
+    #: "omitted entirely rather than null" shape as `now_override` above, and
+    #: for the same reason: a natural run's manifest is byte-identical to one
+    #: from before this field existed, and a run that deliberately routed to a
+    #: broken group is structurally distinguishable from one that failed on
+    #: its own.
+    fault_capability_class: str | None = None
+
     inputs: list[dict[str, Any]] = field(default_factory=list)
     outputs: list[dict[str, Any]] = field(default_factory=list)
     rows_in: int = 0
@@ -494,6 +507,7 @@ def run_job(
     dry_run: bool = False,
     run_mode: str | None = None,
     now_override: dt.datetime | None = None,
+    fault_capability_class: str | None = None,
 ) -> RunContext:
     """Run ``fn`` as job ``job`` and write its manifest, whatever happens.
 
@@ -578,6 +592,18 @@ def run_job(
     than relying on the body's own bookkeeping. `None` (the default) writes
     nothing, so every other job's manifest is unaffected.
 
+    ``fault_capability_class`` records — and effects — a deliberate
+    fault-injection redirect of this run's LLM routing
+    (`alpha-engine-config-I10343`). It is the honesty half of §10.7 fault 3
+    in exactly the shape ``now_override`` is for I10125: the value lands on
+    the manifest as `fault_capability_class`, so a run that failed because an
+    operator pointed it at a group contracted never to serve can never be
+    read as a run that failed on its own. Unlike ``now_override`` it is also
+    the ACTING half — `crucible.llm.call` reads it off the context, which is
+    what lets a job that knows nothing about fault injection be faulted.
+    `None` (the default) writes nothing and changes no routing, so every
+    other job is unaffected.
+
     Returns the :class:`RunContext` on success. Re-raises on failure, after
     the manifest is on disk (or, on ``dry_run=True``, after the one line is
     printed in its place).
@@ -609,6 +635,7 @@ def run_job(
         ctx.attempts = [dict(a) for a in attempts]
         ctx.discriminator = discriminator(ctx) if callable(discriminator) else discriminator
         ctx.now_override = now_override
+        ctx.fault_capability_class = fault_capability_class
 
         # `alpha-engine-config-I9986` deliverable 1: the fleet cost-sink
         # partitions every row under `{prefix}/{date}/{run_id}/`
@@ -759,6 +786,13 @@ def _write_manifest(
         # distinguishable from a natural one — a hand-chosen historical
         # window must never read as though it were observed live.
         manifest["now_override_utc"] = _utc(ctx.now_override)
+    if ctx.fault_capability_class is not None:
+        # Same "omitted entirely" shape, same reason (alpha-engine-config-I10343).
+        # This is the field that makes an INDUCED router failure distinguishable
+        # from a real one: `crucible fault.record --outcome induced` names a
+        # failed manifest, and a reader has to be able to tell that the failure
+        # was arranged.
+        manifest["fault_capability_class"] = ctx.fault_capability_class
     # cost_usd must be >= the sum of llm_calls[].usd (schemas/run_manifest.v1.json,
     # `cost_usd` description) — a schema cannot cross-reference two fields of
     # the same document, so the runner asserts it here, before the write, per

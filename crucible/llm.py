@@ -72,6 +72,9 @@ __all__ = [
     "CostSinkReconciliationError",
     "DEFAULT_LLM_CAP_USD",
     "DEFAULT_LLM_CAP_USD_MEASURED",
+    "FAULT_CAPABILITY_CLASS_ATTR",
+    "FAULT_INJECTION_CAPABILITY_CLASSES",
+    "FaultCapabilityClassRefused",
     "Finding",
     "LLM_CALLSITE_REGISTRY",
     "LlmCallCeilingExceeded",
@@ -86,7 +89,9 @@ __all__ = [
     "audit_call_sites",
     "call",
     "capability_group",
+    "effective_capability_class",
     "load_capability_classes",
+    "parse_fault_capability_class",
     "load_registry",
     "pace_metric",
     "reconcile_manifests_cost",
@@ -376,6 +381,124 @@ def capability_group(capability_class: str) -> str:
             )
         return group
     return capability_class
+
+
+# --------------------------------------------------------------------------
+# Fault injection: the one capability class that is contracted NEVER to serve.
+# --------------------------------------------------------------------------
+
+#: The capability classes whose router group is contracted to **never serve a
+#: request** — the fault-injection targets plan §10.7 fault 3 needs, and the
+#: only classes a run-scoped override (:func:`parse_fault_capability_class`)
+#: may name.
+#:
+#: `chaos_probe` is a real model group in the fleet's private model registry:
+#: two members over two real, currently-configured upstream hosts, each with
+#: a `model` string the host will never serve, so a call always fails at the
+#: provider rather than at the router edge. It resolves BY IDENTITY, exactly
+#: as `low`/`med`/`high`/`ultra` do — no :data:`CAPABILITY_CLASS_GROUPS` row,
+#: no crucible-specific transport, no env var. What made it unreachable from
+#: here until `alpha-engine-config-I10343` is that
+#: :func:`_require_capability_class` refuses any name outside
+#: :func:`_capability_classes`, and `llm_callsites.yaml` did not list it: the
+#: seam existed on the registry side of the boundary with no consumer able to
+#: ask for it.
+#:
+#: **Named here rather than derived, and that is the honest shape.** The
+#: contract "this group never serves" lives in the private registry, which
+#: this public package cannot read and must not learn to read (the group's
+#: membership, its upstream hosts and its models are exactly the
+#: infrastructure detail this tree forbids). What CAN live here is the
+#: consequence: a class in this set may be asked for only by a call site that
+#: exists to be broken, may be requested only by an explicit per-run
+#: operator override, and may never be reached by a production arm. That is
+#: what :mod:`crucible.slots.arms` refuses on, what
+#: :func:`parse_fault_capability_class` admits against, and what
+#: `tests/test_chaos_probe_containment.py` holds in both directions.
+#:
+#: Every member must ALSO appear in `llm_callsites.yaml`'s
+#: `capability_classes` — that file is where the reason for each name is
+#: written down — and must NOT be a `krepis.router` tier group, since a tier
+#: group is askable by identity without any deliberate edit at all. Both are
+#: asserted by test rather than stated here.
+FAULT_INJECTION_CAPABILITY_CLASSES: frozenset[str] = frozenset({"chaos_probe"})
+
+
+class FaultCapabilityClassRefused(ValueError):
+    """A run-scoped capability-class override that is not a fault-injection target.
+
+    The override exists for ONE purpose: routing a single dispatched run to a
+    group contracted never to serve, so plan §10.7 fault 3 can be induced
+    against the real scheduled path. Admitting any other class would make it
+    a second routing plane — a per-invocation flag deciding which model
+    serves a graded run, which is precisely the layer
+    `model-router-policy` §2 keeps above this consumer and principle 8
+    forbids a call site from owning. So the override is refused for `high`
+    and `low` as loudly as for a vendor model id: the fact that a name is a
+    legitimate router group is not a reason to let an operator flag select
+    it.
+    """
+
+
+#: The :class:`~crucible.runner.RunContext` attribute carrying the override.
+#: Named once here because :func:`effective_capability_class` reads it off a
+#: duck-typed context (`ctx` is `Any` at this door — tests pass their own)
+#: and `crucible.runner` sets it; a literal restated at both ends is how the
+#: two drift.
+FAULT_CAPABILITY_CLASS_ATTR = "fault_capability_class"
+
+
+def parse_fault_capability_class(raw: str) -> str:
+    """Validate an operator's ``--fault-capability-class`` value, or refuse it.
+
+    Pure and offline, so a bad invocation is a usage error before a store, a
+    trading day or a provider is touched — the same shape as
+    `crucible.alerts.parse_now_override`, and for the same reason: the
+    override is an OPERATOR act whose validation belongs beside the reason it
+    is allowed at all, not inside the job body that happens to use it.
+
+    Refuses everything outside :data:`FAULT_INJECTION_CAPABILITY_CLASSES`,
+    including real router groups — see :class:`FaultCapabilityClassRefused`.
+    """
+    value = raw.strip()
+    if value in FAULT_INJECTION_CAPABILITY_CLASSES:
+        return value
+    raise FaultCapabilityClassRefused(
+        f"{raw!r} is not a fault-injection capability class. This override may name only "
+        f"{sorted(FAULT_INJECTION_CAPABILITY_CLASSES)} — classes whose router group is "
+        "contracted NEVER to serve, so a run that names one is deliberately inducing plan "
+        "§10.7 fault 3. A real router group is refused here even though it is a legal "
+        "capability class everywhere else: an operator flag that could choose which model "
+        "serves a graded run is a second routing plane, and which model serves a class is "
+        "a registry decision resolved above this package."
+    )
+
+
+def effective_capability_class(ctx: Any, declared: str) -> str:
+    """The class this call actually asks the router for.
+
+    ``declared`` is what the call site states. It is returned unchanged unless
+    the RUN was explicitly launched with a fault-injection override, in which
+    case that override wins for every call the run makes — which is the whole
+    point: a fault is induced against a job that has no idea it is being
+    faulted, exactly as a real router outage would arrive.
+
+    The override is read off the context with a default rather than as a bare
+    attribute, and that is deliberate rather than the rule-5 silent-default
+    it resembles: ``ctx`` is duck-typed :class:`typing.Any` at this door (the
+    cap tests, the fault suite and any future harness pass their own
+    contexts), and "this run declared no override" is the state of every
+    natural run — an ABSENT override is a real, correct reading, not a
+    missing contract. What must never be silent is the other direction: an
+    override that was requested and not applied. That cannot happen here,
+    because the same attribute `crucible.runner.run_job` sets is the one that
+    lands on the manifest as ``fault_capability_class``, so a run whose
+    manifest claims the override is a run whose calls took it.
+    """
+    override = getattr(ctx, FAULT_CAPABILITY_CLASS_ATTR, None)
+    if override is None:
+        return declared
+    return parse_fault_capability_class(str(override))
 
 
 #: The fleet's ONE name for "where is this code running" — krepis' own
@@ -1096,6 +1219,18 @@ def call(
     model id is REFUSED — a call site naming a model is a call site that has
     to be edited when the provider changes (principle 8).
 
+    **A run launched with a fault-injection override asks for THAT class
+    instead** (`alpha-engine-config-I10343`). `crucible.runner.RunContext
+    .fault_capability_class` — set by `run_job` from the CLI's
+    ``--fault-capability-class``, never by a job body — redirects every call
+    this run makes to a capability class contracted never to serve, so plan
+    §10.7 fault 3 (the router returns an error) is inducible against the real
+    scheduled path without a code edit per fault run and without touching any
+    other consumer's routing. The override may name only
+    :data:`FAULT_INJECTION_CAPABILITY_CLASSES`; the same field lands on the
+    manifest, so a run that deliberately routed to a broken group is never
+    mistakable for one that failed on its own.
+
     **The group is resolved through `krepis.router`, and only through it**
     (`alpha-engine-config-I9969`). What the call site states is a capability;
     which model serves it, at which endpoint, on which credential, and in
@@ -1153,6 +1288,18 @@ def call(
             "call site is spend nobody can attribute."
         )
     _require_capability_class(capability_class, callsite_id=callsite_id)
+    # The run-scoped fault-injection override (`alpha-engine-config-I10343`).
+    # Resolved HERE, at the door, rather than at each call site: fault 3's
+    # exercise is a job that fails on a broken router without having been
+    # written to know about fault injection, which is only true if the
+    # redirect happens somewhere no call site had to opt into. Validated
+    # again through `parse_fault_capability_class` (inside
+    # `effective_capability_class`) even though the CLI already validated it
+    # — a context reaching this door with an override the flag would have
+    # refused did not come from the flag.
+    asked = effective_capability_class(ctx, capability_class)
+    if asked != capability_class:
+        _require_capability_class(asked, callsite_id=callsite_id)
     if estimate_usd < 0:
         raise ValueError(f"a call estimate cannot be negative; got {estimate_usd}")
     if estimate_usd > site.max_usd_per_call:
@@ -1216,7 +1363,7 @@ def call(
     from krepis.llm import LLMClient
     from krepis.router import resolve_group_spec, route_is_degraded
 
-    group = capability_group(capability_class)
+    group = capability_group(asked)
     spec, route = resolve_group_spec(
         group,
         exec_context=_exec_context(),
@@ -1233,7 +1380,14 @@ def call(
     ctx.record_llm_call(
         {
             "callsite_id": callsite_id,
-            "model_requested": capability_class,
+            # The class actually asked of the router, which is the DECLARED
+            # class on every natural run and the fault-injection override on a
+            # run that requested one. Recording the declared class here on an
+            # overridden run would put a truthful-looking row about a model
+            # nobody asked for beside a manifest whose own
+            # `fault_capability_class` field says otherwise; the run-level
+            # field says the override happened, this row says what it asked.
+            "model_requested": asked,
             "model_served": result.model,
             # RESOLUTION already fell past the group's primary entry
             # (`model-router-policy` R12: serving from a fallback is an

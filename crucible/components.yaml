@@ -681,6 +681,41 @@ components:
       anchor: next_calendar_day_at
       at: "12:00"
 
+  fault.probe:
+    # alpha-engine-config-I10343: the INDUCER for plan §10.7 fault 3. Reaches
+    # the router once through the declared door, asking for a capability class
+    # whose group is contracted never to serve, so the run fails on the
+    # transport with full telemetry and pages exactly once. On-demand, like
+    # fault.record — a job that can only ever fail would, on a schedule, page
+    # every cycle forever, and the two page conditions have a monthly ceiling
+    # that is itself a metric.
+    description: Induce a router transport failure on the real dispatched path (fault 3).
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      # Always 0.00. The probe's class never serves, so no completion exists
+      # to be billed; the field is declared because a cost class that reads
+      # zero is a measurement, and an omitted one is a forgotten instrument.
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      # It writes no artifact at all: filing the durable record is
+      # fault.record's separate, deliberate act, which re-reads THIS manifest
+      # and refuses unless it says `status: failed`. Declared null rather than
+      # omitted, same as data.heal's outcome.
+      lineage: null
+      # No graded outcome of its own — the fault RECORD carries the claim, and
+      # this job is the event the record is about.
+      outcome: null
+    log_location: /crucible/fault.probe
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
   fault.record:
     # alpha-engine-config-I10320/-I10322/-I10327: files the durable record of
     # one scripted fault (plan §10.7) exercised against the real scheduled
