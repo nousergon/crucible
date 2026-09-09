@@ -680,3 +680,29 @@ components:
     deadline:
       anchor: next_calendar_day_at
       at: "12:00"
+
+  fault.record:
+    # alpha-engine-config-I10320/-I10322: files the durable record of one
+    # scripted fault (plan §10.7) induced against the real scheduled path.
+    # On-demand, like data.heal and experiment.new — an operator/procedure
+    # runs it once per induced fault, never on a schedule.
+    description: File the durable record of one induced scripted fault, or refuse.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:outputs[faults/{trading_day}/{fault_id}.json]
+      # A fault record makes no graded outcome claim of its own — it is
+      # evidence ABOUT a run, not a verdict. Declared null rather than
+      # omitted, same as data.heal.
+      outcome: null
+    log_location: /crucible/fault.record
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
