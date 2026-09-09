@@ -109,6 +109,11 @@ __all__ = [
     "MANIFEST_RUN_MODE_FIELD",
     "MANIFEST_RUN_MODE_LIVE",
     "PHASE0_DELIVERABLES",
+    "PHASE1_DELIVERABLES",
+    "PHASE2_DELIVERABLES",
+    "PHASE3_DELIVERABLES",
+    "PHASE4_DELIVERABLES",
+    "PHASE5_DELIVERABLES",
     "PHASE2_LIVE_SATURDAYS",
     "PHASE2_MAX_PAGES",
     "PHASE2_MAX_TAGGED_USD",
@@ -221,10 +226,13 @@ class GateResult:
     trading_day: dt.date
     window: list[dt.date]
     clauses: list[Clause] = field(default_factory=list)
-    #: How much of the phase issue this clause list grades, or None when the
-    #: gate declares no deliverable list. Not a clause: it is true by
-    #: construction, so counting it in `met_ratio` would inflate the one
-    #: figure plan §6 rule 3 exists to keep honest. Set by `evaluate`.
+    #: How much of the phase issue this clause list grades. Every registered
+    #: gate now carries a declared deliverable table (`alpha-engine-config-
+    #: I10309`), so `coverage_note` always returns a line rather than None;
+    #: the field stays `str | None` for a `GateResult` constructed without
+    #: going through `evaluate`. Not a clause: it is true by construction, so
+    #: counting it in `met_ratio` would inflate the one figure plan §6 rule 3
+    #: exists to keep honest. Set by `evaluate`.
     coverage: str | None = None
 
     @property
@@ -2736,32 +2744,410 @@ PHASE0_DELIVERABLES: tuple[Deliverable, ...] = (
     ),
 )
 
-#: Which phase issue's deliverables each gate is answerable for. A gate absent
-#: from this table grades no declared deliverable list and gets no coverage
-#: line — silence here is "not declared", never "grades everything".
+#: `alpha-engine-config-I9758`'s (phase 2) deliverables, split at the
+#: semicolons of that issue's own single, unbulleted "### Deliverables"
+#: paragraph — the same granularity `alpha-engine-config-I10309` itself uses
+#: when it names these six items. Two are graded (`replays_ok`,
+#: `pages_commissioned`); four are not, and are not stretched onto a clause
+#: that happens to exist — `zero_human_mutating_calls`, `live_saturdays_
+#: first_attempt_ok`, `pages_within_ceiling` and `aws_cost_within_ceiling`
+#: grade plan §6's *closes-when* row, not this issue's declared deliverables,
+#: and are correctly absent from every ``graded_by`` here.
+PHASE2_DELIVERABLES: tuple[Deliverable, ...] = (
+    Deliverable(
+        "scheduler_live_over_five_replay_dates",
+        "the scheduler runs live over the 5 replay dates at accelerated cadence (one per 4h)",
+        "replays_ok",
+    ),
+    Deliverable(
+        "two_page_conditions_on_real_channel",
+        "the two page conditions (absence, failure) route to the real paging channel",
+        None,
+        "no clause reads the transport a page condition routes to on its own; "
+        "`pages_commissioned` reads whether each condition's bus row was delivered "
+        "(`sent: true`) through whatever channel is configured, which folds the real-"
+        "channel fact into commissioning rather than grading it separately",
+    ),
+    Deliverable(
+        "transient_retry_class_in_runner",
+        "the transient-retry class (plan §11.2) is implemented in `crucible.runner`",
+        None,
+        "a property of the runner's source, not of any artifact filed to the store; "
+        "no gate clause reads `crucible/runner.py`",
+    ),
+    Deliverable(
+        "fault_injection_against_scheduled_path",
+        "fault injection (plan §10.7) was run against the live scheduled path",
+        None,
+        "a one-time exercise with no durable fault-injection-run artifact defined in "
+        "the store; nothing files a record of it and no clause reads one",
+    ),
+    Deliverable(
+        "both_page_conditions_commissioned",
+        "both page conditions were induced for real, delivered, and stood down",
+        "pages_commissioned",
+    ),
+    Deliverable(
+        "runbook_in_readme",
+        "the runbook (rerun, replay, roll back, heal, unseal) is written into README",
+        None,
+        "documentation prose in git, not a store artifact; no gate clause reads "
+        "repository README content",
+    ),
+)
+
+#: `alpha-engine-config-I9757`'s (phase 1) deliverables, split at the
+#: semicolons inside each of that issue's three bulleted Track A/B/C lines —
+#: the same per-clause granularity used for phase 2 above, applied to a
+#: Deliverables section that happens to be structured as three tracks rather
+#: than one paragraph. Phase 1 already exited MET 6/6 on 2026-09-09 before
+#: this table existed (`alpha-engine-config-I10309`); nothing here changes
+#: that reading, it only names — for the first time — what of the 20 declared
+#: items those six clauses actually cover (8 of 20).
+PHASE1_DELIVERABLES: tuple[Deliverable, ...] = (
+    # --- Track A ---
+    Deliverable(
+        "cli_commands",
+        "the `crucible` CLI: data.daily, data.weekly, data.heal, experiment.new/run/"
+        "grade, report, explain, migrate.history",
+        "arc_runs_ok",
+    ),
+    Deliverable(
+        "run_manifest_schema",
+        "run-manifest schema: `status` in {ok, failed} only, typed `trading_day`/"
+        "`calendar_date`, resource class",
+        "arc_runs_ok",
+    ),
+    Deliverable(
+        "data_layer_lifted",
+        "data layer lifted from `nousergon-data` + `nousergon_lib.arcticdb`",
+        "arc_runs_ok",
+    ),
+    Deliverable(
+        "feature_layer",
+        "feature layer (plan §10.4)",
+        "arc_runs_ok",
+    ),
+    Deliverable(
+        "u_and_r_slots_on_run_cycle",
+        "U and R slots on `nousergon_lib.arena.engine.run_cycle`",
+        "arms_all_scored",
+    ),
+    Deliverable(
+        "control_arms",
+        "control arms (plan §10.1)",
+        "arms_all_scored",
+    ),
+    Deliverable(
+        "trial_ledger",
+        "trial ledger",
+        None,
+        "no clause reads a trial-ledger artifact; none of the six phase-1 clauses name one",
+    ),
+    Deliverable(
+        "trading_day_contract_test",
+        "trading-day contract test (plan §4.12)",
+        None,
+        "enforced by the blocking pytest suite on every push, not re-read by a live "
+        "gate clause over the store",
+    ),
+    # --- Track B ---
+    Deliverable(
+        "m_slot_lifted",
+        "M slot: `crucible-predictor/training/model_zoo.py` lifted, behavioural veto "
+        "scale-dependent, `TrainingIntegrityError` fails the run",
+        None,
+        "M is excluded from `dispatchable_slots()` until phase 3 (`_clause_"
+        "arms_all_scored`'s own comment: 'M and S have no produce/grade until phase "
+        "3'), so no phase-1 clause reads its arena cycle",
+    ),
+    Deliverable(
+        "s_slot_lifted",
+        "S slot: `strategy_arena.py` + walk-forward + `pit_parity` lifted",
+        None,
+        "S is excluded from `dispatchable_slots()` until phase 3, the same as M above",
+    ),
+    Deliverable(
+        "promote_and_condorcet_retirement",
+        "`promote` with `promote_min_weeks=4` and Condorcet retirement via the lib engine",
+        None,
+        "promotion/retirement is graded by phase 3's `{slot}_promotion_or_verdict_"
+        "backed_non_promotion` clauses, which read the champion pointer and `promote` "
+        "manifests; no phase-1 clause reads either",
+    ),
+    Deliverable(
+        "arena_cycle_artifacts_per_slot",
+        "`arena_cycle` artifacts per slot",
+        "arms_all_scored",
+    ),
+    # --- Track C ---
+    Deliverable(
+        "ci_workflow",
+        "`ci.yml`: uv, ruff, pytest, pip-audit on lockfile, path-filtered, <=5 min",
+        None,
+        "CI's own correctness is enforced by every push running it green, not by a "
+        "gate clause reading the workflow file",
+    ),
+    Deliverable(
+        "deploy_workflow",
+        "`deploy.yml`: wheel to `releases/{sha}/`, smoke, conditional-PUT pointer flip",
+        "pointer_flipped_on_smoke",
+    ),
+    Deliverable(
+        "cfn_template",
+        "CFN template in `nous-ergon-ops` (bucket, scheduler, dispatcher Lambda, spot "
+        "launch template, deploy + runtime roles, default tag)",
+        None,
+        "infrastructure-as-code in a different, private repository; this public repo's "
+        "gate clauses read the store, never another repo's IaC, and `tests/test_no_"
+        "infra_literals.py` forbids naming its resources here",
+    ),
+    Deliverable(
+        "alerting_two_page_conditions",
+        "alerting: two page conditions + weekly heartbeat + `alerts/` bus rows + causal grouping",
+        None,
+        "page-condition commissioning is graded by phase 2's `pages_commissioned` "
+        "clause; phase 1 registers no clause over the alerts bus",
+    ),
+    Deliverable(
+        "drift_metrics",
+        "drift metrics (plan §10.5)",
+        None,
+        "no clause reads a drift-metric artifact",
+    ),
+    Deliverable(
+        "fault_injection_scripts",
+        "fault-injection scripts (plan §10.7)",
+        None,
+        "the scripts' existence is not store-observable; exercising them against the "
+        "scheduled path is phase 2's own (also ungraded) deliverable",
+    ),
+    Deliverable(
+        "console_page_from_manifests",
+        "console page rendered from manifests",
+        None,
+        "a rendering surface; no gate clause asserts the console page exists or reads "
+        "correctly from manifests",
+    ),
+    Deliverable(
+        "components_yaml",
+        "`components.yaml`",
+        None,
+        "enforced by its own coverage pytest (AGENTS.md rule 1), not by a live gate clause",
+    ),
+)
+
+#: `alpha-engine-config-I9759`'s (phase 3) deliverables, split at the
+#: semicolons of that issue's single Deliverables paragraph. Phase 3's four
+#: registered clauses (one per slot) read only the champion pointer and
+#: `promote` manifests — none of them reaches the portfolio engine, the
+#: attribution table, the sealed holdout, the cost model, or the per-slot
+#: benchmark this issue actually declares, so the honest reading is 0 of 5.
+#: That is the gap this mechanism exists to expose, not a mapping to smooth
+#: over.
+PHASE3_DELIVERABLES: tuple[Deliverable, ...] = (
+    Deliverable(
+        "portfolio_engine_used_by_s_slot",
+        "`crucible.portfolio` (MVO + turnover governor + cost model + ADV cap) used "
+        "by S-slot grading",
+        None,
+        "no phase-3 clause reads `crucible.portfolio` or any evidence it was used in "
+        "grading; the four promotion/non-promotion clauses read only the champion "
+        "pointer and `promote` manifests",
+    ),
+    Deliverable(
+        "factor_neutral_attribution",
+        "factor-neutral attribution (beta/sector/size/residual, OLS on ArcticDB ETF series)",
+        None,
+        "no phase-3 clause reads an attribution artifact for residual alpha or gross/net returns",
+    ),
+    Deliverable(
+        "sealed_holdout",
+        "sealed holdout `strategy/holdout.json` with `--unseal` requiring a ruling reference",
+        None,
+        "no phase-3 clause reads `strategy/holdout.json` or an unseal audit trail",
+    ),
+    Deliverable(
+        "named_transaction_cost_model",
+        "named transaction-cost model",
+        None,
+        "no phase-3 clause reads a transaction-cost-model artifact",
+    ),
+    Deliverable(
+        "benchmark_per_slot",
+        "benchmark per slot in `ArenaConfig`",
+        None,
+        "a config-shape fact for unit tests over `crucible.slots.arena_config_for`, "
+        "not a live gate reading",
+    ),
+)
+
+#: `alpha-engine-config-I9760`'s (phase 4) deliverables, split at the
+#: semicolons of the issue's Deliverables paragraph plus its separate
+#: "Decommission:" paragraph under the same heading — 7 trader items, 5
+#: decommission items. Only two of twelve are gate-readable today:
+#: `old_sf_execution_count_zero` grades "old SFs disabled" exactly, and
+#: `trader_one_week_on_v2_champion` is the one consumer-evidence artifact the
+#: trader contract declares at all.
+PHASE4_DELIVERABLES: tuple[Deliverable, ...] = (
+    Deliverable(
+        "trader_reads_champion_contract",
+        "trader reads `champions/{slot}/current.json` + `predictions/{date}.json`, "
+        "refuses a champion whose manifest is not ok/attested",
+        "trader_one_week_on_v2_champion",
+    ),
+    Deliverable(
+        "trader_release_pin_ib_paper_smoke",
+        "trader release pin (`crucible release pin --target trader <sha>`) with IB-paper smoke",
+        None,
+        "no clause reads a release-pin or paper-smoke artifact for the trader",
+    ),
+    Deliverable(
+        "kill_switch_fire_drill",
+        "kill-switch fire drill on paper",
+        None,
+        "no clause reads any fire-drill artifact",
+    ),
+    Deliverable(
+        "broker_reconciliation",
+        "broker reconciliation emitting `run.json`",
+        None,
+        "`trader_one_week_on_v2_champion` reads only the `trading_days` field on the "
+        "trader's consumer-evidence artifact, not a broker-reconciliation manifest",
+    ),
+    Deliverable(
+        "execution_shortfall_attribution_row",
+        "execution-shortfall attribution row",
+        None,
+        "no clause reads an execution-shortfall artifact",
+    ),
+    Deliverable(
+        "shadow_books_per_challenger",
+        "shadow books per challenger (plan §10.6)",
+        None,
+        "no clause reads a shadow-book artifact",
+    ),
+    Deliverable(
+        "portfolio_adopted_by_trader",
+        "`crucible.portfolio` adopted by the trader",
+        None,
+        "no clause reads evidence that the trader adopted `crucible.portfolio`",
+    ),
+    Deliverable(
+        "old_sfs_disabled",
+        "old SFs disabled",
+        "old_sf_execution_count_zero",
+    ),
+    Deliverable(
+        "lambdas_and_alarms_removed",
+        "66 Lambdas + 153 alarms removed via IaC",
+        None,
+        "no clause reads a Lambda/alarm inventory; `old_sf_execution_count_zero` "
+        "counts Step Functions executions only",
+    ),
+    Deliverable(
+        "artifact_registry_tombstoned",
+        "`ARTIFACT_REGISTRY` rows tombstoned RETIRED",
+        None,
+        "no clause reads `ARTIFACT_REGISTRY`",
+    ),
+    Deliverable(
+        "codebuild_consumers_retired",
+        "CodeBuild consumers retired",
+        None,
+        "no clause reads CodeBuild consumer state",
+    ),
+    Deliverable(
+        "system_optimized_doc_rewritten",
+        "`SYSTEM_OPTIMIZED.md` rewritten to v2 as target",
+        None,
+        "documentation content, not store-observable",
+    ),
+)
+
+#: `alpha-engine-config-I9761`'s (phase 5) deliverables, split at the
+#: semicolons of the issue's Deliverables paragraph. Phase 5 registers exactly
+#: one clause, `every_llm_arm_has_a_verdict_within_one_cycle`, which reads
+#: whether each ACTIVE arm declaring an LLM call site has a verdict — the
+#: closest artifact to "arms re-enter... and are graded", and silent on the
+#: other three items.
+PHASE5_DELIVERABLES: tuple[Deliverable, ...] = (
+    Deliverable(
+        "llm_arms_re_enter_as_r_challengers",
+        "LLM analyst arms re-enter one at a time as R challengers via `krepis.llm`/"
+        "LiteLLM router, per-run cost cap via `krepis.usage_pacing`, gated on LIVE "
+        "cycles only with look-ahead disclosure",
+        "every_llm_arm_has_a_verdict_within_one_cycle",
+    ),
+    Deliverable(
+        "judge_calibration",
+        "judge model IDs pinned, calibration set >=30 traces, swap-order pairwise",
+        None,
+        "no clause reads a judge-model pin, calibration-set size, or swap-order result",
+    ),
+    Deliverable(
+        "pit_constituent_lists",
+        "PIT constituent lists",
+        None,
+        "no clause reads a PIT-constituent-list artifact",
+    ),
+    Deliverable(
+        "leave_one_out_ablation_replay",
+        "leave-one-out ablation replay",
+        None,
+        "no clause reads an ablation-replay artifact",
+    ),
+)
+
+#: Which phase issue's deliverables each gate is answerable for. Every gate
+#: `PHASES` registers now carries an entry — `coverage_note` RAISES for a gate
+#: absent from this table (`alpha-engine-config-I10309`, deliverable 3), so a
+#: seventh phase cannot be added without declaring what it owes before its
+#: gate can be evaluated at all. Before this table had five more rows, a
+#: reader comparing phase 0's coverage line to phase 1's `null` closing-record
+#: field had nothing telling them the difference was *undeclared coverage*
+#: rather than *equivalent coverage* — phase 1 had already exited on it.
 GATE_DELIVERABLES: dict[str, tuple[Deliverable, ...]] = {
     "phase0": PHASE0_DELIVERABLES,
+    "phase1": PHASE1_DELIVERABLES,
+    "phase2": PHASE2_DELIVERABLES,
+    "phase3": PHASE3_DELIVERABLES,
+    "phase4": PHASE4_DELIVERABLES,
+    "phase5": PHASE5_DELIVERABLES,
 }
 
 
-def coverage_note(gate: str, clause_names: Iterable[str]) -> str | None:
+def coverage_note(gate: str, clause_names: Iterable[str]) -> str:
     """How much of ``gate``'s phase issue this clause list actually grades.
 
-    Returns None for a gate with no declared deliverable list. Otherwise a
-    single line naming the subset and every deliverable nothing measures —
-    carried on :class:`GateResult`, printed by `render`, and appended to the
-    ladder row's detail, so a phase cannot render MET on a surface that gives
-    no sign three of its five deliverables were never looked at.
+    A single line naming the graded subset and every deliverable nothing
+    measures — carried on :class:`GateResult`, printed by `render`, and
+    appended to the ladder row's detail, so a phase cannot render MET on a
+    surface that gives no sign some of its deliverables were never looked at.
 
-    **Raises** when the table and the clause list disagree: a deliverable
-    naming a clause this reading does not contain, or an ungraded deliverable
-    with no written reason. That is a defect in this file, not a condition of
-    the store, and rule 5's default is `raise` — a reading published from an
-    inconsistent table would quietly grade less than it claims.
+    **Raises** when ``gate`` carries no entry in :data:`GATE_DELIVERABLES` at
+    all (`alpha-engine-config-I10309`, deliverable 3) — a gate with no
+    declared table is not silence, it is the same failure `alpha-engine-
+    config-I9757` already shipped: a phase exiting MET with nobody having
+    enumerated what it owed. Every gate `PHASES` registers must carry an
+    entry before it can be evaluated.
+
+    **Also raises** when the table and the clause list disagree: a
+    deliverable naming a clause this reading does not contain, or an
+    ungraded deliverable with no written reason. That is a defect in this
+    file, not a condition of the store, and rule 5's default is `raise` — a
+    reading published from an inconsistent table would quietly grade less
+    than it claims.
     """
-    deliverables = GATE_DELIVERABLES.get(gate)
-    if not deliverables:
-        return None
+    if gate not in GATE_DELIVERABLES:
+        raise ValueError(
+            f"gate {gate!r} has no entry in GATE_DELIVERABLES. Every gate registered "
+            "in PHASES must declare what its phase issue owes before it can be "
+            "evaluated — an undeclared table is exactly how a phase can exit MET "
+            "with a `coverage: null` closing record. Add a Deliverable table for "
+            "this gate, built from its own tracker issue's Deliverables line."
+        )
+    deliverables = GATE_DELIVERABLES[gate]
     names = set(clause_names)
     orphaned = sorted(
         d.id for d in deliverables if d.graded_by is not None and d.graded_by not in names
