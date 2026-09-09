@@ -296,8 +296,16 @@ class RunContext:
 
     def record_output(self, key: str, payload: bytes, schema_version: str = "v1") -> None:
         """Write ``payload`` to the store and record it as an output."""
-        digest = self.store.put_bytes(key, payload)
-        self.outputs.append({"key": key, "sha256": digest, "schema_version": schema_version})
+        # Hashed here, not taken from the write's return value. Every
+        # `put_bytes` happens to return the content digest today, but the
+        # store contract does not promise it -- `compare_and_swap`, right
+        # below, promises a VERSION TOKEN and returns an S3 ETag, and reading
+        # `sha256` out of a write's return value is exactly how that value
+        # ended up in this field (see `record_output_cas`).
+        self.store.put_bytes(key, payload)
+        self.outputs.append(
+            {"key": key, "sha256": sha256_hex(payload), "schema_version": schema_version}
+        )
 
     def record_rows(self, *, rows_in: int, rows_out: int) -> None:
         self.rows_in = rows_in
@@ -346,9 +354,32 @@ class RunContext:
         reason the store itself never retries: the caller re-reads and
         decides rather than overwriting whatever the winner just published.
         """
-        digest = self.store.compare_and_swap(key, expected, payload)
-        self.outputs.append({"key": key, "sha256": digest, "schema_version": schema_version})
-        return digest
+        version = self.store.compare_and_swap(key, expected, payload)
+        # `sha256` is the CONTENT digest, exactly as in `record_output`. What
+        # `compare_and_swap` returns is the store's new VERSION TOKEN — its
+        # own docstring says so — and the two are not the same value on every
+        # backend. `LocalStore` makes its etag the content digest, so the two
+        # coincide there and every local test agreed with the wrong answer;
+        # `S3Store` returns the object's `ETag`, which is not a sha256 at all
+        # for a multipart write and is not one BY CONTRACT for any write.
+        #
+        # This recorded the version token in the `sha256` field. On S3 that
+        # fails `run_manifest.v2`'s `^[0-9a-f]{64}$` at the end of the job, in
+        # the `finally` that writes the manifest -- AFTER the work has been
+        # done and the object written. Measured 2026-09-09: the `Gate close`
+        # run at 01:03:47Z filed BOTH phase-0 and phase-1 closing records by
+        # CAS and then died on `outputs/0/sha256` and `outputs/1/sha256`, so
+        # it never reached the step that posts the closing reading to the
+        # phase tracker issues. The phase-exit loop failed on the first day it
+        # ever succeeded, and the two trackers stayed open with no comment
+        # explaining why (`alpha-engine-config-I9967`).
+        #
+        # The version token is still RETURNED, because a caller needs it as
+        # the `expected` of its next conditional write.
+        self.outputs.append(
+            {"key": key, "sha256": sha256_hex(payload), "schema_version": schema_version}
+        )
+        return version
 
 
 def run_job(
