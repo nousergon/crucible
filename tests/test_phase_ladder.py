@@ -21,6 +21,7 @@ import pytest
 
 from crucible.console.render import STATUS_COLORS, build_page, render_html, write_page
 from crucible.gate import (
+    GATE_DELIVERABLES,
     GATES,
     LADDER_CONSOLE_STATE,
     LADDER_KEY,
@@ -225,6 +226,7 @@ class TestTheLadderKnowsWhereItIs:
         """`all([])` is True. A gate whose clause list emptied would otherwise
         report every phase behind it as exited."""
         monkeypatch.setitem(GATES, "phase1", (5, lambda *_a, **_k: []))
+        monkeypatch.setitem(GATE_DELIVERABLES, "phase1", ())
         rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
         assert rows["phase1"]["state"] == "UNMEASURED"
         assert rows["phase1"]["met_ratio"] is None
@@ -247,6 +249,7 @@ class TestTheLadderKnowsWhereItIs:
         from crucible.gate import Clause, evaluate
 
         monkeypatch.setitem(GATES, "phase1", (5, lambda *_a, **_k: []))
+        monkeypatch.setitem(GATE_DELIVERABLES, "phase1", ())
         gate_reading = evaluate(store, gate="phase1", trading_day=FRIDAY)
         ladder_rows = {
             r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]
@@ -260,6 +263,7 @@ class TestTheLadderKnowsWhereItIs:
             "phase1",
             (5, lambda *_a, **_k: [Clause("c", "req", False, "unmet", ())]),
         )
+        monkeypatch.setitem(GATE_DELIVERABLES, "phase1", ())
         gate_reading = evaluate(store, gate="phase1", trading_day=FRIDAY)
         ladder_rows = {
             r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]
@@ -327,6 +331,7 @@ class TestAnUnmeasurableClauseRendersAsSuchNotAsFailed:
                 ],
             ),
         )
+        monkeypatch.setitem(GATE_DELIVERABLES, "phase1", ())
         rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
         assert rows["phase1"]["state"] == "UNMEASURABLE"
         assert rows["phase1"]["console_state"] == "FAILED"
@@ -359,6 +364,7 @@ class TestAnUnmeasurableClauseRendersAsSuchNotAsFailed:
                 ],
             ),
         )
+        monkeypatch.setitem(GATE_DELIVERABLES, "phase1", ())
         gate_reading = evaluate(store, gate="phase1", trading_day=FRIDAY)
         assert gate_reading.met_ratio is None
         rows = {r["phase"]: r for r in build_ladder(store, trading_day=FRIDAY).to_dict()["phases"]}
@@ -489,6 +495,7 @@ class TestThePhaseLadderSchemaContract:
         monkeypatch.setitem(
             GATES, "phase1", (5, lambda *_a, **_k: [Clause("c", "req", False, "unmet", ())])
         )
+        monkeypatch.setitem(GATE_DELIVERABLES, "phase1", ())
         args = argparse.Namespace(
             gate="phase1", trading_day=FRIDAY, weeks=None, store=str(tmp_path)
         )

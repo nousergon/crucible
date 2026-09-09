@@ -1091,11 +1091,12 @@ class TestTheGateJobPublishesAnHonestMetric:
     def test_an_empty_clause_list_publishes_NA_not_0_0(self, tmp_path, monkeypatch) -> None:
         import argparse
 
-        from crucible.gate import GATES
+        from crucible.gate import GATE_DELIVERABLES, GATES
         from crucible.store import LocalStore
         from crucible.track_f import gate_handler
 
         monkeypatch.setitem(GATES, "phase1", (5, lambda *_a, **_k: []))
+        monkeypatch.setitem(GATE_DELIVERABLES, "phase1", ())
         store_uri = str(tmp_path)
         args = argparse.Namespace(
             gate="phase1", trading_day=RENDER_DAY, weeks=None, store=store_uri
@@ -1122,7 +1123,7 @@ class TestTheGateJobPublishesAnHonestMetric:
         a numeric OK/FAIL status, not N/A."""
         import argparse
 
-        from crucible.gate import GATES, Clause
+        from crucible.gate import GATE_DELIVERABLES, GATES, Clause
         from crucible.store import LocalStore
         from crucible.track_f import gate_handler
 
@@ -1131,6 +1132,7 @@ class TestTheGateJobPublishesAnHonestMetric:
             "phase1",
             (5, lambda *_a, **_k: [Clause("c", "req", False, "unmet", ())]),
         )
+        monkeypatch.setitem(GATE_DELIVERABLES, "phase1", ())
         store_uri = str(tmp_path)
         args = argparse.Namespace(
             gate="phase1", trading_day=RENDER_DAY, weeks=None, store=store_uri
@@ -1827,12 +1829,45 @@ class TestPhaseZeroSaysWhatItDoesNotGrade:
         assert rows["phase0"]["state"] == "MET", rows["phase0"]["detail"]
         assert "5 of 5" in rows["phase0"]["detail"]
 
-    def test_a_gate_with_no_declared_deliverables_gets_no_coverage_line(self, tmp_path) -> None:
-        """Silence is "not declared", never "grades everything". Phase 1
-        declares no deliverable table, so it publishes no claim about one."""
-        result = evaluate(LocalStore(tmp_path), gate="phase1", trading_day=RENDER_DAY)
-        assert result.coverage is None
-        assert result.to_dict()["coverage"] is None
+    def test_a_gate_with_no_declared_deliverables_RAISES(self) -> None:
+        """`alpha-engine-config-I10309`: silence used to mean "not declared",
+        rendered identically to "grades everything" — which is exactly how
+        phase 1 exited MET with a `coverage: null` closing record while its
+        five clauses were green. A gate absent from `GATE_DELIVERABLES` now
+        raises rather than publishing that silence again."""
+        with pytest.raises(ValueError, match="no entry in GATE_DELIVERABLES"):
+            coverage_note("phase6_unregistered", [])
+
+    def test_every_phase_in_PHASES_has_a_GATE_DELIVERABLES_entry(self) -> None:
+        """Deliverable 3: a phase registered in `PHASES` with no declared
+        table is the failure this test exists to catch before a live reading
+        does — verified to fail without the change (this test predates
+        `PHASE1_DELIVERABLES` through `PHASE5_DELIVERABLES` existing at all;
+        before they were added, `{p.gate for p in PHASES}` was
+        `{"phase0", ..., "phase5"}` and `set(GATE_DELIVERABLES)` was
+        `{"phase0"}`, and this assertion failed)."""
+        gates = {p.gate for p in PHASES if p.gate is not None}
+        assert gates == set(GATE_DELIVERABLES)
+
+    @pytest.mark.parametrize("gate", ["phase1", "phase2", "phase3", "phase4", "phase5"])
+    def test_every_registered_phases_deliverable_table_agrees_with_its_clause_list(
+        self, tmp_path, monkeypatch, gate: str
+    ) -> None:
+        """Every non-phase-0 gate now carries a table too, and `coverage_note`
+        must not raise when reading it — the same orphaned/unexplained check
+        phase 0 has always had to pass, now exercised for the other five."""
+        monkeypatch.setenv("CRUCIBLE_MUTED_TOPIC", "muted-test-topic")
+        result = evaluate(LocalStore(tmp_path), gate=gate, trading_day=RENDER_DAY)
+        assert result.coverage is not None
+        tracker = next(p.tracker for p in PHASES if p.gate == gate)
+        assert tracker in result.coverage
+        for deliverable in GATE_DELIVERABLES[gate]:
+            if deliverable.graded_by is None:
+                assert deliverable.reason.strip(), deliverable.id
+                assert deliverable.id in result.coverage
+            else:
+                assert not deliverable.reason
+                assert deliverable.graded_by in {c.name for c in result.clauses}
 
     def test_a_deliverable_naming_a_clause_the_reading_lacks_RAISES(self) -> None:
         """The edit that would quietly shrink what "phase 0 is met" means: a

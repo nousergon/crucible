@@ -17,7 +17,7 @@ import json
 from unittest import mock
 
 from crucible.cli import main
-from crucible.gate import GATES, Clause
+from crucible.gate import GATE_DELIVERABLES, GATES, Clause
 from crucible.store import LocalStore
 
 
@@ -38,7 +38,10 @@ class TestGateHandlerLineageReadIsGuarded:
             return [Clause("c", "requirement", False, "unmet", (evidence_key,))]
 
         try:
-            with mock.patch.dict(GATES, {"phase1": (5, fake_clauses)}):
+            with (
+                mock.patch.dict(GATES, {"phase1": (5, fake_clauses)}),
+                mock.patch.dict(GATE_DELIVERABLES, {"phase1": ()}),
+            ):
                 # No `--dry-run`: this test asserts the ladder was WRITTEN
                 # for real (below) — `--dry-run` here was vestigial and, as
                 # of alpha-engine-config-I9922 N1, would now correctly refuse
