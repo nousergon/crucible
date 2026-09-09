@@ -37,6 +37,7 @@ __all__ = [
     "CONSOLE_KEY",
     "DISPATCH_ROOT",
     "DRIFT_INPUTS",
+    "FAULT_INJECTION_ROOT",
     "MANIFEST_BASENAME",
     "POINTER_KEY",
     "RELEASES_ROOT",
@@ -68,6 +69,7 @@ __all__ = [
     "drift_metrics_key",
     "experiments_key",
     "experiments_prefix",
+    "fault_injection_key",
     "feature_registry_key",
     "features_key",
     "features_prefix",
@@ -88,6 +90,7 @@ __all__ = [
     "parse_acceptance_reading",
     "parse_bus_key",
     "parse_dispatch_key",
+    "parse_fault_injection_key",
     "parse_manifest_key",
     "retirement_log_key",
     "review_key",
@@ -159,6 +162,63 @@ def parse_bus_key(key: str) -> tuple[str, str] | None:
     or simply not of interest.
     """
     if not key.startswith(ALERTS_ROOT) or not key.endswith(".json"):
+        return None
+    parts = key.split("/")
+    if len(parts) != 3:
+        return None
+    _, trading_day, filename = parts
+    return trading_day, filename[: -len(".json")]
+
+
+#: The root namespace segment every fault-injection record lives under
+#: (plan §10.7). One record per scripted fault induced against the real
+#: scheduled path, naming the manifest key and the bus row that fault
+#: actually produced, so "we ran fault injection" is a reading rather than a
+#: sentence in a session transcript.
+#:
+#: Deliberately a sibling of :data:`RUNS_ROOT` rather than nested under it,
+#: for the reason :data:`DISPATCH_ROOT` is: a fault record is EVIDENCE ABOUT
+#: a run, not a run, and a `runs/{job}/` listing must not be able to reach
+#: it even by accident.
+#:
+#: **No producer files one today.** The two halves that would — a live sweep
+#: reaching a safely-old trading day, and an authorized seam for the three
+#: faults that have none — are open on the tracker, and the reader below is
+#: what makes that absence visible on the phase ladder instead of only in an
+#: issue. A shape declared by its reader is the honest state: the reader can
+#: say exactly which key it looked for, and a producer arriving later has one
+#: contract to write against rather than inventing a second.
+FAULT_INJECTION_ROOT = "faults/"
+
+
+def fault_injection_key(fault_id: str, trading_day: str) -> str:
+    """`faults/{trading_day}/{fault_id}.json` — one record per induced fault.
+
+    Keyed by trading day and not by wall clock: a fault is induced against a
+    trading day's scheduled path, and the manifest and bus row it produced
+    are both keyed that way (rule 3). Inducing the same fault again on the
+    same day overwrites in place, which is correct — the record describes the
+    day's state, and two records for one (fault, day) would be two answers to
+    one question.
+    """
+    assert_trading_day(trading_day, context=f"fault_injection_key({fault_id!r})")
+    if not _DISCRIMINATOR_RE.match(fault_id):
+        raise ValueError(
+            f"fault_id {fault_id!r} must be 1-64 characters of [A-Za-z0-9_.-] — it is a "
+            "path segment, and this is the one place that is enforced."
+        )
+    return f"{FAULT_INJECTION_ROOT}{trading_day}/{fault_id}.json"
+
+
+def parse_fault_injection_key(key: str) -> tuple[str, str] | None:
+    """The inverse of :func:`fault_injection_key`: ``(trading_day, fault_id)``.
+
+    Returns ``None`` for anything not under :data:`FAULT_INJECTION_ROOT` in
+    this exact three-segment shape, so a caller listing the whole root
+    decides what an unrecognised key means rather than this function
+    guessing — the same contract :func:`parse_bus_key` keeps.
+    """
+    if not key.startswith(FAULT_INJECTION_ROOT) or not key.endswith(".json"):
         return None
     parts = key.split("/")
     if len(parts) != 3:
