@@ -80,6 +80,7 @@ from crucible.report import attribution_key
 from crucible.runner import TRANSIENT_CLASSIFIERS
 from crucible.slots import SLOTS, dispatchable_slots, is_control_arm
 from crucible.store import S3Store, Store
+from crucible.synthetic import synthetic_routing_active
 from crucible.tags import (
     TAG_KEY,
     TAG_VALUE,
@@ -4366,11 +4367,35 @@ def _clause_pages_within_ceiling(store: Store, window: list[dt.date]) -> Clause:
     `alerts/{trading_day}/{incident}.json` shape as an integer arity outside
     `crucible.keys` — the failure class where `len(parts) != 4` silently
     dropped 100% of discriminated manifests (`alpha-engine-config-I9879`).
+
+    **A deliberate exercise does not spend the budget** — Brian's 2026-09-09
+    ruling, `alpha-engine-config-I10366` option (b), live from
+    :data:`crucible.synthetic.SYNTHETIC_ROUTING_ACTIVE_FROM`. The clause read
+    **6/2** on 2026-09-04 with induced and replayed runs making up the breach,
+    and `nous-ergon-ops/runbooks/crucible-v2-fault-injection-2026-09-06.md`
+    records that as the reason three of four plan §10.7 faults could not be
+    induced for real: any day close enough to `now` for a live sweep to see a
+    fresh failure is, by construction, inside the ceiling window. The
+    exclusion reads the bus row's own `synthetic` field and nothing else.
     """
     name = "pages_within_ceiling"
+    # `alpha-engine-config-I10366`, Brian's 2026-09-09 ruling (b): a
+    # deliberate exercise does not spend a production alert budget. Resolved
+    # from the moment of THIS READING, not from each row's day, so the whole
+    # history is re-read under one rule on one day rather than the ceiling
+    # carrying its old exercises for another twenty sessions. See
+    # `crucible.synthetic.SYNTHETIC_ROUTING_ACTIVE_FROM` for why the switch is
+    # a date and what it is not allowed to move before 2026-09-20.
+    exclude_synthetic = synthetic_routing_active()
     requirement = (
         f"at most {PHASE2_MAX_PAGES} paged incidents over the window, counted from the "
         "alert bus (one row per incident, not per observation or per member)"
+        + (
+            "; a page whose bus row carries `synthetic` was a deliberate exercise and "
+            "does not count against a production alert budget"
+            if exclude_synthetic
+            else ""
+        )
     )
     sweeps = _list_store_keys(store, runs_prefix("alerts.sweep"))
     if sweeps.problem is not None:
@@ -4386,7 +4411,7 @@ def _clause_pages_within_ceiling(store: Store, window: list[dt.date]) -> Clause:
         )
     start, end = window[0], window[-1]
     try:
-        incidents = pages_in_range(store, start=start, end=end)
+        incidents = pages_in_range(store, start=start, end=end, exclude_synthetic=exclude_synthetic)
     except Exception as exc:
         # A denied or unreachable listing is a statement about OUR access. It
         # must be a red reading on the ladder, never an exception out of
@@ -4478,13 +4503,38 @@ def _clause_pages_commissioned(store: Store) -> Clause:
     re-reading it every render is what makes a later deletion of the bus
     visible, but the trailing window the other phase-2 clauses use would
     make a detector commissioned three weeks ago read as never commissioned.
+
+    **A synthetic row commissions nothing** (`alpha-engine-config-I10366`,
+    live from :data:`crucible.synthetic.SYNTHETIC_ROUTING_ACTIVE_FROM`). This
+    is the clause the ruling's own Delta warns about: once a synthetic page
+    routes to the muted topic its row would still read `sent: true` and could
+    stand down, and this clause would go green on evidence that no human ever
+    heard and that nothing about the real system produced. Commissioning is
+    the claim that the detector fired on the REAL system — so a condition
+    whose only rows are exercises reads "has never fired on the real system",
+    with the exercises named rather than hidden.
     """
     name = "pages_commissioned"
+    # The other half of Brian's 2026-09-09 ruling (`alpha-engine-config-I10366`),
+    # and the one its own Delta names as the trap: routing synthetic pages
+    # away from the operator topic would otherwise turn this clause green by
+    # moving rows OUT OF ITS VIEW. A condition whose only evidence is an
+    # exercise somebody launched on purpose is not commissioned — commissioning
+    # is the claim that the detector fired on the REAL system and a human
+    # heard it. Same date switch as the ceiling, one constant, so the two
+    # clauses can never disagree about what a synthetic row is.
+    exclude_synthetic = synthetic_routing_active()
     requirement = (
         "each page condition ("
         + ", ".join(PAGE_CONDITIONS)
         + ") has fired for real, been delivered (bus row `sent: true`) and stood down "
         "(every member job's manifest for that trading day now reads ok)"
+        + (
+            "; a row carrying `synthetic` is a deliberate exercise and commissions "
+            "nothing — commissioning is a claim about the REAL system"
+            if exclude_synthetic
+            else ""
+        )
     )
     sweeps = _list_store_keys(store, runs_prefix("alerts.sweep"))
     if sweeps.problem is not None:
@@ -4504,6 +4554,7 @@ def _clause_pages_commissioned(store: Store) -> Clause:
     stood_down: dict[str, list[str]] = {c: [] for c in PAGE_CONDITIONS}
     still_open: dict[str, list[str]] = {c: [] for c in PAGE_CONDITIONS}
     undelivered: dict[str, list[str]] = {c: [] for c in PAGE_CONDITIONS}
+    synthetic: dict[str, list[str]] = {c: [] for c in PAGE_CONDITIONS}
     problems: list[str] = []
     access: list[str] = []
     for key in rows.keys:
@@ -4519,6 +4570,13 @@ def _clause_pages_commissioned(store: Store) -> Clause:
         condition = row.get("condition")
         if condition not in PAGE_CONDITIONS:
             problems.append(f"{key}: condition {condition!r} is not one of {PAGE_CONDITIONS}")
+            continue
+        if exclude_synthetic and row.get("synthetic"):
+            # Counted and named, not dropped: a reader must be able to see
+            # that the condition HAS fired on an exercise and still be told
+            # it is not commissioned. Silently skipping it would make "never
+            # fired" and "fired only in a drill" the same reading.
+            synthetic[condition].append(key)
             continue
         if row.get("sent") is not True:
             undelivered[condition].append(key)
@@ -4572,6 +4630,13 @@ def _clause_pages_commissioned(store: Store) -> Clause:
             parts.append(
                 f"{condition}: fired but never delivered (`sent: false`): "
                 + ", ".join(sorted(undelivered[condition])[:2])
+            )
+        elif synthetic[condition]:
+            parts.append(
+                f"{condition}: has never fired on the real system — "
+                f"{len(synthetic[condition])} synthetic row(s) "
+                f"({sorted(synthetic[condition])[0]}) are deliberate exercises and "
+                "commission nothing"
             )
         else:
             parts.append(f"{condition}: has never fired")
