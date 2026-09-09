@@ -39,10 +39,11 @@ from typing import Any, Literal
 
 from crucible.calendar import (
     TRADING_DAYS_PER_WEEK,
+    assert_trading_day,
     previous_trading_day,
     resolve_trading_day,
 )
-from crucible.components import Component, load_registry, scheduled_components
+from crucible.components import NYSE_TZ, Component, load_registry, scheduled_components
 from crucible.documents import load_store_document, read_listed_document, read_manifests_under
 from crucible.keys import (
     ALERTS_ROOT,
@@ -96,6 +97,7 @@ __all__ = [
     "pages_in_range",
     "pages_in_window",
     "pages_topic_subscribers",
+    "parse_now_override",
     "send",
     "sweep",
     "topic_arn",
@@ -340,6 +342,67 @@ SWEEP_JOB = "alerts.sweep"
 #: which is the heartbeat's row to raise (§9.3), not something a longer
 #: window here would fix.
 CATCH_UP_TRADING_DAYS = TRADING_DAYS_PER_WEEK
+
+#: The clock hour :func:`parse_now_override` anchors an override to. Matches
+#: the real sweep's own firing cadence (`track_c.sweep_handler`'s docstring:
+#: "the sweep fires every calendar day at 21:00 ET") so an overridden sweep
+#: evaluates the same catch-up window a natural sweep at that close would
+#: have seen — not some other hour of the same day that happens to see a
+#: different set of deadlines as already due.
+_OVERRIDE_ANCHOR_HOUR_ET = 21
+
+
+def parse_now_override(raw: str, *, actual_now: dt.datetime | None = None) -> dt.datetime:
+    """``--now`` on `crucible alerts.sweep`: an OPERATOR OVERRIDE of the
+    instant :func:`sweep` evaluates against, in place of the real wall clock.
+
+    `alpha-engine-config-I10125`. Both page conditions' catch-up window
+    (:func:`days_to_evaluate`) and :func:`pages_in_window`'s ceiling window
+    are anchored to wall-clock ``now`` by construction — which makes them
+    structurally coincident with `crucible.gate._clause_pages_within_ceiling`'s
+    own live grading window, itself anchored to the real wall clock. A fault
+    injected on a day close enough to `now` for a real sweep to observe it is,
+    by construction, also inside the window that clause is currently grading.
+    This lets an operator sweep a HISTORICAL trading day for real — proving
+    the alerting path end to end — without landing inside a window that is
+    live-graded right now.
+
+    ``raw`` is a trading day (``YYYY-MM-DD``), not an arbitrary timestamp:
+    rule 3 (`crucible/AGENTS.md`) refuses an explicitly passed non-trading
+    day rather than silently resolving it, same as `run_job`'s own
+    ``trading_day`` — and an override is exactly that, an explicit day
+    handed in by an operator, not a value this function resolves. Malformed
+    input and a non-trading day both raise :class:`ValueError`
+    (:class:`crucible.calendar.NonTradingDayKeyError` is one) — no silent
+    clamping to the nearest session.
+
+    Resolved to that day's close at :data:`_OVERRIDE_ANCHOR_HOUR_ET` ET
+    (`crucible.components.NYSE_TZ`) and converted to UTC, so the evaluated
+    catch-up window matches what a natural sweep at that close would have
+    seen — not some other hour of the same day.
+
+    **Refuses a future override.** ``actual_now`` is the real wall clock
+    (injectable for tests; defaults to ``dt.datetime.now(dt.UTC)``) — the
+    resolved moment must not be later than it. A future override would let a
+    sweep page for a trading day that has not happened yet, which is not a
+    historical replay of anything.
+    """
+    try:
+        day = dt.date.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError(f"--now must be YYYY-MM-DD (a trading day); got {raw!r} ({exc})") from exc
+    assert_trading_day(day, context=f"alerts.sweep --now {raw}")
+    moment = dt.datetime.combine(day, dt.time(_OVERRIDE_ANCHOR_HOUR_ET, 0), tzinfo=NYSE_TZ)
+    moment_utc = moment.astimezone(dt.UTC)
+    now = (actual_now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
+    if moment_utc > now:
+        raise ValueError(
+            f"--now {raw} resolves to {moment_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}, which is "
+            f"in the future (now is {now.strftime('%Y-%m-%dT%H:%M:%SZ')}). A sweep cannot "
+            "evaluate a day that has not happened — that would page for something that "
+            "has not occurred, not replay something that has."
+        )
+    return moment_utc
 
 
 def days_to_evaluate(

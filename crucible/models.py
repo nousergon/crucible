@@ -797,6 +797,24 @@ class RunManifestV2(_Strict):
             "`trading_day` already carries (I9781); see `crucible.manifest.manifest_key`."
         ),
     )
+    #: `alpha-engine-config-I10125`: present only when the run's own
+    #: evaluation logic reasoned from an OPERATOR-OVERRIDDEN instant rather
+    #: than the real wall clock at `started`/`finished`. Absent for every
+    #: natural run.
+    now_override_utc: UtcTimestamp | None = Field(
+        default=None,
+        description=(
+            "I10125: present only when the run's own evaluation logic "
+            "reasoned from an OPERATOR-OVERRIDDEN instant rather than the real wall clock at "
+            "`started`/`finished`. Today only `alerts.sweep --now` sets it, to sweep a historical "
+            "trading day's catch-up and ceiling windows without landing inside "
+            "`crucible.gate._clause_pages_within_ceiling`'s live grading window, which is "
+            "anchored to the real wall clock and unaffected by this field. Absent for every "
+            "natural run — never encodes a fact `started`/`finished` already carry, and its "
+            "presence is what makes a hand-chosen historical sweep structurally distinguishable "
+            "from one that actually happened live."
+        ),
+    )
     #: Wall-clock date the run actually executed on, for PROVENANCE ONLY.
     #: Never a key, never an input to a promotion/retirement/freshness/
     #: grading decision.

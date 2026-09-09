@@ -533,6 +533,25 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if spec.name == "data.heal":
             sub.add_argument("--gap", required=True, help="The named gap to repair.")
+        if spec.name == "alerts.sweep":
+            sub.add_argument(
+                "--now",
+                metavar="YYYY-MM-DD",
+                default=None,
+                help=(
+                    "OPERATOR OVERRIDE, not the normal path: evaluate the catch-up and "
+                    "ceiling windows as though this trading day were the sweep's own "
+                    "close, instead of the real wall clock — so a fault on a historical "
+                    "day can be swept for real without landing inside "
+                    "crucible.gate's live pages_within_ceiling window (I10125). Must be "
+                    "a trading day and not in the future; refused (not silently "
+                    "resolved) otherwise. Recorded "
+                    "verbatim as now_override_utc on every manifest this run writes, so "
+                    "an overridden sweep is never mistaken for a natural one. The "
+                    "scheduled/unattended sweep never passes this flag and is "
+                    "unaffected by its existence."
+                ),
+            )
 
         # track-A: the data, feature, U/R, explain and migrate jobs' own flags.
         add_track_a_arguments(spec.name, sub)

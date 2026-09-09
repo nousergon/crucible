@@ -399,17 +399,34 @@ def smoke_handler(args: argparse.Namespace) -> int:
 
 
 def sweep_handler(args: argparse.Namespace) -> int:
-    """Evaluate both page conditions, group by cause, page once per group."""
+    """Evaluate both page conditions, group by cause, page once per group.
+
+    ``--now`` (`alpha-engine-config-I10125`) is resolved and validated HERE,
+    before `run_job` starts — a malformed override, a non-trading day or a
+    future day is a usage error the operator sees immediately, not a failed
+    manifest the job body raised into. `None` when the flag is absent, which
+    is the scheduled/unattended path: it never passes `--now`, so `sweep`
+    below gets `now=None` and evaluates the real wall clock exactly as
+    before this flag existed (`tests/test_alerts_now_override.py` asserts
+    this).
+    """
     dry_run = bool(getattr(args, "dry_run", False))
     store = _store(args)
     result: dict[str, Any] = {}
+    now_raw = getattr(args, "now", None)
+    now_override = None
+    if now_raw:
+        try:
+            now_override = alerts.parse_now_override(now_raw)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
 
     def body(ctx: RunContext) -> None:
         # `alerts.sweep(dry_run=)` evaluates and groups exactly as a real
         # sweep would but never calls `emit` — `outcome["bus_keys"]` is `()`
         # on this path, so the loop below writes nothing without needing its
         # own guard (alpha-engine-config-I9922 R2-1).
-        outcome = alerts.sweep(store, sweep_run_id=ctx.run_id, dry_run=dry_run)
+        outcome = alerts.sweep(store, sweep_run_id=ctx.run_id, dry_run=dry_run, now=now_override)
         result.update(outcome)
         for key in outcome["bus_keys"]:
             ctx.record_output(
@@ -462,6 +479,7 @@ def sweep_handler(args: argparse.Namespace) -> int:
         # rather than a value computed here (alpha-engine-config-I9781).
         discriminator=lambda ctx: ctx.calendar_date.isoformat(),
         dry_run=bool(getattr(args, "dry_run", False)),
+        now_override=now_override,
     )
     print(json.dumps({k: v for k, v in result.items() if k != "metric"}, indent=2))
     return 0
