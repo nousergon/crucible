@@ -328,16 +328,20 @@ class CapabilityClassNotRouted(RuntimeError):
 #:     is the refusal that keeps an unruled name from quietly acquiring an
 #:     answer.
 #:
-#: `reasoning_high` is the live instance. It is declared in
-#: `llm_callsites.yaml` as the class the phase-5 research arms ask for, and
-#: it is a group in NO registry — measured 2026-09-04, the registry declares
-#: exactly `low`, `med`, `high`, `ultra`. Which of those the phase-5 arms and
-#: their judge address is Brian's ruling, open as
-#: `alpha-engine-config-I9970`; the mechanism that routes them is this file's
-#: to own and does not wait on it.
-CAPABILITY_CLASS_GROUPS: dict[str, str | None] = {
-    "reasoning_high": None,
-}
+#: `reasoning_high` was the live instance of the ``None`` case: it was
+#: declared in `llm_callsites.yaml` as the class the phase-5 research arms
+#: asked for, and it addressed no registry group — measured 2026-09-04, the
+#: registry declares exactly `low`, `med`, `high`, `ultra`. Brian's ruling on
+#: `alpha-engine-config-I9970` (2026-09-08, option (a)) settled it: the LLM
+#: research arms address `high`, the phase-5 judge addresses `ultra`, and
+#: `reasoning_high` is not resurrected as a registry group (option (b),
+#: declined — it would have renamed the self-dealing risk in
+#: `alpha-engine-config-I8202` rather than resolved it). Both `high` and
+#: `ultra` are registry groups, so both resolve by IDENTITY and need no row
+#: here. The table is empty because there is no unruled mapping today, not
+#: because the mechanism above it is unused — `crucible.llm_callsites.yaml`'s
+#: own `capability_classes:` field documents the same empty-is-correct state.
+CAPABILITY_CLASS_GROUPS: dict[str, str | None] = {}
 
 
 def capability_group(capability_class: str) -> str:

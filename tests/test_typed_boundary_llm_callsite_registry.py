@@ -32,11 +32,13 @@ from crucible.models import LlmCallsiteRegistryDocument
 def _document(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema_version": "llm_callsite_registry.v1",
-        "capability_classes": ["reasoning_high"],
+        # "high" is a router TIER GROUP (`krepis.router.TIER_GROUPS`), not the
+        # retired `reasoning_high` (`alpha-engine-config-I9970`, 2026-09-08).
+        "capability_classes": ["high"],
         "callsites": {
             "research.thesis": {
                 "purpose": "draft one arm's thesis from the day's features",
-                "capability_class": "reasoning_high",
+                "capability_class": "high",
                 "max_usd_per_call": 0.25,
                 "owner": "crucible.slots.research",
             }
@@ -54,7 +56,11 @@ class TestTheRealFileValidates:
         document = LlmCallsiteRegistryDocument.model_validate(raw)
         assert document.schema_version == "llm_callsite_registry.v1"
         assert document.callsites == {}
-        assert "reasoning_high" in document.capability_classes
+        # `reasoning_high` addressed no registry group and is retired
+        # (`alpha-engine-config-I9970`, 2026-09-08): the phase-5 arms address
+        # `high` and the judge `ultra` directly, both already router TIER
+        # GROUPS, so the file's own extra allowlist is empty.
+        assert document.capability_classes == []
 
 
 class TestALoadedRegistryStillWorksTheSameWay:
@@ -63,10 +69,16 @@ class TestALoadedRegistryStillWorksTheSameWay:
 
         assert load_registry() == LLM_CALLSITE_REGISTRY
 
-    def test_load_capability_classes_is_non_empty_and_declared(self) -> None:
+    def test_load_capability_classes_is_declared_and_typed(self) -> None:
+        """Empty is the correct state today (`alpha-engine-config-I9970`,
+        2026-09-08): `high` and `ultra` resolve by identity through the
+        router's own tiers and need no row in this file's extra allowlist.
+        What this asserts is that the reader still runs end to end against
+        the real file and returns the declared type, not that it is
+        non-empty — see `TestTheRealFileValidates` for the file's content."""
         from crucible.llm import load_capability_classes
 
-        assert load_capability_classes()
+        assert load_capability_classes() == ()
 
 
 class TestAMalformedRegistryNamesTheRowAndTheField:
