@@ -71,6 +71,7 @@ __all__ = [
     "PAGES_TOPIC_VAR",
     "pages_topic",
     "PAGES_TOPIC_ARN_VAR",
+    "NON_OPERATOR_DESTINATIONS",
     "PAGE_CONDITIONS",
     "PENDING_CONFIRMATION",
     "SUBSCRIBERS_METRIC",
@@ -1192,6 +1193,26 @@ def send(
     return _transport_outcome(result, legacy=legacy)
 
 
+#: What `_transport_outcome` records as the destination when the transport
+#: named none. Each is a STATE of the send, not a channel an operator reads:
+#: `suppressed` is a page krepis withheld (dedup or mute), `muted` is the v1
+#: overlap topic the phase-0 quieting routes to, and `sns_only` is a real
+#: publish to the pages topic whose Telegram leg was not reached.
+DESTINATION_SUPPRESSED = "suppressed"
+DESTINATION_MUTED = "muted"
+DESTINATION_SNS_ONLY = "sns_only"
+
+#: Destinations that are NOT the operator-facing paging channel, named here
+#: rather than restated by each reader. A row carrying one of these is a page
+#: that either never left or left down the muted v1 overlap path — in both
+#: cases nobody on the real channel heard it, which is precisely what a gate
+#: clause asking "does this condition route to the real channel" must refuse
+#: to count. `sns_only` is deliberately NOT in this set: the pages topic IS a
+#: real channel, and a publish to it that skipped Telegram is a delivery on
+#: one declared leg, not a non-delivery.
+NON_OPERATOR_DESTINATIONS: frozenset[str] = frozenset({DESTINATION_SUPPRESSED, DESTINATION_MUTED})
+
+
 def _transport_outcome(result: Any, *, legacy: bool) -> tuple[bool, str]:
     """What the transport ACTUALLY did — never what was asked of it.
 
@@ -1236,7 +1257,13 @@ def _transport_outcome(result: Any, *, legacy: bool) -> tuple[bool, str]:
     destination = (
         getattr(result, "telegram_destination", None)
         or getattr(result, "destination", None)
-        or ("suppressed" if suppressed else "muted" if legacy else "sns_only")
+        or (
+            DESTINATION_SUPPRESSED
+            if suppressed
+            else DESTINATION_MUTED
+            if legacy
+            else DESTINATION_SNS_ONLY
+        )
     )
     return sent, str(destination)
 

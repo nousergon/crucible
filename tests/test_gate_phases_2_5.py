@@ -42,6 +42,7 @@ from crucible.gate import (
     PHASE2_MAX_TAGGED_USD,
     PHASE4_MAX_TOTAL_USD,
     PHASES,
+    REPOSITORY_GRADED_CLAUSES,
     evaluate,
     weekly_anchor,
 )
@@ -123,6 +124,13 @@ class TestNoPlanPhaseCanRenderBlank:
         `ce:GetCostAndUsage` and CI has no CloudTrail archive, and a test that
         depended on which of those two is true would pass for the wrong
         reason on a laptop that happens to hold credentials.
+
+        `REPOSITORY_GRADED_CLAUSES` is excluded from the "none is met" half
+        and ONLY from that half: an empty store says nothing about a clause
+        whose artifact is the checkout, and asserting it unmet would be
+        asserting that the runbook and the §2 suite are missing from the very
+        tree the test is running in. The set is checked in the other direction
+        immediately below, so it cannot become a place to park a green clause.
         """
         monkeypatch.setattr(gate_module, "_ce_client", _raising_client)
         monkeypatch.setattr(gate_module, "_s3_client", _raising_client)
@@ -133,8 +141,29 @@ class TestNoPlanPhaseCanRenderBlank:
             f"{gate} reported a reading for every clause against an EMPTY store"
         )
         for clause in result.clauses:
-            assert not clause.met
+            if clause.name not in REPOSITORY_GRADED_CLAUSES:
+                assert not clause.met
             assert clause.detail.strip(), f"{gate}/{clause.name} gave no reason"
+
+    def test_every_repository_graded_clause_is_met_against_this_checkout(
+        self, store: LocalStore
+    ) -> None:
+        """The other direction of the exclusion above, and the one that keeps
+        it honest: each named clause must actually be MET here, with an empty
+        store, because the artifact it grades is this tree. A clause added to
+        the set to silence a red reading fails here instead."""
+        graded = {
+            clause.name: clause
+            for gate in GATES
+            for clause in evaluate(store, gate=gate, trading_day=FRIDAY).clauses
+            if clause.name in REPOSITORY_GRADED_CLAUSES
+        }
+        assert set(graded) == set(REPOSITORY_GRADED_CLAUSES), (
+            f"named but never rendered by any gate: "
+            f"{sorted(set(REPOSITORY_GRADED_CLAUSES) - set(graded))}"
+        )
+        for name, clause in sorted(graded.items()):
+            assert clause.met, f"{name} is not met against this checkout: {clause.detail}"
 
 
 def _raising_client() -> object:

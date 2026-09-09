@@ -26,10 +26,13 @@ from __future__ import annotations
 
 import ast
 import datetime as dt
+import io
 import json
 import re
+import shlex
 from calendar import monthrange
 from collections.abc import Iterable
+from contextlib import redirect_stderr
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
@@ -38,7 +41,7 @@ from typing import TYPE_CHECKING, Any
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
-from crucible.alerts import PAGE_CONDITIONS, pages_in_range
+from crucible.alerts import NON_OPERATOR_DESTINATIONS, PAGE_CONDITIONS, pages_in_range
 from crucible.calendar import TRADING_DAYS_PER_WEEK, is_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
 from crucible.documents import DocumentRead, read_manifests_under
@@ -46,17 +49,20 @@ from crucible.documents import read_path_document as _read_path_document
 from crucible.documents import read_store_document as _read_store_document
 from crucible.keys import (
     ALERTS_ROOT,
+    FAULT_INJECTION_ROOT,
     acceptance_reading_key,
     arena_cycle_key,
     arm_register_key,
     champion_key,
     gate_key,
     gate_prefix,
+    is_manifest_key,
     legacy_dead_lambdas_key,
     legacy_weekly_executions_key,
     manifest_prefix,
     parse_acceptance_reading,
     parse_bus_key,
+    parse_fault_injection_key,
     review_key,
     review_prefix,
     runs_prefix,
@@ -67,6 +73,7 @@ from crucible.manifest import load_schema, manifest_key
 from crucible.models import PhaseClosingReadingDocument, PhaseLadderDocument
 from crucible.release import POINTER_KEY
 from crucible.report import attribution_key
+from crucible.runner import TRANSIENT_CLASSIFIERS
 from crucible.slots import SLOTS, dispatchable_slots, is_control_arm
 from crucible.store import Store
 from crucible.tags import (
@@ -111,6 +118,7 @@ __all__ = [
     "PHASE0_DELIVERABLES",
     "PHASE1_DELIVERABLES",
     "PHASE2_DELIVERABLES",
+    "REPOSITORY_GRADED_CLAUSES",
     "PHASE3_DELIVERABLES",
     "PHASE4_DELIVERABLES",
     "PHASE5_DELIVERABLES",
@@ -2747,12 +2755,28 @@ PHASE0_DELIVERABLES: tuple[Deliverable, ...] = (
 #: `alpha-engine-config-I9758`'s (phase 2) deliverables, split at the
 #: semicolons of that issue's own single, unbulleted "### Deliverables"
 #: paragraph — the same granularity `alpha-engine-config-I10309` itself uses
-#: when it names these six items. Two are graded (`replays_ok`,
-#: `pages_commissioned`); four are not, and are not stretched onto a clause
-#: that happens to exist — `zero_human_mutating_calls`, `live_saturdays_
-#: first_attempt_ok`, `pages_within_ceiling` and `aws_cost_within_ceiling`
-#: grade plan §6's *closes-when* row, not this issue's declared deliverables,
-#: and are correctly absent from every ``graded_by`` here.
+#: when it names these six items.
+#:
+#: **All six are graded** since `alpha-engine-config-I10314`. Four were
+#: ungraded until then, each on a variant of one argument: the fact lives
+#: somewhere a gate does not read — a transport field, the runner's source,
+#: a one-time exercise, prose in git. That argument is what
+#: `alpha-engine-config-I9964` already retired for phase 0: it is a statement
+#: about where the READ would have to go, not about whether a clause can be
+#: written, and under Brian's 2026-09-09 ruling ("all of phase 2 should be
+#: fully validated by the next weekly SF") a deliverable asserted by a human
+#: having looked is not validated at all.
+#:
+#: Three of the four now read a durable artifact on the store and the fourth
+#: reads the repository, the way `acceptance_suite_committed` does. None of
+#: them was made green to arrive: two of the four read UNMEASURABLE today,
+#: naming the artifact that does not exist yet, which is the honest rendering
+#: and the one that puts the gap on the ladder instead of only in an issue.
+#:
+#: `zero_human_mutating_calls`, `live_saturdays_first_attempt_ok`,
+#: `pages_within_ceiling` and `aws_cost_within_ceiling` grade plan §6's
+#: *closes-when* row, not this issue's declared deliverables, and are
+#: correctly absent from every ``graded_by`` here.
 PHASE2_DELIVERABLES: tuple[Deliverable, ...] = (
     Deliverable(
         "scheduler_live_over_five_replay_dates",
@@ -2762,25 +2786,17 @@ PHASE2_DELIVERABLES: tuple[Deliverable, ...] = (
     Deliverable(
         "two_page_conditions_on_real_channel",
         "the two page conditions (absence, failure) route to the real paging channel",
-        None,
-        "no clause reads the transport a page condition routes to on its own; "
-        "`pages_commissioned` reads whether each condition's bus row was delivered "
-        "(`sent: true`) through whatever channel is configured, which folds the real-"
-        "channel fact into commissioning rather than grading it separately",
+        "two_page_conditions_on_real_channel",
     ),
     Deliverable(
         "transient_retry_class_in_runner",
         "the transient-retry class (plan §11.2) is implemented in `crucible.runner`",
-        None,
-        "a property of the runner's source, not of any artifact filed to the store; "
-        "no gate clause reads `crucible/runner.py`",
+        "transient_retry_class_in_runner",
     ),
     Deliverable(
         "fault_injection_against_scheduled_path",
         "fault injection (plan §10.7) was run against the live scheduled path",
-        None,
-        "a one-time exercise with no durable fault-injection-run artifact defined in "
-        "the store; nothing files a record of it and no clause reads one",
+        "fault_injection_against_scheduled_path",
     ),
     Deliverable(
         "both_page_conditions_commissioned",
@@ -2790,9 +2806,7 @@ PHASE2_DELIVERABLES: tuple[Deliverable, ...] = (
     Deliverable(
         "runbook_in_readme",
         "the runbook (rerun, replay, roll back, heal, unseal) is written into README",
-        None,
-        "documentation prose in git, not a store artifact; no gate clause reads "
-        "repository README content",
+        "runbook_in_readme",
     ),
 )
 
@@ -3337,6 +3351,91 @@ TRADER_EVIDENCE_KEY: str | None = None
 #: tested — it is the reading a build would give if the field were removed.
 LLM_ARM_CALLSITE_FIELD: str | None = "llm_callsite"
 
+#: The clauses whose artifact is the REPOSITORY rather than the store.
+#:
+#: Both grade something git is the durable record of — the §2 acceptance
+#: suite and the README runbook — so both read correctly against a checkout
+#: and both are UNMET (never a pass) from a wheel install where the file does
+#: not ship. Named as a set because a reader of an empty-store reading has to
+#: know which clauses an empty store says nothing about:
+#: `tests/test_gate_phases_2_5.py` asserts BOTH directions of it — every
+#: clause outside this set is unmet against an empty store, and every clause
+#: inside it is met against this checkout — so it cannot become a place to
+#: park a clause that merely happens to be green.
+REPOSITORY_GRADED_CLAUSES: frozenset[str] = frozenset(
+    {"acceptance_suite_committed", "runbook_in_readme"}
+)
+
+#: The four scripted faults of plan §10.7, in the order the plan names them,
+#: and the ids a fault-injection record is filed under.
+#:
+#: A declared tuple rather than a scan of `tests/faults/`: the plan is what
+#: says there are four and which four, and a scan of the suite would make the
+#: gate's own definition of "scripted fault" move whenever someone added a
+#: test class. `tests/test_gate_phase2_coverage.py` parses that suite and
+#: asserts it defines exactly this many `TestFault*` cases, so the two cannot
+#: drift silently in the other direction either.
+SCRIPTED_FAULTS: tuple[str, ...] = (
+    "spot_terminated_mid_job",
+    "data_source_withheld",
+    "router_returns_500",
+    "stale_release_pointer",
+)
+
+#: The two fields a fault-injection record must carry: the manifest the
+#: induced fault produced, and the bus row it produced. Both, because either
+#: alone is half the §10.7 exercise — a manifest with no bus row is a job
+#: that failed and paged nobody, and a bus row with no manifest is a page
+#: about a run whose cause was discarded.
+FAULT_RECORD_MANIFEST_FIELD = "manifest_key"
+FAULT_RECORD_BUS_FIELD = "bus_key"
+
+#: The README the phase-2 runbook deliverable lives in. Not a store artifact,
+#: for the reason :data:`ACCEPTANCE_RATCHET_PATH` is not: the runbook's
+#: existence is a property of the REPOSITORY and git is the durable record of
+#: it. Read from a checkout; absent (a wheel install, where the README does
+#: not ship) the clause is UNMET with the path named, never a pass.
+README_PATH = Path(__file__).resolve().parent.parent / "README.md"
+
+#: The runbook heading the five procedures sit under, and the heading depth
+#: each procedure uses. Named rather than inlined so the extractor and the
+#: requirement string cannot disagree about what they are looking for.
+RUNBOOK_SECTION = "## Runbook"
+RUNBOOK_PROCEDURE_PREFIX = "### "
+
+#: The five procedures `alpha-engine-config-I9758` names, and whether each is
+#: RESERVED — documented as a deliberate non-capability rather than as a
+#: command.
+#:
+#: `unseal` is reserved by plan §9.4: unsealing is a human ruling, never an
+#: automated action, and the README says so explicitly. Grading it as
+#: "must contain a command that parses" would mean the runbook passes this
+#: clause only by growing the exact CLI surface the plan forbids, so a
+#: reserved procedure is graded the other way round: it must name NO command
+#: and the CLI must carry no such job. The clause therefore refuses in both
+#: directions — a missing procedure and an invented one.
+RUNBOOK_PROCEDURES: tuple[tuple[str, bool], ...] = (
+    ("rerun", False),
+    ("replay", False),
+    ("roll back", False),
+    ("heal", False),
+    ("unseal", True),
+)
+
+#: One `crucible <job> [args]` command line inside the runbook, with or
+#: without the `uv run` prefix. Line-anchored, so a `crucible ...` mentioned
+#: mid-sentence in prose is not extracted as a command — only the fenced
+#: blocks an operator copies. Kept in the same shape as
+#: `tests/test_runbook_new_experiment.py::_COMMAND`, which is the same
+#: oracle applied to the other runbook (`crucible-PR163`).
+_RUNBOOK_COMMAND_RE = re.compile(r"^(?:uv run )?crucible ([a-z][a-z0-9._-]*)(.*)$", re.MULTILINE)
+
+#: The reason value every manifest's FIRST attempt carries. Everything else
+#: in the schema's attempt vocabulary is a transient class that caused a
+#: RETRY, which is what makes "the enum minus this value" the recordable
+#: retry vocabulary rather than a second hand-kept list.
+MANIFEST_ATTEMPT_INITIAL = "initial"
+
 #: The slots whose recipes are `crucible.slots.arms.ArmSpec` documents and so
 #: carry `params` — the only recipe shape with a place for
 #: `LLM_ARM_CALLSITE_FIELD`. The M slot's recipes are `ModelRecipe`s (a design
@@ -3840,6 +3939,552 @@ def _clause_pages_commissioned(store: Store) -> Clause:
     return Clause(name, requirement, met, "; ".join(parts), evidence)
 
 
+def _clause_two_page_conditions_on_real_channel(store: Store) -> Clause:
+    """`alpha-engine-config-I9758` deliverable 2: both declared page
+    conditions route to the REAL operator channel, read from the bus row's
+    own transport fields.
+
+    **How this differs from `pages_commissioned`, which reads the same rows.**
+    That clause grades the LIFECYCLE of an incident — fired, delivered, stood
+    down — and treats `sent: true` as the whole delivery fact, whatever
+    channel the transport used. This one grades the CHANNEL and nothing else:
+    a row's `destination`, which `crucible.alerts._transport_outcome` fills
+    from what the transport actually did. The two come apart in both
+    directions, which is why neither can stand in for the other:
+
+    * a page routed to the muted v1 overlap topic (`legacy=True`) can read
+      `sent: true` and stand down, so `pages_commissioned` counts it — and
+      nobody on the operator channel ever heard it;
+    * a page delivered on the real channel and never cleared is on the real
+      channel and is not commissioned.
+
+    **What it refuses to say.** The row records ONE destination — krepis'
+    `telegram_destination` when the Telegram leg was reached, else the send's
+    own state — so it can say which channel was reached, and cannot say that
+    every declared leg was. This clause therefore grades the recorded
+    destination and makes no claim about per-leg delivery; a clause that read
+    `operator_chat` as proof the SNS leg also published would be inferring a
+    fact from the absence of a field. The SNS leg's own liveness is the
+    heartbeat's confirmed-subscriber reading, a different artifact with a
+    different producer.
+
+    **A condition with no row at all is UNMEASURABLE, not UNMET.** "Never
+    fired" and "not deliverable" are different facts, and the store cannot
+    tell them apart: a condition that has had nothing to page about has left
+    no delivery record to read. A condition whose rows exist and are ALL
+    undelivered or non-operator-destined is a different reading entirely —
+    that is evidence, and it is UNMET.
+
+    Not windowed, for `pages_commissioned`'s reason: a channel demonstrated
+    once stays demonstrated, and a trailing window would make a condition
+    proved three weeks ago read as never proved.
+    """
+    name = "two_page_conditions_on_real_channel"
+    requirement = (
+        "each page condition ("
+        + ", ".join(PAGE_CONDITIONS)
+        + ") has at least one delivered bus row (`sent: true`) whose `destination` is an "
+        "operator-facing channel rather than a send state ("
+        + ", ".join(sorted(NON_OPERATOR_DESTINATIONS))
+        + ")"
+    )
+    rows = _list_store_keys(store, ALERTS_ROOT)
+    if rows.problem is not None:
+        return _unmeasurable(name, requirement, rows.problem, (ALERTS_ROOT,))
+
+    delivered: dict[str, dict[str, list[str]]] = {c: {} for c in PAGE_CONDITIONS}
+    withheld: dict[str, list[str]] = {c: [] for c in PAGE_CONDITIONS}
+    problems: list[str] = []
+    access: list[str] = []
+    for key in sorted(rows.keys or []):
+        if parse_bus_key(key) is None:
+            continue
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            (access if read.access_problem else problems).append(read.problem)
+            continue
+        row = read.document or {}
+        condition = row.get("condition")
+        if condition not in PAGE_CONDITIONS:
+            problems.append(f"{key}: condition {condition!r} is not one of {PAGE_CONDITIONS}")
+            continue
+        destination = str(row.get("destination") or "").strip()
+        if not destination:
+            problems.append(
+                f"{key}: carries no `destination`, so what channel this page reached "
+                "cannot be read from the row at all"
+            )
+            continue
+        if row.get("sent") is not True or destination in NON_OPERATOR_DESTINATIONS:
+            withheld[condition].append(f"{key} (sent={row.get('sent')!r}, {destination})")
+            continue
+        delivered[condition].setdefault(destination, []).append(key)
+
+    if access:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"{len(access)} bus row(s) could not be read, so at least one condition's "
+            "delivery channel could not be graded: " + " | ".join(sorted(access)[:3]),
+            (ALERTS_ROOT,),
+        )
+    parts: list[str] = []
+    contradicted: list[str] = []
+    silent: list[str] = []
+    for condition in PAGE_CONDITIONS:
+        if delivered[condition]:
+            channels = sorted(delivered[condition])
+            first = sorted(delivered[condition][channels[0]])[0]
+            parts.append(f"{condition}: delivered to {', '.join(channels)} ({first})")
+        elif withheld[condition]:
+            contradicted.append(condition)
+            parts.append(
+                f"{condition}: every row was withheld or non-operator-destined: "
+                + "; ".join(sorted(withheld[condition])[:2])
+            )
+        else:
+            silent.append(condition)
+            parts.append(f"{condition}: no bus row exists, so no delivery record names a channel")
+    if problems:
+        parts.append(f"{len(problems)} malformed bus row(s) ignored: {sorted(problems)[0]}")
+    evidence = tuple(
+        sorted(k for c in PAGE_CONDITIONS for keys in delivered[c].values() for k in keys)
+    )
+    if contradicted:
+        return Clause(name, requirement, False, "; ".join(parts), evidence)
+    if silent:
+        return _unmeasurable(name, requirement, "; ".join(parts), evidence or (ALERTS_ROOT,))
+    return Clause(name, requirement, True, "; ".join(parts), evidence)
+
+
+@lru_cache(maxsize=1)
+def _manifest_retry_reasons() -> frozenset[str]:
+    """The retry classes the CURRENT manifest schema can record, read from it.
+
+    The schema's `AttemptRow.reason` enum minus
+    :data:`MANIFEST_ATTEMPT_INITIAL`. Derived, never restated: the question
+    the retry clause asks is whether a transient retry is RECORDABLE, and
+    that is a question about the contract. A copy of the vocabulary here
+    would answer it from something that drifts.
+    """
+    schema = load_schema()
+    row = schema.get("$defs", {}).get("AttemptRow", {})
+    enum = row.get("properties", {}).get("reason", {}).get("enum", [])
+    return frozenset(str(value) for value in enum) - {MANIFEST_ATTEMPT_INITIAL}
+
+
+def _clause_transient_retry_class_in_runner(store: Store, registry: dict[str, Component]) -> Clause:
+    """`alpha-engine-config-I9758` deliverable 3: the §11.2 transient-retry
+    class is implemented in the runner — graded from a manifest that RECORDS
+    a retry, never from the runner's source.
+
+    A clause that read `crucible/runner.py` would grade the code that wrote
+    it, which is plan §11 risk 1 in one line: "v2 passes its gates because
+    its tests were written to pass". What is graded here is the artifact the
+    class produces when it fires — a run manifest whose `attempts[]` carries
+    a second attempt naming one of the declared classes.
+
+    **"Nothing retried" and "retry cannot be recorded" are two readings, and
+    the contract is what separates them.** Before looking at any manifest
+    this asks the schema which retry classes it can express, and compares
+    that vocabulary with `crucible.runner.TRANSIENT_CLASSIFIERS`:
+
+    * a class the runner declares and the schema cannot record is a retry
+      that could fire and leave no trace — UNMEASURABLE, naming the classes,
+      because no artifact could ever answer the question;
+    * a class the schema records and the runner does not implement is the
+      inverse defect, reported as a problem;
+    * with the two in agreement and no retried attempt anywhere on the
+      store, the reading is UNMEASURABLE and says so in those words: the
+      class is implemented and recordable, and nothing transient has
+      happened yet. Never MET — a retry nobody has seen fire is a detector
+      nobody knows works (AGENTS.md, test discipline).
+
+    Not windowed. A retry, once recorded, stays recorded, and phase 2's raw
+    window is two dates a week apart — a window that would make this clause
+    answer "no transient in the last fortnight" while a recorded one sat on
+    the store. Every registry job's manifest prefix is read through
+    `read_manifests_under`, the one sanctioned prefix reader (rule 1).
+    """
+    name = "transient_retry_class_in_runner"
+    declared = frozenset(reason for reason, _types, _needles in TRANSIENT_CLASSIFIERS)
+    requirement = (
+        "a run manifest records a retried attempt whose `reason` is one of the runner's "
+        f"declared transient classes ({', '.join(sorted(declared))}), and the manifest "
+        "schema can record every class the runner declares"
+    )
+    recordable = _manifest_retry_reasons()
+    if not recordable:
+        return _unmeasurable(
+            name,
+            requirement,
+            "the current run-manifest schema declares no retry vocabulary at all "
+            f"(`$defs.AttemptRow.reason` beyond {MANIFEST_ATTEMPT_INITIAL!r}), so a "
+            "transient retry could fire and leave no trace. Nothing on the store could "
+            "answer this question",
+        )
+    unrecordable = sorted(declared - recordable)
+    if unrecordable:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"the runner declares transient classes the manifest schema cannot record: "
+            f"{unrecordable}. A retry of one of these leaves no artifact, so its absence "
+            "from the store says nothing about whether it fired",
+        )
+    unimplemented = sorted(recordable - declared)
+
+    retried: list[str] = []
+    retried_keys: list[str] = []
+    unknown: list[str] = []
+    listing_problems: list[str] = []
+    faults: list[str] = []
+    manifests = 0
+    for job in sorted(registry):
+        read = read_manifests_under(store, runs_prefix(job))
+        if read.listing_problem is not None:
+            listing_problems.append(read.listing_problem)
+            continue
+        faults.extend(f"{key}: {problem}" for key, problem in sorted(read.faults.items()))
+        for key, document in read.documents:
+            manifests += 1
+            attempts = document.get("attempts")
+            if not isinstance(attempts, list):
+                faults.append(f"{key}: `attempts` is {type(attempts).__name__}, not a list")
+                continue
+            for attempt in attempts:
+                if not isinstance(attempt, dict):
+                    faults.append(f"{key}: an `attempts` row is not an object")
+                    continue
+                if attempt.get("n") in (None, 1):
+                    continue
+                reason = str(attempt.get("reason") or "")
+                if reason in declared:
+                    retried.append(f"{key} (attempt {attempt.get('n')}: {reason})")
+                    retried_keys.append(key)
+                else:
+                    unknown.append(f"{key} (attempt {attempt.get('n')}: {reason!r})")
+
+    if listing_problems:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"{len(listing_problems)} manifest prefix(es) could not be listed, so a "
+            "recorded retry could be sitting in the part that was not read: "
+            + " | ".join(sorted(listing_problems)[:3]),
+        )
+    parts: list[str] = []
+    if unimplemented:
+        parts.append(f"the schema records classes the runner does not implement: {unimplemented}")
+    if unknown:
+        parts.append(
+            f"{len(unknown)} retried attempt(s) name a reason outside the declared class: "
+            + "; ".join(sorted(unknown)[:2])
+        )
+    if faults:
+        parts.append(f"{len(faults)} unreadable manifest(s): {sorted(faults)[0]}")
+    if unknown or unimplemented:
+        return Clause(name, requirement, False, "; ".join(parts), tuple(sorted(retried_keys)))
+    if retried:
+        parts.insert(
+            0,
+            f"{len(retried)} recorded transient retry(ies) across {manifests} manifests: "
+            + "; ".join(sorted(retried)[:2]),
+        )
+        return Clause(name, requirement, True, "; ".join(parts), tuple(sorted(retried_keys)))
+    parts.insert(
+        0,
+        f"{manifests} manifests across {len(registry)} registry jobs record no attempt "
+        f"beyond the first. The class is declared ({', '.join(sorted(declared))}) and the "
+        "schema can record every one of them, so this reads as `nothing transient has "
+        "occurred`, NOT as `retry is not implemented` — and neither of those is met",
+    )
+    return _unmeasurable(name, requirement, "; ".join(parts))
+
+
+def _clause_fault_injection_against_scheduled_path(store: Store) -> Clause:
+    """`alpha-engine-config-I9758` deliverable 4: plan §10.7's fault injection
+    was run against the live scheduled path — graded from a durable record
+    per scripted fault, each naming the manifest and the bus row it produced.
+
+    §10.7's exercise leaves two artifacts behind on the real path: the
+    manifest the failed job wrote, and the bus row the sweep filed for it. A
+    record that merely says "fault 2 was induced" is a sentence; a record
+    naming both keys is checkable, and this clause checks it — both keys must
+    exist on the store, and both must be of the right shape. A record whose
+    named manifest is absent is a claim the store contradicts, and that is
+    the reading this clause exists to make possible: today the exercise is
+    written up in a runbook nothing parses, so "we ran fault injection" and
+    "we did not" render identically on every surface.
+
+    **Three outcomes, deliberately distinct.**
+
+    * A record naming keys the store does not hold, or keys of the wrong
+      shape — UNMET. That is evidence, positively read.
+    * No record for a fault — UNMEASURABLE, naming the exact key that is
+      missing. Nothing files one today (there is no producer of
+      `faults/{trading_day}/{fault}.json` anywhere in this package), and the
+      two halves that would are open on the tracker; an absent record means
+      the exercise is unrecorded, never that it did not happen.
+    * Every scripted fault has a record whose two keys are present — MET.
+
+    Not windowed: an induced fault is a one-time exercise whose record stays
+    true, the same reason `pages_commissioned` is not windowed.
+    """
+    name = "fault_injection_against_scheduled_path"
+    requirement = (
+        f"each of the {len(SCRIPTED_FAULTS)} scripted faults (plan §10.7) has a record "
+        f"under {FAULT_INJECTION_ROOT} naming a `{FAULT_RECORD_MANIFEST_FIELD}` and a "
+        f"`{FAULT_RECORD_BUS_FIELD}` that both exist on the store"
+    )
+    listed = _list_store_keys(store, FAULT_INJECTION_ROOT)
+    if listed.problem is not None:
+        return _unmeasurable(name, requirement, listed.problem, (FAULT_INJECTION_ROOT,))
+
+    records: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    problems: list[str] = []
+    access: list[str] = []
+    for key in sorted(listed.keys or []):
+        parsed = parse_fault_injection_key(key)
+        if parsed is None:
+            continue
+        _day, fault_id = parsed
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            (access if read.access_problem else problems).append(read.problem)
+            continue
+        records.setdefault(fault_id, []).append((key, read.document or {}))
+
+    if access:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"{len(access)} fault record(s) could not be read: " + " | ".join(sorted(access)[:3]),
+            (FAULT_INJECTION_ROOT,),
+        )
+    evidence: list[str] = []
+    missing: list[str] = []
+    contradicted: list[str] = []
+    parts: list[str] = []
+    for fault in SCRIPTED_FAULTS:
+        filed = records.get(fault) or []
+        if not filed:
+            missing.append(fault)
+            parts.append(f"{fault}: no record at {FAULT_INJECTION_ROOT}<trading-day>/{fault}.json")
+            continue
+        key, document = sorted(filed)[-1]
+        named: list[str] = []
+        bad: list[str] = []
+        for field_name, shape_ok, shape in (
+            (FAULT_RECORD_MANIFEST_FIELD, is_manifest_key, "a run manifest key"),
+            (FAULT_RECORD_BUS_FIELD, lambda k: parse_bus_key(k) is not None, "an alert bus key"),
+        ):
+            value = str(document.get(field_name) or "").strip()
+            if not value:
+                bad.append(f"names no `{field_name}`")
+                continue
+            if not shape_ok(value):
+                bad.append(f"`{field_name}` {value!r} is not {shape}")
+                continue
+            read = _read_store_bytes(store, value)
+            if read.problem is not None:
+                access.append(read.problem)
+                continue
+            if read.absent:
+                bad.append(f"`{field_name}` names {value}, which the store does not hold")
+                continue
+            named.append(value)
+        if bad:
+            contradicted.append(fault)
+            parts.append(f"{fault}: {key} " + "; ".join(bad))
+        else:
+            evidence.append(key)
+            evidence.extend(named)
+            parts.append(f"{fault}: {key} -> {', '.join(named)}")
+    if problems:
+        parts.append(f"{len(problems)} malformed record(s) ignored: {sorted(problems)[0]}")
+    if access:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"{len(access)} artifact(s) a fault record names could not be read: "
+            + " | ".join(sorted(access)[:3]),
+            tuple(sorted(evidence)) or (FAULT_INJECTION_ROOT,),
+        )
+    if contradicted:
+        return Clause(name, requirement, False, "; ".join(parts), tuple(sorted(evidence)))
+    if missing:
+        return _unmeasurable(
+            name,
+            requirement,
+            "; ".join(parts),
+            tuple(sorted(evidence)) or (FAULT_INJECTION_ROOT,),
+        )
+    return Clause(name, requirement, True, "; ".join(parts), tuple(sorted(evidence)))
+
+
+def _runbook_sections(text: str) -> dict[str, str]:
+    """Every `### <verb>` subsection of the README's Runbook section.
+
+    The Runbook section only: a `### heal` under some other `##` heading is
+    not the runbook, and a scan of the whole file would grade it as though it
+    were. Keys are lowercased headings, values the body up to the next
+    heading of either depth.
+    """
+    if RUNBOOK_SECTION not in text:
+        return {}
+    body = text.split(RUNBOOK_SECTION, 1)[1]
+    for line in body.splitlines():
+        if line.startswith("## "):
+            body = body.split("\n" + line, 1)[0]
+            break
+    sections: dict[str, str] = {}
+    current: str | None = None
+    collected: list[str] = []
+    for line in body.splitlines():
+        if line.startswith(RUNBOOK_PROCEDURE_PREFIX):
+            if current is not None:
+                sections[current] = "\n".join(collected)
+            current = line[len(RUNBOOK_PROCEDURE_PREFIX) :].strip().lower()
+            collected = []
+            continue
+        if current is not None:
+            collected.append(line)
+    if current is not None:
+        sections[current] = "\n".join(collected)
+    return sections
+
+
+def _parses_against_the_cli(job: str, rest: str) -> str | None:
+    """``None`` if `crucible <job> <rest>` parses, else why it does not.
+
+    The real parser is the oracle — a renamed flag, a removed job or a newly
+    required argument fails HERE rather than in an operator's terminal at the
+    moment they most need the runbook. Imported lazily: `crucible.cli`
+    imports this module, and a top-level import would be a cycle.
+    """
+    from crucible.cli import JOBS, build_parser  # noqa: PLC0415 - cycle: cli imports gate
+
+    if job not in JOBS:
+        return f"names job {job!r}, which the CLI does not carry"
+    try:
+        argv = [job, *shlex.split(rest.split("#", 1)[0])]
+    except ValueError as exc:
+        return f"is not a parseable command line: {exc}"
+    stderr = io.StringIO()
+    try:
+        with redirect_stderr(stderr):
+            build_parser().parse_args(argv)
+    except SystemExit:
+        return f"does not parse: {' '.join(argv)} -> {stderr.getvalue().strip().splitlines()[-1:]}"
+    return None
+
+
+def _cli_carries_job(job: str) -> bool:
+    """Whether the CLI carries ``job`` at all — the reserved procedures' test."""
+    from crucible.cli import JOBS  # noqa: PLC0415 - cycle: cli imports gate
+
+    return job in JOBS
+
+
+def _clause_runbook_in_readme() -> Clause:
+    """`alpha-engine-config-I9758` deliverable 6: the runbook is in the README,
+    and every command it publishes still parses against the real CLI.
+
+    Presence alone is not the deliverable and never was. `crucible-PR163` made
+    the point for the other runbook: a procedure whose commands no longer parse
+    is worse than no procedure, because it fails halfway, in front of somebody
+    who reached for it under pressure. So the parser is the oracle here too —
+    each command is extracted from the runbook's own fenced blocks and handed
+    to `crucible.cli.build_parser`, and a renamed flag turns this clause red
+    rather than an operator's terminal.
+
+    **A reserved procedure is graded the other way round.** `unseal` is a
+    human ruling and never an automated action (plan §9.4); the README says
+    so and names no command. Requiring "a command that parses" from every
+    procedure would mean this clause could only go green if someone built the
+    exact CLI surface the plan forbids. So a reserved procedure must name NO
+    command AND the CLI must carry no such job — the clause refuses a missing
+    procedure and an invented one with equal force (see
+    :data:`RUNBOOK_PROCEDURES`).
+
+    Read from the repository, not the store, for :data:`ACCEPTANCE_RATCHET_PATH`'s
+    reason: the runbook's existence is a property of the checkout and git is its
+    durable record. Absent — a wheel install, where the README does not ship —
+    the clause is UNMET with the path named, never a pass and never
+    unmeasurable: this reader knows exactly which file it wanted and that it is
+    not there.
+    """
+    name = "runbook_in_readme"
+    requirement = (
+        "README carries a "
+        + RUNBOOK_SECTION
+        + " section naming "
+        + ", ".join(verb for verb, _reserved in RUNBOOK_PROCEDURES)
+        + "; every `crucible ...` command it publishes parses against the real CLI, and "
+        "each reserved procedure names no command and no such job exists"
+    )
+    evidence = (str(README_PATH),)
+    if not README_PATH.is_file():
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{README_PATH} is absent, so the runbook cannot be read here",
+            evidence,
+        )
+    try:
+        text = README_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        return _unmeasurable(name, requirement, f"{README_PATH} could not be read: {exc}", evidence)
+    sections = _runbook_sections(text)
+    if not sections:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{README_PATH} carries no `{RUNBOOK_SECTION}` section with "
+            f"`{RUNBOOK_PROCEDURE_PREFIX}` procedures under it",
+            evidence,
+        )
+    parts: list[str] = []
+    problems: list[str] = []
+    for verb, reserved in RUNBOOK_PROCEDURES:
+        body = sections.get(verb)
+        if body is None:
+            problems.append(f"{verb}: no `{RUNBOOK_PROCEDURE_PREFIX}{verb}` section")
+            continue
+        commands = _RUNBOOK_COMMAND_RE.findall(body)
+        if reserved:
+            if commands:
+                problems.append(
+                    f"{verb}: reserved (plan §9.4) but publishes "
+                    f"{len(commands)} command(s): {commands[0][0]}"
+                )
+            elif _cli_carries_job(verb):
+                problems.append(
+                    f"{verb}: documented as reserved, but the CLI carries a {verb!r} job"
+                )
+            else:
+                parts.append(f"{verb}: reserved, no command, no such job")
+            continue
+        if not commands:
+            problems.append(f"{verb}: the section publishes no `crucible ...` command")
+            continue
+        broken = [
+            f"`crucible {job}{rest}` {why}"
+            for job, rest in commands
+            if (why := _parses_against_the_cli(job, rest)) is not None
+        ]
+        if broken:
+            problems.extend(f"{verb}: {b}" for b in broken)
+        else:
+            parts.append(f"{verb}: {len(commands)} command(s), all parse")
+    if problems:
+        return Clause(name, requirement, False, "; ".join(problems), evidence)
+    return Clause(name, requirement, True, "; ".join(parts), evidence)
+
+
 #: Complete days whose TOTAL is graded against the monthly ceiling
 #: (`alpha-engine-config-I9927`): the ceiling's own period, so a weekly batch
 #: lands in the window four or five times and a month-boundary accrual once,
@@ -4174,6 +4819,10 @@ def _phase2(
         _clause_zero_human_mutating_calls(window),
         _clause_pages_within_ceiling(store, window),
         _clause_pages_commissioned(store),
+        _clause_two_page_conditions_on_real_channel(store),
+        _clause_transient_retry_class_in_runner(store, registry),
+        _clause_fault_injection_against_scheduled_path(store),
+        _clause_runbook_in_readme(),
         _clause_aws_cost_within_ceiling(
             window, name="aws_cost_within_ceiling", ceiling_usd=PHASE2_MAX_TAGGED_USD, tagged=True
         ),
