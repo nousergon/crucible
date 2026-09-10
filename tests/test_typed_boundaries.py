@@ -186,7 +186,10 @@ class TestTheCrossFieldRulesSurvivedTheMove:
 
     def test_a_close_plus_deadline_without_an_offset_is_refused(self, tmp_path) -> None:
         document = copy.deepcopy(_document())
-        document["components"]["data.daily"]["deadline"] = {"anchor": "close_plus"}
+        document["components"]["data.daily"]["deadline"] = {
+            "anchor": "close_plus",
+            "cadence": "daily",
+        }
 
         with pytest.raises(ValidationError) as excinfo:
             load_registry(_write(tmp_path, document))

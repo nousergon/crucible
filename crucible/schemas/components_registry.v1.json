@@ -150,6 +150,14 @@
           "default": null,
           "title": "At"
         },
+        "cadence": {
+          "enum": [
+            "daily",
+            "weekly"
+          ],
+          "title": "Cadence",
+          "type": "string"
+        },
         "offset_hours": {
           "anyOf": [
             {
@@ -164,7 +172,8 @@
         }
       },
       "required": [
-        "anchor"
+        "anchor",
+        "cadence"
       ],
       "title": "DeadlineRow",
       "type": "object"

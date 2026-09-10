@@ -628,6 +628,14 @@ def evaluate_absence(
             if component.absence_watched_by != watched_by:
                 continue
             assert component.deadline is not None  # Component.__post_init__ guarantees it
+            # WHICH DAYS FIRST, then "by when". A weekly row is not late on a
+            # Tuesday, it is not due — and grading it as though it were is
+            # what put seven weekly rows on the 2026-09-08 ABSENCE page as
+            # members, on a day none of them was ever going to write. The
+            # cadence is read from the registry (`deadline.cadence`), never
+            # inferred from the prose `schedule` string.
+            if not component.deadline.applies_on(trading_day):
+                continue
             due = component.deadline.due_at(trading_day)
             if moment < due:
                 continue
@@ -770,10 +778,16 @@ def evaluate_dispatch_absence(
     `runs/_dispatch/{job}/{dispatch_id}.json` before `RunInstances` returns
     (`crucible.keys.dispatch_key`) — job, args, instance id, requester,
     dispatch time. This function lists every one of them, resolves the
-    trading day the SAME way every other wall-clock firing does
-    (`crucible.calendar.resolve_trading_day` — rule 3's exhaustive exception
-    for wall-clock scheduling), and pages when the resolved trading day's
+    trading day THAT DISPATCH'S RUN will bind to
+    (:func:`_dispatch_target_trading_day`), and pages when that trading day's
     manifest prefix is still empty past the horizon.
+
+    **Bounded by the same catch-up window as everything else.** A record
+    older than :data:`CATCH_UP_TRADING_DAYS` trading days is not graded: a
+    dispatch record is written once and never rewritten, so an unbounded scan
+    grows for the life of the store and one dispatch that genuinely never
+    landed is re-evaluated every night forever. The manifest is the durable
+    record; this is the sweep's short-lived proof-of-request.
 
     A dispatch inside the horizon is not yet due and is silently skipped —
     the same "only past deadlines are evaluated" rule :func:`evaluate_absence`
@@ -803,6 +817,9 @@ def evaluate_dispatch_absence(
     leave it ``None`` for the real `ec2:DescribeInstances` call.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
+    oldest_graded_day = resolve_trading_day(moment)
+    for _ in range(CATCH_UP_TRADING_DAYS):
+        oldest_graded_day = previous_trading_day(oldest_graded_day)
     pages: list[Page] = []
     listed = _list_manifest_keys(store, DISPATCH_ROOT)
     if listed.problem is not None:
@@ -847,6 +864,16 @@ def evaluate_dispatch_absence(
             )
             continue
         if moment - dispatched_at < horizon:
+            continue
+        # The same window that bounds the other two inputs (`days_to_evaluate`),
+        # applied to the one input that had no bound at all. A dispatch record
+        # is written once and never rewritten, so without this the set of things
+        # the sweep grades grows for the life of the store and a single dispatch
+        # that genuinely never landed is re-evaluated every night forever. The
+        # manifest is the durable record; a dispatch record is the sweep's
+        # short-lived proof-of-request, and it is answerable for it over exactly
+        # the window it is answerable for everything else.
+        if resolve_trading_day(dispatched_at) < oldest_graded_day:
             continue
         trading_day = _dispatch_target_trading_day(args, dispatched_at)
         prefix = manifest_prefix(job, trading_day.isoformat())

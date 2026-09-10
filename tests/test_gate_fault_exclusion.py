@@ -37,7 +37,9 @@ def _registry() -> dict[str, Component]:
     """One arc-dispatched component — `data.weekly`, matching the real
     `crucible.components.yaml` row's name so `manifest_key("data.weekly", ...)`
     reads exactly the key the real job would write."""
-    deadline = Deadline.from_yaml({"anchor": "next_calendar_day_at", "at": "09:00"})
+    deadline = Deadline.from_yaml(
+        {"anchor": "next_calendar_day_at", "cadence": "weekly", "at": "09:00"}
+    )
     component = Component(
         name="data.weekly",
         description="x",

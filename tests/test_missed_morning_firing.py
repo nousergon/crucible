@@ -184,7 +184,7 @@ class TestTheCalibratedThresholdChangesTheReading:
     def test_the_original_210_minute_deadline_would_have_read_it_as_absent(self) -> None:
         from crucible.components import Deadline
 
-        old_deadline = Deadline(anchor="next_calendar_day_at", at=dt.time(9, 30))
+        old_deadline = Deadline(anchor="next_calendar_day_at", cadence="daily", at=dt.time(9, 30))
         assert self.ARRIVAL > old_deadline.due_at(THURSDAY)
 
     def test_the_two_readings_differ(self) -> None:
@@ -195,7 +195,7 @@ class TestTheCalibratedThresholdChangesTheReading:
 
         new_deadline = load_registry()[MORNING].deadline
         assert new_deadline is not None
-        old_deadline = Deadline(anchor="next_calendar_day_at", at=dt.time(9, 30))
+        old_deadline = Deadline(anchor="next_calendar_day_at", cadence="daily", at=dt.time(9, 30))
 
         new_reads_on_time = self.ARRIVAL <= new_deadline.due_at(THURSDAY)
         old_reads_on_time = self.ARRIVAL <= old_deadline.due_at(THURSDAY)

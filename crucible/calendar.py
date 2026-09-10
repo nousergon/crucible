@@ -42,6 +42,7 @@ __all__ = [
     "TRADING_DAYS_PER_WEEK",
     "assert_trading_day",
     "is_trading_day",
+    "is_week_final_trading_day",
     "previous_trading_day",
     "resolve_trading_day",
     "subtract_trading_days",
@@ -79,6 +80,37 @@ def is_trading_day(day: dt.date) -> bool:
     (principle 8).
     """
     return _krepis_is_trading_day(day)
+
+
+def is_week_final_trading_day(day: dt.date) -> bool:
+    """True when ``day`` is the LAST session of its calendar week.
+
+    A weekly job binds to the week it covers, and the trading day it writes
+    its manifest under is that week's final session — Friday normally, and
+    Thursday in a week whose Friday is a holiday. So "is this weekly row due
+    on trading day d" is exactly this question, and asking it from the
+    calendar is what keeps a holiday week from either skipping the row or
+    pointing it at a session that never closed.
+
+    Derived, never a weekday literal: `day.weekday() == 4` is the same
+    predicate with the holiday calendar deleted, and it is wrong in every
+    week the fleet actually loses money on (2026-07-03, 2026-11-27,
+    2026-12-25 all close a week early).
+
+    Walks forward to the Sunday that ends ``day``'s week — at most six
+    :func:`is_trading_day` calls, all against the one NYSE calendar.
+    """
+    if not is_trading_day(day):
+        raise NonTradingDayKeyError(
+            f"{day.isoformat()} is not a trading day, so it is neither the final "
+            "session of its week nor any other session. A cadence question about a "
+            "non-session is a caller bug, not a False."
+        )
+    # Monday is 0, Sunday is 6: this many calendar days remain in the week.
+    for ahead in range(1, 7 - day.weekday()):
+        if is_trading_day(day + dt.timedelta(days=ahead)):
+            return False
+    return True
 
 
 def resolve_trading_day(now: dt.datetime | None = None) -> dt.date:

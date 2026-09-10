@@ -30,11 +30,13 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from crucible.calendar import assert_trading_day
+from crucible.calendar import assert_trading_day, is_week_final_trading_day
 from crucible.models import ComponentsDocument
 
 __all__ = [
     "ANCHORS",
+    "CADENCES",
+    "Cadence",
     "Component",
     "DISPATCHES",
     "Deadline",
@@ -87,6 +89,22 @@ LIFECYCLES: tuple[str, ...] = ("ACTIVE", "DISABLED", "RETIRED")
 #: field name.
 DISPATCHES: tuple[str, ...] = ("arc", "scheduler", "github-actions")
 
+#: WHICH trading days a deadline is due on. Exhaustive, and a machine field
+#: rather than a reading of the prose `schedule` string. `daily` is every
+#: trading day; `weekly` is the last session of each calendar week — the day
+#: a weekly job's manifest binds to (Friday, or Thursday when Friday is a
+#: holiday), never a weekday literal.
+#:
+#: It exists because its absence was a measured false-alarm generator: with
+#: only an anchor and a time, :func:`crucible.alerts.evaluate_absence` graded
+#: every scheduled row on every trading day, so the eight rows reading
+#: `schedule: weekly, Saturday` paged ABSENCE on the four weekdays they were
+#: never going to run. The 2026-09-08 page carried twenty-two members and
+#: seven of them were that. A cadence that lives only in prose is a cadence
+#: nothing enforces.
+CADENCES: tuple[str, ...] = ("daily", "weekly")
+Cadence = Literal["daily", "weekly"]
+
 
 @dataclass(frozen=True)
 class Deadline:
@@ -98,10 +116,19 @@ class Deadline:
     """
 
     anchor: Anchor
+    #: See :data:`CADENCES`. No default: a deadline that does not say which
+    #: days it is due on is the defect this field repairs, and a default
+    #: would let an omission read as a declaration.
+    cadence: Cadence
     offset_hours: float | None = None
     at: dt.time | None = None
 
     def __post_init__(self) -> None:
+        if self.cadence not in CADENCES:
+            raise ValueError(
+                f"{self.cadence!r} is not a deadline cadence. There are exactly "
+                f"{CADENCES}; a third is a design change, not a config value."
+            )
         if self.anchor not in ANCHORS:
             raise ValueError(
                 f"{self.anchor!r} is not a deadline anchor. There are exactly "
@@ -111,6 +138,24 @@ class Deadline:
             raise ValueError("a close_plus deadline needs offset_hours")
         if self.anchor == "next_calendar_day_at" and self.at is None:
             raise ValueError("a next_calendar_day_at deadline needs `at`")
+
+    def applies_on(self, trading_day: dt.date) -> bool:
+        """Is this row due on ``trading_day`` at all?
+
+        Asked BEFORE :meth:`due_at`, and separately from it: "by when" and
+        "on which days" are two questions, and collapsing them is what let a
+        weekly row be graded — and paged — on a Tuesday.
+
+        A `weekly` row is due on the last session of each calendar week,
+        because that is the trading day its manifest binds to. Read from the
+        calendar (:func:`crucible.calendar.is_week_final_trading_day`), never
+        from a weekday number, so a short holiday week moves the due day
+        instead of losing it.
+        """
+        assert_trading_day(trading_day, context=f"deadline cadence {self.cadence}")
+        if self.cadence == "daily":
+            return True
+        return is_week_final_trading_day(trading_day)
 
     def due_at(self, trading_day: dt.date) -> dt.datetime:
         """The UTC instant by which trading day ``trading_day``'s manifest
@@ -139,20 +184,35 @@ class Deadline:
         those.
         """
         day = trading_day.isoformat() if trading_day else "d"
+        # The cadence is part of the sentence, not a separate fact an operator
+        # has to go and look up: "absent, and it was due weekly" and "absent,
+        # and it was due every day" call for different next actions.
+        every = "every trading day" if self.cadence == "daily" else "each week's final session"
         if self.anchor == "close_plus":
             hours = self.offset_hours
             rendered = f"{hours:g}h"
-            return f"{rendered} after the close of trading day {day}"
+            return f"{rendered} after the close of trading day {day} ({every})"
         assert self.at is not None
-        return f"{self.at.strftime('%H:%M')} ET the calendar day after trading day {day}"
+        return f"{self.at.strftime('%H:%M')} ET the calendar day after trading day {day} ({every})"
 
     @classmethod
     def from_yaml(cls, raw: dict[str, Any] | None) -> Deadline | None:
         if raw is None:
             return None
         at = raw.get("at")
+        if "cadence" not in raw:
+            # `raw["cadence"]`'s own KeyError would name the key and nothing
+            # else. A deadline row that predates this field is the exact state
+            # the field exists to make unrepresentable, so it says so.
+            raise ValueError(
+                "a deadline row declares no `cadence`. Every deadline says which "
+                f"trading days it is due on — one of {CADENCES} — because a row "
+                "that only says 'by when' is graded on every trading day, which is "
+                "how eight weekly rows came to page ABSENCE four times a week."
+            )
         return cls(
             anchor=raw["anchor"],
+            cadence=raw["cadence"],
             offset_hours=raw.get("offset_hours"),
             at=dt.time.fromisoformat(at) if at else None,
         )

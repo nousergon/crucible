@@ -45,7 +45,7 @@ def _component(**over) -> Component:
         console_surface="crucible/runs",
         artifact_retention="forever",
         schedule="weekdays after close",
-        deadline=Deadline(anchor="close_plus", offset_hours=3),
+        deadline=Deadline(anchor="close_plus", cadence="daily", offset_hours=3),
     )
     base.update(over)
     return Component(**base)
