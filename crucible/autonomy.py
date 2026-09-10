@@ -102,6 +102,7 @@ __all__ = [
     "count_operator_actions",
     "date_partitions",
     "iter_archive_records",
+    "trailing_calendar_month",
 ]
 
 #: How many archive objects are fetched at once within one calendar day. Each
@@ -415,6 +416,24 @@ def iter_archive_records(
     return ArchiveRead(records=kept, objects_by_day=objects_by_day, records_scanned=scanned)
 
 
+def trailing_calendar_month(render_day: dt.date) -> tuple[dt.date, dt.date]:
+    """The trailing calendar month for ``render_day``: month-to-date.
+
+    `alpha-engine-config-I10416`: the standing monthly reading is a
+    CALENDAR window (one of §4.12's exhaustive trading-days exceptions —
+    CloudTrail windows), not a trading-day one, for the same reason
+    :func:`iter_archive_records` walks calendar days: the archive delivers on
+    wall-clock time and an operator apply on a Saturday must count.
+
+    ``[first day of render_day's month, render_day]``, inclusive of both
+    ends — month-to-date rather than the PRIOR completed month, so the board
+    reads today's accumulation rather than a number that is up to a month
+    stale. A caller wanting the fully-closed prior month passes the last day
+    of that month as ``render_day``.
+    """
+    return render_day.replace(day=1), render_day
+
+
 def count_operator_actions(
     client: Any,
     *,
@@ -424,6 +443,7 @@ def count_operator_actions(
     end: dt.date,
     marker: str = "crucible-v2",
     cfn: Any | None = None,
+    reserved: frozenset[str] = frozenset(),
 ) -> OperatorActionCount:
     """Count human-originated mutating calls against v2 over the window.
 
@@ -435,6 +455,18 @@ def count_operator_actions(
     it defaults to `machine_principals`'s own lazily-constructed client, so a
     production caller (`crucible.gate._clause_zero_human_mutating_calls`)
     passes none.
+
+    ``reserved`` is `alpha-engine-config-I10416`'s §11 row 9 exclusion list —
+    CloudTrail `eventName`s that are human-originated and mutating and are
+    excluded anyway: IB Gateway paper re-auth, privileged SSO actions,
+    rulings on holdout unseal and trader release pin. It is CONFIG
+    (`crucible.config.Settings.autonomy_reserved_events`), never hardcoded
+    here — this function only applies whatever set a caller hands it, and
+    the default is empty, so a caller that passes nothing gets the prior,
+    unreserved behaviour exactly. Applied AFTER the machine-principal
+    allowlist, on the event's OWN `eventName` regardless of who the
+    principal was, so a reserved action never has to also be a registered
+    machine principal to be excluded.
 
     **Coverage is asserted PER CALENDAR DAY.** A window total greater than
     zero says only that the trail existed for SOME of it, and a count read
@@ -493,6 +525,8 @@ def count_operator_actions(
         record = CloudTrailRecord.model_validate(raw_record)
         name, kind = _principal(record)
         if name in principals:
+            continue
+        if record.eventName in reserved:
             continue
         actions.append(
             OperatorAction(

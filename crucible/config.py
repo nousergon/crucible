@@ -53,6 +53,7 @@ from crucible.store import LocalStore, S3Store, Store, read_only
 
 __all__ = [
     "DEFAULT_ARCTIC_BUCKET",
+    "DEFAULT_AUTONOMY_RESERVED_EVENTS",
     "DEFAULT_CLOUDTRAIL_ARCHIVE",
     "DEFAULT_CONSOLE_URL",
     "DEFAULT_STACK_NAME",
@@ -134,6 +135,24 @@ DEFAULT_MUTED_TOPIC = ""
 #: the board yet. Set `CRUCIBLE_CONSOLE_URL`, scheme and host, no trailing slash.
 DEFAULT_CONSOLE_URL = ""
 
+#: `alpha-engine-config-I10416`, §11 row 9: the CloudTrail `eventName`s the
+#: standing monthly autonomy count EXCLUDES even though they are human-
+#: originated and mutating — IB Gateway paper re-auth, privileged SSO
+#: actions, rulings on holdout unseal and trader release pin. Empty by
+#: default, deliberately, for the same reason as :data:`DEFAULT_MUTED_TOPIC`:
+#: the exclusion list is declared in CONFIG (the issue's own words), never a
+#: Python literal in this public-at-phase-1-exit tree, so widening it is one
+#: `gh variable set` an operator can audit rather than a code change that
+#: could quietly grow to cover an unreviewed action. A name here is an AWS
+#: CloudTrail `eventName` — not a resource identifier — so it carries no
+#: bucket, ARN or account number and is safe to publish.
+#:
+#: `crucible.autonomy.count_operator_actions`'s ``reserved`` filters on this
+#: set AFTER the machine-principal allowlist — an event both a machine
+#: principal made AND a reserved name is already excluded by the first test,
+#: so the two never double-count.
+DEFAULT_AUTONOMY_RESERVED_EVENTS = ""
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -153,6 +172,15 @@ class Settings:
     #: `alpha-engine-config-I9926` — see :data:`DEFAULT_CONSOLE_URL`. Read by
     #: `crucible.morning`; nothing else in this tree links out.
     console_url: str = DEFAULT_CONSOLE_URL
+    #: See :data:`DEFAULT_AUTONOMY_RESERVED_EVENTS`. A tuple of CloudTrail
+    #: `eventName`s, resolved from a comma-separated `CRUCIBLE_AUTONOMY_
+    #: RESERVED_EVENTS`; empty means no reservation, not "unmeasured" —
+    #: `crucible.autonomy.count_operator_actions` treats an empty set as a
+    #: normal, valid (if narrow) exclusion list rather than raising, unlike
+    #: :attr:`cloudtrail_archive`, whose empty default IS a refusal to guess
+    #: a bucket. The two default to the empty string/tuple for unrelated
+    #: reasons and must not be read as the same kind of "unset".
+    autonomy_reserved_events: tuple[str, ...] = ()
     origins: dict[str, str] = field(default_factory=dict)
     #: The per-weekly-run LLM spend ceiling, in USD (plan §2 row 3). Declared
     #: HERE, in config, rather than at a call site: a ceiling that lives beside
@@ -220,6 +248,7 @@ class Settings:
             "cloudtrail_archive": self.cloudtrail_archive,
             "stack_name": self.stack_name,
             "console_url": self.console_url,
+            "autonomy_reserved_events": list(self.autonomy_reserved_events),
             "strategy_dir": str(self.strategy_dir) if self.strategy_dir else None,
             "llm_cap_usd": self.llm_cap_usd,
             "llm_cap_usd_measured": self.llm_cap_usd_measured,
@@ -246,6 +275,7 @@ def settings(
     cloudtrail_archive: str | None = None,
     stack_name: str | None = None,
     console_url: str | None = None,
+    autonomy_reserved_events: str | None = None,
     dry_run: bool = False,
 ) -> Settings:
     """Resolve configuration once, and record where each value came from."""
@@ -271,6 +301,14 @@ def settings(
     resolved_console, origins["console_url"] = _resolve(
         console_url, "CRUCIBLE_CONSOLE_URL", DEFAULT_CONSOLE_URL
     )
+    resolved_reserved, origins["autonomy_reserved_events"] = _resolve(
+        autonomy_reserved_events,
+        "CRUCIBLE_AUTONOMY_RESERVED_EVENTS",
+        DEFAULT_AUTONOMY_RESERVED_EVENTS,
+    )
+    reserved_events = tuple(
+        sorted({name.strip() for name in (resolved_reserved or "").split(",") if name.strip()})
+    )
     raw_dir = strategy_dir or os.environ.get("CRUCIBLE_STRATEGY_DIR")
     if raw_dir:
         origins["strategy_dir"] = "argument" if strategy_dir else "environ:CRUCIBLE_STRATEGY_DIR"
@@ -295,6 +333,7 @@ def settings(
         cloudtrail_archive=resolved_archive,
         stack_name=resolved_stack,
         console_url=resolved_console.rstrip("/") if resolved_console else DEFAULT_CONSOLE_URL,
+        autonomy_reserved_events=reserved_events,
         llm_cap_usd=_positive_cap(resolved_cap, origins["llm_cap_usd"]),
         llm_cap_usd_measured=cap_measured,
         origins=origins,

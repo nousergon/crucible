@@ -257,14 +257,19 @@ class TestReadingIsHonestAboutWhatItCouldNotDo:
         at all. So the blindness check was asserted against a vocabulary the
         producer does not use, and the MET case was asserted over rows
         `build_attribution` would never produce. The statuses below come from
-        `krepis.metrics.derive_status`'s real `N/A-*` family, and
-        `TestTheAttributionReaderMatchesItsRealProducer` pins that against the
-        producer's actual output rather than against this fixture.
+        `krepis.metrics.derive_status`'s real `N/A-*`/`GREEN`/`WATCH`/`RED`
+        family, and `TestTheAttributionReaderMatchesItsRealProducer` pins
+        that against the producer's actual output rather than against this
+        fixture. `"OK"` itself survived here past that fix
+        (`alpha-engine-config-I10417` caught it: `crucible.report.GRADE_RANK`
+        has no rank for a status the real producer never emits) — measured
+        rather than argued, the same failure mode this docstring already
+        names, one status later.
         """
         body = [
             {"name": f"row{i}", "status": "N/A-NOT-RUN", "value": None}
             if i < blind
-            else {"name": f"row{i}", "status": "OK", "value": 0.5}
+            else {"name": f"row{i}", "status": "GREEN", "value": 0.5}
             for i in range(rows)
         ]
         return json.dumps(

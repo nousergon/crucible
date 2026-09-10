@@ -64,6 +64,7 @@ from typing import Any
 
 from krepis.metrics import MetricRecord, derive_status
 
+from crucible.aggregation import MemberRow, member_dicts, worst_member
 from crucible.calendar import previous_trading_day
 from crucible.data.daily import COVERAGE_FLOOR_RATIO
 from crucible.documents import load_store_document
@@ -73,12 +74,16 @@ from crucible.slots.grading import CROSS_SECTION_MIN_NAMES, RankICSkip, spearman
 from crucible.store import Store
 
 __all__ = [
+    "ATTRIBUTION_GRADES",
     "ATTRIBUTION_SCHEMA_VERSION",
+    "GRADE_RANK",
     "ROWS",
     "REPORT_WINDOW_TRADING_DAYS",
     "SLOT_WINDOW_TRADING_DAYS",
     "RowSpec",
+    "attribution_grade",
     "attribution_key",
+    "attribution_members",
     "build_attribution",
     "rows_complete_metric",
 ]
@@ -143,6 +148,32 @@ BOOTSTRAP_SEED = 20260901
 RANK_IC_N_FLOOR = SLOT_N_FLOOR
 
 
+#: `alpha-engine-config-I10417`: the rank every attribution row's status is
+#: reduced under, HIGHER IS WORSE. `GREEN` is the only status that keeps the
+#: table's grade `GREEN`. Every `N/A-*` status ranks WORSE than `RED` on
+#: purpose — "we could not verify this layer" must never render better than
+#: "we verified it and it failed", which is the same direction principle 7
+#: names for an absent reading generally. `krepis.metrics.StatusLiteral` is
+#: the source of this vocabulary (module docstring); a status this table
+#: does not know how to rank is refused by `worst_member` rather than
+#: defaulting to the best rank.
+GRADE_RANK: dict[str, int] = {
+    "GREEN": 0,
+    "WATCH": 1,
+    "RED": 2,
+    "N/A-NOT-IMPL": 3,
+    "N/A-NOT-RUN": 3,
+    "N/A-LOW-N": 3,
+    "N/A-MISSING-INPUT": 3,
+}
+
+#: The closed set `attribution_grade` returns. `UNVERIFIED` rather than one
+#: of the four `N/A-*` spellings: the grade is ABOUT THE TABLE, not about one
+#: row, and multiple rows in different not-measured states would otherwise
+#: force a choice between them that means nothing.
+ATTRIBUTION_GRADES: tuple[str, ...] = ("GREEN", "WATCH", "RED", "UNVERIFIED")
+
+
 @dataclass(frozen=True)
 class RowSpec:
     """One row of the §4.5 table: what it answers, and where it reads."""
@@ -205,6 +236,38 @@ ROWS: tuple[RowSpec, ...] = (
 )
 
 
+def attribution_members(rows: list[dict[str, Any]]) -> list[MemberRow]:
+    """The five attribution rows, as `alpha-engine-config-I10417` members.
+
+    ``id`` is the row's own `name` (`data_coverage_ratio`, `signal_rank_ic_r`,
+    ...) — the report card's row names are already a stable id, so this is a
+    view, not a second identifier scheme.
+    """
+    return [
+        MemberRow(id=str(r["name"]), value=r.get("value"), status=str(r["status"])) for r in rows
+    ]
+
+
+def attribution_grade(rows: list[dict[str, Any]]) -> tuple[str, str]:
+    """The table's headline grade, and why — reduced over ``rows`` alone.
+
+    `alpha-engine-config-I10417`: never greener than the worst row. This is
+    the fix for the exact v1 shape the issue names — a weighted tile scored
+    RED was silently excluded from the headline grade because the old reader
+    only asked "did every row report something", never "what did it report".
+    A row is RED, once produced, PART of the grade, not merely present in a
+    count of rows that exist.
+
+    Callers never trust a cached `grade` field: they call this again over the
+    same `rows` the artifact carries (reconstructibility, I10417 clause 3).
+    """
+    members = attribution_members(rows)
+    worst = worst_member(members, rank=GRADE_RANK)
+    grade = "UNVERIFIED" if worst.status.startswith("N/A") else worst.status
+    reason = f"worst row: {worst.id} ({worst.status})"
+    return grade, reason
+
+
 def build_attribution(
     store: Store,
     *,
@@ -240,6 +303,7 @@ def build_attribution(
             "table exists to make impossible."
         )
 
+    grade, grade_reason = attribution_grade(rows)
     return (
         {
             "schema_version": ATTRIBUTION_SCHEMA_VERSION,
@@ -254,6 +318,12 @@ def build_attribution(
             "window_trading_days": REPORT_WINDOW_TRADING_DAYS,
             "window_sessions": [d.isoformat() for d in sessions],
             "rows": rows,
+            # `alpha-engine-config-I10417`: the members list `grade` was
+            # reduced from, so a reader recomputes it (`attribution_grade`)
+            # rather than trusting the cached fields below.
+            "members": member_dicts(attribution_members(rows)),
+            "grade": grade,
+            "grade_reason": grade_reason,
         },
         sorted(set(sources)),
     )

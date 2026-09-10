@@ -77,6 +77,7 @@ __all__ = [
     "BoardRow",
     "Declaration",
     "Declarations",
+    "HumanTouchReading",
     "RowDelta",
     "board_delta",
     "board_payload",
@@ -537,12 +538,19 @@ def _read_attribution(store: Store, trading_day: str) -> Reading:
     failure the previous paragraph of this docstring claimed to prevent, and
     the exact bug class of a test that fabricates the keys its code invented.
 
-    MET therefore requires all three: the declared number of rows, no row in
-    the `N/A-*` family, and no row whose `value` is null. A row count is not a
-    reading, and `build_attribution` already refuses to emit the wrong number
-    of rows — so counting them grades the one thing that cannot go wrong.
+    MET therefore requires FOUR things: the declared number of rows, no row in
+    the `N/A-*` family, no row whose `value` is null, and — `alpha-engine-
+    config-I10417` — no row read `RED`. The fourth is the fix for the exact
+    class the issue names: a row that measured something and read RED used to
+    count as "measured" here with nothing looking at WHAT it measured, so a
+    single red layer never kept this reader from reading MET — the "a
+    weighted tile scored RED was silently excluded from the headline grade"
+    defect, reproduced with the polarity flipped (included in the count,
+    excluded from the verdict). `crucible.report.attribution_grade` is the
+    single reducer for this now (`alpha-engine-config-I10417`); this reader
+    calls it rather than re-deriving a second opinion about the same rows.
     """
-    from crucible.report import ROWS, attribution_key  # noqa: PLC0415 - avoids a cycle
+    from crucible.report import ROWS, attribution_grade, attribution_key  # noqa: PLC0415
 
     key = attribution_key(trading_day)
     document, failure = _fetch(store, key, trading_day)
@@ -573,9 +581,19 @@ def _read_attribution(store: Store, trading_day: str) -> Reading:
             "of health, whatever the table's own row count says.",
             last_read=provenance,
         )
+    grade, grade_reason = attribution_grade(rows)
+    if grade != "GREEN":
+        return Reading(
+            "UNMET",
+            f"{key} grades all {len(rows)} layers, each with a measured value, and the "
+            f"table's own grade is {grade} ({grade_reason}) — a red or unverified member "
+            "must never be reported as a complete, healthy table.",
+            last_read=provenance,
+        )
     return Reading(
         "MET",
-        f"{key} grades all {len(rows)} declared layers, each with a measured value",
+        f"{key} grades all {len(rows)} declared layers, each with a measured value, "
+        f"grade {grade} ({grade_reason})",
         provenance,
     )
 
@@ -732,6 +750,124 @@ class BoardRow:
         }
 
 
+def _autonomy_s3_client() -> Any:
+    """An S3 client for the CloudTrail archive read.
+
+    A separate lazy constructor from `crucible.gate._s3_client`, not a call
+    to it: that name is private to `crucible.gate`, and importing a private
+    name across modules is the same "restated contract" `crucible.keys`'
+    docstring warns about, for a two-line lazy `boto3.client` call that costs
+    nothing to keep local. Both exist so importing this module never requires
+    an AWS SDK or a credential chain.
+    """
+    import boto3  # noqa: PLC0415 - lazy on purpose
+
+    return boto3.client("s3")
+
+
+@dataclass(frozen=True)
+class HumanTouchReading:
+    """`alpha-engine-config-I10416`: the standing monthly human-touch count.
+
+    A property, not a gate that passed once (plan §6 row 2 measures a single
+    window; principle 3 asks about the loop). ``measured`` is `False` exactly
+    when the count could not be read — no archive configured, or a read
+    failure — so a `0` on the board is always a real zero, never a stand-in
+    for "we could not check" (principle 7).
+    """
+
+    month: str
+    count: int
+    actions: tuple[dict[str, Any], ...]
+    detail: str
+    measured: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "month": self.month,
+            "count": self.count,
+            "measured": self.measured,
+            "detail": self.detail,
+            "actions": [dict(a) for a in self.actions],
+        }
+
+
+def _read_human_touch_count(render_day: dt.date, *, cfn: Any | None = None) -> HumanTouchReading:
+    """The trailing-calendar-month human-touch count, read once per render.
+
+    `alpha-engine-config-I10416`: generalises the SAME archive reader the
+    phase-2 gate clause uses (`crucible.autonomy.count_operator_actions`,
+    called by `crucible.gate._clause_zero_human_mutating_calls`) over a
+    different window — month-to-date rather than "since last change" — never
+    a second implementation of the archive walk, the machine-principal
+    allowlist or the reserved-action exclusion.
+
+    A non-zero month is a FINDING here, never a gate quietly re-passed: this
+    function only reads and names the calls; the caller (`build_board`)
+    renders whatever it returns without softening a non-zero count.
+    """
+    from crucible.autonomy import (  # noqa: PLC0415 - heavy import, one call site
+        ArchiveMissingError,
+        StackUnmeasurableError,
+        count_operator_actions,
+        trailing_calendar_month,
+    )
+    from crucible.config import settings  # noqa: PLC0415 - one call site
+
+    month_start, month_end = trailing_calendar_month(render_day)
+    month_label = month_start.strftime("%Y-%m")
+    cfg = settings()
+    if not cfg.cloudtrail_archive:
+        return HumanTouchReading(
+            month_label,
+            0,
+            (),
+            "no CloudTrail archive is configured (CRUCIBLE_CLOUDTRAIL_ARCHIVE is unset). "
+            "Reporting 0 would make 'no trail' and 'no human touched it' the same answer.",
+            measured=False,
+        )
+    bucket = cfg.cloudtrail_archive.removeprefix("s3://").partition("/")[0]
+    prefix = cfg.cloudtrail_archive.removeprefix("s3://").partition("/")[2]
+    try:
+        counted = count_operator_actions(
+            _autonomy_s3_client(),
+            bucket=bucket,
+            prefix=prefix,
+            start=month_start,
+            end=month_end,
+            cfn=cfn,
+            reserved=frozenset(cfg.autonomy_reserved_events),
+        )
+    except (ArchiveMissingError, StackUnmeasurableError) as exc:
+        return HumanTouchReading(month_label, 0, (), f"{type(exc).__name__}: {exc}", measured=False)
+    except Exception as exc:  # noqa: BLE001 - the failure IS the reading; see gate.py's
+        # own `_clause_zero_human_mutating_calls`, which this mirrors: a
+        # credential or network failure must not take the whole board render
+        # down, and the honest answer is "we could not check", not a raise
+        # that leaves the board unrendered for a reason that has nothing to
+        # do with the system being measured.
+        return HumanTouchReading(
+            month_label,
+            0,
+            (),
+            f"the CloudTrail archive could not be read: {type(exc).__name__}: {exc}. That "
+            "is a statement about our access, not about the system being measured.",
+            measured=False,
+        )
+    detail = (
+        f"{counted.count} human mutating call(s) over {month_start.isoformat()}.."
+        f"{month_end.isoformat()}, {counted.records_scanned} records in "
+        f"{counted.objects_read} archive objects"
+    )
+    return HumanTouchReading(
+        month_label,
+        counted.count,
+        tuple(a.to_dict() for a in counted.actions),
+        detail,
+        measured=True,
+    )
+
+
 @dataclass
 class Board:
     """Every declared row, in every source, with its reading."""
@@ -761,6 +897,12 @@ class Board:
         """
         return {state: sum(1 for r in self.rows if r.state == state) for state in BOARD_STATES}
 
+    #: `alpha-engine-config-I10416`: standing monthly, not a gate read once.
+    #: `None` only when `build_board` was never handed one — see that
+    #: function's own docstring; a caller that ran the read always gets a
+    #: `HumanTouchReading`, `measured` or not.
+    human_touch: HumanTouchReading | None = None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": BOARD_SCHEMA_VERSION,
@@ -772,6 +914,12 @@ class Board:
             "red_count": len(self.red),
             "row_count": len(self.rows),
             "rows": [r.to_dict() for r in self.rows],
+            # `alpha-engine-config-I10416`: a STANDING number, not a gate that
+            # passed once. `None` renders as a genuinely absent reading
+            # (nothing asked this render to read it) — distinct from
+            # `measured: false` inside the dict, which is "asked, and could
+            # not".
+            "human_touch_count": None if self.human_touch is None else self.human_touch.to_dict(),
         }
 
 
@@ -786,6 +934,7 @@ def build_board(
     declarations: Declarations | None = None,
     readings: dict[str, Any] | None = None,
     tracker_reader: Callable[[str, int], Any] | None = None,
+    human_touch: HumanTouchReading | None = None,
 ) -> Board:
     """Assemble every declared row and read each one. Reads; never runs.
 
@@ -814,6 +963,16 @@ def build_board(
     open/closed state against the closing records in the store. It never
     raises: with no credential granted every one of those rows reads
     `UNMEASURABLE` carrying the command that grants it.
+
+    ``human_touch`` is `alpha-engine-config-I10416`'s standing monthly
+    reading — computed HERE, by default, over the render's own wall-clock
+    month (:func:`_read_human_touch_count`), the same "self-load unless a
+    caller substitutes one" shape :attr:`registry`/:attr:`declarations`
+    already use, so every EXISTING caller of `build_board` gets
+    `human_touch_count` on its board without a call-site change. It never
+    raises: an unset archive or a read failure renders as `measured: false`
+    with the reason named, the same posture the phase-2 gate clause takes
+    for the identical read.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     # The RUN's trading day when the caller has one, never the wall clock.
@@ -840,10 +999,13 @@ def build_board(
     for row_id, declaration in decl.cutover.items():
         rows.append(_declared_row(store, f"cutover:{row_id}", declaration, day))
 
+    touch = human_touch if human_touch is not None else _read_human_touch_count(moment.date())
+
     return Board(
         trading_day=day,
         generated_at=moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
         rows=rows,
+        human_touch=touch,
     )
 
 
