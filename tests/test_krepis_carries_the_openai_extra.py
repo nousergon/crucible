@@ -46,8 +46,9 @@ def test_the_krepis_pin_carries_the_openai_extra() -> None:
         f"{requirement!r} does not carry the `openai` extra. krepis declares the "
         "OpenAI client as an extra and imports it in `krepis/llm.py`; without it "
         "every LLM call in the `openai` wire format dies "
-        "`ModuleNotFoundError: No module named 'openai'` on the box, which is "
-        "alpha-engine-config-I10473."
+        "`ModuleNotFoundError: No module named 'openai'` on the box. The "
+        "tracker reference is in this module's docstring, deliberately: the "
+        "package may not carry a hardcoded issue literal in a runtime string."
     )
 
 
