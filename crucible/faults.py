@@ -259,9 +259,18 @@ def _probe_published_release_objects_are_retained(store: Store) -> ClosedPath:
 #: `stale_release_pointer` (fault 4) has two, because the state has two routes
 #: in and closing one is not closing the state: the pointer coming to name an
 #: unpublished sha (`pin` refuses at write time) and the artifacts being
-#: deleted from under a valid pointer (Object Lock retention). Fault 4's
-#: OUTCOME is still an open ruling on the tracker (`-I10126`); this module
-#: makes the kind writable and writes no record.
+#: deleted from under a valid pointer (Object Lock retention).
+#:
+#: **Fault 4's outcome is settled, corrected 2026-09-10.** This comment said
+#: it "is still an open ruling on the tracker (`-I10126`); this module makes
+#: the kind writable and writes no record." A record has existed since
+#: 2026-09-09T18:09:03Z — `faults/2026-08-07/stale_release_pointer.json`,
+#: `outcome: unreachable`, both probes above observed. `-I10126` framed the
+#: choice as re-scoping the fault or planting a decoy pin plus a governance
+#: bypass, and `-I10327` dissolved it by building a third kind neither option
+#: had: machine-executed evidence rather than an assertion. Nothing was ruled
+#: out of band, and a stale "awaiting a ruling" line reads exactly like one
+#: that was.
 UNREACHABLE_PROBES: dict[str, tuple[Callable[[Store], ClosedPath], ...]] = {
     "stale_release_pointer": (
         _probe_pin_refuses_an_unpublished_sha,
