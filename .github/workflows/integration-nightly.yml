@@ -49,12 +49,40 @@ name: Integration nightly
 # the "Repository variables are set" step below, loudly, naming exactly what
 # is missing — never a silent no-op.
 
+# ── The `schedule:` trigger is REMOVED, not forgotten ─────────────────────
+#
+# It declared `cron: '0 6 * * *'` when this file landed, and two independent
+# things made that cron a defect rather than a feature (both measured
+# 2026-09-10, `alpha-engine-config-I10467`):
+#
+# 1. **It could not have succeeded.** `crucible-v2-integration` does not
+#    exist as an IAM role — `aws iam get-role` returns NoSuchEntity — and the
+#    comment further down says as much: the role "is infrastructure this
+#    session does not create". So the first firing, 06:00 UTC on 2026-09-11,
+#    would have failed at `configure-aws-credentials`, and every one after it.
+# 2. **It was unobserved.** `nous-ergon-ops`' cross-repo guard
+#    `test_crucible_dispatch_lockstep.py::
+#    test_every_scheduled_workflow_is_named_by_a_registry_row` went red on
+#    `main` the moment this merged: no row in `crucible/components.yaml`
+#    names it as a `dispatch_workflow`, and the guard's own words are "a
+#    scheduled run with no row has no deadline, no absence watcher and no
+#    console surface: it is unobserved, not healthy."
+#
+# The guard offers a row or removal, and a row is not available yet: rows in
+# `components.yaml` are keyed by CLI JOB and the coverage test derives that
+# table in both directions plus the schema's `job` enum, so a row for a
+# workflow that runs `pytest` rather than a `crucible` job fails from the
+# other side. Inventing one to quiet a guard is the shape rule 4 forbids.
+#
+# So the tier keeps the two triggers that work today and loses the one that
+# could only have failed. `workflow_dispatch` runs it on demand;
+# `workflow_call` is the pre-gate half. Re-arming the cron is
+# `alpha-engine-config-I10467`, and it is gated on BOTH halves — the role
+# provisioned, and the tier given a real registered surface (most likely by
+# becoming a `crucible` CLI job that writes a manifest, which is what the
+# guard is actually arguing for and what would earn it a deadline, an
+# absence watcher and a console row).
 on:
-  schedule:
-    # 06:00 UTC — ahead of `board.yml`/`morning-report.yml`'s 06:00 PT
-    # delivery, so a red nightly is visible on the console before the day's
-    # first human reads it, not discovered after.
-    - cron: '0 6 * * *'
   workflow_dispatch: {}
   workflow_call:
     outputs:
