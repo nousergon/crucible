@@ -42,7 +42,7 @@ from crucible.keys import manifest_key as _promote_manifest_key
 from crucible.llm import FAULT_INJECTION_CAPABILITY_CLASSES
 from crucible.models import FAULT_OUTCOME_VALUES
 from crucible.release_retention import RELEASE_LOCK_JOB, release_lock_handler
-from crucible.runmode import RUN_MODES, resolve_run_mode
+from crucible.runmode import RUN_MODES, RunModeError, resolve_run_mode
 from crucible.track_a import HANDLERS as TRACK_A_HANDLERS
 from crucible.track_a import add_track_a_arguments
 
@@ -767,20 +767,91 @@ def resolve_date(raw: str | None, *, now: dt.datetime | None = None) -> dt.date:
         raise SystemExit(f"--date must be YYYY-MM-DD; got {raw!r} ({exc})") from exc
 
 
+#: The exit code an invocation the CLI REFUSED leaves behind, and the reason
+#: it is not 1.
+#:
+#: The crucible-v2 box wrapper (`nous-ergon-ops`
+#: `infrastructure/cloudformation/crucible-v2.yaml`, `_finish`) already
+#: separates the two cases and has since `alpha-engine-config-I10134`: exit 2
+#: pages "MALFORMED DISPATCH ... no run manifest was written by this attempt",
+#: and any other non-zero exit pages "job exited $code ... **if no run manifest
+#: exists the harness died before writing one**". Argparse's own errors exit 2
+#: and land in the first branch correctly; every refusal this module raises by
+#: hand exited 1 and landed in the second, so an operator who mistyped a flag
+#: was told the harness had died.
+#:
+#: Measured 2026-09-09: `fault.probe --fault-capability-class chaos_probe`
+#: paged the generic branch. The probe's manifest happened to exist, so the
+#: page's speculation was merely wrong rather than misleading -- but the same
+#: page is emitted for `--fault-capability-class typo`, which cannot write a
+#: manifest at all because `crucible.llm.parse_fault_capability_class` refuses
+#: it before a store is opened. That is a malformed dispatch by every property
+#: the wrapper's own branch names, and it is now labelled as one.
+USAGE_EXIT_CODE = 2
+
+
+class UsageError(SystemExit):
+    """An invocation this CLI refused, before any job ran.
+
+    A `SystemExit` subclass carrying :data:`USAGE_EXIT_CODE`, so the message
+    still reaches stderr and the process still exits non-zero -- the only
+    thing that changes is which of the box wrapper's two page classes claims
+    it.
+
+    Deliberately NOT used for a job that ran and failed: the manifest is the
+    record there, exit 1 is correct, and widening this to "any error the CLI
+    can name" is how "no manifest was written" would start appearing on runs
+    that wrote one.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(USAGE_EXIT_CODE)
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point. Returns a process exit code.
 
-    Exceptions are NOT caught here. A job that failed must exit non-zero with
-    its traceback intact — the manifest already records the cause, and a
-    tidy error message that returns 0 is a degraded-SUCCEEDED by another name.
+    Exceptions from the JOB are NOT caught here. A job that failed must exit
+    non-zero with its traceback intact -- the manifest already records the
+    cause, and a tidy error message that returns 0 is a degraded-SUCCEEDED by
+    another name.
+
+    The three OPERATOR-INPUT validations below are different in kind: each
+    runs before any handler, none of them can write a manifest, and each one
+    firing means the dispatch was malformed rather than that anything in the
+    system is wrong. They are collected into one block and re-raised as
+    :class:`UsageError`, so they exit :data:`USAGE_EXIT_CODE` and are reported
+    as what they are. Nothing is swallowed: the message is preserved verbatim
+    and the original exception is chained.
     """
     args = build_parser().parse_args(argv)
-    args.trading_day = resolve_date(getattr(args, "date", None))
-    # Resolved once, here, so every handler passes the SAME value to `run_job`
-    # and a `--run-mode` typo is a usage error before any job starts. Resolved
-    # even for the handlers that never write a manifest: an invocation is
-    # live or a replay regardless of what it happens to produce.
-    args.run_mode = resolve_run_mode(getattr(args, "run_mode", None))
+    try:
+        args.trading_day = resolve_date(getattr(args, "date", None))
+        # Resolved once, here, so every handler passes the SAME value to
+        # `run_job` and a `--run-mode` typo is a usage error before any job
+        # starts. Resolved even for the handlers that never write a manifest:
+        # an invocation is live or a replay regardless of what it produces.
+        args.run_mode = resolve_run_mode(getattr(args, "run_mode", None))
+        # Moved here from `crucible.fault_probe.fault_probe_handler` so it
+        # sits with the other two: its own docstring says it is "pure and
+        # offline, so a bad invocation is a usage error before a store, a
+        # trading day or a provider is touched", and this is where the CLI's
+        # usage errors are. The handler reads the validated value off `args`.
+        raw_class = getattr(args, "fault_capability_class", None)
+        if raw_class is not None:
+            from crucible.llm import parse_fault_capability_class
+
+            args.fault_capability_class = parse_fault_capability_class(raw_class)
+    except UsageError:
+        raise
+    except SystemExit as exc:
+        raise UsageError(str(exc)) from exc
+    except (RunModeError, ValueError) as exc:
+        raise UsageError(str(exc)) from exc
     return HANDLERS[args.job](args)
 
 

@@ -159,6 +159,15 @@ def fault_probe_handler(args: argparse.Namespace) -> int:
     from crucible.runner import run_job
 
     store = _resolve_store(args)
+    # Already validated by `crucible.cli.main`'s usage block, which refuses a
+    # bad value with `UsageError` (exit 2) BEFORE any handler is reached. It
+    # was validated here, at exit 1, and the box wrapper reports exit 1 as
+    # "if no run manifest exists the harness died before writing one" -- so a
+    # mistyped flag was reported as a dead harness. Re-validated rather than
+    # trusted: `fault_probe_handler` is also called directly by tests and by
+    # anything that builds a Namespace by hand, and `parse_fault_capability_class`
+    # is pure and offline, so the second call costs nothing and the guarantee
+    # is local.
     requested = llm.parse_fault_capability_class(args.fault_capability_class)
     ctx = run_job(
         FAULT_PROBE_JOB,
