@@ -76,6 +76,7 @@ __all__ = [
     "gate_key",
     "gate_prefix",
     "heal_key",
+    "iac_conformance_key",
     "is_manifest_key",
     "ledger_key",
     "legacy_dead_lambdas_key",
@@ -819,6 +820,14 @@ def drift_metrics_key(trading_day: str) -> str:
     """Where `crucible.track_c.drift_handler` files the cycle's three
     drift `MetricRecord`s, alongside the run manifest's own copy."""
     return f"drift/{trading_day}/metrics.json"
+
+
+def iac_conformance_key(trading_day: str) -> str:
+    """Where `crucible.iac_conformance` files both comparison readings for
+    the cycle (account-vs-template and template-vs-declared-inventory),
+    alongside the run manifest's own copy of each as a `MetricRecord`
+    (`alpha-engine-config-I10418`)."""
+    return f"iac/{trading_day}/conformance.json"
 
 
 # -- one-shot / repair jobs --------------------------------------------------

@@ -149,6 +149,11 @@ class TestJobSurface:
             # separate from `fault.record` (the attester). On-demand -- a job
             # that can only ever fail would page every cycle on a schedule.
             "fault.probe",
+            # alpha-engine-config-I10418: the two IaC conformance
+            # comparisons (account vs template, template vs the plan's
+            # declared inventory). `dispatch: arc` -- a stage of the same
+            # weekly run, not a new schedule or a separate detector fleet.
+            "iac.conformance",
         }
 
     @pytest.mark.parametrize("job", sorted(JOBS))
@@ -510,6 +515,16 @@ class TestDryRunNeverWrites:
             "run raises AND no manifest is written) is asserted directly, against a fake "
             "transport, by tests/test_chaos_probe_containment.py::"
             "TestTheProbeJob::test_a_dry_run_probe_still_fails_and_writes_no_manifest"
+        ),
+        "iac.conformance": (
+            "reaches real CloudFormation/tagging/IAM/SSM clients on every invocation to "
+            "compute both comparisons -- --dry-run only suppresses the store WRITE "
+            "(crucible.iac_conformance.iac_conformance_handler), not the AWS reads "
+            "themselves, so a fresh store with no AWS credentials/region configured "
+            "raises out of client construction rather than returning a clean 0. Its "
+            "--dry-run property (the readings still compute; the store gains no output "
+            "key) is asserted directly, against fake clients, by "
+            "tests/test_iac_conformance.py"
         ),
     }
 

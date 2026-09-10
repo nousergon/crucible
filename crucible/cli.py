@@ -37,6 +37,7 @@ from crucible.calendar import resolve_trading_day
 from crucible.fault_probe import FAULT_PROBE_JOB, fault_probe_handler
 from crucible.faults import FAULT_RECORD_JOB, record_fault
 from crucible.gate import SCRIPTED_FAULTS
+from crucible.iac_conformance import IAC_CONFORMANCE_JOB, iac_conformance_handler
 from crucible.keys import arena_cycle_key, champion_key
 from crucible.keys import manifest_key as _promote_manifest_key
 from crucible.llm import FAULT_INJECTION_CAPABILITY_CLASSES
@@ -413,6 +414,21 @@ JOBS: dict[str, JobSpec] = {
         "Induce a router transport failure on the real dispatched path (§10.7 fault 3)",
         False,
     ),
+    # alpha-engine-config-I10418. `dispatch: arc` in components.yaml, so
+    # `crucible.weekly.arc_stages` picks it up as a stage of the SAME weekly
+    # run — no new schedule, no separate detector fleet, per the issue's own
+    # constraint. Two comparisons, both required: account vs template
+    # (crucible.iac_conformance.audit_account_vs_template) and template vs
+    # the plan's own declared inventory
+    # (crucible.iac_conformance.audit_template_vs_declared) — the second is
+    # what catches a stale plan objective the first renders GREEN against by
+    # construction. A finding pages only once it persists two consecutive
+    # weekly cycles (crucible.iac_conformance.IacConformanceDrift).
+    IAC_CONFORMANCE_JOB: JobSpec(
+        IAC_CONFORMANCE_JOB,
+        "Account-vs-template and template-vs-declared-inventory IaC conformance",
+        True,
+    ),
 }
 
 #: The jobs that carry `--fault-capability-class`, exhaustively.
@@ -489,6 +505,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     morning.MORNING_JOB: morning.morning_handler,
     FAULT_RECORD_JOB: _fault_record,
     FAULT_PROBE_JOB: fault_probe_handler,
+    IAC_CONFORMANCE_JOB: iac_conformance_handler,
 }
 
 

@@ -493,6 +493,36 @@ components:
       cadence: weekly
       at: "17:00"
 
+  iac.conformance:
+    description: >-
+      Two independent IaC conformance readings: (a) live AWS resources
+      tagged system=crucible-v2 vs what the deployed template declares,
+      and (b) the deployed template vs the plan's own declared resource
+      and role inventory (alpha-engine-config-I10418). A finding pages
+      only once it persists two consecutive weekly cycles.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:outputs[iac/{trading_day}/conformance.json]
+      outcome: run.json:metrics[iac_conformance_persisted]
+    log_location: /crucible/iac.conformance
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: weekly, Saturday
+    dispatch: arc
+    deadline:
+      # Between `console` (17:00) and `weekly`'s own deadline (17:30) — see
+      # that row's comment: the arc's own deadline must be no earlier than
+      # any stage it runs, so this cannot land at or after 17:30.
+      anchor: next_calendar_day_at
+      cadence: weekly
+      at: "17:15"
+
   # ── Track F (alpha-engine-config-I9757) ────────────────────────────────
 
   weekly:

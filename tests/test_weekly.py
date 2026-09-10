@@ -212,8 +212,9 @@ class TestRunsTheRealCommand:
             return 0
 
         run_arc(FRIDAY, store="/tmp/store", run_mode=RUN_MODE_REPLAY, main=fake_main, dry_run=True)
-        # 4 unscoped stages + 2 slot-scoped stages x every DISPATCHABLE slot
-        assert len(seen) == 4 + 2 * len(dispatchable_slots())
+        # 5 unscoped stages (data.weekly, drift, report, console,
+        # iac.conformance) + 2 slot-scoped stages x every DISPATCHABLE slot
+        assert len(seen) == 5 + 2 * len(dispatchable_slots())
         for argv in seen:
             assert "--dry-run" in argv, argv
             assert "--run-mode" in argv, argv
@@ -229,7 +230,7 @@ class TestRunsTheRealCommand:
             return 0
 
         run_arc(FRIDAY, store="/tmp/store", run_mode=RUN_MODE_REPLAY, main=fake_main, dry_run=False)
-        assert len(seen) == 4 + 2 * len(dispatchable_slots())
+        assert len(seen) == 5 + 2 * len(dispatchable_slots())
         for argv in seen:
             assert "--dry-run" not in argv, argv
 

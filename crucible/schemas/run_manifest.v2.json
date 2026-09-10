@@ -480,7 +480,8 @@
         "gate.close",
         "report.morning",
         "fault.record",
-        "fault.probe"
+        "fault.probe",
+        "iac.conformance"
       ],
       "title": "Job",
       "type": "string"
