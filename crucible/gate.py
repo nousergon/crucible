@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
+from crucible.aggregation import MemberRow, member_dicts
 from crucible.alerts import NON_OPERATOR_DESTINATIONS, PAGE_CONDITIONS, pages_in_range
 from crucible.calendar import TRADING_DAYS_PER_WEEK, is_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
@@ -98,6 +99,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ACCEPTANCE_RATCHET_PATH",
+    "CLAUSE_MEMBER_RANK",
     "GATE_SCHEMA_VERSION",
     "GATES",
     "LEGACY_DEAD_LAMBDAS_SCHEMA_VERSION",
@@ -236,6 +238,20 @@ class Clause:
         }
 
 
+#: `alpha-engine-config-I10417`: the rank a gate clause's member status is
+#: reduced under, HIGHER IS WORSE. `UNMEASURABLE` ranks worse than `UNMET`
+#: for the same reason `crucible.report.GRADE_RANK` ranks every `N/A-*`
+#: status worse than `RED` — "we could not read this" must never render
+#: better than "we read it and it said no".
+CLAUSE_MEMBER_RANK: dict[str, int] = {"MET": 0, "UNMET": 1, "UNMEASURABLE": 2}
+
+
+def _clause_member_status(clause: Clause) -> str:
+    if clause.unmeasurable:
+        return "UNMEASURABLE"
+    return "MET" if clause.met else "UNMET"
+
+
 @dataclass
 class GateResult:
     """Every clause of one gate, and whether the phase may exit."""
@@ -286,6 +302,20 @@ class GateResult:
             return None
         return sum(1 for c in self.clauses if c.met) / len(self.clauses)
 
+    @property
+    def members(self) -> list[MemberRow]:
+        """`alpha-engine-config-I10417`: this gate's clauses, as members.
+
+        `id` is the clause name, `value` is `met` (the clause's own boolean),
+        `status` is MET/UNMET/UNMEASURABLE (:data:`CLAUSE_MEMBER_RANK`). `met`
+        and `met_ratio` above are already pure functions of `self.clauses` —
+        this is a VIEW onto the same list, not a second reduction, so the two
+        cannot drift apart.
+        """
+        return [
+            MemberRow(id=c.name, value=c.met, status=_clause_member_status(c)) for c in self.clauses
+        ]
+
     def to_dict(self) -> dict[str, Any]:
         ratio = self.met_ratio
         return {
@@ -301,6 +331,11 @@ class GateResult:
             # a clause detail somebody has to read to the end.
             "coverage": self.coverage,
             "clauses": [c.to_dict() for c in self.clauses],
+            # `alpha-engine-config-I10417`: the SAME clauses, as members[],
+            # reconstructible via `worst_member(self.members, rank=
+            # CLAUSE_MEMBER_RANK)` — never `MET` when any clause is `UNMET`
+            # or `UNMEASURABLE`, by construction of `met`/`met_ratio` above.
+            "members": member_dicts(self.members),
         }
 
     def render(self) -> str:
@@ -4299,6 +4334,13 @@ def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Cl
             prefix=archive.removeprefix("s3://").partition("/")[2],
             start=change.at.date(),
             end=render_day,
+            # `alpha-engine-config-I10416` §11 row 9: the same reserved-
+            # action exclusion the standing monthly board reading uses
+            # (`crucible.board._read_human_touch_count`) — one config, both
+            # callers, so an operator-declared exception applies wherever
+            # "zero human mutating calls" is graded rather than only where
+            # it happened to be added first.
+            reserved=frozenset(settings().autonomy_reserved_events),
         )
     except ArchiveMissingError as exc:
         return _unmeasurable(name, requirement, f"ArchiveMissingError: {exc}", evidence)

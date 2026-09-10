@@ -646,3 +646,68 @@ class TestMachinePrincipalsIsDerivedFromTheStack:
         result = _count(two_humans, cfn=_CountingCfn())
         assert result.count == 2
         assert calls["n"] == 1
+
+
+class TestReservedActions:
+    """`alpha-engine-config-I10416` §11 row 9: config-declared exceptions.
+
+    Not hardcoded here or anywhere in this module — `reserved` is whatever
+    set the caller hands in (`crucible.config.Settings.autonomy_reserved_
+    events`, resolved from `CRUCIBLE_AUTONOMY_RESERVED_EVENTS`), and the
+    default is empty, so a caller passing nothing gets the prior behaviour
+    exactly (every other test in this file passes none and is unaffected).
+    """
+
+    def test_a_reserved_event_name_is_excluded_even_though_it_is_human_and_mutating(
+        self,
+    ) -> None:
+        archive = _archive({START: [_record(eventName="AssumeRoleWithSAML")]})
+        result = _count(archive, reserved=frozenset({"AssumeRoleWithSAML"}))
+        assert result.count == 0
+
+    def test_an_unreserved_event_still_counts(self) -> None:
+        archive = _archive({START: [_record(eventName="UpdateFunctionCode")]})
+        result = _count(archive, reserved=frozenset({"AssumeRoleWithSAML"}))
+        assert result.count == 1
+
+    def test_the_default_reserved_set_is_empty_so_nothing_is_excluded_by_default(
+        self,
+    ) -> None:
+        archive = _archive({START: [_record()]})
+        result = _count(archive)
+        assert result.count == 1
+
+    def test_a_reservation_does_not_double_exclude_an_already_machine_action(self) -> None:
+        """A reserved name that is also a registered machine principal is
+        excluded once, by the machine-principal test — reservation applies
+        on top, not instead."""
+        archive = _archive(
+            {
+                START: [
+                    _record(
+                        userIdentity={
+                            "type": "AssumedRole",
+                            "arn": "arn:aws:sts::123456789012:assumed-role/test-runtime/s",
+                            "sessionContext": {"sessionIssuer": {"userName": "test-runtime"}},
+                        }
+                    )
+                ]
+            }
+        )
+        result = _count(archive, reserved=frozenset({"UpdateFunctionCode"}))
+        assert result.count == 0
+
+
+class TestTrailingCalendarMonth:
+    def test_the_window_is_month_to_date(self) -> None:
+        from crucible.autonomy import trailing_calendar_month
+
+        start, end = trailing_calendar_month(dt.date(2026, 9, 10))
+        assert start == dt.date(2026, 9, 1)
+        assert end == dt.date(2026, 9, 10)
+
+    def test_the_first_of_the_month_is_a_one_day_window(self) -> None:
+        from crucible.autonomy import trailing_calendar_month
+
+        start, end = trailing_calendar_month(dt.date(2026, 9, 1))
+        assert start == end == dt.date(2026, 9, 1)
