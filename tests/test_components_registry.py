@@ -180,7 +180,7 @@ class TestDeadlinesAreMachineReadable:
         deadline = load_registry()["data.daily"].deadline
         assert deadline is not None
         assert deadline.describe(dt.date(2026, 8, 28)) == (
-            "3h after the close of trading day 2026-08-28"
+            "3h after the close of trading day 2026-08-28 (every trading day)"
         )
 
     def test_a_deadline_resolves_against_the_trading_calendar(self) -> None:

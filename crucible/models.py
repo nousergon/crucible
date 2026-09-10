@@ -198,6 +198,15 @@ class DeadlineRow(_Strict):
     """
 
     anchor: Literal["close_plus", "next_calendar_day_at"]
+    #: WHICH trading days this row is due on. Required and closed, for the
+    #: same reason `anchor` is: without it the deadline answers "by when"
+    #: while nothing answers "on what days", and `evaluate_absence` graded
+    #: every scheduled row on every trading day. Eight rows read
+    #: `schedule: weekly, Saturday` and were paged absent on the four
+    #: weekdays they were never going to run (measured 2026-09-08: seven of
+    #: the ABSENCE page's twenty-two members). `schedule` above is PROSE and
+    #: is not read by anything; this is the machine field.
+    cadence: Literal["daily", "weekly"]
     offset_hours: float | None = None
     at: dt.time | None = None
 

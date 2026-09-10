@@ -310,3 +310,83 @@ def test_classify_dispatch_absence_with_no_reason_at_all() -> None:
     assert "reclaimed" not in text
     assert "no termination reason available" in text
     assert "investigate" in text
+
+
+class TestTheGradedDayComesFromTheArgsNotTheClock:
+    """`_dispatch_target_trading_day` landed with the resolver but without a
+    test asserting the prefix it produces, which is the thing that pages.
+    These pin it in both directions, and pin the window that bounds the whole
+    input.
+
+    Measured 2026-09-09 against the live store: 20 of the 28 dispatch records
+    under `runs/_dispatch/` carry an explicit `--date`. Nine `data.weekly` /
+    `weekly` / `fault.probe` replays fired on 2026-09-09 for `--date
+    2026-08-07`, `-08-14`, `-08-21` and `-09-11` had every manifest present at
+    that date's prefix and were still paging ABSENCE against the dispatch
+    day's — fourteen of the twenty-two members of that day's page, none of
+    which could ever have cleared. In the other direction, two `alerts.sweep
+    --now 2026-08-07` replays wrote no manifest anywhere and were cleared by
+    the SCHEDULED sweep's manifest sitting under the dispatch day's prefix.
+    """
+
+    #: A replay dispatched on 2026-08-28 for a trading day five weeks earlier.
+    REPLAY_ARGS = "--date 2026-07-24 --run-mode replay"
+    REPLAY_TARGET = dt.date(2026, 7, 24)
+
+    def test_a_manifest_at_the_dated_target_clears_the_dispatch(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _write_dispatch(store, args=self.REPLAY_ARGS)
+        store.put_bytes(
+            manifest_key("data.heal", self.REPLAY_TARGET.isoformat()),
+            json.dumps({"status": "ok"}).encode(),
+        )
+        assert (
+            evaluate_dispatch_absence(
+                store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+            )
+            == []
+        )
+
+    def test_a_manifest_under_the_dispatch_day_does_not_clear_a_dated_dispatch(
+        self, tmp_path
+    ) -> None:
+        """The false negative, and the one that matters: a replay that
+        produced nothing must not be cleared by whatever the scheduled run of
+        the same job happened to write that day."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(store, args=self.REPLAY_ARGS)
+        store.put_bytes(
+            manifest_key("data.heal", DISPATCH_TRADING_DAY.isoformat()),
+            json.dumps({"status": "ok"}).encode(),
+        )
+        [page] = evaluate_dispatch_absence(
+            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+        )
+        assert page.trading_day == self.REPLAY_TARGET
+        assert self.REPLAY_TARGET.isoformat() in page.reason
+
+    def test_an_undated_dispatch_still_grades_against_the_dispatch_clock(self, tmp_path) -> None:
+        """The on-demand case `alpha-engine-config-I10134` was written for is
+        unchanged — this is a refinement of that behaviour, not a replacement."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        [page] = evaluate_dispatch_absence(
+            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+        )
+        assert page.trading_day == DISPATCH_TRADING_DAY
+
+    def test_a_record_older_than_the_catch_up_window_is_no_longer_graded(self, tmp_path) -> None:
+        """The bound every other input already had (`days_to_evaluate`). A
+        dispatch record is written once and never rewritten, so without it the
+        set of things the sweep grades grows for the life of the store and one
+        dispatch that genuinely never landed is re-evaluated every night
+        forever."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        long_after = DISPATCHED_AT + dt.timedelta(days=30)
+        assert (
+            evaluate_dispatch_absence(
+                store, now=long_after, describe_instance_state_reason=_no_reason
+            )
+            == []
+        )

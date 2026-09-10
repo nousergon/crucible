@@ -74,6 +74,7 @@ components:
     dispatch: scheduler
     deadline:
       anchor: close_plus
+      cadence: daily
       offset_hours: 3
 
   data.weekly:
@@ -95,6 +96,7 @@ components:
     dispatch: arc
     deadline:
       anchor: next_calendar_day_at
+      cadence: weekly
       at: "09:00"
 
   data.heal:
@@ -156,6 +158,7 @@ components:
     dispatch: arc
     deadline:
       anchor: next_calendar_day_at
+      cadence: weekly
       at: "12:00"
 
   experiment.grade:
@@ -177,6 +180,7 @@ components:
     dispatch: arc
     deadline:
       anchor: next_calendar_day_at
+      cadence: weekly
       at: "14:00"
 
   promote:
@@ -217,6 +221,7 @@ components:
     dispatch: arc
     deadline:
       anchor: next_calendar_day_at
+      cadence: weekly
       at: "16:00"
 
   explain:
@@ -357,6 +362,7 @@ components:
     dispatch: scheduler
     deadline:
       anchor: close_plus
+      cadence: daily
       offset_hours: 5.5
 
   heartbeat:
@@ -385,6 +391,7 @@ components:
     dispatch: scheduler
     deadline:
       anchor: next_calendar_day_at
+      cadence: weekly
       at: "18:00"
 
   drift:
@@ -408,6 +415,7 @@ components:
     dispatch: arc
     deadline:
       anchor: next_calendar_day_at
+      cadence: weekly
       at: "15:00"
 
   board:
@@ -457,6 +465,7 @@ components:
     dispatch_workflow: board.yml
     deadline:
       anchor: close_plus
+      cadence: daily
       offset_hours: 6
 
   console:
@@ -481,6 +490,7 @@ components:
     dispatch: arc
     deadline:
       anchor: next_calendar_day_at
+      cadence: weekly
       at: "17:00"
 
   # ── Track F (alpha-engine-config-I9757) ────────────────────────────────
@@ -509,6 +519,7 @@ components:
       # Later than `console`, its own last stage. An arc deadline earlier
       # than a stage it runs would page for a run that was still working.
       anchor: next_calendar_day_at
+      cadence: weekly
       at: "17:30"
 
   gate:
@@ -592,6 +603,7 @@ components:
       # here would page on a run that was merely late, which is how a channel
       # gets muted.
       anchor: close_plus
+      cadence: daily
       offset_hours: 10
 
   report.morning:
@@ -679,6 +691,7 @@ components:
     # number of hours so the margin stays 360/420 minutes.
     deadline:
       anchor: next_calendar_day_at
+      cadence: daily
       at: "12:00"
 
   fault.probe:
