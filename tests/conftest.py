@@ -154,7 +154,15 @@ def no_live_cost_explorer(monkeypatch):
     whose result depends on the developer's AWS credentials is not a suite.
     `crucible.gate._ce_client` refuses here; a test that needs a reading
     patches it with `ActiveCostAllocationTag()` or its own stand-in.
+
+    Also resets `crucible.cost`'s process-wide cache + call budget
+    (`alpha-engine-config-I10389`) before AND after every test. Without this,
+    the cache is a module-level singleton shared by the whole pytest
+    process: a reading (or a budget-exhaustion trip) left behind by one test
+    would silently short-circuit or fail the next test's Cost Explorer call,
+    regardless of which fake client that test installs.
     """
+    import crucible.cost as cost_module  # noqa: PLC0415 - local to the fixture
     import crucible.gate as gate_module  # noqa: PLC0415 - local to the fixture
 
     def _refuse():
@@ -164,11 +172,15 @@ def no_live_cost_explorer(monkeypatch):
             "the Active stand-in)"
         )
 
+    cost_module.reset_default_cache()
     original = gate_module._ce_client
     monkeypatch.setattr(gate_module, "_ce_client", _refuse)
-    # The real constructor, for the one test that asserts what it builds
-    # (`tests/test_gate_lazy_clients.py`) without calling the API.
-    return original
+    try:
+        # The real constructor, for the one test that asserts what it builds
+        # (`tests/test_gate_lazy_clients.py`) without calling the API.
+        yield original
+    finally:
+        cost_module.reset_default_cache()
 
 
 @pytest.fixture(autouse=True)

@@ -230,7 +230,7 @@ class CostAllocationStatus:
         return {"status": self.status, "last_updated_date": self.last_updated_date}
 
 
-def cost_allocation_tag_status(ce: Any) -> CostAllocationStatus:
+def cost_allocation_tag_status(ce: Any, *, cache: Any | None = None) -> CostAllocationStatus:
     """Whether `TAG_KEY` is `Active` as a cost-allocation tag in Billing.
 
     `ce:ListCostAllocationTags` is a distinct IAM action from
@@ -240,15 +240,37 @@ def cost_allocation_tag_status(ce: Any) -> CostAllocationStatus:
     valid, measured answer with its own remedy, and conflating "denied" with
     "Inactive" would hide the one case an operator cannot fix by re-running
     the render.
+
+    **Cached and budgeted like every other Cost Explorer read**
+    (`alpha-engine-config-I10389`): activation status changes rarely — an
+    operator flips it once, by hand, with the exact command this module's
+    UNMET message already names — so it is memoized as a CLOSED read for the
+    process's lifetime and shares `crucible.cost`'s process-wide call budget,
+    the same shared object `_clause_aws_cost_within_ceiling` reads through.
+    `cache` is injectable for tests; production code should leave it `None`
+    and get `crucible.cost.default_cache()`.
     """
-    try:
-        response = ce.list_cost_allocation_tags(TagKeys=[TAG_KEY])
-    except Exception as exc:
-        raise CostAllocationTagUnreadableError(
-            f"ce:ListCostAllocationTags could not be read for {TAG_KEY!r}: "
-            f"{type(exc).__name__}: {exc}. That is a statement about our access, not "
-            "about whether the tag is activated."
-        ) from exc
+    from crucible.cost import default_cache  # noqa: PLC0415 - avoids a cost<->tags import cycle
+
+    cache = cache or default_cache()
+    key = ("list_cost_allocation_tags", TAG_KEY)
+
+    def fetch() -> dict[str, Any]:
+        try:
+            return ce.list_cost_allocation_tags(TagKeys=[TAG_KEY])
+        except Exception as exc:
+            raise CostAllocationTagUnreadableError(
+                f"ce:ListCostAllocationTags could not be read for {TAG_KEY!r}: "
+                f"{type(exc).__name__}: {exc}. That is a statement about our access, not "
+                "about whether the tag is activated."
+            ) from exc
+
+    # `closed=True`: unlike a spend total, an activation status has no
+    # "window" to close — the one answer that could change is a human
+    # flipping it, which this process cannot observe mid-run regardless of
+    # TTL, so it is cached for the process's lifetime rather than re-read on
+    # a timer.
+    response = cache.get_or_fetch(key, closed=True, fetch=fetch)
     for entry in response.get("CostAllocationTags") or []:
         if entry.get("TagKey") == TAG_KEY:
             return CostAllocationStatus(

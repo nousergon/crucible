@@ -19,11 +19,45 @@ apart, so the tag filter is a parameter and the ceiling belongs to the caller.
 
 **No account id, no ARN, no region literal.** The client is injected, and the
 tag key/value come from :mod:`crucible.tags`, which already owns them.
+
+**Every read here is cached and budgeted (`alpha-engine-config-I10389`).**
+CloudTrail measured 44,167 `ce:GetCostAndUsage` calls / $441.67 over four days
+(2026-09-03..09-06) from this module's own shape — an unfiltered
+`MONTHLY`/`UnblendedCost` read of a CLOSED historical window
+(`2026-08-01..2026-08-28`), issued thousands of times against an answer that
+cannot change. `ce:GetCostAndUsage` is billed **per request at $0.01**, three
+orders of magnitude more than a typical AWS read, so a cache miss here is a
+spending decision and a retry is a cost multiplier — the fleet's normal
+"retry transient failures" reasoning does not transfer to this API.
+
+**Why a cache and not just fewer call sites.** A closed historical window
+(the interval this request names has already fully elapsed in real wall-clock
+time) is immutable: the same `(start, end, granularity, tagged)` request
+returns the same amount every time, forever, for this process — memoized with
+no TTL. A window reaching into today is still accruing and could in
+principle answer differently a moment later, so it gets a bounded TTL
+instead. **Cost Explorer's own data lags ~24h regardless** — re-asking a
+still-open window sooner than the TTL does not produce a fresher number, it
+produces the same number at a higher price — so the TTL exists only to bound
+how long one long-running process trusts a single reading, not to chase
+freshness. See :class:`CostExplorerCache`.
+
+**The budget is a hard, named failure, never a silent spend.** Every cache
+miss counts against a per-process call budget (`CRUCIBLE_CE_CALL_BUDGET`,
+default :data:`DEFAULT_CE_CALL_BUDGET`); exceeding it raises
+:class:`CostExplorerBudgetExceededError` before the request is made, in the
+same shape :class:`CostUnreadableError` already uses — `crucible.gate` turns
+either into an UNMEASURABLE clause rather than letting the process keep
+spending.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import os
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,12 +65,18 @@ from crucible.tags import TAG_KEY, TAG_VALUE
 
 __all__ = [
     "ClosedMonthReading",
+    "CostExplorerBudgetExceededError",
+    "CostExplorerCache",
     "CostReading",
     "CostUnreadableError",
     "DailyReading",
+    "DEFAULT_CE_CALL_BUDGET",
+    "DEFAULT_CE_OPEN_WINDOW_TTL_SECONDS",
     "closed_month_usd",
+    "default_cache",
     "default_client",
     "month_to_date_usd",
+    "reset_default_cache",
     "trailing_daily_usd",
 ]
 
@@ -48,6 +88,176 @@ class CostUnreadableError(RuntimeError):
     and an account that genuinely spent nothing produce the same float, and
     the gate must be able to tell them apart.
     """
+
+
+class CostExplorerBudgetExceededError(RuntimeError):
+    """A process asked Cost Explorer more times than its declared budget.
+
+    Raised BEFORE the request is made, rather than spending past the budget
+    silently. `ce:GetCostAndUsage` and `ce:ListCostAllocationTags` are billed
+    per request at $0.01 — an unbounded retry loop or a clause re-evaluated
+    once per caller is a spending decision, not a resilience measure
+    (`alpha-engine-config-I10389`: 44,167 uncached calls / $441.67 in four
+    days, eight times either of the account's two prior FULL months' bills).
+    `crucible.gate` turns this into an UNMEASURABLE clause the same way it
+    already does :class:`CostUnreadableError` — this is a producer, and the
+    fleet's default is fail loud rather than silently degrade.
+    """
+
+
+#: Per-process `ce:GetCostAndUsage` / `ce:ListCostAllocationTags` call budget.
+#: Sized for one `crucible gate`/`crucible board` invocation, which reads at
+#: most a handful of distinct `(start, end, granularity, tagged)` windows —
+#: not for a test suite or a script that legitimately wants many distinct
+#: windows in one process, which should pass its own `CostExplorerCache` or
+#: raise `CRUCIBLE_CE_CALL_BUDGET`.
+DEFAULT_CE_CALL_BUDGET = 25
+
+#: How long a reading for a window that has not fully closed is trusted
+#: before this process asks again. Cost Explorer's own data lags ~24h, so a
+#: shorter TTL does not buy a fresher number — it only bounds how long a
+#: long-running process (a daemon, a `--watch` loop) keeps citing one
+#: reading before paying for another.
+DEFAULT_CE_OPEN_WINDOW_TTL_SECONDS = 900
+
+
+@dataclass
+class _CacheEntry:
+    value: Any
+    fetched_monotonic: float
+    closed: bool
+
+
+class CostExplorerCache:
+    """Per-process memoization + hard call budget for Cost Explorer reads.
+
+    Keyed on the exact parameters of one request (`kind`, `start`, `end`,
+    `granularity`, `tagged`, ...). A **closed** window — one whose own `end`
+    boundary has already fully elapsed in real wall-clock time — cannot
+    change, so it is cached for the life of the process with no TTL. An
+    **open** window (it reaches into today) is cached for
+    `open_window_ttl_seconds` — long enough to absorb the several reads one
+    clause evaluation makes, short enough that a long-running process still
+    re-checks occasionally rather than trusting one number forever.
+
+    Every cache MISS increments a hard counter and raises
+    :class:`CostExplorerBudgetExceededError` once `budget` is exceeded,
+    BEFORE `fetch` is called — a failed or denied fetch still counts, since
+    it still represents an attempted, billable request.
+
+    `clock` is injectable so a test can pin "real wall-clock today" without
+    reaching for `dt.date.today()` — this repo's own rule (`AGENTS.md`
+    "Trading days, always" / test discipline) is to use fixed date literals,
+    never live clock arithmetic, in a test.
+    """
+
+    def __init__(
+        self,
+        *,
+        budget: int = DEFAULT_CE_CALL_BUDGET,
+        open_window_ttl_seconds: float = DEFAULT_CE_OPEN_WINDOW_TTL_SECONDS,
+        clock: Callable[[], dt.date] = dt.date.today,
+    ) -> None:
+        self._budget = budget
+        self._ttl = open_window_ttl_seconds
+        self._clock = clock
+        self._store: dict[tuple[Any, ...], _CacheEntry] = {}
+        self._calls = 0
+        self._lock = threading.Lock()
+
+    @property
+    def calls(self) -> int:
+        """Requests actually issued (cache misses), this process."""
+        return self._calls
+
+    @property
+    def budget(self) -> int:
+        return self._budget
+
+    def is_window_closed(self, end: dt.date) -> bool:
+        """Whether a request whose exclusive `End` is `end` has fully elapsed.
+
+        `end` is exclusive in Cost Explorer's own grammar, so the last day
+        actually covered is `end - 1 day`; a window is closed once that day
+        is strictly before real wall-clock today. Deliberately conservative
+        at the boundary — a window whose `end` IS today is treated as open
+        (TTL'd, not cached forever), since the most recent day it names may
+        not have finished settling under Cost Explorer's own ~24h ingestion
+        lag.
+        """
+        return end < self._clock()
+
+    def get_or_fetch(self, key: tuple[Any, ...], *, closed: bool, fetch: Callable[[], Any]) -> Any:
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is not None:
+                if entry.closed or (time.monotonic() - entry.fetched_monotonic) < self._ttl:
+                    return entry.value
+            if self._calls >= self._budget:
+                raise CostExplorerBudgetExceededError(
+                    f"Cost Explorer call budget of {self._budget} exhausted for this "
+                    f"process, on key {key!r}. `ce:GetCostAndUsage` and "
+                    "`ce:ListCostAllocationTags` are billed per request at $0.01 -- "
+                    "raising rather than spending past the declared budget. Set "
+                    "CRUCIBLE_CE_CALL_BUDGET if this process genuinely reads more "
+                    "distinct windows than that."
+                )
+            self._calls += 1
+            value = fetch()
+            self._store[key] = _CacheEntry(
+                value=value, fetched_monotonic=time.monotonic(), closed=closed
+            )
+            return value
+
+    def snapshot(self) -> dict[str, Any]:
+        """Every cached reading's key and closedness, for a caller that wants
+        to persist this process's Cost Explorer activity onto a run manifest
+        or other durable artifact, rather than re-deriving it from CloudTrail."""
+        return {
+            "calls": self._calls,
+            "budget": self._budget,
+            "entries": [{"key": list(key), "closed": e.closed} for key, e in self._store.items()],
+        }
+
+
+def _budget_from_env() -> int:
+    raw = os.environ.get("CRUCIBLE_CE_CALL_BUDGET")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return DEFAULT_CE_CALL_BUDGET
+
+
+_default_cache: CostExplorerCache | None = None
+_default_cache_lock = threading.Lock()
+
+
+def default_cache() -> CostExplorerCache:
+    """The process-wide cache + budget, created lazily on first use.
+
+    Shared by every `crucible.cost` and `crucible.tags` Cost Explorer reader
+    in this process (both modules call this rather than each holding their
+    own), so one budget bounds the whole process's Cost Explorer spend
+    rather than one function's calls in isolation.
+    """
+    global _default_cache
+    with _default_cache_lock:
+        if _default_cache is None:
+            _default_cache = CostExplorerCache(budget=_budget_from_env())
+        return _default_cache
+
+
+def reset_default_cache() -> None:
+    """Test-only: drop the process-wide cache so a test starts clean.
+
+    Without this, two tests in the same pytest process would share cached
+    Cost Explorer readings and call-budget state across test boundaries.
+    """
+    global _default_cache
+    with _default_cache_lock:
+        _default_cache = None
 
 
 @dataclass(frozen=True)
@@ -158,6 +368,7 @@ def month_to_date_usd(
     *,
     today: dt.date,
     tagged: bool,
+    cache: CostExplorerCache | None = None,
 ) -> CostReading:
     """Unblended USD spent so far this calendar month.
 
@@ -175,7 +386,9 @@ def month_to_date_usd(
     """
     start = today.replace(day=1)
     end = max(today, start + dt.timedelta(days=1))
-    amounts = _amounts(client, start=start, end=end, granularity="MONTHLY", tagged=tagged)
+    amounts = _amounts(
+        client, start=start, end=end, granularity="MONTHLY", tagged=tagged, cache=cache
+    )
     return CostReading(
         start=start,
         end=end,
@@ -190,6 +403,7 @@ def trailing_daily_usd(
     today: dt.date,
     days: int,
     tagged: bool,
+    cache: CostExplorerCache | None = None,
 ) -> DailyReading:
     """Unblended USD for each of the ``days`` complete days before ``today``.
 
@@ -202,7 +416,9 @@ def trailing_daily_usd(
     if days < 1:
         raise ValueError("a trailing window of fewer than one day measures nothing")
     start = today - dt.timedelta(days=days)
-    amounts = _amounts(client, start=start, end=today, granularity="DAILY", tagged=tagged)
+    amounts = _amounts(
+        client, start=start, end=today, granularity="DAILY", tagged=tagged, cache=cache
+    )
     if len(amounts) != days:
         raise CostUnreadableError(
             f"Cost Explorer returned {len(amounts)} daily period(s) for "
@@ -217,7 +433,13 @@ def trailing_daily_usd(
     )
 
 
-def closed_month_usd(client: Any, *, today: dt.date, tagged: bool) -> ClosedMonthReading:
+def closed_month_usd(
+    client: Any,
+    *,
+    today: dt.date,
+    tagged: bool,
+    cache: CostExplorerCache | None = None,
+) -> ClosedMonthReading:
     """The PRIOR calendar month's closed total (`alpha-engine-config-I9946`).
 
     The prior month is derived from ``today`` regardless of which day of the
@@ -230,7 +452,7 @@ def closed_month_usd(client: Any, *, today: dt.date, tagged: bool) -> ClosedMont
     """
     end = today.replace(day=1)
     start = (end - dt.timedelta(days=1)).replace(day=1)
-    amount, estimated = _single_period(client, start=start, end=end, tagged=tagged)
+    amount, estimated = _single_period(client, start=start, end=end, tagged=tagged, cache=cache)
     return ClosedMonthReading(
         start=start,
         end=end,
@@ -241,30 +463,23 @@ def closed_month_usd(client: Any, *, today: dt.date, tagged: bool) -> ClosedMont
 
 
 def _single_period(
-    client: Any, *, start: dt.date, end: dt.date, tagged: bool
+    client: Any,
+    *,
+    start: dt.date,
+    end: dt.date,
+    tagged: bool,
+    cache: CostExplorerCache | None = None,
 ) -> tuple[float, bool]:
     """One MONTHLY period's amount and its `Estimated` flag.
 
-    Shares `_amounts`'s request shape and exception handling exactly; the
-    difference is this reader also needs the `Estimated` bit `_amounts`
-    discards, since a month-close reading must say when the number can still
-    move (`alpha-engine-config-I9946`).
+    Shares `_amounts`'s request shape, caching and exception handling
+    exactly; the difference is this reader also needs the `Estimated` bit
+    `_amounts` discards, since a month-close reading must say when the
+    number can still move (`alpha-engine-config-I9946`).
     """
-    request: dict[str, Any] = {
-        "TimePeriod": {"Start": start.isoformat(), "End": end.isoformat()},
-        "Granularity": "MONTHLY",
-        "Metrics": ["UnblendedCost"],
-    }
-    if tagged:
-        request["Filter"] = {"Tags": {"Key": TAG_KEY, "Values": [TAG_VALUE]}}
-    try:
-        response = client.get_cost_and_usage(**request)
-    except Exception as exc:
-        raise CostUnreadableError(
-            f"Cost Explorer could not be read for "
-            f"{start.isoformat()}..{end.isoformat()}: {type(exc).__name__}: {exc}. "
-            "That is a statement about our access, not about what was spent."
-        ) from exc
+    response = _get_cost_and_usage(
+        client, start=start, end=end, granularity="MONTHLY", tagged=tagged, cache=cache
+    )
     periods = response.get("ResultsByTime") or []
     if len(periods) != 1:
         raise CostUnreadableError(
@@ -289,15 +504,29 @@ def _single_period(
     return amount_usd, bool(period.get("Estimated", False))
 
 
-def _amounts(
-    client: Any, *, start: dt.date, end: dt.date, granularity: str, tagged: bool
-) -> list[float]:
-    """The `UnblendedCost` amount of every period Cost Explorer returns.
+def _get_cost_and_usage(
+    client: Any,
+    *,
+    start: dt.date,
+    end: dt.date,
+    granularity: str,
+    tagged: bool,
+    cache: CostExplorerCache | None,
+) -> dict[str, Any]:
+    """The cached, budgeted `ce:GetCostAndUsage` call shared by every reader.
 
-    One request shape for both readers — the month-to-date total and the
-    trailing daily pace differ only in granularity and interval, and two
-    request builders would be two places for the tag filter to drift.
+    One request builder for both `_amounts` and `_single_period` — they
+    differ only in how they parse the response, and two request builders
+    would be two places for the tag filter, and the cache key, to drift.
+
+    Caching is keyed on the exact request (`start`, `end`, `granularity`,
+    `tagged`): a CLOSED window's answer is memoized for the process's
+    lifetime (`alpha-engine-config-I10389` — the defect this closes was
+    exactly this call, unfiltered and uncached, issued thousands of times
+    against an immutable prior-month window); an OPEN window (reaching into
+    today) is memoized with a TTL. See `CostExplorerCache`.
     """
+    cache = cache or default_cache()
     request: dict[str, Any] = {
         "TimePeriod": {"Start": start.isoformat(), "End": end.isoformat()},
         "Granularity": granularity,
@@ -305,21 +534,47 @@ def _amounts(
     }
     if tagged:
         request["Filter"] = {"Tags": {"Key": TAG_KEY, "Values": [TAG_VALUE]}}
-    try:
-        response = client.get_cost_and_usage(**request)
-    except Exception as exc:
-        # The failure mode swallowed: none. This converts an exception into a
-        # NAMED exception whose message carries the original class, and the
-        # recording surface is the gate clause that renders it UNMEASURABLE.
-        # Catching broadly is deliberate: `AccessDenied`, `NoRegionError`,
-        # `NoCredentialsError`, `EndpointConnectionError` and an absent
-        # `boto3` are five unrelated types that mean one thing here — there is
-        # no number — and enumerating them would let the sixth read as green.
-        raise CostUnreadableError(
-            f"Cost Explorer could not be read for "
-            f"{start.isoformat()}..{end.isoformat()}: {type(exc).__name__}: {exc}. "
-            "That is a statement about our access, not about what was spent."
-        ) from exc
+    key = ("get_cost_and_usage", start.isoformat(), end.isoformat(), granularity, tagged)
+
+    def fetch() -> dict[str, Any]:
+        try:
+            return client.get_cost_and_usage(**request)
+        except Exception as exc:
+            # The failure mode swallowed: none. This converts an exception
+            # into a NAMED exception whose message carries the original
+            # class, and the recording surface is the gate clause that
+            # renders it UNMEASURABLE. Catching broadly is deliberate:
+            # `AccessDenied`, `NoRegionError`, `NoCredentialsError`,
+            # `EndpointConnectionError` and an absent `boto3` are five
+            # unrelated types that mean one thing here — there is no number —
+            # and enumerating them would let the sixth read as green.
+            raise CostUnreadableError(
+                f"Cost Explorer could not be read for "
+                f"{start.isoformat()}..{end.isoformat()}: {type(exc).__name__}: {exc}. "
+                "That is a statement about our access, not about what was spent."
+            ) from exc
+
+    return cache.get_or_fetch(key, closed=cache.is_window_closed(end), fetch=fetch)
+
+
+def _amounts(
+    client: Any,
+    *,
+    start: dt.date,
+    end: dt.date,
+    granularity: str,
+    tagged: bool,
+    cache: CostExplorerCache | None = None,
+) -> list[float]:
+    """The `UnblendedCost` amount of every period Cost Explorer returns.
+
+    One request shape for both readers — the month-to-date total and the
+    trailing daily pace differ only in granularity and interval, and two
+    request builders would be two places for the tag filter to drift.
+    """
+    response = _get_cost_and_usage(
+        client, start=start, end=end, granularity=granularity, tagged=tagged, cache=cache
+    )
     periods = response.get("ResultsByTime") or []
     if not periods:
         raise CostUnreadableError(
