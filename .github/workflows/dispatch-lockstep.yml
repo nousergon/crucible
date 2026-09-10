@@ -257,6 +257,53 @@ jobs:
           set -euo pipefail
           gh api "repos/nousergon/crucible/contents/crucible/components.yaml?ref=${HEAD_SHA}" --jq '.content' | base64 -d > crucible/components.yaml
 
+      # The SECOND piece, and the reason it exists: the guard compares
+      # `components.yaml` against the workflows that declare an `on.schedule`
+      # cron, and until 2026-09-10 it read the PR's components.yaml against
+      # the BASE ref's workflows. So a PR whose whole content is a workflow
+      # fix could never turn this check green — measured on
+      # `crucible-PR198`, which removed the very cron the guard was
+      # complaining about and still failed, naming the removed cron. A
+      # required check that a correct fix cannot satisfy teaches people to
+      # merge past it (`alpha-engine-config-I10467`).
+      #
+      # Same documented-safe shape as the step above and no wider: DATA over
+      # the read-only Contents API at the PR head, base64-decoded straight to
+      # files, nothing executed and nothing piped into a shell. This job's
+      # own workflow definition was already loaded by
+      # `pull_request_target` before any of this runs, so replacing files
+      # under `.github/workflows/` in the workspace changes what the TEST
+      # reads and cannot change what runs.
+      #
+      # Deletions are mirrored too. A PR that DELETES a cron workflow is the
+      # other half of the same blindness: leaving the base copy in place
+      # would keep the guard failing over a file the PR removed.
+      - name: Mirror the PR's .github/workflows as data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/nousergon/crucible/contents/.github/workflows?ref=${HEAD_SHA}" \
+            --jq '.[] | select(.type == "file") | .name' > /tmp/pr-workflows.txt
+          # Refuse an empty listing rather than mirroring nothing: an API
+          # hiccup that returned zero files would silently delete every
+          # workflow from the workspace and leave the guard grading an empty
+          # set, which reads GREEN. A guard that passes over no data is the
+          # failure this whole file exists to prevent.
+          if [ ! -s /tmp/pr-workflows.txt ]; then
+            echo "::error::the PR head lists no files under .github/workflows — refusing to mirror an empty set"
+            exit 1
+          fi
+          while IFS= read -r name; do
+            gh api "repos/nousergon/crucible/contents/.github/workflows/${name}?ref=${HEAD_SHA}" \
+              --jq '.content' | base64 -d > ".github/workflows/${name}"
+          done < /tmp/pr-workflows.txt
+          for existing in .github/workflows/*; do
+            base="$(basename "${existing}")"
+            grep -qxF "${base}" /tmp/pr-workflows.txt || rm -f "${existing}"
+          done
+
       # This repo is public and its run logs are public; GitHub masks
       # SECRETS, not repository VARIABLES. The identity assertion below
       # prints an assumed-role ARN that embeds the account id — mask it
