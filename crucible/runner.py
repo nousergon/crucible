@@ -84,11 +84,28 @@ class SpotInterruptionError(BaseException):
 def spot_interruption_guard() -> Iterator[None]:
     """Turn SIGTERM into :class:`SpotInterruptionError` for the duration.
 
-    A spot reclamation arrives as SIGTERM about two minutes before the
-    instance goes away. Without this the process dies with no manifest at
-    all — which surfaces as an ABSENCE page with the cause discarded,
-    rather than as a FAILURE page naming the reclamation and retried once
-    on a fresh instance.
+    Without this the process dies with no manifest at all — which surfaces
+    as an ABSENCE page with the cause discarded, rather than as a FAILURE
+    page naming the reclamation and retried once inside the notice window.
+
+    **Who delivers that SIGTERM, corrected 2026-09-10
+    (`alpha-engine-config-I10438`).** This docstring used to say "a spot
+    reclamation arrives as SIGTERM about two minutes before the instance
+    goes away", and AWS does no such thing: a reclamation is announced on
+    IMDS at `/latest/meta-data/spot/instance-action` and carries no signal.
+    The only SIGTERM AWS causes arrives at OS shutdown, at the END of the
+    two-minute notice, which leaves the retry the shutdown grace period
+    rather than two minutes — so the retry this guard exists to enable
+    could never complete, and `transient_retry_class_in_runner` read
+    UNMEASURABLE for as long as the premise stood (112 manifests across 24
+    jobs, not one attempt past the first).
+
+    The two minutes are real only because the box's own shell polls that
+    IMDS path and signals THIS process on a notice
+    (`nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml`,
+    `_user_data`). The guard is therefore correct and the wiring is what
+    was missing; stated here because a docstring naming the wrong signal
+    source is how the gap survived being read.
 
     Restores the previous handler on exit, including on the raise, so a
     caller that wraps two runs does not leave the second one holding the
