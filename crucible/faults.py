@@ -66,6 +66,11 @@ from typing import Any
 from pydantic import ValidationError
 
 from crucible.documents import read_store_document
+from crucible.fault_probe import (
+    FAULT_PROBE_JOB,
+    PROBE_OUTCOME_UPSTREAM_TRANSPORT_FAILURE,
+    probe_outcome_from_reason,
+)
 from crucible.gate import FAULT_RECORD_BUS_FIELD, FAULT_RECORD_MANIFEST_FIELD, SCRIPTED_FAULTS
 from crucible.keys import fault_injection_key, is_manifest_key, manifest_prefix, parse_bus_key
 from crucible.models import FAULT_OUTCOME_VALUES, FaultRecordDocument
@@ -333,7 +338,62 @@ def _induced_evidence(
             "failed. A run the system handled is `--outcome absorbed`, which requires "
             "the retry to be recorded and forbids a bus key."
         )
+    _refuse_a_failure_that_is_not_the_fault(key, document)
     return key, None
+
+
+def _refuse_a_failure_that_is_not_the_fault(key: str, document: dict[str, Any]) -> None:
+    """A FAILED probe manifest is not automatically evidence of the fault it
+    was launched to induce (`alpha-engine-config-I10367` deliverable 3).
+
+    `status: failed` says the job could not do its work. It does not say
+    WHICH failure happened, and a fault-injection probe has three ways to
+    fail that mean three different things
+    (`crucible.fault_probe.PROBE_OUTCOMES`):
+
+    * a routing or reachability refusal, where nothing upstream was ever
+      contacted — a real finding about the route, and not the fault;
+    * an upstream 5xx or timeout, which is what plan §10.7 fault 3 names and
+      what `crucible.runner.TRANSIENT_CLASSIFIERS` keys its retry class on;
+    * an upstream 4xx, where an upstream answered and refused the request —
+      evidence about that provider's request validator.
+
+    Measured 2026-09-10: the live `chaos_probe` group returned the THIRD of
+    those through the real edge, and every layer between it and this producer
+    read it as a successful induction. So the refusal lives here, where the
+    attestation is written, rather than in the reader that consumes it.
+
+    Keyed on the marker rather than on the job name, so a phase-5 job
+    deliberately routed to a fault-injection class gets the same treatment the
+    moment it classifies its own failure the same way. The job name is still
+    checked in the other direction: a `fault.probe` manifest that carries NO
+    outcome never reached the classifier at all, and a run that did not reach
+    the router is not evidence about the router.
+    """
+    reason = str(document.get("reason") or "")
+    outcome = probe_outcome_from_reason(reason)
+    if outcome is None:
+        if document.get("job") != FAULT_PROBE_JOB:
+            return
+        raise FaultRecordRefusedError(
+            f"{key} is a {FAULT_PROBE_JOB} manifest carrying no fault-probe outcome. "
+            "Every failure of that job that reached its router call is classified "
+            "(`crucible.fault_probe.classify_probe_failure`), so a manifest with no "
+            "outcome failed BEFORE the call — a missing capability class, a store "
+            "that would not open, a probe that served. None of those is evidence "
+            f"about the router. Reason recorded: {reason!r}"
+        )
+    if outcome != PROBE_OUTCOME_UPSTREAM_TRANSPORT_FAILURE:
+        raise FaultRecordRefusedError(
+            f"{key} records fault-probe outcome {outcome!r}, and an `induced` record "
+            f"requires {PROBE_OUTCOME_UPSTREAM_TRANSPORT_FAILURE!r}. A "
+            "`routing_refusal` means no upstream was ever contacted and an "
+            "`upstream_refusal` means one answered and rejected the request at its "
+            "validator; plan §10.7 fault 3 is a transport failure, and its retry "
+            "class is keyed on `provider_5xx`/`provider_timeout`. Filing either of "
+            "the other two would attest to a fault that did not happen. Fix the "
+            "seam so the probe takes a real 5xx — do not relax this refusal."
+        )
 
 
 def _absorbed_evidence(
