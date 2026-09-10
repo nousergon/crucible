@@ -90,7 +90,19 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# `--ignore=tests/integration`: the third test tier (`alpha-engine-config-
+# I10419`) runs against a REAL dedicated S3 prefix and a REAL dedicated
+# ArcticDB library, nightly and before a phase gate — deliberately never
+# per-PR (see tests/integration/README.md). ci.yml and deploy.yml both run
+# `pytest ... --ignore=tests/acceptance` with no path argument, so without
+# this default every existing invocation in both workflows — neither of
+# which this change may edit — would collect and execute tests/integration
+# too, against credentials that do not exist in that context.
+# .github/workflows/integration-nightly.yml is this tier's own execution
+# path; it names `tests/integration` as an explicit test path, which
+# overrides no ignore this addopts sets (pytest merges ignores, it does not
+# let a positional path defeat one).
+addopts = "-q --ignore=tests/integration"
 
 [tool.coverage.run]
 # repository-baseline-policy.md §4.2 C1: the denominator is the whole source
