@@ -1,0 +1,216 @@
+name: Integration nightly
+
+# `alpha-engine-config-I10419`. The third test tier: `tests/integration/`,
+# one case per CLI job against a REAL dedicated S3 prefix and a REAL
+# dedicated ArcticDB library — never the production ones, never per-PR. See
+# `tests/integration/README.md` for the full contract, the job-by-job
+# coverage table, and the deliberate deltas this workflow carries (no new
+# CLI job, no gate.py staleness clause — both filed as follow-ups).
+#
+# `ci.yml`'s own comment names three workflows and no others in this repo;
+# this is the one exception `ci.yml` predates — a fourth, added deliberately
+# because the tier it runs cannot share `ci.yml`'s trigger (`pull_request`)
+# without touching that file, which this PR is instructed not to do. It
+# mirrors `ci.yml`/`deploy.yml`'s identity-assertion and repository-variable
+# shape rather than inventing a new one (`crucible/AGENTS.md`: mirror a SOTA
+# pattern already in this repo).
+#
+# ── Why `workflow_call` as well as `schedule` ──────────────────────────────
+#
+# "nightly, and before any phase gate" (I10419) is two triggers, not one. The
+# nightly half is the `schedule:` below. The pre-gate half has no caller yet:
+# nothing in this repo today runs `crucible gate` on a schedule (it is an
+# operator/board-read action, `AGENTS.md` "Reading a gate from the laptop"),
+# and wiring `gate-close.yml` or a future gate-scheduling workflow to call
+# this one is `gate.py`'s owning track's decision, not this PR's — `gate.py`
+# is out of this session's ownership (see the PR body). `workflow_call:` is
+# exposed so that wiring is a one-line `uses:` addition to whichever workflow
+# ends up owning "before any phase gate", rather than a second copy of this
+# file.
+#
+# ── The identity, and why it does not exist yet ────────────────────────────
+#
+# `CRUCIBLE_INTEGRATION_ROLE_ARN` below follows the exact shape
+# `ACCEPTANCE_ROLE_ARN`/`DEPLOY_ROLE_ARN` already use: built from
+# `vars.CRUCIBLE_ROLE_PREFIX`, asserted after `configure-aws-credentials`
+# rather than trusted, masked before it can reach this public repo's log.
+# The role ITSELF — `{prefix}-integration`, scoped to exactly the dedicated
+# `integration/` store prefix and the dedicated ArcticDB library, per
+# `gate-close.yml`'s own precedent ("an identity is attached to a workflow,
+# not to a step") — is infrastructure this session does not create: a named
+# IAM role is an OPERATOR-GATED apply (`pull-request-policy` §4.2 form 3),
+# same as every other role this repo depends on. Filed as
+# `alpha-engine-config-I10462` (create `{prefix}-integration` in
+# `nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml`, scoped to
+# `integration/*` and the dedicated ArcticDB library only — NEVER the
+# production prefixes or `universe`/`macro`/`preliminary`). Until that lands
+# and the seven `CRUCIBLE_INTEGRATION_*` repository variables in
+# `tests/integration/README.md` are set, every run of this workflow fails at
+# the "Repository variables are set" step below, loudly, naming exactly what
+# is missing — never a silent no-op.
+
+on:
+  schedule:
+    # 06:00 UTC — ahead of `board.yml`/`morning-report.yml`'s 06:00 PT
+    # delivery, so a red nightly is visible on the console before the day's
+    # first human reads it, not discovered after.
+    - cron: '0 6 * * *'
+  workflow_dispatch: {}
+  workflow_call:
+    outputs:
+      outcome:
+        description: 'ok or failed, from the integration summary this run wrote'
+        value: ${{ jobs.integration.outputs.outcome }}
+
+permissions: {}
+
+concurrency:
+  group: integration-nightly
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  CRUCIBLE_INTEGRATION_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.CRUCIBLE_ROLE_PREFIX }}-integration
+  # The dedicated store, ArcticDB bucket/library and paging topics —
+  # NEVER the production values `STORE_URI`/`DEPLOY_ROLE_ARN` resolve to in
+  # `ci.yml`/`deploy.yml`. See tests/integration/README.md for the guards
+  # `conftest.py` runs over each of these before a single test executes.
+  CRUCIBLE_INTEGRATION_STORE_URI: ${{ vars.CRUCIBLE_INTEGRATION_STORE_URI }}
+  CRUCIBLE_INTEGRATION_ARCTIC_BUCKET: ${{ vars.CRUCIBLE_INTEGRATION_ARCTIC_BUCKET }}
+  CRUCIBLE_INTEGRATION_ARCTIC_LIBRARY: ${{ vars.CRUCIBLE_INTEGRATION_ARCTIC_LIBRARY }}
+  CRUCIBLE_INTEGRATION_PAGES_TOPIC: ${{ vars.CRUCIBLE_INTEGRATION_PAGES_TOPIC }}
+  CRUCIBLE_INTEGRATION_MUTED_TOPIC: ${{ vars.CRUCIBLE_INTEGRATION_MUTED_TOPIC }}
+
+jobs:
+  integration:
+    name: tests/integration (real S3 + real ArcticDB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    outputs:
+      outcome: ${{ steps.summary.outputs.outcome }}
+    steps:
+      - name: Repository variables are set
+        run: |
+          missing=0
+          for name in AWS_ACCOUNT_ID CRUCIBLE_INTEGRATION_STORE_URI \
+                      CRUCIBLE_INTEGRATION_ARCTIC_BUCKET CRUCIBLE_INTEGRATION_ARCTIC_LIBRARY \
+                      CRUCIBLE_INTEGRATION_PAGES_TOPIC CRUCIBLE_INTEGRATION_MUTED_TOPIC; do
+            value="${!name}"
+            if [ -z "${value}" ]; then
+              echo "::error::repository variable ${name} is not set — see tests/integration/README.md, 'The dedicated environment'. Set it with: gh variable set ${name} --repo nousergon/crucible --body '<value>'"
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: The lockfile agrees with pyproject.toml
+        run: uv lock --check
+
+      - name: Install (with the arcticdb extra — this tier needs the real thing)
+        run: uv sync --frozen --extra arcticdb
+
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c  # v6.2.4
+        with:
+          role-to-assume: ${{ env.CRUCIBLE_INTEGRATION_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${CRUCIBLE_INTEGRATION_ROLE_ARN##*/}"
+          case "${assumed}" in
+            *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;;
+            *) echo "::error::this job assumed ${assumed}, not ${expected}. It may act ONLY as the dedicated integration identity, scoped to the integration/ store prefix and the dedicated ArcticDB library — never the production roles this repo's other workflows assume. If the role does not exist yet, see alpha-engine-config-I10462 (an operator-gated CloudFormation apply)."; exit 1 ;;
+          esac
+
+      # `tests/integration` is deliberately never on the `pull_request` or
+      # `push: [main]` trigger's own suite — `pyproject.toml`'s `addopts`
+      # ignores it there. This IS its execution path, so it is invoked as an
+      # explicit test path rather than inheriting an ignore that would skip
+      # it here too.
+      - name: Integration tier
+        id: tests
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          uv run --frozen pytest -q tests/integration --tb=short \
+            -o junit_family=legacy --junitxml=integration.xml
+          echo "outcome=ok" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the trading day
+        id: trading_day
+        run: |
+          day="$(uv run --frozen python -c 'from tests.integration.conftest import INTEGRATION_TRADING_DAY; print(INTEGRATION_TRADING_DAY)')"
+          echo "day=${day}" >> "$GITHUB_OUTPUT"
+
+      # The `integration_summary.v1` artifact `tests/integration/README.md`
+      # names — NOT a `run_manifest.v2` object: that needs a registered CLI
+      # job this session's ownership does not include (see
+      # `alpha-engine-config-I10459`). Written unconditionally (`if: always()`)
+      # so a failed nightly is visible on the same surface as a passing one,
+      # never silently absent.
+      - name: Publish the integration summary
+        id: summary
+        if: always()
+        run: |
+          set -euo pipefail
+          outcome="${{ steps.tests.outcome == 'success' && 'ok' || 'failed' }}"
+          echo "outcome=${outcome}" >> "$GITHUB_OUTPUT"
+          uv run --frozen python - <<'PY'
+          import json
+          import os
+          import subprocess
+          from datetime import UTC, datetime
+
+          from crucible.store import open_store
+
+          day = os.environ["TRADING_DAY"]
+          store = open_store(os.environ["CRUCIBLE_INTEGRATION_STORE_URI"])
+          commit = subprocess.run(
+              ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+          ).stdout.strip()
+          payload = {
+              "schema_version": "integration_summary.v1",
+              "trading_day": day,
+              "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "commit": commit,
+              "outcome": os.environ["OUTCOME"],
+              "run_url": os.environ["RUN_URL"],
+          }
+          store.put_bytes(
+              f"integration/summary/{day}.json",
+              json.dumps(payload, indent=2, sort_keys=True).encode("utf-8"),
+          )
+          print(json.dumps(payload, indent=2))
+          PY
+        env:
+          TRADING_DAY: ${{ steps.trading_day.outputs.day }}
+          OUTCOME: ${{ steps.tests.outcome == 'success' && 'ok' || 'failed' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Fail the run if the integration tier failed
+        if: steps.tests.outcome != 'success'
+        run: |
+          echo "::error::tests/integration failed — see the 'Integration tier' step above. The summary was still published (see 'Publish the integration summary')."
+          exit 1
+
+  notify-failure:
+    needs: [integration]
+    if: failure()
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@c115e75840c5e210f857107118428beb4a6fdaa8
+    secrets: inherit
