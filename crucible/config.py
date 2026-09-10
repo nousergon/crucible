@@ -56,6 +56,7 @@ __all__ = [
     "DEFAULT_AUTONOMY_RESERVED_EVENTS",
     "DEFAULT_CLOUDTRAIL_ARCHIVE",
     "DEFAULT_CONSOLE_URL",
+    "DEFAULT_IAC_DECLARED_INVENTORY_PARAM",
     "DEFAULT_STACK_NAME",
     "DEFAULT_LLM_CAP_USD",
     "DEFAULT_LLM_CAP_USD_MEASURED",
@@ -125,6 +126,16 @@ DEFAULT_CLOUDTRAIL_ARCHIVE = ""
 DEFAULT_PAGES_TOPIC = ""
 DEFAULT_MUTED_TOPIC = ""
 
+#: The SSM parameter name `crucible.iac_conformance.declared_inventory_from_ssm`
+#: reads the plan's own declared IaC inventory from — comparison (b),
+#: `alpha-engine-config-I10418`. **No default, deliberately**, same shape as
+#: `DEFAULT_CLOUDTRAIL_ARCHIVE`: this is an infrastructure identifier this
+#: tree may not guess, and an operator sets it once, by hand, independently
+#: of any `aws cloudformation deploy` — see that module's docstring for why
+#: the declared inventory must live outside the template it is checked
+#: against. Empty means UNMEASURABLE, never "zero roles declared".
+DEFAULT_IAC_DECLARED_INVENTORY_PARAM = ""
+
 #: The fleet console's base URL (`policy-console`), where the board's rows are
 #: rendered as Decision entities at a STABLE address — the durable replacement
 #: for the presigned board link the morning report otherwise carries
@@ -169,6 +180,9 @@ class Settings:
     universe_uri: str = DEFAULT_UNIVERSE_URI
     cloudtrail_archive: str = DEFAULT_CLOUDTRAIL_ARCHIVE
     stack_name: str = DEFAULT_STACK_NAME
+    #: See :data:`DEFAULT_IAC_DECLARED_INVENTORY_PARAM`. Read by
+    #: `crucible.iac_conformance.declared_inventory_from_ssm`.
+    iac_declared_inventory_param: str = DEFAULT_IAC_DECLARED_INVENTORY_PARAM
     #: `alpha-engine-config-I9926` — see :data:`DEFAULT_CONSOLE_URL`. Read by
     #: `crucible.morning`; nothing else in this tree links out.
     console_url: str = DEFAULT_CONSOLE_URL
@@ -247,6 +261,7 @@ class Settings:
             "universe_uri": self.universe_uri,
             "cloudtrail_archive": self.cloudtrail_archive,
             "stack_name": self.stack_name,
+            "iac_declared_inventory_param": self.iac_declared_inventory_param,
             "console_url": self.console_url,
             "autonomy_reserved_events": list(self.autonomy_reserved_events),
             "strategy_dir": str(self.strategy_dir) if self.strategy_dir else None,
@@ -276,6 +291,7 @@ def settings(
     stack_name: str | None = None,
     console_url: str | None = None,
     autonomy_reserved_events: str | None = None,
+    iac_declared_inventory_param: str | None = None,
     dry_run: bool = False,
 ) -> Settings:
     """Resolve configuration once, and record where each value came from."""
@@ -309,6 +325,11 @@ def settings(
     reserved_events = tuple(
         sorted({name.strip() for name in (resolved_reserved or "").split(",") if name.strip()})
     )
+    resolved_iac_param, origins["iac_declared_inventory_param"] = _resolve(
+        iac_declared_inventory_param,
+        "CRUCIBLE_IAC_DECLARED_INVENTORY_PARAM",
+        DEFAULT_IAC_DECLARED_INVENTORY_PARAM,
+    )
     raw_dir = strategy_dir or os.environ.get("CRUCIBLE_STRATEGY_DIR")
     if raw_dir:
         origins["strategy_dir"] = "argument" if strategy_dir else "environ:CRUCIBLE_STRATEGY_DIR"
@@ -334,6 +355,7 @@ def settings(
         stack_name=resolved_stack,
         console_url=resolved_console.rstrip("/") if resolved_console else DEFAULT_CONSOLE_URL,
         autonomy_reserved_events=reserved_events,
+        iac_declared_inventory_param=resolved_iac_param or DEFAULT_IAC_DECLARED_INVENTORY_PARAM,
         llm_cap_usd=_positive_cap(resolved_cap, origins["llm_cap_usd"]),
         llm_cap_usd_measured=cap_measured,
         origins=origins,
