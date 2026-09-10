@@ -46,6 +46,7 @@ from crucible.manifest import (
     RUN_MANIFEST_SCHEMA_VERSION,
     STATUSES,
     ManifestValidationError,
+    load_schema,
     manifest_key,
     validate,
 )
@@ -858,6 +859,33 @@ _FALLBACK_DROPPED_FIELDS = (
 )
 
 
+def _schema_max_length(field: str) -> int | None:
+    """The declared `maxLength` for a top-level manifest field, or None.
+
+    Read from the schema rather than restated, so a cap that moves there
+    moves here. A hardcoded 2000 is the second declaration of a fact that
+    already has one, and the two diverge on the day somebody widens the
+    schema and nothing tells this module.
+    """
+    prop = load_schema().get("properties", {}).get(field, {})
+    cap = prop.get("maxLength")
+    return int(cap) if isinstance(cap, int) else None
+
+
+def _fit(text: str, cap: int | None) -> str:
+    """``text`` shortened to ``cap``, saying so where it was cut.
+
+    Truncation is visible on purpose: a reader who cannot tell a complete
+    reason from a clipped one will chase the missing half as if it were
+    never written. The HEAD is kept because an exception's type and message
+    lead, and its stack trails.
+    """
+    if cap is None or len(text) <= cap:
+        return text
+    marker = f" …[truncated to the schema's {cap}-character limit]"
+    return text[: max(0, cap - len(marker))] + marker
+
+
 def _minimal_failed_manifest(
     ctx: RunContext,
     *,
@@ -908,13 +936,16 @@ def _minimal_failed_manifest(
         "trading_day": ctx.trading_day.isoformat(),
         "calendar_date": ctx.calendar_date.isoformat(),
         "status": "failed",
-        "reason": (
-            f"the manifest this run assembled does not validate, so this minimal "
-            f"record stands in its place — every job-contributed field "
-            f"({', '.join(_FALLBACK_DROPPED_FIELDS)}) is dropped, because one of them "
-            f"is what was rejected. The run's own status was {status!r}"
-            + (f" with reason {reason!r}" if reason else " with no reason recorded")
-            + f". The validator said: {detail}"
+        "reason": _fit(
+            (
+                f"the manifest this run assembled does not validate, so this minimal "
+                f"record stands in its place — every job-contributed field "
+                f"({', '.join(_FALLBACK_DROPPED_FIELDS)}) is dropped, because one of "
+                f"them is what was rejected. The validator said: {detail}. The run's "
+                f"own status was {status!r}"
+                + (f" with reason {reason!r}" if reason else " with no reason recorded")
+            ),
+            _schema_max_length("reason"),
         ),
         "started": _utc(started),
         "finished": _utc(finished),
