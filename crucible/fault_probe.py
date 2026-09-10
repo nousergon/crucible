@@ -53,14 +53,22 @@ import json
 from typing import Any
 
 from crucible import llm
-from crucible.runner import RunContext
+from crucible.runner import RunContext, classify_transient
 
 __all__ = [
     "FAULT_PROBE_CALLSITE_ID",
     "FAULT_PROBE_JOB",
+    "PROBE_OUTCOMES",
+    "PROBE_OUTCOME_MARKER",
+    "PROBE_OUTCOME_ROUTING_REFUSAL",
+    "PROBE_OUTCOME_UPSTREAM_REFUSAL",
+    "PROBE_OUTCOME_UPSTREAM_TRANSPORT_FAILURE",
+    "FaultProbeFailure",
     "FaultProbeServedError",
+    "classify_probe_failure",
     "fault_probe_handler",
     "probe_body",
+    "probe_outcome_from_reason",
 ]
 
 #: The job name registered in `crucible.cli.JOBS`, `crucible/components.yaml`
@@ -82,6 +90,172 @@ FAULT_PROBE_CALLSITE_ID = "faults.router_probe"
 PROBE_MESSAGES: tuple[dict[str, str], ...] = (
     {"role": "user", "content": "crucible fault-injection probe; no answer is expected"},
 )
+
+
+#: **The three ways this probe's one router call can end**
+#: (`alpha-engine-config-I10367` deliverable 3), and only one of them is
+#: evidence of plan §10.7 fault 3.
+#:
+#: Fault 3 is "the LLM router returns 500". The retry class it exists to
+#: exercise is keyed on `provider_5xx`/`provider_timeout`
+#: (`crucible.runner.TRANSIENT_CLASSIFIERS`), so a failure outside that class
+#: is a fact about something else — and two of the three cases below are
+#: exactly that, both of them measured live rather than imagined.
+
+#: **(i)** Nothing upstream was ever contacted. `crucible.llm` refusing the
+#: capability class, `krepis.router` refusing the group, the edge answering
+#: 401 before LiteLLM sees the request, a connect timeout, or LiteLLM failing
+#: to reach its own upstream. It says the route is broken, which is a real
+#: finding and is not this fault.
+PROBE_OUTCOME_ROUTING_REFUSAL = "routing_refusal"
+
+#: **(ii)** An upstream answered with a 5xx, or was reached and then timed
+#: out. The ONLY honest `induced` evidence for fault 3.
+PROBE_OUTCOME_UPSTREAM_TRANSPORT_FAILURE = "upstream_transport_failure"
+
+#: **(iii)** An upstream answered and refused with a 4xx. This is what the
+#: `chaos_probe` group produced through the live edge on 2026-09-10 — both
+#: chain members walked, both refused at the provider's REQUEST VALIDATOR.
+#: A record filed off it would be evidence about that validator.
+PROBE_OUTCOME_UPSTREAM_REFUSAL = "upstream_refusal"
+
+#: The closed vocabulary. A fourth case is a PR that has to argue for it.
+PROBE_OUTCOMES: tuple[str, ...] = (
+    PROBE_OUTCOME_ROUTING_REFUSAL,
+    PROBE_OUTCOME_UPSTREAM_TRANSPORT_FAILURE,
+    PROBE_OUTCOME_UPSTREAM_REFUSAL,
+)
+
+#: How the outcome reaches a reader. The manifest's `reason` is the durable
+#: record of why a run failed, and `crucible.faults` re-reads it rather than
+#: trusting anything the recording operator typed — so the classification is
+#: carried IN that string, as a marker no ordinary failure message produces.
+#:
+#: Deliberately not a new manifest FIELD: `run_manifest.v2.json` is the
+#: contract every already-written manifest is read against, and a field only
+#: one of thirteen jobs ever sets would be a schema change bought for one
+#: consumer. The marker is greppable, is preserved verbatim by
+#: `crucible.runner._reason_from`, and cannot be forged by a job that did not
+#: classify anything, because nothing else writes it.
+PROBE_OUTCOME_MARKER = "fault_probe_outcome="
+
+#: Message substrings that mean the transport never got an answer from an
+#: upstream at all — whatever HTTP status the layer above chose to report.
+#:
+#: **This list is the whole point of the classifier.** Measured 2026-09-10
+#: against `litellm` with the generated `chaos_probe` group pointed at a dead
+#: port: LiteLLM maps its own failure to CONNECT onto an HTTP **500** whose
+#: body reads `OpenAIException - Connection error.`, and
+#: `crucible.runner.classify_transient` correctly reads that as
+#: `provider_5xx` — it is looking at the status, which is all a retry
+#: classifier needs. A fault RECORD needs more: that 500 is a routing refusal
+#: wearing fault 3's clothes, and filing it would attest that the router
+#: surfaced an upstream failure when no upstream was reached.
+_NO_UPSTREAM_ANSWER_NEEDLES: tuple[str, ...] = (
+    "connection error",
+    "connection refused",
+    "cannot connect",
+    "name or service not known",
+    "nodename nor servname",
+    "max retries exceeded",
+    "route_unconfigured",
+    "connection timed out",
+)
+
+#: Exception type names that mean the connection itself never came up. Kept
+#: separate from the timeout row of `TRANSIENT_CLASSIFIERS` on purpose: that
+#: table puts `ConnectTimeout` and `ReadTimeout` in ONE retry class, correctly
+#: — both are worth one more attempt — while only the second of them reached
+#: an upstream.
+_NO_UPSTREAM_ANSWER_TYPES: tuple[str, ...] = ("ConnectTimeout", "APIConnectionError")
+
+#: Statuses the ROUTER EDGE answers with before the router process is
+#: consulted (`nous-ergon-ops/.../nginx/conf.d/litellm-router.conf`,
+#: `location /`: `if ($router_consumer = "") { return 401; }`). They are 4xx,
+#: but they are not an upstream refusing anything.
+_EDGE_REFUSAL_STATUSES = frozenset({401, 403})
+
+
+def classify_probe_failure(exc: BaseException) -> str:
+    """Which of :data:`PROBE_OUTCOMES` ``exc`` is evidence of.
+
+    Ordered so the cheap-and-wrong reading never wins: the connection-level
+    tests run FIRST, because a failure to reach an upstream can arrive
+    carrying any status code the layer above chose, and the status code is
+    the only thing a status-based classifier looks at.
+
+    The fall-through is :data:`PROBE_OUTCOME_ROUTING_REFUSAL`, the outcome
+    that is REFUSED for `induced`. An unrecognised failure is not evidence
+    of fault 3, and a classifier whose default was the accepting answer
+    would turn every unfamiliar exception into an attestation.
+    """
+    names = {type(exc).__name__, *(b.__name__ for b in type(exc).__mro__)}
+    haystack = f"{type(exc).__name__}: {exc}".lower()
+    status = getattr(exc, "status_code", None)
+
+    if names & set(_NO_UPSTREAM_ANSWER_TYPES):
+        return PROBE_OUTCOME_ROUTING_REFUSAL
+    if any(needle in haystack for needle in _NO_UPSTREAM_ANSWER_NEEDLES):
+        return PROBE_OUTCOME_ROUTING_REFUSAL
+    if classify_transient(exc) == "provider_timeout":
+        # Everything that reads as a timeout and is NOT a connect timeout:
+        # the upstream was reached and stopped answering, which §10.7's
+        # retry class names alongside a 5xx.
+        return PROBE_OUTCOME_UPSTREAM_TRANSPORT_FAILURE
+    if not isinstance(status, int):
+        # No HTTP exchange happened at all — `crucible.llm` or
+        # `krepis.router` refused before a client existed.
+        return PROBE_OUTCOME_ROUTING_REFUSAL
+    if status in _EDGE_REFUSAL_STATUSES:
+        return PROBE_OUTCOME_ROUTING_REFUSAL
+    if status >= 500:
+        return PROBE_OUTCOME_UPSTREAM_TRANSPORT_FAILURE
+    if 400 <= status < 500:
+        return PROBE_OUTCOME_UPSTREAM_REFUSAL
+    return PROBE_OUTCOME_ROUTING_REFUSAL
+
+
+def probe_outcome_from_reason(reason: str) -> str | None:
+    """The outcome a manifest `reason` records, or None.
+
+    None for a reason carrying no marker AND for one carrying a marker whose
+    value is not declared: an undeclared outcome is not a fourth case, it is
+    a string somebody wrote, and reading it as anything else would be the
+    hole this vocabulary exists to close.
+    """
+    _, marker, rest = reason.partition(PROBE_OUTCOME_MARKER)
+    if not marker:
+        return None
+    candidate = rest.split(":", 1)[0].split()[0] if rest.split() else ""
+    return candidate if candidate in PROBE_OUTCOMES else None
+
+
+class FaultProbeFailure(RuntimeError):
+    """The probe's router call failed, classified.
+
+    Wraps the transport's own exception rather than replacing it: the
+    manifest `reason` is the only durable record of what the router actually
+    said, and a wrapper that discarded it would leave a reader with a
+    category and no evidence for it. `str(cause)` is appended for that
+    reason, and `__cause__` is set by the `raise ... from` at the call site.
+    """
+
+    def __init__(self, outcome: str, cause: BaseException) -> None:
+        if outcome not in PROBE_OUTCOMES:
+            raise ValueError(
+                f"{outcome!r} is not a declared fault-probe outcome. Declared: "
+                f"{list(PROBE_OUTCOMES)}. A fourth case is a deliberate edit to "
+                "PROBE_OUTCOMES, not a string a call site can invent — "
+                "`crucible.faults` decides what may be filed `induced` from this "
+                "vocabulary alone."
+            )
+        self.outcome = outcome
+        self.cause = cause
+        super().__init__(
+            f"{PROBE_OUTCOME_MARKER}{outcome}: the fault-injection probe's router call "
+            f"failed and was classified {outcome!r}. Underlying "
+            f"{type(cause).__name__}: {cause}"
+        )
 
 
 class FaultProbeServedError(RuntimeError):
@@ -124,15 +298,26 @@ def probe_body(ctx: RunContext, *, client_factory: Any = None) -> None:
             "natural invocation: `--fault-capability-class` is required, and a context "
             "that reached this body without it did not come from the CLI."
         )
-    result = llm.call(
-        ctx,
-        callsite_id="faults.router_probe",
-        capability_class=requested,
-        messages=[dict(message) for message in PROBE_MESSAGES],
-        cap=llm.SpendCap(cap_usd=llm.DEFAULT_LLM_CAP_USD),
-        estimate_usd=0.0,
-        client_factory=client_factory,
-    )
+    try:
+        result = llm.call(
+            ctx,
+            callsite_id="faults.router_probe",
+            capability_class=requested,
+            messages=[dict(message) for message in PROBE_MESSAGES],
+            cap=llm.SpendCap(cap_usd=llm.DEFAULT_LLM_CAP_USD),
+            estimate_usd=0.0,
+            client_factory=client_factory,
+        )
+    except Exception as exc:
+        # `Exception`, deliberately NOT `BaseException`
+        # (`alpha-engine-config-I10367` deliverable 3).
+        # `crucible.runner.SpotInterruptionError` is a BaseException so that a
+        # job's own handler cannot swallow a reclamation, and this handler is
+        # one of those: catching it would classify plan §10.7 fault 1 as a
+        # fault-3 outcome and file the record under the wrong fault. It
+        # propagates untouched, and `run_job` writes the reclamation manifest
+        # it already writes for every other job.
+        raise FaultProbeFailure(classify_probe_failure(exc), exc) from exc
     raise FaultProbeServedError(
         f"capability class {requested!r} returned a completion (model "
         f"{getattr(result, 'model', '<unreported>')!r}). It is declared a FAULT-INJECTION "
