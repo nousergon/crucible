@@ -45,6 +45,7 @@ from crucible.calendar import assert_trading_day, resolve_trading_day
 from crucible.manifest import (
     RUN_MANIFEST_SCHEMA_VERSION,
     STATUSES,
+    ManifestValidationError,
     manifest_key,
     validate,
 )
@@ -809,12 +810,118 @@ def _write_manifest(
             f"({llm_usd_total}) for run {ctx.run_id} ({ctx.job}). The schema's own "
             "description promises the runner asserts this; it must never be false."
         )
-    validate(manifest)
-    store.put_bytes(
-        manifest_key(ctx.job, ctx.trading_day.isoformat(), discriminator=ctx.discriminator),
-        json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"),
-    )
+    key = manifest_key(ctx.job, ctx.trading_day.isoformat(), discriminator=ctx.discriminator)
+    try:
+        validate(manifest)
+    except ManifestValidationError as exc:
+        # A validator that can veto the write INVERTS the one guarantee this
+        # system rests on. See :func:`_minimal_failed_manifest`.
+        manifest = _minimal_failed_manifest(
+            ctx, status=status, reason=reason, started=started, finished=finished, detail=str(exc)
+        )
+        validate(manifest)
+    store.put_bytes(key, json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"))
     return manifest
+
+
+#: The manifest fields a run is answerable for no matter what else went
+#: wrong. Everything a job CONTRIBUTES — outputs, inputs, metrics, llm_calls,
+#: the row counts — is dropped from the fallback below, because the whole
+#: reason the fallback exists is that one of those is what the validator
+#: rejected. Keeping any of them would risk the fallback failing the same way
+#: the manifest it replaces did.
+_FALLBACK_DROPPED_FIELDS = (
+    "inputs",
+    "outputs",
+    "metrics",
+    "llm_calls",
+    "rows_in",
+    "rows_out",
+    "rows_rejected",
+)
+
+
+def _minimal_failed_manifest(
+    ctx: RunContext,
+    *,
+    status: str,
+    reason: str,
+    started: dt.datetime,
+    finished: dt.datetime,
+    detail: str,
+) -> dict[str, Any]:
+    """The manifest written when the real one will not validate.
+
+    **Manifest-or-it-didn't-happen is the invariant; the validator is not
+    allowed to break it.** `validate` raising here used to mean no write at
+    all: the exception propagated out of `run_job`'s `finally`, the job
+    exited non-zero with nothing in the store, and `crucible.alerts` reported
+    the run as an ABSENCE — the condition for "nothing was even attempted" —
+    with the cause discarded. That is strictly worse than the failure it was
+    guarding against: an unreadable manifest at least names a run, and this
+    named nothing.
+
+    Measured 2026-09-09 (`alpha-engine-config-I10410`). `gate.close` for
+    trading day 2026-09-08 (GitHub Actions run 34297633089) filed two closing
+    records, recorded them as outputs whose `sha256` field carried a store
+    version token rather than a content digest, and died on
+    `outputs/0/sha256: String should match pattern '^[0-9a-f]{64}$'`.
+    `runs/gate.close/2026-09-08/` is empty to this day, and the only surviving
+    account of a run that DID file two phase closing records is a GitHub
+    Actions log with a 90-day retention. The `sha256` defect itself is fixed
+    (see `record_output`); this is the class above it, which is not.
+
+    The fallback keeps only the fields the runner itself owns and computes,
+    and drops every field a job contributes (:data:`_FALLBACK_DROPPED_FIELDS`)
+    — one of those is what the validator rejected, so carrying them forward
+    would reproduce the same failure. `status` is forced to `failed`: a run
+    whose own account of itself is malformed has not succeeded, whatever it
+    thought, and recording `ok` on a document we had to rebuild would be the
+    graceful-degrade this repository refuses.
+
+    `reason` carries BOTH the original reason (if the job also failed) and
+    the validator's full complaint, because the second is what an operator
+    needs in order to fix the producer and the first is what they came for.
+    """
+    rebuilt: dict[str, Any] = {
+        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "run_id": ctx.run_id,
+        "job": ctx.job,
+        "run_mode": ctx.run_mode,
+        "trading_day": ctx.trading_day.isoformat(),
+        "calendar_date": ctx.calendar_date.isoformat(),
+        "status": "failed",
+        "reason": (
+            f"the manifest this run assembled does not validate, so this minimal "
+            f"record stands in its place — every job-contributed field "
+            f"({', '.join(_FALLBACK_DROPPED_FIELDS)}) is dropped, because one of them "
+            f"is what was rejected. The run's own status was {status!r}"
+            + (f" with reason {reason!r}" if reason else " with no reason recorded")
+            + f". The validator said: {detail}"
+        ),
+        "started": _utc(started),
+        "finished": _utc(finished),
+        "code_sha": _code_sha(),
+        "release_sha": os.environ.get("CRUCIBLE_RELEASE_SHA") or _code_sha(),
+        "seed": ctx.seed,
+        "inputs": [],
+        "outputs": [],
+        "rows_in": 0,
+        "rows_out": 0,
+        "rows_rejected": [],
+        "cost_usd": 0.0,
+        "llm_calls": [],
+        "resource": ctx.resource,
+        "metrics": [],
+        "attempts": ctx.attempts,
+    }
+    if ctx.discriminator is not None:
+        rebuilt["discriminator"] = ctx.discriminator
+    if ctx.now_override is not None:
+        rebuilt["now_override_utc"] = _utc(ctx.now_override)
+    if ctx.fault_capability_class is not None:
+        rebuilt["fault_capability_class"] = ctx.fault_capability_class
+    return rebuilt
 
 
 def _reason_from(exc: BaseException) -> str:
