@@ -27,28 +27,38 @@ common to every synthetic run is that the INVOCATION declared it: `run_mode`
 recorded on the manifest, and both are the only reason the run exists. So
 this module reads those two fields and nothing else.
 
-**It marks; it does not silence.** Everything a synthetic page produces today
-it still produces: the bus row is written, the transport is reached, the
-ceiling still counts it. What changes is that the row and the rendered page
-say what they are, so no reader — human or machine — has to ask "was that
-real?" and no reader has to answer it by recognising a ticker. Suppressing
-here instead would be a suppression collection (AGENTS.md rule 4) and would
-also move two of `crucible.gate`'s live phase-2 clauses, which is not a thing
-to do in the week two live Saturdays are being graded.
+**It marks, and — from :data:`SYNTHETIC_ROUTING_ACTIVE_FROM` — it also
+re-routes. It never silences.** Every synthetic page still writes its bus row,
+still reaches a transport, still lands on a durable topic, still renders on
+the console. What changes on that day is the *delivery* half and the
+*accounting* half, and only those: the page goes to the muted topic instead of
+the operator one, and `crucible.gate`'s page-ceiling clause stops counting an
+exercise against a production alert budget. That is `observability-policy.md`
+§7.2a's line exactly — suppression is a delivery decision, never a recording
+one — and it is why this is not the suppression collection AGENTS.md rule 4
+forbids: nothing stops being written down, and a reader can still count every
+synthetic page there has ever been.
+
+**Brian ruled this on 2026-09-09** (`alpha-engine-config-I10366`, option (b)),
+"executed after 2026-09-19". See :data:`SYNTHETIC_ROUTING_ACTIVE_FROM` for why
+the date is a constant in this file rather than a label on a draft PR.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import shlex
 from typing import Any
 
 from crucible.runmode import RUN_MODE_REPLAY
 
 __all__ = [
+    "SYNTHETIC_ROUTING_ACTIVE_FROM",
     "SYNTHETIC_SUBJECT_PREFIX",
     "args_synthetic_marker",
     "manifest_synthetic_marker",
     "synthetic_marker",
+    "synthetic_routing_active",
 ]
 
 #: Prepended to an incident SUBJECT so a synthetic incident and a real one can
@@ -135,3 +145,71 @@ def _flag_values(tokens: list[str], flags: tuple[str, ...]) -> dict[str, str]:
             elif token.startswith(f"{flag}="):
                 found[flag] = token.split("=", 1)[1]
     return found
+
+
+#: The day the SECOND half of this module's job switches on: a synthetic page
+#: routes to the muted topic and leaves the phase-2 page ceiling.
+#: **Brian's ruling, 2026-09-09 (`alpha-engine-config-I10366`), option (b),
+#: "executed after 2026-09-19".**
+#:
+#: WHY A DATE AND NOT A LABEL, A FLAG OR A FOLLOW-UP PR
+#: ---------------------------------------------------
+#: Phase 2's two live first-attempt Saturdays are **2026-09-12** and
+#: **2026-09-19**. Four `crucible.gate` clauses are being graded across that
+#: window — `live_saturdays_first_attempt_ok`, `replays_ok`,
+#: `pages_within_ceiling`, `pages_commissioned` — and re-reading the last two
+#: mid-window makes the phase-2 exit unauditable: the same store would answer
+#: the same clause differently depending on which day somebody looked, with
+#: nothing in the artifacts saying why.
+#:
+#: The obvious alternatives were each rejected for a named reason:
+#:
+#: * **A `gate:*` label on a draft PR** — the activation then depends on a
+#:   human remembering to come back on 2026-09-20. `~/Development/CLAUDE.md`
+#:   is explicit that a post-merge manual step is not a legitimate form, and
+#:   `alpha-engine-config-I1906` is the recorded instance of exactly that
+#:   shape being closed as *fixed* with the step never performed.
+#: * **An environment variable / feature flag** — same defect wearing a
+#:   configuration hat, plus a second place for the answer to live. The box's
+#:   shell would carry one value and the laptop reading `crucible gate`
+#:   another, and the clause reading would then depend on WHERE it was read.
+#: * **A second PR opened later** — the work would sit unlanded through the
+#:   exact week it is most likely to be forgotten, and the ruling would be
+#:   recorded nowhere executable.
+#:
+#: What a date buys is that the guarantee is **structural**: the code before
+#: this day is provably the code that shipped, and
+#: `tests/test_synthetic_routing_activation.py` asserts that both sides of the
+#: boundary — same store, same rows, one day apart — differ in exactly the two
+#: readings the ruling moves and in nothing else.
+#:
+#: The honest cost, stated rather than hidden: a dated behaviour change is a
+#: scheduled change nobody is standing next to when it fires. It is mitigated
+#: by there being exactly ONE constant (every reader below derives from it,
+#: none carries its own copy), by the post-activation clause detail SAYING it
+#: is active so the flip is visible on the surface it changes, and by the
+#: boundary test. It is not mitigated by anyone remembering.
+SYNTHETIC_ROUTING_ACTIVE_FROM = dt.date(2026, 9, 20)
+
+
+def synthetic_routing_active(*, on: dt.date | dt.datetime | None = None) -> bool:
+    """Whether synthetic pages route to the muted topic and leave the ceiling.
+
+    ``on`` is the moment being asked about — the moment of a send for the
+    routing decision, the moment of the READING for a gate clause. It defaults
+    to today in UTC.
+
+    Deliberately a function of the moment and not of the ROW: the gate clauses
+    grade a whole store at once, so a per-row cutoff would leave the ceiling
+    permanently carrying the exercises that polluted it (it read **6/2** on
+    2026-09-04, and the fault-injection runbook records that as the reason
+    three of four plan §10.7 faults could not be induced for real). One flip,
+    one day, the whole history re-read under one rule.
+    """
+    if on is None:
+        moment = dt.datetime.now(dt.UTC).date()
+    elif isinstance(on, dt.datetime):
+        moment = on.astimezone(dt.UTC).date()
+    else:
+        moment = on
+    return moment >= SYNTHETIC_ROUTING_ACTIVE_FROM

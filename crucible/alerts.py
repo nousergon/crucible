@@ -62,6 +62,7 @@ from crucible.synthetic import (
     SYNTHETIC_SUBJECT_PREFIX,
     args_synthetic_marker,
     manifest_synthetic_marker,
+    synthetic_routing_active,
 )
 
 __all__ = [
@@ -1467,7 +1468,26 @@ def emit(
             keys.append(key)
             continue
         alert_id = _alert_id_for(gp, sweep_run_id)
-        sent, destination = send(gp, alert_id=alert_id, legacy=legacy, transport=transport)
+        # `alpha-engine-config-I10366`, Brian's 2026-09-09 ruling (b): a
+        # DELIBERATE exercise does not wake a human. It is the same
+        # `legacy=True` path the v1 overlap already uses — the muted topic is
+        # env-declared (`CRUCIBLE_MUTED_TOPIC_ARN`), the v2 RuntimeRole is
+        # already granted `sns:Publish` on it, and it carries zero
+        # subscriptions, so the message is a durable record with no delivery.
+        #
+        # This is a DELIVERY decision and nothing else (observability-policy
+        # §7.2a). Below this line the bus row is written exactly as it is for
+        # a real page, with `synthetic` and the real `destination` on it; the
+        # console reads that row; the ceiling metric and the gate can still
+        # count every synthetic page there has ever been. Nothing is dropped
+        # and no suppression collection exists.
+        #
+        # Dated, not flagged: see `crucible.synthetic
+        # .SYNTHETIC_ROUTING_ACTIVE_FROM` for the four phase-2 clauses this
+        # must not move before 2026-09-20 and why a label would not have
+        # guaranteed it.
+        route_legacy = legacy or (bool(gp.synthetic) and synthetic_routing_active(on=moment))
+        sent, destination = send(gp, alert_id=alert_id, legacy=route_legacy, transport=transport)
         row = bus_row(
             gp,
             alert_id=alert_id,
@@ -1531,6 +1551,7 @@ def pages_in_window(
     *,
     now: dt.datetime | None = None,
     window_trading_days: int = CEILING_WINDOW_TRADING_DAYS,
+    exclude_synthetic: bool | None = None,
 ) -> int:
     """How many INCIDENTS were paged over the trailing window.
 
@@ -1550,6 +1571,13 @@ def pages_in_window(
 
     The counting itself is :func:`pages_in_range`; this function only decides
     which trading days the trailing window covers.
+
+    ``exclude_synthetic`` defaults to
+    :func:`crucible.synthetic.synthetic_routing_active` evaluated at ``now``,
+    so the `pages_per_20_trading_days` metric and
+    `crucible.gate._clause_pages_within_ceiling` move together on the same day
+    under the same rule. Two readings of one ceiling that could disagree is
+    the second-contract defect `pages_in_range` was extracted to end.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     end = resolve_trading_day(moment)
@@ -1559,10 +1587,18 @@ def pages_in_window(
     # (see its docstring for why one boundary rule, not two).
     for _ in range(window_trading_days - 1):
         start = previous_trading_day(start)
-    return len(pages_in_range(store, start=start, end=end))
+    if exclude_synthetic is None:
+        exclude_synthetic = synthetic_routing_active(on=moment)
+    return len(pages_in_range(store, start=start, end=end, exclude_synthetic=exclude_synthetic))
 
 
-def pages_in_range(store: Store, *, start: dt.date, end: dt.date) -> list[str]:
+def pages_in_range(
+    store: Store,
+    *,
+    start: dt.date,
+    end: dt.date,
+    exclude_synthetic: bool | None = None,
+) -> list[str]:
     """Every bus row keyed on a day in ``start..end``, INCLUSIVE of both ends.
 
     **The one implementation of "pages over a span".** `crucible.gate`'s
@@ -1579,7 +1615,30 @@ def pages_in_range(store: Store, *, start: dt.date, end: dt.date) -> list[str]:
 
     Keys are parsed through :func:`crucible.keys.parse_bus_key`, never by
     positional index or an arity restated as an integer.
+
+    ``exclude_synthetic`` drops the rows a DELIBERATE exercise wrote — Brian's
+    2026-09-09 ruling (`alpha-engine-config-I10366` (b)): a chaos probe must
+    not spend a production alert budget of two pages a month. It defaults to
+    :func:`crucible.synthetic.synthetic_routing_active` for today, which is
+    False until :data:`crucible.synthetic.SYNTHETIC_ROUTING_ACTIVE_FROM`; pass
+    it explicitly to grade a store either way.
+
+    **The test is the row's own `synthetic` field** — the one
+    `crucible.synthetic` derives from `run_mode` and
+    `fault_capability_class` on the invocation — never a second derivation
+    here from a job name, a reason string or a destination. A second
+    derivation is a second contract, and this one would be the contract that
+    decides whether an incident counts.
+
+    FAILURE MODE SWALLOWED: none. A row that cannot be read, is not an object,
+    or carries no `synthetic` field is **counted**, exactly as it is today.
+    Erring toward "this was real" is the only safe direction for a ceiling —
+    the alternative is an unreadable row quietly leaving the alert budget.
+    RECORDING SURFACE: the returned key list itself (the clause names its
+    evidence keys), and the row is a durable artifact either way.
     """
+    if exclude_synthetic is None:
+        exclude_synthetic = synthetic_routing_active()
     keys: list[str] = []
     for key in store.list_keys(ALERTS_ROOT):
         parsed = parse_bus_key(key)
@@ -1589,9 +1648,26 @@ def pages_in_range(store: Store, *, start: dt.date, end: dt.date) -> list[str]:
             day = dt.date.fromisoformat(parsed[0])
         except ValueError:
             continue
-        if start <= day <= end:
-            keys.append(key)
+        if not (start <= day <= end):
+            continue
+        if exclude_synthetic and _row_is_synthetic(store, key):
+            continue
+        keys.append(key)
     return sorted(keys)
+
+
+def _row_is_synthetic(store: Store, key: str) -> bool:
+    """Did a DELIBERATE exercise write this bus row?
+
+    Read from the row, tolerantly, in the direction that keeps a page in the
+    ceiling: anything this cannot positively establish as synthetic is real.
+    See :func:`pages_in_range` for why that direction and not the other.
+    """
+    read = read_listed_document(store, key)
+    document = read.document
+    if not isinstance(document, dict):
+        return False
+    return bool(document.get("synthetic"))
 
 
 def ceiling_metric(count: int, *, now: dt.datetime) -> dict[str, Any]:
