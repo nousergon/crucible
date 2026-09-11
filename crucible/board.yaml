@@ -78,11 +78,12 @@ objectives:
     reader: null
     artifact: runs/weekly/{trading_day}/run.json
     planned_because: >-
-      The window is read from the run manifests of 2 live plus 5 replayed
+      The window is read from the run manifests of 1 live plus 5 replayed
       Saturdays, and no run has been made under phase-2 conditions yet. Phase 2
-      is alpha-engine-config-I9758; the ruled gate is §6.1's 2 live + 5
-      replayed, NOT §2's superseded "4 consecutive Saturdays". A reader for
-      this row can only be written once a weekly arc has run unattended.
+      is alpha-engine-config-I9758; the ruled gate is §6.1's 1 live + 5
+      replayed (narrowed from 2 live by alpha-engine-config-I10324), NOT §2's
+      superseded "4 consecutive Saturdays". A reader for this row can only be
+      written once a weekly arc has run unattended.
     means_when_red: >-
       The weekly arc has not yet completed the ruled live window unattended.
 
