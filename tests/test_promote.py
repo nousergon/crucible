@@ -32,6 +32,12 @@ from crucible.promote import (
 from crucible.slots import get_slot, is_control_arm
 from crucible.store import LocalStore
 
+#: `alpha-engine-config-I10506`: a real-shaped, non-placeholder sha for
+#: every test that reaches the pointer write — `run_promotion`/
+#: `revert_champion` now REFUSE a missing or all-zero `code_sha` rather than
+#: defaulting to it (see `crucible.promote._require_code_sha`).
+CODE_SHA = "a" * 40
+
 # --------------------------------------------------------------------------
 # Synthetic trading-day series builders.
 # --------------------------------------------------------------------------
@@ -339,6 +345,7 @@ class TestChampionPointer:
             incumbent=ids["champ"],
             store=store,
             manifest_key=f"runs/promote/{dates[-1]}/run.json",
+            code_sha=CODE_SHA,
         )
         pointer = json.loads(store.get_bytes(champion_key("m")))
         assert pointer["arm_id"] == ids["chal"]
@@ -362,6 +369,7 @@ class TestChampionPointer:
             as_of=dates[-1],
             operator="cipher813",
             reason="challenger degraded live",
+            code_sha=CODE_SHA,
         )
         pointer = json.loads(store.get_bytes(champion_key("m")))
         assert pointer["arm_id"] == ids["champ"]
@@ -384,6 +392,93 @@ class TestChampionPointer:
                 operator="cipher813",
                 reason="typo",
             )
+
+
+class TestCodeShaIsRequiredNotDefaulted:
+    """`alpha-engine-config-I10506`: `run_promotion`/`revert_champion` used
+    to default a missing `code_sha` to the all-zero placeholder — and every
+    real invocation WAS missing it (`crucible.cli._promote` never passed
+    one), so every champion pointer this harness ever wrote carried a value
+    that validates the same pattern as a real commit sha and answers
+    nothing. Both now refuse via `crucible.promote._require_code_sha`."""
+
+    def test_run_promotion_refuses_a_missing_code_sha(self, tmp_path) -> None:
+        spec = get_slot("m")
+        dates = trading_days(40)
+        reg, ids = register_with("m", ["champ", "chal"], dates[0])
+        store = LocalStore(tmp_path)
+        with pytest.raises(PromotionRefused, match="code_sha"):
+            run_promotion(
+                spec=spec,
+                as_of=dates[-1],
+                register=reg,
+                series_by_arm={
+                    ids["champ"]: series(ids["champ"], dates, 0.0),
+                    ids["chal"]: series(ids["chal"], dates, 0.045),
+                },
+                incumbent=ids["champ"],
+                store=store,
+                manifest_key=f"runs/promote/{dates[-1]}/run.json",
+            )
+
+    def test_run_promotion_refuses_the_placeholder_code_sha(self, tmp_path) -> None:
+        spec = get_slot("m")
+        dates = trading_days(40)
+        reg, ids = register_with("m", ["champ", "chal"], dates[0])
+        store = LocalStore(tmp_path)
+        with pytest.raises(PromotionRefused, match="code_sha"):
+            run_promotion(
+                spec=spec,
+                as_of=dates[-1],
+                register=reg,
+                series_by_arm={
+                    ids["champ"]: series(ids["champ"], dates, 0.0),
+                    ids["chal"]: series(ids["chal"], dates, 0.045),
+                },
+                incumbent=ids["champ"],
+                store=store,
+                manifest_key=f"runs/promote/{dates[-1]}/run.json",
+                code_sha="0" * 40,
+            )
+
+    def test_revert_champion_refuses_a_missing_code_sha(self, tmp_path) -> None:
+        from crucible.promote import revert_champion
+
+        spec = get_slot("m")
+        dates = trading_days(40)
+        reg, ids = register_with("m", ["champ", "chal"], dates[0])
+        with pytest.raises(PromotionRefused, match="code_sha"):
+            revert_champion(
+                spec=spec,
+                register=reg,
+                store=LocalStore(tmp_path),
+                arm_id=ids["champ"],
+                as_of=dates[-1],
+                operator="cipher813",
+                reason="challenger degraded live",
+            )
+
+    def test_a_promotion_that_never_moves_never_needs_a_code_sha(self, tmp_path) -> None:
+        """The refusal is on the WRITE, not on every call: a cycle that holds
+        never reaches `_write_pointer_if_moved`'s pointer construction, so it
+        must not demand a code_sha it will never use."""
+        spec = narrow(get_slot("m"))
+        dates = trading_days(40)
+        reg, ids = register_with("m", ["champ", "chal"], dates[0])
+        store = LocalStore(tmp_path)
+        result = run_promotion(
+            spec=spec,
+            as_of=dates[-1],
+            register=reg,
+            series_by_arm={
+                ids["champ"]: series(ids["champ"], dates, 0.01),
+                ids["chal"]: series(ids["chal"], dates, 0.0),
+            },
+            incumbent=ids["champ"],
+            store=store,
+            manifest_key=f"runs/promote/{dates[-1]}/run.json",
+        )
+        assert result.decision.moved is False
 
 
 # --------------------------------------------------------------------------
@@ -652,6 +747,7 @@ class TestControlArmsNeverServe:
             series_by_arm=series_by_arm,
             incumbent=ids["real_a"],
             store=store,
+            code_sha=CODE_SHA,
         )
 
         assert result.decision.champion != ids[control]
@@ -681,6 +777,7 @@ class TestControlArmsNeverServe:
             series_by_arm=series_by_arm,
             incumbent=ids["real_a"],
             store=store,
+            code_sha=CODE_SHA,
         ).cycle
 
         assert ids[control] in cycle.decision.ineligible
@@ -704,6 +801,7 @@ class TestControlArmsNeverServe:
             series_by_arm=series_by_arm,
             incumbent=ids["real_a"],
             store=store,
+            code_sha=CODE_SHA,
         ).cycle
 
         assert ids[control] in cycle.scored_arms
@@ -727,6 +825,7 @@ class TestControlArmsNeverServe:
             series_by_arm=series_by_arm,
             incumbent=ids["real_a"],
             store=store,
+            code_sha=CODE_SHA,
             preconditions={
                 ids[control]: (
                     ServingPrecondition(name="behavioural_veto", passed=False, reason="collapsed"),
@@ -860,7 +959,7 @@ class TestIsControlArmIsRegisterBackedAtPromoteCallSites:
             expected=ETAG_ABSENT,
             manifest_key=None,
             run_id=None,
-            code_sha=None,
+            code_sha=CODE_SHA,
             attestation=None,
             now=None,
             register=reg,
@@ -900,7 +999,7 @@ class TestPointerWriteIsConditional:
                 as_of=dates[-1],
                 decided_at="2026-08-28T12:00:00Z",
                 run_id="0" * 26,
-                code_sha="0" * 40,
+                code_sha=CODE_SHA,
                 promotion_source="operator_bootstrap",
                 manifest_key=f"runs/promote/{dates[-1]}/run.json",
                 evidence={"operator": "cipher813", "reason": "concurrent revert"},
@@ -920,6 +1019,7 @@ class TestPointerWriteIsConditional:
                 incumbent=ids["champ"],
                 store=store,
                 pointer_etag=stale,
+                code_sha=CODE_SHA,
             )
 
 

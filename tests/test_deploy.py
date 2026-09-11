@@ -742,6 +742,63 @@ class TestRecord:
         assert "outcome='failure'" in manifest["reason"]
 
 
+class TestAMalformedShaIsRefusedBeforeAnyStep:
+    """`alpha-engine-config-I10506`: `deploy.yml`'s `workflow_dispatch` `sha`
+    input is OPERATOR-TYPED (`inputs.sha || github.sha`), so a malformed
+    value is a real, reachable path. `record` used to paper over it with
+    `_UNKNOWN_SHA` (the all-zero placeholder) rather than refuse; `main` now
+    refuses ANY malformed `--sha` before any of the four steps runs."""
+
+    @pytest.mark.parametrize(
+        "bad_sha",
+        [
+            "0" * 40,  # the placeholder itself
+            "a" * 39,  # too short
+            "a" * 41,  # too long
+            "g" * 40,  # not hex
+            "A" * 40,  # uppercase — the pattern is lowercase-only
+            "not-a-sha-at-all",
+        ],
+    )
+    def test_record_refuses_a_malformed_sha(self, tmp_path, bad_sha: str) -> None:
+        with pytest.raises(SystemExit, match="40-character"):
+            deploy_main(
+                [
+                    "record",
+                    "--sha",
+                    bad_sha,
+                    "--store",
+                    str(tmp_path),
+                    "--outcome",
+                    "success",
+                    "--run-url",
+                    "https://x",
+                ]
+            )
+        assert not (tmp_path / "runs").exists(), (
+            "a refused --sha must not reach any step, and no manifest — placeholder "
+            "or otherwise — is written for it"
+        )
+
+    def test_publish_refuses_a_malformed_sha_before_touching_the_store(self, tmp_path) -> None:
+        with pytest.raises(SystemExit, match="40-character"):
+            deploy_main(
+                [
+                    "publish",
+                    "--sha",
+                    "0" * 40,
+                    "--store",
+                    str(tmp_path),
+                    "--wheel",
+                    str(tmp_path / "does-not-exist.whl"),
+                    "--release-json",
+                    str(tmp_path / "does-not-exist.json"),
+                    "--provenance-json",
+                    str(tmp_path / "does-not-exist.json"),
+                ]
+            )
+
+
 class TestTheWorkflowItself:
     @pytest.fixture
     def workflow(self) -> dict:

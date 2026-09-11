@@ -159,7 +159,7 @@ def _promote(args: argparse.Namespace) -> int:
     import os
 
     from crucible.promote import load_slot_inputs, revert_champion, run_promotion
-    from crucible.runner import run_job
+    from crucible.runner import resolve_code_sha, run_job
     from crucible.slots import get_slot
 
     spec = get_slot(args.slot)
@@ -185,6 +185,15 @@ def _promote(args: argparse.Namespace) -> int:
 
     def job(ctx) -> None:
         as_of = ctx.trading_day.isoformat()
+        # `alpha-engine-config-I10506`: neither call below used to receive a
+        # `code_sha` at all, so `crucible.promote`'s own `code_sha or "0" * 40`
+        # fallback fired on EVERY real invocation and every champion pointer
+        # this harness ever wrote carried the placeholder. `run_job` already
+        # resolves the same value for THIS run's own manifest
+        # (`crucible.runner.resolve_code_sha`, before `job(ctx)` runs — so a
+        # box that cannot measure it never reaches here at all); resolved a
+        # second time here because `RunContext` does not carry it.
+        code_sha = resolve_code_sha()
         if revert_to:
             pointer = revert_champion(
                 spec=spec,
@@ -196,6 +205,7 @@ def _promote(args: argparse.Namespace) -> int:
                 reason=args.reason,
                 manifest_key=_promote_manifest_key("promote", as_of),
                 run_id=ctx.run_id,
+                code_sha=code_sha,
             )
             _record_written(ctx, store, (champion_key(pointer.slot),))
             return
@@ -210,6 +220,7 @@ def _promote(args: argparse.Namespace) -> int:
             store=None if args.dry_run else store,
             manifest_key=_promote_manifest_key("promote", as_of),
             run_id=ctx.run_id,
+            code_sha=code_sha,
         )
         if args.dry_run:
             # `run_promotion(store=None)` already wrote nothing (promote.py's
@@ -869,6 +880,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     and the original exception is chained.
     """
     args = build_parser().parse_args(argv)
+    try:
+        return _resolve_operator_input(args)
+    except UsageError as exc:
+        # Root cause (`alpha-engine-config-I10517`): `UsageError` is a
+        # `SystemExit` subclass constructed with an INT `.code`. Python's own
+        # top-level handling of an uncaught `SystemExit` only prints
+        # something when `.code` is a *string* -- an int code (which this
+        # class always carries) exits silently, so `exc.message`/`__str__`
+        # were never reaching stderr on the installed console script. `main`
+        # is the entry point named in `pyproject.toml`
+        # (`crucible = "crucible.cli:main"`), so catching and printing here,
+        # rather than relying on whatever wraps `main`, fixes every caller at
+        # once instead of only `python -m crucible.cli`.
+        print(str(exc), file=sys.stderr)
+        return USAGE_EXIT_CODE
+
+
+def _resolve_operator_input(args: argparse.Namespace) -> int:
+    """The OPERATOR-INPUT validations, resolved before any handler runs.
+
+    Split out of :func:`main` so `main` itself can be the single place that
+    converts a raised :class:`UsageError` into stderr output plus an exit
+    code -- see `main`'s own `except UsageError` clause.
+    """
     try:
         args.trading_day = resolve_date(getattr(args, "date", None))
         # Resolved once, here, so every handler passes the SAME value to

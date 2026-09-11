@@ -41,7 +41,7 @@ def _payload(**overrides: object) -> dict[str, object]:
         "as_of": DAY,
         "decided_at": "2026-08-29T02:00:00Z",
         "run_id": "01JG0000000000000000000000",
-        "code_sha": "0" * 40,
+        "code_sha": "a" * 40,
         "promotion_source": "evidence",
         "manifest_key": f"runs/promote/{DAY}/run.json",
         "evidence": {"status": "decided", "moved": True, "paired_dates": 40},
@@ -108,6 +108,34 @@ class TestAMalformedPointerNamesTheField:
     def test_from_dict_raises_champion_unusable_error_naming_the_field(self) -> None:
         with pytest.raises(ChampionUnusableError, match="run_id"):
             ChampionPointer.from_dict(_payload(run_id="not-a-ulid"))
+
+    def test_the_all_zero_placeholder_code_sha_is_refused(self) -> None:
+        """`alpha-engine-config-I10506`: same defect, same shape as
+        `RunManifestV2._code_sha_is_not_the_placeholder`
+        (`alpha-engine-config-I10454`) — the all-zero sha validates
+        `code_sha`'s own `pattern` and answers nothing."""
+        with pytest.raises(ValidationError, match="placeholder"):
+            ChampionPointerDocument.model_validate(_payload(code_sha="0" * 40))
+
+    def test_from_dict_refuses_the_placeholder_code_sha_too(self) -> None:
+        with pytest.raises(ChampionUnusableError, match="placeholder"):
+            ChampionPointer.from_dict(_payload(code_sha="0" * 40))
+
+
+class TestCommittedSchemaRefusesThePlaceholderCodeSha:
+    """The published `not` clause `_champion_pointer_json_schema_extra`
+    mirrors into `champion_pointer.v1.json`, exercised with the plain
+    `jsonschema` validator so a consumer with no Python import is proven to
+    get the same refusal a `ChampionPointerDocument.model_validate` caller
+    gets."""
+
+    def test_the_committed_schema_rejects_the_placeholder_via_plain_jsonschema(self) -> None:
+        from jsonschema import ValidationError as JsonSchemaValidationError
+
+        with pytest.raises(JsonSchemaValidationError):
+            Draft202012Validator(json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))).validate(
+                _payload(code_sha="0" * 40)
+            )
 
 
 class TestEvidenceRoundTripsExactlyNotPaddedWithNulls:

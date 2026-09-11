@@ -243,6 +243,39 @@ class TestDateResolution:
             resolve_date(bad)
 
 
+class TestUsageErrorReachesStderr:
+    """`alpha-engine-config-I10517`: `UsageError` is a `SystemExit` subclass
+    constructed with an INT `.code`. Python's own uncaught-`SystemExit`
+    handling only prints something when `.code` is a *string*, so the
+    message never reached the console script's stderr -- only `main`'s
+    return value (an int, silently swallowed by the interpreter) carried the
+    exit code. `main` must print the message itself before returning.
+    """
+
+    def test_a_missing_run_mode_prints_to_stderr_and_exits_two(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.delenv("CRUCIBLE_RUN_MODE", raising=False)
+        code = main(["experiment.new", "--slot", "r", "--arm", "arm_abc"])
+        assert code == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "live" in captured.err
+        assert "replay" in captured.err
+
+    def test_missing_gate_env_prints_to_stderr_and_exits_two(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.delenv("CRUCIBLE_CLOUDTRAIL_ARCHIVE", raising=False)
+        monkeypatch.delenv("CRUCIBLE_MUTED_TOPIC", raising=False)
+        monkeypatch.setenv("CRUCIBLE_RUN_MODE", "live")
+        code = main(["gate", "--gate", "phase2", "--store", "/tmp/does-not-matter"])
+        assert code == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "refuses to read" in captured.err
+
+
 class TestPageConditions:
     def test_there_are_exactly_two(self) -> None:
         assert PAGE_CONDITIONS == ("absence", "failure")

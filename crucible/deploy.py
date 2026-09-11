@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -64,7 +65,11 @@ from crucible.store import PointerConflictError, Store, open_store, sha256_hex
 
 __all__ = ["main"]
 
-_UNKNOWN_SHA = "0" * 40
+#: `alpha-engine-config-I10506`: same value, same reasoning as
+#: `crucible.runner._REAL_SHA_RE`'s excluded case — a producer that cannot
+#: measure a real sha refuses rather than substitutes a value that
+#: validates the same pattern as a real commit sha and answers nothing.
+_REAL_SHA_RE = re.compile(r"^(?!0{40}$)[0-9a-f]{40}$")
 
 
 def _required_smoke_extras() -> frozenset[str]:
@@ -410,8 +415,12 @@ def _record(args: argparse.Namespace, store: Store) -> int:
         "reason": reason,
         "started": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "finished": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "code_sha": args.sha if len(args.sha) == 40 else _UNKNOWN_SHA,
-        "release_sha": args.sha if len(args.sha) == 40 else _UNKNOWN_SHA,
+        # `main` refuses a malformed `--sha` before any step runs (repo rule 5,
+        # `alpha-engine-config-I10506`), so by the time this dict is built
+        # `args.sha` is always a real 40-character lowercase git sha — never
+        # the all-zero placeholder that used to be substituted here.
+        "code_sha": args.sha,
+        "release_sha": args.sha,
         "seed": int(trading_day.strftime("%Y%m%d")),
         "inputs": [],
         "outputs": [],
@@ -508,6 +517,20 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--run-mode", choices=list(RUN_MODES), default=None)
 
     args = parser.parse_args(argv)
+    # `alpha-engine-config-I10506`: `--sha` is OPERATOR-TYPED on
+    # `deploy.yml`'s `workflow_dispatch` (`inputs.sha || github.sha`), so a
+    # malformed value here is a real, reachable path -- refused once, before
+    # ANY step runs, rather than let it reach `record`'s manifest as the
+    # all-zero placeholder that used to validate and answer nothing, or
+    # surface as an unhandled `ValueError` out of `_run_id_from`'s own hex
+    # parse.
+    if not _REAL_SHA_RE.match(args.sha):
+        raise SystemExit(
+            f"--sha={args.sha!r} is not a real 40-character lowercase git sha (or is "
+            "the all-zero placeholder). A malformed sha cannot be written as "
+            "code_sha/release_sha (repo rule 5): fix the invocation rather than "
+            "letting this substitute a placeholder that answers nothing."
+        )
     store = open_store(args.store)
     return {"publish": _publish, "capture": _capture, "flip": _flip, "record": _record}[args.step](
         args, store
