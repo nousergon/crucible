@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nousergon.dev/crucible/schemas/portfolio_construction.v1.json",
+  "title": "portfolio_construction.v1",
+  "description": "Evidence that `crucible.portfolio` constructed the book a grade was taken over, and the cost model that priced it. Rides on the grading run's manifest as a MetricRecord payload; a phase-3 clause reads it there. Self-describing on purpose: it carries the full parameter set INLINE beside the digest, so a reader whose digest no longer resolves still has every value the book was built on.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "trading_day",
+    "arm_id",
+    "engine",
+    "cost_model",
+    "params",
+    "params_digest",
+    "components",
+    "sessions",
+    "turnover_one_way_total",
+    "cost_bps_total",
+    "solver_status"
+  ],
+  "properties": {
+    "schema_version": {"const": "portfolio_construction.v1"},
+    "trading_day": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "description": "NYSE trading day the construction is keyed to."
+    },
+    "arm_id": {
+      "type": "string",
+      "pattern": "^[a-z]:[A-Za-z0-9_.-]+:[0-9a-f]+$"
+    },
+    "engine": {
+      "const": "crucible.portfolio",
+      "description": "The module that built the book. A constant rather than free text: this field is what a gate clause matches on, and a field that could say anything can say nothing."
+    },
+    "cost_model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind", "placeholder", "params"],
+      "description": "The model IN FORCE, by name and by every parameter it read. Recorded on every run that applies costs, so a grade can never be read without knowing what it was charged, and a stand-in can never be mistaken for the configured model.",
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["flat", "sqrt_impact"]},
+        "placeholder": {
+          "type": "boolean",
+          "description": "True when the model is a declared stand-in. Required rather than inferred from the name: a verdict graded against a stand-in must say so on its face."
+        },
+        "params": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {"type": "number"}
+        }
+      }
+    },
+    "params": {
+      "type": "object",
+      "minProperties": 1,
+      "description": "The portfolio parameter set the book was constructed under, in full. Values are strategy edge and originate in the private strategy tree; they are recorded HERE because a verdict whose construction parameters are only referenced is not reproducible once the reference moves.",
+      "additionalProperties": {"type": ["number", "string", "boolean", "null"]}
+    },
+    "params_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "Digest over `params`. A cheap equality test across runs — never the only copy of the values, so a digest whose source has been retuned strands no reader."
+    },
+    "components": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mvo", "turnover_governor", "cost_model", "adv_cap"],
+      "description": "The four named components, each recorded as applied or not WITH A REASON. A component absent from an artifact is indistinguishable from one that never ran; all four are always present.",
+      "properties": {
+        "mvo": {"$ref": "#/$defs/Component"},
+        "turnover_governor": {"$ref": "#/$defs/Component"},
+        "cost_model": {"$ref": "#/$defs/Component"},
+        "adv_cap": {"$ref": "#/$defs/Component"}
+      }
+    },
+    "sessions": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Trading sessions the book spans. Zero is not expressible: a construction over no session produced no evidence and must not be recorded as though it had."
+    },
+    "turnover_one_way_total": {"type": "number", "minimum": 0},
+    "cost_bps_total": {"type": "number", "minimum": 0},
+    "solver_status": {"type": "string", "minLength": 1}
+  },
+  "$defs": {
+    "Component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["applied", "reason"],
+      "properties": {
+        "applied": {"type": "boolean"},
+        "reason": {
+          "anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
+          "description": "Why the component is in the state it is. Null only when applied is true and the reason is simply that it was configured on."
+        }
+      }
+    }
+  }
+}

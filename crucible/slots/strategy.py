@@ -40,28 +40,41 @@ trader switched off.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import yaml
 from nousergon_lib.arena import ArmSeries, derive_arm_id
 
+from crucible.portfolio import (
+    CostModel,
+    CostModelInputError,
+    PortfolioParams,
+    cost_model_from_mapping,
+    portfolio_evidence,
+    solve_target_weights,
+)
 from crucible.slots.vocab import refuse_unknown_keys
 
 __all__ = [
     "ATTESTATION_STATUSES",
     "EXIT_RULES",
     "Book",
+    "BookUniverse",
+    "ConstructedBook",
     "CostModel",
     "ExitRuleSpec",
     "PitParityVerdict",
+    "SessionInputs",
     "StrategyGrade",
     "StrategyRecipe",
     "WalkForwardFold",
     "WalkForwardSpec",
     "build_walk_forward_folds",
+    "construct_book",
     "grade_arm",
     "load_strategy_recipes",
     "pit_parity",
@@ -128,48 +141,6 @@ class ExitRuleSpec:
 
     def to_dict(self) -> dict[str, Any]:
         return {"rule_id": self.rule_id, "params": dict(self.params)}
-
-
-@dataclass(frozen=True)
-class CostModel:
-    """The cost model a grade is net of. NAMED in the arm file, never here.
-
-    ``placeholder`` is a required field rather than an inference from the
-    name: §10.2's real model lands in phase 3, and a verdict graded against a
-    stand-in must say so on its face. A card that hid it would read as a
-    net-of-cost result the day it was not one.
-    """
-
-    name: str
-    placeholder: bool
-    params: dict[str, float]
-
-    def __post_init__(self) -> None:
-        if not self.name:
-            raise ValueError("a cost model must be named; an anonymous cost is unreproducible")
-        missing = sorted({"half_spread_bps", "commission_bps", "slippage_bps"} - set(self.params))
-        if missing:
-            raise ValueError(
-                f"cost model {self.name!r} is missing constant(s) {missing}. A grade net "
-                "of a partially declared cost is not reproducible from the recipe."
-            )
-
-    def bps_per_unit_turnover(self) -> float:
-        """Round-trip cost in basis points per unit of turnover.
-
-        A flat model on purpose: §10.2's square-root market-impact term needs
-        an ADV series the harness does not carry until phase 3, and a
-        half-implemented impact model would be worse than a declared flat one
-        because its number would look like an impact estimate.
-        """
-        return (
-            2.0 * float(self.params["half_spread_bps"])
-            + float(self.params["commission_bps"])
-            + float(self.params["slippage_bps"])
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "placeholder": self.placeholder, "params": dict(self.params)}
 
 
 @dataclass(frozen=True)
@@ -319,7 +290,6 @@ def load_strategy_recipes(directory: Path | str) -> tuple[StrategyRecipe, ...]:
             level="spec",
             slot_label="S",
         )
-        cost = spec["cost_model"]
         recipes.append(
             StrategyRecipe(
                 slot=payload.get("slot", "s"),
@@ -328,11 +298,7 @@ def load_strategy_recipes(directory: Path | str) -> tuple[StrategyRecipe, ...]:
                     ExitRuleSpec(rule_id=r["rule_id"], params=dict(r.get("params") or {}))
                     for r in spec["rules"]
                 ),
-                cost_model=CostModel(
-                    name=cost["name"],
-                    placeholder=bool(cost["placeholder"]),
-                    params={k: float(v) for k, v in (cost.get("params") or {}).items()},
-                ),
+                cost_model=cost_model_from_mapping(spec["cost_model"], source=str(path)),
                 walk_forward=WalkForwardSpec(**(spec.get("walk_forward") or {})),
                 benchmark=spec.get("benchmark", "SPY"),
                 supersedes=payload.get("supersedes"),
@@ -696,18 +662,33 @@ def render_verdict(
     as_of: str,
     alpha_vs_spy: float,
     attestation: dict[str, Any] | None,
+    cost_model: dict[str, Any],
 ) -> dict[str, Any]:
     """The S-slot verdict card. **No attestation PASS, no grade.**
 
     Plan §9.1: "a card without `attestation: PASS` renders UNVERIFIED, never
     a grade." The grade key is OMITTED rather than set alongside a caveat: a
     number rendered beside a warning is a number people quote.
+
+    ``cost_model`` is REQUIRED, and it is rendered on the card whether or not
+    the card carries a grade. A net-of-cost number is a claim about what was
+    charged, and a card able to make that claim without stating the model is
+    the shape in which an optimizer once ran on a cost model nobody configured
+    and nothing said so (`alpha-engine-config-I10503`, precedent `-I6902`). A
+    card whose model is a declared stand-in says `placeholder: true` on its
+    face, where a reader cannot miss it.
     """
+    if not cost_model or "name" not in cost_model:
+        raise ValueError(
+            "a verdict card must name the cost model its grade is net of; got "
+            f"{cost_model!r}. Use `StrategyGrade.cost_model`."
+        )
     status = (attestation or {}).get("status")
     card: dict[str, Any] = {
         "arm_id": arm_id,
         "as_of": as_of,
         "attestation": attestation,
+        "cost_model": dict(cost_model),
     }
     if status != "PASS":
         card["rendered"] = "UNVERIFIED"
@@ -730,10 +711,18 @@ def render_verdict(
 class Book:
     """One arm's realized daily book, already reduced to per-date returns.
 
-    ``turnover`` is the fraction of the book traded on that date; it is what
-    the cost model prices. It is a required field rather than an optional one
+    ``turnover`` is the fraction of the book traded on that date; it is what a
+    flat cost model prices. It is a required field rather than an optional one
     because a cost model applied to an assumed turnover would produce a
     net-of-cost number whose cost nobody supplied.
+
+    ``cost_bps`` is the per-date realized cost, in basis points of the book, as
+    priced by the model the recipe names. It is present when the book was built
+    by :func:`construct_book` and absent when the caller reduced a book by some
+    other route. A PARTICIPATION-AWARE model cannot be applied to a book that
+    omits it: a square-root cost depends on the size of each name's trade
+    against that name's volume, and turnover alone does not carry either — so
+    :func:`grade_arm` refuses rather than averaging the difference away.
     """
 
     dates: tuple[str, ...]
@@ -741,10 +730,14 @@ class Book:
     benchmark_returns: tuple[float, ...]
     turnover: tuple[float, ...]
     benchmark_symbol: str = "SPY"
+    cost_bps: tuple[float, ...] | None = None
 
     def __post_init__(self) -> None:
         n = len(self.dates)
-        for name in ("portfolio_returns", "benchmark_returns", "turnover"):
+        series = ["portfolio_returns", "benchmark_returns", "turnover"]
+        if self.cost_bps is not None:
+            series.append("cost_bps")
+        for name in series:
             if len(getattr(self, name)) != n:
                 raise ValueError(
                     f"Book.{name} has {len(getattr(self, name))} entries for {n} dates; "
@@ -753,14 +746,206 @@ class Book:
 
 
 @dataclass(frozen=True)
+class BookUniverse:
+    """The names a book is constructed over, and the two sentinel positions.
+
+    Frozen and separate from the per-session inputs because it does not move
+    between sessions: a universe that changed shape mid-walk would make every
+    weight vector in the walk a different object, and the turnover between two
+    of them meaningless.
+    """
+
+    tickers: tuple[str, ...]
+    sectors: tuple[str, ...]
+    benchmark_idx: int
+    cash_idx: int
+
+    def __post_init__(self) -> None:
+        if len(self.tickers) != len(self.sectors):
+            raise ValueError(
+                f"{len(self.tickers)} tickers against {len(self.sectors)} sector labels; "
+                "one sector per name"
+            )
+
+
+@dataclass(frozen=True)
+class SessionInputs:
+    """One session's point-in-time inputs to portfolio construction.
+
+    Every array is as of the session's open and the realized returns are the
+    session's own. Nothing here reaches forward: the walk-forward geometry and
+    the contamination attestation are what police that, and a caller that
+    hands this a forward-looking alpha has produced a contaminated grade that
+    :func:`pit_parity` exists to catch.
+    """
+
+    trading_day: str
+    alpha_hat: np.ndarray
+    eligibility: np.ndarray
+    stance_caps: np.ndarray
+    realized_returns: np.ndarray
+    benchmark_return: float
+    returns_panel: np.ndarray | None = None
+    covariance: np.ndarray | None = None
+    adv_usd: np.ndarray | None = None
+    name_sigma: np.ndarray | None = None
+    alpha_uncertainty: np.ndarray | None = None
+    alpha_uncertainty_epistemic: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class ConstructedBook:
+    """A book built by `crucible.portfolio`, with the evidence that it was.
+
+    ``evidence`` is the `portfolio_construction.v1` document — the record a
+    phase-3 clause reads off the grading run's manifest. It is produced HERE,
+    beside the construction, rather than assembled later from diagnostics by a
+    reporting layer: a record built by a second party is a record that can
+    describe a run that did not happen.
+    """
+
+    book: Book
+    evidence: dict[str, Any]
+    weights: tuple[tuple[float, ...], ...]
+    diagnostics: tuple[dict[str, Any], ...]
+
+
+def construct_book(
+    *,
+    recipe: StrategyRecipe,
+    params: PortfolioParams,
+    universe: BookUniverse,
+    sessions: Sequence[SessionInputs],
+    portfolio_notional: float,
+    w_initial: np.ndarray,
+) -> ConstructedBook:
+    """Walk ``sessions``, solving the portfolio each one, and reduce to a Book.
+
+    This is `crucible.portfolio` used by S-slot grading, and it is the only
+    route by which an S arm's book is built. Per session: solve the constrained
+    MVO from the previous session's weights, price the realized trades with the
+    model the recipe NAMES, and take the session's book return as the solved
+    weights against the session's realized returns.
+
+    The cost is priced from the actual weight deltas rather than from the
+    turnover scalar, because a participation-aware model needs to know which
+    names moved and by how much. That per-date cost travels on the
+    :class:`Book`, so the number the grade subtracts is the number the engine
+    charged — not a second estimate of it computed downstream from a summary.
+
+    Raises rather than degrading on every input the named cost model cannot
+    price. Grading is offline and the caller owns every input.
+    """
+    if not sessions:
+        raise ValueError(
+            f"arm {recipe.name!r}: no sessions to construct a book over. An empty walk "
+            "produces no evidence, and recording it as a grade of zero sessions would "
+            "put a number on a comparison that never happened."
+        )
+    if not (float(portfolio_notional) > 0.0):
+        raise ValueError(
+            f"portfolio_notional must be positive; got {portfolio_notional!r}. Weight "
+            "deltas become trade sizes only against a book size."
+        )
+    n_names = len(universe.tickers)
+    w_prev = np.asarray(w_initial, dtype=np.float64).ravel()
+    if w_prev.shape != (n_names,):
+        raise ValueError(f"w_initial shape {w_prev.shape} != ({n_names},)")
+
+    dates: list[str] = []
+    portfolio_returns: list[float] = []
+    benchmark_returns: list[float] = []
+    turnover: list[float] = []
+    cost_bps: list[float] = []
+    all_weights: list[tuple[float, ...]] = []
+    all_diagnostics: list[dict[str, Any]] = []
+
+    for session in sessions:
+        result = solve_target_weights(
+            list(universe.tickers),
+            np.asarray(session.alpha_hat, dtype=np.float64),
+            session.returns_panel,
+            w_prev,
+            list(universe.sectors),
+            np.asarray(session.stance_caps, dtype=np.float64),
+            np.asarray(session.eligibility, dtype=bool),
+            universe.benchmark_idx,
+            universe.cash_idx,
+            params,
+            recipe.cost_model,
+            alpha_uncertainty=session.alpha_uncertainty,
+            alpha_uncertainty_epistemic=session.alpha_uncertainty_epistemic,
+            covariance=session.covariance,
+            adv_usd=session.adv_usd,
+            portfolio_notional=portfolio_notional,
+            name_sigma=session.name_sigma,
+        )
+        weights = np.asarray(result.weights, dtype=np.float64)
+        delta = weights - w_prev
+        realized = np.asarray(session.realized_returns, dtype=np.float64)
+        if realized.shape != (n_names,):
+            raise ValueError(
+                f"{session.trading_day}: realized_returns shape {realized.shape} != ({n_names},)"
+            )
+        dates.append(session.trading_day)
+        portfolio_returns.append(float(weights @ realized))
+        benchmark_returns.append(float(session.benchmark_return))
+        turnover.append(float(np.sum(np.abs(delta)) / 2))
+        cost_bps.append(
+            recipe.cost_model.cost_bps_for_trades(
+                weight_deltas=delta,
+                adv_usd=session.adv_usd,
+                portfolio_notional=portfolio_notional,
+                name_sigma=session.name_sigma,
+            )
+        )
+        all_weights.append(tuple(float(x) for x in weights))
+        all_diagnostics.append(result.diagnostics)
+        w_prev = weights
+
+    book = Book(
+        dates=tuple(dates),
+        portfolio_returns=tuple(portfolio_returns),
+        benchmark_returns=tuple(benchmark_returns),
+        turnover=tuple(turnover),
+        benchmark_symbol=recipe.benchmark,
+        cost_bps=tuple(cost_bps),
+    )
+    evidence = portfolio_evidence(
+        trading_day=dates[-1],
+        arm_id=recipe.arm_id,
+        params=params,
+        cost_model=recipe.cost_model,
+        diagnostics=all_diagnostics[-1],
+        sessions=len(dates),
+        turnover_one_way_total=float(sum(turnover)),
+        cost_bps_total=float(sum(cost_bps)),
+    )
+    return ConstructedBook(
+        book=book,
+        evidence=evidence,
+        weights=tuple(all_weights),
+        diagnostics=tuple(all_diagnostics),
+    )
+
+
+@dataclass(frozen=True)
 class StrategyGrade:
-    """One S arm's cycle grade: the market-relative series, net of cost."""
+    """One S arm's cycle grade: the market-relative series, net of cost.
+
+    ``cost_model`` is the full record of the model in force — name, kind,
+    placeholder flag and every parameter. It travels with the grade rather
+    than being looked up beside it, because a grade and the cost that produced
+    it become separable the moment they live in two places, and a net-of-cost
+    number whose cost model is a lookup away is one that gets quoted without it.
+    """
 
     series: ArmSeries
     benchmark: str
     cost_model_name: str
     cost_model_is_placeholder: bool
     total_cost_bps: float
+    cost_model: dict[str, Any]
 
 
 def grade_arm(
@@ -770,32 +955,54 @@ def grade_arm(
     as_of: str,
     apply_costs: bool = True,
 ) -> StrategyGrade:
-    """Score ``recipe`` per trading day: portfolio return minus SPY, net of cost.
+    """Score ``recipe`` per trading day: portfolio return minus the benchmark, net of cost.
 
     ``apply_costs=False`` exists for the one comparison that needs it — the
-    gross-vs-net delta on the verdict card — and is never the production
-    path: a gross grade promoted an arm on turnover it never paid for.
+    gross-versus-net delta on the verdict card — and is never the production
+    path: a gross grade promotes an arm on turnover it never paid for.
+
+    Where the book carries a per-date ``cost_bps``, that is what is charged:
+    the engine priced the realized trades and re-deriving the number here from
+    a turnover summary would produce a second, quieter estimate of it. Where it
+    does not, a FLAT model is charged at its round-trip rate against the day's
+    turnover, and a participation-aware model REFUSES — its cost is not a
+    function of turnover alone and pretending otherwise is the substitution
+    this whole path exists to make impossible.
     """
     if book.benchmark_symbol != recipe.benchmark:
         raise ValueError(
             f"arm {recipe.name!r} declares benchmark {recipe.benchmark!r} and the book "
             f"carries {book.benchmark_symbol!r}. Grading against a benchmark the recipe "
-            "did not declare is how a selection stage was graded against SPY on "
-            "2026-08-17, inverting wins and losses outright."
+            "did not declare inverts wins and losses outright."
         )
-    rate = recipe.cost_model.bps_per_unit_turnover() * BASIS_POINT if apply_costs else 0.0
+    if apply_costs and book.cost_bps is None and recipe.cost_model.kind != "flat":
+        raise CostModelInputError(
+            f"arm {recipe.name!r} names cost model {recipe.cost_model.name!r}, which "
+            "prices participation, but the book carries no per-date cost. Build the "
+            "book with `construct_book` so the engine prices the realized trades, or "
+            "name a flat model in the recipe — a participation-aware cost cannot be "
+            "recovered from turnover alone, and charging a flat rate instead would "
+            "grade the arm under a model its recipe does not name."
+        )
     scores: dict[str, float] = {}
     total_cost = 0.0
-    for day, port, bench, turn in zip(
-        book.dates,
-        book.portfolio_returns,
-        book.benchmark_returns,
-        book.turnover,
-        strict=True,
+    for index, (day, port, bench, turn) in enumerate(
+        zip(
+            book.dates,
+            book.portfolio_returns,
+            book.benchmark_returns,
+            book.turnover,
+            strict=True,
+        )
     ):
         if day > as_of:
             continue
-        cost = rate * float(turn)
+        if not apply_costs:
+            cost = 0.0
+        elif book.cost_bps is not None:
+            cost = float(book.cost_bps[index]) * BASIS_POINT
+        else:
+            cost = recipe.cost_model.bps_per_unit_turnover() * BASIS_POINT * float(turn)
         total_cost += cost
         scores[day] = float(port) - float(bench) - cost
     return StrategyGrade(
@@ -804,4 +1011,5 @@ def grade_arm(
         cost_model_name=recipe.cost_model.name,
         cost_model_is_placeholder=recipe.cost_model.placeholder,
         total_cost_bps=total_cost / BASIS_POINT,
+        cost_model=recipe.cost_model.record(),
     )

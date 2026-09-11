@@ -42,8 +42,10 @@ from nousergon_lib.arena import ArmRegister
 from nousergon_lib.arena.engine import ArenaConfig
 
 __all__ = [
+    "COST_MODELS",
     "ESTIMATOR_KINDS",
     "EXIT_RULES",
+    "PORTFOLIO_PARAM_FIELDS",
     "REQUIRED_ARM_FIELDS",
     "REQUIRED_RECIPE_FIELDS",
     "SLOTS",
@@ -58,6 +60,7 @@ __all__ = [
     "get_slot",
     "is_control_arm",
     "load_arm_specs",
+    "load_portfolio_params",
     "load_model_recipes",
     "load_strategy_recipes",
     "promotable_arms",
@@ -352,6 +355,11 @@ def promotable_arms(
 # would be circular.
 # ---------------------------------------------------------------------------
 
+from crucible.portfolio import (  # noqa: E402
+    COST_MODELS,
+    PORTFOLIO_PARAM_FIELDS,
+    load_portfolio_params,
+)
 from crucible.slots.arms import REQUIRED_ARM_FIELDS, load_arm_specs  # noqa: E402
 from crucible.slots.model import _ESTIMATORS as _MODEL_ESTIMATOR_KINDS  # noqa: E402
 from crucible.slots.model import (  # noqa: E402

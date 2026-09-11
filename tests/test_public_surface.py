@@ -16,6 +16,7 @@ Normative source: `alpha-engine-config-I9766` deliverable 1; plan §4.11,
 
 from __future__ import annotations
 
+import crucible.portfolio as portfolio_module
 import crucible.slots as slots
 from crucible.slots import arms as arms_module
 from crucible.slots import model as model_module
@@ -70,3 +71,28 @@ def test_the_loaders_are_exported_for_a_consumer_that_only_has_a_directory() -> 
     assert slots.load_model_recipes is model_module.load_model_recipes
     assert slots.load_strategy_recipes is strategy_module.load_strategy_recipes
     assert slots.load_arm_specs is arms_module.load_arm_specs
+
+
+def test_the_portfolio_registries_are_exported_for_the_strategy_tree_to_validate_against() -> None:
+    """`alpha-engine-config-I10500` / `-I10503`. The private strategy tree files
+    a cost-model NAME and a portfolio parameter set; both are checked against
+    registries that live here, and a consumer must import them rather than
+    restate them — a registry restated in a second repository is a contract
+    restated twice, and one of them drifts.
+
+    Identity, not equality: a re-export that COPIES would pass every value
+    assertion on the day it was written and diverge the first time a model or a
+    field was added.
+    """
+    assert slots.COST_MODELS is portfolio_module.COST_MODELS
+    assert slots.PORTFOLIO_PARAM_FIELDS is portfolio_module.PORTFOLIO_PARAM_FIELDS
+    assert slots.load_portfolio_params is portfolio_module.load_portfolio_params
+
+
+def test_an_unregistered_cost_model_is_refused_by_the_exported_registry() -> None:
+    """The registry the strategy tree validates against is the one actually
+    enforced, not a second list that resembles it."""
+    import pytest
+
+    with pytest.raises(portfolio_module.CostModelError, match="unknown cost model"):
+        portfolio_module.CostModel(name="not_a_real_model", placeholder=False, params={})
