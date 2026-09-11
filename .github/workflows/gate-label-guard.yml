@@ -1,0 +1,126 @@
+name: Gate Label Guard
+
+# Ported from `nousergon/alpha-engine-config`'s `.github/workflows/gate-label-guard.yml`
+# (alpha-engine-config-I10128 deliverable 2) — that file is the fleet's reference
+# implementation and this is a port, not a new design; see it for the fuller
+# history (inlined 2026-07-24 after the reusable-workflow pattern
+# `startup_failure`'d, predicate validation added config#5249).
+#
+# Inline structural check: fails while ANY gate:* label is attached to the PR.
+# NOT a required status check on this repo's `main-protection` ruleset — the
+# ruleset's own `required_status_checks` names only `lint + foundation tests`
+# (verified 2026-09-11: `gh api repos/nousergon/crucible/rulesets/22145084`).
+# `gate-taxonomy-policy.md` §4: gate-label-guard is advisory, never required
+# (`auto-merge-policy.md` §2 Gate A) — a required gate-label-guard would block
+# merging the PR that removes the very label putting it in draft.
+#
+# The eleven `gate:*` families plus `complexity:*` were created on this repo
+# 2026-09-11 (alpha-engine-config-I10128 deliverable 1); this workflow is what
+# makes an ungated blocked crucible PR a finding rather than a silent
+# convention, per that issue's deliverable 2.
+
+on:
+  pull_request:
+    types: [opened, reopened, labeled, unlabeled, ready_for_review, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Same reasoning as ci.yml's group: a superseded run is cancelled, not
+  # completed, and a push onto a branch whose previous run is still going
+  # produces a result nobody will read.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate-label-guard:
+    name: gate-label-guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate predicate format (gate:weekly-sf / gate:preopen-sf / gate:postclose-sf / gate:data)
+        run: |
+          set -euo pipefail
+
+          # Read labels and body from GITHUB_EVENT_PATH — the runner's on-disk
+          # event file. Never toJson(github.event) in env: — hits expression-
+          # eval limits.
+
+          jq -r '.pull_request.labels[].name' "$GITHUB_EVENT_PATH" > /tmp/pr_labels.txt || true
+          PR_BODY=$(jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH")
+
+          # Detect which gate label family is present, including date-qualified
+          # names (config-I4444: gate:weekly-sf:2026-07-25).
+          HAS_SF=$(grep -cE '^gate:(weekly-sf|preopen-sf|postclose-sf)(:|$)' /tmp/pr_labels.txt || true)
+          HAS_DATA=$(grep -cE '^gate:data(:|$)' /tmp/pr_labels.txt || true)
+
+          if [ "$HAS_SF" -eq 0 ] && [ "$HAS_DATA" -eq 0 ]; then
+            # No predicate-requiring label — skip validation.
+            exit 0
+          fi
+
+          # gate:*-sf uses Verified-when:; gate:data uses Data-ready-when:.
+          # Both share the same S3 URI grammar (gate_data_sweep._parse_predicate_line
+          # in alpha-engine-config).
+          if [ "$HAS_SF" -gt 0 ]; then
+            KEYWORD="Verified-when"
+            LABEL_FAMILY="gate:*-sf"
+          else
+            KEYWORD="Data-ready-when"
+            LABEL_FAMILY="gate:data"
+          fi
+
+          echo "---"
+          echo "PR carries $LABEL_FAMILY label — validating $KEYWORD: line..."
+
+          HAS_S3=$(echo "$PR_BODY" | grep -ciE "${KEYWORD}:[[:space:]]+s3://" || true)
+          HAS_KEYWORD=$(echo "$PR_BODY" | grep -ciE "${KEYWORD}:" || true)
+          HAS_PLACEHOLDER=$(echo "$PR_BODY" | grep -ciE "${KEYWORD}:[^{}]*\{[^}]*\}" || true)
+
+          if [ "$HAS_S3" -gt 0 ] && [ "$HAS_PLACEHOLDER" -eq 0 ]; then
+            echo "$KEYWORD: predicate format is valid (s3:// URI with no template placeholder)."
+          elif [ "$HAS_S3" -gt 0 ] && [ "$HAS_PLACEHOLDER" -gt 0 ]; then
+            echo ""
+            echo "::error::${KEYWORD}: line contains an unresolved {date}/{trading_day} template placeholder. These are NEVER substituted by this grammar — no real S3 key can match. Use a concrete key, a prefix + newer-than, or a * wildcard (e.g. '${KEYWORD}: s3://bucket/prefix/ newer-than YYYY-MM-DD')."
+            exit 1
+          elif [ "$HAS_KEYWORD" -gt 0 ]; then
+            echo ""
+            echo "::error::${KEYWORD}: line must contain an s3:// URI — a prose description cannot be evaluated by the deterministic sweep and will never auto-clear this gate. Use '${KEYWORD}: s3://bucket/key-or-prefix [exists | >= N objects | newer-than YYYY-MM-DD]'."
+            exit 1
+          else
+            echo ""
+            echo "::error::This PR carries a $LABEL_FAMILY label but has no '${KEYWORD}:' line at all. Add one naming the concrete S3 postcondition that proves the gated behavior specifically ran (e.g. '${KEYWORD}: s3://bucket/prefix/ newer-than YYYY-MM-DD'). Without it this gate can never auto-clear (alpha-engine-config-I2995/I2996)."
+            exit 1
+          fi
+
+      - name: Fail if any gate:* label is present
+        run: |
+          set -euo pipefail
+
+          jq -r '.pull_request.labels[].name' "$GITHUB_EVENT_PATH" > /tmp/pr_labels.txt || true
+
+          echo "Labels under check:"
+          cat /tmp/pr_labels.txt || echo "(none)"
+
+          # DRAFT DEFERRAL (alpha-engine-config-I6282, mirrored from the
+          # reference implementation). This is a MERGE guard and a draft
+          # cannot merge, so failing it on a draft protects nothing while
+          # costing the whole red/green signal on the open queue.
+          #
+          # ready_for_review is in this workflow's trigger list, so the check
+          # re-runs and FAILS the instant a gated draft is flipped ready.
+          IS_DRAFT=$(jq -r '.pull_request.draft // false' "$GITHUB_EVENT_PATH")
+
+          if grep -q '^gate:' /tmp/pr_labels.txt; then
+            GATES=$(grep '^gate:' /tmp/pr_labels.txt | paste -sd, -)
+            if [ "$IS_DRAFT" = 'true' ]; then
+              echo ""
+              echo "::notice::DRAFT carrying gate:* ($GATES). A draft cannot merge, so this guard defers — it re-runs and FAILS on ready_for_review while any gate:* label is still attached."
+              exit 0
+            fi
+            echo ""
+            echo "::error::This PR carries a gate:* label ($GATES). Remove the gate:* label only after verifying the blocker is actually resolved."
+            exit 1
+          fi
+
+          echo "No gate:* label present — check passes."
