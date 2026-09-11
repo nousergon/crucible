@@ -17,6 +17,7 @@ import random
 
 import pytest
 
+from crucible.portfolio import CostModel
 from crucible.slots import get_slot
 from crucible.slots.strategy import (
     ATTESTATION_STATUSES,
@@ -26,6 +27,16 @@ from crucible.slots.strategy import (
     pit_parity,
     render_verdict,
 )
+
+
+def _cost_model() -> CostModel:
+    """The declared flat stand-in, as the filed recipe carries it."""
+    return CostModel(
+        name="flat_bps_v0",
+        placeholder=True,
+        params={"half_spread_bps": 2.5, "commission_bps": 0.5, "slippage_bps": 10.0},
+    )
+
 
 SEVEN = (
     "position_loss_floor",
@@ -386,9 +397,14 @@ class TestAttestationGatesTheCard:
             as_of="2026-08-28",
             alpha_vs_spy=0.031,
             attestation={"kind": "pit_parity", "status": status, "reason": "x"},
+            cost_model=_cost_model().record(),
         )
         assert card["rendered"] == "UNVERIFIED"
         assert "grade" not in card, "an unverified card must not carry a grade at all"
+        assert card["cost_model"]["name"] == "flat_bps_v0", (
+            "an unverified card still names the cost model: what a run was charged is "
+            "a fact about the run, not a decoration on a grade"
+        )
 
     def test_a_card_with_a_pass_renders_its_grade(self) -> None:
         card = render_verdict(
@@ -396,9 +412,27 @@ class TestAttestationGatesTheCard:
             as_of="2026-08-28",
             alpha_vs_spy=0.031,
             attestation={"kind": "pit_parity", "status": "PASS", "reason": "x"},
+            cost_model=_cost_model().record(),
         )
         assert card["rendered"] == "GRADED"
         assert card["grade"]["alpha_vs_spy"] == 0.031
+        assert card["cost_model"]["placeholder"] is True, (
+            "a grade taken net of a stand-in says so on the card's face"
+        )
+
+    def test_a_card_cannot_be_rendered_without_naming_its_cost_model(self) -> None:
+        """`alpha-engine-config-I10503`. A net-of-cost number is a claim about
+        what was charged, and a card able to make it without naming the model is
+        the shape in which an optimizer ran on a cost model nobody configured.
+        """
+        with pytest.raises(ValueError, match="must name the cost model"):
+            render_verdict(
+                arm_id="s:stock_registry:0123456789abcdef",
+                as_of="2026-08-28",
+                alpha_vs_spy=0.031,
+                attestation={"kind": "pit_parity", "status": "PASS", "reason": "x"},
+                cost_model={},
+            )
 
 
 class TestGrade:

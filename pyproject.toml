@@ -59,6 +59,26 @@ dependencies = [
     "numpy>=2.5.3",
     "pandas>=2.0",
     "pyarrow>=25.0.1",
+    # The convex layer for `crucible.portfolio`'s mean-variance program
+    # (`alpha-engine-config-I10500`). The engine composes the objective and the
+    # constraint geometry; cvxpy owns the DCP analysis and dispatch to a conic
+    # solver, and ships CLARABEL as that solver. Writing a projected-gradient
+    # solver here instead would be a second-rate interior-point method this
+    # repository then maintains, against a second-order cone constraint and an
+    # x^{1.5} impact term it would have to linearise (principle 4, principle 6).
+    #
+    # Floored within a minor series rather than pinned: the DCP atoms used here
+    # (norm, quad_form, psd_wrap, power, abs) are the stable core of the API,
+    # and the solver behind them is addressed through cvxpy's own installed-
+    # solver list rather than imported directly (principle 8) — the engine
+    # names CLARABEL, falls back through SCS and OSQP, and records which one
+    # answered.
+    #
+    # Ledoit-Wolf shrinkage is NOT reached through scikit-learn: it is
+    # `nousergon_lib.quant.factor_risk.ledoit_wolf_cov`, pure numpy and already
+    # pinned above, so the institutional default estimator costs this repository
+    # no compiled dependency at all.
+    "cvxpy>=1.9.2,<1.10",
     # The store's S3 backend and the conditional PUT the release pointer
     # flips on. Floored, not pinned: boto3 ships daily and the API surface
     # used here (put_object/head_object/get_paginator, IfMatch/IfNoneMatch)

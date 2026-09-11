@@ -1,0 +1,1970 @@
+"""`crucible.portfolio` — the MVO engine, the turnover governor and the ADV cap.
+
+Lifted with the engine from `crucible-executor/tests/test_portfolio_optimizer.py`.
+The assertions are the source's, because they are the record of what the engine
+was ever shown to do; what changed is the plumbing they run through — a
+validated :class:`PortfolioParams` in place of a defaults dict, and a NAMED
+:class:`CostModel` in place of a mode string.
+
+Three groups of assertion changed on purpose, and each is a test of the NEW
+behaviour rather than a relaxation of the old:
+
+* the participation-aware cost model no longer degrades to a flat penalty when
+  it is handed no book notional or no ADV coverage — it RAISES, and the tests
+  that asserted the degradation now assert the refusal;
+* `oas` shrinkage is not carried, and the test that exercised it is replaced by
+  one asserting it is refused BY NAME rather than resolved to the default;
+* a negative estimation-uncertainty entry is counted on the DIAGNOSTICS rather
+  than in a log line — the durable surface, not the ephemeral one.
+
+**The parameter values below are FIXTURE values**, chosen to make these
+assertions bite. They are not the operating set: that is strategy edge and
+lives in the private strategy tree, and this repository declares no value for
+any field (`repository-tiering-policy` test 2).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from crucible.portfolio import (
+    CostModel,
+    CostModelInputError,
+    OptimizerResult,
+    PortfolioParams,
+    PortfolioParamsError,
+    TurnoverBudgetError,
+    _apply_turnover_governor,
+    _estimate_covariance_daily,
+    _mandatory_turnover_floor,
+    _turnover_diagnostics,
+    _validate_covariance,
+    compute_conviction_budget_multiplier,
+    solve_target_weights,
+)
+
+#: Fixture parameter set. Every field is required by `PortfolioParams`, so the
+#: fixture declares all of them; a test overrides the one it is about.
+_FIXTURE_PARAMS: dict = {
+    "risk_aversion": 5.0,
+    "cash_sleeve_pct": 0.03,
+    "max_sector_pct": 0.25,
+    "min_position_pct": 0.005,
+    "covariance_shrinkage": "ledoit_wolf",
+    "sigma_horizon_days": 1,
+    "ewma_lambda_decay": 0.94,
+    "vol_target_annual": None,
+    "alpha_uncertainty_penalty": 0.0,
+    "alpha_uncertainty_min_cv": 0.01,
+    "max_pct_adv": 0.05,
+    "max_daily_turnover": 0.20,
+    "large_move_turnover_flag": 0.35,
+    "conviction_budget_gate_enabled": True,
+    "conviction_ir_floor": 0.35,
+    "conviction_ir_full": 0.75,
+    "conviction_budget_min_multiple": 0.05,
+    "conviction_gate_min_names": 3,
+}
+
+
+def _params(**overrides) -> PortfolioParams:
+    """A fixture parameter set with ``overrides`` applied."""
+    return PortfolioParams.from_mapping({**_FIXTURE_PARAMS, **overrides}, source="<test fixture>")
+
+
+def _flat_model(*, round_trip_bps: float = 5.0, placeholder: bool = True) -> CostModel:
+    """The flat model at a chosen round-trip rate.
+
+    The rate is put entirely in ``slippage_bps`` so a test that wants a
+    particular charge per unit of turnover can name it directly.
+    """
+    return CostModel(
+        name="flat_bps_v0",
+        placeholder=placeholder,
+        params={
+            "half_spread_bps": 0.0,
+            "commission_bps": 0.0,
+            "slippage_bps": float(round_trip_bps),
+        },
+    )
+
+
+def _impact_model(*, impact_coef_bps: float = 10.0) -> CostModel:
+    """The square-root impact model at a chosen impact coefficient."""
+    return CostModel(
+        name="sqrt_impact_v1",
+        placeholder=False,
+        params={
+            "half_spread_bps": 2.5,
+            "impact_coef_bps": float(impact_coef_bps),
+            "commission_bps": 0.5,
+            "min_cost_bps": 0.0,
+        },
+    )
+
+
+def _synthetic_returns(N: int, T: int = 250, vol: float = 0.01, seed: int = 0) -> np.ndarray:
+    """Generate (T, N) iid normal returns with given daily vol."""
+    rng = np.random.default_rng(seed)
+    return rng.normal(0.0, vol, size=(T, N))
+
+
+def _baseline_universe(
+    n_active: int = 2,
+    sector_labels: list[str] | None = None,
+    daily_vol: float = 0.01,
+) -> dict:
+    """
+    Build a baseline universe with N = n_active + 2 (SPY + CASH).
+    Returns a dict of all kwargs needed for solve_target_weights.
+    """
+    if sector_labels is None:
+        sector_labels = ["tech"] * n_active
+    assert len(sector_labels) == n_active
+
+    tickers = [f"T{i}" for i in range(n_active)] + ["SPY", "CASH"]
+    N = len(tickers)
+    benchmark_idx = N - 2
+    cash_idx = N - 1
+
+    returns = _synthetic_returns(N, vol=daily_vol)
+    returns[:, cash_idx] = 0.0
+
+    return {
+        "tickers": tickers,
+        "alpha_hat": np.zeros(N),
+        "returns_panel": returns,
+        "w_prev": np.zeros(N),
+        "sectors": sector_labels + ["__benchmark__", "__cash__"],
+        "stance_caps": np.full(N, 0.08),
+        "eligibility": np.ones(N, dtype=bool),
+        "benchmark_idx": benchmark_idx,
+        "cash_idx": cash_idx,
+        # These fixtures test the MVO TARGET (w_prev=zeros → full target).
+        # Disable the turnover governor (a separate concern — it caps the
+        # STEP toward the target) so target assertions stay bit-identical;
+        # the governor is exercised directly in TestTurnoverGovernor.
+        "params": _params(max_daily_turnover=None),
+        "cost_model": _flat_model(),
+    }
+
+
+def _solve(u: dict) -> OptimizerResult:
+    u["stance_caps"][u["benchmark_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+    return solve_target_weights(**u)
+
+
+def _positional(u: dict) -> tuple:
+    """The engine's positional arguments, in order, from a fixture dict."""
+    return (
+        u["tickers"],
+        u["alpha_hat"],
+        u["returns_panel"],
+        u["w_prev"],
+        u["sectors"],
+        u["stance_caps"],
+        u["eligibility"],
+        u["benchmark_idx"],
+        u["cash_idx"],
+        u["params"],
+        u["cost_model"],
+    )
+
+
+def test_single_asset_positive_alpha_maxes_position_and_fills_spy():
+    """One asset with positive α̂ → optimizer allocates max_pos to it, SPY absorbs the rest."""
+    u = _baseline_universe(n_active=1)
+    u["alpha_hat"][0] = 0.05
+
+    result = _solve(u)
+    w = result.weights
+
+    assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+    assert w[0] == pytest.approx(0.08, abs=1e-3), (
+        f"Active asset should fill its 0.08 cap; got {w[0]:.4f}"
+    )
+    assert w[u["cash_idx"]] == pytest.approx(0.03, abs=1e-6), "Cash sleeve must be pinned at 0.03"
+    assert w[u["benchmark_idx"]] == pytest.approx(1 - 0.08 - 0.03, abs=1e-3), (
+        f"SPY should absorb residual ~0.89; got {w[u['benchmark_idx']]:.4f}"
+    )
+    assert w.sum() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_two_asset_symmetric_alpha_yields_equal_weights():
+    """Two assets, identical α̂ + identical covariance → optimizer assigns equal weight."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][0] = 0.05
+    u["alpha_hat"][1] = 0.05
+    u["returns_panel"][:, 0] = u["returns_panel"][:, 1]
+
+    result = _solve(u)
+    w = result.weights
+
+    assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+    assert abs(w[0] - w[1]) < 1e-3, (
+        f"Symmetric inputs must give symmetric weights; got w[0]={w[0]:.4f} w[1]={w[1]:.4f}"
+    )
+    assert w[0] == pytest.approx(0.08, abs=1e-3), "Both should hit their 0.08 cap given strong α̂"
+
+
+def test_vol_target_constraint_binds_with_high_vol_universe():
+    """High-vol actives + a vol_target below the cap-filling vol → optimizer backs off caps.
+
+    Uses sample (not Ledoit-Wolf) covariance because LW's trace/N × I shrinkage
+    target is sensitive to synthetic vol heterogeneity. Production uses LW with
+    real stock returns where vols are more homogeneous (1-3% daily). The
+    synthetic setup uses long T (5000 rows) to drive sample cov noise low so
+    feasibility math is predictable.
+    """
+    N = 6
+    T = 5000
+    rng = np.random.default_rng(7)
+    active_vol = 0.05
+    spy_vol = 0.005
+    returns = np.column_stack(
+        [
+            rng.normal(0, active_vol, T),
+            rng.normal(0, active_vol, T),
+            rng.normal(0, active_vol, T),
+            rng.normal(0, active_vol, T),
+            rng.normal(0, spy_vol, T),
+            np.zeros(T),
+        ]
+    )
+    u = {
+        "tickers": ["T0", "T1", "T2", "T3", "SPY", "CASH"],
+        "alpha_hat": np.array([0.10, 0.10, 0.10, 0.10, 0.0, -1e-6]),
+        "returns_panel": returns,
+        "w_prev": np.zeros(N),
+        "sectors": ["tech", "tech", "tech", "tech", "__benchmark__", "__cash__"],
+        "stance_caps": np.array([0.08, 0.08, 0.08, 0.08, 1.0, 1.0]),
+        "eligibility": np.ones(N, dtype=bool),
+        "benchmark_idx": 4,
+        "cash_idx": 5,
+        "params": _params(vol_target_annual=0.10, covariance_shrinkage="sample"),
+        "cost_model": _flat_model(),
+    }
+
+    result = solve_target_weights(**u)
+    w = result.weights
+
+    assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate"), (
+        f"Setup must be feasible; got {result.diagnostics['status']}"
+    )
+    assert result.diagnostics["portfolio_vol_ann"] <= 0.10 + 5e-3, (
+        f"Vol target 0.10 violated; got {result.diagnostics['portfolio_vol_ann']:.4f}"
+    )
+    active_total = w[:4].sum()
+    assert active_total < 4 * 0.08 - 1e-3, (
+        f"Vol-target should prevent filling all 4 caps (would be 0.32); got {active_total:.4f}"
+    )
+
+
+def test_l1_turnover_penalty_reduces_rebalance_when_tcost_high():
+    """Large tcost_bps + w_prev close to optimum → optimizer stays near w_prev."""
+    u_low = _baseline_universe(n_active=2)
+    u_low["alpha_hat"][:2] = 0.01
+    u_low["w_prev"][0] = 0.07
+    u_low["w_prev"][1] = 0.07
+    u_low["w_prev"][u_low["benchmark_idx"]] = 1 - 0.07 - 0.07 - 0.03
+    u_low["w_prev"][u_low["cash_idx"]] = 0.03
+    u_low["cost_model"] = _flat_model(round_trip_bps=0.0)
+    result_low = _solve(u_low)
+
+    u_high = _baseline_universe(n_active=2)
+    u_high["alpha_hat"][:2] = 0.01
+    u_high["w_prev"][0] = 0.07
+    u_high["w_prev"][1] = 0.07
+    u_high["w_prev"][u_high["benchmark_idx"]] = 1 - 0.07 - 0.07 - 0.03
+    u_high["w_prev"][u_high["cash_idx"]] = 0.03
+    u_high["cost_model"] = _flat_model(round_trip_bps=5000.0)
+    result_high = _solve(u_high)
+
+    assert (
+        result_high.diagnostics["turnover_one_way"]
+        < result_low.diagnostics["turnover_one_way"] + 1e-6
+    ), (
+        f"High tcost ({result_high.diagnostics['turnover_one_way']:.4f}) should not "
+        f"trade more than low tcost ({result_low.diagnostics['turnover_one_way']:.4f})"
+    )
+
+
+def test_eligibility_mask_pins_disallowed_to_zero():
+    """An ineligible ticker with very positive α̂ must still get w=0."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][0] = 0.10
+    u["alpha_hat"][1] = 0.05
+    u["eligibility"][0] = False
+
+    result = _solve(u)
+    w = result.weights
+
+    assert w[0] == pytest.approx(0.0, abs=1e-6), (
+        f"Ineligible asset must be pinned to 0; got {w[0]:.4f}"
+    )
+    assert w[1] == pytest.approx(0.08, abs=1e-3), "Eligible competitor should still hit its cap"
+
+
+def test_cash_sleeve_equality_constraint_is_inviolable():
+    """Cash sleeve pin must hold even when α̂ strongly favors equities."""
+    u = _baseline_universe(n_active=4)
+    u["alpha_hat"][:4] = 0.20
+    u["params"] = _params(cash_sleeve_pct=0.05)
+
+    result = _solve(u)
+
+    assert result.weights[u["cash_idx"]] == pytest.approx(0.05, abs=1e-6), (
+        f"Cash sleeve 0.05 violated; got {result.weights[u['cash_idx']]:.6f}"
+    )
+
+
+def test_sector_cap_binds_when_many_names_in_one_sector():
+    """5 names in one sector, all positive α̂ → sector total capped at max_sector_pct."""
+    u = _baseline_universe(n_active=5, sector_labels=["tech"] * 5)
+    u["alpha_hat"][:5] = 0.05
+    u["params"] = _params(max_sector_pct=0.20)
+
+    result = _solve(u)
+    w = result.weights
+
+    tech_total = w[:5].sum()
+    assert tech_total <= 0.20 + 1e-4, f"Sector cap 0.20 violated; got {tech_total:.4f}"
+    assert tech_total >= 0.20 - 1e-3, (
+        f"Sector cap should be binding given strong α̂; got {tech_total:.4f}"
+    )
+
+
+def test_infeasibility_falls_back_to_current_weights_plus_cash():
+    """Conflicting hard constraints → solver returns infeasible → fallback weights returned."""
+    u = _baseline_universe(n_active=1)
+    u["alpha_hat"][0] = 0.05
+    u["stance_caps"][:] = 0.001
+    u["w_prev"][0] = 0.50
+    u["w_prev"][u["benchmark_idx"]] = 0.47
+    u["w_prev"][u["cash_idx"]] = 0.03
+    u["params"] = _params(cash_sleeve_pct=0.03)
+
+    result = solve_target_weights(**u)
+
+    assert result.weights.sum() == pytest.approx(1.0, abs=1e-6)
+    assert result.weights[u["cash_idx"]] == pytest.approx(0.03, abs=1e-6)
+    if result.diagnostics["status"] == "infeasible_fallback":
+        assert result.weights[0] > result.weights[u["benchmark_idx"]] * 0.8, (
+            "Fallback should preserve the rough current allocation profile "
+            "(asset 0 was 0.50, SPY was 0.47)"
+        )
+
+
+# ─── A.1 horizon-scaling tests ──────────────────────────────────────────────
+# Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §A.1
+#
+# Σ is configurable at horizon H (default 1 = daily). The optimizer's three
+# Σ touchpoints (objective, vol-target SOC, diagnostics) must all consume
+# the same horizon; default H=1 preserves bit-identical legacy behavior.
+
+
+def _estimate_cov_via_solve(u: dict) -> np.ndarray:
+    """Helper to extract the Σ used inside solve via _estimate_covariance."""
+    from crucible.portfolio import _estimate_covariance
+
+    return _estimate_covariance(u["returns_panel"], u["params"])
+
+
+def test_default_horizon_preserves_legacy_behavior():
+    """Default cfg (no sigma_horizon_days) must match explicit H=1 bit-identical."""
+    u_default = _baseline_universe(n_active=2)
+    u_default["alpha_hat"][:2] = 0.05
+    u_default["params"] = _params(covariance_shrinkage="sample")
+
+    u_h1 = _baseline_universe(n_active=2)
+    u_h1["alpha_hat"][:2] = 0.05
+    u_h1["returns_panel"] = u_default["returns_panel"].copy()
+    u_h1["params"] = _params(covariance_shrinkage="sample", sigma_horizon_days=1)
+
+    r_default = _solve(u_default)
+    r_h1 = _solve(u_h1)
+
+    np.testing.assert_allclose(r_default.weights, r_h1.weights, atol=1e-8)
+    assert r_default.diagnostics["portfolio_vol_ann"] == pytest.approx(
+        r_h1.diagnostics["portfolio_vol_ann"], abs=1e-10
+    )
+
+
+def test_sigma_scales_linearly_with_horizon():
+    """Σ_H = H · Σ_daily — covariance matrix scales linearly in horizon-days."""
+    u_h1 = _baseline_universe(n_active=3)
+    u_h1["params"] = _params(covariance_shrinkage="sample", sigma_horizon_days=1)
+    sigma_1 = _estimate_cov_via_solve(u_h1)
+
+    u_h21 = _baseline_universe(n_active=3)
+    u_h21["returns_panel"] = u_h1["returns_panel"].copy()
+    u_h21["params"] = _params(covariance_shrinkage="sample", sigma_horizon_days=21)
+    sigma_21 = _estimate_cov_via_solve(u_h21)
+
+    np.testing.assert_allclose(sigma_21, 21.0 * sigma_1, rtol=1e-10)
+
+
+def test_scaling_invariance_horizon_with_compensating_lambda():
+    """Mathematical invariance: solving with (Σ_H, λ_old/H) yields same weights as (Σ_1, λ_old).
+
+    Proves the load-bearing claim that absorbing horizon into λ is mathematically
+    equivalent to scaling Σ by H and rescaling λ. This is the SOTA-rationale gate
+    from the plan doc §A.1 — without this proof, the horizon switch would silently
+    change optimum weights.
+    """
+    u_base = _baseline_universe(n_active=3)
+    u_base["alpha_hat"][:3] = np.array([0.03, 0.05, 0.02])
+    lambda_base = 5.0
+
+    u_h1 = {
+        **u_base,
+        "params": _params(
+            covariance_shrinkage="sample",
+            sigma_horizon_days=1,
+            risk_aversion=lambda_base,
+        ),
+    }
+    u_h21 = {
+        **u_base,
+        "params": _params(
+            covariance_shrinkage="sample",
+            sigma_horizon_days=21,
+            risk_aversion=lambda_base / 21.0,  # compensating rescale
+        ),
+    }
+
+    r_h1 = _solve(u_h1)
+    r_h21 = _solve(u_h21)
+
+    np.testing.assert_allclose(r_h1.weights, r_h21.weights, atol=1e-5)
+
+
+def test_vol_ann_diagnostic_horizon_invariant():
+    """Same portfolio under H=1 and H=21 must produce the same annualized vol diagnostic."""
+    u_h1 = _baseline_universe(n_active=2)
+    u_h1["alpha_hat"][:2] = 0.05
+    u_h1["params"] = _params(covariance_shrinkage="sample", sigma_horizon_days=1)
+    r_h1 = _solve(u_h1)
+
+    u_h21 = _baseline_universe(n_active=2)
+    u_h21["alpha_hat"][:2] = 0.05
+    u_h21["returns_panel"] = u_h1["returns_panel"].copy()
+    u_h21["params"] = _params(
+        covariance_shrinkage="sample",
+        sigma_horizon_days=21,
+        risk_aversion=_FIXTURE_PARAMS["risk_aversion"] / 21.0,
+    )
+    r_h21 = _solve(u_h21)
+
+    assert r_h21.diagnostics["portfolio_vol_ann"] == pytest.approx(
+        r_h1.diagnostics["portfolio_vol_ann"], rel=1e-5
+    )
+
+
+def test_vol_target_soc_horizon_aware():
+    """vol_target_annual must bind to the same annualized cap regardless of Σ horizon.
+
+    A binding 10% annual vol cap on a high-vol universe should produce the same
+    portfolio annualized vol whether Σ is daily (H=1) or 21d (H=21).
+    """
+    N = 6
+    T = 5000
+    rng = np.random.default_rng(11)
+    active_vol = 0.05
+    spy_vol = 0.005
+    returns = np.column_stack(
+        [
+            rng.normal(0, active_vol, T),
+            rng.normal(0, active_vol, T),
+            rng.normal(0, active_vol, T),
+            rng.normal(0, active_vol, T),
+            rng.normal(0, spy_vol, T),
+            np.zeros(T),
+        ]
+    )
+    base_u = {
+        "tickers": ["T0", "T1", "T2", "T3", "SPY", "CASH"],
+        "alpha_hat": np.array([0.10, 0.10, 0.10, 0.10, 0.0, -1e-6]),
+        "returns_panel": returns,
+        "w_prev": np.zeros(N),
+        "sectors": ["tech", "tech", "tech", "tech", "__benchmark__", "__cash__"],
+        "stance_caps": np.array([0.08, 0.08, 0.08, 0.08, 1.0, 1.0]),
+        "eligibility": np.ones(N, dtype=bool),
+        "benchmark_idx": 4,
+        "cash_idx": 5,
+    }
+    base_u["cost_model"] = _flat_model()
+    common = {"vol_target_annual": 0.10, "covariance_shrinkage": "sample"}
+
+    r_h1 = solve_target_weights(**{**base_u, "params": _params(**common, sigma_horizon_days=1)})
+    r_h21 = solve_target_weights(
+        **{
+            **base_u,
+            "params": _params(
+                **common,
+                sigma_horizon_days=21,
+                risk_aversion=_FIXTURE_PARAMS["risk_aversion"] / 21.0,
+            ),
+        }
+    )
+
+    assert r_h1.diagnostics["portfolio_vol_ann"] <= 0.10 + 5e-3
+    assert r_h21.diagnostics["portfolio_vol_ann"] <= 0.10 + 5e-3
+    assert r_h1.diagnostics["portfolio_vol_ann"] == pytest.approx(
+        r_h21.diagnostics["portfolio_vol_ann"],
+        rel=1e-3,
+    )
+
+
+def test_sigma_horizon_days_below_one_raises():
+    """A sub-one horizon is refused when the PARAMETERS are built, not when a
+    solve reaches the covariance step.
+
+    The source raised from inside the solve. Validating at construction moves
+    the refusal ahead of everything the solve would otherwise have done with a
+    parameter set it was never going to be able to use — and, more to the
+    point, ahead of anything it might have WRITTEN.
+    """
+    with pytest.raises(PortfolioParamsError, match="sigma_horizon_days must be >= 1"):
+        _params(sigma_horizon_days=0, covariance_shrinkage="sample")
+
+
+# ─── A.2 EWMA covariance tests ──────────────────────────────────────────────
+# Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §A.2
+#
+# RiskMetrics 1996 EWMA with zero-mean assumption. New estimator option
+# "ewma" + cfg["ewma_lambda_decay"] (default 0.94). Default estimator
+# (ledoit_wolf) is unchanged; EWMA is opt-in.
+
+
+def test_ewma_concentrates_on_recent_regime():
+    """Two-regime synthetic panel: EWMA should be closer to recent regime's
+    sample cov than to a pooled sample cov.
+
+    Construct T=500 daily returns: first 250 rows have N=2 with vol=0.005
+    and ρ=+0.8 (calm regime); last 250 rows have vol=0.03 and ρ=-0.3
+    (stress regime). EWMA(λ=0.94, half-life≈11d) should weight the stress
+    regime heavily because its window is much shorter than 250 days.
+    """
+    from crucible.portfolio import _ewma_covariance
+
+    rng = np.random.default_rng(42)
+    T_per = 250
+
+    # Calm regime: vol 0.005, correlation +0.8
+    calm_cov = np.array([[0.005**2, 0.8 * 0.005**2], [0.8 * 0.005**2, 0.005**2]])
+    calm = rng.multivariate_normal([0, 0], calm_cov, size=T_per)
+
+    # Stress regime: vol 0.03, correlation -0.3 (decorrelating in a crash)
+    stress_cov = np.array([[0.03**2, -0.3 * 0.03**2], [-0.3 * 0.03**2, 0.03**2]])
+    stress = rng.multivariate_normal([0, 0], stress_cov, size=T_per)
+
+    panel = np.vstack([calm, stress])  # calm first, stress last (most recent)
+
+    sigma_sample = np.cov(panel, rowvar=False)
+    sigma_ewma = _ewma_covariance(panel, lambda_decay=0.94)
+
+    # EWMA diagonals should be far closer to stress vol² than to the pooled
+    # ~mean of the two regimes' vol². Pooled vol² ≈ (0.005² + 0.03²) / 2 ≈ 4.6e-4.
+    pooled_var_avg = (0.005**2 + 0.03**2) / 2
+    stress_var = 0.03**2
+    ewma_var_avg = (sigma_ewma[0, 0] + sigma_ewma[1, 1]) / 2
+
+    assert abs(ewma_var_avg - stress_var) < abs(ewma_var_avg - pooled_var_avg), (
+        f"EWMA should track recent regime: ewma_var_avg={ewma_var_avg:.6f}, "
+        f"stress_var={stress_var:.6f}, pooled_var={pooled_var_avg:.6f}"
+    )
+    # And sample-cov should be in-between (averages across both regimes)
+    sample_var_avg = (sigma_sample[0, 0] + sigma_sample[1, 1]) / 2
+    assert abs(sample_var_avg - pooled_var_avg) < abs(sample_var_avg - stress_var), (
+        f"Sample cov should be closer to pooled than to stress; sample_var_avg={sample_var_avg:.6f}"
+    )
+
+
+def test_ewma_lambda_one_degenerates_to_uniform_weighted_cov():
+    """λ=1.0 → uniform weights → cov matches (R.T @ R)/T (zero-mean assumption)."""
+    from crucible.portfolio import _ewma_covariance
+
+    rng = np.random.default_rng(0)
+    returns = rng.normal(0, 0.01, size=(300, 3))
+
+    sigma_ewma_lambda1 = _ewma_covariance(returns, lambda_decay=1.0)
+    sigma_uniform = (returns.T @ returns) / returns.shape[0]
+
+    np.testing.assert_allclose(sigma_ewma_lambda1, sigma_uniform, rtol=1e-10)
+
+
+def test_ewma_weights_normalize_to_one():
+    """The EWMA weights must sum to 1 — sanity check that finite-T normalization
+    is correct so total variance scale is preserved."""
+    from crucible.portfolio import _ewma_covariance
+
+    rng = np.random.default_rng(1)
+    returns = rng.normal(0, 0.01, size=(500, 4))
+
+    sigma = _ewma_covariance(returns, lambda_decay=0.94)
+    # If weights summed wrong, the diagonal magnitude would be off by O(1/T)
+    # vs the true variance. Compare to uniform cov for plausibility check.
+    uniform_var_avg = float(np.mean(np.diag((returns.T @ returns) / 500)))
+    ewma_var_avg = float(np.mean(np.diag(sigma)))
+    # Both should be O(0.01²) = 1e-4. EWMA can deviate in either direction
+    # due to recent-window noise but must be in the same order of magnitude.
+    assert 0.1 * uniform_var_avg < ewma_var_avg < 10 * uniform_var_avg
+
+
+def test_ewma_invalid_lambda_raises():
+    """λ outside [0.5, 1.0] is a config error — RiskMetrics canonical range."""
+    from crucible.portfolio import _ewma_covariance
+
+    rng = np.random.default_rng(2)
+    returns = rng.normal(0, 0.01, size=(100, 2))
+
+    with pytest.raises(ValueError, match="ewma_lambda_decay must be in"):
+        _ewma_covariance(returns, lambda_decay=0.3)
+    with pytest.raises(ValueError, match="ewma_lambda_decay must be in"):
+        _ewma_covariance(returns, lambda_decay=1.1)
+
+
+def test_ewma_estimator_integrates_with_solve_target_weights():
+    """End-to-end: covariance_shrinkage="ewma" produces a valid optimization."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["params"] = _params(covariance_shrinkage="ewma", ewma_lambda_decay=0.94)
+
+    result = _solve(u)
+
+    assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+    assert result.weights.sum() == pytest.approx(1.0, abs=1e-6)
+    assert result.weights[u["cash_idx"]] == pytest.approx(0.03, abs=1e-6)
+    # Conviction picks should hit their cap given strong α̂
+    assert result.weights[0] == pytest.approx(0.08, abs=1e-3)
+    assert result.weights[1] == pytest.approx(0.08, abs=1e-3)
+
+
+def test_ewma_composes_with_sigma_horizon_days():
+    """EWMA Σ at H=21 = 21 × EWMA Σ at H=1 — composition with A.1."""
+    from crucible.portfolio import _estimate_covariance
+
+    rng = np.random.default_rng(3)
+    returns = rng.normal(0, 0.01, size=(300, 4))
+
+    cfg_h1 = _params(covariance_shrinkage="ewma", ewma_lambda_decay=0.94, sigma_horizon_days=1)
+    cfg_h21 = _params(covariance_shrinkage="ewma", ewma_lambda_decay=0.94, sigma_horizon_days=21)
+
+    sigma_h1 = _estimate_covariance(returns, cfg_h1)
+    sigma_h21 = _estimate_covariance(returns, cfg_h21)
+
+    np.testing.assert_allclose(sigma_h21, 21.0 * sigma_h1, rtol=1e-10)
+
+
+def test_default_estimator_unchanged_after_ewma_addition():
+    """Adding EWMA must NOT change behavior when covariance_shrinkage is unset
+    or set to ledoit_wolf — no silent regression of the production path."""
+    u_default = _baseline_universe(n_active=2)
+    u_default["alpha_hat"][:2] = 0.05
+    u_default["params"] = _params()  # the fixture default estimator
+
+    u_explicit_lw = _baseline_universe(n_active=2)
+    u_explicit_lw["alpha_hat"][:2] = 0.05
+    u_explicit_lw["returns_panel"] = u_default["returns_panel"].copy()
+    u_explicit_lw["params"] = _params(covariance_shrinkage="ledoit_wolf")
+
+    r_default = _solve(u_default)
+    r_lw = _solve(u_explicit_lw)
+
+    np.testing.assert_allclose(r_default.weights, r_lw.weights, atol=1e-8)
+
+
+# ─── A.3 OAS estimator tests ────────────────────────────────────────────────
+# Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §A.3
+#
+# Chen et al. 2010 Oracle Approximating Shrinkage. Drop-in alongside LW;
+# sklearn.covariance.OAS shares the .fit().covariance_ interface.
+
+
+def test_default_alpha_uncertainty_penalty_is_off_and_bit_identical():
+    """With cfg["alpha_uncertainty_penalty"] unset (default 0.0) AND no
+    alpha_uncertainty arg, behavior must match legacy MVO bit-identical —
+    a silent change to the production path would be the worst-case
+    failure mode of this PR."""
+    u_legacy = _baseline_universe(n_active=2)
+    u_legacy["alpha_hat"][:2] = 0.05
+    u_legacy["params"] = _params(covariance_shrinkage="sample")
+
+    u_b3 = _baseline_universe(n_active=2)
+    u_b3["alpha_hat"][:2] = 0.05
+    u_b3["returns_panel"] = u_legacy["returns_panel"].copy()
+    u_b3["params"] = _params(covariance_shrinkage="sample")  # penalty left at 0.0
+
+    r_legacy = _solve(u_legacy)
+    r_b3 = _solve(u_b3)
+    np.testing.assert_allclose(r_legacy.weights, r_b3.weights, atol=1e-12)
+    assert r_b3.diagnostics["alpha_uncertainty_penalty_used"] is False
+    # The reason is populated on EVERY solve, including the ones where nothing
+    # was wrong — a field that only appears on the throttled path cannot be
+    # used to tell "off by configuration" from "off because it broke".
+    assert r_b3.diagnostics["alpha_uncertainty_inoperative_reason"] == "gamma_zero"
+
+
+def test_alpha_uncertainty_penalty_off_when_arg_none_even_if_gamma_positive():
+    """γ > 0 but no epistemic vector → penalty skipped, reason recorded.
+
+    Covers every artifact written before the producer emitted the estimation-
+    error half at all, and any model family that has no learned noise
+    precision to decompose."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["params"] = _params(covariance_shrinkage="sample", alpha_uncertainty_penalty=1000.0)
+
+    result = _solve(u)
+    assert result.diagnostics["alpha_uncertainty_penalty_used"] is False
+    assert result.diagnostics["alpha_uncertainty_inoperative_reason"] == ("epistemic_field_absent")
+    # Same as legacy MVO — both names hit the cap
+    assert result.weights[0] == pytest.approx(0.08, abs=1e-3)
+    assert result.weights[1] == pytest.approx(0.08, abs=1e-3)
+
+
+def test_alpha_uncertainty_penalty_off_when_all_std_zero_or_nan():
+    """alpha_uncertainty provided but ALL entries are NaN (full legacy-Ridge
+    fallback case) → penalty term skipped."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["params"] = _params(covariance_shrinkage="sample", alpha_uncertainty_penalty=1000.0)
+    u["stance_caps"][u["benchmark_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    all_nan = np.full(N, np.nan)
+    result = solve_target_weights(**u, alpha_uncertainty_epistemic=all_nan)
+    assert result.diagnostics["alpha_uncertainty_penalty_used"] is False
+    assert result.diagnostics["alpha_uncertainty_inoperative_reason"] == ("epistemic_field_absent")
+
+
+def test_high_uncertainty_pick_shrinks_relative_to_confident_pick():
+    """Two equal-α̂ picks: T0 has high σ (0.04), T1 has low σ (0.002).
+    With γ large enough, T0 shrinks below its cap while T1 stays at cap.
+
+    This is the load-bearing property of B.3 — confident picks size up,
+    diffuse picks size down. Per Garlappi-Uppal-Wang 2007 / plan §B.3."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["params"] = _params(covariance_shrinkage="sample", alpha_uncertainty_penalty=1000.0)
+    u["stance_caps"][u["benchmark_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    unc = np.zeros(N)
+    unc[0] = 0.04  # diffuse
+    unc[1] = 0.002  # confident
+
+    result = solve_target_weights(**u, alpha_uncertainty_epistemic=unc)
+    assert result.diagnostics["alpha_uncertainty_penalty_used"] is True
+    assert result.diagnostics["alpha_uncertainty_vintage"] == "epistemic"
+    assert result.weights[0] < 0.05, (
+        f"High-σ pick should shrink below cap; got {result.weights[0]:.4f}"
+    )
+    assert result.weights[1] == pytest.approx(0.08, abs=1e-3), (
+        f"Low-σ pick should stay at cap; got {result.weights[1]:.4f}"
+    )
+    # And the high-σ pick must shrink BELOW the low-σ pick
+    assert result.weights[0] < result.weights[1]
+
+
+def test_uniform_uncertainty_is_reported_inoperative_not_applied():
+    """DELIBERATE REVERSAL of the original B.3 property (I9452 deliverable 3).
+
+    B.3 originally asserted that a uniformly high σ shrinks every conviction
+    pick proportionally. It does — and that is precisely the failure mode: a
+    flat Ω discriminates between nothing, so it is not robust sizing, it is an
+    undeclared risk-aversion increase applied through a knob nobody is reading
+    as one. This is not a corner case: a predictive std whose observation-noise
+    term is a per-batch scalar is cross-sectionally flat by construction, so
+    this is the ONLY branch a wiring that fed the total could ever take.
+
+    A flat Ω is now REPORTED inoperative and the solve is bit-identical to
+    γ=0 — the operator sees a named reason instead of an unexplained shrink.
+    """
+    u_baseline = _baseline_universe(n_active=3)
+    u_baseline["alpha_hat"][:3] = 0.05
+    u_baseline["params"] = _params(covariance_shrinkage="sample")
+
+    u_flat = _baseline_universe(n_active=3)
+    u_flat["alpha_hat"][:3] = 0.05
+    u_flat["returns_panel"] = u_baseline["returns_panel"].copy()
+    u_flat["params"] = _params(covariance_shrinkage="sample", alpha_uncertainty_penalty=500.0)
+    u_flat["stance_caps"][u_flat["benchmark_idx"]] = 1.0
+    u_flat["stance_caps"][u_flat["cash_idx"]] = 1.0
+
+    r_baseline = _solve(u_baseline)
+    N = len(u_flat["tickers"])
+    unc = np.zeros(N)
+    unc[:3] = 0.05  # identical across every discretionary name
+    r_flat = solve_target_weights(**u_flat, alpha_uncertainty_epistemic=unc)
+
+    assert r_flat.diagnostics["alpha_uncertainty_penalty_used"] is False
+    assert r_flat.diagnostics["alpha_uncertainty_inoperative_reason"] == (
+        "cross_section_below_floor"
+    )
+    assert r_flat.diagnostics["alpha_uncertainty_epistemic_cv"] == pytest.approx(0.0)
+    np.testing.assert_allclose(r_baseline.weights, r_flat.weights, atol=1e-6)
+
+
+def test_large_but_flat_omega_is_caught_by_cv_not_by_magnitude():
+    """A magnitude test could not have caught the real degenerate regime.
+
+    A model whose posterior never left its prior emits an estimation-error
+    vector an order of magnitude LARGER than a healthy one's, and a
+    cross-sectional CV three orders of magnitude SMALLER. Big and useless: a
+    magnitude test reads it as informative and only the CV floor separates it.
+    The fixture below has that shape.
+    """
+    u = _baseline_universe(n_active=3)
+    u["alpha_hat"][:3] = 0.05
+    u["params"] = _params(covariance_shrinkage="sample", alpha_uncertainty_penalty=500.0)
+    u["stance_caps"][u["benchmark_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    unc = np.zeros(N)
+    # Large in magnitude, flat across the cross-section — the degenerate shape.
+    unc[:3] = [0.23019744, 0.23019854, 0.23021499]
+
+    result = solve_target_weights(**u, alpha_uncertainty_epistemic=unc)
+    assert max(unc) > 10 * 0.023, "fixture must be LARGE, or it tests nothing"
+    assert result.diagnostics["alpha_uncertainty_penalty_used"] is False
+    assert result.diagnostics["alpha_uncertainty_inoperative_reason"] == (
+        "cross_section_below_floor"
+    )
+
+
+def test_a_healthy_cross_section_clears_the_floor():
+    """The counterpart: a healthy vector must stay OPERATIVE.
+
+    Without this, the floor is a permanent false positive rather than a
+    detector — and a detector that never passes is indistinguishable from a
+    term that is switched off.
+    """
+    u = _baseline_universe(n_active=3)
+    u["alpha_hat"][:3] = 0.05
+    u["params"] = _params(covariance_shrinkage="sample", alpha_uncertainty_penalty=500.0)
+    u["stance_caps"][u["benchmark_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    unc = np.zeros(N)
+    unc[:3] = [0.01342714, 0.01872044, 0.01263466]
+
+    result = solve_target_weights(**u, alpha_uncertainty_epistemic=unc)
+    assert result.diagnostics["alpha_uncertainty_penalty_used"] is True
+    assert result.diagnostics["alpha_uncertainty_epistemic_cv"] > 0.01
+
+
+def test_the_total_could_never_have_cleared_the_floor():
+    """Why there is no fallback to the TOTAL predictive std.
+
+    The fixture has the shape a total predictive std takes: a per-batch scalar
+    noise term dominating a small per-name one. Built into Ω it is a uniform
+    ridge, and the CV floor says so — so a "fall back to the total when the
+    estimation-error field is absent" path would be dead code that only ever
+    produced an inoperative report. Substituting it would look like a
+    mitigation and be a no-op with a different name.
+    """
+    u = _baseline_universe(n_active=3)
+    u["alpha_hat"][:3] = 0.05
+    u["params"] = _params(covariance_shrinkage="sample", alpha_uncertainty_penalty=500.0)
+    u["stance_caps"][u["benchmark_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    totals = np.zeros(N)
+    totals[:3] = [0.097475, 0.098344, 0.097369]
+
+    # Passed as the TOTAL (its real role) → the term never arms.
+    r_total_only = solve_target_weights(**u, alpha_uncertainty=totals)
+    assert r_total_only.diagnostics["alpha_uncertainty_penalty_used"] is False
+    assert r_total_only.diagnostics["alpha_uncertainty_inoperative_reason"] == (
+        "epistemic_field_absent"
+    )
+
+    # And even if something DID hand the total to Ω, the floor rejects it.
+    r_forced = solve_target_weights(**u, alpha_uncertainty_epistemic=totals)
+    assert r_forced.diagnostics["alpha_uncertainty_penalty_used"] is False
+    assert r_forced.diagnostics["alpha_uncertainty_inoperative_reason"] == (
+        "cross_section_below_floor"
+    )
+
+
+def test_nan_entries_treated_as_zero_uncertainty():
+    """Partial-rollout case: some tickers carry the epistemic field, one does
+    not (legacy Ridge → None → NaN). NaN entries get zero penalty (no info)."""
+    u = _baseline_universe(n_active=3)
+    u["alpha_hat"][:3] = 0.05
+    u["params"] = _params(covariance_shrinkage="sample", alpha_uncertainty_penalty=1000.0)
+    u["stance_caps"][u["benchmark_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    unc = np.full(N, np.nan)
+    unc[0] = 0.04  # T0: diffuse
+    unc[1] = 0.004  # T1: confident
+    # T2 stays NaN → no penalty for it
+
+    result = solve_target_weights(**u, alpha_uncertainty_epistemic=unc)
+    assert result.diagnostics["alpha_uncertainty_penalty_used"] is True
+    # T0 shrinks hardest, T2 (no info) stays at cap.
+    assert result.weights[0] < result.weights[1]
+    assert result.weights[2] == pytest.approx(0.08, abs=1e-3)
+
+
+def test_negative_alpha_uncertainty_is_coerced_and_counted_on_the_diagnostics():
+    """A negative estimation std is an upstream contract violation. It is
+    coerced to zero and COUNTED on the artifact.
+
+    The source logged a warning. A log line is not evidence anyone reads a week
+    later, and this repository grades from durable artifacts: the count travels
+    on the diagnostics, where the run that was affected carries its own record
+    of it.
+    """
+    u = _baseline_universe(n_active=3)
+    u["alpha_hat"][:3] = 0.05
+    u["params"] = _params(covariance_shrinkage="sample", alpha_uncertainty_penalty=1000.0)
+    u["stance_caps"][u["benchmark_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    unc = np.zeros(N)
+    unc[0] = -0.05  # invalid
+    unc[1] = 0.002
+    unc[2] = 0.030
+
+    result = solve_target_weights(**u, alpha_uncertainty_epistemic=unc)
+    assert result.diagnostics["alpha_uncertainty_n_negative_coerced"] == 1
+    # Solve still completes; T0 gets zero penalty (coerced), so it stays at cap
+    assert result.weights[0] == pytest.approx(0.08, abs=1e-3)
+
+
+def test_alpha_uncertainty_wrong_shape_raises():
+    """Shape mismatch IS a load-bearing programming bug — raise loud."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["params"] = _params(covariance_shrinkage="sample", alpha_uncertainty_penalty=1000.0)
+    u["stance_caps"][u["benchmark_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    wrong_shape = np.array([0.01, 0.02])  # N=4 expected
+    with pytest.raises(ValueError, match="alpha_uncertainty_epistemic shape"):
+        solve_target_weights(**u, alpha_uncertainty_epistemic=wrong_shape)
+
+
+def test_uncertainty_penalty_diagnostics_populated():
+    """Diagnostics surface mean_alpha_std_active + penalty_contribution
+    for operator readability when penalty is active."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["params"] = _params(covariance_shrinkage="sample", alpha_uncertainty_penalty=500.0)
+    u["stance_caps"][u["benchmark_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    unc = np.zeros(N)
+    unc[0] = 0.03
+    unc[1] = 0.01
+
+    result = solve_target_weights(**u, alpha_uncertainty_epistemic=unc)
+    diag = result.diagnostics
+    assert diag["alpha_uncertainty_penalty_used"] is True
+    assert diag["alpha_uncertainty_vintage"] == "epistemic"
+    assert diag["alpha_uncertainty_inoperative_reason"] is None
+    assert diag["alpha_uncertainty_epistemic_cv"] > 0.01
+    assert "mean_alpha_std_active" in diag
+    assert diag["mean_alpha_std_active"] > 0
+    assert "alpha_uncertainty_penalty_contribution" in diag
+    assert diag["alpha_uncertainty_penalty_contribution"] > 0
+
+
+def test_uncertainty_penalty_composes_with_horizon_and_ewma():
+    """B.3 must compose with A.1 (sigma_horizon_days) and A.2 (EWMA) —
+    the full SOTA stack should work together, not just in isolation."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][:2] = 0.05
+    u["params"] = _params(
+        covariance_shrinkage="ewma",
+        ewma_lambda_decay=0.94,
+        sigma_horizon_days=21,
+        risk_aversion=5.0 / 21.0,  # compensating rescale per A.1
+        alpha_uncertainty_penalty=1000.0,
+    )
+    u["stance_caps"][u["benchmark_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    unc = np.zeros(N)
+    unc[0] = 0.04
+    unc[1] = 0.002
+
+    result = solve_target_weights(**u, alpha_uncertainty_epistemic=unc)
+    # Solve succeeds AND uncertainty penalty active AND differentiates picks
+    assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+    assert result.diagnostics["alpha_uncertainty_penalty_used"] is True
+    assert result.weights[0] < result.weights[1]
+
+
+# ── The covariance-injection re-solve path ──────────────────────────────────
+# A caller re-solving within a session supplies the DAILY covariance it already
+# estimated rather than re-estimating from a returns panel. These pin that the
+# injected path is mechanism-identical to the estimated one — including the
+# horizon scaling, which is applied on BOTH, so a caller that injects an
+# already-scaled matrix is scaling it twice and the validator says so.
+
+
+def _solved_pair(u: dict):
+    """Solve once estimating Σ from the panel, once injecting Σ_daily from the
+    SAME panel. Returns (estimated_result, injected_result)."""
+    u["stance_caps"][u["benchmark_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+    cfg_full = u["params"]
+    sigma_daily = _estimate_covariance_daily(u["returns_panel"], cfg_full)
+    est = solve_target_weights(**u)
+    inj_kwargs = {**u, "returns_panel": None, "covariance": sigma_daily}
+    inj = solve_target_weights(**inj_kwargs)
+    return est, inj, sigma_daily
+
+
+def test_covariance_injection_matches_estimated_path():
+    """covariance=None vs covariance=Σ_daily (same panel) → identical output."""
+    u = _baseline_universe(n_active=3)
+    u["alpha_hat"][0] = 0.05
+    u["alpha_hat"][1] = 0.03
+    u["alpha_hat"][2] = -0.02
+    est, inj, _ = _solved_pair(u)
+    np.testing.assert_allclose(est.weights, inj.weights, atol=1e-9)
+    assert inj.diagnostics["portfolio_vol_ann"] == pytest.approx(
+        est.diagnostics["portfolio_vol_ann"],
+        rel=1e-9,
+    )
+    assert inj.diagnostics["status"] == est.diagnostics["status"]
+
+
+def test_covariance_injection_horizon_aware():
+    """Injected Σ_daily honors sigma_horizon_days exactly like the estimator."""
+    u = _baseline_universe(n_active=3)
+    u["alpha_hat"][0] = 0.05
+    u["alpha_hat"][1] = 0.03
+    u["params"] = _params(sigma_horizon_days=21)
+    est, inj, _ = _solved_pair(u)
+    np.testing.assert_allclose(est.weights, inj.weights, atol=1e-9)
+    assert inj.diagnostics["portfolio_vol_ann"] == pytest.approx(
+        est.diagnostics["portfolio_vol_ann"],
+        rel=1e-9,
+    )
+
+
+def test_covariance_injection_json_roundtrip():
+    """Σ persisted to JSON (shadow log) and reloaded still re-solves identically."""
+    import json
+
+    u = _baseline_universe(n_active=3)
+    u["alpha_hat"][0] = 0.05
+    u["alpha_hat"][1] = 0.03
+    u["stance_caps"][u["benchmark_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+    cfg_full = u["params"]
+    sigma_daily = _estimate_covariance_daily(u["returns_panel"], cfg_full)
+
+    in_mem = solve_target_weights(**{**u, "returns_panel": None, "covariance": sigma_daily})
+    serialized = json.loads(json.dumps([[float(x) for x in row] for row in sigma_daily]))
+    reloaded = np.asarray(serialized, dtype=float)
+    round_tripped = solve_target_weights(**{**u, "returns_panel": None, "covariance": reloaded})
+    np.testing.assert_allclose(in_mem.weights, round_tripped.weights, atol=1e-9)
+
+
+def test_validate_covariance_rejects_bad_shape():
+    with pytest.raises(ValueError, match="covariance shape"):
+        _validate_covariance(np.eye(4), 5)
+
+
+def test_validate_covariance_rejects_non_finite():
+    bad = np.eye(3)
+    bad[0, 0] = np.nan
+    with pytest.raises(ValueError, match="non-finite"):
+        _validate_covariance(bad, 3)
+
+
+def test_validate_covariance_rejects_non_psd():
+    # Symmetric but indefinite (negative eigenvalue).
+    bad = np.array([[1.0, 2.0, 0.0], [2.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    with pytest.raises(ValueError, match="not PSD"):
+        _validate_covariance(bad, 3)
+
+
+def test_validate_covariance_symmetrizes_tiny_asymmetry():
+    sym = np.array([[1.0, 0.2, 0.1], [0.2, 1.0, 0.3], [0.1, 0.3, 1.0]])
+    nearly = sym.copy()
+    nearly[0, 1] += 1e-12  # JSON-roundtrip-scale asymmetry
+    out = _validate_covariance(nearly, 3)
+    np.testing.assert_allclose(out, out.T, atol=0.0)  # exactly symmetric
+
+
+def test_covariance_provided_allows_none_returns_panel():
+    """returns_panel=None is valid when covariance is supplied."""
+    u = _baseline_universe(n_active=2)
+    u["alpha_hat"][0] = 0.04
+    u["stance_caps"][u["benchmark_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+    cfg_full = u["params"]
+    sigma_daily = _estimate_covariance_daily(u["returns_panel"], cfg_full)
+    res = solve_target_weights(**{**u, "returns_panel": None, "covariance": sigma_daily})
+    assert res.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+
+
+def test_missing_returns_panel_without_covariance_raises():
+    u = _baseline_universe(n_active=2)
+    u["stance_caps"][u["benchmark_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+    with pytest.raises(ValueError, match="returns_panel is required"):
+        solve_target_weights(**{**u, "returns_panel": None})
+
+
+class TestTurnoverBudgetConstraint:
+    """The daily turnover budget is a CONSTRAINT inside the convex program,
+    not a post-solve uniform shrink (alpha-engine-config-I7346).
+
+    The distinction is the whole point: a shrink scales EVERY name's delta by
+    ``cap / requested``, including names whose entire delta is an intended new
+    position, so a hard enough shrink pushes a whole entry cohort under the
+    downstream rebalance band and deletes it unnamed. A constraint makes the
+    optimizer CHOOSE which trades fit the budget, and every surviving name
+    lands at the size it actually wants.
+    See `crucible.portfolio._apply_turnover_constraint`.
+    """
+
+    def _solve_from_prev(self, cap=0.20, flag=0.35):
+        # Six attractive names, each capped at 0.08, against an all-SPY book.
+        # The unconstrained MVO target is ~0.48 one-way away, so a 0.20 budget
+        # genuinely binds. w_prev sums to 1 and sits exactly ON the cash sleeve
+        # and inside every stance cap — the MANDATORY floor is therefore zero
+        # and the budget is purely discretionary, which is the regime these
+        # assertions are about.
+        u = _baseline_universe(n_active=6)
+        u["alpha_hat"][:6] = [0.08, 0.078, 0.076, 0.074, 0.072, 0.070]
+        w_prev = np.zeros(len(u["tickers"]))
+        w_prev[u["benchmark_idx"]] = 0.97
+        w_prev[u["cash_idx"]] = 0.03
+        u["w_prev"] = w_prev
+        u["params"] = _params(max_daily_turnover=cap, large_move_turnover_flag=flag)
+        return _solve(u)
+
+    def test_small_move_below_budget_is_untouched(self):
+        # Already near target → budget never binds → no flag.
+        u = _baseline_universe(n_active=1)
+        u["alpha_hat"][0] = 0.08
+        # Seed w_prev close to the expected target (0.08 / 0.89 SPY / 0.03 cash).
+        w_prev = np.zeros(len(u["tickers"]))
+        w_prev[0] = 0.075
+        w_prev[u["benchmark_idx"]] = 0.895
+        w_prev[u["cash_idx"]] = 0.03
+        u["w_prev"] = w_prev
+        u["params"] = _params(max_daily_turnover=0.20, large_move_turnover_flag=0.35)
+        result = _solve(u)
+        assert result.diagnostics["turnover_constraint_applied"] is True
+        assert result.diagnostics["turnover_constraint_binding"] is False
+        assert result.diagnostics["turnover_capped"] is False
+        assert result.diagnostics["large_move_flagged"] is False
+        assert result.diagnostics["turnover_one_way"] < 0.20
+
+    def test_solved_vector_satisfies_the_budget(self):
+        # The solver, not a post-hoc shrink, keeps executed turnover at/below
+        # the cap. (Universe: T0, SPY, CASH.)
+        result = self._solve_from_prev(cap=0.20)
+        d = result.diagnostics
+        assert d["turnover_constraint_binding"] is True
+        assert d["turnover_capped"] is True
+        assert d["turnover_one_way"] <= 0.20 + 1e-3
+        assert d["turnover_one_way"] == pytest.approx(0.20, abs=1e-2)
+
+    def test_no_post_hoc_scale_factor_is_reported(self):
+        # `turnover_scale_applied` was the shrink's signature. Nothing is
+        # scaled any more, so the key must be gone rather than reported as 1.0
+        # (a reported 1.0 would read as "a shrink ran and was a no-op").
+        result = self._solve_from_prev(cap=0.20)
+        assert "turnover_scale_applied" not in result.diagnostics
+
+    def test_budget_shadow_price_is_published(self):
+        # The dual of the turnover constraint: the marginal objective value of
+        # one more unit of budget. It is what the restraint COST, and it
+        # replaces the old "requested vs executed" gap as the evidence that
+        # the optimizer wanted to move further.
+        result = self._solve_from_prev(cap=0.20)
+        sp = result.diagnostics["turnover_constraint_shadow_price"]
+        assert sp is not None and sp > 0.0
+
+    def test_binding_budget_sets_large_move_flag(self):
+        # A binding budget means the optimizer wanted more than it was
+        # allowed. Under the constraint construction executed turnover can no
+        # longer exceed the flag on a capped day, so without this branch the
+        # large-move detector would have gone permanently silent.
+        result = self._solve_from_prev(cap=0.20, flag=0.35)
+        assert result.diagnostics["large_move_flagged"] is True
+        assert result.diagnostics["large_move_reason"] == "turnover_budget_binding"
+
+    def test_flag_without_budget_flags_but_does_not_constrain(self):
+        # flag set, budget disabled → flagged on the raw comparison, weights
+        # unconstrained (flagging never substitutes for the budget). The flag
+        # is set below the fixture's unconstrained move so the raw comparison
+        # is what fires, with no budget present to bind.
+        result = self._solve_from_prev(cap=None, flag=0.10)
+        assert result.diagnostics["large_move_flagged"] is True
+        assert result.diagnostics["large_move_reason"] == "executed_turnover_above_flag"
+        assert result.diagnostics["turnover_constraint_applied"] is False
+        assert result.diagnostics["turnover_capped"] is False
+
+    def test_budget_disabled_is_bit_identical(self):
+        # max_daily_turnover=None → no constraint, no flag, legacy behaviour.
+        result = self._solve_from_prev(cap=None, flag=None)
+        assert result.diagnostics["turnover_constraint_applied"] is False
+        assert result.diagnostics["turnover_constraint_cap"] is None
+        assert result.diagnostics["turnover_capped"] is False
+        assert result.diagnostics["large_move_flagged"] is False
+
+    def test_turnover_fields_present_on_every_solve(self):
+        # A field that appears only on the interesting path is
+        # indistinguishable from a dead emitter.
+        for cap in (0.20, None):
+            d = self._solve_from_prev(cap=cap).diagnostics
+            for key in (
+                "requested_turnover_one_way",
+                "turnover_constraint_applied",
+                "turnover_constraint_cap",
+                "turnover_mandatory_floor",
+                "turnover_constraint_binding",
+                "turnover_constraint_shadow_price",
+                "turnover_capped",
+                "large_move_flagged",
+                "large_move_reason",
+            ):
+                assert key in d, f"{key} missing with cap={cap}"
+
+    def test_weights_stay_feasible_under_the_budget(self):
+        result = self._solve_from_prev(cap=0.20)
+        assert result.weights.sum() == pytest.approx(1.0, abs=1e-6)
+        assert np.all(result.weights >= -1e-9)
+
+
+class TestTurnoverBudgetDoesNotDeleteAnEntryCohort:
+    """The regression the issue is about (alpha-engine-config-I7346).
+
+    Shape: a book far from target (one oversized legacy holding to unwind)
+    plus SEVERAL new small candidates. Under the old post-solve uniform
+    shrink, the whole step scaled by ``cap / requested``; with requested
+    turnover large the scale factor is small enough that every new position's
+    delta lands under the downstream ``rebalance_band_pct`` and the entire
+    entry cohort is deleted while the solve still reports ``optimal``.
+
+    Under the constraint construction the optimizer spends the budget on the
+    trades it most wants, so whatever it does enter, it enters at a TRADEABLE
+    size — never a uniformly-shrunk sliver.
+    """
+
+    BAND = 0.005  # a downstream rebalance band: a |dw| below it is not traded
+
+    N_ENTRIES = 8
+
+    def _far_from_target(self, cap):
+        # Eight new candidates against a book parked almost entirely in the
+        # benchmark fill. The unconstrained MVO wants ~0.5 one-way, so the budget
+        # binds hard, and every entry is a NEW position: exactly the cohort a
+        # uniform shrink scales toward zero.
+        u = _baseline_universe(n_active=self.N_ENTRIES)
+        u["alpha_hat"][: self.N_ENTRIES] = np.linspace(0.08, 0.06, self.N_ENTRIES)
+        w_prev = np.zeros(len(u["tickers"]))
+        w_prev[u["benchmark_idx"]] = 0.97
+        w_prev[u["cash_idx"]] = 0.03
+        u["w_prev"] = w_prev
+        u["params"] = _params(max_daily_turnover=cap, min_position_pct=0.005)
+        return u
+
+    @staticmethod
+    def _uniform_shrink(weights, w_prev, cap):
+        """The OLD mechanism, reproduced locally so the test states what it is
+        protecting against rather than merely asserting today's numbers:
+
+            w_exec = w_prev + (w_target − w_prev) · (cap / requested)
+        """
+        requested = float(np.sum(np.abs(weights - w_prev)) / 2)
+        if requested <= cap:
+            return weights
+        return w_prev + (weights - w_prev) * (cap / requested)
+
+    def test_new_positions_survive_the_band_at_tradeable_sizes(self):
+        cap = 0.20
+        u = self._far_from_target(cap)
+        w_prev = u["w_prev"].copy()
+        result = _solve(u)
+
+        assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+        assert result.diagnostics["turnover_one_way"] <= cap + 1e-3
+        assert result.diagnostics["turnover_constraint_binding"] is True
+
+        entered = [i for i in range(self.N_ENTRIES) if w_prev[i] == 0.0 and result.weights[i] > 0.0]
+        assert entered, "the solve entered nothing — fixture no longer exercises entries"
+        for i in entered:
+            delta = float(result.weights[i] - w_prev[i])
+            assert delta >= self.BAND, (
+                f"entry T{i} sized at {delta:.5f}, under the {self.BAND} "
+                "rebalance band — it would be deleted downstream, unnamed"
+            )
+
+    def test_the_old_uniform_shrink_deletes_an_entry_cohort(self):
+        # The counterfactual that makes the fix load-bearing. Stated as
+        # arithmetic on the shrink formula rather than as a second solve: the
+        # failure is a property of scaling every delta by cap/requested, not
+        # of any particular solver output, and a test that depends on the
+        # solver landing on a specific vector would rot into a tautology.
+        #
+        # Book: 0.85 in one legacy name to be unwound, plus eight intended
+        # entries of 0.02 each. One-way requested = 0.85, cap 0.20 →
+        # scale 0.235 → each 0.02 entry becomes 0.0047, under the 0.005 band.
+        n = self.N_ENTRIES
+        size = 0.02
+        w_prev = np.zeros(n + 2)
+        w_prev[n] = 0.85  # legacy holding, index n
+        w_prev[n + 1] = 0.12  # SPY-ish remainder
+        target = np.zeros(n + 2)
+        target[:n] = size
+        target[n] = 0.0
+        target[n + 1] = 1.0 - n * size
+
+        requested = float(np.sum(np.abs(target - w_prev)) / 2)
+        cap = 0.20
+        assert requested > cap
+        shrunk = self._uniform_shrink(target, w_prev, cap)
+
+        killed = [i for i in range(n) if abs(shrunk[i] - w_prev[i]) < self.BAND]
+        assert len(killed) == n, (
+            f"only {len(killed)}/{n} entries fell under the band — the fixture "
+            "no longer demonstrates the failure mode"
+        )
+        # And the same shrink applied to the LARGE leg leaves it comfortably
+        # tradeable: the cohort is deleted while the rebalance survives, which
+        # is why the solve still looked healthy.
+        assert abs(shrunk[n] - w_prev[n]) > self.BAND
+
+    def test_budget_is_not_starved_by_a_mandated_exit(self):
+        # A held name that goes INELIGIBLE is pinned to w=0, which mandates
+        # turnover whether or not there is budget for it. If the constraint's
+        # RHS were the raw config cap, the program would be infeasible and the
+        # whole book would fall to the hold path — a new failure mode
+        # introduced by the fix, on the day a forced exit is what must happen.
+        u = _baseline_universe(n_active=2)
+        u["alpha_hat"][:2] = [0.05, 0.04]
+        w_prev = np.zeros(len(u["tickers"]))
+        w_prev[0] = 0.70  # held, and about to be gated off
+        w_prev[u["benchmark_idx"]] = 0.27
+        w_prev[u["cash_idx"]] = 0.03
+        u["w_prev"] = w_prev
+        u["eligibility"] = np.ones(len(u["tickers"]), dtype=bool)
+        u["eligibility"][0] = False
+        # 0.70 must go to zero → 0.35 one-way, far above a 0.05 budget.
+        u["params"] = _params(max_daily_turnover=0.05)
+        result = _solve(u)
+
+        d = result.diagnostics
+        assert d["status"] in ("optimal", "optimal_inaccurate"), (
+            "the mandated exit made the program infeasible — the turnover "
+            "budget starved a non-discretionary trade"
+        )
+        assert result.weights[0] == pytest.approx(0.0, abs=1e-6)
+        assert d["turnover_mandatory_floor"] >= 0.30
+        assert d["turnover_constraint_cap"] >= d["turnover_mandatory_floor"]
+
+
+class TestTurnoverBudgetAssertion:
+    """``_apply_turnover_governor`` no longer shrinks — it asserts, and raises
+    when the solved vector exceeds the budget by more than the post-solve
+    clip can account for."""
+
+    def test_conforming_vector_passes_and_is_unmodified(self):
+        w_prev = np.array([0.10, 0.87, 0.03])
+        weights = np.array([0.15, 0.82, 0.03])  # one-way 0.05
+        meta = {
+            "turnover_constraint_applied": True,
+            "turnover_constraint_cap": 0.20,
+            "turnover_mandatory_floor": 0.0,
+            "turnover_constraint": None,
+        }
+        out, gov = _apply_turnover_governor(
+            weights,
+            w_prev,
+            _params(large_move_turnover_flag=None),
+            turnover_meta=meta,
+            clip_mass_zeroed=0.0,
+        )
+        assert out is weights
+        assert gov["requested_turnover_one_way"] == pytest.approx(0.05)
+
+    def test_violation_raises_rather_than_shrinking(self):
+        w_prev = np.array([0.10, 0.87, 0.03])
+        weights = np.array([0.60, 0.37, 0.03])  # one-way 0.50, cap 0.20
+        meta = {
+            "turnover_constraint_applied": True,
+            "turnover_constraint_cap": 0.20,
+            "turnover_mandatory_floor": 0.0,
+            "turnover_constraint": None,
+        }
+        with pytest.raises(TurnoverBudgetError, match="exceeds the daily"):
+            _apply_turnover_governor(
+                weights,
+                w_prev,
+                _params(),
+                turnover_meta=meta,
+                clip_mass_zeroed=0.0,
+            )
+
+    def test_clip_mass_is_the_tolerance(self):
+        # The dust-drop + renormalize step legitimately adds up to
+        # `clip_mass_zeroed` of one-way turnover. Within that budget the
+        # assertion must NOT fire; beyond it, it must.
+        w_prev = np.array([0.10, 0.87, 0.03])
+        weights = np.array([0.30, 0.67, 0.03])  # one-way 0.20 exactly
+        meta = {"turnover_constraint_cap": 0.19, "turnover_constraint": None}
+        # 0.20 > 0.19 by 0.01 — explained by a 0.02 clip, not by a 0.001 one.
+        _apply_turnover_governor(
+            weights,
+            w_prev,
+            _params(),
+            turnover_meta=meta,
+            clip_mass_zeroed=0.02,
+        )
+        with pytest.raises(TurnoverBudgetError):
+            _apply_turnover_governor(
+                weights,
+                w_prev,
+                _params(),
+                turnover_meta=meta,
+                clip_mass_zeroed=0.001,
+            )
+
+    def test_disabled_budget_never_raises(self):
+        w_prev = np.array([0.10, 0.87, 0.03])
+        weights = np.array([0.90, 0.07, 0.03])
+        meta = {"turnover_constraint_applied": False, "turnover_constraint_cap": None}
+        out, gov = _apply_turnover_governor(
+            weights,
+            w_prev,
+            _params(),
+            turnover_meta=meta,
+            clip_mass_zeroed=0.0,
+        )
+        assert out is weights
+        assert gov["turnover_capped"] is False
+
+
+class TestMandatoryTurnoverFloor:
+    def test_zero_when_w_prev_already_satisfies_the_box(self):
+        w_prev = np.array([0.10, 0.87, 0.03])
+        caps = np.array([0.50, 1.0, 1.0])
+        floor = _mandatory_turnover_floor(
+            w_prev,
+            caps,
+            cash_idx=2,
+            params=_params(cash_sleeve_pct=0.03),
+        )
+        assert floor == pytest.approx(0.0, abs=1e-12)
+
+    def test_counts_a_forced_exit(self):
+        # A held 0.40 pinned to zero forces 0.40 of L1 out and 0.40 back in
+        # elsewhere → 0.40 one-way.
+        w_prev = np.array([0.40, 0.57, 0.03])
+        caps = np.array([0.0, 1.0, 1.0])  # name 0 gated off
+        floor = _mandatory_turnover_floor(
+            w_prev,
+            caps,
+            cash_idx=2,
+            params=_params(cash_sleeve_pct=0.03),
+        )
+        assert floor == pytest.approx(0.40, abs=1e-9)
+
+    def test_counts_the_cash_sleeve_pin(self):
+        # Cash at 0.00 must reach the 0.03 sleeve: 0.03 in, 0.03 out.
+        w_prev = np.array([0.10, 0.90, 0.00])
+        caps = np.array([0.50, 1.0, 1.0])
+        floor = _mandatory_turnover_floor(
+            w_prev,
+            caps,
+            cash_idx=2,
+            params=_params(cash_sleeve_pct=0.03),
+        )
+        assert floor == pytest.approx(0.03, abs=1e-9)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Participation-aware square-root impact cost + the max-%-ADV constraint.
+# The impact law is `nousergon_lib.quant.transaction_cost`'s; only the convex
+# expression it is evaluated inside is local.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _feasible_universe(n_active=2, daily_vol=0.01):
+    """Baseline universe with SPY/CASH stance caps → 1.0 (as ``_solve`` does),
+    so the budget constraint is feasible when calling solve_target_weights
+    directly (the kwargs-splat path used by the ADV tests below)."""
+    u = _baseline_universe(n_active=n_active, daily_vol=daily_vol)
+    u["stance_caps"][u["benchmark_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+    return u
+
+
+def _adv_universe(n_active=2, daily_vol=0.01):
+    """Feasible baseline + an ADV$ vector (SPY/CASH NaN) for the impact term."""
+    u = _feasible_universe(n_active=n_active, daily_vol=daily_vol)
+    N = len(u["tickers"])
+    adv = np.full(N, np.nan)
+    for i in range(n_active):
+        adv[i] = 50_000_000.0  # liquid default; per-test overrides
+    u["cost_model"] = _impact_model()
+    return u, adv
+
+
+def test_sqrt_impact_term_produces_valid_weight_vector():
+    """With adv_usd + portfolio_notional, the participation-aware term is used
+    and the solve still returns a valid (sums-to-1, sleeve-pinned, capped)
+    weight vector."""
+    u, adv = _adv_universe(n_active=2)
+    u["alpha_hat"][0] = 0.05
+    u["alpha_hat"][1] = 0.04
+    result = solve_target_weights(
+        **u,
+        adv_usd=adv,
+        portfolio_notional=1_000_000.0,
+    )
+    w = result.weights
+    assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+    assert result.diagnostics["tcost_term_kind"] == "sqrt_impact"
+    assert result.diagnostics["tcost_n_names_with_adv"] == 2
+    assert w.sum() == pytest.approx(1.0, abs=1e-6)
+    assert w[u["cash_idx"]] == pytest.approx(0.03, abs=1e-6)
+    assert np.all(w >= -1e-8)
+    assert np.all(w <= u["stance_caps"] + 1e-6)
+
+
+def test_sqrt_impact_penalizes_illiquid_name_more_than_liquid():
+    """Two names with IDENTICAL α̂ but different ADV: the illiquid name (thin
+    ADV → higher √-impact cost to trade INTO from w_prev=0) is sized smaller."""
+    u, adv = _adv_universe(n_active=2)
+    u["alpha_hat"][0] = 0.05  # liquid
+    u["alpha_hat"][1] = 0.05  # illiquid, same alpha
+    adv[0] = 500_000_000.0  # very liquid
+    adv[1] = 2_000_000.0  # thin — costly to trade into
+    # Impact coefficient large enough that the illiquid name's marginal impact
+    # cost overtakes its α̂ BEFORE the 0.08 stance cap binds, so the two names
+    # separate (a modest coef leaves both pinned at the cap).
+    u["params"] = _params(max_daily_turnover=None, max_pct_adv=None)
+    u["cost_model"] = _impact_model(impact_coef_bps=3000.0)
+    result = solve_target_weights(
+        **u,
+        adv_usd=adv,
+        portfolio_notional=4_000_000.0,
+    )
+    w = result.weights
+    assert result.diagnostics["tcost_term_kind"] == "sqrt_impact"
+    assert w[0] > w[1] + 1e-4, (
+        f"Liquid name should size larger than the equally-attractive illiquid "
+        f"name; got w_liquid={w[0]:.4f} w_illiquid={w[1]:.4f}"
+    )
+
+
+def test_max_pct_adv_constraint_binds_and_caps_participation():
+    """The max-%-ADV constraint bounds |Δw|·NAV ≤ max_pct_adv·ADV per name.
+    With a thin ADV the target trade is clipped to the participation bound."""
+    u, adv = _adv_universe(n_active=1)
+    u["alpha_hat"][0] = 0.20  # strongly wants the full 0.08 cap
+    adv[0] = 1_000_000.0  # thin
+    nav = 10_000_000.0
+    max_pct_adv = 0.05
+    # Bound in weight space: 0.05 * 1e6 / 1e7 = 0.005 → the name can move at most
+    # 0.5% of NAV from w_prev=0 in a single solve.
+    u["params"] = _params(max_daily_turnover=None, max_pct_adv=max_pct_adv)
+    u["cost_model"] = _impact_model(impact_coef_bps=0.0)  # isolate the constraint
+    result = solve_target_weights(
+        **u,
+        adv_usd=adv,
+        portfolio_notional=nav,
+    )
+    w = result.weights
+    assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+    assert result.diagnostics["max_pct_adv_applied"] is True
+    bound_weight = max_pct_adv * adv[0] / nav  # 0.005
+    assert w[0] <= bound_weight + 1e-5, (
+        f"Trade must respect the {max_pct_adv:.0%}-of-ADV participation cap "
+        f"(bound {bound_weight:.4f}); got w={w[0]:.4f}"
+    )
+    assert w[0] == pytest.approx(bound_weight, abs=5e-4)
+
+
+def test_max_pct_adv_constraint_off_when_disabled():
+    """max_pct_adv=None → no participation constraint; the name reaches its cap."""
+    u, adv = _adv_universe(n_active=1)
+    u["alpha_hat"][0] = 0.20
+    adv[0] = 1_000_000.0
+    u["params"] = _params(max_daily_turnover=None, max_pct_adv=None)
+    u["cost_model"] = _impact_model(impact_coef_bps=0.0)
+    result = solve_target_weights(
+        **u,
+        adv_usd=adv,
+        portfolio_notional=10_000_000.0,
+    )
+    assert result.diagnostics["max_pct_adv_applied"] is False
+    assert result.weights[0] == pytest.approx(0.08, abs=1e-3)
+
+
+def test_a_participation_model_with_no_book_notional_refuses():
+    """No book notional → the named model REFUSES. It does not become a flat one.
+
+    The source degraded here, and that degradation is the whole defect this
+    lift closes: the solve went on, the verdict named a participation-aware
+    model, and a flat penalty is what actually charged it. Grading is offline
+    and the caller owns the notional, so an absent one is a caller defect.
+    """
+    u = _feasible_universe(n_active=2)
+    u["alpha_hat"][0] = 0.05
+    u["cost_model"] = _impact_model()
+    with pytest.raises(CostModelInputError, match="needs the book notional"):
+        solve_target_weights(**u)
+
+
+def test_a_participation_model_with_no_adv_coverage_anywhere_refuses():
+    """A notional but no ADV on any name → REFUSES, for the same reason.
+
+    A universe in which nothing can be priced by participation cannot be
+    graded by a model that prices participation. Charging the spread floor
+    instead would produce a number, and the number would be attributed to a
+    model that never saw a volume.
+    """
+    u = _feasible_universe(n_active=2)
+    u["alpha_hat"][0] = 0.05
+    u["cost_model"] = _impact_model()
+    n_names = len(u["tickers"])
+    with pytest.raises(CostModelInputError, match="no name in this universe has ADV"):
+        solve_target_weights(
+            **u,
+            adv_usd=np.full(n_names, np.nan),
+            portfolio_notional=1_000_000.0,
+        )
+
+
+def test_tcost_flat_l1_matches_legacy_bit_identical():
+    """sqrt_impact fail-soft to flat_l1 reproduces the LEGACY flat-penalty solve
+    exactly (same weights as the pre-1401 path with tcost_mode absent)."""
+    u1 = _feasible_universe(n_active=3)
+    u1["alpha_hat"][:3] = [0.05, 0.03, 0.01]
+    r_legacy = solve_target_weights(
+        **{k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in u1.items()}
+    )
+    assert r_legacy.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+    u2 = _feasible_universe(n_active=3)
+    u2["alpha_hat"][:3] = [0.05, 0.03, 0.01]
+    r_failsoft = solve_target_weights(
+        **u2,
+        adv_usd=None,
+        portfolio_notional=None,
+    )
+    np.testing.assert_allclose(r_legacy.weights, r_failsoft.weights, atol=1e-9)
+
+
+def test_sigma_scaling_engages_with_name_sigma():
+    """Passing name_sigma engages the Almgren-Chriss σ-scaling (diagnostic flag),
+    and the solve remains valid."""
+    u, adv = _adv_universe(n_active=2)
+    u["alpha_hat"][0] = 0.05
+    u["alpha_hat"][1] = 0.05
+    N = len(u["tickers"])
+    name_sigma = np.full(N, np.nan)
+    name_sigma[0] = 0.01
+    name_sigma[1] = 0.04  # 4× more volatile → higher impact cost
+    u["params"] = _params(max_daily_turnover=None, max_pct_adv=None)
+    u["cost_model"] = _impact_model(impact_coef_bps=400.0)
+    result = solve_target_weights(
+        **u,
+        adv_usd=adv,
+        portfolio_notional=4_000_000.0,
+        name_sigma=name_sigma,
+    )
+    assert result.diagnostics["tcost_sigma_scaled"] is True
+    # The higher-σ name (index 1) costs more to trade into → sized smaller.
+    assert result.weights[0] >= result.weights[1] - 1e-6
+
+
+def test_adv_partial_coverage_mixes_impact_and_floor():
+    """When only SOME names have ADV, the covered ones use √-impact and the
+    uncovered ones fall to the half-spread+commission floor; still valid."""
+    u, adv = _adv_universe(n_active=3)
+    u["alpha_hat"][:3] = [0.05, 0.05, 0.05]
+    adv[0] = 50_000_000.0
+    adv[1] = np.nan  # uncovered → floor
+    adv[2] = 3_000_000.0  # thin → penalized
+    u["params"] = _params(max_daily_turnover=None, max_pct_adv=None)
+    u["cost_model"] = _impact_model(impact_coef_bps=300.0)
+    result = solve_target_weights(
+        **u,
+        adv_usd=adv,
+        portfolio_notional=4_000_000.0,
+    )
+    assert result.diagnostics["tcost_term_kind"] == "sqrt_impact"
+    assert result.diagnostics["tcost_n_names_with_adv"] == 2  # names 0 and 2
+    assert result.weights.sum() == pytest.approx(1.0, abs=1e-6)
+
+
+class TestConvictionBudgetGate:
+    """alpha-engine-config-I9315 — the discretionary turnover budget is gated
+    on measured signal quality, not only on a fixed cap.
+
+    The failure this closes: an optimizer pinned at its daily budget for weeks
+    while the UNCONSTRAINED optimum itself moves further each day than the
+    budget allows, so the walk toward it can never converge. A budget alone
+    cannot see that — it caps the step, never the reason for the step. When the
+    cross-sectional alpha spread is a small fraction of the model's own median
+    per-name error bar, the optimizer is ranking names it cannot tell apart and
+    rebalancing between them is a transaction cost, not a trade.
+    """
+
+    @staticmethod
+    def _gate(alpha, sigma, cfg=None, n=None):
+        n = n if n is not None else len(alpha)
+        return compute_conviction_budget_multiplier(
+            np.array(alpha, dtype=float),
+            None if sigma is None else np.array(sigma, dtype=float),
+            np.ones(n, dtype=bool),
+            n - 2,
+            n - 1,
+            _params(**(cfg or {})),
+        )
+
+    def test_high_conviction_is_not_throttled(self):
+        # Healthy regime: spread well above the model's own error bar.
+        out = self._gate([0.10, -0.10, 0.05, -0.05, 0.0, 0.0], [0.02] * 6)
+        assert out["conviction_ir_xs"] > 0.75
+        assert out["conviction_budget_multiplier"] == 1.0
+        assert out["conviction_gate_applied"] is False
+        assert out["conviction_gate_reason"] == "signal_quality_ok"
+
+    def test_tied_names_are_throttled_to_the_floor(self):
+        # The degenerate regime: spread a small fraction of sigma_alpha.
+        out = self._gate([0.001, 0.002, 0.0015, 0.0012, 0.0, 0.0], [0.24] * 6)
+        assert out["conviction_ir_xs"] < 0.05
+        assert out["conviction_budget_multiplier"] == pytest.approx(0.05)
+        assert out["conviction_gate_applied"] is True
+        assert out["conviction_gate_reason"] == "alpha_spread_below_own_noise"
+
+    def test_multiplier_is_monotone_in_signal_quality(self):
+        qs = [
+            self._gate([s, -s, s / 2, -s / 2, 0.0, 0.0], [0.10] * 6)["conviction_budget_multiplier"]
+            for s in (0.01, 0.05, 0.10, 0.30)
+        ]
+        assert qs == sorted(qs)
+        assert qs[0] < 1.0 and qs[-1] == 1.0
+
+    def test_missing_uncertainty_never_tightens_the_budget(self):
+        # Missing data must never produce a budget TIGHTER than configured: a
+        # gate that halts the book on an input outage is a worse failure than
+        # the churn it exists to stop. The reason is recorded, not swallowed.
+        for sigma, reason in (
+            (None, "no_alpha_uncertainty_vector"),
+            ([0.0] * 6, "no_usable_alpha_uncertainty"),
+            ([float("nan")] * 6, "no_usable_alpha_uncertainty"),
+        ):
+            out = self._gate([0.001, 0.002, 0.0015, 0.0012, 0.0, 0.0], sigma)
+            assert out["conviction_budget_multiplier"] == 1.0
+            assert out["conviction_gate_applied"] is False
+            assert out["conviction_gate_reason"] == reason
+
+    def test_disabled_gate_is_inert_and_says_so(self):
+        out = self._gate(
+            [0.001, 0.002, 0.0015, 0.0012, 0.0, 0.0],
+            [0.24] * 6,
+            cfg={"conviction_budget_gate_enabled": False},
+        )
+        assert out["conviction_budget_multiplier"] == 1.0
+        assert out["conviction_gate_reason"] == "disabled"
+
+    def test_an_inverted_band_is_refused_before_it_can_throttle_anything(self):
+        """The source detected an inverted band inside the gate and returned an
+        untouched budget with a reason. Refusing it when the parameters are
+        built is strictly stronger: a band that cannot be evaluated never
+        reaches a solve at all, so there is no run to read the reason off.
+        """
+        with pytest.raises(PortfolioParamsError, match="must exceed conviction_ir_floor"):
+            _params(conviction_ir_floor=0.9, conviction_ir_full=0.4)
+
+    def test_too_few_discretionary_names_is_inert(self):
+        out = compute_conviction_budget_multiplier(
+            np.array([0.01, 0.0, 0.0]),
+            np.array([0.2, 0.0, 0.0]),
+            np.ones(3, dtype=bool),
+            1,
+            2,
+            _params(),
+        )
+        assert out["conviction_budget_multiplier"] == 1.0
+        assert out["conviction_gate_reason"] == "too_few_discretionary_names"
+
+    # ── end-to-end through the solve ─────────────────────────────────────
+
+    @staticmethod
+    def _solve_tied(gate=True, cap=0.20):
+        # Six statistically tied names against an all-SPY book: alphas differ
+        # by ~1/50th of their own sigma. Ungated, the optimizer spends the
+        # whole 20% budget reshuffling them.
+        u = _baseline_universe(n_active=6)
+        u["alpha_hat"][:6] = [0.0100, 0.0102, 0.0104, 0.0106, 0.0108, 0.0110]
+        u["alpha_uncertainty"] = np.full(len(u["tickers"]), 0.25)
+        w_prev = np.zeros(len(u["tickers"]))
+        w_prev[u["benchmark_idx"]] = 0.97
+        w_prev[u["cash_idx"]] = 0.03
+        u["w_prev"] = w_prev
+        u["params"] = _params(
+            max_daily_turnover=cap,
+            large_move_turnover_flag=0.35,
+            conviction_budget_gate_enabled=gate,
+        )
+        return _solve(u)
+
+    def test_gate_collapses_turnover_on_tied_names(self):
+        ungated = self._solve_tied(gate=False).diagnostics
+        gated = self._solve_tied(gate=True).diagnostics
+        assert ungated["turnover_one_way"] == pytest.approx(0.20, abs=1e-2)
+        assert gated["turnover_one_way"] < 0.05
+        assert gated["conviction_gate_applied"] is True
+        assert gated["turnover_budget_configured"] == pytest.approx(0.20)
+        assert gated["turnover_budget_discretionary"] == pytest.approx(0.01)
+
+    def test_gated_binding_does_not_raise_the_large_move_flag(self):
+        # The alert this arc exists to end: a guard doing its job is not an
+        # incident. The budget still binds (on the throttled budget) and the
+        # reason SAYS which, but no operator alert is raised.
+        gated = self._solve_tied(gate=True).diagnostics
+        assert gated["turnover_constraint_binding"] is True
+        assert gated["large_move_reason"] == "conviction_throttled_budget_binding"
+        assert gated["large_move_flagged"] is False
+
+    def test_high_conviction_still_flags_a_binding_budget(self):
+        # The detector must not be killed by the fix: on a day the model
+        # stands behind, a binding budget is still a real operator fact.
+        u = _baseline_universe(n_active=6)
+        u["alpha_hat"][:6] = [0.08, 0.078, 0.076, 0.074, 0.072, 0.070]
+        # sigma_alpha well under the cross-sectional spread (0.0034) -> IR ~1.7,
+        # above the 0.75 full-budget mark: the model stands behind the ranking.
+        u["alpha_uncertainty"] = np.full(len(u["tickers"]), 0.002)
+        w_prev = np.zeros(len(u["tickers"]))
+        w_prev[u["benchmark_idx"]] = 0.97
+        w_prev[u["cash_idx"]] = 0.03
+        u["w_prev"] = w_prev
+        u["params"] = _params(max_daily_turnover=0.20, large_move_turnover_flag=0.35)
+        d = _solve(u).diagnostics
+        assert d["conviction_gate_applied"] is False
+        assert d["turnover_constraint_binding"] is True
+        assert d["large_move_flagged"] is True
+        assert d["large_move_reason"] == "turnover_budget_binding"
+
+    def test_conviction_fields_present_on_every_solve(self):
+        for cap in (0.20, None):
+            for gate in (True, False):
+                d = self._solve_tied(gate=gate, cap=cap).diagnostics
+                for key in (
+                    "conviction_gate_applied",
+                    "conviction_ir_xs",
+                    "conviction_alpha_dispersion",
+                    "conviction_alpha_noise",
+                    "conviction_n_names",
+                    "conviction_budget_multiplier",
+                    "conviction_gate_reason",
+                    "turnover_budget_configured",
+                    "turnover_budget_discretionary",
+                ):
+                    assert key in d, f"{key} missing cap={cap} gate={gate}"
+
+    def test_mandatory_turnover_is_never_starved_by_the_gate(self):
+        # A forced exit is not discretionary. With the gate at its floor
+        # (0.01 discretionary budget), an ineligible position carrying ~10%
+        # of the book must still be fully exited.
+        u = _baseline_universe(n_active=6)
+        u["alpha_hat"][:6] = [0.0100, 0.0102, 0.0104, 0.0106, 0.0108, 0.0110]
+        u["alpha_uncertainty"] = np.full(len(u["tickers"]), 0.25)
+        w_prev = np.zeros(len(u["tickers"]))
+        w_prev[0] = 0.10
+        w_prev[u["benchmark_idx"]] = 0.87
+        w_prev[u["cash_idx"]] = 0.03
+        u["w_prev"] = w_prev
+        u["eligibility"] = np.ones(len(u["tickers"]), dtype=bool)
+        u["eligibility"][0] = False
+        u["params"] = _params(max_daily_turnover=0.20, large_move_turnover_flag=0.35)
+        result = _solve(u)
+        d = result.diagnostics
+        assert d["conviction_gate_applied"] is True
+        assert d["turnover_budget_discretionary"] == pytest.approx(0.01)
+        # The forced exit sets the floor, and the effective budget is raised
+        # to it rather than clipped to the throttled discretionary number.
+        assert d["turnover_mandatory_floor"] >= 0.09
+        assert d["turnover_constraint_cap"] >= d["turnover_mandatory_floor"]
+        assert result.weights[0] == pytest.approx(0.0, abs=1e-6)
+
+
+class TestBudgetBindingComplementarySlackness:
+    """alpha-engine-config-I9315 — a binding verdict needs BOTH halves.
+
+    An interior-point solver returns numerical dust on the order of 1e-8 for
+    an INACTIVE constraint, with budget visibly left unspent. A `dual > 1e-9`
+    test sits far below that dust and reports such a solve as binding — an
+    alert stating the opposite of the truth. A primal-only test fails the other
+    way: the vector checked here is post-clip-and-renormalize, so its turnover
+    is basis points off the solver's own and a genuinely binding budget reads
+    as slack. Requiring both halves rejects the dust and accepts the drift.
+    """
+
+    @staticmethod
+    def _diag(executed, cap, dual):
+        w_prev = np.zeros(4)
+        w_prev[0] = 1.0
+        weights = w_prev.copy()
+        weights[0] -= executed
+        weights[1] += executed
+
+        class _C:
+            dual_value = dual
+
+        return _turnover_diagnostics(
+            weights,
+            w_prev,
+            {
+                "turnover_constraint_applied": True,
+                "turnover_constraint_cap": cap,
+                "turnover_constraint": _C(),
+            },
+        )
+
+    def test_dual_dust_below_the_bound_is_not_binding(self):
+        for executed, dual in ((0.1498, 4.2e-9), (0.1699, 2.4e-8), (0.1227, 1.6e-8)):
+            d = self._diag(executed, 0.20, dual)
+            assert d["turnover_constraint_binding"] is False, executed
+            assert d["turnover_capped"] is False
+
+    def test_post_clip_drift_at_the_bound_is_still_binding(self):
+        # The case a primal-only test misses:
+        # solver at the 0.2000 cap, post-clip-and-renormalize 0.19978.
+        d = self._diag(0.19978, 0.20, 0.00926)
+        assert d["turnover_constraint_binding"] is True
+        assert d["turnover_capped"] is True
+
+    def test_real_dual_at_the_bound_is_binding(self):
+        d = self._diag(0.20, 0.20, 0.0256)
+        assert d["turnover_constraint_binding"] is True
+
+    def test_no_dual_falls_back_to_the_primal_and_records_it(self):
+        d = self._diag(0.20, 0.20, None)
+        assert d["turnover_constraint_binding"] is True
+        assert d["turnover_binding_test"] == "primal_only_no_dual"
+
+    def test_binding_test_is_named_in_the_diagnostics(self):
+        d = self._diag(0.20, 0.20, 0.0256)
+        assert d["turnover_binding_test"] == "complementary_slackness"
