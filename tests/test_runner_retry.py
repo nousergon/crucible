@@ -167,6 +167,68 @@ class TestRetry:
         assert _manifest(store)["rows_in"] == 10  # not 20
 
 
+class TestInterruptionsCounter:
+    """`resource.interruptions` is DERIVED from `attempts[]`, never a second
+    counter (`alpha-engine-config-I10463`). Measured 2026-09-10: a genuinely
+    absorbed spot interruption (`runs/data.daily/2026-08-11/run.json`)
+    produced `status: ok`, `attempts: [initial, spot_interruption]` and
+    `resource.interruptions: 0` — the guard raised, the retry succeeded, and
+    the literal `0` the runner wrote never moved. These tests fail against
+    that code (the field hardcoded to `0`) and pass once the count is derived
+    from `attempts[]`.
+    """
+
+    def test_an_absorbed_interruption_reports_one(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        calls = []
+
+        def flaky(ctx: RunContext) -> None:
+            calls.append(1)
+            if len(calls) == 1:
+                raise SpotInterruptionError("spot_interruption: the instance is being reclaimed")
+
+        run_job("data.daily", flaky, store=store, trading_day=FRIDAY, now=NOW)
+        manifest = _manifest(store)
+        assert manifest["status"] == "ok"
+        assert manifest["resource"]["interruptions"] == 1
+
+    def test_a_clean_run_reports_zero(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+
+        def clean(ctx: RunContext) -> None:
+            pass
+
+        run_job("data.daily", clean, store=store, trading_day=FRIDAY, now=NOW)
+        manifest = _manifest(store)
+        assert manifest["status"] == "ok"
+        assert manifest["resource"]["interruptions"] == 0
+
+    def test_a_run_that_fails_after_one_absorbed_interruption_still_counts_it(
+        self, tmp_path
+    ) -> None:
+        """The counter reflects what was OBSERVED, not just the outcome:
+        `resource.interruptions == 1` on a `failed` manifest whose retry
+        ladder was exhausted by a second, undeclared failure."""
+        store = LocalStore(tmp_path)
+        calls = []
+
+        def flaky_then_broken(ctx: RunContext) -> None:
+            calls.append(1)
+            if len(calls) == 1:
+                raise SpotInterruptionError("spot_interruption: the instance is being reclaimed")
+            raise ValueError("schema drift in the fundamentals frame")
+
+        with pytest.raises(ValueError):
+            run_job("data.daily", flaky_then_broken, store=store, trading_day=FRIDAY, now=NOW)
+        manifest = _manifest(store)
+        assert manifest["status"] == "failed"
+        assert manifest["attempts"] == [
+            {"n": 1, "reason": "initial"},
+            {"n": 2, "reason": "spot_interruption"},
+        ]
+        assert manifest["resource"]["interruptions"] == 1
+
+
 class TestSpotGuard:
     def test_sigterm_without_an_external_guard_still_produces_a_manifest(self, tmp_path) -> None:
         """`run_job` must install `spot_interruption_guard` ITSELF (defect #8,
@@ -228,6 +290,14 @@ class TestSpotGuard:
         manifest = json.loads(manifest_path.read_text())
         assert manifest["status"] == "failed"
         assert "spot_interruption" in manifest["reason"]
+        # `transient_retry=False` here (deliberately, to isolate the guard
+        # install from the retry ladder): `attempts` never grows a
+        # `spot_interruption` entry, so the DERIVED counter reads 0 even
+        # though a real SIGTERM was observed. Out of scope for
+        # alpha-engine-config-I10463 (filed separately) — this asserts the
+        # current, derivation-consistent behavior rather than leaving it
+        # unstated.
+        assert manifest["resource"]["interruptions"] == 0
 
     def test_the_previous_handler_is_restored(self) -> None:
         import signal

@@ -59,6 +59,7 @@ __all__ = [
     "CODE_SHA_ENV",
     "CodeShaError",
     "RunContext",
+    "SPOT_INTERRUPTION_REASON",
     "SpotInterruptionError",
     "TRANSIENT_CLASSIFIERS",
     "classify_transient",
@@ -147,9 +148,17 @@ def spot_interruption_guard() -> Iterator[None]:
 #: control: a retry class that can be widened at runtime is a retry class
 #: that eventually swallows a real defect, because the moment a defect looks
 #: transient is the moment someone is under pressure to make it go away.
+#:
+#: `SPOT_INTERRUPTION_REASON` names the first row's reason once, rather than
+#: repeating the string literal at both this definition and wherever
+#: `resource.interruptions` is derived from `attempts[]` below
+#: (`alpha-engine-config-I10463`) — the two would otherwise be two spellings
+#: of the same fact with no test forcing them to agree.
+SPOT_INTERRUPTION_REASON = "spot_interruption"
+
 TRANSIENT_CLASSIFIERS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     (
-        "spot_interruption",
+        SPOT_INTERRUPTION_REASON,
         ("SpotInterruptionError",),
         ("spot_interruption", "instance is being reclaimed"),
     ),
@@ -864,6 +873,20 @@ def _write_manifest(
     # read as a measurement nobody took.
     ctx.resource["mem_peak_mb"] = _measured_mem_peak_mb()
     ctx.resource["disk_free_mb"] = _measured_disk_free_mb()
+    # DERIVED from `ctx.attempts`, never a second counter (alpha-engine-config-
+    # I10463): a genuinely absorbed spot interruption produced `status: ok`,
+    # `attempts: [initial, spot_interruption]` and `resource.interruptions: 0`
+    # — the guard raised, the retry succeeded, and nothing ever incremented
+    # anything. `ctx.attempts` is the one record that cannot exist without the
+    # guard having raised (`run_job`'s `except BaseException` only appends a
+    # `spot_interruption` entry after `classify_transient` names that reason),
+    # so counting it here means the two fields can never disagree — there is
+    # no second write path to drift. Computed at write time, after every
+    # retry has appended its own entry, so this covers both the absorbed
+    # (`ok`, N>=1 interruptions) and the exhausted-retry (`failed`) shapes.
+    ctx.resource["interruptions"] = sum(
+        1 for attempt in ctx.attempts if attempt.get("reason") == SPOT_INTERRUPTION_REASON
+    )
     manifest = {
         "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
         "run_id": ctx.run_id,
