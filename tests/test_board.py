@@ -23,6 +23,7 @@ import dataclasses
 import datetime as dt
 import json
 import pathlib
+import re
 from abc import ABC
 from typing import Any
 
@@ -436,6 +437,72 @@ class TestNoDeclarationInventsAKey:
                 artifact="k",
                 means_when_red="r",
             )
+
+    # ── The same class, for CONSTANTS rather than keys (alpha-engine-config-I10495) ──
+    #
+    # `board.yaml` invented eight of ten S3 keys once; the guard above stops
+    # that recurring for `reader`/`artifact`. It never covered a numeric
+    # literal restating a gate constant, and that drift recurred: `-I10324`
+    # narrowed `PHASE2_LIVE_SATURDAYS` from 2 to 1 and this file's prose kept
+    # saying 2 for over a week.
+    #
+    # `board.yaml` is loaded by a bare `yaml.safe_load` (`load_declarations`)
+    # with no render-time templating, and `crucible/board.py` is outside this
+    # issue's file scope — so interpolating the constant into the prose (the
+    # structural fix the issue names as preferred) would mean adding a
+    # rendering step to `board.py`, out of scope here. This is the named
+    # stopgap instead: assert every literal equals the constant it claims,
+    # so a future constant change without a matching prose edit fails here
+    # rather than drifting silently for another week.
+
+    def test_the_phase2_saturday_window_is_not_retyped(self, declarations) -> None:
+        from crucible.gate import PHASE2_LIVE_SATURDAYS, PHASE2_REPLAY_SATURDAYS
+
+        body = declarations.all["autonomy"].planned_because
+        long_form = f"{PHASE2_LIVE_SATURDAYS} live plus {PHASE2_REPLAY_SATURDAYS} replayed"
+        short_form = f"{PHASE2_LIVE_SATURDAYS} live + {PHASE2_REPLAY_SATURDAYS} replayed"
+        assert long_form in body, (
+            f"board.yaml's autonomy row no longer matches "
+            f"PHASE2_LIVE_SATURDAYS={PHASE2_LIVE_SATURDAYS!r}/"
+            f"PHASE2_REPLAY_SATURDAYS={PHASE2_REPLAY_SATURDAYS!r} "
+            f"(expected {long_form!r} in {body!r})"
+        )
+        assert short_form in body, (
+            f"board.yaml's autonomy row restates the ruled §6.1 gate as prose that no "
+            f"longer matches the constants (expected {short_form!r} in {body!r})"
+        )
+
+    def test_the_v1_teardown_counts_match_the_phase4_deliverable(self, declarations) -> None:
+        """`board.yaml`'s Lambda/alarm count must track `gate.PHASE4_DELIVERABLES`.
+
+        Neither side holds a single named numeric constant for these counts —
+        both are hand-written text (`board.yaml`'s statement and the
+        `lambdas_and_alarms_removed` deliverable's summary) — so this asserts
+        the two copies of the fact agree, the same shape as
+        `test_every_declared_artifact_matches_the_key_its_reader_uses` above.
+        """
+        from crucible.gate import PHASE4_DELIVERABLES
+
+        deliverable = next(d for d in PHASE4_DELIVERABLES if d.id == "lambdas_and_alarms_removed")
+        statement = declarations.all["v1_resources_deleted"].title
+        counts = re.findall(r"\d+", deliverable.summary)
+        assert counts, f"gate.PHASE4_DELIVERABLES {deliverable.id!r} names no digits to check"
+        for count in counts:
+            assert count in statement, (
+                f"board.yaml's v1_resources_deleted row {statement!r} does not carry "
+                f"{count!r}, present in gate.py's own deliverable summary "
+                f"{deliverable.summary!r}"
+            )
+
+    def test_the_aws_cost_ceiling_matches_the_phase4_constant(self, declarations) -> None:
+        from crucible.gate import PHASE4_MAX_TOTAL_USD
+
+        statement = declarations.all["aws_cost_under_ceiling"].title
+        ceiling = f"${PHASE4_MAX_TOTAL_USD:.0f}"
+        assert ceiling in statement, (
+            f"board.yaml's aws_cost_under_ceiling row {statement!r} does not match "
+            f"PHASE4_MAX_TOTAL_USD={PHASE4_MAX_TOTAL_USD!r} (expected {ceiling!r})"
+        )
 
 
 class TestTheDeclarationSchemaIsClosed:
