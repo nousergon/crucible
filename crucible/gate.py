@@ -83,6 +83,7 @@ from crucible.models import (
     PhaseClosingReadingDocument,
     PhaseLadderDocument,
 )
+from crucible.portfolio import manifest_records_portfolio_engine
 from crucible.release import POINTER_KEY
 from crucible.report import attribution_key
 from crucible.runner import TRANSIENT_CLASSIFIERS
@@ -3123,22 +3124,21 @@ PHASE1_DELIVERABLES: tuple[Deliverable, ...] = (
 )
 
 #: `alpha-engine-config-I9759`'s (phase 3) deliverables, split at the
-#: semicolons of that issue's single Deliverables paragraph. Phase 3's four
-#: registered clauses (one per slot) read only the champion pointer and
-#: `promote` manifests — none of them reaches the portfolio engine, the
-#: attribution table, the sealed holdout, the cost model, or the per-slot
-#: benchmark this issue actually declares, so the honest reading is 0 of 5.
-#: That is the gap this mechanism exists to expose, not a mapping to smooth
-#: over.
+#: semicolons of that issue's single Deliverables paragraph. The four
+#: per-slot clauses read only the champion pointer and `promote` manifests.
+#: `alpha-engine-config-I10510` wired the two `crucible.portfolio` clauses
+#: below, reading `-I10500`/`-I10503`'s `portfolio_construction.v1` evidence
+#: off `experiment.grade[s]` manifests — the honest reading is 2 of 5, and
+#: the S cycle job not existing yet reads those two UNMEASURABLE, not MET,
+#: until it does. `factor_neutral_attribution`, `sealed_holdout` and
+#: `benchmark_per_slot` remain ungraded; that gap is what this mechanism
+#: exists to expose, not a mapping to smooth over.
 PHASE3_DELIVERABLES: tuple[Deliverable, ...] = (
     Deliverable(
         "portfolio_engine_used_by_s_slot",
         "`crucible.portfolio` (MVO + turnover governor + cost model + ADV cap) used "
         "by S-slot grading",
-        None,
-        "no phase-3 clause reads `crucible.portfolio` or any evidence it was used in "
-        "grading; the four promotion/non-promotion clauses read only the champion "
-        "pointer and `promote` manifests",
+        "portfolio_engine_used_by_s_slot",
     ),
     Deliverable(
         "factor_neutral_attribution",
@@ -3155,8 +3155,7 @@ PHASE3_DELIVERABLES: tuple[Deliverable, ...] = (
     Deliverable(
         "named_transaction_cost_model",
         "named transaction-cost model",
-        None,
-        "no phase-3 clause reads a transaction-cost-model artifact",
+        "named_transaction_cost_model",
     ),
     Deliverable(
         "benchmark_per_slot",
@@ -6062,6 +6061,215 @@ def _clause_slot_promotion_or_non_promotion(
     )
 
 
+#: The slot `crucible.portfolio` is a deliverable of — the S (strategy) slot,
+#: read from `experiment.grade[s]`'s manifests. Named once so the two clauses
+#: below cannot disagree about which slot they are reading.
+PORTFOLIO_GRADED_SLOT = "s"
+
+
+def _s_slot_grading_evidence(
+    store: Store, window: list[dt.date]
+) -> tuple[list[tuple[str, dict[str, Any]]], list[str], list[str], list[str], int]:
+    """The `portfolio_construction.v1` documents on every S-slot grading
+    manifest in ``window``, and what stood in the way of reading the rest.
+
+    Shared by both phase-3 `crucible.portfolio` clauses so they read the same
+    manifests through the same one call — `manifest_records_portfolio_engine`
+    lives beside the producer for exactly this reason (`alpha-engine-config-
+    I10510`): a clause restating the `portfolio_construction.v1` shape here
+    would be a second implementation of the reader, and the two would drift.
+
+    Returns ``(documents, problems, access, evidence_keys, manifests_present)``:
+    ``documents`` is ``(key, evidence)`` for every manifest that read `ok` and
+    carried the engine's evidence; ``problems`` are content-side reading
+    failures (malformed manifests, or a metric row `manifest_records_
+    portfolio_engine` itself refuses); ``access`` are store-access failures;
+    ``evidence_keys`` is every key this function looked at, in order;
+    ``manifests_present`` counts manifests that existed and read `ok`,
+    whether or not they carried the evidence — the difference between
+    "the S cycle has never run" and "it ran and said nothing" (principle 1).
+
+    There is deliberately no S-cycle job yet (`crucible.slots.strategy` has
+    no `produce`/`grade`, so `dispatchable_slots()` never schedules
+    `experiment.grade[s]`) — every real store reads `manifests_present == 0`
+    today, which is the honest UNMEASURABLE both clauses read below, not a
+    weakened check against the module merely existing (`-I10500`).
+    """
+    documents: list[tuple[str, dict[str, Any]]] = []
+    problems: list[str] = []
+    access: list[str] = []
+    evidence_keys: list[str] = []
+    manifests_present = 0
+    for day in window:
+        key = manifest_key("experiment.grade", day.isoformat(), discriminator=PORTFOLIO_GRADED_SLOT)
+        evidence_keys.append(key)
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            (access if read.access_problem else problems).append(read.problem)
+            continue
+        if read.absent:
+            continue
+        document = read.document or {}
+        status, problem = _status(key, document)
+        if problem is not None:
+            problems.append(problem)
+            continue
+        if status != "ok":
+            # A failed grading run recorded nothing to trust; `arc_runs_ok`
+            # (phase 1) already grades the failure itself, so this reader
+            # neither counts it as present evidence nor doubles that finding.
+            continue
+        manifests_present += 1
+        try:
+            evidence = manifest_records_portfolio_engine(document)
+        except ValueError as exc:
+            # `manifest_records_portfolio_engine` RAISES on a metric row that
+            # names the engine without carrying its evidence — a producer
+            # defect, not an access failure. `_contained` (below) would catch
+            # this too if it escaped, but catching it HERE keeps one bad
+            # manifest from darkening every other day in the window.
+            problems.append(f"{key}: {exc}")
+            continue
+        if evidence is not None:
+            documents.append((key, evidence))
+    return documents, problems, access, evidence_keys, manifests_present
+
+
+def _s_slot_evidence_unmeasurable_no_manifests(requirement: str, window: list[dt.date]) -> str:
+    return (
+        f"no `experiment.grade[{PORTFOLIO_GRADED_SLOT}]` manifest exists under "
+        f"{runs_prefix('experiment.grade')} over {window[0].isoformat()}.."
+        f"{window[-1].isoformat()}. The S slot has no `produce`/`grade` yet "
+        "(`crucible.slots.dispatchable_slots`), so nothing has graded a book for "
+        "`crucible.portfolio` to have built — this is UNMEASURABLE, not UNMET, until "
+        "the S cycle job lands"
+    )
+
+
+def _clause_portfolio_engine_used_by_s_slot(store: Store, window: list[dt.date]) -> Clause:
+    """`alpha-engine-config-I10510` deliverable 1 (`-I9759`'s phase-3 row):
+    `crucible.portfolio` used by S-slot grading.
+
+    Reads `crucible.portfolio.manifest_records_portfolio_engine` off every
+    `experiment.grade[s]` manifest in the window — never a restatement of the
+    `portfolio_construction.v1` shape (`-I10500`/`-I10503`'s reader lives
+    beside the producer for exactly that reason).
+    """
+    name = "portfolio_engine_used_by_s_slot"
+    requirement = (
+        "`crucible.portfolio` (MVO + turnover governor + cost model + ADV cap) used by "
+        "S-slot grading, read from the `portfolio_construction.v1` evidence "
+        "`crucible.portfolio.manifest_records_portfolio_engine` returns off the S "
+        "grading job's manifests"
+    )
+    documents, problems, access, evidence_keys, present = _s_slot_grading_evidence(store, window)
+    if documents:
+        keys = ", ".join(k for k, _ in documents[:4])
+        return Clause(
+            name,
+            requirement,
+            True,
+            f"{len(documents)} S-slot grading manifest(s) over {window[0].isoformat()}.."
+            f"{window[-1].isoformat()} recorded `crucible.portfolio` construction "
+            f"evidence: {keys}",
+            tuple(evidence_keys),
+        )
+    if problems:
+        detail = "; ".join(problems[:4])
+        if access:
+            detail = f"{detail}; {len(access)} could not be read: {'; '.join(access[:2])}"
+        return Clause(name, requirement, False, detail, tuple(evidence_keys))
+    if access:
+        return _unmeasurable(name, requirement, "; ".join(access[:4]), evidence_keys)
+    if present == 0:
+        return _unmeasurable(
+            name,
+            requirement,
+            _s_slot_evidence_unmeasurable_no_manifests(requirement, window),
+            evidence_keys,
+        )
+    return Clause(
+        name,
+        requirement,
+        False,
+        f"{present} `experiment.grade[{PORTFOLIO_GRADED_SLOT}]` manifest(s) over "
+        f"{window[0].isoformat()}..{window[-1].isoformat()} read `ok` but none recorded "
+        "`crucible.portfolio` construction evidence — the S slot graded without it",
+        tuple(evidence_keys),
+    )
+
+
+def _clause_named_transaction_cost_model(store: Store, window: list[dt.date]) -> Clause:
+    """`alpha-engine-config-I10510` deliverable 2: named transaction-cost model.
+
+    MET requires the S-slot grading evidence's `cost_model` block to carry a
+    `name`, a `kind`, and a non-empty `params` — never a plain read of
+    `placeholder`, which is REPORTED and never a reason to read MET or not
+    (a run graded against a declared stand-in is still a run whose cost model
+    is named).
+    """
+    name = "named_transaction_cost_model"
+    requirement = (
+        "named transaction-cost model: the S-slot grading evidence's `cost_model` "
+        "block carries `name`, `kind`, and a non-empty `params` — `placeholder` is "
+        "reported, never a reason to read this UNMET"
+    )
+    documents, problems, access, evidence_keys, present = _s_slot_grading_evidence(store, window)
+    if documents:
+        key, evidence = documents[-1]
+        cost_model = evidence.get("cost_model")
+        cost_model = cost_model if isinstance(cost_model, dict) else {}
+        missing = []
+        model_name = cost_model.get("name")
+        if not isinstance(model_name, str) or not model_name:
+            missing.append("name")
+        kind = cost_model.get("kind")
+        if not isinstance(kind, str) or not kind:
+            missing.append("kind")
+        params = cost_model.get("params")
+        if not isinstance(params, dict) or not params:
+            missing.append("non-empty params")
+        if missing:
+            return Clause(
+                name,
+                requirement,
+                False,
+                f"{key}: cost_model is missing {', '.join(missing)}: {cost_model!r}",
+                tuple(evidence_keys),
+            )
+        stand_in = " (a declared stand-in)" if cost_model.get("placeholder") else ""
+        return Clause(
+            name,
+            requirement,
+            True,
+            f"{key}: cost model {model_name!r} ({kind}){stand_in}, params: {sorted(params)}",
+            tuple(evidence_keys),
+        )
+    if problems:
+        detail = "; ".join(problems[:4])
+        if access:
+            detail = f"{detail}; {len(access)} could not be read: {'; '.join(access[:2])}"
+        return Clause(name, requirement, False, detail, tuple(evidence_keys))
+    if access:
+        return _unmeasurable(name, requirement, "; ".join(access[:4]), evidence_keys)
+    if present == 0:
+        return _unmeasurable(
+            name,
+            requirement,
+            _s_slot_evidence_unmeasurable_no_manifests(requirement, window),
+            evidence_keys,
+        )
+    return Clause(
+        name,
+        requirement,
+        False,
+        f"{present} `experiment.grade[{PORTFOLIO_GRADED_SLOT}]` manifest(s) over "
+        f"{window[0].isoformat()}..{window[-1].isoformat()} read `ok` but none recorded "
+        "`crucible.portfolio` construction evidence naming a cost model",
+        tuple(evidence_keys),
+    )
+
+
 def _phase3(
     store: Store,
     window: list[dt.date],
@@ -6069,9 +6277,16 @@ def _phase3(
     *,
     trading_day: dt.date,
 ) -> list[Clause]:
-    """Phase 3's exit gate (plan §6 row 3), one clause per slot in `SLOTS`."""
+    """Phase 3's exit gate (plan §6 row 3), one clause per slot in `SLOTS`,
+    plus the two `crucible.portfolio` clauses `alpha-engine-config-I10510`
+    wires (`-I9759`'s phase-3 row)."""
     _unused((registry, trading_day))
-    return [_clause_slot_promotion_or_non_promotion(store, slot, window) for slot in sorted(SLOTS)]
+    return [
+        _clause_slot_promotion_or_non_promotion(store, slot, window) for slot in sorted(SLOTS)
+    ] + [
+        _clause_portfolio_engine_used_by_s_slot(store, window),
+        _clause_named_transaction_cost_model(store, window),
+    ]
 
 
 # ---------------------------------------------------------------------------

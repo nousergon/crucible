@@ -61,12 +61,34 @@ from crucible.keys import (
     verdict_key,
 )
 from crucible.manifest import PREDECESSOR_SCHEMA_VERSION, RUN_MANIFEST_SCHEMA_VERSION
+from crucible.portfolio import PORTFOLIO_EVIDENCE_SCHEMA_VERSION, PORTFOLIO_METRIC_NAME
 from crucible.release import POINTER_KEY
 from crucible.slots import SLOTS
 from crucible.store import LocalStore, S3Store
 
 FRIDAY = dt.date(2026, 8, 28)
 SHA = "a" * 40
+
+#: `CostModel.record()` shapes, per `crucible.portfolio.COST_MODELS` — used
+#: to build fixture `portfolio_construction.v1` documents for phase 3's two
+#: `crucible.portfolio` clauses.
+IMPACT_COST_MODEL = {
+    "name": "sqrt_impact_v1",
+    "kind": "sqrt_impact",
+    "placeholder": False,
+    "params": {
+        "half_spread_bps": 2.5,
+        "impact_coef_bps": 10.0,
+        "commission_bps": 0.5,
+        "min_cost_bps": 0.0,
+    },
+}
+FLAT_COST_MODEL = {
+    "name": "flat_bps_v0",
+    "kind": "flat",
+    "placeholder": True,
+    "params": {"half_spread_bps": 2.5, "commission_bps": 0.5, "slippage_bps": 10.0},
+}
 
 
 def _window(weeks: int) -> list[dt.date]:
@@ -1660,11 +1682,168 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
         assert arena_cycle_key("r", FRIDAY.isoformat()) in clause.detail
         assert "no promote run manifest was filed" not in clause.detail
 
-    def test_one_clause_per_registered_slot(self, store: LocalStore) -> None:
+    def test_one_clause_per_registered_slot_plus_the_two_portfolio_clauses(
+        self, store: LocalStore
+    ) -> None:
         clauses = gate_module._phase3(store, _window(4), {}, trading_day=FRIDAY)
         assert [c.name for c in clauses] == [
             f"{slot}_promotion_or_verdict_backed_non_promotion" for slot in sorted(SLOTS)
-        ]
+        ] + ["portfolio_engine_used_by_s_slot", "named_transaction_cost_model"]
+
+
+def _portfolio_evidence(cost_model: dict, *, day: dt.date = FRIDAY) -> dict:
+    """A schema-shaped `portfolio_construction.v1` document.
+
+    Built by hand rather than through `crucible.portfolio.construct_book` —
+    the engine's own contract (schema conformance, the four components,
+    malformed-input refusal) is `tests/test_portfolio_contracts.py`'s job;
+    this file only exercises the GATE CLAUSES that read the document's
+    `cost_model` block and its mere presence, via the same
+    `manifest_records_portfolio_engine` reader the clause calls.
+    """
+    return {
+        "schema_version": PORTFOLIO_EVIDENCE_SCHEMA_VERSION,
+        "trading_day": day.isoformat(),
+        "arm_id": "s:contract_fixture:0123456789abcdef",
+        "engine": "crucible.portfolio",
+        "cost_model": cost_model,
+        "params": {"cash_sleeve_pct": 0.03},
+        "params_digest": "sha256:" + "0" * 64,
+        "components": {
+            "mvo": {"applied": True, "reason": "optimal"},
+            "turnover_governor": {"applied": True, "reason": None},
+            "cost_model": {"applied": True, "reason": None},
+            "adv_cap": {"applied": False, "reason": "not binding"},
+        },
+        "sessions": 5,
+        "turnover_one_way_total": 0.12,
+        "cost_bps_total": 3.4,
+        "solver_status": "optimal",
+    }
+
+
+def _portfolio_metric_row(cost_model: dict, *, day: dt.date = FRIDAY) -> dict:
+    evidence = _portfolio_evidence(cost_model, day=day)
+    return {
+        "name": PORTFOLIO_METRIC_NAME,
+        "module": "crucible.portfolio",
+        "metric_type": "construction",
+        "n_floor": 1,
+        "status": "OK",
+        "status_reason": "book constructed over 5 session(s) by crucible.portfolio",
+        "source_path": "crucible/portfolio.py",
+        "last_updated_utc": "2026-08-28T21:00:00Z",
+        "value": evidence["cost_bps_total"],
+        "unit": "bps",
+        "horizon_trading_days": None,
+        "portfolio_construction": evidence,
+    }
+
+
+def _s_slot_grading_manifest(cost_model: dict, *, day: dt.date = FRIDAY) -> dict:
+    return {"status": "ok", "reason": "", "metrics": [_portfolio_metric_row(cost_model, day=day)]}
+
+
+class TestPortfolioEngineUsedByTheSSlot:
+    """`alpha-engine-config-I10510` deliverable 1: `crucible.portfolio` used by
+    S-slot grading, read from `experiment.grade[s]` manifests off the same
+    `manifest_records_portfolio_engine` reader the producer ships beside."""
+
+    def test_unmeasurable_when_no_s_slot_manifest_exists(self, store: LocalStore) -> None:
+        """No S cycle job exists yet (`crucible.slots.strategy` has no
+        `produce`/`grade`), so every real store reads this today. UNMEASURABLE,
+        never UNMET: nothing has graded a book for the engine to have built."""
+        clause = gate_module._clause_portfolio_engine_used_by_s_slot(store, _window(4))
+        assert clause.unmeasurable and not clause.met
+        assert "S slot has no `produce`/`grade` yet" in clause.detail
+
+    def test_met_when_a_grading_manifest_carries_the_evidence(self, store: LocalStore) -> None:
+        key = manifest_key("experiment.grade", FRIDAY.isoformat(), discriminator="s")
+        _put(store, key, _s_slot_grading_manifest(IMPACT_COST_MODEL))
+        clause = gate_module._clause_portfolio_engine_used_by_s_slot(store, _window(4))
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert key in clause.detail
+
+    def test_unmet_when_a_grading_manifest_ran_but_recorded_no_evidence(
+        self, store: LocalStore
+    ) -> None:
+        key = manifest_key("experiment.grade", FRIDAY.isoformat(), discriminator="s")
+        _put(store, key, {"status": "ok", "reason": "", "metrics": []})
+        clause = gate_module._clause_portfolio_engine_used_by_s_slot(store, _window(4))
+        assert not clause.met and not clause.unmeasurable
+        assert "none recorded" in clause.detail
+
+    def test_a_row_naming_the_engine_without_evidence_reads_unmeasurable_not_a_crash(
+        self, store: LocalStore
+    ) -> None:
+        """`manifest_records_portfolio_engine` RAISES on a metric row that names
+        the engine without carrying its evidence — the clause must turn that
+        into a reading, never let it escape `evaluate` (AGENTS.md rule 5)."""
+        key = manifest_key("experiment.grade", FRIDAY.isoformat(), discriminator="s")
+        _put(
+            store,
+            key,
+            {
+                "status": "ok",
+                "reason": "",
+                "metrics": [{"name": "portfolio_construction", "module": "crucible.portfolio"}],
+            },
+        )
+        clause = gate_module._clause_portfolio_engine_used_by_s_slot(store, _window(4))
+        assert not clause.met
+        assert "portfolio_construction" in clause.detail
+
+
+class TestNamedTransactionCostModel:
+    """`alpha-engine-config-I10510` deliverable 2: named transaction-cost model."""
+
+    def test_unmeasurable_when_no_s_slot_manifest_exists(self, store: LocalStore) -> None:
+        clause = gate_module._clause_named_transaction_cost_model(store, _window(4))
+        assert clause.unmeasurable and not clause.met
+
+    def test_met_on_a_fully_named_cost_model(self, store: LocalStore) -> None:
+        key = manifest_key("experiment.grade", FRIDAY.isoformat(), discriminator="s")
+        _put(store, key, _s_slot_grading_manifest(IMPACT_COST_MODEL))
+        clause = gate_module._clause_named_transaction_cost_model(store, _window(4))
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert IMPACT_COST_MODEL["name"] in clause.detail
+
+    def test_a_placeholder_cost_model_is_still_met_but_reported(self, store: LocalStore) -> None:
+        """The `placeholder` flag is REPORTED, never a reason to read UNMET — a
+        run graded against a declared stand-in is still a run whose cost model
+        is named, which is the deliverable."""
+        key = manifest_key("experiment.grade", FRIDAY.isoformat(), discriminator="s")
+        _put(store, key, _s_slot_grading_manifest(FLAT_COST_MODEL))
+        clause = gate_module._clause_named_transaction_cost_model(store, _window(4))
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert "stand-in" in clause.detail
+
+    def test_unmet_when_the_cost_model_is_missing_a_required_field(self, store: LocalStore) -> None:
+        key = manifest_key("experiment.grade", FRIDAY.isoformat(), discriminator="s")
+        incomplete = {
+            "name": "sqrt_impact_v1",
+            "kind": "sqrt_impact",
+            "placeholder": False,
+            "params": {},
+        }
+        _put(store, key, _s_slot_grading_manifest(incomplete))
+        clause = gate_module._clause_named_transaction_cost_model(store, _window(4))
+        assert not clause.met and not clause.unmeasurable
+        assert "non-empty params" in clause.detail
+
+
+class TestPhase3DeliverablesTableTracksTheTwoWiredClauses:
+    def test_the_two_deliverables_carry_a_real_clause(self) -> None:
+        by_id = {d.id: d for d in gate_module.PHASE3_DELIVERABLES}
+        assert (
+            by_id["portfolio_engine_used_by_s_slot"].graded_by == "portfolio_engine_used_by_s_slot"
+        )
+        assert by_id["named_transaction_cost_model"].graded_by == "named_transaction_cost_model"
+
+    def test_the_coverage_line_reflects_two_of_five(self, store: LocalStore) -> None:
+        clauses = gate_module._phase3(store, _window(4), {}, trading_day=FRIDAY)
+        note = gate_module.coverage_note("phase3", [c.name for c in clauses])
+        assert "grades 2 of 5" in note
 
 
 # ---------------------------------------------------------------------------
