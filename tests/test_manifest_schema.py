@@ -76,7 +76,11 @@ def _valid_manifest() -> dict:
         "reason": "",
         "started": "2026-08-29T13:00:00Z",
         "finished": "2026-08-29T13:04:11Z",
-        "code_sha": "0" * 40,
+        # Not "0" * 40 — alpha-engine-config-I10454 refuses that as the
+        # placeholder that validates and answers nothing; a floor fixture
+        # for a REQUIRED, non-placeholder field needs a value that would
+        # actually pass.
+        "code_sha": "2" * 40,
         "release_sha": "1" * 40,
         "seed": 20260828,
         "inputs": [
@@ -589,6 +593,58 @@ class TestThePublishedSchemaAloneEnforcesStatusAndReason:
         doc["status"] = "failed"
         doc["reason"] = "SpotInterruption: instance reclaimed at 13:02Z"
         Draft202012Validator(json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))).validate(doc)
+
+
+class TestCodeShaRefusesTheAllZeroPlaceholder:
+    """`alpha-engine-config-I10454`: every v2 manifest a dispatched box
+    wrote carried `code_sha` as forty zeros — a value that satisfied the
+    field's own `^[0-9a-f]{40}$` pattern (identical to a real commit sha)
+    and answered nothing. Proven RED first: before this PR,
+    `test_a_complete_manifest_validates` above accepted `_valid_manifest()`
+    with `code_sha == "0" * 40` (the fixture's original value) with no
+    error at all — see the PR body for that reading.
+
+    `code_sha`'s own `pattern` cannot express "not all zeros" — pydantic-
+    core's regex engine has no look-around
+    (`SchemaError: look-around ... is not supported`, pydantic-core
+    2.46.5) — so the refusal is a `model_validator`
+    (`RunManifestV2._code_sha_is_not_the_placeholder`), mirrored into the
+    published schema's `allOf` by `_run_manifest_v2_json_schema_extra`.
+    Both halves are asserted here, same shape as
+    `TestThePublishedSchemaAloneEnforcesStatusAndReason` above.
+    """
+
+    def test_the_model_refuses_it(self) -> None:
+        doc = _valid_manifest()
+        doc["code_sha"] = "0" * 40
+        with pytest.raises(ManifestValidationError, match="placeholder"):
+            validate(doc)
+
+    def test_the_published_file_alone_refuses_it_too(self) -> None:
+        """No `crucible.models` import — the published schema enforces this
+        on its own, for a consumer that only has the JSON file."""
+        doc = _valid_manifest()
+        doc["code_sha"] = "0" * 40
+        with pytest.raises(ValidationError):
+            Draft202012Validator(json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))).validate(doc)
+
+    def test_a_real_looking_sha_still_validates(self) -> None:
+        """The refusal is specific to the all-zero value, not to `code_sha`
+        in general — every other 40-hex value, including one that is
+        mostly zeros, still passes."""
+        doc = _valid_manifest()
+        doc["code_sha"] = "0" * 39 + "1"
+        validate(doc)
+        Draft202012Validator(json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))).validate(doc)
+
+    def test_release_sha_is_unaffected(self) -> None:
+        """This PR does not touch `release_sha` — the issue's own deliverable
+        1 is that the box's `release_sha` is real today and `code_sha`
+        should be carried the same way. An all-zero `release_sha` is a
+        different, pre-existing question this PR does not answer."""
+        doc = _valid_manifest()
+        doc["release_sha"] = "0" * 40
+        validate(doc)
 
 
 class TestAMalformedV2ManifestNamesTheFieldAtTheBoundary:

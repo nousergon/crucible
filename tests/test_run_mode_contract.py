@@ -312,7 +312,9 @@ def _manifest(**overrides: object) -> dict:
         "reason": "",
         "started": "2026-08-29T13:00:00Z",
         "finished": "2026-08-29T13:04:11Z",
-        "code_sha": "0" * 40,
+        # Not "0" * 40 — alpha-engine-config-I10454 refuses the all-zero
+        # placeholder at the schema level.
+        "code_sha": "2" * 40,
         "release_sha": "1" * 40,
         "seed": 20260828,
         "inputs": [],
