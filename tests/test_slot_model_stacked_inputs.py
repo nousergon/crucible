@@ -218,8 +218,11 @@ class TestThePredictionsArtifactContract:
     """Deliverable 5: a versioned schema with both halves tested at birth."""
 
     def test_the_key_is_per_arm_and_carries_the_arms_spec_hash(self) -> None:
+        """Under `arm_predictions/`, not `predictions/` — the latter is the
+        trader's champion serving feed and the two shared a prefix until
+        `alpha-engine-config-I9822`."""
         key = arm_predictions_key("m:base:abc123", "2026-08-28")
-        assert key == "predictions/m~base~abc123/2026-08-28.json"
+        assert key == "arm_predictions/m~base~abc123/2026-08-28.json"
 
     def test_the_producer_output_round_trips_through_the_consumer(self, tmp_path) -> None:
         store = LocalStore(tmp_path)

@@ -29,6 +29,7 @@ from crucible.calendar import assert_trading_day
 __all__ = [
     "ACCEPTANCE_REQUIRED_FIELDS",
     "ALERTS_ROOT",
+    "ARM_PREDICTIONS_PREFIX",
     "ARM_SEGMENT_SEPARATOR",
     "AcceptanceReading",
     "BOARD_CURRENT_KEY",
@@ -40,6 +41,7 @@ __all__ = [
     "FAULT_INJECTION_ROOT",
     "MANIFEST_BASENAME",
     "POINTER_KEY",
+    "PREDICTIONS_PREFIX",
     "RELEASES_ROOT",
     "REVIEWER_PATTERN",
     "RUNS_ROOT",
@@ -93,6 +95,7 @@ __all__ = [
     "parse_dispatch_key",
     "parse_fault_injection_key",
     "parse_manifest_key",
+    "predictions_key",
     "retirement_log_key",
     "review_key",
     "review_prefix",
@@ -314,15 +317,55 @@ def arm_id_from_segment(segment: str) -> str:
     return segment.replace(ARM_SEGMENT_SEPARATOR, ":")
 
 
+#: The trader's champion serving feed — the contract named in
+#: `crucible.slots.__init__` and in this repo's `AGENTS.md`: *"the trader reads
+#: one contract — `champions/{slot}/current.json` plus
+#: `predictions/{trading_day}.json`"*. ONE object per trading day, at the root
+#: of its own prefix.
+PREDICTIONS_PREFIX = "predictions/"
+
+#: What one ARM predicted, which is a different artifact answering a different
+#: question, and therefore lives under a different prefix
+#: (`alpha-engine-config-I9822`). It shared `predictions/` until 2026-09-11 and
+#: was distinguishable from the serving feed only by counting path segments —
+#: so any consumer doing `store.list_keys("predictions/")` saw both shapes and
+#: had to discriminate by depth. Nothing did.
+#:
+#: **Moved while the prefix was EMPTY.** Measured 2026-09-11: zero objects
+#: existed under `predictions/` in the production store, so this rename
+#: orphaned nothing. The same change made after either shape had been written
+#: would have stranded those objects at an address no code resolves — which is
+#: `alpha-engine-config-I10498`, filed the same day for a feature layer that
+#: was stranded exactly that way by a content-hash move. The cheapest moment to
+#: separate two artifact shapes is before either exists.
+ARM_PREDICTIONS_PREFIX = "arm_predictions/"
+
+
+def predictions_key(trading_day: str) -> str:
+    """The champion's serving feed for ONE trading day — what the trader reads.
+
+    The key builder only. Writing this artifact is the M slot's job and is
+    tracked separately (`alpha-engine-config-I10129`: the feed is declared in
+    the trader contract and written by nothing). It is declared here because a
+    contract with no single source for its key is how the prose and the code
+    drift apart, and because :func:`arm_predictions_key` cannot be tested
+    against a collision with a key that does not exist.
+    """
+    return f"{PREDICTIONS_PREFIX}{trading_day}.json"
+
+
 def arm_predictions_key(arm_id: str, trading_day: str) -> str:
     """What ONE arm predicted on ONE trading day.
 
-    Per-arm, not per-slot: `predictions/{trading_day}.json` is the *champion's*
-    serving feed, and a stacked arm reading that would depend on whichever arm
-    holds the pointer — a base model that silently changes identity between
-    two cycles, and a self-reference the moment the stacked arm won the slot.
+    Per-arm, not per-slot: :func:`predictions_key` is the *champion's* serving
+    feed, and a stacked arm reading that would depend on whichever arm holds
+    the pointer — a base model that silently changes identity between two
+    cycles, and a self-reference the moment the stacked arm won the slot.
+
+    Under `arm_predictions/`, never `predictions/`: see
+    :data:`ARM_PREDICTIONS_PREFIX`.
     """
-    return f"predictions/{arm_key_segment(arm_id)}/{trading_day}.json"
+    return f"{ARM_PREDICTIONS_PREFIX}{arm_key_segment(arm_id)}/{trading_day}.json"
 
 
 # -- data layer -------------------------------------------------------------
