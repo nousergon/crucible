@@ -236,6 +236,14 @@ def release_object_lock_params(
     ``ObjectLockEnabled`` flag this defends against being inert without it is
     an S3-only condition (I9787's "Gotcha").
 
+    This `(None, None)` branch is also WHY `LocalStore.put_bytes`'s own
+    ``NotImplementedError`` guard never fires from the release path
+    (alpha-engine-config-I9817): every caller here resolves its lock params
+    through this function, which deliberately never hands a LocalStore a
+    mode to refuse. That guard remains real for a caller that bypasses this
+    function; it is not what makes a LocalStore-backed release publish
+    unable to claim retention — the absence of a mode passed at all is.
+
     Called only for the wheel and ``release.json`` keys, never for
     :data:`POINTER_KEY` — the pointer flip goes through :func:`pin` /
     ``compare_and_swap``, a different code path that never reaches this.
@@ -590,9 +598,14 @@ class ReleaseProvenance:
     unreproducible (I9786's Gotcha: `built_at` is repository metadata, not
     the build instant — carried here unexamined is still more honest than
     dropping it, since a wrong-but-named field is better than an absent one,
-    and it is never used for anything but display). Never immutable-checked:
-    a second attempt for an already-published sha is EXPECTED to differ here,
-    and each attempt adds a record rather than contending for one slot.
+    and it is never used for anything but display). Never immutable-checked
+    ACROSS attempts: a second, distinct `run_id`/`run_attempt` for an
+    already-published sha is EXPECTED to differ here, and each attempt adds a
+    record rather than contending for one slot. The write at THIS attempt's
+    own key — `provenance_key(sha, run_id, run_attempt)` — IS immutable-
+    checked (alpha-engine-config-I9817): two invocations naming the same
+    attempt must describe the same attempt, or the second is a defect, not a
+    re-run.
     """
 
     schema_version: str
@@ -697,11 +710,20 @@ def publish_release(
         store.put_bytes(
             key, payload, object_lock_mode=lock_mode, object_lock_retain_until=retain_until
         )
-    # Unconditional and unlocked: it is per-attempt by construction (the key
-    # already carries run_id/run_attempt) so it never contends with itself,
-    # and it is the durable trace that this attempt happened even when the
-    # identity keys needed no write at all.
-    store.put_bytes(provenance_key(sha, run_id, run_attempt), provenance.to_json())
+    # Per-attempt by construction (the key already carries run_id/run_attempt)
+    # so it never contends with a DIFFERENT attempt, and it is the durable
+    # trace that this attempt happened even when the identity keys needed no
+    # write at all. Still unlocked (unlike the identity writes above): Object
+    # Lock retention is a claim about the wheel/release.json bytes an
+    # installer trusts, and the provenance record was never that.
+    # Immutability-checked (I9817) though: two invocations naming the SAME
+    # run_id and run_attempt describing different bytes means the record of
+    # "what happened during this attempt" has been silently replaced, which
+    # is exactly the durable-trace guarantee this record exists to provide.
+    provenance_bytes = provenance.to_json()
+    prov_key = provenance_key(sha, run_id, run_attempt)
+    if assert_immutable_write(store, prov_key, provenance_bytes):
+        store.put_bytes(prov_key, provenance_bytes)
     return record
 
 

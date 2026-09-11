@@ -2,11 +2,11 @@
   "$id": "https://github.com/nousergon/crucible/schemas/release_provenance.v1.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "description": "One publish ATTEMPT for a release, at releases/{sha}/provenance/{run_id}-{run_attempt}.json. Split out of release.json by I9786: these three fields move on every rebuild of the same commit, so keeping them in the immutable identity record made a re-run of an unchanged commit an unconditional ReleaseImmutabilityError. Never immutable-checked -- a second attempt for an already-published sha is EXPECTED to differ here, and each attempt is written unconditionally as its own durable record rather than contending for one slot.",
+  "description": "One publish ATTEMPT for a release, at releases/{sha}/provenance/{run_id}-{run_attempt}.json. Split out of release.json by I9786: these three fields move on every rebuild of the same commit, so keeping them in the immutable identity record made a re-run of an unchanged commit an unconditional ReleaseImmutabilityError. Immutable-checked only WITHIN one attempt's own key: a second, distinct run_id/run_attempt for an already-published sha is EXPECTED to differ here and is written as its own durable record; two writes naming the SAME run_id/run_attempt with differing bytes are refused.",
   "properties": {
     "built_at": {
-      "description": "When this attempt ran. Gotcha (I9786): sourced from github.event.repository.updated_at in deploy.yml, which is repository metadata, not the build instant -- carried unexamined because a wrong-but-named field beats an absent one, and it is never used for anything but display.",
-      "minLength": 1,
+      "description": "When this attempt ran. Gotcha (I9786): sourced from github.event.repository.updated_at in deploy.yml, which is repository metadata, not the build instant -- deploy.yml should source this from github.run_started_at instead.",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
       "title": "Built At",
       "type": "string"
     },

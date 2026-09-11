@@ -1369,12 +1369,20 @@ class ReleaseProvenanceDocument(_Strict):
 
     `crucible.release.ReleaseProvenance` validates against this model the
     same way `ReleaseRecord` validates against `ReleaseRecordDocument` —
-    see that model's docstring. Never immutable-checked: a second attempt
-    for an already-published sha is EXPECTED to differ here, and each
-    attempt is written unconditionally as its own durable record rather than
-    contending for one slot.
+    see that model's docstring. Immutable-checked (alpha-engine-config-I9817)
+    only WITHIN one attempt's own key: a second, distinct run_id/run_attempt
+    for an already-published sha is EXPECTED to differ here and is written as
+    its own durable record; two writes naming the SAME run_id/run_attempt
+    with differing bytes are refused.
     """
 
+    # Immutability within one attempt's own key is enforced by
+    # `crucible.release.assert_immutable_write` at the write site, and
+    # `built_at`'s type below by `UtcTimestamp` -- see the class docstring
+    # above for the citation (issue number kept out of these description
+    # strings on purpose: they reach `model_json_schema()`, which
+    # `tests/test_no_stale_tracker_literals.py` scans as a potential
+    # message-fragment surface, not prose).
     model_config = ConfigDict(
         extra="forbid",
         json_schema_extra={
@@ -1387,10 +1395,11 @@ class ReleaseProvenanceDocument(_Strict):
                 "release.json by I9786: these three fields move on "
                 "every rebuild of the same commit, so keeping them in the immutable "
                 "identity record made a re-run of an unchanged commit an unconditional "
-                "ReleaseImmutabilityError. Never immutable-checked -- a second attempt "
-                "for an already-published sha is EXPECTED to differ here, and each "
-                "attempt is written unconditionally as its own durable record rather "
-                "than contending for one slot."
+                "ReleaseImmutabilityError. Immutable-checked only WITHIN one attempt's "
+                "own key: a second, distinct run_id/run_attempt for an "
+                "already-published sha is EXPECTED to differ here and is written as "
+                "its own durable record; two writes naming the SAME run_id/run_attempt "
+                "with differing bytes are refused."
             ),
         },
     )
@@ -1413,13 +1422,18 @@ class ReleaseProvenanceDocument(_Strict):
         description="Distinguishes a 're-run failed jobs' retry that reuses the same "
         "run_id. Part of this document's own key.",
     )
-    built_at: str = Field(
-        min_length=1,
+    # built_at Gotcha (I9786): sourced from github.event.repository.updated_at
+    # in deploy.yml, which is repository metadata, not the build instant --
+    # deploy.yml should source this from github.run_started_at instead
+    # (residual tracked alpha-engine-config-I9817, out of scope for the
+    # workflow file in this change). Typed as UtcTimestamp here so a producer
+    # that DOES source it correctly cannot regress the shape while that
+    # value-correctness fix lands separately.
+    built_at: UtcTimestamp = Field(
         description="When this attempt ran. Gotcha (I9786): sourced from "
         "github.event.repository.updated_at in deploy.yml, which is repository "
-        "metadata, not the build instant -- carried unexamined because a "
-        "wrong-but-named field beats an absent one, and it is never used for anything "
-        "but display.",
+        "metadata, not the build instant -- deploy.yml should source this from "
+        "github.run_started_at instead."
     )
     workflow_run_url: str = Field(
         description="The specific workflow run this attempt is. Different on every "
