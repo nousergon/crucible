@@ -443,9 +443,42 @@ class RunContext:
 
     def record_rejected(self, reason: str, count: int) -> None:
         """§9.2 class 4: rejections carry a reason, always. A bare count
-        cannot be acted on."""
+        cannot be acted on.
+
+        The reason is bounded HERE, at the call site, and by raising rather
+        than truncating (`alpha-engine-config-I10484`).
+
+        Both halves are deliberate. The schema caps a rejection reason at 200
+        characters; over that, the manifest fails validation at write time and
+        the write routes through `_minimal_failed_manifest`, whose
+        `_FALLBACK_DROPPED_FIELDS` includes `rows_rejected` — so a long string
+        costs the run its inputs, outputs, metrics, llm_calls and every row
+        count. That fallback behaviour is correct for a job-contributed field
+        and is not what changes; what changes is that the job no longer
+        introduces the violation silently and learn about it as a schema path
+        in a manifest that lost everything else.
+
+        Raising, not fitting, because of who owns the string. The manifest's
+        own `reason` is fitted by `_write_manifest`: the runner renders it
+        from an exception whose message it does not control, so the overflow
+        is the runner's to absorb. A REJECTION reason is authored by the job,
+        which can shorten it — silently clipping it would discard a category
+        the job chose, at the one place `§9.2 class 4` says the category is
+        the point.
+
+        The cap is read from the schema, never restated: a second declaration
+        of a number that already has one diverges the day somebody widens it.
+        """
         if not reason:
             raise ValueError("a rejected-row entry needs a reason; a bare count is unactionable")
+        cap = _schema_max_length("reason", defs="RejectedRow")
+        if cap is not None and len(reason) > cap:
+            raise ValueError(
+                f"a rejected-row reason may be at most {cap} characters and this one is "
+                f"{len(reason)}. Shorten it here — over the cap the manifest fails "
+                "validation at write time and the fallback drops every job-contributed "
+                f"field. Reason began: {reason[:120]!r}"
+            )
         self.rows_rejected.append({"reason": reason, "count": count})
 
     def record_cost(self, usd: float) -> None:
@@ -877,15 +910,23 @@ _FALLBACK_DROPPED_FIELDS = (
 )
 
 
-def _schema_max_length(field: str) -> int | None:
-    """The declared `maxLength` for a top-level manifest field, or None.
+def _schema_max_length(field: str, *, defs: str | None = None) -> int | None:
+    """The declared `maxLength` for a manifest field, or None.
 
     Read from the schema rather than restated, so a cap that moves there
     moves here. A hardcoded 2000 is the second declaration of a fact that
     already has one, and the two diverge on the day somebody widens the
     schema and nothing tells this module.
+
+    ``defs`` names a `$defs` entry to read the field from instead of the
+    document root — `_schema_max_length("reason", defs="RejectedRow")` is the
+    200-character cap on ONE rejection row, a different number from the
+    2000-character cap on the manifest's own `reason` and reached by a
+    different caller.
     """
-    prop = load_schema().get("properties", {}).get(field, {})
+    schema = load_schema()
+    root = schema.get("$defs", {}).get(defs, {}) if defs else schema
+    prop = root.get("properties", {}).get(field, {})
     cap = prop.get("maxLength")
     return int(cap) if isinstance(cap, int) else None
 
