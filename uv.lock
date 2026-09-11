@@ -253,7 +253,7 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.43.89" },
     { name = "cvxpy", specifier = ">=1.9.2,<1.10" },
     { name = "jsonschema", specifier = ">=4.26.0" },
-    { name = "krepis", extras = ["openai"], specifier = "==0.59.53" },
+    { name = "krepis", extras = ["openai"], specifier = "==0.59.58" },
     { name = "nousergon-lib", extras = ["arcticdb"], marker = "extra == 'arcticdb'", specifier = "==0.124.110" },
     { name = "nousergon-lib", extras = ["github-app"], specifier = "==0.124.110" },
     { name = "numpy", specifier = ">=2.5.3" },
@@ -506,7 +506,7 @@ wheels = [
 
 [[package]]
 name = "krepis"
-version = "0.59.53"
+version = "0.59.58"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -514,9 +514,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fb/42/309d1faff52f49d93fed0752f443cfa329d76dc969f2405b20fc2b6a7332/krepis-0.59.53.tar.gz", hash = "sha256:e137f556409bb4cf032c56932430f37be30f936368b77e208c37efd67a38845f", size = 658176, upload-time = "2026-09-07T15:00:22.726Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d5/9b/2b1bd5cd0c2ac248ebb80212b259f73732821f26618ab5343431ebef7d5f/krepis-0.59.58.tar.gz", hash = "sha256:ef56e7c9c8eb38ba7618e0c1419e77ef2b61c450d482264667858804244556df", size = 694371, upload-time = "2026-09-11T23:36:44.902Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d9/f7/173598b34f785fb963f47fc0237ca9aeaf23b9b021befbacec3d9651873f/krepis-0.59.53-py3-none-any.whl", hash = "sha256:d09784faa4fdef221f27f9027f2cd07c732045c86a79be4c7db15f1e28689d51", size = 413643, upload-time = "2026-09-07T15:00:20.762Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/72/39a354ddc88e21cfc148dc10df0dd2ef2323227a08e2887730a386718b1c/krepis-0.59.58-py3-none-any.whl", hash = "sha256:025794693c003533b177b976d4f20f7b6949456092661ad7fbaa22d7ec52ae9d", size = 440190, upload-time = "2026-09-11T23:36:43.147Z" },
 ]
 
 [package.optional-dependencies]
