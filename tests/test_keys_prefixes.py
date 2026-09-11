@@ -32,6 +32,8 @@ from crucible.keys import (
     ARM_PREDICTIONS_PREFIX,
     DRIFT_INPUTS,
     PREDICTIONS_PREFIX,
+    arm_id_from_segment,
+    arm_predictions_key,
     cross_section_key,
     cross_section_settled_key,
     drift_input_key,
@@ -44,12 +46,10 @@ from crucible.keys import (
     heal_key,
     manifest_key,
     migration_key,
+    predictions_key,
     runs_prefix,
     shadow_key,
     strategy_arm_key,
-    arm_id_from_segment,
-    arm_predictions_key,
-    predictions_key,
     strategy_arms_prefix,
     verdict_key,
 )
@@ -322,6 +322,7 @@ class TestDriftHandlerKeyShape:
         manifest = json.loads(store.get_bytes(manifest_key("drift", day)).decode("utf-8"))
         assert manifest["status"] == "failed"
         assert features_key(DEFAULT_FEATURE_VERSION, day) in manifest["reason"]
+
 
 class TestPredictionsPrefixesCannotCollide:
     """`alpha-engine-config-I9822`: the trader's serving feed and the per-arm
