@@ -75,17 +75,31 @@ class _FakeCfn:
 
 
 class _FakeTagging:
-    def __init__(self, arns: list[str]) -> None:
+    def __init__(self, arns: list[str], tags: dict[str, dict[str, str]] | None = None) -> None:
         self._arns = arns
+        #: Per-ARN tags beyond `system=crucible-v2`. The real API returns them
+        #: in the same page, and they are the only way to tell a resource the
+        #: stack DECLARES from one a declared resource CREATED.
+        self._tags = tags or {}
 
     def get_paginator(self, name: str):
         assert name == "get_resources"
         arns = self._arns
+        extra = self._tags
 
         class _Paginator:
             def paginate(self, *, TagFilters):  # noqa: N803 - boto3's shape
                 assert TagFilters == [{"Key": TAG_KEY, "Values": [TAG_VALUE]}]
-                yield {"ResourceTagMappingList": [{"ResourceARN": a} for a in arns]}
+                yield {
+                    "ResourceTagMappingList": [
+                        {
+                            "ResourceARN": a,
+                            "Tags": [{"Key": TAG_KEY, "Value": TAG_VALUE}]
+                            + [{"Key": k, "Value": v} for k, v in extra.get(a, {}).items()],
+                        }
+                        for a in arns
+                    ]
+                }
 
         return _Paginator()
 
@@ -204,6 +218,159 @@ class TestAccountVsTemplate:
         assert not audit.only_in_account
         assert not audit.only_in_template
 
+    def test_one_unmatched_resource_is_one_finding_not_three(self) -> None:
+        """The defect that made this comparison useless, measured 2026-09-11
+        on release `672e546`: `only_in_account` read **63** against a stack of
+        34 resources, and not one entry was real.
+
+        `crucible.tags` expands each tagged ARN into three identifier forms so
+        that a CloudFormation physical id matches in whichever shape it takes
+        -- a NAME for most types, a full ARN for a few. The comparison then
+        tested each form INDEPENDENTLY, so for every resource the forms that
+        did not happen to equal the physical id were reported as unmatched
+        resources. A Lambda whose physical id is its name matched on the
+        `rsplit(":")` form and was reported twice, for the ARN and the
+        `rsplit("/")` form.
+
+        They are spellings of one resource. A match on any is a match.
+        """
+        arn = "arn:aws:lambda:us-east-1:123456789012:function:test-fn"
+        audit = audit_account_vs_template(
+            stack=STACK,
+            cfn=_FakeCfn([_summary("Fn", "AWS::Lambda::Function", "test-fn")]),
+            tagging=_FakeTagging([arn]),
+            iam=_FakeIam({}),
+        )
+        assert audit.only_in_account == (), (
+            "a resource whose physical id matches one of its identifier forms is "
+            f"matched; got {audit.only_in_account}"
+        )
+        assert audit.met
+
+    def test_a_resource_matching_on_only_the_arn_form_is_matched(self) -> None:
+        """The other direction, and the reason the forms exist at all: an SNS
+        topic's physical id is its full ARN, so the NAME forms miss and the
+        ARN form hits. Both cases have to work off one rule or the rule is
+        per-type, which is what the forms were introduced to avoid.
+        """
+        arn = "arn:aws:sns:us-east-1:123456789012:test-topic"
+        audit = audit_account_vs_template(
+            stack=STACK,
+            cfn=_FakeCfn([_summary("Topic", "AWS::SNS::Topic", arn)]),
+            tagging=_FakeTagging([arn]),
+            iam=_FakeIam({}),
+        )
+        assert audit.only_in_account == ()
+
+    def test_the_audited_stack_is_not_a_finding_against_itself(self) -> None:
+        """A stack carries its own tags and never appears in its own
+        `StackResourceSummaries`, so it can never match. Reporting it is a
+        finding no action can clear.
+        """
+        arn = f"arn:aws:cloudformation:us-east-1:123456789012:stack/{STACK}/abc-123"
+        audit = audit_account_vs_template(
+            stack=STACK,
+            cfn=_FakeCfn([_summary("Fn", "AWS::Lambda::Function", "test-fn")]),
+            tagging=_FakeTagging([arn]),
+            iam=_FakeIam({}),
+        )
+        assert audit.only_in_account == ()
+
+    def test_a_DIFFERENT_stack_carrying_the_tag_is_still_a_finding(self) -> None:
+        """The exclusion above is matched on the stack NAME segment, not on a
+        substring. A second stack tagged into this system is exactly the
+        out-of-band resource the comparison exists to find, and a substring
+        test would swallow one whose name merely contains this one's.
+        """
+        arn = f"arn:aws:cloudformation:us-east-1:123456789012:stack/{STACK}-shadow/abc-123"
+        audit = audit_account_vs_template(
+            stack=STACK,
+            cfn=_FakeCfn([_summary("Fn", "AWS::Lambda::Function", "test-fn")]),
+            tagging=_FakeTagging([arn]),
+            iam=_FakeIam({}),
+        )
+        assert audit.only_in_account == (arn,)
+
+    def test_what_the_stacks_launch_template_tags_is_excluded_and_counted(self) -> None:
+        """Measured 2026-09-11: 10 spot instances and 5 volumes, every one
+        tagged `system=crucible-v2` by the stack's own LaunchTemplate
+        `TagSpecifications`, none of them ever a `StackResourceSummary`, and a
+        NEW one on every dispatch. `only_in_account` grew without bound and no
+        action could clear it. A permanent finding is not a finding.
+
+        The excluded types are read from the deployed template, so a stack
+        with no launch template excludes nothing, and the count is REPORTED --
+        an exclusion nobody can see is indistinguishable from a comparison
+        that failed to look.
+        """
+        template = {
+            "Resources": {
+                "LaunchTemplate": {
+                    "Type": "AWS::EC2::LaunchTemplate",
+                    "Properties": {
+                        "LaunchTemplateData": {
+                            "TagSpecifications": [
+                                {"ResourceType": "instance"},
+                                {"ResourceType": "volume"},
+                            ]
+                        }
+                    },
+                }
+            }
+        }
+        audit = audit_account_vs_template(
+            stack=STACK,
+            cfn=_FakeCfn([_summary("Fn", "AWS::Lambda::Function", "test-fn")], template=template),
+            tagging=_FakeTagging(
+                [
+                    "arn:aws:ec2:us-east-1:123456789012:instance/i-0abc",
+                    "arn:aws:ec2:us-east-1:123456789012:volume/vol-0abc",
+                ]
+            ),
+            iam=_FakeIam({}),
+        )
+        assert audit.only_in_account == ()
+        assert audit.launched_by_the_stack == 2
+        assert "2 excluded as launched by a declared resource" in audit.detail()
+
+    def test_a_type_the_launch_template_does_not_tag_is_still_a_finding(self) -> None:
+        """The exclusion is DERIVED from `TagSpecifications`, never a
+        hardcoded `{"instance", "volume"}`. A template that tags only
+        instances leaves a tagged volume reportable.
+        """
+        template = {
+            "Resources": {
+                "LaunchTemplate": {
+                    "Type": "AWS::EC2::LaunchTemplate",
+                    "Properties": {
+                        "LaunchTemplateData": {"TagSpecifications": [{"ResourceType": "instance"}]}
+                    },
+                }
+            }
+        }
+        volume = "arn:aws:ec2:us-east-1:123456789012:volume/vol-0abc"
+        audit = audit_account_vs_template(
+            stack=STACK,
+            cfn=_FakeCfn([_summary("Fn", "AWS::Lambda::Function", "test-fn")], template=template),
+            tagging=_FakeTagging(["arn:aws:ec2:us-east-1:123456789012:instance/i-0abc", volume]),
+            iam=_FakeIam({}),
+        )
+        assert audit.only_in_account == (volume,)
+        assert audit.launched_by_the_stack == 1
+
+    def test_a_stack_with_no_launch_template_excludes_nothing(self) -> None:
+        instance = "arn:aws:ec2:us-east-1:123456789012:instance/i-0abc"
+        audit = audit_account_vs_template(
+            stack=STACK,
+            cfn=_FakeCfn(
+                [_summary("Fn", "AWS::Lambda::Function", "test-fn")], template={"Resources": {}}
+            ),
+            tagging=_FakeTagging([instance]),
+            iam=_FakeIam({}),
+        )
+        assert audit.only_in_account == (instance,)
+        assert audit.launched_by_the_stack == 0
+
     def test_a_resource_tagged_but_not_stack_managed_is_only_in_account(self) -> None:
         """An out-of-band resource carrying the tag: the direction
         `crucible.tags.audit_stack_tags` alone cannot see, because it only
@@ -215,7 +382,10 @@ class TestAccountVsTemplate:
             iam=_FakeIam({"test-runtime": True}),
         )
         assert not audit.met
-        assert "rogue-topic" in audit.only_in_account
+        # The canonical ARN, ONE entry -- not the three identifier spellings
+        # the comparison matches on. See `test_one_unmatched_resource_is_one
+        # _finding_not_three` for what reporting the spellings cost.
+        assert audit.only_in_account == ("arn:aws:sns:us-east-1:123456789012:rogue-topic",)
         assert not audit.only_in_template
 
     def test_an_out_of_band_iam_role_is_also_only_in_account(self) -> None:
