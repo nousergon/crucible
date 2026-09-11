@@ -7,14 +7,13 @@ name: CI
 # earlier version of this comment asserted "public, so those minutes are free"
 # in the present tense, which was wrong on the day it was written.
 #
-# Three workflows in this repo and no others (revised 2026-09-02 — plan §11
-# risk 1 added `adversarial-review-gate.yml` after this comment was written;
-# see that file for why it does not repeat the sixteen-workflows-per-repo
-# mistake: it is two thin `gh api` calls, no checkout, no `uv sync`). Every
-# guard the v1 repos carry as a per-repo workflow is a pytest in `tests/`
-# here, or it is not carried: sixteen workflows per repo is how a fleet
-# spends 66% of its metered CI minutes on one private repo. deploy.yml is
-# track C's.
+# The set of workflows in this repo, and the rule for adding another, live in
+# `AGENTS.md` § Layout — never restated here as a count (alpha-engine-config-I9887:
+# this comment used to say "three workflows ... and no others" against a tree
+# that had grown to four within a day of being written, then nine). Sixteen
+# workflows per repo is how a fleet spends 66% of its metered CI minutes on
+# one private repo; the rule that keeps this repo off that path is in
+# `AGENTS.md`, not here.
 
 on:
   push:
