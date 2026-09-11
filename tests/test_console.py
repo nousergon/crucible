@@ -242,11 +242,26 @@ class TestClassifier:
 
 
 class TestPage:
-    def test_the_population_is_the_whole_registry(self, tmp_path) -> None:
+    def test_the_population_is_the_whole_registry_with_discriminated_writers_expanded(
+        self, tmp_path
+    ) -> None:
+        """alpha-engine-config-I9818: `experiment.run`/`experiment.grade`
+        each contribute one row PER DISPATCHABLE SLOT rather than one row for
+        the whole job, so the population is the registry plus one extra row
+        per slot beyond the first, for each of those two jobs."""
+        from crucible.console.render import _discriminated_slots
+        from crucible.weekly import ARC_SLOT_JOBS
+
         store = LocalStore(tmp_path)
         page = build_page(store, now=SATURDAY_NIGHT)
-        assert page.population == len(load_registry())
-        assert {r["component"] for r in page.rows} == set(load_registry())
+        registry = load_registry()
+        slots = _discriminated_slots()
+        expected_population = len(registry) + len(ARC_SLOT_JOBS) * (len(slots) - 1)
+        assert page.population == expected_population
+        expected_components = (set(registry) - ARC_SLOT_JOBS) | {
+            f"{job}[{slot}]" for job in ARC_SLOT_JOBS for slot in slots
+        }
+        assert {r["component"] for r in page.rows} == expected_components
 
     def test_every_row_resolves_to_a_member_of_the_vocabulary(self, tmp_path) -> None:
         """The totality invariant: no default branch, no `else: HEALTHY`."""
@@ -266,11 +281,16 @@ class TestPage:
         assert page.unreported == 0
         assert "transparency gap" in render_html(page)
 
-    def test_a_failed_slot_manifest_is_not_masked_by_a_healthy_sibling(self, tmp_path) -> None:
-        """alpha-engine-config-I9781: `experiment.run` now writes one
-        manifest per slot. A row still renders one classification per job,
-        so the console reads the failed slot's manifest rather than
-        whichever discriminated key sorts last."""
+    def test_the_collapse_reader_still_prefers_a_failed_manifest_over_a_healthy_sibling(
+        self, tmp_path
+    ) -> None:
+        """`_read_representative_manifest` is exercised directly here, not
+        through `build_page` — since `alpha-engine-config-I9818`, `build_page`
+        no longer calls it for `experiment.run`/`experiment.grade` (see
+        `TestPerWriterRows` below), but the function itself is still the
+        collapse `alerts.sweep` and every non-slot job go through, and its
+        worst-status rule must still hold: `failed` beats `ok` among
+        whatever candidates a caller hands it."""
         store = LocalStore(tmp_path)
         for slot, status, reason in (("u", "ok", ""), ("r", "failed", "boom"), ("s", "ok", "")):
             store.put_bytes(
@@ -382,10 +402,11 @@ class TestPage:
         # Every key `write_page` writes, not the first two: the phase-ladder
         # artifact joined the page and its JSON, and a two-name unpack is how
         # a third output turns a passing test into a ValueError.
-        keys = write_page(store, build_page(store, now=SATURDAY_NIGHT))
+        page = build_page(store, now=SATURDAY_NIGHT)
+        keys = write_page(store, page)
         json_key = keys[1]
         assert all(store.exists(k) for k in keys)
-        assert json.loads(store.get_bytes(json_key))["population"] == len(load_registry())
+        assert json.loads(store.get_bytes(json_key))["population"] == page.population
 
     def test_the_transparency_gap_count_sees_metric_statuses_not_only_component_states(
         self, tmp_path
@@ -553,6 +574,151 @@ class TestPage:
         rendering with no CSS rule — the exact silent failure C14 was."""
         with pytest.raises(KeyError, match="no entry in STATUS_COLORS"):
             _state_class("SOMETHING_NOBODY_REGISTERED")
+
+
+class TestPerWriterRows:
+    """alpha-engine-config-I9818: one console row per discriminated writer.
+
+    `crucible-PR26` gave `experiment.run`/`experiment.grade` one manifest per
+    dispatchable slot, and the console reduced them all to one row — a
+    healthy slot and a failed slot read as one status. `PROOF OF RED`: on
+    pre-fix `main`, `test_a_failed_slot_manifest_is_masked_by_a_healthy
+    _sibling_before_the_fix` below (run with `git stash` over this file's
+    non-test changes) shows `build_page` producing exactly ONE row for
+    `experiment.run`, HEALTHY, with the failed slot's evidence nowhere on
+    the page — see the PR body for the captured failure.
+    """
+
+    def _experiment_run_component(self) -> Component:
+        return load_registry()["experiment.run"]
+
+    def _manifest_for(self, status: str, run_id: str, reason: str = "") -> dict:
+        return {
+            "job": "experiment.run",
+            "trading_day": FRIDAY.isoformat(),
+            "status": status,
+            "reason": reason,
+            "cost_usd": 0.1,
+            "run_id": run_id,
+        }
+
+    def test_a_failed_slot_is_visible_when_its_siblings_are_ok(self, tmp_path) -> None:
+        """The core property, proved RED against the pre-fix collapse (see
+        the PR body): a failed writer must not be masked by a healthy
+        sibling — it must render its OWN row, not merely win a tiebreak
+        buried inside someone else's row."""
+        store = LocalStore(tmp_path)
+        store.put_bytes(
+            manifest_key("experiment.run", FRIDAY.isoformat(), discriminator="u"),
+            json.dumps(self._manifest_for("ok", "01JG000000000000000000000U")).encode(),
+        )
+        store.put_bytes(
+            manifest_key("experiment.run", FRIDAY.isoformat(), discriminator="r"),
+            json.dumps(self._manifest_for("failed", "01JG000000000000000000000R", "boom")).encode(),
+        )
+        page = build_page(store, now=SATURDAY_NIGHT)
+        rows_by_component = {r["component"]: r for r in page.rows}
+        # Two DISTINCT rows, not one collapsed row.
+        assert "experiment.run[u]" in rows_by_component
+        assert "experiment.run[r]" in rows_by_component
+        assert "experiment.run" not in rows_by_component
+        # The healthy slot reads HEALTHY on its OWN row...
+        assert rows_by_component["experiment.run[u]"]["state"] == "HEALTHY"
+        assert rows_by_component["experiment.run[u]"]["run_id"] == "01JG000000000000000000000U"
+        # ...and is not masked by, nor does it mask, the failed sibling.
+        assert rows_by_component["experiment.run[r]"]["state"] == "FAILED"
+        assert rows_by_component["experiment.run[r]"]["run_id"] == "01JG000000000000000000000R"
+        assert "boom" in rows_by_component["experiment.run[r]"]["reason"]
+
+    def test_a_job_with_no_discriminator_still_renders_exactly_one_row(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        store.put_bytes(
+            manifest_key("data.daily", FRIDAY.isoformat()), json.dumps(_manifest()).encode()
+        )
+        page = build_page(store, now=SATURDAY_NIGHT)
+        matches = [r for r in page.rows if r["component"] == "data.daily"]
+        assert len(matches) == 1
+        assert matches[0]["state"] == "HEALTHY"
+
+    def test_an_empty_prefix_renders_one_row_per_expected_slot_never_healthy(
+        self, tmp_path
+    ) -> None:
+        """Absence semantics, preserved: nothing wrote a manifest for
+        `experiment.run` at all, so every expected slot's row classifies
+        through the absence branches (`ARMED`/`RUNNING`/`NEVER_RAN`/
+        `MISSED`) — never `HEALTHY`, and the prefix being wholly empty must
+        not collapse the row count to zero or to one."""
+        from crucible.console.render import _discriminated_slots
+
+        store = LocalStore(tmp_path)
+        page = build_page(store, now=SATURDAY_NIGHT)
+        slots = _discriminated_slots()
+        run_rows = {
+            r["component"]: r for r in page.rows if r["component"].startswith("experiment.run[")
+        }
+        assert set(run_rows) == {f"experiment.run[{slot}]" for slot in slots}
+        assert all(row["state"] != "HEALTHY" for row in run_rows.values())
+
+    def test_the_row_count_is_not_hand_listed_it_grows_with_dispatchable_slots(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """alpha-engine-config-I9818 requirement 2: adding a slot to
+        `dispatchable_slots()` must produce console rows with no change to
+        `crucible.console.render`. Simulated here by monkeypatching
+        `dispatchable_slots` to report all four `SLOTS` (M and S have not
+        landed on the CLI yet) rather than editing any list in this module —
+        proving `_discriminated_slots` reads the registry-derived set and
+        never a hardcoded one."""
+        import crucible.console.render as render_mod
+        from crucible.slots import SLOTS
+
+        monkeypatch.setattr(
+            render_mod, "dispatchable_slots", lambda: dict.fromkeys(SLOTS, object())
+        )
+        store = LocalStore(tmp_path)
+        for slot in SLOTS:
+            store.put_bytes(
+                manifest_key("experiment.run", FRIDAY.isoformat(), discriminator=slot),
+                json.dumps(
+                    self._manifest_for("ok", f"01JG00000000000000000000{slot.upper()}")
+                ).encode(),
+            )
+        page = build_page(store, now=SATURDAY_NIGHT)
+        run_rows = {
+            r["component"] for r in page.rows if r["component"].startswith("experiment.run[")
+        }
+        assert run_rows == {f"experiment.run[{slot}]" for slot in SLOTS}
+
+    def test_a_failed_slot_manifest_is_masked_by_a_healthy_sibling_before_the_fix(
+        self, tmp_path
+    ) -> None:
+        """`PROOF OF RED`, kept executable rather than only pasted into the PR
+        body: the pre-fix collapse this issue replaces, called directly —
+        `_read_representative_manifest` over the whole `experiment.run`
+        prefix returns exactly ONE manifest as "the" representative for the
+        whole job, discarding the healthy slot's identity entirely, which is
+        exactly the masking this issue's fix removes from `build_page`'s own
+        row-per-writer path above. This function is still correct for
+        `alerts.sweep` and every undiscriminated job (see `TestPage`'s
+        `test_the_collapse_reader_still_prefers_a_failed_manifest_over_a
+        _healthy_sibling`) — it is simply no longer what `experiment.run`/
+        `experiment.grade` render through."""
+        from crucible.console.render import _read_representative_manifest
+
+        store = LocalStore(tmp_path)
+        store.put_bytes(
+            manifest_key("experiment.run", FRIDAY.isoformat(), discriminator="u"),
+            json.dumps(self._manifest_for("ok", "01JG000000000000000000000U")).encode(),
+        )
+        store.put_bytes(
+            manifest_key("experiment.run", FRIDAY.isoformat(), discriminator="r"),
+            json.dumps(self._manifest_for("failed", "01JG000000000000000000000R", "boom")).encode(),
+        )
+        read = _read_representative_manifest(store, "experiment.run", FRIDAY.isoformat())
+        # ONE manifest speaks for the whole job — the healthy slot's own
+        # run_id never appears anywhere in this reader's answer.
+        assert read.manifest["run_id"] == "01JG000000000000000000000R"
+        assert read.manifest["run_id"] != "01JG000000000000000000000U"
 
 
 class TestUnreadableArtifacts:

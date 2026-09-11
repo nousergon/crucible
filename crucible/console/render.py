@@ -11,7 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import html
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, get_args
 
 from krepis.metrics import StatusLiteral
@@ -38,7 +38,9 @@ from crucible.keys import (
     runs_prefix,
 )
 from crucible.manifest import manifest_prefix
+from crucible.slots import SLOTS, dispatchable_slots
 from crucible.store import Store
+from crucible.weekly import ARC_SLOT_JOBS
 
 __all__ = [
     "ATTRIBUTION_STATUSES",
@@ -161,6 +163,19 @@ def _read_representative_manifest(store: Store, job: str, trading_day: str) -> M
     """One manifest to classify ``job`` for ``trading_day`` by, from however
     many its writers produced.
 
+    **Scope, since `alpha-engine-config-I9818`:** this collapse is used for
+    every job EXCEPT the two named in :data:`crucible.weekly.ARC_SLOT_JOBS`
+    (`experiment.run`, `experiment.grade`), which :func:`build_page` renders
+    one row per writer for instead — see :func:`_read_manifests_by_slot`.
+    `alerts.sweep` still collapses through this function: it discriminates by
+    `calendar_date`, not by a registry-derived slot set the way the slot jobs
+    do (its Friday/Saturday/Sunday writers share one trading day by calendar
+    construction, not by a dispatchable-slot count that grows), and I9818's
+    own measured facts scope the per-writer redesign to the slot-expanded
+    stages only. A per-writer console row for `alerts.sweep` is a follow-up
+    this function's continued use here deliberately leaves open, not an
+    oversight.
+
     A job that carries a discriminator (`experiment.run`/`experiment.grade`
     by slot, `alerts.sweep` by `calendar_date`) can have written several
     manifests here since I9781 fixed the collision that used to leave
@@ -187,9 +202,6 @@ def _read_representative_manifest(store: Store, job: str, trading_day: str) -> M
     :func:`build_page` already recorded that race and this function silently
     dropped it (`alpha-engine-config-I9931` item 2); both now read through
     :func:`crucible.documents.read_manifests_under`, so there is one answer.
-
-    Per-writer rows (one per slot) are a console redesign this fix does not
-    make — tracked as a follow-up in the PR body.
     """
     listed = read_manifests_under(store, manifest_prefix(job, trading_day))
     if listed.listing_problem is not None:
@@ -233,6 +245,98 @@ def _has_history(store: Store, job: str) -> bool:
     return False
 
 
+def _discriminated_slots() -> list[str]:
+    """The slots :data:`crucible.weekly.ARC_SLOT_JOBS` expand into, in
+    `SLOTS` order.
+
+    The EXACT expression `crucible.weekly.arc_stages` builds the weekly arc
+    from — `[slot for slot in SLOTS if slot in dispatchable_slots()]` —
+    reused here rather than re-derived, so the console's row count and the
+    arc's own stage count can never disagree about which slots are live. Not
+    hand-listed: `dispatchable_slots()` reads off which slot modules expose
+    `produce`/`grade`, so a slot landing on the CLI (M, then S, at phase 3)
+    grows this list, and therefore the console's row count, with no change
+    here (`alpha-engine-config-I9818`).
+    """
+    return [slot for slot in SLOTS if slot in dispatchable_slots()]
+
+
+def _read_manifests_by_slot(
+    store: Store, job: str, trading_day: str, slots: list[str]
+) -> dict[str, ManifestRead]:
+    """One :class:`ManifestRead` per ``slot`` in ``slots`` — never collapsed
+    across slots the way :func:`_read_representative_manifest` collapses
+    across every discriminator.
+
+    `alpha-engine-config-I9818`: a job in `ARC_SLOT_JOBS` writes one manifest
+    per dispatchable slot at `runs/{job}/{trading_day}/{slot}/run.json`, and
+    the console used to reduce all of them to one row — a healthy slot and a
+    failed slot read as one status, and the row's `run_id`/`trading_day`
+    belonged to whichever manifest won the collapse's tiebreak. This
+    function is the replacement: it still reuses `_read_representative
+    _manifest`'s worst-status-wins rule, but applies it WITHIN one slot's own
+    candidates only (defensive — `crucible.runner` writes exactly one
+    manifest per `(job, trading_day, discriminator)` key, so a slot should
+    never have more than one candidate in practice), never across slots.
+
+    The whole prefix is listed exactly ONCE (`read_manifests_under`) and then
+    partitioned by discriminator, so N slot rows cost one listing rather than
+    N — the same care `crucible.aggregation`'s callers take not to reduce a
+    reduction's own reads into a second N+1 query shape.
+    """
+    listed = read_manifests_under(store, manifest_prefix(job, trading_day))
+    if listed.listing_problem is not None:
+        return {slot: ManifestRead(None, listed.listing_problem, {}) for slot in slots}
+    docs_by_slot: dict[str, list[dict[str, Any]]] = {slot: [] for slot in slots}
+    faults_by_slot: dict[str, dict[str, str]] = {slot: {} for slot in slots}
+    for key, document in listed.documents:
+        parsed = parse_manifest_key(key)
+        assert parsed is not None  # `read_manifests_under` already filtered to manifest keys
+        _, _, discriminator = parsed
+        if discriminator in docs_by_slot:
+            docs_by_slot[discriminator].append(document)
+        # A discriminator outside `slots` (a slot the registry no longer
+        # dispatches, or a stray key) is not this row's business — it is
+        # neither dropped nor mistaken for one of the expected slots.
+    for key, fault in listed.faults.items():
+        parsed = parse_manifest_key(key)
+        assert parsed is not None
+        _, _, discriminator = parsed
+        if discriminator in faults_by_slot:
+            faults_by_slot[discriminator][key] = fault
+    reads: dict[str, ManifestRead] = {}
+    for slot in slots:
+        faults = faults_by_slot[slot]
+        if faults:
+            reads[slot] = ManifestRead(None, "; ".join(faults[k] for k in sorted(faults)), faults)
+            continue
+        candidates = docs_by_slot[slot]
+        if not candidates:
+            reads[slot] = ManifestRead(None, None)
+            continue
+        failed = next((m for m in candidates if m.get("status") == "failed"), None)
+        reads[slot] = ManifestRead(failed if failed is not None else candidates[-1], None)
+    return reads
+
+
+def _has_history_by_slot(store: Store, job: str, slots: list[str]) -> dict[str, bool]:
+    """The multi-slot analogue of :func:`_has_history`: whether each slot in
+    ``slots`` has EVER produced a manifest for ``job``, from one listing of
+    the job's whole history.
+
+    Needed because MISSED vs NEVER_RAN becomes a per-writer fact once a job
+    renders one row per writer: a slot that has never run must not read
+    RUNNING or MISSED just because a sibling slot has history, which is
+    exactly what calling the job-wide `_has_history` per slot would do.
+    """
+    found = dict.fromkeys(slots, False)
+    for key in store.list_keys(runs_prefix(job)):
+        parsed = parse_manifest_key(key)
+        if parsed is not None and parsed[2] in found:
+            found[parsed[2]] = True
+    return found
+
+
 def classify_registry(
     store: Store,
     registry: dict[str, Component],
@@ -240,6 +344,7 @@ def classify_registry(
     now: dt.datetime,
     trading_day: dt.date,
     faults: dict[str, str] | None = None,
+    skip: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, Classification], dict[str, dict[str, Any] | None]]:
     """Classify every registry row once, and hand back the manifests too.
 
@@ -252,10 +357,19 @@ def classify_registry(
     thing for the board itself to introduce.
 
     Returns `(classifications, manifests)` keyed by component name, both
-    covering every registry row. A component with no manifest is present in
-    both maps with a `None` manifest, never absent — an absent key would make
-    a caller's `.get()` return `None` for "no such component" and "no run
-    today" alike.
+    covering every registry row not named in ``skip``. A component with no
+    manifest is present in both maps with a `None` manifest, never absent —
+    an absent key would make a caller's `.get()` return `None` for "no such
+    component" and "no run today" alike.
+
+    ``skip`` names registry rows this call does not classify at all — absent
+    from both returned maps. `alpha-engine-config-I9818`: `build_page` passes
+    `ARC_SLOT_JOBS` here and classifies each of those two jobs itself, one row
+    PER WRITER, instead of through this function's worst-status collapse —
+    asking this function to collapse them too would be wasted work and would
+    report the same unreadable manifest through two routes into `faults`.
+    Every other caller (the board) passes nothing and sees every registry
+    row, exactly as before.
 
     ``faults`` is an optional mapping this fills with `{store key: fault}` for
     every manifest that existed and could not be read. An
@@ -268,6 +382,8 @@ def classify_registry(
     classifications: dict[str, Classification] = {}
     manifests: dict[str, dict[str, Any] | None] = {}
     for name, component in sorted(registry.items()):
+        if name in skip:
+            continue
         read = _read_representative_manifest(store, name, trading_day.isoformat())
         manifests[name] = read.manifest
         if faults is not None:
@@ -310,15 +426,47 @@ def build_page(
     metric_gap = 0
     unreadable: list[dict[str, str]] = []
     manifest_faults: dict[str, str] = {}
+    # `ARC_SLOT_JOBS` is skipped here and classified below instead, one row
+    # PER WRITER rather than through the worst-status collapse
+    # (`alpha-engine-config-I9818`) — see `classify_registry`'s `skip` and
+    # `_read_manifests_by_slot`.
     classifications, manifests = classify_registry(
-        store, reg, now=moment, trading_day=trading_day, faults=manifest_faults
+        store, reg, now=moment, trading_day=trading_day, faults=manifest_faults, skip=ARC_SLOT_JOBS
     )
+    slot_order = _discriminated_slots()
+    row_components: dict[str, Component] = {}
+    for name, component in sorted(reg.items()):
+        if name in ARC_SLOT_JOBS:
+            slot_reads = _read_manifests_by_slot(store, name, trading_day.isoformat(), slot_order)
+            history_by_slot = _has_history_by_slot(store, name, slot_order)
+            for slot in slot_order:
+                row_name = f"{name}[{slot}]"
+                read = slot_reads[slot]
+                manifests[row_name] = read.manifest
+                manifest_faults.update(read.faults)
+                row_components[row_name] = replace(component, name=row_name)
+                classifications[row_name] = classify(
+                    row_components[row_name],
+                    read.manifest,
+                    now=moment,
+                    # An unreadable manifest still counts as history: something
+                    # ran. History is scoped to THIS slot — a sibling slot's
+                    # history must never make an empty slot read RUNNING or
+                    # MISSED instead of NEVER_RAN.
+                    history=read.manifest is not None
+                    or read.problem is not None
+                    or history_by_slot[slot],
+                    unreadable=read.problem,
+                )
+        else:
+            row_components[name] = component
+
     unreadable.extend(
         {"key": key, "fault": fault} for key, fault in sorted(manifest_faults.items())
     )
-    for name, component in sorted(reg.items()):
-        manifest = manifests[name]
-        classification = classifications[name]
+    for row_name, component in sorted(row_components.items()):
+        manifest = manifests[row_name]
+        classification = classifications[row_name]
         rows.append(_row(component, classification, manifest))
         # alpha-engine-config-I9757 (C5): the transparency-gap count read
         # only component STATES, never the metric statuses inside a
