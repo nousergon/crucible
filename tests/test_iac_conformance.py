@@ -23,6 +23,7 @@ from crucible.iac_conformance import (
     COMPARISON_PERSISTED,
     COMPARISON_TEMPLATE_VS_DECLARED,
     IAC_CONFORMANCE_JOB,
+    AccessDeniedReadingTheAccountError,
     DeclaredInventory,
     DeclaredInventoryUnreadableError,
     DeclaredInventoryUnsetError,
@@ -112,6 +113,43 @@ class _FakeIam:
                 yield {"Roles": [{"RoleName": name} for name in roles]}
 
         return _Paginator()
+
+
+class _DenyingIam(_FakeIam):
+    """`list_role_tags` denied on the first role outside this stack's prefix.
+
+    The live shape, measured 2026-09-11 on the v2 box: the grant was
+    scoped `role/crucible-v2-*` while `_tagged_iam_role_names` reads tags on
+    every role `list_roles` returns, so the very first unowned role — `admin`
+    — was denied.
+    """
+
+    def __init__(self, roles: dict[str, bool], *, denied: str) -> None:
+        super().__init__(roles)
+        self._denied = denied
+
+    def list_role_tags(self, *, RoleName: str) -> dict:  # noqa: N803 - boto3's shape
+        if RoleName == self._denied:
+            raise _client_error(
+                "AccessDenied",
+                f"User: <the v2 runtime role, on the v2 box> is not authorized to "
+                f"perform: iam:ListRoleTags on resource: role {RoleName}",
+            )
+        return super().list_role_tags(RoleName=RoleName)
+
+
+def _client_error(code: str, message: str) -> Exception:
+    """A botocore-shaped error without importing botocore: the production code
+    reads `exc.response['Error']['Code']` and nothing else about the type, and
+    a test that imported the real class would be asserting botocore's
+    constructor rather than our own branch."""
+
+    class _ClientError(Exception):
+        def __init__(self) -> None:
+            super().__init__(f"An error occurred ({code}): {message}")
+            self.response = {"Error": {"Code": code, "Message": message}}
+
+    return _ClientError()
 
 
 class _FakeSsm:
@@ -219,6 +257,72 @@ class TestAccountVsTemplate:
 
 
 # ── comparison (b): template vs the plan's declared inventory ───────────
+
+
+class TestAnAccessFailureIsNeverAnArcFailure:
+    """The class defect behind two lost weekly arcs.
+
+    `iac.conformance` is a `dispatch: arc` stage, and `crucible.weekly.run_arc`
+    stops the arc on the first stage that raises. Comparison (b) and the
+    cost-allocation read both already render an access failure UNMEASURABLE
+    and say so in the same words ("a statement about our access"). Comparison
+    (a) did not — it let a raw `ClientError` out — so a missing grant did not
+    cost a metric, it cost the whole Saturday:
+
+      2026-09-10 (first v2-box rehearsal): cloudformation:ListStackResources
+      2026-09-11 (the next one): iam:ListRoleTags on role `admin`
+
+    -- two consecutive rehearsals of 2026-07-31, one denial further along each
+    time. The grants are fixed where they live (`nous-ergon-ops`
+    `infrastructure/cloudformation/crucible-v2.yaml`); these tests are what
+    make a THIRD missing grant cost one red metric instead of an arc.
+    """
+
+    def test_a_denied_role_tag_read_is_declared_not_raw(self) -> None:
+        with pytest.raises(AccessDeniedReadingTheAccountError) as caught:
+            audit_account_vs_template(
+                stack=STACK,
+                cfn=_FakeCfn([_summary("RuntimeRole", "AWS::IAM::Role", "test-runtime")]),
+                tagging=_FakeTagging([]),
+                iam=_DenyingIam({"test-runtime": True, "admin": False}, denied="admin"),
+            )
+        assert "statement about our grants" in str(caught.value)
+
+    def test_a_denied_stack_resource_read_is_declared_too(self) -> None:
+        """The FIRST of the two denials, from the same call path one layer up."""
+        with pytest.raises(AccessDeniedReadingTheAccountError):
+            audit_account_vs_template(
+                stack=STACK,
+                cfn=_FakeCfn(_client_error("AccessDenied", "not authorized: ListStackResources")),
+                tagging=_FakeTagging([]),
+                iam=_FakeIam({}),
+            )
+
+    def test_a_non_access_error_still_propagates(self) -> None:
+        """Fail loud. Only AccessDenied is a statement about our grants; every
+        other failure is a statement about the estate and must not be laundered
+        into UNMEASURABLE."""
+        boom = _client_error("ThrottlingException", "slow down")
+        with pytest.raises(Exception) as caught:
+            audit_account_vs_template(
+                stack=STACK,
+                cfn=_FakeCfn(boom),
+                tagging=_FakeTagging([]),
+                iam=_FakeIam({}),
+            )
+        assert not isinstance(caught.value, AccessDeniedReadingTheAccountError)
+
+    def test_the_stack_not_existing_keeps_its_own_answer(self) -> None:
+        """ "Cannot look" and "nothing to look at" are different answers and
+        must not collapse into one."""
+        missing = _client_error("ValidationError", f"Stack with id {STACK} does not exist")
+        with pytest.raises(StackNotAppliedError):
+            audit_account_vs_template(
+                stack=STACK,
+                cfn=_FakeCfn(missing),
+                tagging=_FakeTagging([]),
+                iam=_FakeIam({}),
+            )
 
 
 class TestTemplateInventoryFromStack:
@@ -386,6 +490,48 @@ class TestTheWeeklyJob:
         assert names[COMPARISON_ACCOUNT_VS_TEMPLATE] == "BREACH"
         assert names[COMPARISON_TEMPLATE_VS_DECLARED] == "OK"
         assert names[COMPARISON_PERSISTED] == "OK"
+
+    def test_a_missing_grant_costs_one_metric_not_the_whole_arc(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The property that makes this an arc-safe stage.
+
+        The handler exits 0 with comparison (a) UNMEASURABLE, so
+        `crucible.weekly.run_arc` — which stops on the first stage that raises
+        — runs the stages after it. UNMEASURABLE is never a pass: the metric is
+        not `OK`, it names the denied action, and the clause reading it stays
+        unmet until the grant lands.
+        """
+        monkeypatch.setenv(
+            "CRUCIBLE_IAC_DECLARED_INVENTORY_PARAM", "/crucible-v2/iac/declared-inventory"
+        )
+        _patch_clients(
+            monkeypatch,
+            cfn=_FakeCfn(
+                [_summary("RuntimeRole", "AWS::IAM::Role", "test-runtime")], TEMPLATE_TWO_ROLES
+            ),
+            tagging=_FakeTagging([]),
+            iam=_DenyingIam({"test-runtime": True, "admin": False}, denied="admin"),
+            ssm=_FakeSsm(
+                json.dumps({"resource_count": 3, "iam_roles": ["DeployRole", "RuntimeRole"]})
+            ),
+        )
+        code = iac_conformance_handler(_args(tmp_path, trading_day=FRIDAY))
+        assert code == 0, "a missing grant must not exit non-zero and stop the arc"
+        store = LocalStore(tmp_path)
+        read = read_store_document(store, manifest_key(IAC_CONFORMANCE_JOB, FRIDAY.isoformat()))
+        assert read.document is not None
+        assert read.document["status"] == "ok"
+        by_name = {m["name"]: m for m in read.document["metrics"]}
+        account = by_name[COMPARISON_ACCOUNT_VS_TEMPLATE]
+        assert account["status"] == "unmeasurable"
+        assert account["status"] != "OK"
+        assert "iam:ListRoleTags" in account["status_reason"], (
+            "the metric must name the denied action, or the operator cannot fix it"
+        )
+        # Comparison (b) reads a different client and is unaffected — a denial
+        # in (a) must not be reported as though it darkened both.
+        assert by_name[COMPARISON_TEMPLATE_VS_DECLARED]["status"] == "OK"
 
     def test_a_finding_persisting_a_second_week_pages(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setenv(

@@ -775,7 +775,25 @@ def _write_manifest(
         "trading_day": ctx.trading_day.isoformat(),
         "calendar_date": ctx.calendar_date.isoformat(),
         "status": status,
-        "reason": reason,
+        # Fitted to the schema's own cap HERE, at the primary assembly, not
+        # only in the fallback below. `reason` is written by this module —
+        # `_reason_from(exc)` renders an exception whose message the runner
+        # does not control and cannot bound (the fault probe's is a LiteLLM
+        # error carrying the router's entire fallback map) — so an over-long
+        # reason is a runner-side overflow, never a claim the job made. Left
+        # unfitted it fails validation and routes the write through
+        # `_minimal_failed_manifest`, which drops every job-contributed field:
+        # inputs, outputs, metrics, llm_calls and all three row counts, thrown
+        # away because a string was long. Measured 2026-09-09 on
+        # `runs/fault.probe/2026-09-09/run.json` — a run whose spend, calls and
+        # lineage were all recorded and none of them survived.
+        #
+        # crucible-PR200 made the fallback survive that case; this makes the
+        # case stop reaching it. The fallback is for a JOB-contributed field
+        # the validator rejects, which is what its dropped-field list is
+        # chosen against; a runner-written field overflowing its own declared
+        # cap is the runner's to fit before it asks anyone to validate it.
+        "reason": _fit(reason, _schema_max_length("reason")),
         "started": _utc(started),
         "finished": _utc(finished),
         "code_sha": _code_sha(),
