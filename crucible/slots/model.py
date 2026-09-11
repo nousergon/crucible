@@ -786,8 +786,17 @@ class ModelRecipe:
     slot: str = "m"
 
     def __post_init__(self) -> None:
-        if not self.features:
-            raise ValueError(f"arm {self.name!r} declares no features")
+        # alpha-engine-config-I9821: this guard predates `inputs` (I9777) — a
+        # PURE meta-learner (every design column a `predictions[...]` input,
+        # `features == ()`) is a real, intended arm shape (the canonical
+        # stacking ensemble), and `not self.features` refused it outright.
+        # The refusal itself is still correct and still required: an arm
+        # with NEITHER features nor inputs has an empty design matrix and
+        # cannot be fit. Testing `design_columns` (the union both
+        # `assert_units_suffixes` calls below and the duplicate check already
+        # use) is the union this guard should have been checking all along.
+        if not self.design_columns:
+            raise ValueError(f"arm {self.name!r} declares no design columns")
         assert_units_suffixes(self.features)
         assert_units_suffixes(tuple(r.column for r in self.inputs))
         duplicates = sorted({c for c in self.design_columns if self.design_columns.count(c) > 1})

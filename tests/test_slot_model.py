@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 from nousergon_lib.arena.engine import TrainingIntegrityError
 
+from crucible.slots.inputs import InputRef
 from crucible.slots.model import (
     MIN_DISPERSION_RATIO,
     REQUIRED_RECIPE_FIELDS,
@@ -264,6 +265,26 @@ class TestRecipeIdentity:
             "policy §3.1: a refit is the arm doing its job — same id, continuous series"
         )
         assert first.fitted_at != second.fitted_at
+
+
+class TestNoDesignColumnsGuard:
+    """alpha-engine-config-I9821: `ModelRecipe.__post_init__` used to test
+    `self.features` alone, predating `spec.inputs` (I9777). A PURE
+    meta-learner — every design column a `predictions[...]` input, no
+    feature-layer columns — is a real, intended arm shape (the canonical
+    stacking ensemble) and must be constructible; an arm with an empty
+    design matrix altogether (no features AND no inputs) must still be
+    refused, by name.
+    """
+
+    def test_a_pure_meta_learner_constructs_with_empty_features(self) -> None:
+        recipe = _recipe(features=(), inputs=(InputRef(kind="predictions", ref="base"),))
+        assert recipe.features == ()
+        assert recipe.design_columns == ("predicted_alpha_base_raw",)
+
+    def test_an_arm_with_neither_features_nor_inputs_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="declares no design columns"):
+            _recipe(features=(), inputs=())
 
 
 # --------------------------------------------------------------------------
