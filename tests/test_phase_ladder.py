@@ -496,8 +496,10 @@ class TestThePhaseLadderSchemaContract:
             GATES, "phase1", (5, lambda *_a, **_k: [Clause("c", "req", False, "unmet", ())])
         )
         monkeypatch.setitem(GATE_DELIVERABLES, "phase1", ())
+        # `publish=True` (`alpha-engine-config-I10492`): the ladder this test
+        # reads back is written only when asked.
         args = argparse.Namespace(
-            gate="phase1", trading_day=FRIDAY, weeks=None, store=str(tmp_path)
+            gate="phase1", trading_day=FRIDAY, weeks=None, store=str(tmp_path), publish=True
         )
         gate_handler(args)
 

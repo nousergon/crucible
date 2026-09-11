@@ -28,6 +28,7 @@ import ast
 import datetime as dt
 import io
 import json
+import os
 import re
 import shlex
 from calendar import monthrange
@@ -42,9 +43,15 @@ from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
 from crucible.aggregation import MemberRow, member_dicts
-from crucible.alerts import NON_OPERATOR_DESTINATIONS, PAGE_CONDITIONS, pages_in_range
+from crucible.alerts import (
+    MUTED_TOPIC_VAR,
+    NON_OPERATOR_DESTINATIONS,
+    PAGE_CONDITIONS,
+    pages_in_range,
+)
 from crucible.calendar import TRADING_DAYS_PER_WEEK, is_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
+from crucible.config import CLOUDTRAIL_ARCHIVE_VAR
 from crucible.documents import DocumentRead, read_manifests_under
 from crucible.documents import read_path_document as _read_path_document
 from crucible.documents import read_store_document as _read_store_document
@@ -119,6 +126,9 @@ __all__ = [
     "LADDER_STATES",
     "ClauseMisconfiguredError",
     "GATE_DELIVERABLES",
+    "GATE_REQUIRED_ENV",
+    "required_env_for_run",
+    "missing_required_env",
     "LLM_ARM_CALLSITE_FIELD",
     "LLM_ARM_RECIPE_SLOTS",
     "MANIFEST_RUN_MODE_FIELD",
@@ -6395,6 +6405,69 @@ def phase_tracker(phase_id: str) -> str:
         f"{[p.id for p in PHASES]}. A tracker derived from an unregistered phase would "
         "be an invented issue number, which is the defect this function exists to remove."
     )
+
+
+#: Environment variables a registered gate's OWN clause list reads, keyed by
+#: gate name (`alpha-engine-config-I10492`). Distinct in kind from
+#: `_contained`'s catch-all: that guard exists so a clause's UNPREDICTABLE
+#: read failure — a denied AWS call, a missing region — cannot darken the
+#: whole ladder, and it must stay that broad. THIS table is the narrow,
+#: PREDICTABLE subset of that surface — "the operator never told this
+#: process where to look" — and `crucible gate` / `crucible gate.close`
+#: check it BEFORE reading anything, so that class refuses loudly instead of
+#: folding into the same UNMEASURABLE string a real read failure produces.
+#: "The world could not be read" and "this process was not told where to
+#: look" must never be the same string on the artifact.
+#:
+#: `old_alerts_muted` (phase 0) calls `crucible.alerts.muted_topic`, which
+#: raises via `crucible.required.require_env` when `MUTED_TOPIC_VAR` is
+#: unset. `zero_human_mutating_calls` (phase 2) reads
+#: `crucible.config.settings().cloudtrail_archive`, which does NOT raise —
+#: an unset `CLOUDTRAIL_ARCHIVE_VAR` resolves to the deliberately empty
+#: `DEFAULT_CLOUDTRAIL_ARCHIVE` and the clause reads a clean UNMEASURABLE —
+#: so this table checks the raw environment directly rather than relying on
+#: either clause's internal failure shape, and catches both cases the same
+#: way.
+#:
+#: Kept honest by `tests/test_gate.py::test_gate_required_env_matches_clauses`:
+#: for each entry, evaluating that gate with the named variable unset (and
+#: every other required variable set) must produce an UNMEASURABLE reading on
+#: exactly the clause this table exists for — so a clause gaining or losing a
+#: required variable is a red CI run, not a silent hole in this table.
+GATE_REQUIRED_ENV: dict[str, tuple[str, ...]] = {
+    "phase0": (MUTED_TOPIC_VAR,),
+    "phase2": (CLOUDTRAIL_ARCHIVE_VAR,),
+}
+
+
+def required_env_for_run() -> tuple[str, ...]:
+    """Every env var ANY registered gate's live evaluation needs, sorted.
+
+    Not just the selected gate's own entry in :data:`GATE_REQUIRED_ENV`:
+    `build_ladder` live-evaluates EVERY registered phase on every call — the
+    ladder answers "which phase is the rebuild on", which needs every rung,
+    not only the one `--gate` named — so a `crucible gate --gate phase2`
+    invocation still needs `phase0`'s required variables too. This is the
+    union over the whole table, computed once here rather than at each call
+    site, so a call site cannot narrow it by accident.
+    """
+    seen: dict[str, None] = {}
+    for names in GATE_REQUIRED_ENV.values():
+        for name in names:
+            seen[name] = None
+    return tuple(seen)
+
+
+def missing_required_env() -> tuple[str, ...]:
+    """Which of :func:`required_env_for_run`'s variables are unset right now.
+
+    A direct `os.environ` check, not a call through `crucible.config.settings`
+    or `crucible.alerts.muted_topic`: those two resolvers disagree about
+    whether an unset variable raises (see :data:`GATE_REQUIRED_ENV`), and this
+    function exists precisely so `crucible gate` does not have to care which
+    shape either one takes.
+    """
+    return tuple(name for name in required_env_for_run() if not os.environ.get(name, "").strip())
 
 
 #: The ladder's closed state vocabulary. Total, with no fall-through, and no

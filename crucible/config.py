@@ -52,6 +52,7 @@ from crucible.llm import DEFAULT_LLM_CAP_USD, DEFAULT_LLM_CAP_USD_MEASURED
 from crucible.store import LocalStore, S3Store, Store, read_only
 
 __all__ = [
+    "CLOUDTRAIL_ARCHIVE_VAR",
     "DEFAULT_ARCTIC_BUCKET",
     "DEFAULT_AUTONOMY_RESERVED_EVENTS",
     "DEFAULT_CLOUDTRAIL_ARCHIVE",
@@ -106,12 +107,27 @@ STRATEGY_PREFIX = "strategy/current"
 #: so the audit carries no literal and a second account is one variable.
 DEFAULT_STACK_NAME = "crucible-v2"
 
+#: The environment variable :data:`DEFAULT_CLOUDTRAIL_ARCHIVE` falls back
+#: from, named once so `crucible.gate.GATE_REQUIRED_ENV`
+#: (`alpha-engine-config-I10492`) cannot drift from the literal `_resolve`
+#: reads below.
+CLOUDTRAIL_ARCHIVE_VAR = "CRUCIBLE_CLOUDTRAIL_ARCHIVE"
+
 #: The CloudTrail archive the autonomy gate reads (§11 risk 8). Empty by
 #: default and NOT a guess: the account had no trail at all when this was
 #: written, and a plausible-looking bucket name here would have produced a
 #: `NoSuchBucket` that reads like a permissions problem rather than the honest
 #: answer, which is that the archive does not exist yet. `crucible.autonomy`
 #: raises `ArchiveMissingError` on an empty value.
+#:
+#: **This default is why `crucible gate`/`crucible gate.close` refuse at
+#: startup when `CRUCIBLE_CLOUDTRAIL_ARCHIVE` is unset**
+#: (`crucible.gate.missing_required_env`, `alpha-engine-config-I10492`): an
+#: empty value here reads as a clean UNMEASURABLE from phase 2's
+#: `zero_human_mutating_calls` clause, indistinguishable from a real archive
+#: read that failed — so a laptop session missing this var was writing that
+#: same string over a correct CI reading. The refusal happens before this
+#: default is ever reached.
 DEFAULT_CLOUDTRAIL_ARCHIVE = ""
 
 #: The SNS topic v2 pages are published to, and the topic the SUPERSEDED v1
@@ -309,7 +325,7 @@ def settings(
         str(DEFAULT_LLM_CAP_USD),
     )
     resolved_archive, origins["cloudtrail_archive"] = _resolve(
-        cloudtrail_archive, "CRUCIBLE_CLOUDTRAIL_ARCHIVE", DEFAULT_CLOUDTRAIL_ARCHIVE
+        cloudtrail_archive, CLOUDTRAIL_ARCHIVE_VAR, DEFAULT_CLOUDTRAIL_ARCHIVE
     )
     resolved_stack, origins["stack_name"] = _resolve(
         stack_name, "CRUCIBLE_STACK", DEFAULT_STACK_NAME

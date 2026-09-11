@@ -309,7 +309,7 @@ def weekly_handler(args: argparse.Namespace) -> int:
 
 
 def gate_handler(args: argparse.Namespace) -> int:
-    """`crucible gate --gate phase1 [--weeks N] [--date YYYY-MM-DD]`.
+    """`crucible gate --gate phase1 [--weeks N] [--date YYYY-MM-DD] [--publish]`.
 
     **The job succeeds when the MEASUREMENT succeeds; the PROCESS exits
     non-zero when the gate is not met.** The two are different facts and
@@ -317,8 +317,23 @@ def gate_handler(args: argparse.Namespace) -> int:
     worse, make an unmet phase look like a broken run that someone reruns
     until it passes. The manifest records `ok` and the reading; the exit code
     is what a caller branches on.
+
+    **`--publish` gates the shared-artifact writes; it does not exist without
+    also reading.** `alpha-engine-config-I10492`: this command is the one
+    every session and every runbook uses to READ where a phase stands, and it
+    used to write `gates/{gate}/{day}/gate.json` and `gates/ladder.json` on
+    every non-`--dry-run` invocation regardless of who ran it or why — so a
+    laptop read missing a required var (`crucible.gate.missing_required_env`
+    refuses that case separately, before this function is even called) could
+    clobber a correct CI reading with a false one. `publish` below is `False`
+    unless `--publish` was passed, and `--dry-run` always overrides it: a run
+    is never both. This job's OWN manifest at `runs/gate/{day}/run.json`
+    still writes on every non-`--dry-run` invocation regardless of `publish`
+    — rule 1 is unconditional; only the SHARED artifacts this job is not the
+    sole owner of are behind the flag.
     """
     dry_run = bool(getattr(args, "dry_run", False))
+    publish = bool(getattr(args, "publish", False)) and not dry_run
     store = open_store(getattr(args, "store", None), dry_run=dry_run)
     store_uri = resolve_store_uri(getattr(args, "store", None))
     result: dict[str, Any] = {}
@@ -332,12 +347,14 @@ def gate_handler(args: argparse.Namespace) -> int:
         document["run_id"] = ctx.run_id
         payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
         key = gate_key(reading.gate, ctx.trading_day.isoformat())
-        # alpha-engine-config-I9922 R2-1: the store guard (dry_run-wrapped
-        # `store` above) is the backstop, not the primary path — `gate` has a
-        # natural report (`reading.render()`/`ladder.render()`, printed
-        # below), so under `--dry-run` it skips the write and reaches that
-        # print rather than dying on the guard before it ever gets there.
-        if not dry_run:
+        # alpha-engine-config-I10492: the shared gate artifact is written only
+        # when `--publish` was passed (and `--dry-run` was not) — see the
+        # docstring above. `--dry-run`'s own store guard
+        # (alpha-engine-config-I9922 R2-1) remains the backstop under
+        # `--dry-run` specifically: a stray write that slipped past `publish`
+        # would still hit `DryRunWriteRefusedError` there rather than
+        # succeed silently.
+        if publish:
             ctx.record_output(key, payload)
         for clause in reading.clauses:
             for evidence in clause.evidence:
@@ -370,7 +387,7 @@ def gate_handler(args: argparse.Namespace) -> int:
             now=ctx.started,
             readings={reading.gate: reading},
         )
-        if not dry_run:
+        if publish:
             ctx.record_output(
                 LADDER_KEY, ladder_payload(ladder), schema_version=LADDER_SCHEMA_VERSION
             )
@@ -378,10 +395,11 @@ def gate_handler(args: argparse.Namespace) -> int:
         # The closing record, derived from the reading above and written at
         # most once (`alpha-engine-config-I9967` deliverable 2). Inside the
         # job body, so the record enters `outputs[]` as lineage and
-        # `crucible explain` can name the run that filed it; skipped under
-        # `--dry-run` for the same reason the gate artifact is, and the
-        # printed line below still reports whether one exists.
-        if not dry_run:
+        # `crucible explain` can name the run that filed it; behind `publish`
+        # for the same reason the gate artifact is (`alpha-engine-config-
+        # I10492`), and the printed line below still reports whether one
+        # exists.
+        if publish:
             file_closing_record(ctx, store, reading, store_uri=store_uri)
         ctx.record_rows(rows_in=len(reading.window), rows_out=len(reading.clauses))
         n_clauses = len(reading.clauses)

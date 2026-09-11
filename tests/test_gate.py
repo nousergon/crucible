@@ -1099,7 +1099,7 @@ class TestTheGateJobPublishesAnHonestMetric:
         monkeypatch.setitem(GATE_DELIVERABLES, "phase1", ())
         store_uri = str(tmp_path)
         args = argparse.Namespace(
-            gate="phase1", trading_day=RENDER_DAY, weeks=None, store=store_uri
+            gate="phase1", trading_day=RENDER_DAY, weeks=None, store=store_uri, publish=True
         )
         exit_code = gate_handler(args)
         assert exit_code == 1  # unmet, per the fail-loud-on-exit-code invariant
@@ -1112,6 +1112,8 @@ class TestTheGateJobPublishesAnHonestMetric:
         assert metric["status_reason"]
         assert metric["status"] != "0.0"
 
+        # `publish=True` above (`alpha-engine-config-I10492`): without it the
+        # dated gate artifact this assertion reads is never written.
         gate_artifact = json.loads(store.get_bytes(gate_key("phase1", RENDER_DAY.isoformat())))
         assert gate_artifact["met_ratio"] is None
 

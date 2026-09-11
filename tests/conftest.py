@@ -21,6 +21,7 @@ import pytest
 
 from crucible.alerts import MUTED_TOPIC_VAR, PAGES_TOPIC_VAR
 from crucible.calendar import is_trading_day
+from crucible.config import CLOUDTRAIL_ARCHIVE_VAR
 from crucible.runmode import RUN_MODE_ENV, RUN_MODE_LIVE
 from crucible.store import LocalStore
 from crucible.tracker import TRACKER_APP_SSM_PREFIX_VAR, TRACKER_TOKEN_VAR
@@ -126,6 +127,28 @@ def declared_topics(monkeypatch):
     """
     monkeypatch.setenv(MUTED_TOPIC_VAR, "test-muted-topic")
     monkeypatch.setenv(PAGES_TOPIC_VAR, "test-pages-topic")
+
+
+@pytest.fixture(autouse=True)
+def declared_cloudtrail_archive(monkeypatch):
+    """`CRUCIBLE_CLOUDTRAIL_ARCHIVE`, declared by default for the same reason
+    :func:`declared_topics` declares the two topic names — `alpha-engine-
+    config-I10492` made a missing value a `crucible gate`/`crucible
+    gate.close` REFUSAL at CLI startup (`crucible.gate.missing_required_env`),
+    where it used to fold into phase 2's `zero_human_mutating_calls` clause
+    reading a clean UNMEASURABLE. A test that goes through `crucible.cli.main`
+    for either job now needs this set or it hits that refusal before its own
+    handler runs at all — most such tests are not testing THIS variable and
+    should not have to know that.
+
+    A SYNTHETIC value naming no real bucket, exactly like the topic names.
+    Tests exercising the unset-archive behaviour itself already clear it with
+    `monkeypatch.delenv("CRUCIBLE_CLOUDTRAIL_ARCHIVE", raising=False)`
+    (`tests/test_gate_phases_2_5.py`, `tests/test_board_human_touch_count.py`)
+    — that unwinds this fixture's `setenv` for that one test only, same as
+    `declared_topics`.
+    """
+    monkeypatch.setenv(CLOUDTRAIL_ARCHIVE_VAR, "s3://test-cloudtrail-archive/trail")
 
 
 class ActiveCostAllocationTag:

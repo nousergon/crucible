@@ -45,7 +45,9 @@ class TestGateHandlerLineageReadIsGuarded:
                 # No `--dry-run`: this test asserts the ladder was WRITTEN
                 # for real (below) — `--dry-run` here was vestigial and, as
                 # of alpha-engine-config-I9922 N1, would now correctly refuse
-                # that write rather than silently being a no-op.
+                # that write rather than silently being a no-op. `--publish`
+                # (`alpha-engine-config-I10492`): the write this test reads
+                # back no longer happens without it.
                 exit_code = main(
                     [
                         "gate",
@@ -55,6 +57,7 @@ class TestGateHandlerLineageReadIsGuarded:
                         str(tmp_path),
                         "--date",
                         "2026-08-28",
+                        "--publish",
                     ]
                 )
         finally:
