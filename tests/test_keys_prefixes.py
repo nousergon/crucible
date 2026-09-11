@@ -51,6 +51,8 @@ from crucible.keys import (
     shadow_key,
     strategy_arm_key,
     strategy_arms_prefix,
+    strategy_slot_key,
+    strategy_slots_prefix,
     verdict_key,
 )
 from crucible.store import LocalStore
@@ -132,6 +134,27 @@ class TestStrategyArmsPrefix:
     def test_an_empty_slot_raises_rather_than_listing_every_slot(self) -> None:
         with pytest.raises(ValueError):
             strategy_arms_prefix("")
+
+
+class TestStrategySlotsPrefix:
+    """`alpha-engine-config-I10511`: the S slot's portfolio-construction
+    parameters, a single file per slot rather than an arm directory."""
+
+    @pytest.mark.parametrize("slot", ["s", "u"])
+    def test_the_key_starts_with_the_prefix(self, slot: str) -> None:
+        prefix = strategy_slots_prefix()
+        assert strategy_slot_key(slot).startswith(prefix)
+
+    def test_the_shape_is_literal(self) -> None:
+        """See `TestStrategyArmsPrefix.test_the_shape_is_literal` — a
+        `startswith` assertion alone cannot catch a consistent rename of the
+        shared `strategy/current/slots/` segment in both functions at once."""
+        assert strategy_slot_key("s") == "strategy/current/slots/s.yaml"
+        assert strategy_slots_prefix() == "strategy/current/slots/"
+
+    def test_an_empty_slot_raises_rather_than_resolving_to_a_real_looking_key(self) -> None:
+        with pytest.raises(ValueError):
+            strategy_slot_key("")
 
 
 class TestRunsPrefix:

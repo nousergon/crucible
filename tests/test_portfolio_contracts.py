@@ -27,7 +27,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
+from crucible.keys import strategy_slot_key
 from crucible.portfolio import (
     COST_MODEL_KINDS,
     COST_MODELS,
@@ -41,6 +43,7 @@ from crucible.portfolio import (
     PortfolioParamsError,
     cost_model_from_mapping,
     load_portfolio_params,
+    load_portfolio_params_from_store,
     manifest_records_portfolio_engine,
     params_digest,
     portfolio_evidence,
@@ -55,6 +58,7 @@ from crucible.slots.strategy import (
     construct_book,
     grade_arm,
 )
+from crucible.store import LocalStore
 
 FIXTURE_PARAMS: dict = {
     "risk_aversion": 5.0,
@@ -306,6 +310,50 @@ class TestTheParametersAreRequiredAndPrivate:
         evidence = _evidence()
         assert evidence["params"] == first.to_dict()
         assert evidence["params_digest"] == params_digest(first)
+
+
+class TestLoadPortfolioParamsFromStore:
+    """`alpha-engine-config-I10511`: a box with no `CRUCIBLE_STRATEGY_DIR`
+    reads the slot's portfolio parameters from the synced store instead of
+    raising with no parameter set at all — mirroring
+    `crucible.slots.arms.load_arm_specs`'s checkout-or-store shape."""
+
+    def _store_with(self, tmp_path, key: str, payload: dict) -> LocalStore:
+        store = LocalStore(root=tmp_path)
+        store.put_bytes(key, yaml.safe_dump(payload).encode("utf-8"))
+        return store
+
+    def test_a_checkout_directory_wins_when_configured(self, tmp_path) -> None:
+        strategy_dir = tmp_path / "strategy"
+        (strategy_dir / "slots").mkdir(parents=True)
+        (strategy_dir / "slots" / "s.yaml").write_text(
+            yaml.safe_dump({"portfolio": FIXTURE_PARAMS}), encoding="utf-8"
+        )
+        params = load_portfolio_params_from_store("s", strategy_dir=strategy_dir)
+        assert params == _params()
+
+    def test_the_store_is_read_when_no_checkout_is_configured(self, tmp_path) -> None:
+        store = self._store_with(
+            tmp_path / "store",
+            strategy_slot_key("s"),
+            {"portfolio": FIXTURE_PARAMS},
+        )
+        params = load_portfolio_params_from_store("s", store=store)
+        assert params == _params()
+
+    def test_an_absent_store_key_raises_naming_the_key(self, tmp_path) -> None:
+        store = LocalStore(root=tmp_path / "store")
+        with pytest.raises(PortfolioParamsError, match="strategy/current/slots/s.yaml"):
+            load_portfolio_params_from_store("s", store=store)
+
+    def test_neither_a_store_nor_a_strategy_dir_raises(self) -> None:
+        with pytest.raises(ValueError, match="needs either a store or a strategy_dir"):
+            load_portfolio_params_from_store("s")
+
+    def test_a_store_document_missing_the_portfolio_block_raises(self, tmp_path) -> None:
+        store = self._store_with(tmp_path / "store", strategy_slot_key("s"), {"other": 1})
+        with pytest.raises(PortfolioParamsError, match="carrying a 'portfolio' block"):
+            load_portfolio_params_from_store("s", store=store)
 
 
 def _evidence(cost: dict | None = None) -> dict:
