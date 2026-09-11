@@ -104,6 +104,8 @@ __all__ = [
     "signals_key",
     "strategy_arm_key",
     "strategy_arms_prefix",
+    "strategy_slot_key",
+    "strategy_slots_prefix",
     "universe_members_key",
     "verdict_key",
 ]
@@ -442,6 +444,44 @@ def strategy_arms_prefix(slot: str) -> str:
             "returning nothing reads as 'no data' rather than the caller's own bug."
         )
     return f"strategy/current/arms/{slot}/"
+
+
+def strategy_slot_key(slot: str) -> str:
+    """A slot's published portfolio-construction parameter set (plan §4.4).
+
+    `alpha-engine-config-I10511`. Sibling of :func:`strategy_arm_key`, but
+    ONE file per slot rather than a directory of named recipes: a slot's
+    portfolio parameters (`crucible.portfolio.PortfolioParams`) are a single
+    document, unlike an arm, of which a slot may register several. Today only
+    `strategy/slots/s.yaml` exists in the repo tree — the S slot's parameter
+    set — but the key is general over ``slot`` so a second slot gaining its
+    own portfolio-construction parameters needs no new key shape.
+    """
+    if not slot:
+        raise ValueError(
+            "slot must be non-empty — a blank slot would resolve to a key indistinguishable "
+            "from a real one and every reader would be one string away from reading the "
+            "wrong slot's parameters."
+        )
+    return f"strategy/current/slots/{slot}.yaml"
+
+
+def strategy_slots_prefix() -> str:
+    """The prefix under which every slot's published parameter file lives.
+
+    `strategy_slot_key(slot)` for any ``slot`` starts with this prefix — the
+    publisher (`alpha-engine-config/scripts/publish_crucible_v2_strategy_tree.py`)
+    lists it to find a slot file retired from the repo tree that the store
+    still carries, the same verify-and-repair shape `strategy_arms_prefix`
+    already gives the arm tree.
+
+    Takes no argument, unlike `strategy_arms_prefix(slot)`: an arm tree is
+    already namespaced by slot on disk (`strategy/arms/{slot}/*.yaml`, many
+    files), while every slot's single parameter file lives flat under one
+    directory (`strategy/slots/{slot}.yaml`) — there is one prefix for the
+    whole namespace, not one per slot.
+    """
+    return "strategy/current/slots/"
 
 
 #: A discriminator is a path segment, not free text: it must round-trip
