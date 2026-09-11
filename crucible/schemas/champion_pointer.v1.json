@@ -227,6 +227,17 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "The single artifact coupling the harness to the trader (plan \u00a73). Written at champions/{slot}/current.json by `crucible promote`, read by the trader before it sizes anything. Versioned because a second implementation of the trader must be able to consume it from this document alone; additionalProperties: false because a field this reader does not understand is a field the producer expected it to act on.",
+  "not": {
+    "description": "code_sha is never the all-zero placeholder: it validates the same pattern as a real commit sha and answers nothing. Mirrors `ChampionPointerDocument._code_sha_is_not_the_placeholder`.",
+    "properties": {
+      "code_sha": {
+        "const": "0000000000000000000000000000000000000000"
+      }
+    },
+    "required": [
+      "code_sha"
+    ]
+  },
   "properties": {
     "arm_id": {
       "description": "The serving arm. Its id encodes its own spec hash (policy \u00a73.1), so an edited recipe cannot reuse it and the trader can always tell which recipe it is running.",
@@ -253,7 +264,7 @@
       "description": "The contamination attestation (plan \u00a79.1). Mandatory in EFFECT for the S slot -- the reader refuses an S champion whose status is not PASS -- and null elsewhere. Not `required` in the schema because a null attestation on U/R/M is correct; the refusal is on the reader, where it can see which slot it is reading."
     },
     "code_sha": {
-      "description": "The commit that decided. An all-zero sha is a DECLARED unknown (running from a wheel with no repository), never an omitted field.",
+      "description": "The commit that decided. A producer that cannot measure it for real refuses to write a pointer at all, rather than substituting the all-zero placeholder.",
       "pattern": "^[0-9a-f]{40}$",
       "title": "Code Sha",
       "type": "string"

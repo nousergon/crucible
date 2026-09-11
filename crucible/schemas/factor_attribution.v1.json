@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nousergon.dev/crucible/schemas/factor_attribution.v1.json",
+  "title": "factor_attribution.v1",
+  "description": "Factor-neutral performance attribution: beta/sector/size factor exposures and return contributions, plus residual (unexplained) alpha, gross and net returns. Computed through `nousergon_lib.quant.factor_risk` (OLS + Ledoit-Wolf); this schema is the phase-3 `factor_neutral_attribution` deliverable's evidence shape (alpha-engine-config-I10501). Rides on a run manifest as a MetricRecord payload. Not the phase-1 `attribution.v1` per-stage status table (crucible/report.py) - that table carries no factor decomposition.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "trading_day",
+    "engine",
+    "window_sessions",
+    "factors",
+    "category_totals",
+    "gross_return",
+    "net_return",
+    "cost_bps_total",
+    "residual_alpha",
+    "risk",
+    "model",
+    "params_digest"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "factor_attribution.v1"
+    },
+    "trading_day": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "description": "NYSE trading day the attribution window ends on."
+    },
+    "engine": {
+      "const": "crucible.attribution",
+      "description": "The module that computed this. A constant, not free text: a gate clause matches on it."
+    },
+    "window_sessions": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Trading-day count of the return window the factor model was fit over."
+    },
+    "factors": {
+      "type": "array",
+      "minItems": 1,
+      "description": "One row per named factor: which category it belongs to, its ETF proxy, the portfolio's exposure (beta) to it, and its return contribution over the window.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "category", "proxy", "exposure", "contribution_return"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "category": {"enum": ["beta", "sector", "size"]},
+          "proxy": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The ETF ticker whose return series stands in for this factor. Strategy edge - named here for reproducibility, never hardcoded in the engine."
+          },
+          "exposure": {"type": "number"},
+          "contribution_return": {"type": "number"}
+        }
+      }
+    },
+    "category_totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["beta", "sector", "size", "residual"],
+      "description": "Return contribution summed by factor category, plus the residual (unexplained / idiosyncratic alpha) that is not a factor category but completes the decomposition: beta + sector + size + residual == gross_return.",
+      "properties": {
+        "beta": {"type": "number"},
+        "sector": {"type": "number"},
+        "size": {"type": "number"},
+        "residual": {"type": "number"}
+      }
+    },
+    "gross_return": {
+      "type": "number",
+      "description": "Realized portfolio return over the window, before transaction costs."
+    },
+    "net_return": {
+      "type": "number",
+      "description": "gross_return net of cost_bps_total (converted from bps of book to a return fraction)."
+    },
+    "cost_bps_total": {
+      "type": "number",
+      "description": "Transaction cost charged over the window, in bps of the book. Sourced from the same cost model `crucible.portfolio` records; carried here rather than re-priced so gross/net tie to one number."
+    },
+    "residual_alpha": {
+      "type": "number",
+      "description": "gross_return minus the sum of every factor's contribution_return. Duplicated at category_totals.residual for a reader that only wants the category breakdown."
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total_vol", "factor_vol", "idio_vol"],
+      "description": "Ex-ante annualized risk decomposition from `nousergon_lib.quant.factor_risk.portfolio_risk`, computed off the same fitted model - descriptive context for the realized-return decomposition above, not itself a return.",
+      "properties": {
+        "total_vol": {"type": "number", "minimum": 0},
+        "factor_vol": {"type": "number", "minimum": 0},
+        "idio_vol": {"type": "number", "minimum": 0}
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["shrinkage", "n_obs", "n_factors", "n_holdings"],
+      "properties": {
+        "shrinkage": {"enum": ["ledoit_wolf", "sample"]},
+        "n_obs": {"type": "integer", "minimum": 1},
+        "n_factors": {"type": "integer", "minimum": 1},
+        "n_holdings": {"type": "integer", "minimum": 1}
+      }
+    },
+    "params_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "Stable digest over the attribution factor parameter set (factor->category/proxy map, benchmark proxy, shrinkage) this window was computed under."
+    }
+  }
+}

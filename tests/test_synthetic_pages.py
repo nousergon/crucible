@@ -328,18 +328,26 @@ class TestAUsageRefusalIsNotAHarnessDeath:
         # exit 1.
         assert excinfo.value.code == USAGE_EXIT_CODE
 
-    def test_a_missing_run_mode_exits_two(self, monkeypatch) -> None:
+    def test_a_missing_run_mode_exits_two(self, monkeypatch, capsys) -> None:
+        """`alpha-engine-config-I10517`: `main` no longer lets a `UsageError`
+        propagate as an uncaught `SystemExit` — Python's own top-level
+        handling only prints an uncaught `SystemExit`'s message when `.code`
+        is a STRING, and `UsageError.code` is always the int
+        `USAGE_EXIT_CODE`, so the message never reached stderr on the
+        installed console script. `main` now catches it, prints the message,
+        and RETURNS the code — still exit 2 at the `sys.exit(main())`
+        console-script boundary, but with the message on stderr this time."""
         from crucible.cli import USAGE_EXIT_CODE, main
         from crucible.runmode import RUN_MODE_ENV
 
         monkeypatch.delenv(RUN_MODE_ENV, raising=False)
-        with pytest.raises(SystemExit) as excinfo:
-            main(["data.weekly", "--date", "2026-09-11"])
-        assert excinfo.value.code == USAGE_EXIT_CODE
+        assert main(["data.weekly", "--date", "2026-09-11"]) == USAGE_EXIT_CODE
+        assert "live" in capsys.readouterr().err
 
-    def test_a_bad_date_exits_two(self) -> None:
+    def test_a_bad_date_exits_two(self, capsys) -> None:
         from crucible.cli import USAGE_EXIT_CODE, main
 
-        with pytest.raises(SystemExit) as excinfo:
-            main(["data.weekly", "--date", "not-a-date", "--run-mode", "live"])
-        assert excinfo.value.code == USAGE_EXIT_CODE
+        assert main(["data.weekly", "--date", "not-a-date", "--run-mode", "live"]) == (
+            USAGE_EXIT_CODE
+        )
+        assert "YYYY-MM-DD" in capsys.readouterr().err

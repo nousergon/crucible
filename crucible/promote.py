@@ -106,6 +106,36 @@ class PromotionRefused(RuntimeError):
     """
 
 
+#: `alpha-engine-config-I10506`: same value, same reasoning as
+#: `crucible.runner._REAL_SHA_RE`'s excluded case and
+#: `crucible.models._PLACEHOLDER_GIT_SHA` — kept local rather than imported
+#: so this module carries no import-time dependency on either.
+_PLACEHOLDER_CODE_SHA = "0" * 40
+
+
+def _require_code_sha(code_sha: str | None, *, slot: str) -> str:
+    """The pointer's `code_sha`, or a refusal.
+
+    Both `run_promotion` and `revert_champion` used to default a missing
+    ``code_sha`` to the all-zero placeholder — and every real invocation WAS
+    missing it (`crucible.cli._promote` never passed one), so every champion
+    pointer this harness ever wrote carried a value that validates the same
+    pattern as a real commit sha and answers nothing. Mirrors
+    `crucible.runner.resolve_code_sha`'s own reasoning: a producer that
+    cannot measure `code_sha` for real must refuse to write at all, never
+    substitute this value.
+    """
+    if code_sha is None or code_sha == _PLACEHOLDER_CODE_SHA:
+        raise PromotionRefused(
+            f"cannot write slot {slot!r}'s champion pointer: code_sha is "
+            f"{code_sha!r}, not a real 40-character lowercase git sha. Half of "
+            "`explain`'s answer to 'why did this promote' would be silently "
+            "absent. Pass the run's own code_sha "
+            "(`crucible.runner.resolve_code_sha()`) rather than leaving it unset."
+        )
+    return code_sha
+
+
 def paired_days_required(spec: SlotSpec) -> int:
     """`promote_min_weeks` expressed in **paired trading days**.
 
@@ -417,7 +447,7 @@ def revert_champion(
         as_of=as_of,
         decided_at=decided_at,
         run_id=run_id or _placeholder_run_id(),
-        code_sha=code_sha or "0" * 40,
+        code_sha=_require_code_sha(code_sha, slot=spec.slot),
         promotion_source="operator_bootstrap",
         manifest_key=manifest_key or _promote_manifest_key("promote", as_of),
         evidence={
@@ -577,7 +607,7 @@ def _write_pointer_if_moved(
         as_of=decision.as_of,
         decided_at=_utc(now),
         run_id=run_id or _placeholder_run_id(),
-        code_sha=code_sha or "0" * 40,
+        code_sha=_require_code_sha(code_sha, slot=spec.slot),
         promotion_source="evidence" if decision.status == "decided" else "bootstrap",
         manifest_key=manifest_key or _promote_manifest_key("promote", decision.as_of),
         evidence=evidence,

@@ -1545,6 +1545,40 @@ class ChampionAttestation(_Strict):
     reason: str | None = None
 
 
+def _champion_pointer_json_schema_extra(schema: dict[str, object]) -> None:
+    """Sets `champion_pointer.v1.json`'s document-level metadata and mirrors
+    `ChampionPointerDocument._code_sha_is_not_the_placeholder`
+    (`alpha-engine-config-I10506`) into the schema's `not`, same shape and
+    same reason `_run_manifest_v2_json_schema_extra` mirrors
+    `RunManifestV2._code_sha_is_not_the_placeholder` — pydantic-core's regex
+    engine has no look-around, so the refusal cannot be folded into
+    `code_sha`'s own `pattern`, and a consumer with no Python import needs
+    the same refusal restated here rather than relying on the
+    model_validator alone.
+    """
+    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    schema["$id"] = "https://github.com/nousergon/crucible/schemas/champion_pointer.v1.json"
+    schema["title"] = "Crucible champion pointer, v1"
+    schema["description"] = (
+        "The single artifact coupling the harness to the trader (plan §3). "
+        "Written at champions/{slot}/current.json by `crucible promote`, read "
+        "by the trader before it sizes anything. Versioned because a second "
+        "implementation of the trader must be able to consume it from this "
+        "document alone; additionalProperties: false because a field this "
+        "reader does not understand is a field the producer expected it to "
+        "act on."
+    )
+    schema["not"] = {
+        "description": (
+            "code_sha is never the all-zero placeholder: it validates the same "
+            "pattern as a real commit sha and answers nothing. Mirrors "
+            "`ChampionPointerDocument._code_sha_is_not_the_placeholder`."
+        ),
+        "properties": {"code_sha": {"const": "0" * 40}},
+        "required": ["code_sha"],
+    }
+
+
 class ChampionPointerDocument(_Strict):
     """`champions/{slot}/current.json` — the one contract the trader reads,
     plan §3/§4.4/§9.1; `champion-challenger-policy.md` §11.
@@ -1560,20 +1594,7 @@ class ChampionPointerDocument(_Strict):
 
     model_config = ConfigDict(
         extra="forbid",
-        json_schema_extra={
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "$id": "https://github.com/nousergon/crucible/schemas/champion_pointer.v1.json",
-            "title": "Crucible champion pointer, v1",
-            "description": (
-                "The single artifact coupling the harness to the trader (plan §3). "
-                "Written at champions/{slot}/current.json by `crucible promote`, read "
-                "by the trader before it sizes anything. Versioned because a second "
-                "implementation of the trader must be able to consume it from this "
-                "document alone; additionalProperties: false because a field this "
-                "reader does not understand is a field the producer expected it to "
-                "act on."
-            ),
-        },
+        json_schema_extra=_champion_pointer_json_schema_extra,
     )
 
     schema_version: Literal["champion_pointer.v1"] = Field(
@@ -1604,9 +1625,14 @@ class ChampionPointerDocument(_Strict):
         description="The run that wrote this pointer. Correlates the decision with "
         "its manifest, its logs and its cost row (§9.2).",
     )
+    # See `_code_sha_is_not_the_placeholder` below (alpha-engine-config-I10506,
+    # same reasoning as `RunManifestV2.code_sha`/-I10454) for why the all-zero
+    # placeholder is refused rather than accepted here — kept out of the
+    # `description` string itself (`tests/test_no_stale_tracker_literals.py`).
     code_sha: GitSha = Field(
-        description="The commit that decided. An all-zero sha is a DECLARED unknown "
-        "(running from a wheel with no repository), never an omitted field."
+        description="The commit that decided. A producer that cannot measure it "
+        "for real refuses to write a pointer at all, rather than substituting "
+        "the all-zero placeholder."
     )
     promotion_source: Literal["evidence", "operator_bootstrap", "bootstrap"] = Field(
         description="How this pointer came to be. `evidence` = the anytime-valid "
@@ -1636,6 +1662,27 @@ class ChampionPointerDocument(_Strict):
         "attestation on U/R/M is correct; the refusal is on the reader, where it can "
         "see which slot it is reading.",
     )
+
+    @model_validator(mode="after")
+    def _code_sha_is_not_the_placeholder(self) -> ChampionPointerDocument:
+        """`alpha-engine-config-I10506`: same defect, second producer.
+        `crucible.promote` defaulted an unresolved `code_sha` to the all-zero
+        placeholder on every real invocation (`crucible.cli._promote` never
+        passed one), so every champion pointer this harness ever wrote
+        carried it -- half of `explain`'s answer to "why did this promote"
+        silently absent. Mirrored into the published schema's `not` by
+        `_champion_pointer_json_schema_extra`, same shape and same reason as
+        `RunManifestV2._code_sha_is_not_the_placeholder`.
+        """
+        if self.code_sha == _PLACEHOLDER_GIT_SHA:
+            raise ValueError(
+                f"code_sha is the all-zero placeholder ({_PLACEHOLDER_GIT_SHA!r}). It "
+                "validates the same pattern as a real commit sha and answers nothing — "
+                "half of 'why did this promote' would be silently absent. A producer "
+                "that cannot measure code_sha for real must refuse to write a pointer "
+                "at all, never substitute this value."
+            )
+        return self
 
 
 # ── I10045 row 7: the feature registry ─────────────────────────────────────
