@@ -85,8 +85,10 @@ from crucible.tags import (
     TAG_KEY,
     TAG_VALUE,
     StackNotAppliedError,
-    _tagged_identifiers,  # noqa: PLC2701 - established cross-module read; see crucible.autonomy
+    TaggedResource,
     audit_stack_tags,
+    identifier_candidates,
+    tagged_resources,
 )
 
 __all__ = [
@@ -226,6 +228,11 @@ class AccountTemplateAudit:
     only_in_template: tuple[tuple[str, str, str], ...]  # (logical_id, type, physical_id)
     template_resource_count: int
     account_tagged_count: int
+    #: Resources excluded because a resource the stack DECLARES created them —
+    #: see `_types_the_stacks_launch_template_tags` for the trade. Reported,
+    #: never merely dropped: an exclusion nobody can see is indistinguishable
+    #: from a comparison that failed to look.
+    launched_by_the_stack: int = 0
 
     @property
     def met(self) -> bool:
@@ -237,6 +244,7 @@ class AccountTemplateAudit:
             "met": self.met,
             "template_resource_count": self.template_resource_count,
             "account_tagged_count": self.account_tagged_count,
+            "launched_by_the_stack": self.launched_by_the_stack,
             "only_in_account": list(self.only_in_account),
             "only_in_template": [
                 {"logical_id": lid, "type": kind, "physical_id": pid}
@@ -245,17 +253,23 @@ class AccountTemplateAudit:
         }
 
     def detail(self) -> str:
+        launched = (
+            f"; {self.launched_by_the_stack} excluded as launched by a declared resource"
+            if self.launched_by_the_stack
+            else ""
+        )
         if self.met:
             return (
                 f"{self.account_tagged_count} tagged resource(s) in the account match the "
                 f"{self.template_resource_count} taggable resource(s) {self.stack!r} declares"
+                f"{launched}"
             )
         parts = []
         if self.only_in_account:
             parts.append(f"{len(self.only_in_account)} tagged but not stack-managed")
         if self.only_in_template:
             parts.append(f"{len(self.only_in_template)} stack-declared but not tagged live")
-        return "; ".join(parts)
+        return "; ".join(parts) + launched
 
 
 def _tagged_iam_role_names(iam: Any) -> set[str]:
@@ -283,6 +297,65 @@ def _tagged_iam_role_names(iam: Any) -> set[str]:
     return names
 
 
+def _is_the_audited_stack(resource: TaggedResource, *, stack: str) -> bool:
+    """Whether `resource` IS the CloudFormation stack being audited.
+
+    A stack carries its own tags and does not appear in its own
+    `StackResourceSummaries`, so it can never match and is not a finding when
+    it does not. Matched on the ARN's own stack name rather than on a
+    substring, so a DIFFERENT stack whose name merely contains this one's is
+    still reported.
+    """
+    if resource.service != "cloudformation" or resource.resource_type != "stack":
+        return False
+    tail = resource.arn.split(":", 5)[-1]
+    parts = tail.split("/")
+    return len(parts) > 1 and parts[1] == stack
+
+
+def _types_the_stacks_launch_template_tags(*, stack: str, cfn: Any) -> frozenset[str]:
+    """The EC2 resource types the stack's own LaunchTemplate applies the tag to.
+
+    Read from `TagSpecifications` in the deployed template, so it is DERIVED
+    from the declaration rather than a hardcoded `{"instance", "volume"}` that
+    would go stale the first time the launch template tagged something else,
+    and would be wrong for any stack that has no launch template at all.
+
+    **What this exclusion trades, stated because it is a real loss.** A
+    resource of one of these types is now outside comparison (a), so an EC2
+    instance somebody tagged `system=crucible-v2` by hand would not be
+    reported. What it buys is a comparison that can ever read clean: the spot
+    boxes the launch template starts carry the tag by design, cannot appear in
+    `StackResourceSummaries`, and a NEW one arrives on every dispatch — so
+    before this, `only_in_account` grew without bound and the finding could
+    never be cleared by any action. A permanent finding is not a finding, it
+    is noise with a counter on it. The excluded count is reported beside the
+    comparison rather than dropped, so the exclusion is visible on the same
+    surface as the result.
+    """
+    try:
+        raw = cfn.get_template(StackName=stack).get("TemplateBody") or ""
+        # boto3 hands back a STRING for a YAML template and an already-parsed
+        # MAPPING for a JSON one. Both are `GetTemplate`'s documented shapes,
+        # and a helper that handled only the first would exclude nothing on a
+        # JSON stack while looking like it had checked.
+        body = raw if isinstance(raw, dict) else _parse_cfn_yaml(raw)
+    except (TemplateUnreadableError, AttributeError, TypeError, ValueError):
+        # An unreadable template excludes NOTHING. Failing open here would
+        # silently widen the comparison; failing closed would silently narrow
+        # it. Reporting more is the direction this module already chose.
+        return frozenset()
+    types: set[str] = set()
+    for resource in (body.get("Resources") or {}).values():
+        if not isinstance(resource, dict) or resource.get("Type") != "AWS::EC2::LaunchTemplate":
+            continue
+        data = ((resource.get("Properties") or {}).get("LaunchTemplateData")) or {}
+        for spec in data.get("TagSpecifications") or []:
+            if isinstance(spec, dict) and spec.get("ResourceType"):
+                types.add(str(spec["ResourceType"]))
+    return frozenset(types)
+
+
 def audit_account_vs_template(
     *, stack: str, cfn: Any, tagging: Any, iam: Any = None
 ) -> AccountTemplateAudit:
@@ -300,8 +373,9 @@ def audit_account_vs_template(
         stack_audit = audit_stack_tags(stack=stack, cfn=cfn, tagging=tagging, iam=iam)
         stack_ids = {physical for _, _, physical in stack_audit.resources}
 
-        tagged_ids = set(_tagged_identifiers(tagging))
-        tagged_ids |= _tagged_iam_role_names(iam)
+        live = tagged_resources(tagging)
+        role_names = _tagged_iam_role_names(iam)
+        launched_types = _types_the_stacks_launch_template_tags(stack=stack, cfn=cfn)
     except StackNotAppliedError:
         # The stack genuinely not existing is a different answer from being
         # unable to look, and it has its own UNMEASURABLE path already.
@@ -315,13 +389,30 @@ def audit_account_vs_template(
             "about whether the estate conforms"
         ) from exc
 
-    only_in_account = tuple(sorted(pid for pid in tagged_ids if pid and pid not in stack_ids))
+    unmatched: list[str] = []
+    launched = 0
+    for resource in live:
+        if identifier_candidates(resource.arn) & stack_ids:
+            continue
+        if _is_the_audited_stack(resource, stack=stack):
+            continue
+        if resource.service == "ec2" and resource.resource_type in launched_types:
+            launched += 1
+            continue
+        unmatched.append(resource.arn)
+
+    # Roles are compared by NAME, never by ARN: `iam:ListRoles` returns the
+    # name, and that is exactly what CloudFormation reports as an IAM role's
+    # physical id. No candidate expansion is needed or correct here.
+    unmatched.extend(sorted(name for name in role_names if name not in stack_ids))
+
     return AccountTemplateAudit(
         stack=stack,
-        only_in_account=only_in_account,
+        only_in_account=tuple(sorted(unmatched)),
         only_in_template=stack_audit.untagged,
         template_resource_count=len(stack_audit.resources),
-        account_tagged_count=len(tagged_ids),
+        account_tagged_count=len(live) + len(role_names),
+        launched_by_the_stack=launched,
     )
 
 

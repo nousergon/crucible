@@ -45,8 +45,11 @@ __all__ = [
     "CostAllocationTagUnreadableError",
     "StackNotAppliedError",
     "TagAudit",
+    "TaggedResource",
     "audit_stack_tags",
     "cost_allocation_tag_status",
+    "identifier_candidates",
+    "tagged_resources",
 ]
 
 TAG_KEY = "system"
@@ -92,6 +95,39 @@ UNTAGGABLE_TYPES: dict[str, str] = {
 
 class StackNotAppliedError(RuntimeError):
     """The stack this audit reads does not exist yet."""
+
+
+@dataclass(frozen=True)
+class TaggedResource:
+    """One live resource carrying `system=crucible-v2`, with its tags.
+
+    ONE entry per resource, which is the distinction this type exists to
+    carry: the identifier forms a physical id might take
+    (:func:`identifier_candidates`) are spellings of this one thing, not
+    things.
+    """
+
+    arn: str
+    tags: dict[str, str]
+
+    @property
+    def service(self) -> str:
+        """The ARN's service segment (`ec2`, `lambda`, `cloudformation`)."""
+        parts = self.arn.split(":")
+        return parts[2] if len(parts) > 2 else ""
+
+    @property
+    def resource_type(self) -> str:
+        """The type segment after the account, without its identifier.
+
+        `arn:aws:ec2:us-east-1:1234:instance/i-0ab` -> `instance`. Empty when
+        the ARN carries no type segment, which is true of S3 buckets.
+        """
+        parts = self.arn.split(":", 5)
+        if len(parts) < 6:
+            return ""
+        tail = parts[5]
+        return tail.split("/", 1)[0] if "/" in tail else ""
 
 
 @dataclass(frozen=True)
@@ -179,22 +215,53 @@ def _stack_resources(cfn: Any, stack: str) -> list[dict[str, Any]]:
     return resources
 
 
-def _tagged_identifiers(tagging: Any) -> set[str]:
-    """Every ARN carrying the tag, plus the last ARN segment of each.
+def identifier_candidates(arn: str) -> set[str]:
+    """The forms a CloudFormation `PhysicalResourceId` might take for `arn`.
 
-    The trailing segment is included because a CloudFormation physical id is a
-    name for most types and a full ARN for a few, so matching on either is
-    what lets one comparison cover both without a per-type table that would go
-    stale the first time a resource type is added.
+    A physical id is a NAME for most types (a Lambda function, an alarm) and a
+    full ARN for a few (an SNS topic), so a comparison has to accept either.
+    These are ALTERNATIVE SPELLINGS OF ONE RESOURCE, and that is the whole
+    point: a match on any of them is a match, and a miss on one of them is
+    not a finding.
     """
-    found: set[str] = set()
+    return {arn, arn.rsplit("/", 1)[-1], arn.rsplit(":", 1)[-1]}
+
+
+def tagged_resources(tagging: Any) -> list[TaggedResource]:
+    """Every resource carrying the tag, one entry each, with its tags.
+
+    Replaces the flat identifier set this module used to return. That set
+    mixed ARNs with their trailing segments, so ONE resource appeared as up to
+    three members and a caller could not tell a resource from a spelling of
+    one — see :func:`identifier_candidates` and
+    `crucible.iac_conformance.audit_account_vs_template` for what that cost.
+
+    The tags come back too: they are the only way to tell a resource the stack
+    DECLARES from one a declared resource CREATED, and fetching them costs
+    nothing extra (`get_resources` returns them in the same page).
+    """
+    found: list[TaggedResource] = []
     paginator = tagging.get_paginator("get_resources")
     for page in paginator.paginate(TagFilters=[{"Key": TAG_KEY, "Values": [TAG_VALUE]}]):
         for entry in page.get("ResourceTagMappingList", []):
             arn = entry["ResourceARN"]
-            found.add(arn)
-            found.add(arn.rsplit("/", 1)[-1])
-            found.add(arn.rsplit(":", 1)[-1])
+            tags = {t["Key"]: t.get("Value", "") for t in entry.get("Tags") or []}
+            found.append(TaggedResource(arn=arn, tags=tags))
+    return found
+
+
+def _tagged_identifiers(tagging: Any) -> set[str]:
+    """Every identifier form of every tagged resource, flattened.
+
+    DERIVED from :func:`tagged_resources` rather than gathered separately, so
+    the two cannot disagree about what is tagged. Still the right shape for
+    `audit_stack_tags`, which asks only "is this physical id tagged" and never
+    reports the set — the flattening is harmless there and wrong for anything
+    that reports.
+    """
+    found: set[str] = set()
+    for resource in tagged_resources(tagging):
+        found |= identifier_candidates(resource.arn)
     return found
 
 
