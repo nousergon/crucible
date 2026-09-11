@@ -897,6 +897,8 @@ def construct_book(
                 adv_usd=session.adv_usd,
                 portfolio_notional=portfolio_notional,
                 name_sigma=session.name_sigma,
+                benchmark_idx=universe.benchmark_idx,
+                cash_idx=universe.cash_idx,
             )
         )
         all_weights.append(tuple(float(x) for x in weights))

@@ -529,3 +529,90 @@ class TestTheEvidenceSchemaIsAGuardThatFires:
         )
         document = {**_evidence(), "engine": "some.other.module"}
         assert list(Draft202012Validator(schema).iter_errors(document))
+
+
+class TestTheChargeAndTheObjectiveUseOneModel:
+    """The realized charge must be priced the way the solve was optimised.
+
+    Two numbers describe the same cost — the objective's term, and the charge
+    `construct_book` subtracts per session. A divergence between them is not
+    loud: both are plausible, both are recorded, and the grade is simply of a
+    book nobody optimised. These pin the two places they could come apart.
+    """
+
+    def test_the_benchmark_and_cash_sleeves_carry_no_impact_in_the_charge(self) -> None:
+        """The objective excludes both from the impact term. So does the charge.
+
+        Without the exclusion the sleeves would be priced as if rebalancing an
+        index fill moved the market, and the charge would exceed what the solve
+        traded off against.
+        """
+        model = CostModel(**IMPACT)
+        deltas = np.array([0.0, 0.0, 0.05, 0.05])  # only the sleeves move
+        adv = np.array([4e7, 1.5e7, 1e10, 1e10])
+        with_sentinels = model.cost_bps_for_trades(
+            weight_deltas=deltas,
+            adv_usd=adv,
+            portfolio_notional=4_000_000.0,
+            benchmark_idx=2,
+            cash_idx=3,
+        )
+        without = model.cost_bps_for_trades(
+            weight_deltas=deltas, adv_usd=adv, portfolio_notional=4_000_000.0
+        )
+        assert with_sentinels < without, (
+            "the sleeves must be cheaper when declared as sleeves; if they are not, "
+            "the exclusion is not reaching the impact term"
+        )
+
+    def test_the_volatility_reference_excludes_the_sleeves(self) -> None:
+        """`ref_sigma` is a cross-sectional MEDIAN, so a sleeve inside it moves
+        the impact scaling of every OTHER name — which is how the charge ends
+        up priced off a different reference from the solve."""
+        model = CostModel(**IMPACT)
+        deltas = np.array([0.04, 0.04, 0.0, 0.0])
+        adv = np.array([4e7, 1.5e7, 1e10, 1e10])
+        # A benchmark volatility far below the real names', so including it in
+        # the median visibly moves the reference.
+        sigma = np.array([0.03, 0.03, 0.001, 0.001])
+        declared = model.cost_bps_for_trades(
+            weight_deltas=deltas,
+            adv_usd=adv,
+            portfolio_notional=4_000_000.0,
+            name_sigma=sigma,
+            benchmark_idx=2,
+            cash_idx=3,
+        )
+        undeclared = model.cost_bps_for_trades(
+            weight_deltas=deltas,
+            adv_usd=adv,
+            portfolio_notional=4_000_000.0,
+            name_sigma=sigma,
+        )
+        assert declared != pytest.approx(undeclared), (
+            "a sleeve left inside the volatility reference changes the charge on the "
+            "real names, which is exactly the silent divergence this excludes"
+        )
+
+    def test_construct_book_declares_the_sleeves_to_the_charge(self) -> None:
+        """The end-to-end version: the book's per-session cost is the one the
+        universe's declared sentinels produce, not the undeclared one."""
+        universe = _universe()
+        constructed = construct_book(
+            recipe=_recipe(IMPACT),
+            params=_params(),
+            universe=universe,
+            sessions=_sessions(days=("2026-08-24",)),
+            portfolio_notional=4_000_000.0,
+            w_initial=np.array([0.0, 0.0, 0.97, 0.03]),
+        )
+        weights = np.array(constructed.weights[0])
+        delta = weights - np.array([0.0, 0.0, 0.97, 0.03])
+        expected = CostModel(**IMPACT).cost_bps_for_trades(
+            weight_deltas=delta,
+            adv_usd=_sessions(days=("2026-08-24",))[0].adv_usd,
+            portfolio_notional=4_000_000.0,
+            benchmark_idx=universe.benchmark_idx,
+            cash_idx=universe.cash_idx,
+        )
+        assert constructed.book.cost_bps[0] == pytest.approx(expected, rel=1e-12)

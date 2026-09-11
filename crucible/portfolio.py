@@ -275,6 +275,8 @@ class CostModel:
         adv_usd: np.ndarray | None,
         portfolio_notional: float | None,
         name_sigma: np.ndarray | None = None,
+        benchmark_idx: int | None = None,
+        cash_idx: int | None = None,
     ) -> float:
         """Cost of one rebalance, in basis points OF THE BOOK.
 
@@ -285,6 +287,15 @@ class CostModel:
         A flat model prices it as ``bps_per_unit_turnover × one-way turnover``.
         A square-root model prices each name separately against its own ADV and
         raises rather than averaging when it is handed a name it cannot price.
+
+        ``benchmark_idx`` and ``cash_idx`` are excluded from the impact term and
+        from the volatility reference, exactly as the objective's cost term
+        excludes them: the benchmark fill and the cash sleeve carry no market
+        impact. They are passed rather than inferred, and they MATTER — the
+        reference volatility is a cross-sectional median, so including a
+        benchmark in it moves the scaling of every other name's impact, and the
+        charge a grade subtracts would then be priced off a different reference
+        from the one the solve optimised against.
         """
         dw = np.abs(np.asarray(weight_deltas, dtype=np.float64).ravel())
         if self.kind == "flat":
@@ -311,13 +322,17 @@ class CostModel:
             )
         nav = float(portfolio_notional)
         model = self.impact_model()
-        sigma_used, ref_sigma = _resolve_ref_sigma(name_sigma, np.isfinite(adv) & (adv > 0.0))
+        usable = np.isfinite(adv) & (adv > 0.0)
+        for sentinel in (benchmark_idx, cash_idx):
+            if sentinel is not None and 0 <= sentinel < usable.size:
+                usable[sentinel] = False
+        sigma_used, ref_sigma = _resolve_ref_sigma(name_sigma, usable)
         total_usd = 0.0
         for i in range(dw.size):
             notional = float(dw[i]) * nav
             if notional <= 0.0:
                 continue
-            name_adv = float(adv[i]) if np.isfinite(adv[i]) and adv[i] > 0.0 else None
+            name_adv = float(adv[i]) if usable[i] else None
             sigma_i: float | None = None
             if sigma_used is not None and ref_sigma:
                 candidate = float(sigma_used[i])
