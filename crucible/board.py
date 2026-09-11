@@ -709,6 +709,15 @@ class BoardRow:
     #: out of an English sentence — a contract restated as a regex, which is
     #: the bug class this repository has already paid for twice.
     clauses: tuple[dict[str, Any], ...] | None = None
+    #: `alpha-engine-config-I10494` deliverable 3: the recorded comparison
+    #: when THIS render's `earliest_satisfiable` moved backward against the
+    #: previous one — `crucible.gate.EarliestSatisfiableSetback.to_dict()`,
+    #: or `None` on every ordinary render (no setback this render, or this
+    #: row carries no earliest-satisfiable date at all). Recorded here as a
+    #: STRUCTURED field rather than folded into `detail` alone, so a future
+    #: page condition (deliberately not wired yet — see the PR body) reads it
+    #: rather than parsing an English sentence back out.
+    setback: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.state not in BOARD_STATES:
@@ -747,6 +756,7 @@ class BoardRow:
             # See the field's own comment: collapsing the two would let a
             # consumer print 0/0 over a render that measured nothing.
             "clauses": None if self.clauses is None else [dict(c) for c in self.clauses],
+            "setback": self.setback,
         }
 
 
@@ -990,6 +1000,7 @@ def build_board(
         rows.append(_declared_row(store, f"objective:{row_id}", declaration, day))
 
     rows.extend(_phase_rows(ladder, day, readings or {}))
+    rows.extend(_earliest_satisfiable_rows(store, day, readings or {}))
     rows.extend(_closing_rows(store, tracker_reader))
     rows.extend(_schedule_rows(ladder, day))
 
@@ -1127,6 +1138,137 @@ def _phase_rows(
                 means_when_red=means_when_red(phase),
                 last_read=ladder_row.read_on,
                 clauses=_clause_views(supplied.get(phase.gate) if phase.gate else None),
+            )
+        )
+    return rows
+
+
+def _earliest_satisfiable_rows(
+    store: Store,
+    trading_day: str,
+    readings: dict[str, Any] | None,
+) -> list[BoardRow]:
+    """One row per §6 phase carrying a registered gate: the earliest day it
+    can next read MET, and the clause setting that floor.
+
+    `alpha-engine-config-I10494` deliverables 2 and 3. Declared for every
+    registered-gate phase — never only phase 2 — so a render that took no
+    reading is a red `UNMEASURED` row rather than an absent one, the same
+    "fully declared" rule `_phase_rows` follows.
+
+    **The setback comparison lives here, not in `crucible.gate`.** `evaluate`
+    reads clauses; it does not compare two renders, and giving it a second
+    store read (the previous day's own artifact) to do so would be a second,
+    narrower contract living inside the function every caller trusts to only
+    read what it was handed. This function already has the store and the
+    trading day, so the comparison is one more read beside the ones
+    `_closing_rows` already makes.
+    """
+    from crucible.calendar import previous_trading_day  # noqa: PLC0415 - avoids an import cycle
+    from crucible.gate import (  # noqa: PLC0415 - avoids a module import cycle
+        PHASES,
+        detect_earliest_satisfiable_setback,
+        gate_key,
+        last_system_change_provenance,
+    )
+
+    supplied = readings or {}
+    rows: list[BoardRow] = []
+    for phase in PHASES:
+        if phase.gate is None:
+            continue
+        row_id = f"phase:{phase.id}:earliest-satisfiable"
+        artifact = gate_key(phase.gate, trading_day)
+        reading = supplied.get(phase.gate)
+        if reading is None:
+            rows.append(
+                BoardRow(
+                    id=row_id,
+                    source="phase",
+                    section=f"§6 phase {phase.number}",
+                    title=f"{phase.title} — earliest satisfiable",
+                    state="UNMEASURED",
+                    detail=(
+                        "no gate reading was taken this render, so no dated-clause "
+                        "projection exists either. This is a statement about the "
+                        "producer, not about the phase."
+                    ),
+                    surface="crucible/board",
+                    artifact=artifact,
+                    means_when_red=(
+                        f"phase {phase.number}'s exit date cannot be read because its "
+                        f"gate was not read this render. Tracker: {phase.tracker} "
+                        f"({phase.tracker_url})."
+                    ),
+                )
+            )
+            continue
+
+        earliest = reading.earliest_satisfiable
+        clause_name = reading.earliest_satisfiable_clause
+
+        # The setback comparison: read the PREVIOUS trading day's own gate
+        # artifact, verbatim, never re-evaluated (`crucible.gate.
+        # detect_earliest_satisfiable_setback`'s own contract). A missing or
+        # unreadable previous artifact is the ordinary case on the first
+        # render of a gate, or after a store outage, and reads as "nothing to
+        # compare against" — never a fault of its own.
+        setback = None
+        try:
+            prev_day = previous_trading_day(dt.date.fromisoformat(trading_day))
+        except Exception:  # noqa: BLE001 - a calendar that cannot resolve one day back is not
+            # a fault THIS row exists to report; the row still renders its
+            # own reading, simply with nothing to compare it against.
+            prev_day = None
+        if prev_day is not None:
+            previous_read = read_store_document(store, gate_key(phase.gate, prev_day.isoformat()))
+            if previous_read.document is not None:
+                setback = detect_earliest_satisfiable_setback(
+                    previous_read.document,
+                    reading,
+                    cause=last_system_change_provenance(store),
+                )
+
+        if earliest is None:
+            state = "MET" if reading.met else "PLANNED"
+            detail = (
+                f"phase {phase.number} already meets its exit gate"
+                if reading.met
+                else f"phase {phase.number} is unmet, but no unmet clause could derive an "
+                "earliest-satisfiable date this render"
+            )
+            means_when_red = (
+                f"phase {phase.number}'s exit gate is unmet with no derivable date. "
+                f"Tracker: {phase.tracker} ({phase.tracker_url})."
+            )
+        else:
+            state = "UNMET"
+            detail = (
+                f"phase {phase.number} exits no earlier than {earliest.isoformat()} "
+                f"(set by {clause_name})"
+            )
+            means_when_red = (
+                f"phase {phase.number} cannot exit before {earliest.isoformat()}; the "
+                f"{clause_name} clause is setting the floor. Tracker: {phase.tracker} "
+                f"({phase.tracker_url})."
+            )
+        if setback is not None:
+            detail = (
+                f"{detail}. SETBACK: moved from {setback.previous_date.isoformat()} to "
+                f"{setback.current_date.isoformat()} ({setback.clause}); cause: {setback.cause}"
+            )
+        rows.append(
+            BoardRow(
+                id=row_id,
+                source="phase",
+                section=f"§6 phase {phase.number}",
+                title=f"{phase.title} — earliest satisfiable",
+                state=state,
+                detail=detail,
+                surface="crucible/board",
+                artifact=artifact,
+                means_when_red=means_when_red,
+                setback=None if setback is None else setback.to_dict(),
             )
         )
     return rows

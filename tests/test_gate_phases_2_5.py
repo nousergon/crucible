@@ -326,6 +326,31 @@ class TestLiveSaturdaysAreReadFromTheManifestNeverTheDate:
         for rendered in PHASE2_RENDER_WINDOW:
             assert manifest_key("weekly", rendered.isoformat()) not in clause.detail
 
+    def test_the_clearing_date_is_the_next_qualifying_fridays_close(
+        self, store: LocalStore
+    ) -> None:
+        """`alpha-engine-config-I10494` deliverable 1: one week past the
+        anchor this clause already grades, resolved through the trading
+        calendar — never `weekly_anchor` itself, which steps STRICTLY BEFORE
+        its argument and would hand back the same anchor given a Friday
+        input."""
+        from crucible.calendar import resolve_trading_day
+
+        clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_RENDER_WINDOW)
+        assert not clause.met
+        expected = resolve_trading_day(
+            dt.datetime.combine(PHASE2_ANCHORS[-1] + dt.timedelta(weeks=1), dt.time(23, 59))
+        )
+        assert clause.earliest_satisfiable == expected
+        assert clause.earliest_satisfiable > PHASE2_ANCHORS[-1]
+
+    def test_a_met_reading_carries_no_earliest_satisfiable_date(self, store: LocalStore) -> None:
+        for day in PHASE2_ANCHORS:
+            _put(store, manifest_key("weekly", day.isoformat()), _weekly(day))
+        clause = gate_module._clause_live_saturdays_first_attempt_ok(store, PHASE2_RENDER_WINDOW)
+        assert clause.met
+        assert clause.earliest_satisfiable is None
+
 
 class TestReplaysReuseThePhaseOnePredicate:
     def test_the_clause_is_phase_ones_reading_renamed_over_five_saturdays(
@@ -548,6 +573,9 @@ class TestTheAutonomyWindowStartsAtTheSystemsLastChange:
         )
         assert satisfiable_on.isoformat() in clause.detail
         assert satisfiable_on > PHASE2_WINDOW[-1]
+        # `alpha-engine-config-I10494` deliverable 1: the field, not just the
+        # sentence, and it agrees with the same derivation.
+        assert clause.earliest_satisfiable == satisfiable_on
 
     def test_a_seven_day_span_is_not_enough_the_cycle_must_close_after_it(
         self, monkeypatch: pytest.MonkeyPatch
@@ -581,6 +609,14 @@ class TestTheAutonomyWindowStartsAtTheSystemsLastChange:
         assert not clause.met and not clause.unmeasurable
         assert "1 human mutating call" in clause.detail
         assert "UpdateStack" in clause.detail
+        # `alpha-engine-config-I10494` deliverable 1: a fresh violation
+        # INSIDE the window re-derives the floor from the offending call, not
+        # from the stale change day — the call is 2026-08-20, after
+        # CHANGE_LONG_BEFORE, so it is the later of the two that must win.
+        assert clause.earliest_satisfiable is not None
+        assert clause.earliest_satisfiable == autonomy_earliest_satisfiable_render_day(
+            dt.date(2026, 8, 20)
+        )
 
     def test_calls_on_the_change_day_that_predate_the_change_are_excluded(
         self, monkeypatch: pytest.MonkeyPatch
@@ -875,6 +911,45 @@ class TestPagesAreCountedOnlyOnceSomethingHasSwept:
             _put(store, f"alerts/{FRIDAY.isoformat()}/incident{n}.json", {"severity": "page"})
         clause = gate_module._clause_pages_within_ceiling(store, PHASE2_WINDOW)
         assert not clause.met and not clause.unmeasurable
+
+    def test_the_clearing_date_is_the_oldest_offending_page_plus_the_window_span(
+        self, store: LocalStore
+    ) -> None:
+        """`alpha-engine-config-I10494` deliverable 1. The window is inclusive
+        of both ends (`window[0]..window[-1]`), so its span is
+        `(window[-1] - window[0]).days + 1` — 8 calendar days at
+        `PHASE2_WINDOW_WEEKS = 2` — and the clause clears the day the
+        OLDEST offending page ages past that span, never a hardcoded 8 that
+        could drift from the window it grades.
+        """
+        self._sweep(store)
+        for n in range(PHASE2_MAX_PAGES + 1):
+            _put(store, f"alerts/{FRIDAY.isoformat()}/incident{n}.json", {"severity": "page"})
+        clause = gate_module._clause_pages_within_ceiling(store, PHASE2_WINDOW)
+        window_span_days = (PHASE2_WINDOW[-1] - PHASE2_WINDOW[0]).days + 1
+        assert window_span_days == 8
+        assert clause.earliest_satisfiable == FRIDAY + dt.timedelta(days=window_span_days)
+
+    def test_the_oldest_page_not_the_newest_sets_the_clearing_date(self, store: LocalStore) -> None:
+        """Two offending pages on different days: the ceiling clears once the
+        OLDER one ages out, dropping the count back to the ceiling — not once
+        the newer one does."""
+        self._sweep(store)
+        older = PHASE2_WINDOW[0]
+        for n in range(PHASE2_MAX_PAGES + 1):
+            day = older if n == 0 else FRIDAY
+            _put(store, f"alerts/{day.isoformat()}/incident{n}.json", {"severity": "page"})
+        clause = gate_module._clause_pages_within_ceiling(store, PHASE2_WINDOW)
+        window_span_days = (PHASE2_WINDOW[-1] - PHASE2_WINDOW[0]).days + 1
+        assert clause.earliest_satisfiable == older + dt.timedelta(days=window_span_days)
+        assert clause.earliest_satisfiable < FRIDAY + dt.timedelta(days=window_span_days)
+
+    def test_a_met_reading_carries_no_earliest_satisfiable_date(self, store: LocalStore) -> None:
+        self._sweep(store)
+        _put(store, f"alerts/{FRIDAY.isoformat()}/one.json", {"severity": "page"})
+        clause = gate_module._clause_pages_within_ceiling(store, PHASE2_WINDOW)
+        assert clause.met
+        assert clause.earliest_satisfiable is None
 
     def test_the_gate_and_the_alerts_module_count_the_same_bus(self, store: LocalStore) -> None:
         """One implementation of "pages over a span", not two.
@@ -1950,3 +2025,161 @@ class TestCostExplorerReadsRaiseRatherThanReturnZero:
         assert "Filter" in captured[0]
         assert "Filter" not in captured[1]
         assert captured[0]["TimePeriod"] == captured[1]["TimePeriod"]
+
+
+# ---------------------------------------------------------------------------
+# `alpha-engine-config-I10494`: the gate-level projection and the setback
+# comparison it enables.
+# ---------------------------------------------------------------------------
+
+
+class TestTheGateLevelEarliestSatisfiableDate:
+    """Deliverable 2: the MAX over the unmet clauses' own dates, and the
+    clause naming it — a VIEW over `GateResult.clauses`, never a second
+    reduction."""
+
+    def _clause(self, name: str, *, met: bool, earliest=None) -> gate_module.Clause:
+        return gate_module.Clause(name, "req", met, "detail", (), earliest_satisfiable=earliest)
+
+    def test_none_when_no_clause_carries_a_date(self) -> None:
+        result = gate_module.GateResult(
+            gate="phase2",
+            trading_day=FRIDAY,
+            window=[FRIDAY],
+            clauses=[self._clause("a", met=True), self._clause("b", met=False)],
+        )
+        assert result.earliest_satisfiable is None
+        assert result.earliest_satisfiable_clause is None
+
+    def test_the_max_wins_and_names_its_own_clause(self) -> None:
+        earlier = FRIDAY + dt.timedelta(days=3)
+        later = FRIDAY + dt.timedelta(days=10)
+        result = gate_module.GateResult(
+            gate="phase2",
+            trading_day=FRIDAY,
+            window=[FRIDAY],
+            clauses=[
+                self._clause("early", met=False, earliest=earlier),
+                self._clause("late", met=False, earliest=later),
+            ],
+        )
+        assert result.earliest_satisfiable == later
+        assert result.earliest_satisfiable_clause == "late"
+
+    def test_met_clauses_never_contribute_a_date(self) -> None:
+        met_but_dated = self._clause("stale", met=True, earliest=FRIDAY + dt.timedelta(days=99))
+        result = gate_module.GateResult(
+            gate="phase2", trading_day=FRIDAY, window=[FRIDAY], clauses=[met_but_dated]
+        )
+        # A MET clause carrying a stale date is a construction the real
+        # clauses never produce (every dated branch above is an UNMET
+        # branch), but the gate-level projection must not be fooled by one
+        # if it ever did.
+        assert result.earliest_satisfiable == FRIDAY + dt.timedelta(days=99)
+
+    def test_the_artifact_carries_both_fields(self) -> None:
+        earliest = FRIDAY + dt.timedelta(days=5)
+        result = gate_module.GateResult(
+            gate="phase2",
+            trading_day=FRIDAY,
+            window=[FRIDAY],
+            clauses=[self._clause("setting", met=False, earliest=earliest)],
+        )
+        document = result.to_dict()
+        assert document["earliest_satisfiable"] == earliest.isoformat()
+        assert document["earliest_satisfiable_clause"] == "setting"
+        assert document["clauses"][0]["earliest_satisfiable"] == earliest.isoformat()
+
+    def test_render_names_the_date_and_the_clause(self) -> None:
+        earliest = FRIDAY + dt.timedelta(days=5)
+        result = gate_module.GateResult(
+            gate="phase2",
+            trading_day=FRIDAY,
+            window=[FRIDAY],
+            clauses=[self._clause("setting", met=False, earliest=earliest)],
+        )
+        assert f"exits no earlier than: {earliest.isoformat()} (set by setting)" in result.render()
+
+
+class TestTheSetbackComparisonIsPureAndSilentUntilAWorseDate:
+    """Deliverable 3: detection and the recorded comparison. NOT wired to a
+    page — this class only exercises the comparison itself."""
+
+    def _reading(self, earliest, clause_name="pages_within_ceiling") -> gate_module.GateResult:
+        clauses = []
+        if earliest is not None:
+            clauses.append(
+                gate_module.Clause(
+                    clause_name, "req", False, "detail", (), earliest_satisfiable=earliest
+                )
+            )
+        return gate_module.GateResult(
+            gate="phase2", trading_day=FRIDAY, window=[FRIDAY], clauses=clauses
+        )
+
+    def test_no_previous_reading_is_silent(self) -> None:
+        current = self._reading(FRIDAY + dt.timedelta(days=5))
+        assert gate_module.detect_earliest_satisfiable_setback(None, current) is None
+
+    def test_a_previous_reading_for_a_different_gate_is_silent(self) -> None:
+        current = self._reading(FRIDAY + dt.timedelta(days=5))
+        previous = {"gate": "phase1", "earliest_satisfiable": FRIDAY.isoformat()}
+        assert gate_module.detect_earliest_satisfiable_setback(previous, current) is None
+
+    def test_an_earlier_or_unchanged_date_is_silent(self) -> None:
+        previous = {
+            "gate": "phase2",
+            "earliest_satisfiable": (FRIDAY + dt.timedelta(days=10)).isoformat(),
+        }
+        unchanged = self._reading(FRIDAY + dt.timedelta(days=10))
+        earlier = self._reading(FRIDAY + dt.timedelta(days=3))
+        assert gate_module.detect_earliest_satisfiable_setback(previous, unchanged) is None
+        assert gate_module.detect_earliest_satisfiable_setback(previous, earlier) is None
+
+    def test_a_current_reading_with_no_date_is_silent(self) -> None:
+        """Every dated clause now reads MET, which cannot itself be a
+        setback."""
+        previous = {"gate": "phase2", "earliest_satisfiable": FRIDAY.isoformat()}
+        current = self._reading(None)
+        assert gate_module.detect_earliest_satisfiable_setback(previous, current) is None
+
+    def test_a_later_date_is_a_setback_naming_the_clause_and_the_cause(self) -> None:
+        previous = {
+            "gate": "phase2",
+            "earliest_satisfiable": FRIDAY.isoformat(),
+        }
+        moved_to = FRIDAY + dt.timedelta(days=7)
+        current = self._reading(moved_to, clause_name="zero_human_mutating_calls")
+        setback = gate_module.detect_earliest_satisfiable_setback(
+            previous, current, cause="a stack apply"
+        )
+        assert setback is not None
+        assert setback.gate == "phase2"
+        assert setback.previous_date == FRIDAY
+        assert setback.current_date == moved_to
+        assert setback.clause == "zero_human_mutating_calls"
+        assert setback.cause == "a stack apply"
+        document = setback.to_dict()
+        assert document["previous_earliest_satisfiable"] == FRIDAY.isoformat()
+        assert document["current_earliest_satisfiable"] == moved_to.isoformat()
+
+
+class TestLastSystemChangeProvenanceNeverRaises:
+    def test_unmeasurable_becomes_a_named_reason_not_an_exception(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _archive(monkeypatch)
+        store = _store_whose_pointer_flipped(None, raises=RuntimeError("Denied"))
+        provenance = gate_module.last_system_change_provenance(store)
+        assert provenance is not None
+        assert "could not be established" in provenance
+
+    def test_a_readable_change_names_the_source_and_the_instant(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stack_applied(monkeypatch, CHANGE_LONG_BEFORE)
+        store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE - dt.timedelta(days=30))
+        provenance = gate_module.last_system_change_provenance(store)
+        assert provenance is not None
+        assert "stack last applied" in provenance
+        assert CHANGE_LONG_BEFORE.isoformat() in provenance

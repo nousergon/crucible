@@ -162,6 +162,9 @@ __all__ = [
     "DocumentRead",
     "SourceScan",
     "GateResult",
+    "EarliestSatisfiableSetback",
+    "detect_earliest_satisfiable_setback",
+    "last_system_change_provenance",
     "Ladder",
     "Phase",
     "PhaseRow",
@@ -231,6 +234,17 @@ class Clause:
     detail: str
     evidence: tuple[str, ...] = ()
     unmeasurable: bool = False
+    #: The first render day on which THIS clause could next read MET, DERIVED
+    #: by the clause itself, never restated by a caller
+    #: (`alpha-engine-config-I10494` deliverable 1). `None` on every MET
+    #: clause (nothing to wait for) and on every clause — met, unmet or
+    #: unmeasurable — whose requirement carries no calendar floor at all, or
+    #: whose floor could not be derived this render (e.g. the underlying
+    #: `LastChangeUnreadableError`). A date here is a statement about WHEN,
+    #: never a softened statement about WHETHER: an unmet clause with
+    #: `earliest_satisfiable=None` is still unmet, exactly as it was before
+    #: this field existed.
+    earliest_satisfiable: dt.date | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -245,6 +259,9 @@ class Clause:
             # rather than an artifact of a bare, undiscriminated read that
             # de-duplication would otherwise mask.
             "evidence": sorted(self.evidence),
+            "earliest_satisfiable": (
+                None if self.earliest_satisfiable is None else self.earliest_satisfiable.isoformat()
+            ),
         }
 
 
@@ -326,8 +343,39 @@ class GateResult:
             MemberRow(id=c.name, value=c.met, status=_clause_member_status(c)) for c in self.clauses
         ]
 
+    @property
+    def earliest_satisfiable(self) -> dt.date | None:
+        """The gate's OWN earliest-satisfiable date: the MAX over every
+        clause's own derived date (`alpha-engine-config-I10494` deliverable
+        2), never re-derived here — a VIEW over `self.clauses`, the same
+        shape `members` already takes over the same list.
+
+        The max, never the min: the gate cannot exit before its SLOWEST
+        dated clause clears, so a phase held only by one late clause still
+        exits no earlier than that clause allows. `None` when no clause
+        carries a date — either every dated clause already reads MET, or
+        every clause that is still unmet could not derive one this render.
+        """
+        dated = [c.earliest_satisfiable for c in self.clauses if c.earliest_satisfiable is not None]
+        return max(dated) if dated else None
+
+    @property
+    def earliest_satisfiable_clause(self) -> str | None:
+        """The name of the clause SETTING `earliest_satisfiable` — the same
+        clause the max above was taken from. `None` under exactly the
+        condition `earliest_satisfiable` is `None`. Ties (two clauses
+        deriving the identical date) resolve to the first such clause in
+        `self.clauses`, `max`'s own stable-tiebreak behaviour, so the pick is
+        deterministic rather than dict-order-dependent.
+        """
+        dated = [c for c in self.clauses if c.earliest_satisfiable is not None]
+        if not dated:
+            return None
+        return max(dated, key=lambda c: c.earliest_satisfiable).name
+
     def to_dict(self) -> dict[str, Any]:
         ratio = self.met_ratio
+        earliest = self.earliest_satisfiable
         return {
             "schema_version": GATE_SCHEMA_VERSION,
             "gate": self.gate,
@@ -346,6 +394,11 @@ class GateResult:
             # CLAUSE_MEMBER_RANK)` — never `MET` when any clause is `UNMET`
             # or `UNMEASURABLE`, by construction of `met`/`met_ratio` above.
             "members": member_dicts(self.members),
+            # `alpha-engine-config-I10494` deliverable 2: the gate-level
+            # projection over the per-clause dates above, and the clause
+            # naming it — never restated, a VIEW over `clauses`.
+            "earliest_satisfiable": None if earliest is None else earliest.isoformat(),
+            "earliest_satisfiable_clause": self.earliest_satisfiable_clause,
         }
 
     def render(self) -> str:
@@ -358,6 +411,12 @@ class GateResult:
         ]
         if self.coverage:
             lines.append(f"coverage: {self.coverage}")
+        earliest = self.earliest_satisfiable
+        if earliest is not None:
+            lines.append(
+                f"exits no earlier than: {earliest.isoformat()} "
+                f"(set by {self.earliest_satisfiable_clause})"
+            )
         for clause in self.clauses:
             marker = "x" if clause.met else ("?" if clause.unmeasurable else " ")
             lines.append(f"  [{marker}] {clause.name}: {clause.detail}")
@@ -3955,7 +4014,24 @@ def _clause_live_saturdays_first_attempt_ok(store: Store, window: list[dt.date])
         ):
             if rows:
                 parts.append(f"{len(rows)} {label}: {'; '.join(rows)}")
-        return Clause(name, requirement, False, "; ".join(parts), tuple(evidence))
+        # `alpha-engine-config-I10494` deliverable 1: the next Friday close
+        # this clause could read as a fresh, not-yet-graded live Saturday —
+        # `days[-1]` plus one calendar week, resolved through the trading
+        # calendar the same way `weekly_anchor` resolves a raw Friday (a
+        # holiday Friday walks back to the real session before it), but
+        # WITHOUT `weekly_anchor`'s own "strictly before" step-back, which
+        # would return `days[-1]` itself right back given a Friday input.
+        next_qualifying = resolve_trading_day(
+            dt.datetime.combine(days[-1] + dt.timedelta(weeks=1), dt.time(23, 59))
+        )
+        return Clause(
+            name,
+            requirement,
+            False,
+            "; ".join(parts),
+            tuple(evidence),
+            earliest_satisfiable=next_qualifying,
+        )
     return Clause(
         name,
         requirement,
@@ -4179,6 +4255,97 @@ def _last_system_change(store: Store, *, cfn: Any | None = None) -> _SystemChang
     )
 
 
+def last_system_change_provenance(store: Store) -> str | None:
+    """`_last_system_change`'s provenance string, or `None` when it could not
+    be established.
+
+    `alpha-engine-config-I10494` deliverable 4: the reusable half of "name
+    what caused the setback" — `_last_system_change` already returns
+    provenance naming which of the release-pointer flip or the stack apply
+    moved, and when; this is the one public seam onto it, so a setback
+    detector outside this module (`crucible.board`, which owns the row that
+    renders it) never re-derives the CloudFormation/pointer read a second
+    time or reaches past this module's leading underscore to get it.
+
+    Never raises: an unreadable pointer or an undescribable stack is a
+    statement about OUR access, not about the system, and the caller here is
+    building an explanatory string for an already-computed setback, not a
+    gate reading that must distinguish UNMET from UNMEASURABLE — so the
+    honest behaviour is to say what went wrong rather than take the caller
+    down with it.
+    """
+    try:
+        return _last_system_change(store).provenance()
+    except LastChangeUnreadableError as exc:
+        return f"the setback's cause could not be established: {exc}"
+
+
+@dataclass(frozen=True)
+class EarliestSatisfiableSetback:
+    """A gate's `earliest_satisfiable` date moved BACKWARD between two
+    renders — deliverable 3's finding (`alpha-engine-config-I10494`), the
+    single event phase 2 is worth interrupting for.
+
+    Detection and this recorded comparison are built here; the PAGE is
+    DELIBERATELY NOT wired to it — see the PR body naming what would arm it.
+    """
+
+    gate: str
+    previous_date: dt.date
+    current_date: dt.date
+    clause: str | None
+    cause: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "gate": self.gate,
+            "previous_earliest_satisfiable": self.previous_date.isoformat(),
+            "current_earliest_satisfiable": self.current_date.isoformat(),
+            "clause": self.clause,
+            "cause": self.cause,
+        }
+
+
+def detect_earliest_satisfiable_setback(
+    previous: dict[str, Any] | None, current: GateResult, *, cause: str | None = None
+) -> EarliestSatisfiableSetback | None:
+    """Compare `current`'s gate-level `earliest_satisfiable` against a PRIOR
+    render's, read verbatim from a stored `gates/{gate}/{day}/gate.json`
+    dict — never re-evaluated, so this is a pure comparison over two already-
+    taken readings and is testable with no store or fixture at all.
+
+    A LATER date is a setback: the phase can now first read MET no earlier
+    than it could before. An earlier or unchanged date, a missing previous
+    reading (the ordinary first-render case), a previous reading for a
+    DIFFERENT gate, or a missing current date (every dated clause now reads
+    MET, which cannot itself be a setback) are all silent — `None`, never an
+    exception, and never a false setback.
+
+    ``cause`` is carried through unexamined — the caller supplies it (see
+    :func:`last_system_change_provenance`) rather than this function
+    fetching it, so a setback can be detected and recorded from two stored
+    dicts with no store access of its own.
+    """
+    if previous is None or previous.get("gate") != current.gate:
+        return None
+    prev_iso = previous.get("earliest_satisfiable")
+    if not prev_iso:
+        return None
+    curr_date = current.earliest_satisfiable
+    if curr_date is None:
+        return None
+    prev_date = dt.date.fromisoformat(prev_iso)
+    if curr_date <= prev_date:
+        return None
+    return EarliestSatisfiableSetback(
+        gate=current.gate,
+        previous_date=prev_date,
+        current_date=curr_date,
+        clause=current.earliest_satisfiable_clause,
+        cause=cause,
+    )
+
+
 def _event_instant(event_time: str) -> dt.datetime | None:
     """A CloudTrail `eventTime` as an instant, or None when it will not parse."""
     try:
@@ -4316,6 +4483,7 @@ def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Cl
             "with every change would make this clause easier the more the system was "
             f"touched. {change.provenance()}",
             evidence,
+            earliest_satisfiable=satisfiable_on,
         )
     if daily_cycles < PHASE2_AUTONOMY_MIN_DAILY_CYCLES:
         # UNMEASURABLE, not UNMET, and deliberately so: under the NYSE calendar
@@ -4377,6 +4545,27 @@ def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Cl
         offenders = ", ".join(
             f"{a.principal} {a.event_name}@{a.event_time}" for a in after_change[:4]
         )
+        # A human mutating call found INSIDE the window is itself a fresh
+        # violation, so the earliest-satisfiable floor is re-derived from
+        # whichever is later — the system's last change or the latest
+        # offending call — never left at the stale `change_day` value: a
+        # call the day before render would otherwise report a date already
+        # in the past. `None` (never a raise) when the calendar cannot
+        # derive one; an UNMET clause without a date is still UNMET.
+        try:
+            offending_floor = max(
+                (
+                    instant.date()
+                    for action in after_change
+                    if (instant := _event_instant(action.event_time)) is not None
+                ),
+                default=change_day,
+            )
+            satisfiable_on = autonomy_earliest_satisfiable_render_day(
+                max(change_day, offending_floor)
+            )
+        except LastChangeUnreadableError:
+            satisfiable_on = None
         return Clause(
             name,
             requirement,
@@ -4385,6 +4574,7 @@ def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Cl
             f"{change.at.isoformat()}..{render_day.isoformat()}: {offenders}. "
             f"{change.provenance()}",
             evidence,
+            earliest_satisfiable=satisfiable_on,
         )
     return Clause(
         name,
@@ -4476,6 +4666,30 @@ def _clause_pages_within_ceiling(store: Store, window: list[dt.date]) -> Clause:
             (ALERTS_ROOT,),
         )
     if len(incidents) > PHASE2_MAX_PAGES:
+        # `alpha-engine-config-I10494` deliverable 1: the DATE this clause
+        # next clears, derived from the same rolling window it is graded
+        # over rather than a second, independently-typed constant. The
+        # window is `[start, end]` INCLUSIVE (both ends, same as
+        # `pages_in_range` above), so its span in calendar days is
+        # `(end - start).days + 1` — 8 today, at `PHASE2_WINDOW_WEEKS = 2`
+        # (a 7-day gap between the two raw window elements) — and moves with
+        # that constant rather than drifting from it the way the split
+        # `PHASE2_LIVE_SATURDAYS`/`PHASE2_WINDOW_WEEKS` constants above this
+        # function were once one value doing two jobs. The clause clears once
+        # the OLDEST page still inside the window ages out of it, i.e. the
+        # render day after `oldest_page_date + window_span_days`.
+        window_span_days = (end - start).days + 1
+        page_dates = [
+            dt.date.fromisoformat(parsed[0])
+            for key in incidents
+            if (parsed := parse_bus_key(key)) is not None
+        ]
+        oldest_page_date = min(page_dates) if page_dates else None
+        earliest = (
+            oldest_page_date + dt.timedelta(days=window_span_days)
+            if oldest_page_date is not None
+            else None
+        )
         return Clause(
             name,
             requirement,
@@ -4483,6 +4697,7 @@ def _clause_pages_within_ceiling(store: Store, window: list[dt.date]) -> Clause:
             f"{len(incidents)} paged incidents over {start.isoformat()}..{end.isoformat()}, "
             f"ceiling {PHASE2_MAX_PAGES}: {', '.join(sorted(incidents)[:4])}",
             tuple(sorted(incidents)),
+            earliest_satisfiable=earliest,
         )
     return Clause(
         name,

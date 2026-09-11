@@ -187,6 +187,129 @@ class TestTheRowSetIsDerived:
             build_board(store, ladder=_Ladder())
 
 
+class TestTheEarliestSatisfiableRow:
+    """`alpha-engine-config-I10494` deliverables 2 and 3: the board row naming
+    when a gated phase can next read MET, and the (never-paging) setback
+    comparison against the previous render."""
+
+    def _phase2(self):
+        return next(p for p in PHASES if p.gate == "phase2")
+
+    def test_no_reading_renders_unmeasured(self, store) -> None:
+        board = build_board(store)
+        phase = self._phase2()
+        row = next(r for r in board.rows if r.id == f"phase:{phase.id}:earliest-satisfiable")
+        assert row.state == "UNMEASURED"
+        assert row.setback is None
+
+    def test_a_dated_unmet_clause_names_the_date_and_the_clause(self, store) -> None:
+        from crucible.gate import Clause, GateResult
+
+        phase = self._phase2()
+        earliest = dt.date(2026, 9, 19)
+        day = dt.date(2026, 9, 11)
+        reading = GateResult(
+            gate="phase2",
+            trading_day=day,
+            window=[day],
+            clauses=[
+                Clause(
+                    "zero_human_mutating_calls",
+                    "req",
+                    False,
+                    "d",
+                    (),
+                    earliest_satisfiable=earliest,
+                )
+            ],
+        )
+        board = build_board(store, trading_day=day, readings={"phase2": reading})
+        row = next(r for r in board.rows if r.id == f"phase:{phase.id}:earliest-satisfiable")
+        assert row.state == "UNMET"
+        assert "2026-09-19" in row.detail
+        assert "zero_human_mutating_calls" in row.detail
+        assert row.setback is None
+
+    def test_a_fully_met_gate_reads_met(self, store) -> None:
+        from crucible.gate import Clause, GateResult
+
+        phase = self._phase2()
+        day = dt.date(2026, 9, 11)
+        reading = GateResult(
+            gate="phase2", trading_day=day, window=[day], clauses=[Clause("c", "req", True, "d")]
+        )
+        board = build_board(store, trading_day=day, readings={"phase2": reading})
+        row = next(r for r in board.rows if r.id == f"phase:{phase.id}:earliest-satisfiable")
+        assert row.state == "MET"
+
+    def test_a_backward_move_is_detected_recorded_and_never_pages(self, store) -> None:
+        """The comparison against the STORED previous render. It is recorded
+        as a structured `setback` field and in `detail`; it is deliberately
+        never wired to a page state — this board's own vocabulary has no page
+        state, and the row's `state` still reads plain UNMET."""
+        from crucible.gate import Clause, GateResult, gate_key
+
+        phase = self._phase2()
+        prev_day = dt.date(2026, 9, 10)
+        curr_day = dt.date(2026, 9, 11)
+        store.put_bytes(
+            gate_key("phase2", prev_day.isoformat()),
+            json.dumps({"gate": "phase2", "earliest_satisfiable": "2026-09-19"}).encode("utf-8"),
+        )
+        reading = GateResult(
+            gate="phase2",
+            trading_day=curr_day,
+            window=[curr_day],
+            clauses=[
+                Clause(
+                    "zero_human_mutating_calls",
+                    "req",
+                    False,
+                    "d",
+                    (),
+                    earliest_satisfiable=dt.date(2026, 9, 26),
+                )
+            ],
+        )
+        board = build_board(store, trading_day=curr_day, readings={"phase2": reading})
+        row = next(r for r in board.rows if r.id == f"phase:{phase.id}:earliest-satisfiable")
+        assert row.state == "UNMET"
+        assert row.setback is not None
+        assert row.setback["previous_earliest_satisfiable"] == "2026-09-19"
+        assert row.setback["current_earliest_satisfiable"] == "2026-09-26"
+        assert "SETBACK" in row.detail
+
+    def test_a_forward_move_is_not_a_setback(self, store) -> None:
+        from crucible.gate import Clause, GateResult, gate_key
+
+        phase = self._phase2()
+        prev_day = dt.date(2026, 9, 10)
+        curr_day = dt.date(2026, 9, 11)
+        store.put_bytes(
+            gate_key("phase2", prev_day.isoformat()),
+            json.dumps({"gate": "phase2", "earliest_satisfiable": "2026-09-26"}).encode("utf-8"),
+        )
+        reading = GateResult(
+            gate="phase2",
+            trading_day=curr_day,
+            window=[curr_day],
+            clauses=[
+                Clause(
+                    "zero_human_mutating_calls",
+                    "req",
+                    False,
+                    "d",
+                    (),
+                    earliest_satisfiable=dt.date(2026, 9, 19),
+                )
+            ],
+        )
+        board = build_board(store, trading_day=curr_day, readings={"phase2": reading})
+        row = next(r for r in board.rows if r.id == f"phase:{phase.id}:earliest-satisfiable")
+        assert row.setback is None
+        assert "SETBACK" not in row.detail
+
+
 class TestTheObjectivesMatchTheAcceptanceSuite:
     """A bijection, asserted in both directions.
 
