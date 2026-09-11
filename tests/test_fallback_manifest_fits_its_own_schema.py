@@ -68,19 +68,23 @@ def test_fit_marks_where_it_cut() -> None:
     assert out.startswith("x"), "the HEAD is kept — an exception's message leads"
 
 
+def _overlong_reason() -> str:
+    overlong = "the router refused: " + ("member skipped; " * 400)
+    assert len(overlong) > REASON_CAP
+    return overlong
+
+
 def test_a_job_whose_reason_exceeds_the_cap_still_writes_a_manifest(tmp_path) -> None:
     """The live case, end to end. Before this change the store was left
     EMPTY and the process exited non-zero, so `crucible.alerts` reported an
     ABSENCE — the condition for "nothing was even attempted".
     """
     store = LocalStore(tmp_path)
-    overlong = "the router refused: " + ("member skipped; " * 400)
-    assert len(overlong) > REASON_CAP
 
     with pytest.raises(RuntimeError):
         run_job(
             "fault.probe",
-            lambda ctx: (_ for _ in ()).throw(RuntimeError(overlong)),
+            lambda ctx: (_ for _ in ()).throw(RuntimeError(_overlong_reason())),
             store=store,
             trading_day=dt.date(2026, 9, 9),
             run_mode="replay",
@@ -94,6 +98,63 @@ def test_a_job_whose_reason_exceeds_the_cap_still_writes_a_manifest(tmp_path) ->
     assert len(manifest["reason"]) <= REASON_CAP
 
 
+def test_an_overlong_reason_never_costs_the_job_its_own_fields(tmp_path) -> None:
+    """The half `crucible-PR200` left open, and the reason this file grew.
+
+    A `reason` too long is the RUNNER's overflow — it renders an exception
+    whose message it does not control. Routing that through the fallback made
+    a long string cost the run its inputs, outputs, metrics, llm_calls and
+    row counts. Measured 2026-09-09 on the live
+    `runs/fault.probe/2026-09-09/run.json`: `llm_calls: []`, `metrics: []`,
+    `outputs: []`, `cost_usd: 0.0` — every one of them recorded by the run and
+    none of them written.
+
+    So the primary assembly fits `reason` to the schema's cap, and this run —
+    which used to land in the fallback — now writes the full document.
+    """
+    store = LocalStore(tmp_path)
+
+    def body(ctx) -> None:
+        ctx.record_metric(
+            {
+                "name": "probe_reached_the_router",
+                "module": "crucible.fault_probe",
+                "metric_type": "gauge",
+                "n_floor": 1,
+                "status": "OK",
+                "status_reason": "the probe reached the router before it was refused",
+                "source_path": "crucible.fault_probe.probe_body",
+                "last_updated_utc": "2026-09-09T00:00:00Z",
+                "value": 1.0,
+                "unit": "bool",
+            }
+        )
+        ctx.rows_in = 7
+        raise RuntimeError(_overlong_reason())
+
+    with pytest.raises(RuntimeError):
+        run_job(
+            "fault.probe",
+            body,
+            store=store,
+            trading_day=dt.date(2026, 9, 9),
+            run_mode="replay",
+            transient_retry=False,
+        )
+
+    manifest = json.loads(store.get_bytes("runs/fault.probe/2026-09-09/run.json"))
+    validate(manifest)
+    assert manifest["status"] == "failed"
+    assert len(manifest["reason"]) <= REASON_CAP
+    assert "truncated" in manifest["reason"], "a clipped reason must say it was clipped"
+    assert "does not validate" not in manifest["reason"], (
+        "an over-long reason must no longer reach the fallback at all — the "
+        "fallback is for a JOB-contributed field the validator rejected"
+    )
+    assert manifest["rows_in"] == 7, "the job's own fields must survive"
+    assert [m["name"] for m in manifest["metrics"]] == ["probe_reached_the_router"]
+
+
 def test_the_fallback_keeps_the_validators_complaint_not_only_the_original(
     tmp_path,
 ) -> None:
@@ -103,10 +164,19 @@ def test_the_fallback_keeps_the_validators_complaint_not_only_the_original(
     the complaint names the field nobody would otherwise know to look at.
     """
     store = LocalStore(tmp_path)
+
+    def body(ctx) -> None:
+        # A JOB-contributed violation, which is what the fallback is FOR:
+        # `rows_in` is declared `minimum: 0`. An over-long `reason` no longer
+        # reaches here — the primary assembly fits it — so triggering the
+        # fallback with one would be testing a path that can no longer occur.
+        ctx.rows_in = -1
+        raise RuntimeError("the job also failed, and this is why")
+
     with pytest.raises(RuntimeError):
         run_job(
             "fault.probe",
-            lambda ctx: (_ for _ in ()).throw(RuntimeError("z" * (REASON_CAP * 2))),
+            body,
             store=store,
             trading_day=dt.date(2026, 9, 9),
             run_mode="replay",
@@ -115,6 +185,7 @@ def test_the_fallback_keeps_the_validators_complaint_not_only_the_original(
     manifest = json.loads(store.get_bytes("runs/fault.probe/2026-09-09/run.json"))
     assert "does not validate" in manifest["reason"]
     assert "The validator said" in manifest["reason"]
+    assert "the job also failed" in manifest["reason"]
 
 
 def test_the_fallback_itself_never_raises_validation(tmp_path) -> None:

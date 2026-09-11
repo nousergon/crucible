@@ -92,6 +92,7 @@ from crucible.tags import (
 __all__ = [
     "IAC_CONFORMANCE_JOB",
     "IAC_CONFORMANCE_MODULE",
+    "AccessDeniedReadingTheAccountError",
     "AccountTemplateAudit",
     "DeclaredInventory",
     "DeclaredInventoryUnreadableError",
@@ -117,6 +118,52 @@ IAC_CONFORMANCE_MODULE = "crucible.iac_conformance"
 COMPARISON_ACCOUNT_VS_TEMPLATE = "iac_account_vs_template"
 COMPARISON_TEMPLATE_VS_DECLARED = "iac_template_vs_declared"
 COMPARISON_PERSISTED = "iac_conformance_persisted"
+
+
+#: The AWS error codes that mean "this identity may not make that call".
+#: A closed set, checked by code rather than by matching on a message: the
+#: message is prose AWS may reword, the code is the contract. Everything
+#: outside this set is a real error and propagates, because the whole point
+#: of the distinction below is that an access failure is a statement about
+#: OUR GRANTS and any other failure is a statement about the estate.
+ACCESS_DENIED_CODES = frozenset({"AccessDenied", "AccessDeniedException", "UnauthorizedOperation"})
+
+
+def _is_access_denied(exc: BaseException) -> bool:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    return response.get("Error", {}).get("Code", "") in ACCESS_DENIED_CODES
+
+
+class AccessDeniedReadingTheAccountError(RuntimeError):
+    """Comparison (a) could not read the account: a grant is missing.
+
+    The sibling of :class:`TemplateUnreadableError` and
+    :class:`DeclaredInventoryUnreadableError`, and it exists because
+    comparison (a) was the ONE of the three that had no such sibling.
+    Comparisons (b) and the cost-allocation read both already say "that is a
+    statement about our access, not about <the subject>" and render
+    UNMEASURABLE; (a) let a raw `ClientError` out of the handler, and
+    `iac.conformance` is an ARC STAGE — so a missing grant did not degrade
+    one metric, it raised `ArcStageFailed` and took the whole weekly arc down
+    with it, twice, on two consecutive rehearsals of 2026-07-31:
+
+      2026-09-10, first rehearsal:
+        AccessDenied ... cloudformation:ListStackResources
+      2026-09-11, after that grant landed:
+        AccessDenied ... iam:ListRoleTags on resource: role admin
+
+    Each cost a whole arc, and on a real Saturday would have cost
+    `live_saturdays_first_attempt_ok` — a phase-2 exit clause that grades the
+    FIRST attempt and cannot be re-run for credit. The grants are fixed in
+    `nous-ergon-ops` where they belong; this class is the reason a THIRD
+    missing grant costs one UNMEASURABLE metric instead of a Saturday.
+
+    UNMEASURABLE is never a pass. The metric still reads red on the board and
+    the clause reading it is still unmet — what changes is only that the
+    stages after this one get to run.
+    """
 
 
 class TemplateUnreadableError(RuntimeError):
@@ -243,12 +290,30 @@ def audit_account_vs_template(
     exist yet — the same UNMEASURABLE-never-a-pass refusal
     `crucible.tags.audit_stack_tags` already gives, reused rather than
     reimplemented (a stack with no resources is vacuous truth either way).
-    """
-    stack_audit = audit_stack_tags(stack=stack, cfn=cfn, tagging=tagging, iam=iam)
-    stack_ids = {physical for _, _, physical in stack_audit.resources}
 
-    tagged_ids = set(_tagged_identifiers(tagging))
-    tagged_ids |= _tagged_iam_role_names(iam)
+    Raises :class:`AccessDeniedReadingTheAccountError` when any of its four
+    reads is denied. Declared, so the handler can render this comparison
+    UNMEASURABLE the way it already renders comparison (b) — see that class
+    for why an arc stage must never let a raw `ClientError` out.
+    """
+    try:
+        stack_audit = audit_stack_tags(stack=stack, cfn=cfn, tagging=tagging, iam=iam)
+        stack_ids = {physical for _, _, physical in stack_audit.resources}
+
+        tagged_ids = set(_tagged_identifiers(tagging))
+        tagged_ids |= _tagged_iam_role_names(iam)
+    except StackNotAppliedError:
+        # The stack genuinely not existing is a different answer from being
+        # unable to look, and it has its own UNMEASURABLE path already.
+        raise
+    except Exception as exc:  # noqa: BLE001 - narrowed on the next line, re-raised otherwise
+        if not _is_access_denied(exc):
+            raise
+        raise AccessDeniedReadingTheAccountError(
+            f"comparison (a) could not read the account for stack {stack!r}: "
+            f"{type(exc).__name__}: {exc}. That is a statement about our grants, not "
+            "about whether the estate conforms"
+        ) from exc
 
     only_in_account = tuple(sorted(pid for pid in tagged_ids if pid and pid not in stack_ids))
     return AccountTemplateAudit(
@@ -588,7 +653,7 @@ def iac_conformance_handler(args: argparse.Namespace) -> int:
             account_audit = audit_account_vs_template(
                 stack=stack, cfn=_cfn_client(), tagging=_tagging_client(), iam=_iam_client()
             )
-        except StackNotAppliedError as exc:
+        except (StackNotAppliedError, AccessDeniedReadingTheAccountError) as exc:
             metrics.append(
                 _metric(
                     COMPARISON_ACCOUNT_VS_TEMPLATE,
