@@ -75,11 +75,12 @@ class TestConfiguredValues:
         """Brian's ruling, 2026-09-01: a new arm is promotable only after 4
         paired weeks against the incumbent — 20 paired TRADING days.
 
-        It lives on the crucible SlotSpec rather than on ArenaConfig because
-        the installed nousergon-lib ArenaConfig has no such field; the
-        eligibility age is a v2 addition awaiting the policy amendment named
-        in I9751."""
+        Read off the library's `ArenaConfig` (`alpha-engine-config-I9763`,
+        `-I10504`): `SlotSpec.promote_min_weeks` is a read-only property
+        forwarding to `arena_config_for(slot).promote_min_weeks`, not a
+        second, crucible-local field."""
         assert get_slot(slot).promote_min_weeks == 4
+        assert arena_config_for(slot).promote_min_weeks == 4
 
     @pytest.mark.parametrize("slot", ["u", "r"])
     def test_a_selection_slot_is_never_benchmarked_against_spy(self, slot: str) -> None:
@@ -360,14 +361,35 @@ class TestSpecIntegrity:
         same process."""
         spec = get_slot("r")
         with pytest.raises(Exception):  # noqa: B017 - dataclass raises FrozenInstanceError
-            spec.promote_min_weeks = 1  # type: ignore[misc]
+            spec.cap = 1  # type: ignore[misc]
 
-    def test_promote_min_weeks_below_one_is_refused(self) -> None:
-        with pytest.raises(ValueError, match="promote_min_weeks"):
+    def test_promote_min_weeks_has_no_crucible_local_setter(self) -> None:
+        """`promote_min_weeks` is a read-only property forwarding to the
+        library's `ArenaConfig` (`alpha-engine-config-I9763`, `-I10504`); it
+        is no longer a `SlotSpec` field, so `SlotSpec` never accepts it as a
+        constructor argument and assigning it raises like any other frozen
+        attribute."""
+        spec = get_slot("r")
+        with pytest.raises(Exception):  # noqa: B017 - dataclass raises FrozenInstanceError
+            spec.promote_min_weeks = 1  # type: ignore[misc]
+        with pytest.raises(TypeError, match="promote_min_weeks"):
             SlotSpec(
                 slot="r",
                 slot_kind="selection_producer",
                 benchmark="population",
                 module="research",
+                promote_min_weeks=0,
+            )
+
+    def test_the_library_refuses_promote_min_weeks_below_one(self) -> None:
+        """The eligibility age's validation moved with the field
+        (`alpha-engine-config-I9763`, `-I10504`): `SlotSpec` no longer
+        duplicates it, the library's `ArenaConfigError` is the only
+        refusal."""
+        with pytest.raises(ArenaConfigError, match="promote_min_weeks"):
+            ArenaConfig(
+                slot="r",
+                slot_kind="selection_producer",
+                benchmark="population",
                 promote_min_weeks=0,
             )

@@ -18,14 +18,14 @@ library's own `ArenaConfig` — rather than a look-alike — is what keeps that
 honest: a crucible-local copy would pass every value assertion and diverge
 silently the first time the library gained a field.
 
-**One field is not the library's.** `promote_min_weeks` (Brian's ruling,
-2026-09-01: a new arm is promotable only after 4 paired weeks — 20 paired
-trading days — against the incumbent) has no counterpart on the installed
-`ArenaConfig`. It is carried on :class:`SlotSpec` until the policy amendment
-named in I9751 lands it in the library, at which point it moves and this
-comment goes with it. It is deliberately NOT smuggled into the library object
-by monkey-patching: a config field that exists on some processes and not
-others is worse than one that lives in a declared second place.
+**`promote_min_weeks` now lives on the library's `ArenaConfig`**
+(`alpha-engine-config-I9763`, `-I10504`) — Brian's ruling, 2026-09-01: a new
+arm is promotable only after 4 paired weeks (20 paired trading days) against
+the incumbent. It was previously carried on :class:`SlotSpec` as a declared
+second place because the installed `ArenaConfig` had no such field; that
+carry-over is gone now that the library does. `SlotSpec.promote_min_weeks`
+stays as a read-only property forwarding to :attr:`SlotSpec.arena` — the
+single source of truth is the library object, never a crucible-local copy.
 
 **Strategy content is not here.** An arm is an immutable recipe living in the
 private config repository, loaded at runtime; its id is the hash of its spec.
@@ -123,11 +123,6 @@ class SlotSpec:
     #: about whether the entry points EXIST yet -- that is read off the
     #: module itself, never asserted here.
     module: str
-    #: Brian's ruling, 2026-09-01. Four paired weeks = 20 paired trading
-    #: days; a holiday week is still one rung (§4.12). Scored and laddered
-    #: from week one, but the pointer cannot move to the arm before week 4;
-    #: within eligibility the decision is the confidence sequence alone.
-    promote_min_weeks: int = 4
     #: §4.4: cap 5 (a RETIREMENT criterion, never an admission gate), grace
     #: 4 weeks, floor 3 active arms, retired arms scored 8 trailing cycles.
     cap: int = 5
@@ -137,14 +132,6 @@ class SlotSpec:
     diff_clip: float = 0.05
     alpha: float = 0.05
     control_arms: tuple[ControlArm, ...] = field(default_factory=tuple)
-
-    def __post_init__(self) -> None:
-        if self.promote_min_weeks < 1:
-            raise ValueError(
-                f"promote_min_weeks must be >= 1; got {self.promote_min_weeks}. Zero "
-                "would promote an arm on its first cycle, which is the eligibility "
-                "age Brian's 2026-09-01 ruling exists to set."
-            )
 
     @property
     def arena(self) -> ArenaConfig:
@@ -166,6 +153,20 @@ class SlotSpec:
             min_active_arms=self.min_active_arms,
             retired_trailing_cycles=self.retired_trailing_cycles,
         )
+
+    @property
+    def promote_min_weeks(self) -> int:
+        """Brian's ruling, 2026-09-01, read off the library's `ArenaConfig`.
+
+        A read-only forward to :attr:`arena` rather than a stored field, so
+        the eligibility age has exactly one source of truth
+        (`alpha-engine-config-I9763`, `-I10504`) — previously this was a
+        second, crucible-local field with its own duplicate validation,
+        which is exactly the shape that let a config fact drift between two
+        readers. `crucible.promote.paired_days_required` and every other
+        consumer keep reading `spec.promote_min_weeks` unchanged.
+        """
+        return self.arena.promote_min_weeks
 
 
 def _controls(slot: str) -> tuple[ControlArm, ...]:
