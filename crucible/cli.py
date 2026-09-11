@@ -36,7 +36,7 @@ from crucible import __version__, morning, track_c, track_e, track_f  # track-C,
 from crucible.calendar import resolve_trading_day
 from crucible.fault_probe import FAULT_PROBE_JOB, fault_probe_handler
 from crucible.faults import FAULT_RECORD_JOB, record_fault
-from crucible.gate import SCRIPTED_FAULTS
+from crucible.gate import SCRIPTED_FAULTS, missing_required_env
 from crucible.iac_conformance import IAC_CONFORMANCE_JOB, iac_conformance_handler
 from crucible.keys import arena_cycle_key, champion_key
 from crucible.keys import manifest_key as _promote_manifest_key
@@ -642,6 +642,29 @@ def build_parser() -> argparse.ArgumentParser:
                 ),
             )
             sub.add_argument(
+                "--publish",
+                action="store_true",
+                # alpha-engine-config-I10492: `crucible gate` is the command
+                # every session and every runbook uses to READ where a phase
+                # stands, and it used to write `gates/{gate}/{day}/gate.json`
+                # and `gates/ladder.json` on every non-`--dry-run` invocation
+                # regardless — so a laptop read with a required var unset
+                # clobbered a correct CI reading with a false negative. The
+                # default is now the structural fix the issue names: no write
+                # unless this flag says so, on top of `--dry-run`'s existing
+                # (and unaffected) read-only guarantee. Nothing in this repo's
+                # CI (`board.yml`, `gate-close.yml`) calls `crucible gate`
+                # directly today, so no workflow needs this flag; a future
+                # scheduled publisher passes it explicitly.
+                help=(
+                    "Write the dated gate reading, the ladder and (if due) the "
+                    "phase's closing record to the store. Without it, `crucible gate` "
+                    "only reads and reports — the default, since this command is the "
+                    "one every session uses to check where a phase stands. Implies "
+                    "nothing about --dry-run: --dry-run always wins."
+                ),
+            )
+            sub.add_argument(
                 "--weeks",
                 type=int,
                 default=None,
@@ -863,6 +886,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             from crucible.llm import parse_fault_capability_class
 
             args.fault_capability_class = parse_fault_capability_class(raw_class)
+        # alpha-engine-config-I10492: `gate` and `gate.close` both live-evaluate
+        # every registered gate (`crucible.gate.build_ladder`), and two clauses
+        # need environment this tree deliberately carries no default for
+        # (`crucible.gate.GATE_REQUIRED_ENV`). A missing one used to fold into
+        # that clause's own UNMEASURABLE reading — indistinguishable from a
+        # real read failure — and get WRITTEN to the shared gate artifact,
+        # clobbering a correct CI reading. Refused here, before either job's
+        # `run_job` opens a store or attempts a read, exactly like the other
+        # operator-input validations in this block.
+        if args.job in ("gate", track_f.GATE_CLOSE_JOB):
+            missing = missing_required_env()
+            if missing:
+                # Not cited by number in this message: `tests/test_no_stale_
+                # tracker_literals.py` forbids a hardcoded tracker literal
+                # outside a docstring/comment (`alpha-engine-config-I9839`) —
+                # see the comment above for the issue this refusal exists for.
+                raise UsageError(
+                    f"crucible {args.job} refuses to read: "
+                    + ", ".join(missing)
+                    + " unset. A missing required variable is a refusal, never an "
+                    "UNMEASURABLE clause — export it per crucible/AGENTS.md's 'reading "
+                    "a gate from the laptop' recipe before re-running."
+                )
     except UsageError:
         raise
     except SystemExit as exc:
