@@ -29,7 +29,11 @@ import pytest
 
 from crucible import keys as crucible_keys
 from crucible.keys import (
+    ARM_PREDICTIONS_PREFIX,
     DRIFT_INPUTS,
+    PREDICTIONS_PREFIX,
+    arm_id_from_segment,
+    arm_predictions_key,
     cross_section_key,
     cross_section_settled_key,
     drift_input_key,
@@ -42,6 +46,7 @@ from crucible.keys import (
     heal_key,
     manifest_key,
     migration_key,
+    predictions_key,
     runs_prefix,
     shadow_key,
     strategy_arm_key,
@@ -317,3 +322,62 @@ class TestDriftHandlerKeyShape:
         manifest = json.loads(store.get_bytes(manifest_key("drift", day)).decode("utf-8"))
         assert manifest["status"] == "failed"
         assert features_key(DEFAULT_FEATURE_VERSION, day) in manifest["reason"]
+
+
+class TestPredictionsPrefixesCannotCollide:
+    """`alpha-engine-config-I9822`: the trader's serving feed and the per-arm
+    artifact shared `predictions/` and were distinguishable only by counting
+    path segments.
+
+    A consumer listing `predictions/` saw both shapes. Nothing discriminated,
+    which made this a design risk rather than a live defect — and the moment
+    something did list that prefix, the cheapest reading (`the one object for
+    this trading day`) would have matched an arm's artifact for an arm whose id
+    happened to look like a date.
+    """
+
+    def test_the_two_shapes_live_under_different_prefixes(self) -> None:
+        day = "2026-08-28"
+        feed = predictions_key(day)
+        arm = arm_predictions_key("m:base:abc123", day)
+
+        assert feed.startswith(PREDICTIONS_PREFIX)
+        assert arm.startswith(ARM_PREDICTIONS_PREFIX)
+        assert not arm.startswith(PREDICTIONS_PREFIX), (
+            "the per-arm artifact is under `predictions/` again; a listing of "
+            "that prefix now returns two shapes and every consumer must "
+            "discriminate by path depth"
+        )
+
+    def test_a_listing_of_the_feed_prefix_cannot_return_an_arm_artifact(self) -> None:
+        """The property that matters, stated as a listing rather than as a
+        string comparison: this is how a consumer actually meets the two."""
+        day = "2026-08-28"
+        keys = [predictions_key(day)] + [
+            arm_predictions_key(arm, day)
+            for arm in ("m:base:abc123", "r:llm:deadbeef", "s:momentum:0001")
+        ]
+        under_feed = [k for k in keys if k.startswith(PREDICTIONS_PREFIX)]
+        assert under_feed == [predictions_key(day)], (
+            f"listing {PREDICTIONS_PREFIX!r} returned {under_feed}; it must "
+            "return the champion's serving feed and nothing else"
+        )
+
+    def test_no_arm_id_can_make_the_two_builders_collide(self) -> None:
+        """Including the adversarial case the shared prefix allowed: an arm
+        whose id looks like a trading day."""
+        day = "2026-08-28"
+        for arm_id in ("m:base:abc123", "2026-08-28", "m:2026-08-28:x", "a:b:c"):
+            assert arm_predictions_key(arm_id, day) != predictions_key(day)
+
+    def test_the_arm_segment_stays_invertible(self) -> None:
+        """`arm_key_segment` refuses an `arm_id` already containing the
+        separator, which is what makes the segment invertible. The prefix move
+        must not have routed around it."""
+        arm_id = "m:base:abc123"
+        key = arm_predictions_key(arm_id, "2026-08-28")
+        segment = key.removeprefix(ARM_PREDICTIONS_PREFIX).split("/")[0]
+        assert arm_id_from_segment(segment) == arm_id
+
+        with pytest.raises(ValueError):
+            arm_predictions_key("m~base~abc123", "2026-08-28")
