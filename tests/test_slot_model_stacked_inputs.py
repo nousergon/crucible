@@ -152,6 +152,43 @@ class TestRegistrationRefusesWhatCannotBeProduced:
         assert recipes["stacked"].spec["inputs"] == ["predictions[base]"]
 
 
+class TestAPureMetaLearnerCanRegister:
+    """alpha-engine-config-I9821: `ModelRecipe.__post_init__`'s no-features
+    guard predated `spec.inputs` (I9777) and still tested `self.features`
+    alone, refusing a PURE meta-learner — every design column a
+    `predictions[...]` input, no feature-layer columns at all — the
+    canonical stacking ensemble. Demonstrated before the fix:
+
+        === a PURE meta-learner (only prediction inputs) cannot be declared ===
+          REFUSED: ValueError arm 'pure' declares no features
+    """
+
+    def test_a_pure_meta_learner_with_only_prediction_inputs_registers(self, tmp_path) -> None:
+        _write(tmp_path, "base", features="[mom_21d_ratio]")
+        _write(
+            tmp_path,
+            "pure",
+            features="[]",
+            inputs=("predictions[base]",),
+        )
+        loaded = load_model_recipes(tmp_path, feature_columns=_LAYER)
+        assert loaded.refused == ()
+        recipes = {r.name: r for r in loaded.registered}
+        assert recipes["pure"].design_columns == (prediction_column("base"),)
+
+    def test_an_arm_with_no_features_and_no_inputs_is_still_refused_by_name(self, tmp_path) -> None:
+        """The refusal itself is correct and must survive the fix: an arm
+        with an empty design matrix — no feature-layer columns AND no
+        inputs — cannot be fit. Construction-time refusals (this one, like
+        the missing-required-field refusal above it in `load_model_recipes`)
+        raise and end the load, rather than becoming a per-arm
+        `InputRefusal` — a recipe this malformed never reaches the
+        producibility check `InputRefusal` exists to report on."""
+        _write(tmp_path, "empty", features="[]")
+        with pytest.raises(ValueError, match=r"arm 'empty' declares no design columns"):
+            load_model_recipes(tmp_path, feature_columns=_LAYER)
+
+
 class TestTheCycleGuard:
     """Deliverable 4."""
 
