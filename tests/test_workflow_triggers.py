@@ -491,6 +491,264 @@ def test_the_lockstep_pr_job_and_the_push_job_never_both_run() -> None:
 
 
 # ---------------------------------------------------------------------------
+# alpha-engine-config-I10468: the PR job's two data-fetch steps ("Fetch the
+# PR's components.yaml as data" and "Mirror the PR's .github/workflows as
+# data") replace a `pull_request_target` job's implicit base-ref checkout
+# with the PR HEAD's tree, fetched over the read-only Contents API. Every
+# test above this section proves that replacement is SAFE (no PR-head
+# checkout, no PR-code execution). None of them prove it actually WORKS —
+# that the resulting on-disk tree is graded as the PR's, not main's, which
+# is the exact defect `alpha-engine-config-I10467`/I10468 measured on
+# `crucible-PR198`: a correct fix (dropping a cron) still failed because the
+# guard read the workflow files from the base ref while reading
+# `components.yaml` from the PR.
+#
+# This extracts BOTH real `run:` bodies (not a restatement) and executes
+# them under bash exactly as `test_the_off_main_guard_actually_exits_non_zero`
+# does, against a fake `gh api` that serves a fixture "PR head" tree that
+# differs from the "base" tree already on disk (mirroring what
+# `actions/checkout@...`'s self-checkout would have left there). The
+# assertions are on the FILES the two steps produce — the same files the
+# push job's `Lockstep guard` step (`tests/crossrepo/test_crucible_dispatch_lockstep.py`
+# in nous-ergon-ops, via `CRUCIBLE_ROOT`) reads — so a later edit that
+# reintroduces the base-tree read (e.g. dropping the Mirror step, or scoping
+# it to only NEW files) fails here without needing a live PR to notice.
+
+
+def _pr_job_step(name: str) -> str:
+    job = Workflow.load(WORKFLOW_DIR / "dispatch-lockstep.yml").jobs[
+        "crucible-dispatch-lockstep-pr"
+    ]
+    matches = [s["run"] for s in job.steps if s.get("name") == name and "run" in s]
+    assert len(matches) == 1, f"expected exactly one {name!r} step, found {len(matches)}"
+    return matches[0]
+
+
+_FAKE_GH_CONTENTS_API = r"""#!/usr/bin/env bash
+set -euo pipefail
+if [ "$1" != "api" ]; then
+  echo "unhandled fake gh invocation (not 'api'): $*" >&2
+  exit 99
+fi
+shift
+url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --jq) shift 2 ;;
+    *) if [ -z "$url" ]; then url="$1"; fi; shift ;;
+  esac
+done
+case "$url" in
+  repos/nousergon/crucible/contents/crucible/components.yaml\?ref=*)
+    cat "$FAKE_COMPONENTS_B64" ;;
+  repos/nousergon/crucible/contents/.github/workflows\?ref=*)
+    cat "$FAKE_LISTING" ;;
+  repos/nousergon/crucible/contents/.github/workflows/*\?ref=*)
+    rest="${url#repos/nousergon/crucible/contents/.github/workflows/}"
+    name="${rest%%\?*}"
+    fixture="$FAKE_WORKFLOWS_DIR/${name}.b64"
+    if [ ! -f "$fixture" ]; then
+      echo "unhandled fake gh endpoint (no fixture for ${name}): $url" >&2
+      exit 99
+    fi
+    cat "$fixture" ;;
+  *) echo "unhandled fake gh endpoint: $url" >&2; exit 99 ;;
+esac
+"""
+
+
+def _b64(text: str) -> str:
+    import base64
+
+    return base64.b64encode(text.encode()).decode()
+
+
+def _run_pr_job_data_fetch(
+    tmp_path: pathlib.Path,
+    *,
+    base_workflows: dict[str, str],
+    base_components: str,
+    head_workflows: dict[str, str],
+    head_components: str,
+) -> subprocess.CompletedProcess:
+    """Seed `tmp_path` as the PR job's self-checkout (base ref) would have
+    left it, then run the real "Fetch ... components.yaml" and "Mirror ...
+    workflows" steps against a fake Contents API answering with the HEAD
+    fixture. Returns the last step's `CompletedProcess`."""
+    (tmp_path / "crucible").mkdir()
+    (tmp_path / "crucible" / "components.yaml").write_text(base_components)
+    workflows_dir = tmp_path / ".github" / "workflows"
+    workflows_dir.mkdir(parents=True)
+    for name, content in base_workflows.items():
+        (workflows_dir / name).write_text(content)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gh").write_text(_FAKE_GH_CONTENTS_API)
+    (bin_dir / "gh").chmod(0o755)
+
+    fixtures_dir = tmp_path / "_fixtures"
+    fixtures_dir.mkdir()
+    components_fixture = fixtures_dir / "components.b64"
+    components_fixture.write_text(_b64(head_components))
+    listing_fixture = fixtures_dir / "listing.txt"
+    listing_fixture.write_text("\n".join(sorted(head_workflows)) + "\n")
+    workflows_fixture_dir = fixtures_dir / "workflows"
+    workflows_fixture_dir.mkdir()
+    for name, content in head_workflows.items():
+        (workflows_fixture_dir / f"{name}.b64").write_text(_b64(content))
+
+    env = {
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "GH_TOKEN": "fake-token",
+        "HEAD_SHA": "d" * 40,
+        "FAKE_COMPONENTS_B64": str(components_fixture),
+        "FAKE_LISTING": str(listing_fixture),
+        "FAKE_WORKFLOWS_DIR": str(workflows_fixture_dir),
+    }
+    result = None
+    for step_name in (
+        "Fetch the PR's components.yaml as data",
+        "Mirror the PR's .github/workflows as data",
+    ):
+        result = subprocess.run(
+            ["bash", "-c", _pr_job_step(step_name)],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"{step_name!r} exited {result.returncode}. "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+    assert result is not None
+    return result
+
+
+_BASE_BOARD_YML = "name: Board\non:\n  workflow_dispatch:\n"
+_HEAD_NEW_CRON_YML = "name: Integration Nightly\non:\n  schedule:\n    - cron: '0 6 * * *'\n"
+_BASE_COMPONENTS = "components:\n  board:\n    dispatch: scheduler\n"
+
+
+def test_the_lockstep_pr_job_mirrors_the_prs_tree_not_the_base_tree(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The exact defect measured on `crucible-PR198`
+    (`alpha-engine-config-I10467`/I10468): a workflow the PR ADDS, with a
+    cron, must appear in the graded tree; a workflow the PR DELETES must not
+    survive as base-tree leftover; an unrelated workflow must pass through
+    unchanged; and `components.yaml` must be the PR's content, not main's."""
+    head_components = _BASE_COMPONENTS + (
+        "  integration_nightly:\n"
+        "    dispatch: github-actions\n"
+        "    dispatch_workflow: integration-nightly.yml\n"
+    )
+    _run_pr_job_data_fetch(
+        tmp_path,
+        base_workflows={
+            "board.yml": _BASE_BOARD_YML,
+            "stale-cron.yml": "name: Stale\non:\n  schedule:\n    - cron: '0 0 * * *'\n",
+        },
+        base_components=_BASE_COMPONENTS,
+        head_workflows={
+            "board.yml": _BASE_BOARD_YML,  # unrelated — must survive unchanged
+            "integration-nightly.yml": _HEAD_NEW_CRON_YML,  # added by the PR
+            # stale-cron.yml omitted: the PR deleted it
+        },
+        head_components=head_components,
+    )
+    workflows_dir = tmp_path / ".github" / "workflows"
+    assert (workflows_dir / "board.yml").read_text() == _BASE_BOARD_YML, (
+        "an unrelated workflow must pass through the mirror unchanged"
+    )
+    assert (workflows_dir / "integration-nightly.yml").read_text() == _HEAD_NEW_CRON_YML, (
+        "a workflow the PR adds must be present with the PR's own content, not absent "
+        "the way a base-tree read would leave it"
+    )
+    assert not (workflows_dir / "stale-cron.yml").exists(), (
+        "a workflow the PR deletes must not survive as base-tree leftover — leaving it "
+        "would keep the guard failing over a file the PR already removed"
+    )
+    assert (tmp_path / "crucible" / "components.yaml").read_text() == head_components, (
+        "components.yaml must be the PR's content, not main's — the other half of the "
+        "same-commit-pair fix"
+    )
+
+
+@pytest.mark.parametrize(
+    "declares_the_row,expect_named",
+    [
+        pytest.param(True, True, id="with-registry-row"),
+        pytest.param(False, False, id="without-registry-row"),
+    ],
+)
+def test_the_mirrored_tree_grades_a_new_cron_workflow_both_directions(
+    tmp_path: pathlib.Path, declares_the_row: bool, expect_named: bool
+) -> None:
+    """Both directions of `alpha-engine-config-I10468`'s deliverable 2,
+    against the ACTUAL mirrored tree rather than a restated fixture: a PR
+    adding `integration-nightly.yml` WITH its `components.yaml` row must
+    graded-pass; the identical PR WITHOUT the row must grade-fail. Before
+    the mirror fix, neither case could ever have reached this predicate
+    correctly — the workflow the PR added was invisible (read from the base
+    tree), so `cron_workflows` never contained it and direction 2 below
+    passed vacuously regardless of the row.
+
+    The predicate itself — "every workflow declaring an `on.schedule` cron
+    is named by some row's `dispatch_workflow`" — is
+    `nous-ergon-ops/tests/crossrepo/test_crucible_dispatch_lockstep.py`'s
+    `_check_every_cron_workflow_is_named_by_a_row`, restated here in its
+    minimal pure form so this test has no dependency on that repo's checkout
+    being present; that file's own `TestTheGuardItselfFires` proves the same
+    two directions against hand-built fixtures instead of a mirrored tree.
+    """
+    head_components = _BASE_COMPONENTS
+    if declares_the_row:
+        head_components += (
+            "  integration_nightly:\n"
+            "    dispatch: github-actions\n"
+            "    dispatch_workflow: integration-nightly.yml\n"
+        )
+    _run_pr_job_data_fetch(
+        tmp_path,
+        base_workflows={"board.yml": _BASE_BOARD_YML},
+        base_components=_BASE_COMPONENTS,
+        head_workflows={
+            "board.yml": _BASE_BOARD_YML,
+            "integration-nightly.yml": _HEAD_NEW_CRON_YML,
+        },
+        head_components=head_components,
+    )
+
+    workflows_dir = tmp_path / ".github" / "workflows"
+    cron_workflows = set()
+    for path in workflows_dir.iterdir():
+        parsed = yaml.safe_load(path.read_text())
+        triggers = parsed.get(True, parsed.get("on"))
+        if isinstance(triggers, dict) and triggers.get("schedule"):
+            cron_workflows.add(path.name)
+    assert cron_workflows == {"integration-nightly.yml"}, (
+        "sanity: the mirrored tree must actually carry the new cron, or this test "
+        "proves nothing about the row"
+    )
+
+    components = yaml.safe_load((tmp_path / "crucible" / "components.yaml").read_text())
+    named = {
+        row.get("dispatch_workflow")
+        for row in components["components"].values()
+        if row.get("dispatch") == "github-actions"
+    }
+    undeclared = cron_workflows - named
+    is_named = "integration-nightly.yml" not in undeclared
+    assert is_named == expect_named, (
+        f"declares_the_row={declares_the_row}: expected "
+        f"'integration-nightly.yml' named={expect_named}, got {is_named} "
+        f"(named={named}, undeclared={undeclared})"
+    )
+
+
+# ---------------------------------------------------------------------------
 # The adversarial review recording workflow.
 #
 # What was deleted here, and why: this file used to carry ~700 lines executing
