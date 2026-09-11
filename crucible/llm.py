@@ -663,17 +663,14 @@ def registry_preflight() -> str:
     """
     from krepis import model_registry as _mr
 
-    # `_entry_reachable_from` is krepis' SINGLE implementation of R28,
+    # `entry_reachable_from` is krepis' SINGLE implementation of R28,
     # including the load-bearing rule that an entry declaring no
     # `reachable_from` is reachable from NOWHERE. Copying that rule into this
     # package would be a second implementation of the thing whose first
     # implementation drifting is the whole failure above, and it would be the
-    # copy that decided whether a box routes. It is private, which is the
-    # honest cost of reading it here; `alpha-engine-config-I10349` tracks
-    # exposing it publicly in krepis, and
-    # `tests/test_registry_preflight.py::TestTheKrepisSeamsExist` fails if it
-    # is renamed rather than letting a box discover it.
-    from krepis.router import _entry_reachable_from
+    # copy that decided whether a box routes. Public since
+    # `alpha-engine-config-I10349`.
+    entry_reachable_from = _mr.entry_reachable_from
 
     exec_context = _exec_context()
 
@@ -702,9 +699,7 @@ def registry_preflight() -> str:
         group = capability_group(capability_class)
         live = registry.live_group_ids(group)
         reachable = [
-            member
-            for member in live
-            if _entry_reachable_from(registry.models[member], exec_context)
+            member for member in live if entry_reachable_from(registry.models[member], exec_context)
         ]
         if not reachable:
             rejections = registry.capability_rejections(group)
