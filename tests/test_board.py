@@ -49,11 +49,12 @@ from crucible.board import (
     pointer_may_move,
     read_declaration,
 )
+from crucible.calendar import previous_trading_day
 from crucible.components import load_registry
 from crucible.console.classify import STATES as COMPONENT_STATES
 from crucible.console.classify import Classification
 from crucible.gate import LADDER_STATES, PHASES, evaluate
-from crucible.keys import acceptance_reading_key
+from crucible.keys import acceptance_reading_key, gate_key
 from crucible.store import LocalStore, Store
 
 ACCEPTANCE_SUITE = (
@@ -1841,3 +1842,126 @@ class TestTheImportTimeGuardsAreShownFiring:
         monkeypatch.setattr(schedule_module, "MILESTONES", (ghost,))
         with pytest.raises(ValueError, match="not in crucible.gate.PHASES"):
             _schedule_rows(None, "2026-09-04")
+
+
+# -- the freshness of the readings, not only what they say (I10508) ---------
+
+
+class TestTheGateReadingsFreshnessRow:
+    """`alpha-engine-config-I10508`'s second deliverable.
+
+    Publishing the dated readings on a cadence without this row would RELOCATE
+    the gap rather than close it: a publisher that silently stops recreates
+    exactly the condition the issue was filed for, and nothing would say so.
+    An old `gates/{gate}/{day}/gate.json` is indistinguishable from a current
+    one - the only thing separating them is a date in a key nobody compares.
+
+    Every not-fresh answer is shown FIRING, including every way of not
+    knowing. `principles.md` §2.7: a component emitting nothing is unobserved,
+    not healthy, and *no data* is never rendered green.
+    """
+
+    ROW_ID = "producer:gate-readings-fresh"
+    DAY = "2026-08-28"
+
+    def _row(self, store, day=None, **kwargs):
+        board = build_board(store, trading_day=dt.date.fromisoformat(day or self.DAY), **kwargs)
+        matches = [r for r in board.rows if r.id == self.ROW_ID]
+        assert len(matches) == 1, f"expected exactly one {self.ROW_ID} row, found {len(matches)}"
+        return matches[0]
+
+    @staticmethod
+    def _publish(store, day: str, gates=None) -> None:
+        from crucible.gate import GATES
+
+        for gate in gates if gates is not None else sorted(GATES):
+            store.put_bytes(gate_key(gate, day), b"{}")
+
+    def test_the_row_is_always_declared(self, store) -> None:
+        """Declared on every render, never conditionally added: a row that
+        appears only when there is something to say cannot say "nothing has
+        been published at all", which is the state this exists for."""
+        assert self._row(store).id == self.ROW_ID
+
+    def test_no_readings_at_all_is_unmeasured_and_red(self, store) -> None:
+        row = self._row(store)
+        assert row.state == "UNMEASURED"
+        assert row.red
+        assert "has ever been filed" in row.detail
+
+    def test_a_reading_from_the_previous_trading_day_is_met(self, store) -> None:
+        """The publisher crons at 23:00 UTC and the board renders at 21:30, so
+        on any ordinary render the newest reading is YESTERDAY's. Requiring
+        today's would make this row red every day, which is how a row stops
+        being read."""
+        previous = previous_trading_day(dt.date.fromisoformat(self.DAY)).isoformat()
+        self._publish(store, previous)
+        row = self._row(store)
+        assert row.state == "MET", row.detail
+        assert not row.red
+
+    def test_a_reading_older_than_one_trading_day_is_unmet_and_red(self, store) -> None:
+        stale = "2026-01-02"
+        self._publish(store, stale)
+        row = self._row(store)
+        assert row.state == "UNMET"
+        assert row.red
+        assert "publisher has stopped" in row.detail
+        assert stale in row.detail
+
+    def test_one_stale_gate_among_fresh_ones_still_reads_red(self, store) -> None:
+        """The row is about EVERY registered gate. A single gate that stopped
+        being published is the realistic failure - a `--gate` argument dropped
+        from a loop - and an aggregate that went green on a majority would hide
+        exactly it."""
+        from crucible.gate import GATES
+
+        gates = sorted(GATES)
+        previous = previous_trading_day(dt.date.fromisoformat(self.DAY)).isoformat()
+        self._publish(store, previous, gates=gates[1:])
+        self._publish(store, "2026-01-02", gates=gates[:1])
+        row = self._row(store)
+        assert row.state == "UNMET"
+        assert gates[0] in row.detail
+
+    def test_a_gate_with_no_reading_outranks_a_stale_one(self, store) -> None:
+        """Absence is a stronger statement than staleness, and the two want
+        different first moves: "the publisher has never run for this gate" is
+        not "the publisher has stopped"."""
+        from crucible.gate import GATES
+
+        gates = sorted(GATES)
+        self._publish(store, "2026-01-02", gates=gates[1:])
+        row = self._row(store)
+        assert row.state == "UNMEASURED"
+        assert gates[0] in row.detail
+
+    def test_a_listing_that_cannot_be_read_is_unmeasurable_not_unmet(self, store) -> None:
+        """A fault in OUR access is not a fact about the producer, and this
+        board argues that distinction harder than it argues anything else. It
+        outranks every other answer, because under it we do not KNOW the
+        producer's state."""
+
+        class _Denied(LocalStore):
+            def list_keys(self, prefix):  # noqa: ARG002
+                raise PermissionError("AccessDenied on ListObjectsV2")
+
+        previous = previous_trading_day(dt.date.fromisoformat(self.DAY)).isoformat()
+        self._publish(store, previous)
+        row = self._row(_Denied(store.root))
+        assert row.state == "UNMEASURABLE"
+        assert row.red
+        assert "fault in our access" in row.detail
+
+    def test_it_names_the_producer_a_reader_has_to_go_and_check(self, store) -> None:
+        """A red dot a reader has to ask an agent about is not a measurement.
+        `means_when_red` names the job and the reason the role might be
+        missing."""
+        row = self._row(store)
+        assert "gate-publish" in row.means_when_red
+        assert "gate-close.yml" in row.means_when_red
+
+    def test_its_artifact_cell_is_a_pasteable_store_prefix(self, store) -> None:
+        row = self._row(store)
+        assert "{" not in row.artifact and "}" not in row.artifact
+        assert row.artifact.startswith("crucible/gates")
