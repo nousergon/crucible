@@ -224,13 +224,20 @@ def _publish(args: argparse.Namespace, store: Store) -> int:
         store.put_bytes(
             key, payload, object_lock_mode=lock_mode, object_lock_retain_until=retain_until
         )
-    # Unconditional and unlocked: keyed per attempt, so it never contends
-    # with itself, and it is the durable trace that THIS attempt happened
-    # even when the identity keys needed no write at all — which is exactly
-    # the re-run-of-an-unchanged-commit case I9786 asks to be a no-op.
-    store.put_bytes(
-        provenance_key(args.sha, provenance.run_id, provenance.run_attempt), provenance.to_json()
-    )
+    # Keyed per attempt, so it never contends with a DIFFERENT attempt, and it
+    # is the durable trace that THIS attempt happened even when the identity
+    # keys needed no write at all — which is exactly the
+    # re-run-of-an-unchanged-commit case I9786 asks to be a no-op. Still
+    # unlocked (unlike the identity writes above): Object Lock retention is a
+    # claim about the wheel/release.json bytes an installer trusts, and the
+    # provenance record was never that. Immutability-checked (I9817) though:
+    # two invocations naming the SAME run_id and run_attempt describing
+    # different bytes means the record of what happened during this attempt
+    # has been silently replaced, which is a defect regardless of locking.
+    prov_key = provenance_key(args.sha, provenance.run_id, provenance.run_attempt)
+    prov_bytes = provenance.to_json()
+    if assert_immutable_write(store, prov_key, prov_bytes):
+        store.put_bytes(prov_key, prov_bytes)
     if not writes:
         print(
             f"releases/{args.sha}/ already holds exactly this identity; nothing to "

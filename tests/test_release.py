@@ -725,6 +725,47 @@ class TestImmutability:
                 run_id="2",
             )
 
+    def test_two_provenance_writes_naming_the_same_attempt_with_differing_bytes_raise(
+        self, tmp_path
+    ) -> None:
+        """alpha-engine-config-I9817: before this fix, the provenance write
+        at the end of `publish_release` was a bare, unchecked
+        `store.put_bytes` — `provenance_key` already refuses an empty
+        `run_id`/`run_attempt`, so two DIFFERENT attempts never collide, but
+        two invocations naming the SAME `run_id`/`run_attempt` and
+        describing the attempt differently silently overwrote each other.
+        The provenance record is the only durable trace that a given attempt
+        happened, so that silent overwrite must become a refusal."""
+        store = LocalStore(tmp_path)
+        publish_release(
+            store,
+            sha=SHA_A,
+            wheel=b"PK\x03\x04 wheel bytes",
+            lockfile=b"# uv.lock",
+            test_summary="42 passed",
+            workflow_run_url="https://github.com/nousergon/crucible/actions/runs/1",
+            run_id="1",
+            run_attempt="1",
+            now=dt.datetime(2026, 9, 1, 23, 4, 28, tzinfo=dt.UTC),
+        )
+        original = store.get_bytes(provenance_key(SHA_A, "1", "1"))
+        with pytest.raises(ReleaseImmutabilityError, match="already exists with different bytes"):
+            publish_release(
+                store,
+                sha=SHA_A,
+                wheel=b"PK\x03\x04 wheel bytes",
+                lockfile=b"# uv.lock",
+                # Same run_id/run_attempt as above; a DIFFERENT test_summary
+                # is enough to make the record of "what happened during this
+                # attempt" disagree with itself.
+                test_summary="a different test run entirely",
+                workflow_run_url="https://github.com/nousergon/crucible/actions/runs/1",
+                run_id="1",
+                run_attempt="1",
+                now=dt.datetime(2026, 9, 1, 23, 4, 28, tzinfo=dt.UTC),
+            )
+        assert store.get_bytes(provenance_key(SHA_A, "1", "1")) == original
+
     def test_the_comparison_is_on_the_bytes_not_on_a_recorded_digest(self, tmp_path) -> None:
         """The thing being protected is precisely the case where a recorded
         claim and the object have diverged, so a digest the writer supplies
@@ -741,7 +782,11 @@ class TestIdentityProvenanceSplit:
     """alpha-engine-config-I9786's shape, asserted directly: `release.json`
     carries only what is a deterministic function of the commit; the fields
     that move on every run live in a separate, per-attempt provenance
-    record that is never immutable-checked."""
+    record that is never immutable-checked ACROSS distinct attempts (see
+    `TestImmutability.test_a_republish_with_different_provenance_is_still_a_no_op`
+    above) but IS checked within one attempt's own key
+    (`TestImmutability.test_two_provenance_writes_naming_the_same_attempt_with_differing_bytes_raise`,
+    alpha-engine-config-I9817)."""
 
     def test_release_json_carries_no_provenance_field(self, tmp_path) -> None:
         store = LocalStore(tmp_path)

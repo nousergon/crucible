@@ -243,6 +243,32 @@ class TestPublish:
         assert store.exists(provenance_key(SHA, "33572214728", "1"))
         assert store.exists(provenance_key(SHA, "33572299999", "1"))
 
+    def test_two_publishes_naming_the_same_attempt_with_differing_bytes_raise(
+        self, tmp_path
+    ) -> None:
+        """alpha-engine-config-I9817: before this fix, the provenance write at
+        the end of `_publish` was a bare, unchecked `store.put_bytes` — two
+        invocations carrying the SAME `run_id`/`run_attempt` silently
+        overwrote each other, and the provenance record is the only durable
+        trace that a given attempt happened. `provenance_key` already refuses
+        an empty `run_id`/`run_attempt`, so this is about two invocations
+        that both supply a real, identical one but describe the attempt
+        differently (here: a different `test_summary`) — that must raise,
+        not silently replace the first record.
+        """
+        store_dir = tmp_path / "store"
+        first_provenance = _provenance_json(SHA, run_id="1", run_attempt="1")
+        second_provenance = json.dumps(
+            {**json.loads(first_provenance), "test_summary": "a different test run entirely"}
+        )
+        assert (
+            self._publish(tmp_path, store_dir, provenance_json=first_provenance, suffix="-a") == 0
+        )
+        original = LocalStore(store_dir).get_bytes(provenance_key(SHA, "1", "1"))
+        with pytest.raises(ReleaseImmutabilityError, match="already exists with different bytes"):
+            self._publish(tmp_path, store_dir, provenance_json=second_provenance, suffix="-b")
+        assert LocalStore(store_dir).get_bytes(provenance_key(SHA, "1", "1")) == original
+
     def test_publish_locks_the_wheel_and_release_json_on_s3_but_not_the_pointer(
         self, tmp_path
     ) -> None:
@@ -1136,3 +1162,56 @@ class TestTheSmokeGate:
                 f"{entry} still carries a required flag. What gates the flip is the "
                 "release verification, which raises; these rows are observations."
             )
+
+
+class TestOpenStoreRejectsAnUnknownScheme:
+    """alpha-engine-config-I9817's "found running it": a relative `file://`
+    store URI is a mistyped store URI, and AGENTS.md rule 5 says the default
+    is raise. Before this fix, `crucible.store.open_store` (what every CLI
+    `--store` flag resolves through, `deploy.py` included) fell through any
+    unrecognized scheme straight to `LocalStore(target)`, which treats the
+    whole URI string — including the `file://` prefix — as a directory name.
+    Demonstrated live: `--store file://./store` wrote to
+    `./file:/store/releases/<sha>/release.json`, one directory named `file:`
+    away from what the caller meant, and reported success.
+    """
+
+    def test_a_relative_file_scheme_uri_raises(self, tmp_path, monkeypatch) -> None:
+        from crucible.store import open_store
+
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(ValueError, match="unsupported store scheme"):
+            open_store("file://./store")
+        # The defect's own symptom: no `file:` directory materializes.
+        assert not (tmp_path / "file:").exists()
+
+    def test_publish_with_a_relative_file_scheme_uri_raises_before_any_write(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The exact repro from the issue: `crucible.deploy publish --store
+        file://./store` must refuse rather than silently publish under a
+        `file:` directory."""
+        monkeypatch.chdir(tmp_path)
+        wheel_path = tmp_path / wheel_filename_for(SHA)
+        wheel_path.write_bytes(WHEEL_BYTES)
+        meta = tmp_path / "release.json"
+        meta.write_text(_release_json(SHA, wheel=WHEEL_BYTES))
+        prov = tmp_path / "provenance.json"
+        prov.write_text(_provenance_json(SHA))
+        with pytest.raises(ValueError, match="unsupported store scheme"):
+            deploy_main(
+                [
+                    "publish",
+                    "--sha",
+                    SHA,
+                    "--store",
+                    "file://./store",
+                    "--wheel",
+                    str(wheel_path),
+                    "--release-json",
+                    str(meta),
+                    "--provenance-json",
+                    str(prov),
+                ]
+            )
+        assert not (tmp_path / "file:").exists()

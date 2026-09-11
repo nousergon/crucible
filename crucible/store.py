@@ -358,6 +358,22 @@ class LocalStore(Store):
             # Historical citation, not a phase pointer: alpha-engine-config-I9787 is
             # where this gap was first found. Kept in this comment rather than the
             # raised message per alpha-engine-config-I9839.
+            #
+            # NOTE (alpha-engine-config-I9817): this guard is NOT reachable from
+            # `crucible.release.publish_release` / `crucible.deploy._publish`
+            # today. Both resolve their lock params through
+            # `crucible.release.release_object_lock_params`, which returns
+            # `(None, None)` for any non-`S3Store` — so a LocalStore-backed
+            # release publish never reaches this branch at all; it silently
+            # publishes with no retention claim, which is correct (a laptop
+            # publish never claims retention), but means this raise defends
+            # only a caller that constructs `object_lock_mode`/
+            # `object_lock_retain_until` directly rather than through that
+            # function — a hand-rolled writer, or a future local backend that
+            # gains a partial Object Lock concept. It is not, itself, what
+            # stops the test suite from going green over an unenforced
+            # guarantee on the release path; `release_object_lock_params`'s
+            # `(None, None)` branch is.
             raise NotImplementedError(
                 f"LocalStore has no Object Lock concept and cannot honour "
                 f"object_lock_mode={object_lock_mode!r} for {key!r}. Accepting and "
@@ -678,6 +694,23 @@ def open_store(uri: str | None, *, dry_run: bool = False) -> Store:
         rest = target[len("s3://") :]
         bucket, _, prefix = rest.partition("/")
         store: Store = S3Store(bucket, prefix)
+    elif "://" in target:
+        # alpha-engine-config-I9817 ("found running it"): a `file://` (or any
+        # other) scheme fell through to `LocalStore(target)` below, which
+        # treats the whole URI string as a directory name — `file://./store`
+        # becomes a literal directory named `file:` holding a `./store`
+        # subtree, one directory level away from what the caller meant and
+        # silently accepted rather than refused. `crucible.config.store_from_uri`
+        # already refuses an unknown scheme this way; mirrored here because
+        # this is the parser CLI `--store` handlers actually call.
+        scheme = target.split("://", 1)[0]
+        raise ValueError(
+            f"unsupported store scheme {scheme!r} in {target!r}. The supported "
+            "backends are `s3://bucket/prefix` and a local directory path; an "
+            "unknown scheme is a typo, and reading it as a directory name would "
+            "write a production run into a folder named after the scheme and "
+            "report success."
+        )
     else:
         store = LocalStore(target)
     return read_only(store) if dry_run else store
