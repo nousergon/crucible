@@ -59,6 +59,7 @@ from crucible.components import Component, load_registry
 from crucible.console.classify import STATES as COMPONENT_STATES
 from crucible.console.classify import Classification
 from crucible.documents import read_store_document
+from crucible.features.depth import FEATURES_PREFIX, check_feature_layer_depth
 from crucible.gate import LADDER_STATES, Ladder, PhaseRow
 from crucible.models import BoardDeclarationRow
 from crucible.store import Store
@@ -1007,6 +1008,8 @@ def build_board(
     for name in sorted(reg):
         rows.append(_component_row(reg[name], (classifications or {}).get(name)))
 
+    rows.append(_feature_layer_depth_row(store))
+
     for row_id, declaration in decl.cutover.items():
         rows.append(_declared_row(store, f"cutover:{row_id}", declaration, day))
 
@@ -1502,6 +1505,58 @@ def _schedule_rows(ladder: Ladder | None, trading_day: str) -> list[BoardRow]:
             )
         )
     return rows
+
+
+def _feature_layer_depth_row(store: Store) -> BoardRow:
+    """`alpha-engine-config-I10498` deliverable 2: red when the live
+    `feature_version()` names a prefix shallower than another version's, or
+    absent entirely. Not sourced from `components.yaml` — this compares two
+    facts already visible to `store.list_keys`, never the output of a job —
+    so it is registered directly here rather than through the component
+    registry, the same way `_declared_row` covers a plan objective with no
+    registry row of its own.
+
+    Reads; never runs, and never raises out of the render: a listing failure
+    (a denied credential, an unreachable store) is a statement about OUR
+    access and renders `UNMEASURABLE`, distinct from `UNMET` — a real
+    comparison that came back shallow or absent.
+    """
+    try:
+        reading = check_feature_layer_depth(store)
+    except Exception as exc:  # noqa: BLE001 - the failure IS the reading
+        state, detail, last_read = (
+            "UNMEASURABLE",
+            f"could not list {FEATURES_PREFIX!r} to compare feature layer version "
+            f"depths: {type(exc).__name__}: {exc}. This is a statement about our access, "
+            "not about whether the live feature layer is orphaned.",
+            None,
+        )
+    else:
+        state = "UNMET" if reading.state == "RED" else "MET"
+        detail = reading.detail
+        last_read = reading.live_version
+
+    return BoardRow(
+        id="component:feature_layer_depth",
+        source="component",
+        section="§10 component 4 — feature registry",
+        title=(
+            "the live feature_version() catalog prefix is at least as deep as every "
+            "other version present in the store"
+        ),
+        state=state,
+        detail=detail,
+        surface="crucible board",
+        artifact=f"{FEATURES_PREFIX}<version>/*.parquet (listed, not one key)",
+        means_when_red=(
+            "a catalog edit moved the content-addressed feature_version() hash and left "
+            "a deeper backfill unreachable at its old prefix, or the live version's "
+            "prefix does not exist at all — every consumer resolves feature_version() "
+            "first, so the layer looks done on the tracker while the code sees a "
+            "handful of sessions"
+        ),
+        last_read=last_read,
+    )
 
 
 def _component_row(component: Component, classification: Classification | None) -> BoardRow:
