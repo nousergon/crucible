@@ -88,6 +88,9 @@ import numpy as np
 import yaml
 from jsonschema import Draft202012Validator
 
+from crucible.keys import strategy_slot_key
+from crucible.store import Store
+
 __all__ = [
     "COST_MODELS",
     "COST_MODEL_KINDS",
@@ -105,6 +108,7 @@ __all__ = [
     "compute_conviction_budget_multiplier",
     "cost_model_from_mapping",
     "load_portfolio_params",
+    "load_portfolio_params_from_store",
     "make_cash_sentinel_returns",
     "manifest_records_portfolio_engine",
     "params_digest",
@@ -619,6 +623,48 @@ def load_portfolio_params(path: Path | str) -> PortfolioParams:
             f"{resolved}: expected a mapping carrying a 'portfolio' block; the file declares none."
         )
     return PortfolioParams.from_mapping(payload["portfolio"], source=str(resolved))
+
+
+def load_portfolio_params_from_store(
+    slot: str,
+    *,
+    store: Store | None = None,
+    strategy_dir: Path | str | None = None,
+) -> PortfolioParams:
+    """A slot's portfolio parameter set, from a checkout or the synced store.
+
+    `alpha-engine-config-I10511`. Mirrors `crucible.slots.arms.load_arm_specs`,
+    which already solves exactly this for arm recipes: the checkout wins when
+    ``strategy_dir`` is configured — a developer editing
+    `alpha-engine-config/strategy/` expects the edit to take effect — and a
+    box with no checkout (the production path) reads the tree synced into the
+    store under `crucible.keys.strategy_slot_key(slot)` instead.
+
+    `load_portfolio_params` stays the direct-path reader both branches end up
+    delegating to (or mirroring): this is the SLOT-aware entry point
+    production code should call, so a caller never has to know in advance
+    whether it is running on a laptop with `CRUCIBLE_STRATEGY_DIR` set or on a
+    spot box with only a store.
+    """
+    if strategy_dir is not None:
+        return load_portfolio_params(Path(strategy_dir) / "slots" / f"{slot}.yaml")
+    if store is None:
+        raise ValueError("load_portfolio_params_from_store needs either a store or a strategy_dir")
+    key = strategy_slot_key(slot)
+    if not store.exists(key):
+        raise PortfolioParamsError(
+            f"no portfolio parameter set at store key {key!r}. Portfolio construction has "
+            "no default parameters: risk aversion, the turnover budget and the "
+            "participation cap are strategy edge and live in the private strategy "
+            "tree. Grading refuses rather than constructing a book on numbers this "
+            "repository invented."
+        )
+    payload = yaml.safe_load(store.get_bytes(key).decode("utf-8"))
+    if not isinstance(payload, Mapping) or "portfolio" not in payload:
+        raise PortfolioParamsError(
+            f"{key}: expected a mapping carrying a 'portfolio' block; the file declares none."
+        )
+    return PortfolioParams.from_mapping(payload["portfolio"], source=key)
 
 
 # ---------------------------------------------------------------------------

@@ -93,27 +93,29 @@ def routable(tmp_path, monkeypatch):
 
 
 class TestTheKrepisSeamsExist:
-    """The two krepis entry points this function reads, asserted by name.
+    """The krepis entry points this function reads, asserted by name.
 
-    `registry_preflight` calls `krepis.router._entry_reachable_from`, which is
-    PRIVATE. That is a deliberate, tracked cost: it is krepis' single
-    implementation of model-router-policy R28, including the rule that an
-    entry declaring no `reachable_from` is reachable from NOWHERE, and a second
-    implementation of that predicate in this package would be the copy
-    deciding whether a box may route. `alpha-engine-config-I10349` tracks
-    exposing it publicly; until then a rename must fail HERE, in CI, rather
-    than on a spot box at the first preflight.
+    `registry_preflight` calls `krepis.model_registry.entry_reachable_from` —
+    PUBLIC since `alpha-engine-config-I10349` — krepis' single implementation
+    of model-router-policy R28, including the rule that an entry declaring no
+    `reachable_from` is reachable from NOWHERE. A second implementation of
+    that predicate in this package would be the copy deciding whether a box
+    may route, so this module imports it rather than re-deriving it. Prior to
+    -I10349 this asserted the (then-private) router symbol by name so a
+    rename would fail HERE, in CI, rather than on a spot box at the first
+    preflight; the public name is a normal import now, asserted below by the
+    AST scan in `test_no_underscore_prefixed_krepis_symbol_is_imported`.
     """
 
     def test_the_reachability_predicate_is_importable_and_honours_absence(self) -> None:
-        from krepis.router import _entry_reachable_from
+        from krepis.model_registry import entry_reachable_from
 
-        assert _entry_reachable_from({"reachable_from": ["ec2"]}, "ec2") is True
-        assert _entry_reachable_from({"reachable_from": ["laptop"]}, "ec2") is False
+        assert entry_reachable_from({"reachable_from": ["ec2"]}, "ec2") is True
+        assert entry_reachable_from({"reachable_from": ["laptop"]}, "ec2") is False
         # The load-bearing half. An entry with no `reachable_from` used to be
         # reachable from everywhere, which is how the Director Lambda resolved
         # a model at a provider it reached unscanned.
-        assert _entry_reachable_from({}, "ec2") is False
+        assert entry_reachable_from({}, "ec2") is False
 
     def test_the_registry_loader_is_the_one_krepis_router_uses(self) -> None:
         from krepis import model_registry
@@ -121,6 +123,24 @@ class TestTheKrepisSeamsExist:
         assert hasattr(model_registry, "load_registry")
         assert hasattr(model_registry.Registry, "live_group_ids")
         assert hasattr(model_registry.Registry, "capability_rejections")
+
+    def test_no_underscore_prefixed_krepis_symbol_is_imported(self) -> None:
+        """`alpha-engine-config-I10349` closes-when: an AST scan, not a grep,
+        so a multi-line or aliased import cannot slip past it."""
+        import ast
+        import inspect
+
+        import crucible.llm as llm_module
+
+        tree = ast.parse(inspect.getsource(llm_module))
+        offenders = [
+            f"{node.module}.{alias.name}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module and "krepis" in node.module
+            for alias in node.names
+            if alias.name.startswith("_")
+        ]
+        assert not offenders, f"underscore-prefixed krepis import(s): {offenders}"
 
 
 class TestTheTierMappingIsReadNotCopied:

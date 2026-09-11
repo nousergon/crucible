@@ -37,7 +37,7 @@ dependencies = [
     # repo addresses a capability class and must never know which wire format
     # the router picks for it (principle 8). A second wire format joins this
     # same pin rather than becoming a crucible-level choice.
-    "krepis[openai]==0.59.53",
+    "krepis[openai]==0.59.58",
     # Run-manifest schema validation. The schema is the enforcement surface
     # for `status in {ok, failed}` (plan §4.2), so validation is a runtime
     # dependency, not a test-only one.
