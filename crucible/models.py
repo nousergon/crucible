@@ -415,6 +415,17 @@ _ISO_DATE_PATTERN = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
 _UTC_TIMESTAMP_PATTERN = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z$"
 _GIT_SHA_PATTERN = r"^[0-9a-f]{40}$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
+#: `alpha-engine-config-I10454`: the all-zero placeholder `code_sha` a
+#: dispatched box used to write, refused at the schema level as well as by
+#: `crucible.runner.resolve_code_sha` — a producer that skips the runner
+#: (or a future one that reintroduces the same default) is still stopped
+#: here. pydantic-core's regex engine has no look-around
+#: (`SchemaError: look-around ... is not supported`, measured against
+#: pydantic-core 2.46.5), so this cannot be one `pattern`; it is enforced by
+#: :meth:`RunManifestV2._code_sha_is_not_the_placeholder` AND mirrored into
+#: the published schema's `not` by `_run_manifest_v2_json_schema_extra`,
+#: same shape as the status/reason cross-field rule just above it.
+_PLACEHOLDER_GIT_SHA = "0" * 40
 
 IsoDate = Annotated[str, Field(pattern=_ISO_DATE_PATTERN, json_schema_extra={"format": "date"})]
 UtcTimestamp = Annotated[
@@ -745,6 +756,18 @@ def _run_manifest_v2_json_schema_extra(schema: dict[str, object]) -> None:
             "if": {"properties": {"status": {"const": "ok"}}, "required": ["status"]},
             "then": {"properties": {"reason": {"const": ""}}},
         },
+        # See `RunManifestV2._code_sha_is_not_the_placeholder` (alpha-engine-config-I10454)
+        # for why this is a mirrored `not` clause rather than folded into
+        # `code_sha`'s own `pattern`.
+        {
+            "description": (
+                "code_sha is never the all-zero placeholder: it validates the same pattern "
+                "as a real commit sha and answers nothing. Mirrors "
+                "`RunManifestV2._code_sha_is_not_the_placeholder`, which pydantic-core's lack "
+                "of regex look-around keeps out of `code_sha`'s own `pattern`."
+            ),
+            "not": {"properties": {"code_sha": {"const": "0" * 40}}, "required": ["code_sha"]},
+        },
     ]
 
 
@@ -913,10 +936,16 @@ class RunManifestV2(_Strict):
             "Written in the runner's `finally` block, so it is present even when the job raised."
         )
     )
+    #: The all-zero placeholder is refused, not just discouraged
+    #: (alpha-engine-config-I10454): a producer that cannot measure this for
+    #: real must not write it, and `crucible.runner.resolve_code_sha` raises
+    #: before any manifest write is attempted rather than defaulting to a
+    #: value that validated and answered nothing.
     code_sha: GitSha = Field(
         description=(
             "Commit sha of the crucible tree that ran. Half of `explain`'s answer to 'why did it "
-            "do that'."
+            "do that'. The all-zero placeholder is refused: a producer that cannot measure this "
+            "for real must not write it."
         )
     )
     release_sha: GitSha = Field(
@@ -1025,6 +1054,30 @@ class RunManifestV2(_Strict):
                 f"status is `ok` but reason={self.reason!r}, not empty. An ok run "
                 "has nothing to explain, and a non-empty reason on success is a "
                 "degraded-SUCCEEDED in disguise."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _code_sha_is_not_the_placeholder(self) -> RunManifestV2:
+        """`alpha-engine-config-I10454`: the all-zero sha validated against
+        `code_sha`'s `pattern` (forty lowercase hex characters, same as any
+        real commit) and answered nothing — every v2 manifest a dispatched
+        box wrote carried it, silently, because nothing refused it. Kept as
+        a model_validator rather than folded into `code_sha`'s `pattern`
+        because pydantic-core's regex engine has no look-around support
+        (measured against pydantic-core 2.46.5); mirrored into the
+        published schema's `not` by `_run_manifest_v2_json_schema_extra`
+        for the same reason `_status_and_reason_agree` is mirrored into its
+        `allOf` — a consumer with no Python import gets the same refusal.
+        """
+        if self.code_sha == _PLACEHOLDER_GIT_SHA:
+            raise ValueError(
+                f"code_sha is the all-zero placeholder ({_PLACEHOLDER_GIT_SHA!r}). It "
+                "validates the same pattern as a real commit sha and answers nothing — "
+                "half of `explain`'s answer to 'why did it do that' would be silently "
+                "absent. A producer that cannot measure code_sha for real must refuse to "
+                "write a manifest at all (see `crucible.runner.resolve_code_sha`), never "
+                "substitute this value."
             )
         return self
 

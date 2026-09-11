@@ -30,6 +30,7 @@ import datetime as dt
 import json
 import os
 import random
+import re
 import resource as posix_resource
 import shutil
 import signal
@@ -55,10 +56,13 @@ from crucible.store import Store, sha256_hex
 
 __all__ = [
     "MAX_ATTEMPTS",
+    "CODE_SHA_ENV",
+    "CodeShaError",
     "RunContext",
     "SpotInterruptionError",
     "TRANSIENT_CLASSIFIERS",
     "classify_transient",
+    "resolve_code_sha",
     "run_job",
     "spot_interruption_guard",
 ]
@@ -194,7 +198,6 @@ def classify_transient(exc: BaseException) -> str | None:
 
 
 _ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32
-_UNKNOWN_SHA = "0" * 40
 
 
 def _new_run_id(now: dt.datetime) -> str:
@@ -213,16 +216,62 @@ def _new_run_id(now: dt.datetime) -> str:
     return "".join(reversed(out))
 
 
-def _code_sha() -> str:
-    """The commit that is running.
+#: A real, non-placeholder git sha: forty lowercase hex characters, and
+#: explicitly NOT the all-zero placeholder (`alpha-engine-config-I10454`).
+#: `run_manifest.v2`'s `code_sha` pattern mirrors this exactly
+#: (`crucible.models._CODE_SHA_PATTERN`) — the two are asserted equal by
+#: `tests/test_runner.py`, so this module and the schema cannot drift into
+#: two different ideas of "real".
+_REAL_SHA_RE = re.compile(r"^(?!0{40}$)[0-9a-f]{40}$")
 
-    Falls back to the all-zero sha when git is unavailable (inside a wheel on
-    a spot box, there is no repository). That is a *declared* unknown carried
-    in a required field, not an omitted field: the manifest still validates
-    and `explain` still reports honestly that the sha could not be read.
+#: The box's dispatcher exports this from the SAME `releases/current` sha it
+#: already reads `CRUCIBLE_RELEASE_SHA` from
+#: (`nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml`) — a
+#: wheel install carries no git checkout, so the commit it was built from has
+#: to be carried IN the release rather than read off a working tree that
+#: does not exist there.
+CODE_SHA_ENV = "CRUCIBLE_CODE_SHA"
+
+
+class CodeShaError(RuntimeError):
+    """`code_sha` could not be resolved to a real, measured commit sha.
+
+    Raised, never defaulted around (repo rule 5): a `0`*40 placeholder used
+    to validate and answer nothing (`alpha-engine-config-I10454`) — half of
+    `explain`'s answer to "why did it do that" was silently absent on every
+    manifest a dispatched box ever wrote. Raised BEFORE `run_job` writes
+    anything, mirroring `crucible.runmode.RunModeError`'s shape: refusing
+    here, before any work starts, is what keeps this refusal from colliding
+    with "manifest or it did not happen" — the process never reaches a job
+    that would need one.
     """
-    env = os.environ.get("CRUCIBLE_CODE_SHA")
-    if env and len(env) == 40:
+
+
+def resolve_code_sha() -> str:
+    """The commit sha of the crucible tree that is running, or raise
+    :class:`CodeShaError`.
+
+    `$CRUCIBLE_CODE_SHA` wins when set — the box's own answer, carried in
+    the release rather than read from a working tree a wheel install does
+    not have. Off the box (a laptop or CI run, inside a real git checkout)
+    the variable is normally unset and `git rev-parse HEAD` in the tree this
+    module ships from is the real answer.
+
+    Either source producing something other than a real 40-character
+    lowercase git sha — unset and no git, a malformed export, a detached
+    checkout with no commits — is refused rather than written as the
+    all-zero placeholder that used to validate and answer nothing.
+    """
+    env = os.environ.get(CODE_SHA_ENV)
+    if env is not None:
+        if not _REAL_SHA_RE.match(env):
+            raise CodeShaError(
+                f"${CODE_SHA_ENV}={env!r} is not a real 40-character lowercase git sha (or "
+                "is the all-zero placeholder). The box's dispatcher exports this from the "
+                "sha under `releases/current`; a malformed value there is a deploy-time "
+                "defect, and code_sha cannot be written as a value nobody measured "
+                "(repo rule 5)."
+            )
         return env
     try:
         out = subprocess.run(
@@ -233,10 +282,20 @@ def _code_sha() -> str:
             check=False,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         )
-    except (OSError, subprocess.SubprocessError):
-        return _UNKNOWN_SHA
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CodeShaError(
+            f"${CODE_SHA_ENV} is unset and `git rev-parse HEAD` could not run ({exc}). "
+            "code_sha cannot be written as a value nobody measured (repo rule 5) — export "
+            f"${CODE_SHA_ENV} on a box with no git checkout, or run from inside one."
+        ) from exc
     sha = out.stdout.strip()
-    return sha if out.returncode == 0 and len(sha) == 40 else _UNKNOWN_SHA
+    if out.returncode != 0 or not _REAL_SHA_RE.match(sha):
+        raise CodeShaError(
+            f"${CODE_SHA_ENV} is unset and `git rev-parse HEAD` did not return a real sha "
+            f"(exit {out.returncode}, stdout {sha!r}). code_sha cannot be written as a value "
+            "nobody measured (repo rule 5)."
+        )
+    return sha
 
 
 def _utc(now: dt.datetime) -> str:
@@ -665,6 +724,12 @@ def run_job(
     # invocation that never said whether it was live or a replay is refused
     # while refusing is still free.
     resolved_run_mode = resolve_run_mode(run_mode)
+    # Same shape, same reason (alpha-engine-config-I10454): a code_sha this
+    # process cannot measure for real is refused HERE, before any manifest
+    # write is attempted — never written as the all-zero placeholder, and
+    # never deferred to the write path, where a raise would collide with
+    # "manifest or it did not happen" (see `CodeShaError`).
+    resolved_code_sha = resolve_code_sha()
     if trading_day is None:
         trading_day = resolve_trading_day(started)
     else:
@@ -764,6 +829,7 @@ def run_job(
                         started=started,
                         now=now,
                         release_sha=release_sha,
+                        code_sha=resolved_code_sha,
                     )
 
         if transient is None:
@@ -780,6 +846,7 @@ def _write_manifest(
     started: dt.datetime,
     now: dt.datetime | None,
     release_sha: str | None,
+    code_sha: str,
 ) -> dict[str, Any]:
     """Assemble, validate and write one manifest. The single writer.
 
@@ -829,8 +896,8 @@ def _write_manifest(
         "reason": _fit(reason, _schema_max_length("reason")),
         "started": _utc(started),
         "finished": _utc(finished),
-        "code_sha": _code_sha(),
-        "release_sha": release_sha or os.environ.get("CRUCIBLE_RELEASE_SHA") or _code_sha(),
+        "code_sha": code_sha,
+        "release_sha": release_sha or os.environ.get("CRUCIBLE_RELEASE_SHA") or code_sha,
         "seed": ctx.seed,
         "inputs": ctx.inputs,
         "outputs": ctx.outputs,
@@ -886,7 +953,14 @@ def _write_manifest(
         # A validator that can veto the write INVERTS the one guarantee this
         # system rests on. See :func:`_minimal_failed_manifest`.
         manifest = _minimal_failed_manifest(
-            ctx, status=status, reason=reason, started=started, finished=finished, detail=str(exc)
+            ctx,
+            status=status,
+            reason=reason,
+            started=started,
+            finished=finished,
+            detail=str(exc),
+            code_sha=code_sha,
+            release_sha=release_sha or os.environ.get("CRUCIBLE_RELEASE_SHA") or code_sha,
         )
         validate(manifest)
     store.put_bytes(key, json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"))
@@ -953,6 +1027,8 @@ def _minimal_failed_manifest(
     started: dt.datetime,
     finished: dt.datetime,
     detail: str,
+    code_sha: str,
+    release_sha: str,
 ) -> dict[str, Any]:
     """The manifest written when the real one will not validate.
 
@@ -1008,8 +1084,8 @@ def _minimal_failed_manifest(
         ),
         "started": _utc(started),
         "finished": _utc(finished),
-        "code_sha": _code_sha(),
-        "release_sha": os.environ.get("CRUCIBLE_RELEASE_SHA") or _code_sha(),
+        "code_sha": code_sha,
+        "release_sha": release_sha,
         "seed": ctx.seed,
         "inputs": [],
         "outputs": [],

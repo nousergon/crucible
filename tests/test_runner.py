@@ -22,7 +22,7 @@ import os
 import pytest
 
 from crucible.manifest import ManifestValidationError, manifest_key, validate
-from crucible.runner import RunContext, run_job
+from crucible.runner import CodeShaError, RunContext, run_job
 from crucible.store import LocalStore
 
 TRADING_DAY = dt.date(2026, 8, 28)
@@ -158,6 +158,93 @@ class TestResourceBlockIsMeasured:
         doc = _read_manifest(store, "smoke")
         assert doc["resource"]["mem_peak_mb"] > 0.0
         assert doc["resource"]["disk_free_mb"] > 0.0
+
+
+class TestCodeShaIsMeasuredNotPlaceholder:
+    """`alpha-engine-config-I10454`: every v2 manifest wrote `code_sha` as
+    forty zeros on a dispatched box — a value that validated and answered
+    nothing, half of `explain`'s answer to 'why did it do that' silently
+    absent. `resolve_code_sha` refuses rather than defaults; these tests
+    show the refusal firing, mirroring `TestResourceBlockIsMeasured`'s
+    `CRUCIBLE_LIFECYCLE=unknown` shape above.
+    """
+
+    def test_crucible_code_sha_env_is_used_when_set(self, tmp_path, monkeypatch) -> None:
+        """The box's dispatcher exports this from the same `releases/current`
+        sha it already reads `CRUCIBLE_RELEASE_SHA` from — a wheel install
+        has no git checkout to read it from otherwise."""
+        store = LocalStore(tmp_path)
+        real_sha = "c" * 40
+        monkeypatch.setenv("CRUCIBLE_CODE_SHA", real_sha)
+
+        run_job("smoke", lambda ctx: None, store=store, trading_day=TRADING_DAY)
+
+        doc = _read_manifest(store, "smoke")
+        assert doc["code_sha"] == real_sha
+
+    def test_an_all_zero_crucible_code_sha_env_is_refused_not_written(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A malformed export is a deploy-time defect, not a run-time one to
+        paper over: the placeholder must be refused even when it arrives
+        THROUGH the env var meant to carry the real value."""
+        store = LocalStore(tmp_path)
+        monkeypatch.setenv("CRUCIBLE_CODE_SHA", "0" * 40)
+
+        with pytest.raises(CodeShaError, match="CRUCIBLE_CODE_SHA"):
+            run_job("smoke", lambda ctx: None, store=store, trading_day=TRADING_DAY)
+
+        assert not store.exists(manifest_key("smoke", TRADING_DAY.isoformat()))
+
+    def test_git_unavailable_and_no_env_refuses_the_run_rather_than_defaulting(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The measured defect (I10454's issue body): a dispatched box
+        installs a wheel with no git checkout, so `git rev-parse HEAD` used
+        to fail and the runner fell back to the all-zero placeholder. It now
+        refuses instead, before any manifest write is attempted — no
+        `run.json` at all, same as `CRUCIBLE_LIFECYCLE=unknown` above, rather
+        than a manifest asserting a measurement nobody took (repo rule 5)."""
+        store = LocalStore(tmp_path)
+        monkeypatch.delenv("CRUCIBLE_CODE_SHA", raising=False)
+        monkeypatch.setenv("PATH", str(tmp_path))  # a directory with no `git` in it
+
+        with pytest.raises(CodeShaError, match="CRUCIBLE_CODE_SHA"):
+            run_job("smoke", lambda ctx: None, store=store, trading_day=TRADING_DAY)
+
+        assert not store.exists(manifest_key("smoke", TRADING_DAY.isoformat()))
+
+    def test_git_is_used_when_the_env_var_is_absent(self, tmp_path, monkeypatch) -> None:
+        """The laptop/CI path: no box shell ran this process, so
+        `git rev-parse HEAD` against the tree this module ships from is the
+        real answer, and it is a real, non-placeholder 40-hex sha."""
+        store = LocalStore(tmp_path)
+        monkeypatch.delenv("CRUCIBLE_CODE_SHA", raising=False)
+
+        run_job("smoke", lambda ctx: None, store=store, trading_day=TRADING_DAY)
+
+        doc = _read_manifest(store, "smoke")
+        assert doc["code_sha"] != "0" * 40
+        assert len(doc["code_sha"]) == 40
+        int(doc["code_sha"], 16)  # every character is real hex
+
+    def test_a_failed_run_still_carries_a_real_code_sha(self, tmp_path, monkeypatch) -> None:
+        """The manifest guarantee holds on the failure path, and code_sha is
+        never the exception: `_minimal_failed_manifest` must carry the SAME
+        resolved value as the primary write, not recompute it."""
+        store = LocalStore(tmp_path)
+        real_sha = "d" * 40
+        monkeypatch.setenv("CRUCIBLE_CODE_SHA", real_sha)
+
+        def boom(ctx: RunContext) -> None:
+            raise ValueError("deliberate")
+
+        with pytest.raises(ValueError):
+            run_job("smoke", boom, store=store, trading_day=TRADING_DAY, transient_retry=False)
+
+        doc = _read_manifest(store, "smoke")
+        assert doc["status"] == "failed"
+        assert doc["code_sha"] == real_sha
 
 
 class TestFailurePath:

@@ -377,6 +377,19 @@
           }
         }
       }
+    },
+    {
+      "description": "code_sha is never the all-zero placeholder: it validates the same pattern as a real commit sha and answers nothing. Mirrors `RunManifestV2._code_sha_is_not_the_placeholder`, which pydantic-core's lack of regex look-around keeps out of `code_sha`'s own `pattern`.",
+      "not": {
+        "properties": {
+          "code_sha": {
+            "const": "0000000000000000000000000000000000000000"
+          }
+        },
+        "required": [
+          "code_sha"
+        ]
+      }
     }
   ],
   "description": "The record every job writes at runs/{job}/{trading_day}/run.json. This schema is the enforcement surface for the plan's central guarantee (\u00a74.2): a run is `ok` or it is `failed`; there is no third state, and it is excluded here rather than by policy. It is also the observability contract (\u00a79.2): one document carries all five signal classes \u2014 execution, cost/tokens, resource, data lineage, and outcome vs baseline \u2014 under one run_id. v2 adds one REQUIRED field, `run_mode`, and is otherwise byte-for-byte v1's contract. v1 declared `additionalProperties: false` and no live/replay field, so no producer could say whether a run was a live Saturday or a replay of a historical one, and phase 2's exit gate (plan \u00a76 row 2 / \u00a76.1) was permanently UNMEASURABLE \u2014 I9918. It is a NEW VERSION rather than a v1 addition because a required field added to v1 would retroactively invalidate every manifest already in the store: `run_manifest.v1.json` stays in this package, frozen, and every object written under it stays readable at its own declared version. Nothing backfills those objects \u2014 a manufactured `run_mode` on a run nobody observed is exactly the false liveness claim this field exists to prevent.",
@@ -398,7 +411,7 @@
       "type": "string"
     },
     "code_sha": {
-      "description": "Commit sha of the crucible tree that ran. Half of `explain`'s answer to 'why did it do that'.",
+      "description": "Commit sha of the crucible tree that ran. Half of `explain`'s answer to 'why did it do that'. The all-zero placeholder is refused: a producer that cannot measure this for real must not write it.",
       "pattern": "^[0-9a-f]{40}$",
       "title": "Code Sha",
       "type": "string"
