@@ -129,6 +129,17 @@ PR_REACHABLE_JOBS: dict[str, str] = {
         "below is the structural guard that a later edit cannot quietly "
         "reintroduce a PR-head checkout or PR-code execution here."
     ),
+    # alpha-engine-config-I10128 deliverable 2 (ported from
+    # alpha-engine-config's own gate-label-guard.yml, the fleet reference
+    # implementation).
+    "gate-label-guard.yml:gate-label-guard": (
+        "reads only `GITHUB_EVENT_PATH` -- the PR's own labels and body, "
+        "already present in the triggering event payload -- and does no "
+        "checkout, no AWS call and no network I/O of any kind. Its subject "
+        "is the diff's own metadata, not live infrastructure, so "
+        "scm-platform-policy.md section 3.1 places it squarely on the "
+        "pull_request path rather than excluding it."
+    ),
 }
 
 

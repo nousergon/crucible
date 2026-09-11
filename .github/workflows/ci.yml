@@ -7,14 +7,13 @@ name: CI
 # earlier version of this comment asserted "public, so those minutes are free"
 # in the present tense, which was wrong on the day it was written.
 #
-# Three workflows in this repo and no others (revised 2026-09-02 — plan §11
-# risk 1 added `adversarial-review-gate.yml` after this comment was written;
-# see that file for why it does not repeat the sixteen-workflows-per-repo
-# mistake: it is two thin `gh api` calls, no checkout, no `uv sync`). Every
-# guard the v1 repos carry as a per-repo workflow is a pytest in `tests/`
-# here, or it is not carried: sixteen workflows per repo is how a fleet
-# spends 66% of its metered CI minutes on one private repo. deploy.yml is
-# track C's.
+# The set of workflows in this repo, and the rule for adding another, live in
+# `AGENTS.md` § Layout — never restated here as a count (alpha-engine-config-I9887:
+# this comment used to say "three workflows ... and no others" against a tree
+# that had grown to four within a day of being written, then nine). Sixteen
+# workflows per repo is how a fleet spends 66% of its metered CI minutes on
+# one private repo; the rule that keeps this repo off that path is in
+# `AGENTS.md`, not here.
 
 on:
   push:
@@ -139,6 +138,39 @@ jobs:
 
       - name: Format check
         run: uv run --frozen ruff format --check
+
+      # Supply-chain gate (alpha-engine-config-I10140: "no pip-audit step
+      # found" against this repo's own conformance sweep, pip-audit-blocking,
+      # config#3088). Blocking, never `continue-on-error` / `|| true` — the
+      # sweep's own check (`_pip_audit_workflow_violation`) fails a repo that
+      # runs pip-audit non-blocking exactly as hard as one that never runs it.
+      #
+      # `uv export` reads the locked, --frozen dependency graph rather than
+      # re-resolving one (same "the lockfile IS the supply chain" argument as
+      # the Install step above) — pip-audit itself never touches uv.lock or
+      # pyproject.toml. pip-audit is installed via bare `pip`, not `uv run
+      # --with` (that re-resolves an environment and trips
+      # tests/test_ci_checks_the_lockfile.py::test_every_uv_run_is_frozen,
+      # which is correct to object — pip-audit is a CI-only tool, not a
+      # runtime or test dependency, so it belongs in neither pyproject.toml
+      # nor uv.lock). Mirrors the fleet's existing per-repo pip-audit steps
+      # (alpha-engine-config/.github/workflows/pip-audit.yml,
+      # crucible-backtester's `ci.yml`) rather than inventing a uv-specific
+      # shortcut.
+      - name: Install pip-audit
+        run: python3 -m pip install --quiet --upgrade pip pip-audit
+
+      - name: Security audit (pip-audit)
+        run: |
+          set -euo pipefail
+          uv export --frozen --no-hashes --no-editable --format requirements-txt > /tmp/requirements-audit.txt
+          IGNORE_ARGS=()
+          if [ -f .github/pip-audit-ignore.txt ]; then
+            while IFS= read -r vuln_id; do
+              IGNORE_ARGS+=(--ignore-vuln "$vuln_id")
+            done < <(grep -vE '^\s*#|^\s*$' .github/pip-audit-ignore.txt)
+          fi
+          pip-audit -r /tmp/requirements-audit.txt "${IGNORE_ARGS[@]}"
 
       # The blocking gate. tests/acceptance is excluded here and run as its
       # own reporting job below — see the comment there for why that is not a
