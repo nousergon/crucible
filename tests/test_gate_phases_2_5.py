@@ -489,21 +489,68 @@ def _store_whose_pointer_flipped(at: dt.datetime | None, *, raises: Exception | 
     return S3Store(TEST_BUCKET, "crucible", client=_HeadOnlyS3(response))
 
 
-class _DescribeOnlyCfn:
-    def __init__(self, response: dict | Exception) -> None:
+class _StackReadingCfn:
+    """`describe_stacks`, plus the `list_stack_resources` paginator
+    `crucible.tags._stack_resources` drives — the two reads
+    `gate._stack_last_updated` combines since `alpha-engine-config-I10527`.
+
+    ``list_error`` raises out of `get_paginator`, which is where a real
+    `AccessDenied` on `cloudformation:ListStackResources` surfaces.
+    """
+
+    def __init__(
+        self,
+        response: dict | Exception,
+        resources: list[dict] | None = None,
+        list_error: Exception | None = None,
+    ) -> None:
         self._response = response
+        self._resources = resources or []
+        self._list_error = list_error
 
     def describe_stacks(self, **_: object) -> dict:
         if isinstance(self._response, Exception):
             raise self._response
         return self._response
 
+    def get_paginator(self, name: str):
+        assert name == "list_stack_resources"
+        if self._list_error is not None:
+            raise self._list_error
+        resources = self._resources
 
-def _stack_applied(monkeypatch: pytest.MonkeyPatch, at: dt.datetime | None, **extra) -> None:
+        class _Paginator:
+            def paginate(self, **_: object):
+                yield {"StackResourceSummaries": list(resources)}
+
+        return _Paginator()
+
+
+def _stack_applied(
+    monkeypatch: pytest.MonkeyPatch,
+    at: dt.datetime | None,
+    *,
+    resources: list[dict] | None = None,
+    list_error: Exception | None = None,
+    **extra,
+) -> None:
+    """A stack whose update STARTED at ``at``.
+
+    Default `resources`: one resource settled at that same instant — the
+    no-op case for `alpha-engine-config-I10527`, which leaves every case
+    written before it reading exactly as it did. Pass `resources` to make the
+    stack's resources settle LATER than the update's start, which is the
+    real shape of an apply.
+    """
     stack: dict = {"LastUpdatedTime": at} if at is not None else {}
     stack.update(extra)
+    stamp = at if at is not None else extra.get("CreationTime")
+    if resources is None and list_error is None:
+        resources = [{"LastUpdatedTimestamp": stamp}]
     monkeypatch.setattr(
-        autonomy_module, "_cfn_client", lambda: _DescribeOnlyCfn({"Stacks": [stack]})
+        autonomy_module,
+        "_cfn_client",
+        lambda: _StackReadingCfn({"Stacks": [stack]}, resources, list_error),
     )
 
 
@@ -511,7 +558,7 @@ def _cfn_unreadable(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         autonomy_module,
         "_cfn_client",
-        lambda: _DescribeOnlyCfn(RuntimeError("ExpiredToken")),
+        lambda: _StackReadingCfn(RuntimeError("ExpiredToken")),
     )
 
 
@@ -752,6 +799,134 @@ class TestTheAutonomyWindowStartsAtTheSystemsLastChange:
         clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
         assert clause.unmeasurable and not clause.met
         assert "RuntimeError" in clause.detail
+
+
+class TestTheStackChangeEndsWhenItsResourcesSettleNotWhenItStarted:
+    """`alpha-engine-config-I10527`. `DescribeStacks` `LastUpdatedTime` is
+    stamped when the update STARTS (`ExecuteChangeSet`); the CreateRole /
+    PutRolePolicy calls the update then performs land AFTER it and are
+    recorded under the OPERATOR's principal. Measured on the 2026-09-12 apply
+    of `-I10508`'s `GatePublisherRole`: stack 01:56:25.883Z, `CreateRole` and
+    `PutRolePolicy` 01:56:32Z. That apply was the system's last change, so its
+    own two calls sat inside the window and the clause read `2 human mutating
+    call(s)` — unclearable until something unrelated moved the window. It was
+    masked only because `crucible-PR224` merged eight minutes later.
+    """
+
+    #: The update's start, and the resource instant seven seconds later at
+    #: which the last role actually settled — the real 2026-09-12 shape, with
+    #: the sub-second component that puts the settle AFTER CloudTrail's
+    #: second-truncated `eventTime` for the same call.
+    STARTED = CHANGE_LONG_BEFORE
+    SETTLED = CHANGE_LONG_BEFORE + dt.timedelta(seconds=7, milliseconds=345)
+
+    def test_the_later_resource_timestamp_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stack_applied(
+            monkeypatch,
+            self.STARTED,
+            resources=[
+                {"LastUpdatedTimestamp": self.STARTED},
+                {"LastUpdatedTimestamp": self.SETTLED},
+            ],
+        )
+        change = gate_module._stack_last_updated()
+        assert change.at == self.SETTLED
+        assert "newest resource LastUpdatedTimestamp" in change.detail
+
+    def test_the_stack_instant_is_a_floor_the_resources_can_never_lower(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A resource that settled BEFORE the update's start — an unchanged
+        resource carried through the update — must not pull the window's start
+        backward over changes it never saw."""
+        _stack_applied(
+            monkeypatch,
+            self.STARTED,
+            resources=[{"LastUpdatedTimestamp": self.STARTED - dt.timedelta(days=40)}],
+        )
+        change = gate_module._stack_last_updated()
+        assert change.at == self.STARTED
+        assert "at or after every one of 1 resource timestamp(s)" in change.detail
+
+    def test_equal_instants_are_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stack_applied(
+            monkeypatch, self.STARTED, resources=[{"LastUpdatedTimestamp": self.STARTED}]
+        )
+        change = gate_module._stack_last_updated()
+        assert change.at == self.STARTED
+
+    def test_unlistable_resources_fall_back_with_the_reason_recorded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Not a silent swallow, and not fail-open: `LastUpdatedTime` is the
+        EARLIER of the two, so the fallback can only widen the window and make
+        the clause read UNMET more loudly — never clean. The reason rides in
+        the provenance string, which is what the gate detail renders."""
+        _stack_applied(
+            monkeypatch,
+            self.STARTED,
+            list_error=RuntimeError("AccessDenied: cloudformation:ListStackResources"),
+        )
+        change = gate_module._stack_last_updated()
+        assert change.at == self.STARTED
+        assert "unlistable" in change.detail
+        assert "ListStackResources" in change.detail
+
+    def test_an_undescribable_stack_is_still_unmeasurable_not_a_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The floor itself is unknown there, which is a different thing from
+        a floor that could not be refined."""
+        _cfn_unreadable(monkeypatch)
+        with pytest.raises(gate_module.LastChangeUnreadableError, match="describe_stacks"):
+            gate_module._stack_last_updated()
+
+    def test_the_applys_own_iam_calls_fall_outside_the_window_it_opened(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The closes-when: an apply that is the system's last change reads 0
+        human mutating calls, not 2."""
+        _archive(monkeypatch)
+        _stack_applied(
+            monkeypatch,
+            self.STARTED,
+            resources=[{"LastUpdatedTimestamp": self.SETTLED}],
+        )
+        _counting(
+            monkeypatch,
+            _Counted(
+                actions=(
+                    _action("2026-08-10T09:00:07Z", "CreateRole"),
+                    _action("2026-08-10T09:00:07Z", "PutRolePolicy"),
+                )
+            ),
+        )
+        store = _store_whose_pointer_flipped(self.STARTED - dt.timedelta(days=30))
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.met and not clause.unmeasurable
+        assert "0 human mutating calls" in clause.detail
+        assert "newest resource LastUpdatedTimestamp" in clause.detail
+
+    def test_a_call_after_the_resources_settled_is_still_counted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The fix moves the boundary by seconds, not past the next hand-run
+        mutation — a hand-run `update-stack` on a resource the machine
+        allowlist never anticipated must still read as a human touch, which is
+        why the `invokedBy: cloudformation.amazonaws.com` filter was refused."""
+        _archive(monkeypatch)
+        _stack_applied(
+            monkeypatch,
+            self.STARTED,
+            resources=[{"LastUpdatedTimestamp": self.SETTLED}],
+        )
+        _counting(
+            monkeypatch, _Counted(actions=(_action("2026-08-12T11:00:00Z", "PutRolePolicy"),))
+        )
+        store = _store_whose_pointer_flipped(self.STARTED - dt.timedelta(days=30))
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert not clause.met and not clause.unmeasurable
+        assert "1 human mutating call(s)" in clause.detail
 
 
 class TestTheMinimumSpanIsDerivedFromTheCycleRequirement:
