@@ -37,6 +37,11 @@ from crucible.calendar import resolve_trading_day
 from crucible.fault_probe import FAULT_PROBE_JOB, fault_probe_handler
 from crucible.faults import FAULT_RECORD_JOB, record_fault
 from crucible.gate import SCRIPTED_FAULTS, missing_required_env
+from crucible.holdout import (
+    HOLDOUT_JOB,
+    add_holdout_arguments,
+    holdout_handler,
+)
 from crucible.iac_conformance import IAC_CONFORMANCE_JOB, iac_conformance_handler
 from crucible.keys import arena_cycle_key, champion_key
 from crucible.keys import manifest_key as _promote_manifest_key
@@ -354,6 +359,16 @@ JOBS: dict[str, JobSpec] = {
     "promote": JobSpec("promote", "Move a slot's champion pointer, evidence-gated", False),
     "report": JobSpec("report", "Reduce the week's manifests into the attribution table", True),
     "explain": JobSpec("explain", "Walk a run_id or verdict back to what produced it", False),
+    # `alpha-engine-config-I10502` (phase-3 `sealed_holdout`). NOT scheduled,
+    # and it must never be: unsealing the holdout is a RESERVED matter
+    # (`principles.md` §3.2), so a clock that could invoke this would be an
+    # automation holding an authority reserved to a human ruling. The read
+    # form writes no manifest at all (see `holdout_handler`).
+    HOLDOUT_JOB: JobSpec(
+        HOLDOUT_JOB,
+        "Read the sealed holdout's seal state, or unseal it under a ruling",
+        False,
+    ),
     "migrate.history": JobSpec(
         "migrate.history", "Import v1 arm history with its provenance", False
     ),
@@ -501,6 +516,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     ),
     # track-C handlers live in crucible/track_c.py so three tracks can land
     # code in parallel without editing one another's lines.
+    HOLDOUT_JOB: holdout_handler,
     "release.pin": track_c.release_pin_handler,
     RELEASE_LOCK_JOB: release_lock_handler,
     "smoke": track_c.smoke_handler,
@@ -698,6 +714,8 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if spec.name == "data.heal":
             sub.add_argument("--gap", required=True, help="The named gap to repair.")
+        if spec.name == HOLDOUT_JOB:
+            add_holdout_arguments(sub)
         if spec.name == FAULT_RECORD_JOB:
             sub.add_argument(
                 "--fault",

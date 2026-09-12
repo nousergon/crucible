@@ -78,6 +78,8 @@ __all__ = [
     "gate_key",
     "gate_prefix",
     "heal_key",
+    "holdout_unseal_key",
+    "holdout_unseal_prefix",
     "iac_conformance_key",
     "is_manifest_key",
     "ledger_key",
@@ -104,6 +106,7 @@ __all__ = [
     "signals_key",
     "strategy_arm_key",
     "strategy_arms_prefix",
+    "strategy_holdout_key",
     "strategy_slot_key",
     "strategy_slots_prefix",
     "universe_members_key",
@@ -660,6 +663,68 @@ def experiments_prefix(arm_id: str) -> str:
     shape those four key functions already own.
     """
     return f"experiments/{arm_key_segment(arm_id)}/"
+
+
+def strategy_holdout_key() -> str:
+    """The sealed holdout document, inside the synced strategy tree (plan §9.4).
+
+    `alpha-engine-config-I10502`. A sibling of :func:`strategy_arm_key` and
+    :func:`strategy_slot_key` and, like them, a document AUTHORED in the
+    private strategy tree (`alpha-engine-config/strategy/holdout.json`) and
+    published into the store under `strategy/current/` — which held-out
+    sessions are reserved is strategy edge, not framework
+    (`repository-tiering-policy` test 2).
+
+    Dateless, like :func:`retirement_log_key` and every other pointer-shaped
+    document: a holdout is not a per-session artifact, it is the standing
+    reservation every session's grading is measured outside of. The §4.12
+    walk skips keys with no date component; the seal's own
+    ``sealed_trading_day`` carries the day it was sealed on, inside the
+    document, where it belongs.
+
+    Takes no argument: there is ONE holdout for the harness, not one per
+    slot. A per-slot holdout would let a slot grade itself against a
+    reservation of its own choosing, which is the property `-I10502` exists
+    to remove.
+    """
+    return "strategy/current/holdout.json"
+
+
+def holdout_unseal_prefix() -> str:
+    """The prefix under which every holdout unseal audit record lives.
+
+    `holdout_unseal_key(trading_day, ruling)` for any argument starts with
+    this prefix — `crucible.holdout.unseal_records` (and the phase-3
+    `sealed_holdout` clause, through it) lists this rather than restating the
+    shape. An unseal nobody can enumerate is an unseal nobody audits.
+    """
+    return "holdout/unseal/"
+
+
+def holdout_unseal_key(trading_day: str, ruling: str) -> str:
+    """One unseal audit record: WHO ruled, on WHICH session, unsealing WHAT.
+
+    `alpha-engine-config-I10502`. Keyed by trading day like everything else
+    (§4.12), then by the ruling reference — so a second unseal under the same
+    ruling on the same session is idempotent by construction (the same key,
+    the same content-addressed bytes) while two different rulings on one day
+    are two records rather than one silently overwriting the other.
+
+    ``ruling`` is validated by `crucible.holdout.assert_ruling_reference`
+    BEFORE it reaches here; this function refuses an empty one only, the same
+    way every other key function in this module refuses an empty segment —
+    the grammar of a ruling reference is the holdout module's to own, and
+    restating it here would be the second declaration that drifts.
+    """
+    assert_trading_day(trading_day, context=f"holdout_unseal_key({ruling!r})")
+    if not ruling:
+        raise ValueError(
+            "an unseal record needs a ruling reference — the whole point of the "
+            "record is naming the human decision that authorised the read, and a "
+            "blank segment would file it at a key indistinguishable from any other "
+            "unauthorised unseal's."
+        )
+    return f"{holdout_unseal_prefix()}{trading_day}/{ruling}.json"
 
 
 def retirement_log_key(slot: str) -> str:
