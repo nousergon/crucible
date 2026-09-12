@@ -4102,12 +4102,14 @@ class _SystemChange:
     source: str
     pointer_at: dt.datetime
     stack_at: dt.datetime
+    stack_detail: str = ""
 
     def provenance(self) -> str:
+        stack_note = f" [{self.stack_detail}]" if self.stack_detail else ""
         return (
             f"window starts {self.at.isoformat()} ({self.source}); release pointer "
             f"{POINTER_KEY} flipped {self.pointer_at.isoformat()}, stack last updated "
-            f"{self.stack_at.isoformat()}"
+            f"{self.stack_at.isoformat()}{stack_note}"
         )
 
 
@@ -4162,15 +4164,57 @@ def _pointer_flip_time(store: Store) -> dt.datetime:
     return _as_utc(last_modified)
 
 
-def _stack_last_updated(cfn: Any | None = None, *, stack: str | None = None) -> dt.datetime:
-    """When the graded stack was last applied, as an instant.
+@dataclass(frozen=True)
+class _StackChange:
+    """When the graded stack FINISHED changing, and which reading said so."""
 
-    `DescribeStacks` rather than the drift or event APIs: `LastUpdatedTime` is
-    the one field that moves on every `aws cloudformation deploy` that changed
-    anything, and it is present on a stack nobody has updated since creation
-    only as `CreationTime` — which is why the fallback below is a fallback and
-    not an error. A never-updated stack HAS a last change; it is the day it
-    was created.
+    at: dt.datetime
+    detail: str
+
+
+def _stack_last_updated(cfn: Any | None = None, *, stack: str | None = None) -> _StackChange:
+    """When the graded stack last FINISHED changing, as an instant.
+
+    `DescribeStacks` `LastUpdatedTime` is the floor, not the answer
+    (`alpha-engine-config-I10527`). CloudFormation stamps it when the update
+    STARTS — `ExecuteChangeSet` — and the resource-level calls the update then
+    performs land AFTER it, recorded in CloudTrail under the operator's own
+    principal because CloudFormation invokes them with the caller's
+    credentials. Measured on the 2026-09-12 apply:
+
+    ```
+    stack LastUpdatedTime      2026-09-12T01:56:25.883Z
+    iam PutRolePolicy          2026-09-12T01:56:32Z    <- inside the window
+    iam CreateRole             2026-09-12T01:56:32Z    <- inside the window
+    ```
+
+    So an apply that is the system's LAST change left its own mutating calls
+    inside `_clause_zero_human_mutating_calls`'s window and read as human
+    mutating calls — unclearable until something else moved the window. The
+    stack's last change is therefore
+    `max(LastUpdatedTime, max(LastUpdatedTimestamp over list_stack_resources))`:
+    the instant the last resource settled, never earlier than the instant the
+    update began.
+
+    NOT `invokedBy == cloudformation.amazonaws.com` filtering instead: that
+    would also excuse a hand-run `aws cloudformation update-stack` against a
+    resource the machine allowlist never anticipated, which is the fail-open
+    the clause's docstring refuses.
+
+    `cloudformation:ListStackResources` is already granted to every
+    gate-rendering identity (`alpha-engine-config-I10493`) and to
+    `RuntimeRole`, so no template change; the read goes through
+    `crucible.tags._stack_resources`, the same paginated reader
+    `crucible.autonomy.machine_principals` uses, rather than a second way to
+    reach one API.
+
+    An unlistable resource set falls back to `LastUpdatedTime` **with the
+    reason recorded in the provenance string** — not a silent swallow, and
+    not fail-open: `LastUpdatedTime` is a real change instant and the EARLIER
+    of the two, so the fallback can only widen the window and make the clause
+    read UNMET more loudly, never clean. An UNDESCRIBABLE stack remains
+    `LastChangeUnreadableError` → UNMEASURABLE, as before: there the floor
+    itself is unknown.
 
     ``stack`` defaults to `crucible.config.settings().stack_name`, the same
     `CRUCIBLE_STACK`-resolved name `crucible.autonomy.machine_principals` and
@@ -4212,7 +4256,44 @@ def _stack_last_updated(cfn: Any | None = None, *, stack: str | None = None) -> 
             f"stack {stack_name!r} reports neither LastUpdatedTime nor CreationTime, so "
             "the instant it last changed is unknown"
         )
-    return _as_utc(when)
+    started = _as_utc(when)
+
+    from crucible.tags import _stack_resources  # noqa: PLC0415 - one paginated reader, shared
+
+    try:
+        resources = _stack_resources(client, stack_name)
+        unlistable = None
+    except Exception as exc:  # noqa: BLE001 - recorded below, never silent
+        resources, unlistable = [], f"{type(exc).__name__}: {exc}"
+    if unlistable is not None:
+        return _StackChange(
+            started,
+            "stack LastUpdatedTime only; resource timestamps unlistable "
+            f"({unlistable}), so the window may start before the apply's own "
+            "resource calls and over-count them",
+        )
+    # OUTSIDE the guard above: `_as_utc` refuses a naive instant, and that
+    # refusal must reach the caller rather than be reclassified as "the list
+    # failed" — a substituted timestamp is not an access problem.
+    stamps = [_as_utc(value) for r in resources if (value := r.get("LastUpdatedTimestamp"))]
+    if not stamps:
+        return _StackChange(
+            started,
+            f"stack LastUpdatedTime only; none of {len(resources)} stack resource(s) "
+            "carried a LastUpdatedTimestamp",
+        )
+    settled = max(stamps)
+    if settled > started:
+        return _StackChange(
+            settled,
+            f"newest resource LastUpdatedTimestamp {settled.isoformat()}, later than the "
+            f"update's start {started.isoformat()}",
+        )
+    return _StackChange(
+        started,
+        f"stack LastUpdatedTime {started.isoformat()}, at or after every one of "
+        f"{len(stamps)} resource timestamp(s)",
+    )
 
 
 def _as_utc(value: dt.datetime) -> dt.datetime:
@@ -4244,13 +4325,18 @@ def _last_system_change(store: Store, *, cfn: Any | None = None) -> _SystemChang
     the window's start before a change it could not see.
     """
     pointer_at = _pointer_flip_time(store)
-    stack_at = _stack_last_updated(cfn)
+    stack = _stack_last_updated(cfn)
+    stack_at = stack.at
     if stack_at > pointer_at:
-        return _SystemChange(stack_at, "stack last applied", pointer_at, stack_at)
+        return _SystemChange(stack_at, "stack last applied", pointer_at, stack_at, stack.detail)
     if pointer_at > stack_at:
-        return _SystemChange(pointer_at, "release pointer flip", pointer_at, stack_at)
+        return _SystemChange(pointer_at, "release pointer flip", pointer_at, stack_at, stack.detail)
     return _SystemChange(
-        pointer_at, "release pointer flip and stack apply, same instant", pointer_at, stack_at
+        pointer_at,
+        "release pointer flip and stack apply, same instant",
+        pointer_at,
+        stack_at,
+        stack.detail,
     )
 
 
