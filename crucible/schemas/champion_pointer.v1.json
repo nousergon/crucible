@@ -157,6 +157,22 @@
           "default": null,
           "title": "Paired Dates Required"
         },
+        "promote_evidence": {
+          "anyOf": [
+            {
+              "enum": [
+                "anytime_valid",
+                "point"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Promote Evidence"
+        },
         "promote_min_weeks": {
           "anyOf": [
             {

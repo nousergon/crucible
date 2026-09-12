@@ -2,19 +2,23 @@
 
 Normative sources: `champion-challenger-policy.md` §5.0/§5.2/§5.3/§6, plan
 §4.4 and §4.12 (Brian ruling 2026-09-01: `promote_min_weeks` = 4 paired
-weeks = 20 paired TRADING days).
+weeks = 20 paired TRADING days; Brian ruling 2026-09-12,
+`alpha-engine-config-I10546`/`-I10547`: the U slot promotes the
+point-estimate leader after 2 paired weeks).
 
 Every test here builds synthetic per-date series and asserts on the decision
-the library engine reaches plus the one thing crucible adds on top of it —
-the eligibility age. Nothing in this file re-implements a statistic: if a
-test could pass against a crucible-local copy of the confidence sequence,
-it is testing the wrong thing.
+**the library engine reaches** — crucible adds no post-filter to it any more
+(`alpha-engine-config-I10547`), only the artifacts that record it. Nothing in
+this file re-implements a statistic: if a test could pass against a
+crucible-local copy of the confidence sequence, it is testing the wrong
+thing.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import json
+import pathlib
 from dataclasses import replace
 
 import pytest
@@ -25,7 +29,7 @@ from crucible.calendar import TRADING_DAYS_PER_WEEK, is_trading_day
 from crucible.promote import (
     PROMOTION_SOURCES,
     PromotionRefused,
-    apply_eligibility_age,
+    age_held_leaders,
     paired_days_required,
     run_promotion,
 )
@@ -105,56 +109,142 @@ def register_with(
 
 
 # --------------------------------------------------------------------------
-# The eligibility age — Brian's 2026-09-01 ruling, in trading days.
+# The eligibility age — the ENGINE's, read off the engine's own decision.
 # --------------------------------------------------------------------------
 
 
-class TestEligibilityAge:
-    def test_four_paired_weeks_is_twenty_paired_trading_days(self) -> None:
-        for slot in ("u", "r", "m", "s"):
-            spec = get_slot(slot)
-            assert spec.promote_min_weeks == 4
-            assert paired_days_required(spec) == 4 * TRADING_DAYS_PER_WEEK == 20
+class TestEligibilityAgeIsTheEngines:
+    def test_crucible_carries_no_age_rule_of_its_own(self) -> None:
+        """`alpha-engine-config-I10547`: one engine, one bar.
 
-    def test_nineteen_paired_days_is_ineligible_even_with_a_supported_lead(self) -> None:
-        spec = narrow(get_slot("m"))
-        dates = trading_days(19)
-        reg, ids = register_with("m", ["champ", "chal"], dates[0])
-        decision = apply_eligibility_age(
-            spec=spec,
-            register=reg,
-            decision=_decide(spec, reg, ids, dates, champ=0.0, chal=0.01),
+        Asserted on the SOURCE as well as on behaviour, because a post-filter
+        that has been reduced to a no-op for the cases these tests happen to
+        build is still a second decision rule waiting to diverge the next
+        time a slot's config changes — which is exactly how the 4-week bar
+        survived the 2026-09-12 ruling in two places at once.
+        """
+        import crucible.promote as promote_module
+
+        source = pathlib.Path(promote_module.__file__).read_text()
+        assert not hasattr(promote_module, "apply_eligibility_age")
+        body = source.split('"""', 2)[-1]
+        assert "def apply_eligibility_age" not in body
+        assert "TRADING_DAYS_PER_WEEK" in body, (
+            "`paired_days_required` stays as the trading-day RENDERING of the "
+            "library's week bar (§4.12 speaks in trading days) — only the "
+            "decision moved"
         )
+
+    def test_the_slots_carry_the_ruled_bars(self) -> None:
+        assert (get_slot("u").promote_min_weeks, get_slot("u").promote_evidence) == (2, "point")
+        for slot in ("r", "m", "s"):
+            spec = get_slot(slot)
+            assert (spec.promote_min_weeks, spec.promote_evidence) == (4, "anytime_valid")
+            assert paired_days_required(spec) == 4 * TRADING_DAYS_PER_WEEK == 20
+        assert paired_days_required(get_slot("u")) == 2 * TRADING_DAYS_PER_WEEK == 10
+
+    def test_a_lead_below_the_bar_does_not_move_the_pointer(self) -> None:
+        spec = narrow(get_slot("m"))
+        dates = trading_days(3 * TRADING_DAYS_PER_WEEK)
+        reg, ids = register_with("m", ["champ", "chal"], dates[0])
+        decision = _decide(spec, reg, ids, dates, champ=0.0, chal=0.01)
         assert decision.champion == ids["champ"]
         assert decision.moved is False
-        assert decision.status == "held"
-        assert "promote_min_weeks" in decision.reason
-        assert "19" in decision.reason
+        assert "promote_min_weeks" in decision.reason, (
+            "the ENGINE names the age bar in its own reason; crucible no longer "
+            "rewrites a decision to say so"
+        )
+        assert age_held_leaders(spec, decision) == (), (
+            "an `anytime_valid` slot reports an age-held LEADER only once the "
+            "sequence supports the lead; at three paired weeks it does not, so the "
+            "hold is on the evidence as much as on the age"
+        )
 
-    def test_twenty_paired_days_with_a_supported_lead_promotes(self) -> None:
+    def test_a_supported_lead_at_the_bar_promotes(self) -> None:
         spec = narrow(get_slot("m"))
-        dates = trading_days(20)
+        dates = trading_days(4 * TRADING_DAYS_PER_WEEK)
         reg, ids = register_with("m", ["champ", "chal"], dates[0])
-        decision = apply_eligibility_age(
-            spec=spec,
-            register=reg,
-            decision=_decide(spec, reg, ids, dates, champ=0.0, chal=0.01),
+        decision = _decide(spec, reg, ids, dates, champ=0.0, chal=0.01)
+        assert decision.champion == ids["chal"]
+        assert decision.moved is True
+        assert decision.status == "decided"
+        assert age_held_leaders(spec, decision) == ()
+
+
+class TestUSlotPromotesThePointEstimateLeaderAtTwoWeeks:
+    """Brian ruling 2026-09-12 (`alpha-engine-config-I10546`, `-I10547`).
+
+    The lead used here is deliberately far too small for the anytime-valid
+    sequence to support at the slot's declared `diff_clip` — so a test that
+    passed under `promote_evidence="anytime_valid"` would prove nothing. It
+    is the POINT estimate that promotes, and the 2-week bar that lets it.
+    """
+
+    LEAD = 0.0005
+
+    def test_two_paired_weeks_promotes_the_point_estimate_leader(self) -> None:
+        spec = get_slot("u")
+        dates = trading_days(2 * TRADING_DAYS_PER_WEEK)
+        reg, ids = register_with("u", ["champ", "chal"], dates[0])
+        decision = _decide(spec, reg, ids, dates, champ=0.0, chal=self.LEAD)
+        comparison = next(c for c in decision.comparisons if c.challenger == ids["chal"])
+        assert comparison.bound is not None and not comparison.bound.supported, (
+            "the fixture must not be winnable on the anytime-valid sequence, or "
+            "this test would pass under either evidence mode"
         )
         assert decision.champion == ids["chal"]
         assert decision.moved is True
         assert decision.status == "decided"
+        assert "point" in decision.reason
 
-    def test_the_age_never_holds_a_pointer_the_sequence_did_not_move(self) -> None:
-        """The age can delay a promotion; it can never cause one, and it can
-        never change a HOLD into anything else (policy §5.0 delta record)."""
-        spec = narrow(get_slot("m"))
-        dates = trading_days(40)
-        reg, ids = register_with("m", ["champ", "chal"], dates[0])
-        held = _decide(spec, reg, ids, dates, champ=0.01, chal=0.0)
-        after = apply_eligibility_age(spec=spec, register=reg, decision=held)
-        assert after.champion == held.champion
-        assert after.moved == held.moved
-        assert after.reason == held.reason
+    def test_one_paired_week_does_not_promote(self) -> None:
+        spec = get_slot("u")
+        dates = trading_days(TRADING_DAYS_PER_WEEK)
+        reg, ids = register_with("u", ["champ", "chal"], dates[0])
+        decision = _decide(spec, reg, ids, dates, champ=0.0, chal=self.LEAD)
+        assert decision.champion == ids["champ"]
+        assert decision.moved is False
+        assert "promote_min_weeks" in decision.reason
+        assert age_held_leaders(spec, decision) == (ids["chal"],)
+
+    def test_a_point_estimate_LOSS_never_promotes(self) -> None:
+        """`point` lowers the evidence bar; it does not remove it."""
+        spec = get_slot("u")
+        dates = trading_days(4 * TRADING_DAYS_PER_WEEK)
+        reg, ids = register_with("u", ["champ", "chal"], dates[0])
+        decision = _decide(spec, reg, ids, dates, champ=self.LEAD, chal=0.0)
+        assert decision.champion == ids["champ"]
+        assert decision.moved is False
+        assert age_held_leaders(spec, decision) == ()
+
+
+class TestPairedDaysAgreeWithTheEngineWeekBar:
+    """§4.12's trading days and `ArenaConfig`'s weeks are the same bar.
+
+    The engine counts `PairedWindow.weeks` — the INCLUSIVE calendar span of
+    the paired window — and crucible reports `paired_days_required`, the same
+    number of weeks in sessions. They have to land on the same boundary, or a
+    cycle would report a bar it was not decided against. Measured over a
+    contiguous run of real NYSE sessions rather than asserted.
+    """
+
+    def test_a_contiguous_run_of_five_sessions_is_exactly_one_week(self) -> None:
+        from nousergon_lib.arena.window import span_weeks
+
+        for weeks in range(1, 7):
+            dates = trading_days(weeks * TRADING_DAYS_PER_WEEK)
+            assert span_weeks(dates[0], dates[-1]) == weeks
+            short = trading_days((weeks - 1) * TRADING_DAYS_PER_WEEK) if weeks > 1 else None
+            if short is not None:
+                assert span_weeks(short[0], short[-1]) == weeks - 1
+
+    def test_every_slots_rendering_matches_its_configured_weeks(self) -> None:
+        from nousergon_lib.arena.window import span_weeks
+
+        for slot in ("u", "r", "m", "s"):
+            spec = get_slot(slot)
+            dates = trading_days(paired_days_required(spec))
+            assert span_weeks(dates[0], dates[-1]) == spec.arena.promote_min_weeks
 
 
 # --------------------------------------------------------------------------
@@ -168,19 +258,11 @@ class TestPointerMovesBothDirections:
         dates = trading_days(40)
         reg, ids = register_with("m", ["champ", "chal"], dates[0])
 
-        forward = apply_eligibility_age(
-            spec=spec,
-            register=reg,
-            decision=_decide(spec, reg, ids, dates, champ=0.0, chal=0.01, incumbent="champ"),
-        )
+        forward = _decide(spec, reg, ids, dates, champ=0.0, chal=0.01, incumbent="champ")
         assert forward.champion == ids["chal"]
         assert forward.moved is True
 
-        back = apply_eligibility_age(
-            spec=spec,
-            register=reg,
-            decision=_decide(spec, reg, ids, dates, champ=0.01, chal=0.0, incumbent="chal"),
-        )
+        back = _decide(spec, reg, ids, dates, champ=0.01, chal=0.0, incumbent="chal")
         assert back.champion == ids["champ"], (
             "policy §5.2: no hysteresis, no cooldown — the pointer returns as soon "
             "as the cumulative window supports the other arm"

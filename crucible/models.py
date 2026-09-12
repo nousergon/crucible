@@ -1526,6 +1526,13 @@ class ChampionEvidence(BaseModel):
     mean_diff: float | None = None
     confidence_sequence: dict[str, Any] | None = None
     promote_min_weeks: Annotated[int, Field(ge=1)] | None = None
+    #: The slot's serving evidence bar, mirroring
+    #: `nousergon_lib.arena.engine.ArenaConfig.promote_evidence`
+    #: (`alpha-engine-config-I10547`). Optional because every pointer written
+    #: before 2026-09-12 predates the field, and an operator-revert pointer
+    #: carries no promotion evidence at all — never because a promotion may
+    #: omit it.
+    promote_evidence: Literal["anytime_valid", "point"] | None = None
     paired_dates_required: Annotated[int, Field(ge=1)] | None = None
     operator: str | None = None
     eligible_arms: list[str] | None = None
@@ -2523,6 +2530,10 @@ class EligibilityHoldEventRow(_ExperimentEventBase):
     kind: Literal["eligibility_hold"]
     reason: str
     promote_min_weeks: Annotated[int, Field(ge=1)]
+    #: Which bar the hold was measured against (`alpha-engine-config-I10547`).
+    #: Optional so rows already on the feed still validate; the writer always
+    #: sets it.
+    promote_evidence: Literal["anytime_valid", "point"] | None = None
     paired_dates_required: Annotated[int, Field(ge=1)]
 
 

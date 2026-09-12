@@ -10,17 +10,16 @@ dependencies = [
     # arena_cycle contract and MetricRecord are consumed here, never
     # re-implemented (crucible_v2_rebuild_plan §4.4).
     #
-    # 0.124.118 is the ANTICIPATED next version once `nousergon-lib` PR402
-    # (`ArenaConfig` gains `promote_min_weeks`, alpha-engine-config-I9763,
-    # -I10504) merges and auto-bumps from the current main HEAD (0.124.117).
-    # `uv.lock` in this diff is UNCHANGED and does not yet resolve this pin —
-    # `uv lock` cannot resolve a version not yet published to PyPI. Whoever
-    # finalizes this PR must run `uv lock` here once PR402 publishes, confirm
-    # the actual published version matches (or correct this literal if
-    # another PR landed in between), and only then merge. `uv sync --frozen`
-    # is expected to fail loudly until that happens — that is the intended
-    # signal, not a regression.
-    "nousergon-lib[github-app]==0.124.118",
+    # 0.124.120 carries `ArenaConfig.promote_evidence` alongside
+    # `promote_min_weeks` (alpha-engine-config-I10546, -I9763, -I10504), which
+    # is what lets the U slot serve on a point-estimate lead at 2 paired weeks
+    # (`alpha-engine-config-I10547`) WITHOUT crucible re-implementing the
+    # decision. Published 2026-09-12, and `uv.lock` in this diff resolves it.
+    # A first-party bump lands with the regenerated lock in the same commit;
+    # `uv lock --refresh` is the form that works in the minutes after a
+    # publish — a plain `uv lock` reports "no version of nousergon-lib" out of
+    # a stale index cache and reads like an unpublished pin.
+    "nousergon-lib[github-app]==0.124.120",
     # Trading calendar, dual-date resolution, structured logging, alerts.
     #
     # `[openai]` is NOT optional here (alpha-engine-config-I10473). krepis
@@ -105,7 +104,7 @@ dependencies = [
 # path it never exercises. `crucible data.daily --source arctic` states the
 # missing extra by name when it is absent — it never falls back to a
 # different source, which would silently change what the run measured.
-arcticdb = ["nousergon-lib[arcticdb]==0.124.118"]
+arcticdb = ["nousergon-lib[arcticdb]==0.124.120"]
 
 [project.scripts]
 crucible = "crucible.cli:main"
