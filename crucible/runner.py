@@ -463,6 +463,25 @@ class RunContext:
     llm_calls: list[dict[str, Any]] = field(default_factory=list)
     metrics: list[dict[str, Any]] = field(default_factory=list)
     attempts: list[dict[str, Any]] = field(default_factory=lambda: [{"n": 1, "reason": "initial"}])
+    #: Set by `run_job`'s exception handler (never by the job body) when
+    #: THIS attempt's own failure classifies as `SPOT_INTERRUPTION_REASON`
+    #: and is terminal — no further attempt will run to append a
+    #: `spot_interruption` row to `attempts[]` for it
+    #: (`alpha-engine-config-I10520`). Three call sites pass
+    #: `transient_retry=False` (`track_c.py`, `track_f.py`,
+    #: `fault_probe.py`), where the spot-interruption guard is still
+    #: installed unconditionally but the classify-and-append step that
+    #: `attempts[]`-derivation depends on never runs, so a real reclamation
+    #: there wrote `resource.interruptions: 0` beside a `reason` that named
+    #: `spot_interruption` — an interruption that unambiguously happened and
+    #: went uncounted. This is a narrower, second signal, not a replacement
+    #: for `attempts[]`: it answers "did THIS attempt end on an
+    #: interruption", while `attempts[]` answers "what caused a retry".
+    #: `_write_manifest` sums both, so the retried-success and
+    #: exhausted-retry shapes `alpha-engine-config-I10463` already counts
+    #: correctly from `attempts[]` alone are unaffected — this flag is only
+    #: ever true on a ctx whose OWN attempt failed and will not retry.
+    spot_interruption_observed: bool = False
     #: `spot`/`escalated_to_on_demand` are measured once, here, at RunContext
     #: construction — the box's lifecycle is a property of how the process
     #: was launched and does not change mid-run. `mem_peak_mb`/`disk_free_mb`
@@ -825,8 +844,20 @@ def run_job(
             # instead of a FAILURE page, with the cause discarded.
             status = "failed"
             reason = _reason_from(exc)
+            # Classified unconditionally (`classify_transient` is pure — no
+            # side effect in calling it whether or not a retry follows), so
+            # a terminal spot interruption can be recorded even when it will
+            # not be retried (`alpha-engine-config-I10520`).
+            exc_class = classify_transient(exc)
             if transient_retry and len(attempts) < MAX_ATTEMPTS:
-                transient = classify_transient(exc)
+                transient = exc_class
+            elif exc_class == SPOT_INTERRUPTION_REASON:
+                # Terminal: no further attempt will run to append a
+                # `spot_interruption` row to `attempts[]` for THIS failure
+                # (either `transient_retry=False`, or the retry ladder is
+                # exhausted). Recorded on `ctx` directly, since `attempts[]`
+                # derivation cannot see a cause that never gets appended.
+                ctx.spot_interruption_observed = True
             if transient is None:
                 raise
         finally:
@@ -905,20 +936,28 @@ def _write_manifest(
     # read as a measurement nobody took.
     ctx.resource["mem_peak_mb"] = _measured_mem_peak_mb()
     ctx.resource["disk_free_mb"] = _measured_disk_free_mb()
-    # DERIVED from `ctx.attempts`, never a second counter (alpha-engine-config-
-    # I10463): a genuinely absorbed spot interruption produced `status: ok`,
+    # DERIVED from `ctx.attempts` plus one narrow second signal
+    # (`alpha-engine-config-I10520`), never a free-standing counter: a
+    # genuinely absorbed spot interruption produced `status: ok`,
     # `attempts: [initial, spot_interruption]` and `resource.interruptions: 0`
-    # — the guard raised, the retry succeeded, and nothing ever incremented
-    # anything. `ctx.attempts` is the one record that cannot exist without the
-    # guard having raised (`run_job`'s `except BaseException` only appends a
-    # `spot_interruption` entry after `classify_transient` names that reason),
-    # so counting it here means the two fields can never disagree — there is
-    # no second write path to drift. Computed at write time, after every
-    # retry has appended its own entry, so this covers both the absorbed
-    # (`ok`, N>=1 interruptions) and the exhausted-retry (`failed`) shapes.
+    # before `alpha-engine-config-I10463` — the guard raised, the retry
+    # succeeded, and nothing ever incremented anything. `ctx.attempts` is the
+    # record of what caused a RETRY, so it cannot see a failure that never
+    # gets retried: a `transient_retry=False` call site (`track_c.py`,
+    # `track_f.py`, `fault_probe.py`) never appends a `spot_interruption` row
+    # for the one attempt it makes, even when that attempt IS a real
+    # reclamation. `ctx.spot_interruption_observed` is that missing signal —
+    # set by `run_job`'s exception handler exactly when THIS attempt's own
+    # failure classified as a spot interruption and is terminal (I10520) —
+    # and it is only ever true on the ctx being written here, so summing it
+    # in cannot double-count against an `attempts[]` entry that belongs to a
+    # DIFFERENT attempt's ctx. Computed at write time, after every retry has
+    # appended its own entry, so this covers the absorbed (`ok`, N>=1
+    # interruptions), the exhausted-retry (`failed`) and the
+    # never-retried (`failed`) shapes alike.
     ctx.resource["interruptions"] = sum(
         1 for attempt in ctx.attempts if attempt.get("reason") == SPOT_INTERRUPTION_REASON
-    )
+    ) + (1 if ctx.spot_interruption_observed else 0)
     manifest = {
         "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
         "run_id": ctx.run_id,
