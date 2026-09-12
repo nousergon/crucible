@@ -21,10 +21,10 @@ tests here assert properties instead.
 `alpha-engine-config-I9957` extends the first property to
 `crucible/slots/model.py`, one module over, where it had never been applied:
 `crucible-PR92` gave a refused M arm an `unservable` metric whose declared
-home is the manifest of the job that loaded the slot, and no job loads it.
-The reading there is a PINNED gap rather than a bare assertion — see
-:class:`TestTheModelPathIsNotDeclaredAndLeftUnwired` for why, and for what
-must happen to it when the M cycle job lands.
+home is the manifest of the job that loaded the slot, and no job loaded it.
+The M cycle job now does, so the reading there is no longer "the whole module
+is unreachable" — see :class:`TestTheModelPathIsNotDeclaredAndLeftUnwired`,
+which asserts the loader IS reached and pins what is still orphaned.
 """
 
 from __future__ import annotations
@@ -266,29 +266,36 @@ class TestEveryDeclarableKindResolves:
         assert set(resolved.resolved_inputs) == {r.text for r in refs.values()}
 
 
-#: The M-path callables `crucible/` reaches from NOTHING today, pinned as a
-#: known gap rather than left to prose (`alpha-engine-config-I9957`).
+#: The M-path callables `crucible/` still reaches from nothing, RE-STATED
+#: (`alpha-engine-config-I9957`).
 #:
-#: Measured 2026-09-04 on `main` (32933bf): the orphan set is `crucible.slots.
-#: model.__all__`'s callables ENTIRELY — all eleven. The M slot has no
-#: production entry point at all, so this is not "one function nobody wired",
-#: it is a 1807-line module reachable only from `tests/`.
+#: Measured 2026-09-04 on `main` (32933bf) the orphan set was `crucible.slots.
+#: model.__all__`'s callables ENTIRELY — all eleven. Deliverable 1 of that
+#: tracker built the M cycle job (`crucible.slots.model.produce` / `.grade`,
+#: dispatched through `crucible.slots.dispatchable_slots`), so the loader now
+#: HAS a production caller and `SlotRecipes.refusal_metrics` lands on a real
+#: `runs/experiment.run/{day}/m/run.json`. The pin was re-stated rather than
+#: deleted, exactly as the assertion it replaced demanded: the class it
+#: detects — a producer declared and reached from nothing — outlives its
+#: first instance.
 #:
-#: Why it is pinned and not simply red: `crucible.track_a._slot_module`
-#: refuses slots `m` and `s` BY DESIGN, in a message naming phase 3 as their
-#: arrival, so `experiment.run --slot m` and `experiment.grade --slot m` —
-#: both declared arc stages (`crucible.weekly.ARC_SLOT_JOBS` x
-#: `crucible.slots.SLOTS`) — exit non-zero every Saturday. Nothing this test
-#: could assert changes that; the M cycle job is phase 3's deliverable.
-#: Pinning it makes the gap a MEASURED number in CI instead of a sentence in
-#: an issue, and the assertion below is an equality, so the day deliverable 1
-#: of I9957 wires the loader this test goes red and the pin must be re-stated
-#: — a gap register that cannot rot in the direction of "we wired it and
-#: forgot to say so".
+#: What is still orphaned, measured 2026-09-06 on this branch: exactly one
+#: callable, `evaluate_input_completeness`. It is policy §5.3's SECOND
+#: serving precondition (per-input rows and freshness), and unlike the
+#: behavioural veto beside it there is no producer anywhere in this
+#: repository for the `observed` mapping it grades — that is an upstream
+#: data-coverage feed, not something the fitting stack can derive. It is
+#: pinned here so the day one exists, this test goes red and the pin is
+#: re-stated deliberately rather than the gap widening in silence.
 #:
 #: The tracker id is cited in prose only, never as a code literal:
 #: `tests/test_no_stale_tracker_literals.py` refuses a hardcoded issue number
 #: in the package, and it caught this constant on the first run.
+
+#: The measured orphan set, as an EQUALITY. A new orphan fails this test on
+#: the day it is written; a wired one fails it too, and must be removed here
+#: in the same change that wires it.
+STILL_ORPHANED_M_CALLABLES: list[str] = ["evaluate_input_completeness"]
 
 
 class TestTheModelPathIsNotDeclaredAndLeftUnwired:
@@ -296,28 +303,42 @@ class TestTheModelPathIsNotDeclaredAndLeftUnwired:
 
     `alpha-engine-config-I9957`: `crucible-PR92` gave a refused M arm a
     per-arm `unservable` metric (`SlotRecipes.refusal_metrics`) whose declared
-    home is "the manifest of whatever job loaded the slot". No job loads the
-    slot. The guard one module over (`crucible/slots/inputs.py`) catches
-    exactly this class and never scanned `model.py`, so the metric could ship
-    green while reaching no manifest a scheduled run ever writes.
+    home is "the manifest of whatever job loaded the slot", and no job loaded
+    the slot. The M cycle job closes that; this class keeps the guard on the
+    module rather than retiring it with its first instance.
     """
 
-    def test_the_whole_m_path_is_unreachable_from_production_code(self) -> None:
+    def test_the_m_loader_is_reached_from_production_code(self) -> None:
+        """Deliverable 1, as a property of the call graph rather than a claim.
+
+        The inverse of what this assertion said before the M cycle job
+        existed. `load_model_recipes` reachable from `crucible/` is what makes
+        `SlotRecipes.refusal_metrics` land on a manifest a scheduled run
+        writes; unreachable, the rows are well-formed and seen by nobody.
+        """
         from crucible.slots import model as model_module  # noqa: PLC0415 - local to this class
 
         orphans = _orphan_callables(model_module)
-        assert "load_model_recipes" in orphans, (
-            "`load_model_recipes` is reachable from production code, so the M slot now "
-            "HAS a caller and `SlotRecipes.refusal_metrics` can land on a real manifest. "
-            "That is deliverable 1 of the tracker this class's docstring names — "
-            "re-state the pin to the callables that are still orphaned, rather than "
-            "deleting the guard: the class it detects outlives its first instance."
+        assert "load_model_recipes" not in orphans, (
+            "`load_model_recipes` is unreachable from production code again, so the M "
+            "slot has no caller and a refused arm's `unservable` row reaches no "
+            "manifest — the defect this module's tracker was filed for, restored."
         )
-        assert orphans == _exported_callables(model_module), (
+        for name in ("produce", "grade", "design_panel", "train_arm", "predict_cross_section"):
+            assert name not in orphans, f"the M cycle job no longer reaches `{name}`"
+
+    def test_the_orphan_set_is_exactly_the_pin(self) -> None:
+        """An equality, so the gap cannot rot in either direction.
+
+        Wire something and forget to say so: red. Declare a new producer and
+        wire it to nothing: red. Either way the pin is re-stated deliberately.
+        """
+        from crucible.slots import model as model_module  # noqa: PLC0415 - local to this class
+
+        assert _orphan_callables(model_module) == STILL_ORPHANED_M_CALLABLES, (
             "the set of M-path callables with no production caller is no longer the "
-            "WHOLE module. Something wired part of `crucible.slots.model` without "
-            "wiring the loader; re-state this pin to the measured set. "
-            f"Orphans now: {orphans}."
+            "pinned one. Re-state `STILL_ORPHANED_M_CALLABLES` to the measured set, in "
+            "the same change that moved it."
         )
 
     def test_the_reachability_check_distinguishes_a_wired_loader_from_an_unwired_one(
