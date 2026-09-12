@@ -56,6 +56,12 @@ from crucible.config import CLOUDTRAIL_ARCHIVE_VAR
 from crucible.documents import DocumentRead, read_manifests_under
 from crucible.documents import read_path_document as _read_path_document
 from crucible.documents import read_store_document as _read_store_document
+from crucible.holdout import (
+    HoldoutAbsentError,
+    HoldoutError,
+    read_sealed_holdout,
+    unseal_records,
+)
 from crucible.keys import (
     ALERTS_ROOT,
     FAULT_INJECTION_ROOT,
@@ -65,6 +71,7 @@ from crucible.keys import (
     champion_key,
     gate_key,
     gate_prefix,
+    holdout_unseal_prefix,
     is_manifest_key,
     legacy_dead_lambdas_key,
     legacy_weekly_executions_key,
@@ -76,6 +83,7 @@ from crucible.keys import (
     review_prefix,
     runs_prefix,
     strategy_arms_prefix,
+    strategy_holdout_key,
     verdict_key,
 )  # noqa: F401 - re-exported
 from crucible.manifest import load_schema, manifest_key
@@ -3156,8 +3164,7 @@ PHASE3_DELIVERABLES: tuple[Deliverable, ...] = (
     Deliverable(
         "sealed_holdout",
         "sealed holdout `strategy/holdout.json` with `--unseal` requiring a ruling reference",
-        None,
-        "no phase-3 clause reads `strategy/holdout.json` or an unseal audit trail",
+        "sealed_holdout",
     ),
     Deliverable(
         "named_transaction_cost_model",
@@ -6493,6 +6500,77 @@ def _clause_factor_neutral_attribution(store: Store, window: list[dt.date]) -> C
     )
 
 
+def _clause_sealed_holdout(store: Store, window: list[dt.date]) -> Clause:
+    """`alpha-engine-config-I10502`: the sealed holdout is gate-readable.
+
+    Reads `crucible.holdout.read_sealed_holdout` — the module's own reader,
+    never a restatement of the `sealed_holdout.v1` shape here (the rule
+    `-I10510` states for `crucible.portfolio` and `-I10501` for
+    `crucible.attribution`). That reader returns the seal's metadata and drops
+    the payload, so evaluating this clause cannot itself read the holdout: a
+    gate that had to unseal the holdout in order to grade the holdout would be
+    the deliverable's own failure mode wearing a clause's clothes.
+
+    **Absent reads UNMEASURABLE and never MET.** `strategy/holdout.json` is
+    authored in the private strategy tree and published into the store; until
+    it is, the harness holds no reservation — which is *no data*, not a
+    holdout of zero sessions, and plan §6 rule 1 forbids painting that green.
+    A document that EXISTS and does not satisfy its own seal is the other
+    answer entirely: a real reading of a real document, and UNMET.
+
+    Every filed unseal must name a ruling. The `holdout_unseal.v1` schema
+    requires one, so a record written by this package always carries it; a
+    record that does not was not written by this package, and a clause reading
+    only the seal would grade the door while ignoring who walked through it.
+    An unseal naming a digest that is not the live seal's is REPORTED and does
+    not unmeet the clause on its own: a holdout re-sealed after an authorised
+    release is the correct thing to have happened, and the record naming the
+    superseded digest is the audit trail working.
+
+    ``window`` is unread. Unlike every other phase-3 clause this one grades a
+    STANDING reservation rather than what happened over a period — a holdout
+    that was sealed before the window opened is exactly as sealed inside it,
+    and narrowing the reading to the window would report a holdout as absent
+    for the single reason that nobody touched it recently.
+    """
+    _unused(window)
+    name = "sealed_holdout"
+    requirement = (
+        f"`{strategy_holdout_key()}` carries a valid `sealed_holdout.v1` seal over a "
+        f"payload that hashes to it, and every unseal record under "
+        f"{holdout_unseal_prefix()} names the ruling that authorised it"
+    )
+    evidence: list[str] = [strategy_holdout_key(), holdout_unseal_prefix()]
+    try:
+        sealed = read_sealed_holdout(store)
+    except HoldoutAbsentError as exc:
+        return _unmeasurable(name, requirement, str(exc), evidence)
+    except HoldoutError as exc:
+        return Clause(name, requirement, False, str(exc), tuple(evidence))
+    records, problems = unseal_records(store)
+    evidence.extend(record.store_key for record in records)
+    if problems:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{sealed.render()}; but {len(problems)} unseal record(s) could not be read "
+            f"as `holdout_unseal.v1`: {'; '.join(problems[:3])}. A record that does not "
+            "name its ruling is an unseal nobody authorised, on the evidence available",
+            tuple(evidence),
+        )
+    superseded = [r for r in records if r.holdout_digest != sealed.digest]
+    detail = f"{sealed.render()}; {len(records)} filed unseal(s)"
+    if records:
+        detail += f", each naming a ruling ({', '.join(sorted({r.ruling for r in records}))})"
+    if superseded:
+        detail += (
+            f"; {len(superseded)} of them released a superseded digest, which is a "
+            "re-seal after an authorised release, not a finding"
+        )
+    return Clause(name, requirement, True, detail, tuple(evidence))
+
+
 def _phase3(
     store: Store,
     window: list[dt.date],
@@ -6511,6 +6589,7 @@ def _phase3(
         _clause_portfolio_engine_used_by_s_slot(store, window),
         _clause_named_transaction_cost_model(store, window),
         _clause_factor_neutral_attribution(store, window),
+        _clause_sealed_holdout(store, window),
     ]
 
 

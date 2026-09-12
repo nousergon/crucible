@@ -120,6 +120,34 @@ components:
     dispatch: null
     deadline: null
 
+  holdout:
+    description: >-
+      Read the sealed holdout's seal state, or unseal it under a named human
+      ruling (alpha-engine-config-I10502, plan 9.4). The read form writes
+      nothing; only --unseal writes, and it writes the audit record naming the
+      ruling.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:outputs[holdout/unseal/{trading_day}/{ruling}.json]
+      # An unseal releases data; it grades nothing. Declared null rather than
+      # omitted, same as data.heal's outcome.
+      outcome: null
+    log_location: /crucible/holdout
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    # NEVER scheduled, and `deadline: null` is the load-bearing half: unsealing
+    # is a RESERVED matter (principles.md 3.2), so there is no cadence this job
+    # is expected to keep and no absence of it that is a defect. A deadline here
+    # would page because a human did not unseal the holdout this week.
+    schedule: null
+    dispatch: null
+    deadline: null
+
   experiment.new:
     description: Register an immutable arm from a recipe spec.
     lifecycle: ACTIVE

@@ -119,6 +119,11 @@ class TestJobSurface:
             "promote",
             "report",
             "explain",
+            # alpha-engine-config-I10502: the sealed holdout's reader and its
+            # ruling-gated --unseal. Never scheduled — unsealing is a reserved
+            # matter (principles.md §3.2), so a clock able to invoke it would
+            # be an automation holding an authority reserved to a human.
+            "holdout",
             "migrate.history",
             "release.pin",
             # alpha-engine-config-I9898: the repair for a release published
@@ -519,6 +524,14 @@ class TestDryRunNeverWrites:
     _EXCLUDED_WITH_REASON = {
         "experiment.new": "needs a synced strategy tree with real arm recipes",
         "migrate.history": "needs seeded v1 sources",
+        "holdout": (
+            "its READ form writes no manifest at all and exits 1 on a fresh store (no "
+            "holdout is published, which is the honest answer), so the shared "
+            "fresh-store row could not distinguish that from a failure; its WRITING "
+            "form refuses before it reaches the store unless --ruling and --reason are "
+            "given, which no shared row supplies. Both are asserted directly by "
+            "tests/test_holdout.py::TestTheCli"
+        ),
         "smoke": "needs a published release publishing through crucible.deploy's own flow",
         "release.lock": (
             "S3-only (apply_release_retention refuses a LocalStore outright); covered "

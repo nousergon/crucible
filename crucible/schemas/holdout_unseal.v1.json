@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nousergon.dev/crucible/schemas/holdout_unseal.v1.json",
+  "title": "holdout_unseal.v1",
+  "description": "One holdout unseal audit record (alpha-engine-config-I10502), written at `holdout/unseal/{trading_day}/{ruling}.json`. Unsealing is a RESERVED matter (principles.md 3.2): `crucible holdout --unseal` refuses without a ruling reference, and this record is what makes the authorised read reconstructable afterwards from durable artifacts alone. `holdout_digest` ties the record to the exact bytes that were released, so a holdout edited after an unseal is visible as such.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "trading_day",
+    "ruling",
+    "operator",
+    "reason",
+    "holdout_digest",
+    "unsealed_at_utc"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "holdout_unseal.v1"
+    },
+    "trading_day": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "description": "NYSE trading day the unseal is keyed to (4.12)."
+    },
+    "ruling": {
+      "type": "string",
+      "pattern": "^alpha-engine-config-I[1-9][0-9]*$",
+      "description": "The human ruling that authorised this unseal, in the fleet reference format. Required by the schema AND refused before this document is built: an unseal with no named ruling is the thing the mechanism exists to prevent, not a field to leave blank."
+    },
+    "operator": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "Who ran the unseal."
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "description": "Why, in the operator's own words. The ruling says it was allowed; this says what it was for."
+    },
+    "holdout_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "The `seal.digest` of the document that was unsealed. A later reading whose live digest differs from every unseal record's is a holdout that moved after it was released."
+    },
+    "unsealed_at_utc": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 32,
+      "description": "Wall-clock UTC instant of the unseal, ISO-8601. Provenance, never a key (4.12)."
+    }
+  }
+}

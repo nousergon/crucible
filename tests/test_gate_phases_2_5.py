@@ -1861,7 +1861,7 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
         assert arena_cycle_key("r", FRIDAY.isoformat()) in clause.detail
         assert "no promote run manifest was filed" not in clause.detail
 
-    def test_one_clause_per_registered_slot_plus_the_three_s_slot_evidence_clauses(
+    def test_one_clause_per_registered_slot_plus_the_four_deliverable_clauses(
         self, store: LocalStore
     ) -> None:
         clauses = gate_module._phase3(store, _window(4), {}, trading_day=FRIDAY)
@@ -1871,6 +1871,10 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
             "portfolio_engine_used_by_s_slot",
             "named_transaction_cost_model",
             "factor_neutral_attribution",
+            # alpha-engine-config-I10502. Unlike the three above it, this one
+            # reads no `experiment.grade[s]` manifest at all: the holdout is a
+            # STANDING reservation, not something a graded window produces.
+            "sealed_holdout",
         ]
 
 
@@ -2212,10 +2216,10 @@ class TestPhase3DeliverablesTableTracksTheWiredClauses:
         assert by_id["named_transaction_cost_model"].graded_by == "named_transaction_cost_model"
         assert by_id["factor_neutral_attribution"].graded_by == "factor_neutral_attribution"
 
-    def test_the_coverage_line_reflects_three_of_five(self, store: LocalStore) -> None:
+    def test_the_coverage_line_reflects_four_of_five(self, store: LocalStore) -> None:
         clauses = gate_module._phase3(store, _window(4), {}, trading_day=FRIDAY)
         note = gate_module.coverage_note("phase3", [c.name for c in clauses])
-        assert "grades 3 of 5" in note
+        assert "grades 4 of 5" in note
 
 
 # ---------------------------------------------------------------------------

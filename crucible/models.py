@@ -328,6 +328,7 @@ JOB_VALUES: tuple[str, ...] = (
     "promote",
     "report",
     "explain",
+    "holdout",
     "migrate.history",
     "release.pin",
     "release.lock",
