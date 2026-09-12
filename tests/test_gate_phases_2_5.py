@@ -35,6 +35,10 @@ import crucible.autonomy as autonomy_module
 import crucible.cost as cost_module
 import crucible.gate as gate_module
 import crucible.llm as llm_module
+from crucible.attribution import (
+    ATTRIBUTION_METRIC_NAME,
+    FACTOR_ATTRIBUTION_SCHEMA_VERSION,
+)
 from crucible.gate import (
     GATES,
     MANIFEST_RUN_MODE_FIELD,
@@ -1857,13 +1861,17 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
         assert arena_cycle_key("r", FRIDAY.isoformat()) in clause.detail
         assert "no promote run manifest was filed" not in clause.detail
 
-    def test_one_clause_per_registered_slot_plus_the_two_portfolio_clauses(
+    def test_one_clause_per_registered_slot_plus_the_three_s_slot_evidence_clauses(
         self, store: LocalStore
     ) -> None:
         clauses = gate_module._phase3(store, _window(4), {}, trading_day=FRIDAY)
         assert [c.name for c in clauses] == [
             f"{slot}_promotion_or_verdict_backed_non_promotion" for slot in sorted(SLOTS)
-        ] + ["portfolio_engine_used_by_s_slot", "named_transaction_cost_model"]
+        ] + [
+            "portfolio_engine_used_by_s_slot",
+            "named_transaction_cost_model",
+            "factor_neutral_attribution",
+        ]
 
 
 def _portfolio_evidence(cost_model: dict, *, day: dt.date = FRIDAY) -> dict:
@@ -2007,18 +2015,207 @@ class TestNamedTransactionCostModel:
         assert "non-empty params" in clause.detail
 
 
-class TestPhase3DeliverablesTableTracksTheTwoWiredClauses:
-    def test_the_two_deliverables_carry_a_real_clause(self) -> None:
+def _attribution_evidence(*, day: dt.date = FRIDAY, **overrides: object) -> dict:
+    """A schema-shaped `factor_attribution.v1` document.
+
+    Built by hand rather than through `crucible.attribution.
+    compute_factor_attribution` for the same reason `_portfolio_evidence` is:
+    the engine's own contract is `tests/test_attribution_contracts.py`'s job,
+    and this file exercises only the GATE CLAUSE that reads the document,
+    through the same `manifest_records_factor_attribution` reader the clause
+    calls.
+    """
+    document = {
+        "schema_version": FACTOR_ATTRIBUTION_SCHEMA_VERSION,
+        "trading_day": day.isoformat(),
+        "engine": "crucible.attribution",
+        "window_sessions": 60,
+        "factors": [
+            {
+                "name": "beta",
+                "category": "beta",
+                "proxy": "SPY",
+                "exposure": 0.92,
+                "contribution_return": 0.0141,
+            },
+            {
+                "name": "size",
+                "category": "size",
+                "proxy": "IWM",
+                "exposure": 0.18,
+                "contribution_return": 0.0022,
+            },
+            {
+                "name": "tech",
+                "category": "sector",
+                "proxy": "XLK",
+                "exposure": 0.31,
+                "contribution_return": 0.0037,
+            },
+        ],
+        "category_totals": {
+            "beta": 0.0141,
+            "sector": 0.0037,
+            "size": 0.0022,
+            "residual": 0.0040,
+        },
+        "gross_return": 0.0240,
+        "net_return": 0.0237,
+        "cost_bps_total": 3.4,
+        "residual_alpha": 0.0040,
+        "risk": {"total_vol": 0.17, "factor_vol": 0.15, "idio_vol": 0.08},
+        "model": {"shrinkage": "ledoit_wolf", "n_obs": 60, "n_factors": 6, "n_holdings": 24},
+        "params_digest": "sha256:" + "1" * 64,
+    }
+    document.update(overrides)
+    return document
+
+
+def _attribution_metric_row(*, day: dt.date = FRIDAY, **overrides: object) -> dict:
+    evidence = _attribution_evidence(day=day, **overrides)
+    return {
+        "name": ATTRIBUTION_METRIC_NAME,
+        "module": "crucible.attribution",
+        "metric_type": "attribution",
+        "n_floor": 1,
+        "status": "OK",
+        "status_reason": "factor attribution over 60 session(s)",
+        "source_path": "crucible/attribution.py",
+        "last_updated_utc": "2026-08-28T21:00:00Z",
+        "value": 0.0040,
+        "unit": "return_fraction",
+        "horizon_trading_days": 60,
+        "factor_attribution": evidence,
+    }
+
+
+def _s_slot_attribution_manifest(*, day: dt.date = FRIDAY, **overrides: object) -> dict:
+    return {
+        "status": "ok",
+        "reason": "",
+        "metrics": [_attribution_metric_row(day=day, **overrides)],
+    }
+
+
+class TestFactorNeutralAttributionClause:
+    """`alpha-engine-config-I10501`: the phase-3 clause that reads the
+    `factor_attribution.v1` artifact off `experiment.grade[s]` manifests,
+    through `crucible.attribution.manifest_records_factor_attribution`."""
+
+    def test_unmeasurable_when_no_s_slot_manifest_exists(self, store: LocalStore) -> None:
+        """No S cycle job exists yet, so every real store reads this today.
+        UNMEASURABLE, never UNMET: nothing has graded a book to decompose."""
+        clause = gate_module._clause_factor_neutral_attribution(store, _window(4))
+        assert clause.unmeasurable and not clause.met
+        assert "`crucible.attribution` to have decomposed" in clause.detail
+
+    def test_met_when_a_grading_manifest_carries_the_decomposition(self, store: LocalStore) -> None:
+        key = manifest_key("experiment.grade", FRIDAY.isoformat(), discriminator="s")
+        _put(store, key, _s_slot_attribution_manifest())
+        clause = gate_module._clause_factor_neutral_attribution(store, _window(4))
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert key in clause.detail
+        assert "residual_alpha=0.004000" in clause.detail
+        for category in ("beta", "sector", "size"):
+            assert category in clause.detail
+
+    def test_unmet_when_the_evidence_carries_no_residual_alpha(self, store: LocalStore) -> None:
+        """A document present but missing one of the figures the closes-when
+        names is a real reading of a real run — UNMET, not UNMEASURABLE."""
+        key = manifest_key("experiment.grade", FRIDAY.isoformat(), discriminator="s")
+        evidence = _attribution_evidence()
+        del evidence["residual_alpha"]
+        row = _attribution_metric_row()
+        row["factor_attribution"] = evidence
+        _put(store, key, {"status": "ok", "reason": "", "metrics": [row]})
+        clause = gate_module._clause_factor_neutral_attribution(store, _window(4))
+        assert not clause.met and not clause.unmeasurable
+        assert "residual_alpha" in clause.detail
+
+    def test_unmet_when_a_category_total_is_missing(self, store: LocalStore) -> None:
+        key = manifest_key("experiment.grade", FRIDAY.isoformat(), discriminator="s")
+        _put(
+            store,
+            key,
+            _s_slot_attribution_manifest(
+                category_totals={"beta": 0.0141, "sector": 0.0037, "size": 0.0022}
+            ),
+        )
+        clause = gate_module._clause_factor_neutral_attribution(store, _window(4))
+        assert not clause.met and not clause.unmeasurable
+        assert "category_totals.residual" in clause.detail
+
+    def test_a_boolean_is_not_a_measured_figure(self, store: LocalStore) -> None:
+        """`bool` is a subclass of `int`; a `True` read as a return would grade
+        a flag as a decomposition."""
+        key = manifest_key("experiment.grade", FRIDAY.isoformat(), discriminator="s")
+        _put(store, key, _s_slot_attribution_manifest(gross_return=True))
+        clause = gate_module._clause_factor_neutral_attribution(store, _window(4))
+        assert not clause.met and not clause.unmeasurable
+        assert "gross_return" in clause.detail
+
+    def test_unmet_when_a_grading_manifest_ran_but_recorded_no_attribution(
+        self, store: LocalStore
+    ) -> None:
+        key = manifest_key("experiment.grade", FRIDAY.isoformat(), discriminator="s")
+        _put(store, key, {"status": "ok", "reason": "", "metrics": []})
+        clause = gate_module._clause_factor_neutral_attribution(store, _window(4))
+        assert not clause.met and not clause.unmeasurable
+        assert "without decomposing" in clause.detail
+
+    def test_a_row_naming_the_engine_without_evidence_reads_not_a_crash(
+        self, store: LocalStore
+    ) -> None:
+        """`manifest_records_factor_attribution` RAISES on a metric row naming
+        the engine with no payload — the clause turns that into a reading
+        rather than letting it escape `evaluate` (AGENTS.md rule 5)."""
+        key = manifest_key("experiment.grade", FRIDAY.isoformat(), discriminator="s")
+        _put(
+            store,
+            key,
+            {
+                "status": "ok",
+                "reason": "",
+                "metrics": [{"name": ATTRIBUTION_METRIC_NAME, "module": "crucible.attribution"}],
+            },
+        )
+        clause = gate_module._clause_factor_neutral_attribution(store, _window(4))
+        assert not clause.met
+        assert ATTRIBUTION_METRIC_NAME in clause.detail
+
+    def test_evidence_at_the_wrong_schema_version_is_a_reading_not_a_crash(
+        self, store: LocalStore
+    ) -> None:
+        key = manifest_key("experiment.grade", FRIDAY.isoformat(), discriminator="s")
+        _put(store, key, _s_slot_attribution_manifest(schema_version="factor_attribution.v2"))
+        clause = gate_module._clause_factor_neutral_attribution(store, _window(4))
+        assert not clause.met
+        assert "factor_attribution.v2" in clause.detail
+
+    def test_the_portfolio_clauses_do_not_read_the_attribution_row(self, store: LocalStore) -> None:
+        """The three S-slot clauses share one manifest walk but pass different
+        readers; an attribution-only manifest must not read as portfolio
+        evidence, or the two deliverables would grade each other."""
+        key = manifest_key("experiment.grade", FRIDAY.isoformat(), discriminator="s")
+        _put(store, key, _s_slot_attribution_manifest())
+        portfolio = gate_module._clause_portfolio_engine_used_by_s_slot(store, _window(4))
+        assert not portfolio.met and not portfolio.unmeasurable
+        assert gate_module._clause_factor_neutral_attribution(store, _window(4)).met
+
+
+class TestPhase3DeliverablesTableTracksTheWiredClauses:
+    def test_the_three_deliverables_carry_a_real_clause(self) -> None:
         by_id = {d.id: d for d in gate_module.PHASE3_DELIVERABLES}
         assert (
             by_id["portfolio_engine_used_by_s_slot"].graded_by == "portfolio_engine_used_by_s_slot"
         )
         assert by_id["named_transaction_cost_model"].graded_by == "named_transaction_cost_model"
+        assert by_id["factor_neutral_attribution"].graded_by == "factor_neutral_attribution"
 
-    def test_the_coverage_line_reflects_two_of_five(self, store: LocalStore) -> None:
+    def test_the_coverage_line_reflects_three_of_five(self, store: LocalStore) -> None:
         clauses = gate_module._phase3(store, _window(4), {}, trading_day=FRIDAY)
         note = gate_module.coverage_note("phase3", [c.name for c in clauses])
-        assert "grades 2 of 5" in note
+        assert "grades 3 of 5" in note
 
 
 # ---------------------------------------------------------------------------
