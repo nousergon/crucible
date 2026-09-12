@@ -1996,13 +1996,16 @@ class PhaseLadderDocument(_Strict):
             "title": "Crucible plan §6 phase ladder, v1",
             "description": (
                 "The record at gates/ladder.json, produced by "
-                "crucible.gate.build_ladder/ladder_payload and republished by both "
-                "crucible gate (crucible/track_f.py::gate_handler) and crucible console "
-                "(crucible/track_c.py::console_handler, via "
-                "crucible/console/render.py::write_page). Versioned because the fleet "
-                "console reads this key through an s3-records adapter, a cross-repo "
-                "consumer; additionalProperties: false because a field this reader does "
-                "not understand is a field the producer expected it to act on (I9825)."
+                "crucible.gate.build_ladder/ladder_payload and published by exactly ONE "
+                "writer: crucible gate --publish / crucible gate.close "
+                "(crucible/track_f.py::gate_handler). crucible console was a second "
+                "publisher until I10575 and re-evaluated every gate under its own "
+                "environment, republishing a false phase0 UNMEASURABLE ladder over the "
+                "gate publisher's phase2 reading; it now READS this key and embeds it. "
+                "Versioned because the fleet console reads this key through an "
+                "s3-records adapter, a cross-repo consumer; additionalProperties: false "
+                "because a field this reader does not understand is a field the producer "
+                "expected it to act on (I9825)."
             ),
         },
     )

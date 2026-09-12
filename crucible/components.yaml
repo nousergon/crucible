@@ -471,14 +471,15 @@ components:
   console:
     description: >-
       Render the static console page from the manifests - the plan §6 phase
-      ladder, runs with their 14-state classification, attribution,
-      champions, week cost, deploys.
+      ladder as gates/ladder.json publishes it (READ, never recomputed and
+      never republished - alpha-engine-config-I10575), runs with their
+      14-state classification, attribution, champions, week cost, deploys.
     lifecycle: ACTIVE
     signals:
       execution: run.json
       cost: run.json:cost_usd
       resource: run.json:resource
-      lineage: run.json:inputs[runs/**,gates/**],outputs[console/index.html,gates/ladder.json]
+      lineage: run.json:inputs[runs/**,gates/**,gates/ladder.json],outputs[console/index.html]
       outcome: run.json:metrics[components_unreported]
     log_location: /crucible/console
     log_retention_days: 90
