@@ -229,6 +229,82 @@ class TestInterruptionsCounter:
         assert manifest["resource"]["interruptions"] == 1
 
 
+class TestInterruptionsOnNoRetry:
+    """`resource.interruptions` on a `transient_retry=False` call
+    (`alpha-engine-config-I10520`). Three real call sites disable the retry
+    ladder deliberately (`track_c.py`, `track_f.py`, `fault_probe.py`) — a
+    caller that must see the first failure rather than a fresh attempt. The
+    spot-interruption guard is still installed unconditionally by `run_job`
+    regardless of `transient_retry`, so a real reclamation on one of those
+    jobs used to write `resource.interruptions: 0` beside a `reason` that
+    named `spot_interruption` — an interruption that unambiguously happened
+    and went uncounted.
+    """
+
+    def test_a_classified_transient_with_no_retry_records_the_interruption(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+
+        def reclaimed(ctx: RunContext) -> None:
+            raise SpotInterruptionError("spot_interruption: the instance is being reclaimed")
+
+        with pytest.raises(SpotInterruptionError):
+            run_job(
+                "smoke",
+                reclaimed,
+                store=store,
+                trading_day=FRIDAY,
+                now=NOW,
+                transient_retry=False,
+            )
+        manifest = _manifest(store, job="smoke")
+        assert manifest["status"] == "failed"
+        assert "spot_interruption" in manifest["reason"]
+        assert manifest["attempts"] == [{"n": 1, "reason": "initial"}]
+        assert manifest["resource"]["interruptions"] == 1
+
+    def test_a_non_transient_failure_with_no_retry_records_zero(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+
+        def broken(ctx: RunContext) -> None:
+            raise ValueError("schema drift in the fundamentals frame")
+
+        with pytest.raises(ValueError):
+            run_job(
+                "smoke",
+                broken,
+                store=store,
+                trading_day=FRIDAY,
+                now=NOW,
+                transient_retry=False,
+            )
+        manifest = _manifest(store, job="smoke")
+        assert manifest["status"] == "failed"
+        assert manifest["attempts"] == [{"n": 1, "reason": "initial"}]
+        assert manifest["resource"]["interruptions"] == 0
+
+    def test_the_retry_path_is_unchanged(self, tmp_path) -> None:
+        """An absorbed interruption on the default (retried) path still
+        reports exactly one, not two — `spot_interruption_observed` is only
+        ever set on the ctx of a TERMINAL, non-retried attempt, so it cannot
+        add to a count `attempts[]` already derives correctly."""
+        store = LocalStore(tmp_path)
+        calls = []
+
+        def flaky(ctx: RunContext) -> None:
+            calls.append(1)
+            if len(calls) == 1:
+                raise SpotInterruptionError("spot_interruption: the instance is being reclaimed")
+
+        run_job("data.daily", flaky, store=store, trading_day=FRIDAY, now=NOW)
+        manifest = _manifest(store)
+        assert manifest["status"] == "ok"
+        assert manifest["attempts"] == [
+            {"n": 1, "reason": "initial"},
+            {"n": 2, "reason": "spot_interruption"},
+        ]
+        assert manifest["resource"]["interruptions"] == 1
+
+
 class TestSpotGuard:
     def test_sigterm_without_an_external_guard_still_produces_a_manifest(self, tmp_path) -> None:
         """`run_job` must install `spot_interruption_guard` ITSELF (defect #8,
@@ -292,12 +368,13 @@ class TestSpotGuard:
         assert "spot_interruption" in manifest["reason"]
         # `transient_retry=False` here (deliberately, to isolate the guard
         # install from the retry ladder): `attempts` never grows a
-        # `spot_interruption` entry, so the DERIVED counter reads 0 even
-        # though a real SIGTERM was observed. Out of scope for
-        # alpha-engine-config-I10463 (filed separately) — this asserts the
-        # current, derivation-consistent behavior rather than leaving it
-        # unstated.
-        assert manifest["resource"]["interruptions"] == 0
+        # `spot_interruption` entry for a call site that opted out of
+        # retrying, so the ATTEMPTS-derived half of the counter alone would
+        # read 0 even though a real SIGTERM was observed. Fixed by
+        # `alpha-engine-config-I10520`: `ctx.spot_interruption_observed` is
+        # the second signal that covers exactly this terminal, no-retry
+        # case, and `resource.interruptions` now reads 1.
+        assert manifest["resource"]["interruptions"] == 1
 
     def test_the_previous_handler_is_restored(self) -> None:
         import signal
