@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import pathlib
 
 import pytest
 
@@ -207,8 +208,22 @@ class TestAbsenceRendersAsAbsence:
     def test_the_html_renders_never_measured_not_a_blank_or_a_zero(
         self, store: LocalStore, unregistered_phase: str
     ) -> None:
-        page = build_page(store, now=NOW)
-        html = render_html(page)
+        """The ladder the PRODUCER built, rendered by the console's page.
+
+        Constructed onto a `ConsolePage` rather than round-tripped through
+        `gates/ladder.json`: this fixture injects a sixth phase, which the
+        `phase_ladder.v1` pattern `^phase[0-5]$` correctly refuses, so the
+        store round-trip would exercise the console's validate-on-read
+        refusal (`alpha-engine-config-I10575`, asserted in
+        `TestTheConsoleReadsTheLadderAndNeverWritesIt`) instead of the
+        never-measured cell this test is about.
+        """
+        from crucible.console.render import ConsolePage
+
+        document = build_ladder(store, trading_day=FRIDAY, now=NOW).to_dict()
+        html = render_html(
+            ConsolePage(trading_day=FRIDAY.isoformat(), generated_utc="x", phase_ladder=document)
+        )
         assert "Phase ladder" in html
         assert "never measured" in html
         assert f"alpha-engine-config-I{_PHASE0_ISSUE}" in html
@@ -419,30 +434,153 @@ class TestAnOutOfOrderPhaseIsVisibleAsSuch:
         assert f"alpha-engine-config-I{_PHASE0_ISSUE}" in rows["phase1"]["detail"]
 
 
-class TestTheLadderIsPublishedWhereSomethingReadsIt:
-    def test_the_console_job_writes_the_ladder_artifact(self, store: LocalStore) -> None:
-        """Deliverable 4: the reading refreshes on the `console` job's weekly
-        arc cadence, not only when somebody types `crucible gate`."""
+def _publish_ladder(store: LocalStore, *, trading_day: dt.date = FRIDAY, **overrides) -> bytes:
+    """`gates/ladder.json` exactly as its ONE producer writes it.
+
+    `crucible.gate.ladder_payload` — the same bytes `crucible gate --publish`
+    and `crucible gate.close` put, so a test that reads the key back is
+    reading the real artifact and not a fixture shaped like one.
+    """
+    ladder = build_ladder(store, trading_day=trading_day, now=NOW)
+    payload = ladder_payload(ladder)
+    if overrides:
+        document = json.loads(payload.decode("utf-8"))
+        document.update(overrides)
+        payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
+    store.put_bytes(LADDER_KEY, payload)
+    return payload
+
+
+class TestTheConsoleReadsTheLadderAndNeverWritesIt:
+    """`alpha-engine-config-I10575`. The console was the SECOND producer of
+    `gates/ladder.json` and re-evaluated every phase gate under its own
+    runtime — which deliberately carries neither `CRUCIBLE_MUTED_TOPIC` nor
+    `CRUCIBLE_CLOUDTRAIL_ARCHIVE` nor `ce:GetCostAndUsage`. On the first live
+    Saturday (2026-09-12) its 11:04Z run overwrote the 02:06Z `phase2` 7/10
+    ladder with a `phase0` UNMEASURABLE 0/5 one, and returned `ok`.
+
+    Every test here asserts a REFUSAL: the console refusing to write the key,
+    and the panel refusing to show anything green when the published ladder
+    is absent, malformed or stale."""
+
+    def test_write_page_does_not_write_the_ladder_key(self, store: LocalStore) -> None:
+        """The console's key set no longer contains `gates/ladder.json`."""
+        _publish_ladder(store)
         page = build_page(store, now=NOW)
-        keys = write_page(store, page)
-        assert LADDER_KEY in keys
+        assert LADDER_KEY not in write_page(store, page)
+
+    def test_the_module_does_not_import_build_ladder(self) -> None:
+        """`grep -c build_ladder crucible/console/render.py` = 0 — the issue's
+        own `closes-when`. Asserted against the source text, not against the
+        module namespace: an import inside a function would satisfy a
+        `hasattr` check and still re-evaluate every gate."""
+        import crucible.console.render as render_module
+
+        source = pathlib.Path(render_module.__file__).read_text(encoding="utf-8")
+        assert "build_ladder" not in source
+
+    def test_a_console_run_leaves_a_phase2_ladder_byte_identical(self, store: LocalStore) -> None:
+        """The `closes-when`: a store whose ladder reads `phase2` is untouched
+        by a console run — zero puts to `LADDER_KEY` — and the page renders
+        phase2."""
+        published = _publish_ladder(store, current_phase="phase2")
+        puts: list[str] = []
+        original_put = store.put_bytes
+
+        def recording_put(key: str, payload: bytes) -> None:
+            puts.append(key)
+            original_put(key, payload)
+
+        store.put_bytes = recording_put  # type: ignore[method-assign]
+        page = build_page(store, now=NOW)
+        write_page(store, page)
+        store.put_bytes = original_put  # type: ignore[method-assign]
+
+        assert LADDER_KEY not in puts
+        assert store.get_bytes(LADDER_KEY) == published
+        assert "phase2" in render_html(page)
+
+    def test_the_embedded_ladder_is_byte_equal_to_the_published_key(
+        self, store: LocalStore
+    ) -> None:
+        """The page cannot disagree with `gates/ladder.json`: what it embeds
+        is what it read, serialized the same way its producer serializes it."""
+        published = _publish_ladder(store)
+        page = build_page(store, now=NOW)
+        embedded = json.dumps(page.phase_ladder, indent=2, sort_keys=True).encode("utf-8")
+        assert embedded == published
+        assert page.phase_ladder_fault is None
+
+    def test_an_absent_ladder_renders_UNREPORTED_and_names_the_producer(
+        self, store: LocalStore
+    ) -> None:
+        page = build_page(store, now=NOW)
+        assert page.phase_ladder == {}
+        assert "is absent" in (page.phase_ladder_fault or "")
+        html = render_html(page)
+        assert "UNREPORTED" in html
+        assert LADDER_KEY in html
+        assert STATUS_COLORS["MET"] not in _ladder_panel(html)
+
+    def test_an_invalid_ladder_renders_UNREPORTED_and_names_the_field(
+        self, store: LocalStore
+    ) -> None:
+        _publish_ladder(store)
+        document = json.loads(store.get_bytes(LADDER_KEY).decode("utf-8"))
+        document["phases"][0]["state"] = "PENDING"
+        store.put_bytes(LADDER_KEY, json.dumps(document).encode("utf-8"))
+
+        page = build_page(store, now=NOW)
+        assert page.phase_ladder == {}
+        assert "does not validate" in (page.phase_ladder_fault or "")
+        assert "UNREPORTED" in render_html(page)
+        assert STATUS_COLORS["MET"] not in _ladder_panel(render_html(page))
+
+    def test_a_ladder_older_than_the_page_renders_UNREPORTED(self, store: LocalStore) -> None:
+        """A publisher that stopped running leaves a valid ladder behind. Shown
+        as this day's reading it is a false green; shown as UNREPORTED it is a
+        dead publisher somebody can fix."""
+        _publish_ladder(store, trading_day=dt.date(2026, 8, 21))
+        page = build_page(store, now=NOW)
+        assert page.phase_ladder == {}
+        assert "stale" in (page.phase_ladder_fault or "")
+        assert "2026-08-21" in (page.phase_ladder_fault or "")
+        assert "UNREPORTED" in render_html(page)
+
+    def test_a_ladder_NEWER_than_the_page_is_rendered(self, store: LocalStore) -> None:
+        """The stale test is one-sided on purpose: a replayed page against a
+        current ladder must show the current reading, not an UNREPORTED panel."""
+        _publish_ladder(store, trading_day=dt.date(2026, 9, 4))
+        page = build_page(store, now=NOW)
+        assert page.phase_ladder != {}
+        assert page.phase_ladder_fault is None
+
+
+def _ladder_panel(html: str) -> str:
+    """Just the ladder section of the page — the panel whose color is asserted.
+
+    Slicing matters: the components table below it legitimately carries green
+    rows, so asserting "no green anywhere on the page" would pass or fail for
+    reasons that have nothing to do with the ladder.
+    """
+    start = html.index("<h2>Phase ladder</h2>")
+    rest = html.index("<h2>", start + 1)
+    return html[start:rest]
+
+
+class TestTheLadderIsPublishedWhereSomethingReadsIt:
+    def test_the_gate_publisher_is_the_only_writer_of_the_artifact(self, store: LocalStore) -> None:
+        """Deliverable 4 as `alpha-engine-config-I10575` leaves it: the reading
+        is published by `crucible gate --publish` / `crucible gate.close`, and
+        the console surface refreshes from that key rather than republishing
+        its own."""
+        _publish_ladder(store)
         published = json.loads(store.get_bytes(LADDER_KEY).decode("utf-8"))
         assert published["schema_version"] == "phase_ladder.v1"
         assert len(published["phases"]) == len(PHASES)
 
-    def test_the_published_bytes_are_the_same_shape_from_both_publishers(
-        self, store: LocalStore
-    ) -> None:
-        """`crucible gate` and `crucible console` both write `gates/ladder.json`.
-        Two publishers of one key that disagreed on its shape would give the
-        console's adapter a row whose fields depend on which job ran last."""
-        ladder = build_ladder(store, trading_day=FRIDAY, now=NOW)
         page = build_page(store, now=NOW)
-        write_page(store, page)
-        from_gate = json.loads(ladder_payload(ladder).decode("utf-8"))
-        from_console = json.loads(store.get_bytes(LADDER_KEY).decode("utf-8"))
-        assert set(from_gate) == set(from_console)
-        assert from_gate["phases"][0].keys() == from_console["phases"][0].keys()
+        assert page.phase_ladder == published
 
     def test_the_render_survives_a_ladder_that_was_never_built(self) -> None:
         """An empty ladder renders as an absence, never as a complete ladder
@@ -450,7 +588,8 @@ class TestTheLadderIsPublishedWhereSomethingReadsIt:
         from crucible.console.render import ConsolePage
 
         html = render_html(ConsolePage(trading_day="2026-08-28", generated_utc="x"))
-        assert "No ladder was built" in html
+        assert "UNREPORTED" in html
+        assert LADDER_KEY in html
 
 
 class TestThePhaseLadderSchemaContract:
@@ -465,15 +604,15 @@ class TestThePhaseLadderSchemaContract:
 
         Draft202012Validator.check_schema(ladder_schema())
 
-    def test_bytes_from_both_producers_validate_against_the_schema(self, store: LocalStore) -> None:
+    def test_bytes_from_the_producer_validate_against_the_schema(self, store: LocalStore) -> None:
+        """One producer, one validation point. The console's copy of this
+        assertion went with its write (`alpha-engine-config-I10575`); the
+        consumer side is now validate-on-READ, asserted in
+        `TestTheConsoleReadsTheLadderAndNeverWritesIt`."""
         from crucible.gate import validate_ladder_document
 
         ladder = build_ladder(store, trading_day=FRIDAY, now=NOW)
         validate_ladder_document(json.loads(ladder_payload(ladder).decode("utf-8")))
-
-        page = build_page(store, now=NOW)
-        write_page(store, page)
-        validate_ladder_document(json.loads(store.get_bytes(LADDER_KEY).decode("utf-8")))
 
     def test_the_gate_jobs_manifest_records_the_ladders_own_schema_version(
         self, tmp_path, monkeypatch: pytest.MonkeyPatch
@@ -508,24 +647,23 @@ class TestThePhaseLadderSchemaContract:
         (ladder_output,) = [o for o in manifest["outputs"] if o["key"] == LADDER_KEY]
         assert ladder_output["schema_version"] == "phase_ladder.v1"
 
-    def test_the_console_jobs_manifest_also_records_the_ladders_own_schema_version(
-        self, tmp_path
-    ) -> None:
-        """Measured on `crucible-PR30` head `a124381`: `console_handler`
-        stamped every `write_page` key, ladder included, with the single
-        literal `console_page.v1`."""
+    def test_the_console_jobs_manifest_records_no_ladder_output_at_all(self, tmp_path) -> None:
+        """`alpha-engine-config-I10575`: the console job's lineage names the
+        page and its JSON and NOT `gates/ladder.json`, because it no longer
+        writes it. A manifest that still claimed the ladder as an output would
+        be the audit trail asserting a write that did not happen."""
         import argparse
 
         from crucible.store import LocalStore
         from crucible.track_c import console_handler
 
+        store = LocalStore(tmp_path)
+        _publish_ladder(store)
         args = argparse.Namespace(trading_day=FRIDAY, store=str(tmp_path))
         console_handler(args)
 
-        store = LocalStore(tmp_path)
         manifest = json.loads(store.get_bytes(f"runs/console/{FRIDAY.isoformat()}/run.json"))
-        (ladder_output,) = [o for o in manifest["outputs"] if o["key"] == LADDER_KEY]
-        assert ladder_output["schema_version"] == "phase_ladder.v1"
+        assert [o["key"] for o in manifest["outputs"] if o["key"] == LADDER_KEY] == []
 
     def test_an_out_of_vocabulary_state_is_refused_by_the_schema(self, store: LocalStore) -> None:
         ladder = build_ladder(store, trading_day=FRIDAY, now=NOW)

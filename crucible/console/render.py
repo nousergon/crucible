@@ -25,7 +25,7 @@ from crucible.documents import (
     read_manifests_under,
     read_store_document,
 )
-from crucible.gate import LADDER_KEY, LADDER_STATES, PHASES, build_ladder
+from crucible.gate import LADDER_KEY, LADDER_SCHEMA_VERSION, LADDER_STATES, PHASES
 from crucible.gate import validate_ladder_document as _validate_ladder_document
 from crucible.keys import (
     CONSOLE_JSON_KEY,
@@ -89,12 +89,24 @@ class ConsolePage:
     #: every other row and says, on its own surface, exactly which key it
     #: could not read and why.
     unreadable: list[dict[str, str]] = field(default_factory=list)
-    #: The plan §6 phase ladder — one row per phase, as `crucible.gate`
-    #: measures it. Carried on the page rather than left to a second command
-    #: so the ladder refreshes on the `console` job's weekly cadence as well
-    #: as on every `crucible gate` read: a surface only ever refreshed by hand
-    #: is the defect `alpha-engine-config-I9757` published three times.
+    #: The plan §6 phase ladder — one row per phase — as READ from
+    #: `gates/ladder.json`, never as computed here. The console is a consumer
+    #: of that key and not a producer of it (`alpha-engine-config-I10575`):
+    #: it re-evaluated every gate under the console runtime's own
+    #: environment, which deliberately carries neither `CRUCIBLE_MUTED_TOPIC`
+    #: nor `CRUCIBLE_CLOUDTRAIL_ARCHIVE` nor `ce:GetCostAndUsage`, and on
+    #: 2026-09-12 republished a phase0 UNMEASURABLE 0/5 ladder over
+    #: `gate.close`'s phase2 7/10 reading while reporting `status: ok`.
+    #: Empty when the ladder could not be read, could not be validated, or is
+    #: older than this page's trading day — ``phase_ladder_fault`` then says
+    #: which, and the panel renders UNREPORTED rather than a recomputed
+    #: ladder.
     phase_ladder: dict[str, Any] = field(default_factory=dict)
+    #: Why ``phase_ladder`` is empty, as a sentence naming `gates/ladder.json`
+    #: and the cause; None when the ladder read. A published field rather than
+    #: a log line: the panel's red has to name what to fix, and the JSON an
+    #: agent reads has to carry the same cause the HTML shows.
+    phase_ladder_fault: str | None = None
     attribution: list[dict[str, Any]] = field(default_factory=list)
     #: The champion pointer document per slot, or None when no pointer has
     #: been written OR the pointer could not be read. Which of those two it is
@@ -401,6 +413,65 @@ def classify_registry(
     return classifications, manifests
 
 
+def _read_ladder(store: Store, trading_day: dt.date) -> tuple[dict[str, Any], str | None]:
+    """`gates/ladder.json` as the gate publisher wrote it, or why it is unusable.
+
+    The console READS this key. It does not compute it and it does not write
+    it — `crucible gate --publish` / `crucible gate.close`
+    (`crucible.gate.ladder_payload`) is the one producer
+    (`alpha-engine-config-I10575`).
+
+    Four outcomes, and three of them are an UNREPORTED panel rather than a
+    ladder:
+
+    * **absent** — nothing has published a ladder yet;
+    * **unreadable** — present and not parseable as an object, or our access
+      to it failed;
+    * **invalid** — present, parseable, and not conformant to
+      `phase_ladder.v1`;
+    * **stale** — present and valid, carrying a `trading_day` EARLIER than
+      the day this page is keyed to, which is the shape of a publisher that
+      stopped running.
+
+    A later `trading_day` is NOT stale and is not refused: a ladder published
+    for a day after this page's is a replay of an older page against a
+    current ladder, and rendering the current reading is correct there. What
+    is refused is showing a reading from before the day being rendered as
+    though it were this day's.
+
+    Nothing here re-evaluates the gates. A recomputed ladder is exactly
+    the defect: it reads green-or-red under whatever environment the console
+    process happens to hold, which is not the environment the gate is
+    measured in.
+    """
+    read = _read(store, LADDER_KEY)
+    if read.absent:
+        return {}, (
+            f"{LADDER_KEY} is absent — no gate publisher has written a ladder. "
+            "`crucible gate.close` (or `crucible gate --publish`) is its one producer; "
+            "the console reads it and never computes it."
+        )
+    if read.problem is not None or read.document is None:
+        return {}, _fault(read, LADDER_KEY) or str(read.problem)
+    document = read.document
+    try:
+        _validate_ladder_document(document)
+    except ValueError as exc:
+        # Not a swallow: the failure mode is "the published ladder does not
+        # conform to phase_ladder.v1", and the recording surface is the
+        # UNREPORTED ladder panel plus this page's JSON, both of which carry
+        # the validator's own sentence naming the offending field.
+        return {}, f"{LADDER_KEY} does not validate against {LADDER_SCHEMA_VERSION}: {exc}"
+    published_day = document.get("trading_day")
+    if not isinstance(published_day, str) or published_day < trading_day.isoformat():
+        return {}, (
+            f"{LADDER_KEY} is stale: it was built for trading day {published_day!r}, "
+            f"before this page's {trading_day.isoformat()}. A reading from an earlier "
+            "day rendered as this day's is the false-green this panel refuses."
+        )
+    return document, None
+
+
 def build_page(
     store: Store,
     *,
@@ -533,7 +604,7 @@ def build_page(
         unreadable.append({"key": attribution_key_, "fault": attribution_fault})
     attribution_rows = _attribution_rows(attribution_read, attribution_key_, unreadable)
     champions, champion_faults = _champions(store, unreadable)
-    ladder = build_ladder(store, trading_day=trading_day, registry=reg, now=moment)
+    ladder, ladder_fault = _read_ladder(store, trading_day)
 
     return ConsolePage(
         trading_day=trading_day.isoformat(),
@@ -547,7 +618,8 @@ def build_page(
         champion_faults=champion_faults,
         deploys=sorted(deploys, key=lambda d: str(d.get("trading_day"))),
         week_cost_usd=round(week_cost, 4),
-        phase_ladder=ladder.to_dict(),
+        phase_ladder=ladder,
+        phase_ladder_fault=ladder_fault,
         unreadable=unreadable,
         unreported=sum(1 for r in rows if r["state"] == "UNREPORTED") + metric_gap,
         population=len(rows),
@@ -959,11 +1031,23 @@ def _ladder_section(page: ConsolePage) -> list[str]:
     """
     ladder = page.phase_ladder
     if not ladder:
+        # UNREPORTED, in the page's own red, never `empty`'s gray and never a
+        # recomputed ladder (`alpha-engine-config-I10575`). The console is a
+        # CONSUMER of `gates/ladder.json`; when that key is absent, unreadable,
+        # malformed or older than this page's trading day, the honest reading
+        # is "we have nothing trustworthy to show" plus the cause — principle
+        # 7: no data is never rendered as green.
+        cause = page.phase_ladder_fault or (
+            f"<code>{_e(LADDER_KEY)}</code> was not read for this page."
+        )
         return [
             "<h2>Phase ladder</h2>",
-            '<p class="empty">No ladder was built for this page. That is an absence, '
-            "not a complete ladder — <code>crucible.gate.build_ladder</code> did not "
-            "run.</p>",
+            '<p class="sub">'
+            f'<span class="state {_state_class("UNREPORTED")}">UNREPORTED</span> · '
+            "the console reads <code>{key}</code> and never computes it; its one "
+            "producer is <code>crucible gate.close</code> / "
+            "<code>crucible gate --publish</code></p>".format(key=_e(LADDER_KEY)),
+            f'<p class="reason {_state_class("UNREPORTED")}">{_e(cause)}</p>',
         ]
     out_of_order = ladder.get("out_of_order") or []
     parts = [
@@ -1000,25 +1084,25 @@ def _ladder_section(page: ConsolePage) -> list[str]:
 
 
 def write_page(store: Store, page: ConsolePage) -> tuple[str, ...]:
-    """Write the HTML, the JSON and the phase-ladder artifact. Returns the keys.
+    """Write the HTML and the JSON. Returns the keys.
 
     The JSON is not an extra: `console-policy` requires every view to serve
     the JSON an agent reads, and a page whose numbers can only be scraped out
     of HTML is a page the next automated reader re-derives incorrectly.
 
-    The ladder is written to its own well-known key as well as being embedded
-    here, because the FLEET console reads it as a source (an `s3-records`
-    adapter over `gates/ladder.json`) and an adapter that had to parse this
-    page's JSON would be coupled to the page's shape rather than to the
-    measurement.
+    **`gates/ladder.json` is NOT written here** (`alpha-engine-config-I10575`).
+    The ladder has exactly one producer — `crucible gate --publish` /
+    `crucible gate.close`, via `crucible.gate.ladder_payload` — and this
+    function used to be a second one, re-evaluating every phase gate under
+    the console runtime's own environment and republishing the result over
+    the gate publisher's. That runtime deliberately lacks
+    `CRUCIBLE_MUTED_TOPIC`, `CRUCIBLE_CLOUDTRAIL_ARCHIVE` and
+    `ce:GetCostAndUsage`, so on the first live Saturday (2026-09-12) the
+    11:04Z console run overwrote the 02:06Z `phase2` 7/10 ladder with a
+    `phase0` UNMEASURABLE 0/5 one and reported `status: ok`. The fleet
+    console's `s3-records` adapter still reads the key directly; it now reads
+    the only reading there is.
     """
     store.put_bytes(CONSOLE_KEY, render_html(page).encode("utf-8"))
     store.put_bytes(CONSOLE_JSON_KEY, page.to_json())
-    # Validated against `phase_ladder.v1` here too — `write_page` is the
-    # SECOND producer of `gates/ladder.json` (`crucible gate` is the first,
-    # via `crucible.gate.ladder_payload`), and this is the one place its
-    # bytes are formed, so a malformed ladder is refused before either
-    # publisher's write lands (alpha-engine-config-I9825).
-    _validate_ladder_document(page.phase_ladder)
-    store.put_bytes(LADDER_KEY, json.dumps(page.phase_ladder, indent=2, sort_keys=True).encode())
-    return CONSOLE_KEY, CONSOLE_JSON_KEY, LADDER_KEY
+    return CONSOLE_KEY, CONSOLE_JSON_KEY

@@ -46,8 +46,6 @@ from crucible.drift import drift_metrics
 from crucible.drift_inputs import DRIFT_INPUT_SCHEMA_VERSION, compute_drift_inputs
 from crucible.gate import (
     GATES,
-    LADDER_KEY,
-    LADDER_SCHEMA_VERSION,
     PHASES,
     build_ladder,
     evaluate,
@@ -886,18 +884,20 @@ def console_handler(args: argparse.Namespace) -> int:
     def body(ctx: RunContext) -> None:
         page = build_page(store, now=dt.datetime.now(dt.UTC))
         # Every key `write_page` wrote, unpacked positionally by nobody: the
-        # ladder artifact joined the page and its JSON, and a two-name unpack
-        # would have failed the console job the moment it did.
+        # set has changed twice (the ladder joined it, then left it again in
+        # `alpha-engine-config-I10575`) and a fixed-arity unpack would have
+        # failed the console job on each change.
         #
-        # Each key gets ITS OWN schema version rather than one blanket stamp —
-        # `gates/ladder.json` speaks `phase_ladder.v1`, not `console_page.v1`;
-        # stamping every `write_page` key the same version is what let the
-        # manifest lineage entry for the ladder disagree with the bytes it
-        # described (`alpha-engine-config-I9825`).
+        # Each key gets ITS OWN schema version rather than one blanket stamp
+        # (`alpha-engine-config-I9825`). `gates/ladder.json` is no longer in
+        # this map because `console` no longer writes it: the ladder has one
+        # producer, `crucible gate --publish` / `crucible gate.close`, and
+        # `build_page` READS the published key rather than re-evaluating
+        # every gate under this job's environment
+        # (`alpha-engine-config-I10575`).
         key_schema_versions = {
             CONSOLE_KEY: "console_page.v1",
             CONSOLE_JSON_KEY: "console_page.v1",
-            LADDER_KEY: LADDER_SCHEMA_VERSION,
         }
         # alpha-engine-config-I9922 R2-1: the store guard is the backstop —
         # `console` has a natural report (the page's own JSON), printed below
