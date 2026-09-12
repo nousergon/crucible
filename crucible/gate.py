@@ -49,6 +49,7 @@ from crucible.alerts import (
     PAGE_CONDITIONS,
     pages_in_range,
 )
+from crucible.attribution import manifest_records_factor_attribution
 from crucible.calendar import TRADING_DAYS_PER_WEEK, is_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
 from crucible.config import CLOUDTRAIL_ARCHIVE_VAR
@@ -155,6 +156,8 @@ __all__ = [
     "weekly_window",
     "PHASE4_MAX_TOTAL_USD",
     "PHASES",
+    "ATTRIBUTION_REQUIRED_RETURNS",
+    "ATTRIBUTION_REQUIRED_CATEGORIES",
     "TRADER_EVIDENCE_KEY",
     "REVIEW_SCHEMA_VERSION",
     "SOURCE_SCAN_SCOPE",
@@ -3143,8 +3146,7 @@ PHASE3_DELIVERABLES: tuple[Deliverable, ...] = (
     Deliverable(
         "factor_neutral_attribution",
         "factor-neutral attribution (beta/sector/size/residual, OLS on ArcticDB ETF series)",
-        None,
-        "no phase-3 clause reads an attribution artifact for residual alpha or gross/net returns",
+        "factor_neutral_attribution",
     ),
     Deliverable(
         "sealed_holdout",
@@ -6154,16 +6156,22 @@ PORTFOLIO_GRADED_SLOT = "s"
 
 
 def _s_slot_grading_evidence(
-    store: Store, window: list[dt.date]
+    store: Store,
+    window: list[dt.date],
+    *,
+    reader: Callable[[dict[str, Any]], dict[str, Any] | None] = manifest_records_portfolio_engine,
 ) -> tuple[list[tuple[str, dict[str, Any]]], list[str], list[str], list[str], int]:
-    """The `portfolio_construction.v1` documents on every S-slot grading
-    manifest in ``window``, and what stood in the way of reading the rest.
+    """The evidence documents ``reader`` finds on every S-slot grading manifest
+    in ``window``, and what stood in the way of reading the rest.
 
-    Shared by both phase-3 `crucible.portfolio` clauses so they read the same
-    manifests through the same one call — `manifest_records_portfolio_engine`
-    lives beside the producer for exactly this reason (`alpha-engine-config-
-    I10510`): a clause restating the `portfolio_construction.v1` shape here
-    would be a second implementation of the reader, and the two would drift.
+    Shared by all three phase-3 S-slot clauses so they read the same manifests
+    through one call, each passing the reader its producer ships beside —
+    `manifest_records_portfolio_engine` (`alpha-engine-config-I10510`) or
+    `crucible.attribution.manifest_records_factor_attribution`
+    (`-I10501`). Those readers live beside their producers for exactly this
+    reason: a clause restating the `portfolio_construction.v1` or
+    `factor_attribution.v1` shape here would be a second implementation, and
+    the two would drift.
 
     Returns ``(documents, problems, access, evidence_keys, manifests_present)``:
     ``documents`` is ``(key, evidence)`` for every manifest that read `ok` and
@@ -6207,9 +6215,9 @@ def _s_slot_grading_evidence(
             continue
         manifests_present += 1
         try:
-            evidence = manifest_records_portfolio_engine(document)
+            evidence = reader(document)
         except ValueError as exc:
-            # `manifest_records_portfolio_engine` RAISES on a metric row that
+            # Every such reader RAISES on a metric row that
             # names the engine without carrying its evidence — a producer
             # defect, not an access failure. `_contained` (below) would catch
             # this too if it escaped, but catching it HERE keeps one bad
@@ -6221,13 +6229,18 @@ def _s_slot_grading_evidence(
     return documents, problems, access, evidence_keys, manifests_present
 
 
-def _s_slot_evidence_unmeasurable_no_manifests(requirement: str, window: list[dt.date]) -> str:
+def _s_slot_evidence_unmeasurable_no_manifests(
+    requirement: str,
+    window: list[dt.date],
+    *,
+    unbuilt: str = "`crucible.portfolio` to have built",
+) -> str:
     return (
         f"no `experiment.grade[{PORTFOLIO_GRADED_SLOT}]` manifest exists under "
         f"{runs_prefix('experiment.grade')} over {window[0].isoformat()}.."
         f"{window[-1].isoformat()}. The S slot has no `produce`/`grade` yet "
-        "(`crucible.slots.dispatchable_slots`), so nothing has graded a book for "
-        "`crucible.portfolio` to have built — this is UNMEASURABLE, not UNMET, until "
+        f"(`crucible.slots.dispatchable_slots`), so nothing has graded a book for "
+        f"{unbuilt} — this is UNMEASURABLE, not UNMET, until "
         "the S cycle job lands"
     )
 
@@ -6356,6 +6369,125 @@ def _clause_named_transaction_cost_model(store: Store, window: list[dt.date]) ->
     )
 
 
+#: The three return figures `alpha-engine-config-I10501`'s closes-when names in
+#: terms ("residual alpha plus gross and net returns"). Listed once so the
+#: clause below cannot quietly grade a narrower document as the deliverable.
+ATTRIBUTION_REQUIRED_RETURNS: tuple[str, ...] = (
+    "residual_alpha",
+    "gross_return",
+    "net_return",
+)
+
+#: The exposure categories the same closes-when names ("beta/sector/size
+#: exposures"). `residual` completes the decomposition and is graded with them
+#: — a category_totals block missing it does not sum to `gross_return`.
+ATTRIBUTION_REQUIRED_CATEGORIES: tuple[str, ...] = ("beta", "sector", "size", "residual")
+
+
+def _is_number(value: Any) -> bool:
+    """True for a JSON number. `bool` is a subclass of `int` and is NOT one —
+    a `True` read as an exposure would grade as a measured figure."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _clause_factor_neutral_attribution(store: Store, window: list[dt.date]) -> Clause:
+    """`alpha-engine-config-I10501`: factor-neutral attribution is gate-readable.
+
+    Reads `crucible.attribution.manifest_records_factor_attribution` off every
+    `experiment.grade[s]` manifest in the window — the reader the producer
+    ships beside, never a restatement of the `factor_attribution.v1` shape
+    here (the same rule `-I10510` states for `crucible.portfolio`).
+
+    MET requires the document to carry the figures the issue's closes-when
+    names: residual alpha, gross and net returns, and a beta/sector/size
+    exposure breakdown over at least one named factor. A document present but
+    missing one of them reads UNMET — it is a real reading of a real run.
+    No manifest at all reads UNMEASURABLE and never MET — "the S cycle has
+    never run" and "it ran and attributed nothing" are different answers, and
+    a clause that cannot tell them apart grades an unobserved run as a failed
+    one. A manifest that ran and carried no decomposition is the second
+    answer, and reads UNMET.
+    """
+    name = "factor_neutral_attribution"
+    requirement = (
+        "factor-neutral attribution (beta/sector/size/residual, OLS on ETF proxy series): "
+        "the S-slot grading evidence `crucible.attribution."
+        "manifest_records_factor_attribution` returns carries "
+        f"{', '.join(ATTRIBUTION_REQUIRED_RETURNS)} and a `category_totals` breakdown over "
+        f"{', '.join(ATTRIBUTION_REQUIRED_CATEGORIES)}"
+    )
+    documents, problems, access, evidence_keys, present = _s_slot_grading_evidence(
+        store, window, reader=manifest_records_factor_attribution
+    )
+    if documents:
+        key, evidence = documents[-1]
+        missing: list[str] = []
+        for figure in ATTRIBUTION_REQUIRED_RETURNS:
+            if not _is_number(evidence.get(figure)):
+                missing.append(figure)
+        totals = evidence.get("category_totals")
+        totals = totals if isinstance(totals, dict) else {}
+        for category in ATTRIBUTION_REQUIRED_CATEGORIES:
+            if not _is_number(totals.get(category)):
+                missing.append(f"category_totals.{category}")
+        factors = evidence.get("factors")
+        if not isinstance(factors, list) or not factors:
+            missing.append("at least one factor row")
+        if missing:
+            return Clause(
+                name,
+                requirement,
+                False,
+                f"{key}: the `factor_attribution.v1` evidence is missing "
+                f"{', '.join(missing)} — a decomposition that does not carry these is "
+                "not the deliverable",
+                tuple(evidence_keys),
+            )
+        categories = sorted(
+            {
+                row.get("category")
+                for row in factors
+                if isinstance(row, dict) and isinstance(row.get("category"), str)
+            }
+        )
+        return Clause(
+            name,
+            requirement,
+            True,
+            f"{key}: {len(factors)} factor row(s) over {', '.join(categories)} "
+            f"({evidence.get('window_sessions')} session(s)): "
+            f"gross={evidence['gross_return']:.6f} net={evidence['net_return']:.6f} "
+            f"residual_alpha={evidence['residual_alpha']:.6f}",
+            tuple(evidence_keys),
+        )
+    if problems:
+        detail = "; ".join(problems[:4])
+        if access:
+            detail = f"{detail}; {len(access)} could not be read: {'; '.join(access[:2])}"
+        return Clause(name, requirement, False, detail, tuple(evidence_keys))
+    if access:
+        return _unmeasurable(name, requirement, "; ".join(access[:4]), evidence_keys)
+    if present == 0:
+        return _unmeasurable(
+            name,
+            requirement,
+            _s_slot_evidence_unmeasurable_no_manifests(
+                requirement, window, unbuilt="`crucible.attribution` to have decomposed"
+            ),
+            evidence_keys,
+        )
+    return Clause(
+        name,
+        requirement,
+        False,
+        f"{present} `experiment.grade[{PORTFOLIO_GRADED_SLOT}]` manifest(s) over "
+        f"{window[0].isoformat()}..{window[-1].isoformat()} read `ok` but none recorded "
+        "`factor_attribution.v1` evidence — the S slot graded a book without decomposing "
+        "its return",
+        tuple(evidence_keys),
+    )
+
+
 def _phase3(
     store: Store,
     window: list[dt.date],
@@ -6365,13 +6497,15 @@ def _phase3(
 ) -> list[Clause]:
     """Phase 3's exit gate (plan §6 row 3), one clause per slot in `SLOTS`,
     plus the two `crucible.portfolio` clauses `alpha-engine-config-I10510`
-    wires (`-I9759`'s phase-3 row)."""
+    wires and the `crucible.attribution` clause `-I10501` wires (`-I9759`'s
+    phase-3 row)."""
     _unused((registry, trading_day))
     return [
         _clause_slot_promotion_or_non_promotion(store, slot, window) for slot in sorted(SLOTS)
     ] + [
         _clause_portfolio_engine_used_by_s_slot(store, window),
         _clause_named_transaction_cost_model(store, window),
+        _clause_factor_neutral_attribution(store, window),
     ]
 
 
