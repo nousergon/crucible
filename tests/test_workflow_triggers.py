@@ -955,13 +955,19 @@ def test_a_verdict_write_is_never_cancelled_by_an_in_flight_dispatch() -> None:
 # off-main guard and was never caught. Each entry here is executed under real
 # bash, once with the two variables empty (must fail, must name the `gh
 # variable set` remedy) and once with them set (must succeed).
+#
+# Keyed by `<workflow>:<job>`, not by workflow file. `gate-close.yml` carries
+# TWO AWS-touching jobs since `alpha-engine-config-I10508` — `gate-publish`
+# and `gate-close`, under two different identities — and a dict keyed by the
+# file could only ever exercise one of them, silently.
 VARIABLE_GUARD_JOBS: dict[str, str] = {
-    "board.yml": "board",
-    "gate-close.yml": "gate-close",
-    "ci.yml": "acceptance",
-    "deploy.yml": "release",
-    "morning-report.yml": "report",
-    "adversarial-review-record.yml": "record-verdict",
+    "board.yml:board": "board",
+    "gate-close.yml:gate-publish": "gate-publish",
+    "gate-close.yml:gate-close": "gate-close",
+    "ci.yml:acceptance": "acceptance",
+    "deploy.yml:release": "release",
+    "morning-report.yml:report": "report",
+    "adversarial-review-record.yml:record-verdict": "record-verdict",
 }
 
 
@@ -1013,31 +1019,34 @@ def test_every_variable_guard_job_still_exists() -> None:
     """A stale entry in `VARIABLE_GUARD_JOBS` would silently stop exercising a
     guard the moment its job was renamed — the same shape of hole
     `test_every_allowlisted_job_still_exists` closes for `PR_REACHABLE_JOBS`."""
-    for workflow_file, job_name in VARIABLE_GUARD_JOBS.items():
+    for label, job_name in VARIABLE_GUARD_JOBS.items():
+        workflow_file = label.split(":", 1)[0]
         workflow = Workflow.load(WORKFLOW_DIR / workflow_file)
-        assert job_name in workflow.jobs, f"{workflow_file}:{job_name} no longer exists"
+        assert job_name in workflow.jobs, f"{label} no longer exists"
 
 
-@pytest.mark.parametrize("workflow_file,job_name", sorted(VARIABLE_GUARD_JOBS.items()))
+@pytest.mark.parametrize("label,job_name", sorted(VARIABLE_GUARD_JOBS.items()))
 def test_the_variable_guard_actually_exits_non_zero_when_unset(
-    tmp_path: pathlib.Path, workflow_file: str, job_name: str
+    tmp_path: pathlib.Path, label: str, job_name: str
 ) -> None:
+    workflow_file = label.split(":", 1)[0]
     script = _variable_guard_run(workflow_file, job_name)
     env = {"PATH": "/usr/bin:/bin", "AWS_ACCOUNT_ID": "", "STORE_URI": ""}
     result = subprocess.run(
         ["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True, env=env
     )
     assert result.returncode != 0, (
-        f"{workflow_file}:{job_name} 'Repository variables are set' step exited "
+        f"{label} 'Repository variables are set' step exited "
         f"0 with both variables unset. stdout={result.stdout!r}"
     )
     assert "gh variable set" in result.stdout, result.stdout
 
 
-@pytest.mark.parametrize("workflow_file,job_name", sorted(VARIABLE_GUARD_JOBS.items()))
+@pytest.mark.parametrize("label,job_name", sorted(VARIABLE_GUARD_JOBS.items()))
 def test_the_variable_guard_passes_when_both_variables_are_set(
-    tmp_path: pathlib.Path, workflow_file: str, job_name: str
+    tmp_path: pathlib.Path, label: str, job_name: str
 ) -> None:
+    workflow_file = label.split(":", 1)[0]
     script = _variable_guard_run(workflow_file, job_name)
     env = {
         "PATH": "/usr/bin:/bin",
@@ -1052,7 +1061,7 @@ def test_the_variable_guard_passes_when_both_variables_are_set(
         ["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True, env=env
     )
     assert result.returncode == 0, (
-        f"{workflow_file}:{job_name} 'Repository variables are set' step failed "
+        f"{label} 'Repository variables are set' step failed "
         f"with both variables set. stdout={result.stdout!r} stderr={result.stderr!r}"
     )
 

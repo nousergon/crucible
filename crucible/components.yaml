@@ -569,16 +569,49 @@ components:
     console_surface: crucible/gates
     artifact_retention: forever
     absence_watched_by: alerts.sweep
-    # Run at a phase exit, which is an event and not a cadence. A gate on a
-    # schedule would be a gate whose absence pages between phases.
+    # DAILY since alpha-engine-config-I10508, and the earlier argument for
+    # `null` is recorded here rather than deleted, because it was right about
+    # something else.
     #
-    # That argument is about the READING and it still holds. It never covered
-    # the FILING (alpha-engine-config-I10095) - see `gate.close` below, which
-    # is scheduled precisely because a phase's exit RECORD cannot wait for
-    # somebody to happen to run this command.
-    schedule: null
-    dispatch: null
-    deadline: null
+    # It read: "run at a phase exit, which is an event and not a cadence; a
+    # gate on a schedule would be a gate whose absence pages between phases."
+    # That is an argument about a gate as a DECISION - nobody should be paged
+    # because no phase exited today, and nothing here does that: `crucible
+    # gate` exits 1 on an unmet gate and the publish job treats that as the
+    # ordinary case.
+    #
+    # It was never an argument about the ARTIFACT. `gates/{gate}/{day}/gate.json`
+    # is a dated reading other surfaces consume - `crucible/board.py`'s
+    # `phase:{id}:earliest-satisfiable` row reads the PREVIOUS trading day's
+    # to detect a setback - and I10492 left it with no producer at all, so it
+    # simply stopped being refreshed while remaining perfectly readable. An
+    # old reading is indistinguishable from a current one; the only thing
+    # separating them is a date in a key nobody compares. A surface kept fresh
+    # by whoever happens to run a command is the defect one layer along, which
+    # is the same sentence `gate.close` below was created for.
+    #
+    # So the READING is now published on a cadence too, by the `gate-publish`
+    # job of .github/workflows/gate-close.yml, under its own THIRD identity -
+    # the gate-publish role, which may write the dated readings
+    # and the ladder and may never write `gates/*/closing.json`. The deadline
+    # below is what makes its absence a page rather than a silence, and
+    # `crucible/board.py`'s `gate-readings-fresh` row renders the same fact on
+    # the daily board.
+    schedule: daily
+    dispatch: github-actions
+    dispatch_workflow: gate-close.yml
+    deadline:
+      # Identical to `gate.close`'s below, and for the identical reason: both
+      # jobs are started by the SAME 23:00 UTC cron in the same workflow, so
+      # they share this account's measured GitHub Actions delivery envelope
+      # (chronically +240 to +304 minutes - alpha-engine-config-I9960,
+      # -I9966). 23:00Z + 304 min is 04:04Z; `close_plus 10` is 02:00 ET the
+      # following morning, which clears the worst measured delay with ~2h of
+      # headroom. A tighter deadline here would page on a run that was merely
+      # late, which is how a channel gets muted.
+      anchor: close_plus
+      cadence: daily
+      offset_hours: 10
 
   gate.close:
     description: >-

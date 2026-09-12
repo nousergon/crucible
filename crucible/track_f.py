@@ -233,10 +233,16 @@ def closing_record_line(store: Store, reading: Any) -> str:
     if filed.problem is not None:
         return f"closing record at {key} could not be read: {filed.problem}"
     if gate_state_for(reading) == "MET":
+        # `crucible gate.close`, not "re-run this command": since
+        # `alpha-engine-config-I10508` this command does not file the record
+        # under any flag, and `gate.close` is its one writer (it also runs
+        # daily, so most readers need do nothing at all). A hint naming a
+        # command that no longer has the authority would send a reader to an
+        # AccessDenied and read as a broken job.
         return (
-            f"no closing record at {key}, and this gate reads MET. Re-run this command "
-            f"with --run-mode {RUN_MODE_LIVE} and without --dry-run to file it and post "
-            f"the reading to {phase.tracker}."
+            f"no closing record at {key}, and this gate reads MET. `crucible "
+            f"{GATE_CLOSE_JOB} --run-mode {RUN_MODE_LIVE}` files it and posts the "
+            f"reading to {phase.tracker}; gate-close.yml runs it daily."
         )
     return f"no closing record at {key} — {phase.tracker} has not exited"
 
@@ -318,6 +324,13 @@ def gate_handler(args: argparse.Namespace) -> int:
     until it passes. The manifest records `ok` and the reading; the exit code
     is what a caller branches on.
 
+    **This command never files the closing record.** `alpha-engine-config-
+    I10508`: `crucible gate.close` is the ONE writer of
+    `gates/{phase}/closing.json`, and this command -- now run on a schedule
+    under an identity that may write the dated readings and the ladder and
+    nothing else -- publishes a reading and can never file the record of one.
+    See the body for the full argument.
+
     **`--publish` gates the shared-artifact writes; it does not exist without
     also reading.** `alpha-engine-config-I10492`: this command is the one
     every session and every runbook uses to READ where a phase stands, and it
@@ -335,6 +348,10 @@ def gate_handler(args: argparse.Namespace) -> int:
     dry_run = bool(getattr(args, "dry_run", False))
     publish = bool(getattr(args, "publish", False)) and not dry_run
     store = open_store(getattr(args, "store", None), dry_run=dry_run)
+    # Still resolved, and now for ONE caller: the `--closing-comment` block at
+    # the foot of this function, which RENDERS a paste target and writes
+    # nothing. It no longer reaches `file_closing_record`, which this command
+    # stopped calling in alpha-engine-config-I10508.
     store_uri = resolve_store_uri(getattr(args, "store", None))
     result: dict[str, Any] = {}
 
@@ -392,15 +409,29 @@ def gate_handler(args: argparse.Namespace) -> int:
                 LADDER_KEY, ladder_payload(ladder), schema_version=LADDER_SCHEMA_VERSION
             )
         result["ladder"] = ladder
-        # The closing record, derived from the reading above and written at
-        # most once (`alpha-engine-config-I9967` deliverable 2). Inside the
-        # job body, so the record enters `outputs[]` as lineage and
-        # `crucible explain` can name the run that filed it; behind `publish`
-        # for the same reason the gate artifact is (`alpha-engine-config-
-        # I10492`), and the printed line below still reports whether one
-        # exists.
-        if publish:
-            file_closing_record(ctx, store, reading, store_uri=store_uri)
+        # THE CLOSING RECORD IS NOT FILED HERE, and has not been since
+        # `alpha-engine-config-I10508`. `crucible gate.close` is its one
+        # writer.
+        #
+        # Two commands able to file the same compare-and-swap record was one
+        # producer too many from the day `gate.close` was created
+        # (`alpha-engine-config-I10095`); making `crucible gate --publish` a
+        # SCHEDULED job is what forced the duplication to be resolved rather
+        # than tolerated. The scheduled publisher runs under its own gate-publish
+        # identity, whose whole reason for being a THIRD identity is that it
+        # writes the dated readings and the ladder
+        # and may never write `gates/*/closing.json` -- it publishes a reading
+        # and can never file the record of one, the exact mirror of
+        # `GateCloseRole`, which files the record and can never publish a
+        # reading. Leaving the call here would have meant either granting the
+        # publisher the closing records (deleting that property) or shipping a
+        # job that dies AccessDenied on the one day a phase turns MET.
+        #
+        # Nothing is lost by the removal: `gate-close.yml` runs `gate.close`
+        # immediately after the publish job, every day, and it evaluates every
+        # registered phase rather than the one `--gate` names.
+        # `closing_record_line` below still reports the record's state on every
+        # read, and now names the command that files it.
         ctx.record_rows(rows_in=len(reading.window), rows_out=len(reading.clauses))
         n_clauses = len(reading.clauses)
         met_count = sum(1 for c in reading.clauses if c.met)

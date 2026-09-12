@@ -36,7 +36,7 @@ import crucible.tracker as tracker_module
 from crucible.cli import HANDLERS, JOBS
 from crucible.components import load_registry
 from crucible.documents import UnreadableDocumentError, read_store_document
-from crucible.gate import PHASES, Clause, GateResult, Phase
+from crucible.gate import GATES, PHASES, Clause, GateResult, Phase
 from crucible.keys import closing_record_key, gate_key, manifest_key
 from crucible.store import LocalStore
 from crucible.track_f import CLOSE_OUTCOMES, GATE_CLOSE_JOB, gate_close_handler
@@ -512,3 +512,276 @@ class TestTheIdentityGuardActuallyFires:
         )
         assert result.returncode == 0, f"{result.stdout!r} {result.stderr!r}"
         assert GATE_CLOSE_ROLE in result.stdout
+
+
+# -- the PUBLISHING half (alpha-engine-config-I10508) -----------------------
+#
+# `alpha-engine-config-I10492` made `crucible gate` read-only unless
+# `--publish` is passed, and nothing in the automated path passed it - so
+# `gates/{gate}/{trading_day}/gate.json` stopped being refreshed while
+# remaining perfectly readable, which is the worst shape a stale artifact can
+# take. `gate-close.yml` gained a `gate-publish` job running BEFORE the
+# `gate-close` job, under a THIRD identity that may write the dated readings
+# and the ladder and may never write `gates/*/closing.json`.
+#
+# Every guard below is shown FIRING, not merely accepting valid input.
+
+GATE_PUBLISH_ROLE = "test-gate-publish"
+
+
+def _publish_job() -> dict:
+    return _workflow()["jobs"]["gate-publish"]
+
+
+def _publish_identity_step() -> str:
+    matches = [
+        s["run"]
+        for s in _publish_job()["steps"]
+        if s.get("name", "").startswith("Confirm the identity")
+    ]
+    assert len(matches) == 1, "expected exactly one identity-confirmation step"
+    return matches[0]
+
+
+def _publish_run_step() -> str:
+    matches = [s["run"] for s in _publish_job()["steps"] if s.get("name", "").startswith("Publish")]
+    assert len(matches) == 1, "expected exactly one publish step"
+    return matches[0]
+
+
+def _stub_bin(tmp_path: pathlib.Path, name: str, body: str) -> pathlib.Path:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    shim = bin_dir / name
+    shim.write_text(body, encoding="utf-8")
+    shim.chmod(0o755)
+    return bin_dir
+
+
+class TestTheDatedReadingsHaveAScheduledPublisher:
+    """`alpha-engine-config-I10508`'s first deliverable: something writes the
+    dated readings on a cadence, and it is not one of the two identities whose
+    separate existence would be destroyed by letting it."""
+
+    def test_the_publish_job_runs_before_the_close_job(self) -> None:
+        assert _workflow()["jobs"]["gate-close"]["needs"] == ["gate-publish"]
+
+    def test_a_failed_publish_does_not_suppress_a_due_closing_record(self) -> None:
+        """The ordering is for a reader's benefit, not a data dependency:
+        `gate.close` re-evaluates every gate itself and reads no artifact the
+        publish job writes. A plain `needs:` would SKIP the filing of a phase
+        that had turned MET because an unrelated gate's publish failed - a
+        second defect bought with the fix for the first."""
+        assert _workflow()["jobs"]["gate-close"]["if"].strip() == "${{ always() }}"
+
+    def test_the_three_identities_are_declared_and_distinct(self) -> None:
+        declared = _workflow()["env"]
+        assert declared["GATE_PUBLISH_ROLE_ARN"].endswith("-gate-publish")
+        assert declared["GATE_CLOSE_ROLE_ARN"].endswith("-gate-close")
+        assert declared["BOARD_ROLE_NAME"].endswith("-board")
+        assert declared["GATE_PUBLISH_ROLE_ARN"] != declared["GATE_CLOSE_ROLE_ARN"]
+        credentials = [
+            s for s in _publish_job()["steps"] if "configure-aws-credentials" in s.get("uses", "")
+        ]
+        assert len(credentials) == 1
+        assert credentials[0]["with"]["role-to-assume"] == "${{ env.GATE_PUBLISH_ROLE_ARN }}"
+
+    def test_it_holds_no_write_permission_beyond_the_oidc_token(self) -> None:
+        assert _publish_job()["permissions"] == {"contents": "read", "id-token": "write"}
+
+    def test_the_gate_list_is_derived_from_the_code_not_restated_in_yaml(self) -> None:
+        """A hardcoded list here is a registry copied at a call site. A seventh
+        phase would be added to `crucible.gate.GATES` and silently never
+        published, and the missing artifact would be indistinguishable from one
+        that is not due yet."""
+        run = _publish_run_step()
+        assert "crucible.gate" in run and "GATES" in run
+        for gate in GATES:
+            assert f"--gate {gate}" not in run, f"{gate} is restated in the workflow YAML"
+
+    def test_the_publish_step_passes_publish_and_run_mode_live(self) -> None:
+        run = _publish_run_step()
+        assert "--publish" in run
+        assert "--run-mode live" in run
+
+    def test_the_publish_job_never_runs_gate_close(self) -> None:
+        """The two authorities stay in the two jobs. A `gate.close` invocation
+        under the publishing identity would die AccessDenied on the closing
+        record - after posting the tracker comment, if it could reach the
+        tracker at all."""
+        assert GATE_CLOSE_JOB not in _publish_run_step()
+
+
+class TestThePublishLoopSurvivesTheOrdinaryCase:
+    """An UNMET gate exits 1, and that is what almost every gate reads on
+    almost every day. The runner's default shell is `bash -e`, so a loop
+    written without care would abort on the first unmet gate and leave the
+    remaining five unpublished - silently, because the job would simply fail
+    and the artifacts would look no different from a run that never happened.
+    """
+
+    @staticmethod
+    def _drive(
+        tmp_path: pathlib.Path, *, gates: str, exit_code: int
+    ) -> subprocess.CompletedProcess:
+        bin_dir = _stub_bin(
+            tmp_path,
+            "uv",
+            "#!/usr/bin/env bash\n"
+            'if [ "$2" = "python" ]; then printf "%s\\n" "' + gates + '"; exit 0; fi\n'
+            'echo "ran: $*"\n'
+            f"exit {exit_code}\n",
+        )
+        return subprocess.run(
+            ["bash", "-e", "-c", _publish_run_step()],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            **{
+                "env": {
+                    "PATH": f"{bin_dir}{os.pathsep}/usr/bin:/bin",
+                    "STORE_URI": "s3://synthetic-store/prefix",
+                }
+            },
+        )
+
+    def test_an_unmet_gate_does_not_abort_the_remaining_gates(self, tmp_path) -> None:
+        result = self._drive(tmp_path, gates="phase0 phase1 phase2", exit_code=1)
+        assert result.returncode == 0, f"{result.stdout!r} {result.stderr!r}"
+        for gate in ("phase0", "phase1", "phase2"):
+            assert f"--gate {gate}" in result.stdout, result.stdout
+
+    def test_a_measurement_failure_fails_the_job_and_names_the_gate(self, tmp_path) -> None:
+        """Exit 2 or above is the CLI's error path - the measurement itself
+        failed - and a reading that could not be measured must not be passed
+        over in silence, or the artifact simply stays at yesterday's date with
+        nothing saying why."""
+        result = self._drive(tmp_path, gates="phase0 phase1", exit_code=2)
+        assert result.returncode != 0
+        assert "could not be published" in result.stdout
+        assert "phase0" in result.stdout and "phase1" in result.stdout
+
+    def test_an_empty_gate_list_refuses_rather_than_exiting_zero(self, tmp_path) -> None:
+        """The vacuous-success case, which is the one that would go unnoticed:
+        a derivation that returned nothing would publish nothing and exit 0,
+        indistinguishable from a healthy run."""
+        result = self._drive(tmp_path, gates="", exit_code=0)
+        assert result.returncode != 0
+        assert "would publish nothing" in result.stdout
+
+
+def _publish_identity_result(tmp_path: pathlib.Path, assumed: str) -> subprocess.CompletedProcess:
+    bin_dir = _stub_bin(tmp_path, "aws", f'#!/usr/bin/env bash\nprintf "%s\\n" "{assumed}"\n')
+    return subprocess.run(
+        ["bash", "-c", _publish_identity_step()],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        **{
+            "env": {
+                "PATH": f"{bin_dir}{os.pathsep}/usr/bin:/bin",
+                "GATE_PUBLISH_ROLE_ARN": f"arn:aws:iam::111111111111:role/{GATE_PUBLISH_ROLE}",
+                "BOARD_ROLE_NAME": BOARD_ROLE,
+                "GATE_CLOSE_ROLE_NAME": GATE_CLOSE_ROLE,
+            }
+        },
+    )
+
+
+class TestThePublishIdentityGuardActuallyFires:
+    """Two negative branches, not one. The publishing identity must be neither
+    the board (read-only over everything it grades) nor gate-close (writes the
+    consequence of a reading, never a reading). Either substitution would look
+    like a simplification and would delete the property the substituted role
+    exists to hold."""
+
+    def test_it_refuses_the_board_role_by_name(self, tmp_path: pathlib.Path) -> None:
+        result = _publish_identity_result(
+            tmp_path, f"arn:aws:sts::111111111111:assumed-role/{BOARD_ROLE}/session"
+        )
+        assert result.returncode != 0, result.stdout
+        assert "board identity" in result.stdout
+
+    def test_it_refuses_the_gate_close_role_by_name(self, tmp_path: pathlib.Path) -> None:
+        result = _publish_identity_result(
+            tmp_path, f"arn:aws:sts::111111111111:assumed-role/{GATE_CLOSE_ROLE}/session"
+        )
+        assert result.returncode != 0, result.stdout
+        assert "gate-close identity" in result.stdout
+
+    def test_it_refuses_any_other_identity_and_names_the_apply(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        result = _publish_identity_result(
+            tmp_path, "arn:aws:sts::111111111111:assumed-role/test-deploy/session"
+        )
+        assert result.returncode != 0, result.stdout
+        assert "apply_crucible_v2_stack.sh" in result.stdout
+
+    def test_it_accepts_the_gate_publish_role(self, tmp_path: pathlib.Path) -> None:
+        result = _publish_identity_result(
+            tmp_path, f"arn:aws:sts::111111111111:assumed-role/{GATE_PUBLISH_ROLE}/session"
+        )
+        assert result.returncode == 0, f"{result.stdout!r} {result.stderr!r}"
+        assert GATE_PUBLISH_ROLE in result.stdout
+
+
+class TestTheGateRowIsDeclaredAsAScheduledJob:
+    def test_its_registry_row_names_the_workflow_that_crons_it(self) -> None:
+        row = load_registry()["gate"]
+        assert row.schedule == "daily"
+        assert row.dispatch == "github-actions"
+        assert row.dispatch_workflow == WORKFLOW.name
+        assert row.deadline is not None, (
+            "a scheduled row with no deadline has an absence nothing can page on"
+        )
+
+
+class TestCrucibleGateNoLongerFilesTheClosingRecord:
+    """`alpha-engine-config-I10508`. Two commands able to file the same
+    compare-and-swap record was one producer too many; making `crucible gate
+    --publish` a SCHEDULED job under an identity that may not write
+    `gates/*/closing.json` is what forced it to be resolved rather than
+    tolerated. `gate.close` is the one writer."""
+
+    def test_a_met_live_publish_writes_the_reading_and_no_closing_record(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        import crucible.track_f as track_f_module
+
+        store = LocalStore(str(tmp_path))
+        gate = sorted(GATES)[0]
+        phase = next(p for p in PHASES if p.gate == gate)
+        monkeypatch.setattr(
+            track_f_module,
+            "evaluate",
+            lambda store, *, gate, trading_day, weeks=None: _reading(gate, met=True),
+        )
+
+        def _refuse(*args, **kwargs):
+            raise AssertionError(
+                "crucible gate reached the tracker. It no longer files the closing "
+                "record, and the publishing identity holds no credential to post one."
+            )
+
+        monkeypatch.setattr(track_f_module, "post_closing_comment", _refuse)
+        track_f_module.gate_handler(
+            argparse.Namespace(
+                gate=gate,
+                store=str(tmp_path),
+                trading_day=DAY,
+                dry_run=False,
+                publish=True,
+                run_mode="live",
+                weeks=None,
+                closing_comment=False,
+            )
+        )
+        assert store.exists(gate_key(gate, DAY.isoformat())), (
+            "the dated reading was not published, which is the whole point of --publish"
+        )
+        assert not store.exists(closing_record_key(phase.id)), (
+            "crucible gate filed a closing record. `gate.close` is its one writer; "
+            "the publishing identity cannot write it, so this call would be an "
+            "AccessDenied in CI on the one day it mattered."
+        )

@@ -91,7 +91,12 @@ env:
   # credential step keeps the account id out of a printed ARN.
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   GATE_CLOSE_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.CRUCIBLE_ROLE_PREFIX }}-gate-close
+  # alpha-engine-config-I10508. The PUBLISHING identity, distinct from both
+  # the board's and gate-close's. See the `gate-publish` job below for why it
+  # is a third role and not a widening of either of the two that existed.
+  GATE_PUBLISH_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.CRUCIBLE_ROLE_PREFIX }}-gate-publish
   BOARD_ROLE_NAME: ${{ vars.CRUCIBLE_ROLE_PREFIX }}-board
+  GATE_CLOSE_ROLE_NAME: ${{ vars.CRUCIBLE_ROLE_PREFIX }}-gate-close
   STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
   # ── the topic names the alerting layer refuses to guess ────────────────
   # `crucible.alerts._required_name` raises unless these are set. They are
@@ -136,9 +141,170 @@ env:
   CRUCIBLE_TRACKER_APP_SSM_PREFIX: ${{ vars.CRUCIBLE_TRACKER_APP_SSM_PREFIX }}
 
 jobs:
+  gate-publish:
+    name: publish every registered gate's dated reading and the ladder
+    runs-on: ubuntu-latest
+    # alpha-engine-config-I10508. The PUBLISHING half of the same loop, and
+    # the job whose absence this issue was filed for.
+    #
+    # `alpha-engine-config-I10492` made `crucible gate` read-only by default:
+    # the dated readings `gates/{gate}/{trading_day}/gate.json` and the ladder
+    # `gates/ladder.json` are written only under `--publish`. Before that they
+    # were kept fresh by whichever human or agent happened to run `crucible
+    # gate` without `--dry-run` -- which was itself the defect I10492 closed.
+    # After it, nothing in the automated path wrote them at all, and an old
+    # `gate.json` is indistinguishable from a current one: the only thing
+    # separating them is a date in a key nobody compares. A merged consumer
+    # already depends on the refresh -- `crucible/board.py`'s
+    # `phase:{id}:earliest-satisfiable` row (crucible-PR214) reads the
+    # PREVIOUS trading day's reading to detect a setback, and with no
+    # publisher that row is permanently dead.
+    #
+    # -- Why a THIRD identity, and not one of the two that existed ---------
+    #
+    # `BoardRole` is read-only over everything it grades, on purpose: an
+    # identity that cannot write into the prefix it reports on cannot be used
+    # to satisfy a clause it is grading, whatever the code does.
+    #
+    # `GateCloseRole` writes `gates/*/closing.json` and nothing else under
+    # `gates/`, on purpose: it writes the CONSEQUENCE of a reading and can
+    # never write a reading.
+    #
+    # Publishing the dated readings from either would delete exactly the
+    # property its separate role exists to hold. So this job runs as a THIRD
+    # identity, `${{ vars.CRUCIBLE_ROLE_PREFIX }}-gate-publish`, which may
+    # write the dated readings, the ladder and its own `runs/gate/*` manifest -- and may write neither
+    # `gates/*/closing.json` nor any other job's manifest prefix, which is
+    # the set the gate clauses themselves grade. The identity step below
+    # refuses BOTH other roles by name, so the separation is asserted from
+    # this side too, exactly as `gate-close` already refuses the board's.
+    #
+    # -- Why it runs BEFORE gate-close -------------------------------------
+    #
+    # `gate.close` files the record of a phase that has turned MET. Reading
+    # and filing in that order means the dated reading behind a closing record
+    # filed the same evening is the one this job just published, rather than
+    # yesterday's. It is an ordering for a reader's benefit; `gate.close`
+    # re-evaluates every gate itself and depends on no artifact this job
+    # writes.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      - name: Repository variables are set
+        run: |
+          missing=0
+          if [ -z "$AWS_ACCOUNT_ID" ]; then
+            echo "::error::repository variable AWS_ACCOUNT_ID is not set -- set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/crucible --body '<12-digit-account-id>'"
+            missing=1
+          fi
+          if [ -z "$STORE_URI" ]; then
+            echo "::error::repository variable CRUCIBLE_STORE_URI is not set -- set it with: gh variable set CRUCIBLE_STORE_URI --repo nousergon/crucible --body '<s3-uri-of-the-crucible-v2-store>'"
+            missing=1
+          fi
+          # A WARNING, not an error, and for the same reason the gate-close
+          # job's own guard gives one: an unset archive makes phase 2's
+          # zero_human_mutating_calls clause UNMEASURABLE, which this job then
+          # publishes honestly as an unmeasurable reading. Failing the whole
+          # run would stop the OTHER five gates being published over a
+          # variable only one of them needs.
+          if [ -z "$CRUCIBLE_CLOUDTRAIL_ARCHIVE" ]; then
+            echo "::warning::repository variable CRUCIBLE_CLOUDTRAIL_ARCHIVE is not set, so phase 2's gate publishes UNMEASURABLE for zero_human_mutating_calls"
+          fi
+          exit "$missing"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c  # v6.2.4
+        with:
+          role-to-assume: ${{ env.GATE_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The identity actually obtained, read back from AWS rather than
+      # restated from `env` -- the same pattern the gate-close job below uses,
+      # with TWO negative branches instead of one. This job must be neither
+      # the board (read-only over everything it grades) nor gate-close (writes
+      # the consequence of a reading, never a reading). Either substitution
+      # would "work" right up until the grant refused the write, and the
+      # separation would be a convention again.
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${GATE_PUBLISH_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${BOARD_ROLE_NAME}/"*) echo "::error::this job assumed the board identity. The board renders the grading surface and is read-only over everything it grades; publishing a dated gate reading from it would make a grading surface able to author what it grades. Point role-to-assume at ${expected}."; exit 1 ;; esac
+          case "${assumed}" in *":assumed-role/${GATE_CLOSE_ROLE_NAME}/"*) echo "::error::this job assumed the gate-close identity. That identity writes gates/*/closing.json -- the CONSEQUENCE of a reading -- and may never write a reading; publishing from it would let one identity declare a phase met and file the record that it exited. Point role-to-assume at ${expected}."; exit 1 ;; esac
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. If the role does not exist yet the crucible-v2 stack has not been applied since the nous-ergon-ops PR for alpha-engine-config-I10508 merged. That apply is OPERATOR-GATED as a security boundary, not automated: run bash scripts/apply_crucible_v2_stack.sh from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until that happens is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+
+      # The gate list is DERIVED from `crucible.gate.GATES`, never restated in
+      # YAML. A hardcoded list here is a registry copied at a call site, which
+      # is the contract-drift shape this repository has paid for more than
+      # once: a seventh phase would be added to the code and silently never
+      # published, and the artifact for it would simply not exist -- absence
+      # that nothing distinguishes from "not due yet".
+      #
+      # `--run-mode live`: a scheduled run is a live run, and
+      # `run_manifest.v2` requires the field with no default. Unlike
+      # `gate.close` nothing here branches on it, but a reading published
+      # under the wrong mode would misdescribe itself on the artifact.
+      #
+      # `set -euo pipefail` and no `|| true`: a gate that cannot be read is a
+      # failure of this job, not a gate to skip past. `crucible gate` exits
+      # non-zero when the gate is UNMET, which is the ordinary case on almost
+      # every day -- so the loop records each exit and fails only on a
+      # MEASUREMENT failure, which is exit code 2 or above from the CLI's
+      # own error path, never the 1 an unmet gate returns.
+      - name: Publish every registered gate's dated reading and the ladder
+        run: |
+          set -uo pipefail
+          gates="$(uv run python -c 'import crucible.gate as g; print(" ".join(sorted(g.GATES)))')"
+          # The runner's default shell is `bash -e`, and `set -uo pipefail`
+          # does not clear `-e`. Each gate read below is therefore written
+          # `cmd && status=0 || status=$?` so an UNMET gate (exit 1, the
+          # ordinary case on almost every day) does not abort the loop and
+          # leave the remaining five gates unpublished.
+          if [ -z "${gates}" ]; then
+            echo "::error::crucible.gate.GATES is empty, so this job would publish nothing and exit 0 -- which is indistinguishable from a healthy run. Refusing."
+            exit 1
+          fi
+          echo "publishing: ${gates}"
+          failed=""
+          for gate in ${gates}; do
+            uv run crucible gate --gate "${gate}" --run-mode live --publish --store "$STORE_URI" && status=0 || status=$?
+            if [ "${status}" -gt 1 ]; then
+              echo "::error::crucible gate --gate ${gate} --publish failed to MEASURE (exit ${status}); its reading was not published"
+              failed="${failed} ${gate}"
+            fi
+          done
+          if [ -n "${failed}" ]; then
+            echo "::error::gates that could not be published:${failed}"
+            exit 1
+          fi
+
   gate-close:
     name: file every closing record that is due
     runs-on: ubuntu-latest
+    # alpha-engine-config-I10508: ordered AFTER the publish job so a closing
+    # record filed this evening sits beside the dated reading published this
+    # evening. `gate.close` re-evaluates every gate itself and reads no
+    # artifact `gate-publish` writes, so this is an ordering and not a data
+    # dependency -- which is why it is `always()` below rather than a plain
+    # `needs:`: a publish that failed must not also suppress the FILING of a
+    # phase that has turned MET.
+    needs: [gate-publish]
+    if: ${{ always() }}
     # 30, from board.yml's MEASURED 25 plus headroom for the tracker
     # round-trips this job makes and the board does not. Both evaluate every
     # registered gate — `crucible board` through `crucible.gate.build_ladder`,
@@ -239,7 +405,7 @@ jobs:
         run: uv run crucible gate.close --run-mode live --store "$STORE_URI"
 
   notify-failure:
-    needs: [gate-close]
+    needs: [gate-publish, gate-close]
     if: ${{ failure() }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@c115e75840c5e210f857107118428beb4a6fdaa8
     secrets: inherit

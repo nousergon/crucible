@@ -99,7 +99,7 @@ DECLARATION_PATH = Path(__file__).parent / "board.yaml"
 #: Where a day's board is filed, and the pointer the console reads. Keyed by
 #: trading day like everything else (§4.12).
 
-#: The five declarations a row can come from. Closed: a sixth source is a
+#: The six declarations a row can come from. Closed: a seventh source is a
 #: design change visible in a diff, not a new dict key someone adds. `schedule`
 #: was added deliberately on `alpha-engine-config-I9914` — the plan §6.1
 #: milestone table — rather than folded into `phase`, because a milestone is
@@ -107,7 +107,22 @@ DECLARATION_PATH = Path(__file__).parent / "board.yaml"
 #: the two must be able to disagree (a milestone can be UNMET past its date
 #: while the phase it names is later read MET) without one silently standing
 #: in for the other.
-SOURCES: tuple[str, ...] = ("objective", "phase", "schedule", "component", "cutover")
+#:
+#: `producer` was added on `alpha-engine-config-I10508`, by the same argument
+#: one layer further out. Every other source grades WHAT THE ARTIFACTS SAY; a
+#: `producer` row grades whether anything is still WRITING them. Folding it
+#: into `phase` would have made "phase 2 is unmet" and "nobody has published a
+#: phase-2 reading since Tuesday" the same kind of statement, and they call for
+#: opposite actions: the first is the system falling short, the second is the
+#: instrument being dark. `I10508` exists because the second was invisible.
+SOURCES: tuple[str, ...] = (
+    "objective",
+    "phase",
+    "schedule",
+    "producer",
+    "component",
+    "cutover",
+)
 
 #: The board's closed state vocabulary. Total, with no fall-through.
 #:
@@ -1003,6 +1018,7 @@ def build_board(
     rows.extend(_phase_rows(ladder, day, readings or {}))
     rows.extend(_earliest_satisfiable_rows(store, day, readings or {}))
     rows.extend(_closing_rows(store, tracker_reader))
+    rows.append(_gate_readings_fresh_row(store, day))
     rows.extend(_schedule_rows(ladder, day))
 
     for name in sorted(reg):
@@ -1275,6 +1291,145 @@ def _earliest_satisfiable_rows(
             )
         )
     return rows
+
+
+def _gate_readings_fresh_row(store: Store, trading_day: str) -> BoardRow:
+    """Is the dated gate reading of every registered gate still current?
+
+    `alpha-engine-config-I10508`'s second deliverable, and the reason it is a
+    row rather than a note. `I10492` made `crucible gate` read-only unless
+    `--publish` is passed, and nothing in the automated path passed it, so
+    `gates/{gate}/{trading_day}/gate.json` stopped being refreshed while
+    remaining perfectly readable. **An old gate reading is indistinguishable
+    from a current one** -- the only thing separating them is a date in a key
+    nobody compares -- so the gap was silent for as long as nobody thought to
+    compare it.
+
+    Adding a scheduled publisher without this row would RELOCATE that gap
+    rather than close it: a publisher that silently stops recreates exactly
+    the same condition, and nothing would say so. `principles.md` §2.7 --
+    a component emitting nothing is unobserved, not healthy, and *no data* is
+    never rendered green.
+
+    **Every not-fresh answer is RED, including every way of not knowing.**
+    The states this row can take are exhaustive and none of them is MET
+    unless every registered gate has a reading dated today or yesterday:
+
+    * a gate with NO reading at all -> `UNMEASURED` (the producer has never
+      run, or its artifacts were lost);
+    * a gate whose newest reading predates the previous trading day ->
+      `UNMET` (the producer has stopped);
+    * a listing that could not be READ -> `UNMEASURABLE` (a store access
+      failure, which is a fault in our access and not a fact about the
+      producer -- the distinction this board argues hardest for);
+    * a trading calendar that cannot resolve one day back -> `UNMEASURABLE`,
+      because without it this row cannot say what "one trading day" means and
+      must not guess.
+
+    **The cadence is one trading day, and yesterday is admitted.** The
+    publisher is the `gate-publish` job of `gate-close.yml`, cronned 23:00
+    UTC, and the board renders at 21:30 UTC -- so on any given render the
+    newest reading is normally YESTERDAY's, published after the previous
+    board. Requiring today's would make this row red on every ordinary day,
+    which is how a row gets ignored. Two trading days of silence is a real
+    stop and reads red.
+    """
+    from crucible.calendar import previous_trading_day  # noqa: PLC0415 - avoids an import cycle
+    from crucible.gate import GATES, gate_prefix, last_read  # noqa: PLC0415 - same cycle
+
+    row_id = "producer:gate-readings-fresh"
+    section = "producers"
+    title = "dated gate readings are current"
+    # The PREFIX this row lists, not a templated key: a board artifact cell is
+    # a store key a reader can paste, and an unsubstituted `{gate}` placeholder
+    # in it is the defect `test_no_row_leaves_an_unsubstituted_placeholder`
+    # exists to catch. The per-gate keys are named in `detail` instead, where
+    # they are concrete.
+    artifact = f"crucible/{gate_prefix(sorted(GATES)[0]).split('/')[0]}/"
+    means_when_red = (
+        "no scheduled run is publishing the dated gate readings, so every surface "
+        "reading them -- the board's earliest-satisfiable rows most of all -- is "
+        "rendering a stale measurement with a fresh-looking date beside it. The "
+        "producer is the `gate-publish` job of crucible's .github/workflows/"
+        "gate-close.yml; check its last run, and that the crucible-v2 stack has "
+        "been applied so the role it assumes exists."
+    )
+
+    def row(state: str, detail: str, last: str | None = None) -> BoardRow:
+        return BoardRow(
+            id=row_id,
+            source="producer",
+            section=section,
+            title=title,
+            state=state,
+            detail=detail,
+            surface="crucible/board",
+            artifact=artifact,
+            means_when_red=means_when_red,
+            last_read=last,
+        )
+
+    try:
+        floor = previous_trading_day(dt.date.fromisoformat(trading_day)).isoformat()
+    except Exception as exc:  # noqa: BLE001 - reported, never swallowed: see below
+        # UNMEASURABLE, not a pass. Without the previous trading day this row
+        # cannot say what "one trading day old" means, and a freshness check
+        # that cannot resolve its own window must say so rather than pick the
+        # answer that happens to be green.
+        return row(
+            "UNMEASURABLE",
+            f"the trading calendar could not resolve the day before {trading_day} "
+            f"({type(exc).__name__}: {exc}), so this row cannot say what one trading "
+            "day of staleness is.",
+        )
+
+    stale: list[str] = []
+    absent: list[str] = []
+    unreadable: list[str] = []
+    newest: list[str] = []
+    for gate in sorted(GATES):
+        day, access_problem = last_read(store, gate)
+        if access_problem:
+            unreadable.append(gate)
+            continue
+        if day is None:
+            absent.append(f"{gate} ({gate_prefix(gate)})")
+            continue
+        newest.append(day)
+        if day < floor:
+            stale.append(f"{gate} last read {day}")
+
+    # Order matters: an access failure is a fault in OUR access and outranks
+    # every fact about the producer, because under it we do not KNOW the
+    # producer's state. Absence outranks staleness for the same reason -- a
+    # gate with no reading at all is a stronger statement than one with an
+    # old one.
+    if unreadable:
+        return row(
+            "UNMEASURABLE",
+            f"the readings of {', '.join(unreadable)} could not be listed, so their "
+            "freshness is unknown. This is a fault in our access to the store, not a "
+            "statement about the publisher.",
+        )
+    if absent:
+        return row(
+            "UNMEASURED",
+            f"no dated reading has ever been filed for {', '.join(absent)}. The "
+            "publisher has never run for these gates, or their artifacts were lost.",
+        )
+    if stale:
+        return row(
+            "UNMET",
+            f"the newest dated reading is older than the previous trading day "
+            f"({floor}) for: {'; '.join(stale)}. The publisher has stopped.",
+            last=min(newest) if newest else None,
+        )
+    return row(
+        "MET",
+        f"every one of the {len(GATES)} registered gates has a dated reading no older "
+        f"than {floor}.",
+        last=min(newest) if newest else None,
+    )
 
 
 def _closing_rows(store: Store, tracker_reader: Callable[[str, int], Any] | None) -> list[BoardRow]:
