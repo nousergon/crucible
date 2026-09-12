@@ -6,27 +6,29 @@ movement), §5.3 (serving preconditions), §6 (Condorcet retirement), §11 (the
 `arena_cycle` artifact); plan §4.4, §4.12, §9.1.
 
 **This module decides nothing statistical.** The ladder, the paired windows,
-the confidence sequence, the Condorcet ranking, the pointer decision and the
-cap-with-grace retirement rule all live in `nousergon_lib.arena` and are
-CALLED (policy §10 makes re-implementing §§3–6 a defect). What crucible adds
-is exactly three things the library does not own:
+the confidence sequence, the Condorcet ranking, the pointer decision, the
+promotion bar and the cap-with-grace retirement rule all live in
+`nousergon_lib.arena` and are CALLED (policy §10 makes re-implementing §§3–6 a
+defect). What crucible adds is exactly two things the library does not own:
 
-1. **The eligibility age**, Brian's 2026-09-01 ruling: an arm is promotable
-   only after `promote_min_weeks` (4) paired weeks against the incumbent —
-   **20 paired TRADING days** (§4.12), not 28 calendar ones. It is applied
-   *after* the library's decision, as a post-filter, and it can only ever
-   turn a MOVE into a HOLD. It never causes a promotion and never changes a
-   hold, which is what makes it a delay rather than a second decision rule.
-
-   It is deliberately **not** implemented as a `ServingPrecondition`. A
-   precondition excludes an arm from serving at all, so an incumbent inside
-   its own first four weeks would force the pointer off itself — the exact
-   inversion of a rule meant to slow promotions down.
-
-2. **The durable artifacts**: the `arena_cycle`, the champion pointer, the
+1. **The durable artifacts**: the `arena_cycle`, the champion pointer, the
    append-only retirement log, and the generated `EXPERIMENTS` feed.
 
-3. **The revert**, which is an operator action and is recorded as one.
+2. **The revert**, which is an operator action and is recorded as one.
+
+**The eligibility age is the LIBRARY's, not this module's**
+(`alpha-engine-config-I10547`). Brian's 2026-09-01 ruling — a challenger is
+promotable only after `promote_min_weeks` paired weeks against the incumbent —
+was enforced here as a post-filter for as long as `ArenaConfig` had no such
+field. It has one now, together with `promote_evidence`, so the bar is
+configured in `crucible.slots` and applied inside `run_cycle`. Keeping a
+second copy here would have meant the 2026-09-12 ruling that puts the U slot
+on `promote_evidence=point` at 2 paired weeks had to be re-implemented twice,
+and the harness would have gone on holding a promotion the engine had already
+decided. What survives is :func:`paired_days_required`, which is the
+library's WEEK bar rendered in the trading days §4.12 speaks in — a reporting
+conversion, no longer a decision (`tests/test_promote.py` asserts the two
+agree on a contiguous window).
 
 Every artifact is written only when a store is supplied. A caller grading in
 memory (a test, a `--dry-run`) gets the same decision and writes nothing —
@@ -39,7 +41,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 from nousergon_lib.arena import (
@@ -72,7 +74,7 @@ from crucible.keys import (
 )
 from crucible.keys import manifest_key as _promote_manifest_key
 from crucible.models import EXPERIMENT_EVENT_ROW_ADAPTER, RetirementLogRow
-from crucible.slots import SlotSpec, is_control_arm
+from crucible.slots import EVIDENCE_POINT, SlotSpec, is_control_arm
 from crucible.store import ETAG_ABSENT, Store
 
 __all__ = [
@@ -80,7 +82,7 @@ __all__ = [
     "PromotionRefused",
     "PromotionResult",
     "SlotInputs",
-    "apply_eligibility_age",
+    "age_held_leaders",
     # Re-exported from `crucible.keys`, which is the single producer of every
     # key shape (plan §4.12). They appear here because a promote consumer
     # imports them from this module, NOT because promote.py also declares
@@ -143,6 +145,17 @@ def paired_days_required(spec: SlotSpec) -> int:
     and a holiday week is still one rung". Counting calendar days here would
     make the bar drift by whatever holidays happened to fall inside the
     window — an eligibility clock nobody declared.
+
+    **Reporting only.** The bar itself is the library's and is stated in
+    paired WEEKS (`ArenaConfig.promote_min_weeks`, read by
+    `nousergon_lib.arena.engine._age_eligible` off `PairedWindow.weeks`);
+    this function exists because every crucible artifact and every §4.12
+    reader speaks trading days. The two agree on a contiguous window — a run
+    of `promote_min_weeks * TRADING_DAYS_PER_WEEK` consecutive trading days
+    spans exactly `promote_min_weeks` weeks — and
+    `tests/test_promote.py::TestPairedDaysAgreeWithTheEngineWeekBar` measures
+    that rather than asserting it. Nothing DECIDES on this number
+    (`alpha-engine-config-I10547`).
     """
     return spec.promote_min_weeks * TRADING_DAYS_PER_WEEK
 
@@ -223,62 +236,38 @@ class PromotionResult:
 
 
 # ---------------------------------------------------------------------------
-# The eligibility age.
+# The eligibility age — READ from the engine's decision, never re-applied.
 # ---------------------------------------------------------------------------
 
 
-def apply_eligibility_age(
-    *,
-    spec: SlotSpec,
-    register: ArmRegister,
-    decision: PointerDecision,
-) -> PointerDecision:
-    """Hold the incumbent when the winner has not yet served its 20 paired days.
+def age_held_leaders(spec: SlotSpec, decision: PointerDecision) -> tuple[str, ...]:
+    """Challengers the engine measured as LEADING but held below the age bar.
 
-    Returns ``decision`` unchanged unless the library moved the pointer to an
-    arm whose paired window against the incumbent is shorter than
-    :func:`paired_days_required`. The one thing this can do is turn a
-    ``decided``/``moved`` decision into a ``held`` one; a hold, a bootstrap,
-    an ``unmeasurable`` and an ``unservable`` all pass through untouched.
+    A reporting read over `decision.comparisons`, not a second decision: the
+    engine has already refused these arms the pointer
+    (`nousergon_lib.arena.engine._promotable`), and this names them so the
+    `experiments` feed can say *why nothing moved* in the one case that
+    clears itself with time.
+
+    "Leading" is read under the slot's own ``promote_evidence`` — the mean
+    paired difference under ``point``, the anytime-valid lower bound under
+    ``anytime_valid`` — because a hold that names arms by a statistic the
+    slot does not decide on would report a queue that will never promote.
     """
-    if not decision.moved or decision.status != "decided":
-        return decision
-    if decision.champion is None or decision.incumbent is None:
-        return decision
-
-    required = paired_days_required(spec)
-    comparison = next((c for c in decision.comparisons if c.challenger == decision.champion), None)
-    if comparison is None:
-        # The library moved the pointer to an arm it recorded no comparison
-        # for. That is a library contract violation, not an eligibility
-        # question, and guessing an answer here would hide it.
-        raise PromotionRefused(
-            f"slot {spec.slot}: the pointer moved to {decision.champion!r} but the "
-            "decision carries no comparison for it, so the paired-window length "
-            "cannot be read. The eligibility age is not evaluable and the promotion "
-            "is refused rather than assumed."
-        )
-
-    paired = comparison.window.n_dates
-    if paired >= required:
-        return decision
-
-    created = register.state(decision.champion).record.created_date
-    return replace(
-        decision,
-        champion=decision.incumbent,
-        moved=False,
-        status="held",
-        reason=(
-            f"{decision.champion} leads {decision.incumbent} on a supported window of "
-            f"{paired} paired trading day(s), but promote_min_weeks="
-            f"{spec.promote_min_weeks} requires {required} paired trading days "
-            f"(4 paired weeks; Brian ruling 2026-09-01). The arm registered on "
-            f"{created} is scored, laddered and reported exactly as any arm, and its "
-            "bound is emitted — the pointer simply may not move to it yet. Original "
-            f"decision: {decision.reason}"
-        ),
-    )
+    held: list[str] = []
+    for comparison in decision.comparisons:
+        window = comparison.window
+        if comparison.status != "measured" or not window.measurable:
+            continue
+        if window.weeks >= spec.promote_min_weeks:
+            continue
+        if spec.promote_evidence == EVIDENCE_POINT:
+            leads = window.mean_diff > 0
+        else:
+            leads = comparison.bound is not None and comparison.bound.supported
+        if leads:
+            held.append(comparison.challenger)
+    return tuple(sorted(held))
 
 
 # ---------------------------------------------------------------------------
@@ -342,15 +331,16 @@ def run_promotion(
         training=training,
     )
 
-    library_decision = cycle.decision
-    decision = apply_eligibility_age(spec=spec, register=register, decision=library_decision)
-    held_by_age = decision is not library_decision
-
-    # The artifact carries the decision as it STANDS, not as the library
-    # reached it — otherwise the console would render a promotion that did
-    # not happen. The library's own reason is preserved inside the amended
-    # reason string, so nothing is lost.
-    cycle = replace(cycle, decision=decision)
+    # The engine's decision IS the decision. Crucible applies no post-filter
+    # to it (`alpha-engine-config-I10547`): the age bar and the evidence bar
+    # are both `ArenaConfig` fields now, configured per slot in
+    # `crucible.slots` and enforced inside `run_cycle`. What is read back out
+    # here is only whether the age bar is what kept the pointer still, so the
+    # `experiments` feed can distinguish a hold that time will clear from one
+    # it will not.
+    decision = cycle.decision
+    age_held = age_held_leaders(spec, decision) if not decision.moved else ()
+    held_by_age = bool(age_held)
 
     written: list[str] = []
     pointer: ChampionPointer | None = None
@@ -585,6 +575,7 @@ def _write_pointer_if_moved(
         "reason": decision.reason,
         "moved": decision.moved,
         "promote_min_weeks": spec.promote_min_weeks,
+        "promote_evidence": spec.promote_evidence,
         "paired_dates_required": paired_days_required(spec),
         "eligible_arms": sorted(
             arm for arm in cycle.active_arms if arm not in (decision.ineligible or {})
@@ -779,6 +770,7 @@ def _append_experiment_events(
                 "as_of": as_of,
                 "reason": decision.reason,
                 "promote_min_weeks": spec.promote_min_weeks,
+                "promote_evidence": spec.promote_evidence,
                 "paired_dates_required": paired_days_required(spec),
             }
         )

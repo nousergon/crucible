@@ -3058,7 +3058,12 @@ PHASE1_DELIVERABLES: tuple[Deliverable, ...] = (
     ),
     Deliverable(
         "promote_and_condorcet_retirement",
-        "`promote` with `promote_min_weeks=4` and Condorcet retirement via the lib engine",
+        # The per-slot values are `crucible.slots`' and Brian's 2026-09-12
+        # ruling (`alpha-engine-config-I10546`, `-I10547`) put U on 2 paired
+        # weeks decided on the point estimate; this line names the RULE, not a
+        # number that would go stale the next time a slot's bar is ruled on.
+        "`promote` with each slot's declared `promote_min_weeks`/"
+        "`promote_evidence` bar and Condorcet retirement, both via the lib engine",
         None,
         "promotion/retirement is graded by phase 3's `{slot}_promotion_or_verdict_"
         "backed_non_promotion` clauses, which read the champion pointer and `promote` "
@@ -6810,9 +6815,14 @@ def _phase5(
 #:   Its `replays_ok` clause re-reads phase 1's predicate over its own
 #:   five-week window, so the narrow live window does not narrow the replay
 #:   one.
-#: * phase 3 — FOUR, `promote_min_weeks` (§5.0): a promotion cannot be won on
-#:   fewer paired weeks than the eligibility age requires, so a shorter window
-#:   could only ever read UNMET.
+#: * phase 3 — FOUR, the LARGEST `promote_min_weeks` any slot declares (§5.0):
+#:   a promotion cannot be won on fewer paired weeks than the eligibility age
+#:   requires, so a shorter window could only ever read UNMET for the slots
+#:   sitting at that bar. It stays four after Brian's 2026-09-12 ruling
+#:   (`alpha-engine-config-I10546`, `-I10547`) dropped the U slot to 2 paired
+#:   weeks on a point estimate: R, M and S are still at four, and a window
+#:   narrowed to the SMALLEST slot's bar would make their clauses unmeetable.
+#:   Read the per-slot bar off `crucible.slots`, never off this number.
 #: * phase 4 — TWO, covering §6 row 4's "one week" trader claim plus a second
 #:   week of cadence evidence for the SF count. Phase 0's window narrowed to
 #:   one on 2026-09-04; phase 4's did NOT, and this is not an oversight. Phase

@@ -18,14 +18,25 @@ library's own `ArenaConfig` — rather than a look-alike — is what keeps that
 honest: a crucible-local copy would pass every value assertion and diverge
 silently the first time the library gained a field.
 
-**`promote_min_weeks` now lives on the library's `ArenaConfig`**
-(`alpha-engine-config-I9763`, `-I10504`) — Brian's ruling, 2026-09-01: a new
-arm is promotable only after 4 paired weeks (20 paired trading days) against
-the incumbent. It was previously carried on :class:`SlotSpec` as a declared
-second place because the installed `ArenaConfig` had no such field; that
-carry-over is gone now that the library does. `SlotSpec.promote_min_weeks`
-stays as a read-only property forwarding to :attr:`SlotSpec.arena` — the
-single source of truth is the library object, never a crucible-local copy.
+**The promotion bar is the library's, configured here per slot**
+(`alpha-engine-config-I9763`, `-I10504`, `-I10547`). Two parameters say when a
+challenger may take the pointer, and both live on `ArenaConfig`:
+`promote_min_weeks` (Brian's ruling 2026-09-01: 4 paired weeks by default) and
+`promote_evidence` (the anytime-valid sequence by default). Crucible declares
+their per-slot VALUES the same way it declares `cap`, `grace_weeks` and
+`alpha` — as fields fed into :attr:`SlotSpec.arena` — and never re-implements
+the rule that reads them. That is the whole of `-I10504`'s invariant: what it
+forbade was a SECOND place holding the value while the library used its own
+default, which is what made the two able to drift. A field passed straight
+into the config cannot: `spec.promote_min_weeks is spec.arena.promote_min_weeks`
+by construction, and `tests/test_slots.py` asserts it for every slot.
+
+**U serves on a point-estimate lead at 2 paired weeks** — Brian's ruling
+2026-09-12 (`alpha-engine-config-I10546`): every scanner challenger is
+promotable, and `universe_cut` promotes the point-estimate leader after 2
+paired weeks. R, M and S keep the 4-week anytime-valid bar. The asymmetry is
+deliberate: a universe cut is re-decided weekly and is cheap to reverse, and
+requiring anytime-valid support of a cut's edge promoted nothing for months.
 
 **Strategy content is not here.** An arm is an immutable recipe living in the
 private config repository, loaded at runtime; its id is the hash of its spec.
@@ -39,10 +50,16 @@ from types import ModuleType
 from typing import Literal
 
 from nousergon_lib.arena import ArmRegister
-from nousergon_lib.arena.engine import ArenaConfig
+from nousergon_lib.arena.engine import (
+    EVIDENCE_ANYTIME_VALID,
+    EVIDENCE_POINT,
+    ArenaConfig,
+)
 
 __all__ = [
     "COST_MODELS",
+    "EVIDENCE_ANYTIME_VALID",
+    "EVIDENCE_POINT",
     "ESTIMATOR_KINDS",
     "EXIT_RULES",
     "PORTFOLIO_PARAM_FIELDS",
@@ -131,6 +148,15 @@ class SlotSpec:
     retired_trailing_cycles: int = 8
     diff_clip: float = 0.05
     alpha: float = 0.05
+    #: §5.0 / Brian ruling 2026-09-01: paired WEEKS a challenger must share
+    #: with the incumbent before it may take the pointer. Declared here and
+    #: enforced by the library — `crucible.promote` carries no age rule of
+    #: its own (`alpha-engine-config-I10547`).
+    promote_min_weeks: int = 4
+    #: The evidence a lead must clear to SERVE: the anytime-valid confidence
+    #: sequence, or the point estimate. Brian ruling 2026-09-12
+    #: (`alpha-engine-config-I10546`) puts the U slot on `point`.
+    promote_evidence: str = EVIDENCE_ANYTIME_VALID
     control_arms: tuple[ControlArm, ...] = field(default_factory=tuple)
 
     @property
@@ -152,21 +178,9 @@ class SlotSpec:
             grace_weeks=self.grace_weeks,
             min_active_arms=self.min_active_arms,
             retired_trailing_cycles=self.retired_trailing_cycles,
+            promote_min_weeks=self.promote_min_weeks,
+            promote_evidence=self.promote_evidence,
         )
-
-    @property
-    def promote_min_weeks(self) -> int:
-        """Brian's ruling, 2026-09-01, read off the library's `ArenaConfig`.
-
-        A read-only forward to :attr:`arena` rather than a stored field, so
-        the eligibility age has exactly one source of truth
-        (`alpha-engine-config-I9763`, `-I10504`) — previously this was a
-        second, crucible-local field with its own duplicate validation,
-        which is exactly the shape that let a config fact drift between two
-        readers. `crucible.promote.paired_days_required` and every other
-        consumer keep reading `spec.promote_min_weeks` unchanged.
-        """
-        return self.arena.promote_min_weeks
 
 
 def _controls(slot: str) -> tuple[ControlArm, ...]:
@@ -184,6 +198,11 @@ SLOTS: dict[str, SlotSpec] = {
         # A selection stage is graded against the population it drew from,
         # count-matched. Never SPY.
         benchmark="population",
+        # Brian ruling 2026-09-12, `alpha-engine-config-I10546`/`-I10547`:
+        # the universe cut promotes the point-estimate leader after 2 paired
+        # weeks. The other three slots keep the 4-week anytime-valid bar.
+        promote_min_weeks=2,
+        promote_evidence=EVIDENCE_POINT,
         control_arms=_controls("u"),
     ),
     "r": SlotSpec(

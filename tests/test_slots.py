@@ -70,17 +70,40 @@ class TestConfiguredValues:
         assert cfg.min_active_arms == 3
         assert cfg.retired_trailing_cycles == 8
 
-    @pytest.mark.parametrize("slot", ["u", "r", "m", "s"])
-    def test_promote_min_weeks_is_four(self, slot: str) -> None:
+    @pytest.mark.parametrize("slot", ["r", "m", "s"])
+    def test_the_promotion_bar_is_four_anytime_valid_weeks(self, slot: str) -> None:
         """Brian's ruling, 2026-09-01: a new arm is promotable only after 4
-        paired weeks against the incumbent — 20 paired TRADING days.
+        paired weeks against the incumbent — 20 paired TRADING days — and
+        only on a lead the anytime-valid sequence supports.
 
-        Read off the library's `ArenaConfig` (`alpha-engine-config-I9763`,
-        `-I10504`): `SlotSpec.promote_min_weeks` is a read-only property
-        forwarding to `arena_config_for(slot).promote_min_weeks`, not a
-        second, crucible-local field."""
+        Both parameters live on the library's `ArenaConfig`
+        (`alpha-engine-config-I9763`, `-I10504`, `-I10547`); crucible declares
+        the per-slot VALUE and the library owns the rule that reads it."""
         assert get_slot(slot).promote_min_weeks == 4
         assert arena_config_for(slot).promote_min_weeks == 4
+        assert arena_config_for(slot).promote_evidence == "anytime_valid"
+
+    def test_the_u_slot_promotes_the_point_estimate_leader_at_two_weeks(self) -> None:
+        """Brian's ruling, 2026-09-12 (`alpha-engine-config-I10546`,
+        `-I10547`): every scanner challenger is promotable, and
+        `universe_cut` promotes the point-estimate leader after 2 paired
+        weeks. A universe cut is re-decided weekly and cheap to reverse;
+        requiring anytime-valid support of a cut's edge promoted nothing."""
+        assert arena_config_for("u").promote_min_weeks == 2
+        assert arena_config_for("u").promote_evidence == "point"
+
+    @pytest.mark.parametrize("slot", ["u", "r", "m", "s"])
+    def test_the_declared_bar_is_the_one_the_library_decides_on(self, slot: str) -> None:
+        """The whole of `-I10504`'s invariant, restated for two fields.
+
+        What it forbade was a crucible-local COPY sitting beside a library
+        default the engine actually read — the shape that lets a config fact
+        drift between two readers. A field passed straight into `ArenaConfig`
+        cannot drift, and this measures that rather than asserting it."""
+        spec = get_slot(slot)
+        cfg = arena_config_for(slot)
+        assert spec.promote_min_weeks == cfg.promote_min_weeks
+        assert spec.promote_evidence == cfg.promote_evidence
 
     @pytest.mark.parametrize("slot", ["u", "r"])
     def test_a_selection_slot_is_never_benchmarked_against_spy(self, slot: str) -> None:
@@ -363,23 +386,41 @@ class TestSpecIntegrity:
         with pytest.raises(Exception):  # noqa: B017 - dataclass raises FrozenInstanceError
             spec.cap = 1  # type: ignore[misc]
 
-    def test_promote_min_weeks_has_no_crucible_local_setter(self) -> None:
-        """`promote_min_weeks` is a read-only property forwarding to the
-        library's `ArenaConfig` (`alpha-engine-config-I9763`, `-I10504`); it
-        is no longer a `SlotSpec` field, so `SlotSpec` never accepts it as a
-        constructor argument and assigning it raises like any other frozen
-        attribute."""
+    def test_the_promotion_bar_is_immutable_and_validated_by_the_library(self) -> None:
+        """`promote_min_weeks` and `promote_evidence` are declared per slot and
+        validated in exactly one place — `ArenaConfig.__post_init__`.
+
+        `SlotSpec` carries them as frozen fields (`alpha-engine-config-I10547`)
+        rather than as read-only properties, because a slot has to be able to
+        DECLARE a value the library default does not carry — the U slot's 2
+        weeks on a point estimate. `-I10504`'s invariant is unchanged: there is
+        still one value, and the library is still the only thing that checks it.
+        `SlotSpec` duplicates no validation, so a bad value is refused the
+        moment `arena` is constructed, not silently accepted here.
+        """
         spec = get_slot("r")
         with pytest.raises(Exception):  # noqa: B017 - dataclass raises FrozenInstanceError
             spec.promote_min_weeks = 1  # type: ignore[misc]
-        with pytest.raises(TypeError, match="promote_min_weeks"):
-            SlotSpec(
-                slot="r",
-                slot_kind="selection_producer",
-                benchmark="population",
-                module="research",
-                promote_min_weeks=0,
-            )
+        with pytest.raises(Exception):  # noqa: B017 - dataclass raises FrozenInstanceError
+            spec.promote_evidence = "point"  # type: ignore[misc]
+        bad = SlotSpec(
+            slot="r",
+            slot_kind="selection_producer",
+            benchmark="population",
+            module="research",
+            promote_min_weeks=0,
+        )
+        with pytest.raises(ArenaConfigError, match="promote_min_weeks"):
+            _ = bad.arena
+        bad_evidence = SlotSpec(
+            slot="r",
+            slot_kind="selection_producer",
+            benchmark="population",
+            module="research",
+            promote_evidence="whenever",
+        )
+        with pytest.raises(ArenaConfigError, match="promote_evidence"):
+            _ = bad_evidence.arena
 
     def test_the_library_refuses_promote_min_weeks_below_one(self) -> None:
         """The eligibility age's validation moved with the field
