@@ -63,7 +63,7 @@ from crucible.gate import (
 from crucible.keys import closing_record_key, manifest_key
 from crucible.runmode import RUN_MODE_LIVE
 from crucible.runner import RunContext, run_job
-from crucible.store import ETAG_ABSENT, Store, open_store, resolve_store_uri
+from crucible.store import ETAG_ABSENT, Store, open_store, read_only, resolve_store_uri
 from crucible.weekly import arc_stages, run_arc
 
 __all__ = [
@@ -340,14 +340,38 @@ def gate_handler(args: argparse.Namespace) -> int:
     refuses that case separately, before this function is even called) could
     clobber a correct CI reading with a false one. `publish` below is `False`
     unless `--publish` was passed, and `--dry-run` always overrides it: a run
-    is never both. This job's OWN manifest at `runs/gate/{day}/run.json`
-    still writes on every non-`--dry-run` invocation regardless of `publish`
-    — rule 1 is unconditional; only the SHARED artifacts this job is not the
-    sole owner of are behind the flag.
+    is never both.
+
+    **Without `--publish` this command writes NOTHING AT ALL** — not the dated
+    reading, not the ladder, and not its own manifest at
+    `runs/gate/{day}/run.json` (`alpha-engine-config-I10576`). The manifest
+    was the one write left behind by I10492's fix, on the stated ground that
+    rule 1 is unconditional, and that ground turned out not to hold for a
+    read: measured 2026-09-12T20:12Z, a laptop `crucible gate` read as
+    `ne-admin` wrote `runs/gate/2026-09-11/run.json`, and
+    `crucible.autonomy` counts that PutObject as a human-originated mutating
+    call inside phase 2's own `zero_human_mutating_calls` window — the
+    documented read recipe in `crucible/AGENTS.md` was an exit hazard for the
+    very gate it reads, every time anyone followed it. A read publishes no
+    shared artifact and so has no lineage to record; a manifest over nothing
+    is a write, and every write by a human principal is a counted touch. So
+    the store is resolved READ-ONLY when `publish` is false (the same
+    `crucible.store.read_only` wrapper `--dry-run` uses, carrying its own
+    reason so the refusal names this command rather than a flag nobody
+    passed), and `run_job(write_manifest=False)` suppresses the manifest.
+    With `--publish` every one of the three writes happens exactly as before.
     """
     dry_run = bool(getattr(args, "dry_run", False))
     publish = bool(getattr(args, "publish", False)) and not dry_run
     store = open_store(getattr(args, "store", None), dry_run=dry_run)
+    if not publish and not dry_run:
+        # alpha-engine-config-I10576. The `if publish:` guards in `body` below
+        # are the primary path; this is the BACKSTOP, in the same relationship
+        # `--dry-run`'s store guard has to those guards (I9922 R2-1). A clause
+        # evaluation or a future addition that reached the backend behind
+        # their backs now raises loudly here instead of leaving a write a
+        # human principal gets counted for.
+        store = read_only(store, reason="crucible gate without --publish")
     # Still resolved, and now for ONE caller: the `--closing-comment` block at
     # the foot of this function, which RENDERS a paste target and writes
     # nothing. It no longer reaches `file_closing_record`, which this command
@@ -485,12 +509,18 @@ def gate_handler(args: argparse.Namespace) -> int:
     # read-only `store` above turns those `ctx.record_output` calls into a
     # loud `DryRunWriteRefusedError`; `dry_run=` here keeps `run_job` from
     # also attempting its own manifest write on top of that.
+    #
+    # `write_manifest=publish` is the alpha-engine-config-I10576 half: without
+    # `--publish` this run publishes nothing, so it records nothing either —
+    # see the docstring. `dry_run` already implies `publish is False`, so the
+    # two arguments never contradict each other.
     run_job(
         "gate",
         body,
         store=store,
         trading_day=args.trading_day,
         dry_run=dry_run,
+        write_manifest=publish,
         run_mode=getattr(args, "run_mode", None),
     )
     reading = result["reading"]

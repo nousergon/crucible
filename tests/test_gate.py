@@ -1136,8 +1136,11 @@ class TestTheGateJobPublishesAnHonestMetric:
         )
         monkeypatch.setitem(GATE_DELIVERABLES, "phase1", ())
         store_uri = str(tmp_path)
+        # `publish=True` (`alpha-engine-config-I10576`): the gate job's own
+        # manifest, which this assertion reads, is written only by a
+        # publishing run — a non-publishing `crucible gate` writes nothing.
         args = argparse.Namespace(
-            gate="phase1", trading_day=RENDER_DAY, weeks=None, store=store_uri
+            gate="phase1", trading_day=RENDER_DAY, weeks=None, store=store_uri, publish=True
         )
         gate_handler(args)
 

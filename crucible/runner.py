@@ -625,6 +625,7 @@ def run_job(
     transient_retry: bool = True,
     discriminator: str | Callable[[RunContext], str] | None = None,
     dry_run: bool = False,
+    write_manifest: bool = True,
     run_mode: str | None = None,
     now_override: dt.datetime | None = None,
     fault_capability_class: str | None = None,
@@ -681,6 +682,25 @@ def run_job(
     covers the one write `run_job` itself makes; the store every CLI handler
     resolves is ALSO read-only under `--dry-run` (`crucible.store.read_only`),
     which is what actually stops `fn`'s own writes.
+
+    ``write_manifest=False`` suppresses the manifest write for an invocation
+    that publishes NOTHING — `alpha-engine-config-I10576`. It is deliberately
+    a second parameter rather than a reuse of ``dry_run``, and the reason is
+    the printed line: `crucible gate` without `--publish` is a READ, not a
+    dry run, and telling an operator who asked for a live reading that they
+    performed a "dry_run" is a false statement about what just ran on the one
+    surface they are looking at. The parameter names what actually differs.
+
+    The rule it carves out of is rule 1 ("manifest or it did not happen"), and
+    the carve-out is exact: a manifest records a run's LINEAGE — what it read,
+    what it published, what it spent. A run that publishes no shared artifact
+    has no lineage a later reader could need, and the manifest over it is
+    itself a write. Every write by a human principal is a counted touch: the
+    measured case was a laptop `crucible gate` read writing
+    `runs/gate/{day}/run.json`, which `crucible.autonomy` then counted against
+    phase 2's own `zero_human_mutating_calls` clause — the documented read
+    recipe making the gate it reads unmeetable. A job that PUBLISHES still
+    writes its manifest unconditionally; only the read does not.
 
     ``run_mode`` is `live` or `replay` and is REQUIRED, in the sense that
     omitting it here falls through to ``$CRUCIBLE_RUN_MODE`` and then to a
@@ -828,6 +848,18 @@ def run_job(
                     print(
                         f"dry_run: {job} {ctx.trading_day.isoformat()} — no manifest written, "
                         f"no outputs recorded (status would have been {status!r})"
+                    )
+                elif not write_manifest:
+                    # A REAL run that published nothing (alpha-engine-config-
+                    # I10576). Distinct wording from the `dry_run` line above
+                    # on purpose: this run read live state and reported it,
+                    # which is not a dry run in the operator's sense, and a
+                    # line claiming otherwise would be the third instance of
+                    # the class this issue belongs to — a surface asserting
+                    # something that is not what happened.
+                    print(
+                        f"read-only: {job} {ctx.trading_day.isoformat()} — no manifest written "
+                        f"(this invocation published nothing; status {status!r})"
                     )
                 else:
                     _write_manifest(

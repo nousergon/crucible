@@ -337,6 +337,10 @@ def test_gate(integration_store_uri: str, integration_store: Store) -> None:
     """
     from crucible.track_f import gate_names
 
+    # `--publish` (`alpha-engine-config-I10576`): without it `crucible gate`
+    # writes nothing at all, manifest included, so `_assert_ok` would have no
+    # manifest to grade. The integration store is dedicated and disposable,
+    # so publishing the dated reading and the ladder into it is safe.
     cli_main(
         [
             "gate",
@@ -348,6 +352,7 @@ def test_gate(integration_store_uri: str, integration_store: Store) -> None:
             "live",
             "--date",
             INTEGRATION_TRADING_DAY,
+            "--publish",
         ]
     )
     _assert_ok(integration_store, "gate")

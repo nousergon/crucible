@@ -107,6 +107,9 @@ class TestGateHandlerOutcomeMetricNamesTheUnmeasurableCause:
             # No `--dry-run`: this test reads the real run manifest below —
             # see the sibling test's comment above for why the flag was
             # dropped rather than kept as a (now-refusing) no-op.
+            # `--publish` (`alpha-engine-config-I10576`): the gate job's OWN
+            # manifest is now written only by a publishing run, so the read
+            # below has nothing to read without it.
             main(
                 [
                     "gate",
@@ -116,6 +119,7 @@ class TestGateHandlerOutcomeMetricNamesTheUnmeasurableCause:
                     str(tmp_path),
                     "--date",
                     "2026-08-28",
+                    "--publish",
                 ]
             )
 

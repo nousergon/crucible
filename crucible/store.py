@@ -36,6 +36,7 @@ from crucible.calendar import (
 __all__ = [
     "ETAG_ABSENT",
     "PRESIGN_MAX_S",
+    "DEFAULT_READ_ONLY_REASON",
     "DryRunWriteRefusedError",
     "LocalStore",
     "PointerConflictError",
@@ -59,6 +60,12 @@ PRESIGN_MAX_S = 7 * 24 * 3600
 #: primitive, so a pointer's first write and its every later write go
 #: through one code path rather than two with different race properties.
 ETAG_ABSENT = "\x00absent"
+
+#: What a :func:`read_only` refusal leads with when its caller named no other
+#: reason. `--dry-run` was the only read-only caller until
+#: `alpha-engine-config-I10576`, so it stays the default rather than becoming
+#: a generic wording that tells an operator nothing.
+DEFAULT_READ_ONLY_REASON = "--dry-run"
 
 
 class PointerConflictError(RuntimeError):
@@ -112,11 +119,19 @@ def _read_only_class(base: type) -> type:
         return cached
 
     def _refuse(self: Any, key: str = "<unknown key>", *args: Any, **kwargs: Any) -> Any:
+        # The REASON is carried on the instance, not baked into this closure:
+        # the class is cached per backend, and `--dry-run` is no longer the
+        # only caller that resolves a store read-only
+        # (`alpha-engine-config-I10576` made a non-`--publish` `crucible gate`
+        # read-only too). A refusal naming `--dry-run` on a run that never
+        # passed it sends the operator looking for a flag they did not set.
+        why = getattr(self, "_read_only_reason", None) or DEFAULT_READ_ONLY_REASON
         raise DryRunWriteRefusedError(
-            f"--dry-run: refusing to write {key!r} — this store was resolved read-only "
-            "(crucible.store.open_store(..., dry_run=True) / "
-            "crucible.config.Settings.store(dry_run=True)). A dry run must not reach "
-            "the backend; see DryRunWriteRefusedError's own docstring."
+            f"{why}: refusing to write {key!r} — this store was resolved read-only "
+            "(crucible.store.read_only, reached via open_store(..., dry_run=True), "
+            "crucible.config.Settings.store(dry_run=True), or a handler that wraps "
+            "its own store). A read must not reach the backend; see "
+            "DryRunWriteRefusedError's own docstring."
         )
 
     namespace = {name: _refuse for name in Store.MUTATORS}
@@ -125,17 +140,25 @@ def _read_only_class(base: type) -> type:
     return cls
 
 
-def read_only(store: Store) -> Store:
+def read_only(store: Store, *, reason: str | None = None) -> Store:
     """``store``, wrapped so every :data:`Store.MUTATORS` call raises
     :class:`DryRunWriteRefusedError` instead of reaching the backend.
 
     Every :data:`Store.READERS` method, and every other attribute, behaves
     exactly as it does on ``store`` — this IS that object's state, under a
     subclass with two methods overridden, not a copy or a second connection.
+
+    ``reason`` is the prefix the refusal message leads with, naming WHICH
+    read-only invocation refused (`alpha-engine-config-I10576`). It defaults
+    to ``--dry-run`` because that was the only caller for as long as there was
+    only one; a second caller passing its own reason is what keeps the message
+    from naming a flag the operator never typed.
     """
     cls = _read_only_class(type(store))
     wrapped = object.__new__(cls)
     wrapped.__dict__.update(store.__dict__)
+    if reason:
+        wrapped._read_only_reason = reason
     return wrapped
 
 
