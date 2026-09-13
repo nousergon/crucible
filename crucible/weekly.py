@@ -39,7 +39,14 @@ __all__ = ["ARC_SLOT_JOBS", "ARCTIC_LIBRARY_JOBS", "Stage", "arc_stages", "run_a
 #: The arc jobs that are run once per slot rather than once. Derived from the
 #: CLI's own `--slot` requirement in `tests/test_weekly.py`, so a new
 #: slot-scoped job cannot join the arc and silently run for one slot.
-ARC_SLOT_JOBS: frozenset[str] = frozenset({"experiment.run", "experiment.grade"})
+#:
+#: `promote` joined at `alpha-engine-config-I9759`. `experiment.grade` decides
+#: the pointer and writes the `arena_cycle`; `promote` is what ACTS on that
+#: decision, and it was dispatched by nothing — so the v2 arena had graded
+#: every week since phase 1 and never once written a champion pointer or a
+#: promote run. Every §6 phase-3 promotion clause therefore read UNMEASURABLE:
+#: not "the slot held its pointer", but "nothing looked".
+ARC_SLOT_JOBS: frozenset[str] = frozenset({"experiment.run", "experiment.grade", "promote"})
 
 #: The arc jobs that read ArcticDB directly and therefore accept
 #: `--arctic-library` (`crucible.track_a._source`). Only `data.weekly` is a
