@@ -11,6 +11,7 @@ import math
 from pathlib import Path
 
 import pytest
+import yaml
 
 from crucible.attribution import (
     ATTRIBUTION_FACTOR_CATEGORIES,
@@ -20,8 +21,11 @@ from crucible.attribution import (
     compute_factor_attribution,
     factor_return_series,
     load_attribution_params,
+    load_attribution_params_from_store,
     params_digest,
 )
+from crucible.keys import strategy_slot_key
+from crucible.store import LocalStore
 
 TRADING_DAY = "2026-07-06"
 WINDOW = 6
@@ -206,6 +210,61 @@ attribution:
     assert params.benchmark_proxy == "SPY"
     assert set(params.factors) == {"market", "sector_tech", "size_factor"}
     assert {f.category for f in params.factors.values()} == set(ATTRIBUTION_FACTOR_CATEGORIES)
+
+
+_STORE_SPEC = {
+    "attribution": {
+        "benchmark_proxy": "SPY",
+        "shrinkage": "ledoit_wolf",
+        "factors": {
+            "market": {"category": "beta", "proxy": "SPY"},
+            "sector_tech": {"category": "sector", "proxy": "XLK"},
+            "size_factor": {"category": "size", "proxy": "IWM"},
+        },
+    }
+}
+
+
+class TestLoadAttributionParamsFromStore:
+    """Mirrors `TestLoadPortfolioParamsFromStore` in `tests/test_portfolio_contracts.py`
+    exactly — the checkout-or-store shape `load_attribution_params_from_store`
+    borrows from `load_portfolio_params_from_store`."""
+
+    def test_a_checkout_directory_wins_when_configured(self, tmp_path: Path) -> None:
+        strategy_dir = tmp_path / "strategy"
+        (strategy_dir / "slots").mkdir(parents=True)
+        (strategy_dir / "slots" / "attribution.yaml").write_text(
+            yaml.safe_dump(_STORE_SPEC), encoding="utf-8"
+        )
+        params = load_attribution_params_from_store(strategy_dir=strategy_dir)
+        assert params.benchmark_proxy == "SPY"
+        assert set(params.factors) == {"market", "sector_tech", "size_factor"}
+
+    def test_the_store_is_read_when_no_checkout_is_configured(self, tmp_path: Path) -> None:
+        store = LocalStore(root=tmp_path / "store")
+        store.put_bytes(
+            strategy_slot_key("attribution"), yaml.safe_dump(_STORE_SPEC).encode("utf-8")
+        )
+        params = load_attribution_params_from_store(store=store)
+        assert params.benchmark_proxy == "SPY"
+        assert set(params.factors) == {"market", "sector_tech", "size_factor"}
+
+    def test_an_absent_store_key_raises_naming_the_key(self, tmp_path: Path) -> None:
+        store = LocalStore(root=tmp_path / "store")
+        with pytest.raises(AttributionParamsError, match="strategy/current/slots/attribution.yaml"):
+            load_attribution_params_from_store(store=store)
+
+    def test_neither_a_store_nor_a_strategy_dir_raises(self) -> None:
+        with pytest.raises(ValueError, match="needs either a store or a strategy_dir"):
+            load_attribution_params_from_store()
+
+    def test_a_store_document_missing_the_attribution_block_raises(self, tmp_path: Path) -> None:
+        store = LocalStore(root=tmp_path / "store")
+        store.put_bytes(
+            strategy_slot_key("attribution"), yaml.safe_dump({"other": 1}).encode("utf-8")
+        )
+        with pytest.raises(AttributionParamsError, match="carrying an 'attribution' block"):
+            load_attribution_params_from_store(store=store)
 
 
 class TestFactorDefSpread:

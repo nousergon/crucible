@@ -42,8 +42,13 @@ source itself, exactly as `nousergon_lib.quant.factor_risk` is
 data-source-agnostic and `crucible.portfolio` composes it without becoming a
 data client.
 
-**Not yet wired to a gate clause or a scheduled job.** See the PR body for
-what a follow-up must call.
+**Wired.** `crucible/gate.py::_clause_factor_neutral_attribution` reads the
+evidence this module produces off `experiment.grade[s]` manifests
+(`crucible-PR229`), and `crucible/slots/strategy.py::grade` is the producer —
+it calls `load_attribution_params_from_store`, builds each factor's return
+series from the price panel already in hand via `factor_return_series`, and
+records `attribution_metric_record` beside `portfolio_metric_record` on the
+same manifest (`alpha-engine-config-I10678`).
 """
 
 from __future__ import annotations
@@ -70,6 +75,7 @@ __all__ = [
     "compute_factor_attribution",
     "factor_return_series",
     "load_attribution_params",
+    "load_attribution_params_from_store",
     "manifest_records_factor_attribution",
     "params_digest",
 ]
@@ -232,6 +238,46 @@ def load_attribution_params(path: Path | str) -> AttributionFactorParams:
             "the file declares none."
         )
     return AttributionFactorParams.from_mapping(payload["attribution"], source=str(resolved))
+
+
+def load_attribution_params_from_store(
+    *,
+    store: Any | None = None,
+    strategy_dir: Path | str | None = None,
+) -> AttributionFactorParams:
+    """The attribution factor spec, from a checkout or the synced store.
+
+    Mirrors `crucible.portfolio.load_portfolio_params_from_store` exactly, for
+    the same reason: the checkout wins when ``strategy_dir`` is configured — a
+    developer editing `alpha-engine-config/strategy/` expects the edit to take
+    effect — and a box with no checkout (the production path) reads the tree
+    synced into the store instead. The spec is not a per-slot document
+    (`crucible.keys.strategy_slot_key` is general over any name, not just
+    ``u``/``r``/``m``/``s`` — see `strategy/slots/attribution.yaml`'s own
+    header), so this calls the same key function `load_portfolio_params_from_store`
+    does, with ``"attribution"`` as the name.
+    """
+    if strategy_dir is not None:
+        return load_attribution_params(Path(strategy_dir) / "slots" / "attribution.yaml")
+    if store is None:
+        raise ValueError(
+            "load_attribution_params_from_store needs either a store or a strategy_dir"
+        )
+    from crucible.keys import strategy_slot_key  # noqa: PLC0415 - avoids a cycle
+
+    key = strategy_slot_key("attribution")
+    if not store.exists(key):
+        raise AttributionParamsError(
+            f"no attribution factor spec at store key {key!r}. The beta/sector/size ETF "
+            "proxy list is strategy edge and lives in the private strategy tree; there is "
+            "no default this repository can invent."
+        )
+    payload = yaml.safe_load(store.get_bytes(key).decode("utf-8"))
+    if not isinstance(payload, Mapping) or "attribution" not in payload:
+        raise AttributionParamsError(
+            f"{key}: expected a mapping carrying an 'attribution' block; the file declares none."
+        )
+    return AttributionFactorParams.from_mapping(payload["attribution"], source=key)
 
 
 def factor_return_series(

@@ -52,6 +52,13 @@ import yaml
 from nousergon_lib.arena import ArmRegister, ArmSeries, derive_arm_id
 from nousergon_lib.arena.engine import ServingPrecondition
 
+from crucible.attribution import (
+    AttributionFactorParams,
+    attribution_metric_record,
+    compute_factor_attribution,
+    factor_return_series,
+    load_attribution_params_from_store,
+)
 from crucible.features import DEFAULT_FEATURE_VERSION, feature_names, read_features
 from crucible.keys import arm_predictions_key, features_key
 from crucible.portfolio import (
@@ -1007,6 +1014,75 @@ def construct_book(
         evidence=evidence,
         weights=tuple(all_weights),
         diagnostics=tuple(all_diagnostics),
+    )
+
+
+def _attribute_book(
+    constructed: ConstructedBook,
+    *,
+    universe: BookUniverse,
+    returns: Any,
+    params: AttributionFactorParams,
+    as_of: str,
+) -> dict[str, Any]:
+    """The `factor_attribution.v1` evidence for ``constructed``'s book.
+
+    Decomposes the book's realized gross return (the same panel window
+    `construct_book` walked) against the factor spec's ETF proxies. Every
+    input series is read from ``returns`` — the same `_close_returns(panel)`
+    frame the book was constructed over — so the decomposition and the
+    construction it explains are measured against the identical panel, never
+    a second read.
+
+    Fails loud (module rule 5) on any proxy or holding the panel carries no
+    row for: S is graded against a market index, and a decomposition missing
+    a factor is not the deliverable — nothing here is stubbed or zero-filled
+    to make a thin panel pass.
+    """
+    from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
+
+    dates = constructed.book.dates
+    holding_returns: dict[str, list[float]] = {}
+    for ticker in universe.tickers:
+        if ticker == CASH_TICKER:
+            # The book's own realized-return construction (`_build_sessions`)
+            # charges cash a flat 0.0 every session — the identical sentinel,
+            # not a second convention for the same position.
+            holding_returns[ticker] = [0.0] * len(dates)
+            continue
+        if ticker not in returns.columns:
+            raise MissingArtifactError(
+                f"attribution over the book graded {as_of}: holding {ticker!r} has no row "
+                "in the price panel this book was constructed over. A book position with "
+                "no return series cannot be attributed and none is invented for it."
+            )
+        holding_returns[ticker] = [float(returns.loc[day, ticker]) for day in dates]
+
+    factor_returns: dict[str, list[float]] = {}
+    for name, fdef in params.factors.items():
+        proxies = {fdef.proxy, *([fdef.short_proxy] if fdef.short_proxy is not None else [])}
+        proxy_returns: dict[str, list[float]] = {}
+        for ticker in proxies:
+            if ticker not in returns.columns:
+                raise MissingArtifactError(
+                    f"attribution factor {name!r} proxies {ticker!r}, which the price panel "
+                    f"at {as_of} carries no rows for. Factor-neutral attribution is not "
+                    "optional for the S slot and no proxy is substituted for a missing one "
+                    f"— compile the panel with {ticker!r} in the universe."
+                )
+            proxy_returns[ticker] = [float(returns.loc[day, ticker]) for day in dates]
+        factor_returns[name] = factor_return_series(fdef, proxy_returns)
+
+    weights = dict(zip(universe.tickers, constructed.weights[-1], strict=True))
+    return compute_factor_attribution(
+        trading_day=dates[-1],
+        window_sessions=len(dates),
+        holding_returns=holding_returns,
+        weights=weights,
+        factor_returns=factor_returns,
+        params=params,
+        gross_return=float(sum(constructed.book.portfolio_returns)),
+        cost_bps_total=float(constructed.evidence["cost_bps_total"]),
     )
 
 
@@ -2131,6 +2207,13 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     params = load_portfolio_params_from_store(
         SLOT, store=ctx.store, strategy_dir=getattr(settings, "strategy_dir", None)
     )
+    # The factor-neutral attribution spec (beta/sector/size ETF proxies) —
+    # loaded once for the whole cycle, the same way `params` is, since it is
+    # the apparatus every graded S arm's book is measured through and not a
+    # per-arm choice (`strategy/slots/attribution.yaml`'s own header).
+    attribution_params = load_attribution_params_from_store(
+        store=ctx.store, strategy_dir=getattr(settings, "strategy_dir", None)
+    )
     feature_version = kwargs.get("feature_version") or DEFAULT_FEATURE_VERSION
     panel = _read_panel(ctx.store, ctx.trading_day)
     returns = _close_returns(panel)
@@ -2224,6 +2307,18 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             w_initial=w_initial,
         )
         ctx.record_metric(portfolio_metric_record(constructed.evidence, now_utc=_utc_now()))
+        ctx.record_metric(
+            attribution_metric_record(
+                _attribute_book(
+                    constructed,
+                    universe=universe,
+                    returns=returns,
+                    params=attribution_params,
+                    as_of=as_of,
+                ),
+                now_utc=_utc_now(),
+            )
+        )
         arm_grade = grade_arm(recipe, constructed.book, as_of=as_of)
         series[spec.arm_id] = arm_grade.series
         settled.update(arm_grade.series.scores)
