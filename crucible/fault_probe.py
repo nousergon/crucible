@@ -289,6 +289,15 @@ def probe_body(ctx: RunContext, *, client_factory: Any = None) -> None:
     it. `crucible.llm.call` resolves the effective class from the same
     attribute, so this is the honest statement of what is being asked for
     rather than a second source of it.
+
+    Classification of a failed router call happens inside `crucible.llm.call`
+    itself now, not here (`alpha-engine-config-I10446`): that door reads the
+    same `ctx.fault_capability_class` attribute this body just read, so it
+    already raises :class:`FaultProbeFailure`, already classified, for ANY
+    run launched with the override — not only this job. This body no longer
+    wraps the call in its own `try`/`except`; there is nothing left for it to
+    do that the door does not already do, and a second wrapper here would
+    only risk double-wrapping the exception the door already raises.
     """
     requested = ctx.fault_capability_class
     if requested is None:
@@ -298,26 +307,15 @@ def probe_body(ctx: RunContext, *, client_factory: Any = None) -> None:
             "natural invocation: `--fault-capability-class` is required, and a context "
             "that reached this body without it did not come from the CLI."
         )
-    try:
-        result = llm.call(
-            ctx,
-            callsite_id="faults.router_probe",
-            capability_class=requested,
-            messages=[dict(message) for message in PROBE_MESSAGES],
-            cap=llm.SpendCap(cap_usd=llm.DEFAULT_LLM_CAP_USD),
-            estimate_usd=0.0,
-            client_factory=client_factory,
-        )
-    except Exception as exc:
-        # `Exception`, deliberately NOT `BaseException`
-        # (`alpha-engine-config-I10367` deliverable 3).
-        # `crucible.runner.SpotInterruptionError` is a BaseException so that a
-        # job's own handler cannot swallow a reclamation, and this handler is
-        # one of those: catching it would classify plan §10.7 fault 1 as a
-        # fault-3 outcome and file the record under the wrong fault. It
-        # propagates untouched, and `run_job` writes the reclamation manifest
-        # it already writes for every other job.
-        raise FaultProbeFailure(classify_probe_failure(exc), exc) from exc
+    result = llm.call(
+        ctx,
+        callsite_id="faults.router_probe",
+        capability_class=requested,
+        messages=[dict(message) for message in PROBE_MESSAGES],
+        cap=llm.SpendCap(cap_usd=llm.DEFAULT_LLM_CAP_USD),
+        estimate_usd=0.0,
+        client_factory=client_factory,
+    )
     raise FaultProbeServedError(
         f"capability class {requested!r} returned a completion (model "
         f"{getattr(result, 'model', '<unreported>')!r}). It is declared a FAULT-INJECTION "
