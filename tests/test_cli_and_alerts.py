@@ -159,6 +159,13 @@ class TestJobSurface:
             # declared inventory). `dispatch: arc` -- a stage of the same
             # weekly run, not a new schedule or a separate detector fleet.
             "iac.conformance",
+            # alpha-engine-config-I10459: promotes the integration tier's
+            # summary artifact to a real registered job -- a thin handler
+            # that shells to `pytest tests/integration` and reports
+            # pass/fail through `run_job`. Workflow-triggered only, like
+            # `iac.conformance`'s `dispatch: arc` sibling -- no schedule or
+            # deadline of its own.
+            "test.integration",
         }
 
     @pytest.mark.parametrize("job", sorted(JOBS))
@@ -571,6 +578,14 @@ class TestDryRunNeverWrites:
             "--dry-run property (the readings still compute; the store gains no output "
             "key) is asserted directly, against fake clients, by "
             "tests/test_iac_conformance.py"
+        ),
+        "test.integration": (
+            "shells out to a real `pytest tests/integration` subprocess on every "
+            "invocation -- --dry-run only suppresses THIS job's own manifest write "
+            "(run_job(dry_run=True)), never the subprocess call, so a fresh store with "
+            "no CRUCIBLE_INTEGRATION_* environment configured fails inside that real "
+            "suite's own fixtures rather than returning a clean 0. Covered directly, "
+            "against a faked subprocess, by tests/test_integration_summary_job.py"
         ),
     }
 

@@ -161,6 +161,81 @@ def _dedicated_topic_env(integration_pages_topic: str, integration_muted_topic: 
     os.environ["CRUCIBLE_MUTED_TOPIC"] = integration_muted_topic
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _arctic_bucket_env(integration_arctic_bucket: str) -> None:
+    """`crucible.track_a._source` resolves `ArcticPriceSource`'s BUCKET from
+    `CRUCIBLE_ARCTIC_BUCKET` — there is no `--arctic-bucket` CLI flag,
+    deliberately (`alpha-engine-config-I10457`): the production entry point
+    takes no bucket override, only a LIBRARY one, since the bucket is not
+    this tier's isolation unit (see README.md, "Why the ArcticDB bucket is
+    not itself dedicated" — the LIBRARY is). Pointing `CRUCIBLE_ARCTIC_BUCKET`
+    at this tier's bucket for the session is therefore safe as long as every
+    ArcticDB-reading case below also passes `--arctic-library`, which is the
+    actual isolation guarantee: `ArcticPriceSource(library=...)` never falls
+    through to the production `universe`/`macro`/`preliminary` libraries
+    (see `crucible.data.sources.ArcticPriceSource`'s own docstring).
+    """
+    os.environ["CRUCIBLE_ARCTIC_BUCKET"] = integration_arctic_bucket
+
+
+@pytest.fixture(scope="session")
+def integration_arctic_symbols(arctic_library: Any) -> list[str]:
+    """Synthetic OHLCV rows for three symbols, written into the DEDICATED
+    library so `data.daily`/`data.weekly`/`data.heal`
+    (`alpha-engine-config-I10457`) have something real to read through
+    `ArcticPriceSource(library=...)` — proving the full `crucible.cli.main`
+    wire end to end, the same property `test_arctic_connectivity.py` proves
+    at the raw `Library.write`/`read` level. Written in the raw
+    Open/High/Low/Close/Volume shape `ArcticPriceSource.load_panel`'s
+    `_OHLCV_RENAME` expects — never the already-normalized `*_raw` panel
+    shape `tests/conftest.py::synthetic_frames` produces for the unit suite's
+    `FramePriceSource` fixtures, which is a different contract.
+
+    ~300 trading sessions, comfortably above `data.daily`'s default 400
+    CALENDAR-day lookback (`crucible.data.daily.DEFAULT_LOOKBACK_DAYS`,
+    roughly 275 trading sessions) so the feature layer's longest window
+    (252-session momentum) is never starved. Torn down after the session so
+    a rerun starts from the same clean state, mirroring
+    `test_arctic_connectivity.py`'s own idempotent teardown.
+    """
+    import math
+    import random
+
+    import pandas as pd
+
+    symbols = ["INTGA", "INTGB", "INTGC"]
+    end = dt.date.fromisoformat(INTEGRATION_TRADING_DAY)
+    days: list[dt.date] = []
+    day = end
+    while len(days) < 300:
+        if is_trading_day(day):
+            days.append(day)
+        day -= dt.timedelta(days=1)
+    days.sort()
+
+    rng = random.Random(20260908)
+    for symbol in symbols:
+        price = rng.uniform(20.0, 200.0)
+        rows = []
+        for _day in days:
+            price = max(1.0, price * math.exp(rng.gauss(0.0003, 0.01)))
+            rows.append(
+                {
+                    "Open": price * 0.998,
+                    "High": price * 1.005,
+                    "Low": price * 0.995,
+                    "Close": price,
+                    "Volume": rng.uniform(3e5, 4e6),
+                }
+            )
+        frame = pd.DataFrame(rows, index=pd.DatetimeIndex(days))
+        arctic_library.write(symbol, frame)
+    yield symbols
+    for symbol in symbols:
+        if arctic_library.has_symbol(symbol):
+            arctic_library.delete(symbol)
+
+
 @pytest.fixture(scope="session")
 def strategy_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Three U-slot arms that do not share a ranking callable.
