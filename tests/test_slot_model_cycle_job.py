@@ -710,3 +710,91 @@ class TestAnUnmeasurableCpcvCarriesNoNumber:
             )
         else:
             assert row["unit"] == "rank_ic" and isinstance(row["value"], float)
+
+
+class TestTheProduceJobServesTheTrader:
+    """The SERVING half of `experiment.run --slot m`: the second document of
+    the trader contract, `predictions/{trading_day}.json`
+    (`alpha-engine-config-I10129`).
+
+    `crucible/keys.py` named that key from `crucible-PR207` and nothing wrote
+    it, so the harness could hold a valid, attested M champion and serve the
+    trader nothing with no surface saying so. These are the two readings that
+    distinguish "no feed is owed" from "a feed is owed and absent".
+    """
+
+    def _seat_champion(self, store, arm_id, *, day, status="ok"):
+        import json as _json
+
+        from crucible.champion import ChampionPointer, read_champion_etag, write_champion
+
+        manifest_key_ = f"runs/promote/{day}/run.json"
+        pointer = ChampionPointer(
+            slot=SLOT,
+            arm_id=arm_id,
+            as_of=day,
+            decided_at="2026-08-29T02:00:00Z",
+            run_id="01JG0000000000000000000000",
+            code_sha="a" * 40,
+            promotion_source="evidence",
+            manifest_key=manifest_key_,
+            evidence={"status": "decided", "moved": True, "paired_dates": 40},
+        )
+        write_champion(store, pointer, expected=read_champion_etag(store, SLOT))
+        store.put_bytes(
+            manifest_key_,
+            _json.dumps(
+                {"status": status, "job": "promote", "trading_day": day, "reason": ""}
+            ).encode("utf-8"),
+        )
+        return pointer
+
+    def test_no_champion_owes_no_feed_and_the_run_says_so(self, store, strategy) -> None:
+        from crucible.keys import predictions_key
+
+        _, result = _run_produce(store, strategy, arm_name="base")
+        assert result["champion_feed"] is None
+        assert not store.exists(predictions_key(RUN_DAY))
+
+    def test_a_seated_champion_is_served_and_the_feed_is_on_the_manifest(
+        self, store, strategy
+    ) -> None:
+        from crucible.keys import predictions_key
+        from crucible.serving import read_predictions_feed
+
+        _, first = _run_produce(store, strategy, day=SESSIONS[44], arm_name="base")
+        arm_id = first["arms"][0]
+        self._seat_champion(store, arm_id, day=SESSIONS[44])
+
+        _, result = _run_produce(store, strategy, arm_name="base")
+        key = predictions_key(RUN_DAY)
+        assert result["champion_feed"] == key
+
+        feed = read_predictions_feed(store, RUN_DAY)
+        assert feed.champion == arm_id
+        # The republication property: the trader's numbers ARE the arm's own
+        # artifact, not a fourth derivation of the same fit.
+        assert feed.source_key == arm_predictions_key(arm_id, RUN_DAY)
+        assert (
+            feed.predicted_alpha
+            == json.loads(store.get_bytes(feed.source_key).decode("utf-8"))["predicted_alpha"]
+        )
+
+        outputs = {row["key"] for row in _manifest(store, "experiment.run", RUN_DAY)["outputs"]}
+        assert key in outputs, (
+            "the feed the trader reads must enter the manifest's outputs[], or "
+            "`crucible explain` cannot name the run that served it"
+        )
+
+    def test_a_champion_whose_producing_run_failed_stops_the_produce_job(
+        self, store, strategy
+    ) -> None:
+        from crucible.champion import ChampionUnusableError
+        from crucible.keys import predictions_key
+
+        _, first = _run_produce(store, strategy, day=SESSIONS[44], arm_name="base")
+        self._seat_champion(store, first["arms"][0], day=SESSIONS[44], status="failed")
+
+        with pytest.raises(ChampionUnusableError):
+            _run_produce(store, strategy, arm_name="base")
+        assert not store.exists(predictions_key(RUN_DAY))

@@ -2251,6 +2251,7 @@ def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     "this arm's inputs were broken" must never render alike.
     """
     from crucible.calendar import assert_trading_day  # noqa: PLC0415 - avoids a cycle
+    from crucible.serving import publish_predictions_feed  # noqa: PLC0415 - avoids a cycle
     from crucible.slots import get_slot  # noqa: PLC0415 - avoids a cycle
     from crucible.slots.arms import (  # noqa: PLC0415 - avoids a cycle
         control_specs,
@@ -2399,6 +2400,18 @@ def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         # produced no cross-section did not have nothing to do.
         raise SlotUnservableError(tuple(warming))
 
+    # The SERVING half of this job, and the second half of the trader contract
+    # (`crucible/AGENTS.md`: the trader reads `champions/{slot}/current.json`
+    # PLUS `predictions/{trading_day}.json`). A republication of exactly the
+    # `arm_predictions.v1` document the champion pointer resolves to — never a
+    # fourth derivation of the same numbers — so the trader's cross-section and
+    # the one `crucible explain` walks are the same bytes. Returns None and
+    # writes nothing while the slot has no champion, which is every cycle
+    # before the M slot's first promotion; refuses outright for a pointer whose
+    # producing run was not `ok`, and raises when the pointer names an arm that
+    # produced nothing this cycle. `alpha-engine-config-I10129`.
+    feed_written = publish_predictions_feed(ctx.store, trading_day=trading_day, ctx=ctx)
+
     ctx.record_rows(rows_in=len(specs), rows_out=len(produced))
     ctx.record_metric(
         {
@@ -2424,6 +2437,9 @@ def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         "arms": produced,
         "refused": [{"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused],
         "feature_version": str(source.version),
+        # `None` when the slot has no champion, which is a true statement and
+        # deliberately a different one from a key that was written.
+        "champion_feed": feed_written,
     }
 
 
