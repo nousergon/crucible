@@ -950,6 +950,17 @@ class TestAttributingAStackApply:
         assert result.latest_human is None
         assert result.unattributable is not None
 
+    def test_a_call_with_no_request_parameters_names_no_stack(self) -> None:
+        """CloudTrail omits `requestParameters` on some records. Reading the
+        absence as a match would attribute an unrelated call to this stack;
+        reading it as "not this stack" leaves the real apply unexplained,
+        which the caller treats as HUMAN."""
+        record = _apply_record(self.MACHINE_APPLY, A_MACHINE_ROLE)
+        record["requestParameters"] = None
+        result = _attribute_applies(_archive({END: [record]}))
+        assert result.applies == ()
+        assert result.unattributable is not None
+
     def test_a_read_only_cloudformation_call_is_not_an_apply(self) -> None:
         record = _apply_record(self.MACHINE_APPLY, "a-laptop-operator")
         record["eventName"] = "DescribeStacks"
