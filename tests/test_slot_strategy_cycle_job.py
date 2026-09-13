@@ -29,16 +29,22 @@ import pytest
 from crucible.calendar import is_trading_day
 from crucible.config import Settings
 from crucible.documents import load_store_document
+from crucible.features import DEFAULT_FEATURE_VERSION
 from crucible.keys import (
     arena_cycle_key,
     arm_predictions_key,
     champion_key,
     data_panel_key,
+    features_key,
     manifest_prefix,
     session_inputs_key,
     shadow_key,
 )
-from crucible.portfolio import CostModel, manifest_records_portfolio_engine
+from crucible.portfolio import (
+    PORTFOLIO_METRIC_NAME,
+    CostModel,
+    manifest_records_portfolio_engine,
+)
 from crucible.runner import run_job
 from crucible.slots import dispatchable_slots
 from crucible.slots import strategy as strategy_module
@@ -135,6 +141,30 @@ def _benchmark_rows(days: list[dt.date]) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _write_features(
+    store, *, days: list[dt.date], tickers: list[str], dollar_volume_usd: float = 5e8
+) -> None:
+    """Compile a minimal `dollar_volume_20d_raw` feature artifact per day.
+
+    Enough to exercise `crucible.slots.strategy._read_session_adv` — it reads
+    `ticker` and the ADV column and nothing else — without pulling in the
+    full feature-compilation pipeline, which is `crucible/features/compute.py`
+    and out of scope for this job's own tests.
+    """
+    for day in days:
+        frame = pd.DataFrame(
+            {
+                "trading_day": [day.isoformat()] * len(tickers),
+                "ticker": tickers,
+                "dollar_volume_20d_raw": [dollar_volume_usd] * len(tickers),
+            }
+        )
+        store.put_bytes(
+            features_key(DEFAULT_FEATURE_VERSION, day.isoformat()),
+            frame.to_parquet(index=False),
+        )
 
 
 @pytest.fixture
@@ -350,6 +380,64 @@ class TestTheEvidenceReachesARealManifest:
         )
 
 
+class TestParticipationAwareGradingEndToEnd:
+    """`alpha-engine-config-I10669`'s own closes-when, on a real cycle.
+
+    A `sqrt_impact_v1` arm registers, `experiment.run`/`experiment.grade`
+    complete over it, and its `portfolio_construction` evidence carries a
+    non-placeholder cost model priced with a real ADV vector and a real book
+    notional — not the `GRADING_NOTIONAL = 1.0` unit placeholder every arm,
+    flat or participation-priced, was constructed against before this fix.
+    """
+
+    def test_a_sqrt_impact_arm_grades_with_real_adv_and_notional(self, world) -> None:
+        store, settings, root, days = world
+        population = load_store_document(store, shadow_key(U_CHAMPION, days[0].isoformat()))[
+            "population"
+        ]
+        _write_features(store, days=days, tickers=[*population, "SPY"])
+        (root / "arms" / SLOT / "impact.yaml").write_text(
+            _recipe_yaml("impact", registered_at=days[0].isoformat(), cost=IMPACT_COST),
+            encoding="utf-8",
+        )
+
+        _run_produce(store, settings, days)
+        result, manifest, _ctx = _run_grade(store, settings)
+
+        assert manifest["status"] == "ok"
+        assert result["refused"] == []
+        impact_grade = next(
+            g for g in result["strategy_grades"].values() if g["cost_model"] == "sqrt_impact_v1"
+        )
+        assert impact_grade["sessions"] >= 1
+
+        evidences = [
+            m["portfolio_construction"]
+            for m in manifest["metrics"]
+            if m["name"] == PORTFOLIO_METRIC_NAME
+        ]
+        impact_evidence = next(e for e in evidences if e["cost_model"]["name"] == "sqrt_impact_v1")
+        assert impact_evidence["cost_model"]["placeholder"] is False
+        assert impact_evidence["cost_model"]["params"] == {
+            "half_spread_bps": 2.5,
+            "commission_bps": 0.5,
+            "impact_coef_bps": 12.0,
+            "min_cost_bps": 1.0,
+        }
+        assert impact_evidence["params"]["book_notional_usd"] == pytest.approx(1_000_000.0)
+        assert impact_evidence["components"]["cost_model"]["reason"] == "sqrt_impact", (
+            "the sqrt-impact term did not engage — it fell back to the flat branch, which "
+            "is exactly the fallback-cost-model defect this arm's refusal exists to prevent"
+        )
+
+        # And the sibling flat arm's grade is UNCHANGED by a participation
+        # arm existing beside it: `book_notional_usd` now prices every book,
+        # but a flat cost model's charge is a function of weight deltas
+        # alone and never reads the notional.
+        flat_evidence = next(e for e in evidences if e["cost_model"]["name"] == "flat_bps_v0")
+        assert flat_evidence["cost_model"]["placeholder"] is True
+
+
 class TestRefusalsAreRecordedFirstAndPerArm:
     def test_an_arm_with_no_oos_clock_registers_stamped_from_its_first_run(self, world) -> None:
         """`alpha-engine-config-I10634` (Brian ruling 2026-09-13, option (b)):
@@ -496,15 +584,55 @@ class TestRefusalsAreRecordedFirstAndPerArm:
         unchanged = read_register(store, SLOT).state(recipe.arm_id).record.created_date
         assert unchanged == days[0].isoformat()
 
-    def test_a_participation_model_is_refused_and_never_substituted(self, world) -> None:
+    def test_a_participation_model_registers_once_adv_and_notional_are_wired(self, world) -> None:
+        """`alpha-engine-config-I10669`: the refusal used to fire on EVERY
+        non-flat cost model unconditionally, before `_build_sessions` wired a
+        real ADV vector and `construct_book` was handed a real book
+        notional. Both are wired now — `dollar_volume_20d_raw` is in the
+        feature catalog and `book_notional_usd` is a declared portfolio-params
+        field — so a participation-aware arm registers instead of being
+        refused forever."""
         store, settings, root, days = world
         (root / "arms" / SLOT / "impact.yaml").write_text(
             _recipe_yaml("impact", registered_at=days[0].isoformat(), cost=IMPACT_COST),
             encoding="utf-8",
         )
         loaded = load_strategy_slot(strategy_dir=root)
-        assert [r.arm for r in loaded.refused] == ["impact"]
-        assert "NOT swapped for a flat one" in loaded.refused[0].reason
+        assert loaded.refused == ()
+        assert sorted(a.name for a in loaded.registered) == ["impact", "stock_registry"]
+
+    def test_a_participation_model_still_refuses_with_no_adv_column_declared(
+        self, world, monkeypatch
+    ) -> None:
+        """The relaxed refusal is not a no-op: it still fires when the
+        catalog genuinely cannot produce the series the model needs."""
+        store, settings, root, days = world
+        (root / "arms" / SLOT / "impact.yaml").write_text(
+            _recipe_yaml("impact", registered_at=days[0].isoformat(), cost=IMPACT_COST),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(strategy_module, "_adv_column_declared", lambda: False)
+        loaded = load_strategy_slot(strategy_dir=root)
+        refused = {r.arm: r for r in loaded.refused}
+        assert "impact" in refused
+        assert refused["impact"].unresolvable == ("adv_usd",)
+        assert "NOT swapped for a flat one" in refused["impact"].reason
+        assert [a.name for a in loaded.registered] == ["stock_registry"]
+
+    def test_a_participation_model_still_refuses_with_no_notional_field_declared(
+        self, world, monkeypatch
+    ) -> None:
+        """The other half of the same guard: no declared book-notional field."""
+        store, settings, root, days = world
+        (root / "arms" / SLOT / "impact.yaml").write_text(
+            _recipe_yaml("impact", registered_at=days[0].isoformat(), cost=IMPACT_COST),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(strategy_module, "_notional_field_declared", lambda: False)
+        loaded = load_strategy_slot(strategy_dir=root)
+        refused = {r.arm: r for r in loaded.refused}
+        assert "impact" in refused
+        assert refused["impact"].unresolvable == ("portfolio_notional",)
         assert [a.name for a in loaded.registered] == ["stock_registry"]
 
     def test_the_raise_that_guards_the_same_substitution_still_fires(self) -> None:
@@ -825,4 +953,5 @@ portfolio:
   conviction_ir_full: 0.75
   conviction_budget_min_multiple: 0.05
   conviction_gate_min_names: 3
+  book_notional_usd: 1000000.0
 """
