@@ -16,7 +16,7 @@ import datetime as dt
 import pytest
 
 from crucible.alerts import PAGE_CONDITIONS, Page, dedup_key
-from crucible.cli import HANDLERS, JOBS, build_parser, is_stub, main, resolve_date
+from crucible.cli import HANDLERS, JOBS, NON_JOB_HANDLERS, build_parser, is_stub, main, resolve_date
 
 FRIDAY = dt.date(2026, 8, 28)
 
@@ -184,8 +184,15 @@ class TestJobSurface:
 
     def test_every_job_has_a_handler(self) -> None:
         """The guard below only covers stubs, so this covers the rest: a job
-        in JOBS with no handler at all would silently drop out of both."""
-        assert set(HANDLERS) == set(JOBS)
+        in JOBS with no handler at all would silently drop out of both.
+
+        `NON_JOB_HANDLERS` is the one named exception: a handler wired into
+        `HANDLERS` for a repair tool that patches an existing document rather
+        than writing a new `run_manifest.v2` (`migrate.code_sha`,
+        alpha-engine-config-I10626) and so deliberately claims no `JOBS`
+        slot. Only names listed there are exempt — anything else missing
+        from `JOBS` still fails this assertion."""
+        assert set(HANDLERS) - NON_JOB_HANDLERS == set(JOBS)
 
     def test_an_unimplemented_job_raises_and_never_returns_zero(self) -> None:
         """A stub that exits 0 is indistinguishable from a job that ran and

@@ -1111,16 +1111,29 @@ class TestTheSmokeGate:
         smoke exited 0 / `ok` — the flip would have proceeded over a corrupt
         pointer. On `main` before PR83 the same store raised. The pointer's
         shape is now validated BEFORE the swallow: a raise, a `failed`
-        manifest, no flip."""
+        manifest, no flip.
+
+        `alpha-engine-config-I9847` (wave 2): the refusal now comes from
+        `ReleasePointerDocument` (via `release.parse_release_pointer`)
+        rather than from `release.assert_sha` — a `sha` this malformed never
+        reaches `assert_sha` any more, it is refused one step earlier, at the
+        document boundary, with the SAME "does not conform" message shape
+        every other boundary in this migration raises."""
         store = LocalStore(tmp_path)
         publish_release(
             store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
         )
         store.put_bytes(
             POINTER_KEY,
-            json.dumps({"sha": "NOT-A-VALID-SHA", "target": "current"}).encode("utf-8"),
+            json.dumps(
+                {
+                    "sha": "NOT-A-VALID-SHA",
+                    "target": "current",
+                    "pinned_at": "2026-06-01T00:00:00Z",
+                }
+            ).encode("utf-8"),
         )
-        with pytest.raises(ValueError, match="not a 40-character lowercase git sha"):
+        with pytest.raises(ValueError, match="does not conform to a release pointer"):
             self._run(tmp_path)
         assert self._manifest(tmp_path)["status"] == "failed"
 

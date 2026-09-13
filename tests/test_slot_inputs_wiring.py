@@ -370,6 +370,11 @@ class TestEveryDeclarableKindResolves:
 #: cannot: that `dispatchable_slots()` finds `produce`/`grade` on all four
 #: slot modules and the arc actually dispatches to each.
 STILL_ORPHANED_M_CALLABLES: list[str] = [
+    # The §5.3 veto's three new producers (`alpha-engine-config-I10680`).
+    # Reached from `grade`, which is itself reached only through
+    # `dispatchable_slots()`'s dynamic dispatch — so they are pinned here for
+    # the same reason `grade` is, not because nothing calls them.
+    "calibrate_up_probability",
     "cpcv_oos_ic",
     "design_panel",
     "evaluate_behavioural_veto",
@@ -379,6 +384,8 @@ STILL_ORPHANED_M_CALLABLES: list[str] = [
     "predict_cross_section",
     "produce",
     "produce_arm_predictions",
+    "realized_hit_rate",
+    "serving_metrics",
     "settled_training_days",
     "train_arm",
 ]

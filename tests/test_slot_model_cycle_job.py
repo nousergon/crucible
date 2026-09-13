@@ -425,16 +425,60 @@ class TestGradeRunsTheSharedEngine:
         document = _manifest(store, "experiment.grade", GRADE_DAY)
         assert any(m["name"] == ARM_REFUSED_METRIC for m in document["metrics"])
 
-    def test_no_arm_may_serve_while_its_veto_cannot_be_computed(self, store, strategy) -> None:
-        """Policy §5.1: an uncomputed gate is not a pass. With no incumbent
-        and no producer for three of the four §5.3 metrics, the veto reads
-        `insufficient` and the serving precondition FAILS — visible on the
-        cycle artifact rather than assumed."""
+    def test_the_veto_reaches_a_real_verdict_on_a_replayed_cycle(self, store, strategy) -> None:
+        """`alpha-engine-config-I10680`, on the real job over a real store.
+
+        Three of the veto's four inputs had no producer, so EVERY arm on
+        EVERY cycle read `insufficient` and the M slot could never serve. Now
+        the unstacked arm reaches a real verdict off 30+ settled out-of-sample
+        decision dates, and `insufficient` is left only for the stacked arm,
+        whose base has not published a panel that deep — a short window, which
+        the artifact states rather than leaving to be inferred.
+
+        The fixture's features are drawn independently of the label, so the
+        verdict on the unstacked arm is `veto`: a model with no edge has a
+        sub-coin-flip hit rate and names nothing it can serve. That is the
+        gate working, not the producer failing — `TestTheVetoProducers` in
+        `tests/test_slot_model.py` asserts the `pass` side on a panel with a
+        planted edge.
+        """
         self._produce_a_series(store, strategy)
         _, result = self._grade(store, strategy, GRADE_DAY)
-        assert {g["veto"] for g in result["model_grades"].values()} == {"insufficient"}
+        grades = result["model_grades"]
+        unstacked = next(g for arm, g in grades.items() if ":base:" in arm)
+        stacked = next(g for arm, g in grades.items() if ":stacked:" in arm)
+
+        assert unstacked["veto"] == "veto"
+        assert unstacked["settled_n"] >= 30
+        assert unstacked["settled_first"] and unstacked["settled_last"]
+        assert set(unstacked["veto_metrics"]) >= {
+            "alpha_stdev",
+            "stdev_p_up",
+            "n_high_confidence",
+            "model_hit_rate_30d",
+        }
+        assert "veto_window_reason" not in unstacked
+
+        assert stacked["veto"] == "insufficient"
+        assert "settled out-of-sample decision date(s)" in stacked["veto_window_reason"]
+
         cycle = json.loads(store.get_bytes(result["arena_cycle_key"]).decode("utf-8"))
         assert "behavioural_veto" in json.dumps(cycle)
+
+    def test_the_cycle_reports_whether_the_veto_could_be_read_at_all(self, store, strategy) -> None:
+        """`serving_veto_window`: `insufficient` has a temporary cause now, and
+        a cycle that did not say which would make the fix look like the gap."""
+        from crucible.slots.model import DEAD_SLOT_METRIC, SERVING_VETO_WINDOW_METRIC
+
+        self._produce_a_series(store, strategy)
+        self._grade(store, strategy, GRADE_DAY)
+        document = _manifest(store, "experiment.grade", GRADE_DAY)
+        rows = [m for m in document["metrics"] if m["name"] == SERVING_VETO_WINDOW_METRIC]
+        assert len(rows) == 1
+        assert rows[0]["status"] == "OK"
+        assert rows[0]["value"] == 1.0
+        # And the permanent finding is GONE, because the producers exist.
+        assert not [m for m in document["metrics"] if m["name"] == DEAD_SLOT_METRIC]
 
     def test_the_control_exclusion_survives_a_caller_supplied_precondition(
         self, store, strategy
@@ -621,11 +665,15 @@ class TestAStackedArmWaitsForItsBaseWithoutTakingTheSlotDown:
 
 
 class TestTheIncumbentsMetricsComeFromThePointer:
-    """`_incumbent_serving_metrics`: the champion's own cross-section, or `{}`.
+    """`_baseline_serving_metrics`: the champion's own cross-section, or `{}`.
 
     `{}` is not a neutral default — every dispersion rule is a RATIO against
     the incumbent, so an absent one makes the veto `insufficient` rather than
-    a pass.
+    a pass. The second return value is whether a champion EXISTS, which is a
+    different question and carries a different reading
+    (`alpha-engine-config-I10680`): no champion at all makes the dispersion
+    family `inapplicable`, while a champion whose cross-section is missing
+    keeps it `uncomputable`.
     """
 
     def _grade_at(self, store, strategy, day):
@@ -641,8 +689,11 @@ class TestTheIncumbentsMetricsComeFromThePointer:
         return result
 
     def test_a_champion_pointer_supplies_the_dispersion_denominator(self, store, strategy) -> None:
+        """A champion NOT graded this cycle still supplies its `alpha_stdev`
+        off the cross-section it published — and nothing else, so the veto
+        reads `insufficient` rather than comparing two constructions."""
         from crucible.keys import champion_key
-        from crucible.slots.model import _incumbent_serving_metrics
+        from crucible.slots.model import _baseline_serving_metrics, _champion_arm
 
         _warm_the_base(store, strategy)
         for day in SESSIONS[46:52]:
@@ -654,29 +705,59 @@ class TestTheIncumbentsMetricsComeFromThePointer:
             if line.strip() and ":base:" in line
         )
         store.put_bytes(champion_key(SLOT), json.dumps({"champion": champion}).encode("utf-8"))
-        metrics = _incumbent_serving_metrics(store, as_of=GRADE_DAY)
+        assert _champion_arm(store) == champion
+        metrics, has_incumbent = _baseline_serving_metrics(
+            store, champion=champion, candidates={}, as_of=GRADE_DAY
+        )
+        assert has_incumbent
         assert set(metrics) == {"alpha_stdev"}
         assert metrics["alpha_stdev"] > 0.0
+
+    def test_a_champion_graded_this_cycle_supplies_its_own_in_cycle_row(self, store) -> None:
+        """Policy §4: the ratio's numerator and denominator come off the same
+        producer over the same window, so the comparison is between two
+        models rather than between two constructions."""
+        from crucible.slots.model import _baseline_serving_metrics
+
+        row = {"alpha_stdev": 0.02, "stdev_p_up": 0.05}
+        metrics, has_incumbent = _baseline_serving_metrics(
+            store,
+            champion="m:base:0123456789ab",
+            candidates={"m:base:0123456789ab": row},
+            as_of=GRADE_DAY,
+        )
+        assert has_incumbent
+        assert metrics == row
 
     def test_a_pointer_to_an_arm_that_did_not_predict_today_supplies_nothing(
         self, store, strategy
     ) -> None:
         """Absent, never fabricated: a stale dispersion figure would let a
-        collapsed candidate clear a ratio against a day it never ran."""
+        collapsed candidate clear a ratio against a day it never ran.
+
+        `has_incumbent` stays TRUE — the champion exists, it just cannot be
+        measured, and reading that as "no champion" would let a candidate walk
+        past the dispersion family on the absolute rules alone."""
         from crucible.keys import champion_key
-        from crucible.slots.model import _incumbent_serving_metrics
+        from crucible.slots.model import _baseline_serving_metrics
 
         store.put_bytes(
             champion_key(SLOT), json.dumps({"champion": "m:absent:0123456789ab"}).encode("utf-8")
         )
-        assert _incumbent_serving_metrics(store, as_of=GRADE_DAY) == {}
+        assert _baseline_serving_metrics(
+            store, champion="m:absent:0123456789ab", candidates={}, as_of=GRADE_DAY
+        ) == ({}, True)
 
     def test_a_champion_document_with_no_pointer_supplies_nothing(self, store) -> None:
         from crucible.keys import champion_key
-        from crucible.slots.model import _incumbent_serving_metrics
+        from crucible.slots.model import _baseline_serving_metrics, _champion_arm
 
         store.put_bytes(champion_key(SLOT), json.dumps({"champion": ""}).encode("utf-8"))
-        assert _incumbent_serving_metrics(store, as_of=GRADE_DAY) == {}
+        assert _champion_arm(store) is None
+        assert _baseline_serving_metrics(store, champion=None, candidates={}, as_of=GRADE_DAY) == (
+            {},
+            False,
+        )
 
 
 class TestAnUnmeasurableCpcvCarriesNoNumber:

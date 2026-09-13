@@ -107,7 +107,10 @@ __all__ = [
     "DEAD_SLOT_METRIC",
     "DISPERSION_METRICS",
     "FLOOR_VETO_METRICS",
+    "HIGH_CONFIDENCE_P_UP",
     "MIN_DISPERSION_RATIO",
+    "SERVING_VETO_WINDOW_METRIC",
+    "SETTLED_WINDOW_DECISION_DATES",
     "UNPRODUCED_VETO_METRICS",
     "M_SELECTION_TOP_N",
     "OOS_METHOD",
@@ -128,10 +131,13 @@ __all__ = [
     "InputRefusal",
     "ModelRecipe",
     "RegisteredModelArm",
+    "SettledCrossSections",
     "SupersededArmUndeclaredError",
     "SlotRecipes",
     "SlotUnservableError",
     "UnresolvedInputError",
+    "UpProbabilityCalibration",
+    "calibrate_up_probability",
     "design_panel",
     "predict_cross_section",
     "produce_arm_predictions",
@@ -145,7 +151,9 @@ __all__ = [
     "grade_arm",
     "load_model_recipes",
     "produce",
+    "realized_hit_rate",
     "registration_specs",
+    "serving_metrics",
     "settled_training_days",
     "train_arm",
 ]
@@ -177,33 +185,76 @@ FLOOR_VETO_METRICS: dict[str, float] = {"model_hit_rate_30d": 0.50}
 #: The veto inputs NOTHING IN THIS HARNESS PRODUCES, and the producer each
 #: one waits on (`alpha-engine-config-I9759`, from `crucible-PR149`'s note).
 #:
-#: `_serving_metrics` supplies `alpha_stdev` and deliberately nothing else:
-#: inventing a stand-in for any of these is the exact failure mode
-#: :func:`evaluate_behavioural_veto` exists against — a gate reporting a pass
-#: for a statistic nobody measured (`champion-challenger-policy.md` §5.1).
-#: So they are recorded in `uncomputable`, the veto reads `insufficient`, the
-#: precondition FAILS, and the M pointer cannot move. That is the honest
-#: reading of each cycle.
+#: **EMPTY since `alpha-engine-config-I10680`, and that is the whole point of
+#: it still existing.** It carried `stdev_p_up`, `n_high_confidence` and
+#: `model_hit_rate_30d` from 2026-09-13 until their producers landed: for as
+#: long as a veto input has no producer, the veto can only ever read
+#: `insufficient`, the serving precondition can only ever FAIL, and the M
+#: pointer can never move — not this cycle, but permanently. §5.1's rule is
+#: "an uncomputed gate is not a pass"; it is not "a gate that can never
+#: compute is a healthy slot", and the difference is a slot that renders
+#: identically to one that merely held its pointer this week.
 #:
-#: It is NOT an honest reading of the SLOT. §5.1's rule is "an uncomputed
-#: gate is not a pass"; it is not "a gate that can never compute is a healthy
-#: slot". Every M cycle since the slot landed has produced the same
-#: `insufficient` for the same three metrics for the same reason, and the
-#: only surface saying so was a per-arm precondition reason inside the cycle
-#: artifact — so a slot that can never promote rendered identically to one
-#: that merely held its pointer this week. :data:`DEAD_SLOT_METRIC` is the
-#: difference: it is emitted on every `experiment.grade[m]` manifest that
-#: reaches this state, naming the metrics and their missing producers, so the
-#: gap is OBSERVED rather than rediscovered. A component emitting nothing
-#: about a permanent condition is unobserved, not healthy (principle 7).
-UNPRODUCED_VETO_METRICS: dict[str, str] = {
-    "stdev_p_up": "a calibrated up-probability; M arms predict alpha, not a probability",
-    "n_high_confidence": "a declared confidence threshold over the predicted cross-section",
-    "model_hit_rate_30d": "a realized trailing-30-session hit rate over settled M verdicts",
-}
+#: The three producers are now :func:`serving_metrics` and its helpers:
+#: `model_hit_rate_30d` from the arm's own settled walk-forward cross
+#: sections, and `stdev_p_up`/`n_high_confidence` through the per-arm
+#: up-probability calibration fitted on that same settled block. None of them
+#: is a stand-in — each is read off a real measurement, which is the only
+#: form §5.1 permits.
+#:
+#: Two contract tests hold this to the truth in BOTH directions
+#: (`tests/test_slot_model.py::TestTheDeadSlotIsObserved`): every name here
+#: must be one a rule family actually reads, and every veto input
+#: :func:`serving_metrics` does not emit must be declared here. So a metric
+#: added to a rule family with no producer re-populates this map and
+#: re-arms :data:`DEAD_SLOT_METRIC` rather than killing the slot in silence.
+UNPRODUCED_VETO_METRICS: dict[str, str] = {}
 
 #: The metric name :data:`UNPRODUCED_VETO_METRICS` is reported under.
 DEAD_SLOT_METRIC = "serving_veto_has_no_producer"
+
+#: The metric name the cycle reports the veto's per-cycle reading under when
+#: every producer exists and the window is simply not long enough yet
+#: (`alpha-engine-config-I10680`). Distinct from :data:`DEAD_SLOT_METRIC` by
+#: design: "no arm can EVER serve" and "no arm can serve YET" have different
+#: owners and different remedies, and collapsing them into one row is how a
+#: temporary state gets read as a permanent one and a permanent one gets
+#: waited out.
+SERVING_VETO_WINDOW_METRIC = "serving_veto_window"
+
+#: Settled out-of-sample DECISION DATES an arm needs before its realized
+#: veto inputs exist. The metric's own name declares the window —
+#: `model_hit_rate_30d` — and a hit rate computed over eight dates reported
+#: under that name is a different statistic wearing it, which is the same
+#: class of defect as the unit-scale error :data:`PROPORTION_METRICS` exists
+#: against. Not a tuned bar and not an evidence floor in policy §5.0's sense
+#: (those are removed, and `promote_min_weeks` is the only age rule): it is
+#: the well-formedness condition of the statistic itself. The up-probability
+#: calibration is fitted on the SAME block, so one number states the whole
+#: minimum.
+#:
+#: What it costs, in sessions: a date's label settles `label_horizon` sessions
+#: after it, and the walk-forward window opens at `registered_at`, so an arm
+#: needs `SETTLED_WINDOW_DECISION_DATES + label_horizon_trading_days`
+#: sessions of panel beyond its registration — 51 at the default 21-session
+#: horizon, a little over ten trading weeks.
+SETTLED_WINDOW_DECISION_DATES = 30
+
+#: The calibrated up-probability above which a name counts toward
+#: `n_high_confidence`. **The coin flip, and deliberately nothing else.**
+#:
+#: A tuned confidence bar would be a strategy parameter and would not belong
+#: in this repository at all. It is not needed: the zero-veto rule this feeds
+#: asks whether the model *names anything it can serve*, and the answer is
+#: read off the selection the slot actually hands downstream — the top
+#: :data:`M_SELECTION_TOP_N` names — counting those whose calibrated
+#: probability of beating the cross-section is better than a coin flip. Zero
+#: then means exactly what the 2026-08-21 model did: of the ten names it
+#: ranked highest, not one was calibrated to beat the population, so there
+#: was nothing in its output to trade. Both inputs (the selection width and
+#: the coin flip) are already declared in this module; the bar introduces no
+#: new number.
+HIGH_CONFIDENCE_P_UP = 0.5
 
 #: Metrics this module declares to be 0–1 proportions, range-checked on BOTH
 #: sides before any floor is applied.
@@ -253,12 +304,23 @@ UNITS_SUFFIXES: tuple[str, ...] = UNIT_SUFFIXES
 
 @dataclass(frozen=True)
 class VetoResult:
-    """The veto's verdict, with every reason it reached it."""
+    """The veto's verdict, with every reason it reached it.
+
+    ``uncomputable`` and ``inapplicable`` are deliberately two fields, not
+    one (`alpha-engine-config-I10680`). A metric that has no producer, or
+    whose window is too short, was NOT MEASURED and makes the result
+    ``insufficient`` — §5.1. A *relative* rule on a slot with no incumbent
+    has no comparand to measure against at all, which is a different fact
+    with a different remedy, and folding it into ``uncomputable`` would make
+    a cold slot permanently unservable for a reason no producer could ever
+    fix. See :func:`evaluate_behavioural_veto`.
+    """
 
     status: str  # veto | pass | insufficient
     reasons: tuple[str, ...] = ()
     uncomputable: tuple[str, ...] = ()
     metrics: dict[str, Any] = field(default_factory=dict)
+    inapplicable: tuple[str, ...] = ()
 
     def as_precondition(self) -> ServingPrecondition:
         """The engine consumes an evaluated RESULT, never a computation.
@@ -277,6 +339,16 @@ class VetoResult:
             )
         else:
             reason = "; ".join(self.reasons)
+        if self.inapplicable:
+            # Recorded on the PASS too, and on the precondition rather than
+            # only in `metrics`: "passed every rule" and "passed every rule
+            # that had a comparand" are different claims about a first
+            # champion, and the artifact must not render them identically.
+            note = (
+                f"{', '.join(self.inapplicable)} had no incumbent to compare against "
+                "(the slot has no champion); the absolute rules were applied in full"
+            )
+            reason = f"{reason}; {note}" if reason else note
         return ServingPrecondition(name="behavioural_veto", passed=passed, reason=reason)
 
 
@@ -285,6 +357,7 @@ def evaluate_behavioural_veto(
     incumbent: dict[str, Any],
     *,
     min_dispersion_ratio: float = MIN_DISPERSION_RATIO,
+    has_incumbent: bool = True,
 ) -> VetoResult:
     """The M slot's serving veto. **Keep it scale-dependent.**
 
@@ -303,18 +376,61 @@ def evaluate_behavioural_veto(
     Every metric in :data:`PROPORTION_METRICS` is range-asserted on BOTH sides
     first and raises :class:`MetricScaleError` when it is outside [0, 1]. A
     percentage-scaled hit rate used to sail past its own absolute floor.
+
+    **``has_incumbent=False`` — the cold-start reading**
+    (`alpha-engine-config-I10680`). Every dispersion rule is a ratio against
+    what is BEING SERVED. On a slot whose `champions/m/current.json` does not
+    exist, nothing is being served, so the rule has no comparand — and this
+    is a *measured* property of the M slot, not a convenience: §10.1's null
+    control, which `crucible-PR257` made the baseline for a first champion,
+    is a SELECTION-shaped harness control (`control_null_m` ranks names on
+    noise). It publishes no predicted-alpha cross-section, so it has no
+    `alpha_stdev` and no `stdev_p_up` in the candidate's units; scoring one
+    off its noise draw would compare a 1e-3 alpha spread against a unit
+    normal and veto every real arm on arithmetic.
+
+    So a cold slot records the dispersion family in ``inapplicable`` rather
+    than ``uncomputable``, and the verdict rests on the two ABSOLUTE families
+    — which are fully measured. This is not §5.1's forbidden move: nothing is
+    reported as a pass for a statistic nobody measured, because the statistic
+    is not a statistic about this slot until something is serving. It applies
+    at most once in a slot's life, and from the second cycle after a first
+    champion the ratios are back.
+
+    What the cold slot keeps instead is an ABSOLUTE non-degeneracy check on
+    the same two metrics: a dispersion of zero is vetoed outright. That is
+    strictly narrower than the ratio rule — it catches a model that collapsed
+    to a constant, not one that merely halved — and it is the part of the
+    2026-08-28 lesson that survives having nothing to halve against.
     """
     _assert_proportions(candidate, "candidate")
     _assert_proportions(incumbent, "incumbent")
 
     reasons: list[str] = []
     uncomputable: list[str] = []
+    inapplicable: list[str] = []
     metrics: dict[str, Any] = {}
 
     for name in DISPERSION_METRICS:
         cand = candidate.get(name)
+        if cand is None:
+            uncomputable.append(name)
+            continue
+        if not has_incumbent:
+            # No comparand exists. The absolute floor of the ratio rule — a
+            # collapsed constant — still applies and still vetoes.
+            inapplicable.append(name)
+            metrics[name] = cand
+            if float(cand) <= 0.0:
+                reasons.append(
+                    f"{name}={cand!r} with no incumbent to compare against: the slot has no "
+                    "champion, so the dispersion RATIO has no comparand, but a cross-section "
+                    "with zero spread is a collapsed model whichever way it is measured and "
+                    "is not the arm a cold slot wins its first champion with"
+                )
+            continue
         inc = incumbent.get(name)
-        if cand is None or inc is None:
+        if inc is None:
             uncomputable.append(name)
             continue
         if float(inc) == 0.0:
@@ -351,10 +467,10 @@ def evaluate_behavioural_veto(
             reasons.append(f"{name}={cand!r} is below the absolute floor {floor}")
 
     if reasons:
-        return VetoResult("veto", tuple(reasons), tuple(uncomputable), metrics)
+        return VetoResult("veto", tuple(reasons), tuple(uncomputable), metrics, tuple(inapplicable))
     if uncomputable:
-        return VetoResult("insufficient", (), tuple(uncomputable), metrics)
-    return VetoResult("pass", (), (), metrics)
+        return VetoResult("insufficient", (), tuple(uncomputable), metrics, tuple(inapplicable))
+    return VetoResult("pass", (), (), metrics, tuple(inapplicable))
 
 
 def _assert_proportions(metrics: dict[str, Any], side: str) -> None:
@@ -1797,6 +1913,63 @@ OOS_METHOD = "walk_forward_purged"
 
 
 @dataclass(frozen=True)
+class SettledCrossSections:
+    """An arm's out-of-sample predictions beside the labels that REALIZED.
+
+    `alpha-engine-config-I10680`. The walk-forward grader already builds a
+    predicted and a realized vector for every date it scores, and used to
+    keep only the rank IC of the pair. Three of the §5.3 veto's four inputs
+    are statistics of exactly this block — a realized directional hit rate,
+    and the up-probability calibration that `stdev_p_up` and
+    `n_high_confidence` are read through — so the block is now carried out
+    of the grader rather than recomputed by a second walk somewhere else,
+    which is the only way the veto's inputs and the arm's score can be
+    guaranteed to describe the same fit on the same dates.
+
+    **Settled only.** A date is here when its `label_horizon` forward return
+    is realized on or before the cycle's `as_of` (:func:`settled_training_
+    days`). A date whose label has not settled has a prediction and no
+    outcome, and counting it would put an unresolved bet in a hit rate.
+
+    **Cross-sectional excess, not raw return.** Both sides are demeaned per
+    date. M declares `population` as its benchmark — the scored cross-section
+    IS the benchmark (plan §9.1) — so "the model was directionally right"
+    means right about beating the population, and the 0.50 floor
+    :data:`FLOOR_VETO_METRICS` applies is then a genuine coin flip rather
+    than a bar that market drift alone clears. Demeaning is a shift, not a
+    division: nothing about §5.3's scale-dependence is touched by it.
+    """
+
+    dates: tuple[str, ...] = ()
+    #: Shape ``(len(dates), n_names)``, cross-sectionally demeaned.
+    predicted: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype="float64"))
+    #: Shape ``(len(dates), n_names)``, cross-sectionally demeaned.
+    realized: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype="float64"))
+
+    def __post_init__(self) -> None:
+        if self.predicted.shape != self.realized.shape:
+            raise ValueError(
+                f"predicted {self.predicted.shape} and realized {self.realized.shape} must "
+                "describe the same block; a mismatch would pair a prediction with another "
+                "name's outcome"
+            )
+        if self.predicted.shape[0] != len(self.dates):
+            raise ValueError(
+                f"{len(self.dates)} date(s) but {self.predicted.shape[0]} row(s) of predictions"
+            )
+
+    @property
+    def n_dates(self) -> int:
+        return len(self.dates)
+
+    def tail(self, n: int) -> SettledCrossSections:
+        """The most recent ``n`` settled decision dates."""
+        return SettledCrossSections(
+            dates=self.dates[-n:], predicted=self.predicted[-n:], realized=self.realized[-n:]
+        )
+
+
+@dataclass(frozen=True)
 class ModelGrade:
     """One arm's cycle grade: the OOS series, the CPCV battery, the fit.
 
@@ -1825,6 +1998,10 @@ class ModelGrade:
     unrankable_dates: tuple[str, ...] = ()
     oos_method: str = OOS_METHOD
     benchmark: str = "population"
+    #: The scored dates whose labels have REALIZED, with both sides of each
+    #: cross-section. The §5.3 veto's realized inputs are read off this and
+    #: nothing else — see :class:`SettledCrossSections`.
+    settled: SettledCrossSections = field(default_factory=SettledCrossSections)
 
     def __post_init__(self) -> None:
         if self.status not in ("ok", "unmeasurable"):
@@ -1902,6 +2079,13 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
     n_names = len(panel.names)
 
     scorable = [i for i, day in enumerate(panel.dates) if day <= as_of]
+    # The scored dates whose labels have realized by `as_of`. Computed once,
+    # from the same function the purge uses, so "settled" means one thing on
+    # the training side and the measurement side (`alpha-engine-config-I10680`).
+    realized_by_as_of = set(settled_training_days(panel, as_of=as_of, label_horizon=horizon))
+    settled_dates: list[str] = []
+    settled_predicted: list[np.ndarray] = []
+    settled_realized: list[np.ndarray] = []
     in_sample_n = 0
     scores: dict[str, float] = {}
     unrankable: list[str] = []
@@ -1932,6 +2116,16 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
         rows = i * n_names + np.arange(n_names)
         predicted = _design(recipe, panel, rows) @ coefficients + intercept
         actual = panel.forward_returns.reshape(-1)[rows]
+        if i in realized_by_as_of:
+            # Demeaned per date: M's benchmark is the cross-section it scored
+            # (plan §9.1), so the quantity with a settled outcome is the
+            # excess, not the raw return. An unrankable date is still a
+            # settled observation — it is a miss on the SERIES because "no
+            # ordering" is not "zero skill", which says nothing about whether
+            # the day's directions were right.
+            settled_dates.append(day)
+            settled_predicted.append(predicted - predicted.mean())
+            settled_realized.append(actual - actual.mean())
         ic = _rank_ic(predicted, actual)
         if ic is None:
             unrankable.append(day)
@@ -1986,6 +2180,15 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
         oos_n=len(scores),
         in_sample_n=in_sample_n,
         unrankable_dates=tuple(unrankable),
+        settled=SettledCrossSections(
+            dates=tuple(settled_dates),
+            predicted=np.array(settled_predicted, dtype="float64").reshape(
+                len(settled_dates), n_names
+            ),
+            realized=np.array(settled_realized, dtype="float64").reshape(
+                len(settled_dates), n_names
+            ),
+        ),
     )
 
 
@@ -2435,25 +2638,290 @@ def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     }
 
 
-def _serving_metrics(predicted: dict[str, float]) -> dict[str, Any]:
-    """The §5.3 veto inputs one predicted cross-section can actually supply.
+#: IRLS iterations the up-probability calibration is allowed. A logistic fit
+#: on two parameters converges in a handful; not converging inside this many
+#: is a degenerate block (perfect separation, a constant predictor), and the
+#: calibration REFUSES rather than returning the last iterate. A half-fitted
+#: map would put a number on `stdev_p_up` that no measurement stands behind.
+_CALIBRATION_MAX_ITERATIONS = 50
 
-    `alpha_stdev` and nothing else, deliberately. `stdev_p_up`,
-    `n_high_confidence` and `model_hit_rate_30d` each need a producer this
-    harness does not have — a calibrated up-probability, a confidence
-    threshold, and a realized 30-day hit rate — and inventing a stand-in for
-    any of them is the exact failure mode :func:`evaluate_behavioural_veto`
-    documents: a gate that reports a pass for a statistic nobody measured
-    (`champion-challenger-policy.md` §5.1). Absent metrics make the veto read
-    `insufficient`, which FAILS the serving precondition, so an M arm cannot
-    take the pointer until those producers exist. That is the honest reading
-    and it is visible on the cycle artifact rather than assumed.
+#: Convergence tolerance on the coefficient step, in units of the internally
+#: standardised predictor.
+_CALIBRATION_TOLERANCE = 1e-8
+
+
+@dataclass(frozen=True)
+class UpProbabilityCalibration:
+    """An arm's fitted map from predicted excess alpha to P(beats the population).
+
+    `alpha-engine-config-I10680`. Platt scaling — a two-parameter logistic
+    of the realized direction on the predicted excess — fitted on the arm's
+    OWN settled walk-forward block (:class:`SettledCrossSections`), which is
+    the only history that is out-of-sample by construction.
+
+    **Fitted on HISTORY, applied to TODAY, and that is what keeps §5.3's
+    scale-dependence intact.** The map is a fixed affine function of the
+    predicted alpha, so a cross-section whose spread collapses to half
+    produces an up-probability spread that collapses with it — which is the
+    property `stdev_p_up` is in :data:`DISPERSION_METRICS` for. Fitting the
+    map on today's cross-section instead (or standardising the predictor at
+    serving time) would divide the collapse away exactly as the standardized
+    ratio did on 2026-08-28, and is the one thing this class must never do.
+    The internal standardisation below is of the TRAINING block only and is
+    folded back out of the returned coefficients, so the map it yields is in
+    the arm's own predicted-alpha units.
+    """
+
+    slope: float
+    intercept: float
+    n_pairs: int
+    n_dates: int
+
+    def p_up(self, predicted_excess: np.ndarray) -> np.ndarray:
+        """P(this name beats the cross-section) for each predicted excess."""
+        return 1.0 / (1.0 + np.exp(-(self.slope * np.asarray(predicted_excess) + self.intercept)))
+
+
+def calibrate_up_probability(settled: SettledCrossSections) -> UpProbabilityCalibration | None:
+    """Fit :class:`UpProbabilityCalibration` on ``settled``, or ``None``.
+
+    ``None`` — never a default map — when the block cannot support a fit:
+    no rows, one realized direction only (nothing to discriminate), a
+    constant predictor, a non-finite value, or IRLS not converging inside
+    :data:`_CALIBRATION_MAX_ITERATIONS`. The caller records the absence, the
+    veto reads `insufficient`, and the arm does not serve. An identity or
+    a 0.5-everywhere fallback would be a stand-in for a statistic nobody
+    measured (`champion-challenger-policy.md` §5.1).
+    """
+    x = np.asarray(settled.predicted, dtype="float64").reshape(-1)
+    outcomes = np.asarray(settled.realized, dtype="float64").reshape(-1)
+    if x.size == 0:
+        return None
+    finite = np.isfinite(x) & np.isfinite(outcomes)
+    x, outcomes = x[finite], outcomes[finite]
+    if x.size == 0:
+        return None
+    y = (outcomes > 0.0).astype("float64")
+    if float(y.sum()) in (0.0, float(y.size)):
+        # One class only: a logistic fit would run to infinity, and a map
+        # that says "every name goes up" is not a calibration.
+        return None
+    scale = float(x.std())
+    if scale < DEGENERATE_STD:
+        return None
+    z = x / scale
+
+    beta = np.zeros(2, dtype="float64")
+    design = np.column_stack((np.ones_like(z), z))
+    converged = False
+    for _ in range(_CALIBRATION_MAX_ITERATIONS):
+        probability = 1.0 / (1.0 + np.exp(-(design @ beta)))
+        weights = probability * (1.0 - probability)
+        hessian = design.T @ (design * weights[:, None])
+        # A ridge on the order of the float epsilon, not a regulariser: it
+        # keeps a near-singular Hessian solvable without moving the fit.
+        hessian[np.diag_indices(2)] += 1e-10
+        gradient = design.T @ (y - probability)
+        try:
+            step = np.linalg.solve(hessian, gradient)
+        except np.linalg.LinAlgError:
+            return None
+        if not np.isfinite(step).all():
+            return None
+        beta = beta + step
+        if float(np.max(np.abs(step))) < _CALIBRATION_TOLERANCE:
+            converged = True
+            break
+    if not converged or not np.isfinite(beta).all():
+        return None
+    return UpProbabilityCalibration(
+        slope=float(beta[1] / scale),
+        intercept=float(beta[0]),
+        n_pairs=int(x.size),
+        n_dates=settled.n_dates,
+    )
+
+
+def realized_hit_rate(settled: SettledCrossSections) -> float | None:
+    """Sign agreement between predicted and realized excess, or ``None``.
+
+    The proportion of (settled date, name) pairs whose predicted excess and
+    realized excess share a sign. Both sides are already cross-sectionally
+    demeaned (:class:`SettledCrossSections`), so this is "how often was the
+    model right about beating the population" — against which
+    :data:`FLOOR_VETO_METRICS`' 0.50 is a coin flip rather than a bar that a
+    rising market clears on its own.
+
+    Pairs where either side is exactly zero or non-finite are excluded: a
+    name the model expressed no view on is not a directional call, and
+    scoring it either way would move the statistic without any prediction
+    behind it. ``None`` when nothing is left, which the caller records as
+    uncomputable rather than as a rate.
+    """
+    predicted = np.asarray(settled.predicted, dtype="float64").reshape(-1)
+    realized = np.asarray(settled.realized, dtype="float64").reshape(-1)
+    usable = np.isfinite(predicted) & np.isfinite(realized) & (predicted != 0.0) & (realized != 0.0)
+    if not usable.any():
+        return None
+    agree = np.sign(predicted[usable]) == np.sign(realized[usable])
+    return float(agree.sum()) / float(usable.sum())
+
+
+def _serving_metrics(predicted: dict[str, float]) -> dict[str, Any]:
+    """The §5.3 veto input one predicted cross-section supplies on its own.
+
+    `alpha_stdev`, and only it: the other three are statistics of the arm's
+    settled HISTORY as well as of today's cross-section, and they are
+    produced by :func:`serving_metrics`, which takes both.
 
     Raw, never standardized (policy §5.3): dividing by the spread is the
     transformation that made 2026-08-28's collapse read as healthy.
     """
     values = np.array(sorted(predicted.values()), dtype="float64")
     return {"alpha_stdev": float(values.std())}
+
+
+def serving_metrics(
+    predicted: dict[str, float],
+    *,
+    settled: SettledCrossSections,
+    window: int = SETTLED_WINDOW_DECISION_DATES,
+    top_n: int = M_SELECTION_TOP_N,
+) -> tuple[dict[str, Any], str]:
+    """Every §5.3 veto input this arm can supply, and why any is missing.
+
+    `alpha-engine-config-I10680` — the producers the veto waited on.
+
+    * ``alpha_stdev`` — today's predicted cross-section's spread, raw.
+    * ``model_hit_rate_30d`` — :func:`realized_hit_rate` over the trailing
+      :data:`SETTLED_WINDOW_DECISION_DATES` settled decision dates.
+    * ``stdev_p_up`` — the spread of the calibrated up-probability across
+      today's cross-section, through the arm's own
+      :class:`UpProbabilityCalibration`.
+    * ``n_high_confidence`` — how many of the ``top_n`` names the slot would
+      actually serve carry a calibrated probability above
+      :data:`HIGH_CONFIDENCE_P_UP` of beating the population.
+
+    Returns the metrics and a REASON, empty when all four are present. The
+    reason is non-empty exactly when the settled window is too short (or a
+    fit on it is not supportable), which is the only legitimate route to
+    `insufficient` once the producers exist — and it is stated rather than
+    left for a reader to infer from an absent key.
+
+    Nothing is defaulted. A metric that cannot be computed is ABSENT, which
+    :func:`evaluate_behavioural_veto` reads as `insufficient` and never as a
+    pass (`champion-challenger-policy.md` §5.1).
+    """
+    metrics = _serving_metrics(predicted)
+    if settled.n_dates < window:
+        return metrics, (
+            f"{settled.n_dates} settled out-of-sample decision date(s), and the realized "
+            f"veto inputs need {window}: `model_hit_rate_30d` names its own window, and a "
+            "hit rate computed over fewer dates reported under that name is a different "
+            "statistic wearing it. The up-probability calibration is fitted on the same "
+            "block. This is the window being short, not a producer being absent"
+        )
+
+    block = settled.tail(window)
+    hit_rate = realized_hit_rate(block)
+    if hit_rate is not None:
+        metrics["model_hit_rate_30d"] = hit_rate
+
+    calibration = calibrate_up_probability(block)
+    if calibration is None:
+        return metrics, (
+            f"the up-probability calibration could not be fitted on {block.n_dates} settled "
+            f"date(s) ({block.predicted.size} name-date pair(s)): the block carries one "
+            "realized direction only, a constant predictor, or a fit that did not "
+            "converge. `stdev_p_up` and `n_high_confidence` are read through that map and "
+            "are absent rather than assumed"
+        )
+
+    names = sorted(predicted)
+    values = np.array([predicted[n] for n in names], dtype="float64")
+    # Demeaned to match the block the map was fitted on, which is the
+    # cross-sectional excess. A shift, not a division — the collapse the
+    # dispersion rule looks for survives it.
+    probabilities = calibration.p_up(values - values.mean())
+    metrics["stdev_p_up"] = float(probabilities.std())
+
+    served = np.argsort(-values, kind="stable")[: min(top_n, values.size)]
+    metrics["n_high_confidence"] = int((probabilities[served] > HIGH_CONFIDENCE_P_UP).sum())
+    if hit_rate is None:
+        return metrics, (
+            f"no (date, name) pair over {block.n_dates} settled date(s) carried a non-zero "
+            "predicted AND realized excess, so there is no directional call to score. "
+            "`model_hit_rate_30d` is absent rather than 0.5"
+        )
+    return metrics, ""
+
+
+def _grade_lookback(recipe: ModelRecipe) -> int:
+    """Sessions of panel :func:`grade` reads, so the settled window can fill.
+
+    `alpha-engine-config-I10680`. The produce path needs exactly one fit, so
+    it reads ``min_trading_days + label_horizon`` sessions. The grade path
+    additionally measures the §5.3 veto's realized inputs over
+    :data:`SETTLED_WINDOW_DECISION_DATES` settled out-of-sample decision
+    dates, and each of those costs a session twice over: once to be scorable
+    at all, once for its label to settle. With the old lookback the
+    walk-forward had room for a handful of scorable dates and none of them
+    settled, so the realized inputs could not have existed however long the
+    slot ran — a producer bounded by the window it was given rather than by
+    the data.
+
+    Reading MORE panel does not weaken the purge: every scored day is still
+    predicted by a fit trained only on days whose labels had settled by that
+    day (:func:`grade_arm`), and the window still opens no earlier than the
+    arm's ``registered_at``. It reads more parquet, which is the whole cost.
+    """
+    return (
+        recipe.training_window.min_trading_days
+        + 2 * recipe.label_horizon_trading_days
+        + SETTLED_WINDOW_DECISION_DATES
+    )
+
+
+def _grade_panel(
+    recipe: ModelRecipe, *, source: Any, as_of: str, loaded: SlotRecipes, ctx: Any
+) -> FeaturePanel:
+    """The panel :func:`grade` walks, at :func:`_grade_lookback` where it can be.
+
+    Two attempts, and the second is not a degradation to hide
+    (`alpha-engine-config-I10680`). A STACKED arm reads `predictions[base]` on
+    every row of its panel, so it can only be measured over a window its base
+    has actually published — and the extended window reaches further back than
+    any base has run. Falling back to the produce-sized window keeps the
+    stacked arm's CPCV reading and its veto exactly as they were: its settled
+    window is then short, the veto reads `insufficient`, and
+    :func:`_record_serving_veto_window` says so with the arm named. The
+    alternative was the extended read raising and the arm being refused
+    outright, which would have taken away a reading it already had.
+    """
+
+    def read(lookback: int) -> FeaturePanel:
+        return design_panel(
+            recipe,
+            source=source,
+            trading_day=as_of,
+            recipes=list(loaded.registered),
+            store=ctx.store,
+            lookback_trading_days=lookback,
+            ctx=ctx,
+        )
+
+    try:
+        return read(_grade_lookback(recipe))
+    except BasePredictionsUnavailableError:
+        # Not swallowed: the produce-sized read below either succeeds — and
+        # the arm grades exactly as it did before this change — or raises the
+        # same exception straight into `grade`'s refusal row.
+        return read(_produce_lookback(recipe))
+
+
+def _produce_lookback(recipe: ModelRecipe) -> int:
+    """Sessions of panel one fit needs: the declared window plus the purge."""
+    return recipe.training_window.min_trading_days + recipe.label_horizon_trading_days
 
 
 def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
@@ -2469,10 +2937,14 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
       the pointer is decided on is still the one the arena pairs;
     * a **behavioural-veto serving precondition** per arm, from
       :func:`evaluate_behavioural_veto` over the arm's own predicted
-      cross-section against the incumbent's. With no incumbent and no
-      producer for three of the four metrics the veto reads, it returns
-      `insufficient` — which fails the precondition and keeps the M pointer
-      where it is. See :func:`_serving_metrics`.
+      cross-section against the incumbent's. All four of the metrics the veto
+      reads are produced here (:func:`serving_metrics`,
+      `alpha-engine-config-I10680`), so the reading is `pass` or `veto` on any
+      arm carrying :data:`SETTLED_WINDOW_DECISION_DATES` settled
+      out-of-sample decision dates, and `insufficient` only while that window
+      is short. The veto is evaluated in a second pass over the graded arms,
+      because the incumbent's inputs must come off the same producer and the
+      same window as every candidate's — see :func:`_baseline_serving_metrics`.
 
     The refusal rows are recorded here too, on this manifest, for the same
     reason they are recorded on the produce manifest: a slot that became
@@ -2483,24 +2955,16 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     loaded, specs = _registered_arms(ctx, settings=settings)
     as_of = ctx.trading_day.isoformat()
     source = FeatureLayerSource(store=ctx.store, version=kwargs.get("feature_version"))
-    incumbent = _incumbent_serving_metrics(ctx.store, as_of=as_of)
+    champion = _champion_arm(ctx.store)
 
     preconditions: dict[str, list[ServingPrecondition]] = {}
     grades: dict[str, dict[str, Any]] = {}
+    candidates: dict[str, dict[str, Any]] = {}
+    windows: dict[str, str] = {}
     for spec in _in_dependency_order(specs):
         recipe = spec.recipe
         try:
-            panel = design_panel(
-                recipe,
-                source=source,
-                trading_day=as_of,
-                recipes=list(loaded.registered),
-                store=ctx.store,
-                lookback_trading_days=(
-                    recipe.training_window.min_trading_days + recipe.label_horizon_trading_days
-                ),
-                ctx=ctx,
-            )
+            panel = _grade_panel(recipe, source=source, as_of=as_of, loaded=loaded, ctx=ctx)
         except BasePredictionsUnavailableError as exc:
             # The produce-side warm-up, seen again here. Same failure mode,
             # same reason it is per-arm rather than slot-wide (see `produce`),
@@ -2554,19 +3018,41 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         # nobody made. `CPCVResult.mean_ic` refuses to be read at all in that
         # state, which is what surfaced this.
         ctx.record_metric(row)
-        veto = evaluate_behavioural_veto(
-            _serving_metrics(predict_cross_section(model_grade.fit, panel, trading_day=as_of)),
-            incumbent,
+        candidates[spec.arm_id], windows[spec.arm_id] = serving_metrics(
+            predict_cross_section(model_grade.fit, panel, trading_day=as_of),
+            settled=model_grade.settled,
         )
-        preconditions[spec.arm_id] = [veto.as_precondition()]
         grades[spec.arm_id] = {
             "cpcv_mean_ic": model_grade.cpcv.mean_ic if measurable else None,
             "oos_n": model_grade.oos_n,
             "status": model_grade.status,
-            "veto": veto.status,
+            # The window the veto's realized inputs were read over, on the
+            # artifact. A gate whose window a reader has to re-derive from the
+            # code that produced it is a gate nobody can check.
+            "settled_n": model_grade.settled.n_dates,
+            "settled_first": model_grade.settled.dates[0] if model_grade.settled.dates else None,
+            "settled_last": model_grade.settled.dates[-1] if model_grade.settled.dates else None,
         }
 
+    # The veto runs in a SECOND pass, because the incumbent's own veto inputs
+    # are produced by the same code over the same window as every candidate's
+    # (`alpha-engine-config-I10680`). Policy §4: hold everything constant
+    # except the thing under test — a ratio whose numerator came from this
+    # cycle's walk-forward and whose denominator came from a stored artifact
+    # would be comparing two constructions, not two models.
+    incumbent, has_incumbent = _baseline_serving_metrics(
+        ctx.store, champion=champion, candidates=candidates, as_of=as_of
+    )
+    for arm_id, candidate in candidates.items():
+        veto = evaluate_behavioural_veto(candidate, incumbent, has_incumbent=has_incumbent)
+        preconditions[arm_id] = [veto.as_precondition()]
+        grades[arm_id]["veto"] = veto.status
+        grades[arm_id]["veto_metrics"] = veto.metrics
+        if windows[arm_id]:
+            grades[arm_id]["veto_window_reason"] = windows[arm_id]
+
     _record_dead_slot_finding(ctx, grades, as_of=as_of)
+    _record_serving_veto_window(ctx, grades, windows, as_of=as_of)
 
     result = run_grade(
         ctx,
@@ -2604,6 +3090,12 @@ def _record_dead_slot_finding(ctx: Any, grades: dict[str, dict[str, Any]], *, as
     Silent when at least one arm's veto passed or vetoed on real values: the
     slot is then alive and this row would be a false permanent finding.
     """
+    if not UNPRODUCED_VETO_METRICS:
+        # Every veto input has a producer (`alpha-engine-config-I10680`), so
+        # an all-`insufficient` cycle is a short window, not a dead slot, and
+        # `_record_serving_veto_window` is the row that says so. Emitting this
+        # one anyway would name three producers that exist.
+        return
     statuses = {row.get("veto") for row in grades.values()}
     if not statuses or statuses != {"insufficient"}:
         return
@@ -2632,29 +3124,136 @@ def _record_dead_slot_finding(ctx: Any, grades: dict[str, dict[str, Any]], *, as
     )
 
 
-def _incumbent_serving_metrics(store: Any, *, as_of: str) -> dict[str, Any]:
-    """The champion M arm's own cross-section metrics, or `{}` when there is none.
-
-    `{}` is not a neutral default and is not treated as one: every
-    dispersion rule in :func:`evaluate_behavioural_veto` is a RATIO against
-    the incumbent's value for the same metric, so an absent incumbent makes
-    every one of them uncomputable and the veto reads `insufficient`. A slot
-    with no champion cannot veto a candidate on dispersion, and pretending
-    otherwise is the direction a veto may never fail.
-    """
+def _champion_arm(store: Any) -> str | None:
+    """The M slot's champion arm id, or ``None`` when the slot has none."""
     from crucible.documents import load_store_document  # noqa: PLC0415 - avoids a cycle
     from crucible.keys import champion_key  # noqa: PLC0415 - one call site
-    from crucible.slots.inputs import read_arm_predictions  # noqa: PLC0415 - avoids a cycle
 
     key = champion_key(SLOT)
     if not store.exists(key):
-        return {}
+        return None
     champion = load_store_document(store, key).get("champion")
-    if not champion:
-        return {}
+    return str(champion) if champion else None
+
+
+def _baseline_serving_metrics(
+    store: Any,
+    *,
+    champion: str | None,
+    candidates: dict[str, dict[str, Any]],
+    as_of: str,
+) -> tuple[dict[str, Any], bool]:
+    """The incumbent's veto inputs, and whether there IS an incumbent.
+
+    Three states, deliberately distinguished (`alpha-engine-config-I10680`):
+
+    1. **No champion pointer.** ``({}, False)``. Every dispersion rule is a
+       ratio against what is being served, and nothing is; the veto records
+       the family `inapplicable` and decides on the absolute rules alone. §10.1's
+       null control, which `crucible-PR257` made the baseline for a first
+       champion on the SCORE series, cannot stand in here: `control_null_m` is
+       a selection-shaped harness control that ranks names on a noise draw and
+       publishes no predicted-alpha cross-section, so it has no `alpha_stdev`
+       in the candidates' units at all. Measured, not assumed — see
+       `crucible.slots._controls`.
+    2. **Champion graded this cycle.** Its own row out of ``candidates`` —
+       same producer, same window, same fit vintage as every candidate's
+       (policy §4). This is the ordinary case: the champion arm is registered
+       and graded every cycle.
+    3. **Champion NOT graded this cycle** (retired from the register,
+       refused on inputs). ``(alpha_stdev only, True)`` off the stored
+       cross-section it published for ``as_of``, or ``({}, True)`` when even
+       that is absent. Either way `stdev_p_up` is uncomputable and the veto
+       reads `insufficient` — which is correct and is emphatically not state 1:
+       a champion we cannot measure must not read as a slot with nothing to
+       compare against, because that direction lets an unmeasured arm keep
+       serving while a candidate walks past a gate on absolute rules alone.
+    """
+    from crucible.slots.inputs import read_arm_predictions  # noqa: PLC0415 - avoids a cycle
+
+    if champion is None:
+        return {}, False
+    if champion in candidates:
+        return candidates[champion], True
     if not store.exists(arm_predictions_key(champion, as_of)):
-        return {}
-    return _serving_metrics(read_arm_predictions(store, arm_id=champion, trading_day=as_of))
+        return {}, True
+    return _serving_metrics(read_arm_predictions(store, arm_id=champion, trading_day=as_of)), True
+
+
+def _record_serving_veto_window(
+    ctx: Any,
+    grades: dict[str, dict[str, Any]],
+    windows: dict[str, str],
+    *,
+    as_of: str,
+) -> None:
+    """Emit :data:`SERVING_VETO_WINDOW_METRIC` — the veto's per-cycle reading.
+
+    `alpha-engine-config-I10680`. The M slot spent every cycle of its life
+    reading `insufficient`, and the reason was permanent (no producer). Now
+    that the producers exist the same reading has a temporary cause — an arm
+    whose settled out-of-sample window is shorter than
+    :data:`SETTLED_WINDOW_DECISION_DATES` — and a cycle must say which it is
+    or the fix looks like the gap.
+
+    ``status``:
+
+    * ``OK`` — at least one arm reached a real verdict (`pass` or `veto`). The
+      value is how many did, and the slot can serve.
+    * ``unmeasurable`` — every arm reads `insufficient` and every one of them
+      named a short window. Nothing is broken and nothing is owed; the arms
+      are accruing settled dates. No VALUE is carried, for the same reason an
+      unmeasurable CPCV battery carries none.
+    * ``FAIL`` — every arm reads `insufficient` and at least one did NOT name
+      a short window, so something other than the window is missing. That is
+      an unexplained dead slot and it pages.
+
+    Silent on a cycle that graded no arm: an empty slot is not an unservable
+    one.
+    """
+    if not grades:
+        return
+    verdicts = [row.get("veto") for row in grades.values()]
+    live = [v for v in verdicts if v in ("pass", "veto")]
+    row: dict[str, Any] = {
+        "name": SERVING_VETO_WINDOW_METRIC,
+        "module": f"crucible.slots.{SLOT}",
+        "metric_type": "count",
+        "n_floor": 1,
+        "source_path": arena_cycle_key(SLOT, as_of),
+        "last_updated_utc": _utc_now(),
+    }
+    if live:
+        row["status"] = "OK"
+        row["value"] = float(len(live))
+        row["unit"] = "arms"
+        row["status_reason"] = (
+            f"{len(live)} of {len(grades)} graded arm(s) reached a real §5.3 behavioural-veto "
+            f"verdict on {as_of} against {SETTLED_WINDOW_DECISION_DATES} settled "
+            "out-of-sample decision date(s); the slot can serve a champion"
+        )
+    elif all(windows.get(arm) for arm in grades):
+        row["status"] = "unmeasurable"
+        row["status_reason"] = (
+            f"every one of {len(grades)} graded arm(s) reads `insufficient` on {as_of} "
+            f"because its settled out-of-sample window is shorter than "
+            f"{SETTLED_WINDOW_DECISION_DATES} decision date(s): "
+            + " | ".join(f"{arm}: {windows[arm]}" for arm in sorted(grades))
+            + ". Every producer exists; the arms are accruing dates and no action is owed"
+        )
+    else:
+        row["status"] = "FAIL"
+        row["value"] = float(len(grades))
+        row["unit"] = "arms"
+        unexplained = sorted(arm for arm in grades if not windows.get(arm))
+        row["status_reason"] = (
+            f"every one of {len(grades)} graded arm(s) reads `insufficient` on {as_of} and "
+            f"arm(s) {unexplained} did NOT name a short settled window, so a veto input is "
+            "missing for a reason other than the window. An uncomputed gate is not a pass "
+            "(champion-challenger-policy.md §5.1), so the M pointer cannot move until this "
+            "is diagnosed"
+        )
+    ctx.record_metric(row)
 
 
 def _utc_now() -> str:

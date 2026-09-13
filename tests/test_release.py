@@ -335,6 +335,40 @@ class TestPointer:
         pin(store, SHA_A)
         assert current_release(store) == SHA_A
 
+    def test_a_pointer_missing_sha_raises_named_at_the_boundary(self, tmp_path) -> None:
+        """`alpha-engine-config-I9847` (wave 2): `read_pointer` used to hand
+        back `payload["sha"]` off the raw dict — a pointer written without
+        `sha` reached `current_release`/`resolve_release` as a bare
+        `KeyError`. Now validated through `ReleasePointerDocument`, and the
+        refusal names the field and the document."""
+        store = LocalStore(tmp_path)
+        store.put_bytes(
+            POINTER_KEY,
+            json.dumps(
+                {"not_sha": SHA_A, "target": "current", "pinned_at": "2026-06-01T00:00:00Z"}
+            ).encode(),
+        )
+        with pytest.raises(ValueError, match="does not conform to a release pointer"):
+            read_pointer(store)
+
+    def test_a_pointer_with_an_extra_key_raises_named_at_the_boundary(self, tmp_path) -> None:
+        """`extra="forbid"`: a second key on this document is an edit nothing
+        downstream was told to look for."""
+        store = LocalStore(tmp_path)
+        store.put_bytes(
+            POINTER_KEY,
+            json.dumps(
+                {
+                    "sha": SHA_A,
+                    "target": "current",
+                    "pinned_at": "2026-06-01T00:00:00Z",
+                    "note": "oops",
+                }
+            ).encode(),
+        )
+        with pytest.raises(ValueError, match="does not conform to a release pointer"):
+            read_pointer(store)
+
     def test_the_trader_pin_is_a_separate_pointer(self, tmp_path) -> None:
         """A trader that followed `current` would be promoted by every merge."""
         store = LocalStore(tmp_path)

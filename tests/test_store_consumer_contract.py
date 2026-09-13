@@ -211,6 +211,15 @@ def _morning_previous(store) -> set[str]:
     return {ARRAY_KEY, VANISHING_KEY}
 
 
+def _explain_load(store) -> set[str]:
+    """`crucible.explain.load_manifests` (alpha-engine-config-I10626): moved
+    from STRICT to SURFACE — a corrupt or non-conforming manifest anywhere
+    under `runs/` must not stop `crucible explain` from walking every OTHER
+    manifest, the same shape the console/board/ladder already hold."""
+    load = explain.load_manifests(store)
+    return set(load.unreadable)
+
+
 SURFACE_CONSUMERS: dict[str, Callable[[Any], set[str]]] = {
     "crucible.console.render.build_page": _console,
     "crucible.alerts.evaluate_failure": _alerts_failure,
@@ -218,6 +227,7 @@ SURFACE_CONSUMERS: dict[str, Callable[[Any], set[str]]] = {
     "crucible.gate.build_ladder": _ladder,
     "crucible.board._fetch": _board_fetch,
     "crucible.morning._read_json": _morning_previous,
+    "crucible.explain.load_manifests": _explain_load,
 }
 
 
@@ -236,7 +246,6 @@ class TestEverySurfaceConsumer:
 
 
 STRICT_CONSUMERS: dict[str, Callable[[Any], Any]] = {
-    "crucible.explain.load_manifests": explain.load_manifests,
     "crucible.llm.week_to_date_llm_spend": lambda store: llm.week_to_date_llm_spend(
         store, window_start=FRIDAY, trading_day=FRIDAY
     ),
