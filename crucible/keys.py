@@ -45,6 +45,7 @@ __all__ = [
     "RELEASES_ROOT",
     "REVIEWER_PATTERN",
     "RUNS_ROOT",
+    "TRADER_EVIDENCE_KEY",
     "TRADER_PIN_KEY",
     "TRIGGER_RE",
     "TRIGGER_UNKNOWN",
@@ -1089,6 +1090,28 @@ POINTER_KEY = f"{RELEASES_ROOT}current"
 #: `current` would be promoted by every merge, and release promotion to the
 #: trader is an explicit off-market-hours action (plan §4.11).
 TRADER_PIN_KEY = "trader/release_pin"
+
+#: The trader's consumer-evidence document (`alpha-engine-config-I10648`).
+#: ONE rolling key, not a dated one: `crucible.gate` reads a single document
+#: and takes `trading_days` from it, because the question the phase-4 clause
+#: asks — "has the trader run a week on the v2 champion" — is cumulative, and a
+#: dated artifact would make the gate reconstruct the count by listing, which
+#: is a second implementation of a number the trader already knows.
+#:
+#: **The harness may not reach into the trader** (plan §3: two separate systems
+#: coupled by two contract documents). So this key is not the harness inspecting
+#: the trader — it is the artifact the trader AGREED to write, declared here so
+#: both sides name the same string. `crucible-trader` writes it under its own
+#: identity, which may write this key and `runs/trader.read/*` and nothing else
+#: in the store.
+#:
+#: Under `trader/` beside :data:`TRADER_PIN_KEY`, and a module-level CONSTANT
+#: rather than a `def trader_evidence_key()` for the same reason that one is:
+#: the key is fixed, and a helper returning `f"trader/..."` would enter the
+#: population `nous-ergon-ops`'s store-prefix lockstep guard derives
+#: the spot-box runtime role's PutObject grants from — granting the box a
+#: write on the one prefix it must not have.
+TRADER_EVIDENCE_KEY = "trader/evidence.json"
 
 
 def board_key(trading_day: str) -> str:
