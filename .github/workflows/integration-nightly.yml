@@ -131,6 +131,16 @@ env:
   CRUCIBLE_PAGES_TOPIC: ${{ vars.CRUCIBLE_INTEGRATION_PAGES_TOPIC }}
   CRUCIBLE_MUTED_TOPIC: ${{ vars.CRUCIBLE_INTEGRATION_MUTED_TOPIC }}
   CRUCIBLE_LIQUIDITY_FLOOR_USD: ${{ vars.CRUCIBLE_LIQUIDITY_FLOOR_USD }}
+  # `report.morning` (`alpha-engine-config-I10458`): the SAME fleet App SSM
+  # prefix `morning-report.yml` reads, not a dedicated integration one — the
+  # App is credential, not isolation, and this job's isolation is entirely
+  # `tests/integration/conftest.py::_morning_destination_env` pointing
+  # `CRUCIBLE_MORNING_TRACKER_REPO` at the PUBLIC `nousergon/crucible` rolling
+  # issue instead of the private production tracker. A WARNING, not a hard
+  # failure, below — same reasoning as `morning-report.yml`'s own check: the
+  # named `TrackerError` this job raises without it is already the loud
+  # failure, not a silent one this step needs to duplicate.
+  CRUCIBLE_TRACKER_APP_SSM_PREFIX: ${{ vars.CRUCIBLE_TRACKER_APP_SSM_PREFIX }}
 
 jobs:
   integration:
@@ -155,6 +165,14 @@ jobs:
               missing=1
             fi
           done
+          # A WARNING, not a hard failure (`alpha-engine-config-I10458`,
+          # mirrors `morning-report.yml`'s own check): an unset App prefix
+          # means `crucible report.morning`'s tracker calls raise a named
+          # `TrackerError` and that ONE case fails loudly — a real, visible
+          # failure, not the silent gap this tier exists to close.
+          if [ -z "${CRUCIBLE_TRACKER_APP_SSM_PREFIX}" ]; then
+            echo "::warning::repository variable CRUCIBLE_TRACKER_APP_SSM_PREFIX is not set — crucible test.integration's report.morning case will fail loudly with a named TrackerError. Set it with: gh variable set CRUCIBLE_TRACKER_APP_SSM_PREFIX --repo nousergon/crucible --body '<prefix>', and grant the crucible-v2-integration role ssm:GetParameter on that prefix (alpha-engine-config-I10462's own IAM scope, extended — an operator-gated CloudFormation apply)."
+          fi
           exit "${missing}"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

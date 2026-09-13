@@ -67,6 +67,8 @@ from crucible.morning import (
     NO_OPERATOR_ACTION,
     ROLLING_ISSUE_TITLE,
     STALE_AFTER,
+    TELEGRAM_DESTINATION_OVERRIDE_VAR,
+    TRACKER_REPO_OVERRIDE_VAR,
     TRANSPORT_PREFIX,
     UPDATE_MESSAGE_MAX_CHARS,
     MorningInputs,
@@ -1080,6 +1082,33 @@ class TestDelivery:
         (call,) = transport.calls
         assert call["parse_mode"] == "HTML"
 
+    def test_console_artifact_is_forwarded_unconditionally(self):
+        """`alpha-engine-config-I10458`: passed even on the unoverridden,
+        production destination — inert there, but always present so a
+        `console_only` override never falls back to the operator chat for
+        want of it."""
+        transport = _Transport()
+        deliver("hello", transport=transport, console_artifact="s3://bucket/key")
+        (call,) = transport.calls
+        assert call["console_artifact"] == "s3://bucket/key"
+
+    def test_destination_override_unset_is_the_production_default(self, monkeypatch):
+        monkeypatch.delenv(TELEGRAM_DESTINATION_OVERRIDE_VAR, raising=False)
+        transport = _Transport()
+        deliver("hello", transport=transport)
+        (call,) = transport.calls
+        assert call["destination"] == "operator_chat"
+
+    def test_destination_override_is_honoured(self, monkeypatch):
+        """`alpha-engine-config-I10458`: the integration tier's own override
+        — `console_only` — is passed straight through to krepis."""
+        monkeypatch.setenv(TELEGRAM_DESTINATION_OVERRIDE_VAR, "console_only")
+        transport = _Transport()
+        deliver("hello", transport=transport, console_artifact="s3://bucket/key")
+        (call,) = transport.calls
+        assert call["destination"] == "console_only"
+        assert call["console_artifact"] == "s3://bucket/key"
+
 
 # ── the job ───────────────────────────────────────────────────────────────
 
@@ -1120,6 +1149,36 @@ class TestTheJob:
         # The message actually sent carries the comment's OWN permalink.
         (sent,) = transport.calls
         assert UPDATE_URL in sent["message"]
+        # The console-artifact key is derived from the store this run wrote
+        # to, unconditionally, and names the SAME key the manifest records
+        # (`alpha-engine-config-I10458`) — never a placeholder.
+        keys = [
+            k
+            for k in LocalStore(tmp_path).list_keys(f"runs/{MORNING_JOB}/")
+            if k.endswith("run.json")
+        ]
+        manifest = json.loads(LocalStore(tmp_path).get_bytes(keys[0]))
+        message_key = _message_output(manifest)["key"]
+        assert sent["console_artifact"].endswith(message_key)
+
+    def test_tracker_repo_override_is_honoured_end_to_end(self, tmp_path, monkeypatch):
+        """`alpha-engine-config-I10458`: an override repo is used for the
+        find/create/post/update-body calls AND for the history/board URL —
+        unset by default, so every OTHER test in this module (which never
+        sets it) still exercises the production `TRACKER_REPO`."""
+        _seed(tmp_path, previous=_board())
+        override_repo = "nousergon/crucible"
+        calls = _stub_tracker(monkeypatch, existing_issue=7)
+        monkeypatch.setattr("crucible.morning._krepis_publish", lambda *a, **k: _Result())
+        monkeypatch.setenv(TRACKER_REPO_OVERRIDE_VAR, override_repo)
+
+        assert morning_handler(_args(tmp_path, dry_run=False)) == 0
+
+        assert calls["find"] == [(override_repo, ROLLING_ISSUE_TITLE)]
+        (post_call,) = calls["post"]
+        assert post_call[0] == override_repo
+        (update_body_call,) = calls["update_body"]
+        assert update_body_call[0] == override_repo
 
     def test_the_rolling_issue_is_created_when_absent(self, tmp_path, monkeypatch):
         _seed(tmp_path, previous=_board())
