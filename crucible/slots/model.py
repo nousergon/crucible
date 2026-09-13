@@ -1540,6 +1540,12 @@ def _assert_inputs_resolved(recipe: ModelRecipe, panel: FeaturePanel) -> None:
 #: ceiling would have fitted the arm on nothing and returned `ok`.
 DEFAULT_MAX_INCOMPLETE_ROW_RATIO = 0.10
 
+#: How many excluded ticker names a completeness record names outright. The
+#: full count is always carried; the sample is for a reader who wants somewhere
+#: to start, and is bounded because a manifest is loaded whole by every
+#: consumer of it.
+_SAMPLE_SIZE = 20
+
 #: The metric name the completeness record is filed under on the run manifest.
 #: Named rather than spelled at the call site so a console adapter and a test
 #: read the same literal.
@@ -1590,6 +1596,15 @@ class FeatureCompleteness:
         return self.excluded_ratio > self.ceiling
 
     def to_dict(self) -> dict[str, Any]:
+        """The manifest form: every COUNT in full, the identifier lists BOUNDED.
+
+        A 504-session training block over a ~900-name universe can exclude at
+        least one row of nearly every name on nearly every session, and the
+        unbounded lists put ~900 tickers and ~400 dates into one metric row —
+        measured at 200KB on the first real replay, on a document every
+        console reader and every `explain` walk loads whole. The counts are
+        what a reader acts on; the samples are what they open a parquet with.
+        """
         return {
             "arm_name": self.arm_name,
             "rows_total": self.rows_total,
@@ -1598,8 +1613,11 @@ class FeatureCompleteness:
             "excluded_ratio": self.excluded_ratio,
             "ceiling": self.ceiling,
             "nan_rows_by_column": dict(self.nan_rows_by_column),
-            "excluded_names": list(self.excluded_names),
-            "excluded_dates": list(self.excluded_dates),
+            "excluded_name_count": len(self.excluded_names),
+            "excluded_names_sample": list(self.excluded_names[:_SAMPLE_SIZE]),
+            "excluded_session_count": len(self.excluded_dates),
+            "excluded_first_session": self.excluded_dates[0] if self.excluded_dates else None,
+            "excluded_last_session": self.excluded_dates[-1] if self.excluded_dates else None,
         }
 
     @property

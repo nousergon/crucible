@@ -923,12 +923,13 @@ class TestTheCompletenessRecordReachesARealManifest:
             "each files its own reading"
         )
         record = next(r for r in rows if r["phase"] == "training")["feature_completeness"]
-        assert record["excluded_names"] == ["AAA"]
+        assert record["excluded_names_sample"] == ["AAA"]
+        assert record["excluded_name_count"] == 1
         assert record["rows_excluded"] == record["rows_total"] - record["rows_complete"]
         assert record["nan_rows_by_column"][BASE_COLUMN] == record["rows_excluded"]
         assert document["rows_rejected"]
         served = next(r for r in rows if r["phase"] == "serving")["feature_completeness"]
-        assert served["excluded_names"] == ["AAA"]
+        assert served["excluded_names_sample"] == ["AAA"]
         assert result["training_rows_excluded"] == record["rows_excluded"] + served["rows_excluded"]
         assert document["status"] == "ok", document["reason"]
 

@@ -1561,7 +1561,8 @@ class TestTheCompletenessRecordReachesTheManifest:
         record = row["feature_completeness"]
         assert record["rows_excluded"] == fit.completeness.rows_excluded
         assert record["nan_rows_by_column"]["mom_21d_ratio"] > 0
-        assert record["excluded_names"] == [panel.names[0]]
+        assert record["excluded_names_sample"] == [panel.names[0]]
+        assert record["excluded_name_count"] == 1
 
     def test_the_rejection_detail_fits_the_schemas_cap(self, panel) -> None:
         """`RunContext.record_rejected` RAISES over 200 characters and the
@@ -1570,3 +1571,26 @@ class TestTheCompletenessRecordReachesTheManifest:
         fit = train_arm(_recipe(), holed, as_of="2026-08-28")
         assert fit.completeness is not None
         assert len(fit.completeness.detail) <= 200
+
+
+class TestTheRecordIsBoundedOnTheManifest:
+    """Measured on the first real replay: the unbounded identifier lists put
+    ~900 tickers and ~400 dates into one metric row, ~200KB on a document
+    every console reader and every `explain` walk loads whole. The counts are
+    complete; the samples are bounded."""
+
+    def test_the_name_and_session_lists_are_capped_and_the_counts_are_not(self, panel) -> None:
+        from crucible.slots.model import _SAMPLE_SIZE
+
+        # Three whole sessions nulled: every name is excluded on at least one
+        # row, so the name count exceeds the sample cap while the ratio stays
+        # well under the default ceiling.
+        holed = _hole(panel, "mom_21d_ratio", rows=slice(0, 3), names=slice(None))
+        fit = train_arm(_recipe(), holed, as_of="2026-08-28")
+        assert fit.completeness is not None
+        record = fit.completeness.to_dict()
+        assert record["excluded_name_count"] == len(panel.names)
+        assert len(record["excluded_names_sample"]) <= _SAMPLE_SIZE
+        assert record["excluded_session_count"] >= 1
+        assert record["excluded_first_session"] in panel.dates
+        assert record["excluded_last_session"] in panel.dates
