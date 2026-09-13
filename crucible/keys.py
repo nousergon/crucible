@@ -42,6 +42,8 @@ __all__ = [
     "MANIFEST_BASENAME",
     "POINTER_KEY",
     "PREDICTIONS_PREFIX",
+    "PUBLIC_JSON_KEY",
+    "PUBLIC_KEY",
     "RELEASES_ROOT",
     "REVIEWER_PATTERN",
     "RUNS_ROOT",
@@ -1069,6 +1071,17 @@ BOARD_HTML_KEY = "board/index.html"
 #: to resolve a module-level Name (alpha-engine-config-I9899, round 2).
 CONSOLE_KEY = "console/index.html"
 CONSOLE_JSON_KEY = "console/index.json"
+
+#: The PUBLIC surface and its agent-readable twin (`alpha-engine-config-I10223`).
+#: A SEPARATE prefix from `console/`, not a second file beside it, because the
+#: prefix is what the serving boundary is drawn on: `public/*` is the only
+#: prefix intended to leave the bucket, and a CloudFront origin-access policy
+#: scoped to it cannot reach `console/`, `runs/`, `champions/` or `report/` by
+#: any request an outside reader can make. A boundary that is a filename
+#: convention inside one prefix is a boundary one typo wide.
+#: `crucible.console.public` is the one producer.
+PUBLIC_KEY = "public/index.html"
+PUBLIC_JSON_KEY = "public/index.json"
 
 #: Every published release lives under here — `releases/{sha}/...` (owned by
 #: `crucible.release.release_prefix`, an architectural exception registered

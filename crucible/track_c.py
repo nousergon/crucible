@@ -34,6 +34,12 @@ from crucible.board import (
 )
 from crucible.calendar import resolve_trading_day
 from crucible.components import load_registry
+from crucible.console.public import (
+    PUBLIC_JSON_KEY,
+    PUBLIC_KEY,
+    build_public_page,
+    write_public_page,
+)
 from crucible.console.render import (
     CONSOLE_JSON_KEY,
     CONSOLE_KEY,
@@ -898,16 +904,29 @@ def console_handler(args: argparse.Namespace) -> int:
         key_schema_versions = {
             CONSOLE_KEY: "console_page.v1",
             CONSOLE_JSON_KEY: "console_page.v1",
+            PUBLIC_KEY: "public_page.v1",
+            PUBLIC_JSON_KEY: "public_page.v1",
         }
         # alpha-engine-config-I9922 R2-1: the store guard is the backstop —
         # `console` has a natural report (the page's own JSON), printed below
         # under `--dry-run` rather than reached only by dying on the guard
         # inside `write_page` (which calls `store.put_bytes` directly, not
         # through `ctx`).
+        #
+        # The PUBLIC surface is rendered by the SAME job, from the same read of
+        # the store (`alpha-engine-config-I10223`). Not a second component: a
+        # separate job would need its own schedule, its own absence detector
+        # and its own registry row, and would put the public page and the
+        # operator console on two different readings of one store — which is
+        # the drift `board` and `console` already paid for on the ladder. The
+        # two pages share no PROJECTION (see `crucible.console.public`'s module
+        # docstring); they share a trigger.
+        public = build_public_page(store, now=dt.datetime.now(dt.UTC))
         if dry_run:
             print(page.to_json().decode("utf-8"))
+            print(public.to_json().decode("utf-8"))
         else:
-            for key in write_page(store, page):
+            for key in (*write_page(store, page), *write_public_page(store, public)):
                 ctx.record_output(
                     key, store.get_bytes(key), schema_version=key_schema_versions[key]
                 )
