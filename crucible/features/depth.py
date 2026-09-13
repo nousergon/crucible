@@ -1,6 +1,28 @@
-"""Whether the live feature layer is the deepest one in the store.
+"""Whether the live feature layer is the deepest one in the store, and
+whether what it holds measured anything.
 
-Normative source: `alpha-engine-config-I10498` deliverable 2.
+Normative source: `alpha-engine-config-I10498` deliverable 2 (depth);
+`alpha-engine-config-I10693` (completeness).
+
+**Depth counts objects, never contents** — that is this module's own
+documented scope, and it has an exact failure mode of its own:
+`alpha-engine-config-I10688` measured `features/v6df3c0a27b70` at 536 session
+objects, the deepest version present, so `check_feature_layer_depth` read
+GREEN, while `residual_momentum_252d_skip21d_ratio` and its z-score were
+`NaN` for 903 of 903 tickers on all 536 sessions — the producer's trailing
+panel was 275 sessions and the column needs 313
+(`crucible.features.compute._RESIDUAL_MOMENTUM_DEPTH_TRADING_DAYS`). The
+producer bug is fixed (`crucible-PR266`: `min_panel_trading_days`,
+`PanelDepthError`), but a layer compiled before that guard landed — every
+object in the store at the time of measurement — still reads GREEN on depth
+alone, and nothing about depth catches the *next* column shaped the same
+way. `check_feature_layer_completeness` is the sibling reading that closes
+that blindness: it reads the live version's most recent session and grades
+each catalogue column on what fraction of its rows are null, RED only when a
+column is null on **every** row — `catalog_column_depths()` already explains
+an ordinary head-of-history null (a ticker younger than a column's declared
+depth), so the only ratio no per-ticker depth can explain is every ticker at
+once.
 
 The feature layer is content-addressed: `feature_version()` hashes the whole
 `registry.py::CATALOG` (see `crucible.features.registry`), so a catalog edit
@@ -34,14 +56,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from crucible.features.registry import feature_version
+from crucible.features.compute import catalog_column_depths, read_features
+from crucible.features.registry import feature_names, feature_version
+from crucible.keys import features_key, features_prefix
 from crucible.store import Store
 
 __all__ = [
     "FEATURES_PREFIX",
     "PARQUET_SUFFIX",
+    "NULL_RATIO_CEILING",
     "FeatureLayerDepthReading",
+    "FeatureLayerCompletenessReading",
     "check_feature_layer_depth",
+    "check_feature_layer_completeness",
     "count_session_objects_by_version",
 ]
 
@@ -179,4 +206,130 @@ def check_feature_layer_depth(
         deepest_version=deepest_version,
         deepest_count=deepest_count,
         counts=counts,
+    )
+
+
+#: The null ratio (fraction of rows null on one session) at or above which a
+#: catalogue column is graded RED. Named and applied uniformly to every
+#: catalogue column — never a per-column allowlist of "expected null" names
+#: (`crucible/AGENTS.md` rule 4: no suppression collections). A column
+#: legitimately null for the few tickers younger than its declared depth
+#: (`catalog_column_depths()`) sits far below this ceiling — measured
+#: 2026-09-13 at 4 of 903 tickers (0.44%) once the producer was fixed. Half
+#: the universe null at once is not a head-of-history shape any per-ticker
+#: depth explains; the `-I10688` shape (903 of 903) is the extreme of it.
+#: Principle 7: a column that measured nothing for most of the universe is
+#: unobserved, not green.
+NULL_RATIO_CEILING = 0.5
+
+
+@dataclass(frozen=True)
+class FeatureLayerCompletenessReading:
+    """The result of one column-completeness comparison over the live
+    version's most recent session. `state` is the board's whole verdict;
+    `null_ratios` carries every catalogue column's null fraction so a
+    partial degradation is visible on the reading before it reaches
+    :data:`NULL_RATIO_CEILING`.
+    """
+
+    state: DepthState
+    detail: str
+    live_version: str
+    session: str | None
+    null_ratios: dict[str, float] = field(default_factory=dict)
+    dead_columns: tuple[str, ...] = field(default_factory=tuple)
+
+
+def check_feature_layer_completeness(
+    store: Store, *, live_version: str | None = None
+) -> FeatureLayerCompletenessReading:
+    """RED when any catalogue column is null on at least :data:`NULL_RATIO_CEILING`
+    of the rows of the live
+    version's most recent session parquet; GREEN otherwise.
+
+    Depth (:func:`check_feature_layer_depth`) asks how many sessions exist.
+    This asks whether the deepest catalogue column measured anything on the
+    most recent one — the two are complementary, never a replacement for
+    each other, and both render as separate `crucible board` rows.
+
+    Reads two objects at most (a listing, then one session parquet); never
+    calls out to AWS on its own account beyond that and never raises for an
+    ordinary outcome. A genuine read failure (a denied credential, a store
+    that cannot be reached, a corrupt parquet) propagates to the caller
+    exactly as any other :class:`Store` read would, so the caller —
+    `crucible.board` — decides how a read failure renders (`UNMEASURABLE`,
+    never folded into a false green), the same posture
+    :func:`check_feature_layer_depth` takes.
+    """
+    version = live_version if live_version is not None else feature_version()
+    prefix = features_prefix(version)
+    sessions = sorted(
+        key[len(prefix) : -len(PARQUET_SUFFIX)]
+        for key in store.list_keys(prefix)
+        if key.endswith(PARQUET_SUFFIX)
+    )
+
+    if not sessions:
+        return FeatureLayerCompletenessReading(
+            state="RED",
+            detail=(
+                f"no session parquet exists under {prefix!r} — the live "
+                f"feature_version() {version!r} has never been built, so no column's "
+                "completeness can be read"
+            ),
+            live_version=version,
+            session=None,
+        )
+
+    session = sessions[-1]
+    key = features_key(version, session)
+    frame = read_features(store.get_bytes(key))
+
+    if len(frame) == 0:
+        return FeatureLayerCompletenessReading(
+            state="RED",
+            detail=(f"{key!r} holds zero rows — a session with no tickers measured nothing"),
+            live_version=version,
+            session=session,
+        )
+
+    depths = catalog_column_depths()
+    columns = [c for c in feature_names() if c in frame.columns]
+    null_ratios = {col: float(frame[col].isna().mean()) for col in columns}
+    dead_columns = tuple(
+        sorted(col for col, ratio in null_ratios.items() if ratio >= NULL_RATIO_CEILING)
+    )
+
+    if dead_columns:
+        named = ", ".join(
+            f"{col!r} (declared depth {depths.get(col, 'unknown')} session(s))"
+            for col in dead_columns
+        )
+        detail = (
+            f"{key!r}: catalogue column(s) null on >= {NULL_RATIO_CEILING:.0%} of "
+            f"{len(frame)} row(s) of the most recent session ({session}): {named} — a "
+            "column that looks computed and measured nothing for most of the universe, "
+            "the avg_volume_20d/residual_momentum class. "
+            "catalog_column_depths() explains an ordinary null for one ticker younger "
+            "than a column's declared depth; it never explains every ticker null at once"
+        )
+        state: DepthState = "RED"
+    else:
+        worst_col, worst_ratio = (
+            max(null_ratios.items(), key=lambda kv: kv[1]) if null_ratios else (None, 0.0)
+        )
+        detail = (
+            f"{key!r}: no catalogue column is null on >= {NULL_RATIO_CEILING:.0%} of rows "
+            f"of the most recent session ({session}, {len(frame)} row(s)); worst null ratio "
+            f"{worst_ratio:.2%} on {worst_col!r}"
+        )
+        state = "GREEN"
+
+    return FeatureLayerCompletenessReading(
+        state=state,
+        detail=detail,
+        live_version=version,
+        session=session,
+        null_ratios=null_ratios,
+        dead_columns=dead_columns,
     )

@@ -59,7 +59,11 @@ from crucible.components import Component, load_registry
 from crucible.console.classify import STATES as COMPONENT_STATES
 from crucible.console.classify import Classification
 from crucible.documents import read_store_document
-from crucible.features.depth import FEATURES_PREFIX, check_feature_layer_depth
+from crucible.features.depth import (
+    FEATURES_PREFIX,
+    check_feature_layer_completeness,
+    check_feature_layer_depth,
+)
 from crucible.gate import LADDER_STATES, STANDING_SLOS, Ladder, PhaseRow
 from crucible.keys import ALERTS_ROOT
 from crucible.models import BoardDeclarationRow
@@ -1039,6 +1043,7 @@ def build_board(
         rows.append(_component_row(reg[name], (classifications or {}).get(name)))
 
     rows.append(_feature_layer_depth_row(store))
+    rows.append(_feature_layer_completeness_row(store))
 
     touch = human_touch if human_touch is not None else _read_human_touch_count(moment.date())
     rows.extend(_standing_rows(store, day, touch))
@@ -1724,6 +1729,54 @@ def _feature_layer_depth_row(store: Store) -> BoardRow:
             "prefix does not exist at all — every consumer resolves feature_version() "
             "first, so the layer looks done on the tracker while the code sees a "
             "handful of sessions"
+        ),
+        last_read=last_read,
+    )
+
+
+def _feature_layer_completeness_row(store: Store) -> BoardRow:
+    """`alpha-engine-config-I10693`: red when a catalogue column is null on
+    half or more rows of the live version's most recent session — the completeness
+    gap `_feature_layer_depth_row` cannot see, since depth counts objects,
+    never contents. Sibling row, same posture: a read failure renders
+    `UNMEASURABLE`, never folded into a false green.
+
+    Measured 2026-09-13 (`alpha-engine-config-I10688`): the depth row read
+    GREEN over `features/v6df3c0a27b70` while
+    `residual_momentum_252d_skip21d_ratio` was null for 903 of 903 tickers on
+    all 536 sessions the layer held. This row is what would have caught it.
+    """
+    try:
+        reading = check_feature_layer_completeness(store)
+    except Exception as exc:  # noqa: BLE001 - the failure IS the reading
+        state, detail, last_read = (
+            "UNMEASURABLE",
+            f"could not read the live feature layer's most recent session to grade "
+            f"column completeness: {type(exc).__name__}: {exc}. This is a statement "
+            "about our access, not about whether a catalogue column is dead.",
+            None,
+        )
+    else:
+        state = "UNMET" if reading.state == "RED" else "MET"
+        detail = reading.detail
+        last_read = reading.session
+
+    return BoardRow(
+        id="component:feature_layer_completeness",
+        source="component",
+        section="§10 component 4 — feature registry",
+        title=(
+            "no catalogue column is null on half or more rows of the live feature layer's most "
+            "recent session"
+        ),
+        state=state,
+        detail=detail,
+        surface="crucible board",
+        artifact=f"{FEATURES_PREFIX}<version>/<most recent session>.parquet (per-column nulls)",
+        means_when_red=(
+            "a catalogue column measured nothing on every ticker of the most recent "
+            "session — a column that looks computed and is dead, invisible to the "
+            "depth row because depth counts objects, never contents"
         ),
         last_read=last_read,
     )
