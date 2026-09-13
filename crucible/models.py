@@ -147,6 +147,7 @@ __all__ = [
     "PhaseClosingReadingDocument",
     "PhaseLadderDocument",
     "PhaseLadderRow",
+    "PredictionsFeedDocument",
     "PromotionEventRow",
     "RegistryDefaults",
     "RejectedRow",
@@ -2844,3 +2845,98 @@ class FaultRecordDocument(_Strict):
                 f"least 2; this one reads {self.attempt.n}."
             )
         return self
+
+
+# ── The M champion's serving feed (alpha-engine-config-I10129) ─────────────
+# Additive only, appended after the prior rows' markers for the same rebase
+# reason. This is the SECOND half of the trader contract: `AGENTS.md` — "the
+# trader reads one contract — `champions/{slot}/current.json` plus
+# `predictions/{trading_day}.json`" — and until this model existed only the
+# first half had a schema, so a second implementation of the trader could
+# type-check the pointer and had to guess at the payload it points to.
+
+
+def _predictions_feed_json_schema_extra(schema: dict[str, object]) -> None:
+    """Sets `predictions_feed.v1.json`'s document-level metadata.
+
+    No `not`/`allOf` mirror: every rule this document carries is expressible
+    in the field constraints themselves (a closed `slot`, a date pattern, a
+    non-empty `predicted_alpha`), so unlike `champion_pointer.v1` there is no
+    cross-field rule that pydantic can state and JSON Schema cannot. Stated
+    rather than left implicit, because "this extra hook has no mirror" and
+    "somebody forgot the mirror" are otherwise the same absence.
+    """
+    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    schema["$id"] = "https://github.com/nousergon/crucible/schemas/predictions_feed.v1.json"
+    schema["title"] = "Crucible champion predictions feed, v1"
+    schema["description"] = (
+        "The M champion's serving feed for one NYSE trading day, written at "
+        "predictions/{trading_day}.json and read by the trader beside "
+        "champions/m/current.json (plan §3). It is a REPUBLICATION of exactly "
+        "one arm_predictions.v1 document — the one the champion pointer "
+        "resolves to — never an independently computed cross-section: the "
+        "serving path resolves the pointer, it never imports a ranking "
+        "function directly. `source_key` names the document republished so "
+        "the trader's read and the harness's grade are provably the same "
+        "numbers. additionalProperties: false because a field this reader "
+        "does not understand is a field the producer expected it to act on."
+    )
+
+
+class PredictionsFeedDocument(_Strict):
+    """`predictions/{trading_day}.json` — what the trader serves, plan §3/§4.4.
+
+    Its own schema rather than a second `feed.v*` variant
+    (`alpha-engine-config-I10129` deliverable 3): R's and U's `feed.v1`
+    carries `members`, a SELECTION, and M's payload is a predicted-alpha
+    CROSS-SECTION. Reusing `feed.v1` with a differently-typed field would
+    make one `schema_version` string mean two document shapes, and every
+    consumer would then have to discriminate on the slot after claiming to
+    have validated the document.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra=_predictions_feed_json_schema_extra,
+    )
+
+    schema_version: Literal["predictions_feed.v1"] = Field(
+        description="Version of THIS schema. A consumer that cannot read the version "
+        "refuses the document rather than guessing."
+    )
+    slot: Literal["m"] = Field(
+        description="The slot whose champion this feed serves. Closed to `m`: "
+        "`predictions/{trading_day}.json` is the M contract specifically, and R's and "
+        "U's champions serve their own keys (`signals_key`, `universe_members_key`)."
+    )
+    trading_day: str = Field(
+        pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+        description="The NYSE trading day this cross-section is for (§4.12). Repeated "
+        "in the body as well as in the key so a misfiled feed is detectable by the "
+        "reader rather than only by the path it was found at.",
+    )
+    champion: str = Field(
+        min_length=1,
+        description="The arm the pointer named when this feed was written. Its id "
+        "encodes its own spec hash (policy §3.1), so the trader can always tell which "
+        "recipe produced the numbers it is about to size.",
+    )
+    feature_version: str = Field(
+        min_length=1,
+        description="The feature-layer vintage the champion's fit read, carried "
+        "through from the republished arm_predictions.v1 document. Without it a feed "
+        "cannot be reproduced from the store it was written against.",
+    )
+    source_key: str = Field(
+        min_length=1,
+        description="The arm_predictions.v1 key this feed republishes. The hop "
+        "`crucible explain` walks from the trader's read back to the arm's own "
+        "artifact and from there to the run that fitted it.",
+    )
+    predicted_alpha: dict[str, float] = Field(
+        min_length=1,
+        description="Name -> predicted alpha, the champion's cross-section for this "
+        "session. Never empty: a feed with no names is not an empty opinion, it is a "
+        "producer that failed and wrote anyway, and the trader must page rather than "
+        "flatten the book on it.",
+    )

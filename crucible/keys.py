@@ -349,9 +349,16 @@ ARM_PREDICTIONS_PREFIX = "arm_predictions/"
 def predictions_key(trading_day: str) -> str:
     """The champion's serving feed for ONE trading day — what the trader reads.
 
-    The key builder only. Writing this artifact is the M slot's job and is
-    tracked separately (`alpha-engine-config-I10129`: the feed is declared in
-    the trader contract and written by nothing). It is declared here because a
+    Written by :func:`crucible.serving.publish_predictions_feed`, which
+    republishes the `arm_predictions.v1` document the M champion pointer
+    resolves to — never an independently computed cross-section. Read by
+    :func:`crucible.serving.read_predictions_feed`, the reference consumer
+    the trader imports.
+
+    Was a key builder with no producer from `crucible-PR207` until
+    `alpha-engine-config-I10129` closed it: the contract named in
+    `AGENTS.md` is `champions/{slot}/current.json` PLUS this key, and half
+    of it had no writer. Declared here rather than at the writer because a
     contract with no single source for its key is how the prose and the code
     drift apart, and because :func:`arm_predictions_key` cannot be tested
     against a collision with a key that does not exist.
