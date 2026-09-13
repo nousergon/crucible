@@ -39,13 +39,14 @@ from the plan text:
 uv run python -c "from crucible.cli import JOBS; print(len(JOBS)); [print(k) for k in JOBS]"
 ```
 
-### Exercised for real (24 of 25)
+### Exercised for real (25 of 25)
 
 `experiment.new`, `data.daily`, `data.weekly`, `data.heal`, `experiment.run`,
 `weekly`, `experiment.grade`, `promote`, `explain`, `release.pin`,
 `release.lock`, `smoke`, `alerts.sweep`, `heartbeat`, `drift`, `console`,
-`board`, `gate`, `gate.close`, `report`, `fault.record`, `fault.probe`,
-`migrate.history`, `test.integration` — each invoked through the real
+`board`, `gate`, `gate.close`, `report`, `report.morning`, `fault.record`,
+`fault.probe`, `migrate.history`, `test.integration` — each invoked through
+the real
 `crucible.cli.main` entry point (not the handler function directly — this is
 the wire a spot instance actually dispatches), against the dedicated store,
 producing a real `run.json`.
@@ -92,19 +93,54 @@ open:
 `test.integration` is this tier's own job (`alpha-engine-config-I10459`) —
 see "The summary artifact" below.
 
-### Not exercised, and why (1 of 25)
+### Not exercised, and why (0 of 25)
 
-**`report.morning`** — `crucible.morning._operator_chat()` resolves
-`krepis.alerts.DESTINATION_OPERATOR_CHAT` (a real Telegram channel) with no
-override, and `crucible.morning._find_or_create_rolling_issue()` posts to a
-real GitHub tracker repo with no override either. Running this job for real,
-nightly, would deliver synthetic integration content to Brian's real
-operator channel and the real tracker every night — that is a product
-decision (a reserved matter, `principles.md` §3.2: "is this decision
-reserved or delegated"), not one this tier makes unilaterally. Excluded
-pending a ruling and, if approved, a dedicated-destination override in
-`crucible/morning.py`. Filed as `alpha-engine-config-I10458` (needs Brian's
-ruling first).
+None. `report.morning` was the one gap (`alpha-engine-config-I10458`) — see
+"The dedicated destinations" below for how it closed.
+
+## The dedicated destinations — `report.morning` (`alpha-engine-config-I10458`)
+
+Brian ruled option (a), narrow: `crucible.morning._operator_chat()` and
+`crucible.morning._tracker_repo()` both resolve through
+`crucible.required.optional_env` — unset in production, so every production
+firing is byte-for-byte unchanged — and `_morning_destination_env`
+(`conftest.py`, session-autouse) points this tier's run at two dedicated
+destinations, neither a bucket/role/topic-shaped infrastructure identifier
+this repo forbids as a literal:
+
+* **The GitHub half — `CRUCIBLE_MORNING_TRACKER_REPO=nousergon/crucible`.**
+  A "muted" tracker equivalent to `CRUCIBLE_INTEGRATION_MUTED_TOPIC` does not
+  exist for GitHub issues the way it does for an SNS topic with no
+  subscribers, so this tier posts a REAL comment to a rolling `[v2 board]
+  daily update` issue on the PUBLIC `nousergon/crucible` repo itself —
+  dedicated by being a different repo from the private production tracker,
+  the same role a dedicated ArcticDB library plays for `universe`/`macro`/
+  `preliminary`.
+* **The Telegram half — `CRUCIBLE_MORNING_TELEGRAM_DESTINATION=
+  console_only`.** Considered and rejected: routing through the
+  `CRUCIBLE_INTEGRATION_MUTED_TOPIC` SNS route, which `morning.py::deliver`
+  cannot reach at all — `sns=False` is hardcoded and deliberate (see
+  `crucible/morning.py`'s module docstring: "`crucible.alerts` is
+  deliberately NOT imported" so a daily digest can never become a page), and
+  changing that would undo the exact property this job exists to hold.
+  Considered and rejected: a literal `--dry-run`, which skips the tracker
+  post AND the delivery both (`morning_handler`'s own contract) — it would
+  prove nothing about the send path it exists to exercise. What ships
+  instead: krepis' own `destination="console_only"` plus the
+  `console_artifact` `deliver` now always passes — a REAL, fully-exercised
+  `publish()` call that `krepis.alerts.resolve_destination` delivers to the
+  named artifact and returns `ok=True` for, without sending anything to
+  Telegram. `CRUCIBLE_MORNING_TELEGRAM_DESTINATION` and `CRUCIBLE_MORNING_
+  TRACKER_REPO` are both general-purpose overrides on `crucible/morning.py`
+  itself, not integration-tier-only code — this tier is simply their first
+  and only caller.
+
+**Credential note.** The GitHub half still needs the fleet App's SSM prefix
+(`CRUCIBLE_TRACKER_APP_SSM_PREFIX`) granted to the integration role — see
+`.github/workflows/integration-nightly.yml`'s own warning and
+`alpha-engine-config-I10462`'s IAM scope. Until that grant lands, this ONE
+case fails loudly with a named `TrackerError`, which is the correct,
+observable failure mode (`crucible/AGENTS.md` rule 5) — never a silent gap.
 
 ## The dedicated environment, resolved from required env — never a literal
 

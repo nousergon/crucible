@@ -521,12 +521,16 @@ components:
       ladder as gates/ladder.json publishes it (READ, never recomputed and
       never republished - alpha-engine-config-I10575), runs with their
       14-state classification, attribution, champions, week cost, deploys.
+      Also renders the PUBLIC surface (public/index.html + .json,
+      alpha-engine-config-I10223) from the same read of the store - a separate
+      projection carrying no alpha figure, no cost and no infrastructure
+      identifier, never a second copy of the operator page.
     lifecycle: ACTIVE
     signals:
       execution: run.json
       cost: run.json:cost_usd
       resource: run.json:resource
-      lineage: run.json:inputs[runs/**,gates/**,gates/ladder.json],outputs[console/index.html]
+      lineage: run.json:inputs[runs/**,gates/**,gates/ladder.json,board/current.json,arena/**,champions/**,report/**],outputs[console/index.html,public/index.html]
       outcome: run.json:metrics[components_unreported]
     log_location: /crucible/console
     log_retention_days: 90

@@ -1,6 +1,9 @@
-"""One real case per exercisable CLI job (23 of 25 — see README.md; `weekly`,
-`experiment.grade` and `promote` added by `alpha-engine-config-I10633`).
-`test.integration` is the 24th job README.md's own count includes — it is
+"""One real case per exercisable CLI job (24 of 25 — see README.md; `weekly`,
+`experiment.grade` and `promote` added by `alpha-engine-config-I10633`;
+`report.morning` added by `alpha-engine-config-I10458`, against a dedicated
+tracker repo and a non-notifying Telegram destination, never Brian's real
+operator chat or the private production tracker).
+`test.integration` is the 25th job README.md's own count includes — it is
 exercised by `.github/workflows/integration-nightly.yml` invoking this
 whole suite, not by a case within it.
 
@@ -601,6 +604,46 @@ def test_heartbeat(integration_store_uri: str, integration_store: Store) -> None
         ]
     )
     _assert_ok(integration_store, "heartbeat")
+
+
+def test_report_morning(integration_store_uri: str, integration_store: Store) -> None:
+    """The 25th and last job (`alpha-engine-config-I10458`; see README.md,
+    "The dedicated destinations"). `conftest.py::_morning_destination_env`
+    (session-autouse) points this run at TWO dedicated destinations, never
+    Brian's real operator chat or the private production tracker:
+
+    * the GitHub half posts a REAL comment to the rolling `[v2 board] daily
+      update` issue on the PUBLIC `nousergon/crucible` repo itself — there is
+      no muted-tracker equivalent to a zero-subscriber SNS topic, so a
+      dedicated PUBLIC repo is the isolation boundary here, the same role a
+      dedicated library plays for ArcticDB;
+    * the Telegram half is a REAL `krepis.alerts.publish()` call routed to
+      `destination="console_only"` with a real `console_artifact` — fully
+      exercised, `ok=True`, and incapable of reaching a phone (`krepis.
+      alerts.resolve_destination`'s own contract), which is what makes this
+      a proof of the delivery PATH rather than a `--dry-run` stub that would
+      skip the send and prove nothing about it.
+
+    A missing `CRUCIBLE_TRACKER_APP_SSM_PREFIX` grant on the integration
+    role fails this ONE case with a named `TrackerError` — loud, not absent
+    (`crucible/AGENTS.md` rule 5) — until `alpha-engine-config-I10462`'s own
+    IAM scope is extended to it.
+    """
+    cli_main(
+        [
+            "report.morning",
+            "--store",
+            integration_store_uri,
+            "--run-mode",
+            "live",
+            "--date",
+            INTEGRATION_TRADING_DAY,
+        ]
+    )
+    manifest = _assert_ok(integration_store, "report.morning")
+    assert manifest["outputs"], (
+        "report.morning wrote no outputs — the message/update/history rows never landed"
+    )
 
 
 def test_gate(integration_store_uri: str, integration_store: Store) -> None:

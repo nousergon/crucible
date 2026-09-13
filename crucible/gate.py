@@ -91,6 +91,7 @@ from crucible.keys import (
     strategy_holdout_key,
     verdict_key,
 )  # noqa: F401 - re-exported
+from crucible.keys import TRADER_EVIDENCE_KEY as _TRADER_EVIDENCE_KEY
 from crucible.manifest import load_schema, manifest_key
 from crucible.models import (
     FaultRecordDocument,
@@ -4124,15 +4125,23 @@ PHASE2_MAX_TAGGED_USD = 40.0
 PHASE4_MAX_TOTAL_USD = 70.0
 
 #: The store key carrying the trader's evidence that it ran a week on the v2
-#: champion — `None` because the trader contract declares no such artifact
-#: today. Phase 4's trader clause reads UNMEASURABLE naming that missing
-#: declaration; the gap is `alpha-engine-config-I9760`'s own scope (plan §3:
-#: the trader is a separate system, and the harness may not reach into it).
+#: champion. `None` until `alpha-engine-config-I10648` (2026-09-13), when the
+#: trader contract declared the artifact and this became the key it declared —
+#: `crucible.keys.TRADER_EVIDENCE_KEY`, resolved rather than restated so the
+#: producer and the gate cannot name two different strings.
 #:
-#: A declared constant rather than an inline `None` check so the day the
-#: contract names its artifact is a one-line edit here, and so the MET and
-#: UNMET branches below are reachable and tested today.
-TRADER_EVIDENCE_KEY: str | None = None
+#: It stays `str | None` in TYPE and the `is None` branch below stays live. That
+#: is not dead defensiveness: the branch is the honest reading for any build in
+#: which the contract declares nothing, it is what a revert of the declaration
+#: would produce, and `tests/test_gate_phases_2_5.py` reaches it by setting this
+#: constant to `None`. Deleting it would make "the contract declares no
+#: artifact" and "the trader has filed nothing yet" the same UNMET reading, and
+#: those are different facts about the system.
+#:
+#: **The harness may not reach into the trader** (plan §3). The gate reads an
+#: artifact the trader AGREED to write; it never inspects trader processes, logs
+#: or a broker API.
+TRADER_EVIDENCE_KEY: str | None = _TRADER_EVIDENCE_KEY
 
 #: The `spec.params` key naming which registered LLM call site an arm reaches
 #: a model through — `crucible.slots.arms.LLM_CALLSITE_PARAM`, restated here

@@ -214,6 +214,41 @@ def _dedicated_topic_env(integration_pages_topic: str, integration_muted_topic: 
     os.environ["CRUCIBLE_MUTED_TOPIC"] = integration_muted_topic
 
 
+#: `report.morning`'s own dedicated destinations (`alpha-engine-config-
+#: I10458`, Brian ruling option (a), narrow) — neither is an infrastructure
+#: identifier this repo forbids as a literal (`tests/test_no_infra_
+#: literals.py`): one names THIS public repo, the other is krepis' own
+#: destination-enum string, not a bucket/role/topic name. Both resolve
+#: through `crucible.required.optional_env`, unset in production.
+#:
+#: **The GitHub half — `nousergon/crucible`, not a second, muted tracker
+#: repo.** A "muted" tracker equivalent to `CRUCIBLE_INTEGRATION_MUTED_
+#: TOPIC` does not exist for GitHub issues the way it does for an SNS topic
+#: with no subscribers — an issue always has a repo of record, and creating
+#: a dedicated private repo for this alone would be a second tracker to
+#: keep alive for one nightly case. `nousergon/crucible` is already public,
+#: already where this workflow runs, and posting a rolling `[v2 board]
+#: daily update` issue there keeps synthetic content out of the PRIVATE
+#: production tracker without inventing new infrastructure.
+#:
+#: **The Telegram half — `console_only`, not a muted chat.** "a chat id
+#: with no members is not a thing" (the issue's own words): krepis'
+#: `console_only` destination, paired with the `console_artifact`
+#: `crucible.morning.deliver` now always passes, delivers to a NAMED
+#: durable artifact and returns `ok=True` WITHOUT sending anything to
+#: Telegram (`krepis.alerts.resolve_destination`) — a real, fully-exercised
+#: `publish()` call, not a `--dry-run` stub that would skip the send
+#: entirely and prove nothing about it.
+CRUCIBLE_MORNING_TRACKER_REPO = "nousergon/crucible"
+CRUCIBLE_MORNING_TELEGRAM_DESTINATION = "console_only"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _morning_destination_env() -> None:
+    os.environ["CRUCIBLE_MORNING_TRACKER_REPO"] = CRUCIBLE_MORNING_TRACKER_REPO
+    os.environ["CRUCIBLE_MORNING_TELEGRAM_DESTINATION"] = CRUCIBLE_MORNING_TELEGRAM_DESTINATION
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _arctic_bucket_env(integration_arctic_bucket: str) -> None:
     """`crucible.track_a._source` resolves `ArcticPriceSource`'s BUCKET from
