@@ -123,15 +123,49 @@ def _token(tmp_path, store, name="pointer.token") -> str:
 
 
 def _write_smoke(store, sha=SHA, status="ok", *, trading_day=None, smoked_extras=("arcticdb",)):
+    """A conformant `run_manifest.v2` document (alpha-engine-config-I10682):
+    `crucible.deploy._flip` now validates the smoke manifest whole through
+    `crucible.manifest.validate`/`RunManifestV2` before reading any field off
+    it, so a fixture missing a required field (this one used to write only
+    five of the schema's ~twenty required fields) would fail every flip
+    test at the new validation step rather than at the behaviour each test
+    actually means to exercise. Shape matches `tests/test_manifest_schema.py
+    ::_valid_manifest`, the floor fixture for the schema itself."""
     from crucible.calendar import resolve_trading_day
 
     day = (trading_day or resolve_trading_day()).isoformat()
+    reason = "" if status == "ok" else "RuntimeError: live read failed"
     manifest: dict = {
+        "schema_version": "run_manifest.v2",
+        "run_id": "01JG0000000000000000000001",
         "job": "smoke",
-        "release_sha": sha,
-        "status": status,
-        "reason": "" if status == "ok" else "RuntimeError: live read failed",
+        "run_mode": "live",
         "trading_day": day,
+        "calendar_date": day,
+        "status": status,
+        "reason": reason,
+        "started": "2026-08-29T13:00:00Z",
+        "finished": "2026-08-29T13:04:11Z",
+        "code_sha": "2" * 40,
+        "release_sha": sha,
+        "seed": 0,
+        "inputs": [],
+        "outputs": [],
+        "rows_in": 0,
+        "rows_out": 0,
+        "rows_rejected": [],
+        "cost_usd": 0.0,
+        "llm_calls": [],
+        "resource": {
+            "instance_type": "r6i.large",
+            "spot": False,
+            "escalated_to_on_demand": False,
+            "interruptions": 0,
+            "mem_peak_mb": 512,
+            "disk_free_mb": 10000,
+        },
+        "metrics": [],
+        "attempts": [{"n": 1, "reason": "initial"}],
     }
     # alpha-engine-config-I10069: every flip test writes a manifest that
     # already covers the required extras (pyproject.toml declares
@@ -139,7 +173,19 @@ def _write_smoke(store, sha=SHA, status="ok", *, trading_day=None, smoked_extras
     # — a fixture that omitted this by default would make every existing
     # flip test pass by accident rather than by testing what it claims to.
     if smoked_extras is not None:
-        manifest["metrics"] = [{"name": "smoke_ok", "smoked_extras": list(smoked_extras)}]
+        manifest["metrics"] = [
+            {
+                "name": "smoke_ok",
+                "module": "crucible.track_c",
+                "metric_type": "operational",
+                "n_floor": 0,
+                "status": "OK",
+                "status_reason": "fixture",
+                "source_path": "runs/smoke/{trading_day}/run.json",
+                "last_updated_utc": "2026-08-29T13:04:11Z",
+                "smoked_extras": list(smoked_extras),
+            }
+        ]
     store.put_bytes(manifest_key("smoke", day), json.dumps(manifest).encode())
 
 
@@ -476,6 +522,30 @@ class TestFlip:
             deploy_main(
                 ["flip", "--sha", SHA, "--store", str(tmp_path), "--expect-pointer-file", token]
             )
+
+    def test_a_smoke_manifest_missing_a_required_field_refuses_the_flip(self, tmp_path) -> None:
+        """alpha-engine-config-I10682: before this, `_flip` read the smoke
+        manifest via `load_store_document` (parses JSON, nothing more) and
+        then dict-indexed `smoke.get("status")`/`.get("reason")` — a smoke
+        manifest missing `status` entirely read as `None` several lines
+        below, refusing the flip with a message that never named the real
+        defect (the document, not the deploy). It now validates the smoke
+        manifest whole, through `crucible.manifest.validate`/`RunManifestV2`,
+        before any field is read off it."""
+        store = self._published(tmp_path)
+        _write_smoke(store)
+        from crucible.calendar import resolve_trading_day
+
+        day = resolve_trading_day().isoformat()
+        manifest = json.loads(store.get_bytes(manifest_key("smoke", day)))
+        del manifest["status"]
+        store.put_bytes(manifest_key("smoke", day), json.dumps(manifest).encode())
+        token = _token(tmp_path, store)
+        with pytest.raises(SystemExit, match="does not conform"):
+            deploy_main(
+                ["flip", "--sha", SHA, "--store", str(tmp_path), "--expect-pointer-file", token]
+            )
+        assert current_release(store) is None
 
     def test_an_operator_rollback_during_the_smoke_fails_the_deploy(self, tmp_path) -> None:
         """The interval the compare-and-swap must cover is THE WHOLE SMOKE.

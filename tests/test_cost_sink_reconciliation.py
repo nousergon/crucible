@@ -164,6 +164,22 @@ class TestUnreadableSinkRow:
         with pytest.raises(CostSinkReconciliationError, match="no numeric"):
             reconcile_run_cost(manifest, bucket=BUCKET, prefix=PREFIX, s3_client=fake_s3)
 
+    def test_a_row_that_is_not_an_object_raises_named_rather_than_attributeerror(
+        self, fake_s3
+    ) -> None:
+        """alpha-engine-config-I10682: before `crucible.models.CostSinkRow`
+        validated each parsed row, a line that was valid JSON but not an
+        object — a bare list here — reached `row.get("cost_usd")` and raised
+        an unnamed `AttributeError` rather than the named
+        `CostSinkReconciliationError` every other bad row in this loop
+        produces."""
+        key = f"{PREFIX}/{CALENDAR_DATE.isoformat()}/{RUN_ID}/test.probe.0.jsonl"
+        fake_s3.put_object(Bucket=BUCKET, Key=key, Body=b"[1, 2, 3]\n")
+        manifest = _manifest(llm_calls_usd=[0.0])
+
+        with pytest.raises(CostSinkReconciliationError, match="does not conform"):
+            reconcile_run_cost(manifest, bucket=BUCKET, prefix=PREFIX, s3_client=fake_s3)
+
     def test_a_malformed_jsonl_line_raises_naming_the_key_and_line(self, fake_s3) -> None:
         key = f"{PREFIX}/{CALENDAR_DATE.isoformat()}/{RUN_ID}/test.probe.0.jsonl"
         fake_s3.put_object(Bucket=BUCKET, Key=key, Body=b"{not json}\n")
