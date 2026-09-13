@@ -995,13 +995,19 @@ class TestTheDeadSlotIsObserved:
         rows: list[dict] = []
         return SimpleNamespace(record_metric=rows.append), rows
 
-    def test_every_arm_insufficient_emits_the_finding_with_its_producers(self) -> None:
-        from crucible.slots.model import (
-            DEAD_SLOT_METRIC,
-            UNPRODUCED_VETO_METRICS,
-            _record_dead_slot_finding,
-        )
+    def test_every_arm_insufficient_emits_the_finding_with_its_producers(self, monkeypatch) -> None:
+        """The finding fires for as long as a veto input has no producer.
 
+        `UNPRODUCED_VETO_METRICS` is empty since `alpha-engine-config-I10680`
+        landed the three producers, so the declaration is re-populated here
+        rather than deleted with the test: what has to keep working is that a
+        metric added to a rule family with NO producer re-arms this row.
+        """
+        from crucible.slots import model as model_module
+        from crucible.slots.model import DEAD_SLOT_METRIC, _record_dead_slot_finding
+
+        waiting = {"some_new_metric": "a producer nobody has written"}
+        monkeypatch.setattr(model_module, "UNPRODUCED_VETO_METRICS", waiting)
         ctx, rows = self._ctx()
         _record_dead_slot_finding(
             ctx, {"a": {"veto": "insufficient"}, "b": {"veto": "insufficient"}}, as_of="2026-08-28"
@@ -1013,9 +1019,22 @@ class TestTheDeadSlotIsObserved:
         # Every unproduced metric is NAMED with what it waits on: a finding
         # that says "insufficient" and not which producer is missing sends
         # the next reader back to re-derive it.
-        for name, why in UNPRODUCED_VETO_METRICS.items():
+        for name, why in waiting.items():
             assert name in row["status_reason"]
             assert why in row["status_reason"]
+
+    def test_with_every_producer_present_an_insufficient_cycle_is_not_a_dead_slot(self) -> None:
+        """`alpha-engine-config-I10680`. An all-`insufficient` cycle now has a
+        temporary cause — a short settled window — and naming three producers
+        that exist would send the next reader to build them again."""
+        from crucible.slots.model import UNPRODUCED_VETO_METRICS, _record_dead_slot_finding
+
+        assert UNPRODUCED_VETO_METRICS == {}
+        ctx, rows = self._ctx()
+        _record_dead_slot_finding(
+            ctx, {"a": {"veto": "insufficient"}, "b": {"veto": "insufficient"}}, as_of="2026-09-11"
+        )
+        assert rows == []
 
     def test_one_arm_with_a_real_verdict_emits_nothing(self) -> None:
         from crucible.slots.model import _record_dead_slot_finding
@@ -1047,20 +1066,381 @@ class TestTheDeadSlotIsObserved:
         read = set(DISPERSION_METRICS) | set(ZERO_VETO_METRICS) | set(FLOOR_VETO_METRICS)
         assert set(UNPRODUCED_VETO_METRICS) <= read
 
-    def test_the_declaration_matches_what_the_producer_actually_emits(self) -> None:
-        """The other direction: every veto input `_serving_metrics` does NOT
-        emit must be declared here. A metric quietly added to a rule family
-        with no producer would otherwise kill the slot with no finding."""
-        import numpy as np
+    def test_the_declaration_matches_what_the_producer_actually_emits(self, panel) -> None:
+        """The other direction: every veto input the PRODUCER does not emit
+        must be declared here. A metric quietly added to a rule family with
+        no producer would otherwise kill the slot with no finding.
 
+        Measured against `serving_metrics` over a real graded arm with a
+        window long enough to support every statistic — which is the only
+        state in which "the producer does not emit it" means "nobody can
+        produce it" rather than "not yet"."""
         from crucible.slots.model import (
             DISPERSION_METRICS,
             FLOOR_VETO_METRICS,
             UNPRODUCED_VETO_METRICS,
             ZERO_VETO_METRICS,
-            _serving_metrics,
+            grade_arm,
+            predict_cross_section,
+            serving_metrics,
         )
 
-        produced = set(_serving_metrics({"AAA": 1.0, "BBB": float(np.float64(-1.0))}))
+        recipe = _recipe()
+        graded = grade_arm(recipe, panel, as_of=panel.dates[-1])
+        metrics, reason = serving_metrics(
+            predict_cross_section(graded.fit, panel, trading_day=panel.dates[-1]),
+            settled=graded.settled,
+        )
+        assert reason == "", reason
         read = set(DISPERSION_METRICS) | set(ZERO_VETO_METRICS) | set(FLOOR_VETO_METRICS)
-        assert read - produced == set(UNPRODUCED_VETO_METRICS)
+        assert read - set(metrics) == set(UNPRODUCED_VETO_METRICS)
+
+
+# --------------------------------------------------------------------------
+# §5.3 precondition 1 — the PRODUCERS behind it (alpha-engine-config-I10680).
+# --------------------------------------------------------------------------
+
+
+class TestTheVetoProducers:
+    """Three of the veto's four inputs had no producer, so the veto read
+    `insufficient` on every cycle, the serving precondition failed on every
+    cycle, and the M slot could never serve a champion — permanently, and for
+    a reason no amount of waiting fixed.
+
+    These tests assert the produced statistics have the SHAPE the veto
+    expects, and — the load-bearing one — that the up-probability calibration
+    keeps `stdev_p_up` scale-DEPENDENT. A calibration fitted on today's
+    cross-section, or a predictor standardised at serving time, would divide
+    a collapse away exactly as the standardized ratio did on 2026-08-28.
+    """
+
+    def _graded(self, panel, *, recipe=None, as_of=None):
+        from crucible.slots.model import grade_arm, predict_cross_section
+
+        recipe = recipe or _recipe()
+        as_of = as_of or panel.dates[-1]
+        graded = grade_arm(recipe, panel, as_of=as_of)
+        return graded, predict_cross_section(graded.fit, panel, trading_day=as_of)
+
+    def test_a_long_enough_window_produces_all_four_veto_inputs(self, panel) -> None:
+        from crucible.slots.model import (
+            DISPERSION_METRICS,
+            FLOOR_VETO_METRICS,
+            ZERO_VETO_METRICS,
+            serving_metrics,
+        )
+
+        graded, predicted = self._graded(panel)
+        metrics, reason = serving_metrics(predicted, settled=graded.settled)
+        assert reason == ""
+        for name in (*DISPERSION_METRICS, *ZERO_VETO_METRICS, *FLOOR_VETO_METRICS):
+            assert name in metrics, name
+
+    def test_the_veto_reads_pass_or_veto_on_a_real_cycle_never_insufficient(self, panel) -> None:
+        """The whole point of the issue: a real cycle reaches a real verdict."""
+        from crucible.slots.model import evaluate_behavioural_veto, serving_metrics
+
+        graded, predicted = self._graded(panel)
+        metrics, _ = serving_metrics(predicted, settled=graded.settled)
+        veto = evaluate_behavioural_veto(metrics, metrics, has_incumbent=True)
+        assert veto.status in ("pass", "veto")
+        assert veto.uncomputable == ()
+
+    def test_a_short_settled_window_is_insufficient_and_states_the_minimum(self, panel) -> None:
+        from crucible.slots.model import (
+            SETTLED_WINDOW_DECISION_DATES,
+            evaluate_behavioural_veto,
+            serving_metrics,
+        )
+
+        graded, predicted = self._graded(panel)
+        short = graded.settled.tail(SETTLED_WINDOW_DECISION_DATES - 1)
+        metrics, reason = serving_metrics(predicted, settled=short)
+        assert str(SETTLED_WINDOW_DECISION_DATES) in reason
+        assert "window being short, not a producer being absent" in reason
+        veto = evaluate_behavioural_veto(metrics, metrics, has_incumbent=True)
+        assert veto.status == "insufficient"
+
+    def test_the_hit_rate_is_a_proportion_the_scale_assertion_accepts(self, panel) -> None:
+        """`PROPORTION_METRICS` raises outside [0, 1]; the producer must never
+        be the thing that trips it."""
+        from crucible.slots.model import serving_metrics
+
+        graded, predicted = self._graded(panel)
+        metrics, _ = serving_metrics(predicted, settled=graded.settled)
+        assert 0.0 <= metrics["model_hit_rate_30d"] <= 1.0
+
+    def test_a_planted_edge_puts_the_hit_rate_above_the_floor(self, panel) -> None:
+        """The fixture panel plants momentum in the label, so an arm that
+        reads momentum must beat a coin flip. If it did not, the floor would
+        be gating the producer rather than the model."""
+        from crucible.slots.model import FLOOR_VETO_METRICS, serving_metrics
+
+        graded, predicted = self._graded(panel)
+        metrics, _ = serving_metrics(predicted, settled=graded.settled)
+        assert metrics["model_hit_rate_30d"] > FLOOR_VETO_METRICS["model_hit_rate_30d"]
+
+    def test_a_collapsed_cross_section_collapses_p_up_with_it(self, panel) -> None:
+        """THE test this design exists to pass. The calibration is fitted on
+        HISTORY and applied to today, so halving today's spread halves the
+        up-probability spread — and the dispersion ratio catches it. A map
+        fitted on today's cross-section would restore the spread and the
+        collapse would read as healthy, which is the 2026-08-28 defect."""
+        from crucible.slots.model import (
+            MIN_DISPERSION_RATIO,
+            evaluate_behavioural_veto,
+            serving_metrics,
+        )
+
+        graded, predicted = self._graded(panel)
+        incumbent, _ = serving_metrics(predicted, settled=graded.settled)
+        collapsed = {name: value * 0.25 for name, value in predicted.items()}
+        candidate, _ = serving_metrics(collapsed, settled=graded.settled)
+
+        assert candidate["stdev_p_up"] / incumbent["stdev_p_up"] < MIN_DISPERSION_RATIO
+        veto = evaluate_behavioural_veto(candidate, incumbent, has_incumbent=True)
+        assert veto.status == "veto"
+        assert any("stdev_p_up" in reason for reason in veto.reasons)
+
+    def test_the_calibration_is_not_refitted_per_cross_section(self, panel) -> None:
+        """The mechanism behind the test above, asserted directly: the map is
+        a fixed affine function of predicted alpha, so scaling the input
+        scales the logit."""
+        from crucible.slots.model import calibrate_up_probability
+
+        graded, _ = self._graded(panel)
+        calibration = calibrate_up_probability(graded.settled)
+        assert calibration is not None
+        values = np.array([-0.4, 0.0, 0.4])
+        halved = calibration.p_up(values * 0.5)
+        full = calibration.p_up(values)
+        assert float(np.std(halved)) < float(np.std(full))
+
+    def test_one_realized_direction_refuses_the_calibration_rather_than_assuming_one(
+        self, panel
+    ) -> None:
+        from crucible.slots.model import SettledCrossSections, calibrate_up_probability
+
+        graded, _ = self._graded(panel)
+        block = graded.settled
+        one_sided = SettledCrossSections(
+            dates=block.dates,
+            predicted=block.predicted,
+            realized=np.abs(block.realized) + 1.0,
+        )
+        assert calibrate_up_probability(one_sided) is None
+
+    def test_a_calibration_that_cannot_be_fitted_leaves_the_metrics_absent(self, panel) -> None:
+        from crucible.slots.model import (
+            SettledCrossSections,
+            evaluate_behavioural_veto,
+            serving_metrics,
+        )
+
+        graded, predicted = self._graded(panel)
+        block = graded.settled
+        one_sided = SettledCrossSections(
+            dates=block.dates,
+            predicted=block.predicted,
+            realized=np.abs(block.realized) + 1.0,
+        )
+        metrics, reason = serving_metrics(predicted, settled=one_sided)
+        assert "stdev_p_up" not in metrics
+        assert "n_high_confidence" not in metrics
+        assert "could not be fitted" in reason
+        veto = evaluate_behavioural_veto(metrics, metrics, has_incumbent=True)
+        # Never a pass. `veto` also settles the arm, and an existing reason
+        # outranks an absent metric because both exclude it — what may never
+        # happen is the absent metric being read as satisfied.
+        assert veto.status != "pass"
+        assert set(veto.uncomputable) == {"stdev_p_up", "n_high_confidence"}
+
+    def test_n_high_confidence_counts_only_the_selection_the_slot_would_serve(self, panel) -> None:
+        from crucible.slots.model import M_SELECTION_TOP_N, serving_metrics
+
+        graded, predicted = self._graded(panel)
+        metrics, _ = serving_metrics(predicted, settled=graded.settled)
+        assert 0 <= metrics["n_high_confidence"] <= M_SELECTION_TOP_N
+
+    def test_a_constant_cross_section_names_nothing_and_is_vetoed_absolutely(self, panel) -> None:
+        """The 2026-08-21 condition, reached through the real producer: a
+        model whose predictions carry no ordering has nothing to serve, and
+        the zero-veto is absolute — no incumbent required."""
+        from crucible.slots.model import evaluate_behavioural_veto, serving_metrics
+
+        graded, predicted = self._graded(panel)
+        flat = dict.fromkeys(predicted, 0.0)
+        metrics, reason = serving_metrics(flat, settled=graded.settled)
+        assert reason == ""
+        assert metrics["n_high_confidence"] == 0
+        veto = evaluate_behavioural_veto(metrics, metrics, has_incumbent=True)
+        assert veto.status == "veto"
+        assert any("names nothing at high confidence" in r for r in veto.reasons)
+
+    def test_a_planted_edge_passes_the_veto_on_a_cold_slot(self, panel) -> None:
+        """The `pass` side. The fixture panel plants momentum in the label, so
+        an arm that reads momentum clears the hit-rate floor and names
+        tradeable positions — and on a slot with no champion the dispersion
+        family has no comparand, so the verdict rests on the absolute rules."""
+        from crucible.slots.model import evaluate_behavioural_veto, serving_metrics
+
+        graded, predicted = self._graded(panel)
+        metrics, reason = serving_metrics(predicted, settled=graded.settled)
+        assert reason == ""
+        veto = evaluate_behavioural_veto(metrics, {}, has_incumbent=False)
+        assert veto.status == "pass", veto.reasons
+        assert metrics["n_high_confidence"] > 0
+
+    def test_only_settled_dates_reach_the_block(self, panel) -> None:
+        """A date whose label has not realized has a prediction and no
+        outcome; counting it would put an unresolved bet in a hit rate."""
+        recipe = _recipe()
+        as_of = panel.dates[-1]
+        graded, _ = self._graded(panel, recipe=recipe, as_of=as_of)
+        horizon = recipe.label_horizon_trading_days
+        last_settled = panel.dates[-1 - horizon]
+        assert graded.settled.dates
+        assert max(graded.settled.dates) <= last_settled
+        assert set(graded.settled.dates) <= set(graded.series.scores) | set(graded.unrankable_dates)
+
+    def test_both_sides_of_the_settled_block_are_cross_sectional_excess(self, panel) -> None:
+        """M's benchmark is the cross-section it scored, so a hit is a hit
+        against the population and the 0.50 floor is a genuine coin flip
+        rather than a bar market drift clears on its own."""
+        graded, _ = self._graded(panel)
+        assert np.allclose(graded.settled.predicted.mean(axis=1), 0.0)
+        assert np.allclose(graded.settled.realized.mean(axis=1), 0.0)
+
+
+class TestTheColdSlotReading:
+    """A slot with no champion has nothing for a dispersion RATIO to compare
+    against, and §10.1's null control cannot stand in: `control_null_m` is a
+    selection-shaped harness control that ranks names on a noise draw and
+    publishes no predicted-alpha cross-section at all."""
+
+    def test_the_null_control_publishes_no_cross_section_to_compare_against(self) -> None:
+        """The measured fact the cold-start reading rests on."""
+        from crucible.slots import get_slot
+
+        controls = {c.kind: c.arm_id for c in get_slot("m").control_arms}
+        assert controls == {"planted": "control_planted_m", "null": "control_null_m"}
+
+    def test_dispersion_is_inapplicable_not_uncomputable(self) -> None:
+        from crucible.slots.model import DISPERSION_METRICS, evaluate_behavioural_veto
+
+        candidate = {
+            "alpha_stdev": 0.02,
+            "stdev_p_up": 0.05,
+            "n_high_confidence": 6,
+            "model_hit_rate_30d": 0.54,
+        }
+        veto = evaluate_behavioural_veto(candidate, {}, has_incumbent=False)
+        assert veto.status == "pass"
+        assert veto.inapplicable == DISPERSION_METRICS
+        assert veto.uncomputable == ()
+        # And the artifact says so: "passed every rule" and "passed every rule
+        # that had a comparand" are different claims about a first champion.
+        precondition = veto.as_precondition()
+        assert precondition.passed
+        assert "no incumbent to compare against" in precondition.reason
+
+    def test_a_cold_slot_still_vetoes_a_collapsed_cross_section(self) -> None:
+        from crucible.slots.model import evaluate_behavioural_veto
+
+        veto = evaluate_behavioural_veto(
+            {
+                "alpha_stdev": 0.0,
+                "stdev_p_up": 0.0,
+                "n_high_confidence": 4,
+                "model_hit_rate_30d": 0.54,
+            },
+            {},
+            has_incumbent=False,
+        )
+        assert veto.status == "veto"
+        assert any("zero spread is a collapsed model" in r for r in veto.reasons)
+
+    def test_an_absent_incumbent_metric_is_still_uncomputable_when_there_is_a_champion(
+        self,
+    ) -> None:
+        """The direction that must not be relaxed: a champion we cannot
+        measure is not a slot with nothing to compare against."""
+        from crucible.slots.model import evaluate_behavioural_veto
+
+        veto = evaluate_behavioural_veto(
+            {
+                "alpha_stdev": 0.02,
+                "stdev_p_up": 0.05,
+                "n_high_confidence": 6,
+                "model_hit_rate_30d": 0.54,
+            },
+            {},
+            has_incumbent=True,
+        )
+        assert veto.status == "insufficient"
+        assert set(veto.uncomputable) == {"alpha_stdev", "stdev_p_up"}
+        assert veto.inapplicable == ()
+
+
+class TestTheServingVetoWindowIsObserved:
+    """`alpha-engine-config-I10680`. `insufficient` used to have exactly one
+    cause and it was permanent. Now it has a temporary one, and a cycle must
+    say which — or the fix looks identical to the gap."""
+
+    def _ctx(self):
+        from types import SimpleNamespace
+
+        rows: list[dict] = []
+        return SimpleNamespace(record_metric=rows.append), rows
+
+    def test_a_live_verdict_is_reported_ok(self) -> None:
+        from crucible.slots.model import SERVING_VETO_WINDOW_METRIC, _record_serving_veto_window
+
+        ctx, rows = self._ctx()
+        _record_serving_veto_window(
+            ctx,
+            {"a": {"veto": "pass"}, "b": {"veto": "insufficient"}},
+            {"b": "short"},
+            as_of="2026-09-11",
+        )
+        assert len(rows) == 1
+        assert rows[0]["name"] == SERVING_VETO_WINDOW_METRIC
+        assert rows[0]["status"] == "OK"
+        assert rows[0]["value"] == 1.0
+
+    def test_every_arm_short_of_the_window_is_unmeasurable_not_a_failure(self) -> None:
+        """Nothing is broken and nothing is owed: the arms are accruing
+        settled dates."""
+        from crucible.slots.model import _record_serving_veto_window
+
+        ctx, rows = self._ctx()
+        _record_serving_veto_window(
+            ctx,
+            {"a": {"veto": "insufficient"}, "b": {"veto": "insufficient"}},
+            {"a": "8 settled date(s)", "b": "8 settled date(s)"},
+            as_of="2026-09-11",
+        )
+        assert rows[0]["status"] == "unmeasurable"
+        assert "value" not in rows[0]
+
+    def test_insufficient_with_no_window_reason_fails_loud(self) -> None:
+        """A veto input missing for a reason other than the window is an
+        unexplained dead slot, and it pages."""
+        from crucible.slots.model import _record_serving_veto_window
+
+        ctx, rows = self._ctx()
+        _record_serving_veto_window(
+            ctx,
+            {"a": {"veto": "insufficient"}, "b": {"veto": "insufficient"}},
+            {"a": "8 settled date(s)"},
+            as_of="2026-09-11",
+        )
+        assert rows[0]["status"] == "FAIL"
+        assert "did NOT name a short settled window" in rows[0]["status_reason"]
+
+    def test_a_cycle_that_graded_nothing_emits_nothing(self) -> None:
+        from crucible.slots.model import _record_serving_veto_window
+
+        ctx, rows = self._ctx()
+        _record_serving_veto_window(ctx, {}, {}, as_of="2026-09-11")
+        assert rows == []
