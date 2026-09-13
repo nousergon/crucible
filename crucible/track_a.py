@@ -28,6 +28,7 @@ from crucible.config import settings as resolve_settings
 from crucible.data import ArcticPriceSource, PriceSource, run_daily, run_heal, run_weekly
 from crucible.data.universe import DeclaredUniverse, load_declared_universe, universe_from_argv
 from crucible.explain import explain as explain_lineage
+from crucible.explain import money_path_chain_verifier
 from crucible.explain import render as render_lineage
 from crucible.gate import PHASES
 from crucible.keys import arm_register_key
@@ -55,6 +56,15 @@ _SLOT_MODULES = dispatchable_slots()
 #: §6). Derived rather than hardcoded so a phase renumbering cannot leave
 #: `_slot_module`'s message stale (alpha-engine-config-I9839).
 _ALL_SLOTS_PHASE = next(p for p in PHASES if p.id == "phase3")
+
+#: `_verify_chain_or_refuse`'s refusal names phase 2 (derived from `PHASES`,
+#: same shape `_ALL_SLOTS_PHASE` above uses) and the money-path chain PR's
+#: own tracker issue — a HISTORICAL, non-phase issue `PHASES` can never
+#: derive, so it is a plain `int` read at f-string time rather than a
+#: literal string (`tests/test_no_stale_tracker_literals.py`,
+#: alpha-engine-config-I9839).
+_PHASE2 = next(p for p in PHASES if p.id == "phase2")
+_MONEY_PATH_CHAIN_ISSUE = 10414
 
 
 def _today() -> dt.date:
@@ -481,12 +491,24 @@ def handle_explain(args: argparse.Namespace) -> int:
     receipt, not noise.
 
     `--dry-run` prints the walk and files nothing (`run_job(dry_run=True)`).
+
+    **`--verify-chain`** (`alpha-engine-config-I10625`) is checked AFTER the
+    walk is printed and the manifest recorded — a broken chain is not a
+    failure of the walk itself (`explain` "runs" successfully either way;
+    the walk is what lets an operator SEE the break), so it never turns this
+    run's own manifest into a `failed` one. It is the caller's refusal, per
+    `crucible.explain.money_path_chain_verifier`'s docstring: `crucible-PR240`
+    (`alpha-engine-config-I10414`) is a gated DRAFT, so this build carries no
+    verifier yet, and passing the flag today is a loud, named refusal rather
+    than a silent no-op that would look like a clean chain.
     """
     config = _settings(args)
     store = config.store()
+    captured: dict[str, Any] = {}
 
     def job(ctx: Any) -> None:
         lineage = explain_lineage(store, args.target)
+        captured["lineage"] = lineage
         for key in _lineage_keys(lineage):
             if store.exists(key):
                 ctx.record_input(key, store.get_bytes(key))
@@ -500,7 +522,36 @@ def handle_explain(args: argparse.Namespace) -> int:
         run_mode=getattr(args, "run_mode", None),
         dry_run=bool(getattr(args, "dry_run", False)),
     )
+    if getattr(args, "verify_chain", False):
+        _verify_chain_or_refuse(captured["lineage"])
     return 0
+
+
+def _verify_chain_or_refuse(lineage: Any) -> None:
+    """`--verify-chain`'s refusal-or-check, isolated so its exit shape is one place.
+
+    Refuses (uncaught `SystemExit`, same shape `_source` above uses — a
+    string-coded `SystemExit` prints to stderr and exits non-zero, the
+    `crucible-PR219` precedent `main` relies on for every OTHER usage
+    refusal) when this build has no verifier at all, or when the `Lineage`
+    this build returns carries no `chain` field to check — both true today,
+    since `crucible-PR240` has not merged. Once it has, `verifier` resolves
+    and `lineage.chain` is `None` for a walk that never crossed the money
+    path (nothing to verify — not an error) or a `ChainVerification` whose
+    own `raise_if_broken()` is the non-zero exit on a real break.
+    """
+    verifier = money_path_chain_verifier()
+    if verifier is None or not hasattr(lineage, "chain"):
+        raise SystemExit(
+            "--verify-chain: this build carries no money-path chain verifier. "
+            f"`crucible-PR240` (alpha-engine-config-I{_MONEY_PATH_CHAIN_ISSUE}) is a "
+            "gated DRAFT that has not merged yet — it stays behind "
+            f"{_PHASE2.tracker}'s exit. Refusing rather than silently skipping the "
+            "chain check the flag was asked to run."
+        )
+    chain = lineage.chain
+    if chain is not None:
+        chain.raise_if_broken()
 
 
 def handle_migrate_history(args: argparse.Namespace) -> int:
