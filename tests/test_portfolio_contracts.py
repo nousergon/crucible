@@ -79,6 +79,7 @@ FIXTURE_PARAMS: dict = {
     "conviction_ir_full": 0.75,
     "conviction_budget_min_multiple": 0.05,
     "conviction_gate_min_names": 3,
+    "book_notional_usd": 1_000_000.0,
 }
 
 FLAT = {

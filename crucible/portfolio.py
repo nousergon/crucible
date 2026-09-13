@@ -442,6 +442,7 @@ PORTFOLIO_PARAM_FIELDS: dict[str, str] = {
     "conviction_ir_full": "number",
     "conviction_budget_min_multiple": "number",
     "conviction_gate_min_names": "integer",
+    "book_notional_usd": "number",
 }
 
 _NULLABLE_PARAMS: frozenset[str] = frozenset(
@@ -488,6 +489,17 @@ class PortfolioParams:
     conviction_ir_full: float
     conviction_budget_min_multiple: float
     conviction_gate_min_names: int
+    #: The book size, in dollars, weight deltas are turned into trade sizes
+    #: against. `crucible.slots.strategy.construct_book`'s ONLY source for
+    #: `portfolio_notional` — there is no literal in the public repository
+    #: (`alpha-engine-config-I10669`: a `GRADING_NOTIONAL = 1.0` module
+    #: constant priced every book, including participation-aware ones, at a
+    #: unit book size nobody chose). A flat cost model's charge is a pure
+    #: function of weight deltas and does not read this value at all, so
+    #: threading the real book size through it changes nothing it grades;
+    #: a participation-aware model's charge is `NAV^1.5` in this value, so a
+    #: wrong one is a wrong grade for exactly the arms this field exists for.
+    book_notional_usd: float
 
     def __post_init__(self) -> None:
         if self.covariance_shrinkage in _ESTIMATORS_NOT_CARRIED:
@@ -530,6 +542,12 @@ class PortfolioParams:
             raise PortfolioParamsError(
                 "conviction_budget_min_multiple must be in [0, 1]; got "
                 f"{self.conviction_budget_min_multiple}"
+            )
+        if not (self.book_notional_usd > 0.0):
+            raise PortfolioParamsError(
+                f"book_notional_usd must be positive; got {self.book_notional_usd!r}. Weight "
+                "deltas become trade sizes only against a positive book size, and a "
+                "non-positive one is not a smaller book — it is not a book."
             )
 
     @classmethod
