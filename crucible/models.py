@@ -346,6 +346,7 @@ JOB_VALUES: tuple[str, ...] = (
     "fault.record",
     "fault.probe",
     "iac.conformance",
+    "test.integration",
 )
 
 #: The exhaustive `attempts[].reason` vocabulary: `initial` for the first

@@ -70,6 +70,138 @@ def test_experiment_new(integration_store_uri: str, integration_store: Store, st
     assert manifest["outputs"], "experiment.new wrote no outputs — the arm register never landed"
 
 
+# ── data.daily / data.weekly / data.heal — the dedicated-library override
+#    (`alpha-engine-config-I10457`) unblocks all three: each reads real
+#    ArcticDB rows through `ArcticPriceSource(library=...)`, never the
+#    production `universe` library ──────────────────────────────────────────
+
+
+def test_data_daily(
+    integration_store_uri: str,
+    integration_store: Store,
+    integration_arctic_library: str,
+    integration_arctic_symbols: list[str],
+) -> None:
+    cli_main(
+        [
+            "data.daily",
+            "--store",
+            integration_store_uri,
+            "--arctic-library",
+            integration_arctic_library,
+            "--symbols",
+            ",".join(integration_arctic_symbols),
+            "--run-mode",
+            "live",
+            "--date",
+            INTEGRATION_TRADING_DAY,
+        ]
+    )
+    manifest = _assert_ok(integration_store, "data.daily")
+    assert manifest["outputs"], "data.daily wrote no outputs — the feature layer never landed"
+
+
+def test_data_weekly(
+    integration_store_uri: str,
+    integration_store: Store,
+    integration_arctic_library: str,
+    integration_arctic_symbols: list[str],
+) -> None:
+    cli_main(
+        [
+            "data.weekly",
+            "--store",
+            integration_store_uri,
+            "--arctic-library",
+            integration_arctic_library,
+            "--symbols",
+            ",".join(integration_arctic_symbols),
+            "--run-mode",
+            "live",
+            "--date",
+            INTEGRATION_TRADING_DAY,
+        ]
+    )
+    _assert_ok(integration_store, "data.weekly")
+
+
+def test_data_heal(
+    integration_store_uri: str,
+    integration_store: Store,
+    integration_arctic_library: str,
+    integration_arctic_symbols: list[str],
+) -> None:
+    """A 1-session range — well inside `LAPTOP_SESSION_ALLOWANCE` (3), so this
+    runs on a GitHub-hosted (non-EC2) runner with no `--i-am-in-region`."""
+    cli_main(
+        [
+            "data.heal",
+            "--gap",
+            "integration-tier-probe",
+            "--from",
+            INTEGRATION_TRADING_DAY,
+            "--to",
+            INTEGRATION_TRADING_DAY,
+            "--store",
+            integration_store_uri,
+            "--arctic-library",
+            integration_arctic_library,
+            "--symbols",
+            ",".join(integration_arctic_symbols),
+            "--run-mode",
+            "live",
+            "--date",
+            INTEGRATION_TRADING_DAY,
+        ]
+    )
+    _assert_ok(integration_store, "data.heal")
+
+
+# ── experiment.run — never touches ArcticDB directly
+#    (`crucible.slots.cycle.run_produce` reads the feature layer `data.daily`
+#    above just wrote into THIS store); its non-degenerate exercise was
+#    blocked only by `data.daily` having nothing real to read
+#    (`alpha-engine-config-I10457`), never by a gap of its own. See the note
+#    below `test_experiment_run` for why `experiment.grade`/`promote` are
+#    NOT added here. ─────────────────────────────────────────────────────
+
+
+def test_experiment_run(integration_store_uri: str, integration_store: Store) -> None:
+    cli_main(
+        [
+            "experiment.run",
+            "--slot",
+            "u",
+            "--store",
+            integration_store_uri,
+            "--run-mode",
+            "live",
+            "--date",
+            INTEGRATION_TRADING_DAY,
+        ]
+    )
+    manifest = _assert_ok(integration_store, "experiment.run", discriminator="u")
+    assert manifest["outputs"], "experiment.run wrote no outputs — no arm's shadow landed"
+
+
+# `experiment.grade`/`promote` are NOT added here. Investigation for
+# `alpha-engine-config-I10457` found their blocker is NOT the ArcticDB gap
+# this PR fixes: `crucible.slots.cycle.run_grade` scores only SETTLED shadows
+# (`forward_returns` needs price data `horizon_trading_days` — default 21 —
+# AFTER the shadow's own date), and this tier's `INTEGRATION_TRADING_DAY` is
+# a fixed literal with no later trading day ever produced in the dedicated
+# store, by design (AGENTS.md, "Test discipline": fixed date literals, never
+# `today` arithmetic). A grade run here would legitimately score zero
+# settled cuts, forever, on every nightly run — proving nothing beyond what
+# `experiment.run`, `data.daily` and `data.weekly` above already prove.
+# Exercising `experiment.grade`/`promote` for real needs a multi-week
+# historical panel (several distinct trading days, each settled relative to
+# a later one), which is real design work distinct from this issue's
+# ArcticDB-library scope. Filed as a follow-up rather than landed
+# speculatively and unverifiable from this session (no real S3/ArcticDB
+# access — `alpha-engine-config-I9771`).
+
+
 # ── explain — walks the lineage of the register experiment.new just wrote ──
 
 
