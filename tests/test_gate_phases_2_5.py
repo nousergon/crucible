@@ -35,6 +35,7 @@ import crucible.alerts as alerts_module
 import crucible.autonomy as autonomy_module
 import crucible.cost as cost_module
 import crucible.gate as gate_module
+import crucible.keys as keys_module
 import crucible.llm as llm_module
 from crucible.attribution import (
     ATTRIBUTION_METRIC_NAME,
@@ -2576,12 +2577,44 @@ TRADER_EVIDENCE = "consumers/trader/v2_champion_week.json"
 
 
 class TestTheTraderIsGradedThroughItsContractOrNotAtAll:
-    def test_unmeasurable_while_the_contract_declares_no_artifact(self, store: LocalStore) -> None:
-        """The harness may not reach into the trader, so an undeclared
-        artifact is a missing CONTRACT, not a missing file."""
+    def test_the_gate_reads_the_key_the_contract_declares(self) -> None:
+        """`alpha-engine-config-I10648`. The gate does not name a key of its
+        own: it resolves `crucible.keys.TRADER_EVIDENCE_KEY`, which is the key
+        `crucible-trader` writes and the only key its IAM identity may write.
+        Two literals would be two contracts, and the day they diverged the
+        clause would read `absent` against a document that exists."""
+        assert gate_module.TRADER_EVIDENCE_KEY == keys_module.TRADER_EVIDENCE_KEY
+        assert gate_module.TRADER_EVIDENCE_KEY is not None
+
+    def test_unmet_and_not_unmeasurable_once_the_contract_declares_the_artifact(
+        self, store: LocalStore
+    ) -> None:
+        """The headline phase-4 clause is GRADED now. Before `-I10648` this read
+        UNMEASURABLE for every store, which meant phase 4's own headline
+        deliverable could never be false — and a clause that cannot produce a
+        negative result grades nothing."""
+        clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+        assert not clause.unmeasurable and not clause.met
+        assert "is absent" in clause.detail
+
+    def test_unmeasurable_again_if_the_contract_ever_declares_nothing(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The branch stays live on purpose. "The contract declares no artifact"
+        and "the trader has filed nothing yet" are different facts about the
+        system, and collapsing them into one UNMET would hide a reverted
+        contract behind a trader that simply has not run."""
+        monkeypatch.setattr(gate_module, "TRADER_EVIDENCE_KEY", None)
         clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
         assert clause.unmeasurable and not clause.met
         assert "declares no consumer-evidence artifact" in clause.detail
+
+    def test_met_on_a_full_week_at_the_declared_key(self, store: LocalStore) -> None:
+        """No monkeypatch: the real key, the real reading. Five trading days,
+        which is one week (§4.12) and not seven calendar days."""
+        _put(store, keys_module.TRADER_EVIDENCE_KEY, {"trading_days": 5})
+        clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+        assert clause.met and not clause.unmeasurable
 
     def test_unmet_once_declared_and_absent(
         self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
