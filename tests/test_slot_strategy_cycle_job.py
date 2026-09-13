@@ -123,16 +123,24 @@ def _recipe_yaml(name: str, *, registered_at: str | None, cost: str = FLAT_COST)
     return "\n".join(head) + "\nspec:\n  benchmark: SPY\n" + cost + RULES
 
 
-def _benchmark_rows(days: list[dt.date]) -> pd.DataFrame:
-    rng = random.Random(7)
-    price = 500.0
+def _price_rows(
+    days: list[dt.date], *, ticker: str, seed: int, start_price: float = 500.0
+) -> pd.DataFrame:
+    """One ETF proxy's synthetic OHLCV rows — `_benchmark_rows`'s shape, any ticker.
+
+    `ATTRIBUTION_YAML`'s factor proxies (and the SPY benchmark) all need a real
+    panel row, exactly the way the benchmark itself does — a different `seed`
+    per ticker so the series are not degenerate copies of one another.
+    """
+    rng = random.Random(seed)
+    price = start_price
     rows = []
     for day in days:
         price *= math.exp(rng.gauss(0.0003, 0.006))
         rows.append(
             {
                 "trading_day": day,
-                "ticker": "SPY",
+                "ticker": ticker,
                 "open_raw": price * 0.999,
                 "high_raw": price * 1.004,
                 "low_raw": price * 0.996,
@@ -141,6 +149,34 @@ def _benchmark_rows(days: list[dt.date]) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _benchmark_rows(days: list[dt.date]) -> pd.DataFrame:
+    return _price_rows(days, ticker="SPY", seed=7)
+
+
+#: The minimal factor spec the fixture writes to `strategy/slots/attribution.yaml`
+#: — one proxy per required category (`ATTRIBUTION_FACTOR_CATEGORIES`), rather
+#: than production's six, so a settled window of a handful of sessions clears
+#: `nousergon_lib.quant.factor_risk.estimate_factor_model`'s `n >= k + 2`
+#: identification floor (k=3 factors here, so 5 settled sessions suffice).
+ATTRIBUTION_FACTOR_PROXIES: dict[str, str] = {"market": "SPY", "size": "IWM", "sector_tech": "XLK"}
+
+ATTRIBUTION_YAML = """\
+attribution:
+  benchmark_proxy: SPY
+  shrinkage: ledoit_wolf
+  factors:
+    market:
+      category: beta
+      proxy: SPY
+    size:
+      category: size
+      proxy: IWM
+    sector_tech:
+      category: sector
+      proxy: XLK
+"""
 
 
 def _write_features(
@@ -179,8 +215,18 @@ def world(tmp_path):
     store = LocalStore(tmp_path / "store")
     days = sessions_ending(AS_OF, 60)
     frames = synthetic_frames(end=AS_OF, n_tickers=12, sessions=60)
+    # Every attribution factor proxy (`ATTRIBUTION_FACTOR_PROXIES`) needs a real
+    # panel row, exactly the way the SPY benchmark already does — the factor
+    # model is fit from these series, not stubbed. Fixed per-ticker seeds
+    # (never `hash(ticker)`, which is process-randomized) so the panel is
+    # byte-identical across runs.
+    proxy_seeds = {"SPY": 7, "IWM": 17, "XLK": 23}
+    proxy_rows = [
+        _price_rows(days, ticker=ticker, seed=proxy_seeds[ticker])
+        for ticker in sorted({"SPY", *ATTRIBUTION_FACTOR_PROXIES.values()})
+    ]
     panel = pd.concat(
-        [frame.reset_index() for frame in frames.values()] + [_benchmark_rows(days)],
+        [frame.reset_index() for frame in frames.values()] + proxy_rows,
         ignore_index=True,
     )
     store.put_bytes(data_panel_key(AS_OF.isoformat()), panel.to_parquet(index=False))
@@ -193,7 +239,10 @@ def world(tmp_path):
                 {"schema_version": "champion_pointer.v1", "slot": slot, "champion": champion}
             ).encode("utf-8"),
         )
-    decision_days = sessions_ending(AS_OF, 4)
+    # 7 decision days -> 6 settled sessions (the last is always unsettled) —
+    # enough to clear `estimate_factor_model`'s `n >= k + 2` floor for the
+    # fixture's 3-factor spec (k=3, floor 5).
+    decision_days = sessions_ending(AS_OF, 7)
     rng = np.random.default_rng(3)
     for day in decision_days:
         store.put_bytes(
@@ -236,6 +285,7 @@ def world(tmp_path):
     )
     (root / "slots").mkdir(parents=True)
     (root / "slots" / "s.yaml").write_text(_PARAMS_YAML, encoding="utf-8")
+    (root / "slots" / "attribution.yaml").write_text(ATTRIBUTION_YAML, encoding="utf-8")
     settings = Settings(store_uri=str(tmp_path / "store"), arctic_bucket="", strategy_dir=root)
     return store, settings, root, decision_days
 
@@ -327,6 +377,41 @@ class TestTheEvidenceReachesARealManifest:
                 f"{name} carries no clause, so this job's evidence is read by nothing"
             )
         assert manifest_records_portfolio_engine(manifest) is not None
+
+    def test_a_graded_run_carries_the_factor_attribution_document(self, world) -> None:
+        """`alpha-engine-config-I10678`'s own closes-when: the call site this
+        issue adds, verified on the manifest a real run wrote."""
+        from crucible.attribution import manifest_records_factor_attribution
+
+        store, settings, _root, days = world
+        _run_produce(store, settings, days)
+        result, manifest, _ctx = _run_grade(store, settings)
+
+        assert manifest["status"] == "ok"
+        evidence = manifest_records_factor_attribution(manifest)
+        assert evidence is not None, (
+            "the S grading manifest carries no `factor_attribution` row, so the phase-3 "
+            "clause reads UNMEASURABLE — the exact state this issue exists to end"
+        )
+        assert evidence["engine"] == "crucible.attribution"
+        assert set(ATTRIBUTION_FACTOR_PROXIES) <= {row["name"] for row in evidence["factors"]}
+        assert set(evidence["category_totals"]) == {"beta", "sector", "size", "residual"}
+        for figure in ("residual_alpha", "gross_return", "net_return"):
+            assert isinstance(evidence[figure], float)
+        assert result["strategy_grades"]
+
+    def test_the_phase_three_attribution_clause_reads_met_off_that_manifest(self, world) -> None:
+        """`crucible-PR229`'s clause, run against this job's own output — the
+        deliverable's own closes-when: `crucible gate --gate phase3` moves off
+        UNMEASURABLE the moment a real S-slot grading run carries the evidence."""
+        from crucible.gate import _clause_factor_neutral_attribution
+
+        store, settings, _root, days = world
+        _run_produce(store, settings, days)
+        _result, _manifest, _ctx = _run_grade(store, settings)
+
+        clause = _clause_factor_neutral_attribution(store, [AS_OF])
+        assert clause.met is True, clause.detail
 
     def test_produce_writes_one_session_inputs_document_per_arm(self, world) -> None:
         store, settings, _root, days = world
@@ -893,6 +978,22 @@ class TestTheInputsAreNamedWhenTheyAreAbsent:
             panel[panel["ticker"] != "SPY"].to_parquet(index=False),
         )
         with pytest.raises(MissingArtifactError, match="carries no rows for"):
+            _run_grade(store, settings)
+
+    def test_a_factor_proxy_the_panel_does_not_carry_is_refused_not_stubbed(self, world) -> None:
+        """S is graded against a market index, and a decomposition with no
+        factors is not the deliverable: no proxy is substituted and no figure
+        is stubbed for a missing factor series (module rule 5)."""
+        store, settings, _root, days = world
+        _run_produce(store, settings, days)
+        panel = pd.read_parquet(
+            __import__("io").BytesIO(store.get_bytes(data_panel_key(AS_OF.isoformat())))
+        )
+        store.put_bytes(
+            data_panel_key(AS_OF.isoformat()),
+            panel[panel["ticker"] != "IWM"].to_parquet(index=False),
+        )
+        with pytest.raises(MissingArtifactError, match="attribution factor 'size' proxies 'IWM'"):
             _run_grade(store, settings)
 
     def test_an_unknown_arm_selector_is_refused_rather_than_producing_nothing(self, world) -> None:
