@@ -27,16 +27,27 @@ from crucible.promote import (
     retirement_log_key,
 )
 from crucible.store import LocalStore
+from tests.support.manifests import write_grade_manifest
 from tests.support.panels import trading_days
 
 DAY = "2026-08-28"
 
 
 #: The arms every fixture below registers. `control_null_m` is §10.1's null
-#: control and is registered like any other arm: since
-#: `alpha-engine-config-I9759` it is the BASELINE a slot with no champion
-#: measures its first promotion against, so a fixture without it exercises
-#: the refusal rather than the promotion path.
+#: control, registered like any other arm.
+#:
+#: `alpha-engine-config-I9759` gave a slot with no champion a first
+#: promotion won on evidence, by substituting the null control as the
+#: baseline incumbent BEFORE calling `run_cycle` — that substitution lived
+#: inside `crucible.promote.run_promotion`, which called `run_cycle` itself.
+#: `alpha-engine-config-I10679` removed that call (`promote` now acts on the
+#: cycle `experiment.grade` already computed) and `experiment.grade`
+#: (`crucible/slots/cycle.py::run_grade`) does not (yet) apply the
+#: substitution — see `alpha-engine-config-I10687`, filed to move it there.
+#: So `control_null_m` is still registered here (grade still scores and
+#: ladders it every cycle, per §10.1), but it no longer changes what a
+#: cold slot's `grade()` decides: a slot with no seated champion grades as a
+#: raw §9.1 bootstrap either way until I10687 lands.
 _ARMS: tuple[tuple[str, float], ...] = (
     ("champ", 0.0),
     ("chal", 0.045),
@@ -46,6 +57,10 @@ _ARMS: tuple[tuple[str, float], ...] = (
 
 
 def _seed(tmp_path, arms: tuple[tuple[str, float], ...]):
+    """Register every arm and its series. Does NOT grade — a real slot's
+    champion pointer (or absence of one) exists BEFORE grade runs, and
+    `grade()` below must read whatever `seat()` did, exactly as
+    `crucible.slots.cycle._incumbent` does in production."""
     store = LocalStore(tmp_path)
     dates = trading_days(40, dt.date.fromisoformat(DAY))
     register = ArmRegister()
@@ -64,26 +79,41 @@ def _seed(tmp_path, arms: tuple[tuple[str, float], ...]):
         arm_register_key("m"),
         b"".join(json.dumps(e).encode() + b"\n" for e in register.to_dicts()),
     )
-    grade(store, register, ids, dates)
     return store, register, ids, dates
 
 
-def grade(store, register, ids, dates, *, ineligible: dict[str, list] | None = None) -> None:
-    """The `arena_cycle` `experiment.grade[m]` writes an hour before promote.
+def grade(store, register, ids, dates, *, preconditions: dict | None = None) -> None:
+    """The `arena_cycle` (plus its OWN run manifest) `experiment.grade[m]`
+    writes an hour before promote.
 
-    `promote` reads its `decision.ineligible` for the eligibility grade
-    evaluated (`alpha-engine-config-I9759`); without this artifact promote
-    refuses, because the M behavioural veto and the S contamination
-    attestation exist nowhere else and a promotion decided without them is a
-    promotion decided with every slot-evaluated veto silently empty.
+    `crucible.promote.read_graded_cycle` (`alpha-engine-config-I10679`) acts
+    on this cycle's WHOLE decision, computed here through the same
+    `run_cycle` call `run_grade` makes — never hand-patched after the fact,
+    since a decision recomputed from a real `preconditions` map is what
+    `run_grade` actually produces, and a surgically-edited `ineligible` field
+    on an unrelated decision was already the wrong fixture shape before this
+    issue. `read_graded_cycle` also refuses unless `experiment.grade`'s own
+    manifest claims the cycle, so this fixture writes both, exactly as the
+    real job does (`crucible/slots/cycle.py::run_grade` via
+    `ctx.record_output`, `crucible/runner.py::run_job` for the manifest).
+
+    Reads the CURRENT champion pointer as the incumbent, mirroring
+    `crucible.slots.cycle._incumbent` — so a test that calls `seat()` before
+    `grade()` gets a cycle decided against that incumbent, and a test that
+    does not gets the slot's genuine cold-start.
     """
     import json as _json
 
     from nousergon_lib.arena.engine import run_cycle
 
-    from crucible.arena_io import arena_cycle_key as _key
     from crucible.arena_io import write_arena_cycle
+    from crucible.champion import champion_key as _champion_key
+    from crucible.documents import load_store_document as _load_store_document
     from crucible.slots import get_slot
+
+    incumbent = None
+    if store.exists(_champion_key("m")):
+        incumbent = _load_store_document(store, _champion_key("m")).get("arm_id")
 
     series_by_arm = {
         arm_id: ArmSeries(
@@ -97,20 +127,18 @@ def grade(store, register, ids, dates, *, ineligible: dict[str, list] | None = N
         as_of=DAY,
         register=register,
         series_by_arm=series_by_arm,
-        incumbent=None,
+        incumbent=incumbent,
+        preconditions=preconditions,
     )
-    payload = cycle.to_dict()
-    if ineligible is not None:
-        payload["decision"]["ineligible"] = ineligible
-        store.put_bytes(_key("m", DAY), _json.dumps(payload).encode())
-        return
     write_arena_cycle(store, cycle)
+    write_grade_manifest(store, "m", DAY)
 
 
 @pytest.fixture
 def seeded(tmp_path):
     """A slot with three registered arms plus the null control, 40 paired
-    trading days each, and the graded cycle promote reads."""
+    trading days each — NOT yet graded; a test grades after seating (or not)
+    its own incumbent."""
     return _seed(tmp_path, _ARMS)
 
 
@@ -173,8 +201,9 @@ class TestPromoteCommand:
     def test_it_writes_the_cycle_the_pointer_and_the_retirement_log(
         self, seeded, monkeypatch
     ) -> None:
-        store, _, ids, dates = seeded
+        store, register, ids, dates = seeded
         seat(store, ids, dates)
+        grade(store, register, ids, dates)
         monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
 
         assert main(["promote", "--slot", "m", "--date", DAY]) == 0
@@ -198,36 +227,25 @@ class TestPromoteCommand:
         assert manifest["status"] == "ok"
         assert any(o["key"] == champion_key("m") for o in manifest["outputs"])
 
-    def test_a_cold_slot_wins_its_first_champion_on_evidence(self, seeded, monkeypatch) -> None:
-        """`alpha-engine-config-I9759`: no incumbent, and the pointer still
-        records `evidence`.
-
-        §10.1's null control stands in as the baseline, so the engine's
-        ordinary `decided` path runs — the same paired window, the same
-        `promote_min_weeks`, the same `promote_evidence` — and the first
-        champion is one the system won. Before this, a cold slot took the
-        library's §9.1 cold start and wrote `promotion_source: bootstrap`,
-        which the §6 phase-3 gate rejects by name: the FIRST pointer of every
-        slot was, by construction, the one kind that does not count.
+    def test_a_cold_slot_bootstrap_cycle_is_refused_not_seated(self, seeded, monkeypatch) -> None:
+        """`alpha-engine-config-I9759` gave a cold slot (no incumbent) a
+        first champion won on evidence, by substituting §10.1's null control
+        as the baseline incumbent inside `crucible.promote.run_promotion`'s
+        own (now-removed) `run_cycle` call. `alpha-engine-config-I10679`
+        removed that call — `promote` now acts on the cycle
+        `experiment.grade` already computed, and grade does not (yet) apply
+        the substitution (`alpha-engine-config-I10687`, filed to move it
+        there). So a cold slot's graded cycle is a raw §9.1 bootstrap, and
+        `promote` refuses it rather than silently reintroducing the
+        un-evidenced `promotion_source: bootstrap` pointer I9759 exists to
+        prevent — a real, documented regression until I10687 lands.
         """
-        store, _, ids, _ = seeded
+        store, register, ids, dates = seeded
+        grade(store, register, ids, dates)
         monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
-        assert main(["promote", "--slot", "m", "--date", DAY]) == 0
-        pointer = read_champion(store, "m")
-        assert pointer.promotion_source == "evidence"
-        assert pointer.arm_id == ids["chal"]
-        # The baseline is NAMED, so a reader can tell "beat the incumbent"
-        # from "beat noise" — materially different claims.
-        assert pointer.evidence["baseline_control"] == ids["control_null_m"]
-        assert pointer.evidence["had_incumbent"] is False
-
-    def test_the_baseline_control_is_never_itself_promoted(self, seeded, monkeypatch) -> None:
-        """The null control is exempted from the control veto so it can BE
-        the incumbent; that exemption must not make it promotable."""
-        store, _, ids, _ = seeded
-        monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
-        assert main(["promote", "--slot", "m", "--date", DAY]) == 0
-        assert read_champion(store, "m").arm_id != ids["control_null_m"]
+        with pytest.raises(PromotionRefused, match="bootstrap"):
+            main(["promote", "--slot", "m", "--date", DAY])
+        assert not store.exists(champion_key("m"))
 
     def test_a_cold_slot_with_no_null_control_refuses_rather_than_bootstrapping(
         self, seeded_without_control, monkeypatch
@@ -238,57 +256,61 @@ class TestPromoteCommand:
         slot with no pointer and an `ok` manifest, which is indistinguishable
         from a legitimate verdict-backed non-promotion.
         """
-        store, _, _, _ = seeded_without_control
+        store, register, ids, dates = seeded_without_control
+        grade(store, register, ids, dates)
         monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
-        with pytest.raises(PromotionRefused, match="cold-start"):
+        with pytest.raises(PromotionRefused, match="bootstrap"):
             main(["promote", "--slot", "m", "--date", DAY])
         assert not store.exists(champion_key("m"))
 
     def test_an_arm_grade_refused_to_serve_is_not_promoted_by_promote(
-        self, tmp_path, monkeypatch
+        self, seeded, monkeypatch
     ) -> None:
-        """`alpha-engine-config-I9759`: promote runs the SAME engine over the
-        SAME series as `experiment.grade`, and until this fix it ran it with
-        `preconditions=None` — so the M slot's §5.3 behavioural veto and the
-        S slot's contamination attestation, both evaluated inside
-        `experiment.grade` and expressible nowhere else, did not exist for
-        the job that moves the pointer. Grade would refuse to serve an arm
-        and promote would serve it, from the same series, in the same hour.
-        """
-        store, register, ids, dates = _seed(tmp_path, _ARMS)
+        """`alpha-engine-config-I9759`/`-I10679`: `promote` acts on the
+        eligibility `experiment.grade` evaluated — the M slot's §5.3
+        behavioural veto and the S slot's contamination attestation, both
+        evaluated inside `experiment.grade` and expressible nowhere else.
+        Seeded with a REAL incumbent (`champ`) so this test exercises the
+        eligibility veto on its own, decoupled from the currently-refused
+        cold-start path (`alpha-engine-config-I10687`)."""
+        from nousergon_lib.arena import ServingPrecondition
+
+        store, register, ids, dates = seeded
+        seat(store, ids, dates, arm="champ")
         grade(
             store,
             register,
             ids,
             dates,
-            ineligible={
-                ids["chal"]: [
-                    {
-                        "name": "behavioural_veto",
-                        "passed": False,
-                        "reason": "an uncomputed gate is not a pass",
-                    }
-                ]
+            preconditions={
+                ids["chal"]: (
+                    ServingPrecondition(
+                        name="behavioural_veto",
+                        passed=False,
+                        reason="an uncomputed gate is not a pass",
+                    ),
+                )
             },
         )
         monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
         assert main(["promote", "--slot", "m", "--date", DAY]) == 0
-        # `chal` is the only arm that leads the null-control baseline, so a
-        # veto grade evaluated on it leaves the slot with NO champion — the
-        # verdict-backed non-promotion. Before the fix the pointer moved to
-        # `chal`, the arm grade had just refused to serve.
-        assert not store.exists(champion_key("m"))
+        # `chal` is the only arm that leads `champ`, so a veto grade
+        # evaluated on it leaves the incumbent HELD — not the verdict-backed
+        # non-promotion this used to test as "no champion at all" (which,
+        # under the OLD architecture, meant a cold slot; see the class
+        # docstring for why that path is decoupled here).
+        assert read_champion(store, "m").arm_id == ids["champ"]
 
     def test_promote_refuses_when_the_graded_cycle_is_absent(self, seeded, monkeypatch) -> None:
-        """The arc runs grade at 14:00 and promote at 15:00. An absent cycle
-        means grade did not finish, and a promotion decided without it is
-        decided with every slot-evaluated veto empty."""
-        from crucible.arena_io import arena_cycle_key
-
+        """The arc runs grade at 14:00 and promote at 15:00. An absent
+        manifest means grade did not run or did not finish, and a promotion
+        decided without it is decided on an artifact nothing vouches for.
+        `seeded` no longer grades on its own (`alpha-engine-config-I10679`
+        made grading incumbent-dependent, so a test decides when to grade
+        relative to `seat()`) — this test simply never calls `grade()`."""
         store, _, _, _ = seeded
-        (store.root / arena_cycle_key("m", DAY)).unlink()
         monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
-        with pytest.raises(PromotionRefused, match="no graded arena cycle"):
+        with pytest.raises(PromotionRefused, match="experiment.grade` run manifest"):
             main(["promote", "--slot", "m", "--date", DAY])
 
     def test_a_dry_run_decides_and_writes_nothing(self, seeded, monkeypatch) -> None:
@@ -301,11 +323,13 @@ class TestPromoteCommand:
         manifest is a vacuous pass."""
         from crucible.manifest import manifest_key
 
-        store, _, _, _ = seeded
+        store, register, ids, dates = seeded
+        seat(store, ids, dates)
+        grade(store, register, ids, dates)
         monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
         graded = store.get_bytes(arena_cycle_key("m", DAY))
         assert main(["promote", "--slot", "m", "--date", DAY, "--dry-run"]) == 0
-        assert not store.exists(champion_key("m"))
+        assert read_champion(store, "m").arm_id == ids["champ"], "the SEATED pointer, untouched"
         # The cycle promote READS is untouched; the one it would have written
         # over it was not written (`run_promotion(store=None)`).
         assert store.get_bytes(arena_cycle_key("m", DAY)) == graded

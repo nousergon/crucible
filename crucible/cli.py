@@ -177,8 +177,8 @@ def _promote(args: argparse.Namespace) -> int:
     import os
 
     from crucible.promote import (
-        graded_preconditions,
         load_slot_inputs,
+        read_graded_cycle,
         revert_champion,
         run_promotion,
     )
@@ -243,20 +243,17 @@ def _promote(args: argparse.Namespace) -> int:
             return
 
         inputs = load_slot_inputs(store, args.slot)
+        # `alpha-engine-config-I10679`: the cycle `experiment.grade` computed
+        # an hour earlier, read back rather than recomputed — the pointer
+        # decision, the retirement verdicts and the serving preconditions
+        # (the M behavioural veto, the S contamination attestation) are ALL
+        # already inside it. `read_graded_cycle` also refuses loudly if that
+        # run's own manifest is absent, failed, or does not claim the cycle.
+        graded_cycle = read_graded_cycle(store, args.slot, as_of)
         result = run_promotion(
             spec=spec,
-            as_of=as_of,
             register=inputs.register,
-            series_by_arm=inputs.series_by_arm,
-            incumbent=inputs.incumbent,
-            # `alpha-engine-config-I9759`: the eligibility `experiment.grade`
-            # evaluated an hour earlier, read back off its own cycle artifact.
-            # Passing nothing here — which is what this call did until I9759 —
-            # ran the SAME engine over the SAME series with the M behavioural
-            # veto and the S contamination attestation silently empty, so the
-            # job that moves the pointer could serve an arm the job that
-            # grades it had refused.
-            preconditions=graded_preconditions(store, args.slot, as_of),
+            cycle=graded_cycle,
             pointer_etag=inputs.pointer_etag,
             store=None if args.dry_run else store,
             manifest_key=promote_manifest,

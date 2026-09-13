@@ -54,12 +54,32 @@ class _StubSlotModule:
     the real `run_job`, writing a real manifest) without touching Arctic or
     the arena engine — neither of which this contract needs."""
 
+    def __init__(self, slot: str) -> None:
+        self._slot = slot
+
     def produce(self, ctx: Any, *, settings: Any, arm_name: str | None) -> None:
         ctx.record_rows(rows_in=0, rows_out=0)
 
     def grade(self, ctx: Any, *, settings: Any) -> dict[str, Any]:
+        """Claims the `arena_cycle` `_seed_slot_for_promote` already wrote.
+
+        `alpha-engine-config-I10679`: `crucible.promote.read_graded_cycle`
+        refuses unless `experiment.grade`'s OWN manifest claims the cycle
+        key among its outputs — a document sitting at the expected key is
+        not proof this run wrote it. The real slot modules write the cycle
+        via `crucible/slots/cycle.py::run_grade`'s own `ctx.record_output`;
+        this stub avoids the real business logic (Arctic, the arena engine)
+        this contract does not need, but still has to make the SAME claim,
+        or the manifest it writes fails that check the moment `promote`
+        reads it — which is exactly what this contract's `promote` handler
+        does.
+        """
+        from crucible.keys import arena_cycle_key
+
         ctx.record_rows(rows_in=0, rows_out=0)
-        return {}
+        key = arena_cycle_key(self._slot, ctx.trading_day.isoformat())
+        ctx.record_output(key, ctx.store.get_bytes(key), schema_version="arena_cycle.v1")
+        return {"arena_cycle_key": key}
 
 
 def _experiment_args(job: str, slot: str, store_uri: str) -> argparse.Namespace:
@@ -84,11 +104,15 @@ def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
 
     `promote` joined `ARC_SLOT_JOBS` at `alpha-engine-config-I9759`, and it
     is not a stub-able job the way `experiment.run`/`experiment.grade` are
-    here: it reads the arm register, every arm's series and — since I9759 —
-    the graded `arena_cycle` whose `decision.ineligible` carries the
-    eligibility `experiment.grade` evaluated. Seeded through the library's
-    own `ArmRegister` and `run_cycle` plus `crucible.arena_io`, so the
-    manifest this test then asserts on is written by the REAL handler.
+    here: it reads the arm register, every arm's series and — since
+    `alpha-engine-config-I10679` — the WHOLE cycle `experiment.grade`
+    computed, via `crucible.promote.read_graded_cycle`, which additionally
+    refuses unless grade's own run manifest claims that cycle among its
+    outputs. Seeded through the library's own `ArmRegister` and `run_cycle`
+    plus `crucible.arena_io` and `tests.support.manifests.write_grade_manifest`,
+    so the manifest this test then asserts on is written by the REAL
+    `promote` handler, reading a cycle a real (if stubbed) grade run would
+    have produced.
     """
     import json
 
@@ -98,6 +122,7 @@ def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
     from crucible.arena_io import write_arena_cycle
     from crucible.promote import arm_register_key, arm_series_key
     from crucible.slots import get_slot
+    from tests.support.manifests import write_grade_manifest
     from tests.support.panels import trading_days
 
     spec = get_slot(slot)
@@ -122,7 +147,9 @@ def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
         arm_register_key(slot),
         b"".join(json.dumps(e).encode() + b"\n" for e in register.to_dicts()),
     )
-    # The graded cycle `experiment.grade` would have written an hour earlier.
+    # The graded cycle `experiment.grade` would have written an hour earlier,
+    # plus its own claiming manifest — both required by
+    # `crucible.promote.read_graded_cycle` (`alpha-engine-config-I10679`).
     write_arena_cycle(
         store,
         run_cycle(
@@ -133,6 +160,7 @@ def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
             incumbent=baseline,
         ),
     )
+    write_grade_manifest(store, slot, FRIDAY.isoformat())
 
 
 def _seed_non_slot_stages(store: LocalStore, registry: dict[str, Any]) -> None:
@@ -164,7 +192,7 @@ class TestGateReadsWhatTheRealWriterWrote:
             "slot-scoped job needs a writer added here too, or this test "
             "would silently stop covering the class it exists for"
         )
-        monkeypatch.setattr(track_a, "_slot_module", lambda slot: _StubSlotModule())
+        monkeypatch.setattr(track_a, "_slot_module", lambda slot: _StubSlotModule(slot))
         store_uri = str(tmp_path)
         store = LocalStore(tmp_path)
         registry = load_registry()
@@ -220,7 +248,7 @@ class TestGateReadsWhatTheRealWriterWrote:
         the REAL discriminated writer must fail this test — proving the
         discriminator argument in the gate's read is load-bearing, not
         decorative."""
-        monkeypatch.setattr(track_a, "_slot_module", lambda slot: _StubSlotModule())
+        monkeypatch.setattr(track_a, "_slot_module", lambda slot: _StubSlotModule(slot))
         store_uri = str(tmp_path)
         store = LocalStore(tmp_path)
         registry = load_registry()
