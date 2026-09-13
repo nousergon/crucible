@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from crucible.calendar import is_trading_day
 from crucible.config import Settings
 from crucible.documents import load_store_document
 from crucible.keys import (
@@ -41,6 +42,7 @@ from crucible.portfolio import CostModel, manifest_records_portfolio_engine
 from crucible.runner import run_job
 from crucible.slots import dispatchable_slots
 from crucible.slots import strategy as strategy_module
+from crucible.slots.arms import read_register
 from crucible.slots.cycle import MissingArtifactError, run_grade
 from crucible.slots.inputs import SlotUnservableError
 from crucible.slots.strategy import (
@@ -54,12 +56,22 @@ from crucible.slots.strategy import (
     _attestation_precondition,
     grade,
     load_strategy_slot,
+    parse_strategy_document,
     produce,
     registration_specs,
     resolve_session,
 )
 from crucible.store import LocalStore
 from tests.conftest import sessions_ending, synthetic_frames
+
+
+def _next_session(day: dt.date) -> dt.date:
+    """The first NYSE session strictly after ``day``."""
+    day = day + dt.timedelta(days=1)
+    while not is_trading_day(day):
+        day += dt.timedelta(days=1)
+    return day
+
 
 AS_OF = dt.date(2026, 8, 28)
 M_CHAMPION = "m:fixture_model:aaaaaaaaaaaa"
@@ -339,7 +351,13 @@ class TestTheEvidenceReachesARealManifest:
 
 
 class TestRefusalsAreRecordedFirstAndPerArm:
-    def test_an_arm_without_an_oos_clock_is_refused_by_name(self, world) -> None:
+    def test_an_arm_with_no_oos_clock_registers_stamped_from_its_first_run(self, world) -> None:
+        """`alpha-engine-config-I10634` (Brian ruling 2026-09-13, option (b)):
+        the clock starts at the first cycle that produced scorable evidence,
+        never at a filing date. A recipe declaring no `registered_at` is NOT
+        refused — it registers, and the register row it gets is stamped from
+        THIS run's own trading day, not left unset or defaulted elsewhere.
+        """
         store, settings, root, days = world
         (root / "arms" / SLOT / "no_clock.yaml").write_text(
             _recipe_yaml("no_clock", registered_at=None), encoding="utf-8"
@@ -353,10 +371,130 @@ class TestRefusalsAreRecordedFirstAndPerArm:
             run_mode="replay",
         )
         rows = [m for m in ctx.metrics if m["name"] == "arm_refused_at_registration"]
+        assert rows == [], "a recipe declaring no `registered_at` registers, it is not refused"
+        # Both arms produced — the sibling AND the one with no declared clock.
+        assert any(m["name"] == "arms_produced" and m["value"] == 2.0 for m in ctx.metrics)
+
+        recipe = parse_strategy_document(
+            (root / "arms" / SLOT / "no_clock.yaml").read_bytes(), origin="no_clock.yaml"
+        )
+        record = read_register(store, SLOT).state(recipe.arm_id).record
+        assert record.created_date == days[-1].isoformat()
+
+    def test_an_already_registered_undeclared_arm_keeps_its_first_stamp(self, world) -> None:
+        """A SECOND cycle over an arm that still declares no `registered_at`
+        does not re-stamp it: the register row already carries a first date,
+        and that is what resolves — never `today` again."""
+        store, settings, root, days = world
+        (root / "arms" / SLOT / "no_clock.yaml").write_text(
+            _recipe_yaml("no_clock", registered_at=None), encoding="utf-8"
+        )
+        run_job(
+            "experiment.run",
+            lambda c: produce(c, settings=settings),
+            store=store,
+            trading_day=days[0],
+            discriminator=SLOT,
+            run_mode="replay",
+        )
+        run_job(
+            "experiment.run",
+            lambda c: produce(c, settings=settings),
+            store=store,
+            trading_day=days[-1],
+            discriminator=SLOT,
+            run_mode="replay",
+        )
+        recipe = parse_strategy_document(
+            (root / "arms" / SLOT / "no_clock.yaml").read_bytes(), origin="no_clock.yaml"
+        )
+        record = read_register(store, SLOT).state(recipe.arm_id).record
+        assert record.created_date == days[0].isoformat()
+
+    def test_no_registered_at_and_no_cycle_context_still_refuses(self, world) -> None:
+        """`load_strategy_slot` called directly, with no register and no
+        `today` — the shape `crucible.track_a`'s manual `experiment.new`
+        path uses. Pre-`alpha-engine-config-I10634` behaviour: nothing to
+        stamp the clock with, so the recipe still refuses."""
+        store, settings, root, days = world
+        (root / "arms" / SLOT / "no_clock.yaml").write_text(
+            _recipe_yaml("no_clock", registered_at=None), encoding="utf-8"
+        )
+        loaded = load_strategy_slot(strategy_dir=root)
+        refused = {r.arm: r for r in loaded.refused}
+        assert "no_clock" in refused
+        assert "registered_at" in refused["no_clock"].reason
+        assert [a.name for a in loaded.registered] == ["stock_registry"]
+
+    def test_a_future_registered_at_is_refused_by_name(self, world) -> None:
+        """One of the two refusal cases a DECLARED `registered_at` still has:
+        a clock cannot start in the future. Per arm, never slot-wide."""
+        store, settings, root, days = world
+        future = _next_session(days[-1])
+        (root / "arms" / SLOT / "premature.yaml").write_text(
+            _recipe_yaml("premature", registered_at=future.isoformat()), encoding="utf-8"
+        )
+        ctx = run_job(
+            "experiment.run",
+            lambda c: produce(c, settings=settings),
+            store=store,
+            trading_day=days[-1],
+            discriminator=SLOT,
+            run_mode="replay",
+        )
+        rows = [m for m in ctx.metrics if m["name"] == "arm_refused_at_registration"]
         assert [r["status"] for r in rows] == ["unservable"]
-        assert "registered_at" in rows[0]["status_reason"]
+        assert "AFTER" in rows[0]["status_reason"]
+        assert "premature" in rows[0]["source_path"]
         # Per arm, never slot-wide: the sibling still produced.
         assert any(m["name"] == "arms_produced" and m["value"] == 1.0 for m in ctx.metrics)
+
+    def test_a_registered_at_moved_after_the_first_register_row_is_refused(self, world) -> None:
+        """The second refusal case: a clock that can be moved is not a clock.
+
+        First cycle registers the arm with no declared `registered_at`,
+        stamped from that run's trading day. Declaring a LATER date on a
+        later cycle is refused rather than silently re-dating an arm already
+        serving."""
+        store, settings, root, days = world
+        (root / "arms" / SLOT / "mover.yaml").write_text(
+            _recipe_yaml("mover", registered_at=None), encoding="utf-8"
+        )
+        run_job(
+            "experiment.run",
+            lambda c: produce(c, settings=settings),
+            store=store,
+            trading_day=days[0],
+            discriminator=SLOT,
+            run_mode="replay",
+        )
+        recipe = parse_strategy_document(
+            (root / "arms" / SLOT / "mover.yaml").read_bytes(), origin="mover.yaml"
+        )
+        first_recorded = read_register(store, SLOT).state(recipe.arm_id).record.created_date
+        assert first_recorded == days[0].isoformat()
+
+        (root / "arms" / SLOT / "mover.yaml").write_text(
+            _recipe_yaml("mover", registered_at=days[-1].isoformat()), encoding="utf-8"
+        )
+        ctx = run_job(
+            "experiment.run",
+            lambda c: produce(c, settings=settings),
+            store=store,
+            trading_day=days[-1],
+            discriminator=SLOT,
+            run_mode="replay",
+        )
+        rows = [
+            m
+            for m in ctx.metrics
+            if m["name"] == "arm_refused_at_registration" and "mover" in m["source_path"]
+        ]
+        assert rows and rows[0]["status"] == "unservable"
+        assert "AFTER" in rows[0]["status_reason"]
+        # The register row is untouched: still the date the arm first registered.
+        unchanged = read_register(store, SLOT).state(recipe.arm_id).record.created_date
+        assert unchanged == days[0].isoformat()
 
     def test_a_participation_model_is_refused_and_never_substituted(self, world) -> None:
         store, settings, root, days = world
@@ -411,8 +549,9 @@ class TestRefusalsAreRecordedFirstAndPerArm:
         from crucible.alerts import evaluate_failure
 
         store, settings, root, days = world
+        future = _next_session(days[-1])
         (root / "arms" / SLOT / "stock_registry.yaml").write_text(
-            _recipe_yaml("stock_registry", registered_at=None), encoding="utf-8"
+            _recipe_yaml("stock_registry", registered_at=future.isoformat()), encoding="utf-8"
         )
         with pytest.raises(SlotUnservableError):
             run_job(

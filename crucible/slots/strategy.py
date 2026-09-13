@@ -49,7 +49,7 @@ from typing import Any
 
 import numpy as np
 import yaml
-from nousergon_lib.arena import ArmSeries, derive_arm_id
+from nousergon_lib.arena import ArmRegister, ArmSeries, derive_arm_id
 from nousergon_lib.arena.engine import ServingPrecondition
 
 from crucible.keys import arm_predictions_key
@@ -234,12 +234,17 @@ class StrategyRecipe:
     supersedes: str | None = None
     slot: str = "s"
     #: The start of the arm's out-of-sample clock, and a SESSION when set
-    #: (§4.12). Optional on the dataclass and REQUIRED to register — see
-    #: :func:`_registerable`, which refuses an arm that declares none rather
-    #: than clocking it from a date this harness chose. Deliberately NOT part
-    #: of :attr:`spec`, exactly as `crucible.slots.arms.ArmSpec` keeps it out
-    #: of its own hash: when an arm was registered is provenance, not what it
-    #: computes, and hashing it would give one recipe two ids.
+    #: (§4.12). Optional on the dataclass and optional to register
+    #: (`alpha-engine-config-I10634`, Brian ruling 2026-09-13, option (b)):
+    #: an arm declaring none is not refused, it registers with its clock
+    #: stamped from the first `experiment.run[s]` that registers it — see
+    #: :func:`_resolve_registered_at`. A DECLARED value is still refused if
+    #: it names the future or a date after the arm's already-recorded first
+    #: register row, because a clock that can be moved is not a clock.
+    #: Deliberately NOT part of :attr:`spec`, exactly as
+    #: `crucible.slots.arms.ArmSpec` keeps it out of its own hash: when an
+    #: arm was registered is provenance, not what it computes, and hashing
+    #: it would give one recipe two ids.
     registered_at: str | None = None
 
     def __post_init__(self) -> None:
@@ -311,9 +316,10 @@ S_SPEC_KEYS: frozenset[str] = frozenset({*REQUIRED_STRATEGY_FIELDS, "walk_forwar
 #: OOS-clocked the way U/R/M arms are", because nothing read the field —
 #: making the slot dispatchable is exactly what stops that being true, since
 #: every ladder rung the arena decides is counted in trading weeks from it.
-#: Optional in the VOCABULARY and required to REGISTER, so a recipe filed
-#: before it existed still loads and is visibly refused rather than
-#: disappearing behind a parse error (see :func:`_registerable`).
+#: Optional in the VOCABULARY and optional to REGISTER since
+#: `alpha-engine-config-I10634`: a recipe declaring none registers with its
+#: clock stamped from its first registering cycle rather than being refused
+#: (see :func:`_resolve_registered_at`).
 S_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
     {"slot", "name", "notes", "supersedes", "spec", "registered_at"}
 )
@@ -1233,6 +1239,15 @@ class RegisteredStrategyArm:
     control: bool = False
     control_kind: str | None = None
     bootstrap: bool = False
+    #: The arm's RESOLVED out-of-sample clock start, when it is not simply
+    #: `recipe.registered_at` (`alpha-engine-config-I10634`): set by
+    #: :func:`load_strategy_slot`/:func:`_resolve_registered_at` when the
+    #: recipe declares no `registered_at` and the field is stamped instead
+    #: from the register's own row or from the current cycle's trading day.
+    #: None here means "read `recipe.registered_at` instead" — which is what
+    #: every caller that builds this class straight from a recipe already
+    #: declaring the field gets, unchanged.
+    registered_at_override: str | None = None
 
     @property
     def name(self) -> str:
@@ -1252,8 +1267,11 @@ class RegisteredStrategyArm:
 
     @property
     def registered_at(self) -> str:
-        # Never None here: an arm that declares no `registered_at` is refused
-        # at load (:func:`_registerable`) and never reaches this class.
+        if self.registered_at_override is not None:
+            return self.registered_at_override
+        # Never None here in that case: an arm resolved with no override and
+        # no declared `registered_at` never reaches this class — it is
+        # refused at load (:func:`_resolve_registered_at`).
         assert self.recipe.registered_at is not None
         return self.recipe.registered_at
 
@@ -1270,40 +1288,97 @@ class RegisteredStrategyArm:
         return {}
 
 
-def _registerable(recipe: StrategyRecipe, *, origin: str) -> InputRefusal | None:
-    """Why ``recipe`` cannot register, or None.
+def _resolve_registered_at(
+    recipe: StrategyRecipe,
+    *,
+    origin: str,
+    register: ArmRegister | None,
+    today: str | None,
+) -> tuple[str | None, InputRefusal | None]:
+    """The arm's resolved out-of-sample clock start, or why it refuses.
 
-    ONE condition today, and it is not a style preference. Every ladder rung
-    the arena decides on — `promote_min_weeks`, `grace_weeks`, the retirement
-    cap's grace window — is counted in trading weeks from the arm's
-    `created_date`, and `nousergon_lib.arena` has no reading of an arm with no
-    such date. `crucible.slots.arms.ArmSpec` therefore requires `registered_at`
-    of every U/R arm and asserts it is a SESSION (§4.12).
+    **Ruled 2026-09-13** (`alpha-engine-config-I10634`, Brian, option (b)):
+    the clock starts at the first cycle that produced scorable evidence, not
+    at a filing date nobody can verify from a recipe file alone. So a recipe
+    declaring no `registered_at` REGISTERS rather than refuses — the field
+    is stamped by the S cycle job (`experiment.run[s]`, via
+    :func:`load_strategy_slot`) from the arm's own register row if it
+    already has one, or from ``today`` (this cycle's own trading day) on its
+    first registering cycle. Every ladder rung the arena decides on —
+    `promote_min_weeks`, `grace_weeks`, the retirement grace window — is
+    counted in trading weeks from whatever this function returns, exactly as
+    it always was for U/R arms via `crucible.slots.arms.ArmSpec`.
 
-    S recipes were exempt, and the exemption was TRUE while it stood: this
-    module's own docstring recorded that "an S arm is not OOS-clocked the way
-    U/R/M arms are (no such key is read anywhere in this module)", and while
-    the slot had no `produce`/`grade` nothing read it. Making S dispatchable
-    is exactly what stops that being true. So the field becomes required, and
-    an arm without it is refused PER ARM with the field named — not given a
-    fabricated clock, which would start the arm's whole eligibility window on
-    a date nobody chose and compound silently for the arm's entire life.
+    A recipe that DOES declare `registered_at` is still refused in two
+    cases, because a clock that can be moved is not a clock:
+
+    * the date is AFTER ``today`` — an out-of-sample clock cannot start in
+      the future;
+    * the arm already has a register row and the declared date is AFTER
+      that row's `created_date` — moving the clock forward once an arm is
+      already serving would silently shorten every ladder rung already
+      elapsed against the original date.
+
+    Declaring a date that is on-or-before the arm's own first register row
+    (or, for an arm not yet registered, any valid trading day at or before
+    ``today``) is accepted and used verbatim — unchanged from how S recipes
+    that declare the field always worked, and how U/R recipes work today.
+
+    ``register`` and ``today`` are ``None`` for a caller with no cycle
+    context — `crucible.track_a`'s manual `experiment.new` path, and any
+    fixture that calls :func:`load_strategy_slot` directly. Such a caller
+    keeps the PRE-`alpha-engine-config-I10634` behaviour: a recipe declaring
+    no `registered_at` still refuses, because without a cycle's trading day
+    there is no date to stamp it with and no register to consult for one.
     """
-    if not recipe.registered_at:
-        return InputRefusal(
-            arm=recipe.name,
-            unresolvable=("registered_at",),
-            reason=(
-                f"arm {recipe.name!r} ({origin}) declares no `registered_at`, so it has "
-                "no out-of-sample clock. Every rung the arena decides on — the paired "
-                "weeks before a challenger may serve, the retirement grace window — is "
-                "counted in trading weeks from that date, and there is no reading of an "
-                "arm that has none. Refused at registration rather than clocked from a "
-                "date this harness chose: add `registered_at: <a NYSE session>` to the "
-                "recipe. The slot's other arms register."
-            ),
-        )
-    return None
+    existing: str | None = None
+    if register is not None and recipe.arm_id in register:
+        existing = register.state(recipe.arm_id).record.created_date
+
+    if recipe.registered_at is not None:
+        if today is not None and recipe.registered_at > today:
+            return None, InputRefusal(
+                arm=recipe.name,
+                unresolvable=("registered_at",),
+                reason=(
+                    f"arm {recipe.name!r} ({origin}) declares `registered_at: "
+                    f"{recipe.registered_at}`, which is AFTER {today}, this cycle's "
+                    "trading day. An out-of-sample clock cannot start in the future: "
+                    "declare a date on or before the day this arm actually registers, or "
+                    "omit the field and let the S cycle job stamp it from the first run "
+                    "that registers the arm."
+                ),
+            )
+        if existing is not None and recipe.registered_at > existing:
+            return None, InputRefusal(
+                arm=recipe.name,
+                unresolvable=("registered_at",),
+                reason=(
+                    f"arm {recipe.name!r} ({origin}) declares `registered_at: "
+                    f"{recipe.registered_at}`, which is AFTER {existing}, the date this "
+                    "arm's register row already carries. Every ladder rung is counted in "
+                    "trading weeks from the FIRST register row, and a clock that can be "
+                    "moved forward after the fact is not a clock: the recipe refuses "
+                    "rather than re-dating an arm already serving."
+                ),
+            )
+        return recipe.registered_at, None
+
+    if existing is not None:
+        return existing, None
+    if today is not None:
+        return today, None
+    return None, InputRefusal(
+        arm=recipe.name,
+        unresolvable=("registered_at",),
+        reason=(
+            f"arm {recipe.name!r} ({origin}) declares no `registered_at`, so it has no "
+            "out-of-sample clock and no cycle trading day was supplied to stamp one "
+            "from. The S cycle job (`experiment.run --slot s`) stamps this field from "
+            "the first run that registers the arm; loaded outside a cycle, the arm has "
+            "nothing to be stamped with and refuses."
+        ),
+    )
 
 
 def _participation_refusal(recipe: StrategyRecipe) -> InputRefusal | None:
@@ -1390,7 +1465,18 @@ def registration_specs(loaded: SlotStrategies) -> list[RegisteredStrategyArm]:
                     "and has no register row to link to. Not a series link and not an "
                     "inheritance of any record."
                 )
-        specs.append(RegisteredStrategyArm(arm.recipe, supersedes=link, notes=notes))
+        specs.append(
+            RegisteredStrategyArm(
+                arm.recipe,
+                supersedes=link,
+                notes=notes,
+                # Forwarded, not re-resolved: `arm.registered_at` already
+                # carries whatever :func:`load_strategy_slot` resolved (a
+                # declared date, a register-row date, or today's stamp), and
+                # this rebuild must not lose it (`alpha-engine-config-I10634`).
+                registered_at_override=arm.registered_at,
+            )
+        )
     return specs
 
 
@@ -1398,6 +1484,8 @@ def load_strategy_slot(
     *,
     store: Any = None,
     strategy_dir: Path | str | None = None,
+    register: ArmRegister | None = None,
+    today: str | None = None,
 ) -> SlotStrategies:
     """Every filed S recipe, split into the arms that register and those that do not.
 
@@ -1412,6 +1500,12 @@ def load_strategy_slot(
     consumers validating recipe CONTENT call; this is the slot-aware entry
     point production code calls, so a job never has to know in advance
     whether it is running on a laptop or on a spot box.
+
+    ``register`` (the slot's persisted `ArmRegister`, for resolving an
+    already-registered arm's first row) and ``today`` (this cycle's trading
+    day, for stamping a NEW arm's clock and refusing a future-dated one) are
+    optional — see :func:`_resolve_registered_at` for what a caller that
+    omits them gets.
     """
     from crucible.keys import strategy_arms_prefix  # noqa: PLC0415 - avoids a cycle
 
@@ -1433,11 +1527,15 @@ def load_strategy_slot(
     refused: list[InputRefusal] = []
     for origin, payload in sources:
         recipe = parse_strategy_document(payload, origin=origin)
-        refusal = _registerable(recipe, origin=origin) or _participation_refusal(recipe)
+        resolved_at, refusal = _resolve_registered_at(
+            recipe, origin=origin, register=register, today=today
+        )
+        if refusal is None:
+            refusal = _participation_refusal(recipe)
         if refusal is not None:
             refused.append(refusal)
             continue
-        registered.append(RegisteredStrategyArm(recipe))
+        registered.append(RegisteredStrategyArm(recipe, registered_at_override=resolved_at))
     if sources and not registered:
         # Every arm refused: the slot can serve nothing, and that PAGES
         # through the ordinary failed-manifest path (plan §7 `unservable`).
@@ -1615,12 +1713,24 @@ def _load_slot(ctx: Any, *, settings: Any) -> SlotStrategies:
       loader. Without this the whole-slot case would page with a `reason` and
       no per-arm rows — the least informative manifest of the three possible
       outcomes, on the worst of them.
+
+    Reads the slot's register and this cycle's trading day so
+    :func:`load_strategy_slot` can resolve `registered_at` for a recipe that
+    declares none (`alpha-engine-config-I10634`) — the register is always
+    read from ``ctx.store`` regardless of ``strategy_dir``, since the arm
+    register is a store artifact, not part of the strategy checkout.
     """
+    from crucible.slots.arms import read_register  # noqa: PLC0415 - avoids a cycle
+
     strategy_dir = getattr(settings, "strategy_dir", None)
+    register = read_register(ctx.store, SLOT)
+    today = ctx.trading_day.isoformat()
     try:
         loaded = load_strategy_slot(
             store=None if strategy_dir is not None else ctx.store,
             strategy_dir=strategy_dir,
+            register=register,
+            today=today,
         )
     except SlotUnservableError as exc:
         for metric in SlotStrategies(registered=(), refused=exc.refusals).refusal_metrics(
