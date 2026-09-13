@@ -31,10 +31,12 @@ from crucible.gate import (
     _ArcRegistryHistory,
     _clause_arc_runs_ok,
     _clause_replays_ok,
+    _slots_declared_by,
     weekly_window,
 )
 from crucible.manifest import manifest_key
 from crucible.release import ReleaseRecord, release_json_key, wheel_key_for
+from crucible.slots import SLOTS, dispatchable_slots
 from crucible.store import LocalStore
 
 FRIDAY = dt.date(2026, 8, 28)
@@ -89,17 +91,28 @@ def _components_yaml(*names: str) -> bytes:
     return f"version: 1\ndefaults: {{}}\ncomponents:\n{rows}".encode()
 
 
-def _publish_release(store: LocalStore, sha: str, *names: str) -> None:
-    """A release whose published wheel declares ``names`` as its arc.
+def _publish_release(store: LocalStore, sha: str, *names: str, slots: tuple[str, ...] = ()) -> None:
+    """A release whose published wheel declares ``names`` as its arc and
+    ``slots`` as the slots it could dispatch.
 
     Built through `ReleaseRecord` and `wheel_key_for`, not by hand: the
     grader resolves the wheel through `crucible.release`'s own resolver, so
     a fixture that invented the key shape would stop testing the resolution.
+
+    A slot is shipped as its real module path carrying both entry points —
+    the same artifact `crucible.slots.dispatchable_slots` would import, which
+    is what makes the release-derived reading a reading of that release
+    rather than of the tree the test happens to run in.
     """
     wheel_filename = f"crucible-0.1.0+g{sha[:12]}-py3-none-any.whl"
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("crucible/components.yaml", _components_yaml(*names))
+        for slot in slots:
+            archive.writestr(
+                f"crucible/slots/{SLOTS[slot].module}.py",
+                "def produce():\n    ...\n\n\ndef grade():\n    ...\n",
+            )
     payload = buffer.getvalue()
     store.put_bytes(wheel_key_for(sha, wheel_filename), payload)
     record = ReleaseRecord(
@@ -337,3 +350,182 @@ def test_the_arc_manifests_own_status_does_not_gate_the_lookup(
     )
     clause = _clause_arc_runs_ok(store, [FRIDAY], _registry())
     assert clause.met, clause.detail
+
+
+# ---------------------------------------------------------------------------
+# The SLOT axis — `alpha-engine-config-I10628`, the other half of `-I10478`.
+#
+# `crucible.weekly.arc_stages` expands a slot-scoped job into one stage per
+# DISPATCHABLE slot, and `dispatchable_slots()` is read from the grader's own
+# process. So promoting the M slot at phase 3 would retroactively add
+# `experiment.run[m]@<every past day>` to the requirement set of days whose
+# release could not have dispatched it — the same class, a second axis, and no
+# live instance yet only because `dispatchable_slots()` has not moved since the
+# replay Saturdays ran.
+#
+# The fixture inverts the live situation deliberately: the grading process
+# dispatches two slots, and the release under test shipped one.
+# ---------------------------------------------------------------------------
+
+SLOT_JOB = "experiment.run"
+
+
+def _slot_registry() -> dict[str, Component]:
+    """TODAY's registry, with a SLOT-SCOPED arc row. `experiment.run` is in
+    `crucible.weekly.ARC_SLOT_JOBS`, so `arc_stages` expands it per slot."""
+    return {SLOT_JOB: _component(SLOT_JOB, "12:00")}
+
+
+def _seed_slot_arc(store: LocalStore, day: dt.date, sha: str, *slots: str) -> None:
+    store.put_bytes(manifest_key("weekly", day.isoformat()), _manifest("weekly", day, sha))
+    for slot in slots:
+        store.put_bytes(
+            manifest_key(SLOT_JOB, day.isoformat(), discriminator=slot),
+            _manifest(SLOT_JOB, day, sha),
+        )
+
+
+@pytest.fixture
+def two_live_slots() -> tuple[str, str]:
+    """Two slots this process can dispatch, so the test asks a question about
+    the grading tree it is actually running in rather than a hypothetical one.
+
+    Read live, never listed: the dispatchable set GROWS (m at phase 3, s after
+    it) and these assertions must not need editing when it does. It never
+    shrinks below two — `dispatchable_slots` itself raises on an empty set, and
+    u and r have both been dispatchable since phase 1 — so a tree with fewer is
+    a broken tree and is asserted rather than stepped around.
+    """
+    live = list(dispatchable_slots())
+    assert len(live) >= 2, (
+        f"fewer than two dispatchable slots in this tree: {live}. The slot axis cannot "
+        "be graded at all without a promoted slot to grade it against"
+    )
+    return live[0], live[1]
+
+
+class TestASlotTheDaysReleaseCouldNotDispatchIsNotRequired:
+    def test_a_past_day_is_graded_on_its_own_releases_slots(
+        self, tmp_path: object, two_live_slots: tuple[str, str]
+    ) -> None:
+        """The test that would have caught it: a past day on a release with
+        one dispatchable slot, graded by a process with two, reads MET."""
+        shipped, promoted = two_live_slots
+        store = LocalStore(tmp_path)  # type: ignore[arg-type]
+        _publish_release(store, OLD_RELEASE, SLOT_JOB, slots=(shipped,))
+        _seed_slot_arc(store, FRIDAY, OLD_RELEASE, shipped)
+        clause = _clause_arc_runs_ok(store, [FRIDAY], _slot_registry())
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert f"{SLOT_JOB}[{promoted}]@{FRIDAY.isoformat()}" in clause.detail
+        assert "could not dispatch that slot" in clause.detail
+
+    def test_a_slot_the_days_release_COULD_dispatch_is_still_required(
+        self, tmp_path: object, two_live_slots: tuple[str, str]
+    ) -> None:
+        """The constraint the issue states: do NOT weaken the grading of any
+        day whose release DID carry the slot."""
+        shipped, promoted = two_live_slots
+        store = LocalStore(tmp_path)  # type: ignore[arg-type]
+        _publish_release(store, NEW_RELEASE, SLOT_JOB, slots=(shipped, promoted))
+        _seed_slot_arc(store, FRIDAY, NEW_RELEASE, shipped)
+        clause = _clause_arc_runs_ok(store, [FRIDAY], _slot_registry())
+        assert not clause.met
+        assert f"{SLOT_JOB}[{promoted}]@{FRIDAY.isoformat()}" in clause.detail
+        assert "never ran" in clause.detail
+
+
+class TestTheSlotNarrowingRefusesInEveryOtherDirection:
+    def test_a_day_whose_arc_never_ran_is_excused_from_no_slot(
+        self, tmp_path: object, two_live_slots: tuple[str, str]
+    ) -> None:
+        shipped, _ = two_live_slots
+        store = LocalStore(tmp_path)  # type: ignore[arg-type]
+        _publish_release(store, OLD_RELEASE, SLOT_JOB, slots=(shipped,))
+        clause = _clause_arc_runs_ok(store, [FRIDAY], _slot_registry())
+        assert not clause.met
+        assert "never ran" in clause.detail
+        assert "not required" not in clause.detail
+
+    def test_an_unreadable_release_excuses_no_slot_and_says_so(
+        self, tmp_path: object, two_live_slots: tuple[str, str]
+    ) -> None:
+        shipped, promoted = two_live_slots
+        store = LocalStore(tmp_path)  # type: ignore[arg-type]
+        _seed_slot_arc(store, FRIDAY, OLD_RELEASE, shipped)  # no release published
+        clause = _clause_arc_runs_ok(store, [FRIDAY], _slot_registry())
+        assert not clause.met
+        assert f"{SLOT_JOB}[{promoted}]@{FRIDAY.isoformat()}" in clause.detail
+        assert "never published" in clause.detail
+        assert "could not dispatch that slot" not in clause.detail
+
+    def test_a_slot_stage_that_FAILED_is_never_narrowed_away(
+        self, tmp_path: object, two_live_slots: tuple[str, str]
+    ) -> None:
+        """The narrowing touches an ABSENT manifest only — on this axis too."""
+        shipped, promoted = two_live_slots
+        store = LocalStore(tmp_path)  # type: ignore[arg-type]
+        _publish_release(store, OLD_RELEASE, SLOT_JOB, slots=(shipped,))
+        _seed_slot_arc(store, FRIDAY, OLD_RELEASE, shipped)
+        store.put_bytes(
+            manifest_key(SLOT_JOB, FRIDAY.isoformat(), discriminator=promoted),
+            _manifest(SLOT_JOB, FRIDAY, OLD_RELEASE, status="failed"),
+        )
+        clause = _clause_arc_runs_ok(store, [FRIDAY], _slot_registry())
+        assert not clause.met
+        assert "1 failed" in clause.detail
+
+
+class TestWhatAReleaseDeclaresAboutSlotsIsReadFromItsSource:
+    """Parsed, never imported: executing a past release's slot modules inside
+    the grader would be a second copy of the package running, not a reading."""
+
+    @staticmethod
+    def _wheel(**members: str) -> zipfile.ZipFile:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            for path, source in members.items():
+                archive.writestr(path, source)
+        return zipfile.ZipFile(io.BytesIO(buffer.getvalue()))
+
+    def test_both_entry_points_are_required(self) -> None:
+        slot = next(iter(SLOTS))
+        module = SLOTS[slot].module
+        with self._wheel(**{f"crucible/slots/{module}.py": "def produce():\n    ...\n"}) as archive:
+            assert slot not in _slots_declared_by(archive)
+
+    def test_a_module_defining_both_is_dispatchable(self) -> None:
+        slot = next(iter(SLOTS))
+        module = SLOTS[slot].module
+        source = "async def produce():\n    ...\n\n\nasync def grade():\n    ...\n"
+        with self._wheel(**{f"crucible/slots/{module}.py": source}) as archive:
+            assert slot in _slots_declared_by(archive)
+
+    def test_a_release_predating_the_module_declares_nothing(self) -> None:
+        with self._wheel(**{"crucible/__init__.py": ""}) as archive:
+            assert _slots_declared_by(archive) == frozenset()
+
+    def test_a_slot_module_that_will_not_parse_raises_rather_than_narrowing(self) -> None:
+        """A member that is THERE and unreadable is a fact about our reading,
+        and `_ArcRegistryHistory` reports it as unmeasurable. Silently reading
+        it as "not dispatchable" would let a corrupt wheel clear a phase."""
+        slot = next(iter(SLOTS))
+        module = SLOTS[slot].module
+        with self._wheel(**{f"crucible/slots/{module}.py": "def produce(:\n"}) as archive:
+            with pytest.raises(SyntaxError):
+                _slots_declared_by(archive)
+
+
+def test_one_wheel_read_answers_both_axes(tmp_path: object) -> None:
+    """Both axes come out of the same immutable artifact, so they are cached
+    together — reading the wheel twice would double the S3 round trips for one
+    question about one release."""
+    store = LocalStore(tmp_path)  # type: ignore[arg-type]
+    _publish_release(store, OLD_RELEASE, OLD_STAGE, slots=(next(iter(SLOTS)),))
+    _seed_arc(store, FRIDAY, OLD_RELEASE, OLD_STAGE)
+    history = _ArcRegistryHistory(store)
+    jobs, jobs_problem = history.declared_on(FRIDAY)
+    slots, slots_problem = history.slots_on(FRIDAY)
+    assert jobs == frozenset({OLD_STAGE})
+    assert slots == frozenset({next(iter(SLOTS))})
+    assert jobs_problem is None and slots_problem is None
+    assert len(history._by_sha) == 1
