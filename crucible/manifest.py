@@ -29,11 +29,23 @@ AND are mirrored into the published schema's `allOf` by
 `_run_manifest_v2_json_schema_extra` (PR123 review finding 3) — see
 `crucible/models.py`'s module docstring. `run_manifest.v1` stays on the
 original jsonschema-only path below: it is FROZEN and carries no model.
+
+**THE MONEY-PATH HASH CHAIN (`alpha-engine-config-I10414`, plan §9.5).**
+:func:`write_manifest` is the single writer, and it is the only place a
+`money_path_link` is produced. A run that wrote a money-path artifact is
+appended to a hash chain whose every record carries the sha256 of its
+predecessor's *stored bytes*; :func:`crucible.explain.verify_money_path_chain`
+walks it and reports a break as `status: failed`. The predicates that decide
+what "money path" means live here, in :data:`MONEY_PATH_PREDICATES`, built
+out of `crucible.keys` functions rather than restated literals — the key
+shapes stay `crucible.keys`' to own, and which of them carry money is this
+module's.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -42,8 +54,18 @@ from jsonschema import Draft202012Validator
 from pydantic import ValidationError as PydanticValidationError
 
 from crucible.documents import load_store_document
-from crucible.keys import manifest_key, manifest_prefix  # noqa: F401 - re-exported
+from crucible.keys import (  # noqa: F401 - manifest_key/manifest_prefix re-exported
+    RUNS_ROOT,
+    champion_key,
+    holdout_unseal_prefix,
+    is_manifest_key,
+    manifest_key,
+    manifest_prefix,
+    predictions_key,
+    strategy_holdout_key,
+)
 from crucible.models import RunManifestV2
+from crucible.store import Store, sha256_hex
 
 #: The version every producer writes TODAY. Bumped to v2 by
 #: alpha-engine-config-I9918: v1 declared no live/replay field and set
@@ -224,3 +246,225 @@ def read_manifest(
     )
     validate(document)
     return document
+
+
+# ── The money-path hash chain (alpha-engine-config-I10414, plan §9.5) ───────
+
+#: What "on the money path" means, as predicates over a store key rather than
+#: as a list of prefix literals.
+#:
+#: Built out of `crucible.keys` functions on purpose. The key SHAPES are
+#: `crucible.keys`' to own (`tests/test_no_inline_store_keys.py`,
+#: `tests/test_key_construction_placement.py`); which of those shapes carry
+#: money is a judgement about the system, and it belongs next to the writer
+#: that acts on it. Restating `"champions/"` here would be the second
+#: declaration that drifts the first time a prefix moves — which it has: the
+#: arm-prediction prefix moved out of `predictions/` on 2026-09-11
+#: (`alpha-engine-config-I9822`), and a literal here would have silently
+#: started chaining every arm's predictions along with the serving feed.
+#:
+#: **The set as it stands, and what is deliberately not in it.** Plan §9.5
+#: names orders, fills, reconciliation results and the NAV series. None of
+#: those has a key in `crucible.keys` yet — the trader is a separate system
+#: and phase 4 is where it lands — so chaining them is not something this
+#: change can do, and pretending otherwise by inventing their keys here would
+#: put a shape in the chain that no producer writes. What exists today and
+#: decides where money goes is the champion contract the trader reads
+#: (`champions/{slot}/current.json` plus `predictions/{trading_day}.json`,
+#: this repo's `AGENTS.md`) and the sealed holdout that bounds what may be
+#: graded into it. Those are chained here; each order/fill/NAV key joins by
+#: adding one predicate below, and `tests/test_money_path_chain.py` pins the
+#: membership so an addition is a deliberate edit rather than a silent widen.
+#:
+#: This is NOT a suppression collection (`AGENTS.md` rule 4): it is a
+#: positive membership rule that only ever ADMITS keys to a check. A key
+#: absent from it is not exempted from anything — it is outside the domain
+#: this chain makes a claim about, and `crucible explain` never reports a
+#: chain verdict over a walk that does not cross one of these keys.
+MONEY_PATH_PREDICATES: tuple[Callable[[str], bool], ...] = (
+    # The four champion pointers — the trader's whole read surface.
+    lambda key: key in {champion_key(slot) for slot in ("u", "r", "m", "s")},
+    # The champion's serving feed for one trading day. Matched by rebuilding
+    # the key from the day the candidate claims, so `arm_predictions/` (a
+    # different artifact answering a different question, I9822) can never
+    # match by sharing a prefix.
+    lambda key: (
+        key == predictions_key(key.rsplit("/", 1)[-1].removesuffix(".json"))
+        if key.endswith(".json")
+        else False
+    ),
+    # The sealed holdout: the standing reservation every grading that reaches
+    # the money path is measured outside of.
+    lambda key: key == strategy_holdout_key(),
+    # Every unseal audit record: WHO ruled, on WHICH session, unsealing WHAT.
+    lambda key: key.startswith(holdout_unseal_prefix()),
+)
+
+
+class MoneyPathChainError(RuntimeError):
+    """The money-path chain could not be extended or could not be verified.
+
+    A `RuntimeError`, not a validation error: a chain that cannot be read is
+    not a malformed document, it is a store that cannot answer the one
+    question the chain exists to answer.
+    """
+
+
+def on_money_path(key: str) -> bool:
+    """Whether ``key`` is a money-path artifact (:data:`MONEY_PATH_PREDICATES`)."""
+    return any(predicate(key) for predicate in MONEY_PATH_PREDICATES)
+
+
+def money_path_writes(manifest: dict[str, Any]) -> tuple[str, ...]:
+    """The money-path keys ``manifest`` claims as OUTPUTS, sorted.
+
+    Outputs only. A run that READ the champion pointer has not changed where
+    money goes and does not belong in the chain; a chain that grew a record
+    per reader would make its own length meaningless.
+
+    Tolerant of a malformed document ON PURPOSE: this is the membership test
+    :func:`money_path_manifests` applies BEFORE validating, so it runs over
+    documents nothing has checked yet. An entry that is not an object with a
+    string `key` cannot be a money-path output, and answering "no" for it is
+    not a swallow — the document is still validated the moment it is admitted,
+    and a malformed manifest that DOES claim a money-path key is refused
+    there, loudly, with the key named.
+    """
+    outputs = manifest.get("outputs")
+    if not isinstance(outputs, list):
+        return ()
+    return tuple(
+        sorted(
+            {
+                output["key"]
+                for output in outputs
+                if isinstance(output, dict)
+                and isinstance(output.get("key"), str)
+                and on_money_path(output["key"])
+            }
+        )
+    )
+
+
+def money_path_manifests(store: Store) -> list[tuple[str, dict[str, Any]]]:
+    """Every money-path run manifest in ``store`` as ``(key, manifest)``,
+    oldest first by ``(finished, run_id)``.
+
+    Every ADMITTED document is validated, like everywhere else a manifest is
+    read: a chain assembled out of documents nobody checked is a chain nobody
+    should act on, and a malformed money-path manifest is a predecessor the
+    chain cannot honestly be extended over.
+
+    **Membership is decided before validation, and that ordering is
+    load-bearing.** This function runs on the WRITE path
+    (:func:`money_path_link_for`), so validating every manifest under `runs/`
+    would let one malformed document anywhere in the store veto the write of
+    an unrelated run's manifest — inverting `AGENTS.md` rule 1
+    (manifest-or-it-didn't-happen) for a document the chain makes no claim
+    about. It is the same failure `alpha-engine-config-I9900` recorded from
+    the other side, where one stray file beside a run manifest took the whole
+    board down. So a document is read, asked whether it claims a money-path
+    OUTPUT, and only then held to the schema.
+
+    ``run_id`` breaks a `finished` tie. Two manifests can share a
+    whole-second timestamp, and a tie broken by dict order would give the same
+    store two different chains on two reads — the verifier would then call one
+    of them broken at random.
+    """
+    found: list[tuple[str, dict[str, Any]]] = []
+    for candidate in store.list_keys(RUNS_ROOT):
+        if not is_manifest_key(candidate):
+            continue
+        document = load_store_document(store, candidate)
+        if not money_path_writes(document):
+            continue
+        validate(document)
+        found.append((candidate, document))
+    return sorted(found, key=lambda pair: (pair[1]["finished"], pair[1]["run_id"]))
+
+
+def digest_of_stored(store: Store, key: str) -> str:
+    """The sha256 of what ``store`` actually holds at ``key``.
+
+    **The whole chain rests on this being a content digest and nothing else.**
+    `nous-ergon-ops-I1145`: a backend version token — `Store.etag`, whose own
+    docstring calls itself opaque — was written into a field named `sha256`.
+    It agreed with every local test, because the local backend's token happens
+    to be a content hash, and it was wrong on S3 the moment an object was
+    uploaded multipart. So this function reads the bytes and hashes them, and
+    `tests/test_money_path_chain.py` asserts that no chain code path calls
+    `Store.etag` at all.
+    """
+    return sha256_hex(store.get_bytes(key))
+
+
+def money_path_link_for(store: Store, manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """The `money_path_link` ``manifest`` should carry, or ``None``.
+
+    ``None`` for a run that wrote nothing on the money path — which is the
+    overwhelming majority, and which costs no store round-trip at all: the
+    membership test is :func:`money_path_writes` over the manifest already in
+    hand, so the listing below only ever happens on a run that is joining the
+    chain.
+
+    **Failures propagate.** A store whose head cannot be listed or read is a
+    store the manifest write that follows would not survive either, and a
+    linkless money-path manifest written "to be safe" is precisely the break
+    :func:`crucible.explain.verify_money_path_chain` is built to refuse. There
+    is no degraded link.
+    """
+    writes = money_path_writes(manifest)
+    if not writes:
+        return None
+    chain = money_path_manifests(store)
+    # A rerun of the same job on the same trading day writes the SAME key, so
+    # a predecessor that is this very manifest's key would be chaining a
+    # record to the bytes it is about to overwrite. Drop it: this run replaces
+    # that record rather than following it.
+    key = manifest_key(
+        manifest["job"], manifest["trading_day"], discriminator=manifest.get("discriminator")
+    )
+    chain = [pair for pair in chain if pair[0] != key]
+    if not chain:
+        return {
+            "index": 0,
+            "prev_sha256": None,
+            "prev_run_id": None,
+            "money_path_writes": list(writes),
+        }
+    head_key, head = chain[-1]
+    head_link = head.get("money_path_link")
+    if head_link is None:
+        raise MoneyPathChainError(
+            f"the latest money-path manifest in this store ({head['run_id']} at "
+            f"{head_key}) carries no `money_path_link`, so this run has nothing to "
+            "chain to. Either it predates the chain — in which case the chain must be "
+            "started deliberately against a store whose money-path history is known, "
+            "not by silently electing this run the genesis — or the link was removed, "
+            "which is the tamper this record exists to make visible."
+        )
+    return {
+        "index": head_link["index"] + 1,
+        "prev_sha256": digest_of_stored(store, head_key),
+        "prev_run_id": head["run_id"],
+        "money_path_writes": list(writes),
+    }
+
+
+def write_manifest(store: Store, key: str, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Attach the money-path chain link, validate, and write. The single writer.
+
+    `crucible.runner._write_manifest` assembles the document and calls this;
+    nothing else writes a run manifest. Validation happens AFTER the link is
+    attached, so the bytes that land in the store are the bytes that were
+    checked — a link attached after validation would be an unvalidated field
+    on the one document the whole system's trust rests on.
+
+    Returns the manifest as written, link included.
+    """
+    link = money_path_link_for(store, manifest)
+    if link is not None:
+        manifest = {**manifest, "money_path_link": link}
+    validate(manifest)
+    store.put_bytes(key, json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"))
+    return manifest

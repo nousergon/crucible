@@ -485,8 +485,18 @@ def holdout_key_readers() -> tuple[str, ...]:
     :func:`read_sealed_holdout` like everyone else. A member of this tuple
     that ever calls `store.get_bytes` on the holdout key is a defect; naming
     the key is not.
+
+    `crucible/manifest.py` is the third entry and is the same shape as the
+    second (`alpha-engine-config-I10414`): `MONEY_PATH_PREDICATES` names the
+    key to decide whether a run that WROTE it joins the money-path hash chain.
+    It never reads the document — it compares a key it was handed against this
+    one — and it names the key by calling `crucible.keys.strategy_holdout_key`
+    rather than restating the literal, which is the behaviour this tuple
+    exists to keep honest: the alternative (aliasing the import so the AST
+    walk stops matching) would be evading the detector rather than
+    registering with it.
     """
-    return ("crucible/holdout.py", "crucible/gate.py")
+    return ("crucible/holdout.py", "crucible/gate.py", "crucible/manifest.py")
 
 
 def add_holdout_arguments(parser: Any) -> None:

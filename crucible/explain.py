@@ -23,6 +23,18 @@ artifacts, and a second store of the same edges is a thing to keep in sync.
 **An unresolvable hop is reported, never elided.** A key nobody claims as an
 output is printed as `produced by: UNKNOWN`, with the key. A chain that
 quietly dropped its unexplained hops would read as complete.
+
+**A walk that crosses the money path verifies the hash chain**
+(`alpha-engine-config-I10414`, plan §9.5). Every money-path manifest carries
+`money_path_link.prev_sha256` — the digest of its predecessor's stored bytes,
+written by `crucible.manifest.write_manifest`. :func:`verify_money_path_chain`
+walks that and grades it `ok` or `failed`, the manifest's own two statuses and
+no third. A break is a FINDING, not a log line: it names the record index, the
+run, the digest the record claims and the digest the store actually holds, and
+:meth:`ChainVerification.raise_if_broken` turns it into a non-zero exit for a
+caller that must fail on it. The v1 NAV series was manually restated over four
+sessions; a restatement is legitimate, an unnoticed one is not, and this is
+what makes the difference machine-checkable.
 """
 
 from __future__ import annotations
@@ -32,12 +44,28 @@ from typing import TYPE_CHECKING, Any
 
 from crucible.documents import load_store_document
 from crucible.keys import RUNS_ROOT, is_manifest_key, manifest_key
-from crucible.manifest import validate
+from crucible.manifest import (
+    MoneyPathChainError,
+    digest_of_stored,
+    money_path_manifests,
+    money_path_writes,
+    on_money_path,
+    validate,
+)
 
 if TYPE_CHECKING:
     from crucible.store import Store
 
-__all__ = ["Lineage", "explain", "load_manifests", "render"]
+__all__ = [
+    "ChainRecord",
+    "ChainVerification",
+    "Lineage",
+    "MoneyPathChainError",
+    "explain",
+    "load_manifests",
+    "render",
+    "verify_money_path_chain",
+]
 
 #: How deep the walk goes before it stops. A cycle in the input/output graph
 #: is impossible by construction (a key has one producer, and a run cannot
@@ -66,6 +94,12 @@ class Lineage:
     depth: int
     parents: list[Lineage] = field(default_factory=list)
     collisions: tuple[str, ...] = ()
+    #: The money-path chain verdict, set on the ROOT node only and only when
+    #: this walk crosses the money path (alpha-engine-config-I10414). `None`
+    #: on every other node and on every walk that touches no money-path
+    #: artifact — which is a different answer from "the chain verified", and
+    #: `render` prints the two differently for exactly that reason.
+    chain: ChainVerification | None = None
 
     def to_dict(self) -> dict[str, Any]:
         run = self.manifest or {}
@@ -83,8 +117,204 @@ class Lineage:
             "llm_calls": len(run.get("llm_calls") or []),
             "inputs": [i["key"] for i in run.get("inputs") or []],
             "also_claimed_by": list(self.collisions),
+            "money_path_chain": self.chain.to_dict() if self.chain is not None else None,
             "parents": [p.to_dict() for p in self.parents],
         }
+
+
+@dataclass(frozen=True)
+class ChainRecord:
+    """One verified (or refuted) record of the money-path hash chain."""
+
+    index: int
+    run_id: str
+    key: str
+    #: The digest of this record's OWN stored bytes, as the store holds them
+    #: now. Its successor's `prev_sha256` is compared against this.
+    sha256: str
+    #: What this record CLAIMS its predecessor's digest is. `None` at index 0.
+    prev_sha256: str | None
+    #: What the predecessor's digest ACTUALLY is, read back from the store.
+    #: `None` at index 0. Equal to `prev_sha256` on an intact link — and the
+    #: pair is carried rather than a bare boolean because "the chain is
+    #: broken" is not an actionable finding and "claimed X, store holds Y" is.
+    actual_prev_sha256: str | None
+    money_path_writes: tuple[str, ...]
+
+    @property
+    def intact(self) -> bool:
+        return self.prev_sha256 == self.actual_prev_sha256
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "run_id": self.run_id,
+            "manifest": self.key,
+            "sha256": self.sha256,
+            "prev_sha256_claimed": self.prev_sha256,
+            "prev_sha256_actual": self.actual_prev_sha256,
+            "money_path_writes": list(self.money_path_writes),
+            "intact": self.intact,
+        }
+
+
+@dataclass(frozen=True)
+class ChainVerification:
+    """The money-path chain's verdict. `ok` or `failed`, and nothing else.
+
+    The manifest's own two statuses (plan §4.2), deliberately: a chain with a
+    `degraded` or `unverified` state would be the third status this whole
+    system exists to make unrepresentable, and it is the state a tampered
+    history would settle into.
+    """
+
+    status: str
+    reason: str
+    records: tuple[ChainRecord, ...]
+    #: Money-path manifests written at or after the genesis record that carry
+    #: NO link, oldest first. Each is a `failed` finding in its own right: a
+    #: record can only be removed from a hash chain by removing its link, so
+    #: an unlinked money-path manifest is either the tamper or the producer
+    #: that skipped the writer. Never a warning, and never dropped — a chain
+    #: that verified the records it still had would grade a deletion green.
+    unlinked: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "records": [r.to_dict() for r in self.records],
+            "unlinked": list(self.unlinked),
+        }
+
+    def raise_if_broken(self) -> None:
+        """Raise :class:`crucible.manifest.MoneyPathChainError` unless `ok`.
+
+        The hook for a caller whose correct response to a break is to STOP —
+        the `crucible explain` CLI handler, and any phase-4 gate clause that
+        reads chain verification. `explain` itself never raises: an operator
+        holding a broken chain needs to see the walk that reaches it, and a
+        command that refused to print the lineage at the moment the lineage
+        became interesting would be the wrong trade.
+        """
+        if not self.ok:
+            raise MoneyPathChainError(self.reason)
+
+
+def verify_money_path_chain(store: Store) -> ChainVerification:
+    """Walk the money-path hash chain in ``store`` and grade it.
+
+    Every money-path manifest (`crucible.manifest.money_path_manifests`) is
+    ordered by `(finished, run_id)` and checked three ways:
+
+    1. **Indices are 0..N-1, contiguous.** A gap is a removed record. A chain
+       that renumbered around one would report a deletion as health.
+    2. **Each record's `prev_sha256` equals the digest of the predecessor's
+       bytes AS THE STORE HOLDS THEM NOW** — read back and hashed here, never
+       compared against a stored copy of itself and never against
+       `Store.etag`, which is an opaque backend version token
+       (`nous-ergon-ops-I1145`). This is the check that catches the mutation:
+       edit any record and its successor's link stops matching.
+    3. **No money-path manifest at or after the genesis lacks a link.** A
+       record leaves a hash chain by having its link removed, so the absence
+       is the finding.
+
+    Returns `status: ok` over an empty chain, with a reason saying so: a store
+    where nothing has touched the money path has an intact (empty) history,
+    which is a true statement and a different one from "verified 40 records".
+    """
+    chain = money_path_manifests(store)
+    linked = [(k, m) for k, m in chain if m.get("money_path_link") is not None]
+    unlinked = [(k, m) for k, m in chain if m.get("money_path_link") is None]
+
+    if not linked:
+        if unlinked:
+            return ChainVerification(
+                status="failed",
+                reason=(
+                    f"{len(unlinked)} money-path manifest(s) exist and NOT ONE carries a "
+                    f"`money_path_link`: {[k for k, _ in unlinked]}. Either every link was "
+                    "removed, or these runs predate the chain and it has never been started "
+                    "against this store — and those two are indistinguishable from here, "
+                    "which is why this is `failed` rather than a quiet pass over a store "
+                    "with no chain in it."
+                ),
+                records=(),
+                unlinked=tuple(k for k, _ in unlinked),
+            )
+        return ChainVerification(
+            status="ok",
+            reason="no money-path artifact has been written in this store; the chain is empty.",
+            records=(),
+        )
+
+    genesis_finished = linked[0][1]["finished"]
+    orphans = tuple(k for k, m in unlinked if m["finished"] >= genesis_finished)
+
+    records: list[ChainRecord] = []
+    findings: list[str] = []
+    previous: tuple[str, dict[str, Any], str] | None = None  # (key, manifest, digest)
+    for position, (key, manifest) in enumerate(linked):
+        link = manifest["money_path_link"]
+        actual_prev = digest_of_stored(store, previous[0]) if previous is not None else None
+        record = ChainRecord(
+            index=link["index"],
+            run_id=manifest["run_id"],
+            key=key,
+            sha256=digest_of_stored(store, key),
+            prev_sha256=link["prev_sha256"],
+            actual_prev_sha256=actual_prev,
+            money_path_writes=money_path_writes(manifest),
+        )
+        records.append(record)
+        if record.index != position:
+            findings.append(
+                f"record at chain position {position} declares index {record.index} "
+                f"(run {record.run_id}, {key}). Indices are contiguous from 0; a gap is a "
+                "record that was removed, and a chain renumbered around one would report "
+                "the deletion as health."
+            )
+        if not record.intact:
+            findings.append(
+                f"CHAIN BROKEN at record {record.index} (run {record.run_id}, {key}): it "
+                f"claims prev_sha256={record.prev_sha256!r}, and the predecessor it names "
+                f"({link['prev_run_id']}, {previous[0] if previous else None}) actually "
+                f"hashes to {record.actual_prev_sha256!r}. The predecessor's bytes are not "
+                "the bytes this record was written against."
+            )
+        if previous is not None and link["prev_run_id"] != previous[1]["run_id"]:
+            findings.append(
+                f"record {record.index} (run {record.run_id}) names predecessor "
+                f"{link['prev_run_id']!r}, but the record before it in the chain is run "
+                f"{previous[1]['run_id']!r}. The digest and the run id must point at the "
+                "same predecessor or the chain is describing two different histories."
+            )
+        previous = (key, manifest, record.sha256)
+
+    for orphan in orphans:
+        findings.append(
+            f"{orphan} wrote a money-path artifact at or after the chain's genesis and "
+            "carries no `money_path_link`. A record leaves a hash chain by having its link "
+            "removed, so an unlinked money-path manifest is the tamper, or a producer that "
+            "bypassed `crucible.manifest.write_manifest`."
+        )
+
+    if findings:
+        return ChainVerification(
+            status="failed",
+            reason="money-path chain verification FAILED:\n  - " + "\n  - ".join(findings),
+            records=tuple(records),
+            unlinked=orphans,
+        )
+    return ChainVerification(
+        status="ok",
+        reason=f"{len(records)} money-path record(s) verified, indices 0..{len(records) - 1}.",
+        records=tuple(records),
+    )
 
 
 def load_manifests(store: Store) -> list[dict[str, Any]]:
@@ -172,7 +402,34 @@ def explain(store: Store, target: str) -> Lineage:
             "match, because an explanation of the wrong run is worse than none."
         )
 
-    return _walk(root_key, root_manifest, by_output, collisions, depth=0, seen=set())
+    root = _walk(root_key, root_manifest, by_output, collisions, depth=0, seen=set())
+    if _crosses_money_path(root):
+        # Verified over the WHOLE store, not over the nodes this walk
+        # reached. A chain is only evidence if the record before the one you
+        # are looking at is checked too, and the walk that brought an operator
+        # here has no reason to have visited it.
+        root.chain = verify_money_path_chain(store)
+    return root
+
+
+def _crosses_money_path(node: Lineage) -> bool:
+    """Whether any hop of this walk touches a money-path artifact.
+
+    Three signals, because each alone has a blind spot: the node's own key; a
+    money-path OUTPUT of the run at that node (the run that wrote the champion
+    pointer is on the money path even when the walk arrived at it by another
+    of its outputs); and a `money_path_link` already on the manifest (which
+    catches a run whose money-path output key has since been retired from
+    `MONEY_PATH_PREDICATES` — its record is still in the chain, and the chain
+    must still verify).
+    """
+    if on_money_path(node.key):
+        return True
+    if node.manifest is not None and (
+        money_path_writes(node.manifest) or node.manifest.get("money_path_link") is not None
+    ):
+        return True
+    return any(_crosses_money_path(parent) for parent in node.parents)
 
 
 def _walk(
@@ -206,8 +463,21 @@ def _walk(
 
 
 def render(node: Lineage) -> str:
-    """The chain, as an operator reads it. One line per hop, indented by depth."""
+    """The chain, as an operator reads it. One line per hop, indented by depth.
+
+    The money-path verdict goes FIRST when the walk crosses the money path —
+    ahead of the lineage, not appended under it. A break printed below forty
+    lines of hops is a warning wearing a finding's clothes, and the whole
+    point of `alpha-engine-config-I10414` is that a tampered history is the
+    first thing the reader learns, not the last.
+    """
     lines: list[str] = []
+    if node.chain is not None:
+        if node.chain.ok:
+            lines.append(f"MONEY-PATH CHAIN: ok — {node.chain.reason}")
+        else:
+            lines.append(f"MONEY-PATH CHAIN: FAILED — {node.chain.reason}")
+        lines.append("")
 
     def emit(current: Lineage) -> None:
         pad = "  " * current.depth
