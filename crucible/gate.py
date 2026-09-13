@@ -4120,17 +4120,29 @@ class LastChangeUnreadableError(RuntimeError):
 #: reconstruct (principle 1).
 AUTONOMY_HUMAN_ONLY_RULING = 10608
 
+#: The tracker issue carrying Brian's ruling (option (a)) that the
+#: `crucible-v2` stack apply is AUTOMATED on merge under a least-privilege
+#: machine role. It is why the stack half of the window start is attributed
+#: at all: until it, every apply was operator-gated and human by
+#: construction. Same derived-citation shape as the constant above, and for
+#: the same reason — `tests/test_no_stale_tracker_literals.py` forbids the
+#: literal anywhere a message can reach, and a window start that stopped
+#: moving on automated applies with no reference to the decision that made it
+#: stop is a number nobody can reconstruct (principle 1).
+AUTONOMY_MACHINE_APPLY_RULING = 10609
+
 
 @dataclass(frozen=True)
 class _SystemChange:
     """When the graded system last changed BY A HUMAN, and which reading said so.
 
     ``at`` is the window start; ``source`` names the reading that set it.
-    ``pointer_at`` is the release pointer's latest flip WHOEVER wrote it —
-    kept on the record even when a machine wrote it and it therefore did not
+    ``pointer_at`` is the release pointer's latest flip WHOEVER wrote it, and
+    ``stack_at`` the stack's latest change WHOEVER applied it — both kept on
+    the record even when a machine was behind them and they therefore did not
     move the start, because a provenance string that printed only the winning
-    reading would make a machine deploy invisible to anyone reconstructing
-    the window (principle 1).
+    reading would make a machine deploy or a machine apply invisible to
+    anyone reconstructing the window (principle 1).
     """
 
     at: dt.datetime
@@ -4140,6 +4152,7 @@ class _SystemChange:
     stack_detail: str = ""
     pointer_detail: str = ""
     human_pointer_at: dt.datetime | None = None
+    human_stack_at: dt.datetime | None = None
 
     def provenance(self) -> str:
         stack_note = f" [{self.stack_detail}]" if self.stack_detail else ""
@@ -4151,7 +4164,10 @@ class _SystemChange:
             "HUMAN-originated change restarts this window: a release flip written by a "
             "stack machine principal is the autonomy this phase certifies, not an "
             f"interruption of it (alpha-engine-config-I{AUTONOMY_HUMAN_ONLY_RULING}, "
-            "Brian's ruling 2026-09-12, option (a))"
+            "Brian's ruling 2026-09-12, option (a)) — and since the stack apply is "
+            "itself automated on merge under a machine role "
+            f"(alpha-engine-config-I{AUTONOMY_MACHINE_APPLY_RULING}, option (a)), the "
+            "same test is applied to it"
         )
 
 
@@ -4208,10 +4224,20 @@ def _pointer_flip_time(store: Store) -> dt.datetime:
 
 @dataclass(frozen=True)
 class _StackChange:
-    """When the graded stack FINISHED changing, and which reading said so."""
+    """When the graded stack FINISHED changing, and which reading said so.
+
+    ``created`` is the stack's `CreationTime` — the instant of its FIRST
+    apply, which is the operator bootstrap and is human by construction (the
+    v2 environment did not exist before it). It is the floor
+    `_human_stack_apply`'s backward archive walk stops at, and the window
+    start it falls back to when every apply since has been a machine one.
+    `None` when `DescribeStacks` reported no `CreationTime` at all, which
+    leaves that walk without a floor and is handled there as HUMAN.
+    """
 
     at: dt.datetime
     detail: str
+    created: dt.datetime | None = None
 
 
 def _stack_last_updated(cfn: Any | None = None, *, stack: str | None = None) -> _StackChange:
@@ -4299,6 +4325,8 @@ def _stack_last_updated(cfn: Any | None = None, *, stack: str | None = None) -> 
             "the instant it last changed is unknown"
         )
     started = _as_utc(when)
+    creation = stacks[0].get("CreationTime")
+    created = _as_utc(creation) if creation is not None else None
 
     from crucible.tags import _stack_resources  # noqa: PLC0415 - one paginated reader, shared
 
@@ -4313,6 +4341,7 @@ def _stack_last_updated(cfn: Any | None = None, *, stack: str | None = None) -> 
             "stack LastUpdatedTime only; resource timestamps unlistable "
             f"({unlistable}), so the window may start before the apply's own "
             "resource calls and over-count them",
+            created,
         )
     # OUTSIDE the guard above: `_as_utc` refuses a naive instant, and that
     # refusal must reach the caller rather than be reclassified as "the list
@@ -4323,6 +4352,7 @@ def _stack_last_updated(cfn: Any | None = None, *, stack: str | None = None) -> 
             started,
             f"stack LastUpdatedTime only; none of {len(resources)} stack resource(s) "
             "carried a LastUpdatedTimestamp",
+            created,
         )
     settled = max(stamps)
     if settled > started:
@@ -4330,11 +4360,13 @@ def _stack_last_updated(cfn: Any | None = None, *, stack: str | None = None) -> 
             settled,
             f"newest resource LastUpdatedTimestamp {settled.isoformat()}, later than the "
             f"update's start {started.isoformat()}",
+            created,
         )
     return _StackChange(
         started,
         f"stack LastUpdatedTime {started.isoformat()}, at or after every one of "
         f"{len(stamps)} resource timestamp(s)",
+        created,
     )
 
 
@@ -4438,6 +4470,139 @@ def _human_pointer_flip(
     )
 
 
+def _human_stack_apply(
+    stack_at: dt.datetime,
+    created: dt.datetime | None,
+    *,
+    s3: Any | None = None,
+    archive: str | None = None,
+    cfn: Any | None = None,
+) -> tuple[dt.datetime, str, bool]:
+    """The instant the stack half contributes to the window start, and whether
+    a HUMAN put it there.
+
+    `alpha-engine-config-I10609`, Brian's ruling option (a): the `crucible-v2`
+    stack apply is automated on merge under a least-privilege machine role, as
+    five sibling stacks in `nous-ergon-ops` already are. Until that ruling the
+    apply was operator-gated, so the stack's change instant WAS a human change
+    instant and needed no attribution. It is not any more, and an automated
+    apply that restarted the window would recreate on the stack half exactly
+    the defect `alpha-engine-config-I10608` removed from the pointer half:
+    every merge of a template change would set the phase back, and "runs
+    unattended" and "keeps developing" would again be mutually exclusive by
+    construction.
+
+    Returns `(instant, detail, human)`:
+
+    * `human=True` — the latest apply after ``created`` was issued by a
+      principal that is no stack role, so ``instant`` is that apply and it
+      restarts the window.
+    * `human=False` — every apply since the stack was created was issued by a
+      stack machine principal, so ``instant`` falls back to ``created``: the
+      stack's FIRST apply, the operator bootstrap, which is human by
+      construction. The window start then stops moving on automated applies
+      without ever being unbounded.
+
+    **Never raises, and every failure resolves to HUMAN.** An unconfigured
+    archive, an unreadable one, an uncovered trail day, an unparseable event
+    time, a stack change matching no archived call, and a stack reporting no
+    `CreationTime` to floor the walk at all — each returns ``stack_at`` with
+    the reason in the detail. That is the direction a clause asserting a count
+    of zero has to fail in: calling an unattributable apply human restarts the
+    window and keeps the clause UNMET for longer, where calling it machine
+    would let an archive nobody can read clear a phase. Nothing here is
+    unknown about the SYSTEM — only about who ran one call — so there is
+    nothing to render UNMEASURABLE.
+
+    This is not the fail-open `_clause_zero_human_mutating_calls` refuses. The
+    machine allowlist is DERIVED from the stack's own `AWS::IAM::Role`
+    resources (`crucible.autonomy.machine_principals`), so it can excuse only
+    a principal the template itself creates — widening it means a template PR.
+    A hand-run `aws cloudformation deploy` from the laptop authenticates as an
+    operator profile, which is no stack role, and still restarts the window.
+    """
+    from crucible.autonomy import attribute_stack_applies  # noqa: PLC0415 - heavy, one call site
+    from crucible.config import settings  # noqa: PLC0415 - one call site
+
+    if created is None:
+        return (
+            stack_at,
+            (
+                "the stack reports no CreationTime, so the backward walk over the archive has "
+                "no floor to stop at and the apply is treated as HUMAN"
+            ),
+            True,
+        )
+    if stack_at <= created:
+        return (
+            stack_at,
+            (
+                f"the stack has not been updated since it was created ({created.isoformat()}), "
+                "so its creation IS its last apply — the operator bootstrap, HUMAN by "
+                "construction"
+            ),
+            True,
+        )
+    location = archive if archive is not None else settings().cloudtrail_archive
+    if not location:
+        return (
+            stack_at,
+            (
+                "no CloudTrail archive is configured, so the apply's principal is unknown and "
+                "the apply is treated as HUMAN"
+            ),
+            True,
+        )
+    naked = location.removeprefix("s3://")
+    try:
+        attribution = attribute_stack_applies(
+            s3 if s3 is not None else _s3_client(),
+            bucket=naked.partition("/")[0],
+            prefix=naked.partition("/")[2],
+            stack_name=settings().stack_name,
+            since=created,
+            until=stack_at,
+            cfn=cfn,
+        )
+    except Exception as exc:  # noqa: BLE001 - recorded in the detail, never silent
+        return (
+            stack_at,
+            (
+                f"the apply's principal could not be read from the CloudTrail archive "
+                f"({type(exc).__name__}: {exc}), so it is treated as HUMAN"
+            ),
+            True,
+        )
+    if attribution.unattributable is not None:
+        return stack_at, f"{attribution.unattributable} — treated as HUMAN", True
+    if attribution.latest_human is not None:
+        latest = max(
+            (a for a in attribution.applies if not a.machine and a.at == attribution.latest_human),
+            key=lambda a: a.at,
+        )
+        return (
+            attribution.latest_human,
+            (
+                f"applied by {latest.principal} ({latest.principal_type}) via "
+                f"{latest.event_name} at {latest.at.isoformat()}, which is no stack machine "
+                "principal — a HUMAN apply, so it restarts the window"
+            ),
+            True,
+        )
+    machines = sorted({a.principal for a in attribution.applies if a.machine})
+    return (
+        created,
+        (
+            f"all {len(attribution.applies)} archived apply call(s) since "
+            f"{created.isoformat()} were issued by stack machine principal(s) "
+            f"({', '.join(machines) or 'none'}), so the apply is the merge pipeline running "
+            "unattended and does NOT restart the window; the start falls back to the stack's "
+            "creation, its own operator bootstrap"
+        ),
+        False,
+    )
+
+
 def _last_system_change(
     store: Store,
     *,
@@ -4445,7 +4610,7 @@ def _last_system_change(
     s3: Any | None = None,
     archive: str | None = None,
 ) -> _SystemChange:
-    """`max(stack last applied, latest HUMAN release pointer move)`.
+    """`max(latest HUMAN stack apply, latest HUMAN release pointer move)`.
 
     **BOTH inputs, and neither substitutes for the other** (`alpha-engine-
     config-I10324`). A wheel flip changes what the box RUNS and leaves the
@@ -4466,15 +4631,29 @@ def _last_system_change(
     phase certifies. A LAPTOP `crucible release.pin` still restarts it,
     because that writer is not a stack role.
 
-    The stack apply needs no such filter and gets none: `ExecuteChangeSet`
-    against `crucible-v2` is operator-gated and human-only today, and adding
-    a machine carve-out there would be the fail-open the clause's own
-    docstring refuses — a second mechanism excusing whatever a future
-    allowlist did not anticipate.
+    **The stack half is filtered the same way now** (`alpha-engine-config-
+    I10609`, Brian's ruling option (a)). That ruling automated the
+    `crucible-v2` apply on merge under a least-privilege machine role, as
+    five sibling stacks in `nous-ergon-ops` already were. This docstring
+    used to say the stack apply "needs no such filter and gets none", on the
+    ground that `ExecuteChangeSet` against `crucible-v2` was operator-gated
+    and human-only; that premise is what the ruling changed, and leaving the
+    sentence standing would have made every merge of a template change
+    restart the window — the exact defect I10608 removed from the pointer
+    half. :func:`_human_stack_apply` does the attribution, from the same
+    archive, and documents why it is not the fail-open the clause refuses:
+    the allowlist is DERIVED from the stack's own roles, so it cannot excuse
+    a principal the template does not create, and a hand-run
+    `aws cloudformation deploy` from the laptop is no stack role and still
+    restarts the window.
     """
     pointer_at = _pointer_flip_time(store)
     stack = _stack_last_updated(cfn)
-    stack_at = stack.at
+    stack_at, apply_detail, applied_by_human = _human_stack_apply(
+        stack.at, stack.created, s3=s3, archive=archive, cfn=cfn
+    )
+    human_stack_at = stack_at if applied_by_human else None
+    stack_detail = f"{stack.detail}; {apply_detail}"
     if pointer_at <= stack_at:
         # No archive read at all: a flip at or before the stack apply cannot
         # move the start whoever wrote it, and a CloudTrail walk to establish
@@ -4483,10 +4662,12 @@ def _last_system_change(
             stack_at,
             _SOURCE_STACK_APPLY,
             pointer_at,
-            stack_at,
-            stack.detail,
+            stack.at,
+            stack_detail,
             "at or before the stack apply, so it cannot start the window and its "
             "writer was not read",
+            None,
+            human_stack_at,
         )
     human_at, pointer_detail = _human_pointer_flip(
         cast("S3Store", store), pointer_at, stack_at, s3=s3, archive=archive, cfn=cfn
@@ -4496,19 +4677,21 @@ def _last_system_change(
             human_at,
             _SOURCE_HUMAN_POINTER,
             pointer_at,
-            stack_at,
-            stack.detail,
+            stack.at,
+            stack_detail,
             pointer_detail,
             human_at,
+            human_stack_at,
         )
     return _SystemChange(
         stack_at,
         _SOURCE_STACK_APPLY,
         pointer_at,
-        stack_at,
-        stack.detail,
+        stack.at,
+        stack_detail,
         pointer_detail,
         human_at,
+        human_stack_at,
     )
 
 
@@ -4635,13 +4818,28 @@ def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Cl
     So the window is `[last change, render day]`, and both halves of that
     construction are load-bearing:
 
-    * `last change = max(stack last applied, latest HUMAN release pointer
-      move)` — :func:`_last_system_change`, which documents why neither input
-      covers the other. A pleasant consequence, and the reason there is NO
-      carve-out here for operator-gated applies: an apply now DEFINES the
+    * `last change = max(latest HUMAN stack apply, latest HUMAN release
+      pointer move)` — :func:`_last_system_change`, which documents why
+      neither input covers the other. A pleasant consequence, and the reason
+      there is NO carve-out here for a human apply: such an apply DEFINES the
       window's start rather than violating it. A carve-out would be a second
       mechanism for the same thing, and the one that fails open the day an
       operator does something the allowlist did not anticipate.
+
+      **Both halves are now attributed** (`alpha-engine-config-I10609`,
+      Brian's ruling option (a)). This paragraph used to add that the stack
+      apply "needs no such filter and gets none", because the apply was
+      operator-gated and human-only; that ruling automated it on merge under
+      a least-privilege machine role, so the premise is gone and the sentence
+      went with it rather than being left to contradict the code. The filter
+      is not the fail-open refused above: `crucible.autonomy.
+      machine_principals` DERIVES the allowlist from the stack's own
+      `AWS::IAM::Role` resources, so it excuses only a principal the template
+      itself creates — widening it is a template PR, not a read-time act —
+      and a hand-run `aws cloudformation deploy` authenticates as an operator
+      profile, which is no stack role and still restarts the window. An apply
+      the archive cannot attribute is treated as HUMAN, the same safe
+      direction the pointer half takes.
 
       **Only a HUMAN change restarts the window** (`alpha-engine-config-
       I10608`, Brian's ruling 2026-09-12, option (a) — a phase-2 clause
@@ -4700,11 +4898,13 @@ def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Cl
     name = "zero_human_mutating_calls"
     requirement = (
         "zero human-originated mutating calls touched a v2 resource between the "
-        "system's last HUMAN change (the later of the "
-        f"{settings().stack_name} stack's last apply and the latest release pointer "
-        "move written by a principal that is not a stack machine role — a machine "
-        "release flip is the autonomy being graded, alpha-engine-config-"
-        f"I{AUTONOMY_HUMAN_ONLY_RULING}) and the render day, over a span "
+        "system's last HUMAN change (the later of the latest "
+        f"{settings().stack_name} stack apply and the latest release pointer "
+        "move, each counted only when written by a principal that is not a stack "
+        "machine role — a machine release flip is the autonomy being graded, "
+        f"alpha-engine-config-I{AUTONOMY_HUMAN_ONLY_RULING}, and so is a machine "
+        f"stack apply, alpha-engine-config-I{AUTONOMY_MACHINE_APPLY_RULING}) and the "
+        "render day, over a span "
         "containing one complete unattended weekly cycle closing after the change plus "
         f"at least {PHASE2_AUTONOMY_MIN_DAILY_CYCLES} complete daily cycle(s) in it, "
         "counted from the CloudTrail S3 archive (never `lookup-events`, which truncates "

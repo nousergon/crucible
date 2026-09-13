@@ -854,3 +854,184 @@ class TestAttributingAPointerWrite:
         result = _attribute(_archive({END: [bad]}))
         assert result.latest_human is None
         assert "will not parse" in (result.unattributable or "")
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I10609 — attributing a CloudFormation stack apply
+# ---------------------------------------------------------------------------
+
+#: The stack these fixtures attribute applies against. Synthetic: the real
+#: stack name is `crucible.config.DEFAULT_STACK_NAME` and the reader takes it
+#: as an argument, so nothing here has to name it.
+APPLY_STACK = "a-test-stack"
+
+#: The same stack addressed by ARN, which is how `ExecuteChangeSet` names it.
+APPLY_STACK_ARN = f"arn:aws:cloudformation:a-region:123456789012:stack/{APPLY_STACK}/abc-123"
+
+
+def _apply_record(at: dt.datetime, principal: str, **over) -> dict:
+    document = _record(
+        eventTime=at.isoformat().replace("+00:00", "Z"),
+        eventName="ExecuteChangeSet",
+        eventSource="cloudformation.amazonaws.com",
+        requestParameters={"stackName": APPLY_STACK, "changeSetName": "a-change-set"},
+        userIdentity={
+            "type": "AssumedRole",
+            "arn": f"arn:aws:sts::123456789012:assumed-role/{principal}/a-session",
+            "sessionContext": {"sessionIssuer": {"userName": principal}},
+        },
+    )
+    document.update(over)
+    return document
+
+
+def _attribute_applies(client, **over):
+    from crucible.autonomy import attribute_stack_applies
+
+    kwargs = {
+        "bucket": "trail",
+        "prefix": f"{ARCHIVE_PREFIX}/us-east-1",
+        "stack_name": APPLY_STACK,
+        "since": dt.datetime(2026, 8, 3, 0, 0, tzinfo=dt.UTC),
+        "until": dt.datetime(2026, 8, 4, 12, 0, tzinfo=dt.UTC),
+        "cfn": _FakeCfn(),
+    }
+    kwargs.update(over)
+    return attribute_stack_applies(client, **kwargs)
+
+
+class TestAttributingAStackApply:
+    """`alpha-engine-config-I10609` option (a): the stack apply is automated
+    on merge under a machine role, so "who applied the stack" becomes the
+    same question `attribute_pointer_writes` answers for the release pointer
+    — and it is answered the same way, from the archive, because
+    `DescribeStacks` reports WHEN the stack changed and never WHO changed it.
+    """
+
+    MACHINE_APPLY = dt.datetime(2026, 8, 4, 12, 0, tzinfo=dt.UTC)
+    HUMAN_APPLY = dt.datetime(2026, 8, 4, 12, 0, tzinfo=dt.UTC)
+
+    def test_an_apply_by_a_stack_role_is_machine(self) -> None:
+        archive = _archive({END: [_apply_record(self.MACHINE_APPLY, A_MACHINE_ROLE)]})
+        result = _attribute_applies(archive)
+        assert result.unattributable is None
+        assert result.latest_human is None
+        assert [a.machine for a in result.applies] == [True]
+
+    def test_an_apply_by_anyone_else_is_human(self) -> None:
+        archive = _archive({END: [_apply_record(self.HUMAN_APPLY, "a-laptop-operator")]})
+        result = _attribute_applies(archive)
+        assert result.unattributable is None
+        assert result.latest_human == self.HUMAN_APPLY
+
+    def test_an_sso_principal_is_human(self) -> None:
+        """The default `_record` identity is an SSO role, which is exactly the
+        shape an operator apply carries and is no stack resource."""
+        record = _apply_record(self.HUMAN_APPLY, "a-laptop-operator")
+        record["userIdentity"] = _record()["userIdentity"]
+        record["eventTime"] = self.HUMAN_APPLY.isoformat().replace("+00:00", "Z")
+        result = _attribute_applies(_archive({END: [record]}))
+        assert result.latest_human == self.HUMAN_APPLY
+
+    def test_the_stack_named_by_arn_is_the_same_stack(self) -> None:
+        """`ExecuteChangeSet` names the stack by ARN, not by name — a matcher
+        that compared only the bare name would attribute nothing on the one
+        call that actually applies a template."""
+        record = _apply_record(self.MACHINE_APPLY, A_MACHINE_ROLE)
+        record["requestParameters"] = {"stackName": APPLY_STACK_ARN}
+        result = _attribute_applies(_archive({END: [record]}))
+        assert [a.machine for a in result.applies] == [True]
+
+    def test_an_apply_against_another_stack_is_not_this_stacks_apply(self) -> None:
+        record = _apply_record(self.MACHINE_APPLY, "a-laptop-operator")
+        record["requestParameters"] = {"stackName": "another-stack"}
+        result = _attribute_applies(_archive({END: [record]}))
+        assert result.applies == ()
+        assert result.latest_human is None
+        assert result.unattributable is not None
+
+    def test_a_read_only_cloudformation_call_is_not_an_apply(self) -> None:
+        record = _apply_record(self.MACHINE_APPLY, "a-laptop-operator")
+        record["eventName"] = "DescribeStacks"
+        result = _attribute_applies(_archive({END: [record]}))
+        assert result.applies == ()
+        assert result.unattributable is not None
+
+    def test_an_apply_at_or_before_the_floor_cannot_be_the_answer(self) -> None:
+        early = dt.datetime(2026, 8, 3, 6, 0, tzinfo=dt.UTC)
+        archive = _archive(
+            {
+                START: [_apply_record(early, "a-laptop-operator")],
+                END: [_apply_record(self.MACHINE_APPLY, A_MACHINE_ROLE)],
+            }
+        )
+        result = _attribute_applies(archive, since=dt.datetime(2026, 8, 3, 9, 0, tzinfo=dt.UTC))
+        assert result.latest_human is None
+        assert result.unattributable is None
+
+    def test_an_apply_no_archived_call_explains_is_unattributable(self) -> None:
+        result = _attribute_applies(_archive({}))
+        assert result.latest_human is None
+        assert "matches no archived" in (result.unattributable or "")
+
+    def test_an_uncovered_day_is_a_gap_not_silence(self) -> None:
+        result = _attribute_applies(_archive({}, cover=(END,)))
+        assert result.latest_human is None
+        assert "delivered no objects" in (result.unattributable or "")
+
+    def test_an_unparseable_event_time_is_unattributable(self) -> None:
+        bad = _apply_record(self.MACHINE_APPLY, A_MACHINE_ROLE, eventTime="not-a-timestamp")
+        result = _attribute_applies(_archive({END: [bad]}))
+        assert result.latest_human is None
+        assert "will not parse" in (result.unattributable or "")
+
+    def test_no_bucket_is_refused_rather_than_answered(self) -> None:
+        with pytest.raises(ArchiveMissingError):
+            _attribute_applies(_archive({}), bucket="")
+
+    def test_the_scan_stops_at_the_newest_day_carrying_a_human_apply(self) -> None:
+        archive = _archive(
+            {
+                START: [_apply_record(dt.datetime(2026, 8, 3, 6, 0, tzinfo=dt.UTC), "older")],
+                END: [_apply_record(self.HUMAN_APPLY, "a-laptop-operator")],
+            }
+        )
+        result = _attribute_applies(archive)
+        assert result.latest_human == self.HUMAN_APPLY
+        assert [a.principal for a in result.applies] == ["a-laptop-operator"]
+
+    def test_the_backward_scan_is_bounded_and_says_so(self) -> None:
+        """The floor here is the stack's CREATION, which recedes without limit
+        as machine applies accumulate — unlike the pointer read, whose floor
+        is the stack apply and is therefore always recent. An unbounded walk
+        would read months of archive inside the board job's timeout, so the
+        bound exists; reaching it resolves to UNATTRIBUTABLE, which the caller
+        reads as HUMAN, never as "no human applied it"."""
+        from crucible.autonomy import _STACK_ATTRIBUTION_MAX_DAYS
+
+        until = dt.datetime(2026, 8, 4, 12, 0, tzinfo=dt.UTC)
+        floor = until - dt.timedelta(days=_STACK_ATTRIBUTION_MAX_DAYS + 10)
+        days = tuple(
+            floor.date() + dt.timedelta(days=offset)
+            for offset in range((until.date() - floor.date()).days + 1)
+        )
+        archive = _archive({until.date(): [_apply_record(until, A_MACHINE_ROLE)]}, cover=days)
+        result = _attribute_applies(archive, since=floor, until=until)
+        assert result.latest_human is None
+        assert "scanned" in (result.unattributable or "")
+
+    def test_every_apply_being_machine_within_the_floor_is_not_unattributable(self) -> None:
+        """The case the whole change exists for: the apply pipeline ran, no
+        human touched the stack, and the reader says so cleanly."""
+        archive = _archive(
+            {
+                START: [
+                    _apply_record(dt.datetime(2026, 8, 3, 6, 0, tzinfo=dt.UTC), A_MACHINE_ROLE)
+                ],
+                END: [_apply_record(self.MACHINE_APPLY, A_MACHINE_ROLE)],
+            }
+        )
+        result = _attribute_applies(archive)
+        assert result.unattributable is None
+        assert result.latest_human is None
+        assert [a.machine for a in result.applies] == [True, True]
