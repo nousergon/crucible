@@ -42,9 +42,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from crucible.documents import load_store_document
-from crucible.keys import RUNS_ROOT, is_manifest_key, manifest_key
+from crucible.documents import read_manifests_under
+from crucible.keys import RUNS_ROOT, manifest_key
 from crucible.manifest import (
+    ManifestValidationError,
     MoneyPathChainError,
     digest_of_stored,
     money_path_manifests,
@@ -60,6 +61,7 @@ __all__ = [
     "ChainRecord",
     "ChainVerification",
     "Lineage",
+    "ManifestLoad",
     "MoneyPathChainError",
     "explain",
     "load_manifests",
@@ -100,6 +102,13 @@ class Lineage:
     #: artifact — which is a different answer from "the chain verified", and
     #: `render` prints the two differently for exactly that reason.
     chain: ChainVerification | None = None
+    #: Every manifest under `runs/` this walk's own :func:`load_manifests`
+    #: call could not validate — `{key: reason}` — set on the ROOT node only,
+    #: the same convention `chain` uses (`alpha-engine-config-I10626`). Not
+    #: about THIS walk's hops: a store-wide count, so an operator sees the
+    #: gap even on a walk that never touches the broken keys. Named rather
+    #: than elided, in the same spirit as `produced by: UNKNOWN`.
+    unreadable: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         run = self.manifest or {}
@@ -118,6 +127,10 @@ class Lineage:
             "inputs": [i["key"] for i in run.get("inputs") or []],
             "also_claimed_by": list(self.collisions),
             "money_path_chain": self.chain.to_dict() if self.chain is not None else None,
+            "unreadable_manifests": {
+                "count": len(self.unreadable),
+                "keys": dict(self.unreadable),
+            },
             "parents": [p.to_dict() for p in self.parents],
         }
 
@@ -317,27 +330,48 @@ def verify_money_path_chain(store: Store) -> ChainVerification:
     )
 
 
-def load_manifests(store: Store) -> list[dict[str, Any]]:
-    """Every run manifest in the store, validated on read.
+@dataclass(frozen=True)
+class ManifestLoad:
+    """Every readable, conformant manifest under `runs/`, and every one that
+    was not — SURFACE face (alpha-engine-config-I10626), not strict.
 
-    Validated because a manifest written by an older release is still
-    refused if it does not conform — an explanation assembled from a
-    document nobody checked is an explanation nobody should act on.
+    `explain` publishes what it can, exactly like the console, the board and
+    the ladder do over the same store: a corrupt or non-conforming manifest
+    is a fault named on the output, never a reason the whole walk refuses to
+    run. `unreadable` covers two distinct failure modes without collapsing
+    them into one bucket-with-no-reason: a JSON-level fault from
+    `crucible.documents.read_manifests_under` (corrupt body, listed-then-
+    vanished, wrong shape) and a SCHEMA-level one from `crucible.manifest.
+    validate` (a conformant JSON object that still fails `run_manifest.v2` —
+    the all-zero `code_sha` placeholder, before `alpha-engine-config-I10626`'s
+    migration, was exactly this).
     """
-    out: list[dict[str, Any]] = []
-    for key in store.list_keys(RUNS_ROOT):
-        # `is_manifest_key`, not a `"/run.json"` suffix literal: the basename
-        # is `crucible.keys`' to own, and the predicate checks the root and the
-        # arity too (alpha-engine-config-I9900).
-        if not is_manifest_key(key):
+
+    manifests: tuple[dict[str, Any], ...] = ()
+    unreadable: dict[str, str] = field(default_factory=dict)
+
+
+def load_manifests(store: Store) -> ManifestLoad:
+    """Every run manifest in the store: the ones that validate, and the ones
+    that do not, named rather than raised over.
+
+    `crucible.documents.read_manifests_under` already refuses to collapse a
+    listing failure into "nothing here" (`raise_if_unlistable`) — that
+    failure mode is about OUR ACCESS to the prefix, not about any one
+    manifest, so it stays a raise; a per-manifest fault does not.
+    """
+    listing = read_manifests_under(store, RUNS_ROOT)
+    listing.raise_if_unlistable()
+    manifests: list[dict[str, Any]] = []
+    unreadable: dict[str, str] = dict(listing.faults)
+    for key, document in listing.documents:
+        try:
+            validate(document)
+        except ManifestValidationError as exc:
+            unreadable[key] = str(exc)
             continue
-        # STRICT face of the one reader (`crucible.documents`): an explanation
-        # is refused over a corrupt manifest, with the key named, the same way
-        # `validate` refuses a non-conforming one.
-        document = load_store_document(store, key)
-        validate(document)
-        out.append(document)
-    return out
+        manifests.append(document)
+    return ManifestLoad(tuple(manifests), unreadable)
 
 
 def _index(
@@ -375,12 +409,19 @@ def explain(store: Store, target: str) -> Lineage:
     because an operator holding a verdict has a key, and an operator holding
     a page has a run id.
     """
-    manifests = load_manifests(store)
+    load = load_manifests(store)
+    manifests = list(load.manifests)
     if not manifests:
+        suffix = (
+            f" {len(load.unreadable)} manifest(s) ARE present but did not validate: "
+            f"{', '.join(sorted(load.unreadable))}."
+            if load.unreadable
+            else ""
+        )
         raise FileNotFoundError(
-            "no run manifests under `runs/` in this store. Nothing has run here, so "
-            "there is no lineage — which is a different answer from 'this verdict has "
-            "no explanation'."
+            "no CONFORMANT run manifests under `runs/` in this store. Nothing readable "
+            "has run here, so there is no lineage — which is a different answer from "
+            "'this verdict has no explanation'." + suffix
         )
     by_run, by_output, collisions = _index(manifests)
 
@@ -403,6 +444,7 @@ def explain(store: Store, target: str) -> Lineage:
         )
 
     root = _walk(root_key, root_manifest, by_output, collisions, depth=0, seen=set())
+    root.unreadable = dict(load.unreadable)
     if _crosses_money_path(root):
         # Verified over the WHOLE store, not over the nodes this walk
         # reached. A chain is only evidence if the record before the one you
@@ -478,6 +520,14 @@ def render(node: Lineage) -> str:
         else:
             lines.append(f"MONEY-PATH CHAIN: FAILED — {node.chain.reason}")
         lines.append("")
+
+    # Never elided, in the same spirit as `produced by: UNKNOWN` below — a
+    # zero is printed rather than the line being omitted when there is
+    # nothing to report (`alpha-engine-config-I10626`).
+    lines.append(f"{len(node.unreadable)} manifest(s) in this store could not be validated.")
+    for key, reason in sorted(node.unreadable.items()):
+        lines.append(f"  - {key}: {reason}")
+    lines.append("")
 
     def emit(current: Lineage) -> None:
         pad = "  " * current.depth

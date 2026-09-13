@@ -45,7 +45,11 @@ from pydantic import BaseModel, ValidationError
 
 from crucible.documents import load_document_bytes, load_store_document
 from crucible.keys import POINTER_KEY, TRADER_PIN_KEY, manifest_key
-from crucible.models import ReleaseProvenanceDocument, ReleaseRecordDocument
+from crucible.models import (
+    ReleasePointerDocument,
+    ReleaseProvenanceDocument,
+    ReleaseRecordDocument,
+)
 from crucible.store import ETAG_ABSENT, PointerConflictError, S3Store, Store, sha256_hex
 
 #: `alpha-engine-config-I10045` row 5: `_validate_release_artifact` used to
@@ -109,6 +113,7 @@ __all__ = [
     "TRADER_PIN_KEY",
     "assert_sha",
     "current_release",
+    "parse_release_pointer",
     "parse_release_record",
     "pin",
     "provenance_key",
@@ -727,6 +732,32 @@ def publish_release(
     return record
 
 
+def parse_release_pointer(source: str, payload: dict[str, Any]) -> ReleasePointerDocument:
+    """Validate ``payload`` (a document already read from ``source``) against
+    `crucible.models.ReleasePointerDocument`, raising with every field named.
+
+    `alpha-engine-config-I9847` (wave 2): factored out of :func:`read_pointer`
+    so `crucible.track_c`'s own STRICT read of this same document (the
+    pointed-release branch of its smoke) raises the identical message shape
+    rather than growing a second hand-rolled wrapper — the same "one source
+    of truth" argument `_validate_release_artifact` makes for the release
+    record and provenance. Both call sites already raise on a document
+    `load_store_document`/`load_document_bytes` could not even parse; this
+    closes the gap one level up, where the document parses but does not
+    conform (a bad `sha`, a missing `target`, an extra key).
+    """
+    try:
+        return ReleasePointerDocument.model_validate(payload)
+    except ValidationError as exc:
+        detail = "\n".join(
+            f"  - {'.'.join(str(p) for p in e['loc']) or '<root>'}: {e['msg']}"
+            for e in exc.errors()
+        )
+        raise ValueError(
+            f"{source}: document does not conform to a release pointer:\n{detail}"
+        ) from exc
+
+
 def read_pointer(store: Store, key: str = POINTER_KEY) -> tuple[str | None, str]:
     """``(sha, version_token)``. ``sha`` is None when the pointer is unset.
 
@@ -739,7 +770,12 @@ def read_pointer(store: Store, key: str = POINTER_KEY) -> tuple[str | None, str]
     if version == ETAG_ABSENT:
         return None, ETAG_ABSENT
     payload = load_store_document(store, key)
-    return payload["sha"], version
+    # `alpha-engine-config-I9847` (wave 2): validated through
+    # `ReleasePointerDocument` rather than indexed straight off the raw
+    # dict — a pointer written without `sha` used to reach this function's
+    # caller as a bare `KeyError` naming neither the document nor the field.
+    pointer = parse_release_pointer(key, payload)
+    return pointer.sha, version
 
 
 def current_release(store: Store) -> str | None:

@@ -829,6 +829,25 @@ class TestUnreadableArtifacts:
         assert champion_key("u") in {entry["key"] for entry in page.unreadable}
         assert "unreadable" in render_html(page)
 
+    def test_a_champion_pointer_that_parses_but_does_not_conform_is_unreadable(
+        self, tmp_path
+    ) -> None:
+        """`alpha-engine-config-I9847` (wave 2): a pointer document that
+        parses as JSON but is missing a required field (`ChampionPointerDocument`)
+        used to read `read.document if read.document else None` straight
+        through — a slot rendered as a present, apparently-fine champion with
+        no `arm_id` a downstream reader would crash on. Now folded into the
+        SAME unreadable/faults reporting a parse failure already produces."""
+        store = LocalStore(tmp_path)
+        store.put_bytes(
+            champion_key("u"),
+            json.dumps({"schema_version": "champion_pointer.v1", "slot": "u"}).encode(),
+        )
+        page = build_page(store, now=SATURDAY_NIGHT)
+        assert page.champions["u"] is None
+        assert "does not conform to a champion pointer" in page.champion_faults["u"]
+        assert champion_key("u") in {entry["key"] for entry in page.unreadable}
+
     def test_an_attribution_artifact_with_a_wrong_typed_rows_field(self, tmp_path) -> None:
         """It parses to an object and then carries `rows` as a string. The
         crash used to happen in the renderer, one line later, with the same
