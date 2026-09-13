@@ -981,3 +981,86 @@ def panel():
     from tests.support.panels import synthetic_panel
 
     return synthetic_panel(n_days=160, n_names=25, seed=7)
+
+
+class TestTheDeadSlotIsObserved:
+    """`alpha-engine-config-I9759`: a veto that can NEVER compute is a slot
+    that can never promote, and until this metric existed the only trace was
+    a per-arm precondition reason inside the cycle artifact — so a slot that
+    can never serve rendered identically to one that held its pointer."""
+
+    def _ctx(self):
+        from types import SimpleNamespace
+
+        rows: list[dict] = []
+        return SimpleNamespace(record_metric=rows.append), rows
+
+    def test_every_arm_insufficient_emits_the_finding_with_its_producers(self) -> None:
+        from crucible.slots.model import (
+            DEAD_SLOT_METRIC,
+            UNPRODUCED_VETO_METRICS,
+            _record_dead_slot_finding,
+        )
+
+        ctx, rows = self._ctx()
+        _record_dead_slot_finding(
+            ctx, {"a": {"veto": "insufficient"}, "b": {"veto": "insufficient"}}, as_of="2026-08-28"
+        )
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["name"] == DEAD_SLOT_METRIC
+        assert row["status"] == "FAIL"
+        # Every unproduced metric is NAMED with what it waits on: a finding
+        # that says "insufficient" and not which producer is missing sends
+        # the next reader back to re-derive it.
+        for name, why in UNPRODUCED_VETO_METRICS.items():
+            assert name in row["status_reason"]
+            assert why in row["status_reason"]
+
+    def test_one_arm_with_a_real_verdict_emits_nothing(self) -> None:
+        from crucible.slots.model import _record_dead_slot_finding
+
+        ctx, rows = self._ctx()
+        _record_dead_slot_finding(
+            ctx, {"a": {"veto": "insufficient"}, "b": {"veto": "pass"}}, as_of="2026-08-28"
+        )
+        assert rows == [], "a slot with one live verdict is alive, not dead"
+
+    def test_a_cycle_that_graded_nothing_emits_nothing(self) -> None:
+        """No arms is an empty slot, not a permanently dead one."""
+        from crucible.slots.model import _record_dead_slot_finding
+
+        ctx, rows = self._ctx()
+        _record_dead_slot_finding(ctx, {}, as_of="2026-08-28")
+        assert rows == []
+
+    def test_every_unproduced_metric_is_one_the_veto_actually_reads(self) -> None:
+        """The declaration cannot drift into naming a metric no rule uses —
+        which would be a permanent finding about nothing."""
+        from crucible.slots.model import (
+            DISPERSION_METRICS,
+            FLOOR_VETO_METRICS,
+            UNPRODUCED_VETO_METRICS,
+            ZERO_VETO_METRICS,
+        )
+
+        read = set(DISPERSION_METRICS) | set(ZERO_VETO_METRICS) | set(FLOOR_VETO_METRICS)
+        assert set(UNPRODUCED_VETO_METRICS) <= read
+
+    def test_the_declaration_matches_what_the_producer_actually_emits(self) -> None:
+        """The other direction: every veto input `_serving_metrics` does NOT
+        emit must be declared here. A metric quietly added to a rule family
+        with no producer would otherwise kill the slot with no finding."""
+        import numpy as np
+
+        from crucible.slots.model import (
+            DISPERSION_METRICS,
+            FLOOR_VETO_METRICS,
+            UNPRODUCED_VETO_METRICS,
+            ZERO_VETO_METRICS,
+            _serving_metrics,
+        )
+
+        produced = set(_serving_metrics({"AAA": 1.0, "BBB": float(np.float64(-1.0))}))
+        read = set(DISPERSION_METRICS) | set(ZERO_VETO_METRICS) | set(FLOOR_VETO_METRICS)
+        assert read - produced == set(UNPRODUCED_VETO_METRICS)

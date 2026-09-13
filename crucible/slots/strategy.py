@@ -42,7 +42,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -52,8 +52,10 @@ import yaml
 from nousergon_lib.arena import ArmRegister, ArmSeries, derive_arm_id
 from nousergon_lib.arena.engine import ServingPrecondition
 
-from crucible.keys import arm_predictions_key
+from crucible.features import DEFAULT_FEATURE_VERSION, feature_names, read_features
+from crucible.keys import arm_predictions_key, features_key
 from crucible.portfolio import (
+    PORTFOLIO_PARAM_FIELDS,
     CostModel,
     CostModelInputError,
     PortfolioParams,
@@ -1147,16 +1149,27 @@ COVARIANCE_LOOKBACK_TRADING_DAYS = 260
 #: compare the slots on axes that only look alike.
 S_HORIZON_TRADING_DAYS = 1
 
-#: The book size weight deltas are turned into trade sizes against. ONE, and
-#: that is not a tuned value: at a notional of 1 the weights ARE the book, so
-#: a FLAT cost model — whose charge is a function of the weight deltas alone —
-#: is priced exactly. A PARTICIPATION-AWARE model is not: its charge depends
-#: on each name's trade against that name's ADV, which needs a real book size.
-#: So an arm naming one is REFUSED at registration (see
-#: :func:`_participation_refusal`) rather than priced against a book size this
-#: repository invented — which is the `-I10503` defect (the optimizer ran on a
-#: fallback cost model and nothing said so) reproduced inside v2.
-GRADING_NOTIONAL = 1.0
+#: The ADV series a participation-aware cost model prices trades against.
+#: Already in the feature catalog (`alpha-engine-config-I10669`: the earlier
+#: belief that this series "does not exist" was false, and filing a second
+#: USD-volume column under a new name would be the exact `avg_volume_20d`
+#: units-suffix defect the fleet's feature-store rule exists to prevent) —
+#: `dollar_volume_20d_raw` is the mean traded notional over 20 sessions,
+#: which is average daily dollar volume by definition. Checked dynamically,
+#: never hardcoded, so a catalog change is what :func:`_participation_refusal`
+#: reflects, not a belief frozen at the time this line was written.
+ADV_FEATURE_COLUMN = "dollar_volume_20d_raw"
+
+#: The portfolio-params field :func:`construct_book`'s ``portfolio_notional``
+#: is read from (`crucible.portfolio.PortfolioParams.book_notional_usd`) —
+#: the real book size a participation-aware model needs, threaded through the
+#: slot's own tuned parameter set rather than a `GRADING_NOTIONAL = 1.0`
+#: module constant this repository invented (`alpha-engine-config-I10669`,
+#: the `-I10503` defect — the optimizer ran on a fallback cost model and
+#: nothing said so — reproduced inside v2). A FLAT cost model's charge is a
+#: function of the weight deltas alone and never reads this value, so
+#: threading the real book size through it does not change what it grades.
+NOTIONAL_PARAM_FIELD = "book_notional_usd"
 
 
 @dataclass(frozen=True)
@@ -1371,15 +1384,49 @@ def _resolve_registered_at(
     )
 
 
+def _adv_column_declared() -> bool:
+    """Whether the feature catalog can ever produce the ADV series.
+
+    A registration-time question about the CATALOG, not about one session's
+    compiled artifact — a compiled-feature gap for one day is a per-session
+    absence, and `crucible.portfolio._clean_adv`/`_build_tcost_term` already
+    raise (`CostModelInputError`) if a participation-aware arm is ever handed
+    no usable ADV coverage for the names it is pricing. This function answers
+    the structural question underneath that: does this repository's feature
+    layer declare the series at all.
+    """
+    return ADV_FEATURE_COLUMN in feature_names()
+
+
+def _notional_field_declared() -> bool:
+    """Whether the portfolio-params schema carries a real book notional.
+
+    Also structural: `PortfolioParams.__post_init__` refuses a non-positive
+    value and `PortfolioParams.from_mapping` refuses a payload missing the
+    field entirely, so a slot whose strategy tree fails to declare a real
+    book size RAISES loudly when the parameter set loads — it does not reach
+    this function as a silent gap. This checks that the field the engine
+    would read even exists in the schema, which is the fact that was false
+    before `alpha-engine-config-I10669` (`GRADING_NOTIONAL = 1.0` was a
+    module constant, not a configurable field at all).
+    """
+    return NOTIONAL_PARAM_FIELD in PORTFOLIO_PARAM_FIELDS
+
+
 def _participation_refusal(recipe: StrategyRecipe) -> InputRefusal | None:
     """Why a registered arm cannot be CONSTRUCTED this cycle, or None.
 
     A participation-aware cost model prices each name's trade against that
-    name's ADV and against the book's size. The v2 feature layer carries
-    `dollar_volume_20d_raw`, but no session-level ADV vector reaches the
-    construction path and the grading notional is 1 (see
-    :data:`GRADING_NOTIONAL`), so the two inputs such a model needs do not
-    exist.
+    name's ADV and against the book's size. Both inputs are now wired end to
+    end (`alpha-engine-config-I10669`): `_build_sessions` joins the feature
+    layer's `dollar_volume_20d_raw` onto `SessionInputs.adv_usd`, and
+    `construct_book`'s `portfolio_notional` is read from the slot's own
+    `PortfolioParams.book_notional_usd` rather than a unit placeholder. So
+    this refuses ONLY when one of the two is genuinely unresolvable — the
+    catalog declares no ADV series, or the params schema declares no real
+    notional field — never unconditionally on the cost model's kind, which
+    would keep refusing every participation-priced arm forever regardless of
+    whether its inputs are actually available.
 
     The refusal is at registration and PER ARM, and it must not be "fall back
     to a flat charge": a book graded under a model its recipe does not name is
@@ -1388,20 +1435,28 @@ def _participation_refusal(recipe: StrategyRecipe) -> InputRefusal | None:
     substitution one layer in (`grade_arm`'s `CostModelInputError`, and
     `construct_book`'s per-session pricing) is not softened by this and is
     tested still firing: this refusal stops the arm before it is handed
-    nothing, and that raise stops it if it ever is.
+    nothing structural to work with; that raise stops it if a SPECIFIC
+    session's compiled data still leaves it with no usable coverage.
     """
     if recipe.cost_model.kind == "flat":
         return None
+    missing: list[str] = []
+    if not _adv_column_declared():
+        missing.append("adv_usd")
+    if not _notional_field_declared():
+        missing.append("portfolio_notional")
+    if not missing:
+        return None
     return InputRefusal(
         arm=recipe.name,
-        unresolvable=("adv_usd", "portfolio_notional"),
+        unresolvable=tuple(missing),
         reason=(
             f"arm {recipe.name!r} names cost model {recipe.cost_model.name!r}, whose "
-            f"kind {recipe.cost_model.kind!r} prices participation: it needs a per-name "
-            "ADV vector and a real book notional, and the S construction path has "
-            "neither. Refused BY NAME at registration; the model is NOT swapped for a "
-            "flat one, because a book graded under a model its recipe does not name is "
-            "a number whose cost nobody supplied."
+            f"kind {recipe.cost_model.kind!r} prices participation: it needs "
+            f"{', '.join(missing)}, and the S construction path has no route to "
+            f"{'either' if len(missing) > 1 else 'it'}. Refused BY NAME at registration; "
+            "the model is NOT swapped for a flat one, because a book graded under a "
+            "model its recipe does not name is a number whose cost nobody supplied."
         ),
     )
 
@@ -1866,6 +1921,50 @@ def _session_dates(store: Any, arm_id: str) -> list[str]:
     )
 
 
+def _read_session_adv(store: Any, *, feature_version: str, trading_day: str) -> dict[str, float]:
+    """This trading day's `dollar_volume_20d_raw`, one entry per ticker the
+    compiled feature layer carries for it — or an empty mapping.
+
+    Absence here is deliberately NOT the ``_participation_refusal`` question
+    ("can the catalog ever produce this series") — it is answered by whatever
+    consumes the resulting `adv_usd` vector. `crucible.portfolio._clean_adv`
+    reports an uncovered name as unusable, and a participation-aware cost
+    model left with no usable name RAISES (`CostModelInputError`) rather than
+    pricing the gap silently; a flat-cost arm never reads this vector at all,
+    so a compiled-feature gap that would matter to nobody does not fail its
+    grade.
+    """
+    key = features_key(feature_version, trading_day)
+    if not store.exists(key):
+        return {}
+    frame = read_features(store.get_bytes(key))
+    if ADV_FEATURE_COLUMN not in frame.columns:
+        return {}
+    return {
+        str(ticker): float(value)
+        for ticker, value in zip(frame["ticker"], frame[ADV_FEATURE_COLUMN], strict=True)
+    }
+
+
+def _adv_by_day(
+    store: Any,
+    *,
+    feature_version: str,
+    days: Iterable[str],
+    cache: dict[str, dict[str, float]],
+) -> dict[str, dict[str, float]]:
+    """Populate ``cache`` with every day in ``days`` not already resolved.
+
+    Shared across the point-in-time pass and the contamination re-resolution
+    pass in :func:`_attest`, which mostly walk the same decision dates — one
+    feature read per day for the whole grade cycle, not one per arm.
+    """
+    for day in days:
+        if day not in cache:
+            cache[day] = _read_session_adv(store, feature_version=feature_version, trading_day=day)
+    return cache
+
+
 def _build_sessions(
     resolved: Sequence[ResolvedSession],
     *,
@@ -1873,6 +1972,7 @@ def _build_sessions(
     benchmark: str,
     universe: BookUniverse,
     next_session: Mapping[str, str],
+    adv_by_day: Mapping[str, Mapping[str, float]],
 ) -> list[SessionInputs]:
     """Join each recorded session onto the return it actually earned.
 
@@ -1881,6 +1981,15 @@ def _build_sessions(
     every other slot uses. A session whose successor the panel does not carry
     yet is not settled and is simply absent here; it enters on the first cycle
     after it settles, never as a zero.
+
+    ``adv_by_day`` carries each session's `dollar_volume_20d_raw`, keyed by
+    ticker (:func:`_read_session_adv`), and is joined onto ``SessionInputs.
+    adv_usd`` — one entry per name in ``universe.tickers`` order, benchmark
+    and cash sentinels excluded (they are never in ``session.tickers`` to
+    begin with, so they are left NaN here, the same value
+    `crucible.portfolio._clean_adv` already treats as "no coverage" and
+    additionally excludes both sentinels from by index — belt and suspenders,
+    not a second mechanism).
     """
     n = len(universe.tickers)
     index = {ticker: i for i, ticker in enumerate(universe.tickers)}
@@ -1891,6 +2000,8 @@ def _build_sessions(
         alpha = np.zeros(n)
         eligible = np.zeros(n, dtype=bool)
         caps = np.zeros(n)
+        adv = np.full(n, np.nan)
+        day_adv = adv_by_day.get(session.trading_day, {})
         for ticker, a, e, c in zip(
             session.tickers,
             session.alpha_hat,
@@ -1900,6 +2011,9 @@ def _build_sessions(
         ):
             i = index[ticker]
             alpha[i], eligible[i], caps[i] = a, e, c
+            value = day_adv.get(ticker)
+            if value is not None:
+                adv[i] = value
         # The two sentinels are always eligible and always uncapped: the
         # benchmark IS the no-conviction fill and cash is an equality pin, and
         # `crucible.portfolio._validate_inputs` refuses a book where either is
@@ -1927,6 +2041,7 @@ def _build_sessions(
                 realized_returns=realized,
                 benchmark_return=float(returns.loc[settle, benchmark]),
                 returns_panel=panel_matrix,
+                adv_usd=adv,
             )
         )
     return out
@@ -2016,6 +2131,7 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     params = load_portfolio_params_from_store(
         SLOT, store=ctx.store, strategy_dir=getattr(settings, "strategy_dir", None)
     )
+    feature_version = kwargs.get("feature_version") or DEFAULT_FEATURE_VERSION
     panel = _read_panel(ctx.store, ctx.trading_day)
     returns = _close_returns(panel)
     sessions_index = [str(d) for d in returns.index]
@@ -2023,6 +2139,10 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     # panel has no successor and is therefore UNSETTLED, which is a state, not
     # a zero-return day.
     next_session = dict(zip(sessions_index[:-1], sessions_index[1:], strict=True))
+    # One feature read per decision day for the WHOLE cycle, shared by every
+    # arm's point-in-time pass and its `_attest` re-resolution — not one per
+    # arm, which would re-read the same day's artifact once per registered arm.
+    adv_cache: dict[str, dict[str, float]] = {}
 
     series: dict[str, ArmSeries] = {}
     preconditions: dict[str, list[ServingPrecondition]] = {}
@@ -2081,19 +2201,26 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         w_initial = np.zeros(len(universe.tickers))
         w_initial[universe.cash_idx] = 1.0
 
+        _adv_by_day(
+            ctx.store,
+            feature_version=feature_version,
+            days=(s.trading_day for s in resolved),
+            cache=adv_cache,
+        )
         built = _build_sessions(
             resolved,
             returns=returns,
             benchmark=recipe.benchmark,
             universe=universe,
             next_session=next_session,
+            adv_by_day=adv_cache,
         )
         constructed = construct_book(
             recipe=recipe,
             params=params,
             universe=universe,
             sessions=built,
-            portfolio_notional=GRADING_NOTIONAL,
+            portfolio_notional=params.book_notional_usd,
             w_initial=w_initial,
         )
         ctx.record_metric(portfolio_metric_record(constructed.evidence, now_utc=_utc_now()))
@@ -2112,6 +2239,8 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             w_initial=w_initial,
             point_in_time=arm_grade.series.scores,
             as_of=as_of,
+            feature_version=feature_version,
+            adv_cache=adv_cache,
         )
         preconditions[spec.arm_id] = [_attestation_precondition(attestation)]
         graded[spec.arm_id] = {
@@ -2176,6 +2305,8 @@ def _attest(
     w_initial: np.ndarray,
     point_in_time: Mapping[str, float],
     as_of: str,
+    feature_version: str,
+    adv_cache: dict[str, dict[str, float]],
 ) -> PitParityVerdict:
     """The §9.1 contamination attestation, measured rather than asserted.
 
@@ -2207,6 +2338,12 @@ def _attest(
             # whether the arm may SERVE.
             continue
     if current:
+        _adv_by_day(
+            ctx.store,
+            feature_version=feature_version,
+            days=(s.trading_day for s in current),
+            cache=adv_cache,
+        )
         contaminated_book = construct_book(
             recipe=recipe,
             params=params,
@@ -2217,8 +2354,9 @@ def _attest(
                 benchmark=recipe.benchmark,
                 universe=universe,
                 next_session=next_session,
+                adv_by_day=adv_cache,
             ),
-            portfolio_notional=GRADING_NOTIONAL,
+            portfolio_notional=params.book_notional_usd,
             w_initial=w_initial,
         )
         contaminated = dict(grade_arm(recipe, contaminated_book.book, as_of=as_of).series.scores)

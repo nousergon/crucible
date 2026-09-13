@@ -763,13 +763,38 @@ class TestDryRunNeverWrites:
         fallback (unlike `crucible.slots.arms.read_register`), so `promote`
         needs the register key to exist at all — an empty one is enough to
         reach the real dry-run path (`run_promotion(store=None)`,
-        pre-existing, `cli.py::_promote`)."""
+        pre-existing, `cli.py::_promote`).
+
+        The graded `arena_cycle` is seeded for the same reason and is not a
+        second fixture doing the same job: since `alpha-engine-config-I9759`
+        `promote` READS the eligibility `experiment.grade` evaluated, and
+        refuses outright when that artifact is absent, so an empty register
+        alone no longer reaches the dry-run path. Seeded here with the
+        library's own `run_cycle` over the same empty register, which is
+        exactly what `experiment.grade` would have written for a slot with
+        nothing scored: `unservable`, no arms, no vetoes.
+        """
+        from nousergon_lib.arena import ArmRegister
+        from nousergon_lib.arena.engine import run_cycle
+
+        from crucible.arena_io import write_arena_cycle
         from crucible.promote import arm_register_key
+        from crucible.slots import get_slot
         from crucible.store import LocalStore
 
         monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
         store = LocalStore(tmp_path)
         store.put_bytes(arm_register_key("r"), b"")
+        write_arena_cycle(
+            store,
+            run_cycle(
+                config=get_slot("r").arena,
+                as_of=FRIDAY.isoformat(),
+                register=ArmRegister(),
+                series_by_arm={},
+                incumbent=None,
+            ),
+        )
         before = sorted(store.list_keys())
         argv = [
             *_minimal_argv("promote"),

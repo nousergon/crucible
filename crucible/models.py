@@ -160,6 +160,7 @@ __all__ = [
     "ReviewDocument",
     "RunManifestV2",
     "SignalsRow",
+    "TraderEvidenceDocument",
     "TrialRow",
 ]
 
@@ -3143,3 +3144,126 @@ class PredictionsFeedDocument(_Strict):
         "producer that failed and wrote anyway, and the trader must page rather than "
         "flatten the book on it.",
     )
+
+
+# -- The trader's consumer evidence (alpha-engine-config-I10648) ------------
+# Appended after the prior rows' markers for the same rebase reason as every
+# block above. This is the artifact the PHASE-4 GATE reads
+# (`crucible.gate.TRADER_EVIDENCE_KEY`), and the trader is its producer.
+#
+# It exists because the harness may not reach into the trader (plan §3): the
+# two are separate systems coupled by contract documents, so the only honest
+# way to grade "the trader ran a week on the v2 champion" is to read an artifact
+# the trader agreed to write. Its integrity comes from the money-path hash chain
+# (`crucible.explain.verify_money_path_chain`), not from the writer being a
+# different party.
+
+
+def _trader_evidence_json_schema_extra(schema: dict[str, object]) -> None:
+    """Sets `trader_evidence.v1.json`'s document-level metadata and mirrors the
+    one cross-field rule pydantic states and JSON Schema cannot.
+
+    `trading_days` must equal `len(days_served)`. A model_validator enforces it
+    in-process; the published schema carries it in `description` and in a
+    `$comment`, because a second implementation of the trader reads this file
+    without a Python import and would otherwise be free to file a count its own
+    day list does not support — which is the whole forgery this document exists
+    to prevent.
+    """
+    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    schema["$id"] = "https://github.com/nousergon/crucible/schemas/trader_evidence.v1.json"
+    schema["title"] = "Crucible trader consumer evidence, v1"
+    schema["$comment"] = (
+        "trading_days MUST equal the number of distinct entries in days_served, and "
+        "days_served MUST be strictly increasing. JSON Schema cannot state either, so "
+        "a consumer validating against this file alone must check both itself."
+    )
+    schema["description"] = (
+        "The trader's rolling account of the trading days it served on the v2 "
+        "champion, written at the key `crucible.keys.TRADER_EVIDENCE_KEY` and read "
+        "by the phase-4 gate clause `trader_one_week_on_v2_champion`. Cumulative, "
+        "not dated: the question the clause asks is cumulative, and a dated artifact "
+        "would make the gate reconstruct the count by listing — a second "
+        "implementation of a number the trader already knows. "
+        "additionalProperties: false because a field this reader does not understand "
+        "is a field the producer expected it to act on."
+    )
+
+
+class TraderEvidenceDocument(_Strict):
+    """`trader/evidence.json` — the trader's own record, and the gate's evidence."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra=_trader_evidence_json_schema_extra,
+    )
+
+    schema_version: Literal["trader_evidence.v1"] = Field(
+        description="Version of THIS schema. A consumer that cannot read the version "
+        "refuses the document rather than guessing."
+    )
+    slot: Literal["m"] = Field(
+        description="The slot whose champion was served. Closed to `m`: "
+        "`predictions/{trading_day}.json` is the M contract specifically, and the R "
+        "and U champions serve their own keys."
+    )
+    champion: str = Field(
+        min_length=1,
+        description="The arm id served across `days_served`. A promotion ENDS a run of "
+        "days: the trader starts a new count under the new arm rather than carrying the "
+        "old one forward, because 'a week on the v2 champion' is a week on ONE champion.",
+    )
+    trading_days: int = Field(
+        ge=0,
+        description="Count of NYSE trading days served on this champion (§4.12) — five "
+        "to a week, and a holiday week is still one week. The field the gate reads. It "
+        "is required to equal len(days_served), so it cannot be inflated without "
+        "inventing the days to support it.",
+    )
+    days_served: list[str] = Field(
+        description="The trading days themselves, strictly increasing. Carried beside "
+        "the count so the count is checkable rather than asserted — the "
+        "shape of a suite that only ever tests the happy path, one contract out.",
+    )
+    calendar_date: str = Field(
+        pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+        description="Wall-clock date this document was last written. Provenance only, "
+        "never a key (§4.12).",
+    )
+
+    @model_validator(mode="after")
+    def _count_is_supported_by_the_days(self) -> TraderEvidenceDocument:
+        """The count and the day list agree, and the days are real and ordered.
+
+        Mirrored into the published schema by
+        :func:`_trader_evidence_json_schema_extra`.
+        """
+        for day in self.days_served:
+            try:
+                dt.date.fromisoformat(day)
+            except ValueError as exc:
+                # Re-raised, never swallowed: the caller must see WHICH entry is
+                # malformed, and `fromisoformat` says "invalid isoformat string"
+                # without naming the field it came from.
+                raise ValueError(
+                    f"days_served carries {day!r}, which is not a calendar date. Every "
+                    "entry is a NYSE trading day (§4.12), and a shape-only check would "
+                    "accept 2026-02-31."
+                ) from exc
+        if len(set(self.days_served)) != len(self.days_served):
+            raise ValueError(
+                "days_served repeats a trading day. A session served twice is one day, "
+                "and counting it twice is how a four-day week reads as five."
+            )
+        if list(self.days_served) != sorted(self.days_served):
+            raise ValueError(
+                "days_served is not strictly increasing. An out-of-order list is either "
+                "a merge of two records or a hand edit, and neither is evidence."
+            )
+        if self.trading_days != len(self.days_served):
+            raise ValueError(
+                f"trading_days={self.trading_days} but days_served carries "
+                f"{len(self.days_served)} day(s). The count the gate reads must be "
+                "supported by the days that produced it."
+            )
+        return self
