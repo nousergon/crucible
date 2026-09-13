@@ -114,6 +114,7 @@ def _valid_manifest() -> dict:
                 "cache_read": 11000,
                 "cache_write": 0,
                 "usd": 0.41,
+                "arm_id": None,
             }
         ],
         "resource": {

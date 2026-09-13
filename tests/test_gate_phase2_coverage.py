@@ -41,7 +41,10 @@ from crucible.gate import (
     MANIFEST_ATTEMPT_INITIAL,
     RUNBOOK_PROCEDURES,
     SCRIPTED_FAULTS,
+    UNSEAL_RESERVATION_ISSUE,
+    ReservedMechanism,
 )
+from crucible.holdout import HOLDOUT_JOB, UnsealRulingRequiredError
 from crucible.keys import (
     FAULT_INJECTION_ROOT,
     fault_injection_key,
@@ -564,12 +567,14 @@ class TestRunbookInReadme:
         clause = gate_module._clause_runbook_in_readme()
         assert not clause.met
 
-    def test_a_reserved_procedure_publishing_a_command_is_unmet(
+    def test_a_reserved_procedure_publishing_another_jobs_command_is_unmet(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The reserved half, refusing. `unseal` is a human ruling (plan §9.4);
-        a runbook that hands an operator a command for it is a defect, and a
-        clause that graded "has a command that parses" would reward it."""
+        """The reserved half, refusing. `unseal` is a human ruling (plan §9.4)
+        and the ruled command is the ONLY one its section may publish — a
+        second command here is one an operator reaches for instead of the
+        ruled path, and a clause that graded "has a command that parses"
+        would reward it."""
         reserved = [verb for verb, is_reserved in RUNBOOK_PROCEDURES if is_reserved]
         assert reserved, "no procedure is declared reserved — this test grades nothing"
         body = gate_module.README_PATH.read_text(encoding="utf-8")
@@ -582,6 +587,111 @@ class TestRunbookInReadme:
         clause = gate_module._clause_runbook_in_readme()
         assert not clause.met
         assert "reserved" in clause.detail
+
+
+class TestReservedMechanismIsGradedOnItsRefusal:
+    """`alpha-engine-config-I10599`. Reserved-ness used to be graded as an
+    ABSENCE — the section names no command and the CLI carries no such job.
+    Since `alpha-engine-config-I10502` the mechanism EXISTS and is reserved
+    because it refuses without a ruling, so the old predicate graded the
+    wrong property and would have gone red the day someone documented the
+    ruled command correctly.
+
+    Every case below drives the grader from a STUB, because a detector nobody
+    has made fail is a detector nobody knows works.
+    """
+
+    @staticmethod
+    def _mechanism(refuse: object) -> ReservedMechanism:
+        return ReservedMechanism(job=HOLDOUT_JOB, refuse=refuse)  # type: ignore[arg-type]
+
+    def test_the_real_mechanism_grades_clean(self) -> None:
+        reserved = [m for _verb, m in RUNBOOK_PROCEDURES if m is not None]
+        assert reserved, "no procedure is declared reserved — this test grades nothing"
+        for mechanism in reserved:
+            assert mechanism.problem() is None
+
+    def test_a_mechanism_that_ACCEPTS_a_missing_ruling_is_a_finding(self) -> None:
+        """The issue's own self-test: a stub whose unseal accepts an empty
+        ruling. A reserved action that proceeds without a ruling has not been
+        reserved — it has been announced."""
+        problem = self._mechanism(lambda ruling, *, action: ruling or "").problem()
+        assert problem is not None
+        assert "ACCEPTED" in problem
+        assert "no ruling at all" in problem
+
+    def test_a_mechanism_that_takes_a_bare_issue_number_is_a_finding(self) -> None:
+        """Refusing `None` is not enough. A bare number identifies no ruling
+        anybody can look up later, and the tracker is not this repository."""
+
+        def refuse(ruling: str | None, *, action: str) -> str:
+            if not ruling:
+                raise UnsealRulingRequiredError(action)
+            return ruling
+
+        problem = self._mechanism(refuse).problem()
+        assert problem is not None
+        assert "a bare issue number" in problem
+
+    def test_a_mechanism_that_refuses_EVERYTHING_is_a_finding(self) -> None:
+        """A blanket `raise` is broken, not reserved — and a clause satisfied
+        by one would be satisfied by a mechanism nobody can use."""
+
+        def refuse(ruling: str | None, *, action: str) -> str:
+            raise UnsealRulingRequiredError(action)
+
+        problem = self._mechanism(refuse).problem()
+        assert problem is not None
+        assert "refuses everything" in problem
+
+    def test_a_mechanism_that_records_a_different_reference_is_a_finding(self) -> None:
+        def refuse(ruling: str | None, *, action: str) -> str:
+            if not ruling or not ruling.startswith("alpha-engine-config-I"):
+                raise UnsealRulingRequiredError(action)
+            return "something else"
+
+        problem = self._mechanism(refuse).problem()
+        assert problem is not None
+        assert "must be the one it was given" in problem
+
+    def test_a_mechanism_the_cli_cannot_reach_is_a_finding(self) -> None:
+        """The inversion of the old predicate: the CLI must CARRY the reserved
+        job. A reservation nobody can reach is a missing capability wearing a
+        reservation's clothes."""
+        mechanism = ReservedMechanism(
+            job="not-a-job", refuse=lambda ruling, *, action: ruling or ""
+        )
+        problem = mechanism.problem()
+        assert problem is not None
+        assert "carries no" in problem
+
+    def test_the_probe_reference_is_well_formed(self) -> None:
+        """The grader's positive case has to be a reference the real refusal
+        accepts, or "refuses everything" would fire on a correct mechanism."""
+        from crucible.holdout import assert_ruling_reference
+
+        ruled = f"alpha-engine-config-I{UNSEAL_RESERVATION_ISSUE}"
+        assert assert_ruling_reference(ruled, action="x") == ruled
+
+    def test_the_whole_clause_goes_unmet_when_the_mechanism_stops_refusing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End to end: the README is untouched and correct, and the clause
+        still refuses — because the property it grades is the refusal, not the
+        prose."""
+        patched = tuple(
+            (verb, self._mechanism(lambda ruling, *, action: ruling or "") if m else None)
+            for verb, m in RUNBOOK_PROCEDURES
+        )
+        monkeypatch.setattr(gate_module, "RUNBOOK_PROCEDURES", patched)
+        clause = gate_module._clause_runbook_in_readme()
+        assert not clause.met and not clause.unmeasurable
+        assert "ACCEPTED" in clause.detail
+
+    def test_the_requirement_states_the_refusal_rather_than_an_absence(self) -> None:
+        clause = gate_module._clause_runbook_in_readme()
+        assert "refuses to act without a ruling reference" in clause.requirement
+        assert "no such job exists" not in clause.requirement
 
 
 # ── coverage: the reading the issue was filed on ───────────────────────────

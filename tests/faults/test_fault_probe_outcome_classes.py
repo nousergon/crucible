@@ -37,6 +37,7 @@ import json
 
 import pytest
 
+from crucible import llm
 from crucible.fault_probe import (
     FAULT_PROBE_JOB,
     PROBE_OUTCOME_MARKER,
@@ -319,3 +320,128 @@ class TestTheWrapperItself:
 
     def test_a_reason_with_an_undeclared_marker_reads_none(self) -> None:
         assert probe_outcome_from_reason(PROBE_OUTCOME_MARKER + "invented") is None
+
+
+def _non_probe_manifest(
+    store, monkeypatch, exc: BaseException, *, job: str = "experiment.run"
+) -> dict:
+    """A job OTHER than `fault.probe`, deliberately routed to a
+    fault-injection capability class via `--fault-capability-class` — the
+    phase-5 shape `crucible.fault_probe`'s own docstring names — through the
+    door every LLM call passes through, `crucible.llm.call`, with nothing
+    about the job body itself naming fault injection
+    (`alpha-engine-config-I10446`).
+    """
+    _stub_router(monkeypatch)
+    monkeypatch.setattr("krepis.llm.LLMClient", lambda *a, **k: _RaisingClient(exc))
+
+    def body(ctx) -> None:
+        llm.call(
+            ctx,
+            callsite_id="faults.router_probe",
+            capability_class="chaos_probe",
+            messages=[{"role": "user", "content": "x"}],
+            cap=llm.SpendCap(cap_usd=llm.DEFAULT_LLM_CAP_USD),
+            estimate_usd=0.0,
+        )
+
+    with pytest.raises(BaseException):  # noqa: B017 - the failure is the point
+        run_job(
+            job,
+            body,
+            store=store,
+            trading_day=FRIDAY,
+            transient_retry=False,
+            fault_capability_class="chaos_probe",
+        )
+    return json.loads(store.get_bytes(manifest_key(job, FRIDAY.isoformat())))
+
+
+class TestANonProbeJobRoutedToFaultInjectionClassifiesToo:
+    """`alpha-engine-config-I10446`: a job routed to a fault-injection class
+    that is not `fault.probe` used to record no outcome at all, so nothing
+    refused its `induced` record on the strength of `status: failed` alone —
+    the exact reading `-I10367` closed for `fault.probe`. Classification now
+    lives in `crucible.llm.call`, keyed on `ctx.fault_capability_class`
+    alone, so it fires for any job the same way.
+    """
+
+    def test_the_manifest_carries_the_outcome(self, tmp_path, monkeypatch) -> None:
+        manifest = _non_probe_manifest(LocalStore(tmp_path), monkeypatch, MEASURED_UPSTREAM_400)
+        assert manifest["job"] == "experiment.run"
+        assert manifest["fault_capability_class"] == "chaos_probe"
+        assert probe_outcome_from_reason(manifest["reason"]) == PROBE_OUTCOME_UPSTREAM_REFUSAL
+
+    def _record(self, store, manifest) -> None:
+        def job(ctx) -> None:
+            record_fault(
+                ctx,
+                store,
+                fault_id="router_returns_500",
+                outcome="induced",
+                target_job="experiment.run",
+                trading_day=FRIDAY.isoformat(),
+                run_id=manifest["run_id"],
+                bus_key=BUS_KEY,
+            )
+
+        run_job("fault.record", job, store=store, trading_day=FRIDAY, transient_retry=False)
+
+    def test_a_4xx_is_refused(self, tmp_path, monkeypatch) -> None:
+        store = LocalStore(tmp_path)
+        manifest = _non_probe_manifest(store, monkeypatch, MEASURED_UPSTREAM_400)
+        store.put_bytes(BUS_KEY, b"{}")
+        with pytest.raises(FaultRecordRefusedError, match="upstream_refusal"):
+            self._record(store, manifest)
+
+    def test_a_5xx_is_accepted(self, tmp_path, monkeypatch) -> None:
+        store = LocalStore(tmp_path)
+        manifest = _non_probe_manifest(store, monkeypatch, MEASURED_UPSTREAM_503)
+        store.put_bytes(BUS_KEY, b"{}")
+        self._record(store, manifest)
+
+    def test_a_job_routed_to_the_class_that_never_reached_the_router_is_refused(
+        self, tmp_path
+    ) -> None:
+        # The hole `-I10446` closes: the run declared the override
+        # (`fault_capability_class` lands on the manifest either way) but
+        # blew up before the router call, so no outcome was ever classified.
+        # Not evidence of the fault either way, exactly like a `fault.probe`
+        # manifest that never reached the classifier.
+        store = LocalStore(tmp_path)
+
+        def body(ctx) -> None:
+            raise ValueError("blew up before reaching the router")
+
+        with pytest.raises(ValueError):
+            run_job(
+                "experiment.run",
+                body,
+                store=store,
+                trading_day=FRIDAY,
+                transient_retry=False,
+                fault_capability_class="chaos_probe",
+            )
+        manifest = json.loads(store.get_bytes(manifest_key("experiment.run", FRIDAY.isoformat())))
+        store.put_bytes(BUS_KEY, b"{}")
+        with pytest.raises(FaultRecordRefusedError, match="no fault-probe outcome"):
+            self._record(store, manifest)
+
+    def test_a_job_never_routed_to_a_fault_injection_class_is_outside_this_refusal(
+        self, tmp_path
+    ) -> None:
+        # An ordinary failed run, no override at all: `_refuse_a_failure_
+        # that_is_not_the_fault` has nothing to say about it, and the
+        # ordinary `induced` evidence check (a FAILED manifest with the
+        # right `run_id`) is the only gate it needs to clear.
+        store = LocalStore(tmp_path)
+
+        def body(ctx) -> None:
+            raise ValueError("an ordinary failure, nothing to do with fault injection")
+
+        with pytest.raises(ValueError):
+            run_job("experiment.run", body, store=store, trading_day=FRIDAY, transient_retry=False)
+        manifest = json.loads(store.get_bytes(manifest_key("experiment.run", FRIDAY.isoformat())))
+        assert "fault_capability_class" not in manifest
+        store.put_bytes(BUS_KEY, b"{}")
+        self._record(store, manifest)

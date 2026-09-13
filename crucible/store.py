@@ -43,6 +43,7 @@ __all__ = [
     "S3Store",
     "Store",
     "open_store",
+    "parse_store_scheme",
     "read_only",
     "resolve_store_uri",
     "sha256_hex",
@@ -696,6 +697,41 @@ def resolve_store_uri(uri: str | None) -> str:
     return target
 
 
+def parse_store_scheme(uri: str) -> tuple[str, str]:
+    """Classify ``uri``'s scheme: ``("s3", rest)`` or ``("local", uri)``.
+
+    The one place `s3://` vs an unsupported scheme vs a local directory is
+    told apart. `open_store` (this module) and `crucible.config.store_from_uri`
+    each validated an independent copy of this same three-branch check —
+    `store_from_uri` had it correctly from the start; `open_store` gained a
+    textually separate copy in `alpha-engine-config-I9817` to fix a measured
+    defect (`--store file://./store` silently wrote into a literal `file:`
+    directory). `alpha-engine-config-I10519` collapses both copies into this
+    one function; each caller still applies its own bucket-parsing and
+    local-path construction on top; see `open_store` and `store_from_uri`,
+    which differ slightly in exactly that step (`~`-expansion and
+    slash-stripping) and stay that way rather than being silently unified
+    along with the scheme check.
+
+    For ``"s3"``, ``rest`` is the URI's substring after ``s3://``,
+    unstripped and unpartitioned. RAISES for any other ``://`` scheme:
+    reading an unknown scheme as a directory name would silently write a
+    production run into a folder named after the scheme and report success.
+    """
+    if uri.startswith("s3://"):
+        return "s3", uri[len("s3://") :]
+    if "://" in uri:
+        scheme = uri.split("://", 1)[0]
+        raise ValueError(
+            f"unsupported store scheme {scheme!r} in {uri!r}. The supported "
+            "backends are `s3://bucket/prefix` and a local directory path; an "
+            "unknown scheme is a typo, and reading it as a directory name would "
+            "write a production run into a folder named after the scheme and "
+            "report success."
+        )
+    return "local", uri
+
+
 def open_store(uri: str | None, *, dry_run: bool = False) -> Store:
     """`s3://bucket/prefix` or a directory path, resolved to a backend.
 
@@ -713,27 +749,10 @@ def open_store(uri: str | None, *, dry_run: bool = False) -> Store:
     checks the flag.
     """
     target = resolve_store_uri(uri)
-    if target.startswith("s3://"):
-        rest = target[len("s3://") :]
+    kind, rest = parse_store_scheme(target)
+    if kind == "s3":
         bucket, _, prefix = rest.partition("/")
         store: Store = S3Store(bucket, prefix)
-    elif "://" in target:
-        # alpha-engine-config-I9817 ("found running it"): a `file://` (or any
-        # other) scheme fell through to `LocalStore(target)` below, which
-        # treats the whole URI string as a directory name — `file://./store`
-        # becomes a literal directory named `file:` holding a `./store`
-        # subtree, one directory level away from what the caller meant and
-        # silently accepted rather than refused. `crucible.config.store_from_uri`
-        # already refuses an unknown scheme this way; mirrored here because
-        # this is the parser CLI `--store` handlers actually call.
-        scheme = target.split("://", 1)[0]
-        raise ValueError(
-            f"unsupported store scheme {scheme!r} in {target!r}. The supported "
-            "backends are `s3://bucket/prefix` and a local directory path; an "
-            "unknown scheme is a typo, and reading it as a directory name would "
-            "write a production run into a folder named after the scheme and "
-            "report success."
-        )
     else:
         store = LocalStore(target)
     return read_only(store) if dry_run else store

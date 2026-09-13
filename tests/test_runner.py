@@ -398,6 +398,108 @@ class TestCostAssertion:
             run_job("experiment.run", job, store=store, trading_day=TRADING_DAY)
 
 
+def _llm_call(**overrides) -> dict:
+    call = {
+        "callsite_id": "research.rank.v1",
+        "model_requested": "tier:high",
+        "model_served": "glm-4.6",
+        "route_degraded": False,
+        "fallback_used": False,
+        "served_deployment": "high-1",
+        "tokens_in": 100,
+        "tokens_out": 10,
+        "cache_read": 0,
+        "cache_write": 0,
+        "usd": 0.10,
+    }
+    call.update(overrides)
+    return call
+
+
+class TestArmAttribution:
+    """`alpha-engine-config-I9920`: phase 5's exit gate needs provider-side
+    LLM spend reconcilable per arm. `record_llm_call` is the one writer of
+    `llm_calls[].arm_id`, stamped from the ambient `scoring_arm` scope."""
+
+    def test_a_call_outside_scoring_arm_records_a_declared_null(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+
+        def job(ctx: RunContext) -> None:
+            ctx.record_llm_call(_llm_call())
+
+        run_job("experiment.run", job, store=store, trading_day=TRADING_DAY)
+        manifest = _read_manifest(store, "experiment.run")
+        assert manifest["llm_calls"][0]["arm_id"] is None
+
+    def test_a_call_inside_scoring_arm_is_attributed(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+
+        def job(ctx: RunContext) -> None:
+            with ctx.scoring_arm("r:momentum_llm:abc123"):
+                ctx.record_llm_call(_llm_call())
+
+        run_job("experiment.run", job, store=store, trading_day=TRADING_DAY)
+        manifest = _read_manifest(store, "experiment.run")
+        assert manifest["llm_calls"][0]["arm_id"] == "r:momentum_llm:abc123"
+
+    def test_scoping_restores_the_previous_arm_on_exit_not_null(self, tmp_path) -> None:
+        """Nested scoring: a call made after an inner `scoring_arm` block
+        exits is attributed back to the OUTER arm, not to nothing — a plain
+        "clear to None on exit" would misattribute it."""
+        store = LocalStore(tmp_path)
+
+        def job(ctx: RunContext) -> None:
+            with ctx.scoring_arm("r:outer:1"):
+                with ctx.scoring_arm("r:inner:2"):
+                    ctx.record_llm_call(_llm_call(usd=0.01))
+                ctx.record_llm_call(_llm_call(usd=0.02))
+            ctx.record_llm_call(_llm_call(usd=0.03))
+
+        run_job("experiment.run", job, store=store, trading_day=TRADING_DAY)
+        manifest = _read_manifest(store, "experiment.run")
+        assert [c["arm_id"] for c in manifest["llm_calls"]] == [
+            "r:inner:2",
+            "r:outer:1",
+            None,
+        ]
+
+    def test_scoring_arm_restores_the_previous_value_on_a_raise(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+
+        def job(ctx: RunContext) -> None:
+            with pytest.raises(RuntimeError):
+                with ctx.scoring_arm("r:will_fail:1"):
+                    raise RuntimeError("boom")
+            ctx.record_llm_call(_llm_call())
+
+        run_job("experiment.run", job, store=store, trading_day=TRADING_DAY)
+        manifest = _read_manifest(store, "experiment.run")
+        assert manifest["llm_calls"][0]["arm_id"] is None
+
+    def test_scoring_arm_refuses_an_empty_arm_id(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+
+        def job(ctx: RunContext) -> None:
+            with pytest.raises(ValueError, match="non-empty arm_id"):
+                with ctx.scoring_arm(""):
+                    pass
+
+        run_job("experiment.run", job, store=store, trading_day=TRADING_DAY)
+
+    def test_record_llm_call_refuses_a_caller_supplied_arm_id(self, tmp_path) -> None:
+        """`arm_id` is derived, not supplied — two answers to "which arm"
+        from two layers is not a value to silently pick between."""
+        store = LocalStore(tmp_path)
+
+        def job(ctx: RunContext) -> None:
+            ctx.record_llm_call(_llm_call(arm_id="r:sneaky:1"))
+
+        with pytest.raises(ValueError, match="does not accept a caller-supplied value"):
+            run_job(
+                "experiment.run", job, store=store, trading_day=TRADING_DAY, transient_retry=False
+            )
+
+
 class TestDiscriminator:
     """alpha-engine-config-I9781: a discriminator keeps concurrent or
     repeated writers of the same job+trading_day from colliding."""

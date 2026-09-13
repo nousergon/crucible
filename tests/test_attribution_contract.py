@@ -119,6 +119,36 @@ def test_metric_row_with_a_future_schema_version_raises() -> None:
         manifest_records_factor_attribution(manifest)
 
 
+def test_a_spread_factors_evidence_row_validates_and_carries_short_proxy() -> None:
+    """`alpha-engine-config-I10592`: a factor row records the spread it was
+    computed from, so the evidence document names its own construction."""
+    params = AttributionFactorParams(
+        factors={
+            "market": FactorDef(category="beta", proxy="SPY"),
+            "sector_tech": FactorDef(category="sector", proxy="XLK"),
+            "size_factor": FactorDef(category="size", proxy="IWM", short_proxy="SPY"),
+        },
+        benchmark_proxy="SPY",
+    )
+    gross = sum(_WEIGHTS[t] * sum(_HOLDING_RETURNS[t]) for t in _WEIGHTS)
+    evidence = compute_factor_attribution(
+        trading_day="2026-07-06",
+        window_sessions=6,
+        holding_returns=_HOLDING_RETURNS,
+        weights=_WEIGHTS,
+        factor_returns={"market": _MARKET, "sector_tech": _SECTOR, "size_factor": _SIZE},
+        params=params,
+        gross_return=gross,
+        cost_bps_total=10.0,
+    )
+    schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+    errors = list(Draft202012Validator(schema).iter_errors(evidence))
+    assert not errors, [e.message for e in errors]
+    by_name = {row["name"]: row for row in evidence["factors"]}
+    assert by_name["size_factor"]["short_proxy"] == "SPY"
+    assert "short_proxy" not in by_name["market"]
+
+
 def test_producer_refuses_to_emit_a_document_missing_a_required_field() -> None:
     """A hand-corrupted document must fail the same validator the producer runs at birth."""
     schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))

@@ -18,6 +18,7 @@ from crucible.attribution import (
     AttributionParamsError,
     FactorDef,
     compute_factor_attribution,
+    factor_return_series,
     load_attribution_params,
     params_digest,
 )
@@ -205,6 +206,108 @@ attribution:
     assert params.benchmark_proxy == "SPY"
     assert set(params.factors) == {"market", "sector_tech", "size_factor"}
     assert {f.category for f in params.factors.values()} == set(ATTRIBUTION_FACTOR_CATEGORIES)
+
+
+class TestFactorDefSpread:
+    def test_a_bare_proxy_has_no_short_proxy(self) -> None:
+        assert FactorDef(category="size", proxy="IWM").short_proxy is None
+
+    def test_a_long_short_spread_is_accepted(self) -> None:
+        fdef = FactorDef(category="size", proxy="IWM", short_proxy="SPY")
+        assert fdef.proxy == "IWM"
+        assert fdef.short_proxy == "SPY"
+
+    def test_an_empty_short_proxy_is_refused(self) -> None:
+        with pytest.raises(AttributionParamsError, match="non-empty"):
+            FactorDef(category="size", proxy="IWM", short_proxy="")
+
+    def test_a_short_proxy_identical_to_the_long_leg_is_refused(self) -> None:
+        with pytest.raises(AttributionParamsError, match="same ticker"):
+            FactorDef(category="size", proxy="IWM", short_proxy="IWM")
+
+
+class TestFactorReturnSeries:
+    def test_a_raw_factor_returns_its_long_legs_series_unchanged(self) -> None:
+        fdef = FactorDef(category="size", proxy="IWM")
+        series = factor_return_series(fdef, {"IWM": [0.01, -0.02, 0.03]})
+        assert series == [0.01, -0.02, 0.03]
+
+    def test_a_spread_factor_is_the_long_leg_minus_the_short_leg(self) -> None:
+        fdef = FactorDef(category="size", proxy="IWM", short_proxy="SPY")
+        series = factor_return_series(
+            fdef, {"IWM": [0.010, -0.020, 0.030], "SPY": [0.004, -0.006, 0.002]}
+        )
+        assert series == pytest.approx([0.006, -0.014, 0.028])
+
+    def test_a_spread_factor_is_not_silently_the_long_leg_alone(self) -> None:
+        """The exact defect `alpha-engine-config-I10592` exists to fix: a
+        constructor that used only `proxy` for a `short_proxy` factor would
+        pass this test's first assertion and fail its second."""
+        fdef = FactorDef(category="size", proxy="IWM", short_proxy="SPY")
+        proxy_returns = {"IWM": [0.010, -0.020, 0.030], "SPY": [0.004, -0.006, 0.002]}
+        series = factor_return_series(fdef, proxy_returns)
+        assert series != proxy_returns["IWM"]
+
+    def test_mismatched_leg_lengths_are_refused(self) -> None:
+        fdef = FactorDef(category="size", proxy="IWM", short_proxy="SPY")
+        with pytest.raises(ValueError, match="aligned to the same sessions"):
+            factor_return_series(fdef, {"IWM": [0.01, 0.02], "SPY": [0.01]})
+
+
+class TestParamsDigestOfASpreadSpec:
+    def test_a_spread_spec_digests_differently_from_the_raw_form(self) -> None:
+        raw = AttributionFactorParams(
+            factors={
+                "market": FactorDef(category="beta", proxy="SPY"),
+                "sector_tech": FactorDef(category="sector", proxy="XLK"),
+                "size_factor": FactorDef(category="size", proxy="IWM"),
+            },
+            benchmark_proxy="SPY",
+        )
+        spread = AttributionFactorParams(
+            factors={
+                "market": FactorDef(category="beta", proxy="SPY"),
+                "sector_tech": FactorDef(category="sector", proxy="XLK"),
+                "size_factor": FactorDef(category="size", proxy="IWM", short_proxy="SPY"),
+            },
+            benchmark_proxy="SPY",
+        )
+        assert params_digest(raw) != params_digest(spread)
+
+    def test_to_dict_round_trips_the_short_proxy(self) -> None:
+        params = AttributionFactorParams(
+            factors={
+                "market": FactorDef(category="beta", proxy="SPY"),
+                "sector_tech": FactorDef(category="sector", proxy="XLK"),
+                "size_factor": FactorDef(category="size", proxy="IWM", short_proxy="SPY"),
+            },
+            benchmark_proxy="SPY",
+        )
+        assert params.to_dict()["factors"]["size_factor"]["short_proxy"] == "SPY"
+        assert "short_proxy" not in params.to_dict()["factors"]["market"]
+
+    def test_load_attribution_params_parses_a_short_proxy(self, tmp_path: Path) -> None:
+        spec = tmp_path / "attribution.yaml"
+        spec.write_text(
+            """
+attribution:
+  benchmark_proxy: SPY
+  factors:
+    market:
+      category: beta
+      proxy: SPY
+    sector_tech:
+      category: sector
+      proxy: XLK
+    size_factor:
+      category: size
+      proxy: IWM
+      short_proxy: SPY
+""",
+            encoding="utf-8",
+        )
+        params = load_attribution_params(spec)
+        assert params.factors["size_factor"].short_proxy == "SPY"
 
 
 def test_params_digest_is_stable_and_order_independent() -> None:
