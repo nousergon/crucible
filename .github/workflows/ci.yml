@@ -98,6 +98,31 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
+      # Every def test_*/class Test* under tests/ is actually collectible by
+      # pytest (alpha-engine-config-I10005): krepis tests/test_router.py
+      # carried four def test_* for route_is_degraded -- the predicate this
+      # repo's crucible/llm.py reads to stamp route_degraded on the v2 run
+      # manifest -- nested inside a helper AFTER its `return`, never
+      # collected, indistinguishable from passing on every surface this job
+      # reports. Fixed there by krepis PR203; this step is the guard for the
+      # class. The checker is stdlib-only (ast/pathlib), so it runs before
+      # uv sync and needs no install. Script lives in nousergon-lib
+      # (policy-shared-code second-adoption: needed immediately by krepis and
+      # this repo's CI), fetched unpinned into a subdirectory -- same pattern
+      # nousergon-lib's own action-pin-guard.yml documents: the consumer pins
+      # the skeleton, not the script.
+      - name: Checkout the test-shape guard (nousergon-lib, I10005)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: nousergon/nousergon-lib
+          sparse-checkout: |
+            scripts/lint_test_shape.py
+          sparse-checkout-cone-mode: false
+          path: .fleet/nousergon-lib
+
+      - name: Every test_*/Test* is collectible by pytest (I10005)
+        run: python3 .fleet/nousergon-lib/scripts/lint_test_shape.py .
+
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           enable-cache: true
