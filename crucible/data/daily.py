@@ -40,6 +40,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from crucible.calendar import assert_trading_day
@@ -56,7 +57,7 @@ from crucible.keys import (
     feature_registry_key,
     features_key,
 )
-from crucible.slots import declared_benchmark_symbols
+from crucible.slots import attribution_factor_symbols, declared_benchmark_symbols
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -174,6 +175,7 @@ def run_daily(
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     expected_symbols: list[str] | None = None,
     coverage_floor: float = COVERAGE_FLOOR_RATIO,
+    strategy_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Compile the day. Called through `crucible.runner.run_job`, never directly.
 
@@ -187,6 +189,13 @@ def run_daily(
     restored. A ratio computed over whatever arrived would always read 1.0;
     a ratio with no declared denominator is not "not applicable", it is a
     run that cannot detect a partial universe at all.
+
+    ``strategy_dir``, when given, is forwarded to
+    `crucible.slots.attribution_factor_symbols` exactly the way
+    `crucible.slots.strategy.grade` forwards `settings.strategy_dir` to
+    `load_attribution_params_from_store` — a developer editing
+    `alpha-engine-config/strategy/` locally expects the edit to reach this
+    fetch too, not just the grading read.
 
     There is deliberately no ``feature_version`` parameter. `crucible-PR27`
     added a `--feature-version` override that flowed only into the S3 KEY
@@ -332,35 +341,50 @@ def run_daily(
             "containing a third of the market."
         )
 
-    # S is graded against SPY (`crucible.slots.SLOTS["s"].benchmark`), and
-    # `crucible.slots.strategy.grade_arm` refuses a book whose benchmark has
-    # no panel row. Every non-population benchmark any slot declares is
-    # fetched here — as a real symbol, through the same source, never a
-    # zero-fill — so the day another slot declares an index benchmark the
-    # panel requirement is red at compile time rather than discovered at
-    # grading time on a box (`alpha-engine-config-I10635`). Symbols already
-    # part of the declared universe are not refetched.
-    extra_benchmarks = sorted(declared_benchmark_symbols() - set(expected_symbols))
-    if extra_benchmarks:
-        import pandas as pd  # noqa: PLC0415 - only needed on the benchmark-merge path
+    # Two declared sources of panel symbols beyond the universe itself, both
+    # fetched here — as real symbols, through the same source, never a
+    # zero-fill — so a compile-time gap is red at compile time rather than
+    # discovered as a grading refusal on a box:
+    #
+    # * S is graded against SPY (`crucible.slots.SLOTS["s"].benchmark`), and
+    #   `crucible.slots.strategy.grade_arm` refuses a book whose benchmark
+    #   has no panel row (`alpha-engine-config-I10635`).
+    # * The factor-neutral attribution spec
+    #   (`strategy/slots/attribution.yaml`, when one is declared) names ETF
+    #   proxies for the beta/sector/size factors, and
+    #   `crucible.attribution.compute_factor_attribution` (called from
+    #   `crucible.slots.strategy.grade`) raises `MissingArtifactError` the
+    #   moment one has no panel row (`alpha-engine-config-I10683`).
+    #
+    # Symbols already part of the declared universe are not refetched.
+    extra_panel_symbols = sorted(
+        (
+            declared_benchmark_symbols()
+            | attribution_factor_symbols(store=ctx.store, strategy_dir=strategy_dir)
+        )
+        - set(expected_symbols)
+    )
+    if extra_panel_symbols:
+        import pandas as pd  # noqa: PLC0415 - only needed on the extra-symbol merge path
 
-        benchmark_panel = source.load_panel(
+        extra_panel = source.load_panel(
             end=trading_day,
             lookback_days=lookback_days,
-            symbols=extra_benchmarks,
+            symbols=extra_panel_symbols,
         )
-        benchmark_day_rows = benchmark_panel[benchmark_panel["trading_day"] == trading_day]
-        benchmark_observed_today = {str(t) for t in benchmark_day_rows["ticker"].unique()}
-        benchmark_missing_today = sorted(set(extra_benchmarks) - benchmark_observed_today)
-        if benchmark_missing_today:
+        extra_day_rows = extra_panel[extra_panel["trading_day"] == trading_day]
+        extra_observed_today = {str(t) for t in extra_day_rows["ticker"].unique()}
+        extra_missing_today = sorted(set(extra_panel_symbols) - extra_observed_today)
+        if extra_missing_today:
             raise MissingSourceError(
-                f"benchmark symbol(s) {benchmark_missing_today} — declared by a slot's "
-                f"`SlotSpec.benchmark` — have no close on {trading_day}, the day this "
-                "panel covers. A slot's benchmark return is read for the settle session "
-                "exactly like any ticker's; a panel missing it is not a degraded read, "
-                "it is the grading refusal this fetch exists to prevent."
+                f"symbol(s) {extra_missing_today} — declared by a slot's "
+                "`SlotSpec.benchmark` or by the factor-attribution spec's "
+                f"`AttributionFactorParams.factors` — have no close on {trading_day}, "
+                "the day this panel covers. Each is read for the settle session "
+                "exactly like any ticker's; a panel missing one is not a degraded "
+                "read, it is the grading refusal this fetch exists to prevent."
             )
-        panel = pd.concat([panel, benchmark_panel], ignore_index=True)
+        panel = pd.concat([panel, extra_panel], ignore_index=True)
         panel = panel.sort_values(["trading_day", "ticker"]).reset_index(drop=True)
 
     panel_key = data_panel_key(trading_day.isoformat())
