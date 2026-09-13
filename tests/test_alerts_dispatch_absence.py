@@ -12,6 +12,8 @@ from __future__ import annotations
 import datetime as dt
 import json
 
+import pytest
+
 from crucible.alerts import (
     DISPATCH_ABSENCE_HORIZON,
     Page,
@@ -147,6 +149,35 @@ class TestDispatchAbsence:
         )
         assert len(pages) == 1
         assert "cannot be graded against the absence horizon" in pages[0].reason
+
+    def test_a_dispatch_record_with_a_wrongly_typed_field_is_an_access_fault(
+        self, tmp_path
+    ) -> None:
+        """`alpha-engine-config-I9847` (wave 2): `args` written as a list
+        (not the string every real dispatcher writes) used to reach
+        `args_synthetic_marker` unnamed. Validated through
+        `DispatchRecordDocument` before either helper sees it — with no
+        `access_faults` list supplied, the sweep raises `StoreAccessError`
+        naming the record, the same shape an unreadable record already
+        raised through before this migration."""
+        from crucible.alerts import StoreAccessError
+
+        store = LocalStore(tmp_path)
+        store.put_bytes(
+            dispatch_key("data.heal", "badargs"),
+            json.dumps(
+                {
+                    "job": "data.heal",
+                    "args": ["--from", "x"],
+                    "instance_id": "i-bad",
+                    "dispatched_at_utc": "2026-08-28T04:03:00Z",
+                }
+            ).encode(),
+        )
+        with pytest.raises(StoreAccessError, match="does not conform"):
+            evaluate_dispatch_absence(
+                store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+            )
 
     def test_this_is_the_evidence_a_matching_scheduled_absence_groups_with(self, tmp_path) -> None:
         """§9.3: both share `cause_key` `absence:{trading_day}`, so an

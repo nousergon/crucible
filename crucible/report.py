@@ -63,6 +63,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from krepis.metrics import MetricRecord, derive_status
+from pydantic import ValidationError
 
 from crucible.aggregation import MemberRow, member_dicts, worst_member
 from crucible.calendar import previous_trading_day
@@ -70,6 +71,7 @@ from crucible.data.daily import COVERAGE_FLOOR_RATIO
 from crucible.documents import load_store_document
 from crucible.keys import arena_cycle_key, attribution_key, champion_key, experiments_prefix
 from crucible.manifest import manifest_key
+from crucible.models import ArenaCycleDocument, ChampionPointerDocument
 from crucible.slots.cycle import MIN_ACTIVE_ARMS_FINDING_METRIC
 from crucible.slots.grading import CROSS_SECTION_MIN_NAMES, RankICSkip, spearman_ic
 from crucible.store import Store
@@ -511,7 +513,7 @@ def _slot_row(
     pointer_key = champion_key(spec.slot or "")
     window = _window(trading_day, SLOT_WINDOW_TRADING_DAYS)
     floor_note = _min_active_arms_note(store, spec.slot, window) if spec.slot else None
-    pointer = _read_json(store, pointer_key)
+    pointer = _read_champion_pointer(store, pointer_key)
     if pointer is None:
         return _row(
             spec,
@@ -651,7 +653,7 @@ def _rank_ic_row(
     """
     pointer_key = champion_key(spec.slot or "")
     window = _window(trading_day, SLOT_WINDOW_TRADING_DAYS)
-    pointer = _read_json(store, pointer_key)
+    pointer = _read_champion_pointer(store, pointer_key)
     if pointer is None:
         return _row(
             spec,
@@ -911,6 +913,16 @@ def _min_active_arms_note(store: Store, slot: str, window: list[dt.date]) -> str
         if not store.exists(key):
             continue
         cycle = _read_json(store, key)
+        # `alpha-engine-config-I9847` (wave 2): validated through
+        # `ArenaCycleDocument` before being dict-indexed below — a cycle
+        # that parses but does not conform used to read `finding = None`
+        # via plain `.get()` and this note went silent, which is the same
+        # false-fine reading `extra="forbid"` exists to refuse elsewhere.
+        if cycle is not None:
+            try:
+                ArenaCycleDocument.model_validate(cycle)
+            except ValidationError as exc:
+                raise ValueError(f"{key} does not conform to arena_cycle: {exc}") from exc
         finding = (cycle or {}).get(MIN_ACTIVE_ARMS_FINDING_METRIC)
         if finding and finding.get("status") == "BELOW_FLOOR":
             return (
@@ -931,6 +943,32 @@ def _read_json(store: Store, key: str) -> dict[str, Any] | None:
         return None
     # STRICT face of the one reader: corrupt RAISES, with the key named.
     return load_store_document(store, key)
+
+
+def _read_champion_pointer(store: Store, key: str) -> dict[str, Any] | None:
+    """The champion pointer at ``key``, or None when absent. A corrupt one RAISES.
+
+    `alpha-engine-config-I9847` (wave 2): `_slot_row`/`_rank_ic_row` used to
+    index `pointer["arm_id"]` straight off `_read_json`'s raw dict — a
+    pointer missing `arm_id` (or carrying it renamed) raised a bare
+    `KeyError` at that indexing line rather than the named-field failure
+    `crucible.champion.ChampionPointer.from_dict`'s callers already get.
+    Validated through `crucible.models.ChampionPointerDocument`, the same
+    model `crucible.champion` validates a payload against — this function
+    does not call into `crucible.champion` itself: that module's readers
+    additionally enforce the promotion GATES (attestation PASS, producing
+    run status `ok`), which is a business rule this report card must not
+    apply — a champion failing those gates is still the champion the report
+    is describing, not one this reader gets to refuse.
+    """
+    pointer = _read_json(store, key)
+    if pointer is None:
+        return None
+    try:
+        ChampionPointerDocument.model_validate(pointer)
+    except ValidationError as exc:
+        raise ValueError(f"{key} does not conform to a champion pointer: {exc}") from exc
+    return pointer
 
 
 def _metric_value(manifest: dict[str, Any], name: str) -> float | None:

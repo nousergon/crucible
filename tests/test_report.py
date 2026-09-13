@@ -37,6 +37,32 @@ NOW = dt.datetime(2026, 8, 29, 12, 0, tzinfo=dt.UTC)
 ARM = "r:momentum_sleeve:ab12cd"
 S_ARM = "s:momentum_sleeve:ab12cd"
 
+#: The rest of an `ArenaCycleDocument`-conforming `arena_cycle` document,
+#: beyond the min-active-arms finding under test (`alpha-engine-config-I9847`
+#: wave 2: `crucible.report._min_active_arms_note` now validates every cycle
+#: it reads through that model). Mirrors `test_typed_boundary_arena_cycle.
+#: py`'s minimal payload rather than restating it — a second hand-typed
+#: minimal shape is the second copy that migration's own worked example
+#: warns against.
+_MIN_ARENA_CYCLE_FIELDS: dict[str, object] = {
+    "schema_version": 1,
+    "slot": "s",
+    "slot_kind": "selection",
+    "benchmark": "population",
+    "as_of": DAY.isoformat(),
+    "decision": {
+        "slot": "s",
+        "as_of": DAY.isoformat(),
+        "incumbent": None,
+        "champion": None,
+        "moved": False,
+        "status": "decided",
+        "reason": "test fixture",
+        "comparisons": [],
+        "ineligible": {},
+    },
+}
+
 
 def _store(tmp_path) -> LocalStore:
     return LocalStore(tmp_path / "store")
@@ -67,13 +93,20 @@ def _write_data_day(store: LocalStore, day: dt.date, ratio: float | None) -> Non
 
 
 def _write_champion(store: LocalStore, slot: str, arm_id: str) -> None:
+    # `code_sha="a" * 40`, not the all-zero placeholder: `alpha-engine-config-
+    # I9847` (wave 2) validates every champion pointer this module reads
+    # through `crucible.models.ChampionPointerDocument`, whose
+    # `_code_sha_is_not_the_placeholder` validator (alpha-engine-config-
+    # I10506) refuses the placeholder this fixture wrote directly to the
+    # store (bypassing `crucible.champion.write_champion`'s own check) before
+    # this migration reached this reader.
     pointer = ChampionPointer(
         slot=slot,
         arm_id=arm_id,
         as_of=DAY.isoformat(),
         decided_at="2026-08-28T21:00:00Z",
         run_id="01JG0000000000000000000000",
-        code_sha="0" * 40,
+        code_sha="a" * 40,
         promotion_source="evidence",
         manifest_key=manifest_key("promote", DAY.isoformat()),
     )
@@ -352,13 +385,14 @@ class TestPortfolioAlphaRow:
             arena_cycle_key("s", DAY.isoformat()),
             json.dumps(
                 {
+                    **_MIN_ARENA_CYCLE_FIELDS,
                     MIN_ACTIVE_ARMS_FINDING_METRIC: {
                         "status": "BELOW_FLOOR",
                         "min_active_arms": 3,
                         "promotable_arm_count": 1,
                         "promotable_arms": [S_ARM],
                         "reason": "1 promotable arm(s) against a floor of 3",
-                    }
+                    },
                 }
             ).encode("utf-8"),
         )
@@ -382,19 +416,43 @@ class TestPortfolioAlphaRow:
             arena_cycle_key("s", DAY.isoformat()),
             json.dumps(
                 {
+                    **_MIN_ARENA_CYCLE_FIELDS,
                     MIN_ACTIVE_ARMS_FINDING_METRIC: {
                         "status": "OK",
                         "min_active_arms": 3,
                         "promotable_arm_count": 3,
                         "promotable_arms": [S_ARM, "s:b:x", "s:c:x"],
                         "reason": "3 promotable arm(s) meets the floor of 3",
-                    }
+                    },
                 }
             ).encode("utf-8"),
         )
         document, _ = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
         row = next(r for r in document["rows"] if r["name"] == "portfolio_excess_return_s_ratio")
         assert "min_active_arms" not in row["status_reason"]
+
+    def test_an_arena_cycle_that_does_not_conform_raises_named(self, tmp_path) -> None:
+        """`alpha-engine-config-I9847` (wave 2): a cycle document missing the
+        fields a real writer always carries used to read `finding = None`
+        off a bare `.get()`, so this note went silent for a malformed cycle
+        exactly the way a healthy but below-floor slot does — the false-fine
+        `extra="forbid"` boundaries elsewhere in this migration exist to
+        refuse. It now raises, naming the document."""
+        from crucible.keys import arena_cycle_key
+
+        store = _store(tmp_path)
+        _write_champion(store, "s", S_ARM)
+        _write_verdicts(
+            store,
+            S_ARM,
+            {"2026-07-01": 0.02, "2026-07-02": 0.01, "2026-07-06": 0.03},
+        )
+        store.put_bytes(
+            arena_cycle_key("s", DAY.isoformat()),
+            json.dumps({"active_arms": []}).encode("utf-8"),
+        )
+        with pytest.raises(ValueError, match="does not conform to arena_cycle"):
+            build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
 
 
 class TestRankICRow:

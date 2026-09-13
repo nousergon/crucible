@@ -296,7 +296,13 @@ def smoke_handler(args: argparse.Namespace) -> int:
                 # fetch here is a TOCTOU on the one object `deploy._flip` moves
                 # concurrently: lineage would say one sha and the smoke act on
                 # another (crucible-PR81 review, B1).
-                pointed = load_document_bytes(key, payload)["sha"]
+                # `alpha-engine-config-I9847` (wave 2): validated through
+                # `release.parse_release_pointer` — the same wrapper
+                # `release.read_pointer` uses — rather than indexed off the
+                # raw dict. See `ReleasePointerDocument`'s docstring for why
+                # this read and `read_pointer`'s are the two STRICT reads it
+                # exists for.
+                pointed = release.parse_release_pointer(key, load_document_bytes(key, payload)).sha
                 # A v2-or-v3 record for the POINTED sha, not `sha` under
                 # test — its wheel may live at the legacy (unpip-installable)
                 # v2 path, so `wheel_key(pointed)` alone cannot answer this.
