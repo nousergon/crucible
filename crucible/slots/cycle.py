@@ -91,13 +91,34 @@ if TYPE_CHECKING:
     from crucible.store import Store
 
 __all__ = [
+    "BASELINE_CONTROL_KIND",
+    "INCUMBENT_SOURCE_FIELD",
     "MIN_ACTIVE_ARMS_FINDING_METRIC",
     "MissingArtifactError",
+    "baseline_control_arm",
     "min_active_arms_finding",
     "partition_by_catalog",
     "run_grade",
     "run_produce",
 ]
+
+#: `alpha-engine-config-I9759` / `-I10687`: §10.1's control kind that stands
+#: in for an ABSENT incumbent. The null control is pure noise by
+#: construction, so "beats the null control on the configured evidence over
+#: `promote_min_weeks` paired weeks" is the same statement the incumbent
+#: comparison makes, against the only baseline a slot with no champion has.
+#: The PLANTED control is never this: it reads next-period returns, so an arm
+#: that merely beat it would still be a look-ahead-relative measurement.
+BASELINE_CONTROL_KIND = "null"
+
+#: `alpha-engine-config-I10687`: the crucible-owned key recording WHERE the
+#: incumbent this cycle decided against came from — the champion pointer, a
+#: substituted §10.1 baseline, or nothing at all. Written onto the
+#: `arena_cycle` payload and onto the grade job's own manifest as a metric,
+#: because "this slot graded against noise" and "this slot graded against a
+#: seated champion" are two different readings of the same `decided` status
+#: and no reader should have to recover the difference from an arm id.
+INCUMBENT_SOURCE_FIELD = "incumbent_source"
 
 #: `alpha-engine-config-I10636`: the metric name the below-floor finding is
 #: recorded under on the grade job's own manifest, so an operator reading
@@ -190,6 +211,32 @@ def _incumbent(store: Store, slot: str) -> str | None:
     if not store.exists(key):
         return None
     return load_store_document(store, key).get("arm_id")
+
+
+def baseline_control_arm(slot_spec: Any, series_by_arm: dict[str, Any]) -> str | None:
+    """The slot's scored :data:`BASELINE_CONTROL_KIND` control arm, if any.
+
+    Matched on the control's KIND rather than on the register's ``control``
+    flag, because the flag says *whether* an arm is a control and this needs
+    *which kind* — the register records the first and not the second, and
+    the planted control must never stand in as a baseline.
+
+    Addressed by the same ``{slot}:{name}:{spec_hash}`` identity every other
+    arm carries (:func:`crucible.slots.arms.control_specs` derives it), so
+    the id returned is one `series_by_arm` and the register both know.
+
+    ``None`` when the slot registers no null control or it was not scored
+    this cycle. The caller does NOT fall back: a slot with nothing scored yet
+    is not an error, it is an empty slot, and the engine already answers that
+    with `unservable` and a stated reason — a verdict-backed non-promotion
+    that writes no pointer. The refusal belongs at the one place a champion
+    would otherwise be SEATED on no evidence, which is
+    `crucible.promote._write_pointer_if_moved`'s `bootstrap` branch.
+    """
+    for spec in control_specs(slot_spec):
+        if spec.control_kind == BASELINE_CONTROL_KIND and spec.arm_id in series_by_arm:
+            return spec.arm_id
+    return None
 
 
 def _shadow_dates(store: Store, arm_id: str) -> list[str]:
@@ -789,10 +836,87 @@ def run_grade(
     # behavioural veto; S supplies the contamination attestation), and the
     # control exclusion must survive that — a caller able to displace it is a
     # look-ahead arm one dict key away from the pointer.
+    #
+    # `alpha-engine-config-I9759` / `-I10687` — THE FIRST CHAMPION.
+    #
+    # With no incumbent the library cold-starts (§9.1): it ranks the eligible
+    # arms and takes the top one with `status="bootstrap"`, on no evidence at
+    # all. That pointer is written with `promotion_source="bootstrap"`, which
+    # the §6 phase-3 clause rejects by name — "a bootstrap or an operator
+    # revert is not a promotion the system won". So a slot with no champion
+    # could never win one: its FIRST pointer was, by construction, the one
+    # kind of pointer that does not count, and every subsequent promotion
+    # would be measured against an arm nothing had ever compared.
+    #
+    # The fix is not a new promotion source. §10.1 already registers a NULL
+    # control in every slot, every cycle, precisely so that "is this arm
+    # better than noise?" is a measured question — so with no incumbent the
+    # null control STANDS IN as the baseline and the engine's ordinary
+    # `decided`/`held` path runs unchanged: the same paired window, the same
+    # `promote_min_weeks`, the same `promote_evidence`. A first champion is
+    # then won on evidence or not won at all, and a cycle that wins nothing
+    # files a `held` decision with a stated reason — the verdict-backed
+    # non-promotion the same clause accepts.
+    #
+    # It lives HERE, in the one writer that computes the cycle, rather than
+    # in `crucible.promote`: promote acts on the cycle this function already
+    # decided (`alpha-engine-config-I10679`), so a substitution applied there
+    # would be a second cycle computation and the two jobs could disagree.
+    champion = _incumbent(ctx.store, slot)
+    baseline = baseline_control_arm(slot_spec, series_by_arm) if champion is None else None
+    incumbent = champion if baseline is None else baseline
+    if champion is not None:
+        incumbent_source = {
+            "arm_id": champion,
+            "source": "champion_pointer",
+            "baseline_control_kind": None,
+            "reason": (
+                f"slot {slot!r} graded against its seated champion {champion}, read "
+                f"from {champion_key(slot)}"
+            ),
+        }
+    elif baseline is not None:
+        incumbent_source = {
+            "arm_id": baseline,
+            "source": "baseline_control",
+            "baseline_control_kind": BASELINE_CONTROL_KIND,
+            "reason": (
+                f"slot {slot!r} has no champion pointer; §10.1's "
+                f"{BASELINE_CONTROL_KIND} control {baseline} stood in as the baseline "
+                "incumbent so a first champion is won on evidence rather than "
+                "cold-started on none. The baseline is "
+                "exempt from the control veto because an incumbent that fails a "
+                "serving precondition forces the pointer off itself; it is still "
+                "barred from the promotable pool and can never be seated."
+            ),
+        }
+    else:
+        incumbent_source = {
+            "arm_id": None,
+            "source": "none",
+            "baseline_control_kind": None,
+            "reason": (
+                f"slot {slot!r} has neither a champion pointer nor a scored "
+                f"{BASELINE_CONTROL_KIND} control this cycle; the engine decides on "
+                "its own §9.1 terms and states its reason"
+            ),
+        }
+
     evaluated: dict[str, list[ServingPrecondition]] = {
         arm_id: list(rules) for arm_id, rules in (preconditions or {}).items()
     }
     for control in controls:
+        # The substituted baseline is the ONE arm this veto is not applied
+        # to: it has to be ELIGIBLE to be the incumbent, because the engine
+        # forces the pointer off an incumbent that fails a precondition —
+        # which would turn a cold slot's first cycle into an unbarred
+        # promotion of whatever ranked first. Exempting it does not make it
+        # promotable: a challenger is never compared to itself, so `moved` is
+        # false whenever the baseline "wins", it stays out of `promotable`
+        # below, and `_write_pointer_if_moved` refuses a control outright.
+        # Only the baseline is ever exempt; the planted control never is.
+        if control.arm_id == baseline:
+            continue
         evaluated.setdefault(control.arm_id, []).append(
             ServingPrecondition(
                 name="not_a_control_arm",
@@ -810,7 +934,8 @@ def run_grade(
         register=register,
         control_ids=control_by_kind,
         series_by_arm=series_by_arm,
-        incumbent=_incumbent(ctx.store, slot),
+        incumbent=incumbent,
+        baseline=baseline,
         preconditions=evaluated,
         training=training_ok(list(register.active_arms())),
     )
@@ -896,6 +1021,11 @@ def run_grade(
     # (`alpha-engine-config-I10636`; library-side tracking issue filed
     # separately since the shape is `nousergon_lib.arena`'s to own).
     cycle_payload[MIN_ACTIVE_ARMS_FINDING_METRIC] = floor_finding
+    # `alpha-engine-config-I10687`: same shape, same reason — a crucible-owned
+    # key beside the library's own fields. `decision.incumbent` names WHICH
+    # arm; this names WHERE it came from, which is the difference between a
+    # slot measured against a seated champion and one measured against noise.
+    cycle_payload[INCUMBENT_SOURCE_FIELD] = incumbent_source
     ctx.record_output(
         cycle_key,
         json.dumps(cycle_payload, indent=2, sort_keys=True).encode("utf-8"),
@@ -1001,6 +1131,25 @@ def run_grade(
     )
     ctx.record_metric(
         {
+            # `alpha-engine-config-I10687`: rendered unconditionally, so the
+            # grade job's own manifest says whether this cycle was decided
+            # against a seated champion or against §10.1's null control. A
+            # `decided` status means two different things in those two cases
+            # and the manifest must not render them identically (policy §3).
+            "name": INCUMBENT_SOURCE_FIELD,
+            "module": f"crucible.slots.{slot}",
+            "metric_type": "decision",
+            "value": 1.0 if incumbent_source["source"] == "baseline_control" else 0.0,
+            "unit": "indicator",
+            "n_floor": 0,
+            "status": "OK",
+            "status_reason": str(incumbent_source["reason"]),
+            "source_path": cycle_key,
+            "last_updated_utc": _utc_now(),
+        }
+    )
+    ctx.record_metric(
+        {
             # `alpha-engine-config-I10636`: rendered unconditionally, with an
             # explicit OK/FAIL status, so a slot stranded below its floor is
             # a reading nobody has to infer from `active_arms` still counting
@@ -1026,6 +1175,7 @@ def run_grade(
         "active_arms": list(cycle.active_arms),
         "promotable_arms": promotable,
         MIN_ACTIVE_ARMS_FINDING_METRIC: floor_finding,
+        INCUMBENT_SOURCE_FIELD: incumbent_source,
         "settled_dates": settled_days,
         "horizon_trading_days": measured_horizon,
         "unsettled": {a: sorted(d) for a, d in unsettled.items()},

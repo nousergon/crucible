@@ -820,6 +820,14 @@ class TestTheEngineSeamsAreAdditiveAndNotDisplaceable:
         A caller that passed a precondition for a control must not be able to
         displace the exclusion — that is a look-ahead arm one dict key away
         from the pointer.
+
+        This fixture's slot has NO champion pointer, so `run_grade`
+        substitutes §10.1's null control as the baseline incumbent and
+        exempts exactly that arm from the veto
+        (`alpha-engine-config-I10687`): it has to be eligible to BE the
+        incumbent. The planted control — the one that reads next-period
+        returns — is never exempt, and the substituted baseline is still
+        barred from the pointer, which is what the last two assertions pin.
         """
         from nousergon_lib.arena.engine import ServingPrecondition
 
@@ -829,10 +837,14 @@ class TestTheEngineSeamsAreAdditiveAndNotDisplaceable:
         cycle = load_store_document(store, arena_cycle_key(SLOT, AS_OF.isoformat()))
         ineligible = cycle["decision"]["ineligible"]
         controls = [arm for arm in ineligible if "control_" in arm]
-        assert len(controls) == 2
+        baseline = result["incumbent_source"]["arm_id"]
+        assert result["incumbent_source"]["source"] == "baseline_control"
+        assert [a for a in controls if "control_planted_" in a] == controls
+        assert len(controls) == 1
         for arm in controls:
             assert any(rule["name"] == "not_a_control_arm" for rule in ineligible[arm])
         assert result["pointer"]["champion"] not in controls
+        assert baseline not in result["promotable_arms"]
         assert ServingPrecondition  # imported for the contract it names
 
     def test_a_supplied_series_for_an_unregistered_arm_is_refused(self, world) -> None:
