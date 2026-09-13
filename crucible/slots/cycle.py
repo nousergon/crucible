@@ -381,8 +381,32 @@ def run_grade(
     settings: Settings,
     horizon_trading_days: int = DEFAULT_HORIZON_TRADING_DAYS,
     feature_version: str = DEFAULT_FEATURE_VERSION,
+    specs: Sequence[Any] | None = None,
+    preconditions: dict[str, list[ServingPrecondition]] | None = None,
 ) -> dict[str, Any]:
-    """Score every settled shadow, verify the controls, run the cycle, write it."""
+    """Score every settled shadow, verify the controls, run the cycle, write it.
+
+    ``specs`` is the slot's loaded recipe set. It defaults to
+    :func:`crucible.slots.arms.load_arm_specs`, which serves U and R; the M
+    slot supplies its own, because an M recipe is a `ModelRecipe` read by
+    `crucible.slots.model.load_model_recipes` and `load_arm_specs` refuses
+    slot `m` BY NAME (`crucible.slots.arms.FOREIGN_RECIPE_LOADERS`). A
+    parameter rather than a loader table here: this module must not import
+    `crucible.slots.model`, which pulls the fitting stack onto the U/R path
+    (see :data:`ARM_REFUSED_METRIC`). Only two things are read off a spec —
+    what to register, and `params['top_n']` for the count-matched controls —
+    so any recipe type carrying those two facts grades through this one
+    engine rather than through a second copy of it
+    (`alpha-engine-config-I9957`).
+
+    ``preconditions`` are per-arm SERVING preconditions the caller has already
+    EVALUATED (policy §5.3: "supplied to the engine as evaluated results; the
+    engine does not compute them and must not be given a default"). The
+    control-arm exclusion below is merged into whatever the caller supplied,
+    never replaced by it: §10.1 is the harness's rule, not a slot's, and a
+    caller that passed a precondition for a control must not be able to
+    displace it.
+    """
     slot_spec = get_slot(slot)
     as_of = ctx.trading_day
     assert_trading_day(as_of, context=f"experiment.grade {slot} --date {as_of}")
@@ -394,10 +418,14 @@ def run_grade(
         schema_version="panel.v1",
     )
 
-    specs = load_arm_specs(slot, store=ctx.store, strategy_dir=settings.strategy_dir)
+    loaded_specs = (
+        list(specs)
+        if specs is not None
+        else load_arm_specs(slot, store=ctx.store, strategy_dir=settings.strategy_dir)
+    )
     controls = control_specs(slot_spec)
     register = read_register(ctx.store, slot)
-    register, _ = register_arms(register, specs + controls)
+    register, _ = register_arms(register, loaded_specs + controls)
     write_register(ctx.store, slot, register)
 
     # Kind -> REGISTERED arm id. A control is addressed by the same
@@ -581,7 +609,7 @@ def run_grade(
         for day in settled_days:
             window = returns_cache[day]
             returns = window.returns
-            top_n = _control_top_n(specs)
+            top_n = _control_top_n(loaded_specs)
             selection = control_selection(
                 control.control_kind,
                 returns,
@@ -640,8 +668,17 @@ def run_grade(
     # the pointer on evidence and be a look-ahead in production; the
     # precondition puts the refusal, and its reason, into the cycle artifact
     # where an operator can read it.
-    preconditions = {
-        control.arm_id: [
+    #
+    # Merged ONTO whatever the caller supplied rather than replacing it: a
+    # slot may add its own evaluated preconditions (M supplies the §5.3
+    # behavioural veto), and the control exclusion must survive that — a
+    # caller able to displace it is a look-ahead arm one dict key away from
+    # the pointer.
+    evaluated: dict[str, list[ServingPrecondition]] = {
+        arm_id: list(rules) for arm_id, rules in (preconditions or {}).items()
+    }
+    for control in controls:
+        evaluated.setdefault(control.arm_id, []).append(
             ServingPrecondition(
                 name="not_a_control_arm",
                 passed=False,
@@ -650,9 +687,7 @@ def run_grade(
                     "grader, excluded from the pointer (§10.1)"
                 ),
             )
-        ]
-        for control in controls
-    }
+        )
 
     cycle, control_detail = grade_slot(
         slot_spec,
@@ -661,7 +696,7 @@ def run_grade(
         control_ids=control_by_kind,
         series_by_arm=series_by_arm,
         incumbent=_incumbent(ctx.store, slot),
-        preconditions=preconditions,
+        preconditions=evaluated,
         training=training_ok(list(register.active_arms())),
     )
 
