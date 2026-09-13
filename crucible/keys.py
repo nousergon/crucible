@@ -102,6 +102,7 @@ __all__ = [
     "review_key",
     "review_prefix",
     "runs_prefix",
+    "session_inputs_key",
     "shadow_key",
     "signals_key",
     "strategy_arm_key",
@@ -659,10 +660,30 @@ def cross_section_settled_key(arm_id: str, trading_day: str) -> str:
     return f"experiments/{arm_key_segment(arm_id)}/{trading_day}/cross_section_settled.json"
 
 
+def session_inputs_key(arm_id: str, trading_day: str) -> str:
+    """The POINT-IN-TIME construction inputs one S arm saw on ``trading_day``.
+
+    The S slot's analogue of `shadow_key`, and it exists for the same reason.
+    An S arm's score is its realized book's return against the benchmark, net
+    of cost — a number produced at GRADE time by walking the sessions again
+    through `crucible.portfolio`. If the alpha vector, the eligibility mask
+    and the caps that walk read were resolved at grade time too, the grade
+    would be taken over whatever those upstream artifacts say TODAY, and a
+    revision anywhere upstream would silently re-price the arm's whole
+    history. So `experiment.run --slot s` writes what the session actually
+    carried, once, on the session, and the grade reads it back.
+
+    Lives beside `shadow.json` under the same `experiments/{arm}/{day}/`
+    prefix, so `experiments_prefix` still walks every dated artifact an arm
+    has.
+    """
+    return f"experiments/{arm_key_segment(arm_id)}/{trading_day}/session_inputs.json"
+
+
 def experiments_prefix(arm_id: str) -> str:
     """The prefix under which every dated artifact for ``arm_id`` lives —
-    `shadow_key`, `verdict_key`, `cross_section_key` and
-    `cross_section_settled_key` all start with it.
+    `shadow_key`, `verdict_key`, `cross_section_key`,
+    `cross_section_settled_key` and `session_inputs_key` all start with it.
 
     A reader that walks every trading day an arm has an artifact for
     (`crucible.report`'s slot-alpha and rank-IC rows, `crucible.slots.cycle`'s

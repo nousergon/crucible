@@ -47,6 +47,7 @@ a spec built in code carries the same contract as one read off disk.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -70,10 +71,12 @@ __all__ = [
     "ArmSpec",
     "ForeignRecipeSchemaError",
     "InapplicableArmError",
+    "SupersededArmUndeclaredError",
     "control_specs",
     "load_arm_specs",
     "read_register",
     "register_arms",
+    "resolve_declared_lineage",
     "write_register",
 ]
 
@@ -471,6 +474,100 @@ def write_register(store: Store, slot: str, register: ArmRegister) -> bytes:
     ).encode("utf-8")
     store.put_bytes(arm_register_key(slot), payload)
     return payload
+
+
+class SupersededArmUndeclaredError(ValueError):
+    """A recipe's `supersedes` names an arm this slot does not declare at all.
+
+    Distinct from "the parent is refused", which is legitimate. The check
+    :func:`register_arms` performs — a lineage pointer must not point at
+    nothing — is kept here, moved from "is the parent REGISTERED" to "does
+    the slot DECLARE the parent", because those two stopped being the same
+    question the moment a refusal became a per-arm value
+    (`alpha-engine-config-I9955`).
+
+    **Lifted from `crucible.slots.model` and `crucible.slots.strategy`**
+    (`alpha-engine-config-I10637`): the M cycle job (`-PR149`) and the S
+    cycle job (`-PR242`) each defined this class, identically, over a
+    different recipe type. Both existed because the guard below relaxes and
+    moves *this* module's own refusal in `register_arms`, so it belongs
+    beside it — one definition, imported by both slot modules.
+    """
+
+
+def resolve_declared_lineage(
+    registered: Sequence[tuple[str, str, str | None]],
+    refused: Sequence[str],
+) -> dict[str, tuple[str | None, str]]:
+    """Resolve every registered arm's declared `supersedes` into a register
+    LINK or into row PROVENANCE.
+
+    **Lifted from `crucible.slots.model.registration_specs` and
+    `crucible.slots.strategy.registration_specs`**
+    (`alpha-engine-config-I10637`, `policy-shared-code`'s second-adoption
+    trigger: both landed the identical guard over a different recipe type,
+    `crucible-PR149` and `crucible-PR242`). Generic over "a spec carrying
+    `name`, `arm_id` and a declared `supersedes`" — each slot module passes
+    its own registered items as ``(name, arm_id, declared_supersedes)``
+    triples rather than the class itself, because M's registered items are
+    bare `ModelRecipe`s and S's are already-wrapped `RegisteredStrategyArm`s;
+    a shared triple is the one shape both can produce without either
+    reaching into the other's types.
+
+    **A recipe's `supersedes` and a register row's `supersedes` are two
+    different facts, and conflating them broke the M slot outright**
+    (`alpha-engine-config-I9957`, measured 2026-09-06 against the live
+    strategy tree). :func:`register_arms` refuses a pointer to an arm it
+    cannot find in the register — correctly, "a lineage pointer to nothing
+    reads as history that was checked". But Brian's `alpha-engine-config-
+    I9808` ruling (b) deliberately created an M arm that supersedes a
+    sibling which is REFUSED at registration and stays refused until phase
+    5, so the parent has no register row and never will. The two rulings
+    collide: an arm that supersedes a declared-but-refused sibling must
+    still register.
+
+    So the declared string is carried as PROVENANCE (this function's
+    returned ``notes``), and the register LINK (returned ``supersedes``) is
+    set only when the parent actually has a row to link to. What is NOT
+    softened is the guard's purpose: a `supersedes` naming an arm this slot
+    does not declare at all — a typo, a deleted file, another slot's arm —
+    still raises, as :class:`SupersededArmUndeclaredError`. The check moved
+    from "registered" to "declared"; it did not go away.
+
+    Returns a mapping from ``arm_id`` to ``(supersedes_link, notes)``, one
+    entry per item in ``registered``, for the caller to fold back into its
+    own per-slot output type.
+    """
+    from crucible.slots.inputs import arm_name_from_id  # noqa: PLC0415 - avoids a cycle
+
+    registered_ids = {arm_id for _, arm_id, _ in registered}
+    declared = {name for name, _, _ in registered} | set(refused)
+    resolved: dict[str, tuple[str | None, str]] = {}
+    for name, arm_id, declared_supersedes in registered:
+        link: str | None = None
+        notes = ""
+        if declared_supersedes:
+            parent = arm_name_from_id(declared_supersedes)
+            if parent not in declared:
+                raise SupersededArmUndeclaredError(
+                    f"arm {name!r} declares supersedes={declared_supersedes!r}, whose "
+                    f"name {parent!r} is not an arm this slot declares. The slot registers "
+                    f"{sorted(n for n, _, _ in registered)} and refuses {sorted(refused)}. "
+                    "A lineage pointer to nothing reads as history that was checked; a "
+                    "pointer to a REFUSED sibling is checked history and is accepted, "
+                    "carried as provenance rather than as a register link."
+                )
+            if declared_supersedes in registered_ids:
+                link = declared_supersedes
+            else:
+                notes = (
+                    f"Supersedes {declared_supersedes} — declared lineage, carried as "
+                    "provenance because that arm is refused at registration in this slot "
+                    "and has no register row to link to. Not a series link and not an "
+                    "inheritance of any record."
+                )
+        resolved[arm_id] = (link, notes)
+    return resolved
 
 
 def register_arms(

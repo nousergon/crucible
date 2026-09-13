@@ -434,30 +434,62 @@ def run_grade(
     feature_version: str = DEFAULT_FEATURE_VERSION,
     specs: Sequence[Any] | None = None,
     preconditions: dict[str, list[ServingPrecondition]] | None = None,
+    series: dict[str, ArmSeries] | None = None,
+    settled_dates: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Score every settled shadow, verify the controls, run the cycle, write it.
 
+    Four keyword seams, all additive and all defaulting to the U/R behaviour
+    this function has always had. Each exists because one slot states a fact
+    this engine cannot derive — never because that slot grades through a
+    second copy of the engine (plan §4.4, "four slots, one engine").
+
     ``specs`` is the slot's loaded recipe set. It defaults to
-    :func:`crucible.slots.arms.load_arm_specs`, which serves U and R; the M
-    slot supplies its own, because an M recipe is a `ModelRecipe` read by
-    `crucible.slots.model.load_model_recipes` and `load_arm_specs` refuses
-    slot `m` BY NAME (`crucible.slots.arms.FOREIGN_RECIPE_LOADERS`). A
-    parameter rather than a loader table here: this module must not import
-    `crucible.slots.model`, which pulls the fitting stack onto the U/R path
-    (see :data:`ARM_REFUSED_METRIC`). Only two things are read off a spec —
-    what to register, and `params['top_n']` for the count-matched controls —
-    so any recipe type carrying those two facts grades through this one
-    engine rather than through a second copy of it
-    (`alpha-engine-config-I9957`).
+    :func:`crucible.slots.arms.load_arm_specs`, which serves U and R; M and S
+    supply their own, because their recipes are read by their own loaders and
+    `load_arm_specs` refuses both slots BY NAME
+    (`crucible.slots.arms.FOREIGN_RECIPE_LOADERS`). A parameter rather than a
+    loader table here: this module must not import `crucible.slots.model` or
+    `crucible.slots.strategy`, which would pull the fitting stack and the
+    portfolio solver onto the U/R path. Only two things are read off a spec —
+    what to register, and ``params['top_n']`` for the count-matched controls —
+    so any recipe type carrying those two facts grades through this one engine
+    rather than through a second copy of it (`alpha-engine-config-I9957`).
 
     ``preconditions`` are per-arm SERVING preconditions the caller has already
-    EVALUATED (policy §5.3: "supplied to the engine as evaluated results; the
-    engine does not compute them and must not be given a default"). The
+    EVALUATED (policy §5.3: supplied to the engine as evaluated results; the
+    engine does not compute them and must not be given a default). The
     control-arm exclusion below is merged into whatever the caller supplied,
     never replaced by it: §10.1 is the harness's rule, not a slot's, and a
     caller that passed a precondition for a control must not be able to
     displace it.
+
+    ``series`` and ``settled_dates`` are the S slot's seam, and they travel
+    together (`alpha-engine-config-I10512`). U, R and M are SELECTION-shaped:
+    each writes a shadow on the decision date and its score is that
+    selection's realized excess return, which the loop below computes. An S
+    arm's score is not a selection's return at all — it is its realized
+    book's return against SPY net of the cost the engine charged, produced by
+    `crucible.slots.strategy.grade_arm` over a book `crucible.portfolio`
+    constructed. Re-deriving that here would be a second portfolio engine, so
+    the S job hands the finished :class:`~nousergon_lib.arena.window.ArmSeries`
+    over and names the settled decision dates the CONTROLS must be scored on
+    — which is the one thing the shadow loop would otherwise have supplied.
+    Everything after remains shared: the register, both halves of the control
+    battery, the pointer decision, the `arena_cycle` artifact and the trial
+    ledger. Supplying one without the other is refused rather than defaulted:
+    a caller-supplied series with no dates would score the controls on nothing
+    and publish a cycle whose grader was never checked.
     """
+    if (series is None) != (settled_dates is None):
+        raise ValueError(
+            "`series` and `settled_dates` are supplied together or not at all; got "
+            f"series={'set' if series is not None else 'None'}, "
+            f"settled_dates={'set' if settled_dates is not None else 'None'}. A "
+            "caller-supplied series with no settled dates would score the slot's "
+            "controls on no date at all, and §10.1's whole point is that a cycle "
+            "whose grader was not checked has void verdicts."
+        )
     slot_spec = get_slot(slot)
     as_of = ctx.trading_day
     assert_trading_day(as_of, context=f"experiment.grade {slot} --date {as_of}")
@@ -485,6 +517,18 @@ def run_grade(
     control_by_kind = {c.control_kind: c.arm_id for c in controls}
     control_ids = set(control_by_kind.values())
     scored_arms = register.scored_arms(as_of.isoformat(), slot_spec.retired_trailing_cycles)
+
+    # A supplied series for an arm the register does not score is a caller
+    # error, not a silent extra row on the cycle: `run_cycle` would carry an
+    # arm no register row backs, and its verdicts would speak about an arm the
+    # retirement and cap math has never heard of.
+    unregistered = sorted(set(series or {}) - set(scored_arms))
+    if unregistered:
+        raise MissingArtifactError(
+            f"slot {slot!r} was supplied a graded series for {unregistered}, which the "
+            f"register does not score as of {as_of}. An arm scored without a register "
+            "row is policy §3's defect exactly."
+        )
 
     # One returns cache per settled decision date, shared by every arm: the
     # forward return of a ticker from date d does not depend on who picked it,
@@ -559,10 +603,23 @@ def run_grade(
         returns_cache[day] = window
         return window
 
+    # The S seam: the caller has already produced every real arm's series, so
+    # there is no shadow to score — only the settled dates the controls need.
+    # `_returns_for` is still what resolves them, so the label control (§10.1)
+    # runs over exactly the dates this cycle publishes, on every slot alike.
+    for day in settled_dates or ():
+        _returns_for(day)
+
     for arm_id in scored_arms:
         if arm_id in control_ids:
             continue
+        # Every real arm the register says to score is SUPPLIED a series, even
+        # when it has nothing in it — `run_cycle` requires one per arm and the
+        # pairing is per comparison, so an arm with nothing to say cannot null
+        # another arm's figure (I9745, closed by construction).
         verdicts.setdefault(arm_id, {})
+        if series is not None:
+            continue
         for day in _shadow_dates(ctx.store, arm_id):
             window = _returns_for(day)
             if window is None:
@@ -690,8 +747,15 @@ def run_grade(
                 verdict_key(control.arm_id, day), control_payload, schema_version="verdict.v1"
             )
 
+    # A caller-supplied series WINS for the arm it names and is never merged
+    # into: `series` is the whole of that arm's scored history on its own
+    # axis, and folding a selection-shaped score into it would put two
+    # different measurements in one series under one name.
+    supplied = dict(series or {})
     series_by_arm: dict[str, ArmSeries] = {
-        arm_id: ArmSeries(
+        arm_id: supplied[arm_id]
+        if arm_id in supplied
+        else ArmSeries(
             arm_id=arm_id,
             scores=scores,
             # A control has no shadow — it is generated here, at grade time,
@@ -704,7 +768,7 @@ def run_grade(
                 else {}
             ),
         )
-        for arm_id, scores in sorted(verdicts.items())
+        for arm_id, scores in sorted({**{a: {} for a in supplied}, **verdicts}.items())
     }
     # An arm with NO settled score is still SUPPLIED, carrying an empty
     # series. Deliberate on both counts: `run_cycle` requires a series for
@@ -722,9 +786,9 @@ def run_grade(
     #
     # Merged ONTO whatever the caller supplied rather than replacing it: a
     # slot may add its own evaluated preconditions (M supplies the §5.3
-    # behavioural veto), and the control exclusion must survive that — a
-    # caller able to displace it is a look-ahead arm one dict key away from
-    # the pointer.
+    # behavioural veto; S supplies the contamination attestation), and the
+    # control exclusion must survive that — a caller able to displace it is a
+    # look-ahead arm one dict key away from the pointer.
     evaluated: dict[str, list[ServingPrecondition]] = {
         arm_id: list(rules) for arm_id, rules in (preconditions or {}).items()
     }

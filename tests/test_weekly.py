@@ -57,15 +57,17 @@ class TestDerivation:
     ) -> None:
         """Every slot the CLI can run, in `SLOTS` order — and no other.
 
-        Re-stated with the M cycle job (`alpha-engine-config-I9957`). Until
-        it existed M and S had no `produce`/`grade` and expanding over all of
-        `SLOTS` made every arc fail at `experiment.run[m]` (measured
-        2026-09-04); M now has both, so it is a stage and S still is not. The
-        order is the data dependency: the universe cut feeds the signal, the
-        signal feeds the model.
+        Re-stated with both the M cycle job (`alpha-engine-config-I9957`) and
+        the S cycle job (`-I10512`). Until they existed, M and S had no
+        `produce`/`grade` and expanding over all of `SLOTS` made every arc
+        fail at `experiment.run[m]` (measured 2026-09-04); both now have
+        both, so both are stages — which is the derivation working, and is
+        exactly why this pin is an equality. The order is `SLOTS` order, the
+        data dependency: the universe cut feeds the signal, the signal feeds
+        the model, the model feeds the strategy.
         """
         expected = [slot for slot in SLOTS if slot in dispatchable_slots()]
-        assert expected == ["u", "r", "m"], expected
+        assert expected == ["u", "r", "m", "s"], expected
         for job in ARC_SLOT_JOBS:
             slots = [s.slot for s in arc_stages(FRIDAY) if s.job == job]
             assert slots == expected, f"{job} must run for every dispatchable slot, in SLOTS order"
@@ -78,7 +80,7 @@ class TestDerivation:
         monkeypatch.delattr(research, "grade")
         assert "r" not in dispatchable_slots()
         slots = {s.slot for s in arc_stages(FRIDAY) if s.job in ARC_SLOT_JOBS}
-        assert slots == {"u", "m"}
+        assert slots == {"u", "m", "s"}
 
     def test_the_dispatch_table_and_the_arc_read_one_source(self) -> None:
         """`experiment.run --slot s` refuses by name (track A) and the arc

@@ -7,14 +7,15 @@ makes a hard precondition for phase 6 (real capital) was a control no gate
 graded — and phase 6's entry condition (5) is "the money-path artifacts
 hash-chained", a condition with no clause behind it.
 
-**The verifier lands in `crucible-PR240`, held as a draft until phase 2 exits,
-so both states are asserted here**: the clause reads UNMEASURABLE with a named
-reason while `crucible.explain.verify_money_path_chain` is absent, and grades
-the verdict the moment it exists — with no edit to `crucible/gate.py`. The
-present-verifier cases drive a stand-in matching `ChainVerification`'s declared
-shape; the absent-verifier case is measured against the real tree, so the day
-`PR240` lands the first test below starts failing and says so rather than
-quietly continuing to pass on a fake.
+**`crucible-PR240` has landed** (`crucible-PR251` corrected the module for it
+after `PR248`'s self-expiring absent-verifier test fired as designed):
+`crucible.explain.verify_money_path_chain` exists, and the clause reads it
+with no edit to `crucible/gate.py` — the lazy import in the clause's own
+`try` block is what makes that true.
+`TestTheClauseMergesBeforeItsVerifier.test_the_live_verifier_reads_an_empty_store_as_unmet`
+asserts that against the real, empty tree; the readings below still drive a
+stand-in matching `ChainVerification`'s declared shape via `monkeypatch`,
+which remains valid now that the real attribute exists to patch.
 """
 
 from __future__ import annotations

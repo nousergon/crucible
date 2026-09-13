@@ -304,35 +304,51 @@ def _slot_module(slot: str) -> Any:
         return _SLOT_MODULES[slot]
     except KeyError as exc:
         raise SystemExit(
-            f"slot {slot!r} is not implemented in track A. U and R are here; M and S "
-            f"arrive with track B ({_ALL_SLOTS_PHASE.tracker}). A handler that returned "
-            "0 for an unimplemented slot would be indistinguishable from a cycle that "
-            "ran and had nothing to do."
+            f"slot {slot!r} is not implemented in track A. U, R, M and S are here "
+            f"(`crucible.slots.dispatchable_slots()` reads {sorted(_SLOT_MODULES)} live); "
+            f"a slot beyond those four arrives with track B ({_ALL_SLOTS_PHASE.tracker}). "
+            "A handler that returned 0 for an unimplemented slot would be "
+            "indistinguishable from a cycle that ran and had nothing to do."
         ) from exc
 
 
 def _recipes_for_registration(slot: str, *, config: Any, store: Any) -> list[Any]:
     """The slot's loaded recipes, in the shape `register_arms` reads.
 
-    One entry point over two recipe SCHEMAS (`alpha-engine-config-I9957`).
-    U and R recipes are `ArmSpec`s; an M recipe is a `ModelRecipe`, wrapped in
-    `crucible.slots.model.RegisteredModelArm` so its own id — the hash of its
-    own spec — is what registers. Re-deriving an id here from an `ArmSpec`
-    view would give one arm two identities, and the register, the shadows and
-    the series would each speak about a different one.
+    One entry point over three recipe SCHEMAS (`alpha-engine-config-I9957`,
+    `-I10512`). U and R recipes are `ArmSpec`s; an M recipe is a
+    `ModelRecipe`, wrapped in `crucible.slots.model.RegisteredModelArm`; an S
+    recipe is a `StrategyRecipe`, wrapped in
+    `crucible.slots.strategy.RegisteredStrategyArm`. Each wrapper carries its
+    own id — the hash of its own spec — so it is what registers.
+    Re-deriving an id here from an `ArmSpec` view would give one arm two
+    identities, and the register, the shadow/session-inputs artifacts and the
+    series would each speak about a different one.
 
-    S is not here: `load_arm_specs` raises `ForeignRecipeSchemaError` for it
-    and the caller converts that into the exit that names the phase.
+    Both M and S are here: `load_arm_specs` still raises
+    `ForeignRecipeSchemaError` for either slot name (it serves U and R only),
+    but neither slot reaches that call any more — each is dispatched to its
+    own loader below, before `load_arm_specs` is ever asked for it.
     """
-    if slot != "m":
-        return list(load_arm_specs(slot, store=store, strategy_dir=config.strategy_dir))
-    from crucible.slots.model import (  # noqa: PLC0415 - heavy import, one call site
-        load_model_recipes,
-        registration_specs,
-    )
+    if slot == "m":
+        from crucible.slots.model import (  # noqa: PLC0415 - heavy import, one call site
+            load_model_recipes,
+            registration_specs,
+        )
 
-    directory = Path(config.strategy_dir) / "arms" / slot if config.strategy_dir else None
-    loaded = load_model_recipes(directory, store=None if directory is not None else store)
+        directory = Path(config.strategy_dir) / "arms" / slot if config.strategy_dir else None
+        loaded = load_model_recipes(directory, store=None if directory is not None else store)
+    elif slot == "s":
+        from crucible.slots.strategy import (  # noqa: PLC0415 - heavy import, one call site
+            load_strategy_slot,
+            registration_specs,
+        )
+
+        loaded = load_strategy_slot(
+            store=None if config.strategy_dir else store, strategy_dir=config.strategy_dir
+        )
+    else:
+        return list(load_arm_specs(slot, store=store, strategy_dir=config.strategy_dir))
     print(
         json.dumps(
             {
@@ -357,20 +373,25 @@ def handle_experiment_new(args: argparse.Namespace) -> int:
     own help text is "report what would be written; write nothing", and
     this handler wrote the register regardless of it).
 
-    **M is no longer refused by name** (`alpha-engine-config-I9957`). Its
-    recipes are `ModelRecipe` documents, not `ArmSpec`s, so `load_arm_specs`
-    still refuses slot `m` — that refusal is correct and stays — and this
-    handler now resolves the M loader instead of converting the refusal into
-    an exit. `crucible.slots.model.load_model_recipes` reads the same tree
-    from the same two sources, and its refused arms are reported here rather
+    **Neither M nor S is refused by name any longer**
+    (`alpha-engine-config-I9957`, `-I10512`). Both recipe types —
+    `ModelRecipe` and `StrategyRecipe` documents — are not `ArmSpec`s, so
+    `load_arm_specs` still refuses slots `m` and `s` — that refusal is
+    correct and stays, it is simply never reached for them any more: this
+    handler resolves each slot's own loader
+    (`crucible.slots.model.load_model_recipes`,
+    `crucible.slots.strategy.load_strategy_slot`) instead of converting the
+    refusal into an exit. Both read the same two sources (a checkout or the
+    synced store tree), and each slot's refused arms are reported here rather
     than silently dropped: an arm that will not register is the fact an
     operator running `experiment.new` most needs.
 
-    **S is still refused by name**, in the same shape :func:`_slot_module`
-    uses (`alpha-engine-config-I9961`): its recipes are `StrategyRecipe`
-    documents and its produce/grade entry points arrive with the S slot's own
-    phase-3 deliverable. Registering nothing and exiting 0 would be
-    indistinguishable from a slot whose arms were all already present.
+    All four slots admit `--slot` now. The `ForeignRecipeSchemaError` handler
+    below is kept as a defensive backstop — `_recipes_for_registration`
+    dispatches M and S to their own loaders before `load_arm_specs` is ever
+    asked for either, so the exception path is not expected to fire for any
+    of the four current slots; it stays in case a future slot adds a fourth
+    recipe schema without a loader wired in here yet.
     """
     config = _settings(args)
     store = config.store()
@@ -378,10 +399,10 @@ def handle_experiment_new(args: argparse.Namespace) -> int:
         specs = _recipes_for_registration(args.slot, config=config, store=store)
     except ForeignRecipeSchemaError as exc:
         raise SystemExit(
-            f"{exc} U, R and M are here; S arrives with track B "
-            f"({_ALL_SLOTS_PHASE.tracker}), which is when its recipes gain a register "
-            "writer. Registering nothing and exiting 0 would be indistinguishable from a "
-            "slot whose arms were all already present."
+            f"{exc} U, R, M and S are all here; a slot beyond those four arrives with "
+            f"track B ({_ALL_SLOTS_PHASE.tracker}), which is when its recipes gain a "
+            "register writer. Registering nothing and exiting 0 would be "
+            "indistinguishable from a slot whose arms were all already present."
         ) from exc
     arm = getattr(args, "arm", None)
     if arm:
