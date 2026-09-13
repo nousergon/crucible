@@ -226,9 +226,28 @@ components:
     console_surface: crucible/slots
     artifact_retention: forever
     absence_watched_by: alerts.sweep
-    schedule: null
-    dispatch: null
-    deadline: null
+    # `alpha-engine-config-I9759`: promote is a STAGE of the weekly arc, not an
+    # on-demand job. Until this row said so the v2 arena had never once written
+    # a promote run or a champion pointer — `experiment.grade` decided, and
+    # nothing acted on the decision — so all four §6 phase-3 promotion clauses
+    # read UNMEASURABLE by construction: nothing had looked.
+    #
+    # 15:00, between `experiment.grade` at 14:00 and `report` at 16:00, because
+    # the deadline table IS the dependency order (`crucible.weekly.arc_stages`):
+    # promote reads the arena cycle grade wrote, and report reduces both.
+    #
+    # Slot-scoped (`crucible.weekly.ARC_SLOT_JOBS`), like `experiment.run` and
+    # `experiment.grade`: four slots, one job name, one trading day, four
+    # writers, so each files its own manifest under `runs/promote/{day}/{slot}/`.
+    # The alternative — one combined run iterating the slots — makes the M
+    # slot's `TrainingIntegrityError` (policy §3, a whole-slot failure by
+    # design) take U, R and S's promotions down with it.
+    schedule: weekly, Saturday
+    dispatch: arc
+    deadline:
+      anchor: next_calendar_day_at
+      cadence: weekly
+      at: "15:00"
 
   report:
     description: Reduce the week's manifests into the five-row attribution table.

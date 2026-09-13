@@ -221,8 +221,11 @@ class TestRunsTheRealCommand:
 
         run_arc(FRIDAY, store="/tmp/store", run_mode=RUN_MODE_REPLAY, main=fake_main, dry_run=True)
         # 5 unscoped stages (data.weekly, drift, report, console,
-        # iac.conformance) + 2 slot-scoped stages x every DISPATCHABLE slot
-        assert len(seen) == 5 + 2 * len(dispatchable_slots())
+        # iac.conformance) + one stage per ARC_SLOT_JOB x every DISPATCHABLE
+        # slot. Derived from `ARC_SLOT_JOBS` rather than written as a literal
+        # so a job joining the slot-scoped set (`promote`,
+        # `alpha-engine-config-I9759`) does not need this arithmetic edited.
+        assert len(seen) == 5 + len(ARC_SLOT_JOBS) * len(dispatchable_slots())
         for argv in seen:
             assert "--dry-run" in argv, argv
             assert "--run-mode" in argv, argv
@@ -238,7 +241,7 @@ class TestRunsTheRealCommand:
             return 0
 
         run_arc(FRIDAY, store="/tmp/store", run_mode=RUN_MODE_REPLAY, main=fake_main, dry_run=False)
-        assert len(seen) == 5 + 2 * len(dispatchable_slots())
+        assert len(seen) == 5 + len(ARC_SLOT_JOBS) * len(dispatchable_slots())
         for argv in seen:
             assert "--dry-run" not in argv, argv
 
