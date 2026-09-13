@@ -11,7 +11,9 @@ from crucible.features import (
     UNIT_SUFFIXES,
     FeatureSpec,
     build_features,
+    catalog_column_depths,
     feature_version,
+    min_panel_trading_days,
     registry_payload,
 )
 from crucible.features.compute import LIQUIDITY_FLOOR_VAR, liquidity_floor_usd
@@ -254,3 +256,71 @@ class TestTheLiquidityFloorRefusesRatherThanGuessing:
             monkeypatch.setenv(LIQUIDITY_FLOOR_VAR, value)
             with pytest.raises(RuntimeError, match="not positive"):
                 liquidity_floor_usd()
+
+
+class TestPanelDepthIsDeclaredByTheProducer:
+    """`alpha-engine-config-I10688`.
+
+    Measured 2026-09-13 against the production layer at
+    `features/v6df3c0a27b70/2026-09-11.parquet`: 1,820 null cells over 903
+    tickers x 25 columns, of which 1,806 (99.2%) were
+    `residual_momentum_252d_skip21d_ratio` and its z-score — null for 903 of
+    903 tickers, on every one of the 536 sessions the layer had been compiled
+    for. The trailing panel carried 275 sessions; the column needs 313. The
+    other 14 cells were four genuinely short-history tickers (62, 75, 220 and
+    225 sessions), which is the layer working as declared.
+    """
+
+    def test_the_deepest_column_needs_more_than_its_declared_window(self) -> None:
+        declared = max(s.window_trading_days or 1 for s in CATALOG)
+        assert min_panel_trading_days() > declared, (
+            "reading the deepest DECLARED window_trading_days as the panel requirement "
+            "is the defect: 252 is true of the economic lookback and false of the panel, "
+            "because the window is composed over a residual stream that is itself 61 "
+            "sessions deep"
+        )
+
+    def test_the_deepest_column_is_the_residual_momentum_ratio_at_313(self) -> None:
+        depths = catalog_column_depths()
+        assert min_panel_trading_days() == 313
+        assert depths["residual_momentum_252d_skip21d_ratio"] == 313
+        assert depths["residual_momentum_252d_skip21d_zscore"] == 313
+        assert depths["mom_12_1_log_return"] == 253
+
+    def test_a_catalogue_column_with_no_declared_depth_is_refused(self) -> None:
+        unknown = (
+            FeatureSpec(
+                name="brand_new_ratio",
+                unit="ratio",
+                expression="something(close, 400)",
+                description="a column whose panel depth nobody wrote down",
+                inputs=("close_raw",),
+                market_wide=False,
+            ),
+        )
+        with pytest.raises(ValueError, match="declare no lookback depth"):
+            min_panel_trading_days(unknown)
+
+    def test_one_session_short_leaves_the_deepest_column_null_for_every_ticker(
+        self, source, cycle_date
+    ) -> None:
+        """The exact production condition, reproduced.
+
+        Not "thinner" and not "some tickers null": EVERY ticker, which is what
+        makes it indistinguishable from a layer that was never built.
+        """
+        panel = source.load_panel(end=cycle_date, lookback_days=1200)
+        days = sorted({d for d in panel["trading_day"].unique()})
+        short = panel[panel["trading_day"] >= days[-(min_panel_trading_days() - 1)]]
+        features, _ = build_features(short)
+        assert features["residual_momentum_252d_skip21d_ratio"].isna().all()
+
+    def test_at_the_declared_depth_the_column_has_values(self, source, cycle_date) -> None:
+        panel = source.load_panel(end=cycle_date, lookback_days=1200)
+        days = sorted({d for d in panel["trading_day"].unique()})
+        exact = panel[panel["trading_day"] >= days[-min_panel_trading_days()]]
+        features, _ = build_features(exact)
+        assert features["residual_momentum_252d_skip21d_ratio"].notna().any(), (
+            "one more session than the test above, and the column measures something — "
+            "which is the whole of the defect: the producer was asked for 275"
+        )

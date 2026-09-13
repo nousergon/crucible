@@ -1444,3 +1444,153 @@ class TestTheServingVetoWindowIsObserved:
         ctx, rows = self._ctx()
         _record_serving_veto_window(ctx, {}, {}, as_of="2026-09-11")
         assert rows == []
+
+
+# --------------------------------------------------------------------------
+# Per-row feature completeness (`alpha-engine-config-I10688`).
+# --------------------------------------------------------------------------
+
+
+def _hole(panel: FeaturePanel, column: str, *, rows: slice, names: slice) -> FeaturePanel:
+    """A copy of ``panel`` with NULLs punched into one column."""
+    block = panel.column(column).copy()
+    block[rows, names] = np.nan
+    return replace(panel, features={**panel.features, column: block})
+
+
+class TestFeatureCompletenessSelectsRowsAndRefusesAnOutage:
+    """`alpha-engine-config-I10688`, the training half.
+
+    The refusal on non-finite training inputs stays exactly as Brian ruled it
+    on 2026-08-29 — `_assert_trainable` is unchanged and still refuses any
+    non-finite cell. What changes is WHICH block it is asked about: the design
+    selects the ticker-rows whose whole feature vector is finite, records what
+    it dropped, and refuses outright when the dropped share exceeds the arm's
+    declared ceiling. Nothing is imputed and nothing is filled.
+    """
+
+    def test_a_handful_of_short_history_names_are_excluded_not_fatal(self, panel) -> None:
+        """The measured production class B: four tickers out of 903 (62, 75,
+        220 and 225 sessions of history) lack a 252-session window. That is the
+        feature layer working as declared, and it must not fail the cycle."""
+        holed = _hole(panel, "mom_21d_ratio", rows=slice(None), names=slice(0, 1))
+        fit = train_arm(_recipe(), holed, as_of="2026-08-28")
+        assert fit.completeness is not None
+        assert fit.completeness.rows_excluded > 0
+        assert fit.completeness.excluded_names == (panel.names[0],)
+        assert fit.completeness.nan_rows_by_column["mom_21d_ratio"] > 0
+        assert fit.n_rows == fit.completeness.rows_complete
+
+    def test_a_whole_dead_column_refuses_rather_than_fitting_on_nothing(self, panel) -> None:
+        """The measured production class A: one column null for 903 of 903
+        tickers. Selecting complete rows without a ceiling would have discarded
+        every row and returned `ok`."""
+        dead = _hole(panel, "mom_21d_ratio", rows=slice(None), names=slice(None))
+        with pytest.raises(TrainingIntegrityError, match="incomplete feature vector"):
+            train_arm(_recipe(), dead, as_of="2026-08-28")
+
+    def test_the_refusal_names_the_column_and_the_ceiling(self, panel) -> None:
+        dead = _hole(panel, "mom_21d_ratio", rows=slice(None), names=slice(None))
+        with pytest.raises(TrainingIntegrityError, match="mom_21d_ratio"):
+            train_arm(_recipe(), dead, as_of="2026-08-28")
+
+    def test_an_exclusion_just_over_the_ceiling_refuses(self, panel) -> None:
+        n_names = len(panel.names)
+        over = int(n_names * 0.25) + 1
+        holed = _hole(panel, "mom_21d_ratio", rows=slice(None), names=slice(0, over))
+        with pytest.raises(TrainingIntegrityError, match="above the declared ceiling"):
+            train_arm(_recipe(), holed, as_of="2026-08-28")
+
+    def test_an_arm_may_declare_its_own_ceiling(self, panel) -> None:
+        n_names = len(panel.names)
+        over = int(n_names * 0.25) + 1
+        holed = _hole(panel, "mom_21d_ratio", rows=slice(None), names=slice(0, over))
+        tolerant = _recipe(max_incomplete_row_ratio=0.5)
+        fit = train_arm(tolerant, holed, as_of="2026-08-28")
+        assert fit.completeness is not None
+        assert fit.completeness.ceiling == 0.5
+        assert 0.10 < fit.completeness.excluded_ratio < 0.5
+
+    def test_the_default_ceiling_applies_when_the_arm_declares_none(self) -> None:
+        from crucible.slots.model import DEFAULT_MAX_INCOMPLETE_ROW_RATIO
+
+        assert _recipe().max_incomplete_row_ratio is None
+        assert _recipe().resolved_max_incomplete_row_ratio == DEFAULT_MAX_INCOMPLETE_ROW_RATIO
+
+    def test_nothing_is_imputed(self, panel) -> None:
+        """The rows that survive are the rows that were measured.
+
+        A fit on the holed panel must equal a fit on the same panel with those
+        ticker-rows removed — never a fit on a filled or zeroed version, which
+        is the `avg_volume_20d` treatment in the training layer.
+        """
+        holed = _hole(panel, "mom_21d_ratio", rows=slice(None), names=slice(0, 1))
+        zeroed = panel.with_zeroed(("mom_21d_ratio",))
+        holed_fit = train_arm(_recipe(), holed, as_of="2026-08-28")
+        with pytest.raises(TrainingIntegrityError):
+            train_arm(_recipe(), zeroed, as_of="2026-08-28")
+        assert holed_fit.n_rows < len(panel.dates) * len(panel.names)
+
+    def test_a_ceiling_outside_zero_to_one_is_refused_at_construction(self) -> None:
+        with pytest.raises(ValueError, match="max_incomplete_row_ratio"):
+            _recipe(max_incomplete_row_ratio=1.0)
+        with pytest.raises(ValueError, match="max_incomplete_row_ratio"):
+            _recipe(max_incomplete_row_ratio=-0.1)
+
+
+class TestTheCeilingIsPartOfTheArmOnlyWhenDeclared:
+    def test_an_arm_declaring_none_keeps_the_id_it_registered_under(self) -> None:
+        """Policy §3.1: a field that always appeared in the hashed spec would
+        re-id every arm already registered and orphan its score series."""
+        assert "max_incomplete_row_ratio" not in _recipe().spec
+
+    def test_declaring_a_ceiling_is_a_different_arm(self) -> None:
+        assert _recipe().arm_id != _recipe(max_incomplete_row_ratio=0.2).arm_id
+        assert _recipe(max_incomplete_row_ratio=0.2).spec["max_incomplete_row_ratio"] == 0.2
+
+
+class TestTheCompletenessRecordReachesTheManifest:
+    def test_the_record_is_metric_shaped_and_carries_the_per_column_counts(self, panel) -> None:
+        holed = _hole(panel, "mom_21d_ratio", rows=slice(None), names=slice(0, 1))
+        fit = train_arm(_recipe(), holed, as_of="2026-08-28")
+        assert fit.completeness is not None
+        row = fit.completeness.as_metric(slot="m")
+        assert row["name"] == "feature_completeness_excluded_ratio"
+        assert row["status"] == "OK"
+        assert row["unit"] == "ratio"
+        record = row["feature_completeness"]
+        assert record["rows_excluded"] == fit.completeness.rows_excluded
+        assert record["nan_rows_by_column"]["mom_21d_ratio"] > 0
+        assert record["excluded_names_sample"] == [panel.names[0]]
+        assert record["excluded_name_count"] == 1
+
+    def test_the_rejection_detail_fits_the_schemas_cap(self, panel) -> None:
+        """`RunContext.record_rejected` RAISES over 200 characters and the
+        fallback manifest drops every other field with it."""
+        holed = _hole(panel, "mom_21d_ratio", rows=slice(None), names=slice(0, 1))
+        fit = train_arm(_recipe(), holed, as_of="2026-08-28")
+        assert fit.completeness is not None
+        assert len(fit.completeness.detail) <= 200
+
+
+class TestTheRecordIsBoundedOnTheManifest:
+    """Measured on the first real replay: the unbounded identifier lists put
+    ~900 tickers and ~400 dates into one metric row, ~200KB on a document
+    every console reader and every `explain` walk loads whole. The counts are
+    complete; the samples are bounded."""
+
+    def test_the_name_and_session_lists_are_capped_and_the_counts_are_not(self, panel) -> None:
+        from crucible.slots.model import _SAMPLE_SIZE
+
+        # Three whole sessions nulled: every name is excluded on at least one
+        # row, so the name count exceeds the sample cap while the ratio stays
+        # well under the default ceiling.
+        holed = _hole(panel, "mom_21d_ratio", rows=slice(0, 3), names=slice(None))
+        fit = train_arm(_recipe(), holed, as_of="2026-08-28")
+        assert fit.completeness is not None
+        record = fit.completeness.to_dict()
+        assert record["excluded_name_count"] == len(panel.names)
+        assert len(record["excluded_names_sample"]) <= _SAMPLE_SIZE
+        assert record["excluded_session_count"] >= 1
+        assert record["excluded_first_session"] in panel.dates
+        assert record["excluded_last_session"] in panel.dates

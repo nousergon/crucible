@@ -15,7 +15,13 @@ a lookup a `read_parquet` already answers.
 
 from __future__ import annotations
 
-from crucible.features.compute import build_features, liquidity_floor_usd, read_features
+from crucible.features.compute import (
+    build_features,
+    catalog_column_depths,
+    liquidity_floor_usd,
+    min_panel_trading_days,
+    read_features,
+)
 from crucible.features.registry import (
     CATALOG,
     FEATURE_REGISTRY_SCHEMA_PATH,
@@ -44,6 +50,8 @@ __all__ = [
     "FeatureRegistryValidationError",
     "FeatureSpec",
     "build_features",
+    "catalog_column_depths",
+    "min_panel_trading_days",
     "feature_names",
     "feature_version",
     "load_registry_schema",

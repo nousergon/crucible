@@ -39,11 +39,17 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 from typing import TYPE_CHECKING, Any
 
 from crucible.calendar import assert_trading_day
 from crucible.data.sources import MissingSourceError, PriceSource
-from crucible.features import build_features, registry_payload
+from crucible.features import (
+    build_features,
+    catalog_column_depths,
+    min_panel_trading_days,
+    registry_payload,
+)
 from crucible.keys import (
     coverage_key,
     data_panel_key,
@@ -58,19 +64,47 @@ if TYPE_CHECKING:
     from crucible.runner import RunContext
 
 __all__ = [
+    "CALENDAR_DAYS_PER_TRADING_DAY",
     "COVERAGE_FLOOR_RATIO",
     "DEFAULT_LOOKBACK_DAYS",
+    "MIN_PANEL_TRADING_DAYS",
     "CoverageError",
+    "PanelDepthError",
     "UndeclaredUniverseError",
     "run_daily",
     "write_panel",
 ]
 
-#: The trailing window the feature layer needs. 400 calendar days is a little
-#: over 252 sessions plus slack: the longest feature horizon is 252 trading
-#: days, and a window that only just covers it produces a first row of NaN on
-#: every holiday-heavy year.
-DEFAULT_LOOKBACK_DAYS = 400
+#: Sessions of history the feature layer needs before EVERY catalogue column
+#: is computable, read from the producer that declares it
+#: (`crucible.features.min_panel_trading_days`) rather than restated here. 313
+#: today, and it moves on its own the day a window constant does.
+MIN_PANEL_TRADING_DAYS = min_panel_trading_days()
+
+#: Calendar days per trading day, used ONLY to size the vendor request — the
+#: panel the vendor returns is then measured in SESSIONS against
+#: :data:`MIN_PANEL_TRADING_DAYS` below, so this factor being generous costs a
+#: slightly larger fetch and being wrong costs nothing silently. Measured over
+#: the NYSE calendar krepis covers (2016-01-01 onward): the worst calendar span
+#: of 313 consecutive sessions is 460 days, a ratio of 1.470; 1.55 carries the
+#: margin.
+CALENDAR_DAYS_PER_TRADING_DAY = 1.55
+
+#: The trailing window requested from the price source, in CALENDAR days
+#: because that is the unit every vendor range takes.
+#:
+#: **Was a hard-coded 400** whose comment read "the longest feature horizon is
+#: 252 trading days" — a true statement about the deepest DECLARED
+#: `window_trading_days` and a false one about the panel, because
+#: `residual_momentum_252d_skip21d_ratio` composes that window over a residual
+#: return stream that is itself 61 sessions deep. 400 calendar days is 275
+#: sessions; the catalogue needs 313. Measured 2026-09-13
+#: (`alpha-engine-config-I10688`): that column was null for 903 of 903 tickers
+#: on every one of the 536 sessions the layer had been compiled for, so the M
+#: arm that ranks on it (`residual_momentum`) could never fit on any date. A
+#: literal cannot notice a window constant changing under it; this cannot be
+#: wrong without `min_panel_trading_days` being wrong.
+DEFAULT_LOOKBACK_DAYS = math.ceil(MIN_PANEL_TRADING_DAYS * CALENDAR_DAYS_PER_TRADING_DAY)
 
 #: A day covering less of the expected universe than this FAILS. Not a
 #: warning: 901 of 903 tickers silently failing a gate for months is the bug
@@ -81,6 +115,25 @@ COVERAGE_FLOOR_RATIO = 0.90
 
 class CoverageError(RuntimeError):
     """The panel was readable but too thin to compute on."""
+
+
+class PanelDepthError(RuntimeError):
+    """The panel covered the universe but too FEW SESSIONS to compute on.
+
+    The orthogonal half of :class:`CoverageError`, and the one nothing
+    measured until `alpha-engine-config-I10688`. Coverage asks how much of the
+    universe closed on the day; depth asks how far back the trailing window
+    reaches. A panel can be 1.00 on coverage and still be shallower than the
+    catalogue's deepest column needs — and the artifact it produces is not
+    thinner, it carries that column NULL FOR EVERY TICKER, on every day,
+    forever. Measured: 903 of 903 tickers, 536 of 536 sessions, one column
+    that looked computed and measured nothing.
+
+    Raised rather than recorded: this is the `avg_volume_20d` class exactly
+    (a column consumed as a measurement that was never one), and the feature
+    layer's own contract says a column is null because a TICKER lacks history,
+    never because the producer was not asked for enough of it.
+    """
 
 
 class UndeclaredUniverseError(RuntimeError):
@@ -218,6 +271,41 @@ def run_daily(
     )
     if absent:
         ctx.record_rejected("no close on the trading day", len(absent))
+
+    panel_sessions = int(panel["trading_day"].nunique())
+    ctx.record_metric(
+        {
+            "name": "panel_depth_trading_days",
+            "module": "crucible.data.daily",
+            "metric_type": "coverage",
+            "value": float(panel_sessions),
+            "unit": "trading_days",
+            "n_floor": 1,
+            "status": "OK" if panel_sessions >= MIN_PANEL_TRADING_DAYS else "FAIL",
+            "status_reason": (
+                f"the trailing panel for {trading_day} carries {panel_sessions} session(s); "
+                f"the feature catalogue's deepest column needs {MIN_PANEL_TRADING_DAYS}"
+            ),
+            "source_path": data_panel_key(trading_day.isoformat()),
+            "last_updated_utc": _utc_now(),
+            "baseline": float(MIN_PANEL_TRADING_DAYS),
+        }
+    )
+    if panel_sessions < MIN_PANEL_TRADING_DAYS:
+        deepest = max(
+            (name for name, depth in catalog_column_depths().items() if depth > panel_sessions),
+            key=lambda name: catalog_column_depths()[name],
+            default="",
+        )
+        raise PanelDepthError(
+            f"the trailing panel for {trading_day} carries {panel_sessions} session(s), "
+            f"below the {MIN_PANEL_TRADING_DAYS} the feature catalogue's deepest column "
+            f"needs (lookback_days={lookback_days} calendar days). Column {deepest!r} "
+            "would be NULL for every ticker on this day, and so on every other day the "
+            "same window was used — a column that looks computed and measured nothing. "
+            "Raise `lookback_days`; the derived default "
+            f"is {DEFAULT_LOOKBACK_DAYS}."
+        )
 
     ctx.record_rows(rows_in=int(len(panel)), rows_out=int(len(panel)))
     ctx.record_metric(

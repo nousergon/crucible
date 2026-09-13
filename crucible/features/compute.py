@@ -37,7 +37,10 @@ __all__ = [
     "RESIDUAL_MOMENTUM_SKIP_TRADING_DAYS",
     "RESIDUAL_MOMENTUM_WINDOW_TRADING_DAYS",
     "RESIDUAL_VOL_WINDOW_TRADING_DAYS",
+    "SMA_LONG_WINDOW_TRADING_DAYS",
     "build_features",
+    "catalog_column_depths",
+    "min_panel_trading_days",
 ]
 
 #: The environment variable carrying the liquidity gate, in USD of mean
@@ -116,9 +119,130 @@ RESIDUAL_MOMENTUM_CUM_TRADING_DAYS = (
     RESIDUAL_MOMENTUM_WINDOW_TRADING_DAYS - RESIDUAL_MOMENTUM_SKIP_TRADING_DAYS
 )
 
+#: The two simple-moving-average windows. Named for the same reason as the
+#: residual block above: :func:`catalog_column_depths` quotes them, and a
+#: window declared twice is a window that drifts.
+SMA_SHORT_WINDOW_TRADING_DAYS = 50
+SMA_LONG_WINDOW_TRADING_DAYS = 200
+
+#: Wilder's RSI window.
+RSI_WINDOW_TRADING_DAYS = 14
+
 #: Guards the information-ratio division. v1's `_EPS`, carried across so the
 #: two implementations do not disagree on a near-zero denominator.
 _EPS = 1e-8
+
+#: Sessions of a ticker's own history before `return_1d_log_return` — the
+#: first link of every chained column below — has a value. A one-session diff
+#: needs two rows.
+_RETURN_DEPTH_TRADING_DAYS = 2
+
+#: Sessions before `beta_60d_raw` has a value. The rolling moments consume
+#: `BETA_WINDOW_TRADING_DAYS` sessions OF RETURNS (which themselves start one
+#: session in), and the result is then shifted one session so a row's beta is
+#: estimated strictly before the row it prices.
+_BETA_DEPTH_TRADING_DAYS = _RETURN_DEPTH_TRADING_DAYS - 1 + BETA_WINDOW_TRADING_DAYS + 1
+
+#: Sessions before `residual_momentum_252d_skip21d_ratio` has a value — the
+#: DEEPEST column in the catalogue, and the reason this arithmetic is written
+#: down rather than left implicit. The residual return stream starts where
+#: beta does; the cumulation consumes `RESIDUAL_MOMENTUM_CUM_TRADING_DAYS`
+#: sessions OF THAT STREAM; the 12-1 skip then shifts the result
+#: `RESIDUAL_MOMENTUM_SKIP_TRADING_DAYS` sessions further.
+#:
+#: **It is 313, not 252.** The column's declared `window_trading_days` is 252
+#: — a true statement about the economic lookback, and a false one about the
+#: panel the producer needs, because the window is composed over a residual
+#: stream that is itself 61 sessions deep. Reading the declared window as the
+#: panel requirement is exactly how `alpha-engine-config-I10688` happened:
+#: `crucible.data.daily.DEFAULT_LOOKBACK_DAYS` was 400 CALENDAR days ("a
+#: little over 252 sessions plus slack"), which is 275 sessions, and this
+#: column was therefore null for 903 of 903 tickers on every one of the 536
+#: sessions the layer had been compiled for — a column that looked computed
+#: and measured nothing, the `avg_volume_20d` class this module's units
+#: contract exists to prevent.
+_RESIDUAL_MOMENTUM_DEPTH_TRADING_DAYS = (
+    _BETA_DEPTH_TRADING_DAYS
+    - 1
+    + RESIDUAL_MOMENTUM_CUM_TRADING_DAYS
+    + RESIDUAL_MOMENTUM_SKIP_TRADING_DAYS
+)
+
+
+def catalog_column_depths() -> dict[str, int]:
+    """`{column: sessions of a ticker's own history before it has a value}`.
+
+    DERIVED from the window constants above, never restated: the whole point
+    is that one edit to a window moves both the computation and the panel the
+    producer asks for. A column absent from this mapping reads only the
+    current row and needs one session.
+
+    Cross-sectional columns (`_zscore`, `tech_score_ratio`) inherit the depth
+    of the deepest column they are computed from, because a z-score of a null
+    is a null.
+    """
+    residual_vol = _BETA_DEPTH_TRADING_DAYS - 1 + RESIDUAL_VOL_WINDOW_TRADING_DAYS
+    momentum_change = _RETURN_DEPTH_TRADING_DAYS - 1 + 2 * MOMENTUM_CHANGE_WINDOW_TRADING_DAYS
+    mom_12_1 = RESIDUAL_MOMENTUM_WINDOW_TRADING_DAYS + 1
+    momentum_20d = 21
+    return_60d = 61
+    depths = {
+        "close_raw": 1,
+        "return_1d_log_return": _RETURN_DEPTH_TRADING_DAYS,
+        "momentum_20d_log_return": momentum_20d,
+        "return_60d_log_return": return_60d,
+        "mom_12_1_log_return": mom_12_1,
+        "volatility_20d_ratio": _RETURN_DEPTH_TRADING_DAYS - 1 + 20,
+        "close_to_sma50_ratio": SMA_SHORT_WINDOW_TRADING_DAYS,
+        "close_to_sma200_ratio": SMA_LONG_WINDOW_TRADING_DAYS,
+        "rsi_14_ratio": RSI_WINDOW_TRADING_DAYS + 1,
+        "dollar_volume_20d_raw": 20,
+        "liquidity_pass_raw": 20,
+        "market_return_1d_log_return": _RETURN_DEPTH_TRADING_DAYS,
+        "beta_60d_raw": _BETA_DEPTH_TRADING_DAYS,
+        "residual_return_1d_log_return": _BETA_DEPTH_TRADING_DAYS,
+        "residual_vol_20d_ratio": residual_vol,
+        "residual_momentum_252d_skip21d_ratio": _RESIDUAL_MOMENTUM_DEPTH_TRADING_DAYS,
+        "momentum_change_21d_log_return": momentum_change,
+    }
+    depths["momentum_20d_zscore"] = depths["momentum_20d_log_return"]
+    depths["return_60d_zscore"] = depths["return_60d_log_return"]
+    depths["mom_12_1_zscore"] = depths["mom_12_1_log_return"]
+    depths["residual_momentum_252d_skip21d_zscore"] = depths["residual_momentum_252d_skip21d_ratio"]
+    depths["momentum_change_21d_zscore"] = depths["momentum_change_21d_log_return"]
+    depths["tech_score_ratio"] = max(
+        depths["rsi_14_ratio"],
+        depths["close_to_sma50_ratio"],
+        depths["close_to_sma200_ratio"],
+        depths["momentum_20d_log_return"],
+    )
+    return depths
+
+
+def min_panel_trading_days(catalog: tuple[FeatureSpec, ...] = CATALOG) -> int:
+    """Sessions of history every column of ``catalog`` needs to be computable.
+
+    The producer's declared demand on the price panel, and the number
+    `crucible.data.daily` sizes its trailing window from. A panel shallower
+    than this does not produce a thinner cross-section — it produces a
+    cross-section whose deepest columns are null for EVERY ticker, which no
+    consumer can distinguish from a layer that was never built.
+
+    A column the catalogue declares and this function does not know the depth
+    of raises rather than defaulting to one session: a new column whose depth
+    nobody wrote down is how the panel silently stops covering the catalogue.
+    """
+    depths = catalog_column_depths()
+    unknown = sorted(spec.name for spec in catalog if spec.name not in depths)
+    if unknown:
+        raise ValueError(
+            f"catalogue column(s) {unknown} declare no lookback depth in "
+            "`catalog_column_depths`. The depth is what sizes the producer's price "
+            "panel; a column whose depth is unwritten is a column the panel may be "
+            "too short for, null on every ticker and indistinguishable from a layer "
+            "that was never compiled."
+        )
+    return max(depths[spec.name] for spec in catalog)
 
 
 def _rank01(series: pd.Series) -> pd.Series:
@@ -199,13 +323,19 @@ def build_features(
     ].transform(lambda s: s.rolling(20, min_periods=20).std(ddof=0))
 
     frame["close_to_sma50_ratio"] = frame["close_raw"] / grouped.transform(
-        lambda s: s.rolling(50, min_periods=50).mean()
+        lambda s: s.rolling(
+            SMA_SHORT_WINDOW_TRADING_DAYS, min_periods=SMA_SHORT_WINDOW_TRADING_DAYS
+        ).mean()
     )
     frame["close_to_sma200_ratio"] = frame["close_raw"] / grouped.transform(
-        lambda s: s.rolling(200, min_periods=200).mean()
+        lambda s: s.rolling(
+            SMA_LONG_WINDOW_TRADING_DAYS, min_periods=SMA_LONG_WINDOW_TRADING_DAYS
+        ).mean()
     )
     frame["rsi_14_ratio"] = (
-        frame.groupby("ticker", sort=False)["close_raw"].transform(lambda s: _wilder_rsi(s, 14))
+        frame.groupby("ticker", sort=False)["close_raw"].transform(
+            lambda s: _wilder_rsi(s, RSI_WINDOW_TRADING_DAYS)
+        )
         / 100.0
     )
 
