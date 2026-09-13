@@ -36,10 +36,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from crucible.calendar import resolve_trading_day
+from crucible.champion import PROMOTION_SOURCES, ChampionPointer
 from crucible.documents import load_document_bytes, load_store_document, read_manifests_under
 from crucible.keys import RUNS_ROOT, champion_key, migration_key
+from crucible.keys import manifest_key as run_manifest_key
 from crucible.manifest import money_path_writes, validate
 from crucible.release import release_json_key
+from crucible.runner import resolve_code_sha
 from crucible.slots.arms import ArmSpec, read_register, register_arms, write_register
 from crucible.store import PointerConflictError, sha256_hex
 
@@ -262,18 +265,39 @@ def run_migrate_history(
         register, _ = register_arms(register, [spec])
         write_register(ctx.store, slot, register)
         key = champion_key(slot)
-        payload = json.dumps(
-            {
-                "schema_version": "champion.v1",
-                "slot": slot,
-                "champion": spec.arm_id,
-                "promoted_at": pointer.get("promoted_at"),
-                "promotion_source": pointer.get("promotion_source", "unknown"),
-                "imported_from": next(s.key for s in SOURCES if s.slot == slot),
+        source_key = next(s.key for s in SOURCES if s.slot == slot)
+        v1_promotion_source = pointer.get("promotion_source", "unknown")
+        champion_pointer = ChampionPointer(
+            slot=slot,
+            arm_id=spec.arm_id,
+            as_of=_date_of(pointer),
+            decided_at=dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            run_id=ctx.run_id,
+            code_sha=resolve_code_sha(),
+            promotion_source=_map_promotion_source(v1_promotion_source),
+            manifest_key=run_manifest_key(ctx.job, ctx.trading_day.isoformat()),
+            evidence={
+                "status": "migrated",
+                "reason": (
+                    f"imported from v1 key {source_key!r} by `crucible migrate.history` "
+                    f"(v1 promotion_source: {v1_promotion_source!r})"
+                ),
+                "moved": False,
             },
-            indent=2,
-            sort_keys=True,
-        ).encode("utf-8")
+            # `kind="pit_parity"`/`status="UNKNOWN"` is the closed schema's only shape
+            # for "this pointer carries no contamination attestation" (`ATTESTED_SLOTS`
+            # is `("s",)` only, so U/R/M ignore this field on read) — `key` names the
+            # v1 source so a reviewer can trace the import without decoding `evidence`,
+            # and `UNKNOWN` is deliberate: a future S-slot import would be refused by
+            # `read_champion` on the exact rule the trader applies to a real pointer.
+            attestation={
+                "kind": "pit_parity",
+                "status": "UNKNOWN",
+                "key": source_key,
+                "reason": "v1 import carries no contamination attestation.",
+            },
+        )
+        payload = json.dumps(champion_pointer.to_dict(), indent=2, sort_keys=True).encode("utf-8")
         # §4.2's outputs contract and §10.8's lineage walk both need this
         # pointer, and `store.py` provides exactly one CAS primitive for the
         # thing this key is: a pointer more than one actor can write.
@@ -281,9 +305,8 @@ def run_migrate_history(
         # a bare `compare_and_swap` either) is the one call that both writes
         # conditionally AND enters this write into `outputs[]` — a bare PUT
         # here was last-writer-wins on the one pointer the store has a CAS
-        # primitive for, and it never entered the manifest's lineage, so
-        # `crucible explain champions/{slot}/current.json` raised `KeyError`
-        # for every imported champion (alpha-engine-config-I9757 defect #7).
+        # primitive for, and it never entered the manifest's lineage
+        # (`alpha-engine-config-I9757` defect #7).
         # A migration is one-shot but not guaranteed single-attempt (the
         # runner retries a transient failure with a fresh context, and the
         # command itself is documented idempotent), so the expected version
@@ -352,6 +375,25 @@ def _date_of(pointer: dict[str, Any]) -> str:
             "been running since 2026-07-13."
         )
     return str(raw)[:10]
+
+
+def _map_promotion_source(v1_promotion_source: str) -> str:
+    """The v1 pointer's `promotion_source`, coerced into
+    :data:`~crucible.champion.PROMOTION_SOURCES` — the closed set
+    `ChampionPointer` validates against.
+
+    Passed through unchanged when it already names one of the three v2
+    values (`operator_bootstrap` is the common case: R's champion has
+    carried it since 2026-07-13, and the whole point of carrying it across
+    is that a never-moved pointer keeps rendering as the finding it is).
+    Anything else — an absent field, or a v1-only value such as
+    `gate_engine` — is mapped to `operator_bootstrap` rather than
+    `evidence`: a migration did not re-run the arena, so the imported
+    pointer must never be mistaken for one the evidence won. The raw v1
+    value is never discarded — it is carried in the pointer's own
+    `evidence.reason`.
+    """
+    return v1_promotion_source if v1_promotion_source in PROMOTION_SOURCES else "operator_bootstrap"
 
 
 # ── `crucible migrate.code_sha` (alpha-engine-config-I10626) ────────────────
