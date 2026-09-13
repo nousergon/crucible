@@ -672,10 +672,9 @@ def build_parser() -> argparse.ArgumentParser:
                 "--verify-chain",
                 action="store_true",
                 help=(
-                    "Verify the money-path hash chain (plan §9.5) and exit non-zero on "
-                    f"a break. `crucible-PR240` ({_money_path_chain_tracker()}) is a "
-                    "gated DRAFT that has not merged: passing this flag against a build "
-                    "with no chain verifier is a loud refusal, not a silent no-op."
+                    "Verify the money-path hash chain (plan §9.5, "
+                    f"{_money_path_chain_tracker()}) and exit non-zero on a break. A "
+                    "no-op when the walk never crossed the money path."
                 ),
             )
         if spec.name == "release.pin":
