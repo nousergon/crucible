@@ -236,7 +236,7 @@ def world(tmp_path):
         store.put_bytes(
             champion_key(slot),
             json.dumps(
-                {"schema_version": "champion_pointer.v1", "slot": slot, "champion": champion}
+                {"schema_version": "champion_pointer.v1", "slot": slot, "arm_id": champion}
             ).encode("utf-8"),
         )
     # 7 decision days -> 6 settled sessions (the last is always unsettled) —
@@ -945,7 +945,7 @@ class TestTheInputsAreNamedWhenTheyAreAbsent:
                 {
                     "schema_version": "champion_pointer.v1",
                     "slot": "u",
-                    "champion": "u:never_ran:cccccccccccc",
+                    "arm_id": "u:never_ran:cccccccccccc",
                 }
             ).encode("utf-8"),
         )

@@ -189,7 +189,7 @@ def _incumbent(store: Store, slot: str) -> str | None:
     key = champion_key(slot)
     if not store.exists(key):
         return None
-    return load_store_document(store, key).get("champion")
+    return load_store_document(store, key).get("arm_id")
 
 
 def _shadow_dates(store: Store, arm_id: str) -> list[str]:

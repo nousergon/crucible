@@ -1731,7 +1731,7 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
 
     m_pointer = champion_key("m")
     champion = (
-        load_store_document(store, m_pointer).get("champion") if store.exists(m_pointer) else None
+        load_store_document(store, m_pointer).get("arm_id") if store.exists(m_pointer) else None
     )
     if not champion:
         raise MissingArtifactError(
@@ -1746,7 +1746,7 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
 
     u_pointer = champion_key("u")
     u_champion = (
-        load_store_document(store, u_pointer).get("champion") if store.exists(u_pointer) else None
+        load_store_document(store, u_pointer).get("arm_id") if store.exists(u_pointer) else None
     )
     cut: set[str] | None = None
     eligibility_source = (
