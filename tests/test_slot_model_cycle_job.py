@@ -939,7 +939,6 @@ class TestTheCompletenessRecordReachesARealManifest:
         import io
 
         import pandas as pd
-
         from nousergon_lib.arena.engine import TrainingIntegrityError
 
         for day in SESSIONS:

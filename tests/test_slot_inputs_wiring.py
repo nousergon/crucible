@@ -385,6 +385,11 @@ STILL_ORPHANED_M_CALLABLES: list[str] = [
     "produce",
     "produce_arm_predictions",
     "realized_hit_rate",
+    # `alpha-engine-config-I10688`: the recording form of
+    # `predict_cross_section`, which returns the served cross-section AND the
+    # `FeatureCompleteness` reading for it. Reached from `produce`, and pinned
+    # for the same reason `produce` is.
+    "score_cross_section",
     "serving_metrics",
     "settled_training_days",
     "train_arm",
