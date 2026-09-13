@@ -18,6 +18,16 @@ running the real writer (`crucible.cli.HANDLERS[job]`, through `run_job`)
 and the real reader (`crucible.gate._clause_arc_runs_ok`, via `evaluate`)
 against one `LocalStore`. A future PR that changes either side without
 changing the other fails this test, not a copy of the old formula.
+
+`alpha-engine-config-I10677` added a second instance of the same class:
+`crucible.gate._clause_slot_promotion_or_non_promotion` (via
+`_promote_non_promotion`) read the bare `manifest_key("promote", day)`
+after `alpha-engine-config-I9759` made `promote` a slot-scoped writer —
+`runs/promote/{day}/{slot}/run.json` — leaving the four phase-3 promotion
+clauses permanently UNMEASURABLE against a store holding real promote
+manifests. `TestThePromoteClauseReadsTheRealDiscriminatedWriter` below
+covers that reader the same way: the real writer, the real reader, one
+store, no hand-computed key.
 """
 
 from __future__ import annotations
@@ -244,3 +254,75 @@ class TestGateReadsWhatTheRealWriterWrote:
         )
         real = _clause_arc_runs_ok(store, [FRIDAY], registry)
         assert real.met, real.detail
+
+
+class TestThePromoteClauseReadsTheRealDiscriminatedWriter:
+    """`alpha-engine-config-I10677`: `_clause_slot_promotion_or_non_promotion`
+    (via `_promote_non_promotion`) read the BARE `manifest_key("promote", day)`
+    while `promote` — since `alpha-engine-config-I9759` — writes
+    `runs/promote/{day}/{slot}/run.json`, the same `manifest_key`
+    discriminator case this file already covers for
+    `experiment.run`/`experiment.grade`. Four slots, one job, one trading day,
+    four writers; the phase-3 clause read the wrong key for all four and
+    would stay UNMEASURABLE forever, on a store holding four real promote
+    manifests.
+
+    Same discipline as the class above: every key on both sides comes from
+    actually running the real writer (`crucible.cli.HANDLERS["promote"]`) and
+    the real reader (`crucible.gate._clause_slot_promotion_or_non_promotion`)
+    against one `LocalStore` — never a hand-computed expected key.
+    """
+
+    def test_the_clause_reads_the_real_promote_writer_as_met_or_unmet_not_unmeasurable(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from crucible.gate import _clause_slot_promotion_or_non_promotion
+
+        monkeypatch.setattr(track_a, "_slot_module", lambda slot: _StubSlotModule())
+        store_uri = str(tmp_path)
+        store = LocalStore(tmp_path)
+        for slot in SLOTS:
+            _seed_slot_for_promote(store, slot)
+        for slot in SLOTS:
+            args = _experiment_args("promote", slot, store_uri)
+            assert HANDLERS["promote"](args) == 0
+            key = manifest_key("promote", FRIDAY.isoformat(), discriminator=slot)
+            assert store.exists(key), f"expected the real promote writer at {key}"
+
+        for slot in SLOTS:
+            clause = _clause_slot_promotion_or_non_promotion(store, slot, [FRIDAY])
+            assert not clause.unmeasurable, (
+                f"slot {slot!r}: a real promote manifest exists at the discriminated key "
+                f"but the clause could not read it — {clause.detail}"
+            )
+
+    def test_a_manifest_filed_only_at_the_bare_key_is_not_consulted(self, tmp_path) -> None:
+        """Inverse/mutation check, so this file cannot pass by accident: a
+        manifest filed ONLY at the old bare key (the pre-fix gate's read, and
+        the shape no real writer produces once `promote` joined
+        `ARC_SLOT_JOBS`) must not satisfy the clause. If the discriminator
+        were dropped from the gate's read, this store would make the clause
+        MET again on evidence that was never actually looked at."""
+        from crucible.gate import _clause_slot_promotion_or_non_promotion
+        from crucible.keys import arena_cycle_key
+
+        store = LocalStore(tmp_path)
+        bare_key = manifest_key("promote", FRIDAY.isoformat())
+        store.put_bytes(
+            bare_key,
+            (
+                b'{"status": "ok", "reason": "", "metrics": [{"name": "pointer_moved", '
+                b'"source_path": "'
+                + arena_cycle_key("r", FRIDAY.isoformat()).encode()
+                + b'", "value": 0, "status_reason": "the challenger lost 3 of 4 paired '
+                b'weeks"}]}'
+            ),
+        )
+        clause = _clause_slot_promotion_or_non_promotion(store, "r", [FRIDAY])
+        assert clause.unmeasurable and not clause.met, (
+            "a manifest filed only at the bare key must read UNMEASURABLE — the clause "
+            "must consult the slot-discriminated key, not the bare one"
+        )
+        discriminated_key = manifest_key("promote", FRIDAY.isoformat(), discriminator="r")
+        assert discriminated_key in clause.evidence
+        assert bare_key not in clause.evidence
