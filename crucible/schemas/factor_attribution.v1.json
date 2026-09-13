@@ -52,7 +52,12 @@
           "proxy": {
             "type": "string",
             "minLength": 1,
-            "description": "The ETF ticker whose return series stands in for this factor. Strategy edge - named here for reproducibility, never hardcoded in the engine."
+            "description": "The ETF ticker whose return series stands in for this factor (the long leg of a spread, or the whole factor when short_proxy is absent). Strategy edge - named here for reproducibility, never hardcoded in the engine."
+          },
+          "short_proxy": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The ETF ticker subtracted from proxy to form a long/short spread - the textbook style-factor premium (e.g. size = IWM minus SPY). Absent means this factor is proxy's raw return, unchanged from the pre-spread shape."
           },
           "exposure": {"type": "number"},
           "contribution_return": {"type": "number"}

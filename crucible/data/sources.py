@@ -360,11 +360,26 @@ class ArcticPriceSource(PriceSource):
     The `arcticdb` extra is imported lazily and its absence is reported by
     name. It is never substituted with a different source: a run that
     silently read a fallback measured something other than what it reports.
+
+    **`library` is a dedicated-library override** (`alpha-engine-config-
+    I10457`). Default (`None`) is production, byte-for-byte unchanged: the
+    read still goes through `nousergon_lib.arcticdb.load_universe_ohlcv`/
+    `open_universe_lib`, both hard-wired to the single production `universe`
+    library. Passing a name routes through the generic
+    `open_arctic(bucket).get_library(name, create_if_missing=True)` +
+    `_load_arctic_frames` path instead — the same low-level path
+    `tests/integration/conftest.py::arctic_library` already uses to avoid
+    ever touching `open_universe_lib`'s hard-wired name. The two paths never
+    cross: a dedicated-library read that fell through to the production
+    helpers on any failure would silently read `universe` from a call that
+    asked for something else.
     """
 
     name = "arcticdb:universe"
 
-    def __init__(self, bucket: str, *, region: str | None = None) -> None:
+    def __init__(
+        self, bucket: str, *, region: str | None = None, library: str | None = None
+    ) -> None:
         # `crucible/config.py::DEFAULT_ARCTIC_BUCKET` carries no default bucket
         # name (`alpha-engine-config-I9906` finding 3 — a bucket name in a
         # public repo's package source is an infrastructure identifier
@@ -380,6 +395,34 @@ class ArcticPriceSource(PriceSource):
             )
         self.bucket = bucket
         self.region = region
+        self.library = library
+
+    def _library_label(self) -> str:
+        return f"library {self.library!r}" if self.library else "universe library"
+
+    def _load_dedicated_library_frames(
+        self, *, end: dt.date, lookback_days: int, symbols: list[str] | None
+    ) -> dict[str, Any]:
+        """The generic read path a dedicated `library` override takes.
+
+        Never calls `load_universe_ohlcv`/`open_universe_lib` — both are
+        hard-wired to `UNIVERSE_LIB` and a fallback to either here would
+        silently read the production library from a call that named a
+        different one.
+        """
+        from nousergon_lib.arcticdb import _load_arctic_frames, open_arctic
+
+        arctic = open_arctic(self.bucket, region=self.region)
+        lib = arctic.get_library(self.library, create_if_missing=True)
+        resolved_symbols = symbols if symbols is not None else sorted(lib.list_symbols())
+        return _load_arctic_frames(
+            lib,
+            resolved_symbols,
+            lookback_days=lookback_days,
+            end=str(end),
+            columns=None,
+            label=f"ArcticPriceSource(library={self.library!r})",
+        )
 
     def load_panel(
         self,
@@ -389,7 +432,10 @@ class ArcticPriceSource(PriceSource):
         symbols: list[str] | None = None,
     ) -> pd.DataFrame:
         try:
-            from nousergon_lib.arcticdb import load_universe_ohlcv
+            if self.library:
+                from nousergon_lib.arcticdb import _load_arctic_frames, open_arctic  # noqa: F401
+            else:
+                from nousergon_lib.arcticdb import load_universe_ohlcv
         except ImportError as exc:
             raise MissingSourceError(
                 "the ArcticDB price source needs the `arcticdb` extra: install "
@@ -398,25 +444,30 @@ class ArcticPriceSource(PriceSource):
             ) from exc
 
         try:
-            frames = load_universe_ohlcv(
-                self.bucket,
-                symbols=symbols,
-                lookback_days=lookback_days,
-                end=str(end),
-                region=self.region,
-            )
+            if self.library:
+                frames = self._load_dedicated_library_frames(
+                    end=end, lookback_days=lookback_days, symbols=symbols
+                )
+            else:
+                frames = load_universe_ohlcv(
+                    self.bucket,
+                    symbols=symbols,
+                    lookback_days=lookback_days,
+                    end=str(end),
+                    region=self.region,
+                )
         except Exception as exc:
             raise MissingSourceError(
-                f"ArcticDB universe library on bucket {self.bucket!r} could not be read "
-                f"for the window ending {end}: {type(exc).__name__}: {exc}"
+                f"ArcticDB {self._library_label()} on bucket {self.bucket!r} could not be "
+                f"read for the window ending {end}: {type(exc).__name__}: {exc}"
             ) from exc
 
         if not frames:
             raise MissingSourceError(
-                f"ArcticDB universe library on bucket {self.bucket!r} returned zero "
-                f"symbols for the window ending {end}. `load_universe_ohlcv` drops "
-                "per-ticker read failures at WARNING and returns what it got, so an "
-                "empty result is an outage or a wrong bucket, not an empty market."
+                f"ArcticDB {self._library_label()} on bucket {self.bucket!r} returned zero "
+                f"symbols for the window ending {end}. The batch read drops per-ticker "
+                "read failures at WARNING and returns what it got, so an empty result is "
+                "an outage or a wrong bucket/library, not an empty market."
             )
         unlisted: list[str] = []
         if symbols is not None:
@@ -463,10 +514,18 @@ class ArcticPriceSource(PriceSource):
         ``None`` here never itself decides "unlisted", only "unresolved".
         """
         import pandas as pd
-        from nousergon_lib.arcticdb import open_universe_lib
 
         try:
-            lib = open_universe_lib(self.bucket, region=self.region)
+            if self.library:
+                from nousergon_lib.arcticdb import open_arctic
+
+                lib = open_arctic(self.bucket, region=self.region).get_library(
+                    self.library, create_if_missing=True
+                )
+            else:
+                from nousergon_lib.arcticdb import open_universe_lib
+
+                lib = open_universe_lib(self.bucket, region=self.region)
         except Exception:
             # The library itself could not be opened: every symbol is equally
             # unresolved (`None`), so `_classify_absent_symbols` classifies all
@@ -496,11 +555,19 @@ class ArcticPriceSource(PriceSource):
         return bounds
 
     def snapshot_id(self) -> str:
-        """`arcticdb:{bucket}` — the library is versioned, this read is not.
+        """`arcticdb:{bucket}[:{library}]` — the library is versioned, this
+        read is not.
 
         ArcticDB versions every write, so a restatement is recoverable; what
-        this identifier pins is WHICH store was read. Pinning a per-symbol
-        version tuple would be an artifact of its own, and is the follow-up
-        named in the PR body rather than a value invented here.
+        this identifier pins is WHICH store — bucket AND library — was read.
+        The `:{library}` suffix only appears with a dedicated-library
+        override (`alpha-engine-config-I10457`): the production default
+        (`library=None`) keeps the exact string every already-written
+        manifest carries, so this is additive, not a provenance format
+        change for existing runs. Pinning a per-symbol version tuple would be
+        an artifact of its own, and is the follow-up named in the PR body
+        rather than a value invented here.
         """
+        if self.library:
+            return f"arcticdb:{self.bucket}:{self.library}"
         return f"arcticdb:{self.bucket}"

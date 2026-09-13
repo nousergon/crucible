@@ -508,7 +508,8 @@
         "report.morning",
         "fault.record",
         "fault.probe",
-        "iac.conformance"
+        "iac.conformance",
+        "test.integration"
       ],
       "title": "Job",
       "type": "string"

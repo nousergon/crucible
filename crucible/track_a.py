@@ -83,10 +83,20 @@ def _source(args: argparse.Namespace, config: Any) -> PriceSource:
     `arctic` is the only production source. A source that is unavailable
     raises by name from inside `load_panel`; it never falls back, because a
     substituted source measures something other than what the run reports.
+
+    `--arctic-library` (`alpha-engine-config-I10457`) is additive and
+    production-inert: production never passes it, so `library` resolves to
+    `None` and `ArcticPriceSource` reads the production `universe` library
+    exactly as before this flag existed. The integration tier is the only
+    caller (`tests/integration/test_cli_jobs.py`), and the value it passes is
+    resolved through `crucible.required.require_env` in its own conftest —
+    RAISE-on-absent already lives there, not here.
     """
     name = getattr(args, "source", None) or "arctic"
     if name == "arctic":
-        return ArcticPriceSource(config.arctic_bucket)
+        return ArcticPriceSource(
+            config.arctic_bucket, library=getattr(args, "arctic_library", None) or None
+        )
     raise SystemExit(
         f"--source {name!r} is not a registered price source. The registered source is "
         "`arctic`; a test supplies its own `PriceSource` by calling the job function "
@@ -597,6 +607,20 @@ def add_track_a_arguments(name: str, sub: argparse.ArgumentParser) -> None:
             "--source",
             default="arctic",
             help="Price source. `arctic` is the only production source; it never falls back.",
+        )
+        # alpha-engine-config-I10457: the dedicated-library override.
+        sub.add_argument(
+            "--arctic-library",
+            dest="arctic_library",
+            default=None,
+            help=(
+                "Dedicated ArcticDB library name to read instead of the production "
+                "`universe` library. ADDITIVE: absent, behaviour is unchanged "
+                "production. Never set outside the integration test tier, which "
+                "resolves it from CRUCIBLE_INTEGRATION_ARCTIC_LIBRARY via "
+                "crucible.required.require_env — that is the only caller that "
+                "declares this flag."
+            ),
         )
         sub.add_argument(
             "--symbols",

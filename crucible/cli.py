@@ -43,6 +43,7 @@ from crucible.holdout import (
     holdout_handler,
 )
 from crucible.iac_conformance import IAC_CONFORMANCE_JOB, iac_conformance_handler
+from crucible.integration_summary import INTEGRATION_TEST_JOB, integration_test_handler
 from crucible.keys import arena_cycle_key, champion_key
 from crucible.keys import manifest_key as _promote_manifest_key
 from crucible.llm import FAULT_INJECTION_CAPABILITY_CLASSES
@@ -455,6 +456,19 @@ JOBS: dict[str, JobSpec] = {
         "Account-vs-template and template-vs-declared-inventory IaC conformance",
         True,
     ),
+    # alpha-engine-config-I10459. Promotes the integration tier's summary
+    # artifact from a hand-rolled `store.put_bytes` call inside
+    # `.github/workflows/integration-nightly.yml` to a real registered job:
+    # shells out to `pytest tests/integration` and writes a real
+    # `run_manifest.v2` document, like every other job. NOT scheduled — it
+    # stays workflow-triggered by that workflow's own
+    # `schedule`/`workflow_call`/`workflow_dispatch` triggers, never a second
+    # independent starter for the same nightly run.
+    INTEGRATION_TEST_JOB: JobSpec(
+        INTEGRATION_TEST_JOB,
+        "Run tests/integration (real S3 + real ArcticDB) and report pass/fail",
+        False,
+    ),
 }
 
 #: The jobs that carry `--fault-capability-class`, exhaustively.
@@ -533,6 +547,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     FAULT_RECORD_JOB: _fault_record,
     FAULT_PROBE_JOB: fault_probe_handler,
     IAC_CONFORMANCE_JOB: iac_conformance_handler,
+    INTEGRATION_TEST_JOB: integration_test_handler,
 }
 
 

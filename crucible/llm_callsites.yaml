@@ -33,13 +33,16 @@ schema_version: llm_callsite_registry.v1
 # capability, which is a membership question with a positive answer. A
 # denylist is wrong by default and wrong again with every new vendor.
 #
-# `crucible.llm` unions this list with `krepis.router.TIER_GROUPS` — the
-# router's own tier-to-group mapping — so the router's groups are askable
-# without being restated here, and a group removed there stops being askable.
-# This list is for classes THIS deployment's router serves beyond the bare
-# tiers. Adding a name is a deliberate edit in the file where the reason for
-# every name is written down; it is not something a call site can do to
-# itself.
+# `crucible.llm` unions this list with `krepis.router.registry_groups()` — the
+# registry's own declared model group set, asked for by name — so the
+# router's real groups are askable without being restated here, and a group
+# removed from the registry stops being askable. (This used to union
+# `krepis.router.TIER_GROUPS`, a tier-to-group MAPPING rather than the group
+# set, which admitted the tier name `mid` and dropped the real group `ultra`
+# — `alpha-engine-config-I9971`.) This list is for classes THIS deployment's
+# router serves beyond the bare registry groups. Adding a name is a
+# deliberate edit in the file where the reason for every name is written
+# down; it is not something a call site can do to itself.
 # EMPTY IS THE CORRECT STATE, same reasoning as `callsites: {}` below.
 #
 # This list used to carry `reasoning_high` — a string that read as a router
@@ -49,11 +52,11 @@ schema_version: llm_callsite_registry.v1
 # `CapabilityClassNotRouted`. Brian's ruling on `alpha-engine-config-I9970`
 # (2026-09-08, option (a)) settled which real groups the phase-5 call sites
 # address: the LLM research arms ask for `high`, the phase-5 judge asks for
-# `ultra`. Both are already router TIER GROUPS (`krepis.router.TIER_GROUPS`),
-# so both are askable by IDENTITY through the union in
-# `crucible.llm._capability_classes` with no row here — this list exists
-# only for a class whose name is NOT already a group name, and there is none
-# today.
+# `ultra`. Both are already registry model groups
+# (`krepis.router.registry_groups()`), so both are askable by IDENTITY
+# through the union in `crucible.llm._capability_classes` with no row here —
+# this list exists only for a class whose name is NOT already a group name,
+# and there is none today.
 #
 # ONE NAME NOW CARRIES A REASON (`alpha-engine-config-I10343`):
 #

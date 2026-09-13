@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from crucible.llm import DEFAULT_LLM_CAP_USD, DEFAULT_LLM_CAP_USD_MEASURED
-from crucible.store import LocalStore, S3Store, Store, read_only
+from crucible.store import LocalStore, S3Store, Store, parse_store_scheme, read_only
 
 __all__ = [
     "CLOUDTRAIL_ARCHIVE_VAR",
@@ -405,23 +405,22 @@ def _positive_cap(raw: str, origin: str) -> float:
 def store_from_uri(uri: str) -> Store:
     """``s3://bucket/prefix`` to an :class:`S3Store`; anything else to a directory.
 
-    A URI carrying a scheme this function does not know RAISES. Reading an
-    unknown scheme as a relative directory would silently write a production
-    run's artifacts into a folder named after the scheme, beside the source
-    tree, and report success.
+    Scheme classification (`s3://` vs an unknown scheme vs a local path)
+    delegates to `crucible.store.parse_store_scheme`
+    (`alpha-engine-config-I10519`) — the same check `crucible.store.open_store`
+    runs, so a `--store` value the CLI accepts and a `Settings.store_uri` this
+    function resolves are refused identically rather than by two
+    independently maintained copies of the same three branches. A URI
+    carrying a scheme this function does not know RAISES: reading an unknown
+    scheme as a relative directory would silently write a production run's
+    artifacts into a folder named after the scheme, beside the source tree,
+    and report success.
     """
-    if uri.startswith("s3://"):
-        rest = uri[len("s3://") :].strip("/")
-        if not rest:
+    kind, rest = parse_store_scheme(uri)
+    if kind == "s3":
+        stripped = rest.strip("/")
+        if not stripped:
             raise ValueError(f"{uri!r} names no bucket")
-        bucket, _, prefix = rest.partition("/")
+        bucket, _, prefix = stripped.partition("/")
         return S3Store(bucket=bucket, prefix=prefix)
-    if "://" in uri:
-        scheme = uri.split("://", 1)[0]
-        raise ValueError(
-            f"unsupported store scheme {scheme!r} in {uri!r}. The supported backends "
-            "are `s3://bucket/prefix` and a local directory path; an unknown scheme "
-            "is a typo, and reading it as a directory name would write a production "
-            "run into a folder named after the scheme and report success."
-        )
     return LocalStore(Path(uri).expanduser())

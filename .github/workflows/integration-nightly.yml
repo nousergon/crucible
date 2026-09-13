@@ -109,6 +109,28 @@ env:
   CRUCIBLE_INTEGRATION_ARCTIC_LIBRARY: ${{ vars.CRUCIBLE_INTEGRATION_ARCTIC_LIBRARY }}
   CRUCIBLE_INTEGRATION_PAGES_TOPIC: ${{ vars.CRUCIBLE_INTEGRATION_PAGES_TOPIC }}
   CRUCIBLE_INTEGRATION_MUTED_TOPIC: ${{ vars.CRUCIBLE_INTEGRATION_MUTED_TOPIC }}
+  # `crucible test.integration` (below) now runs a crucible command with
+  # `--run-mode live`, which `tests/test_workflow_required_env.py` reads as
+  # "reaches the production store" and requires every `require_env` call
+  # site under `crucible/` to be declared here — even though the ONLY
+  # process that actually calls `crucible.alerts`/`crucible.features.compute`
+  # is the `pytest tests/integration` SUBPROCESS this job shells out to,
+  # which re-derives its own `CRUCIBLE_PAGES_TOPIC`/`CRUCIBLE_MUTED_TOPIC`
+  # from the `_INTEGRATION_` values above via
+  # `tests/integration/conftest.py::_dedicated_topic_env` regardless of what
+  # is set here. Declared anyway, pointed at the SAME dedicated values —
+  # never the production ones `board.yml`/`deploy.yml`/`gate-close.yml`
+  # resolve — so the static guard (correctly) cannot tell this workflow
+  # apart from one that skipped declaring a var it truly needs, and so a
+  # future caller of `crucible.alerts`/`crucible.features.compute` from
+  # OUTSIDE the pytest subprocess is not silently pointed at production
+  # either. `CRUCIBLE_LIQUIDITY_FLOOR_USD` carries no dedicated-integration
+  # variant (it is a feature threshold, not an isolation boundary — the
+  # library/store/topic split is) so it reuses the same repository variable
+  # `board.yml`/`deploy.yml`/`gate-close.yml` already do.
+  CRUCIBLE_PAGES_TOPIC: ${{ vars.CRUCIBLE_INTEGRATION_PAGES_TOPIC }}
+  CRUCIBLE_MUTED_TOPIC: ${{ vars.CRUCIBLE_INTEGRATION_MUTED_TOPIC }}
+  CRUCIBLE_LIQUIDITY_FLOOR_USD: ${{ vars.CRUCIBLE_LIQUIDITY_FLOOR_USD }}
 
 jobs:
   integration:
@@ -119,7 +141,7 @@ jobs:
       contents: read
       id-token: write   # OIDC only; no long-lived AWS keys in this repository
     outputs:
-      outcome: ${{ steps.summary.outputs.outcome }}
+      outcome: ${{ steps.tests.outcome == 'success' && 'ok' || 'failed' }}
     steps:
       - name: Repository variables are set
         run: |
@@ -168,73 +190,30 @@ jobs:
 
       # `tests/integration` is deliberately never on the `pull_request` or
       # `push: [main]` trigger's own suite — `pyproject.toml`'s `addopts`
-      # ignores it there. This IS its execution path, so it is invoked as an
-      # explicit test path rather than inheriting an ignore that would skip
-      # it here too.
-      - name: Integration tier
+      # ignores it there. This IS its execution path.
+      #
+      # `crucible test.integration` (`alpha-engine-config-I10459`) is a
+      # registered CLI job: a thin handler that shells to
+      # `pytest tests/integration --tb=short` and writes a real
+      # `run_manifest.v2` document at `runs/test.integration/{trading_day}/
+      # run.json` in the dedicated store, in a `try/finally` (rule 1) — this
+      # replaces the two hand-rolled steps this workflow used to carry (a
+      # bare `pytest` invocation, then a raw `store.put_bytes` write of a
+      # plain `integration_summary.v1` object that was never manifest-or-it-
+      # didn't-happen and carried no `components.yaml` row).
+      - name: Integration tier (crucible test.integration)
         id: tests
         continue-on-error: true
         run: |
           set -euo pipefail
-          uv run --frozen pytest -q tests/integration --tb=short \
-            -o junit_family=legacy --junitxml=integration.xml
-          echo "outcome=ok" >> "$GITHUB_OUTPUT"
-
-      - name: Resolve the trading day
-        id: trading_day
-        run: |
-          day="$(uv run --frozen python -c 'from tests.integration.conftest import INTEGRATION_TRADING_DAY; print(INTEGRATION_TRADING_DAY)')"
-          echo "day=${day}" >> "$GITHUB_OUTPUT"
-
-      # The `integration_summary.v1` artifact `tests/integration/README.md`
-      # names — NOT a `run_manifest.v2` object: that needs a registered CLI
-      # job this session's ownership does not include (see
-      # `alpha-engine-config-I10459`). Written unconditionally (`if: always()`)
-      # so a failed nightly is visible on the same surface as a passing one,
-      # never silently absent.
-      - name: Publish the integration summary
-        id: summary
-        if: always()
-        run: |
-          set -euo pipefail
-          outcome="${{ steps.tests.outcome == 'success' && 'ok' || 'failed' }}"
-          echo "outcome=${outcome}" >> "$GITHUB_OUTPUT"
-          uv run --frozen python - <<'PY'
-          import json
-          import os
-          import subprocess
-          from datetime import UTC, datetime
-
-          from crucible.store import open_store
-
-          day = os.environ["TRADING_DAY"]
-          store = open_store(os.environ["CRUCIBLE_INTEGRATION_STORE_URI"])
-          commit = subprocess.run(
-              ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
-          ).stdout.strip()
-          payload = {
-              "schema_version": "integration_summary.v1",
-              "trading_day": day,
-              "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "commit": commit,
-              "outcome": os.environ["OUTCOME"],
-              "run_url": os.environ["RUN_URL"],
-          }
-          store.put_bytes(
-              f"integration/summary/{day}.json",
-              json.dumps(payload, indent=2, sort_keys=True).encode("utf-8"),
-          )
-          print(json.dumps(payload, indent=2))
-          PY
-        env:
-          TRADING_DAY: ${{ steps.trading_day.outputs.day }}
-          OUTCOME: ${{ steps.tests.outcome == 'success' && 'ok' || 'failed' }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          uv run --frozen crucible test.integration \
+            --store "$CRUCIBLE_INTEGRATION_STORE_URI" \
+            --run-mode live
 
       - name: Fail the run if the integration tier failed
         if: steps.tests.outcome != 'success'
         run: |
-          echo "::error::tests/integration failed — see the 'Integration tier' step above. The summary was still published (see 'Publish the integration summary')."
+          echo "::error::crucible test.integration failed — see the 'Integration tier (crucible test.integration)' step above. Its manifest (runs/test.integration/{trading_day}/run.json in the dedicated store) still recorded the failure — real telemetry, never a silently absent one."
           exit 1
 
   notify-failure:

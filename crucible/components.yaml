@@ -848,3 +848,33 @@ components:
     schedule: null
     dispatch: null
     deadline: null
+
+  test.integration:
+    # alpha-engine-config-I10459: promotes the integration tier's summary
+    # artifact from a hand-rolled `store.put_bytes` call inside
+    # `.github/workflows/integration-nightly.yml` to a real registered job.
+    # `schedule`/`dispatch`/`deadline` are all null on purpose — this stays
+    # WORKFLOW-triggered by that workflow's own `schedule`/`workflow_call`/
+    # `workflow_dispatch` triggers, never a second, independent
+    # EventBridge/spot-dispatched starter for the same nightly run.
+    description: Run tests/integration (real S3 + real ArcticDB) and report pass/fail.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      # Writes nothing of its own beside its manifest — the artifacts
+      # `tests/integration` itself produces belong to THEIR OWN jobs'
+      # lineage (each case invokes `crucible.cli.main` for real), not to
+      # this summarizing job's.
+      lineage: null
+      outcome: run.json:metrics[tests_integration_exit_code]
+    log_location: /crucible/test.integration
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
