@@ -230,13 +230,43 @@ class TestTheStackReadThatCausedThis:
     ) -> None:
         """The reading that was lost: `gates/ladder.json` evaluates every phase
         gate, so one clause raising took the weekly arc's `console` stage down
-        with it. Every other clause must still produce a row."""
+        with it. Every other clause must still produce a row.
+
+        The autonomy clause left phase 2's clause list on 2026-09-13 (Brian's
+        ruling — see `tests/test_standing_slos.py`), so the gate reached here
+        is phase 4, whose cost clause constructs the other AWS client this
+        module is about. The property is unchanged and is deliberately NOT
+        pinned to a particular clause: it is "a gate renders whatever its
+        clauses could not read", and pinning it to one name is how it would
+        quietly stop testing anything the next time a clause moved.
+        """
         monkeypatch.setenv("CRUCIBLE_CLOUDTRAIL_ARCHIVE", "s3://a-test-archive/trail")
         self._no_region(monkeypatch)
-        result = gate_module.evaluate(
-            _store_with_a_readable_pointer(), gate="phase2", trading_day=DAY
+        for gate in gate_module.GATES:
+            result = gate_module.evaluate(
+                _store_with_a_readable_pointer(), gate=gate, trading_day=DAY
+            )
+            assert result.clauses, f"{gate} rendered no clause at all"
+            assert all(isinstance(c, Clause) for c in result.clauses)
+
+    def test_the_unregistered_autonomy_clause_is_still_contained(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`_clause_zero_human_mutating_calls` gates no phase since Brian's
+        2026-09-13 ruling, and containment is a property of the MODULE rather
+        than of the registry — a clause read by a board row, a script or a
+        future gate must still be unable to raise into its caller."""
+        monkeypatch.setenv("CRUCIBLE_CLOUDTRAIL_ARCHIVE", "s3://a-test-archive/trail")
+        self._no_region(monkeypatch)
+        assert "zero_human_mutating_calls" not in {
+            c.name
+            for gate in gate_module.GATES
+            for c in gate_module.evaluate(
+                _store_with_a_readable_pointer(), gate=gate, trading_day=DAY
+            ).clauses
+        }
+        clause = gate_module._clause_zero_human_mutating_calls(
+            _store_with_a_readable_pointer(), [DAY]
         )
-        assert len(result.clauses) > 5
-        by_name = {c.name: c for c in result.clauses}
-        assert by_name["zero_human_mutating_calls"].unmeasurable
-        assert "NoRegionError" in by_name["zero_human_mutating_calls"].detail
+        assert clause.unmeasurable and not clause.met
+        assert "NoRegionError" in clause.detail

@@ -203,7 +203,7 @@ jobs:
           # honest answer and is already on the board. Failing the whole
           # render here would take 40-odd readable rows down over one.
           if [ -z "$CRUCIBLE_CLOUDTRAIL_ARCHIVE" ]; then
-            echo "::warning::repository variable CRUCIBLE_CLOUDTRAIL_ARCHIVE is not set, so phase 2's zero_human_mutating_calls will render UNMEASURABLE — set it with: gh variable set CRUCIBLE_CLOUDTRAIL_ARCHIVE --repo nousergon/crucible --body \"\$(AWS_PROFILE=ne-admin aws cloudformation list-exports --query \"Exports[?Name=='fleet-cloudtrail-archive-uri'].Value\" --output text)\""
+            echo "::warning::repository variable CRUCIBLE_CLOUDTRAIL_ARCHIVE is not set, so the standing autonomy row (human_touch_count) will render UNMEASURABLE — set it with: gh variable set CRUCIBLE_CLOUDTRAIL_ARCHIVE --repo nousergon/crucible --body \"\$(AWS_PROFILE=ne-admin aws cloudformation list-exports --query \"Exports[?Name=='fleet-cloudtrail-archive-uri'].Value\" --output text)\""
           fi
           # A WARNING for the same reason the archive check above is one, and
           # the operator-gated grant this board is waiting on

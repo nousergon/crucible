@@ -60,7 +60,8 @@ from crucible.console.classify import STATES as COMPONENT_STATES
 from crucible.console.classify import Classification
 from crucible.documents import read_store_document
 from crucible.features.depth import FEATURES_PREFIX, check_feature_layer_depth
-from crucible.gate import LADDER_STATES, Ladder, PhaseRow
+from crucible.gate import LADDER_STATES, STANDING_SLOS, Ladder, PhaseRow
+from crucible.keys import ALERTS_ROOT
 from crucible.models import BoardDeclarationRow
 from crucible.store import Store
 
@@ -74,6 +75,7 @@ __all__ = [
     "LADDER_BOARD_STATE",
     "RED_STATES",
     "SOURCES",
+    "STANDING_SLO_DECLARATIONS",
     "Board",
     "BoardRow",
     "Declaration",
@@ -115,10 +117,19 @@ DECLARATION_PATH = Path(__file__).parent / "board.yaml"
 #: phase-2 reading since Tuesday" the same kind of statement, and they call for
 #: opposite actions: the first is the system falling short, the second is the
 #: instrument being dark. `I10508` exists because the second was invisible.
+#: `standing` was added on 2026-09-13, the same deliberate way `schedule` was.
+#: Brian's ruling that day took three calendar-floored readings off phase 2's
+#: exit gate (`crucible.gate._phase2`) and said they keep being measured with
+#: no phase consequence. A reading with no phase consequence cannot live under
+#: `phase`: a `phase` row answers "may this phase exit", and folding an SLO
+#: into it would either drag the phase red for something that no longer gates
+#: it, or hide the SLO behind a phase that is green. They are different
+#: questions and they get different sources.
 SOURCES: tuple[str, ...] = (
     "objective",
     "phase",
     "schedule",
+    "standing",
     "producer",
     "component",
     "cutover",
@@ -997,8 +1008,11 @@ def build_board(
     already use, so every EXISTING caller of `build_board` gets
     `human_touch_count` on its board without a call-site change. It never
     raises: an unset archive or a read failure renders as `measured: false`
-    with the reason named, the same posture the phase-2 gate clause takes
-    for the identical read.
+    with the reason named. Since 2026-09-13 it feeds TWO surfaces from the one
+    read — the `human_touch_count` payload field and the standing autonomy ROW
+    (:func:`_standing_rows`) — because Brian's ruling that day left the board
+    as the only place the number is read at all, and a payload field no page
+    renders is not a measurement anyone sees.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     # The RUN's trading day when the caller has one, never the wall clock.
@@ -1026,10 +1040,11 @@ def build_board(
 
     rows.append(_feature_layer_depth_row(store))
 
+    touch = human_touch if human_touch is not None else _read_human_touch_count(moment.date())
+    rows.extend(_standing_rows(store, day, touch))
+
     for row_id, declaration in decl.cutover.items():
         rows.append(_declared_row(store, f"cutover:{row_id}", declaration, day))
-
-    touch = human_touch if human_touch is not None else _read_human_touch_count(moment.date())
 
     return Board(
         trading_day=day,
@@ -1712,6 +1727,141 @@ def _feature_layer_depth_row(store: Store) -> BoardRow:
         ),
         last_read=last_read,
     )
+
+
+#: The standing SLO rows, keyed by the `crucible.gate` clause name each one
+#: renders — and the DECLARATION each row needs that a `Clause` does not
+#: carry: a title a reader can scan, a fallback artifact for the render where
+#: the clause names no key (a clean `pages_within_ceiling` has no incidents to
+#: cite, and a row with no artifact is refused by `BoardRow.__post_init__`),
+#: and what red means.
+#:
+#: Keyed by clause name and checked against `crucible.gate.STANDING_SLOS` at
+#: import, so a clause added to or removed from that tuple is a loud failure
+#: here rather than a row that silently stops rendering.
+STANDING_SLO_DECLARATIONS: dict[str, dict[str, str]] = {
+    "live_saturdays_first_attempt_ok": {
+        "title": "the live weekly Saturday runs `ok` on its first attempt",
+        "artifact": "runs/weekly/<saturday>/run.json",
+        "means_when_red": (
+            "the most recent LIVE weekly Saturday did not read `status: ok` on its first "
+            "attempt — it was rerun, it failed, or it never ran. This no longer gates any "
+            "phase (Brian's ruling 2026-09-13); it is the standing measure of whether the "
+            "weekly path runs unattended, and a red here is a real regression in exactly "
+            "the property the rebuild exists to produce."
+        ),
+    },
+    "pages_within_ceiling": {
+        "title": "paged incidents stay within the standing ceiling",
+        "artifact": ALERTS_ROOT,
+        "means_when_red": (
+            "more paged incidents were filed over the window than the ceiling allows, or "
+            "the alert bus could not be listed. This no longer gates any phase (Brian's "
+            "ruling 2026-09-13); it is the standing measure of whether the paging channel "
+            "is signal, and a red here means the next real page is arriving into noise."
+        ),
+    },
+}
+
+
+def _standing_state(*, met: bool, unmeasurable: bool) -> str:
+    """One state rule for every standing row, in ONE place.
+
+    `UNMEASURABLE` outranks `MET`: a zero nobody could verify is never a clean
+    reading (principle 7). Written once rather than at each row, because the
+    two rows that would otherwise each carry this conditional are exactly the
+    place a "0 is fine" would be reintroduced on one of them only.
+    """
+    if unmeasurable:
+        return "UNMEASURABLE"
+    return "MET" if met else "UNMET"
+
+
+def _standing_rows(store: Store, trading_day: str, touch: HumanTouchReading) -> list[BoardRow]:
+    """The standing SLO rows — measured every render, gating nothing.
+
+    Brian's ruling of 2026-09-13 took three calendar-floored readings off
+    phase 2's exit gate and kept every one of them as a standing reading (see
+    `crucible.gate._phase2` for the ruling verbatim). This function is where
+    "kept" is made true: a removal that left them unrendered would be the
+    deletion the ruling explicitly did not ask for, and the three numbers
+    would stop being read the day the phase closed.
+
+    Two of the three come from `crucible.gate.standing_slo_clauses`, evaluated
+    over phase 2's own window. The third — the autonomy reading — is the
+    `HumanTouchReading` this render already took
+    (`alpha-engine-config-I10416`), never a second walk of the same CloudTrail
+    archive: one archive, one number, two windows would be two answers to one
+    question on one page.
+
+    Reads; never runs, and never raises: `standing_slo_clauses` returns
+    contained clauses, and a read failure renders `UNMEASURABLE` — red, and
+    distinct from a clean `UNMET`.
+    """
+    from crucible.gate import standing_slo_clauses  # noqa: PLC0415 - heavy, one call site
+
+    rows = [
+        BoardRow(
+            id="standing:human_touch_count",
+            source="standing",
+            section="standing SLO — unattended operation",
+            title="no human mutating call reaches the v2 system",
+            # A non-zero count is UNMET and an unreadable archive is
+            # UNMEASURABLE; a zero we could not verify is NEVER green. That is
+            # the whole reason `HumanTouchReading.measured` exists.
+            state=_standing_state(met=touch.count == 0, unmeasurable=not touch.measured),
+            detail=f"{touch.month}: {touch.detail}",
+            surface="crucible board",
+            # Named generically, never as the archive's URI: this page is
+            # published, and the bucket is an infrastructure identifier this
+            # tree does not carry (`crucible/AGENTS.md`, Visibility).
+            artifact="the CloudTrail S3 archive named by CRUCIBLE_CLOUDTRAIL_ARCHIVE",
+            means_when_red=(
+                "a human made a mutating call against the v2 system this calendar month, "
+                "or the CloudTrail archive could not be read at all. This no longer gates "
+                "any phase (Brian's ruling 2026-09-13); it is the standing measure of "
+                "whether the system is actually running unattended, and every touch it "
+                "names is a tracked gap rather than a fact to hide."
+            ),
+        )
+    ]
+    for clause in standing_slo_clauses(store, trading_day=dt.date.fromisoformat(trading_day)):
+        declaration = STANDING_SLO_DECLARATIONS[clause.name]
+        rows.append(
+            BoardRow(
+                id=f"standing:{clause.name}",
+                source="standing",
+                section="standing SLO — unattended operation",
+                title=declaration["title"],
+                state=_standing_state(met=clause.met, unmeasurable=clause.unmeasurable),
+                detail=clause.detail,
+                surface="crucible board",
+                artifact=", ".join(sorted(clause.evidence)) or declaration["artifact"],
+                means_when_red=declaration["means_when_red"],
+                clauses=(clause.to_dict(),),
+            )
+        )
+    return rows
+
+
+def _check_standing_declarations(declared: Iterable[str]) -> None:
+    """Refuse a declaration table that is not exactly `gate.STANDING_SLOS`.
+
+    A function rather than an import-time `assert`, for the reason
+    :func:`_check_total` gives: `assert` is compiled out under `python -O`,
+    and `tests/test_board_standing_slos.py` calls this with a mismatched set
+    so the guard itself is known to fire.
+    """
+    if set(declared) != set(STANDING_SLO_DECLARATIONS):
+        raise ValueError(
+            f"crucible.gate.STANDING_SLOS is {sorted(set(declared))} but this module "
+            f"declares rows for {sorted(STANDING_SLO_DECLARATIONS)}. An SLO with no "
+            "declaration renders nowhere, and a declaration with no SLO is a row "
+            "measuring nothing while looking configured."
+        )
+
+
+_check_standing_declarations(STANDING_SLOS)
 
 
 def _component_row(component: Component, classification: Classification | None) -> BoardRow:
