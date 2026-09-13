@@ -13,7 +13,9 @@ from __future__ import annotations
 import datetime as dt
 import json
 
-from crucible.alerts import PAGE_CONDITIONS, evaluate_min_active_arms
+import pytest
+
+from crucible.alerts import PAGE_CONDITIONS, StoreAccessError, evaluate_min_active_arms
 from crucible.keys import arena_cycle_key
 from crucible.slots.cycle import MIN_ACTIVE_ARMS_FINDING_METRIC
 from crucible.store import LocalStore
@@ -24,12 +26,37 @@ NOW = dt.datetime(2026, 8, 29, 23, 0, tzinfo=dt.UTC)
 
 
 def _write_cycle(store: LocalStore, slot: str, day: dt.date, *, status: str, count: int) -> None:
+    # The full `ArenaCycleDocument`-conforming shape (`alpha-engine-config-
+    # I9847` wave 2): `test_typed_boundary_arena_cycle.py`'s minimal payload,
+    # not a stripped-down fixture — `crucible.alerts._read_arena_cycle` now
+    # validates every cycle it reads through that model, and a document
+    # missing the required top-level fields a real writer always carries
+    # (`schema_version`, `slot`, `slot_kind`, `benchmark`, `as_of`,
+    # `decision`) is exactly the malformed-input case the migration exists
+    # to catch, not one this fixture should paper over.
     store.put_bytes(
         arena_cycle_key(slot, day.isoformat()),
         json.dumps(
             {
+                "schema_version": 1,
+                "slot": slot,
+                "slot_kind": "selection",
+                "benchmark": "population",
+                "as_of": day.isoformat(),
+                "scored_arms": [f"{slot}:real_{i}:x" for i in range(count)],
                 "active_arms": [f"{slot}:control_planted_{slot}:x", f"{slot}:control_null_{slot}:x"]
                 + [f"{slot}:real_{i}:x" for i in range(count)],
+                "decision": {
+                    "slot": slot,
+                    "as_of": day.isoformat(),
+                    "incumbent": None,
+                    "champion": None,
+                    "moved": False,
+                    "status": "decided",
+                    "reason": "test fixture",
+                    "comparisons": [],
+                    "ineligible": {},
+                },
                 MIN_ACTIVE_ARMS_FINDING_METRIC: {
                     "status": status,
                     "min_active_arms": 3,
@@ -90,3 +117,19 @@ class TestEvaluateMinActiveArms:
         s_pages = [p for p in pages if p.job == "slots.s"]
         assert len(s_pages) == 1
         assert s_pages[0].trading_day == FRIDAY
+
+    def test_a_cycle_that_does_not_conform_to_arena_cycle_raises_named(self, tmp_path) -> None:
+        """`alpha-engine-config-I9847` (wave 2): a cycle document that parses
+        as JSON but is missing a field a real writer always carries (here,
+        the whole required shape — `decision`, `as_of`, `slot`...) used to
+        read as `finding = None` off a bare `.get()` and this slot silently
+        never paged. It is now surfaced as the SAME unreadable outcome a
+        parse failure already produces, naming the document and raising
+        through `StoreAccessError` with no `access_faults` sink supplied."""
+        store = LocalStore(tmp_path)
+        store.put_bytes(
+            arena_cycle_key("s", FRIDAY.isoformat()),
+            json.dumps({"active_arms": []}).encode("utf-8"),
+        )
+        with pytest.raises(StoreAccessError, match="does not conform to arena_cycle"):
+            evaluate_min_active_arms(store, now=NOW)

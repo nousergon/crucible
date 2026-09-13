@@ -35,18 +35,30 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from crucible.documents import load_store_document
-from crucible.keys import champion_key, migration_key
+from crucible.calendar import resolve_trading_day
+from crucible.documents import load_document_bytes, load_store_document, read_manifests_under
+from crucible.keys import RUNS_ROOT, champion_key, migration_key
+from crucible.manifest import money_path_writes, validate
+from crucible.release import release_json_key
 from crucible.slots.arms import ArmSpec, read_register, register_arms, write_register
+from crucible.store import PointerConflictError, sha256_hex
 
 if TYPE_CHECKING:
     from crucible.store import Store
 
+#: `alpha-engine-config-I10506`/`crucible.promote._PLACEHOLDER_CODE_SHA`:
+#: same value, same reasoning — kept local rather than imported from
+#: `crucible.models` (a private name there) so this module carries no
+#: import-time dependency on it.
+_PLACEHOLDER_CODE_SHA = "0" * 40
+
 __all__ = [
     "SOURCES",
+    "CodeShaMigrationReport",
     "MigrationSourceMissing",
     "V1Source",
     "read_v1_json",
+    "run_migrate_code_sha",
     "run_migrate_history",
 ]
 
@@ -340,3 +352,372 @@ def _date_of(pointer: dict[str, Any]) -> str:
             "been running since 2026-07-13."
         )
     return str(raw)[:10]
+
+
+# ── `crucible migrate.code_sha` (alpha-engine-config-I10626) ────────────────
+#
+# 89 of 164 production run manifests carry the all-zero `code_sha`
+# placeholder, written before `crucible.runner.resolve_code_sha` and the
+# schema-level refusal (alpha-engine-config-I10454) existed. No producer has
+# written it since crucible-PR219 (2026-09-11), but `crucible.manifest.validate`
+# validates ON READ, so `crucible explain` cannot complete a lineage walk
+# against the store as it stands today.
+#
+# This is a one-off REPAIR, not a job: it patches documents another job
+# already wrote, so it cannot honestly run through `crucible.runner.run_job`
+# (whose manifest schema's `job` enum is closed, `crucible/models.py`, and is
+# out of this change's ownership) and does not claim to. What it does instead:
+#
+# 1. Reads every manifest under `runs/` (`crucible.documents.read_manifests_under`,
+#    the same tolerant reader `crucible.explain` will eventually use for I10626's
+#    other half — never `crucible.manifest.validate`'s STRICT face, which is
+#    exactly what raises on these 89 today).
+# 2. For each manifest whose `code_sha` is the placeholder, DERIVES the real
+#    value from the durable record of what `releases/current` pointed at when
+#    the manifest's own `started` instant was reached: the most recent
+#    successful `deploy` manifest at or before that instant
+#    (`runs/deploy/{trading_day}/run.json`, `status: ok`, written directly by
+#    `crucible.deploy._record` — see its own `code_sha`/`release_sha` fields).
+#    Cross-checked against every OTHER manifest sharing the same `trading_day`:
+#    they all read `releases/current` at close to the same time, so a
+#    conflicting `code_sha` among them is treated as ambiguity, not resolved
+#    by picking one.
+# 3. REFUSES, naming the manifest and the reason, rather than guessing, when:
+#    the manifest is on the money path (`crucible.manifest.money_path_writes`
+#    / `money_path_link`) — a fabricated `code_sha` there is exactly the
+#    false-provenance claim I10454 exists to prevent; the manifest is itself a
+#    `deploy` record (its `code_sha` names the release BEING deployed, not one
+#    read from the pointer, so this derivation does not apply); no successful
+#    deploy record exists at or before the manifest's `started` instant; same-
+#    trading-day peers disagree on `code_sha`; or the derived sha has no
+#    `releases/{sha}/release.json` in the store to verify it against.
+# 4. Rewrites ONLY `code_sha` on a refused-nowhere-else manifest, via
+#    `Store.compare_and_swap` (never a bare PUT — a manifest is a "single
+#    object more than one actor could touch" the moment a repair tool exists
+#    for it), re-validated whole against `RunManifestV2` before the write. The
+#    rewrite is recorded ON the manifest itself: an `inputs[]` entry naming the
+#    deploy manifest the sha was read from (so the existing `inputs`/`outputs`
+#    lineage a future `explain` walk already understands gains one more real
+#    edge), and a `metrics[]` row naming the placeholder it replaced, the
+#    source and this migration's own run id — `MetricRecordRow` is the one
+#    open (`extra="allow"`) shape on the manifest, by design, for exactly this
+#    kind of forward-compatible annotation.
+# 5. Writes ONE summary document per attempt at `migrations/{trading_day}/{run_id}.json`
+#    (`crucible.keys.migration_key`, the same shape `run_migrate_history`
+#    already files under) — every key this run touched or refused, and why,
+#    so the repair itself is explainable without re-deriving it from prose.
+#
+# **One-shot and idempotent.** A manifest whose `code_sha` is already real
+# (rewritten by a prior attempt, or never broken) is not a candidate at all —
+# re-running finds nothing left to do for it. A refusal is not remembered
+# across runs: a later attempt, with more deploy history available, may
+# resolve it, and CI does not need this module to carry state to say so.
+
+
+@dataclass(frozen=True)
+class CodeShaMigrationReport:
+    """What one `crucible migrate.code_sha` attempt did, in full.
+
+    ``rewritten`` and ``refused`` are exhaustive: every manifest this run
+    found carrying the all-zero `code_sha` placeholder appears in exactly one
+    of the two, named by its store key, never silently dropped
+    (`alpha-engine-config-I10626`).
+    """
+
+    migration_run_id: str
+    dry_run: bool
+    rewritten: tuple[dict[str, Any], ...] = ()
+    refused: tuple[dict[str, Any], ...] = ()
+
+    @property
+    def counts(self) -> dict[str, int]:
+        return {"rewritten": len(self.rewritten), "refused": len(self.refused)}
+
+    def summary_line(self) -> str:
+        suffix = " (dry run — nothing written)" if self.dry_run else ""
+        return f"{len(self.rewritten)} rewritten, {len(self.refused)} refused{suffix}"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "migrate_code_sha.v1",
+            "migration_run_id": self.migration_run_id,
+            "dry_run": self.dry_run,
+            "rewritten": list(self.rewritten),
+            "refused": list(self.refused),
+            "counts": self.counts,
+        }
+
+
+def _parse_utc_instant(raw: Any) -> dt.datetime | None:
+    """``raw`` as a UTC instant, or ``None`` if it is not one.
+
+    Never raises: every call site here is deciding whether to TRUST a
+    timestamp read off a manifest nothing has validated yet, and an
+    unparseable one is a reason to refuse that manifest, not to crash the
+    whole migration attempt.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _successful_deploy_events(
+    documents: list[tuple[str, dict[str, Any]]],
+) -> list[tuple[dt.datetime, str, str]]:
+    """Every successful `deploy` manifest as ``(finished_at, code_sha, key)``,
+    oldest first.
+
+    `finished`, not `started`: `crucible.deploy._record` writes both close to
+    the same instant, but `finished` is when the flip it is REPORTING was
+    already observed (its own `promoted == args.sha` check), so it is the
+    later and more conservative bound for "the pointer had moved by this
+    instant".
+    """
+    events: list[tuple[dt.datetime, str, str]] = []
+    for key, document in documents:
+        if document.get("job") != "deploy" or document.get("status") != "ok":
+            continue
+        sha = document.get("code_sha")
+        if not isinstance(sha, str) or sha == _PLACEHOLDER_CODE_SHA:
+            continue
+        instant = _parse_utc_instant(document.get("finished"))
+        if instant is None:
+            continue
+        events.append((instant, sha, key))
+    events.sort(key=lambda event: event[0])
+    return events
+
+
+def _conflicting_same_day_peers(
+    documents: list[tuple[str, dict[str, Any]]],
+    *,
+    trading_day: Any,
+    exclude_key: str,
+    candidate_sha: str,
+) -> dict[str, list[str]]:
+    """Every OTHER `code_sha` a same-`trading_day` peer manifest carries,
+    mapped to the keys that carry it — empty when every peer agrees with
+    ``candidate_sha`` (or there are no peers with a real value to compare).
+
+    `deploy` manifests are excluded: they are the source of `candidate_sha`
+    in the common case, and comparing a candidate against itself proves
+    nothing.
+    """
+    conflicts: dict[str, list[str]] = {}
+    for key, document in documents:
+        if key == exclude_key or document.get("job") == "deploy":
+            continue
+        if document.get("trading_day") != trading_day:
+            continue
+        sha = document.get("code_sha")
+        if not isinstance(sha, str) or sha == _PLACEHOLDER_CODE_SHA or sha == candidate_sha:
+            continue
+        conflicts.setdefault(sha, []).append(key)
+    return conflicts
+
+
+def _derive_code_sha(
+    key: str,
+    document: dict[str, Any],
+    *,
+    store: Store,
+    deploy_events: list[tuple[dt.datetime, str, str]],
+    documents: list[tuple[str, dict[str, Any]]],
+) -> tuple[str, str] | tuple[None, str]:
+    """The real `code_sha` for ``document`` and the key it was derived from,
+    or ``(None, reason)``.
+
+    Returns ``(sha, source_key)`` on success — ``source_key`` is the deploy
+    manifest's own store key, returned directly (never through a dict) so
+    every caller binds it as a plain tuple-unpack name, the shape
+    `tests/test_no_inline_store_keys.py` accepts for a key that already came
+    from a real `crucible.keys` call elsewhere. ``(None, reason)`` on a
+    refusal, with ``reason`` naming exactly why.
+    """
+    if document.get("money_path_link") is not None or money_path_writes(document):
+        # A fabricated code_sha here is the exact false-provenance claim
+        # alpha-engine-config-I10454 refuses.
+        return (
+            None,
+            "on the money path (money_path_link/outputs); a fabricated code_sha there is "
+            "refused rather than guessed.",
+        )
+    if document.get("job") == "deploy":
+        return (
+            None,
+            "job=deploy: its code_sha names the release BEING deployed, not one read from "
+            "releases/current — this migration's derivation does not apply to it.",
+        )
+    started = _parse_utc_instant(document.get("started"))
+    if started is None:
+        return (
+            None,
+            f"no readable `started` UTC instant (got {document.get('started')!r}) to derive "
+            "a release-as-of time from.",
+        )
+    candidates = [event for event in deploy_events if event[0] <= started]
+    if not candidates:
+        return (
+            None,
+            f"no successful deploy manifest is recorded at or before "
+            f"started={started.isoformat()}; there is no durable record of which release "
+            "was current.",
+        )
+    _instant, sha, source_key = candidates[-1]
+    conflicts = _conflicting_same_day_peers(
+        documents,
+        trading_day=document.get("trading_day"),
+        exclude_key=key,
+        candidate_sha=sha,
+    )
+    if conflicts:
+        named = ", ".join(f"{s} ({', '.join(keys)})" for s, keys in sorted(conflicts.items()))
+        return (
+            None,
+            f"ambiguous: same-trading_day peers disagree with the derived code_sha {sha} "
+            f"(from {source_key}): {named}.",
+        )
+    if not store.exists(release_json_key(sha)):
+        return (
+            None,
+            f"derived code_sha {sha} (from {source_key}) has no releases/{sha}/release.json "
+            "in the store; refusing to write an unverifiable sha.",
+        )
+    return sha, source_key
+
+
+def run_migrate_code_sha(store: Store, *, dry_run: bool = False) -> CodeShaMigrationReport:
+    """Derive and rewrite the all-zero `code_sha` placeholder, store-wide.
+
+    See the module-level comment above for the full derivation and refusal
+    rules. Safe to re-run: a manifest already carrying a real `code_sha` is
+    not a candidate, so a rerun after fixing one absence in the deploy
+    history only touches what is still broken.
+    """
+    now = dt.datetime.now(dt.UTC)
+    migration_run_id = now.strftime("%Y%m%dT%H%M%S%fZ")
+    listing = read_manifests_under(store, RUNS_ROOT)
+    listing.raise_if_unlistable()
+    documents = list(listing.documents)
+    deploy_events = _successful_deploy_events(documents)
+
+    rewritten: list[dict[str, Any]] = []
+    refused: list[dict[str, Any]] = []
+
+    for key, document in documents:
+        if document.get("code_sha") != _PLACEHOLDER_CODE_SHA:
+            continue
+        # `_derive_code_sha` returns `(sha, source_key)` on success or
+        # `(None, reason)` on a refusal — one name, two meanings depending on
+        # which branch below reads it, so it stays unlabeled here rather than
+        # claiming a single purpose it does not have.
+        sha, source_key_or_reason = _derive_code_sha(
+            key, document, store=store, deploy_events=deploy_events, documents=documents
+        )
+        if sha is None:
+            refused.append({"key": key, "reason": source_key_or_reason})
+            continue
+        source_key = source_key_or_reason
+        if dry_run:
+            rewritten.append(
+                {
+                    "key": key,
+                    "old_code_sha": _PLACEHOLDER_CODE_SHA,
+                    "new_code_sha": sha,
+                    "source_key": source_key,
+                    "dry_run": True,
+                }
+            )
+            continue
+
+        expected_version = store.etag(key)
+        current_bytes = store.get_bytes(key)
+        current_document = load_document_bytes(key, current_bytes)
+        if current_document.get("code_sha") != _PLACEHOLDER_CODE_SHA:
+            # Raced with (or already fixed by) another attempt between the
+            # listing above and this write — idempotent, not an error: the
+            # manifest is no longer a candidate, so this run simply reports
+            # it as one it did not need to touch.
+            refused.append(
+                {
+                    "key": key,
+                    "reason": "code_sha changed since listing (another writer already fixed "
+                    "it); nothing left for this attempt to do.",
+                }
+            )
+            continue
+        source_bytes = store.get_bytes(source_key)
+        new_document = dict(current_document)
+        new_document["code_sha"] = sha
+        new_document["inputs"] = [
+            *current_document.get("inputs", []),
+            {
+                "key": source_key,
+                "sha256": sha256_hex(source_bytes),
+                "schema_version": "run_manifest.v2",
+            },
+        ]
+        new_document["metrics"] = [
+            *current_document.get("metrics", []),
+            {
+                "name": "code_sha_migrated",
+                "module": "crucible.migrate",
+                "metric_type": "provenance",
+                "n_floor": 0,
+                "status": "OK",
+                # Tracker: alpha-engine-config-I10454 (the schema-level
+                # refusal this repairs the fallout of), -I10626 (this
+                # migration's own issue) — cited here rather than in the
+                # runtime string below, per test_no_stale_tracker_literals.py.
+                "status_reason": (
+                    f"code_sha derived from {source_key} (release {sha}); the original "
+                    "manifest carried the all-zero placeholder."
+                ),
+                "source_path": source_key,
+                "last_updated_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                # Extra, forward-compat fields (MetricRecordRow is
+                # extra="allow" — see the module-level comment, point 4):
+                # structured provenance a future reader can key off without
+                # parsing status_reason's prose.
+                "migrated_from_code_sha": _PLACEHOLDER_CODE_SHA,
+                "migration_run_id": migration_run_id,
+            },
+        ]
+        validate(new_document)
+        payload = json.dumps(new_document, indent=2, sort_keys=True).encode("utf-8")
+        try:
+            store.compare_and_swap(key, expected_version, payload)
+        except PointerConflictError as exc:
+            refused.append(
+                {
+                    "key": key,
+                    "reason": f"concurrent write detected (compare-and-swap conflict): {exc}. "
+                    "Re-run this migration to re-evaluate.",
+                }
+            )
+            continue
+        rewritten.append(
+            {
+                "key": key,
+                "old_code_sha": _PLACEHOLDER_CODE_SHA,
+                "new_code_sha": sha,
+                "source_key": source_key,
+            }
+        )
+
+    report = CodeShaMigrationReport(
+        migration_run_id=migration_run_id,
+        dry_run=dry_run,
+        rewritten=tuple(rewritten),
+        refused=tuple(refused),
+    )
+    if not dry_run:
+        trading_day = resolve_trading_day(now)
+        store.put_bytes(
+            migration_key(trading_day.isoformat(), migration_run_id),
+            json.dumps(report.as_dict(), indent=2, sort_keys=True).encode("utf-8"),
+        )
+    return report
