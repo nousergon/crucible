@@ -1153,10 +1153,12 @@ def _unregistered_note(unregistered: list[str], *, reason: str = _UNREGISTERED_R
 def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
     requirement = (
         "each slot's arena cycle scored every ACTIVE registered arm and both control "
-        "arms, on every trading day in the window"
+        "arms, on every trading day in the window, on every slot the release that ran "
+        "that day's arc could dispatch"
     )
     gaps: list[str] = []
     unmeasurable: list[str] = []
+    undispatchable: list[str] = []
     evidence: list[str] = []
     # Each slot's register is read ONCE, before the day loop. `_register_arms`
     # reads a single key per SLOT, not per day — re-reading it inside the day
@@ -1165,11 +1167,21 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
     # duplicates of it and hiding a genuinely missing arena cycle for an
     # unrelated slot/day (`alpha-engine-config-I9869` round 3, finding 5).
     registers: dict[str, tuple[set[str], str | None, str | None, bool]] = {}
-    # The slots the CLI can RUN, not every slot the harness declares: M and
-    # S have no `produce`/`grade` until phase 3, and a phase-1 clause that
-    # demanded their arena cycles could never read MET before phase 3 shipped
-    # (measured 2026-09-04). Same derivation `arc_stages` uses, so the two
-    # phase-1 clauses agree about which slots a week must have scored.
+    # The CANDIDATE slots are the ones the CLI can run TODAY — unchanged from
+    # before. What changed is that a MISSING arena cycle for one of them is no
+    # longer an automatic gap: whether a past day's release could have
+    # dispatched that slot is checked below, on the absence path only,
+    # exactly where `_clause_arc_runs_ok` consults `_ArcRegistryHistory` for
+    # the JOB axis (`alpha-engine-config-I10628`, crucible-PR248). Keeping
+    # the history read scoped to "the cycle is absent" — rather than asking
+    # every day's release up front — is what keeps a fully-scored store from
+    # gaining a hidden dependency on every day's release being readable; the
+    # window-wide `dispatchable_slots()` filter this replaced applied TODAY's
+    # answer to every day with no `day` in sight at all, which is the bug: M
+    # or S landing entry points at phase 3 retroactively demanded their arena
+    # cycles on past days whose release could not have dispatched them — a
+    # clause grading past days against the present tree, by a commit that
+    # names neither.
     slots = {slot: SLOTS[slot] for slot in SLOTS if slot in dispatchable_slots()}
     for slot in slots:
         registered, register_key, register_problem, register_access, _register_unused = (
@@ -1180,6 +1192,7 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
             evidence.append(register_key)
         if register_problem is not None:
             (unmeasurable if register_access else gaps).append(register_problem)
+    history = _ArcRegistryHistory(store)
     for day in window:
         for slot, spec in slots.items():
             key = arena_cycle_key(slot, day.isoformat())
@@ -1189,6 +1202,20 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
                 (unmeasurable if read.access_problem else gaps).append(read.problem)
                 continue
             if read.absent:
+                facts, why = history.slots_on(day)
+                if why is not None and why not in unmeasurable:
+                    # NOT a swallow: the miss below still stands. The read
+                    # failure is carried so a reader can tell "we could not
+                    # establish the release" from "the release ran without it".
+                    unmeasurable.append(why)
+                elif facts is not None and slot not in facts:
+                    # The SLOT axis (`alpha-engine-config-I10628`), applied
+                    # here rather than to `_clause_arc_runs_ok`'s job set:
+                    # only an ABSENT cycle, only when the day's own release
+                    # could be read, and always named below rather than
+                    # quietly dropped.
+                    undispatchable.append(f"{slot}@{day.isoformat()}")
+                    continue
                 gaps.append(f"{slot}@{day.isoformat()}: no arena_cycle artifact")
                 continue
             cycle = read.document or {}
@@ -1228,6 +1255,8 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
             parts.append(f"{len(unmeasurable)} could not be read: {'; '.join(unmeasurable[:2])}")
         if gaps:
             parts.append("; ".join(gaps[:4]))
+        if undispatchable:
+            parts.append(_unregistered_note(undispatchable, reason=_UNDISPATCHABLE_REASON))
         return Clause(
             "arms_all_scored",
             requirement,
@@ -1239,11 +1268,16 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
             # occurred (round 3, finding 6).
             unmeasurable=bool(unmeasurable) and not gaps,
         )
+    detail = (
+        f"{len(slots)} slots x {len(window)} days, every registered arm and both controls scored"
+    )
+    if undispatchable:
+        detail += f"; {_unregistered_note(undispatchable, reason=_UNDISPATCHABLE_REASON)}"
     return Clause(
         "arms_all_scored",
         requirement,
         True,
-        f"{len(slots)} slots x {len(window)} days, every registered arm and both controls scored",
+        detail,
         tuple(evidence),
     )
 
