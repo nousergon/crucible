@@ -290,7 +290,11 @@ class TestFaultFourStaleReleasePointer:
             now=NOW,
         )
         store.compare_and_swap(
-            POINTER_KEY, ETAG_ABSENT, json.dumps({"sha": SHA, "target": "current"}).encode()
+            POINTER_KEY,
+            ETAG_ABSENT,
+            json.dumps(
+                {"sha": SHA, "target": "current", "pinned_at": "2026-06-01T00:00:00Z"}
+            ).encode(),
         )
         (tmp_path / wheel_key(SHA)).unlink()
 

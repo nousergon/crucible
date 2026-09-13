@@ -126,6 +126,7 @@ __all__ = [
     "ComponentsDocument",
     "DeadlineRow",
     "DeclaredUniverseDocument",
+    "DispatchRecordDocument",
     "EXPERIMENT_EVENT_ROW_ADAPTER",
     "FAULT_OUTCOME_VALUES",
     "EligibilityHoldEventRow",
@@ -152,6 +153,7 @@ __all__ = [
     "PromotionEventRow",
     "RegistryDefaults",
     "RejectedRow",
+    "ReleasePointerDocument",
     "ReleaseProvenanceDocument",
     "ReleaseRecordDocument",
     "ResourceRow",
@@ -1566,6 +1568,57 @@ class LlmCallsiteRegistryDocument(_Strict):
 # ── I10045 row 5: the release pointer + provenance ─────────────────────────
 # Additive only, appended after the prior rows' markers for the same
 # rebase reason.
+
+
+class ReleasePointerDocument(_Strict):
+    """`releases/current` (:data:`crucible.release.POINTER_KEY`) — the one
+    mutable object the whole release layout turns on, plan §4.11.
+
+    `alpha-engine-config-I9847` (wave 2): `crucible.release.read_pointer` used
+    to hand back `payload["sha"]` off the raw dict `load_store_document`
+    returns, and `crucible.track_c`'s smoke read the same shape through
+    `load_document_bytes(key, payload)["sha"]` — both a `KeyError` three
+    frames from the read that actually saw the bad document (`current_release`,
+    `resolve_release`, `crucible.deploy._capture`, the smoke's pointed-release
+    branch), not a named-field failure at the boundary. `extra="forbid"`:
+    a second key on this document is an edit nothing downstream was told to
+    look for.
+
+    Three fields, matching `crucible.release.pin`'s own payload exactly
+    (`target`/`pinned_at` are written alongside `sha`, both at
+    `releases/current` and at `trader/release_pin` — `crucible.release.
+    TRADER_PIN_KEY` is the SAME document shape under a different key, per
+    `pin`'s own `PIN_TARGETS`).
+
+    Deliberately NOT modelling `crucible.deploy._record`'s read
+    (`read_store_document(store, POINTER_KEY)` then `.require("sha", str)`):
+    that call site is `if: always()` and must degrade a present-but-corrupt
+    pointer into a `status: failed` manifest rather than raise, which is
+    exactly what `DocumentRead.require` already gives it, field-named,
+    without importing a model into a path that must never propagate an
+    exception (alpha-engine-config-I9945). This model is for the STRICT
+    reads only, both of which already raise on a document
+    `load_store_document`/`load_document_bytes` could not even parse — it
+    closes the gap one level up, where the document parses but does not
+    conform.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sha: GitSha = Field(
+        description="The release this pointer serves. Content-addresses "
+        "releases/{sha}/ -- everything else about the pointed build (the wheel, "
+        "release.json, provenance) is looked up from this alone."
+    )
+    target: Literal["current", "trader"] = Field(
+        description="Which of the two pointers this document is — `crucible.release."
+        "PIN_TARGETS`, restated as a closed set rather than a bare `str` because a "
+        "third target is a design change, the same reason `RunManifestV2.job` is closed."
+    )
+    pinned_at: str = Field(
+        pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+        description="UTC instant this pointer was written, for provenance only.",
+    )
 
 
 class ReleaseRecordDocument(_Strict):
@@ -3143,3 +3196,42 @@ class PredictionsFeedDocument(_Strict):
         "producer that failed and wrote anyway, and the trader must page rather than "
         "flatten the book on it.",
     )
+
+
+# ── alpha-engine-config-I9847 (wave 2): the dispatcher's absence-input ────
+
+
+class DispatchRecordDocument(BaseModel):
+    """`runs/_dispatch/{job}/{dispatch_id}.json` — AGENTS.md "Alerting":
+    the second INPUT to the absence condition, written by the v2 dispatcher
+    (infrastructure outside this package) before its launch call returns,
+    and read by `crucible.alerts.evaluate_dispatch_absence`.
+
+    `extra="allow"`, not forbidden: unlike `components.yaml` or a run
+    manifest, this document is written by infrastructure this repository
+    does not own or test against (AGENTS.md: "job, args, instance id,
+    requester, dispatch time"), the same reason `MetricRecordRow` stays open
+    — forbidding here would refuse a record the moment the dispatcher adds a
+    field this reader has no opinion about, which is a different defect from
+    the one this migration closes.
+
+    Every field is optional with a safe default rather than required: before
+    this model existed, `evaluate_dispatch_absence` read every one of them
+    with `document.get(...)`, already treating a missing key as "unknown"
+    rather than a hard failure (`instance_id` defaults to `"unknown"` in the
+    reader today), and the page this function emits must never be the thing
+    that fails to page because a partially-written dispatch record could not
+    be parsed. A field present with the WRONG TYPE still refuses — that is
+    the gap this closes: `document.get("dispatched_at_utc")` returning `42`
+    used to reach `_parse_dispatch_time` and fail there with no mention of
+    which document was bad; now it fails at the boundary, named.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    schema_version: str | None = None
+    job: str | None = None
+    args: str = ""
+    instance_id: str | None = None
+    requested_by: str | None = None
+    dispatched_at_utc: str | None = None

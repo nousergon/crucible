@@ -38,6 +38,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from pydantic import ValidationError
+
 from crucible.calendar import (
     TRADING_DAYS_PER_WEEK,
     assert_trading_day,
@@ -57,6 +59,7 @@ from crucible.keys import (
     parse_manifest_key,
 )
 from crucible.manifest import manifest_prefix
+from crucible.models import ArenaCycleDocument, DispatchRecordDocument
 from crucible.required import require_env
 from crucible.slots import SLOTS
 from crucible.slots.cycle import MIN_ACTIVE_ARMS_FINDING_METRIC
@@ -844,13 +847,26 @@ def evaluate_dispatch_absence(
                 raise StoreAccessError(problem)
             access_faults.append(problem)
             continue
-        document = read.document
-        args = document.get("args", "")
+        # `alpha-engine-config-I9847` (wave 2): validated through
+        # `DispatchRecordDocument` rather than indexed straight off the raw
+        # dict — see that model's docstring. `extra="allow"` and every field
+        # optional/defaulted means this only ever refuses a field present
+        # with the WRONG TYPE (e.g. `args` written as a list); that used to
+        # reach `args_synthetic_marker`/`_parse_dispatch_time` unnamed.
+        try:
+            dispatch = DispatchRecordDocument.model_validate(read.document)
+        except ValidationError as exc:
+            problem = f"dispatch record {key!r} does not conform: {exc}"
+            if access_faults is None:
+                raise StoreAccessError(problem) from exc
+            access_faults.append(problem)
+            continue
+        args = dispatch.args
         # The dispatch record's argv is the operator statement one layer
         # above the manifest, and it is all there is: an absence page exists
         # precisely because no manifest was written to read `run_mode` off.
         synthetic = args_synthetic_marker(args)
-        dispatched_at = _parse_dispatch_time(document.get("dispatched_at_utc"))
+        dispatched_at = _parse_dispatch_time(dispatch.dispatched_at_utc)
         if dispatched_at is None:
             pages.append(
                 Page(
@@ -859,7 +875,7 @@ def evaluate_dispatch_absence(
                     trading_day=resolve_trading_day(moment),
                     reason=(
                         f"dispatch record {key} carries an unreadable "
-                        f"dispatched_at_utc ({document.get('dispatched_at_utc')!r}); it "
+                        f"dispatched_at_utc ({dispatch.dispatched_at_utc!r}); it "
                         "cannot be graded against the absence horizon and is treated as "
                         "one — a record this module cannot age is a record it cannot "
                         "clear"
@@ -890,7 +906,7 @@ def evaluate_dispatch_absence(
             continue
         if any(is_manifest_key(k) for k in manifest_listed.keys or ()):
             continue
-        instance_id = document.get("instance_id", "unknown")
+        instance_id = dispatch.instance_id or "unknown"
         if instance_id == "unknown":
             classification = "no instance_id recorded — investigate the box directly"
         else:
@@ -1098,6 +1114,18 @@ def _read_arena_cycle(store: Store, slot: str, day: dt.date) -> dict[str, Any] |
 
     A present-but-unreadable document is surfaced through ``read_listed_document``'s
     fault, not silently treated as absent — see :func:`evaluate_min_active_arms`.
+
+    `alpha-engine-config-I9847` (wave 2): the document is validated through
+    `crucible.models.ArenaCycleDocument` before being handed back — the same
+    model `crucible.arena_io.read_arena_cycle` validates its own caller
+    through — rather than trusted as a raw dict. This function's return
+    shape is UNCHANGED (still the plain dict `evaluate_min_active_arms`
+    already dict-indexes, per that model's own docstring on why manifest-
+    and-arena-cycle consumers keep reading dicts): a cycle that fails the
+    model is folded into the SAME `{"__unreadable__": ...}` sentinel a
+    parse failure already used, rather than raising, because this reader
+    must keep evaluating past one bad cycle the way it already does past an
+    unreadable one.
     """
     key = arena_cycle_key(slot, day.isoformat())
     if not store.exists(key):
@@ -1105,6 +1133,10 @@ def _read_arena_cycle(store: Store, slot: str, day: dt.date) -> dict[str, Any] |
     read = read_listed_document(store, key)
     if read.document is None:
         return {"__unreadable__": read.problem}
+    try:
+        ArenaCycleDocument.model_validate(read.document)
+    except ValidationError as exc:
+        return {"__unreadable__": f"{key} does not conform to arena_cycle: {exc}"}
     return read.document
 
 

@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, get_args
 
 from krepis.metrics import StatusLiteral
+from pydantic import ValidationError
 
 from crucible.calendar import previous_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
@@ -38,6 +39,7 @@ from crucible.keys import (
     runs_prefix,
 )
 from crucible.manifest import manifest_prefix
+from crucible.models import ChampionPointerDocument
 from crucible.slots import SLOTS, dispatchable_slots
 from crucible.store import Store
 from crucible.weekly import ARC_SLOT_JOBS
@@ -700,6 +702,18 @@ def _champions(
         key = champion_key(slot)
         read = _read(store, key)
         fault = _fault(read, key)
+        if fault is None and read.document is not None:
+            # `alpha-engine-config-I9847` (wave 2): validated through
+            # `ChampionPointerDocument` — the same shape check `_fault`
+            # already applies to a parse failure, extended one level up to
+            # a document that parses but does not conform. Folded into the
+            # SAME unreadable/faults reporting `_fault` feeds, never a
+            # raise: this page must render every OTHER slot even when one
+            # pointer is corrupt.
+            try:
+                ChampionPointerDocument.model_validate(read.document)
+            except ValidationError as exc:
+                fault = f"{key} does not conform to a champion pointer: {exc}"
         if fault is not None:
             unreadable.append({"key": key, "fault": fault})
             faults[slot] = fault
