@@ -556,6 +556,34 @@ class LlmCallRow(_Strict):
     cache_read: Annotated[int, Field(ge=0)]
     cache_write: Annotated[int, Field(ge=0)]
     usd: Annotated[float, Field(ge=0)]
+    #: Which registered arm (`crucible.slots.arms.ArmSpec.arm_id`) this call
+    #: was made on behalf of — `null` when the call is not attributable to
+    #: one, e.g. `faults.router_probe`'s fault-injection probe, or a
+    #: call made before any arm is in scope. Required and nullable, same
+    #: shape as `served_deployment` above: an omitted key would be
+    #: indistinguishable from a call nobody classified, where a declared
+    #: `null` is an assertion that no arm was in scope.
+    #: `crucible.runner.RunContext.record_llm_call` is the ONLY writer of
+    #: this field — it reads the ambient arm set by
+    #: `RunContext.scoring_arm`, so `crucible.llm.call` (which knows the
+    #: call site but not the arm) never has to be told which arm is asking
+    #: (`alpha-engine-config-I9920`: phase 5's exit gate needs provider-side
+    #: LLM spend attributable per arm, and the call site alone cannot answer
+    #: that — two arms can share one call site). Added WITHOUT a version
+    #: bump: `crucible/llm_callsites.yaml`'s one registered call site is a
+    #: fault-injection target no arm may select
+    #: (`crucible.slots.arms._require_registered_callsite`), so no manifest
+    #: in the store carries an `llm_calls` row this could retroactively
+    #: invalidate — the same reasoning `route_degraded` and `fallback_used`
+    #: record above.
+    arm_id: str | None = Field(
+        description=(
+            "The registered arm id this call was made on behalf of, or null when the call is "
+            "not attributable to one. Required so an unclassified call is a declared null, not "
+            "an absent key indistinguishable from a producer that never learned this field "
+            "existed."
+        )
+    )
 
 
 class ResourceRow(_Strict):

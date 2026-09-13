@@ -461,6 +461,14 @@ class RunContext:
     rows_rejected: list[dict[str, Any]] = field(default_factory=list)
     cost_usd: float = 0.0
     llm_calls: list[dict[str, Any]] = field(default_factory=list)
+    #: The arm `record_llm_call` attributes the NEXT call to, set only via
+    #: `scoring_arm` (never assigned directly — a bare setter here would let
+    #: a job forget to clear it and misattribute every later call in the same
+    #: process). `None` outside a `scoring_arm` block, which is most of a
+    #: run's life: `crucible.llm.call` has exactly one production caller
+    #: today (`crucible.fault_probe`), and a fault probe is not scoring an
+    #: arm (`alpha-engine-config-I9920`).
+    _current_arm_id: str | None = field(default=None, repr=False)
     metrics: list[dict[str, Any]] = field(default_factory=list)
     attempts: list[dict[str, Any]] = field(default_factory=lambda: [{"n": 1, "reason": "initial"}])
     #: Set by `run_job`'s exception handler (never by the job body) when
@@ -573,9 +581,46 @@ class RunContext:
 
     def record_llm_call(self, call: dict[str, Any]) -> None:
         """§9.2 class 2. The caller supplies the record; the runner adds its
-        `usd` to the run total so spend is never counted in one place only."""
-        self.llm_calls.append(call)
+        `usd` to the run total so spend is never counted in one place only.
+
+        Also stamps `arm_id` from the ambient `scoring_arm` scope
+        (`alpha-engine-config-I9920`), so `crucible.llm.call` — which knows
+        the call site, not the arm — never has to be told which arm is
+        asking. `call` is copied rather than mutated in place: the caller's
+        own dict must not silently grow a key it never set. A caller that
+        already set `arm_id` itself is refused, not overridden — two
+        answers to "which arm" from two different layers is not a value to
+        silently pick between.
+        """
+        if "arm_id" in call:
+            raise ValueError(
+                f"llm_calls row already carries arm_id={call['arm_id']!r}; "
+                "record_llm_call derives it from the ambient `scoring_arm` scope and does "
+                "not accept a caller-supplied value."
+            )
+        self.llm_calls.append({**call, "arm_id": self._current_arm_id})
         self.cost_usd += float(call.get("usd", 0.0))
+
+    @contextmanager
+    def scoring_arm(self, arm_id: str) -> Iterator[None]:
+        """Attribute every `llm_calls[]` row recorded inside this block to
+        `arm_id` (`alpha-engine-config-I9920`).
+
+        Phase 5's exit gate needs provider-side LLM spend reconcilable per
+        arm; the call site alone cannot answer "which arm" because two arms
+        can share one registered call site. Nestable — a job scoring arm A
+        that calls into something scoring arm B sees B's calls attributed to
+        B and its own subsequent calls attributed back to A, because the
+        previous value is restored on exit rather than cleared.
+        """
+        if not arm_id:
+            raise ValueError("scoring_arm needs a non-empty arm_id")
+        previous = self._current_arm_id
+        self._current_arm_id = arm_id
+        try:
+            yield
+        finally:
+            self._current_arm_id = previous
 
     def record_metric(self, metric: dict[str, Any]) -> None:
         """§9.2 class 5. MetricRecord-shaped; the schema enforces that a

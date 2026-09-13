@@ -63,6 +63,18 @@
       "additionalProperties": false,
       "description": "\u00a79.2 class 2: one logical LLM call.\n\n`model_requested`/`model_served` are separate because a routed call that\nsilently served a different model is the failure this field exists to\nmake visible (principle 8: never a provider model id at the call site,\nalways a capability class or registry group). `route_degraded` and\n`fallback_used` are both required booleans and are separate facts \u2014\nresolve-time versus call-time \u2014 because on the router-edge route the\nfallback chain is walked by the proxy AFTER resolution, so a route can\nresolve healthy while the call is actually served by a fallback\n(`alpha-engine-config-I9969`, `I10006`).",
       "properties": {
+        "arm_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The registered arm id this call was made on behalf of, or null when the call is not attributable to one. Required so an unclassified call is a declared null, not an absent key indistinguishable from a producer that never learned this field existed.",
+          "title": "Arm Id"
+        },
         "cache_read": {
           "minimum": 0,
           "title": "Cache Read",
@@ -140,7 +152,8 @@
         "tokens_out",
         "cache_read",
         "cache_write",
-        "usd"
+        "usd",
+        "arm_id"
       ],
       "title": "LlmCallRow",
       "type": "object"
