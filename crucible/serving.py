@@ -142,11 +142,19 @@ def publish_predictions_feed(
     *,
     trading_day: str,
     slot: str = PREDICTIONS_FEED_SLOT,
+    ctx: Any = None,
 ) -> str | None:
     """Republish the champion's cross-section at the trader's key; return it.
 
     Returns the key written, or ``None`` when the slot has no champion
     pointer and therefore owes no feed.
+
+    Given a ``ctx``, the write goes through
+    :meth:`~crucible.runner.RunContext.record_output`, so the feed enters the
+    run manifest's ``outputs[]`` and `crucible explain` can name the run that
+    served the trader — the same reason `write_arm_predictions` takes one.
+    Without a ``ctx`` it is a plain store write, which is what a replay or an
+    operator republication is.
 
     Raises :class:`~crucible.champion.ChampionUnusableError` when a pointer
     exists and the reader refuses it, and
@@ -207,7 +215,10 @@ def publish_predictions_feed(
     )
     _validate(feed.to_dict())
     key = predictions_key(trading_day)
-    store.put_bytes(key, feed.to_bytes())
+    if ctx is not None:
+        ctx.record_output(key, feed.to_bytes(), schema_version=PREDICTIONS_FEED_SCHEMA_VERSION)
+    else:
+        store.put_bytes(key, feed.to_bytes())
     return key
 
 
