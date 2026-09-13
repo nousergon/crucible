@@ -104,11 +104,15 @@ def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
 
     `promote` joined `ARC_SLOT_JOBS` at `alpha-engine-config-I9759`, and it
     is not a stub-able job the way `experiment.run`/`experiment.grade` are
-    here: it reads the arm register, every arm's series and — since I9759 —
-    the graded `arena_cycle` whose `decision.ineligible` carries the
-    eligibility `experiment.grade` evaluated. Seeded through the library's
-    own `ArmRegister` and `run_cycle` plus `crucible.arena_io`, so the
-    manifest this test then asserts on is written by the REAL handler.
+    here: it reads the arm register, every arm's series and — since
+    `alpha-engine-config-I10679` — the WHOLE cycle `experiment.grade`
+    computed, via `crucible.promote.read_graded_cycle`, which additionally
+    refuses unless grade's own run manifest claims that cycle among its
+    outputs. Seeded through the library's own `ArmRegister` and `run_cycle`
+    plus `crucible.arena_io` and `tests.support.manifests.write_grade_manifest`,
+    so the manifest this test then asserts on is written by the REAL
+    `promote` handler, reading a cycle a real (if stubbed) grade run would
+    have produced.
     """
     import json
 
@@ -118,6 +122,7 @@ def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
     from crucible.arena_io import write_arena_cycle
     from crucible.promote import arm_register_key, arm_series_key
     from crucible.slots import get_slot
+    from tests.support.manifests import write_grade_manifest
     from tests.support.panels import trading_days
 
     spec = get_slot(slot)
@@ -142,7 +147,9 @@ def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
         arm_register_key(slot),
         b"".join(json.dumps(e).encode() + b"\n" for e in register.to_dicts()),
     )
-    # The graded cycle `experiment.grade` would have written an hour earlier.
+    # The graded cycle `experiment.grade` would have written an hour earlier,
+    # plus its own claiming manifest — both required by
+    # `crucible.promote.read_graded_cycle` (`alpha-engine-config-I10679`).
     write_arena_cycle(
         store,
         run_cycle(
@@ -153,6 +160,7 @@ def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
             incumbent=baseline,
         ),
     )
+    write_grade_manifest(store, slot, FRIDAY.isoformat())
 
 
 def _seed_non_slot_stages(store: LocalStore, registry: dict[str, Any]) -> None:
