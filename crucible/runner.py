@@ -27,7 +27,6 @@ that would happen.
 from __future__ import annotations
 
 import datetime as dt
-import json
 import os
 import random
 import re
@@ -50,6 +49,7 @@ from crucible.manifest import (
     load_schema,
     manifest_key,
     validate,
+    write_manifest,
 )
 from crucible.runmode import resolve_run_mode
 from crucible.store import Store, sha256_hex
@@ -1102,8 +1102,14 @@ def _write_manifest(
             release_sha=release_sha or os.environ.get("CRUCIBLE_RELEASE_SHA") or code_sha,
         )
         validate(manifest)
-    store.put_bytes(key, json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"))
-    return manifest
+    # `crucible.manifest.write_manifest`, not `store.put_bytes` directly:
+    # attaching the money-path chain link (alpha-engine-config-I10414, plan
+    # §9.5) has to happen between assembly and validation, so the bytes that
+    # land are the bytes that were checked. It re-validates — the `validate`
+    # above stays because it is what routes a rejected manifest through
+    # `_minimal_failed_manifest`, and the fallback must be linked and checked
+    # too.
+    return write_manifest(store, key, manifest)
 
 
 #: The manifest fields a run is answerable for no matter what else went

@@ -84,6 +84,7 @@ from crucible.keys import (
     parse_acceptance_reading,
     parse_bus_key,
     parse_fault_injection_key,
+    parse_manifest_key,
     review_key,
     review_prefix,
     runs_prefix,
@@ -817,6 +818,68 @@ def _arc_jobs_declared_by(raw: bytes) -> frozenset[str]:
     )
 
 
+#: Where a published wheel keeps the module whose entry points decide whether
+#: a release could dispatch a slot. `crucible.slots.dispatchable_slots` asks
+#: the same question by IMPORTING these in the grading process — which is
+#: precisely the present-tree reading `alpha-engine-config-I10628` is about.
+_RELEASE_SLOT_MODULE = "crucible/slots/{module}.py"
+
+#: The two entry points `experiment.run` and `experiment.grade` call. A slot
+#: whose module exposes both is dispatchable — `dispatchable_slots`' own
+#: predicate, applied to a release's SOURCE rather than to an import.
+_SLOT_ENTRY_POINTS: frozenset[str] = frozenset({"produce", "grade"})
+
+
+def _slots_declared_by(archive: zipfile.ZipFile) -> frozenset[str]:
+    """Which slots a published wheel could dispatch, PARSED, never imported.
+
+    Importing a three-week-old release's slot modules inside the grader would
+    not be a reading of that release — it would be a second copy of the
+    package executing in a process that already has one, with that release's
+    import side effects. So the predicate is applied statically: the module
+    the slot's spec names must define both entry points at module level.
+
+    The slot→module map comes from TODAY's :data:`SLOTS` on purpose. The
+    question this answers is narrow and is always asked about a stage the
+    grader is *about to require*: could the release that ran this day's arc
+    have dispatched THIS slot. A release predating the slot's module carries
+    no such member, and that absence is the answer — not a read failure. A
+    member that IS there and will not parse raises out of here and is
+    reported as unreadable, because that is a fact about our reading.
+    """
+    found: set[str] = set()
+    for slot, spec in SLOTS.items():
+        try:
+            source = archive.read(_RELEASE_SLOT_MODULE.format(module=spec.module))
+        except KeyError:
+            continue
+        defined = {
+            node.name
+            for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        }
+        if _SLOT_ENTRY_POINTS <= defined:
+            found.add(slot)
+    return frozenset(found)
+
+
+@dataclass(frozen=True)
+class _ReleaseFacts:
+    """What ONE published release declared about the arc it could run.
+
+    Both axes of the requirement come out of the same immutable artifact and
+    are therefore cached together: reading the wheel twice — once for the job
+    axis and once for the slot axis — would double the S3 round trips for one
+    question about one release.
+    """
+
+    #: The ACTIVE `dispatch: arc` job names — the JOB axis (`-I10478`).
+    arc_jobs: frozenset[str]
+    #: The slots whose entry points this release shipped — the SLOT axis
+    #: (`alpha-engine-config-I10628`).
+    slots: frozenset[str]
+
+
 @dataclass
 class _ArcRegistryHistory:
     """Which stages the arc HAD on a given trading day, read from that day's
@@ -865,23 +928,45 @@ class _ArcRegistryHistory:
     """
 
     store: Store
-    _by_day: dict[dt.date, tuple[frozenset[str] | None, str | None]] = field(default_factory=dict)
-    _by_sha: dict[str, tuple[frozenset[str] | None, str | None]] = field(default_factory=dict)
+    _by_day: dict[dt.date, tuple[_ReleaseFacts | None, str | None]] = field(default_factory=dict)
+    _by_sha: dict[str, tuple[_ReleaseFacts | None, str | None]] = field(default_factory=dict)
 
-    def declared_on(self, day: dt.date) -> tuple[frozenset[str] | None, str | None]:
-        """``(jobs, problem)`` for ``day``'s own release.
+    def facts_on(self, day: dt.date) -> tuple[_ReleaseFacts | None, str | None]:
+        """``(facts, problem)`` for ``day``'s own release.
 
-        ``jobs`` is ``None`` when the day's arc set cannot be established at
+        ``facts`` is ``None`` when the day's release cannot be established at
         all — no arc manifest, or a lookup that failed — and the caller then
-        requires every currently-registered stage. ``problem`` is non-None
-        only when something could not be READ, so the caller can report it
-        beside the finding it did not suppress.
+        requires every currently-registered stage on every currently
+        dispatchable slot. ``problem`` is non-None only when something could
+        not be READ, so the caller can report it beside the finding it did
+        not suppress.
         """
         if day not in self._by_day:
             self._by_day[day] = self._resolve(day)
         return self._by_day[day]
 
-    def _resolve(self, day: dt.date) -> tuple[frozenset[str] | None, str | None]:
+    def declared_on(self, day: dt.date) -> tuple[frozenset[str] | None, str | None]:
+        """The JOB axis of :meth:`facts_on` — which stages ``day``'s release
+        carried (`alpha-engine-config-I10478`)."""
+        facts, problem = self.facts_on(day)
+        return (None if facts is None else facts.arc_jobs), problem
+
+    def slots_on(self, day: dt.date) -> tuple[frozenset[str] | None, str | None]:
+        """The SLOT axis of :meth:`facts_on` — which slots ``day``'s release
+        could dispatch (`alpha-engine-config-I10628`).
+
+        The other half of the same defect. `crucible.weekly.arc_stages`
+        expands a slot-scoped job over `dispatchable_slots()`, read from the
+        grading process, so promoting the M slot at phase 3 would
+        retroactively add `experiment.run[m]@<every past day>` to the
+        requirement set of days whose release could not have dispatched it —
+        a clause grading past days against the present tree, by a commit that
+        names neither.
+        """
+        facts, problem = self.facts_on(day)
+        return (None if facts is None else facts.slots), problem
+
+    def _resolve(self, day: dt.date) -> tuple[_ReleaseFacts | None, str | None]:
         key = manifest_key(ARC_MANIFEST_JOB, day.isoformat())
         read = _read_store_document(self.store, key)
         if read.problem is not None:
@@ -897,12 +982,12 @@ class _ArcRegistryHistory:
             )
         return self._for_sha(sha)
 
-    def _for_sha(self, sha: str) -> tuple[frozenset[str] | None, str | None]:
+    def _for_sha(self, sha: str) -> tuple[_ReleaseFacts | None, str | None]:
         if sha not in self._by_sha:
             self._by_sha[sha] = self._read_release(sha)
         return self._by_sha[sha]
 
-    def _read_release(self, sha: str) -> tuple[frozenset[str] | None, str | None]:
+    def _read_release(self, sha: str) -> tuple[_ReleaseFacts | None, str | None]:
         from crucible.release import published_wheel_key  # noqa: PLC0415 - cycle
 
         try:
@@ -920,10 +1005,11 @@ class _ArcRegistryHistory:
         try:
             with zipfile.ZipFile(io.BytesIO(read.raw or b"")) as archive:
                 raw = archive.read(_RELEASE_REGISTRY_MEMBER)
-            return _arc_jobs_declared_by(raw), None
+                slots = _slots_declared_by(archive)
+            return _ReleaseFacts(_arc_jobs_declared_by(raw), slots), None
         except Exception as exc:  # noqa: BLE001 - reported, never suppressed
             return None, (
-                f"{wheel} carries no readable {_RELEASE_REGISTRY_MEMBER}: "
+                f"{wheel} carries no readable {_RELEASE_REGISTRY_MEMBER} or slot modules: "
                 f"{type(exc).__name__}: {exc}"
             )
 
@@ -938,8 +1024,9 @@ def _clause_arc_runs_ok(
         "every stage the arc CARRIED on each trading day in the window wrote a manifest "
         "with status `ok`, or its failure is excused by a fault-injection record naming "
         "that exact run_id. A stage is required of a day only when the release that ran "
-        "that day's arc declared it — read from the day's own manifest and that release's "
-        "published wheel, never from the registry the grader happens to be running"
+        "that day's arc declared it, ON A SLOT that release could dispatch — both read "
+        "from the day's own manifest and that release's published wheel, never from the "
+        "registry or the slot modules the grader happens to be running"
     )
     missing: list[str] = []
     malformed: list[str] = []
@@ -947,6 +1034,7 @@ def _clause_arc_runs_ok(
     failed: list[str] = []
     excused: list[str] = []
     unregistered: list[str] = []
+    undispatchable: list[str] = []
     evidence: list[str] = []
     history = _ArcRegistryHistory(store)
     excused_run_ids, excused_problem = _fault_excused_run_ids(store)
@@ -961,7 +1049,7 @@ def _clause_arc_runs_ok(
                 (unmeasurable if read.access_problem else malformed).append(read.problem)
                 continue
             if read.absent:
-                declared, why = history.declared_on(day)
+                facts, why = history.facts_on(day)
                 if why is not None and why not in unmeasurable:
                     # NOT a swallow: the miss below still stands. The read
                     # failure is carried so a reader can tell "we could not
@@ -969,8 +1057,15 @@ def _clause_arc_runs_ok(
                     # Deduped: one unreadable release is one problem, not one
                     # per stage that asked about it.
                     unmeasurable.append(why)
-                elif declared is not None and stage.job not in declared:
+                elif facts is not None and stage.job not in facts.arc_jobs:
                     unregistered.append(f"{stage.label}@{day.isoformat()}")
+                    continue
+                elif facts is not None and stage.slot is not None and stage.slot not in facts.slots:
+                    # The SLOT axis (`alpha-engine-config-I10628`), narrowed
+                    # under exactly the job axis's rules: only an ABSENT
+                    # manifest, only when the day's own release could be read,
+                    # and always named below rather than quietly dropped.
+                    undispatchable.append(f"{stage.label}@{day.isoformat()}")
                     continue
                 missing.append(f"{stage.label}@{day.isoformat()}")
                 continue
@@ -999,6 +1094,8 @@ def _clause_arc_runs_ok(
             parts.append(f"{len(excused)} excused by a fault record: {'; '.join(excused[:2])}")
         if unregistered:
             parts.append(_unregistered_note(unregistered))
+        if undispatchable:
+            parts.append(_unregistered_note(undispatchable, reason=_UNDISPATCHABLE_REASON))
         content_gap = bool(missing or malformed or failed)
         return Clause(
             "arc_runs_ok",
@@ -1016,10 +1113,25 @@ def _clause_arc_runs_ok(
         detail += f" ({len(excused)} excused by a matching fault record: {'; '.join(excused[:2])})"
     if unregistered:
         detail += f"; {_unregistered_note(unregistered)}"
+    if undispatchable:
+        detail += f"; {_unregistered_note(undispatchable, reason=_UNDISPATCHABLE_REASON)}"
     return Clause("arc_runs_ok", requirement, True, detail, tuple(evidence))
 
 
-def _unregistered_note(unregistered: list[str]) -> str:
+#: Why the JOB axis narrowed a requirement (`alpha-engine-config-I10478`).
+_UNREGISTERED_REASON = "the release that ran that day's arc declared no such stage"
+
+#: Why the SLOT axis narrowed one (`alpha-engine-config-I10628`). A separate
+#: sentence, not a shared one: "the stage did not exist" and "the stage existed
+#: but the slot could not be dispatched" call for different follow-up, and a
+#: note that blurred them would send a reader to the wrong registry.
+_UNDISPATCHABLE_REASON = (
+    "the release that ran that day's arc could not dispatch that slot — its slot module "
+    "exposed no `produce`/`grade`"
+)
+
+
+def _unregistered_note(unregistered: list[str], *, reason: str = _UNREGISTERED_REASON) -> str:
     """How a narrowed requirement is REPORTED — always, and named one by one.
 
     A requirement the grader narrowed is a fact about the reading, not
@@ -1027,12 +1139,14 @@ def _unregistered_note(unregistered: list[str]) -> str:
     registry lists is indistinguishable from one that graded them and found
     them present. So every excluded stage/day pair is stated with the reason,
     whether the clause reads MET or UNMET.
+
+    ``reason`` is which narrowing this is — the job axis by default, the slot
+    axis (`alpha-engine-config-I10628`) when passed. One renderer, two
+    reasons, so a second axis cannot be added with a quieter note than the
+    first one's.
     """
     shown = ", ".join(unregistered[:4]) + ("..." if len(unregistered) > 4 else "")
-    return (
-        f"{len(unregistered)} not required (the release that ran that day's arc declared "
-        f"no such stage): {shown}"
-    )
+    return f"{len(unregistered)} not required ({reason}): {shown}"
 
 
 def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
@@ -7242,6 +7356,125 @@ def _clause_sealed_holdout(store: Store, window: list[dt.date]) -> Clause:
     return Clause(name, requirement, True, detail, tuple(evidence))
 
 
+#: The registered job that runs `tests/integration` against the real store and
+#: the real ArcticDB and files a manifest for it (`alpha-engine-config-I10459`,
+#: `crucible-PR241`). Read here through `crucible.documents.read_manifests_under`
+#: rather than through the interim hand-rolled `integration_summary.v1` object
+#: the nightly workflow used to `put_bytes` itself — one manifest reader for the
+#: whole package, and the shape this clause grades is the one every other job
+#: writes.
+INTEGRATION_JOB = "test.integration"
+
+
+def _clause_integration_tier_current(store: Store, window: list[dt.date]) -> Clause:
+    """The integration tier produced a fresh `ok` reading
+    (`alpha-engine-config-I10460`, from `-I10419`).
+
+    Everything else this package grades is graded against artifacts written by
+    jobs running in the same process shape as the unit tests. The integration
+    tier is the ONE reading taken against the real store and the real ArcticDB,
+    and until this clause existed the phase gate could not see it at all: the
+    nightly could fail every night for a month and no gate would be a shade
+    different.
+
+    **Staleness is this gate's own window, not a new number.** The precedent is
+    `_clause_independently_reviewed`, which calls a review "filed on {day},
+    outside this gate's window" — a clause that invented its own currency
+    horizon would be a second definition of "recent" that can disagree with the
+    first. So the reading has to be filed on a trading day the gate is already
+    looking at.
+
+    **Absent is UNMET, never UNMEASURABLE.** :class:`Clause` reserves
+    unmeasurable for a failed READING — a denial, a listing we could not take,
+    a schema that predates the question. A prefix we listed successfully and
+    found empty is a reading, and what it says is that the tier produced
+    nothing. Grading that unmeasurable would put "the integration tier has
+    never run" behind a message that reads like an access problem.
+
+    **The most recent reading is the one graded**, not "any ok reading in the
+    window": a tier that passed on Monday and has failed every night since
+    would otherwise read MET off the Monday. Listing order is the day, so the
+    last key is the latest.
+    """
+    name = "integration_tier_current_and_ok"
+    prefix = runs_prefix(INTEGRATION_JOB)
+    requirement = (
+        f"the most recent `{INTEGRATION_JOB}` run manifest under `{prefix}` is filed on a "
+        "trading day inside this gate's own window and reads status `ok`. No reading at "
+        "all is UNMET — the tier producing nothing is a finding about the system, not "
+        "about our access"
+    )
+    read = read_manifests_under(store, prefix)
+    if read.listing_problem is not None:
+        return _unmeasurable(name, requirement, read.listing_problem, (prefix,))
+    evidence = tuple([key for key, _ in read.documents] + sorted(read.faults)) or (prefix,)
+    if not read.documents:
+        if read.faults:
+            # Every manifest there is unreadable: we know nothing about the
+            # tier, which is the unmeasurable case exactly.
+            return _unmeasurable(
+                name,
+                requirement,
+                f"{len(read.faults)} {INTEGRATION_JOB} manifest(s) under `{prefix}` could "
+                f"not be read: {'; '.join(sorted(read.faults.values())[:2])}",
+                evidence,
+            )
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"`{prefix}` holds no {INTEGRATION_JOB} manifest. The integration tier has "
+            "filed no reading this gate can accept or refuse, so the real-store path is "
+            "ungraded — which is the finding, not a reason to pass",
+            evidence,
+        )
+    key, document = read.documents[-1]
+    parsed = parse_manifest_key(key)
+    if parsed is None:
+        # Unreachable via `read_manifests_under` (it keeps manifest keys only)
+        # and asserted rather than assumed: the day comes from the KEY, which
+        # is what the store actually holds.
+        return Clause(name, requirement, False, f"{key} is not a manifest key", evidence)
+    day = parsed[1]
+    faults_note = (
+        f"; {len(read.faults)} other manifest(s) unreadable: "
+        f"{'; '.join(sorted(read.faults.values())[:2])}"
+        if read.faults
+        else ""
+    )
+    oldest = window[0].isoformat()
+    if day < oldest:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{key} is the most recent {INTEGRATION_JOB} reading and is filed on {day}, "
+            f"before this gate's window opens on {oldest}. A stale pass is not a pass: "
+            f"nothing says the real-store path still works{faults_note}",
+            evidence,
+        )
+    status, problem = _status(key, document)
+    if problem is not None:
+        return Clause(name, requirement, False, problem + faults_note, evidence)
+    if status != "ok":
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{key}: the most recent {INTEGRATION_JOB} reading is `{status}` — "
+            f"{document['reason']}{faults_note}",
+            evidence,
+        )
+    return Clause(
+        name,
+        requirement,
+        True,
+        f"{key}: {INTEGRATION_JOB} read `ok` on {day}, inside this gate's window opening "
+        f"on {oldest}{faults_note}",
+        evidence,
+    )
+
+
 def _phase3(
     store: Store,
     window: list[dt.date],
@@ -7261,6 +7494,23 @@ def _phase3(
         _clause_named_transaction_cost_model(store, window),
         _clause_factor_neutral_attribution(store, window),
         _clause_sealed_holdout(store, window),
+        # `alpha-engine-config-I10460`. The issue asked for the clause on
+        # "each phase's gate"; it is registered on phase 3 ALONE, and the
+        # reason is `crucible.aggregation`'s own rule that no aggregate hides
+        # a member. A gate's verdict is the reduction of its member clauses,
+        # so one nightly reading registered as a member of six aggregates
+        # moves six phase verdicts at once — including phases 0 and 1, which
+        # have already exited MET. A closed phase re-reading UNMET because a
+        # nightly CI job failed last night is `alpha-engine-config-I10478`'s
+        # class exactly: a past reading changed by the present tree. Phase 2
+        # is excluded for the neighbouring reason — its clause list is being
+        # graded first-attempt for the 2026-09-19 render, and a member added
+        # mid-grading moves the denominator of a reading already in flight.
+        # Phase 3 is the lowest phase that has neither exited nor begun
+        # grading, and it is the first whose own deliverables (the portfolio
+        # engine, factor-neutral attribution, the sealed holdout) are the
+        # real-store paths the integration tier is evidence for.
+        _clause_integration_tier_current(store, window),
     ]
 
 
@@ -7330,6 +7580,103 @@ def _clause_trader_week_on_v2_champion(store: Store, window: list[dt.date]) -> C
     )
 
 
+def _clause_money_path_chain_verified(store: Store) -> Clause:
+    """The money-path hash chain verifies (`alpha-engine-config-I10627`).
+
+    `alpha-engine-config-I10414` built the chain and the verifier; its own
+    `closes-when` includes "the phase-4 gate reads chain verification as a
+    clause", and until now nothing did — so the tamper-evidence plan §9.5
+    makes a hard precondition for phase 6 (real capital) was a control that
+    nothing graded. Phase 6's entry condition (5) is "the money-path artifacts
+    hash-chained per the row below"; a condition with no clause behind it is a
+    condition nobody reads.
+
+    Three readings, deliberately distinct:
+
+    * **`failed` is UNMET, never unmeasurable.** We read the history and it
+      does not verify. That calls for an investigation of the store, and
+      rendering it as "we could not read it" would name the wrong remedy on
+      the one clause where the remedy matters most.
+    * **An empty chain is UNMET too, and this is a decision, not an
+      inheritance.** `verify_money_path_chain` returns `ok` over a store
+      nothing has written a money-path artifact to, with a reason saying the
+      chain is empty. That is a true statement and it is not evidence that the
+      control works — and by phase 4 the money path IS written, so an empty
+      chain at phase-4 grading is itself the finding.
+    * **A store we cannot open is UNMEASURABLE**, which is what the
+      containment wrapper already produces for any raise out of the verifier.
+
+    **The verifier is imported lazily and its absence is a NAMED
+    unmeasurable.** `verify_money_path_chain` lands in `crucible-PR240`, held
+    as a draft until phase 2 exits. A module-level import would make this file
+    unimportable until that merges, which would take every gate down; a bare
+    `except ImportError` would read as an environment problem. So the reason
+    says which function is missing and which change supplies it, and the
+    clause turns live — with no edit here — the moment `PR240` lands.
+    """
+    name = "money_path_chain_verified"
+    requirement = (
+        "the money-path hash chain over every money-path manifest verifies: indices "
+        "contiguous, each record's `prev_sha256` equal to the digest of its "
+        "predecessor's bytes as the store holds them now, and no unlinked money-path "
+        "manifest at or after the genesis. An EMPTY chain is unmet, not met — by phase 4 "
+        "the money path is written, and an intact empty history is not evidence the "
+        "control works"
+    )
+    try:
+        from crucible.explain import verify_money_path_chain  # noqa: PLC0415 - see docstring
+    except ImportError as exc:
+        return _unmeasurable(
+            name,
+            requirement,
+            "`crucible.explain` exposes no `verify_money_path_chain`, so the chain was "
+            f"not walked at all ({type(exc).__name__}: {exc}). The verifier lands with "
+            "`crucible-PR240`, and this clause reads the chain the moment it does, with "
+            "no change here. UNMEASURABLE rather than unmet: nothing has been learned "
+            "about the store",
+        )
+    verification = verify_money_path_chain(store)
+    records = verification.records
+    evidence = tuple(r.key for r in records)
+    if not verification.ok:
+        broken = next((r for r in records if not r.intact), None)
+        parts = [f"the money-path chain is `{verification.status}`: {verification.reason}"]
+        if broken is not None:
+            parts.append(
+                f"record {broken.index} ({broken.key}, run {broken.run_id}) claims its "
+                f"predecessor's digest is {broken.prev_sha256}, and the store holds "
+                f"{broken.actual_prev_sha256}"
+            )
+        if verification.unlinked:
+            parts.append(
+                f"{len(verification.unlinked)} money-path manifest(s) carry no link: "
+                f"{', '.join(verification.unlinked[:4])}"
+            )
+        parts.append(f"{len(records)} record(s) walked")
+        return Clause(name, requirement, False, "; ".join(parts), evidence)
+    if not records:
+        return Clause(
+            name,
+            requirement,
+            False,
+            "the money-path chain is empty — no money-path manifest has been written to "
+            f"this store, so `verify_money_path_chain` grades it `{verification.status}` "
+            f"({verification.reason}). True, and not evidence the control works: by "
+            f"{phase_tracker('phase4')} the money path is written, so a chain with "
+            "nothing in it is the finding",
+            evidence,
+        )
+    return Clause(
+        name,
+        requirement,
+        True,
+        f"{len(records)} money-path record(s) verified, indices "
+        f"{records[0].index}..{records[-1].index}, each link recomputed from the bytes "
+        f"the store holds now: {verification.reason}",
+        evidence,
+    )
+
+
 def _phase4(
     store: Store,
     window: list[dt.date],
@@ -7341,6 +7688,7 @@ def _phase4(
     _unused((registry, trading_day))
     return [
         _clause_trader_week_on_v2_champion(store, window),
+        _clause_money_path_chain_verified(store),
         _clause_aws_cost_within_ceiling(
             window, name="aws_total_within_ceiling", ceiling_usd=PHASE4_MAX_TOTAL_USD, tagged=False
         ),

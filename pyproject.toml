@@ -128,6 +128,7 @@ packages = ["crucible"]
 
 [tool.ruff]
 line-length = 100
+extend-exclude = [".fleet"]  # CI-only sparse checkouts of sibling repos (I10005 guard); never our code
 target-version = "py312"
 
 [tool.ruff.lint]
