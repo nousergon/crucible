@@ -349,6 +349,30 @@ def _fault_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def _migrate_code_sha(args: argparse.Namespace) -> int:
+    """`crucible migrate.code_sha [--dry-run] [--store URI]`.
+
+    Not run through `run_job` (see the note beside its subparser in
+    `build_parser`) — it patches other jobs' manifests, so it uses the same
+    `--store`/`--dry-run` resolution every job uses (`_resolve_store`) without
+    claiming a manifest of its own. See `crucible.migrate.run_migrate_code_sha`
+    for the derivation and refusal rules; this is the printed report only.
+    """
+    from crucible.migrate import run_migrate_code_sha
+
+    store = _resolve_store(args)
+    report = run_migrate_code_sha(store, dry_run=bool(getattr(args, "dry_run", False)))
+    print(f"crucible migrate.code_sha: {report.summary_line()}")
+    for row in report.rewritten:
+        print(
+            f"  rewrote {row['key']}: {row['old_code_sha']} -> {row['new_code_sha']} "
+            f"(from {row['source_key']})"
+        )
+    for row in report.refused:
+        print(f"  refused {row['key']}: {row['reason']}")
+    return 0
+
+
 def _record_written(ctx, store, keys) -> None:
     """Record artifacts the job wrote through the store directly.
 
@@ -501,6 +525,18 @@ JOBS: dict[str, JobSpec] = {
 #: deliberate edit here, on the day such an arm exists.
 FAULT_CAPABILITY_CLASS_JOBS: frozenset[str] = frozenset({FAULT_PROBE_JOB})
 
+#: Handlers wired into `HANDLERS` that are deliberately NOT in `JOBS`: a
+#: one-off repair over documents another job already wrote (patches a field
+#: in place rather than writing a new `run_manifest.v2` document), so it
+#: cannot honestly claim a `job` enum slot or a `components.yaml` row meant
+#: for a manifest-producing job (see the note beside `migrate.code_sha`'s
+#: subparser in `build_parser`, alpha-engine-config-I10626).
+#: `tests/test_cli_and_alerts.py::TestJobSurface::test_every_job_has_a_handler`
+#: reads this set rather than requiring `set(HANDLERS) == set(JOBS)`, so a
+#: FUTURE handler that silently drops out of `JOBS` by accident is still
+#: caught — only a name listed here is exempt.
+NON_JOB_HANDLERS: frozenset[str] = frozenset({"migrate.code_sha"})
+
 
 HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     "data.daily": _todo("data.daily", "track A", "Lifts the ingest core from nousergon-data."),
@@ -540,6 +576,11 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
         "Carries R's `operator_bootstrap` champion flag into v2 so the first "
         "evidence-won promotion is visible as such.",
     ),
+    # Not in `JOBS` (see the note beside its subparser in `build_parser`),
+    # but `dest="job"` is shared across every subparser this module builds,
+    # so `migrate.code_sha` reaches `main`'s `HANDLERS[args.job](args)`
+    # dispatch the same way every real job does.
+    "migrate.code_sha": _migrate_code_sha,
     # track-C handlers live in crucible/track_c.py so three tracks can land
     # code in parallel without editing one another's lines.
     HOLDOUT_JOB: holdout_handler,
@@ -853,6 +894,48 @@ def build_parser() -> argparse.ArgumentParser:
 
         # track-A: the data, feature, U/R, explain and migrate jobs' own flags.
         add_track_a_arguments(spec.name, sub)
+
+    # `migrate.code_sha` (alpha-engine-config-I10626): a one-off REPAIR of
+    # manifests another job already wrote, not a job in its own right, so it
+    # is deliberately NOT in `JOBS` — it patches an existing `code_sha`
+    # rather than writing a new `run_manifest.v2` document, and that schema's
+    # `job` enum is closed (`crucible/models.py`, out of this change's
+    # ownership). Wired here, by hand, alongside `JOBS`-driven dispatch
+    # rather than through it: `tests/test_components_registry.py` derives its
+    # checks from `JOBS`, and a row there would wrongly demand a
+    # `components.yaml` entry and a schema-enum slot for a tool that writes
+    # no manifest of its own. `--run-mode`/`--store`/`--dry-run` are repeated
+    # here (not looped, since this parser is built outside the `JOBS` loop
+    # above) so the invocation looks and behaves like every other `crucible`
+    # command.
+    # Tracker: alpha-engine-config-I10626 (cited here, not in the help
+    # string itself — tests/test_no_stale_tracker_literals.py forbids a
+    # hardcoded tracker reference in any non-docstring string).
+    migrate_code_sha_help = (
+        "One-off: derive and rewrite the all-zero code_sha placeholder on existing run manifests"
+    )
+    migrate_code_sha_sub = subparsers.add_parser(
+        "migrate.code_sha", help=migrate_code_sha_help, description=migrate_code_sha_help
+    )
+    migrate_code_sha_sub.add_argument(
+        "--run-mode",
+        choices=list(RUN_MODES),
+        default=None,
+        help=(
+            "Required by every `crucible` invocation (see `crucible.runmode`); unused by "
+            "this repair, which writes no run-manifest-schema document of its own."
+        ),
+    )
+    migrate_code_sha_sub.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be rewritten and refused; write nothing.",
+    )
+    migrate_code_sha_sub.add_argument(
+        "--store",
+        metavar="URI",
+        help="Store root: an s3://bucket/prefix URI or a local directory path.",
+    )
 
     return parser
 
