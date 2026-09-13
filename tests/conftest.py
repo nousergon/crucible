@@ -22,14 +22,25 @@ import pytest
 from crucible.alerts import MUTED_TOPIC_VAR, PAGES_TOPIC_VAR
 from crucible.calendar import is_trading_day
 from crucible.config import CLOUDTRAIL_ARCHIVE_VAR
+from crucible.features import min_panel_trading_days
 from crucible.runmode import RUN_MODE_ENV, RUN_MODE_LIVE
 from crucible.store import LocalStore
 from crucible.tracker import TRACKER_APP_SSM_PREFIX_VAR, TRACKER_TOKEN_VAR
 
-#: Enough sessions for the 252-session feature window plus a 21-session
-#: horizon plus the dates a ladder needs. Shorter panels make `mom_12_1`
-#: null everywhere, which silently disarms the arms that rank on it.
-SESSIONS = 320
+#: Enough sessions for the DEEPEST feature the catalogue declares, plus a
+#: 21-session horizon plus the dates a ladder needs.
+#:
+#: DERIVED, not a literal. It was 320 with a comment reading "the 252-session
+#: feature window" — the same false belief that made
+#: `crucible.data.daily.DEFAULT_LOOKBACK_DAYS` 400 calendar days: 252 is the
+#: deepest DECLARED `window_trading_days`, while
+#: `residual_momentum_252d_skip21d_ratio` composes that window over a residual
+#: return stream 61 sessions deep and needs 313. A fixture shorter than the
+#: catalogue needs makes the deepest columns null everywhere, which is exactly
+#: the production condition the suite must be able to tell apart from a
+#: healthy one — so the fixture tracks the producer's own declaration rather
+#: than a number somebody has to remember to raise.
+SESSIONS = min_panel_trading_days() + 50
 
 
 def sessions_ending(end: dt.date, count: int) -> list[dt.date]:

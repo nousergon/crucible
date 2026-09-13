@@ -39,6 +39,7 @@ from crucible.slots.inputs import SlotUnservableError
 from crucible.slots.model import (
     ARM_REFUSED_METRIC,
     CPCV_OOS_IC_METRIC,
+    FEATURE_COMPLETENESS_METRIC,
     SLOT,
     ModelRecipe,
     RegisteredModelArm,
@@ -881,3 +882,73 @@ class TestTheProduceJobServesTheTrader:
         with pytest.raises(ChampionUnusableError):
             _run_produce(store, strategy, arm_name="base")
         assert not store.exists(predictions_key(RUN_DAY))
+
+
+class TestTheCompletenessRecordReachesARealManifest:
+    """`alpha-engine-config-I10688`. The record is only real if a scheduled
+    run writes it: a completeness record the produce job computes and drops is
+    the same silence the excluded rows would have had."""
+
+    def test_a_clean_cycle_records_a_zero_exclusion_reading(self, store, strategy) -> None:
+        """Principle 7: absence is not green. A cycle that excluded nothing
+        must still SAY so — a missing row and a zero row must not render
+        alike."""
+        _warm_the_base(store, strategy)
+        _run_produce(store, strategy)
+        document = _manifest(store, "experiment.run", RUN_DAY)
+        rows = [m for m in document["metrics"] if m["name"] == FEATURE_COMPLETENESS_METRIC]
+        assert rows, "every produced arm files a completeness reading, breach or not"
+        assert {r["status"] for r in rows} == {"OK"}
+        assert all(r["value"] == 0.0 for r in rows)
+        assert all("nan_rows_by_column" in r["feature_completeness"] for r in rows)
+
+    def test_an_excluded_ticker_row_is_counted_on_the_manifest(self, store, strategy) -> None:
+        """One name's feature column punched out across the whole layer: the
+        production class-B shape (a new listing without the full lookback)."""
+        import io
+
+        import pandas as pd
+
+        for day in SESSIONS:
+            key = f"features/{DEFAULT_FEATURE_VERSION}/{day}.parquet"
+            frame = pd.read_parquet(io.BytesIO(store.get_bytes(key)))
+            frame.loc[frame["ticker"] == "AAA", BASE_COLUMN] = float("nan")
+            store.put_bytes(key, frame.to_parquet(index=False))
+
+        _, result = _run_produce(store, strategy, arm_name="base")
+        document = _manifest(store, "experiment.run", RUN_DAY)
+        rows = [m for m in document["metrics"] if m["name"] == FEATURE_COMPLETENESS_METRIC]
+        assert {r["phase"] for r in rows} == {"training", "serving"}, (
+            "the fit's block and the served session answer different questions and "
+            "each files its own reading"
+        )
+        record = next(r for r in rows if r["phase"] == "training")["feature_completeness"]
+        assert record["excluded_names_sample"] == ["AAA"]
+        assert record["excluded_name_count"] == 1
+        assert record["rows_excluded"] == record["rows_total"] - record["rows_complete"]
+        assert record["nan_rows_by_column"][BASE_COLUMN] == record["rows_excluded"]
+        assert document["rows_rejected"]
+        served = next(r for r in rows if r["phase"] == "serving")["feature_completeness"]
+        assert served["excluded_names_sample"] == ["AAA"]
+        assert result["training_rows_excluded"] == record["rows_excluded"] + served["rows_excluded"]
+        assert document["status"] == "ok", document["reason"]
+
+    def test_a_dead_column_fails_the_whole_slot_rather_than_fitting_on_nothing(
+        self, store, strategy
+    ) -> None:
+        """The production class-A shape: 903 of 903 tickers null."""
+        import io
+
+        import pandas as pd
+        from nousergon_lib.arena.engine import TrainingIntegrityError
+
+        for day in SESSIONS:
+            key = f"features/{DEFAULT_FEATURE_VERSION}/{day}.parquet"
+            frame = pd.read_parquet(io.BytesIO(store.get_bytes(key)))
+            frame[BASE_COLUMN] = float("nan")
+            store.put_bytes(key, frame.to_parquet(index=False))
+
+        with pytest.raises(TrainingIntegrityError, match="incomplete feature vector"):
+            _run_produce(store, strategy, arm_name="base")
+        document = _manifest(store, "experiment.run", RUN_DAY)
+        assert document["status"] == "failed"

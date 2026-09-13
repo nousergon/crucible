@@ -19,7 +19,7 @@ dependencies = [
     # `uv lock --refresh` is the form that works in the minutes after a
     # publish — a plain `uv lock` reports "no version of nousergon-lib" out of
     # a stale index cache and reads like an unpublished pin.
-    "nousergon-lib[github-app]==0.124.120",
+    "nousergon-lib[github-app]==0.124.124",
     # Trading calendar, dual-date resolution, structured logging, alerts.
     #
     # `[openai]` is NOT optional here (alpha-engine-config-I10473). krepis
@@ -104,7 +104,7 @@ dependencies = [
 # path it never exercises. `crucible data.daily --source arctic` states the
 # missing extra by name when it is absent — it never falls back to a
 # different source, which would silently change what the run measured.
-arcticdb = ["nousergon-lib[arcticdb]==0.124.120"]
+arcticdb = ["nousergon-lib[arcticdb]==0.124.124"]
 
 [project.scripts]
 crucible = "crucible.cli:main"

@@ -140,6 +140,7 @@ __all__ = [
     "calibrate_up_probability",
     "design_panel",
     "predict_cross_section",
+    "score_cross_section",
     "produce_arm_predictions",
     "TrainingWindowSpec",
     "VetoResult",
@@ -950,6 +951,17 @@ class ModelRecipe:
     #: arm whose whole design matrix comes from the feature layer, which is
     #: why it is absent from :attr:`spec` when empty — see that property.
     inputs: tuple[InputRef, ...] = ()
+    #: The share of the training block's ticker-rows this arm tolerates losing
+    #: to an incomplete feature vector before the fit refuses. `None` means
+    #: the arm declares none and is held to
+    #: :data:`DEFAULT_MAX_INCOMPLETE_ROW_RATIO`.
+    #:
+    #: A TUNED number and therefore a private-tree one: how much of a
+    #: cross-section an arm may lose and still be the arm that was
+    #: pre-registered is a belief about that arm's hypothesis, not a property
+    #: of the harness. It is read here, defaulted here, and set in
+    #: `alpha-engine-config/strategy/`.
+    max_incomplete_row_ratio: float | None = None
     supersedes: str | None = None
     slot: str = "m"
     #: Where these bytes were read from — a checkout path or a store key.
@@ -984,6 +996,16 @@ class ModelRecipe:
             raise ValueError("label_horizon_trading_days must be >= 1 (trading days, §4.12)")
         if self.refit_cadence_trading_days < 1:
             raise ValueError("refit_cadence_trading_days must be >= 1 (trading days, §4.12)")
+        if self.max_incomplete_row_ratio is not None and not (
+            0.0 <= self.max_incomplete_row_ratio < 1.0
+        ):
+            raise ValueError(
+                f"arm {self.name!r}: max_incomplete_row_ratio="
+                f"{self.max_incomplete_row_ratio!r} is outside [0, 1). It is the SHARE of "
+                "the training block that may be dropped for an incomplete feature vector; "
+                "a value of 1 or above is a ceiling nothing can breach, which is the same "
+                "as having none."
+            )
         try:
             dt.date.fromisoformat(self.registered_at)
         except ValueError as exc:
@@ -1047,7 +1069,20 @@ class ModelRecipe:
             # re-hash every arm already registered and orphan its score
             # series the moment this field shipped (policy §3.1).
             payload["inputs"] = [r.text for r in self.inputs]
+        if self.max_incomplete_row_ratio is not None:
+            # Same rule, same reason. It IS hashed once declared — how much of
+            # a cross-section an arm may lose and still be itself is part of
+            # what the arm is, so changing it is a different arm — but an arm
+            # that declares none keeps the id it registered under.
+            payload["max_incomplete_row_ratio"] = float(self.max_incomplete_row_ratio)
         return payload
+
+    @property
+    def resolved_max_incomplete_row_ratio(self) -> float:
+        """The ceiling this arm is actually held to — declared or default."""
+        if self.max_incomplete_row_ratio is None:
+            return DEFAULT_MAX_INCOMPLETE_ROW_RATIO
+        return float(self.max_incomplete_row_ratio)
 
     @property
     def arm_id(self) -> str:
@@ -1071,7 +1106,9 @@ REQUIRED_RECIPE_FIELDS: tuple[str, ...] = (
 #: (`alpha-engine-config-I9777`). A key outside this set is accepted-and-
 #: ignored nowhere: it is a guarantee the loader cannot honour, and the
 #: loader refuses it by name.
-M_SPEC_KEYS: frozenset[str] = frozenset({*REQUIRED_RECIPE_FIELDS, "inputs"})
+M_SPEC_KEYS: frozenset[str] = frozenset(
+    {*REQUIRED_RECIPE_FIELDS, "inputs", "max_incomplete_row_ratio"}
+)
 
 #: Every top-level key a filed M recipe may declare (`alpha-engine-config-
 #: I9944`) — named explicitly in the issue rather than derived, because
@@ -1222,6 +1259,11 @@ def _parse_model_recipe(payload: bytes, origin: str) -> ModelRecipe:
         cpcv=CPCVSpec(**spec["cpcv"]),
         registered_at=str(document["registered_at"]),
         inputs=tuple(parse_input_ref(t) for t in (spec.get("inputs") or ())),
+        max_incomplete_row_ratio=(
+            None
+            if spec.get("max_incomplete_row_ratio") is None
+            else float(spec["max_incomplete_row_ratio"])
+        ),
         supersedes=document.get("supersedes"),
         source_key=origin,
     )
@@ -1427,6 +1469,14 @@ class Fit:
     fitted_at: str
     n_rows: int
     training_status: TrainingStatus
+    #: Which ticker-rows of the training block the design SELECTED, and what
+    #: it dropped. Carried on the fit rather than recorded inside the fitter
+    #: so the record reaches the manifest through the job that owns the
+    #: manifest — `_fit_rows` is also called by the grader and by `_fold_ic`,
+    #: neither of which holds a `ctx`, and a recorder threaded into a pure
+    #: function would have to be optional and would then be absent exactly
+    #: where it mattered.
+    completeness: FeatureCompleteness | None = None
 
 
 def _design(recipe: ModelRecipe, panel: FeaturePanel, rows: np.ndarray) -> np.ndarray:
@@ -1469,6 +1519,201 @@ def _assert_inputs_resolved(recipe: ModelRecipe, panel: FeaturePanel) -> None:
         "refusal replaces the `KeyError` about a missing parquet column that made the "
         "wiring gap read as a feature-layer gap."
     )
+
+
+#: The share of a training block's ticker-rows that may be dropped for an
+#: incomplete feature vector before the fit is refused outright.
+#:
+#: A GENERIC order-of-magnitude guard, not a tuned value: an arm that has to
+#: discard more than one row in ten is no longer being fitted on the
+#: cross-section it was pre-registered against, and the difference between
+#: "a handful of new listings lack a 252-session window" and "the feature
+#: layer stopped producing a column" is exactly the difference this number
+#: has to keep loud. The tuned per-arm value belongs in the arm's own recipe
+#: (`spec.max_incomplete_row_ratio`), in the private strategy tree; this is
+#: what an arm that declares none is held to.
+#:
+#: Root cause it exists (`alpha-engine-config-I10688`): with no ceiling at
+#: all, ANY row-selection rule silently accepts a total outage. Measured that
+#: day, `residual_momentum_252d_skip21d_zscore` was null for 903 of 903
+#: tickers on every compiled session; selecting complete rows without a
+#: ceiling would have fitted the arm on nothing and returned `ok`.
+DEFAULT_MAX_INCOMPLETE_ROW_RATIO = 0.10
+
+#: How many excluded ticker names a completeness record names outright. The
+#: full count is always carried; the sample is for a reader who wants somewhere
+#: to start, and is bounded because a manifest is loaded whole by every
+#: consumer of it.
+_SAMPLE_SIZE = 20
+
+#: The metric name the completeness record is filed under on the run manifest.
+#: Named rather than spelled at the call site so a console adapter and a test
+#: read the same literal.
+FEATURE_COMPLETENESS_METRIC = "feature_completeness_excluded_ratio"
+
+
+@dataclass(frozen=True)
+class FeatureCompleteness:
+    """Which ticker-rows of a training block carry a COMPLETE feature vector.
+
+    The producer declares per-row completeness and the training design selects
+    on it; this record is the second half of that contract — what was dropped,
+    which column was missing, and which names it cost — written onto the run
+    manifest so an excluded row is a recorded exclusion rather than an
+    invisible one.
+
+    The distinction this type exists to keep is between two conditions that
+    produce byte-identical nulls:
+
+    * a ticker listed inside the arm's lookback (an IPO, a symbol change) and
+      genuinely has no 252-session window yet — correct, expected, and the
+      feature layer's declared behaviour ("the layer never fills");
+    * a column the producer stopped computing — a vendor outage, a panel
+      shallower than the catalogue needs — which must FAIL the cycle.
+
+    Row selection alone cannot tell them apart, which is why
+    :attr:`excluded_ratio` is checked against a declared ceiling and the fit
+    refuses above it. Dropping rows without a ceiling is the suppression
+    collection `crucible/AGENTS.md` rule 4 forbids, wearing a statistician's
+    hat.
+    """
+
+    arm_name: str
+    rows_total: int
+    rows_complete: int
+    excluded_ratio: float
+    ceiling: float
+    nan_rows_by_column: dict[str, int]
+    excluded_names: tuple[str, ...]
+    excluded_dates: tuple[str, ...]
+
+    @property
+    def rows_excluded(self) -> int:
+        return self.rows_total - self.rows_complete
+
+    @property
+    def breached(self) -> bool:
+        return self.excluded_ratio > self.ceiling
+
+    def to_dict(self) -> dict[str, Any]:
+        """The manifest form: every COUNT in full, the identifier lists BOUNDED.
+
+        A 504-session training block over a ~900-name universe can exclude at
+        least one row of nearly every name on nearly every session, and the
+        unbounded lists put ~900 tickers and ~400 dates into one metric row —
+        measured at 200KB on the first real replay, on a document every
+        console reader and every `explain` walk loads whole. The counts are
+        what a reader acts on; the samples are what they open a parquet with.
+        """
+        return {
+            "arm_name": self.arm_name,
+            "rows_total": self.rows_total,
+            "rows_complete": self.rows_complete,
+            "rows_excluded": self.rows_excluded,
+            "excluded_ratio": self.excluded_ratio,
+            "ceiling": self.ceiling,
+            "nan_rows_by_column": dict(self.nan_rows_by_column),
+            "excluded_name_count": len(self.excluded_names),
+            "excluded_names_sample": list(self.excluded_names[:_SAMPLE_SIZE]),
+            "excluded_session_count": len(self.excluded_dates),
+            "excluded_first_session": self.excluded_dates[0] if self.excluded_dates else None,
+            "excluded_last_session": self.excluded_dates[-1] if self.excluded_dates else None,
+        }
+
+    @property
+    def detail(self) -> str:
+        """The one-line reason a rejection or a refusal carries.
+
+        Bounded at the schema's 200-character rejection cap by construction —
+        the column list is truncated, never the counts — because
+        `RunContext.record_rejected` RAISES on an over-long reason and costs
+        the run every other field it had recorded
+        (`alpha-engine-config-I10484`).
+        """
+        worst = sorted(self.nan_rows_by_column.items(), key=lambda kv: (-kv[1], kv[0]))
+        named = ", ".join(f"{name}={count}" for name, count in worst[:3] if count)
+        return (
+            f"incomplete feature vector: {self.rows_excluded}/{self.rows_total} rows "
+            f"({self.excluded_ratio:.4f}); {named or 'no column null'}"
+        )[:200]
+
+    def as_metric(
+        self, *, slot: str, phase: str = "training", now: dt.datetime | None = None
+    ) -> dict[str, Any]:
+        """The manifest row. `feature_completeness` rides as an extra field.
+
+        ``phase`` separates the TRAINING block's reading from the SERVING
+        session's: the same arm files both on one manifest, they answer
+        different questions (what the fit was computed over, and which names
+        the cross-section could rank), and one row overwriting the other in a
+        reader's mind is how a clean fit on a session nobody could be scored
+        for reads as healthy.
+
+        `run_manifest.v2.json`'s `MetricRecordRow` is `additionalProperties:
+        true` on purpose, so the whole record reaches the manifest beside the
+        number rather than being flattened into prose nobody can query.
+        """
+        stamp = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return {
+            "name": FEATURE_COMPLETENESS_METRIC,
+            "module": f"crucible.slots.{slot}",
+            "metric_type": "coverage",
+            "value": float(self.excluded_ratio),
+            "unit": "ratio",
+            "n_floor": 1,
+            "status": "BREACH" if self.breached else "OK",
+            "phase": phase,
+            "status_reason": (
+                f"arm {self.arm_name!r} ({phase}): {self.rows_excluded} of "
+                f"{self.rows_total} ticker-row(s) dropped for an incomplete feature vector "
+                f"({self.excluded_ratio:.4f} against a ceiling of {self.ceiling}); "
+                f"{len(self.excluded_names)} name(s) affected"
+            ),
+            "source_path": f"strategy/arms/{slot}/{self.arm_name}.yaml",
+            "last_updated_utc": stamp,
+            "baseline": float(self.ceiling),
+            "feature_completeness": {**self.to_dict(), "phase": phase},
+        }
+
+
+def feature_completeness(
+    recipe: ModelRecipe,
+    panel: FeaturePanel,
+    rows: np.ndarray,
+    matrix: np.ndarray,
+    labels: np.ndarray,
+) -> tuple[np.ndarray, FeatureCompleteness]:
+    """The complete-row mask over a training block, and the record of it.
+
+    A row is COMPLETE when every design column AND the forward label on it is
+    finite. Nothing is imputed and nothing is filled: an incomplete row is
+    removed from the fit and counted, which is the only treatment that leaves
+    the surviving rows measurements rather than a mixture of measurements and
+    inventions.
+    """
+    complete = np.isfinite(matrix).all(axis=1) & np.isfinite(labels)
+    n_names = len(panel.names)
+    nan_rows_by_column: dict[str, int] = {}
+    for index, column in enumerate(recipe.design_columns):
+        nan_rows_by_column[column] = int((~np.isfinite(matrix[:, index])).sum())
+    nan_rows_by_column["forward_return"] = int((~np.isfinite(labels)).sum())
+
+    dropped = rows[~complete]
+    excluded_names = tuple(sorted({panel.names[int(r) % n_names] for r in dropped}))
+    excluded_dates = tuple(sorted({panel.dates[int(r) // n_names] for r in dropped}))
+    total = int(matrix.shape[0])
+    kept = int(complete.sum())
+    record = FeatureCompleteness(
+        arm_name=recipe.name,
+        rows_total=total,
+        rows_complete=kept,
+        excluded_ratio=(total - kept) / total if total else 1.0,
+        ceiling=recipe.resolved_max_incomplete_row_ratio,
+        nan_rows_by_column=nan_rows_by_column,
+        excluded_names=excluded_names,
+        excluded_dates=excluded_dates,
+    )
+    return complete, record
 
 
 def _assert_trainable(recipe: ModelRecipe, matrix: np.ndarray, labels: np.ndarray) -> None:
@@ -1536,7 +1781,7 @@ def settled_training_days(panel: FeaturePanel, *, as_of: str, label_horizon: int
 
 def _fit_rows(
     recipe: ModelRecipe, panel: FeaturePanel, day_indices: list[int]
-) -> tuple[np.ndarray, float, int]:
+) -> tuple[np.ndarray, float, int, FeatureCompleteness]:
     """Fit the recipe on the named panel days. Raises on an unsound fit.
 
     One implementation, three callers — :func:`train_arm`, :func:`_fold_ic`
@@ -1548,9 +1793,34 @@ def _fit_rows(
     rows = np.array([d * n_names + n for d in day_indices for n in range(n_names)], dtype=int)
     matrix = _design(recipe, panel, rows)
     labels = panel.forward_returns.reshape(-1)[rows]
+
+    # SELECT, then assert. The order is the whole design: `_assert_trainable`
+    # is unchanged and still refuses any non-finite cell (Brian ruling
+    # 2026-08-29) — it is now asked about a block the design VOUCHED for,
+    # rather than about every row the panel happened to carry. What the
+    # selection may not do is hide an outage, so the ratio it drops is
+    # checked against the arm's declared ceiling FIRST and the fit refuses
+    # above it.
+    complete, record = feature_completeness(recipe, panel, rows, matrix, labels)
+    if record.breached:
+        worst = sorted(record.nan_rows_by_column.items(), key=lambda kv: (-kv[1], kv[0]))
+        raise TrainingIntegrityError(
+            f"arm {recipe.name}: {record.rows_excluded} of {record.rows_total} "
+            f"ticker-row(s) carry an incomplete feature vector "
+            f"({record.excluded_ratio:.4f}), above the declared ceiling "
+            f"{record.ceiling}. Null rows by column: "
+            f"{[f'{n}={c}' for n, c in worst if c]}; {len(record.excluded_names)} "
+            f"name(s) and {len(record.excluded_dates)} session(s) affected. A handful "
+            "of new listings without a full lookback is the layer working as declared; "
+            "a share this large is a producer gap, and fitting on what survived would "
+            "grade the arm on a cross-section nobody pre-registered it against."
+        )
+    matrix = matrix[complete]
+    labels = labels[complete]
+
     _assert_trainable(recipe, matrix, labels)
     coefficients, intercept = _fit_linear(recipe.estimator, matrix, labels)
-    return coefficients, intercept, int(matrix.shape[0])
+    return coefficients, intercept, int(matrix.shape[0]), record
 
 
 def train_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> Fit:
@@ -1581,7 +1851,7 @@ def train_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> Fit:
     if recipe.training_window.kind == "rolling":
         usable = usable[-recipe.training_window.min_trading_days :]
 
-    coefficients, intercept, n_rows = _fit_rows(recipe, panel, usable)
+    coefficients, intercept, n_rows, completeness = _fit_rows(recipe, panel, usable)
     return Fit(
         arm_id=recipe.arm_id,
         recipe=recipe,
@@ -1590,10 +1860,13 @@ def train_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> Fit:
         fitted_at=as_of,
         n_rows=n_rows,
         training_status=TrainingStatus(arm_id=recipe.arm_id, ok=True),
+        completeness=completeness,
     )
 
 
-def predict_cross_section(fit: Fit, panel: FeaturePanel, *, trading_day: str) -> dict[str, float]:
+def score_cross_section(
+    fit: Fit, panel: FeaturePanel, *, trading_day: str
+) -> tuple[dict[str, float], FeatureCompleteness]:
     """``fit``'s predicted alpha per name for ONE session of ``panel``.
 
     The same `_design` the fit was trained through, so a stacked arm's
@@ -1611,16 +1884,59 @@ def predict_cross_section(fit: Fit, panel: FeaturePanel, *, trading_day: str) ->
             "some other session's features."
         ) from exc
     rows = row * len(panel.names) + np.arange(len(panel.names))
-    values = _design(fit.recipe, panel, rows) @ fit.coefficients + fit.intercept
-    unscored = [n for n, v in zip(panel.names, values, strict=True) if not np.isfinite(float(v))]
+    matrix = _design(fit.recipe, panel, rows)
+
+    # The SERVING half of the completeness contract. A name whose feature
+    # vector is incomplete on this session is a name this arm cannot score,
+    # and there are exactly two honest things to do with it: leave it out of
+    # the cross-section, or refuse the session. Writing a NaN into the
+    # predictions artifact is neither — it is a hole a stacked arm would train
+    # on — which is what the refusal below used to be the only defence
+    # against, at the cost of one new listing failing the whole slot.
+    #
+    # The SAME ceiling the training block is held to, deliberately: if this
+    # many names cannot be scored, the layer is broken and a ranking over what
+    # survived is a ranking of a different universe.
+    scorable = np.isfinite(matrix).all(axis=1)
+    labels = np.full(matrix.shape[0], 0.0)
+    _, record = feature_completeness(fit.recipe, panel, rows, matrix, labels)
+    if record.breached:
+        raise TrainingIntegrityError(
+            f"arm {fit.recipe.name}: {record.rows_excluded} of {record.rows_total} "
+            f"name(s) carry an incomplete feature vector on {trading_day} "
+            f"({record.excluded_ratio:.4f}), above the declared ceiling "
+            f"{record.ceiling}; first five {list(record.excluded_names[:5])}. Ranking "
+            "the remainder would rank a different universe from the one this arm is "
+            "graded against."
+        )
+
+    values = matrix @ fit.coefficients + fit.intercept
+    unscored = [
+        n
+        for n, v, ok in zip(panel.names, values, scorable, strict=True)
+        if ok and not np.isfinite(float(v))
+    ]
     if unscored:
         raise TrainingIntegrityError(
             f"arm {fit.recipe.name}: {len(unscored)} name(s) produced a non-finite "
-            f"prediction on {trading_day}, first five {unscored[:5]}. A NaN written into "
-            "the predictions artifact is a hole a downstream stacked arm would either "
-            "train on or refuse a whole session for; it fails here instead."
+            f"prediction on {trading_day} from a COMPLETE feature vector, first five "
+            f"{unscored[:5]}. A finite design matrix that fits to a NaN is a defect in "
+            "the fit, not a gap in the inputs, and it fails here rather than writing a "
+            "hole a downstream stacked arm would train on."
         )
-    return {n: float(v) for n, v in zip(panel.names, values, strict=True)}
+    predicted = {n: float(v) for n, v, ok in zip(panel.names, values, scorable, strict=True) if ok}
+    return predicted, record
+
+
+def predict_cross_section(fit: Fit, panel: FeaturePanel, *, trading_day: str) -> dict[str, float]:
+    """``fit``'s predicted alpha per SCORABLE name for one session.
+
+    The scores alone, for every caller that has no manifest to record the
+    completeness half onto. :func:`score_cross_section` is the same
+    computation and returns both; there is no second derivation.
+    """
+    predicted, _ = score_cross_section(fit, panel, trading_day=trading_day)
+    return predicted
 
 
 def produce_arm_predictions(ctx: Any, *, fit: Fit, panel: FeaturePanel, trading_day: str) -> str:
@@ -1822,7 +2138,7 @@ def _fold_ic(
 ) -> float | None:
     """One fold's out-of-sample rank IC, or ``None`` when it cannot be ranked."""
     n_names = len(panel.names)
-    coefficients, intercept, _ = _fit_rows(recipe, panel, [int(i) for i in train_idx])
+    coefficients, intercept, _, _ = _fit_rows(recipe, panel, [int(i) for i in train_idx])
     test_rows = _flatten(test_idx, n_names)
     predicted = _design(recipe, panel, test_rows) @ coefficients + intercept
     actual = panel.forward_returns.reshape(-1)[test_rows]
@@ -2111,7 +2427,7 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
             in_sample_n += 1
             continue
         if coefficients is None or last_refit is None or (i - last_refit) >= cadence:
-            coefficients, intercept, _ = _fit_rows(recipe, panel, train_days)
+            coefficients, intercept, _, _ = _fit_rows(recipe, panel, train_days)
             last_refit = i
         rows = i * n_names + np.arange(n_names)
         predicted = _design(recipe, panel, rows) @ coefficients + intercept
@@ -2494,6 +2810,7 @@ def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     recipes = list(loaded.registered)
     produced: list[str] = []
     warming: list[InputRefusal] = []
+    excluded_rows = 0
     for spec in _in_dependency_order(specs):
         recipe = spec.recipe
         try:
@@ -2546,7 +2863,20 @@ def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             )
             continue
         fit = train_arm(recipe, panel, as_of=trading_day)
-        predicted = predict_cross_section(fit, panel, trading_day=trading_day)
+        if fit.completeness is not None:
+            # §9.2 class 4 and class 5, both: the count with its reason, and
+            # the ratio with the ceiling it was measured against. An excluded
+            # ticker-row that reaches no manifest is a suppression collection
+            # with no file (`crucible/AGENTS.md` rule 4).
+            ctx.record_metric(fit.completeness.as_metric(slot=SLOT, phase="training"))
+            if fit.completeness.rows_excluded:
+                ctx.record_rejected(fit.completeness.detail, fit.completeness.rows_excluded)
+                excluded_rows += fit.completeness.rows_excluded
+        predicted, serving = score_cross_section(fit, panel, trading_day=trading_day)
+        ctx.record_metric(serving.as_metric(slot=SLOT, phase="serving"))
+        if serving.rows_excluded:
+            ctx.record_rejected(serving.detail, serving.rows_excluded)
+            excluded_rows += serving.rows_excluded
         produce_arm_predictions(ctx, fit=fit, panel=panel, trading_day=trading_day)
         ranked = sorted(predicted.items(), key=lambda item: (-item[1], item[0]))
         shadow = ShadowSelection(
@@ -2632,6 +2962,10 @@ def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         "arms": produced,
         "refused": [{"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused],
         "feature_version": str(source.version),
+        # The count, not the record: the per-column detail is on the manifest
+        # metric, and a payload that restated it would be a second copy free
+        # to disagree with the first.
+        "training_rows_excluded": excluded_rows,
         # `None` when the slot has no champion, which is a true statement and
         # deliberately a different one from a key that was written.
         "champion_feed": feed_written,
