@@ -68,6 +68,7 @@ __all__ = [
     "FactorDef",
     "attribution_metric_record",
     "compute_factor_attribution",
+    "factor_return_series",
     "load_attribution_params",
     "manifest_records_factor_attribution",
     "params_digest",
@@ -97,10 +98,20 @@ class AttributionParamsError(ValueError):
 
 @dataclass(frozen=True)
 class FactorDef:
-    """One named factor: which category it is, and the ETF proxy that sources it."""
+    """One named factor: which category it is, and the ETF proxy(ies) that source it.
+
+    ``proxy`` alone is a raw return series (e.g. the beta factor is SPY's own
+    return). Setting ``short_proxy`` turns the factor into a long/short
+    SPREAD — ``proxy`` minus ``short_proxy``, per session — which is how the
+    literature actually defines a style-factor premium (size = small-cap
+    minus large-cap, not small-cap alone). Absent ``short_proxy`` is today's
+    behaviour unchanged, so every existing spec loads exactly as before
+    (`alpha-engine-config-I10592`).
+    """
 
     category: str
     proxy: str
+    short_proxy: str | None = None
 
     def __post_init__(self) -> None:
         if self.category not in ATTRIBUTION_FACTOR_CATEGORIES:
@@ -109,6 +120,18 @@ class FactorDef:
             )
         if not self.proxy:
             raise AttributionParamsError("a factor's proxy ticker must be non-empty")
+        if self.short_proxy is not None:
+            if not self.short_proxy:
+                raise AttributionParamsError(
+                    "a factor's short_proxy, if given, must be non-empty — omit the key "
+                    "entirely for a raw (non-spread) factor rather than passing an empty one"
+                )
+            if self.short_proxy == self.proxy:
+                raise AttributionParamsError(
+                    f"factor's short_proxy {self.short_proxy!r} is the same ticker as its "
+                    f"proxy {self.proxy!r}; a spread of a ticker against itself is always "
+                    "zero and not the premium anyone intended to express"
+                )
 
 
 @dataclass(frozen=True)
@@ -150,13 +173,16 @@ class AttributionFactorParams:
             )
 
     def to_dict(self) -> dict[str, Any]:
+        factors: dict[str, Any] = {}
+        for name, fd in sorted(self.factors.items()):
+            row: dict[str, Any] = {"category": fd.category, "proxy": fd.proxy}
+            if fd.short_proxy is not None:
+                row["short_proxy"] = fd.short_proxy
+            factors[name] = row
         return {
             "benchmark_proxy": self.benchmark_proxy,
             "shrinkage": self.shrinkage,
-            "factors": {
-                name: {"category": fd.category, "proxy": fd.proxy}
-                for name, fd in sorted(self.factors.items())
-            },
+            "factors": factors,
         }
 
     @classmethod
@@ -173,7 +199,9 @@ class AttributionFactorParams:
                 )
             category = str(block["category"])
             proxy = str(block["proxy"])
-            factors[str(name)] = FactorDef(category=category, proxy=proxy)
+            short_proxy_raw = block.get("short_proxy")
+            short_proxy = str(short_proxy_raw) if short_proxy_raw is not None else None
+            factors[str(name)] = FactorDef(category=category, proxy=proxy, short_proxy=short_proxy)
         return cls(
             factors=factors,
             benchmark_proxy=str(payload["benchmark_proxy"]),
@@ -204,6 +232,39 @@ def load_attribution_params(path: Path | str) -> AttributionFactorParams:
             "the file declares none."
         )
     return AttributionFactorParams.from_mapping(payload["attribution"], source=str(resolved))
+
+
+def factor_return_series(
+    fdef: FactorDef, proxy_returns: Mapping[str, Sequence[float]]
+) -> list[float]:
+    """The per-session return series ``fdef``'s exposure is measured against.
+
+    A raw factor (``short_proxy`` absent) returns its long leg's series
+    unchanged. A spread factor returns the long leg MINUS the short leg, per
+    session — the textbook long/short style-factor premium (e.g. size =
+    small-cap minus large-cap). ``proxy_returns`` maps ticker to return
+    series, the same shape `crucible.data.sources.PriceSource` returns; this
+    function never reads a store, matching every other function in this
+    module.
+
+    This is the one place that construction happens, so a future caller
+    (the S-cycle job, `alpha-engine-config-I10512`) that builds
+    ``factor_returns[name]`` for `compute_factor_attribution` through this
+    function cannot silently reproduce the raw-return defect
+    `alpha-engine-config-I10592` exists to fix — using the long leg alone for
+    a `short_proxy` factor.
+    """
+    long_series = proxy_returns[fdef.proxy]
+    if fdef.short_proxy is None:
+        return list(long_series)
+    short_series = proxy_returns[fdef.short_proxy]
+    if len(long_series) != len(short_series):
+        raise ValueError(
+            f"{fdef.proxy!r} has {len(long_series)} observations but its short leg "
+            f"{fdef.short_proxy!r} has {len(short_series)}; a spread needs both legs "
+            "aligned to the same sessions."
+        )
+    return [long - short for long, short in zip(long_series, short_series, strict=True)]
 
 
 def params_digest(params: AttributionFactorParams) -> str:
@@ -281,15 +342,16 @@ def compute_factor_attribution(
         contribution = exposure * float(sum(factor_returns[name]))
         category_totals[fdef.category] += contribution
         explained_return += contribution
-        factor_rows.append(
-            {
-                "name": name,
-                "category": fdef.category,
-                "proxy": fdef.proxy,
-                "exposure": exposure,
-                "contribution_return": contribution,
-            }
-        )
+        row: dict[str, Any] = {
+            "name": name,
+            "category": fdef.category,
+            "proxy": fdef.proxy,
+        }
+        if fdef.short_proxy is not None:
+            row["short_proxy"] = fdef.short_proxy
+        row["exposure"] = exposure
+        row["contribution_return"] = contribution
+        factor_rows.append(row)
 
     residual_alpha = float(gross_return) - explained_return
     net_return = float(gross_return) - float(cost_bps_total) / 1.0e4
