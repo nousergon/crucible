@@ -88,6 +88,7 @@ from crucible.keys import (
     shadow_key,
     strategy_arms_prefix,
 )
+from crucible.slots.arms import SupersededArmUndeclaredError, resolve_declared_lineage
 from crucible.slots.inputs import (
     BasePredictionsUnavailableError,
     InputRef,
@@ -2082,73 +2083,31 @@ class RegisteredModelArm:
     bootstrap: bool = False
 
 
-class SupersededArmUndeclaredError(ValueError):
-    """A recipe's `supersedes` names an arm this slot does not declare at all.
-
-    Distinct from "the parent is refused", which is legitimate. The check the
-    register performs — a lineage pointer must not point at nothing — is kept
-    here, moved from "is the parent REGISTERED" to "does the slot DECLARE the
-    parent", because those two stopped being the same question the moment a
-    refusal became a per-arm value (`alpha-engine-config-I9955`).
-    """
-
-
 def registration_specs(loaded: SlotRecipes) -> list[RegisteredModelArm]:
     """The slot's registered recipes, with their declared lineage resolved.
 
-    **A recipe's `supersedes` and a register row's `supersedes` are two
-    different facts, and conflating them broke the M slot outright**
-    (`alpha-engine-config-I9957`, measured 2026-09-06 against the live
-    strategy tree). `crucible.slots.arms.register_arms` refuses a pointer to
-    an arm it cannot find in the register — correctly, "a lineage pointer to
-    nothing reads as history that was checked". But Brian's
-    `alpha-engine-config-I9808` ruling (b) deliberately created an M arm that
-    supersedes a sibling which is REFUSED at registration and stays refused
-    until phase 5, so the parent has no register row and never will. The two
-    rulings collide and the whole M slot failed to register on the first real
-    call, with a message about a lineage pointer that in fact names a real,
-    declared, visibly-refused arm.
-
-    The recipe file itself already says which fact it is stating: "Provenance
-    and a stated lineage — NOT a series link and NOT an inheritance of any
-    record." So the declared string is carried as PROVENANCE on the register
-    row's notes, and the register LINK is set only when the parent actually
-    has a row to link to.
-
-    What is NOT softened is the guard's purpose. A `supersedes` naming an arm
-    this slot does not declare at all — a typo, a deleted file, another
-    slot's arm — still raises, as :class:`SupersededArmUndeclaredError`. The
-    check moved from "registered" to "declared"; it did not go away.
+    Thin per-slot adapter over `crucible.slots.arms.resolve_declared_lineage`
+    (`alpha-engine-config-I10637`, `policy-shared-code`'s second-adoption
+    trigger: this function and `crucible.slots.strategy.registration_specs`
+    carried the identical lineage-resolution guard, raising the identical
+    :class:`~crucible.slots.arms.SupersededArmUndeclaredError`, over a
+    different recipe type). The resolution logic — what makes an M arm that
+    supersedes a declared-but-refused sibling register anyway
+    (`alpha-engine-config-I9957`, `-I9808` ruling (b)) — now lives once, in
+    `crucible.slots.arms`; what stays here is only the M-specific shape:
+    `loaded.registered` is a tuple of raw `ModelRecipe`s (M has no separate
+    "registered arm" wrapper until this function builds one), and the output
+    wraps each in :class:`RegisteredModelArm`.
     """
-    from crucible.slots.inputs import arm_name_from_id  # noqa: PLC0415 - avoids a cycle
-
-    registered_ids = {recipe.arm_id for recipe in loaded.registered}
-    declared = {recipe.name for recipe in loaded.registered} | {r.arm for r in loaded.refused}
+    resolved = resolve_declared_lineage(
+        registered=[
+            (recipe.name, recipe.arm_id, recipe.supersedes) for recipe in loaded.registered
+        ],
+        refused=[r.arm for r in loaded.refused],
+    )
     specs: list[RegisteredModelArm] = []
     for recipe in loaded.registered:
-        link: str | None = None
-        notes = ""
-        if recipe.supersedes:
-            parent = arm_name_from_id(recipe.supersedes)
-            if parent not in declared:
-                raise SupersededArmUndeclaredError(
-                    f"arm {recipe.name!r} declares supersedes={recipe.supersedes!r}, whose "
-                    f"name {parent!r} is not an arm this slot declares. The slot registers "
-                    f"{sorted(r.name for r in loaded.registered)} and refuses "
-                    f"{sorted(r.arm for r in loaded.refused)}. A lineage pointer to nothing "
-                    "reads as history that was checked; a pointer to a REFUSED sibling is "
-                    "checked history and is accepted, carried as provenance rather than as "
-                    "a register link."
-                )
-            if recipe.supersedes in registered_ids:
-                link = recipe.supersedes
-            else:
-                notes = (
-                    f"Supersedes {recipe.supersedes} — declared lineage, carried as "
-                    "provenance because that arm is refused at registration in this slot "
-                    "and has no register row to link to. Not a series link and not an "
-                    "inheritance of any record."
-                )
+        link, notes = resolved[recipe.arm_id]
         specs.append(RegisteredModelArm(recipe, supersedes=link, notes=notes))
     return specs
 

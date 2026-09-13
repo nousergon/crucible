@@ -498,16 +498,18 @@ class TestExperimentNewRegistersTheMSlot:
         assert sorted(s.name for s in specs) == ["base", "stacked"]
         assert "refused_leg" in capsys.readouterr().out
 
-    def test_s_is_still_refused_by_name(self, store) -> None:
-        import argparse
-
-        from crucible.slots.arms import ForeignRecipeSchemaError
-        from crucible.track_a import _recipes_for_registration
+    def test_load_arm_specs_still_refuses_s_by_name(self, store) -> None:
+        """`_recipes_for_registration` no longer reaches this refusal for `s`
+        (`alpha-engine-config-I10512`: it dispatches `s` to
+        `load_strategy_slot` before `load_arm_specs` is ever asked for it),
+        but `load_arm_specs` itself still refuses slot `s` BY NAME — it
+        serves U and R only — and that refusal is exercised here directly,
+        at the loader, rather than through a caller that no longer reaches
+        it."""
+        from crucible.slots.arms import ForeignRecipeSchemaError, load_arm_specs
 
         with pytest.raises(ForeignRecipeSchemaError):
-            _recipes_for_registration(
-                "s", config=argparse.Namespace(strategy_dir=None), store=store
-            )
+            load_arm_specs("s", store=store, strategy_dir=None)
 
 
 class TestRefusalMetricsAreRecordedBeforeAnyFittingWork:

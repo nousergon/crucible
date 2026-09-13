@@ -349,7 +349,39 @@ class TestEveryDeclarableKindResolves:
 #: The measured orphan set, as an EQUALITY. A new orphan fails this test on
 #: the day it is written; a wired one fails it too, and must be removed here
 #: in the same change that wires it.
-STILL_ORPHANED_M_CALLABLES: list[str] = ["evaluate_input_completeness"]
+#: **Corrected 2026-09-13** (`alpha-engine-config-I10512`, measured while
+#: merging the S cycle job onto the M cycle job): the pin used to read
+#: `["evaluate_input_completeness"]`, on a detector that matched a bound name
+#: BARE — so a file importing `crucible.slots.strategy.grade_arm` under the
+#: name `grade_arm` made `crucible.slots.model.grade_arm` read as wired too,
+#: a name COLLISION rather than a caller. `_entry_points` (this file, above)
+#: now resolves per file against what that file imports FROM THIS module, and
+#: under the fixed detector every one of these reads as orphaned: none is
+#: imported BY NAME from `crucible.slots.model` anywhere in `crucible/`. They
+#: ARE reached in production — `crucible.track_a.handle_experiment_run` calls
+#: `module.produce(...)`/`module.grade(...)` on the module
+#: `crucible.slots.dispatchable_slots()` resolves at runtime — but that
+#: dispatch is invisible to a static import-graph scan BY DESIGN:
+#: `dispatchable_slots()`'s whole point (see its own docstring) is that a
+#: slot's entry points are read off the module rather than off a call-site
+#: list, so the arc grows with "no list to update" the moment a slot lands.
+#: Every dispatchable slot — U, R, M, S alike — is wired exactly this way,
+#: and `tests/test_weekly.py::TestDerivation` pins the property a static scan
+#: cannot: that `dispatchable_slots()` finds `produce`/`grade` on all four
+#: slot modules and the arc actually dispatches to each.
+STILL_ORPHANED_M_CALLABLES: list[str] = [
+    "cpcv_oos_ic",
+    "design_panel",
+    "evaluate_behavioural_veto",
+    "evaluate_input_completeness",
+    "grade",
+    "grade_arm",
+    "predict_cross_section",
+    "produce",
+    "produce_arm_predictions",
+    "settled_training_days",
+    "train_arm",
+]
 
 
 class TestTheModelPathIsNotDeclaredAndLeftUnwired:
@@ -360,15 +392,25 @@ class TestTheModelPathIsNotDeclaredAndLeftUnwired:
     home is "the manifest of whatever job loaded the slot", and no job loaded
     the slot. The M cycle job closes that; this class keeps the guard on the
     module rather than retiring it with its first instance.
+
+    See :data:`STILL_ORPHANED_M_CALLABLES` for why `produce`/`grade` and
+    everything they call are pinned as orphans rather than asserted
+    reachable: they are wired, but only through `dispatchable_slots()`'s
+    dynamic dispatch, which this static scan cannot and must not try to see.
     """
 
     def test_the_m_loader_is_reached_from_production_code(self) -> None:
         """Deliverable 1, as a property of the call graph rather than a claim.
 
-        The inverse of what this assertion said before the M cycle job
-        existed. `load_model_recipes` reachable from `crucible/` is what makes
+        `load_model_recipes` reachable from `crucible/` is what makes
         `SlotRecipes.refusal_metrics` land on a manifest a scheduled run
-        writes; unreachable, the rows are well-formed and seen by nobody.
+        writes; unreachable, the rows are well-formed and seen by nobody. It
+        is the one M-path callable this STATIC scan can attest to — reached
+        through `track_a._recipes_for_registration`, which needs no dynamic
+        dispatch. `produce`/`grade` are reached only through
+        `dispatchable_slots()`'s dynamic lookup (see the class docstring)
+        and are pinned as orphans in :data:`STILL_ORPHANED_M_CALLABLES`
+        rather than asserted reachable here.
         """
         from crucible.slots import model as model_module  # noqa: PLC0415 - local to this class
 
@@ -378,8 +420,6 @@ class TestTheModelPathIsNotDeclaredAndLeftUnwired:
             "slot has no caller and a refused arm's `unservable` row reaches no "
             "manifest — the defect this module's tracker was filed for, restored."
         )
-        for name in ("produce", "grade", "design_panel", "train_arm", "predict_cross_section"):
-            assert name not in orphans, f"the M cycle job no longer reaches `{name}`"
 
     def test_the_orphan_set_is_exactly_the_pin(self) -> None:
         """An equality, so the gap cannot rot in either direction.

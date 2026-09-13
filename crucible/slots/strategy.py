@@ -64,6 +64,7 @@ from crucible.portfolio import (
     portfolio_metric_record,
     solve_target_weights,
 )
+from crucible.slots.arms import SupersededArmUndeclaredError, resolve_declared_lineage
 from crucible.slots.inputs import InputRefusal, SlotUnservableError
 from crucible.slots.vocab import refuse_unknown_keys
 
@@ -1158,17 +1159,6 @@ S_HORIZON_TRADING_DAYS = 1
 GRADING_NOTIONAL = 1.0
 
 
-class SupersededArmUndeclaredError(ValueError):
-    """A recipe's `supersedes` names an arm this slot does not declare at all.
-
-    Distinct from "the parent is refused", which is legitimate. The check the
-    register performs — a lineage pointer must not point at nothing — is kept
-    here, moved from "is the parent REGISTERED" to "does the slot DECLARE the
-    parent", because those two stopped being the same question the moment a
-    refusal became a per-arm value (`alpha-engine-config-I9955`).
-    """
-
-
 @dataclass(frozen=True)
 class SlotStrategies:
     """The S slot as loaded: the arms that register, and the arms that do not.
@@ -1419,65 +1409,37 @@ def _participation_refusal(recipe: StrategyRecipe) -> InputRefusal | None:
 def registration_specs(loaded: SlotStrategies) -> list[RegisteredStrategyArm]:
     """The slot's loaded arms with their declared lineage resolved.
 
-    **A recipe's `supersedes` and a register row's `supersedes` are two
-    different facts**, and `crucible.slots.arms.register_arms` refuses a
-    pointer to an arm it cannot find in the register — correctly: "a lineage
-    pointer to nothing reads as history that was checked". But a refused
-    sibling is declared, visible and permanently unregistered, so a pointer at
-    one is checked history. `StrategyRecipe.with_rules` is the ONLY way an S
+    Thin per-slot adapter over `crucible.slots.arms.resolve_declared_lineage`
+    (`alpha-engine-config-I10637`, `policy-shared-code`'s second-adoption
+    trigger: this function and `crucible.slots.model.registration_specs`
+    carried the identical lineage-resolution guard, raising the identical
+    :class:`~crucible.slots.arms.SupersededArmUndeclaredError`, over a
+    different recipe type — `StrategyRecipe.with_rules` is the ONLY way an S
     arm is retuned (§3.1) and it always sets `supersedes`, so the moment an
-    arm is refused every descendant of it would fail to register too.
-
-    So the declared string is carried as PROVENANCE on the register row's
-    notes, and the register LINK is set only when the parent actually has a
-    row to link to. What is NOT softened is the guard's purpose: a
-    `supersedes` naming an arm this slot does not declare at all — a typo, a
-    deleted file, another slot's arm — still raises, as
-    :class:`SupersededArmUndeclaredError`.
+    arm is refused every descendant of it would fail to register too, exactly
+    the M-slot collision the shared resolver was written for). The
+    resolution logic now lives once, in `crucible.slots.arms`; what stays
+    here is only the S-specific shape: `loaded.registered` is already a
+    tuple of :class:`RegisteredStrategyArm`, so the declared parent is read
+    off `arm.recipe.supersedes` rather than off a bare recipe.
     """
-    from crucible.slots.inputs import arm_name_from_id  # noqa: PLC0415 - avoids a cycle
-
-    registered_ids = {recipe.arm_id for recipe in loaded.registered}
-    declared = {r.name for r in loaded.registered} | {r.arm for r in loaded.refused}
-    specs: list[RegisteredStrategyArm] = []
-    for arm in loaded.registered:
-        link: str | None = None
-        notes = ""
-        declared_parent = arm.recipe.supersedes
-        if declared_parent:
-            parent = arm_name_from_id(declared_parent)
-            if parent not in declared:
-                raise SupersededArmUndeclaredError(
-                    f"arm {arm.name!r} declares supersedes={declared_parent!r}, whose "
-                    f"name {parent!r} is not an arm this slot declares. The slot "
-                    f"registers {sorted(r.name for r in loaded.registered)} and refuses "
-                    f"{sorted(r.arm for r in loaded.refused)}. A lineage pointer to "
-                    "nothing reads as history that was checked; a pointer to a REFUSED "
-                    "sibling is checked history and is accepted, carried as provenance "
-                    "rather than as a register link."
-                )
-            if declared_parent in registered_ids:
-                link = declared_parent
-            else:
-                notes = (
-                    f"Supersedes {declared_parent} — declared lineage, carried as "
-                    "provenance because that arm is refused at registration in this slot "
-                    "and has no register row to link to. Not a series link and not an "
-                    "inheritance of any record."
-                )
-        specs.append(
-            RegisteredStrategyArm(
-                arm.recipe,
-                supersedes=link,
-                notes=notes,
-                # Forwarded, not re-resolved: `arm.registered_at` already
-                # carries whatever :func:`load_strategy_slot` resolved (a
-                # declared date, a register-row date, or today's stamp), and
-                # this rebuild must not lose it (`alpha-engine-config-I10634`).
-                registered_at_override=arm.registered_at,
-            )
+    resolved = resolve_declared_lineage(
+        registered=[(arm.name, arm.arm_id, arm.recipe.supersedes) for arm in loaded.registered],
+        refused=[r.arm for r in loaded.refused],
+    )
+    return [
+        RegisteredStrategyArm(
+            arm.recipe,
+            supersedes=resolved[arm.arm_id][0],
+            notes=resolved[arm.arm_id][1],
+            # Forwarded, not re-resolved: `arm.registered_at` already
+            # carries whatever :func:`load_strategy_slot` resolved (a
+            # declared date, a register-row date, or today's stamp), and
+            # this rebuild must not lose it (`alpha-engine-config-I10634`).
+            registered_at_override=arm.registered_at,
         )
-    return specs
+        for arm in loaded.registered
+    ]
 
 
 def load_strategy_slot(
