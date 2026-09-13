@@ -68,13 +68,67 @@ def _referenced_names(tree: ast.AST) -> set[str]:
     return used
 
 
+def _module_paths(root: Path, module: Path) -> tuple[str, str, str]:
+    """`crucible/slots/model.py` -> (`crucible.slots.model`, `crucible.slots`, `model`).
+
+    All three spellings are needed because all three reach the module: the
+    fully qualified import, `from <package> import <stem>` (which binds the
+    MODULE object), and a root-relative import inside a flat package.
+    """
+    parts = (root.name, *module.resolve().relative_to(root.resolve()).with_suffix("").parts)
+    return ".".join(parts), ".".join(parts[:-1]), parts[-1]
+
+
+def _names_bound_from(tree: ast.AST, paths: tuple[str, str, str]) -> set[str]:
+    """The names a file binds FROM ``dotted``, and the aliases it binds it under.
+
+    `from crucible.slots.model import train_arm` binds `train_arm`;
+    `import crucible.slots.model as m` binds the alias `m`, through which any
+    attribute reference reaches the module. Everything else in the file — a
+    same-named function of its own, a name imported from somewhere else — is
+    not a reference to this module and must not be counted as one.
+    """
+    dotted, parent, stem = paths
+    bound: set[str] = set()
+    aliased = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in {dotted, stem}:
+            bound |= {alias.asname or alias.name for alias in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module == parent:
+            aliased = aliased or any(alias.name == stem for alias in node.names)
+        elif isinstance(node, ast.Import):
+            aliased = aliased or any(alias.name == dotted for alias in node.names)
+    if aliased:
+        # An alias reaches every public name; the caller intersects with what
+        # the module actually exports, so this cannot over-report.
+        bound |= {"*"}
+    return bound
+
+
 def _entry_points(root: Path, *, module: Path) -> set[str]:
-    """Names of ``module`` that production code outside it actually references."""
+    """Names of ``module`` that production code outside it actually references.
+
+    **Resolved per file against what that file IMPORTS from this module**, not
+    by bare name. Two modules may legitimately define the same name — the S
+    slot and the M slot each have a `grade_arm`, because each grades its own
+    recipe type — and a scan that matched on the name alone reported the M
+    slot as WIRED the day the S cycle job referenced its own `grade_arm`
+    (`alpha-engine-config-I10512`, measured on this test). That is this file's
+    own failure mode inverted: a detector that mistakes a name collision for
+    wiring reports a gap closed that is still open, which is worse than not
+    detecting it, because the pin below then reads as re-stated.
+    """
+    paths = _module_paths(root, module)
     used: set[str] = set()
     for path in sorted(root.rglob("*.py")):
         if path.resolve() == module.resolve():
             continue
-        used |= _referenced_names(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        bound = _names_bound_from(tree, paths)
+        if not bound:
+            continue
+        referenced = _referenced_names(tree)
+        used |= referenced if "*" in bound else (referenced & bound)
     return used
 
 

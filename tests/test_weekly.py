@@ -55,11 +55,17 @@ class TestDerivation:
     def test_a_slot_scoped_job_expands_to_every_dispatchable_slot_in_dependency_order(
         self,
     ) -> None:
-        """Every slot the CLI can run, in `SLOTS` order — and no other. M and
-        S have no `produce`/`grade` until phase 3; expanding over them made
-        every arc fail at `experiment.run[m]` (measured 2026-09-04)."""
+        """Every slot the CLI can run, in `SLOTS` order — and no other.
+
+        Re-stated, not deleted, by `alpha-engine-config-I10512`: the S cycle
+        job gives `crucible/slots/strategy.py` its `produce`/`grade`, so S
+        joins the arc with no list to edit — which is the derivation working,
+        and is exactly why this pin is an equality. M is still absent until
+        its own cycle job lands; expanding over a slot with no entry points
+        made every arc fail at `experiment.run[m]` (measured 2026-09-04).
+        """
         expected = [slot for slot in SLOTS if slot in dispatchable_slots()]
-        assert expected == ["u", "r"], expected
+        assert expected == ["u", "r", "s"], expected
         for job in ARC_SLOT_JOBS:
             slots = [s.slot for s in arc_stages(FRIDAY) if s.job == job]
             assert slots == expected, f"{job} must run for every dispatchable slot, in SLOTS order"
@@ -72,7 +78,7 @@ class TestDerivation:
         monkeypatch.delattr(research, "grade")
         assert "r" not in dispatchable_slots()
         slots = {s.slot for s in arc_stages(FRIDAY) if s.job in ARC_SLOT_JOBS}
-        assert slots == {"u"}
+        assert slots == {"u", "s"}
 
     def test_the_dispatch_table_and_the_arc_read_one_source(self) -> None:
         """`experiment.run --slot m` refuses by name (track A) and the arc
