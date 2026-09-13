@@ -1048,6 +1048,7 @@ def grade_slot(
     control_ids: dict[str, str],
     series_by_arm: dict[str, ArmSeries],
     incumbent: str | None,
+    baseline: str | None = None,
     preconditions: dict[str, list[ServingPrecondition]] | None = None,
     training: dict[str, TrainingStatus] | None = None,
 ) -> tuple[ArenaCycle, dict[str, Any]]:
@@ -1058,6 +1059,16 @@ def grade_slot(
     `nousergon_lib.arena` and are CALLED. A slot re-implementing policy
     §§3-6 is a defect (policy §10), so this function's whole job is to
     assemble inputs, verify the harness, and hand over.
+
+    ``baseline`` is the §10.1 null control the caller substituted as
+    ``incumbent`` for a slot with no champion (`alpha-engine-config-I9759`,
+    moved here by `-I10687`). It narrows the control assertion below and
+    nothing else: an incumbent the pointer never left is reported by the
+    engine as `champion == incumbent` with `moved=False`, so a cycle that
+    HOLDS a substituted baseline would otherwise read as "the pointer landed
+    on a control arm". The assertion that actually matters — a control arm
+    never TAKES the pointer — is unchanged and is stated below in the form
+    that survives the exemption.
     """
     control_detail = assert_controls_ordered(control_ids, series_by_arm, slot=slot_spec.slot)
 
@@ -1075,9 +1086,20 @@ def grade_slot(
     # pointer from the arms it was given, so the exclusion is asserted here
     # rather than assumed — a control that reached the pointer would be a
     # look-ahead arm serving production.
-    if cycle.decision.champion is not None and cycle.decision.champion in set(control_ids.values()):
+    #
+    # Two cases, because `alpha-engine-config-I10687` makes one of them
+    # legitimate: a control arm that the pointer MOVED to is always the
+    # defect this raise exists to catch, and so is a control arm standing as
+    # champion when it was not the substituted baseline. A substituted
+    # baseline still holding the pointer is a NON-promotion — `moved` is
+    # false, `crucible.promote` writes nothing — and failing the whole grade
+    # run on it would make the first-champion path unusable for exactly the
+    # cold slot it exists for.
+    champion = cycle.decision.champion
+    is_control = champion is not None and champion in set(control_ids.values())
+    if is_control and (cycle.decision.moved or champion != baseline):
         raise GraderControlError(
-            f"the pointer landed on {cycle.decision.champion!r}, which is a control arm. "
+            f"the pointer landed on {champion!r}, which is a control arm. "
             "The planted control reads the realized forward return; serving it would "
             "be a look-ahead in production (§10.1)."
         )

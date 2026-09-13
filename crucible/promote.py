@@ -380,20 +380,15 @@ def run_promotion(
     library cold-starts (§9.1): it ranks the eligible arms and takes the top
     one with `status="bootstrap"`, on no evidence at all — the one pointer
     kind the §6 phase-3 clause rejects by name ("a bootstrap or an operator
-    revert is not a promotion the system won"). Before this issue, `promote`
-    substituted §10.1's null control as the baseline incumbent so the
-    engine's ordinary `decided`/`held` path ran instead
-    (`alpha-engine-config-I9759`) — that substitution happened INSIDE the
-    now-removed `run_cycle` call, and this module can no longer apply it: it
-    does not compute the cycle any more, `experiment.grade` does, and grade
-    does not yet apply it either (`crucible/slots/cycle.py::run_grade` calls
-    `run_cycle` with the real incumbent or `None`, unconditionally). A first
-    champion therefore cannot currently be won on evidence — refused loudly
-    by :func:`_write_pointer_if_moved`, rather than silently regressing to
-    the un-evidenced `bootstrap` pointer I9759 exists to prevent. Filed:
-    `alpha-engine-config-I10687` (move the substitution into
-    `run_grade`, the shared writer, so grade's own artifact never bootstraps
-    while a scored null control exists).
+    revert is not a promotion the system won"). The substitution that keeps a
+    cold slot off that path — §10.1's null control standing in as the
+    baseline incumbent (`alpha-engine-config-I9759`) — lives in
+    `crucible.slots.cycle.run_grade`, the one writer that computes the cycle
+    (`alpha-engine-config-I10687`). A first champion is therefore won on
+    evidence, or held with a stated reason, before `promote` ever reads the
+    artifact; this refusal is what remains for the case grade could not
+    substitute at all (no scored null control), and it fails loudly rather
+    than silently seating the un-evidenced pointer I9759 exists to prevent.
     """
     decision = cycle.decision
     age_held = age_held_leaders(spec, decision) if not decision.moved else ()
@@ -571,13 +566,12 @@ def _write_pointer_if_moved(
         # writer that quietly declined would leave the slot with no pointer
         # and an `ok` manifest, indistinguishable from a legitimate
         # verdict-backed non-promotion. The library cold-starts (§9.1) only
-        # when handed no incumbent at all; `experiment.grade` does not
-        # currently substitute §10.1's null control as a baseline the way
-        # `promote` used to before this issue (`alpha-engine-config-I9759`'s
-        # substitution lived INSIDE the `run_cycle` call this module no
-        # longer makes, and has no home in `run_grade` yet —
-        # `alpha-engine-config-I10687` tracks moving it there). Writing this
-        # pointer would seat a champion nothing won, with
+        # when handed no incumbent at all, and `experiment.grade` now
+        # substitutes §10.1's null control as the baseline incumbent for a
+        # slot with no champion (`alpha-engine-config-I9759`, moved into
+        # `crucible.slots.cycle.run_grade` by `-I10687`) — so reaching this
+        # branch means the slot had no scored null control either. Writing
+        # this pointer would seat a champion nothing won, with
         # `promotion_source: bootstrap` — the one value the §6 phase-3 gate
         # rejects by name — AND make every later promotion measure against
         # an arm nothing had ever compared.
@@ -586,10 +580,10 @@ def _write_pointer_if_moved(
             f"({decision.reason!r}), which would seat {decision.champion!r} as champion "
             "on no evidence at all and write `promotion_source: bootstrap` — a pointer "
             "the §6 phase-3 gate rejects by name as 'not a promotion the system won'. "
-            "`experiment.grade` does not yet substitute §10.1's null control as a "
-            "baseline incumbent for a slot with none; until it does, a cold slot's "
-            "first champion cannot currently be won on evidence, and this is refused "
-            "rather than silently seated."
+            "`experiment.grade` substitutes §10.1's null control as the baseline "
+            "incumbent for a slot with no champion, so a cycle that still bootstrapped "
+            "had no scored null control to stand in. Score the slot's controls and "
+            "re-grade; this is refused rather than silently seated."
         )
     if decision.status != "decided":
         return None

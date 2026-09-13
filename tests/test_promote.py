@@ -67,8 +67,20 @@ def series(arm_id: str, dates: list[str], value: float) -> ArmSeries:
     return ArmSeries(arm_id=arm_id, scores={d: value for d in dates})
 
 
-def _control_vetoed(spec, series_by_arm: dict, register: ArmRegister, preconditions: dict | None):
+def _control_vetoed(
+    spec,
+    series_by_arm: dict,
+    register: ArmRegister,
+    preconditions: dict | None,
+    *,
+    exempt: str | None = None,
+):
     """Add a FAILED `not_a_control_arm` precondition to every control arm.
+
+    ``exempt`` mirrors `run_grade`'s own exemption
+    (`alpha-engine-config-I10687`): the null control substituted as the
+    baseline incumbent for a slot with no champion has to be ELIGIBLE to be
+    that incumbent, or the engine forces the pointer off it.
 
     Mirrors `crucible/slots/cycle.py::run_grade`'s own injection (§10.1):
     grade applies this veto itself, independently of `crucible.promote`,
@@ -78,7 +90,9 @@ def _control_vetoed(spec, series_by_arm: dict, register: ArmRegister, preconditi
     stands in for this too, or a control-veto test here would be asserting
     against a cycle `run_grade` would never actually produce.
     """
-    controls = {arm for arm in series_by_arm if is_control_arm(spec, arm, register)}
+    controls = {
+        arm for arm in series_by_arm if arm != exempt and is_control_arm(spec, arm, register)
+    }
     if not controls:
         return preconditions
     merged: dict[str, tuple] = {arm: tuple(checks) for arm, checks in (preconditions or {}).items()}
@@ -106,6 +120,7 @@ def _cycle_for(
     series_by_arm: dict,
     *,
     incumbent: str | None = None,
+    baseline: str | None = None,
     preconditions: dict | None = None,
     training: dict | None = None,
 ):
@@ -128,8 +143,10 @@ def _cycle_for(
         as_of=as_of,
         register=register,
         series_by_arm=series_by_arm,
-        incumbent=incumbent,
-        preconditions=_control_vetoed(spec, series_by_arm, register, preconditions),
+        incumbent=incumbent if baseline is None else baseline,
+        preconditions=_control_vetoed(
+            spec, series_by_arm, register, preconditions, exempt=baseline
+        ),
         training=training,
     )
 
@@ -1390,24 +1407,86 @@ class TestArmSeriesKeyUsesTheSharedSeparator:
             assert segment in key, f"{key!r} does not route through arm_key_segment"
 
 
-class TestAFirstChampionCannotCurrentlyBeWon:
-    """`alpha-engine-config-I9759` gave a cold slot (no incumbent) a first
+class TestAFirstChampionIsWonOnEvidence:
+    """`alpha-engine-config-I9759` gave a slot with no champion a first
     champion won on evidence, by substituting §10.1's null control as the
     baseline incumbent BEFORE calling `run_cycle` — a step that lived inside
     `run_promotion`, which called `run_cycle` itself.
 
     `alpha-engine-config-I10679` removed that call: `run_promotion` now acts
-    on a cycle `experiment.grade` already computed, and grade does not (yet)
-    apply the substitution (`crucible/slots/cycle.py::run_grade` calls
-    `run_cycle` with the real incumbent or `None`, unconditionally — see
-    `alpha-engine-config-I10687`, filed to move it there). So a slot with no
-    incumbent now reaches `run_promotion` with a raw `bootstrap` decision,
-    and `run_promotion` refuses it rather than silently reintroducing the
-    un-evidenced pointer I9759 exists to prevent. This is a real, documented
-    regression until I10693 lands — these tests pin the REFUSAL, not a win.
+    on a cycle `experiment.grade` already computed, and the substitution went
+    with it — so for a window a cold slot reached `run_promotion` with a raw
+    `bootstrap` decision and was refused.
+
+    `alpha-engine-config-I10687` moved the substitution into
+    `crucible.slots.cycle.run_grade`, the one writer that computes the cycle.
+    These tests pin the WIN again — `_cycle_for(..., baseline=...)` stands in
+    for `run_grade`'s substitution here exactly as `_control_vetoed` stands
+    in for its control veto — and keep the bootstrap refusal pinned for the
+    one case grade cannot substitute: a slot with no scored null control.
     """
 
-    def test_a_cold_slot_bootstrap_cycle_is_refused_not_seated(self, tmp_path) -> None:
+    def _cold_slot(self, lead: float):
+        """A U slot with two real arms, a registered null control, and no
+        champion — the live shape of all four slots today."""
+        spec = get_slot("u")
+        dates = trading_days(40)
+        reg, ids = register_with(
+            "u",
+            ["real_a", "real_b", "control_null_u"],
+            dates[0],
+            control_names=frozenset({"control_null_u"}),
+        )
+        series_by_arm = {
+            ids["real_a"]: series(ids["real_a"], dates, 0.0),
+            ids["real_b"]: series(ids["real_b"], dates, lead),
+            ids["control_null_u"]: series(ids["control_null_u"], dates, 0.0),
+        }
+        return spec, dates, reg, ids, series_by_arm
+
+    def test_a_cold_slot_wins_its_first_champion_on_evidence(self, tmp_path) -> None:
+        """The whole chain: substitute, grade, promote. The decision is
+        `decided` (never `bootstrap`), the champion is a REAL arm measured
+        against the null control, and the seated pointer's
+        `promotion_source` is `evidence` — the value the §6 phase-3 clause
+        accepts."""
+        spec, dates, reg, ids, series_by_arm = self._cold_slot(0.045)
+        baseline = ids["control_null_u"]
+        cycle = _cycle_for(spec, dates[-1], reg, series_by_arm, incumbent=None, baseline=baseline)
+        assert cycle.decision.incumbent == baseline
+        assert cycle.decision.status == "decided"
+        assert cycle.decision.champion == ids["real_b"]
+        assert cycle.decision.moved is True
+
+        store = LocalStore(tmp_path)
+        result = run_promotion(spec=spec, register=reg, cycle=cycle, store=store, code_sha=CODE_SHA)
+        assert result.pointer is not None
+        assert result.pointer.arm_id == ids["real_b"]
+        assert result.pointer.promotion_source == "evidence"
+        assert result.pointer.promotion_source in PROMOTION_SOURCES
+
+    def test_the_baseline_is_eligible_but_never_itself_seated(self, tmp_path) -> None:
+        """The exemption makes the baseline ELIGIBLE — it is absent from
+        `ineligible` while the planted control would not be — and does NOT
+        make it promotable: with no real arm leading it, the cycle HOLDS,
+        `moved` is false, and `run_promotion` writes no pointer at all."""
+        spec, dates, reg, ids, series_by_arm = self._cold_slot(0.0)
+        baseline = ids["control_null_u"]
+        cycle = _cycle_for(spec, dates[-1], reg, series_by_arm, incumbent=None, baseline=baseline)
+        assert baseline not in cycle.decision.ineligible
+        assert cycle.decision.status == "held"
+        assert cycle.decision.moved is False
+        assert cycle.decision.reason
+
+        store = LocalStore(tmp_path)
+        result = run_promotion(spec=spec, register=reg, cycle=cycle, store=store, code_sha=CODE_SHA)
+        assert result.pointer is None
+
+    def test_a_slot_with_no_scored_null_control_is_still_refused(self, tmp_path) -> None:
+        """The bootstrap refusal is not dead code: `run_grade` substitutes
+        only what it has, and a slot with no scored null control still
+        reaches `promote` with a §9.1 cold start, which is refused rather
+        than seated."""
         spec = get_slot("u")
         dates = trading_days(40)
         reg, ids = register_with("u", ["real_a", "real_b"], dates[0])
@@ -1416,10 +1495,7 @@ class TestAFirstChampionCannotCurrentlyBeWon:
             ids["real_b"]: series(ids["real_b"], dates, 0.045),
         }
         cycle = _cycle_for(spec, dates[-1], reg, series_by_arm, incumbent=None)
-        assert cycle.decision.status == "bootstrap", (
-            "sanity: a raw `run_cycle` with no incumbent and no baseline "
-            "substitution takes the library's §9.1 cold start"
-        )
+        assert cycle.decision.status == "bootstrap"
         store = LocalStore(tmp_path)
         with pytest.raises(PromotionRefused, match="bootstrap"):
             run_promotion(spec=spec, register=reg, cycle=cycle, store=store, code_sha=CODE_SHA)
