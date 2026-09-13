@@ -31,6 +31,7 @@ import json
 import os
 import re
 import shlex
+import zipfile
 from calendar import monthrange
 from collections.abc import Callable, Iterable
 from contextlib import redirect_stderr
@@ -57,8 +58,12 @@ from crucible.documents import DocumentRead, read_manifests_under
 from crucible.documents import read_path_document as _read_path_document
 from crucible.documents import read_store_document as _read_store_document
 from crucible.holdout import (
+    HOLDOUT_JOB,
+    RULING_REFERENCE_PATTERN,
     HoldoutAbsentError,
     HoldoutError,
+    UnsealRulingRequiredError,
+    assert_ruling_reference,
     read_sealed_holdout,
     unseal_records,
 )
@@ -774,6 +779,155 @@ def _fault_excused_run_ids(store: Store) -> tuple[frozenset[str] | None, str | N
     return frozenset(run_ids), None
 
 
+#: The job whose manifest records WHICH RELEASE ran a trading day's arc. Its
+#: `release_sha` is written by the runner from the release the process is
+#: actually executing, so it is the day's own provenance rather than a
+#: statement about the tree the grader happens to be running in.
+ARC_MANIFEST_JOB = "weekly"
+
+#: Where a published wheel keeps the registry it shipped with. A wheel is
+#: content-addressed by git sha, published once by the deploy identity and
+#: immutability-checked on write (`crucible.release.assert_immutable_write`),
+#: so what it declares about a release cannot be edited afterwards.
+_RELEASE_REGISTRY_MEMBER = "crucible/components.yaml"
+
+
+def _arc_jobs_declared_by(raw: bytes) -> frozenset[str]:
+    """The ACTIVE `dispatch: arc` job names a `components.yaml` declares.
+
+    Deliberately NOT `crucible.components.load_registry`. That loader
+    validates every row against TODAY's `Component` — a historical registry
+    predating a since-required field (`Deadline.cadence` is the live example)
+    raises there, and a gate clause that cannot read a three-week-old release
+    would be a reader defeated by the very history it exists to consult. The
+    question asked here is narrow — WAS this job an arc stage in this release
+    — so only the two fields that answer it are read.
+    """
+    import yaml  # noqa: PLC0415 - only this reader needs it
+
+    document = yaml.safe_load(raw) or {}
+    rows = document.get("components") or {}
+    items = rows.items() if isinstance(rows, dict) else ((r.get("name"), r) for r in rows)
+    return frozenset(
+        str(name)
+        for name, row in items
+        if name
+        and (row or {}).get("dispatch") == "arc"
+        and (row or {}).get("lifecycle") == "ACTIVE"
+    )
+
+
+@dataclass
+class _ArcRegistryHistory:
+    """Which stages the arc HAD on a given trading day, read from that day's
+    own release (`alpha-engine-config-I10478`).
+
+    `_clause_arc_runs_ok` used to grade every past day against the registry
+    in the grader's own process, so merging a new `dispatch: arc` row turned
+    days that closed before the row existed retroactively red — with no
+    artifact having changed, attributed to days nobody touched, by a commit
+    that named neither. Adding `iac.conformance` took `replays_ok` from MET
+    to NOT MET over four Saturdays that way.
+
+    **The requirement comes from the provenance of the day being graded.**
+    The day's arc manifest names the `release_sha` that ran it; that
+    release's published wheel carries the `components.yaml` that release
+    shipped; a stage is required of the day only if THAT file declared it.
+
+    Why this source and not the two cheaper ones:
+
+    * a hand-written `since:` field per row is a date the same PR that adds
+      the row gets to choose. Backdating it is a one-line edit no artifact
+      contradicts, and one entry per row excusing days is a suppression
+      collection wearing a schema (repo rule 4).
+    * "the stage's first manifest" is circular in the worst direction: a
+      stage that has NEVER run has no first manifest, so it would be excused
+      from every day forever — the precise absence this clause exists to
+      catch.
+    * a release wheel is content-addressed by git sha, published by the
+      deploy identity, immutability-checked on write and retained; and the
+      manifest's `release_sha` is written by the runner from the release the
+      process is actually executing. Backdating either means forging an S3
+      object under the deploy role, which CloudTrail attributes.
+
+    **It only ever narrows a MISSING finding, and only when it can prove the
+    narrowing.** A day with no arc manifest at all is not excused from
+    anything — there is no release to consult, and "no arc ran" is the
+    finding, not a reason to ask for fewer stages. A lookup that fails to
+    read is likewise not an excuse: the miss stands and the read failure is
+    reported beside it. Both defaults over-require, which keeps the clause
+    red for longer; the opposite would let an unreadable release clear a
+    phase.
+
+    Consulted lazily, so a window with no missing manifest costs no reads at
+    all — and the live arcs, which are complete and run under a release
+    declaring every current stage, are graded exactly as before.
+    """
+
+    store: Store
+    _by_day: dict[dt.date, tuple[frozenset[str] | None, str | None]] = field(default_factory=dict)
+    _by_sha: dict[str, tuple[frozenset[str] | None, str | None]] = field(default_factory=dict)
+
+    def declared_on(self, day: dt.date) -> tuple[frozenset[str] | None, str | None]:
+        """``(jobs, problem)`` for ``day``'s own release.
+
+        ``jobs`` is ``None`` when the day's arc set cannot be established at
+        all — no arc manifest, or a lookup that failed — and the caller then
+        requires every currently-registered stage. ``problem`` is non-None
+        only when something could not be READ, so the caller can report it
+        beside the finding it did not suppress.
+        """
+        if day not in self._by_day:
+            self._by_day[day] = self._resolve(day)
+        return self._by_day[day]
+
+    def _resolve(self, day: dt.date) -> tuple[frozenset[str] | None, str | None]:
+        key = manifest_key(ARC_MANIFEST_JOB, day.isoformat())
+        read = _read_store_document(self.store, key)
+        if read.problem is not None:
+            return None, read.problem
+        if read.absent:
+            # No arc ran. Nothing to excuse, and nothing unread either.
+            return None, None
+        sha = str((read.document or {}).get("release_sha") or "").strip()
+        if not sha:
+            return None, (
+                f"{key} names no `release_sha`, so the arc that day was graded against "
+                "cannot be established from the day's own provenance"
+            )
+        return self._for_sha(sha)
+
+    def _for_sha(self, sha: str) -> tuple[frozenset[str] | None, str | None]:
+        if sha not in self._by_sha:
+            self._by_sha[sha] = self._read_release(sha)
+        return self._by_sha[sha]
+
+    def _read_release(self, sha: str) -> tuple[frozenset[str] | None, str | None]:
+        from crucible.release import published_wheel_key  # noqa: PLC0415 - cycle
+
+        try:
+            wheel = published_wheel_key(self.store, sha)
+        except Exception as exc:  # noqa: BLE001 - reported, never suppressed
+            return None, (
+                f"release {sha} could not be resolved to a published wheel: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        read = _read_store_bytes(self.store, wheel)
+        if read.problem is not None:
+            return None, read.problem
+        if read.absent:
+            return None, f"{wheel} is absent, so what that release declared cannot be read"
+        try:
+            with zipfile.ZipFile(io.BytesIO(read.raw or b"")) as archive:
+                raw = archive.read(_RELEASE_REGISTRY_MEMBER)
+            return _arc_jobs_declared_by(raw), None
+        except Exception as exc:  # noqa: BLE001 - reported, never suppressed
+            return None, (
+                f"{wheel} carries no readable {_RELEASE_REGISTRY_MEMBER}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+
 def _clause_arc_runs_ok(
     store: Store, window: list[dt.date], registry: dict[str, Component]
 ) -> Clause:
@@ -781,16 +935,20 @@ def _clause_arc_runs_ok(
     # counted against this clause (alpha-engine-config-I10322) -- see
     # `_fault_excused_run_ids` below.
     requirement = (
-        "every stage of the weekly arc wrote a manifest with status `ok` for each "
-        "trading day in the window, or its failure is excused by a fault-injection "
-        "record naming that exact run_id"
+        "every stage the arc CARRIED on each trading day in the window wrote a manifest "
+        "with status `ok`, or its failure is excused by a fault-injection record naming "
+        "that exact run_id. A stage is required of a day only when the release that ran "
+        "that day's arc declared it — read from the day's own manifest and that release's "
+        "published wheel, never from the registry the grader happens to be running"
     )
     missing: list[str] = []
     malformed: list[str] = []
     unmeasurable: list[str] = []
     failed: list[str] = []
     excused: list[str] = []
+    unregistered: list[str] = []
     evidence: list[str] = []
+    history = _ArcRegistryHistory(store)
     excused_run_ids, excused_problem = _fault_excused_run_ids(store)
     if excused_problem is not None:
         unmeasurable.append(excused_problem)
@@ -803,6 +961,17 @@ def _clause_arc_runs_ok(
                 (unmeasurable if read.access_problem else malformed).append(read.problem)
                 continue
             if read.absent:
+                declared, why = history.declared_on(day)
+                if why is not None and why not in unmeasurable:
+                    # NOT a swallow: the miss below still stands. The read
+                    # failure is carried so a reader can tell "we could not
+                    # consult the day's release" from "the stage was there".
+                    # Deduped: one unreadable release is one problem, not one
+                    # per stage that asked about it.
+                    unmeasurable.append(why)
+                elif declared is not None and stage.job not in declared:
+                    unregistered.append(f"{stage.label}@{day.isoformat()}")
+                    continue
                 missing.append(f"{stage.label}@{day.isoformat()}")
                 continue
             document = read.document or {}
@@ -828,6 +997,8 @@ def _clause_arc_runs_ok(
             parts.append(f"{len(failed)} failed ({'; '.join(failed[:2])})")
         if excused:
             parts.append(f"{len(excused)} excused by a fault record: {'; '.join(excused[:2])}")
+        if unregistered:
+            parts.append(_unregistered_note(unregistered))
         content_gap = bool(missing or malformed or failed)
         return Clause(
             "arc_runs_ok",
@@ -843,7 +1014,25 @@ def _clause_arc_runs_ok(
     detail = f"{len(evidence)} stage manifests over {len(window)} trading days, all ok"
     if excused:
         detail += f" ({len(excused)} excused by a matching fault record: {'; '.join(excused[:2])})"
+    if unregistered:
+        detail += f"; {_unregistered_note(unregistered)}"
     return Clause("arc_runs_ok", requirement, True, detail, tuple(evidence))
+
+
+def _unregistered_note(unregistered: list[str]) -> str:
+    """How a narrowed requirement is REPORTED — always, and named one by one.
+
+    A requirement the grader narrowed is a fact about the reading, not
+    housekeeping: a clause that quietly asked for fewer stages than the
+    registry lists is indistinguishable from one that graded them and found
+    them present. So every excluded stage/day pair is stated with the reason,
+    whether the clause reads MET or UNMET.
+    """
+    shown = ", ".join(unregistered[:4]) + ("..." if len(unregistered) > 4 else "")
+    return (
+        f"{len(unregistered)} not required (the release that ran that day's arc declared "
+        f"no such stage): {shown}"
+    )
 
 
 def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
@@ -3858,23 +4047,116 @@ README_PATH = Path(__file__).resolve().parent.parent / "README.md"
 RUNBOOK_SECTION = "## Runbook"
 RUNBOOK_PROCEDURE_PREFIX = "### "
 
-#: The five procedures `alpha-engine-config-I9758` names, and whether each is
-#: RESERVED — documented as a deliberate non-capability rather than as a
-#: command.
+#: The issue that re-stated how a RESERVED runbook procedure is graded. Its
+#: number is also the well-formed reference :meth:`ReservedMechanism.problem`
+#: hands the refusal to prove the refusal is a FILTER rather than a blanket
+#: raise. Nothing is ever written under it; it is a probe value.
+UNSEAL_RESERVATION_ISSUE = 10599
+
+
+@dataclass(frozen=True)
+class ReservedMechanism:
+    """How a RESERVED runbook procedure is graded — the mechanism's REFUSAL.
+
+    Reserved-ness used to be graded as an ABSENCE: the section named no
+    command and the CLI carried no such job. That predicate was written when
+    no unsealing mechanism existed, and it said reserved-ness IS the absence
+    of a capability. It is not. `crucible holdout --unseal` exists; it is
+    reserved because it **refuses without a ruling reference** and files an
+    audit record naming the ruling — the reservation is enforced at the call,
+    not by the capability being missing. Grading the absence would have gone
+    red the day someone correctly documented the ruled command, which is the
+    opposite of what this clause should reward.
+
+    So a reserved procedure is graded as three things, and refuses in every
+    direction:
+
+    * the CLI **carries** ``job`` — a reservation nobody can reach is a
+      missing capability wearing a reservation's clothes;
+    * every command the section publishes parses and names **that job** — a
+      reserved procedure names its own mechanism and nothing else, so the
+      runbook cannot point an operator at some other command instead;
+    * ``refuse`` **rejects** every malformed authorisation in
+      :data:`_UNRULED` and **accepts** a well-formed reference. Both halves
+      are graded: a mechanism that refuses everything is broken, not
+      reserved, and a clause satisfied by ``raise`` unconditionally would be
+      satisfied by a mechanism nobody can use.
+
+    ``refuse`` is injectable so the grader itself has a self-test — a
+    detector nobody has made fail is a detector nobody knows works. See
+    `tests/test_gate_phase2_coverage.py`.
+    """
+
+    job: str
+    refuse: Callable[..., str]
+
+    def problem(self) -> str | None:
+        """``None`` when the mechanism is genuinely reserved, else why not."""
+        if not _cli_carries_job(self.job):
+            return (
+                f"documented as reserved, but the CLI carries no {self.job!r} job, so the "
+                "mechanism the section names cannot be reached at all"
+            )
+        action = f"`crucible {self.job}`"
+        for candidate, description in _UNRULED:
+            try:
+                self.refuse(candidate, action=action)
+            except UnsealRulingRequiredError:
+                continue
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                return (
+                    f"the reserved mechanism raised {type(exc).__name__} rather than its own "
+                    f"refusal for {description} ({candidate!r}): {exc}"
+                )
+            return (
+                f"the reserved mechanism ACCEPTED {description} ({candidate!r}). A reserved "
+                "action that proceeds without a ruling has not been reserved — it has been "
+                f"announced. Expected {RULING_REFERENCE_PATTERN}"
+            )
+        ruled = f"alpha-engine-config-I{UNSEAL_RESERVATION_ISSUE}"
+        try:
+            accepted = self.refuse(ruled, action=action)
+        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+            return (
+                f"the reserved mechanism refused the well-formed ruling reference {ruled!r} "
+                f"with {type(exc).__name__}: {exc}. A mechanism that refuses everything is "
+                "broken, not reserved"
+            )
+        if accepted != ruled:
+            return (
+                f"the reserved mechanism returned {accepted!r} for the ruling {ruled!r}; the "
+                "reference it records must be the one it was given"
+            )
+        return None
+
+
+#: Authorisations a reserved mechanism must REFUSE, with what each one is.
+#: Not a list of everything malformed — a list of the shapes someone reaches
+#: for when they want the reserved action and have no ruling: nothing at all,
+#: an empty string, a bare issue number, and another repository's issue.
+_UNRULED: tuple[tuple[str | None, str], ...] = (
+    (None, "no ruling at all"),
+    ("", "an empty ruling"),
+    ("9758", "a bare issue number"),
+    ("nousergon/crucible#231", "another repository's issue"),
+)
+
+#: The five procedures `alpha-engine-config-I9758` names, and the
+#: :class:`ReservedMechanism` grading each RESERVED one — ``None`` for an
+#: ordinary procedure, whose commands only have to parse.
 #:
 #: `unseal` is reserved by plan §9.4: unsealing is a human ruling, never an
-#: automated action, and the README says so explicitly. Grading it as
-#: "must contain a command that parses" would mean the runbook passes this
-#: clause only by growing the exact CLI surface the plan forbids, so a
-#: reserved procedure is graded the other way round: it must name NO command
-#: and the CLI must carry no such job. The clause therefore refuses in both
-#: directions — a missing procedure and an invented one.
-RUNBOOK_PROCEDURES: tuple[tuple[str, bool], ...] = (
-    ("rerun", False),
-    ("replay", False),
-    ("roll back", False),
-    ("heal", False),
-    ("unseal", True),
+#: automated action. Since `alpha-engine-config-I10502` the mechanism EXISTS
+#: (`crucible holdout --unseal`), so reserved-ness is no longer the absence
+#: of a command — it is the refusal at the call. See
+#: :class:`ReservedMechanism` for what that grades and why the old predicate
+#: graded the wrong property.
+RUNBOOK_PROCEDURES: tuple[tuple[str, ReservedMechanism | None], ...] = (
+    ("rerun", None),
+    ("replay", None),
+    ("roll back", None),
+    ("heal", None),
+    ("unseal", ReservedMechanism(job=HOLDOUT_JOB, refuse=assert_ruling_reference)),
 )
 
 #: One `crucible <job> [args]` command line inside the runbook, with or
@@ -5718,14 +6000,17 @@ def _clause_runbook_in_readme() -> Clause:
     to `crucible.cli.build_parser`, and a renamed flag turns this clause red
     rather than an operator's terminal.
 
-    **A reserved procedure is graded the other way round.** `unseal` is a
-    human ruling and never an automated action (plan §9.4); the README says
-    so and names no command. Requiring "a command that parses" from every
-    procedure would mean this clause could only go green if someone built the
-    exact CLI surface the plan forbids. So a reserved procedure must name NO
-    command AND the CLI must carry no such job — the clause refuses a missing
-    procedure and an invented one with equal force (see
-    :data:`RUNBOOK_PROCEDURES`).
+    **A reserved procedure is graded on its REFUSAL, not on its absence**
+    (`alpha-engine-config-I10599`). `unseal` is a human ruling and never an
+    automated action (plan §9.4), but since `alpha-engine-config-I10502` the
+    mechanism exists: `crucible holdout --unseal` refuses without a ruling
+    reference and files an audit record naming the ruling. The old predicate
+    — "names no command and the CLI carries no such job" — graded the wrong
+    property, and would have gone red the day someone correctly documented
+    the ruled command. A reserved procedure now has to publish a parsing
+    command naming its own mechanism AND that mechanism has to refuse an
+    unruled call; see :class:`ReservedMechanism` for every direction it
+    refuses in.
 
     Read from the repository, not the store, for :data:`ACCEPTANCE_RATCHET_PATH`'s
     reason: the runbook's existence is a property of the checkout and git is its
@@ -5741,7 +6026,8 @@ def _clause_runbook_in_readme() -> Clause:
         + " section naming "
         + ", ".join(verb for verb, _reserved in RUNBOOK_PROCEDURES)
         + "; every `crucible ...` command it publishes parses against the real CLI, and "
-        "each reserved procedure names no command and no such job exists"
+        "each reserved procedure names its own mechanism, which refuses to act without a "
+        "ruling reference"
     )
     evidence = (str(README_PATH),)
     if not README_PATH.is_file():
@@ -5774,19 +6060,6 @@ def _clause_runbook_in_readme() -> Clause:
             problems.append(f"{verb}: no `{RUNBOOK_PROCEDURE_PREFIX}{verb}` section")
             continue
         commands = _RUNBOOK_COMMAND_RE.findall(body)
-        if reserved:
-            if commands:
-                problems.append(
-                    f"{verb}: reserved (plan §9.4) but publishes "
-                    f"{len(commands)} command(s): {commands[0][0]}"
-                )
-            elif _cli_carries_job(verb):
-                problems.append(
-                    f"{verb}: documented as reserved, but the CLI carries a {verb!r} job"
-                )
-            else:
-                parts.append(f"{verb}: reserved, no command, no such job")
-            continue
         if not commands:
             problems.append(f"{verb}: the section publishes no `crucible ...` command")
             continue
@@ -5797,8 +6070,27 @@ def _clause_runbook_in_readme() -> Clause:
         ]
         if broken:
             problems.extend(f"{verb}: {b}" for b in broken)
-        else:
+            continue
+        if reserved is None:
             parts.append(f"{verb}: {len(commands)} command(s), all parse")
+            continue
+        stray = sorted({job for job, _rest in commands if job != reserved.job})
+        if stray:
+            problems.append(
+                f"{verb}: reserved, but the section publishes {stray} beside the "
+                f"{reserved.job!r} job the reservation is enforced in. A reserved procedure "
+                "names its own mechanism and nothing else — a second command here is one "
+                "an operator reaches for instead of the ruled path"
+            )
+            continue
+        problem = reserved.problem()
+        if problem is not None:
+            problems.append(f"{verb}: {problem}")
+            continue
+        parts.append(
+            f"{verb}: reserved, {len(commands)} command(s), all parse; "
+            f"`crucible {reserved.job}` refuses an unruled call"
+        )
     if problems:
         return Clause(name, requirement, False, "; ".join(problems), evidence)
     return Clause(name, requirement, True, "; ".join(parts), evidence)
