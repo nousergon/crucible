@@ -124,6 +124,7 @@ __all__ = [
     "ClosedPathRow",
     "ComponentRow",
     "ComponentsDocument",
+    "CostSinkRow",
     "DeadlineRow",
     "DeclaredUniverseDocument",
     "DispatchRecordDocument",
@@ -894,6 +895,42 @@ class MetricRecordRow(BaseModel):
                 "safely render or compare."
             )
         return self
+
+
+# ── alpha-engine-config-I10682: the cost-sink row ──────────────────────────
+
+
+class CostSinkRow(BaseModel):
+    """One row of `krepis.cost_sink.S3JsonlCostSink`'s per-call-site JSONL,
+    read at `crucible.llm._cost_sink_row_usd` — reconciling a run's own
+    recorded LLM spend (`llm_calls[].usd` on the run manifest) against what
+    the cost sink independently recorded for the same `run_id`.
+
+    `extra="allow"`, matching `MetricRecordRow`'s precedent (`alpha-engine-
+    config-I9847` wave 2): this artifact is written by `krepis`/
+    `nousergon_lib`, not a `crucible` producer (`alpha-engine-config-I10682`)
+    — forbidding unknown fields here would refuse a row the moment the
+    library adds one this reader has no opinion about, a different defect
+    from the one this closes.
+
+    `cost_usd` stays `Any`, deliberately not narrowed to `float | None`: the
+    reader's OWN check — a row with no numeric `cost_usd` raises, since
+    `krepis.cost.record_llm_call` writes `cost_usd: None` for
+    `cost_source == "usage_unreported"` and summing `None` as zero would
+    understate `sink_usd` by exactly the amount a mismatch is supposed to
+    catch — must still see a `bool` as *not* numeric; pydantic's `float`
+    coercion treats `True`/`False` as `1.0`/`0.0` and would silently defeat
+    that check. This model closes the boundary that existed before it (a bare
+    `json.loads(line)` whose only failure mode was "not JSON at all" — a
+    non-object row, e.g. a JSON list or scalar, reached `row.get(...)` and
+    raised an unnamed `AttributeError` three frames from the line that broke)
+    without moving the numeric-vs-placebo judgement, which is this
+    CONSUMER's, onto the document's own shape.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    cost_usd: Any = None
 
 
 def _run_manifest_v2_json_schema_extra(schema: dict[str, object]) -> None:
