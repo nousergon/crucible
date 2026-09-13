@@ -55,7 +55,7 @@ from nousergon_lib.arena import (
 from nousergon_lib.arena.arms import EVENT_RETIRED, ArmEvent, ImmutableArmError
 from nousergon_lib.arena.engine import run_cycle
 
-from crucible.arena_io import write_arena_cycle
+from crucible.arena_io import read_arena_cycle, write_arena_cycle
 from crucible.calendar import TRADING_DAYS_PER_WEEK, assert_trading_day
 from crucible.champion import (
     PROMOTION_SOURCES,
@@ -66,6 +66,7 @@ from crucible.champion import (
 )
 from crucible.documents import load_document_bytes, load_store_document
 from crucible.keys import (
+    arena_cycle_key,
     arm_register_key,
     arm_series_key,
     champion_key,
@@ -74,15 +75,17 @@ from crucible.keys import (
 )
 from crucible.keys import manifest_key as _promote_manifest_key
 from crucible.models import EXPERIMENT_EVENT_ROW_ADAPTER, RetirementLogRow
-from crucible.slots import EVIDENCE_POINT, SlotSpec, is_control_arm
+from crucible.slots import EVIDENCE_POINT, SlotSpec, arm_name, is_control_arm
 from crucible.store import ETAG_ABSENT, Store
 
 __all__ = [
+    "BASELINE_CONTROL_KIND",
     "PROMOTION_SOURCES",
     "PromotionRefused",
     "PromotionResult",
     "SlotInputs",
     "age_held_leaders",
+    "baseline_control_arm",
     # Re-exported from `crucible.keys`, which is the single producer of every
     # key shape (plan §4.12). They appear here because a promote consumer
     # imports them from this module, NOT because promote.py also declares
@@ -92,6 +95,7 @@ __all__ = [
     "arm_register_key",
     "arm_series_key",
     "experiments_key",
+    "graded_preconditions",
     "load_slot_inputs",
     "paired_days_required",
     "retirement_log_key",
@@ -158,6 +162,94 @@ def paired_days_required(spec: SlotSpec) -> int:
     (`alpha-engine-config-I10547`).
     """
     return spec.promote_min_weeks * TRADING_DAYS_PER_WEEK
+
+
+#: §10.1's control kind that stands in for an ABSENT incumbent
+#: (`alpha-engine-config-I9759`). The null control is pure noise by
+#: construction, so "beats the null control on the configured evidence over
+#: `promote_min_weeks` paired weeks" is the same statement the incumbent
+#: comparison makes, against the only baseline a slot with no champion has.
+#: The PLANTED control is never this: it reads next-period returns, so an arm
+#: that merely beat it would still be a look-ahead-relative measurement.
+BASELINE_CONTROL_KIND = "null"
+
+
+def baseline_control_arm(spec: SlotSpec, series_by_arm: dict[str, ArmSeries]) -> str | None:
+    """The scored :data:`BASELINE_CONTROL_KIND` control arm of ``spec``, if any.
+
+    Matched on the arm's NAME component rather than on the register's
+    ``control`` flag, because the flag says *whether* an arm is a control and
+    this needs *which kind* — the register records the first and not the
+    second. :func:`crucible.slots.arm_name` refuses a malformed id rather
+    than guessing, which is the behaviour this wants: an id whose name cannot
+    be read must not silently fail to be recognised as the baseline.
+
+    ``None`` when the slot registers no null control or it was not scored
+    this cycle. The caller RAISES on that rather than falling back — see
+    :func:`run_promotion`.
+    """
+    names = {c.arm_id for c in spec.control_arms if c.kind == BASELINE_CONTROL_KIND}
+    if not names:
+        return None
+    for arm_id in sorted(series_by_arm):
+        if arm_name(arm_id) in names:
+            return arm_id
+    return None
+
+
+def graded_preconditions(
+    store: Store, slot: str, as_of: str
+) -> dict[str, tuple[ServingPrecondition, ...]]:
+    """The serving preconditions `experiment.grade` evaluated, rehydrated.
+
+    **`promote` must never decide on a different eligibility set than the
+    grade it follows.** Both jobs call `run_cycle`, and until
+    `alpha-engine-config-I9759` promote called it with `preconditions=None`:
+    the M slot's §5.3 behavioural veto and the S slot's contamination
+    attestation — both evaluated in `experiment.grade`, both expressible only
+    there, since they need the fitted model and the constructed book — simply
+    did not exist for the job that moves the pointer. Grade would refuse to
+    serve an arm and promote would serve it, from the same series, in the
+    same hour. That was survivable only while `promote` was dispatched by
+    nothing; it becomes a weekly event the moment promote is an arc stage.
+
+    Read off the cycle artifact's own `decision.ineligible`, which is the
+    library's serialisation of exactly these objects. Only the FAILED checks
+    are carried, which is sufficient and not a narrowing: `_eligible` is
+    `all(p.passed ...)`, so an arm absent from `ineligible` is an arm with
+    nothing against it either way.
+
+    Raises :class:`PromotionRefused` when the graded cycle is absent. The arc
+    runs `experiment.grade[{slot}]` at 14:00 and `promote[{slot}]` at 15:00,
+    so an absent cycle means grade did not run or did not finish — and a
+    promotion decided without it would be decided with every slot-evaluated
+    veto silently empty.
+    """
+    try:
+        document = read_arena_cycle(store, slot, as_of)
+    except KeyError as exc:
+        raise PromotionRefused(
+            f"slot {slot!r} has no graded arena cycle at {arena_cycle_key(slot, as_of)} for "
+            f"{as_of}. `promote` acts on the eligibility `experiment.grade` evaluated — "
+            "the M behavioural veto and the S contamination attestation exist nowhere "
+            "else — so deciding the pointer without it would decide it with every "
+            "slot-evaluated veto empty. Run `experiment.grade --slot "
+            f"{slot} --date {as_of}` first; the weekly arc already does, at 14:00."
+        ) from exc
+    ineligible = document.decision.get("ineligible") or {}
+    rehydrated: dict[str, tuple[ServingPrecondition, ...]] = {}
+    for arm_id, checks in ineligible.items():
+        failed = tuple(
+            ServingPrecondition(
+                name=str(check.get("name") or "unnamed"),
+                passed=bool(check.get("passed")),
+                reason=str(check.get("reason") or ""),
+            )
+            for check in checks or ()
+        )
+        if failed:
+            rehydrated[arm_id] = failed
+    return rehydrated
 
 
 @dataclass(frozen=True)
@@ -321,13 +413,48 @@ def run_promotion(
     """
     assert_trading_day(as_of, context=f"promote --slot {spec.slot} as_of")
 
+    # `alpha-engine-config-I9759` — THE FIRST CHAMPION.
+    #
+    # With no incumbent the library cold-starts (§9.1): it ranks the eligible
+    # arms and takes the top one with `status="bootstrap"`, on no evidence at
+    # all. That pointer is written with `promotion_source="bootstrap"`, which
+    # the §6 phase-3 clause rejects by name — "a bootstrap or an operator
+    # revert is not a promotion the system won". So a slot with no champion
+    # could never win one: its FIRST pointer was, by construction, the one
+    # kind of pointer that does not count, and every subsequent promotion
+    # would be measured against an arm nothing had ever compared.
+    #
+    # The fix is not a new promotion source. §10.1 already registers a NULL
+    # control in every slot, every cycle, precisely so that "is this arm
+    # better than noise?" is a measured question — so with no incumbent the
+    # null control STANDS IN as the baseline and the engine's ordinary
+    # `decided`/`held` path runs unchanged: the same paired window, the same
+    # `promote_min_weeks`, the same `promote_evidence`. A first champion is
+    # then won on evidence or not won at all, and a cycle that wins nothing
+    # files a `held` decision with a stated reason — the verdict-backed
+    # non-promotion the same clause accepts.
+    #
+    # The baseline is exempted from the control veto below (it has to be
+    # eligible to be the incumbent) and cannot itself be promoted: the engine
+    # never compares the incumbent to itself, so `moved` is false whenever the
+    # baseline "wins", and `_write_pointer_if_moved` refuses a control outright.
+    # No pre-check that a baseline EXISTS: a slot with nothing scored yet is
+    # not an error, it is an empty slot, and the engine already answers it
+    # with `unservable` and a stated reason — a verdict-backed non-promotion,
+    # which is a legitimate outcome and writes no pointer. The refusal
+    # belongs at the one place a champion would otherwise be SEATED on no
+    # evidence, which is `_write_pointer_if_moved`'s `bootstrap` branch.
+    baseline = baseline_control_arm(spec, series_by_arm) if incumbent is None else None
+
     cycle = run_cycle(
         config=spec.arena,
         as_of=as_of,
         register=register,
         series_by_arm=series_by_arm,
-        incumbent=incumbent,
-        preconditions=_with_control_vetoes(spec, series_by_arm, preconditions, register),
+        incumbent=incumbent if baseline is None else baseline,
+        preconditions=_with_control_vetoes(
+            spec, series_by_arm, preconditions, register, exempt=baseline
+        ),
         training=training,
     )
 
@@ -358,6 +485,7 @@ def run_promotion(
             store=store,
             spec=spec,
             cycle=cycle,
+            baseline=baseline,
             expected=expected,
             manifest_key=manifest_key,
             run_id=run_id,
@@ -439,7 +567,12 @@ def revert_champion(
         run_id=run_id or _placeholder_run_id(),
         code_sha=_require_code_sha(code_sha, slot=spec.slot),
         promotion_source="operator_bootstrap",
-        manifest_key=manifest_key or _promote_manifest_key("promote", as_of),
+        # `alpha-engine-config-I9759`: slot-discriminated, like the key the
+        # CLI actually passes. Four slots write `promote` on one trading day,
+        # so the bare shape names a manifest belonging to whichever slot ran
+        # last and `explain` walks the promotion back to the wrong run.
+        manifest_key=manifest_key
+        or _promote_manifest_key("promote", as_of, discriminator=spec.slot),
         evidence={
             "operator": operator,
             "reason": reason,
@@ -484,6 +617,8 @@ def _with_control_vetoes(
     series_by_arm: dict[str, ArmSeries],
     preconditions: dict[str, tuple[ServingPrecondition, ...]] | None,
     register: ArmRegister,
+    *,
+    exempt: str | None = None,
 ) -> dict[str, tuple[ServingPrecondition, ...]] | None:
     """Add a FAILED serving precondition to every control arm being scored.
 
@@ -507,8 +642,20 @@ def _with_control_vetoes(
     so the veto is register-backed rather than the name-only fallback
     (`alpha-engine-config-I10044`) — a filed non-control recipe whose
     generated name collides with a control's name must not be vetoed here.
+
+    ``exempt`` is the one arm the veto is NOT applied to: the null control
+    standing in as the baseline incumbent for a slot with no champion
+    (`alpha-engine-config-I9759`). It must be ELIGIBLE to be the incumbent —
+    the engine forces the pointer off an incumbent that fails a precondition,
+    which would turn a cold slot's first cycle into an unbarred promotion of
+    whatever ranked first. Exempting it does not make it promotable: a
+    challenger is never compared to itself, so `moved` is false whenever the
+    baseline "wins", and `_write_pointer_if_moved` refuses a control outright.
+    Only the baseline is ever exempt; the planted control never is.
     """
-    controls = {arm for arm in series_by_arm if is_control_arm(spec, arm, register)}
+    controls = {
+        arm for arm in series_by_arm if arm != exempt and is_control_arm(spec, arm, register)
+    }
     if not controls:
         return preconditions
     merged: dict[str, tuple[ServingPrecondition, ...]] = {
@@ -536,6 +683,7 @@ def _write_pointer_if_moved(
     store: Store,
     spec: SlotSpec,
     cycle: ArenaCycle,
+    baseline: str | None,
     expected: str,
     manifest_key: str | None,
     run_id: str | None,
@@ -547,7 +695,29 @@ def _write_pointer_if_moved(
     decision = cycle.decision
     if decision.champion is None:
         return None
-    if decision.status not in ("decided", "bootstrap"):
+    if decision.status == "bootstrap":
+        # `alpha-engine-config-I9759`: unreachable, and a RAISE rather than a
+        # `return None` for the same reason the control guard below is. The
+        # library cold-starts only when it is handed no incumbent, and
+        # `run_promotion` now always supplies one — the real champion, or
+        # §10.1's null control as the baseline, or it refuses before the
+        # engine is called at all. A bootstrap decision arriving here means
+        # that substitution stopped happening, and the pointer it would write
+        # carries `promotion_source: bootstrap`, which the §6 phase-3 gate
+        # rejects by name. Writing it quietly would seat a champion nothing
+        # won AND make every later promotion measure against it.
+        wanted = sorted(c.arm_id for c in spec.control_arms if c.kind == BASELINE_CONTROL_KIND)
+        raise PromotionRefused(
+            f"slot {spec.slot}: the engine returned a §9.1 cold-start decision "
+            f"({decision.reason!r}), which would seat {decision.champion!r} as champion "
+            "on no evidence at all and write `promotion_source: bootstrap` — a pointer "
+            "the §6 phase-3 gate rejects by name as 'not a promotion the system won'. "
+            "`run_promotion` substitutes §10.1's null control as the baseline incumbent "
+            "precisely so this branch is never taken; reaching it means the slot has no "
+            f"champion AND no scored null control. Register and score {wanted} so the "
+            "first champion is won against noise rather than assumed."
+        )
+    if decision.status != "decided":
         return None
     if not decision.moved:
         return None
@@ -571,6 +741,14 @@ def _write_pointer_if_moved(
     comparison = next((c for c in decision.comparisons if c.challenger == decision.champion), None)
     evidence: dict[str, Any] = {
         "incumbent": decision.incumbent,
+        # `alpha-engine-config-I9759`: which of the two things `incumbent`
+        # names. On a first promotion it is §10.1's null control standing in
+        # for an absent champion, and a reader who could not tell the two
+        # apart would read "beat the incumbent" where the truth is "beat
+        # noise" — a materially weaker claim, and the one `explain` must be
+        # able to make. `null` on every subsequent promotion.
+        "baseline_control": baseline,
+        "had_incumbent": baseline is None,
         "status": decision.status,
         "reason": decision.reason,
         "moved": decision.moved,
@@ -599,8 +777,14 @@ def _write_pointer_if_moved(
         decided_at=_utc(now),
         run_id=run_id or _placeholder_run_id(),
         code_sha=_require_code_sha(code_sha, slot=spec.slot),
-        promotion_source="evidence" if decision.status == "decided" else "bootstrap",
-        manifest_key=manifest_key or _promote_manifest_key("promote", decision.as_of),
+        # `decided` is the only status that reaches this line
+        # (`alpha-engine-config-I9759`): `bootstrap` raises above and every
+        # other status returns before it. Written as the literal rather than
+        # a conditional so the one value this writer can produce is stated
+        # once, where it is read.
+        promotion_source="evidence",
+        manifest_key=manifest_key
+        or _promote_manifest_key("promote", decision.as_of, discriminator=spec.slot),
         evidence=evidence,
         attestation=attestation,
     )

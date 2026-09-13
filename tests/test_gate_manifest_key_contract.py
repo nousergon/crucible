@@ -62,6 +62,66 @@ def _experiment_args(job: str, slot: str, store_uri: str) -> argparse.Namespace:
         strategy_dir=None,
         trading_day=FRIDAY,
         date=FRIDAY.isoformat(),
+        revert_to=None,
+        reason=None,
+        operator=None,
+        run_mode=None,
+    )
+
+
+def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
+    """Everything `promote --slot <s>` reads, written by the real writers.
+
+    `promote` joined `ARC_SLOT_JOBS` at `alpha-engine-config-I9759`, and it
+    is not a stub-able job the way `experiment.run`/`experiment.grade` are
+    here: it reads the arm register, every arm's series and — since I9759 —
+    the graded `arena_cycle` whose `decision.ineligible` carries the
+    eligibility `experiment.grade` evaluated. Seeded through the library's
+    own `ArmRegister` and `run_cycle` plus `crucible.arena_io`, so the
+    manifest this test then asserts on is written by the REAL handler.
+    """
+    import json
+
+    from nousergon_lib.arena import ArmRegister, ArmSeries
+    from nousergon_lib.arena.engine import run_cycle
+
+    from crucible.arena_io import write_arena_cycle
+    from crucible.promote import arm_register_key, arm_series_key
+    from crucible.slots import get_slot
+    from tests.support.panels import trading_days
+
+    spec = get_slot(slot)
+    dates = trading_days(40, FRIDAY)
+    register = ArmRegister()
+    series_by_arm: dict[str, ArmSeries] = {}
+    seeded = [(f"control_null_{slot}", 0.0), ("chal", 0.03)]
+    baseline = ""
+    for name, value in seeded:
+        register, record = register.register(
+            slot=slot, name=name, spec={"name": name}, created_date=dates[0]
+        )
+        if name.startswith("control_null_"):
+            baseline = record.arm_id
+        series = ArmSeries(arm_id=record.arm_id, scores={d: value for d in dates})
+        series_by_arm[record.arm_id] = series
+        store.put_bytes(
+            arm_series_key(slot, record.arm_id),
+            json.dumps({"arm_id": record.arm_id, "scores": series.scores, "misses": []}).encode(),
+        )
+    store.put_bytes(
+        arm_register_key(slot),
+        b"".join(json.dumps(e).encode() + b"\n" for e in register.to_dicts()),
+    )
+    # The graded cycle `experiment.grade` would have written an hour earlier.
+    write_arena_cycle(
+        store,
+        run_cycle(
+            config=spec.arena,
+            as_of=FRIDAY.isoformat(),
+            register=register,
+            series_by_arm=series_by_arm,
+            incumbent=baseline,
+        ),
     )
 
 
@@ -89,7 +149,7 @@ class TestGateReadsWhatTheRealWriterWrote:
         asks the real `_clause_arc_runs_ok` to read the same store. Only the
         business logic inside each slot module is stubbed; the manifest
         write path and the gate's read path are both exercised unmodified."""
-        assert ARC_SLOT_JOBS == frozenset({"experiment.run", "experiment.grade"}), (
+        assert ARC_SLOT_JOBS == frozenset({"experiment.run", "experiment.grade", "promote"}), (
             "this test enumerates ARC_SLOT_JOBS explicitly below — a new "
             "slot-scoped job needs a writer added here too, or this test "
             "would silently stop covering the class it exists for"
@@ -99,6 +159,8 @@ class TestGateReadsWhatTheRealWriterWrote:
         store = LocalStore(tmp_path)
         registry = load_registry()
         _seed_non_slot_stages(store, registry)
+        for slot in SLOTS:
+            _seed_slot_for_promote(store, slot)
 
         for job in sorted(ARC_SLOT_JOBS):
             for slot in SLOTS:
@@ -136,7 +198,7 @@ class TestGateReadsWhatTheRealWriterWrote:
         # Exactly the slot-scoped stages (every DISPATCHABLE slot x
         # {experiment.run, experiment.grade}) are missing — the 4 non-slot
         # stages, which never had a discriminator to begin with, are unaffected.
-        expected = 2 * len(dispatchable_slots())
+        expected = len(ARC_SLOT_JOBS) * len(dispatchable_slots())
         assert f"{expected} never ran" in clause.detail, clause.detail
 
     def test_removing_the_discriminator_from_the_gate_read_reintroduces_the_defect(
@@ -153,6 +215,8 @@ class TestGateReadsWhatTheRealWriterWrote:
         store = LocalStore(tmp_path)
         registry = load_registry()
         _seed_non_slot_stages(store, registry)
+        for slot in SLOTS:
+            _seed_slot_for_promote(store, slot)
         for job in sorted(ARC_SLOT_JOBS):
             for slot in SLOTS:
                 assert HANDLERS[job](_experiment_args(job, slot, store_uri)) == 0
