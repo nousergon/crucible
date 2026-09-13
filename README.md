@@ -160,25 +160,33 @@ healed on a box via this path.
 Reserved: a human ruling, never an automated action (plan §9.4), and the
 unseal is recorded permanently against the holdout the arms then see.
 
-There is **no unsealing job and no automated path to the holdout's contents**.
-The sealed document at `strategy/current/holdout.json` is read through
+There is **no automated path to the holdout's contents**. The sealed document
+at `strategy/current/holdout.json` is read through
 `crucible.holdout.read_sealed_holdout`, which returns the seal — the digest,
 the day it was sealed, who sealed it, what it is reserved for — and drops the
 payload entirely, so nothing that grades, renders or logs a reading can leak
 the reservation.
 
-Releasing the payload is an operator action that **refuses without a ruling
-reference** (`alpha-engine-config-I<N>`) and a stated reason: the refusal is a
-usage error, it writes nothing, and there is no proceed-anyway form of it. A
-release that is ruled writes a `holdout_unseal.v1` audit record naming the
-ruling, the operator, the reason and the exact digest released, and the
-phase-3 `sealed_holdout` gate clause reads both the seal and every filed
-record. Run the harness's own `--help` for the flag surface rather than
-copying a command out of this section — unsealing is not a procedure anyone
-should be pasting from a runbook under pressure.
+Releasing the payload is an operator action, and the reservation is enforced
+at the call rather than by the command being absent:
+
+```
+crucible holdout --unseal --ruling alpha-engine-config-I<N> --reason "<why>"
+```
+
+Without `--ruling` naming a fleet ruling, and `--reason` saying what the
+release is for, it **refuses**: the refusal is a usage error, it writes
+nothing, and there is no proceed-anyway form of it. A bare issue number and
+another repository's issue are refused the same way — the reference has to be
+one anybody can look up later. A release that is ruled writes a
+`holdout_unseal.v1` audit record naming the ruling, the operator, the reason
+and the exact digest released, and the phase-3 `sealed_holdout` gate clause
+reads both the seal and every filed record.
 
 Do not build a scheduled or automated caller for it; this section documents a
-reservation, not an operations step.
+reservation, not an operations step. The reservation is what the phase-2
+`runbook_in_readme` clause grades here — that the mechanism refuses an unruled
+call, never that no mechanism exists.
 
 ## Development
 
