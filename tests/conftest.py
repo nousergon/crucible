@@ -497,3 +497,43 @@ def _declared_liquidity_floor(monkeypatch: pytest.MonkeyPatch) -> None:
     also pass if the number leaked back into the tree.
     """
     monkeypatch.setenv("CRUCIBLE_LIQUIDITY_FLOOR_USD", "1000000")
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _a_registry_resolves_in_ci(tmp_path_factory):
+    """CI mirrors the box: a registry is ALWAYS resolvable.
+
+    Since `alpha-engine-config-I9971`, `crucible.llm._capability_classes`
+    enumerates the registry's own declared groups. On a box `registry_preflight`
+    refuses the job before any call site asks for a class, so "no registry"
+    never reaches a call. On the laptop the walk-up finds
+    `alpha-engine-config/private-docs/`. In the public repo's CI neither holds,
+    and every test that exercises a call site asking for `high` (the fault
+    probes) would fail on membership — a difference between the suite and the
+    box, not a property of the code. So when nothing resolves, this writes a
+    registry declaring the real group set and points `LLM_MODEL_REGISTRY_PATH`
+    at it for the session. Tests that assert the ABSENT case
+    (`test_registry_preflight.py`, `test_llm_cap.py`) `delenv` the variable
+    themselves and chdir to a tmp path, so they are unaffected.
+    """
+    import os
+
+    import yaml
+    from krepis.router import TIER_GROUPS, _find_registry
+
+    if _find_registry() is not None:
+        yield
+        return
+    groups = {}
+    models = []
+    for group in sorted(set(TIER_GROUPS.values()) | {"ultra", "chaos_probe"}):
+        model_id = f"model-for-{group}"
+        groups[group] = [model_id]
+        models.append({"id": model_id, "reachable_from": ["ec2", "laptop"]})
+    path = tmp_path_factory.mktemp("registry") / "LLM_MODEL_REGISTRY.yaml"
+    path.write_text(yaml.safe_dump({"models": models, "model_groups": groups}), encoding="utf-8")
+    os.environ["LLM_MODEL_REGISTRY_PATH"] = str(path)
+    try:
+        yield
+    finally:
+        os.environ.pop("LLM_MODEL_REGISTRY_PATH", None)
