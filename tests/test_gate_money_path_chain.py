@@ -93,27 +93,19 @@ def store(tmp_path: object) -> LocalStore:
 
 
 class TestTheClauseMergesBeforeItsVerifier:
-    def test_an_absent_verifier_is_unmeasurable_with_a_named_reason(
-        self, store: LocalStore
-    ) -> None:
-        """Measured against the real tree. `crucible-PR240` is a draft, so
-        `crucible.explain` exposes no verifier yet and the clause must say
-        exactly that rather than raising, reading MET, or reading UNMET — no
-        statement has been made about the store at all.
-
-        When `PR240` lands this test fails, which is the point: it is the
-        notification that the clause went live, not a thing to keep green.
-        """
-        if hasattr(explain_module, "verify_money_path_chain"):
-            pytest.fail(
-                "`crucible.explain.verify_money_path_chain` now exists (crucible-PR240 "
-                "has landed). Delete this test and assert the live readings below "
-                "against the real verifier instead of the stand-in."
-            )
+    def test_the_live_verifier_reads_an_empty_store_as_unmet(self, store: LocalStore) -> None:
+        """`crucible-PR240` landed: the clause now calls the REAL
+        `crucible.explain.verify_money_path_chain`. Against a store with no
+        money-path record the verifier grades `ok` over zero records and the
+        clause reads UNMET, never MET — an empty chain is not evidence the
+        money path is tamper-evident, it is evidence nothing has been written
+        — and never UNMEASURABLE, which is reserved for the verifier being
+        absent, a state that can no longer occur."""
+        assert hasattr(explain_module, "verify_money_path_chain")
         clause = _clause_money_path_chain_verified(store)
-        assert clause.unmeasurable and not clause.met
-        assert "verify_money_path_chain" in clause.detail
-        assert "crucible-PR240" in clause.detail
+        assert not clause.unmeasurable, clause.detail
+        assert not clause.met, clause.detail
+        assert "empty" in clause.detail
 
     def test_the_clause_is_registered_on_phase_4(self, store: LocalStore) -> None:
         names = [c.name for c in _phase4(store, [FRIDAY], {}, trading_day=FRIDAY)]
