@@ -50,6 +50,7 @@ from crucible.keys import (
     feature_registry_key,
     features_key,
 )
+from crucible.slots import declared_benchmark_symbols
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -242,6 +243,37 @@ def run_daily(
             "degraded one — every downstream gate passes on a well-formed artifact "
             "containing a third of the market."
         )
+
+    # S is graded against SPY (`crucible.slots.SLOTS["s"].benchmark`), and
+    # `crucible.slots.strategy.grade_arm` refuses a book whose benchmark has
+    # no panel row. Every non-population benchmark any slot declares is
+    # fetched here — as a real symbol, through the same source, never a
+    # zero-fill — so the day another slot declares an index benchmark the
+    # panel requirement is red at compile time rather than discovered at
+    # grading time on a box (`alpha-engine-config-I10635`). Symbols already
+    # part of the declared universe are not refetched.
+    extra_benchmarks = sorted(declared_benchmark_symbols() - set(expected_symbols))
+    if extra_benchmarks:
+        import pandas as pd  # noqa: PLC0415 - only needed on the benchmark-merge path
+
+        benchmark_panel = source.load_panel(
+            end=trading_day,
+            lookback_days=lookback_days,
+            symbols=extra_benchmarks,
+        )
+        benchmark_day_rows = benchmark_panel[benchmark_panel["trading_day"] == trading_day]
+        benchmark_observed_today = {str(t) for t in benchmark_day_rows["ticker"].unique()}
+        benchmark_missing_today = sorted(set(extra_benchmarks) - benchmark_observed_today)
+        if benchmark_missing_today:
+            raise MissingSourceError(
+                f"benchmark symbol(s) {benchmark_missing_today} — declared by a slot's "
+                f"`SlotSpec.benchmark` — have no close on {trading_day}, the day this "
+                "panel covers. A slot's benchmark return is read for the settle session "
+                "exactly like any ticker's; a panel missing it is not a degraded read, "
+                "it is the grading refusal this fetch exists to prevent."
+            )
+        panel = pd.concat([panel, benchmark_panel], ignore_index=True)
+        panel = panel.sort_values(["trading_day", "ticker"]).reset_index(drop=True)
 
     panel_key = data_panel_key(trading_day.isoformat())
     write_panel(ctx, panel, panel_key)

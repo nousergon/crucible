@@ -37,7 +37,7 @@ from crucible.manifest import validate
 if TYPE_CHECKING:
     from crucible.store import Store
 
-__all__ = ["Lineage", "explain", "load_manifests", "render"]
+__all__ = ["Lineage", "explain", "load_manifests", "money_path_chain_verifier", "render"]
 
 #: How deep the walk goes before it stops. A cycle in the input/output graph
 #: is impossible by construction (a key has one producer, and a run cannot
@@ -238,3 +238,23 @@ def render(node: Lineage) -> str:
 
     emit(node)
     return "\n".join(lines)
+
+
+def money_path_chain_verifier() -> Any | None:
+    """The money-path hash-chain verifier, if this build carries one.
+
+    `crucible.explain` gains `verify_money_path_chain` /
+    `ChainVerification.raise_if_broken` and a `chain` field on `Lineage` only
+    once `crucible-PR240` (`alpha-engine-config-I10414`) merges — it is a
+    gated DRAFT held behind phase 2's exit (`alpha-engine-config-I9758`), so
+    it must not land before the graded 2026-09-19 Saturday arc. Until then
+    this returns `None`.
+
+    Looked up by name at call time (`globals()`, not a module-level import)
+    so the CLI's `--verify-chain` flag (`alpha-engine-config-I10625`) needs
+    no further edit the day PR240 lands: the function it names simply starts
+    existing. A caller that finds `None` here refuses loudly — see
+    `crucible.track_a.handle_explain` — rather than silently skipping the
+    check the flag was asked to run.
+    """
+    return globals().get("verify_money_path_chain")

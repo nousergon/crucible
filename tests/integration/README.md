@@ -39,15 +39,16 @@ from the plan text:
 uv run python -c "from crucible.cli import JOBS; print(len(JOBS)); [print(k) for k in JOBS]"
 ```
 
-### Exercised for real (21 of 25)
+### Exercised for real (24 of 25)
 
 `experiment.new`, `data.daily`, `data.weekly`, `data.heal`, `experiment.run`,
-`explain`, `release.pin`, `release.lock`, `smoke`, `alerts.sweep`,
-`heartbeat`, `drift`, `console`, `board`, `gate`, `gate.close`, `report`,
-`fault.record`, `fault.probe`, `migrate.history`, `test.integration` — each
-invoked through the real `crucible.cli.main` entry point (not the handler
-function directly — this is the wire a spot instance actually dispatches),
-against the dedicated store, producing a real `run.json`.
+`weekly`, `experiment.grade`, `promote`, `explain`, `release.pin`,
+`release.lock`, `smoke`, `alerts.sweep`, `heartbeat`, `drift`, `console`,
+`board`, `gate`, `gate.close`, `report`, `fault.record`, `fault.probe`,
+`migrate.history`, `test.integration` — each invoked through the real
+`crucible.cli.main` entry point (not the handler function directly — this is
+the wire a spot instance actually dispatches), against the dedicated store,
+producing a real `run.json`.
 
 `data.daily`, `data.weekly`, `data.heal` and `experiment.run` are newly
 exercised here (`alpha-engine-config-I10457`): `ArcticPriceSource(library=
@@ -63,36 +64,35 @@ feature layer `data.daily` writes into the STORE, never ArcticDB directly —
 its non-degenerate exercise was simply downstream of `data.daily` having
 nothing real to read.
 
+`weekly`, `experiment.grade` and `promote` are newly exercised here
+(`alpha-engine-config-I10633`), closing the two residual gaps I10457 left
+open:
+
+* `crucible.weekly.Stage.argv`/`run_arc` now accept an `arctic_library`
+  parameter, appended as `--arctic-library <name>` onto every
+  `ARCTIC_LIBRARY_JOBS` stage's own argv (`crucible/weekly.py`) — additive
+  and production-inert, the identical shape `--dry-run` already used.
+  `test_weekly` exercises the arc's own `data.weekly` stage through this
+  threading for real, against the dedicated library; the arc's other stages
+  (the R slot's own arm registration is a separate, sibling-owned concern,
+  `alpha-engine-config-I10628`) are stubbed there and exercised standalone,
+  for real, by this module's other cases.
+* `conftest.py::SETTLED_TRADING_DAY` (`2026-10-07`) is a second FIXED
+  literal, exactly `DEFAULT_HORIZON_TRADING_DAYS` (21) NYSE sessions after
+  `INTEGRATION_TRADING_DAY` — seeded rather than hand-written (the issue's
+  own alternative (b)) so the real `data.daily`/`experiment.run` producer
+  path settles a shadow rather than fabricating a verdict shape by hand.
+  `integration_arctic_symbols` now seeds one continuous synthetic OHLCV
+  series through `SETTLED_TRADING_DAY`, and `test_experiment_grade` grades
+  the shadow `test_experiment_run` produced at `INTEGRATION_TRADING_DAY`
+  against a panel compiled AT `SETTLED_TRADING_DAY`, asserting the result
+  carries a genuinely non-empty `settled_dates`. `test_promote` runs
+  immediately after, against the same graded cycle.
+
 `test.integration` is this tier's own job (`alpha-engine-config-I10459`) —
 see "The summary artifact" below.
 
-### Not exercised, and why (4 of 25)
-
-**`experiment.grade`, `promote`** — NOT blocked by the ArcticDB gap
-`alpha-engine-config-I10457` fixed, contrary to that issue's original
-framing. `crucible.slots.cycle.run_grade` scores only SETTLED shadows
-(`forward_returns` needs price data `horizon_trading_days` — default 21 —
-AFTER the shadow's own date), and this tier's `INTEGRATION_TRADING_DAY` is a
-fixed literal with no later trading day ever produced in the dedicated store
-(`AGENTS.md`, "Test discipline": fixed date literals, never `today`
-arithmetic). A grade run here would legitimately score zero settled cuts,
-forever, on every nightly run — proving nothing beyond what `experiment.run`
-above already proves. A real exercise needs a multi-week historical panel
-(several distinct trading days, each settled relative to a later one), which
-is real design work distinct from the ArcticDB-library scope. Filed as
-`alpha-engine-config-I10633`.
-
-**`weekly`** — `crucible.weekly.run_arc`/`arc_stages` build each stage's own
-`argv` internally and do not thread `--arctic-library` through to the
-`data.daily`/`data.weekly` stages they launch, so running `weekly` here today
-would silently read the PRODUCTION `universe` library within the shared
-integration bucket rather than the dedicated one — the opposite of what this
-tier exists to guarantee. Threading the override through `arc_stages` is a
-real, scoped change to `crucible/weekly.py` (outside this issue's
-`crucible/data/`-and-CLI-registration ownership) rather than something to
-rush in unreviewed. Filed as `alpha-engine-config-I10633` (same issue as
-`experiment.grade`/`promote` above — both are residual gaps this
-investigation found, not new ArcticDB work).
+### Not exercised, and why (1 of 25)
 
 **`report.morning`** — `crucible.morning._operator_chat()` resolves
 `krepis.alerts.DESTINATION_OPERATOR_CHAT` (a real Telegram channel) with no

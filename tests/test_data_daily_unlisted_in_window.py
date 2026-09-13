@@ -39,7 +39,7 @@ def _extend(frames: dict[str, object], ticker: str, dates: list[dt.date]) -> dic
 
 class TestSymbolsUnlistedInWindowMetric:
     def test_an_unlisted_symbol_is_named_in_the_metric_and_coverage_still_passes(
-        self, store, frames, cycle_date
+        self, store, frames, benchmark_frames, cycle_date
     ) -> None:
         newco_dates = [cycle_date + dt.timedelta(days=200)]
         with_newco = _extend(frames, "NEWCO", newco_dates)
@@ -47,7 +47,11 @@ class TestSymbolsUnlistedInWindowMetric:
 
         ctx = run_job(
             "data.daily",
-            lambda c: run_daily(c, source=FramePriceSource(with_newco), expected_symbols=expected),
+            lambda c: run_daily(
+                c,
+                source=FramePriceSource({**with_newco, **benchmark_frames}),
+                expected_symbols=expected,
+            ),
             store=store,
             trading_day=cycle_date,
         )
@@ -110,7 +114,7 @@ class TestSymbolsUnlistedInWindowMetric:
 
 class TestHealAcrossAListingBoundary:
     def test_a_symbol_that_lists_mid_range_is_unlisted_on_early_sessions_only(
-        self, store, frames, cycle_date, monkeypatch
+        self, store, frames, benchmark_frames, cycle_date, monkeypatch
     ) -> None:
         """Three fixture sessions, one symbol listing on the middle day: the
         first heal session counts it unlisted, the later two include it."""
@@ -130,7 +134,7 @@ class TestHealAcrossAListingBoundary:
             "data.heal",
             lambda c: run_heal(
                 c,
-                source=FramePriceSource(with_midlist),
+                source=FramePriceSource({**with_midlist, **benchmark_frames}),
                 start=first,
                 end=last,
                 gap="test-listing-boundary",

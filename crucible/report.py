@@ -68,8 +68,9 @@ from crucible.aggregation import MemberRow, member_dicts, worst_member
 from crucible.calendar import previous_trading_day
 from crucible.data.daily import COVERAGE_FLOOR_RATIO
 from crucible.documents import load_store_document
-from crucible.keys import attribution_key, champion_key, experiments_prefix
+from crucible.keys import arena_cycle_key, attribution_key, champion_key, experiments_prefix
 from crucible.manifest import manifest_key
+from crucible.slots.cycle import MIN_ACTIVE_ARMS_FINDING_METRIC
 from crucible.slots.grading import CROSS_SECTION_MIN_NAMES, RankICSkip, spearman_ic
 from crucible.store import Store
 
@@ -509,6 +510,7 @@ def _slot_row(
     """
     pointer_key = champion_key(spec.slot or "")
     window = _window(trading_day, SLOT_WINDOW_TRADING_DAYS)
+    floor_note = _min_active_arms_note(store, spec.slot, window) if spec.slot else None
     pointer = _read_json(store, pointer_key)
     if pointer is None:
         return _row(
@@ -525,7 +527,8 @@ def _slot_row(
                 f"slot {spec.slot!r} has no champion pointer at {pointer_key}; the slot has "
                 "not run an arena cycle, so there is no champion whose alpha this row could "
                 "report"
-            ),
+            )
+            + (f" [{floor_note}]" if floor_note else ""),
         )
     sources.append(pointer_key)
     arm_id = pointer["arm_id"]
@@ -563,7 +566,8 @@ def _slot_row(
                 f"window {first}..{last} under {prefix} ({outside} verdict(s) exist outside "
                 "it); a decision date's verdict does not exist until its horizon settles, "
                 "so this is a horizon that has not passed, not an arm with no edge"
-            ),
+            )
+            + (f" [{floor_note}]" if floor_note else ""),
         )
     if len(horizons) != 1:
         raise ValueError(
@@ -590,7 +594,8 @@ def _slot_row(
             f"{len(window)}-session window {first}..{last}, {_ci_phrase(low, high)}; the "
             "baseline is 0.0 because the benchmark is the equal-weight population the "
             "selection drew from"
-        ),
+        )
+        + (f" [{floor_note}]" if floor_note else ""),
         n_floor=SLOT_N_FLOOR,
         target=0.0,
         red_line=0.0,
@@ -887,6 +892,33 @@ def _window(trading_day: dt.date, length: int = REPORT_WINDOW_TRADING_DAYS) -> l
     for _ in range(length - 1):
         days.append(previous_trading_day(days[-1]))
     return sorted(days)
+
+
+def _min_active_arms_note(store: Store, slot: str, window: list[dt.date]) -> str | None:
+    """§10.1 / `alpha-engine-config-I10636`: fold the floor finding into the
+    row's own reason, so a reader of the report does not have to separately
+    open the `arena_cycle` artifact to learn a slot cannot produce a
+    comparison at all.
+
+    Walks the SAME window `_slot_row` already computed, most recent day
+    first — no new listing primitive, and no claim about a cycle outside the
+    span the row itself declares. Silent (returns None) once the slot clears
+    the floor, or when it has not run a graded cycle in the window at all;
+    either is already stated by the row's other branches (no verdicts, N/A).
+    """
+    for day in reversed(window):
+        key = arena_cycle_key(slot, day.isoformat())
+        if not store.exists(key):
+            continue
+        cycle = _read_json(store, key)
+        finding = (cycle or {}).get(MIN_ACTIVE_ARMS_FINDING_METRIC)
+        if finding and finding.get("status") == "BELOW_FLOOR":
+            return (
+                f"min_active_arms: {finding.get('reason', 'below the floor')} "
+                f"(as of {day.isoformat()})"
+            )
+        return None
+    return None
 
 
 def _read_json(store: Store, key: str) -> dict[str, Any] | None:
