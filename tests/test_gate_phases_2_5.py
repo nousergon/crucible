@@ -3071,3 +3071,190 @@ class TestLastSystemChangeProvenanceNeverRaises:
         assert provenance is not None
         assert "stack last applied" in provenance
         assert CHANGE_LONG_BEFORE.isoformat() in provenance
+
+
+# ── alpha-engine-config-I10609: attributing the stack's own apply ──────────
+# Brian's ruling option (a) automates the `crucible-v2` apply on merge under a
+# least-privilege machine role. `DescribeStacks` says WHEN the stack changed
+# and never WHO changed it, so the principal comes from the same archive the
+# pointer half already reads.
+
+
+def _stack_apply_call(
+    at: dt.datetime, principal: str, *, event_name: str = "ExecuteChangeSet"
+) -> dict:
+    """One archived CloudFormation call that changed the graded stack.
+
+    The stack NAME is read from `crucible.config.settings()` rather than
+    written down: it is the same value the reader resolves, so the fixture
+    cannot assert against a name production does not use, and no
+    infrastructure literal enters this tree.
+    """
+    from crucible.config import settings
+
+    return {
+        "eventTime": at.isoformat().replace("+00:00", "Z"),
+        "eventName": event_name,
+        "eventSource": "cloudformation.amazonaws.com",
+        "readOnly": False,
+        "requestID": f"r-{at.isoformat()}",
+        "requestParameters": {"stackName": settings().stack_name},
+        "userIdentity": {
+            "type": "AssumedRole",
+            "arn": f"arn:aws:sts::123456789012:assumed-role/{principal}/a-session",
+            "sessionContext": {"sessionIssuer": {"userName": principal}},
+        },
+    }
+
+
+def _stack_applied_and_created(
+    monkeypatch: pytest.MonkeyPatch, at: dt.datetime, created: dt.datetime
+) -> None:
+    """A stack created at ``created``, last changed at ``at``, naming one
+    `AWS::IAM::Role` so the derived machine allowlist is non-empty."""
+    _stack_applied(
+        monkeypatch,
+        at,
+        resources=[
+            {
+                "ResourceType": "AWS::IAM::Role",
+                "PhysicalResourceId": MACHINE_ROLE,
+                "LastUpdatedTimestamp": at,
+            }
+        ],
+        CreationTime=created,
+    )
+
+
+class TestAMachineStackApplyDoesNotRestartTheWindow:
+    """`alpha-engine-config-I10609`, option (a). The stack apply used to be
+    operator-gated, so its instant WAS a human instant and needed no
+    attribution. Automating it on merge would otherwise recreate on the stack
+    half the defect `alpha-engine-config-I10608` removed from the pointer
+    half: every merge of a template change setting the phase back.
+    """
+
+    #: The stack's creation — the operator bootstrap apply, human by
+    #: construction, and the floor the backward walk stops at.
+    CREATED = CHANGE_LONG_BEFORE
+    #: A later apply, an hour before the read. Human, it leaves an hour-long
+    #: window and the clause UNMET; machine, it changes nothing.
+    APPLIED = CHANGE_AN_HOUR_BEFORE_THE_READ
+
+    def _covered(self) -> tuple[dt.date, ...]:
+        return _days(self.CREATED.date(), self.APPLIED.date())
+
+    def test_a_machine_apply_an_hour_before_the_read_does_not_shorten_the_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The case the change exists for: the apply pipeline ran on a merge,
+        the window keeps its start at the stack's own bootstrap, and the
+        clause reads MET."""
+        _archive(monkeypatch)
+        _stack_applied_and_created(monkeypatch, self.APPLIED, self.CREATED)
+        _counting(monkeypatch, _Counted(0))
+        _pointer_archive(
+            monkeypatch,
+            [_stack_apply_call(self.APPLIED, MACHINE_ROLE)],
+            covered=self._covered(),
+        )
+        store = _store_whose_pointer_flipped(self.CREATED - dt.timedelta(days=30))
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.met and not clause.unmeasurable
+        assert f"window starts {self.CREATED.isoformat()}" in clause.detail
+        assert "does NOT restart the window" in clause.detail
+        assert MACHINE_ROLE in clause.detail
+
+    def test_the_same_apply_by_a_human_still_restarts_the_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The anti-gaming half, and the pair that IS the ruling: an operator
+        `aws cloudformation deploy` authenticates as no stack role, so it sets
+        the window start and the clause reads UNMET."""
+        _archive(monkeypatch)
+        _stack_applied_and_created(monkeypatch, self.APPLIED, self.CREATED)
+        _counting(monkeypatch, _Counted(0))
+        _pointer_archive(
+            monkeypatch,
+            [_stack_apply_call(self.APPLIED, HUMAN_OPERATOR)],
+            covered=self._covered(),
+        )
+        store = _store_whose_pointer_flipped(self.CREATED - dt.timedelta(days=30))
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert not clause.met and not clause.unmeasurable
+        assert "no complete weekly cycle has run unattended" in clause.detail
+        assert HUMAN_OPERATOR in clause.detail
+        assert "a HUMAN apply" in clause.detail
+
+    def test_an_apply_the_archive_cannot_explain_is_treated_as_human(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A covered archive carrying no call that accounts for the stack's
+        own change instant settles nothing, and the safe reading of "settles
+        nothing" is HUMAN — treating it as machine would let an archive
+        nobody can read clear a phase."""
+        _archive(monkeypatch)
+        _stack_applied_and_created(monkeypatch, self.APPLIED, self.CREATED)
+        _counting(monkeypatch, _Counted(0))
+        _pointer_archive(monkeypatch, [], covered=self._covered())
+        store = _store_whose_pointer_flipped(self.CREATED - dt.timedelta(days=30))
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert not clause.met and not clause.unmeasurable
+        assert "matches no archived" in clause.detail
+        assert "treated as HUMAN" in clause.detail
+
+    def test_an_uncovered_trail_day_is_treated_as_human(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _archive(monkeypatch)
+        _stack_applied_and_created(monkeypatch, self.APPLIED, self.CREATED)
+        _counting(monkeypatch, _Counted(0))
+        _pointer_archive(monkeypatch, [], covered=())
+        store = _store_whose_pointer_flipped(self.CREATED - dt.timedelta(days=30))
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert not clause.met and not clause.unmeasurable
+        assert "delivered no objects" in clause.detail
+        assert "treated as HUMAN" in clause.detail
+
+    def test_a_stack_reporting_no_creation_time_is_treated_as_human(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No floor to walk back to, so nothing can be attributed — and the
+        answer is the pre-I10609 behaviour rather than a cleared gate."""
+        _archive(monkeypatch)
+        _stack_applied(monkeypatch, self.APPLIED)
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(self.CREATED - dt.timedelta(days=30))
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert not clause.met and not clause.unmeasurable
+        assert "no CreationTime" in clause.detail
+
+    def test_a_stack_never_updated_since_creation_reads_its_creation_as_the_apply(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The bootstrap case: one apply, the operator's, and no archive read
+        at all to establish something already known."""
+        _archive(monkeypatch)
+        _stack_applied_and_created(monkeypatch, self.CREATED, self.CREATED)
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(self.CREATED - dt.timedelta(days=30))
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.met and not clause.unmeasurable
+        assert "HUMAN by construction" in clause.detail
+
+    def test_the_raw_apply_instant_stays_on_the_reading_whoever_applied_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Principle 1: a machine apply that did not move the start must still
+        be reconstructable from the provenance string."""
+        _archive(monkeypatch)
+        _stack_applied_and_created(monkeypatch, self.APPLIED, self.CREATED)
+        _counting(monkeypatch, _Counted(0))
+        _pointer_archive(
+            monkeypatch,
+            [_stack_apply_call(self.APPLIED, MACHINE_ROLE)],
+            covered=self._covered(),
+        )
+        store = _store_whose_pointer_flipped(self.CREATED - dt.timedelta(days=30))
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert f"stack last updated {self.APPLIED.isoformat()}" in clause.detail
