@@ -207,6 +207,40 @@ def no_live_cost_explorer(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_capability_classes_cache():
+    """`crucible.llm._capability_classes` reads the registry now
+    (`alpha-engine-config-I9971`: `krepis.router.registry_groups()`, in
+    place of the fixed `TIER_GROUPS` dict it used to union), so its
+    `lru_cache(maxsize=1)` is no longer registry-independent. Left
+    uncleared, a stale cache entry from a PRECEDING test's registry file
+    (or its absence) would silently answer `_require_capability_class` and
+    `registry_preflight` for a DIFFERENT file's declared groups in every
+    later test. Cleared before AND after every test — mirrors
+    `no_live_cost_explorer`'s reset of `crucible.cost`'s own process-wide
+    cache for the identical reason.
+    """
+    import crucible.llm as llm_module
+
+    def _clear() -> None:
+        # A test may itself have monkeypatched `_capability_classes` to a
+        # plain lambda (`test_llm_router_route.py`,
+        # `test_registry_preflight.py`); pytest's own `monkeypatch` fixture
+        # restores the real function on ITS teardown, whose ordering
+        # relative to this autouse fixture is not guaranteed, so the
+        # attribute may be a bare callable with no `cache_clear` at either
+        # boundary here.
+        cache_clear = getattr(llm_module._capability_classes, "cache_clear", None)
+        if cache_clear is not None:
+            cache_clear()
+
+    _clear()
+    try:
+        yield
+    finally:
+        _clear()
+
+
+@pytest.fixture(autouse=True)
 def no_tracker_credential(monkeypatch):
     """No test reaches GitHub by accident.
 

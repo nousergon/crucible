@@ -258,24 +258,50 @@ def _capability_classes() -> frozenset[str]:
 
     Two sources, unioned, and neither is a restatement of the other:
 
-    ``krepis.router.TIER_GROUPS``
-        the router's own tier-to-group mapping, read rather than copied, so a
-        group added there is askable here without an edit and a group removed
-        there stops being askable.
+    ``krepis.router.registry_groups()``
+        the registry's own declared model groups, asked for by name rather
+        than approximated. **This used to union ``krepis.router.TIER_GROUPS``
+        instead** — a *tier*-to-group MAPPING, not the group set, whose keys
+        are complexity tiers (`low`, `mid`, `high`) and whose values are the
+        groups those tiers resolve to (`low`, `med`, `high`). That union
+        admitted `mid` (a tier, never a registry group) and — because the
+        registry's fourth group, `ultra`, appears in neither `TIER_GROUPS`'s
+        keys nor its values — silently dropped the one group that serves the
+        fleet's Director and a phase-5 judge (`alpha-engine-config-I9971`).
+        `registry_groups()` is the router's own enumerator over
+        `model_groups` and cannot diverge from what the registry declares.
 
     ``capability_classes`` in ``llm_callsites.yaml``
-        the classes this deployment's router serves beyond the bare tiers,
-        declared once beside the call sites that use them. A call site cannot
-        add its own — the list is a deliberate edit in the file where the
-        reason for each name is written down.
-    """
-    from krepis.router import TIER_GROUPS
+        the classes this deployment's router serves beyond the bare
+        registry groups, declared once beside the call sites that use them.
+        A call site cannot add its own — the list is a deliberate edit in
+        the file where the reason for each name is written down.
 
-    return (
-        frozenset(TIER_GROUPS)
-        | frozenset(TIER_GROUPS.values())
-        | frozenset(load_capability_classes())
-    )
+    **An unresolvable registry degrades this allowlist; it does not crash
+    the import.** This function runs at MODULE IMPORT (``LLM_CALLSITE_REGISTRY
+    = load_registry()`` below validates every declared ``capability_class``
+    against it), and most environments that import this package — the CI
+    runner, a laptop outside the private ``alpha-engine-config`` checkout —
+    have no ``LLM_MODEL_REGISTRY.yaml`` reachable at all.
+    ``krepis.router.registry_groups()`` correctly RAISES rather than
+    returning an empty tuple when the registry cannot be found — that
+    contract is what keeps a *resolvable-but-empty* registry from looking
+    identical to a healthy one. An *unresolvable* registry is a different
+    fact: this process has no registry to be wrong about. Every class this
+    deployment declares beyond the bare registry groups still validates
+    (``llm_callsites.yaml``'s own list needs no registry), and a bare
+    registry-group name simply is not askable here — the same call would
+    fail at the router edge for the identical reason, so this only moves
+    that failure from import time to the point something actually asks for
+    a registry group with no registry to resolve it against.
+    """
+    from krepis.router import registry_groups
+
+    try:
+        groups: frozenset[str] = frozenset(registry_groups())
+    except FileNotFoundError:
+        groups = frozenset()
+    return groups | frozenset(load_capability_classes())
 
 
 def _require_capability_class(value: str, *, callsite_id: str) -> None:
@@ -365,18 +391,25 @@ def capability_group(capability_class: str) -> str:
         this package's own ruled mappings, and its explicit refusals.
 
     ``krepis.router.TIER_GROUPS``
-        the ROUTER's tier-to-group mapping, read rather than copied — the same
-        source :func:`_capability_classes` reads to decide which tier names are
-        askable at all. `alpha-engine-config-I10346`: reading it for
-        membership and NOT for resolution is what left `mid` askable and
-        unroutable. `TIER_GROUPS` maps `mid` to the group `med`, the registry
-        declares `med` and has never declared `mid`, and identity resolution
-        below sent `mid` to a group that does not exist — a call site
-        declaring the tier krepis itself names would have passed
-        :func:`_require_capability_class` and then failed at the router.
-        Restating `mid: med` in :data:`CAPABILITY_CLASS_GROUPS` was the wrong
-        fix for it: that is a second copy of a mapping krepis owns, and the
-        copy would be the one deciding what a box routes to.
+        the ROUTER's tier-to-group mapping, read rather than copied, so a
+        tier name resolves to the group it actually addresses (`mid` ->
+        `med`) rather than by identity. `alpha-engine-config-I10346`:
+        reading it for membership and NOT for resolution is what once left
+        `mid` askable and unroutable — `_require_capability_class` admitted
+        it (`TIER_GROUPS` keys and values were both in the allowlist), and
+        identity resolution then sent `mid` to a group of the same name that
+        the registry has never declared, failing at the router instead of at
+        the membership check. `alpha-engine-config-I9971` closed that
+        specific gap from the other side: :func:`_capability_classes` now
+        unions `krepis.router.registry_groups()` — the registry's own
+        declared group set — rather than `TIER_GROUPS`, so `mid` is refused
+        by :func:`_require_capability_class` before this function is ever
+        reached. `capability_group` still reads `TIER_GROUPS` for
+        RESOLUTION (a declared tier maps to its serving group), a distinct
+        question from membership answered above it. Restating `mid: med` in
+        :data:`CAPABILITY_CLASS_GROUPS` remains the wrong fix: that is a
+        second copy of a mapping krepis owns, and the copy would be the one
+        deciding what a box routes to.
 
     identity
         a class whose name IS a group name (`low`, `high`, `ultra`,
@@ -630,7 +663,7 @@ def registry_preflight() -> str:
     against that file. Resolving the group does not.
 
     **Why the class set is derived, never listed.** :func:`_capability_classes`
-    already unions `krepis.router.TIER_GROUPS` with `llm_callsites.yaml`'s
+    already unions `krepis.router.registry_groups()` with `llm_callsites.yaml`'s
     declared classes, so a class this package gains tomorrow is covered here
     without an edit, and a class it loses stops being asserted.
     :data:`FAULT_INJECTION_CAPABILITY_CLASSES` is subtracted because those
