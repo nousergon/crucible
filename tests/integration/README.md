@@ -25,52 +25,74 @@ real infrastructure, and a slow per-PR tier gets skipped in its first week.
 this reason — every existing `pytest` invocation in `ci.yml` and `deploy.yml`
 already excludes this directory without either workflow file changing.
 
-## The twenty-four jobs, enumerated from `crucible/cli.py::JOBS`
+## The jobs, enumerated from `crucible/cli.py::JOBS`
 
-**This count is itself a finding.** The rebuild plan and this repo's own
-history cite "thirteen jobs" (`crucible_v2_rebuild_plan_260901.md` §4.1,
-`README.md`); `crucible.cli.JOBS` carries **twenty-four** as of this tier's
-introduction (2026-09-10) — eleven track-C/F/fault/morning/release-lock jobs
-landed after the plan's own count was written and nothing updated the
-citation. Enumerate live, never from memory or from the plan text:
+**This count is itself a finding, and it moves.** The rebuild plan and this
+repo's own history cite "thirteen jobs" (`crucible_v2_rebuild_plan_260901.md`
+§4.1, `README.md`); `crucible.cli.JOBS` carried twenty-four as of this
+tier's introduction (2026-09-10) and twenty-five as of `test.integration`'s
+own registration (`alpha-engine-config-I10459`) — re-count from the code,
+never from a number written down here. Enumerate live, never from memory or
+from the plan text:
 
 ```
 uv run python -c "from crucible.cli import JOBS; print(len(JOBS)); [print(k) for k in JOBS]"
 ```
 
-### Exercised for real (16 of 24)
+### Exercised for real (24 of 25)
 
-`experiment.new`, `explain`, `release.pin`, `release.lock`, `smoke`,
-`alerts.sweep`, `heartbeat`, `drift`, `console`, `board`, `gate`,
-`gate.close`, `report`, `fault.record`, `fault.probe`, `migrate.history` —
-each invoked through the real `crucible.cli.main` entry point (not the
-handler function directly — this is the wire a spot instance actually
-dispatches), against the dedicated store, producing a real `run.json`.
+`experiment.new`, `data.daily`, `data.weekly`, `data.heal`, `experiment.run`,
+`weekly`, `experiment.grade`, `promote`, `explain`, `release.pin`,
+`release.lock`, `smoke`, `alerts.sweep`, `heartbeat`, `drift`, `console`,
+`board`, `gate`, `gate.close`, `report`, `fault.record`, `fault.probe`,
+`migrate.history`, `test.integration` — each invoked through the real
+`crucible.cli.main` entry point (not the handler function directly — this is
+the wire a spot instance actually dispatches), against the dedicated store,
+producing a real `run.json`.
 
-### Not exercised, and why (8 of 24)
+`data.daily`, `data.weekly`, `data.heal` and `experiment.run` are newly
+exercised here (`alpha-engine-config-I10457`): `ArcticPriceSource(library=
+...)` — additive, `library=None` (the default, used by every production
+call site) is byte-for-byte unchanged — routes the three data jobs through
+`open_arctic(bucket).get_library(name, create_if_missing=True)` +
+`nousergon_lib.arcticdb._load_arctic_frames` instead of the production-
+hard-wired `open_universe_lib`/`load_universe_ohlcv`, against real synthetic
+OHLCV rows this tier seeds into `CRUCIBLE_INTEGRATION_ARCTIC_LIBRARY` itself
+(`conftest.py::integration_arctic_symbols`). `experiment.run` was never
+blocked by ArcticDB at all — `crucible.slots.cycle.run_produce` reads the
+feature layer `data.daily` writes into the STORE, never ArcticDB directly —
+its non-degenerate exercise was simply downstream of `data.daily` having
+nothing real to read.
 
-**`data.daily`, `data.weekly`, `data.heal`** — `crucible.data.sources.
-ArcticPriceSource` and the `nousergon_lib.arcticdb` helpers it calls
-(`open_universe_lib`, `load_universe_ohlcv`) are hard-wired to the single
-production `universe` library on `CRUCIBLE_ARCTIC_BUCKET`; there is no
-library-selection parameter anywhere in that call path (verified against
-installed `nousergon-lib==0.124.110`, 2026-09-10). This tier cannot point
-these three jobs at a dedicated, isolated library without either widening
-`nousergon_lib.arcticdb`'s API (a separate repo, out of this session's
-scope) or adding a `library` override to `ArcticPriceSource` in this repo —
-a real, correct, additive fix, but a production-source change this session
-left unmade rather than rushed in unreviewed alongside a new test tier. The
-real-ArcticDB dependency this tier's hard constraints require is instead
-proven generically by `test_arctic_connectivity.py`: a write/read round trip
-against the dedicated library, using the low-level `open_arctic(bucket).
-get_library(name, create_if_missing=True)` path, which carries no
-library-name constant.
+`weekly`, `experiment.grade` and `promote` are newly exercised here
+(`alpha-engine-config-I10633`), closing the two residual gaps I10457 left
+open:
 
-**`experiment.run`, `experiment.grade`, `promote`, `weekly`** — each slot's
-`produce`/`grade` scores arms against the feature layer `data.daily`/
-`data.weekly` materialize; a non-degenerate exercise of these four is
-downstream of the same ArcticDB gap and blocked by it. `weekly` runs the
-declared weekly arc, which calls several of the above.
+* `crucible.weekly.Stage.argv`/`run_arc` now accept an `arctic_library`
+  parameter, appended as `--arctic-library <name>` onto every
+  `ARCTIC_LIBRARY_JOBS` stage's own argv (`crucible/weekly.py`) — additive
+  and production-inert, the identical shape `--dry-run` already used.
+  `test_weekly` exercises the arc's own `data.weekly` stage through this
+  threading for real, against the dedicated library; the arc's other stages
+  (the R slot's own arm registration is a separate, sibling-owned concern,
+  `alpha-engine-config-I10628`) are stubbed there and exercised standalone,
+  for real, by this module's other cases.
+* `conftest.py::SETTLED_TRADING_DAY` (`2026-10-07`) is a second FIXED
+  literal, exactly `DEFAULT_HORIZON_TRADING_DAYS` (21) NYSE sessions after
+  `INTEGRATION_TRADING_DAY` — seeded rather than hand-written (the issue's
+  own alternative (b)) so the real `data.daily`/`experiment.run` producer
+  path settles a shadow rather than fabricating a verdict shape by hand.
+  `integration_arctic_symbols` now seeds one continuous synthetic OHLCV
+  series through `SETTLED_TRADING_DAY`, and `test_experiment_grade` grades
+  the shadow `test_experiment_run` produced at `INTEGRATION_TRADING_DAY`
+  against a panel compiled AT `SETTLED_TRADING_DAY`, asserting the result
+  carries a genuinely non-empty `settled_dates`. `test_promote` runs
+  immediately after, against the same graded cycle.
+
+`test.integration` is this tier's own job (`alpha-engine-config-I10459`) —
+see "The summary artifact" below.
+
+### Not exercised, and why (1 of 25)
 
 **`report.morning`** — `crucible.morning._operator_chat()` resolves
 `krepis.alerts.DESTINATION_OPERATOR_CHAT` (a real Telegram channel) with no
@@ -81,11 +103,8 @@ operator channel and the real tracker every night — that is a product
 decision (a reserved matter, `principles.md` §3.2: "is this decision
 reserved or delegated"), not one this tier makes unilaterally. Excluded
 pending a ruling and, if approved, a dedicated-destination override in
-`crucible/morning.py`.
-
-Both gaps above are filed: `alpha-engine-config-I10457` (ArcticDB library
-override, unblocks 7 of the 8 excluded jobs) and `alpha-engine-config-I10458`
-(report.morning dedicated destination, needs Brian's ruling first).
+`crucible/morning.py`. Filed as `alpha-engine-config-I10458` (needs Brian's
+ruling first).
 
 ## The dedicated environment, resolved from required env — never a literal
 
@@ -101,6 +120,14 @@ plausible-looking default that could resolve to production.
 | `CRUCIBLE_INTEGRATION_ARCTIC_LIBRARY` | the dedicated library NAME within that bucket | `conftest.py` refuses a name matching any of `nousergon_lib.arcticdb`'s production library constants (`universe`, `macro`, `preliminary`) |
 | `CRUCIBLE_INTEGRATION_PAGES_TOPIC` | the SNS topic `alerts.sweep`/`heartbeat` publish to for real | passed to the jobs as `CRUCIBLE_PAGES_TOPIC` — never the production topic |
 | `CRUCIBLE_INTEGRATION_MUTED_TOPIC` | the muted-topic clause reads | passed as `CRUCIBLE_MUTED_TOPIC` |
+
+`data.daily`/`data.weekly`/`data.heal` additionally pass
+`--arctic-library "$CRUCIBLE_INTEGRATION_ARCTIC_LIBRARY"`
+(`alpha-engine-config-I10457`) — the CLI flag `ArcticPriceSource(library=
+...)` threads through; there is deliberately no `--arctic-bucket` flag, only
+`CRUCIBLE_ARCTIC_BUCKET` (set from `CRUCIBLE_INTEGRATION_ARCTIC_BUCKET` by
+`conftest.py::_arctic_bucket_env`, session-scoped autouse), since the bucket
+is not this tier's isolation unit — see below.
 
 **Why the ArcticDB bucket is not itself "dedicated".** ArcticDB has no
 per-bucket-per-tenant isolation cheaper than a second bucket; the *library*
@@ -118,41 +145,33 @@ arithmetic" (Test discipline). Verified a real trading day at collection
 time via `crucible.calendar.is_trading_day`, not merely asserted in a
 comment.
 
-## The summary artifact, and its DELIBERATE delta from `run.json`
+## The summary artifact — a real registered CLI job
 
-**Not implemented as a registered CLI job.** Doing so correctly needs a new
-entry in `crucible.cli.JOBS`/`HANDLERS`, a `components.yaml` row, and a new
-member in `run_manifest.v2.json`'s closed `job` enum — three files this
-session's ownership does not include and that the IaC/weekly-job-runner
-track may also be touching concurrently. Filed as
-`alpha-engine-config-I10459` (promote this to a real `crucible
-integration.nightly` job once the enum and registry are free to edit) — the
-correct SOTA shape, staged rather than rushed.
+**`test.integration`** (`alpha-engine-config-I10459`, `crucible.
+integration_summary`) replaces the hand-rolled `store.put_bytes` write this
+workflow used to carry: a thin handler that shells out to
+`pytest tests/integration --tb=short` and reports pass/fail through
+`crucible.runner.run_job`, writing a real, schema-validated
+`run_manifest.v2` document at `runs/test.integration/{trading_day}/
+run.json` in the dedicated store — like every other job (rule 1, manifest or
+it did not happen). No schedule, no deadline: `components.yaml`'s row
+declares both `null` deliberately, since this job stays workflow-triggered
+by `.github/workflows/integration-nightly.yml`'s own `schedule`/
+`workflow_call`/`workflow_dispatch` triggers rather than gaining a second,
+independent starter for the same nightly run.
 
-Until then, `.github/workflows/integration-nightly.yml` writes a plain JSON
-summary directly to `integration/summary/{trading_day}.json` in the
-**dedicated** store after the suite runs:
-
-```json
-{
-  "schema_version": "integration_summary.v1",
-  "trading_day": "YYYY-MM-DD",
-  "generated_at": "2026-09-10T06:00:00Z",
-  "commit": "<sha>",
-  "outcome": "ok" | "failed",
-  "jobs_exercised": ["experiment.new", "explain", ...],
-  "jobs_not_exercised": {"data.daily": "<the reason above>", ...},
-  "junit_summary": {"passed": N, "failed": M}
-}
-```
+The pass/fail exit code and a tail of the process's combined stdout/stderr
+land in the manifest's `metrics[]` (`tests_integration_exit_code`) — a
+failure's `reason` carries the same tail, so a reader does not have to open
+the workflow's own log to learn what broke.
 
 **This is why the gate's staleness refusal is not implemented in this PR.**
 `crucible/gate.py` is owned by a sibling track this session; reading
-`integration/summary/{trading_day}.json` and refusing a reading older than N
-trading days is a small, well-specified addition once this key exists —
-`alpha-engine-config-I10460` names the exact key, the `integration_
-summary.v1` shape above, and the staleness window (recommend: the gate's own
-window, same as every other clause) for whoever picks it up.
+`runs/test.integration/{trading_day}/run.json` and refusing a reading older
+than N trading days is a small, well-specified addition now that the key
+exists — `alpha-engine-config-I10460` names the exact key and the staleness
+window (recommend: the gate's own window, same as every other clause) for
+whoever picks it up.
 
 ## Running it
 

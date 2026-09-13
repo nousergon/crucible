@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+from pathlib import Path
 from typing import Any
 
 from crucible import migrate as migrate_module
@@ -83,10 +84,20 @@ def _source(args: argparse.Namespace, config: Any) -> PriceSource:
     `arctic` is the only production source. A source that is unavailable
     raises by name from inside `load_panel`; it never falls back, because a
     substituted source measures something other than what the run reports.
+
+    `--arctic-library` (`alpha-engine-config-I10457`) is additive and
+    production-inert: production never passes it, so `library` resolves to
+    `None` and `ArcticPriceSource` reads the production `universe` library
+    exactly as before this flag existed. The integration tier is the only
+    caller (`tests/integration/test_cli_jobs.py`), and the value it passes is
+    resolved through `crucible.required.require_env` in its own conftest —
+    RAISE-on-absent already lives there, not here.
     """
     name = getattr(args, "source", None) or "arctic"
     if name == "arctic":
-        return ArcticPriceSource(config.arctic_bucket)
+        return ArcticPriceSource(
+            config.arctic_bucket, library=getattr(args, "arctic_library", None) or None
+        )
     raise SystemExit(
         f"--source {name!r} is not a registered price source. The registered source is "
         "`arctic`; a test supplies its own `PriceSource` by calling the job function "
@@ -300,6 +311,41 @@ def _slot_module(slot: str) -> Any:
         ) from exc
 
 
+def _recipes_for_registration(slot: str, *, config: Any, store: Any) -> list[Any]:
+    """The slot's loaded recipes, in the shape `register_arms` reads.
+
+    One entry point over two recipe SCHEMAS (`alpha-engine-config-I9957`).
+    U and R recipes are `ArmSpec`s; an M recipe is a `ModelRecipe`, wrapped in
+    `crucible.slots.model.RegisteredModelArm` so its own id — the hash of its
+    own spec — is what registers. Re-deriving an id here from an `ArmSpec`
+    view would give one arm two identities, and the register, the shadows and
+    the series would each speak about a different one.
+
+    S is not here: `load_arm_specs` raises `ForeignRecipeSchemaError` for it
+    and the caller converts that into the exit that names the phase.
+    """
+    if slot != "m":
+        return list(load_arm_specs(slot, store=store, strategy_dir=config.strategy_dir))
+    from crucible.slots.model import (  # noqa: PLC0415 - heavy import, one call site
+        load_model_recipes,
+        registration_specs,
+    )
+
+    directory = Path(config.strategy_dir) / "arms" / slot if config.strategy_dir else None
+    loaded = load_model_recipes(directory, store=None if directory is not None else store)
+    print(
+        json.dumps(
+            {
+                "refused": [
+                    {"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused
+                ]
+            },
+            indent=2,
+        )
+    )
+    return registration_specs(loaded)
+
+
 def handle_experiment_new(args: argparse.Namespace) -> int:
     """Register the slot's recipes, appending only what is new.
 
@@ -311,23 +357,29 @@ def handle_experiment_new(args: argparse.Namespace) -> int:
     own help text is "report what would be written; write nothing", and
     this handler wrote the register regardless of it).
 
-    **M and S are refused here in the same shape :func:`_slot_module` uses**
-    (`alpha-engine-config-I9961`). `--slot` admits all four, and for M and S
-    this command used to reach `load_arm_specs`, fail on a missing `ranker`,
-    and present as a malformed recipe tree — for recipes that are well-formed
-    under the schema their own slot declares. The loader now refuses the slot
-    by name; this converts that into the same exit `experiment.run --slot m`
-    already produces, so the two commands give one answer about when M and S
-    arrive rather than two unrelated failures.
+    **M is no longer refused by name** (`alpha-engine-config-I9957`). Its
+    recipes are `ModelRecipe` documents, not `ArmSpec`s, so `load_arm_specs`
+    still refuses slot `m` — that refusal is correct and stays — and this
+    handler now resolves the M loader instead of converting the refusal into
+    an exit. `crucible.slots.model.load_model_recipes` reads the same tree
+    from the same two sources, and its refused arms are reported here rather
+    than silently dropped: an arm that will not register is the fact an
+    operator running `experiment.new` most needs.
+
+    **S is still refused by name**, in the same shape :func:`_slot_module`
+    uses (`alpha-engine-config-I9961`): its recipes are `StrategyRecipe`
+    documents and its produce/grade entry points arrive with the S slot's own
+    phase-3 deliverable. Registering nothing and exiting 0 would be
+    indistinguishable from a slot whose arms were all already present.
     """
     config = _settings(args)
     store = config.store()
     try:
-        specs = load_arm_specs(args.slot, store=store, strategy_dir=config.strategy_dir)
+        specs = _recipes_for_registration(args.slot, config=config, store=store)
     except ForeignRecipeSchemaError as exc:
         raise SystemExit(
-            f"{exc} U and R are here; M and S arrive with track B "
-            f"({_ALL_SLOTS_PHASE.tracker}), which is when their recipes gain a register "
+            f"{exc} U, R and M are here; S arrives with track B "
+            f"({_ALL_SLOTS_PHASE.tracker}), which is when its recipes gain a register "
             "writer. Registering nothing and exiting 0 would be indistinguishable from a "
             "slot whose arms were all already present."
         ) from exc
@@ -471,12 +523,26 @@ def handle_explain(args: argparse.Namespace) -> int:
     receipt, not noise.
 
     `--dry-run` prints the walk and files nothing (`run_job(dry_run=True)`).
+
+    **`--verify-chain`** (`alpha-engine-config-I10625`) is checked AFTER the
+    walk is printed and the manifest recorded — a broken chain is not a
+    failure of the walk itself (`explain` "runs" successfully either way;
+    the walk is what lets an operator SEE the break), so it never turns this
+    run's own manifest into a `failed` one. It is the caller's refusal:
+    `crucible.explain.explain` already sets `Lineage.chain` to a
+    `ChainVerification` whenever the walk crosses the money path
+    (`alpha-engine-config-I10414`, plan §9.5) and leaves it `None` otherwise;
+    `--verify-chain` calls `chain.raise_if_broken()` when a chain was
+    computed, which is a no-op on an intact chain and a non-zero exit naming
+    the break otherwise.
     """
     config = _settings(args)
     store = config.store()
+    captured: dict[str, Any] = {}
 
     def job(ctx: Any) -> None:
         lineage = explain_lineage(store, args.target)
+        captured["lineage"] = lineage
         for key in _lineage_keys(lineage):
             if store.exists(key):
                 ctx.record_input(key, store.get_bytes(key))
@@ -490,7 +556,24 @@ def handle_explain(args: argparse.Namespace) -> int:
         run_mode=getattr(args, "run_mode", None),
         dry_run=bool(getattr(args, "dry_run", False)),
     )
+    if getattr(args, "verify_chain", False):
+        _verify_chain_or_refuse(captured["lineage"])
     return 0
+
+
+def _verify_chain_or_refuse(lineage: Any) -> None:
+    """`--verify-chain`'s check, isolated so its exit shape is one place.
+
+    `lineage.chain` is `None` for a walk that never crossed the money path
+    (nothing to verify — not an error) or the `ChainVerification` computed
+    by `crucible.explain.explain` over the whole store. `raise_if_broken()`
+    is a no-op when it verified `ok` and an uncaught
+    `crucible.manifest.MoneyPathChainError` — non-zero exit, reason attached
+    — when it did not.
+    """
+    chain = lineage.chain
+    if chain is not None:
+        chain.raise_if_broken()
 
 
 def handle_migrate_history(args: argparse.Namespace) -> int:
@@ -551,6 +634,20 @@ def add_track_a_arguments(name: str, sub: argparse.ArgumentParser) -> None:
             "--source",
             default="arctic",
             help="Price source. `arctic` is the only production source; it never falls back.",
+        )
+        # alpha-engine-config-I10457: the dedicated-library override.
+        sub.add_argument(
+            "--arctic-library",
+            dest="arctic_library",
+            default=None,
+            help=(
+                "Dedicated ArcticDB library name to read instead of the production "
+                "`universe` library. ADDITIVE: absent, behaviour is unchanged "
+                "production. Never set outside the integration test tier, which "
+                "resolves it from CRUCIBLE_INTEGRATION_ARCTIC_LIBRARY via "
+                "crucible.required.require_env — that is the only caller that "
+                "declares this flag."
+            ),
         )
         sub.add_argument(
             "--symbols",

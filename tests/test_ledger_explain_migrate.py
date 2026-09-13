@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
 from crucible.data import run_daily
 from crucible.explain import explain, render
+from crucible.keys import manifest_key
 from crucible.ledger import append_trials, n_trials, read_trials
 from crucible.migrate import SOURCES, MigrationSourceMissing, run_migrate_history
 from crucible.runner import run_job
@@ -644,3 +646,284 @@ class TestExplainWalksAVerdict:
         manifest = json.loads(store.get_bytes(manifest_key("explain", day)))
         assert manifest["status"] == "failed"
         assert "neither a run_id" in manifest["reason"]
+
+
+def _money_path_manifest(
+    run_id: str,
+    *,
+    job: str = "promote",
+    outputs: list[str] | None = None,
+    finished: str = "2026-08-31T13:04:11Z",
+    trading_day: str = "2026-08-28",
+) -> dict[str, Any]:
+    """A conformant v2 manifest at the floor, plus whatever outputs a test
+    needs — the same shape `tests/test_money_path_chain.py::_manifest` uses,
+    duplicated here rather than imported across test modules."""
+    from crucible.manifest import RUN_MANIFEST_SCHEMA_VERSION
+    from crucible.store import sha256_hex
+
+    return {
+        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "run_id": run_id,
+        "job": job,
+        "run_mode": "live",
+        "trading_day": trading_day,
+        "calendar_date": "2026-08-31",
+        "status": "ok",
+        "reason": "",
+        "started": "2026-08-31T13:00:00Z",
+        "finished": finished,
+        "code_sha": "a" * 40,
+        "release_sha": "b" * 40,
+        "seed": 7,
+        "inputs": [],
+        "outputs": [
+            {"key": k, "sha256": sha256_hex(k.encode()), "schema_version": "v1"}
+            for k in (outputs or [])
+        ],
+        "rows_in": 0,
+        "rows_out": 0,
+        "rows_rejected": [],
+        "cost_usd": 0.0,
+        "llm_calls": [],
+        "resource": {
+            "instance_type": "local",
+            "spot": False,
+            "escalated_to_on_demand": False,
+            "interruptions": 0,
+            "mem_peak_mb": 1.0,
+            "disk_free_mb": 1.0,
+        },
+        "metrics": [],
+        "attempts": [{"n": 1, "reason": "initial"}],
+    }
+
+
+def _write_money_path_manifest(store, manifest: dict[str, Any]) -> str:
+    """Write ``manifest`` through the single writer; return its manifest key."""
+    from crucible.manifest import write_manifest
+
+    key = manifest_key(
+        manifest["job"], manifest["trading_day"], discriminator=manifest.get("discriminator")
+    )
+    write_manifest(store, key, manifest)
+    return key
+
+
+class TestVerifyChainFlag:
+    """`--verify-chain` (`alpha-engine-config-I10625`), wired to
+    `crucible.explain`'s real `verify_money_path_chain` / `ChainVerification`
+    / `Lineage.chain` (`crucible-PR240`, `alpha-engine-config-I10414`) — no
+    monkeypatched stand-in: these tests build a real money-path chain with
+    `crucible.manifest.write_manifest` and walk it through the CLI.
+    """
+
+    TRADING_DAY = "2026-08-28"
+
+    def _chain(self, store) -> list[str]:
+        from crucible.keys import champion_key, predictions_key
+
+        return [
+            _write_money_path_manifest(
+                store,
+                _money_path_manifest(
+                    "01JG0000000000000000000001",
+                    outputs=[champion_key("m")],
+                    finished="2026-08-31T13:00:11Z",
+                ),
+            ),
+            _write_money_path_manifest(
+                store,
+                _money_path_manifest(
+                    "01JG0000000000000000000002",
+                    job="experiment.run",
+                    outputs=[predictions_key(self.TRADING_DAY)],
+                    finished="2026-08-31T14:00:11Z",
+                ),
+            ),
+        ]
+
+    def test_verify_chain_is_silent_ok_when_the_walk_never_crossed_the_money_path(
+        self, store, tmp_path, monkeypatch
+    ) -> None:
+        self._chain(store)
+        report_key = "report/2026-08-28/attribution.json"
+        _write_money_path_manifest(
+            store,
+            _money_path_manifest(
+                "01JG000000000000000000000B",
+                job="report",
+                outputs=[report_key],
+                finished="2026-08-31T15:00:11Z",
+            ),
+        )
+        from crucible.cli import main
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        rc = main(
+            [
+                "explain",
+                "--date",
+                self.TRADING_DAY,
+                "--run-mode",
+                "replay",
+                "--store",
+                str(store.root),
+                "--verify-chain",
+                report_key,
+            ]
+        )
+        assert rc == 0
+
+    def test_verify_chain_exits_zero_on_an_intact_chain(self, store, tmp_path, monkeypatch) -> None:
+        from crucible.cli import main
+        from crucible.keys import predictions_key
+
+        self._chain(store)
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        rc = main(
+            [
+                "explain",
+                "--date",
+                self.TRADING_DAY,
+                "--run-mode",
+                "replay",
+                "--store",
+                str(store.root),
+                "--verify-chain",
+                predictions_key(self.TRADING_DAY),
+            ]
+        )
+        assert rc == 0
+
+    def test_verify_chain_exits_non_zero_and_names_the_break_on_a_broken_chain(
+        self, store, tmp_path, monkeypatch
+    ) -> None:
+        from crucible.cli import main
+        from crucible.keys import predictions_key
+        from crucible.manifest import MoneyPathChainError
+
+        keys = self._chain(store)
+        tampered = json.loads(store.get_bytes(keys[0]))
+        tampered["seed"] = 999
+        store.put_bytes(keys[0], json.dumps(tampered, indent=2, sort_keys=True).encode("utf-8"))
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        with pytest.raises(MoneyPathChainError, match="CHAIN BROKEN"):
+            main(
+                [
+                    "explain",
+                    "--date",
+                    self.TRADING_DAY,
+                    "--run-mode",
+                    "replay",
+                    "--store",
+                    str(store.root),
+                    "--verify-chain",
+                    predictions_key(self.TRADING_DAY),
+                ]
+            )
+
+    def test_verify_chain_omitted_never_raises_on_a_broken_chain(
+        self, store, tmp_path, monkeypatch
+    ) -> None:
+        """Without the flag, a broken chain is never even consulted —
+        `explain` prints the walk and exits 0 regardless, exactly as it does
+        today over a store carrying no chain at all."""
+        from crucible.cli import main
+        from crucible.keys import predictions_key
+
+        keys = self._chain(store)
+        tampered = json.loads(store.get_bytes(keys[0]))
+        tampered["seed"] = 999
+        store.put_bytes(keys[0], json.dumps(tampered, indent=2, sort_keys=True).encode("utf-8"))
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        rc = main(
+            [
+                "explain",
+                "--date",
+                self.TRADING_DAY,
+                "--run-mode",
+                "replay",
+                "--store",
+                str(store.root),
+                predictions_key(self.TRADING_DAY),
+            ]
+        )
+        assert rc == 0
+
+
+class TestExplainDryRunRecordsZeroMutations:
+    """`--dry-run` writes nothing — asserted against a store that RECORDS
+    every mutating call, the same contract shape `alpha-engine-config-I10576`
+    /`crucible-PR225` established for `crucible gate`.
+
+    `explain` itself is NOT a no-write read in the shape `crucible gate`
+    became: `alpha-engine-config-I9757` (`crucible-PR115`, measured
+    2026-09-05, `TestExplainWalksAVerdict`'s own docstring above) ruled the
+    opposite way on purpose — the phase-1 gate clause
+    `_clause_explain_walks_a_verdict` has nothing to read unless a real
+    `explain` invocation files its manifest, so `explain` writes its own
+    `runs/explain/{day}/run.json` like every other job (`AGENTS.md` rule 1)
+    and reverting that would reopen I9757. `--dry-run` is rule 1's one
+    declared exception, and this test pins zero mutating calls through it —
+    not zero mutating calls unconditionally.
+    """
+
+    def test_dry_run_makes_no_mutating_call_at_all(
+        self, source, cycle_date, tmp_path, monkeypatch
+    ) -> None:
+        from crucible.cli import main
+        from crucible.store import LocalStore
+
+        class RecordingStore(LocalStore):
+            def __init__(self, root: Any) -> None:
+                super().__init__(root)
+                self.mutations: list[str] = []
+
+            def put_bytes(self, key: str, payload: bytes, **kwargs: Any) -> Any:
+                self.mutations.append(key)
+                return super().put_bytes(key, payload, **kwargs)
+
+            def compare_and_swap(self, key: str, expected: str, payload: bytes, **kw: Any) -> Any:
+                self.mutations.append(key)
+                return super().compare_and_swap(key, expected, payload, **kw)
+
+        recorder = RecordingStore(tmp_path / "store")
+        run_job(
+            "data.daily",
+            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            store=recorder,
+            trading_day=cycle_date,
+        )
+        recorder.mutations.clear()
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        # `crucible.track_a` resolves its store through `Settings.store()`,
+        # which builds one from the URI via `crucible.config.store_from_uri`
+        # — patched here (not `open_store`, which `track_a` never calls) so
+        # the RESOLVED store is the recorder, dry-run wrapping included.
+        monkeypatch.setattr("crucible.config.store_from_uri", lambda uri: recorder)
+
+        from crucible.keys import manifest_key
+
+        manifest = json.loads(
+            recorder.get_bytes(manifest_key("data.daily", cycle_date.isoformat()))
+        )
+        target = manifest["outputs"][0]["key"]
+        rc = main(
+            [
+                "explain",
+                "--date",
+                cycle_date.isoformat(),
+                "--run-mode",
+                "replay",
+                "--store",
+                str(recorder.root),
+                "--dry-run",
+                target,
+            ]
+        )
+        assert rc == 0
+        assert recorder.mutations == []

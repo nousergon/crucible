@@ -43,6 +43,7 @@ from crucible.holdout import (
     holdout_handler,
 )
 from crucible.iac_conformance import IAC_CONFORMANCE_JOB, iac_conformance_handler
+from crucible.integration_summary import INTEGRATION_TEST_JOB, integration_test_handler
 from crucible.keys import arena_cycle_key, champion_key
 from crucible.keys import manifest_key as _promote_manifest_key
 from crucible.llm import FAULT_INJECTION_CAPABILITY_CLASSES
@@ -92,6 +93,18 @@ _EPIC_ISSUE = 9751
 
 def _epic_tracker() -> str:
     return f"alpha-engine-config-I{_EPIC_ISSUE}"
+
+
+#: The money-path hash-chain verifier's own tracker issue (`crucible-PR240`)
+#: — a HISTORICAL, non-phase issue that `crucible.gate.phase_tracker` can
+#: never derive, so `tests/test_no_stale_tracker_literals.py` requires this
+#: shape (a plain `int`, read at f-string time) rather than a literal
+#: `"alpha-engine-config-I10414"` anywhere a user-facing string can carry it.
+_MONEY_PATH_CHAIN_ISSUE = 10414
+
+
+def _money_path_chain_tracker() -> str:
+    return f"alpha-engine-config-I{_MONEY_PATH_CHAIN_ISSUE}"
 
 
 def _todo(job: str, track: str, note: str) -> Callable[[argparse.Namespace], int]:
@@ -455,6 +468,19 @@ JOBS: dict[str, JobSpec] = {
         "Account-vs-template and template-vs-declared-inventory IaC conformance",
         True,
     ),
+    # alpha-engine-config-I10459. Promotes the integration tier's summary
+    # artifact from a hand-rolled `store.put_bytes` call inside
+    # `.github/workflows/integration-nightly.yml` to a real registered job:
+    # shells out to `pytest tests/integration` and writes a real
+    # `run_manifest.v2` document, like every other job. NOT scheduled — it
+    # stays workflow-triggered by that workflow's own
+    # `schedule`/`workflow_call`/`workflow_dispatch` triggers, never a second
+    # independent starter for the same nightly run.
+    INTEGRATION_TEST_JOB: JobSpec(
+        INTEGRATION_TEST_JOB,
+        "Run tests/integration (real S3 + real ArcticDB) and report pass/fail",
+        False,
+    ),
 }
 
 #: The jobs that carry `--fault-capability-class`, exhaustively.
@@ -533,6 +559,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     FAULT_RECORD_JOB: _fault_record,
     FAULT_PROBE_JOB: fault_probe_handler,
     IAC_CONFORMANCE_JOB: iac_conformance_handler,
+    INTEGRATION_TEST_JOB: integration_test_handler,
 }
 
 
@@ -641,6 +668,15 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if spec.name == "explain":
             sub.add_argument("target", metavar="RUN_ID|VERDICT_KEY")
+            sub.add_argument(
+                "--verify-chain",
+                action="store_true",
+                help=(
+                    "Verify the money-path hash chain (plan §9.5, "
+                    f"{_money_path_chain_tracker()}) and exit non-zero on a break. A "
+                    "no-op when the walk never crossed the money path."
+                ),
+            )
         if spec.name == "release.pin":
             sub.add_argument("sha", metavar="RELEASE_SHA")
             sub.add_argument("--target", choices=["current", "trader"], default="current")

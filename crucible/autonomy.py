@@ -99,9 +99,12 @@ __all__ = [
     "OperatorAction",
     "OperatorActionCount",
     "PointerAttribution",
+    "StackApply",
+    "StackApplyAttribution",
     "PointerWrite",
     "StackUnmeasurableError",
     "attribute_pointer_writes",
+    "attribute_stack_applies",
     "count_operator_actions",
     "date_partitions",
     "iter_archive_records",
@@ -752,3 +755,240 @@ def _pointer_event_instant(event_time: str) -> dt.datetime | None:
     if parsed.tzinfo is None:
         return None
     return parsed.astimezone(dt.UTC)
+
+
+# ── alpha-engine-config-I10609: which stack applies were HUMAN ─────────────
+# Brian ruled option (a) on `alpha-engine-config-I10609`: the `crucible-v2`
+# CloudFormation apply is automated on merge under a least-privilege machine
+# role, as five sibling stacks in `nous-ergon-ops` already are. That makes
+# "who applied the stack" exactly the question :func:`attribute_pointer_writes`
+# answers for the release pointer, and it has to be answered the same way —
+# from the archive — because `DescribeStacks` reports WHEN the stack last
+# changed and never WHO changed it. A stack carries no writer any more than
+# the pointer document does.
+#
+# The machine allowlist needs no extension to cover the new role: it is
+# DERIVED from the stack's own `AWS::IAM::Role` resources
+# (:func:`machine_principals`), and the apply role is declared IN that
+# template, so it joins the allowlist the moment the stack is applied. No
+# role name is written into this public tree, here or anywhere else.
+
+#: The CloudFormation calls that can change a stack. Broad on purpose, for
+#: the same reason `_POINTER_WRITE_EVENTS` is: an attribution set narrower
+#: than the API surface fails in the direction that reads clean, and an apply
+#: performed by a call this set does not name is UNATTRIBUTABLE — handled by
+#: the caller as HUMAN — rather than silently absent. `CreateChangeSet` is
+#: included although it changes nothing by itself: it is mutating, it names
+#: the stack, and `count_operator_actions` already counts it as a human
+#: action, so excluding it here would make the two readings disagree about
+#: the same event.
+_STACK_APPLY_EVENTS = frozenset(
+    {"CreateStack", "UpdateStack", "ExecuteChangeSet", "CreateChangeSet", "DeleteStack"}
+)
+
+#: The service the calls above are recorded under.
+_CLOUDFORMATION_SOURCE = "cloudformation.amazonaws.com"
+
+#: How far apart the stack's own change instant and the CloudTrail
+#: `eventTime` for the call that caused it may sit and still be the same
+#: event. Wider than `POINTER_ATTRIBUTION_TOLERANCE` and for a measured
+#: reason: the stack instant `crucible.gate._stack_last_updated` reports is
+#: the newest RESOURCE settle time, which trails `ExecuteChangeSet` by the
+#: length of the apply — 2-4 minutes for this template, and
+#: `nous-ergon-ops`'s own stack detector calls an apply STUCK rather than in
+#: flight at ten. Fifteen minutes is past the longest apply the fleet treats
+#: as healthy; it is slack, not a tolerance being leaned on.
+STACK_APPLY_ATTRIBUTION_TOLERANCE = dt.timedelta(minutes=15)
+
+#: How many calendar days back the apply attribution will walk before giving
+#: up and answering UNATTRIBUTABLE. The pointer read needs no such bound —
+#: its floor is the stack apply, which is by construction recent. This read's
+#: floor is the stack's CREATION, which recedes without limit as machine
+#: applies accumulate, so an unbounded walk would read months of archive
+#: inside the board job's timeout (one production day is ~1,123 objects, a
+#: few seconds at `_ARCHIVE_WORKERS` concurrency). Reaching the bound resolves
+#: to UNATTRIBUTABLE, which the caller reads as HUMAN — the strict direction,
+#: never "no human applied it".
+_STACK_ATTRIBUTION_MAX_DAYS = 45
+
+
+@dataclass(frozen=True)
+class StackApply:
+    """One archived call that changed the graded stack, and who issued it."""
+
+    at: dt.datetime
+    event_name: str
+    principal: str
+    principal_type: str
+    machine: bool
+
+
+@dataclass(frozen=True)
+class StackApplyAttribution:
+    """What the archive could say about who has applied the stack.
+
+    ``unattributable`` is a REASON string when the archive could not settle
+    the question and `None` when it could — the same contract
+    :class:`PointerAttribution` carries, and for the same reason: the caller
+    (`crucible.gate._human_stack_apply`) turns any reason at all into "treat
+    the apply as human", which restarts the autonomy window and keeps the
+    clause UNMET for longer. Over-counting human changes is the safe
+    direction for a clause asserting a count of zero.
+    """
+
+    applies: tuple[StackApply, ...]
+    latest_human: dt.datetime | None
+    unattributable: str | None
+    objects_read: int
+    records_scanned: int
+
+
+def _names_stack(record: dict[str, Any], stack_name: str) -> bool:
+    """Whether ``record``'s `requestParameters` name ``stack_name``.
+
+    Matched on the parameter rather than by substring — `_touches`'s
+    deliberately broad scan would match any record merely mentioning the
+    stack — and accepting both spellings, because `ExecuteChangeSet` names
+    the stack by ARN where `UpdateStack` names it bare. A matcher that
+    compared only the bare name would attribute nothing on the one call that
+    actually applies a template.
+    """
+    params = record.get("requestParameters")
+    if not isinstance(params, dict):
+        return False
+    named = str(params.get("stackName") or "")
+    return named == stack_name or f":stack/{stack_name}/" in named
+
+
+def attribute_stack_applies(
+    client: Any,
+    *,
+    bucket: str,
+    prefix: str,
+    stack_name: str,
+    since: dt.datetime,
+    until: dt.datetime,
+    cfn: Any | None = None,
+) -> StackApplyAttribution:
+    """Who applied ``stack_name`` in ``(since, until]``, from the archive.
+
+    ``bucket``/``prefix`` locate the CloudTrail archive. ``since`` is the
+    floor the answer has to beat — the stack's CREATION, whose own apply was
+    the operator bootstrap and is human by construction. The walk goes
+    BACKWARD from ``until`` and stops at the first day carrying a human
+    apply: the latest human apply is on the newest day that has one, and
+    nothing older can change the answer.
+
+    A day the trail delivered nothing for is `unattributable`, not "nobody
+    applied the stack that day": a trail always delivers, so an empty day
+    means the trail does not cover it, and counting a gap as silence is the
+    §11 risk 8 failure with a different cause. So is running out of
+    :data:`_STACK_ATTRIBUTION_MAX_DAYS` without reaching ``since``.
+    """
+    if not bucket:
+        raise ArchiveMissingError(
+            "no CloudTrail archive bucket is configured, so no stack apply can be "
+            "attributed to a principal."
+        )
+
+    def _is_stack_apply(record: dict[str, Any]) -> bool:
+        if record.get("eventSource") != _CLOUDFORMATION_SOURCE:
+            return False
+        if record.get("eventName") not in _STACK_APPLY_EVENTS:
+            return False
+        return _names_stack(record, stack_name)
+
+    principals: tuple[str, ...] | None = None
+    applies: list[StackApply] = []
+    objects_read = 0
+    records_scanned = 0
+    day = until.date()
+    floor_day = since.date()
+    scanned_days = 0
+    while day >= floor_day:
+        if scanned_days >= _STACK_ATTRIBUTION_MAX_DAYS:
+            return StackApplyAttribution(
+                applies=tuple(sorted(applies, key=lambda a: a.at)),
+                latest_human=None,
+                unattributable=(
+                    f"scanned {scanned_days} calendar day(s) back from "
+                    f"{until.date().isoformat()} without reaching the stack's creation "
+                    f"({floor_day.isoformat()}) or finding a human apply, which is this "
+                    "read's bound — so who last applied the stack by hand is unknown"
+                ),
+                objects_read=objects_read,
+                records_scanned=records_scanned,
+            )
+        read = iter_archive_records(
+            client, bucket=bucket, prefix=prefix, start=day, end=day, keep=_is_stack_apply
+        )
+        objects_read += read.objects_read
+        records_scanned += read.records_scanned
+        scanned_days += 1
+        if read.uncovered_days:
+            return StackApplyAttribution(
+                applies=tuple(sorted(applies, key=lambda a: a.at)),
+                latest_human=None,
+                unattributable=(
+                    f"the CloudTrail archive s3://{bucket}/{prefix} delivered no objects "
+                    f"for {day.isoformat()}, so who applied the stack that day cannot be "
+                    "read. A trail always delivers, so an uncovered day is a gap, not "
+                    "silence"
+                ),
+                objects_read=objects_read,
+                records_scanned=records_scanned,
+            )
+        found_human = False
+        for raw_record in read.records:
+            record = CloudTrailRecord.model_validate(raw_record)
+            instant = _pointer_event_instant(record.eventTime)
+            if instant is None:
+                return StackApplyAttribution(
+                    applies=tuple(sorted(applies, key=lambda a: a.at)),
+                    latest_human=None,
+                    unattributable=(
+                        f"a stack apply carried an eventTime that will not parse "
+                        f"({record.eventTime!r}), so it cannot be placed relative to the "
+                        "window's floor"
+                    ),
+                    objects_read=objects_read,
+                    records_scanned=records_scanned,
+                )
+            if principals is None:
+                # Derived lazily and ONCE, exactly as the pointer read does: a
+                # span with no apply at all must not require a CloudFormation
+                # call to answer.
+                principals = machine_principals(cfn)
+            name, kind = _principal(record)
+            applied = StackApply(
+                at=instant,
+                event_name=record.eventName,
+                principal=name,
+                principal_type=kind,
+                machine=name in principals,
+            )
+            applies.append(applied)
+            if not applied.machine and applied.at > since:
+                found_human = True
+        if found_human:
+            break
+        day -= dt.timedelta(days=1)
+    ordered = tuple(sorted(applies, key=lambda a: a.at))
+    humans = [a.at for a in ordered if not a.machine and a.at > since]
+    if humans:
+        return StackApplyAttribution(ordered, max(humans), None, objects_read, records_scanned)
+    if not any(abs(a.at - until) <= STACK_APPLY_ATTRIBUTION_TOLERANCE for a in ordered):
+        return StackApplyAttribution(
+            applies=ordered,
+            latest_human=None,
+            unattributable=(
+                f"the stack's own change instant {until.isoformat()} matches no archived "
+                f"{'/'.join(sorted(_STACK_APPLY_EVENTS))} on stack {stack_name!r} within "
+                f"{STACK_APPLY_ATTRIBUTION_TOLERANCE}, so the principal behind the change "
+                f"that is actually there is unknown ({len(ordered)} stack apply call(s) "
+                "were archived over the scanned days)"
+            ),
+            objects_read=objects_read,
+            records_scanned=records_scanned,
+        )
+    return StackApplyAttribution(ordered, None, None, objects_read, records_scanned)

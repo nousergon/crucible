@@ -49,6 +49,7 @@ def synthetic_frames(
     n_tickers: int = 40,
     sessions: int = SESSIONS,
     seed: int = 20260901,
+    names: list[str] | None = None,
 ) -> dict[str, object]:
     """A ``{ticker: OHLCV frame}`` mapping with a real, persistent cross-section.
 
@@ -56,14 +57,19 @@ def synthetic_frames(
     a signal rather than noise: without persistent per-name drift, a
     momentum ranker is a random selector and the whole grading path would be
     tested against a market in which nothing is measurable.
+
+    ``names``, when given, replaces the generated ``T000``... labels
+    one-for-one (and overrides ``n_tickers`` with its own length) — used to
+    synthesize a named symbol such as a slot's benchmark (`SPY`) with the
+    same shape and history length as the rest of the cross-section.
     """
     import pandas as pd
 
     days = sessions_ending(end, sessions)
     rng = random.Random(seed)
     frames: dict[str, object] = {}
-    for index in range(n_tickers):
-        ticker = f"T{index:03d}"
+    tickers = names if names is not None else [f"T{i:03d}" for i in range(n_tickers)]
+    for ticker in tickers:
         drift = rng.gauss(0.0004, 0.0009)
         vol = rng.uniform(0.008, 0.02)
         price = rng.uniform(20.0, 300.0)
@@ -207,6 +213,40 @@ def no_live_cost_explorer(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_capability_classes_cache():
+    """`crucible.llm._capability_classes` reads the registry now
+    (`alpha-engine-config-I9971`: `krepis.router.registry_groups()`, in
+    place of the fixed `TIER_GROUPS` dict it used to union), so its
+    `lru_cache(maxsize=1)` is no longer registry-independent. Left
+    uncleared, a stale cache entry from a PRECEDING test's registry file
+    (or its absence) would silently answer `_require_capability_class` and
+    `registry_preflight` for a DIFFERENT file's declared groups in every
+    later test. Cleared before AND after every test — mirrors
+    `no_live_cost_explorer`'s reset of `crucible.cost`'s own process-wide
+    cache for the identical reason.
+    """
+    import crucible.llm as llm_module
+
+    def _clear() -> None:
+        # A test may itself have monkeypatched `_capability_classes` to a
+        # plain lambda (`test_llm_router_route.py`,
+        # `test_registry_preflight.py`); pytest's own `monkeypatch` fixture
+        # restores the real function on ITS teardown, whose ordering
+        # relative to this autouse fixture is not guaranteed, so the
+        # attribute may be a bare callable with no `cache_clear` at either
+        # boundary here.
+        cache_clear = getattr(llm_module._capability_classes, "cache_clear", None)
+        if cache_clear is not None:
+            cache_clear()
+
+    _clear()
+    try:
+        yield
+    finally:
+        _clear()
+
+
+@pytest.fixture(autouse=True)
 def no_tracker_credential(monkeypatch):
     """No test reaches GitHub by accident.
 
@@ -245,10 +285,35 @@ def frames(cycle_date):
 
 
 @pytest.fixture
-def source(frames):
+def benchmark_frames(cycle_date):
+    """Every slot's declared non-population benchmark (today: S's `SPY`), as
+    its own synthetic OHLCV frame with the same shape and history length as
+    the rest of the cross-section.
+
+    `data.daily` now fetches every declared benchmark through the source
+    alongside the declared universe (`alpha-engine-config-I10635`). Kept
+    separate from the `frames` fixture on purpose: `frames` stays exactly
+    the population a test declares as its universe (`sorted(frames)`), and
+    the benchmark row is merged into a `FramePriceSource` explicitly wherever
+    a test builds its own, exactly like production fetches it separately.
+    """
+    from crucible.slots import declared_benchmark_symbols
+
+    return synthetic_frames(
+        end=cycle_date, names=sorted(declared_benchmark_symbols()), seed=20260902
+    )
+
+
+@pytest.fixture
+def source(frames, benchmark_frames):
+    """A test exercising the benchmark-fetch failure path builds its own
+    bare `FramePriceSource` instead of this fixture.
+    """
     from crucible.data import FramePriceSource
 
-    return FramePriceSource(frames, snapshot="frames:conftest-seed-20260901")
+    return FramePriceSource(
+        {**frames, **benchmark_frames}, snapshot="frames:conftest-seed-20260901"
+    )
 
 
 @pytest.fixture
@@ -463,3 +528,43 @@ def _declared_liquidity_floor(monkeypatch: pytest.MonkeyPatch) -> None:
     also pass if the number leaked back into the tree.
     """
     monkeypatch.setenv("CRUCIBLE_LIQUIDITY_FLOOR_USD", "1000000")
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _a_registry_resolves_in_ci(tmp_path_factory):
+    """CI mirrors the box: a registry is ALWAYS resolvable.
+
+    Since `alpha-engine-config-I9971`, `crucible.llm._capability_classes`
+    enumerates the registry's own declared groups. On a box `registry_preflight`
+    refuses the job before any call site asks for a class, so "no registry"
+    never reaches a call. On the laptop the walk-up finds
+    `alpha-engine-config/private-docs/`. In the public repo's CI neither holds,
+    and every test that exercises a call site asking for `high` (the fault
+    probes) would fail on membership — a difference between the suite and the
+    box, not a property of the code. So when nothing resolves, this writes a
+    registry declaring the real group set and points `LLM_MODEL_REGISTRY_PATH`
+    at it for the session. Tests that assert the ABSENT case
+    (`test_registry_preflight.py`, `test_llm_cap.py`) `delenv` the variable
+    themselves and chdir to a tmp path, so they are unaffected.
+    """
+    import os
+
+    import yaml
+    from krepis.router import TIER_GROUPS, _find_registry
+
+    if _find_registry() is not None:
+        yield
+        return
+    groups = {}
+    models = []
+    for group in sorted(set(TIER_GROUPS.values()) | {"ultra", "chaos_probe"}):
+        model_id = f"model-for-{group}"
+        groups[group] = [model_id]
+        models.append({"id": model_id, "reachable_from": ["ec2", "laptop"]})
+    path = tmp_path_factory.mktemp("registry") / "LLM_MODEL_REGISTRY.yaml"
+    path.write_text(yaml.safe_dump({"models": models, "model_groups": groups}), encoding="utf-8")
+    os.environ["LLM_MODEL_REGISTRY_PATH"] = str(path)
+    try:
+        yield
+    finally:
+        os.environ.pop("LLM_MODEL_REGISTRY_PATH", None)

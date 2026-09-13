@@ -34,12 +34,19 @@ from dataclasses import dataclass
 from crucible.components import Component, load_registry
 from crucible.slots import SLOTS, dispatchable_slots
 
-__all__ = ["ARC_SLOT_JOBS", "Stage", "arc_stages", "run_arc"]
+__all__ = ["ARC_SLOT_JOBS", "ARCTIC_LIBRARY_JOBS", "Stage", "arc_stages", "run_arc"]
 
 #: The arc jobs that are run once per slot rather than once. Derived from the
 #: CLI's own `--slot` requirement in `tests/test_weekly.py`, so a new
 #: slot-scoped job cannot join the arc and silently run for one slot.
 ARC_SLOT_JOBS: frozenset[str] = frozenset({"experiment.run", "experiment.grade"})
+
+#: The arc jobs that read ArcticDB directly and therefore accept
+#: `--arctic-library` (`crucible.track_a._source`). Only `data.weekly` is a
+#: declared arc stage today; `data.daily` is named alongside it because it
+#: takes the identical flag for the identical reason and a future arc row
+#: for it must not need a second edit here (`alpha-engine-config-I10633`).
+ARCTIC_LIBRARY_JOBS: frozenset[str] = frozenset({"data.daily", "data.weekly"})
 
 
 @dataclass(frozen=True)
@@ -57,6 +64,7 @@ class Stage:
         store: str | None,
         run_mode: str,
         dry_run: bool = False,
+        arctic_library: str | None = None,
     ) -> list[str]:
         """The exact argv an operator would type for this stage.
 
@@ -75,12 +83,24 @@ class Stage:
         (alpha-engine-config-I9922 N1): the arc's own `--dry-run` reaches a
         stage ONLY via that stage's own argv, since there is no `args` object
         shared between this call and the stage's.
+
+        ``arctic_library`` appends `--arctic-library <name>` for a stage in
+        `ARCTIC_LIBRARY_JOBS` only (`alpha-engine-config-I10633`), mirroring
+        `crucible.track_a._source`'s own additive flag: absent, a stage's argv
+        is byte-for-byte unchanged and the job reads the production `universe`
+        library exactly as before this parameter existed. Without this, the
+        arc run inside `tests/integration/` would silently read the
+        PRODUCTION library within the shared integration bucket rather than
+        the dedicated one — the opposite of this tier's isolation guarantee
+        (see `tests/integration/README.md`, "Not exercised, and why").
         """
         argv = [self.job, "--date", trading_day.isoformat(), "--run-mode", run_mode]
         if store:
             argv += ["--store", store]
         if self.slot:
             argv += ["--slot", self.slot]
+        if arctic_library and self.job in ARCTIC_LIBRARY_JOBS:
+            argv += ["--arctic-library", arctic_library]
         if dry_run:
             # alpha-engine-config-I9922 N1: `weekly --dry-run` used to ignore
             # the flag entirely and dispatch every stage for real. Each stage
@@ -152,6 +172,7 @@ def run_arc(
     registry: dict[str, Component] | None = None,
     main: object | None = None,
     dry_run: bool = False,
+    arctic_library: str | None = None,
 ) -> list[Stage]:
     """Run every stage for ``trading_day``. Raises on the first failure.
 
@@ -169,6 +190,15 @@ def run_arc(
     ``dry_run=True`` passes `--dry-run` down to every stage's own argv
     (alpha-engine-config-I9922 N1) — the arc previously ignored the flag and
     dispatched every stage for real regardless of it.
+
+    ``arctic_library`` passes `--arctic-library <name>` down to every stage in
+    `ARCTIC_LIBRARY_JOBS` (`alpha-engine-config-I10633`) — additive and
+    production-inert like `dry_run` above: absent, no stage's argv changes.
+    The arc's own CLI job takes no `--arctic-library` flag itself (only the
+    dedicated integration-test tier calls this parameter directly, resolving
+    the value from `CRUCIBLE_INTEGRATION_ARCTIC_LIBRARY` via
+    `crucible.required.require_env` in its own conftest — RAISE-on-absent
+    already lives there, not here).
     """
     if main is None:
         from crucible.cli import main as cli_main  # noqa: PLC0415 - cycle; see docstring
@@ -178,7 +208,13 @@ def run_arc(
     for stage in arc_stages(trading_day, registry):
         try:
             code = main(  # type: ignore[operator]
-                stage.argv(trading_day=trading_day, store=store, run_mode=run_mode, dry_run=dry_run)
+                stage.argv(
+                    trading_day=trading_day,
+                    store=store,
+                    run_mode=run_mode,
+                    dry_run=dry_run,
+                    arctic_library=arctic_library,
+                )
             )
         except BaseException as exc:  # noqa: BLE001 - re-raised on the next line
             # NOT a swallow: re-raised immediately, chained to the original.
