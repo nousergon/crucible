@@ -1403,12 +1403,20 @@ class TestTheSaturdayCountAndTheWindowWidthAreSeparateConstants:
     ) -> None:
         """Behavioural counterpart: the window `evaluate` builds is
         `PHASE2_WINDOW_WEEKS` wide while the live clause names exactly
-        `PHASE2_LIVE_SATURDAYS` manifest keys."""
+        `PHASE2_LIVE_SATURDAYS` manifest keys.
+
+        The live clause left the phase-2 gate on 2026-09-13 (Brian's ruling)
+        and is read through `standing_slo_clauses` instead — which builds the
+        SAME `PHASE2_WINDOW_WEEKS`-wide window, which is the property this
+        test exists to pin. Reading it off the gate result would now pass
+        vacuously, so it is read off the standing reader.
+        """
         monkeypatch.setattr(gate_module, "_ce_client", _raising_client)
         monkeypatch.setattr(gate_module, "_s3_client", _raising_client)
         result = evaluate(store, gate="phase2", trading_day=FRIDAY)
         assert len(result.window) == PHASE2_WINDOW_WEEKS
-        live = next(c for c in result.clauses if c.name == "live_saturdays_first_attempt_ok")
+        standing = gate_module.standing_slo_clauses(store, trading_day=FRIDAY)
+        live = next(c for c in standing if c.name == "live_saturdays_first_attempt_ok")
         assert len(live.evidence) == PHASE2_LIVE_SATURDAYS
 
     def test_the_page_ceiling_window_still_excludes_the_week_before(self) -> None:

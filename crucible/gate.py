@@ -53,7 +53,6 @@ from crucible.alerts import (
 from crucible.attribution import manifest_records_factor_attribution
 from crucible.calendar import TRADING_DAYS_PER_WEEK, is_trading_day, resolve_trading_day
 from crucible.components import Component, load_registry
-from crucible.config import CLOUDTRAIL_ARCHIVE_VAR
 from crucible.documents import DocumentRead, read_manifests_under
 from crucible.documents import read_path_document as _read_path_document
 from crucible.documents import read_store_document as _read_store_document
@@ -163,6 +162,8 @@ __all__ = [
     "PHASE2_MAX_PAGES",
     "PHASE2_MAX_TAGGED_USD",
     "PHASE2_REPLAY_SATURDAYS",
+    "STANDING_SLOS",
+    "standing_slo_clauses",
     "COST_LEADING_DAYS",
     "COST_TRAILING_DAYS",
     "WEEKLY_ANCHORED_GATES",
@@ -3145,10 +3146,17 @@ PHASE0_DELIVERABLES: tuple[Deliverable, ...] = (
 #: naming the artifact that does not exist yet, which is the honest rendering
 #: and the one that puts the gap on the ladder instead of only in an issue.
 #:
-#: `zero_human_mutating_calls`, `live_saturdays_first_attempt_ok`,
-#: `pages_within_ceiling` and `aws_cost_within_ceiling` grade plan §6's
-#: *closes-when* row, not this issue's declared deliverables, and are
-#: correctly absent from every ``graded_by`` here.
+#: `aws_cost_within_ceiling` grades plan §6's *closes-when* row, not this
+#: issue's declared deliverables, and is correctly absent from every
+#: ``graded_by`` here. So did `zero_human_mutating_calls`,
+#: `live_saturdays_first_attempt_ok` and `pages_within_ceiling` until Brian's
+#: 2026-09-13 ruling took the three calendar-floored clauses off the exit gate
+#: (see :func:`_phase2`); they now read every render as standing SLO rows
+#: instead (:func:`standing_slo_clauses`). Because none of them ever graded a
+#: declared deliverable, this table and the `coverage` line it produces —
+#: `grades all 6 of 6 alpha-engine-config-I9758 deliverables` — are unchanged
+#: by that removal, which is the property that makes the removal a change of
+#: CONSEQUENCE rather than of coverage.
 PHASE2_DELIVERABLES: tuple[Deliverable, ...] = (
     Deliverable(
         "scheduler_live_over_five_replay_dates",
@@ -3798,19 +3806,26 @@ MANIFEST_RUN_MODE_LIVE = "live"
 MANIFEST_RUN_MODE_GAP_ISSUE = 9918
 LLM_ARM_CALLSITE_GAP_ISSUE = 9920
 
-#: How many first-attempt `ok` LIVE Saturdays phase 2 requires, and NOTHING
-#: else. Read by `_clause_live_saturdays_first_attempt_ok` alone.
+#: How many first-attempt `ok` LIVE Saturdays the standing live-Saturday SLO
+#: requires, and NOTHING else. Read by
+#: `_clause_live_saturdays_first_attempt_ok` alone.
+#:
+#: **Standing, not a phase-2 exit clause, since Brian's 2026-09-13 ruling**
+#: (:func:`_phase2`). The number and everything below it are unchanged: the
+#: reading still happens every render and still reads RED when unmet — what
+#: was removed is the phase consequence, which is why this constant stays
+#: here rather than moving or being deleted.
 #:
 #: **One, per Brian's ruling 2026-09-09** (`alpha-engine-config-I10324`),
 #: narrowed from §6.1's "2 consecutive first-attempt `ok` Saturdays, not 4" so
 #: phase 2 is completable by the 2026-09-12 weekly Step Function. A lowered bar
 #: carries its rationale or it is drift, so:
 #:
-#: * the evidence loss is bounded, not waived — nine other phase-2 clauses
-#:   carry the unattended claim (`zero_human_mutating_calls`, `replays_ok` over
-#:   five replay Saturdays, the two page clauses, the retry class, the fault
-#:   injection, the runbook, the commissioned-pages clause and the cost
-#:   ceiling), so one live Saturday is the only piece of evidence that shrinks;
+#: * the evidence loss is bounded, not waived — the other phase-2 clauses
+#:   carry the unattended claim (`replays_ok` over five replay Saturdays, the
+#:   two page clauses, the retry class, the fault injection, the runbook, the
+#:   commissioned-pages clause and the cost ceiling), so one live Saturday is
+#:   the only piece of evidence that shrinks;
 #: * phase 4's `trader_one_week_on_v2_champion` collects a further week of live
 #:   operation regardless, on the same infrastructure, before the old system is
 #:   gone — the soak is deferred, not deleted;
@@ -3830,9 +3845,13 @@ LLM_ARM_CALLSITE_GAP_ISSUE = 9920
 #: other's call site.
 PHASE2_LIVE_SATURDAYS = 1
 
-#: How many weeks wide phase 2's gate WINDOW is, and nothing else. Read by
-#: `GATES["phase2"]` alone, whence `evaluate` builds the window every phase-2
-#: clause is handed.
+#: How many weeks wide phase 2's WINDOW is, and nothing else. Read by
+#: `GATES["phase2"]` — whence `evaluate` builds the window every phase-2 clause
+#: is handed — and by :func:`standing_slo_clauses`, which builds the identical
+#: window for the two standing SLO rows through the same `_window` call. Two
+#: call sites of one constant, never a second stepping rule: a standing row
+#: whose denominator drifted from the gate's would publish a differently
+#: denominated number under a name the plan gives one meaning.
 #:
 #: TWO, which is what the pre-split constant happened to hold — so this split
 #: changes no window, deliberately: the Saturday count moved and the window did
@@ -3946,7 +3965,9 @@ def autonomy_daily_cycles_in_span(change: dt.date, render_day: dt.date) -> int:
 #: How many replay Saturdays phase 2 re-grades through the phase-1 predicate.
 PHASE2_REPLAY_SATURDAYS = 5
 
-#: Plan §6 row 2: at most two pages over the phase-2 window.
+#: Plan §6 row 2: at most two pages over the phase-2 window. A STANDING SLO
+#: since Brian's 2026-09-13 ruling (:func:`_phase2`), not an exit clause —
+#: the ceiling is unchanged and still read every render.
 PHASE2_MAX_PAGES = 2
 
 #: Plan §6 row 2 and row 4, in USD. Row 2 is the spend carrying
@@ -4186,6 +4207,11 @@ LLM_ARM_RECIPE_SLOTS: tuple[str, ...] = ("u", "r")
 
 def _clause_live_saturdays_first_attempt_ok(store: Store, window: list[dt.date]) -> Clause:
     """Plan §6 row 2 / §6.1: consecutive LIVE first-attempt `ok` Saturdays.
+
+    **A STANDING SLO, not a phase-2 exit clause, since Brian's 2026-09-13
+    ruling** (:func:`_phase2`). Unchanged in every other respect: read every
+    render through :func:`standing_slo_clauses`, rendered as its own board row,
+    RED when unmet. Only the phase consequence was removed.
 
     **LIVE is read from the manifest, never inferred from the date.** A replay
     of a future Saturday and a re-run of a live one are both indistinguishable
@@ -5080,6 +5106,18 @@ def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Cl
     """Plan §6 row 2 and §11 risk 8: zero human-originated mutating calls, over
     a window that starts at the system's LAST CHANGE.
 
+    **No longer a phase-2 exit clause, since Brian's 2026-09-13 ruling**
+    (:func:`_phase2`). It is not registered on any gate and is not in
+    :data:`STANDING_SLOS` either — the standing autonomy reading on the board
+    is `crucible.board._read_human_touch_count`, which walks the SAME archive
+    through the same `crucible.autonomy.count_operator_actions` over a
+    trailing calendar month and renders it as its own row, RED when non-zero
+    or unreadable. This function stays here, intact and tested, because it is
+    the one that derives `earliest_satisfiable` from a last-change instant and
+    carries the anti-gaming properties the board reading does not need and a
+    future gate might; deleting it would discard those properties to remove a
+    consequence, which is not what was ruled.
+
     Read through `crucible.autonomy`, which walks the CloudTrail **S3
     archive**. `aws cloudtrail lookup-events` is forbidden there and the
     acceptance suite asserts the module has no path to it: the username lookup
@@ -5380,6 +5418,9 @@ def _clause_pages_within_ceiling(store: Store, window: list[dt.date]) -> Clause:
     fresh failure is, by construction, inside the ceiling window. The
     exclusion reads the bus row's own `synthetic` field and nothing else.
     """
+    # **A STANDING SLO, not a phase-2 exit clause, since Brian's 2026-09-13
+    # ruling** (`_phase2`): read every render through `standing_slo_clauses`,
+    # rendered as its own board row, RED when unmet, with no phase consequence.
     name = "pages_within_ceiling"
     # `alpha-engine-config-I10366`, Brian's 2026-09-09 ruling (b): a
     # deliberate exercise does not spend a production alert budget. Resolved
@@ -6622,13 +6663,30 @@ def _phase2(
     *,
     trading_day: dt.date,
 ) -> list[Clause]:
-    """Phase 2's exit gate (plan §6 row 2, §6.1's ruled minimum)."""
+    """Phase 2's exit gate (plan §6 row 2, §6.1's ruled minimum).
+
+    **Seven clauses, not ten, since Brian's ruling of 2026-09-13:** *"lets
+    remove the time related gates for phase 2, so this should close phase 2
+    now. lets then proceed as recommended, advancing crucible v2 through
+    phases 3 and 4 as actionable."* `live_saturdays_first_attempt_ok`,
+    `zero_human_mutating_calls` and `pages_within_ceiling` are the three
+    clauses whose floor is a CALENDAR — each could only turn green by waiting,
+    not by anything the system could be made to do — and under "no outside
+    users, paper trading; ship behind measured SLOs, gate only irreversible
+    steps on evidence" a phase exit is not the irreversible step they were
+    protecting.
+
+    **They are removed from this gate and from no other surface.** The three
+    clause functions are unchanged and still read every render, as standing
+    SLO rows on the board (:func:`standing_slo_clauses`,
+    `crucible.board._standing_rows`): the numbers keep being measured and read
+    RED when unmet, with no phase consequence. Deleting them would have been
+    the other change — the one that stops measuring — and that is not what was
+    ruled.
+    """
     _unused((trading_day,))
     return [
-        _clause_live_saturdays_first_attempt_ok(store, window),
         _clause_replays_ok(store, window, registry),
-        _clause_zero_human_mutating_calls(store, window),
-        _clause_pages_within_ceiling(store, window),
         _clause_pages_commissioned(store),
         _clause_two_page_conditions_on_real_channel(store),
         _clause_transient_retry_class_in_runner(store, registry),
@@ -7717,6 +7775,57 @@ def evaluate(
     return result
 
 
+#: The three plan §6 row-2 readings that are STANDING SLOs rather than phase-2
+#: exit clauses, since Brian's ruling of 2026-09-13 (see :func:`_phase2` for
+#: the ruling verbatim and the reasoning).
+#:
+#: Named here, once, and read by `crucible.board` through
+#: :func:`standing_slo_clauses` — never by a board-side list of clause names,
+#: which would be this module's contract restated somewhere it could drift.
+#:
+#: `zero_human_mutating_calls` is deliberately ABSENT from this tuple and is
+#: not re-read by the board: `crucible.board._read_human_touch_count`
+#: (`alpha-engine-config-I10416`) already reads the identical CloudTrail
+#: archive over a trailing calendar month and renders it as the standing
+#: autonomy row. Evaluating the clause here as well would make two archive
+#: walks per render that answer the same question over two windows, and put
+#: two numbers for "how many humans touched it" on one page.
+STANDING_SLOS: tuple[str, ...] = (
+    "live_saturdays_first_attempt_ok",
+    "pages_within_ceiling",
+)
+
+
+def standing_slo_clauses(store: Store, *, trading_day: dt.date) -> list[Clause]:
+    """:data:`STANDING_SLOS`, read over phase 2's own window. Reads; never runs.
+
+    The window is `PHASE2_WINDOW_WEEKS` wide and built exactly as `evaluate`
+    builds it for `phase2` — the same `_window` call, not a copy of the
+    stepping rule — because these clauses' requirement strings are denominated
+    in that window (`pages_within_ceiling`'s ceiling is *per window*, and a
+    ceiling counted over a different denominator is a different claim wearing
+    the same name).
+
+    Each returned :class:`Clause` is contained like every other
+    (`_contain_clause_exceptions`), so a denied read renders UNMEASURABLE and
+    never takes the board render down.
+    """
+    window = _window(trading_day, PHASE2_WINDOW_WEEKS)
+    clauses = [
+        _clause_live_saturdays_first_attempt_ok(store, window),
+        _clause_pages_within_ceiling(store, window),
+    ]
+    read = tuple(c.name for c in clauses)
+    if read != STANDING_SLOS:
+        raise ClauseMisconfiguredError(
+            f"standing_slo_clauses returned {read}, which is not STANDING_SLOS "
+            f"{STANDING_SLOS}. The board declares one row per declared SLO; a reader "
+            "returning a different set would render a row measuring something other "
+            "than the thing it is named for."
+        )
+    return clauses
+
+
 def _unused(_: Iterable[Any]) -> None:
     return None
 
@@ -7831,13 +7940,19 @@ def phase_tracker(phase_id: str) -> str:
 #:
 #: `old_alerts_muted` (phase 0) calls `crucible.alerts.muted_topic`, which
 #: raises via `crucible.required.require_env` when `MUTED_TOPIC_VAR` is
-#: unset. `zero_human_mutating_calls` (phase 2) reads
-#: `crucible.config.settings().cloudtrail_archive`, which does NOT raise —
-#: an unset `CLOUDTRAIL_ARCHIVE_VAR` resolves to the deliberately empty
-#: `DEFAULT_CLOUDTRAIL_ARCHIVE` and the clause reads a clean UNMEASURABLE —
-#: so this table checks the raw environment directly rather than relying on
-#: either clause's internal failure shape, and catches both cases the same
-#: way.
+#: unset. This table checks the raw environment directly rather than relying
+#: on a clause's internal failure shape, because the two resolvers this tree
+#: uses disagree about whether an unset variable raises at all.
+#:
+#: **`phase2` carried `CRUCIBLE_CLOUDTRAIL_ARCHIVE` here until 2026-09-13.** Its
+#: only reader was `zero_human_mutating_calls`, which Brian's ruling that day
+#: took off the exit gate (see :func:`_phase2`); no registered gate's clause
+#: list reads the archive any more, so a `crucible gate` run that refused
+#: without it would be refusing on behalf of a clause it no longer evaluates.
+#: The archive is still read every board render, by
+#: `crucible.board._read_human_touch_count`, and an unset variable renders
+#: there as an UNMEASURABLE standing autonomy ROW — red, named, and on the
+#: surface an operator actually opens — rather than as silence.
 #:
 #: Kept honest by `tests/test_gate.py::test_gate_required_env_matches_clauses`:
 #: for each entry, evaluating that gate with the named variable unset (and
@@ -7846,7 +7961,6 @@ def phase_tracker(phase_id: str) -> str:
 #: required variable is a red CI run, not a silent hole in this table.
 GATE_REQUIRED_ENV: dict[str, tuple[str, ...]] = {
     "phase0": (MUTED_TOPIC_VAR,),
-    "phase2": (CLOUDTRAIL_ARCHIVE_VAR,),
 }
 
 

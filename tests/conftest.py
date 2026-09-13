@@ -138,14 +138,16 @@ def declared_topics(monkeypatch):
 @pytest.fixture(autouse=True)
 def declared_cloudtrail_archive(monkeypatch):
     """`CRUCIBLE_CLOUDTRAIL_ARCHIVE`, declared by default for the same reason
-    :func:`declared_topics` declares the two topic names — `alpha-engine-
-    config-I10492` made a missing value a `crucible gate`/`crucible
-    gate.close` REFUSAL at CLI startup (`crucible.gate.missing_required_env`),
-    where it used to fold into phase 2's `zero_human_mutating_calls` clause
-    reading a clean UNMEASURABLE. A test that goes through `crucible.cli.main`
-    for either job now needs this set or it hits that refusal before its own
-    handler runs at all — most such tests are not testing THIS variable and
-    should not have to know that.
+    :func:`declared_topics` declares the two topic names: a test that is not
+    testing THIS variable should not have to know which reading needs it.
+
+    Its reader is now `crucible.board._read_human_touch_count`, the standing
+    autonomy row. It was `crucible.gate.GATE_REQUIRED_ENV["phase2"]` until
+    2026-09-13, when Brian's ruling took `zero_human_mutating_calls` off the
+    phase-2 exit gate and no registered gate read the archive any more, so the
+    `crucible gate`/`crucible gate.close` startup refusal (`alpha-engine-
+    config-I10492`) no longer covers it. An unset archive is now a red
+    UNMEASURABLE row on the board rather than a refusal at the CLI.
 
     A SYNTHETIC value naming no real bucket, exactly like the topic names.
     Tests exercising the unset-archive behaviour itself already clear it with
