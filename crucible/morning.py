@@ -112,6 +112,7 @@ from crucible.keys import (
     parse_acceptance_reading,
     runs_prefix,
 )
+from crucible.required import optional_env
 from crucible.store import PRESIGN_MAX_S, LocalStore, S3Store, Store, open_store
 
 __all__ = [
@@ -137,6 +138,8 @@ __all__ = [
     "ROLLING_ISSUE_TITLE",
     "SILENT_STATES",
     "STALE_AFTER",
+    "TELEGRAM_DESTINATION_OVERRIDE_VAR",
+    "TRACKER_REPO_OVERRIDE_VAR",
     "UPDATE_MESSAGE_MAX_CHARS",
     "UndeliveredError",
     "TRANSPORT_PREFIX",
@@ -169,6 +172,19 @@ BOARD_JOB = "board"
 #: would silently move the budget and the message would start being refused.
 DELIVERY_SEVERITY = "info"
 DELIVERY_SOURCE = f"crucible-v2/{MORNING_JOB}"
+
+#: Dedicated-destination overrides (`alpha-engine-config-I10458`, Brian
+#: ruling option (a), narrow). Both resolve through `crucible.required.
+#: optional_env` — the ONE resolver — and both default to the production
+#: value, unchanged, when unset: a production invocation that declares
+#: neither behaves exactly as it did before this pair existed. Their only
+#: consumer today is the integration tier's own `conftest.py`, which points
+#: them at a dedicated `nousergon/crucible` tracker issue and a non-
+#: notifying Telegram destination so `report.morning` can run for real,
+#: nightly, without reaching Brian's real operator chat or the real
+#: `alpha-engine-config` tracker.
+TRACKER_REPO_OVERRIDE_VAR = "CRUCIBLE_MORNING_TRACKER_REPO"
+TELEGRAM_DESTINATION_OVERRIDE_VAR = "CRUCIBLE_MORNING_TELEGRAM_DESTINATION"
 
 #: The board states that mean "nobody can read this", as opposed to "this
 #: reads no". Reported as their own figure: a board where half the rows
@@ -1232,22 +1248,73 @@ def _krepis_publish(*args: Any, **kwargs: Any) -> Any:
 
 
 def _operator_chat() -> str:
-    """krepis' own name for the incident channel. Imported at call time.
+    """The Telegram destination :func:`deliver` publishes to. Imported at
+    call time.
 
-    Lazy for the same reason :func:`_krepis_publish` is, and read from krepis
-    rather than restated as `"operator_chat"` here: a literal would keep
-    passing this module's tests on the day krepis renamed the destination,
-    and a routing value that no longer names anything falls back to whatever
-    the resolver decides — which is the failure this argument exists to
-    prevent.
+    Lazy for the same reason :func:`_krepis_publish` is. The PRODUCTION
+    default is read from krepis rather than restated as `"operator_chat"`
+    here: a literal would keep passing this module's tests on the day krepis
+    renamed the destination, and a routing value that no longer names
+    anything falls back to whatever the resolver decides — which is the
+    failure this argument exists to prevent.
+
+    **Overridable** (`alpha-engine-config-I10458`, `TELEGRAM_DESTINATION_
+    OVERRIDE_VAR`, resolved through `crucible.required.optional_env`) —
+    unset in production, so every existing caller sees `operator_chat`
+    unchanged. The integration tier is the only intended caller of the
+    override, and it sets it to `krepis.alerts.DESTINATION_CONSOLE_ONLY`:
+    combined with the `console_artifact` :func:`deliver` always passes now,
+    `krepis.alerts.resolve_destination` delivers the finding to that
+    artifact and returns `ok=True` WITHOUT sending anything to Telegram
+    (`resolve_destination`'s own contract: an explicit `console_only` with a
+    non-empty `console_artifact` is honoured, not folded back to the operator
+    chat) — a real, fully-exercised `publish()` call that cannot reach
+    Brian's phone or the muted-alert-chat-with-no-members that does not
+    exist for Telegram the way it does for an SNS topic. `operator_chat` and
+    `log_chat` are also legal override values (untested here beyond the
+    default, since this module has never needed either), and any other
+    string is `krepis.alerts.resolve_destination`'s own `ValueError`.
     """
     from krepis.alerts import DESTINATION_OPERATOR_CHAT  # noqa: PLC0415 - lazy on purpose
 
-    return DESTINATION_OPERATOR_CHAT
+    return optional_env(TELEGRAM_DESTINATION_OVERRIDE_VAR, default=DESTINATION_OPERATOR_CHAT)
 
 
-def deliver(message: str, *, transport: Callable[..., Any] | None = None) -> str:
+def _tracker_repo() -> str:
+    """The `owner/repo` :func:`_find_or_create_rolling_issue` and the
+    delivery body post to.
+
+    **Overridable** (`alpha-engine-config-I10458`, `TRACKER_REPO_OVERRIDE_
+    VAR`) — unset in production, so every existing caller sees
+    `crucible.gate.TRACKER_REPO` (`nousergon/alpha-engine-config`)
+    unchanged. The integration tier points this at a dedicated rolling
+    issue on the PUBLIC `nousergon/crucible` repo instead: the fleet App
+    already holds `Issues: write` org-wide (`crucible.tracker.credential`),
+    so the same credential reaches either repo unchanged — the override
+    exists to keep nightly synthetic content out of the PRIVATE production
+    tracker, not to route around a credential this adapter never had.
+    """
+    return optional_env(TRACKER_REPO_OVERRIDE_VAR, default=TRACKER_REPO)
+
+
+def deliver(
+    message: str,
+    *,
+    transport: Callable[..., Any] | None = None,
+    console_artifact: str | None = None,
+) -> str:
     """Send ``message`` on the operator channel. Returns the destination.
+
+    **``console_artifact``** (`alpha-engine-config-I10458`): the durable
+    surface this message is ALSO published to — in production, the store key
+    :func:`morning_handler` writes this same message to. Passed to
+    `krepis.alerts.publish` unconditionally, and inert unless
+    :func:`_operator_chat` has been overridden to `console_only`
+    (`TELEGRAM_DESTINATION_OVERRIDE_VAR`): the production, unoverridden path
+    resolves to `operator_chat`, which never reads this argument. It exists
+    so a `console_only` override delivers to a NAMED artifact rather than
+    krepis' own "no artifact named" fallback, which is the operator chat —
+    silently defeating the override the day someone forgets this argument.
 
     **Telegram only, `severity="info"`, `silent=False`.** Plan §4.6 admits
     exactly two page conditions and this is neither, so it must not reach
@@ -1313,6 +1380,7 @@ def deliver(message: str, *, transport: Callable[..., Any] | None = None) -> str
         silent=False,
         dedup_key=None,
         destination=_operator_chat(),
+        console_artifact=console_artifact,
         raise_on_total_failure=True,
         parse_mode="HTML",
     )
@@ -1401,10 +1469,11 @@ def _find_or_create_rolling_issue() -> int:
     whichever one a race or a manual duplicate left behind is a full update
     nobody can find from the headline that links it.
     """
-    number = tracker.find_issue_by_title(TRACKER_REPO, ROLLING_ISSUE_TITLE)
+    repo = _tracker_repo()
+    number = tracker.find_issue_by_title(repo, ROLLING_ISSUE_TITLE)
     if number is not None:
         return number
-    number, _url = tracker.create_issue(TRACKER_REPO, ROLLING_ISSUE_TITLE, _ROLLING_ISSUE_BODY)
+    number, _url = tracker.create_issue(repo, ROLLING_ISSUE_TITLE, _ROLLING_ISSUE_BODY)
     return number
 
 
@@ -1665,13 +1734,19 @@ def morning_handler(args: argparse.Namespace) -> int:
             # nothing under `runs/` changes and no comment is ever posted.
             print(update)
             return
+        repo = _tracker_repo()
         issue_number = _find_or_create_rolling_issue()
-        history_url = f"https://github.com/{TRACKER_REPO}/issues/{issue_number}"
-        update_url = tracker.post_comment(TRACKER_REPO, issue_number, update)
+        history_url = f"https://github.com/{repo}/issues/{issue_number}"
+        update_url = tracker.post_comment(repo, issue_number, update)
         message = render_message(inputs, now=now, update_url=update_url, history_url=history_url)
-        destination = deliver(message)
         payload = message.encode("utf-8")
         artifact = morning_report_key(ctx.trading_day.isoformat(), ctx.calendar_date.isoformat())
+        # The console-artifact URI is computed BEFORE `deliver` runs, and
+        # passed unconditionally (`alpha-engine-config-I10458`): it is the
+        # surface a `console_only` override (`_operator_chat`) publishes to
+        # INSTEAD of Telegram, and it must name the message's own recorded
+        # key, not a placeholder — see `deliver`'s docstring.
+        destination = deliver(message, console_artifact=f"{store_uri(store)}/{artifact}")
         ctx.record_output(artifact, payload)
         update_artifact = morning_update_key(
             ctx.trading_day.isoformat(), ctx.calendar_date.isoformat()
@@ -1733,9 +1808,7 @@ def morning_handler(args: argparse.Namespace) -> int:
                 "unit": "issue_number",
                 "n_floor": 1,
                 "status": "OK",
-                "status_reason": (
-                    f"posted the full update to {TRACKER_REPO}#{issue_number}: {update_url}"
-                ),
+                "status_reason": (f"posted the full update to {repo}#{issue_number}: {update_url}"),
                 "source_path": update_url,
                 "last_updated_utc": now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
@@ -1748,7 +1821,7 @@ def morning_handler(args: argparse.Namespace) -> int:
         # manifest's `reason` names it, and `alerts.sweep`'s failure
         # condition pages on it) rather than silently leaving a stale index.
         history_body = render_history_body(store, console_url=console_url)
-        tracker.update_issue_body(TRACKER_REPO, issue_number, history_body)
+        tracker.update_issue_body(repo, issue_number, history_body)
 
     run_job(
         MORNING_JOB,
