@@ -296,9 +296,7 @@ class TestThePromoteClauseReadsTheRealDiscriminatedWriter:
                 f"but the clause could not read it — {clause.detail}"
             )
 
-    def test_a_manifest_filed_only_at_the_bare_key_is_not_consulted(
-        self, tmp_path
-    ) -> None:
+    def test_a_manifest_filed_only_at_the_bare_key_is_not_consulted(self, tmp_path) -> None:
         """Inverse/mutation check, so this file cannot pass by accident: a
         manifest filed ONLY at the old bare key (the pre-fix gate's read, and
         the shape no real writer produces once `promote` joined
