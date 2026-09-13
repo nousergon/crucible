@@ -34,9 +34,23 @@ by construction, and `tests/test_slots.py` asserts it for every slot.
 **U serves on a point-estimate lead at 2 paired weeks** — Brian's ruling
 2026-09-12 (`alpha-engine-config-I10546`): every scanner challenger is
 promotable, and `universe_cut` promotes the point-estimate leader after 2
-paired weeks. R, M and S keep the 4-week anytime-valid bar. The asymmetry is
+paired weeks. R and S keep the 4-week anytime-valid bar. The asymmetry is
 deliberate: a universe cut is re-decided weekly and is cheap to reverse, and
 requiring anytime-valid support of a cut's edge promoted nothing for months.
+
+**M serves on a point-estimate lead too, but keeps the 4-week age**
+(`alpha-engine-config-I10689`, applying Brian's `universe_cut` ruling above
+per his 2026-09-13 direction — fully autonomous v2, alpha as the experiment,
+velocity over waiting). At 4 paired weekly dates the anytime-valid interval
+is wide for the same reason it was inert for `universe_cut` at 2, so the
+2026-11-14 cycle — the earliest an M champion is even possible
+(`alpha-engine-config-I9759`) — would likely read `held` under
+`anytime_valid`, which the phase-4 trader contract does not accept. M keeps
+`promote_min_weeks=4` rather than adopting `universe_cut`'s 2: unlike a
+universe cut, a wrong M call swaps one predictor among a scored set, not the
+whole universe, so only the evidence mode is relaxed and the age rule is
+left at the fleet default. See the per-slot delta record in
+`champion-challenger-policy.md` §5.0.
 
 **Strategy content is not here.** An arm is an immutable recipe living in the
 private config repository, loaded at runtime; its id is the hash of its spec.
@@ -220,6 +234,15 @@ SLOTS: dict[str, SlotSpec] = {
         # CPCV OOS IC on canonical 21 trading-day labels; the population is
         # the scored cross-section, not an index.
         benchmark="population",
+        # Brian ruling 2026-09-13, `alpha-engine-config-I10689`, applying the
+        # `universe_cut` ruling (`-I10546`) to M: `promote_evidence: point`
+        # so the first promotable cycle (2026-11-14) can actually decide
+        # rather than reading `held` under a 4-paired-week anytime-valid
+        # interval. `promote_min_weeks` STAYS at the 4-week default — a
+        # narrower deviation than `universe_cut`'s 2, since a wrong M call
+        # swaps one predictor among a scored set, not the whole universe.
+        promote_min_weeks=4,
+        promote_evidence=EVIDENCE_POINT,
         control_arms=_controls("m"),
     ),
     "s": SlotSpec(

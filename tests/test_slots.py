@@ -70,7 +70,7 @@ class TestConfiguredValues:
         assert cfg.min_active_arms == 3
         assert cfg.retired_trailing_cycles == 8
 
-    @pytest.mark.parametrize("slot", ["r", "m", "s"])
+    @pytest.mark.parametrize("slot", ["r", "s"])
     def test_the_promotion_bar_is_four_anytime_valid_weeks(self, slot: str) -> None:
         """Brian's ruling, 2026-09-01: a new arm is promotable only after 4
         paired weeks against the incumbent — 20 paired TRADING days — and
@@ -78,7 +78,12 @@ class TestConfiguredValues:
 
         Both parameters live on the library's `ArenaConfig`
         (`alpha-engine-config-I9763`, `-I10504`, `-I10547`); crucible declares
-        the per-slot VALUE and the library owns the rule that reads it."""
+        the per-slot VALUE and the library owns the rule that reads it.
+
+        M is excluded from this parametrization — see
+        `test_the_m_slot_promotes_the_point_estimate_leader_at_four_weeks`
+        below (`alpha-engine-config-I10689`); it keeps the 4-week age but not
+        the anytime-valid evidence mode."""
         assert get_slot(slot).promote_min_weeks == 4
         assert arena_config_for(slot).promote_min_weeks == 4
         assert arena_config_for(slot).promote_evidence == "anytime_valid"
@@ -91,6 +96,18 @@ class TestConfiguredValues:
         requiring anytime-valid support of a cut's edge promoted nothing."""
         assert arena_config_for("u").promote_min_weeks == 2
         assert arena_config_for("u").promote_evidence == "point"
+
+    def test_the_m_slot_promotes_the_point_estimate_leader_at_four_weeks(self) -> None:
+        """Brian's ruling, 2026-09-13 (`alpha-engine-config-I10689`),
+        applying the `universe_cut` ruling (`-I10546`) to M: the anytime-valid
+        interval is wide at 4 paired weeks for the same reason it was inert
+        for `universe_cut` at 2, so M promotes on the point-estimate lead
+        too. Unlike `universe_cut`, M keeps `promote_min_weeks == 4` rather
+        than 2 — a wrong M call swaps one predictor among a scored set, not
+        the whole universe, so only the evidence mode is relaxed."""
+        assert get_slot("m").promote_min_weeks == 4
+        assert arena_config_for("m").promote_min_weeks == 4
+        assert arena_config_for("m").promote_evidence == "point"
 
     @pytest.mark.parametrize("slot", ["u", "r", "m", "s"])
     def test_the_declared_bar_is_the_one_the_library_decides_on(self, slot: str) -> None:

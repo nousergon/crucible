@@ -136,17 +136,26 @@ class TestEligibilityAgeIsTheEngines:
         )
 
     def test_the_slots_carry_the_ruled_bars(self) -> None:
+        """`alpha-engine-config-I10689`: M moved to `point` evidence (like U)
+        but keeps the 4-week age (unlike U's 2) — so it is asserted
+        separately from both the anytime-valid pair and from U's 2-week bar."""
         assert (get_slot("u").promote_min_weeks, get_slot("u").promote_evidence) == (2, "point")
-        for slot in ("r", "m", "s"):
+        assert (get_slot("m").promote_min_weeks, get_slot("m").promote_evidence) == (4, "point")
+        for slot in ("r", "s"):
             spec = get_slot(slot)
             assert (spec.promote_min_weeks, spec.promote_evidence) == (4, "anytime_valid")
             assert paired_days_required(spec) == 4 * TRADING_DAYS_PER_WEEK == 20
+        assert paired_days_required(get_slot("m")) == 4 * TRADING_DAYS_PER_WEEK == 20
         assert paired_days_required(get_slot("u")) == 2 * TRADING_DAYS_PER_WEEK == 10
 
     def test_a_lead_below_the_bar_does_not_move_the_pointer(self) -> None:
-        spec = narrow(get_slot("m"))
+        """`anytime_valid` slot (S, not M — M moved to `point` under
+        `alpha-engine-config-I10689`; see
+        `TestMSlotPromotesThePointEstimateLeaderAtFourWeeks` for its own age
+        behaviour)."""
+        spec = narrow(get_slot("s"))
         dates = trading_days(3 * TRADING_DAYS_PER_WEEK)
-        reg, ids = register_with("m", ["champ", "chal"], dates[0])
+        reg, ids = register_with("s", ["champ", "chal"], dates[0])
         decision = _decide(spec, reg, ids, dates, champ=0.0, chal=0.01)
         assert decision.champion == ids["champ"]
         assert decision.moved is False
@@ -161,7 +170,40 @@ class TestEligibilityAgeIsTheEngines:
         )
 
     def test_a_supported_lead_at_the_bar_promotes(self) -> None:
-        spec = narrow(get_slot("m"))
+        spec = narrow(get_slot("s"))
+        dates = trading_days(4 * TRADING_DAYS_PER_WEEK)
+        reg, ids = register_with("s", ["champ", "chal"], dates[0])
+        decision = _decide(spec, reg, ids, dates, champ=0.0, chal=0.01)
+        assert decision.champion == ids["chal"]
+        assert decision.moved is True
+        assert decision.status == "decided"
+        assert age_held_leaders(spec, decision) == ()
+
+
+class TestMSlotPromotesThePointEstimateLeaderAtFourWeeks:
+    """Brian ruling 2026-09-13 (`alpha-engine-config-I10689`), applying the
+    `universe_cut` ruling (`-I10546`) to M: `promote_evidence: point` with
+    `promote_min_weeks` left at the fleet default of 4 — the narrower
+    deviation, since a wrong M call swaps one predictor among a scored set,
+    not the whole universe. Below the age bar, M still holds like every
+    other slot; unlike an `anytime_valid` slot, the held leader is named
+    on the POINT estimate, not on a confidence-sequence bound."""
+
+    def test_a_lead_below_the_bar_does_not_move_the_pointer(self) -> None:
+        spec = get_slot("m")
+        dates = trading_days(3 * TRADING_DAYS_PER_WEEK)
+        reg, ids = register_with("m", ["champ", "chal"], dates[0])
+        decision = _decide(spec, reg, ids, dates, champ=0.0, chal=0.01)
+        assert decision.champion == ids["champ"]
+        assert decision.moved is False
+        assert "promote_min_weeks" in decision.reason
+        assert age_held_leaders(spec, decision) == (ids["chal"],), (
+            "a `point` slot reports an age-held leader off the point-estimate "
+            "mean_diff alone, with no confidence-sequence bound involved"
+        )
+
+    def test_a_lead_at_the_bar_promotes(self) -> None:
+        spec = get_slot("m")
         dates = trading_days(4 * TRADING_DAYS_PER_WEEK)
         reg, ids = register_with("m", ["champ", "chal"], dates[0])
         decision = _decide(spec, reg, ids, dates, champ=0.0, chal=0.01)
