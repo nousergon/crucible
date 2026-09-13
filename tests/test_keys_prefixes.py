@@ -296,8 +296,13 @@ class TestDriftHandlerKeyShape:
         from crucible.data import FramePriceSource
         from crucible.data.daily import run_daily
         from crucible.runner import run_job
+        from crucible.slots import declared_benchmark_symbols
 
-        source = FramePriceSource(synthetic_frames(end=FRIDAY), snapshot="frames:keys-test")
+        frames = synthetic_frames(end=FRIDAY)
+        benchmarks = synthetic_frames(
+            end=FRIDAY, names=sorted(declared_benchmark_symbols()), seed=20260902
+        )
+        source = FramePriceSource({**frames, **benchmarks}, snapshot="frames:keys-test")
         for day in sessions_ending(FRIDAY, 2):
             run_job(
                 "data.daily",

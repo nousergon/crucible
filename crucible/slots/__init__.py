@@ -73,6 +73,7 @@ __all__ = [
     "SlotSpec",
     "arena_config_for",
     "arm_name",
+    "declared_benchmark_symbols",
     "dispatchable_slots",
     "get_slot",
     "is_control_arm",
@@ -279,6 +280,25 @@ def get_slot(slot: str) -> SlotSpec:
 def arena_config_for(slot: str) -> ArenaConfig:
     """The `nousergon_lib.arena` config for ``slot``."""
     return get_slot(slot).arena
+
+
+def declared_benchmark_symbols() -> frozenset[str]:
+    """Every non-population benchmark symbol a slot declares.
+
+    ``"population"`` (U, R, M) means "graded against the universe it was
+    drawn from" — it names no ticker and needs no panel row. Every other
+    value (today: only S's ``"SPY"``) is a real symbol the panel compiler
+    must carry a row for on every session it covers, or
+    `crucible.slots.strategy.grade_arm` refuses the book
+    (`alpha-engine-config-I10635`).
+
+    Derived from :data:`SLOTS` rather than duplicated at the compiler: a
+    second literal naming the same symbol is a second place it can be
+    changed, which is the exact units-mismatch shape this repository exists
+    to catch (`avg_volume_20d`, 901/903 tickers silently failing the
+    liquidity gate for months).
+    """
+    return frozenset(spec.benchmark for spec in SLOTS.values() if spec.benchmark != "population")
 
 
 def arm_name(arm_id: str) -> str:
