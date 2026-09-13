@@ -90,7 +90,21 @@ if TYPE_CHECKING:
     from crucible.runner import RunContext
     from crucible.store import Store
 
-__all__ = ["MissingArtifactError", "partition_by_catalog", "run_grade", "run_produce"]
+__all__ = [
+    "MIN_ACTIVE_ARMS_FINDING_METRIC",
+    "MissingArtifactError",
+    "min_active_arms_finding",
+    "partition_by_catalog",
+    "run_grade",
+    "run_produce",
+]
+
+#: `alpha-engine-config-I10636`: the metric name the below-floor finding is
+#: recorded under on the grade job's own manifest, so an operator reading
+#: `runs/experiment.grade/{slot}/{day}/run.json` sees it beside the other
+#: three control/pointer metrics rather than having to open the `arena_cycle`
+#: artifact to learn the slot is unservable.
+MIN_ACTIVE_ARMS_FINDING_METRIC = "min_active_arms_finding"
 
 #: The metric one refused arm files on the producing job's manifest — the
 #: same name the M slot uses (`crucible.slots.model.ARM_REFUSED_METRIC`),
@@ -107,6 +121,43 @@ class MissingArtifactError(RuntimeError):
     action is to produce that key, and a reason that does not name it sends
     them looking.
     """
+
+
+def min_active_arms_finding(slot_spec: Any, promotable: Sequence[str]) -> dict[str, Any]:
+    """§10.1 / `alpha-engine-config-I10636`: the floor, read against REAL arms.
+
+    `ArenaCycle.active_arms` (the library's own field) deliberately still
+    counts controls — that is documented at `nousergon_lib.arena.engine
+    .evaluate_retirements` as correct, since the register's own
+    ``active_arms()`` must report every live arm. Comparing that count to
+    ``min_active_arms`` is exactly the defect this issue measured: the two
+    control arms every slot carries make a one-real-arm slot read as three
+    against a floor of three.
+
+    ``promotable`` is the caller's own `crucible.slots.promotable_arms(...)`
+    result — controls already excluded — so this function forks no shape of
+    the library's; it only compares a count the library never compares.
+
+    Rendered unconditionally, with an explicit status, so a healthy slot and
+    an unmeasured one are never the same reading (principles §7): a reader of
+    the `arena_cycle` artifact or the grade job's manifest sees ``OK`` or
+    ``BELOW_FLOOR``, never silence.
+    """
+    floor = int(slot_spec.min_active_arms)
+    count = len(promotable)
+    below = count < floor
+    return {
+        "status": "BELOW_FLOOR" if below else "OK",
+        "min_active_arms": floor,
+        "promotable_arm_count": count,
+        "promotable_arms": list(promotable),
+        "reason": (
+            f"{count} promotable arm(s) (controls excluded, §10.1) against a floor of "
+            f"{floor}; a slot below its floor produces zero comparisons"
+            if below
+            else f"{count} promotable arm(s) (controls excluded, §10.1) meets the floor of {floor}"
+        ),
+    }
 
 
 def _read_features(store: Store, version: str, trading_day: dt.date) -> pd.DataFrame:
@@ -403,7 +454,7 @@ def run_grade(
     portfolio solver onto the U/R path. Only two things are read off a spec —
     what to register, and ``params['top_n']`` for the count-matched controls —
     so any recipe type carrying those two facts grades through this one engine
-    rather than through a second copy of it.
+    rather than through a second copy of it (`alpha-engine-config-I9957`).
 
     ``preconditions`` are per-arm SERVING preconditions the caller has already
     EVALUATED (policy §5.3: supplied to the engine as evaluated results; the
@@ -795,10 +846,59 @@ def run_grade(
         )
     measured_horizon = measured_horizons.pop()
 
+    # §10.1 as an EXCLUSION that BINDS here, not as a field this run reports.
+    #
+    # `promotable_arms` is the slot registry's filter and stays the shared
+    # implementation of the rule. It is now REGISTER-BACKED
+    # (`alpha-engine-config-I9943`): `register_arms` forwards `ArmSpec.control`
+    # onto the registered `ArmRecord.control`, so `is_control_arm` reads the
+    # recorded flag for any id this `register` carries rather than matching
+    # the name component against `slot_spec.control_arms`. Passing `register`
+    # here is the end state this call site's prior comment named as correct
+    # once the registry filter could resolve registered ids itself — the
+    # `not in control_ids` intersection below is now redundant with the
+    # filter and is KEPT anyway as the belt-and-suspenders check the raise
+    # immediately after it depends on: a control that reached `promotable`
+    # despite the register-backed filter is exactly the defect
+    # `GraderControlError` exists to catch, and removing the redundancy would
+    # remove the second witness that catches it.
+    #
+    # Computed here, BEFORE the `arena_cycle` write, so the below-floor
+    # finding (`alpha-engine-config-I10636`) can ride on the same artifact
+    # rather than being derivable only from a later job's own return value —
+    # the `active_arms` field on that artifact is the library's own and
+    # deliberately still counts controls (`nousergon_lib.arena.engine
+    # .evaluate_retirements`), so a reader of the artifact who does not also
+    # read this finding would see 3 active arms against a floor of 3 and
+    # read a one-real-arm slot as healthy.
+    promotable = [
+        a
+        for a in promotable_arms(slot_spec, list(cycle.active_arms), register)
+        if a not in control_ids
+    ]
+    leaked = sorted(set(promotable) & control_ids)
+    if leaked:
+        raise GraderControlError(
+            f"control arm(s) {leaked} reached the promotion pool for slot {slot!r}. The "
+            "planted control ranks on the realized forward return, so an arm of this "
+            "kind in the promotable pool is a look-ahead one promotion away from "
+            "production (§10.1)."
+        )
+    floor_finding = min_active_arms_finding(slot_spec, promotable)
+
     cycle_key = arena_cycle_key(slot, as_of.isoformat())
+    cycle_payload = cycle.to_dict()
+    # A crucible-owned key alongside the library's own fields, never a field
+    # the library's `ArenaCycle` shape defines — `active_arms` above stays
+    # exactly what the library wrote. Forking that shape here would pass
+    # every value assertion today and silently drift the first time the
+    # library gained a field of its own with this name
+    # (`alpha-engine-config-I10636`; library-side tracking issue filed
+    # separately since the shape is `nousergon_lib.arena`'s to own).
+    cycle_payload[MIN_ACTIVE_ARMS_FINDING_METRIC] = floor_finding
     ctx.record_output(
         cycle_key,
-        json.dumps(cycle.to_dict(), indent=2, sort_keys=True).encode("utf-8"),
+        json.dumps(cycle_payload, indent=2, sort_keys=True).encode("utf-8"),
         schema_version="arena_cycle.v1",
     )
 
@@ -899,36 +999,24 @@ def run_grade(
             "last_updated_utc": _utc_now(),
         }
     )
-
-    # §10.1 as an EXCLUSION that BINDS here, not as a field this run reports.
-    #
-    # `promotable_arms` is the slot registry's filter and stays the shared
-    # implementation of the rule. It is now REGISTER-BACKED
-    # (`alpha-engine-config-I9943`): `register_arms` forwards `ArmSpec.control`
-    # onto the registered `ArmRecord.control`, so `is_control_arm` reads the
-    # recorded flag for any id this `register` carries rather than matching
-    # the name component against `slot_spec.control_arms`. Passing `register`
-    # here is the end state this call site's prior comment named as correct
-    # once the registry filter could resolve registered ids itself — the
-    # `not in control_ids` intersection below is now redundant with the
-    # filter and is KEPT anyway as the belt-and-suspenders check the raise
-    # immediately after it depends on: a control that reached `promotable`
-    # despite the register-backed filter is exactly the defect
-    # `GraderControlError` exists to catch, and removing the redundancy would
-    # remove the second witness that catches it.
-    promotable = [
-        a
-        for a in promotable_arms(slot_spec, list(cycle.active_arms), register)
-        if a not in control_ids
-    ]
-    leaked = sorted(set(promotable) & control_ids)
-    if leaked:
-        raise GraderControlError(
-            f"control arm(s) {leaked} reached the promotion pool for slot {slot!r}. The "
-            "planted control ranks on the realized forward return, so an arm of this "
-            "kind in the promotable pool is a look-ahead one promotion away from "
-            "production (§10.1)."
-        )
+    ctx.record_metric(
+        {
+            # `alpha-engine-config-I10636`: rendered unconditionally, with an
+            # explicit OK/FAIL status, so a slot stranded below its floor is
+            # a reading nobody has to infer from `active_arms` still counting
+            # the two controls (§10.1).
+            "name": MIN_ACTIVE_ARMS_FINDING_METRIC,
+            "module": f"crucible.slots.{slot}",
+            "metric_type": "count",
+            "value": float(floor_finding["promotable_arm_count"]),
+            "unit": "arms",
+            "n_floor": 0,
+            "status": "FAIL" if floor_finding["status"] == "BELOW_FLOOR" else "OK",
+            "status_reason": floor_finding["reason"],
+            "source_path": cycle_key,
+            "last_updated_utc": _utc_now(),
+        }
+    )
 
     return {
         "slot": slot,
@@ -937,6 +1025,7 @@ def run_grade(
         "scored_arms": list(cycle.scored_arms),
         "active_arms": list(cycle.active_arms),
         "promotable_arms": promotable,
+        MIN_ACTIVE_ARMS_FINDING_METRIC: floor_finding,
         "settled_dates": settled_days,
         "horizon_trading_days": measured_horizon,
         "unsettled": {a: sorted(d) for a, d in unsettled.items()},

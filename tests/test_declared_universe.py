@@ -184,7 +184,7 @@ class TestResolutionOrder:
 
 class TestTheRunRecordsWhatItGradedAgainst:
     def test_the_universe_is_copied_beside_the_run_and_listed_as_an_output(
-        self, tmp_path, store, frames, cycle_date
+        self, tmp_path, store, frames, benchmark_frames, cycle_date
     ) -> None:
         from crucible.data import FramePriceSource
 
@@ -194,7 +194,7 @@ class TestTheRunRecordsWhatItGradedAgainst:
             "data.daily",
             lambda c: run_daily(
                 c,
-                source=FramePriceSource(frames),
+                source=FramePriceSource({**frames, **benchmark_frames}),
                 expected_symbols=_expected_symbols(declared, c),
             ),
             store=store,

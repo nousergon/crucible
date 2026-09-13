@@ -15,7 +15,7 @@ import pytest
 from crucible.components import DISPATCHES, Component, Deadline, load_registry
 from crucible.runmode import RUN_MODE_ENV, RUN_MODE_LIVE, RUN_MODE_REPLAY
 from crucible.slots import SLOTS, dispatchable_slots
-from crucible.weekly import ARC_SLOT_JOBS, ArcStageFailed, arc_stages, run_arc
+from crucible.weekly import ARC_SLOT_JOBS, ARCTIC_LIBRARY_JOBS, ArcStageFailed, arc_stages, run_arc
 
 FRIDAY = dt.date(2026, 8, 28)
 
@@ -57,15 +57,17 @@ class TestDerivation:
     ) -> None:
         """Every slot the CLI can run, in `SLOTS` order — and no other.
 
-        Re-stated, not deleted, by `alpha-engine-config-I10512`: the S cycle
-        job gives `crucible/slots/strategy.py` its `produce`/`grade`, so S
-        joins the arc with no list to edit — which is the derivation working,
-        and is exactly why this pin is an equality. M is still absent until
-        its own cycle job lands; expanding over a slot with no entry points
-        made every arc fail at `experiment.run[m]` (measured 2026-09-04).
+        Re-stated with both the M cycle job (`alpha-engine-config-I9957`) and
+        the S cycle job (`-I10512`). Until they existed, M and S had no
+        `produce`/`grade` and expanding over all of `SLOTS` made every arc
+        fail at `experiment.run[m]` (measured 2026-09-04); both now have
+        both, so both are stages — which is the derivation working, and is
+        exactly why this pin is an equality. The order is `SLOTS` order, the
+        data dependency: the universe cut feeds the signal, the signal feeds
+        the model, the model feeds the strategy.
         """
         expected = [slot for slot in SLOTS if slot in dispatchable_slots()]
-        assert expected == ["u", "r", "s"], expected
+        assert expected == ["u", "r", "m", "s"], expected
         for job in ARC_SLOT_JOBS:
             slots = [s.slot for s in arc_stages(FRIDAY) if s.job == job]
             assert slots == expected, f"{job} must run for every dispatchable slot, in SLOTS order"
@@ -78,10 +80,10 @@ class TestDerivation:
         monkeypatch.delattr(research, "grade")
         assert "r" not in dispatchable_slots()
         slots = {s.slot for s in arc_stages(FRIDAY) if s.job in ARC_SLOT_JOBS}
-        assert slots == {"u", "s"}
+        assert slots == {"u", "m", "s"}
 
     def test_the_dispatch_table_and_the_arc_read_one_source(self) -> None:
-        """`experiment.run --slot m` refuses by name (track A) and the arc
+        """`experiment.run --slot s` refuses by name (track A) and the arc
         never asks for it: both derive from `dispatchable_slots`, so the arc
         cannot schedule a stage the CLI will refuse."""
         from crucible.track_a import _SLOT_MODULES
@@ -260,6 +262,75 @@ class TestRunsTheRealCommand:
 
         with pytest.raises(RuntimeError, match="provider_5xx"):
             run_arc(FRIDAY, store=None, run_mode=RUN_MODE_LIVE, main=fake_main)
+
+
+class TestArcticLibraryThreading:
+    """alpha-engine-config-I10633: `weekly` could not be exercised against the
+    dedicated ArcticDB library because no stage's argv ever carried
+    `--arctic-library` — an arc run inside `tests/integration/` would
+    silently fall through to the PRODUCTION `universe` library. Additive and
+    production-inert (`Stage.argv`'s own docstring): absent, argv is
+    unchanged."""
+
+    def test_stage_argv_omits_the_flag_when_no_library_is_given(self) -> None:
+        stages = arc_stages(FRIDAY)
+        weekly_stage = next(s for s in stages if s.job == "data.weekly")
+        argv = weekly_stage.argv(trading_day=FRIDAY, store=None, run_mode=RUN_MODE_LIVE)
+        assert "--arctic-library" not in argv, argv
+
+    def test_stage_argv_appends_the_flag_for_an_arctic_library_job(self) -> None:
+        stages = arc_stages(FRIDAY)
+        weekly_stage = next(s for s in stages if s.job == "data.weekly")
+        argv = weekly_stage.argv(
+            trading_day=FRIDAY, store=None, run_mode=RUN_MODE_LIVE, arctic_library="integration-lib"
+        )
+        assert argv[argv.index("--arctic-library") + 1] == "integration-lib", argv
+
+    def test_stage_argv_never_puts_the_flag_on_a_non_arctic_stage(self) -> None:
+        """`report` reads no ArcticDB library; a flag that leaked onto every
+        stage's argv regardless of `ARCTIC_LIBRARY_JOBS` would make `report`
+        refuse on an argument it does not declare."""
+        stages = arc_stages(FRIDAY)
+        report_stage = next(s for s in stages if s.job == "report")
+        argv = report_stage.argv(
+            trading_day=FRIDAY, store=None, run_mode=RUN_MODE_LIVE, arctic_library="integration-lib"
+        )
+        assert "--arctic-library" not in argv, argv
+
+    def test_run_arc_threads_the_library_onto_every_arctic_library_stage_only(self) -> None:
+        seen: list[list[str]] = []
+
+        def fake_main(argv: list[str]) -> int:
+            seen.append(argv)
+            return 0
+
+        run_arc(
+            FRIDAY,
+            store="/tmp/store",
+            run_mode=RUN_MODE_LIVE,
+            main=fake_main,
+            arctic_library="integration-lib",
+        )
+        for argv in seen:
+            job = argv[0]
+            if job in ARCTIC_LIBRARY_JOBS:
+                assert argv[argv.index("--arctic-library") + 1] == "integration-lib", argv
+            else:
+                assert "--arctic-library" not in argv, argv
+
+    def test_run_arc_omits_the_flag_from_every_stage_when_not_given(self) -> None:
+        """The default (`arctic_library=None`) — production's own shape —
+        must leave every stage's argv byte-for-byte unchanged from before
+        this parameter existed."""
+        seen: list[list[str]] = []
+
+        def fake_main(argv: list[str]) -> int:
+            seen.append(argv)
+            return 0
+
+        run_arc(FRIDAY, store="/tmp/store", run_mode=RUN_MODE_LIVE, main=fake_main)
+        for argv in seen:
+            assert "--arctic-library" not in argv, argv
 
 
 class TestDeadlineOfTheArcItself:

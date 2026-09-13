@@ -49,6 +49,7 @@ def synthetic_frames(
     n_tickers: int = 40,
     sessions: int = SESSIONS,
     seed: int = 20260901,
+    names: list[str] | None = None,
 ) -> dict[str, object]:
     """A ``{ticker: OHLCV frame}`` mapping with a real, persistent cross-section.
 
@@ -56,14 +57,19 @@ def synthetic_frames(
     a signal rather than noise: without persistent per-name drift, a
     momentum ranker is a random selector and the whole grading path would be
     tested against a market in which nothing is measurable.
+
+    ``names``, when given, replaces the generated ``T000``... labels
+    one-for-one (and overrides ``n_tickers`` with its own length) — used to
+    synthesize a named symbol such as a slot's benchmark (`SPY`) with the
+    same shape and history length as the rest of the cross-section.
     """
     import pandas as pd
 
     days = sessions_ending(end, sessions)
     rng = random.Random(seed)
     frames: dict[str, object] = {}
-    for index in range(n_tickers):
-        ticker = f"T{index:03d}"
+    tickers = names if names is not None else [f"T{i:03d}" for i in range(n_tickers)]
+    for ticker in tickers:
         drift = rng.gauss(0.0004, 0.0009)
         vol = rng.uniform(0.008, 0.02)
         price = rng.uniform(20.0, 300.0)
@@ -279,10 +285,35 @@ def frames(cycle_date):
 
 
 @pytest.fixture
-def source(frames):
+def benchmark_frames(cycle_date):
+    """Every slot's declared non-population benchmark (today: S's `SPY`), as
+    its own synthetic OHLCV frame with the same shape and history length as
+    the rest of the cross-section.
+
+    `data.daily` now fetches every declared benchmark through the source
+    alongside the declared universe (`alpha-engine-config-I10635`). Kept
+    separate from the `frames` fixture on purpose: `frames` stays exactly
+    the population a test declares as its universe (`sorted(frames)`), and
+    the benchmark row is merged into a `FramePriceSource` explicitly wherever
+    a test builds its own, exactly like production fetches it separately.
+    """
+    from crucible.slots import declared_benchmark_symbols
+
+    return synthetic_frames(
+        end=cycle_date, names=sorted(declared_benchmark_symbols()), seed=20260902
+    )
+
+
+@pytest.fixture
+def source(frames, benchmark_frames):
+    """A test exercising the benchmark-fetch failure path builds its own
+    bare `FramePriceSource` instead of this fixture.
+    """
     from crucible.data import FramePriceSource
 
-    return FramePriceSource(frames, snapshot="frames:conftest-seed-20260901")
+    return FramePriceSource(
+        {**frames, **benchmark_frames}, snapshot="frames:conftest-seed-20260901"
+    )
 
 
 @pytest.fixture

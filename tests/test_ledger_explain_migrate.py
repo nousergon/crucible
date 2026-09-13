@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
@@ -644,3 +645,263 @@ class TestExplainWalksAVerdict:
         manifest = json.loads(store.get_bytes(manifest_key("explain", day)))
         assert manifest["status"] == "failed"
         assert "neither a run_id" in manifest["reason"]
+
+
+class _StubChain:
+    """A stand-in for the future `ChainVerification` (`crucible-PR240`,
+    `alpha-engine-config-I10414`) — that class does not exist in this build,
+    so the `--verify-chain` tests below simulate its presence rather than
+    waiting on the gated draft to merge."""
+
+    def __init__(self, broken: bool) -> None:
+        self._broken = broken
+        self.checked = False
+
+    def raise_if_broken(self) -> None:
+        self.checked = True
+        if self._broken:
+            raise RuntimeError("MONEY-PATH CHAIN: FAILED — stub break at record 0")
+
+
+class _StubLineage:
+    """A minimal stand-in for `crucible.explain.Lineage` carrying a `chain`
+    field — the shape PR240 adds. `key`/`parents` are enough for
+    `crucible.track_a._lineage_keys`; `render_lineage` is monkeypatched
+    alongside so a real `Lineage`'s richer shape is never required."""
+
+    def __init__(self, chain: _StubChain | None) -> None:
+        self.key = "stub/key.json"
+        self.parents: list[Any] = []
+        self.manifest = None
+        self.collisions: tuple[str, ...] = ()
+        self.chain = chain
+
+
+class TestVerifyChainFlag:
+    """`--verify-chain` (`alpha-engine-config-I10625`).
+
+    `crucible-PR240` (`alpha-engine-config-I10414`) — the PR that gives
+    `crucible.explain` a real `verify_money_path_chain` / `ChainVerification`
+    / `Lineage.chain` — is a gated DRAFT that has not merged: it stays behind
+    phase 2's exit (`alpha-engine-config-I9758`). So THIS build's contract is
+    "refuse loudly, never silently skip", and the intact/broken-chain cases
+    are exercised against a monkeypatched stand-in for the verifier PR240
+    will add, not the real thing.
+    """
+
+    def test_verify_chain_refuses_when_this_build_has_no_verifier(
+        self, store, source, cycle_date, tmp_path, monkeypatch
+    ) -> None:
+        from crucible.cli import main
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        run_job(
+            "data.daily",
+            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            store=store,
+            trading_day=cycle_date,
+        )
+        from crucible.keys import manifest_key
+
+        manifest = json.loads(store.get_bytes(manifest_key("data.daily", cycle_date.isoformat())))
+        target = manifest["outputs"][0]["key"]
+        with pytest.raises(SystemExit, match="no money-path chain verifier"):
+            main(
+                [
+                    "explain",
+                    "--date",
+                    cycle_date.isoformat(),
+                    "--run-mode",
+                    "replay",
+                    "--store",
+                    str(store.root),
+                    "--verify-chain",
+                    target,
+                ]
+            )
+
+    def test_verify_chain_is_silent_ok_when_the_walk_never_crossed_the_money_path(
+        self, store, source, cycle_date, tmp_path, monkeypatch
+    ) -> None:
+        from crucible import track_a
+        from crucible.cli import main
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        monkeypatch.setattr(track_a, "money_path_chain_verifier", lambda: object())
+        monkeypatch.setattr(track_a, "explain_lineage", lambda _store, _target: _StubLineage(None))
+        monkeypatch.setattr(track_a, "render_lineage", lambda _node: "stub render")
+
+        rc = main(
+            [
+                "explain",
+                "--date",
+                cycle_date.isoformat(),
+                "--run-mode",
+                "replay",
+                "--store",
+                str(store.root),
+                "--verify-chain",
+                "anything",
+            ]
+        )
+        assert rc == 0
+
+    def test_verify_chain_exits_zero_on_an_intact_chain(
+        self, store, source, cycle_date, tmp_path, monkeypatch
+    ) -> None:
+        from crucible import track_a
+        from crucible.cli import main
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        chain = _StubChain(broken=False)
+        monkeypatch.setattr(track_a, "money_path_chain_verifier", lambda: object())
+        monkeypatch.setattr(track_a, "explain_lineage", lambda _store, _target: _StubLineage(chain))
+        monkeypatch.setattr(track_a, "render_lineage", lambda _node: "stub render")
+
+        rc = main(
+            [
+                "explain",
+                "--date",
+                cycle_date.isoformat(),
+                "--run-mode",
+                "replay",
+                "--store",
+                str(store.root),
+                "--verify-chain",
+                "anything",
+            ]
+        )
+        assert rc == 0
+        assert chain.checked, "raise_if_broken() must actually be called, not just present"
+
+    def test_verify_chain_exits_non_zero_and_names_the_break_on_a_broken_chain(
+        self, store, source, cycle_date, tmp_path, monkeypatch
+    ) -> None:
+        from crucible import track_a
+        from crucible.cli import main
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        chain = _StubChain(broken=True)
+        monkeypatch.setattr(track_a, "money_path_chain_verifier", lambda: object())
+        monkeypatch.setattr(track_a, "explain_lineage", lambda _store, _target: _StubLineage(chain))
+        monkeypatch.setattr(track_a, "render_lineage", lambda _node: "stub render")
+
+        with pytest.raises(RuntimeError, match="MONEY-PATH CHAIN: FAILED"):
+            main(
+                [
+                    "explain",
+                    "--date",
+                    cycle_date.isoformat(),
+                    "--run-mode",
+                    "replay",
+                    "--store",
+                    str(store.root),
+                    "--verify-chain",
+                    "anything",
+                ]
+            )
+
+    def test_verify_chain_omitted_never_touches_the_chain(
+        self, store, source, cycle_date, tmp_path, monkeypatch
+    ) -> None:
+        """Without the flag, a broken stub chain is never even consulted —
+        `explain` prints the walk and exits 0 regardless, exactly as it does
+        today with no verifier at all."""
+        from crucible import track_a
+        from crucible.cli import main
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        chain = _StubChain(broken=True)
+        monkeypatch.setattr(track_a, "money_path_chain_verifier", lambda: object())
+        monkeypatch.setattr(track_a, "explain_lineage", lambda _store, _target: _StubLineage(chain))
+        monkeypatch.setattr(track_a, "render_lineage", lambda _node: "stub render")
+
+        rc = main(
+            [
+                "explain",
+                "--date",
+                cycle_date.isoformat(),
+                "--run-mode",
+                "replay",
+                "--store",
+                str(store.root),
+                "anything",
+            ]
+        )
+        assert rc == 0
+        assert not chain.checked
+
+
+class TestExplainDryRunRecordsZeroMutations:
+    """`--dry-run` writes nothing — asserted against a store that RECORDS
+    every mutating call, the same contract shape `alpha-engine-config-I10576`
+    /`crucible-PR225` established for `crucible gate`.
+
+    `explain` itself is NOT a no-write read in the shape `crucible gate`
+    became: `alpha-engine-config-I9757` (`crucible-PR115`, measured
+    2026-09-05, `TestExplainWalksAVerdict`'s own docstring above) ruled the
+    opposite way on purpose — the phase-1 gate clause
+    `_clause_explain_walks_a_verdict` has nothing to read unless a real
+    `explain` invocation files its manifest, so `explain` writes its own
+    `runs/explain/{day}/run.json` like every other job (`AGENTS.md` rule 1)
+    and reverting that would reopen I9757. `--dry-run` is rule 1's one
+    declared exception, and this test pins zero mutating calls through it —
+    not zero mutating calls unconditionally.
+    """
+
+    def test_dry_run_makes_no_mutating_call_at_all(
+        self, source, cycle_date, tmp_path, monkeypatch
+    ) -> None:
+        from crucible.cli import main
+        from crucible.store import LocalStore
+
+        class RecordingStore(LocalStore):
+            def __init__(self, root: Any) -> None:
+                super().__init__(root)
+                self.mutations: list[str] = []
+
+            def put_bytes(self, key: str, payload: bytes, **kwargs: Any) -> Any:
+                self.mutations.append(key)
+                return super().put_bytes(key, payload, **kwargs)
+
+            def compare_and_swap(self, key: str, expected: str, payload: bytes, **kw: Any) -> Any:
+                self.mutations.append(key)
+                return super().compare_and_swap(key, expected, payload, **kw)
+
+        recorder = RecordingStore(tmp_path / "store")
+        run_job(
+            "data.daily",
+            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            store=recorder,
+            trading_day=cycle_date,
+        )
+        recorder.mutations.clear()
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        # `crucible.track_a` resolves its store through `Settings.store()`,
+        # which builds one from the URI via `crucible.config.store_from_uri`
+        # — patched here (not `open_store`, which `track_a` never calls) so
+        # the RESOLVED store is the recorder, dry-run wrapping included.
+        monkeypatch.setattr("crucible.config.store_from_uri", lambda uri: recorder)
+
+        from crucible.keys import manifest_key
+
+        manifest = json.loads(
+            recorder.get_bytes(manifest_key("data.daily", cycle_date.isoformat()))
+        )
+        target = manifest["outputs"][0]["key"]
+        rc = main(
+            [
+                "explain",
+                "--date",
+                cycle_date.isoformat(),
+                "--run-mode",
+                "replay",
+                "--store",
+                str(recorder.root),
+                "--dry-run",
+                target,
+            ]
+        )
+        assert rc == 0
+        assert recorder.mutations == []

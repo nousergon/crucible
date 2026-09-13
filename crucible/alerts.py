@@ -50,6 +50,7 @@ from crucible.keys import (
     ALERTS_ROOT,
     DISPATCH_ROOT,
     RUNS_ROOT,
+    arena_cycle_key,
     is_manifest_key,
     parse_bus_key,
     parse_dispatch_key,
@@ -57,6 +58,8 @@ from crucible.keys import (
 )
 from crucible.manifest import manifest_prefix
 from crucible.required import require_env
+from crucible.slots import SLOTS
+from crucible.slots.cycle import MIN_ACTIVE_ARMS_FINDING_METRIC
 from crucible.store import Store
 from crucible.synthetic import (
     SYNTHETIC_SUBJECT_PREFIX,
@@ -92,12 +95,14 @@ __all__ = [
     "bus_row",
     "cause_key",
     "ceiling_metric",
+    "MIN_ACTIVE_ARMS_LOOKBACK_TRADING_DAYS",
     "days_to_evaluate",
     "dedup_key",
     "emit",
     "evaluate_absence",
     "evaluate_dispatch_absence",
     "evaluate_failure",
+    "evaluate_min_active_arms",
     "group_pages",
     "heartbeat",
     "incident_id",
@@ -1069,6 +1074,127 @@ def evaluate_failure(
 #: than the check relaxed: relaxing it would let every failure page ship
 #: without correlation identity, to accommodate the rarest case.
 _UNPARSEABLE_RUN_ID = "0" * 26
+
+
+#: `alpha-engine-config-I10636`: the bound on how far back
+#: :func:`evaluate_min_active_arms` walks to find the INCIDENT's anchor day.
+#: `min_active_arms` is a standing per-slot state, not a per-trading-day
+#: event like absence/failure — the arena grades weekly, so a fresh
+#: `trading_day` every cycle would page every week for an unchanged reading,
+#: which is exactly what the issue this exists for measured against the S
+#: slot. Anchoring the page's `trading_day` at the EARLIEST cycle in this
+#: window that already read BELOW_FLOOR gives it the same `incident_key`
+#: every later sweep would derive, so :func:`emit` advances the existing bus
+#: row instead of sending again (the same "re-paging is impossible by
+#: construction" property :func:`days_to_evaluate` documents for the other
+#: two conditions). Bounded, not unbounded, so a slot stranded below its
+#: floor for a year does not go permanently silent — it re-anchors, and
+#: re-pages, on a roughly quarterly cadence instead.
+MIN_ACTIVE_ARMS_LOOKBACK_TRADING_DAYS = 60
+
+
+def _read_arena_cycle(store: Store, slot: str, day: dt.date) -> dict[str, Any] | None:
+    """The `arena_cycle` document for ``slot`` on ``day``, or None if absent.
+
+    A present-but-unreadable document is surfaced through ``read_listed_document``'s
+    fault, not silently treated as absent — see :func:`evaluate_min_active_arms`.
+    """
+    key = arena_cycle_key(slot, day.isoformat())
+    if not store.exists(key):
+        return None
+    read = read_listed_document(store, key)
+    if read.document is None:
+        return {"__unreadable__": read.problem}
+    return read.document
+
+
+def evaluate_min_active_arms(
+    store: Store,
+    *,
+    now: dt.datetime | None = None,
+    access_faults: list[str] | None = None,
+) -> list[Page]:
+    """§10.1 / `alpha-engine-config-I10636`: page once per slot for a standing
+    below-floor state — never once per trading day it persists.
+
+    Reuses the FAILURE condition rather than adding a third (§4.6 admits
+    exactly two): a slot below `min_active_arms` has failed to do the one
+    thing an arena cycle exists to do — produce a comparison — and `job`
+    names the slot (`slots.{slot}`) rather than a `components.yaml` row,
+    since the finding binds to a slot, not to one scheduled job's run.
+
+    Evaluates only the MOST RECENT `arena_cycle` per slot; the finding is a
+    snapshot of current standing, not a per-day series to replay. See
+    :data:`MIN_ACTIVE_ARMS_LOOKBACK_TRADING_DAYS` for why the emitted page's
+    `trading_day` is the incident's anchor day rather than today's.
+    """
+    moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
+    today = resolve_trading_day(moment)
+    pages: list[Page] = []
+    for slot in sorted(SLOTS):
+        day = today
+        latest: dict[str, Any] | None = None
+        latest_day: dt.date | None = None
+        for _ in range(MIN_ACTIVE_ARMS_LOOKBACK_TRADING_DAYS):
+            cycle = _read_arena_cycle(store, slot, day)
+            if cycle is not None:
+                latest, latest_day = cycle, day
+                break
+            day = previous_trading_day(day)
+        if latest is None or latest_day is None:
+            # No graded cycle for this slot in the window at all: nothing to
+            # page about here — a slot that has never run is not this
+            # condition's concern, and an absent scheduled job pages through
+            # `evaluate_absence` instead.
+            continue
+        if "__unreadable__" in latest:
+            if access_faults is None:
+                raise StoreAccessError(str(latest["__unreadable__"]))
+            access_faults.append(str(latest["__unreadable__"]))
+            continue
+        finding = latest.get(MIN_ACTIVE_ARMS_FINDING_METRIC)
+        if not finding or finding.get("status") != "BELOW_FLOOR":
+            continue
+
+        # The incident's anchor: walk backward from the latest below-floor
+        # cycle to the EARLIEST one in an unbroken below-floor streak, bounded
+        # by the same lookback. The arena grades weekly (§4.4), so most
+        # trading days in between carry no cycle artifact at all — those are
+        # SKIPPED, not treated as a break, or the walk would stop on the very
+        # first non-cycle day and anchor at `latest_day` every time, which is
+        # the re-page-every-week defect this function exists to close. Only a
+        # cycle that actually READ (OK, or unreadable) ends the streak.
+        anchor = latest_day
+        probe = previous_trading_day(anchor)
+        steps = 0
+        while steps < MIN_ACTIVE_ARMS_LOOKBACK_TRADING_DAYS:
+            prior = _read_arena_cycle(store, slot, probe)
+            if prior is None:
+                probe = previous_trading_day(probe)
+                steps += 1
+                continue
+            if "__unreadable__" in prior:
+                break
+            prior_finding = prior.get(MIN_ACTIVE_ARMS_FINDING_METRIC)
+            if not prior_finding or prior_finding.get("status") != "BELOW_FLOOR":
+                break
+            anchor = probe
+            probe = previous_trading_day(probe)
+            steps += 1
+
+        pages.append(
+            Page(
+                condition="failure",
+                job=f"slots.{slot}",
+                trading_day=anchor,
+                reason=(
+                    f"slot {slot!r}: {finding.get('reason') or 'below its min_active_arms floor'} "
+                    f"(latest reading {latest_day.isoformat()})"
+                ),
+                run_id=latest.get("run_id") or _UNPARSEABLE_RUN_ID,
+            )
+        )
+    return pages
 
 
 # ── The bus, the transport, and the ceiling ───────────────────────────────
@@ -2202,6 +2328,7 @@ def sweep(
             describe_instance_state_reason=describe_instance_state_reason,
         )
         + evaluate_failure(store, now=moment, registry=registry, access_faults=access_faults)
+        + evaluate_min_active_arms(store, now=moment, access_faults=access_faults)
     )
     groups = group_pages(pages)
     if dry_run:

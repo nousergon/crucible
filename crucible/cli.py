@@ -95,6 +95,18 @@ def _epic_tracker() -> str:
     return f"alpha-engine-config-I{_EPIC_ISSUE}"
 
 
+#: The money-path hash-chain verifier's own tracker issue (`crucible-PR240`)
+#: — a HISTORICAL, non-phase issue that `crucible.gate.phase_tracker` can
+#: never derive, so `tests/test_no_stale_tracker_literals.py` requires this
+#: shape (a plain `int`, read at f-string time) rather than a literal
+#: `"alpha-engine-config-I10414"` anywhere a user-facing string can carry it.
+_MONEY_PATH_CHAIN_ISSUE = 10414
+
+
+def _money_path_chain_tracker() -> str:
+    return f"alpha-engine-config-I{_MONEY_PATH_CHAIN_ISSUE}"
+
+
 def _todo(job: str, track: str, note: str) -> Callable[[argparse.Namespace], int]:
     """A handler that refuses loudly, naming who owns it.
 
@@ -656,6 +668,16 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if spec.name == "explain":
             sub.add_argument("target", metavar="RUN_ID|VERDICT_KEY")
+            sub.add_argument(
+                "--verify-chain",
+                action="store_true",
+                help=(
+                    "Verify the money-path hash chain (plan §9.5) and exit non-zero on "
+                    f"a break. `crucible-PR240` ({_money_path_chain_tracker()}) is a "
+                    "gated DRAFT that has not merged: passing this flag against a build "
+                    "with no chain verifier is a loud refusal, not a silent no-op."
+                ),
+            )
         if spec.name == "release.pin":
             sub.add_argument("sha", metavar="RELEASE_SHA")
             sub.add_argument("--target", choices=["current", "trader"], default="current")

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+from pathlib import Path
 from typing import Any
 
 from crucible import migrate as migrate_module
@@ -28,6 +29,7 @@ from crucible.config import settings as resolve_settings
 from crucible.data import ArcticPriceSource, PriceSource, run_daily, run_heal, run_weekly
 from crucible.data.universe import DeclaredUniverse, load_declared_universe, universe_from_argv
 from crucible.explain import explain as explain_lineage
+from crucible.explain import money_path_chain_verifier
 from crucible.explain import render as render_lineage
 from crucible.gate import PHASES
 from crucible.keys import arm_register_key
@@ -55,6 +57,15 @@ _SLOT_MODULES = dispatchable_slots()
 #: §6). Derived rather than hardcoded so a phase renumbering cannot leave
 #: `_slot_module`'s message stale (alpha-engine-config-I9839).
 _ALL_SLOTS_PHASE = next(p for p in PHASES if p.id == "phase3")
+
+#: `_verify_chain_or_refuse`'s refusal names phase 2 (derived from `PHASES`,
+#: same shape `_ALL_SLOTS_PHASE` above uses) and the money-path chain PR's
+#: own tracker issue — a HISTORICAL, non-phase issue `PHASES` can never
+#: derive, so it is a plain `int` read at f-string time rather than a
+#: literal string (`tests/test_no_stale_tracker_literals.py`,
+#: alpha-engine-config-I9839).
+_PHASE2 = next(p for p in PHASES if p.id == "phase2")
+_MONEY_PATH_CHAIN_ISSUE = 10414
 
 
 def _today() -> dt.date:
@@ -303,37 +314,51 @@ def _slot_module(slot: str) -> Any:
         return _SLOT_MODULES[slot]
     except KeyError as exc:
         raise SystemExit(
-            f"slot {slot!r} is not implemented in track A. U and R are here; M and S "
-            f"arrive with track B ({_ALL_SLOTS_PHASE.tracker}). A handler that returned "
-            "0 for an unimplemented slot would be indistinguishable from a cycle that "
-            "ran and had nothing to do."
+            f"slot {slot!r} is not implemented in track A. U, R, M and S are here "
+            f"(`crucible.slots.dispatchable_slots()` reads {sorted(_SLOT_MODULES)} live); "
+            f"a slot beyond those four arrives with track B ({_ALL_SLOTS_PHASE.tracker}). "
+            "A handler that returned 0 for an unimplemented slot would be "
+            "indistinguishable from a cycle that ran and had nothing to do."
         ) from exc
 
 
 def _recipes_for_registration(slot: str, *, config: Any, store: Any) -> list[Any]:
     """The slot's loaded recipes, in the shape `register_arms` reads.
 
-    One entry point over two recipe SCHEMAS (`alpha-engine-config-I10512`).
-    U and R recipes are `ArmSpec`s; an S recipe is a `StrategyRecipe`, wrapped
-    in `crucible.slots.strategy.RegisteredStrategyArm` so its own id — the
-    hash of its own spec — is what registers. Re-deriving an id here from an
-    `ArmSpec` view would give one arm two identities, and the register, the
-    session-inputs artifacts and the series would each speak about a
-    different one.
+    One entry point over three recipe SCHEMAS (`alpha-engine-config-I9957`,
+    `-I10512`). U and R recipes are `ArmSpec`s; an M recipe is a
+    `ModelRecipe`, wrapped in `crucible.slots.model.RegisteredModelArm`; an S
+    recipe is a `StrategyRecipe`, wrapped in
+    `crucible.slots.strategy.RegisteredStrategyArm`. Each wrapper carries its
+    own id — the hash of its own spec — so it is what registers.
+    Re-deriving an id here from an `ArmSpec` view would give one arm two
+    identities, and the register, the shadow/session-inputs artifacts and the
+    series would each speak about a different one.
 
-    M is not here: `load_arm_specs` raises `ForeignRecipeSchemaError` for it
-    and the caller converts that into the exit that names the phase.
+    Both M and S are here: `load_arm_specs` still raises
+    `ForeignRecipeSchemaError` for either slot name (it serves U and R only),
+    but neither slot reaches that call any more — each is dispatched to its
+    own loader below, before `load_arm_specs` is ever asked for it.
     """
-    if slot != "s":
-        return list(load_arm_specs(slot, store=store, strategy_dir=config.strategy_dir))
-    from crucible.slots.strategy import (  # noqa: PLC0415 - heavy import, one call site
-        load_strategy_slot,
-        registration_specs,
-    )
+    if slot == "m":
+        from crucible.slots.model import (  # noqa: PLC0415 - heavy import, one call site
+            load_model_recipes,
+            registration_specs,
+        )
 
-    loaded = load_strategy_slot(
-        store=None if config.strategy_dir else store, strategy_dir=config.strategy_dir
-    )
+        directory = Path(config.strategy_dir) / "arms" / slot if config.strategy_dir else None
+        loaded = load_model_recipes(directory, store=None if directory is not None else store)
+    elif slot == "s":
+        from crucible.slots.strategy import (  # noqa: PLC0415 - heavy import, one call site
+            load_strategy_slot,
+            registration_specs,
+        )
+
+        loaded = load_strategy_slot(
+            store=None if config.strategy_dir else store, strategy_dir=config.strategy_dir
+        )
+    else:
+        return list(load_arm_specs(slot, store=store, strategy_dir=config.strategy_dir))
     print(
         json.dumps(
             {
@@ -358,23 +383,25 @@ def handle_experiment_new(args: argparse.Namespace) -> int:
     own help text is "report what would be written; write nothing", and
     this handler wrote the register regardless of it).
 
-    **S is no longer refused by name** (`alpha-engine-config-I10512`). Its
-    recipes are `StrategyRecipe` documents, not `ArmSpec`s, so `load_arm_specs`
-    still refuses slot `s` — that refusal is correct and stays — and this
-    handler now resolves the S loader instead of converting the refusal into
-    an exit. `crucible.slots.strategy.load_strategy_slot` reads the same tree
-    from the same two sources, and its refused arms are reported here rather
+    **Neither M nor S is refused by name any longer**
+    (`alpha-engine-config-I9957`, `-I10512`). Both recipe types —
+    `ModelRecipe` and `StrategyRecipe` documents — are not `ArmSpec`s, so
+    `load_arm_specs` still refuses slots `m` and `s` — that refusal is
+    correct and stays, it is simply never reached for them any more: this
+    handler resolves each slot's own loader
+    (`crucible.slots.model.load_model_recipes`,
+    `crucible.slots.strategy.load_strategy_slot`) instead of converting the
+    refusal into an exit. Both read the same two sources (a checkout or the
+    synced store tree), and each slot's refused arms are reported here rather
     than silently dropped: an arm that will not register is the fact an
     operator running `experiment.new` most needs.
 
-    **M is still refused by name**, in the same shape :func:`_slot_module`
-    uses (`alpha-engine-config-I9961`): its recipes are `ModelRecipe`
-    documents and its produce/grade entry points arrive with the M slot's own
-    phase-3 deliverable. `--slot` admits all four, and for M this command
-    reaches `load_arm_specs`, which refuses the slot BY NAME rather than
-    failing on a missing `ranker` and presenting as a malformed recipe tree.
-    Registering nothing and exiting 0 would be indistinguishable from a slot
-    whose arms were all already present.
+    All four slots admit `--slot` now. The `ForeignRecipeSchemaError` handler
+    below is kept as a defensive backstop — `_recipes_for_registration`
+    dispatches M and S to their own loaders before `load_arm_specs` is ever
+    asked for either, so the exception path is not expected to fire for any
+    of the four current slots; it stays in case a future slot adds a fourth
+    recipe schema without a loader wired in here yet.
     """
     config = _settings(args)
     store = config.store()
@@ -382,10 +409,10 @@ def handle_experiment_new(args: argparse.Namespace) -> int:
         specs = _recipes_for_registration(args.slot, config=config, store=store)
     except ForeignRecipeSchemaError as exc:
         raise SystemExit(
-            f"{exc} U, R and S are here; M arrives with track B "
-            f"({_ALL_SLOTS_PHASE.tracker}), which is when its recipes gain a register "
-            "writer. Registering nothing and exiting 0 would be indistinguishable from a "
-            "slot whose arms were all already present."
+            f"{exc} U, R, M and S are all here; a slot beyond those four arrives with "
+            f"track B ({_ALL_SLOTS_PHASE.tracker}), which is when its recipes gain a "
+            "register writer. Registering nothing and exiting 0 would be "
+            "indistinguishable from a slot whose arms were all already present."
         ) from exc
     arm = getattr(args, "arm", None)
     if arm:
@@ -527,12 +554,24 @@ def handle_explain(args: argparse.Namespace) -> int:
     receipt, not noise.
 
     `--dry-run` prints the walk and files nothing (`run_job(dry_run=True)`).
+
+    **`--verify-chain`** (`alpha-engine-config-I10625`) is checked AFTER the
+    walk is printed and the manifest recorded — a broken chain is not a
+    failure of the walk itself (`explain` "runs" successfully either way;
+    the walk is what lets an operator SEE the break), so it never turns this
+    run's own manifest into a `failed` one. It is the caller's refusal, per
+    `crucible.explain.money_path_chain_verifier`'s docstring: `crucible-PR240`
+    (`alpha-engine-config-I10414`) is a gated DRAFT, so this build carries no
+    verifier yet, and passing the flag today is a loud, named refusal rather
+    than a silent no-op that would look like a clean chain.
     """
     config = _settings(args)
     store = config.store()
+    captured: dict[str, Any] = {}
 
     def job(ctx: Any) -> None:
         lineage = explain_lineage(store, args.target)
+        captured["lineage"] = lineage
         for key in _lineage_keys(lineage):
             if store.exists(key):
                 ctx.record_input(key, store.get_bytes(key))
@@ -546,7 +585,36 @@ def handle_explain(args: argparse.Namespace) -> int:
         run_mode=getattr(args, "run_mode", None),
         dry_run=bool(getattr(args, "dry_run", False)),
     )
+    if getattr(args, "verify_chain", False):
+        _verify_chain_or_refuse(captured["lineage"])
     return 0
+
+
+def _verify_chain_or_refuse(lineage: Any) -> None:
+    """`--verify-chain`'s refusal-or-check, isolated so its exit shape is one place.
+
+    Refuses (uncaught `SystemExit`, same shape `_source` above uses — a
+    string-coded `SystemExit` prints to stderr and exits non-zero, the
+    `crucible-PR219` precedent `main` relies on for every OTHER usage
+    refusal) when this build has no verifier at all, or when the `Lineage`
+    this build returns carries no `chain` field to check — both true today,
+    since `crucible-PR240` has not merged. Once it has, `verifier` resolves
+    and `lineage.chain` is `None` for a walk that never crossed the money
+    path (nothing to verify — not an error) or a `ChainVerification` whose
+    own `raise_if_broken()` is the non-zero exit on a real break.
+    """
+    verifier = money_path_chain_verifier()
+    if verifier is None or not hasattr(lineage, "chain"):
+        raise SystemExit(
+            "--verify-chain: this build carries no money-path chain verifier. "
+            f"`crucible-PR240` (alpha-engine-config-I{_MONEY_PATH_CHAIN_ISSUE}) is a "
+            "gated DRAFT that has not merged yet — it stays behind "
+            f"{_PHASE2.tracker}'s exit. Refusing rather than silently skipping the "
+            "chain check the flag was asked to run."
+        )
+    chain = lineage.chain
+    if chain is not None:
+        chain.raise_if_broken()
 
 
 def handle_migrate_history(args: argparse.Namespace) -> int:

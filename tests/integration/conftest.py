@@ -19,6 +19,7 @@ or `deploy.yml` invocation reaches a test that would use them. Only
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -27,10 +28,12 @@ import pytest
 
 from crucible.calendar import is_trading_day
 from crucible.required import require_env
+from crucible.slots.grading import DEFAULT_HORIZON_TRADING_DAYS
 from crucible.store import Store, open_store
 
 __all__ = [
     "INTEGRATION_TRADING_DAY",
+    "SETTLED_TRADING_DAY",
 ]
 
 #: Fixed literal, never wall-clock (AGENTS.md, Test discipline). A Tuesday,
@@ -42,6 +45,56 @@ assert is_trading_day(dt.date.fromisoformat(INTEGRATION_TRADING_DAY)), (
     f"INTEGRATION_TRADING_DAY={INTEGRATION_TRADING_DAY!r} is not a real NYSE trading day "
     "per crucible.calendar — every key this tier writes binds to it (plan §4.12), so a "
     "non-trading literal would fail every job's own refusal rather than this assertion."
+)
+
+#: A second FIXED literal (`alpha-engine-config-I10633`), exactly
+#: `DEFAULT_HORIZON_TRADING_DAYS` (21) NYSE sessions after
+#: `INTEGRATION_TRADING_DAY` — never `today` arithmetic, same discipline as
+#: the constant above. `experiment.grade`/`promote` score only SETTLED
+#: shadows (`crucible.slots.cycle.run_grade`: `forward_returns` needs price
+#: data `horizon_trading_days` sessions AFTER the shadow's own date), and a
+#: tier with only ONE fixed trading day could never produce one — every
+#: nightly `experiment.grade` run would legitimately score zero cuts,
+#: forever. Seeding a second, LATER day was chosen over hand-writing shadow
+#: history directly into the store (the issue's own alternative (b)):
+#: this way the real `data.daily`/`experiment.run` producer path is
+#: exercised a second time, at a later date, rather than fabricating the
+#: verdicts those producers exist to compute — hand-written history would
+#: prove the grader can read a shape it was told to expect, not that the
+#: producer chain actually produces a settleable one.
+SETTLED_TRADING_DAY = "2026-10-07"
+
+assert is_trading_day(dt.date.fromisoformat(SETTLED_TRADING_DAY)), (
+    f"SETTLED_TRADING_DAY={SETTLED_TRADING_DAY!r} is not a real NYSE trading day per "
+    "crucible.calendar — every key this tier writes binds to it (plan §4.12)."
+)
+
+
+def _sessions_between(start: dt.date, end: dt.date) -> int:
+    """Count of NYSE sessions strictly after ``start`` up to and including
+    ``end``, walked one calendar day at a time — the same construction
+    `integration_arctic_symbols` below already uses, so this assertion
+    cannot disagree with what that fixture actually seeds."""
+    count = 0
+    day = start
+    while day < end:
+        day += dt.timedelta(days=1)
+        if is_trading_day(day):
+            count += 1
+    return count
+
+
+assert (
+    _sessions_between(
+        dt.date.fromisoformat(INTEGRATION_TRADING_DAY), dt.date.fromisoformat(SETTLED_TRADING_DAY)
+    )
+    == DEFAULT_HORIZON_TRADING_DAYS
+), (
+    f"SETTLED_TRADING_DAY={SETTLED_TRADING_DAY!r} is not exactly "
+    f"{DEFAULT_HORIZON_TRADING_DAYS} NYSE sessions after INTEGRATION_TRADING_DAY="
+    f"{INTEGRATION_TRADING_DAY!r} — a shadow produced on the earlier day would not "
+    "settle by the later one, and `experiment.grade` would legitimately score zero "
+    "cuts against it, same as with only one fixed day."
 )
 
 #: The three production ArcticDB library names this tier's dedicated library
@@ -178,6 +231,38 @@ def _arctic_bucket_env(integration_arctic_bucket: str) -> None:
     os.environ["CRUCIBLE_ARCTIC_BUCKET"] = integration_arctic_bucket
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _declared_universe_env(
+    integration_arctic_symbols: list[str], tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Point `CRUCIBLE_UNIVERSE_URI` at a local membership document naming
+    this tier's own dedicated symbols (`crucible.data.universe`).
+
+    Every case above that calls `data.daily`/`data.weekly`/`data.heal`
+    directly passes `--symbols` on its own argv and never needed this — the
+    explicit argument always wins over the environment
+    (`crucible.track_a._declared_universe`). `weekly`
+    (`alpha-engine-config-I10633`) is the first case in this tier that does
+    NOT: `crucible.weekly.Stage.argv` carries no `--symbols` for any stage,
+    by design (`crucible/data/universe.py`'s own docstring — "the weekly
+    arc's `Stage.argv` carries no `--symbols`... every scheduled data job —
+    and the first stage of every weekly arc — failed by construction with
+    `UndeclaredUniverseError`", the exact gap this env var exists to close in
+    production). Without it, `test_weekly`'s own `data.weekly` stage would
+    refuse before ever reaching the ArcticDB read this tier exists to prove.
+    A local path is a fully real exercise of this resolution path, not a
+    shortcut around it — `load_declared_universe` reads a local path and an
+    `s3://` URI through the same code, differing only in how bytes are
+    fetched (`crucible/data/universe.py`'s own docstring).
+    """
+    document = tmp_path_factory.mktemp("integration-universe") / "constituents.json"
+    document.write_text(
+        json.dumps({"tickers": list(integration_arctic_symbols)}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    os.environ["CRUCIBLE_UNIVERSE_URI"] = str(document)
+
+
 @pytest.fixture(scope="session")
 def integration_arctic_symbols(arctic_library: Any) -> list[str]:
     """Synthetic OHLCV rows for three symbols, written into the DEDICATED
@@ -191,12 +276,21 @@ def integration_arctic_symbols(arctic_library: Any) -> list[str]:
     shape `tests/conftest.py::synthetic_frames` produces for the unit suite's
     `FramePriceSource` fixtures, which is a different contract.
 
-    ~300 trading sessions, comfortably above `data.daily`'s default 400
-    CALENDAR-day lookback (`crucible.data.daily.DEFAULT_LOOKBACK_DAYS`,
-    roughly 275 trading sessions) so the feature layer's longest window
-    (252-session momentum) is never starved. Torn down after the session so
-    a rerun starts from the same clean state, mirroring
-    `test_arctic_connectivity.py`'s own idempotent teardown.
+    ~300 trading sessions BEFORE `INTEGRATION_TRADING_DAY`, comfortably above
+    `data.daily`'s default 400 CALENDAR-day lookback
+    (`crucible.data.daily.DEFAULT_LOOKBACK_DAYS`, roughly 275 trading
+    sessions) so the feature layer's longest window (252-session momentum) is
+    never starved — plus every session THROUGH `SETTLED_TRADING_DAY`
+    (`alpha-engine-config-I10633`), one continuous random walk rather than
+    two independent ones, so a `data.daily`/`data.weekly` run at either fixed
+    day reads the same coherent series and a shadow produced at
+    `INTEGRATION_TRADING_DAY` settles against real forward prices rather than
+    a second, unrelated draw. Every session up to and including
+    `INTEGRATION_TRADING_DAY` is byte-for-byte what this fixture wrote before
+    this extension — the walk only gains a forward tail, nothing before it
+    changes. Torn down after the session so a rerun starts from the same
+    clean state, mirroring `test_arctic_connectivity.py`'s own idempotent
+    teardown.
     """
     import math
     import random
@@ -204,14 +298,22 @@ def integration_arctic_symbols(arctic_library: Any) -> list[str]:
     import pandas as pd
 
     symbols = ["INTGA", "INTGB", "INTGC"]
-    end = dt.date.fromisoformat(INTEGRATION_TRADING_DAY)
+    anchor = dt.date.fromisoformat(INTEGRATION_TRADING_DAY)
+    settled = dt.date.fromisoformat(SETTLED_TRADING_DAY)
     days: list[dt.date] = []
-    day = end
+    day = anchor
     while len(days) < 300:
         if is_trading_day(day):
             days.append(day)
         day -= dt.timedelta(days=1)
     days.sort()
+    # Forward tail through the settled day — `anchor` itself is already the
+    # last element above, so this starts the day after it.
+    day = anchor
+    while day < settled:
+        day += dt.timedelta(days=1)
+        if is_trading_day(day):
+            days.append(day)
 
     rng = random.Random(20260908)
     for symbol in symbols:

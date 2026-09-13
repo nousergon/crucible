@@ -1,4 +1,8 @@
-"""One real case per exercisable CLI job (16 of 24 — see README.md).
+"""One real case per exercisable CLI job (23 of 25 — see README.md; `weekly`,
+`experiment.grade` and `promote` added by `alpha-engine-config-I10633`).
+`test.integration` is the 24th job README.md's own count includes — it is
+exercised by `.github/workflows/integration-nightly.yml` invoking this
+whole suite, not by a case within it.
 
 Every case invokes `crucible.cli.main`, the real process entry point, not a
 handler function directly — the wire a spot instance actually dispatches
@@ -18,6 +22,7 @@ MANIFEST's status, never the process exit code, for exactly that reason.
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 from typing import Any
@@ -28,17 +33,35 @@ from crucible.calendar import assert_trading_day
 from crucible.cli import main as cli_main
 from crucible.manifest import read_manifest
 from crucible.store import Store
-from tests.integration.conftest import INTEGRATION_TRADING_DAY
+from tests.integration.conftest import INTEGRATION_TRADING_DAY, SETTLED_TRADING_DAY
 
 pytestmark = pytest.mark.usefixtures("_dedicated_topic_env")
 
 
-def _manifest(store: Store, job: str, *, discriminator: str | None = None) -> dict[str, Any]:
-    return read_manifest(store, job, INTEGRATION_TRADING_DAY, discriminator=discriminator)
+def _manifest(
+    store: Store,
+    job: str,
+    *,
+    discriminator: str | None = None,
+    trading_day: str = INTEGRATION_TRADING_DAY,
+) -> dict[str, Any]:
+    return read_manifest(store, job, trading_day, discriminator=discriminator)
 
 
-def _assert_ok(store: Store, job: str, *, discriminator: str | None = None) -> dict[str, Any]:
-    manifest = _manifest(store, job, discriminator=discriminator)
+def _assert_ok(
+    store: Store,
+    job: str,
+    *,
+    discriminator: str | None = None,
+    trading_day: str = INTEGRATION_TRADING_DAY,
+) -> dict[str, Any]:
+    # `trading_day` (`alpha-engine-config-I10633`): every case before
+    # `test_experiment_grade` keys its manifest at `INTEGRATION_TRADING_DAY`
+    # (the default, unchanged) — `experiment.grade`/`promote` and the second
+    # `data.daily` run above key theirs at `SETTLED_TRADING_DAY` instead, and
+    # a helper that stayed hardcoded to the one module constant would read
+    # back the WRONG manifest (or none at all) for every one of them.
+    manifest = _manifest(store, job, discriminator=discriminator, trading_day=trading_day)
     assert manifest["status"] == "ok", (
         f"{job}: expected status ok against the dedicated store, got "
         f"{manifest['status']!r}: {manifest.get('reason')}"
@@ -161,9 +184,9 @@ def test_data_heal(
 #    (`crucible.slots.cycle.run_produce` reads the feature layer `data.daily`
 #    above just wrote into THIS store); its non-degenerate exercise was
 #    blocked only by `data.daily` having nothing real to read
-#    (`alpha-engine-config-I10457`), never by a gap of its own. See the note
-#    below `test_experiment_run` for why `experiment.grade`/`promote` are
-#    NOT added here. ─────────────────────────────────────────────────────
+#    (`alpha-engine-config-I10457`), never by a gap of its own. This shadow
+#    is what `test_experiment_grade` below settles, against a second, LATER
+#    trading day. ─────────────────────────────────────────────────────────
 
 
 def test_experiment_run(integration_store_uri: str, integration_store: Store) -> None:
@@ -184,22 +207,140 @@ def test_experiment_run(integration_store_uri: str, integration_store: Store) ->
     assert manifest["outputs"], "experiment.run wrote no outputs — no arm's shadow landed"
 
 
-# `experiment.grade`/`promote` are NOT added here. Investigation for
-# `alpha-engine-config-I10457` found their blocker is NOT the ArcticDB gap
-# this PR fixes: `crucible.slots.cycle.run_grade` scores only SETTLED shadows
-# (`forward_returns` needs price data `horizon_trading_days` — default 21 —
-# AFTER the shadow's own date), and this tier's `INTEGRATION_TRADING_DAY` is
-# a fixed literal with no later trading day ever produced in the dedicated
-# store, by design (AGENTS.md, "Test discipline": fixed date literals, never
-# `today` arithmetic). A grade run here would legitimately score zero
-# settled cuts, forever, on every nightly run — proving nothing beyond what
-# `experiment.run`, `data.daily` and `data.weekly` above already prove.
-# Exercising `experiment.grade`/`promote` for real needs a multi-week
-# historical panel (several distinct trading days, each settled relative to
-# a later one), which is real design work distinct from this issue's
-# ArcticDB-library scope. Filed as a follow-up rather than landed
-# speculatively and unverifiable from this session (no real S3/ArcticDB
-# access — `alpha-engine-config-I9771`).
+# ── weekly — the arc's own `data.weekly` stage against the dedicated
+#    ArcticDB library (`alpha-engine-config-I10633`) ────────────────────────
+
+
+def test_weekly(
+    integration_store_uri: str,
+    integration_store: Store,
+    integration_arctic_library: str,
+    integration_arctic_symbols: list[str],
+) -> None:
+    """`crucible.weekly.Stage.argv`/`run_arc` now thread `--arctic-library`
+    onto every `ARCTIC_LIBRARY_JOBS` stage. Before this, an arc run here
+    would have had its `data.weekly` stage silently read the PRODUCTION
+    `universe` library within the shared integration bucket rather than the
+    dedicated one — the opposite of this tier's isolation guarantee (see
+    README.md, "Not exercised, and why").
+
+    Only `data.weekly` is invoked through the real `crucible.cli.main` wire
+    here; every other arc stage is stubbed. The R slot's own arm
+    registration (`alpha-engine-config-I10628`, a sibling track's own
+    scope) and the arc's remaining stages are exercised standalone, for
+    real, by this module's other cases — chaining them all through one real
+    `weekly` invocation would entangle this issue's own deliverable
+    (`--arctic-library` threading) with that unrelated, unowned surface.
+    `CRUCIBLE_UNIVERSE_URI` (`conftest.py::_declared_universe_env`) is what
+    lets the real `data.weekly` stage resolve a universe at all: `Stage.argv`
+    carries no `--symbols` for any stage, by design
+    (`crucible/data/universe.py`'s own docstring).
+    """
+    from crucible.weekly import run_arc
+
+    trading_day = dt.date.fromisoformat(INTEGRATION_TRADING_DAY)
+
+    def main(argv: list[str]) -> int:
+        if argv[0] == "data.weekly":
+            return cli_main(argv)
+        return 0
+
+    ran = run_arc(
+        trading_day,
+        store=integration_store_uri,
+        run_mode="live",
+        main=main,
+        arctic_library=integration_arctic_library,
+    )
+    assert any(s.job == "data.weekly" for s in ran), "the arc did not run a data.weekly stage"
+    _assert_ok(integration_store, "data.weekly")
+
+
+# ── experiment.grade / promote — a second, LATER seeded trading day
+#    (`alpha-engine-config-I10633`) settles the shadow `test_experiment_run`
+#    above produced at `INTEGRATION_TRADING_DAY`, exactly
+#    `DEFAULT_HORIZON_TRADING_DAYS` sessions earlier
+#    (`conftest.py::SETTLED_TRADING_DAY`) ─────────────────────────────────
+
+
+def test_experiment_grade(
+    integration_store_uri: str,
+    integration_store: Store,
+    integration_arctic_library: str,
+    integration_arctic_symbols: list[str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The panel `experiment.grade` reads is keyed by ITS OWN `--date`
+    # (`crucible.slots.cycle._read_panel`), never the shadow's produce date —
+    # so grading against `SETTLED_TRADING_DAY` needs a panel compiled AT
+    # `SETTLED_TRADING_DAY`, covering both it and `INTEGRATION_TRADING_DAY`
+    # inside `data.daily`'s trailing lookback window.
+    cli_main(
+        [
+            "data.daily",
+            "--store",
+            integration_store_uri,
+            "--arctic-library",
+            integration_arctic_library,
+            "--symbols",
+            ",".join(integration_arctic_symbols),
+            "--run-mode",
+            "live",
+            "--date",
+            SETTLED_TRADING_DAY,
+        ]
+    )
+    _assert_ok(integration_store, "data.daily", trading_day=SETTLED_TRADING_DAY)
+
+    cli_main(
+        [
+            "experiment.grade",
+            "--slot",
+            "u",
+            "--store",
+            integration_store_uri,
+            "--run-mode",
+            "live",
+            "--date",
+            SETTLED_TRADING_DAY,
+        ]
+    )
+    manifest = _assert_ok(
+        integration_store, "experiment.grade", discriminator="u", trading_day=SETTLED_TRADING_DAY
+    )
+    assert manifest["outputs"], "experiment.grade wrote no outputs — no arena cycle landed"
+
+    # `handle_experiment_grade` prints `settled_dates` — the direct evidence
+    # this cycle scored a REAL settled cut, not merely that it exited 0.
+    result = json.loads(capsys.readouterr().out)
+    assert result["settled_dates"], (
+        "experiment.grade scored zero settled cuts — the seeded second trading day "
+        f"({SETTLED_TRADING_DAY}) did not actually settle the shadow "
+        f"{INTEGRATION_TRADING_DAY} produced; this is exactly the degenerate case a "
+        "single fixed trading day could never avoid."
+    )
+    assert result["scored_arms"], "experiment.grade scored no arms at all"
+
+
+def test_promote(integration_store_uri: str, integration_store: Store) -> None:
+    """Runs after `test_experiment_grade` above, against the same graded
+    cycle — `promote` is evidence-gated (policy §3) and may legitimately
+    hold rather than move the pointer on a single week's cycle; only the
+    manifest's own status is asserted, same as `test_gate`."""
+    cli_main(
+        [
+            "promote",
+            "--slot",
+            "u",
+            "--store",
+            integration_store_uri,
+            "--run-mode",
+            "live",
+            "--date",
+            SETTLED_TRADING_DAY,
+        ]
+    )
+    _assert_ok(integration_store, "promote", trading_day=SETTLED_TRADING_DAY)
 
 
 # ── explain — walks the lineage of the register experiment.new just wrote ──
