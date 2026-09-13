@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import datetime as dt
+import gzip
 import json
 import pathlib
 
@@ -571,6 +572,130 @@ def _counting(monkeypatch: pytest.MonkeyPatch, counted: _Counted) -> None:
     monkeypatch.setattr(autonomy_module, "count_operator_actions", lambda *a, **k: counted)
 
 
+# ── alpha-engine-config-I10608: attributing the release pointer's flip ─────
+# Brian's ruling 2026-09-12 (option (a)). The window restarts on a HUMAN
+# change only, so who wrote `releases/current` is now load-bearing, and it is
+# read from the CloudTrail archive rather than the pointer document.
+
+#: A stack machine role and a laptop operator. Synthetic names: no
+#: infrastructure identifier is written into this tree
+#: (`tests/test_no_infra_literals.py`), and the allowlist is matched on the
+#: role NAME CloudFormation reports as an `AWS::IAM::Role`'s
+#: `PhysicalResourceId`.
+MACHINE_ROLE = "a-test-stack-deploy-role"
+HUMAN_OPERATOR = "a-laptop-operator"
+
+#: The full S3 key `S3Store("a-test-store", "crucible")` puts the pointer at.
+POINTER_S3_KEY = f"crucible/{POINTER_KEY}"
+
+
+def _pointer_write(at: dt.datetime, principal: str, *, event_name: str = "PutObject") -> dict:
+    """One archived S3 data event moving the release pointer."""
+    return {
+        "eventTime": at.isoformat().replace("+00:00", "Z"),
+        "eventName": event_name,
+        "eventSource": "s3.amazonaws.com",
+        "readOnly": False,
+        "requestID": f"r-{at.isoformat()}",
+        "requestParameters": {"bucketName": TEST_BUCKET, "key": POINTER_S3_KEY},
+        "userIdentity": {
+            "type": "AssumedRole",
+            "arn": f"arn:aws:sts::123456789012:assumed-role/{principal}/a-session",
+            "sessionContext": {"sessionIssuer": {"userName": principal}},
+        },
+    }
+
+
+class _ArchiveS3:
+    """An S3 client over an in-memory CloudTrail archive, day-partitioned.
+
+    Deliberately a real key layout — `{prefix}/{region}/{YYYY}/{MM}/{DD}/` —
+    because `crucible.autonomy.date_partitions` DISCOVERS the region level,
+    and a fake that flattened it would pass a reader asking for the wrong
+    thing. Every day in ``covered`` gets an object even when it holds no
+    pointer write: a day with no object is an UNCOVERED day, which the
+    reader treats as unattributable rather than as silence, and the two must
+    be distinguishable in a fixture.
+    """
+
+    def __init__(self, records_by_day: dict[dt.date, list[dict]]) -> None:
+        self._objects = {
+            f"trail/a-region/{day:%Y/%m/%d}/one.json.gz": records
+            for day, records in records_by_day.items()
+        }
+
+    def get_paginator(self, name: str):
+        assert name == "list_objects_v2"
+        objects = self._objects
+
+        class _Paginator:
+            def paginate(  # noqa: N803 - boto3's shape
+                self, *, Bucket: str, Prefix: str, Delimiter: str | None = None
+            ):
+                keys = [k for k in sorted(objects) if k.startswith(Prefix)]
+                if Delimiter is None:
+                    yield {"Contents": [{"Key": k} for k in keys]}
+                    return
+                common: dict[str, None] = {}
+                for key in keys:
+                    head, sep, _ = key[len(Prefix) :].partition(Delimiter)
+                    if sep:
+                        common[f"{Prefix}{head}{Delimiter}"] = None
+                yield {"Contents": [], "CommonPrefixes": [{"Prefix": p} for p in common]}
+
+        return _Paginator()
+
+    def get_object(self, *, Bucket: str, Key: str):  # noqa: N803 - boto3's shape
+        payload = gzip.compress(json.dumps({"Records": self._objects[Key]}).encode("utf-8"))
+
+        class _Body:
+            def read(self) -> bytes:
+                return payload
+
+        return {"Body": _Body()}
+
+
+def _pointer_archive(
+    monkeypatch: pytest.MonkeyPatch,
+    writes: list[dict],
+    *,
+    covered: tuple[dt.date, ...],
+) -> None:
+    """Point `gate._s3_client` at an archive covering ``covered``.
+
+    Call AFTER `_counting`, which substitutes the same seam with a client
+    that answers nothing — `count_operator_actions` is stubbed there and does
+    not use it, but the pointer attribution read does.
+    """
+    by_day: dict[dt.date, list[dict]] = {day: [] for day in covered}
+    for write in writes:
+        day = dt.datetime.fromisoformat(write["eventTime"].replace("Z", "+00:00")).date()
+        by_day.setdefault(day, []).append(write)
+    client = _ArchiveS3(by_day)
+    monkeypatch.setattr(gate_module, "_s3_client", lambda: client)
+
+
+def _stack_with_a_machine_role(monkeypatch: pytest.MonkeyPatch, at: dt.datetime) -> None:
+    """A stack applied at ``at`` that also names one `AWS::IAM::Role`, so
+    `crucible.autonomy.machine_principals` has a non-empty allowlist to
+    classify pointer writers against."""
+    _stack_applied(
+        monkeypatch,
+        at,
+        resources=[
+            {
+                "ResourceType": "AWS::IAM::Role",
+                "PhysicalResourceId": MACHINE_ROLE,
+                "LastUpdatedTimestamp": at,
+            }
+        ],
+    )
+
+
+def _days(first: dt.date, last: dt.date) -> tuple[dt.date, ...]:
+    return tuple(first + dt.timedelta(days=offset) for offset in range((last - first).days + 1))
+
+
 class TestTheAutonomyWindowStartsAtTheSystemsLastChange:
     """`alpha-engine-config-I10324`. The clause used to read the phase's
     rolling calendar window, which straddled its own fixes: measured 2026-09-09
@@ -594,18 +719,29 @@ class TestTheAutonomyWindowStartsAtTheSystemsLastChange:
         assert CHANGE_LONG_BEFORE.isoformat() in clause.detail
         assert "stack last applied" in clause.detail
 
-    def test_a_release_flip_with_no_stack_apply_also_starts_the_window(
+    def test_a_human_release_flip_with_no_stack_apply_also_starts_the_window(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The other direction, and the reason both inputs are read: a wheel
-        flip changes what the box RUNS while the stack is untouched."""
+        flip changes what the box RUNS while the stack is untouched.
+
+        Since `alpha-engine-config-I10608` the flip must be HUMAN to do it, so
+        this case now pins the writer to a laptop operator — the `crucible
+        release.pin` shape — rather than leaving it unattributed."""
         _archive(monkeypatch)
-        _stack_applied(monkeypatch, CHANGE_LONG_BEFORE - dt.timedelta(days=30))
+        stack_at = CHANGE_LONG_BEFORE - dt.timedelta(days=30)
+        _stack_with_a_machine_role(monkeypatch, stack_at)
         _counting(monkeypatch, _Counted(0))
+        _pointer_archive(
+            monkeypatch,
+            [_pointer_write(CHANGE_LONG_BEFORE, HUMAN_OPERATOR)],
+            covered=_days(stack_at.date(), CHANGE_LONG_BEFORE.date()),
+        )
         store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE)
         clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
         assert clause.met
-        assert "release pointer flip" in clause.detail
+        assert "human release pointer move" in clause.detail
+        assert HUMAN_OPERATOR in clause.detail
         assert CHANGE_LONG_BEFORE.isoformat() in clause.detail
 
     def test_the_reading_prints_both_inputs_whichever_won(
@@ -803,6 +939,203 @@ class TestTheAutonomyWindowStartsAtTheSystemsLastChange:
         clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
         assert clause.unmeasurable and not clause.met
         assert "RuntimeError" in clause.detail
+
+
+class TestOnlyAHumanChangeRestartsTheAutonomyWindow:
+    """`alpha-engine-config-I10608`, Brian's ruling 2026-09-12, option (a).
+
+    Every merge to `crucible` flips `releases/current` under the stack's
+    deploy role, so while ANY flip restarted the window the phase could only
+    exit in a week nobody shipped anything — "runs unattended" and "keeps
+    developing" made mutually exclusive by construction. A machine deploy
+    through the release pipeline IS the autonomy this clause certifies. The
+    flip's writer comes from the CloudTrail archive, never from the pointer
+    document, which is byte-identical whoever put it there.
+
+    The anti-gaming property is UNCHANGED and still tested above: a human
+    apply or human pin one minute before the read still restarts the window,
+    and the window must still contain a complete weekly cycle plus the daily
+    cycles after the change.
+    """
+
+    #: A machine release flip two days after the human apply — the live shape
+    #: measured 2026-09-12, where a 01:56:48Z stack apply was followed by five
+    #: `DeployRole` flips through 22:20:35Z.
+    MACHINE_FLIP = CHANGE_LONG_BEFORE + dt.timedelta(days=2)
+
+    def test_a_machine_flip_after_a_human_apply_leaves_the_start_at_the_apply(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The whole point of the ruling: a merge does not reset the phase."""
+        _archive(monkeypatch)
+        _stack_with_a_machine_role(monkeypatch, CHANGE_LONG_BEFORE)
+        _counting(monkeypatch, _Counted(0))
+        _pointer_archive(
+            monkeypatch,
+            [_pointer_write(self.MACHINE_FLIP, MACHINE_ROLE)],
+            covered=_days(CHANGE_LONG_BEFORE.date(), self.MACHINE_FLIP.date()),
+        )
+        store = _store_whose_pointer_flipped(self.MACHINE_FLIP)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.met and not clause.unmeasurable
+        assert "stack last applied" in clause.detail
+        # The start is the apply, and the later machine flip is on the record
+        # rather than hidden — a reader must be able to see that a deploy
+        # happened and why it did not move the window (principle 1).
+        assert f"window starts {CHANGE_LONG_BEFORE.isoformat()}" in clause.detail
+        assert self.MACHINE_FLIP.isoformat() in clause.detail
+        assert "does NOT restart the window" in clause.detail
+        assert MACHINE_ROLE in clause.detail
+
+    def test_a_human_pin_after_a_machine_flip_moves_the_start_to_the_pin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A laptop `crucible release.pin` is not a stack role, so it still
+        restarts the window — the carve-out is for the PIPELINE, not for
+        release moves in general."""
+        _archive(monkeypatch)
+        human_pin = self.MACHINE_FLIP + dt.timedelta(days=1)
+        _stack_with_a_machine_role(monkeypatch, CHANGE_LONG_BEFORE)
+        _counting(monkeypatch, _Counted(0))
+        _pointer_archive(
+            monkeypatch,
+            [
+                _pointer_write(self.MACHINE_FLIP, MACHINE_ROLE),
+                _pointer_write(human_pin, HUMAN_OPERATOR),
+            ],
+            covered=_days(CHANGE_LONG_BEFORE.date(), human_pin.date()),
+        )
+        store = _store_whose_pointer_flipped(human_pin)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.met and not clause.unmeasurable
+        assert "human release pointer move" in clause.detail
+        assert f"window starts {human_pin.isoformat()}" in clause.detail
+        assert HUMAN_OPERATOR in clause.detail
+
+    def test_a_flip_the_archive_cannot_attribute_is_treated_as_human(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Over-counting is the safe direction. Treating an unattributable
+        flip as machine would let an archive we cannot read CLEAR a phase;
+        treating it as human only keeps the clause UNMET for longer."""
+        _archive(monkeypatch)
+        _stack_with_a_machine_role(monkeypatch, CHANGE_LONG_BEFORE)
+        _counting(monkeypatch, _Counted(0))
+        # Days delivered, no pointer write in any of them: the flip on the
+        # object is real and the archive explains none of it.
+        _pointer_archive(
+            monkeypatch,
+            [],
+            covered=_days(CHANGE_LONG_BEFORE.date(), self.MACHINE_FLIP.date()),
+        )
+        store = _store_whose_pointer_flipped(self.MACHINE_FLIP)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.met and not clause.unmeasurable
+        assert f"window starts {self.MACHINE_FLIP.isoformat()}" in clause.detail
+        assert "matches no archived" in clause.detail
+        assert "treated as HUMAN" in clause.detail
+
+    def test_an_uncovered_archive_day_is_a_gap_not_silence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A trail always delivers, so a day with no object means the trail
+        does not cover it. Counting that as "nobody moved the pointer" is §11
+        risk 8 with a different cause."""
+        _archive(monkeypatch)
+        _stack_with_a_machine_role(monkeypatch, CHANGE_LONG_BEFORE)
+        _counting(monkeypatch, _Counted(0))
+        _pointer_archive(
+            monkeypatch,
+            [_pointer_write(self.MACHINE_FLIP, MACHINE_ROLE)],
+            covered=(self.MACHINE_FLIP.date(),),  # the apply's own day missing
+        )
+        store = _store_whose_pointer_flipped(self.MACHINE_FLIP)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.met and not clause.unmeasurable
+        assert "delivered no objects" in clause.detail
+        assert "treated as HUMAN" in clause.detail
+        assert f"window starts {self.MACHINE_FLIP.isoformat()}" in clause.detail
+
+    def test_an_unreadable_archive_treats_the_flip_as_human_not_unmeasurable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing is unknown about the SYSTEM here — only about who moved a
+        pointer — and the safe reading of that is available without refusing
+        to grade. The call-count read below is a different question and still
+        renders UNMEASURABLE when the archive fails."""
+        _archive(monkeypatch)
+        _stack_with_a_machine_role(monkeypatch, CHANGE_LONG_BEFORE)
+        # `_counting` leaves `_s3_client` answering nothing at all, which is
+        # what an archive read failing looks like from here; the count itself
+        # is stubbed, so this exercises only the attribution read.
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(self.MACHINE_FLIP)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.met and not clause.unmeasurable
+        assert "could not be read from the CloudTrail archive" in clause.detail
+        assert f"window starts {self.MACHINE_FLIP.isoformat()}" in clause.detail
+
+    def test_a_flip_at_or_before_the_apply_is_never_attributed_at_all(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A CloudTrail walk establishing a fact that cannot change the answer
+        is cost, not evidence — so the archive is not touched when the stack
+        apply already wins."""
+        _archive(monkeypatch)
+        _stack_with_a_machine_role(monkeypatch, CHANGE_LONG_BEFORE)
+        # The client `_counting` leaves in place answers nothing; reaching it
+        # would produce a "could not be read" detail, so the assertion below
+        # that the writer was NOT read is what proves the read was skipped.
+        _counting(monkeypatch, _Counted(0))
+        store = _store_whose_pointer_flipped(CHANGE_LONG_BEFORE - dt.timedelta(days=1))
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.met and not clause.unmeasurable
+        assert "stack last applied" in clause.detail
+        assert "its writer was not read" in clause.detail
+
+    def test_the_anti_gaming_floor_survives_a_human_pin_an_hour_before_the_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Deliverable 2. The ruling narrowed WHICH changes restart the
+        window; it did not touch the requirement that the window contain a
+        complete weekly cycle after the change."""
+        _archive(monkeypatch)
+        stack_at = CHANGE_LONG_BEFORE
+        pin_at = CHANGE_AN_HOUR_BEFORE_THE_READ
+        _stack_with_a_machine_role(monkeypatch, stack_at)
+        _counting(monkeypatch, _Counted(0))
+        _pointer_archive(
+            monkeypatch,
+            [_pointer_write(pin_at, HUMAN_OPERATOR)],
+            covered=_days(stack_at.date(), pin_at.date()),
+        )
+        store = _store_whose_pointer_flipped(pin_at)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert not clause.met and not clause.unmeasurable
+        assert "no complete weekly cycle has run unattended" in clause.detail
+        assert clause.earliest_satisfiable == autonomy_earliest_satisfiable_render_day(
+            pin_at.date()
+        )
+
+    def test_a_machine_flip_an_hour_before_the_read_does_not_shorten_the_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same instant, written by the pipeline instead: the window keeps
+        its start at the human apply eighteen days earlier and the clause
+        reads MET. This pair IS the ruling."""
+        _archive(monkeypatch)
+        flip_at = CHANGE_AN_HOUR_BEFORE_THE_READ
+        _stack_with_a_machine_role(monkeypatch, CHANGE_LONG_BEFORE)
+        _counting(monkeypatch, _Counted(0))
+        _pointer_archive(
+            monkeypatch,
+            [_pointer_write(flip_at, MACHINE_ROLE)],
+            covered=_days(CHANGE_LONG_BEFORE.date(), flip_at.date()),
+        )
+        store = _store_whose_pointer_flipped(flip_at)
+        clause = gate_module._clause_zero_human_mutating_calls(store, PHASE2_WINDOW)
+        assert clause.met and not clause.unmeasurable
+        assert f"window starts {CHANGE_LONG_BEFORE.isoformat()}" in clause.detail
 
 
 class TestTheStackChangeEndsWhenItsResourcesSettleNotWhenItStarted:

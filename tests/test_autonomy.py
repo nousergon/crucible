@@ -711,3 +711,146 @@ class TestTrailingCalendarMonth:
 
         start, end = trailing_calendar_month(dt.date(2026, 9, 1))
         assert start == end == dt.date(2026, 9, 1)
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I10608 — attributing a release-pointer write
+# ---------------------------------------------------------------------------
+
+#: The pointer's full S3 key and the store bucket the writes name. Synthetic:
+#: `tests/test_no_infra_literals.py` keeps real identifiers out of this tree.
+STORE_BUCKET = "a-test-store"
+POINTER_OBJECT_KEY = "crucible/releases/current"
+
+#: One of `_FakeCfn`'s default roles, so a write issued by it classifies as
+#: MACHINE through the same stack derivation production uses.
+A_MACHINE_ROLE = DEFAULT_MACHINE_ROLES[0]
+
+
+def _pointer_record(at: dt.datetime, principal: str, **over) -> dict:
+    document = _record(
+        eventTime=at.isoformat().replace("+00:00", "Z"),
+        eventName="PutObject",
+        eventSource="s3.amazonaws.com",
+        requestParameters={"bucketName": STORE_BUCKET, "key": POINTER_OBJECT_KEY},
+        userIdentity={
+            "type": "AssumedRole",
+            "arn": f"arn:aws:sts::123456789012:assumed-role/{principal}/a-session",
+            "sessionContext": {"sessionIssuer": {"userName": principal}},
+        },
+    )
+    document.update(over)
+    return document
+
+
+def _attribute(client, **over):
+    from crucible.autonomy import attribute_pointer_writes
+
+    kwargs = {
+        "bucket": "trail",
+        "prefix": f"{ARCHIVE_PREFIX}/us-east-1",
+        "object_bucket": STORE_BUCKET,
+        "object_key": POINTER_OBJECT_KEY,
+        "since": dt.datetime(2026, 8, 3, 0, 0, tzinfo=dt.UTC),
+        "until": dt.datetime(2026, 8, 4, 12, 0, tzinfo=dt.UTC),
+        "cfn": _FakeCfn(),
+    }
+    kwargs.update(over)
+    return attribute_pointer_writes(client, **kwargs)
+
+
+class TestAttributingAPointerWrite:
+    """Brian's ruling 2026-09-12 (option (a)): the autonomy window restarts on
+    a HUMAN change only, so `crucible.gate` needs to know who moved
+    `releases/current`. The pointer document cannot say — it is a
+    deterministic `release.json` reference, byte-identical whoever put it
+    there — so the writer comes from the archive this module already walks.
+    """
+
+    MACHINE_FLIP = dt.datetime(2026, 8, 4, 12, 0, tzinfo=dt.UTC)
+    HUMAN_PIN = dt.datetime(2026, 8, 4, 12, 0, tzinfo=dt.UTC)
+
+    def test_a_write_by_a_stack_role_is_machine(self) -> None:
+        archive = _archive({END: [_pointer_record(self.MACHINE_FLIP, A_MACHINE_ROLE)]})
+        result = _attribute(archive)
+        assert result.unattributable is None
+        assert result.latest_human is None
+        assert [w.machine for w in result.writes] == [True]
+
+    def test_a_write_by_anyone_else_is_human(self) -> None:
+        archive = _archive({END: [_pointer_record(self.HUMAN_PIN, "a-laptop-operator")]})
+        result = _attribute(archive)
+        assert result.unattributable is None
+        assert result.latest_human == self.HUMAN_PIN
+
+    def test_a_write_at_or_before_the_floor_cannot_be_the_answer(self) -> None:
+        """``since`` is the floor the answer has to beat — the stack apply,
+        which already starts the window."""
+        early = dt.datetime(2026, 8, 3, 6, 0, tzinfo=dt.UTC)
+        archive = _archive(
+            {
+                START: [_pointer_record(early, "a-laptop-operator")],
+                END: [_pointer_record(self.MACHINE_FLIP, A_MACHINE_ROLE)],
+            }
+        )
+        result = _attribute(archive, since=dt.datetime(2026, 8, 3, 9, 0, tzinfo=dt.UTC))
+        assert result.latest_human is None
+        assert result.unattributable is None
+
+    def test_a_write_against_another_key_is_not_a_pointer_write(self) -> None:
+        """Matched on `requestParameters`, not by substring: `_touches`'s
+        deliberately broad scan would match any record merely mentioning the
+        key, and this read asks about ONE named object."""
+        other = _pointer_record(self.MACHINE_FLIP, "a-laptop-operator")
+        other["requestParameters"] = {
+            "bucketName": STORE_BUCKET,
+            "key": "crucible/releases/2026-08-04/release.json",
+        }
+        result = _attribute(_archive({END: [other]}))
+        assert result.writes == ()
+        assert result.latest_human is None
+        # Nothing explains the flip at `until`, which is the caller's cue to
+        # treat it as human.
+        assert result.unattributable is not None
+
+    def test_a_flip_no_archived_write_explains_is_unattributable(self) -> None:
+        result = _attribute(_archive({}))
+        assert result.latest_human is None
+        assert "matches no archived" in (result.unattributable or "")
+
+    def test_an_uncovered_day_is_a_gap_not_silence(self) -> None:
+        """A trail always delivers, so a day with no object means the trail
+        does not cover it — never "nobody moved the pointer"."""
+        result = _attribute(_archive({}, cover=(END,)))
+        assert result.latest_human is None
+        assert "delivered no objects" in (result.unattributable or "")
+
+    def test_the_scan_stops_at_the_newest_day_carrying_a_human_write(self) -> None:
+        """Walked BACKWARD with an early stop: the latest human write is on
+        the newest day that has one, so nothing older can change the answer.
+        On a system flipping the pointer daily that is one day of archive
+        rather than the whole span."""
+        archive = _archive(
+            {
+                START: [_pointer_record(dt.datetime(2026, 8, 3, 6, 0, tzinfo=dt.UTC), "older")],
+                END: [_pointer_record(self.HUMAN_PIN, "a-laptop-operator")],
+            }
+        )
+        result = _attribute(archive)
+        assert result.latest_human == self.HUMAN_PIN
+        assert [w.principal for w in result.writes] == ["a-laptop-operator"]
+
+    def test_no_bucket_is_refused_rather_than_answered(self) -> None:
+        from crucible.autonomy import ArchiveMissingError
+
+        with pytest.raises(ArchiveMissingError):
+            _attribute(_archive({}), bucket="")
+
+    def test_an_unparseable_event_time_is_unattributable(self) -> None:
+        """A write that cannot be placed relative to the floor settles
+        nothing, and the caller's safe reading of "settles nothing" is
+        HUMAN."""
+        bad = _pointer_record(self.MACHINE_FLIP, A_MACHINE_ROLE, eventTime="not-a-timestamp")
+        result = _attribute(_archive({END: [bad]}))
+        assert result.latest_human is None
+        assert "will not parse" in (result.unattributable or "")

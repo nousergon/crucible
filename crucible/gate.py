@@ -37,7 +37,7 @@ from contextlib import redirect_stderr
 from dataclasses import dataclass, field, replace
 from functools import lru_cache, wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
@@ -4108,22 +4108,50 @@ class LastChangeUnreadableError(RuntimeError):
     """
 
 
+#: The tracker issue carrying Brian's 2026-09-12 ruling (option (a)) that
+#: only a HUMAN change restarts the autonomy window. An `int`, rendered into
+#: the reading with an f-string rather than written as a literal string:
+#: `tests/test_no_stale_tracker_literals.py` forbids a hardcoded
+#: `alpha-engine-config-I<N>` anywhere a message can reach, and names this
+#: exact build-it-from-the-number shape as the legitimate way to put a
+#: citation a READER needs into text a reader sees. The clause's detail has
+#: to carry it: a window start that silently stopped moving on deploys, with
+#: no reference to the decision that made it stop, is a number nobody can
+#: reconstruct (principle 1).
+AUTONOMY_HUMAN_ONLY_RULING = 10608
+
+
 @dataclass(frozen=True)
 class _SystemChange:
-    """When the graded system last changed, and which input said so."""
+    """When the graded system last changed BY A HUMAN, and which reading said so.
+
+    ``at`` is the window start; ``source`` names the reading that set it.
+    ``pointer_at`` is the release pointer's latest flip WHOEVER wrote it —
+    kept on the record even when a machine wrote it and it therefore did not
+    move the start, because a provenance string that printed only the winning
+    reading would make a machine deploy invisible to anyone reconstructing
+    the window (principle 1).
+    """
 
     at: dt.datetime
     source: str
     pointer_at: dt.datetime
     stack_at: dt.datetime
     stack_detail: str = ""
+    pointer_detail: str = ""
+    human_pointer_at: dt.datetime | None = None
 
     def provenance(self) -> str:
         stack_note = f" [{self.stack_detail}]" if self.stack_detail else ""
+        pointer_note = f" [{self.pointer_detail}]" if self.pointer_detail else ""
         return (
             f"window starts {self.at.isoformat()} ({self.source}); release pointer "
-            f"{POINTER_KEY} flipped {self.pointer_at.isoformat()}, stack last updated "
-            f"{self.stack_at.isoformat()}{stack_note}"
+            f"{POINTER_KEY} last flipped {self.pointer_at.isoformat()}{pointer_note}, "
+            f"stack last updated {self.stack_at.isoformat()}{stack_note}. Only a "
+            "HUMAN-originated change restarts this window: a release flip written by a "
+            "stack machine principal is the autonomy this phase certifies, not an "
+            f"interruption of it (alpha-engine-config-I{AUTONOMY_HUMAN_ONLY_RULING}, "
+            "Brian's ruling 2026-09-12, option (a))"
         )
 
 
@@ -4327,8 +4355,97 @@ def _as_utc(value: dt.datetime) -> dt.datetime:
     return value.astimezone(dt.UTC)
 
 
-def _last_system_change(store: Store, *, cfn: Any | None = None) -> _SystemChange:
-    """`max(release pointer flip, stack last applied)`, with its provenance.
+#: The reading that set the window start when a human moved the release
+#: pointer, and when the stack was applied. Named constants because the
+#: clause detail, the board's setback cause and the tests all assert on
+#: them, and three spellings of the same reading is how a provenance string
+#: stops being greppable.
+_SOURCE_HUMAN_POINTER = "human release pointer move"
+_SOURCE_STACK_APPLY = "stack last applied"
+
+
+def _human_pointer_flip(
+    store: S3Store,
+    pointer_at: dt.datetime,
+    floor: dt.datetime,
+    *,
+    s3: Any | None = None,
+    archive: str | None = None,
+    cfn: Any | None = None,
+) -> tuple[dt.datetime | None, str]:
+    """The latest HUMAN release-pointer move after ``floor``, and why.
+
+    `alpha-engine-config-I10608`, Brian's ruling 2026-09-12 (option (a)).
+    Returns `(instant, detail)` where ``instant`` is `None` when every
+    pointer move since ``floor`` was written by a stack machine principal —
+    the case that no longer restarts the window.
+
+    **Never raises, and every failure resolves to HUMAN.** An unconfigured
+    archive, an unreadable one, an uncovered day, an unparseable event time
+    and a flip matching no archived write all return ``pointer_at`` with the
+    reason in the detail. That is the direction a clause asserting a count of
+    zero has to fail in: treating an unattributable flip as human restarts
+    the window and keeps the clause UNMET for longer, where treating it as
+    machine would let an unreadable archive clear a phase. It is also why
+    this is not an `UNMEASURABLE` path — nothing here is unknown about the
+    system, only about who moved a pointer, and the safe reading of that is
+    available without refusing to grade.
+    """
+    from crucible.autonomy import attribute_pointer_writes  # noqa: PLC0415 - heavy, one call site
+    from crucible.config import settings  # noqa: PLC0415 - one call site
+
+    location = archive if archive is not None else settings().cloudtrail_archive
+    if not location:
+        return pointer_at, (
+            "no CloudTrail archive is configured, so the flip's writer is unknown and "
+            "the flip is treated as HUMAN"
+        )
+    naked = location.removeprefix("s3://")
+    try:
+        attribution = attribute_pointer_writes(
+            s3 if s3 is not None else _s3_client(),
+            bucket=naked.partition("/")[0],
+            prefix=naked.partition("/")[2],
+            object_bucket=store.bucket,
+            object_key=store._s3_key(POINTER_KEY),
+            since=floor,
+            until=pointer_at,
+            cfn=cfn,
+        )
+    except Exception as exc:  # noqa: BLE001 - recorded in the detail, never silent
+        return pointer_at, (
+            f"the flip's writer could not be read from the CloudTrail archive "
+            f"({type(exc).__name__}: {exc}), so it is treated as HUMAN"
+        )
+    if attribution.unattributable is not None:
+        return pointer_at, f"{attribution.unattributable} — treated as HUMAN"
+    if attribution.latest_human is not None:
+        latest = max(
+            (w for w in attribution.writes if not w.machine and w.at == attribution.latest_human),
+            key=lambda w: w.at,
+        )
+        return attribution.latest_human, (
+            f"written by {latest.principal} ({latest.principal_type}) via "
+            f"{latest.event_name} at {latest.at.isoformat()}, which is no stack machine "
+            "principal — a HUMAN pin, so it restarts the window"
+        )
+    machines = sorted({w.principal for w in attribution.writes if w.machine})
+    return None, (
+        f"all {len(attribution.writes)} archived pointer write(s) since "
+        f"{floor.isoformat()} were issued by stack machine principal(s) "
+        f"({', '.join(machines) or 'none'}), so the flip is the release pipeline "
+        "running unattended and does NOT restart the window"
+    )
+
+
+def _last_system_change(
+    store: Store,
+    *,
+    cfn: Any | None = None,
+    s3: Any | None = None,
+    archive: str | None = None,
+) -> _SystemChange:
+    """`max(stack last applied, latest HUMAN release pointer move)`.
 
     **BOTH inputs, and neither substitutes for the other** (`alpha-engine-
     config-I10324`). A wheel flip changes what the box RUNS and leaves the
@@ -4337,20 +4454,61 @@ def _last_system_change(store: Store, *, cfn: Any | None = None) -> _SystemChang
     fixes that made the v2 box able to page and able to run a full-universe
     weekly on 2026-09-09 were both the latter. Reading either alone would put
     the window's start before a change it could not see.
+
+    **The pointer half is now filtered to HUMAN writers** (`alpha-engine-
+    config-I10608`, Brian's ruling 2026-09-12, option (a)). Every merge to
+    `crucible` flips `releases/current` under `DeployRole` via `deploy.yml`,
+    so under the prior `max(any pointer flip, stack apply)` rule every merge
+    restarted the window and the phase could only exit in a week nobody
+    shipped anything — "runs unattended" and "keeps developing" made mutually
+    exclusive by construction. The measurement was also wrong on its own
+    terms: a machine deploy through the release pipeline IS the autonomy the
+    phase certifies. A LAPTOP `crucible release.pin` still restarts it,
+    because that writer is not a stack role.
+
+    The stack apply needs no such filter and gets none: `ExecuteChangeSet`
+    against `crucible-v2` is operator-gated and human-only today, and adding
+    a machine carve-out there would be the fail-open the clause's own
+    docstring refuses — a second mechanism excusing whatever a future
+    allowlist did not anticipate.
     """
     pointer_at = _pointer_flip_time(store)
     stack = _stack_last_updated(cfn)
     stack_at = stack.at
-    if stack_at > pointer_at:
-        return _SystemChange(stack_at, "stack last applied", pointer_at, stack_at, stack.detail)
-    if pointer_at > stack_at:
-        return _SystemChange(pointer_at, "release pointer flip", pointer_at, stack_at, stack.detail)
+    if pointer_at <= stack_at:
+        # No archive read at all: a flip at or before the stack apply cannot
+        # move the start whoever wrote it, and a CloudTrail walk to establish
+        # a fact that changes nothing is cost, not evidence.
+        return _SystemChange(
+            stack_at,
+            _SOURCE_STACK_APPLY,
+            pointer_at,
+            stack_at,
+            stack.detail,
+            "at or before the stack apply, so it cannot start the window and its "
+            "writer was not read",
+        )
+    human_at, pointer_detail = _human_pointer_flip(
+        cast("S3Store", store), pointer_at, stack_at, s3=s3, archive=archive, cfn=cfn
+    )
+    if human_at is not None and human_at > stack_at:
+        return _SystemChange(
+            human_at,
+            _SOURCE_HUMAN_POINTER,
+            pointer_at,
+            stack_at,
+            stack.detail,
+            pointer_detail,
+            human_at,
+        )
     return _SystemChange(
-        pointer_at,
-        "release pointer flip and stack apply, same instant",
+        stack_at,
+        _SOURCE_STACK_APPLY,
         pointer_at,
         stack_at,
         stack.detail,
+        pointer_detail,
+        human_at,
     )
 
 
@@ -4477,13 +4635,31 @@ def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Cl
     So the window is `[last change, render day]`, and both halves of that
     construction are load-bearing:
 
-    * `last change = max(release pointer flip, stack last applied)` —
-      :func:`_last_system_change`, which documents why neither input covers the
-      other. A pleasant consequence, and the reason there is NO carve-out here
-      for operator-gated applies: an apply now DEFINES the window's start
-      rather than violating it. A carve-out would be a second mechanism for the
-      same thing, and the one that fails open the day an operator does
-      something the allowlist did not anticipate.
+    * `last change = max(stack last applied, latest HUMAN release pointer
+      move)` — :func:`_last_system_change`, which documents why neither input
+      covers the other. A pleasant consequence, and the reason there is NO
+      carve-out here for operator-gated applies: an apply now DEFINES the
+      window's start rather than violating it. A carve-out would be a second
+      mechanism for the same thing, and the one that fails open the day an
+      operator does something the allowlist did not anticipate.
+
+      **Only a HUMAN change restarts the window** (`alpha-engine-config-
+      I10608`, Brian's ruling 2026-09-12, option (a) — a phase-2 clause
+      changed inside phase 2's own window, on that authority, `principles.md`
+      §3.2). Every merge to `crucible` flips `releases/current` under
+      `DeployRole` via `deploy.yml`, so while ANY flip restarted the window
+      the phase could only exit in a week nobody shipped anything: "runs
+      unattended" and "keeps developing" were mutually exclusive by
+      construction. And the reading was wrong on its own terms — a machine
+      deploy through the release pipeline IS the autonomy this clause
+      certifies, not an interruption of it. The flip's writer is read from
+      the same CloudTrail archive this clause already walks
+      (`crucible.autonomy.attribute_pointer_writes`), never from the pointer
+      document, which is byte-identical whoever put it there
+      (`alpha-engine-config-I9786`). A laptop `crucible release.pin` is not a
+      stack machine principal and still restarts the window, and a flip the
+      archive cannot attribute is treated as HUMAN — over-counting is the
+      safe direction here exactly as it is for the call count below.
     * the window must ALSO contain one complete weekly cycle whose close falls
       after the change, plus the daily cycles falling in that span
       (:func:`autonomy_earliest_satisfiable_render_day`). Without that, every
@@ -4524,8 +4700,11 @@ def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Cl
     name = "zero_human_mutating_calls"
     requirement = (
         "zero human-originated mutating calls touched a v2 resource between the "
-        "system's last change (the later of the release pointer flip and the "
-        f"{settings().stack_name} stack's last apply) and the render day, over a span "
+        "system's last HUMAN change (the later of the "
+        f"{settings().stack_name} stack's last apply and the latest release pointer "
+        "move written by a principal that is not a stack machine role — a machine "
+        "release flip is the autonomy being graded, alpha-engine-config-"
+        f"I{AUTONOMY_HUMAN_ONLY_RULING}) and the render day, over a span "
         "containing one complete unattended weekly cycle closing after the change plus "
         f"at least {PHASE2_AUTONOMY_MIN_DAILY_CYCLES} complete daily cycle(s) in it, "
         "counted from the CloudTrail S3 archive (never `lookup-events`, which truncates "

@@ -98,7 +98,10 @@ __all__ = [
     "ArchiveRead",
     "OperatorAction",
     "OperatorActionCount",
+    "PointerAttribution",
+    "PointerWrite",
     "StackUnmeasurableError",
+    "attribute_pointer_writes",
     "count_operator_actions",
     "date_partitions",
     "iter_archive_records",
@@ -545,3 +548,207 @@ def count_operator_actions(
         records_scanned=read.records_scanned,
         actions=tuple(sorted(actions, key=lambda a: a.event_time)),
     )
+
+
+# ── alpha-engine-config-I10608: which pointer flips were HUMAN ─────────────
+# Brian's ruling 2026-09-12 (option (a)): the autonomy window restarts on a
+# human-originated change only. A release-pointer flip written by a stack
+# machine principal — `deploy.yml` under `DeployRole` — IS the autonomy the
+# phase certifies, not an interruption of it, so it must not restart the
+# window. Only the pointer's OWN writer can settle that, and the pointer
+# document carries no writer: `releases/current` is a deterministic
+# `release.json` reference (`alpha-engine-config-I9786`), identical whoever
+# put it there. So the writer is read from the same CloudTrail S3 archive
+# this module already walks, never inferred from the document.
+
+#: The S3 API calls that can move `releases/current`. `PutObject` is what
+#: `crucible.release` issues; the other two are included because a gate whose
+#: attribution set is narrower than the API surface fails in the direction
+#: that reads clean — a flip written by a call this set does not name would
+#: be UNATTRIBUTABLE, which is handled, rather than silently absent.
+_POINTER_WRITE_EVENTS = frozenset({"PutObject", "CopyObject", "CompleteMultipartUpload"})
+
+#: How far apart the pointer object's `LastModified` and the CloudTrail
+#: `eventTime` for the same write may sit and still be the same event. Both
+#: are second-granularity and stamped by the same service within one request,
+#: so seconds is the real distance; five minutes is slack, not a tolerance
+#: being leaned on. Its ONLY use is deciding whether the flip we can see
+#: (`HeadObject`) is the flip we attributed — a flip with no matching record
+#: is treated as human by the caller.
+POINTER_ATTRIBUTION_TOLERANCE = dt.timedelta(minutes=5)
+
+
+@dataclass(frozen=True)
+class PointerWrite:
+    """One archived write of the release pointer, and who issued it."""
+
+    at: dt.datetime
+    event_name: str
+    principal: str
+    principal_type: str
+    machine: bool
+
+
+@dataclass(frozen=True)
+class PointerAttribution:
+    """What the archive could say about who has moved the pointer.
+
+    ``unattributable`` is a REASON string when the archive could not settle
+    the question and `None` when it could. It is never an empty answer
+    dressed as a clean one: the caller
+    (`crucible.gate._last_system_change`) turns any reason at all into
+    "treat the flip as human", which restarts the window and keeps the
+    clause UNMET for longer. Over-counting human changes is the safe
+    direction for a clause asserting a count of zero — the same direction
+    :func:`_touches` chose, and the inverse of a gate that reads clean
+    because it could not see.
+    """
+
+    writes: tuple[PointerWrite, ...]
+    latest_human: dt.datetime | None
+    unattributable: str | None
+    objects_read: int
+    records_scanned: int
+
+
+def attribute_pointer_writes(
+    client: Any,
+    *,
+    bucket: str,
+    prefix: str,
+    object_bucket: str,
+    object_key: str,
+    since: dt.datetime,
+    until: dt.datetime,
+    cfn: Any | None = None,
+) -> PointerAttribution:
+    """Who wrote ``object_key`` in ``(since, until]``, from the archive.
+
+    ``bucket``/``prefix`` locate the CloudTrail archive;
+    ``object_bucket``/``object_key`` are the v2 store's bucket and the
+    pointer's FULL key (`S3Store._s3_key(POINTER_KEY)`), matched against the
+    record's own `requestParameters` rather than by substring — this is the
+    one read in this module asking about a single named object, and
+    :func:`_touches`'s deliberately broad substring scan would match any
+    record that merely mentions the key.
+
+    ``since`` is the floor the answer has to beat: the stack's last apply,
+    which is human today and already starts the window. A pointer write at or
+    before it cannot move the start, so the scan walks calendar days BACKWARD
+    from ``until`` and stops at the first day carrying a human write — the
+    latest human write is on the newest day that has one, and nothing older
+    can change the answer. On a system flipping the pointer daily that is one
+    day of archive, not the whole span.
+
+    A day the trail delivered nothing for is `unattributable`, not "no writes
+    that day": a trail always delivers, so an empty day means the trail does
+    not cover it, and counting a gap as silence is the §11 risk 8 failure
+    with a different cause.
+    """
+    if not bucket:
+        raise ArchiveMissingError(
+            "no CloudTrail archive bucket is configured, so no release-pointer write "
+            "can be attributed to a principal."
+        )
+
+    def _is_pointer_write(record: dict[str, Any]) -> bool:
+        if record.get("eventName") not in _POINTER_WRITE_EVENTS:
+            return False
+        params = record.get("requestParameters")
+        if not isinstance(params, dict):
+            return False
+        if params.get("bucketName") != object_bucket:
+            return False
+        return str(params.get("key") or "").lstrip("/") == object_key
+
+    principals: tuple[str, ...] | None = None
+    writes: list[PointerWrite] = []
+    objects_read = 0
+    records_scanned = 0
+    day = until.date()
+    floor_day = since.date()
+    while day >= floor_day:
+        read = iter_archive_records(
+            client, bucket=bucket, prefix=prefix, start=day, end=day, keep=_is_pointer_write
+        )
+        objects_read += read.objects_read
+        records_scanned += read.records_scanned
+        if read.uncovered_days:
+            return PointerAttribution(
+                writes=tuple(sorted(writes, key=lambda w: w.at)),
+                latest_human=None,
+                unattributable=(
+                    f"the CloudTrail archive s3://{bucket}/{prefix} delivered no objects "
+                    f"for {day.isoformat()}, so who moved the pointer that day cannot be "
+                    "read. A trail always delivers, so an uncovered day is a gap, not "
+                    "silence"
+                ),
+                objects_read=objects_read,
+                records_scanned=records_scanned,
+            )
+        found_human = False
+        for raw_record in read.records:
+            record = CloudTrailRecord.model_validate(raw_record)
+            instant = _pointer_event_instant(record.eventTime)
+            if instant is None:
+                return PointerAttribution(
+                    writes=tuple(sorted(writes, key=lambda w: w.at)),
+                    latest_human=None,
+                    unattributable=(
+                        f"a pointer write carried an eventTime that will not parse "
+                        f"({record.eventTime!r}), so it cannot be placed relative to the "
+                        "window's floor"
+                    ),
+                    objects_read=objects_read,
+                    records_scanned=records_scanned,
+                )
+            if principals is None:
+                # Derived lazily and ONCE: a span with no pointer write at all
+                # must not require a CloudFormation call to answer.
+                principals = machine_principals(cfn)
+            name, kind = _principal(record)
+            write = PointerWrite(
+                at=instant,
+                event_name=record.eventName,
+                principal=name,
+                principal_type=kind,
+                machine=name in principals,
+            )
+            writes.append(write)
+            if not write.machine and write.at > since:
+                found_human = True
+        if found_human:
+            break
+        day -= dt.timedelta(days=1)
+    ordered = tuple(sorted(writes, key=lambda w: w.at))
+    humans = [w.at for w in ordered if not w.machine and w.at > since]
+    if humans:
+        return PointerAttribution(ordered, max(humans), None, objects_read, records_scanned)
+    if not any(abs(w.at - until) <= POINTER_ATTRIBUTION_TOLERANCE for w in ordered):
+        return PointerAttribution(
+            writes=ordered,
+            latest_human=None,
+            unattributable=(
+                f"the pointer's own flip instant {until.isoformat()} matches no archived "
+                f"{'/'.join(sorted(_POINTER_WRITE_EVENTS))} on s3://{object_bucket}/"
+                f"{object_key} within {POINTER_ATTRIBUTION_TOLERANCE}, so the writer of "
+                f"the flip that is actually there is unknown ({len(ordered)} pointer "
+                "write(s) were archived over the scanned days)"
+            ),
+            objects_read=objects_read,
+            records_scanned=records_scanned,
+        )
+    return PointerAttribution(ordered, None, None, objects_read, records_scanned)
+
+
+def _pointer_event_instant(event_time: str) -> dt.datetime | None:
+    """A CloudTrail `eventTime` as a UTC instant, or `None` if it will not
+    parse. Mirrors `crucible.gate._event_instant` rather than importing it —
+    that module imports this one, not the other way round."""
+    try:
+        parsed = dt.datetime.fromisoformat(event_time.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(dt.UTC)
