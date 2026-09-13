@@ -772,7 +772,11 @@ class TestDryRunNeverWrites:
         alone no longer reaches the dry-run path. Seeded here with the
         library's own `run_cycle` over the same empty register, which is
         exactly what `experiment.grade` would have written for a slot with
-        nothing scored: `unservable`, no arms, no vetoes.
+        nothing scored: `unservable`, no arms, no vetoes. `alpha-engine-config-
+        I10679` made `crucible.promote.read_graded_cycle` additionally check
+        `experiment.grade`'s own run manifest before trusting that artifact,
+        so this fixture writes one too, via the same test helper the promote
+        test suites use.
         """
         from nousergon_lib.arena import ArmRegister
         from nousergon_lib.arena.engine import run_cycle
@@ -781,6 +785,7 @@ class TestDryRunNeverWrites:
         from crucible.promote import arm_register_key
         from crucible.slots import get_slot
         from crucible.store import LocalStore
+        from tests.support.manifests import write_grade_manifest
 
         monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
         store = LocalStore(tmp_path)
@@ -795,6 +800,7 @@ class TestDryRunNeverWrites:
                 incumbent=None,
             ),
         )
+        write_grade_manifest(store, "r", FRIDAY.isoformat())
         before = sorted(store.list_keys())
         argv = [
             *_minimal_argv("promote"),

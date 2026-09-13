@@ -54,12 +54,32 @@ class _StubSlotModule:
     the real `run_job`, writing a real manifest) without touching Arctic or
     the arena engine — neither of which this contract needs."""
 
+    def __init__(self, slot: str) -> None:
+        self._slot = slot
+
     def produce(self, ctx: Any, *, settings: Any, arm_name: str | None) -> None:
         ctx.record_rows(rows_in=0, rows_out=0)
 
     def grade(self, ctx: Any, *, settings: Any) -> dict[str, Any]:
+        """Claims the `arena_cycle` `_seed_slot_for_promote` already wrote.
+
+        `alpha-engine-config-I10679`: `crucible.promote.read_graded_cycle`
+        refuses unless `experiment.grade`'s OWN manifest claims the cycle
+        key among its outputs — a document sitting at the expected key is
+        not proof this run wrote it. The real slot modules write the cycle
+        via `crucible/slots/cycle.py::run_grade`'s own `ctx.record_output`;
+        this stub avoids the real business logic (Arctic, the arena engine)
+        this contract does not need, but still has to make the SAME claim,
+        or the manifest it writes fails that check the moment `promote`
+        reads it — which is exactly what this contract's `promote` handler
+        does.
+        """
+        from crucible.keys import arena_cycle_key
+
         ctx.record_rows(rows_in=0, rows_out=0)
-        return {}
+        key = arena_cycle_key(self._slot, ctx.trading_day.isoformat())
+        ctx.record_output(key, ctx.store.get_bytes(key), schema_version="arena_cycle.v1")
+        return {"arena_cycle_key": key}
 
 
 def _experiment_args(job: str, slot: str, store_uri: str) -> argparse.Namespace:
@@ -164,7 +184,7 @@ class TestGateReadsWhatTheRealWriterWrote:
             "slot-scoped job needs a writer added here too, or this test "
             "would silently stop covering the class it exists for"
         )
-        monkeypatch.setattr(track_a, "_slot_module", lambda slot: _StubSlotModule())
+        monkeypatch.setattr(track_a, "_slot_module", lambda slot: _StubSlotModule(slot))
         store_uri = str(tmp_path)
         store = LocalStore(tmp_path)
         registry = load_registry()
@@ -220,7 +240,7 @@ class TestGateReadsWhatTheRealWriterWrote:
         the REAL discriminated writer must fail this test — proving the
         discriminator argument in the gate's read is load-bearing, not
         decorative."""
-        monkeypatch.setattr(track_a, "_slot_module", lambda slot: _StubSlotModule())
+        monkeypatch.setattr(track_a, "_slot_module", lambda slot: _StubSlotModule(slot))
         store_uri = str(tmp_path)
         store = LocalStore(tmp_path)
         registry = load_registry()

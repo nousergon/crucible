@@ -67,6 +67,73 @@ def series(arm_id: str, dates: list[str], value: float) -> ArmSeries:
     return ArmSeries(arm_id=arm_id, scores={d: value for d in dates})
 
 
+def _control_vetoed(spec, series_by_arm: dict, register: ArmRegister, preconditions: dict | None):
+    """Add a FAILED `not_a_control_arm` precondition to every control arm.
+
+    Mirrors `crucible/slots/cycle.py::run_grade`'s own injection (§10.1):
+    grade applies this veto itself, independently of `crucible.promote`,
+    which is why `alpha-engine-config-I10679` could remove promote's OWN
+    copy of it (`_with_control_vetoes`) without losing the exclusion in
+    production. `_cycle_for` stands in for `run_grade` in this file, so it
+    stands in for this too, or a control-veto test here would be asserting
+    against a cycle `run_grade` would never actually produce.
+    """
+    controls = {arm for arm in series_by_arm if is_control_arm(spec, arm, register)}
+    if not controls:
+        return preconditions
+    merged: dict[str, tuple] = {arm: tuple(checks) for arm, checks in (preconditions or {}).items()}
+    for arm in sorted(controls):
+        merged[arm] = merged.get(arm, ()) + (
+            ServingPrecondition(
+                name="not_a_control_arm",
+                passed=False,
+                reason=(
+                    f"{arm} is a slot {spec.slot!r} control arm (§10.1): it is scored "
+                    "every cycle to prove the grader ranks planted > real > null, and "
+                    "it never serves. The planted control reads next-period returns by "
+                    "construction, so promoting it would put a look-ahead arm on the "
+                    "one contract the trader reads."
+                ),
+            ),
+        )
+    return merged
+
+
+def _cycle_for(
+    spec,
+    as_of: str,
+    register: ArmRegister,
+    series_by_arm: dict,
+    *,
+    incumbent: str | None = None,
+    preconditions: dict | None = None,
+    training: dict | None = None,
+):
+    """One `ArenaCycle`, built exactly as `experiment.grade` builds one.
+
+    `alpha-engine-config-I10679`: `run_promotion` no longer calls
+    `nousergon_lib.arena.engine.run_cycle` itself — it acts on a cycle the
+    caller supplies, sourced in production from
+    `crucible.promote.read_graded_cycle`. Every test below that used to hand
+    `run_promotion` the raw series/incumbent/preconditions/training and let
+    it call `run_cycle` internally now builds the SAME cycle here, through
+    the SAME library call, and passes it in — the decision each test asserts
+    on is unchanged, because the computation itself has only moved, not
+    changed.
+    """
+    from nousergon_lib.arena.engine import run_cycle
+
+    return run_cycle(
+        config=spec.arena,
+        as_of=as_of,
+        register=register,
+        series_by_arm=series_by_arm,
+        incumbent=incumbent,
+        preconditions=_control_vetoed(spec, series_by_arm, register, preconditions),
+        training=training,
+    )
+
+
 def narrow(spec, clip: float = 0.01):
     """The slot's own spec with a smaller declared difference clip.
 
@@ -328,19 +395,23 @@ class TestServingPreconditions:
         }
         cycle = run_promotion(
             spec=spec,
-            as_of=dates[-1],
             register=reg,
-            series_by_arm=series_by_arm,
-            incumbent=ids["champ"],
-            preconditions={
-                ids["chal"]: (
-                    ServingPrecondition(
-                        name="behavioural_veto",
-                        passed=False,
-                        reason="prediction spread collapsed",
-                    ),
-                )
-            },
+            cycle=_cycle_for(
+                spec,
+                dates[-1],
+                reg,
+                series_by_arm,
+                incumbent=ids["champ"],
+                preconditions={
+                    ids["chal"]: (
+                        ServingPrecondition(
+                            name="behavioural_veto",
+                            passed=False,
+                            reason="prediction spread collapsed",
+                        ),
+                    )
+                },
+            ),
         ).cycle
         assert cycle.decision.champion == ids["champ"]
         assert ids["chal"] in cycle.decision.ineligible
@@ -352,16 +423,27 @@ class TestServingPreconditions:
 
 
 class TestTrainingIntegrity:
+    """`alpha-engine-config-I10679`: the training-integrity check happens
+    where the cycle is computed. Before this issue that was inside
+    `run_promotion` (which called `run_cycle` itself); it is now inside
+    `experiment.grade` (`crucible/slots/cycle.py::run_grade`, which also
+    calls `run_cycle`) — `run_promotion` no longer computes anything, so it
+    can no longer be the thing that raises here. These tests assert the
+    raise happens at cycle-construction time, which `_cycle_for` stands in
+    for in this file the same way it stands in for `run_grade` in
+    production.
+    """
+
     def test_one_unsound_fit_fails_the_whole_slot(self) -> None:
         spec = get_slot("m")
         dates = trading_days(25)
         reg, ids = register_with("m", ["a", "b"], dates[0])
         with pytest.raises(TrainingIntegrityError):
-            run_promotion(
-                spec=spec,
-                as_of=dates[-1],
-                register=reg,
-                series_by_arm={
+            _cycle_for(
+                spec,
+                dates[-1],
+                reg,
+                {
                     ids["a"]: series(ids["a"], dates, 0.01),
                     ids["b"]: series(ids["b"], dates, 0.0),
                 },
@@ -377,11 +459,11 @@ class TestTrainingIntegrity:
         dates = trading_days(25)
         reg, ids = register_with("m", ["a", "b"], dates[0])
         with pytest.raises(TrainingIntegrityError):
-            run_promotion(
-                spec=spec,
-                as_of=dates[-1],
-                register=reg,
-                series_by_arm={
+            _cycle_for(
+                spec,
+                dates[-1],
+                reg,
+                {
                     ids["a"]: series(ids["a"], dates, 0.01),
                     ids["b"]: series(ids["b"], dates, 0.0),
                 },
@@ -404,10 +486,14 @@ class TestRetirement:
         scores = {"a": 0.05, "b": 0.0, "c": -0.05}
         result = run_promotion(
             spec=spec,
-            as_of=dates[-1],
             register=reg,
-            series_by_arm={ids[n]: series(ids[n], dates, scores[n]) for n in names},
-            incumbent=ids["a"],
+            cycle=_cycle_for(
+                spec,
+                dates[-1],
+                reg,
+                {ids[n]: series(ids[n], dates, scores[n]) for n in names},
+                incumbent=ids["a"],
+            ),
         )
         retired = [v for v in result.cycle.retirements if v.retire]
         assert retired == [], "policy §6.1: min_active_arms=3 — a three-arm pool can retire nobody"
@@ -424,19 +510,21 @@ class TestRetirement:
         names = ["a", "b", "c"]
         reg, ids = register_with("m", names, dates[0])
         store = LocalStore(tmp_path)
-        args = dict(
-            spec=spec,
-            register=reg,
-            series_by_arm={
-                ids[n]: series(ids[n], dates, v)
-                for n, v in zip(names, (0.05, 0.0, -0.05), strict=True)
-            },
-            incumbent=ids["a"],
-            store=store,
-        )
-        run_promotion(as_of=dates[-2], **args)
+        series_by_arm = {
+            ids[n]: series(ids[n], dates, v) for n, v in zip(names, (0.05, 0.0, -0.05), strict=True)
+        }
+
+        def _run(as_of: str):
+            return run_promotion(
+                spec=spec,
+                register=reg,
+                cycle=_cycle_for(spec, as_of, reg, series_by_arm, incumbent=ids["a"]),
+                store=store,
+            )
+
+        _run(dates[-2])
         first = store.get_bytes("retirements/m/events.jsonl").decode()
-        run_promotion(as_of=dates[-1], **args)
+        _run(dates[-1])
         second = store.get_bytes("retirements/m/events.jsonl").decode()
         assert second.startswith(first), "the retirement log is append-only"
         assert len(second.splitlines()) == 2 * len(names)
@@ -460,13 +548,17 @@ class TestChampionPointer:
         store = LocalStore(tmp_path)
         run_promotion(
             spec=spec,
-            as_of=dates[-1],
             register=reg,
-            series_by_arm={
-                ids["champ"]: series(ids["champ"], dates, 0.0),
-                ids["chal"]: series(ids["chal"], dates, 0.045),
-            },
-            incumbent=ids["champ"],
+            cycle=_cycle_for(
+                spec,
+                dates[-1],
+                reg,
+                {
+                    ids["champ"]: series(ids["champ"], dates, 0.0),
+                    ids["chal"]: series(ids["chal"], dates, 0.045),
+                },
+                incumbent=ids["champ"],
+            ),
             store=store,
             manifest_key=f"runs/promote/{dates[-1]}/run.json",
             code_sha=CODE_SHA,
@@ -534,13 +626,17 @@ class TestCodeShaIsRequiredNotDefaulted:
         with pytest.raises(PromotionRefused, match="code_sha"):
             run_promotion(
                 spec=spec,
-                as_of=dates[-1],
                 register=reg,
-                series_by_arm={
-                    ids["champ"]: series(ids["champ"], dates, 0.0),
-                    ids["chal"]: series(ids["chal"], dates, 0.045),
-                },
-                incumbent=ids["champ"],
+                cycle=_cycle_for(
+                    spec,
+                    dates[-1],
+                    reg,
+                    {
+                        ids["champ"]: series(ids["champ"], dates, 0.0),
+                        ids["chal"]: series(ids["chal"], dates, 0.045),
+                    },
+                    incumbent=ids["champ"],
+                ),
                 store=store,
                 manifest_key=f"runs/promote/{dates[-1]}/run.json",
             )
@@ -553,13 +649,17 @@ class TestCodeShaIsRequiredNotDefaulted:
         with pytest.raises(PromotionRefused, match="code_sha"):
             run_promotion(
                 spec=spec,
-                as_of=dates[-1],
                 register=reg,
-                series_by_arm={
-                    ids["champ"]: series(ids["champ"], dates, 0.0),
-                    ids["chal"]: series(ids["chal"], dates, 0.045),
-                },
-                incumbent=ids["champ"],
+                cycle=_cycle_for(
+                    spec,
+                    dates[-1],
+                    reg,
+                    {
+                        ids["champ"]: series(ids["champ"], dates, 0.0),
+                        ids["chal"]: series(ids["chal"], dates, 0.045),
+                    },
+                    incumbent=ids["champ"],
+                ),
                 store=store,
                 manifest_key=f"runs/promote/{dates[-1]}/run.json",
                 code_sha="0" * 40,
@@ -592,13 +692,17 @@ class TestCodeShaIsRequiredNotDefaulted:
         store = LocalStore(tmp_path)
         result = run_promotion(
             spec=spec,
-            as_of=dates[-1],
             register=reg,
-            series_by_arm={
-                ids["champ"]: series(ids["champ"], dates, 0.01),
-                ids["chal"]: series(ids["chal"], dates, 0.0),
-            },
-            incumbent=ids["champ"],
+            cycle=_cycle_for(
+                spec,
+                dates[-1],
+                reg,
+                {
+                    ids["champ"]: series(ids["champ"], dates, 0.01),
+                    ids["chal"]: series(ids["chal"], dates, 0.0),
+                },
+                incumbent=ids["champ"],
+            ),
             store=store,
             manifest_key=f"runs/promote/{dates[-1]}/run.json",
         )
@@ -618,13 +722,17 @@ class TestExperimentsFeed:
         store = LocalStore(tmp_path)
         run_promotion(
             spec=spec,
-            as_of=dates[-1],
             register=reg,
-            series_by_arm={
-                ids["champ"]: series(ids["champ"], dates, 0.045),
-                ids["chal"]: series(ids["chal"], dates, 0.0),
-            },
-            incumbent=ids["champ"],
+            cycle=_cycle_for(
+                spec,
+                dates[-1],
+                reg,
+                {
+                    ids["champ"]: series(ids["champ"], dates, 0.045),
+                    ids["chal"]: series(ids["chal"], dates, 0.0),
+                },
+                incumbent=ids["champ"],
+            ),
             store=store,
         )
         rows = [
@@ -740,10 +848,8 @@ class TestRetirementReachesTheRegister:
 
         result = run_promotion(
             spec=spec,
-            as_of=dates[-1],
             register=reg,
-            series_by_arm=series_by_arm,
-            incumbent=ids["a"],
+            cycle=_cycle_for(spec, dates[-1], reg, series_by_arm, incumbent=ids["a"]),
             store=store,
         )
         retired = {v.arm_id for v in result.cycle.retirements if v.retire}
@@ -772,10 +878,8 @@ class TestRetirementReachesTheRegister:
         spec, reg, ids, series_by_arm = four_arm_slot(store, dates)
         args = dict(
             spec=spec,
-            as_of=dates[-1],
             register=reg,
-            series_by_arm=series_by_arm,
-            incumbent=ids["a"],
+            cycle=_cycle_for(spec, dates[-1], reg, series_by_arm, incumbent=ids["a"]),
             store=store,
         )
         run_promotion(**args)
@@ -797,10 +901,8 @@ class TestRetirementReachesTheRegister:
         spec, reg, ids, series_by_arm = four_arm_slot(store, dates)
         run_promotion(
             spec=spec,
-            as_of=dates[-1],
             register=reg,
-            series_by_arm=series_by_arm,
-            incumbent=ids["a"],
+            cycle=_cycle_for(spec, dates[-1], reg, series_by_arm, incumbent=ids["a"]),
             store=store,
         )
         after = load_slot_inputs(store, "m").register
@@ -866,10 +968,8 @@ class TestControlArmsNeverServe:
 
         result = run_promotion(
             spec=spec,
-            as_of=dates[-1],
             register=reg,
-            series_by_arm=series_by_arm,
-            incumbent=ids["real_a"],
+            cycle=_cycle_for(spec, dates[-1], reg, series_by_arm, incumbent=ids["real_a"]),
             store=store,
             code_sha=CODE_SHA,
         )
@@ -896,10 +996,8 @@ class TestControlArmsNeverServe:
 
         cycle = run_promotion(
             spec=spec,
-            as_of=dates[-1],
             register=reg,
-            series_by_arm=series_by_arm,
-            incumbent=ids["real_a"],
+            cycle=_cycle_for(spec, dates[-1], reg, series_by_arm, incumbent=ids["real_a"]),
             store=store,
             code_sha=CODE_SHA,
         ).cycle
@@ -920,10 +1018,8 @@ class TestControlArmsNeverServe:
 
         cycle = run_promotion(
             spec=spec,
-            as_of=dates[-1],
             register=reg,
-            series_by_arm=series_by_arm,
-            incumbent=ids["real_a"],
+            cycle=_cycle_for(spec, dates[-1], reg, series_by_arm, incumbent=ids["real_a"]),
             store=store,
             code_sha=CODE_SHA,
         ).cycle
@@ -944,17 +1040,23 @@ class TestControlArmsNeverServe:
 
         cycle = run_promotion(
             spec=spec,
-            as_of=dates[-1],
             register=reg,
-            series_by_arm=series_by_arm,
-            incumbent=ids["real_a"],
+            cycle=_cycle_for(
+                spec,
+                dates[-1],
+                reg,
+                series_by_arm,
+                incumbent=ids["real_a"],
+                preconditions={
+                    ids[control]: (
+                        ServingPrecondition(
+                            name="behavioural_veto", passed=False, reason="collapsed"
+                        ),
+                    )
+                },
+            ),
             store=store,
             code_sha=CODE_SHA,
-            preconditions={
-                ids[control]: (
-                    ServingPrecondition(name="behavioural_veto", passed=False, reason="collapsed"),
-                )
-            },
         ).cycle
 
         names = {v.name for v in cycle.decision.ineligible[ids[control]]}
@@ -975,10 +1077,8 @@ class TestControlArmsNeverServe:
 
         cycle = run_promotion(
             spec=spec,
-            as_of=dates[-1],
             register=reg,
-            series_by_arm=series_by_arm,
-            incumbent=ids["real_a"],
+            cycle=_cycle_for(spec, dates[-1], reg, series_by_arm, incumbent=ids["real_a"]),
         ).cycle
         forged = replace(
             cycle,
@@ -986,7 +1086,6 @@ class TestControlArmsNeverServe:
         )
         with pytest.raises(PromotionRefused, match="control arm"):
             _write_pointer_if_moved(
-                baseline=None,
                 store=store,
                 spec=spec,
                 cycle=forged,
@@ -1001,20 +1100,22 @@ class TestControlArmsNeverServe:
 
 
 # --------------------------------------------------------------------------
-# `alpha-engine-config-I10044`: `_with_control_vetoes` and
-# `_write_pointer_if_moved` thread the already-loaded register into
-# `is_control_arm`, mirroring `tests/test_slots.py::TestIsControlArmIsRegisterBacked`
-# at both promote.py call sites.
+# `alpha-engine-config-I10044`: `_write_pointer_if_moved` threads the
+# already-loaded register into `is_control_arm`, mirroring
+# `tests/test_slots.py::TestIsControlArmIsRegisterBacked`. Its sibling call
+# site, `_with_control_vetoes`, was removed by `alpha-engine-config-I10679`
+# (promote no longer computes the cycle, so it no longer injects the veto —
+# `crucible/slots/cycle.py::run_grade` carries its own, independent copy,
+# covered by that module's own tests).
 # --------------------------------------------------------------------------
 
 
 class TestIsControlArmIsRegisterBackedAtPromoteCallSites:
     """A filed, non-control recipe whose generated name COLLIDES with a
     slot's control-arm name (``control_planted_m``) must not be treated as a
-    control once it is registered with ``control=False`` — at either call
-    site. Before threading the register through, both fell back to the NAME
-    match and would have vetoed / refused a real arm that only happened to
-    share a control's name.
+    control once it is registered with ``control=False``. Before threading
+    the register through, this fell back to the NAME match and would have
+    refused a real arm that only happened to share a control's name.
     """
 
     def _slot_with_a_filed_name_collision(self, dates: list[str]):
@@ -1029,24 +1130,6 @@ class TestIsControlArmIsRegisterBackedAtPromoteCallSites:
             ids[collider_name]: series(ids[collider_name], dates, 0.045),
         }
         return spec, reg, ids, collider_name, series_by_arm
-
-    def test_with_control_vetoes_does_not_veto_a_name_collision_once_registered(
-        self, tmp_path
-    ) -> None:
-        from crucible.promote import _with_control_vetoes
-
-        dates = trading_days(40)
-        spec, reg, ids, collider_name, series_by_arm = self._slot_with_a_filed_name_collision(dates)
-        collider_id = ids[collider_name]
-
-        assert is_control_arm(spec, collider_id), (
-            "sanity: the NAME-ONLY fallback (no register) still matches the colliding name"
-        )
-        vetoed = _with_control_vetoes(spec, series_by_arm, None, reg)
-        assert vetoed is None or collider_id not in vetoed, (
-            "the record says control=False; a name collision must not be vetoed once "
-            "the arm is registered, once the register is threaded through"
-        )
 
     def test_write_pointer_if_moved_does_not_refuse_a_name_collision_as_champion(
         self, tmp_path
@@ -1067,10 +1150,8 @@ class TestIsControlArmIsRegisterBackedAtPromoteCallSites:
 
         cycle = run_promotion(
             spec=spec,
-            as_of=dates[-1],
             register=reg,
-            series_by_arm=series_by_arm,
-            incumbent=ids["real_a"],
+            cycle=_cycle_for(spec, dates[-1], reg, series_by_arm, incumbent=ids["real_a"]),
         ).cycle
         forged = replace(
             cycle,
@@ -1078,7 +1159,6 @@ class TestIsControlArmIsRegisterBackedAtPromoteCallSites:
         )
 
         pointer = _write_pointer_if_moved(
-            baseline=None,
             store=store,
             spec=spec,
             cycle=forged,
@@ -1136,13 +1216,17 @@ class TestPointerWriteIsConditional:
         with pytest.raises(PointerConflictError):
             run_promotion(
                 spec=spec,
-                as_of=dates[-1],
                 register=reg,
-                series_by_arm={
-                    ids["champ"]: series(ids["champ"], dates, 0.0),
-                    ids["chal"]: series(ids["chal"], dates, 0.01),
-                },
-                incumbent=ids["champ"],
+                cycle=_cycle_for(
+                    spec,
+                    dates[-1],
+                    reg,
+                    {
+                        ids["champ"]: series(ids["champ"], dates, 0.0),
+                        ids["chal"]: series(ids["chal"], dates, 0.01),
+                    },
+                    incumbent=ids["champ"],
+                ),
                 store=store,
                 pointer_etag=stale,
                 code_sha=CODE_SHA,
@@ -1166,15 +1250,13 @@ class TestAppendIsIdempotent:
         names = ["a", "b", "c"]
         reg, ids = register_with("m", names, dates[0])
         seed_register(store, "m", reg)
+        series_by_arm = {
+            ids[n]: series(ids[n], dates, v) for n, v in zip(names, (0.05, 0.0, -0.05), strict=True)
+        }
         args = dict(
             spec=spec,
-            as_of=dates[-1],
             register=reg,
-            series_by_arm={
-                ids[n]: series(ids[n], dates, v)
-                for n, v in zip(names, (0.05, 0.0, -0.05), strict=True)
-            },
-            incumbent=ids["a"],
+            cycle=_cycle_for(spec, dates[-1], reg, series_by_arm, incumbent=ids["a"]),
             store=store,
         )
         run_promotion(**args)
@@ -1199,18 +1281,20 @@ class TestAppendIsIdempotent:
         names = ["a", "b", "c"]
         reg, ids = register_with("m", names, dates[0])
         seed_register(store, "m", reg)
-        args = dict(
-            spec=spec,
-            register=reg,
-            series_by_arm={
-                ids[n]: series(ids[n], dates, v)
-                for n, v in zip(names, (0.05, 0.0, -0.05), strict=True)
-            },
-            incumbent=ids["a"],
-            store=store,
-        )
-        run_promotion(as_of=dates[-2], **args)
-        run_promotion(as_of=dates[-1], **args)
+        series_by_arm = {
+            ids[n]: series(ids[n], dates, v) for n, v in zip(names, (0.05, 0.0, -0.05), strict=True)
+        }
+
+        def _run(as_of: str):
+            return run_promotion(
+                spec=spec,
+                register=reg,
+                cycle=_cycle_for(spec, as_of, reg, series_by_arm, incumbent=ids["a"]),
+                store=store,
+            )
+
+        _run(dates[-2])
+        _run(dates[-1])
         log = store.get_bytes("retirements/m/events.jsonl").decode().splitlines()
         assert len(log) == 2 * len(names)
 
@@ -1306,50 +1390,49 @@ class TestArmSeriesKeyUsesTheSharedSeparator:
             assert segment in key, f"{key!r} does not route through arm_key_segment"
 
 
-class TestTheFirstChampionIsWonNotAssumed:
-    """`alpha-engine-config-I9759`. A slot with no incumbent used to take the
-    library's §9.1 cold start and write `promotion_source: bootstrap` — the
-    one value the §6 phase-3 gate rejects by name. §10.1's null control is
-    registered in every slot, every cycle, precisely so "better than noise?"
-    is a measured question, so it stands in as the baseline and the engine's
-    ordinary `decided`/`held` path runs unchanged."""
+class TestAFirstChampionCannotCurrentlyBeWon:
+    """`alpha-engine-config-I9759` gave a cold slot (no incumbent) a first
+    champion won on evidence, by substituting §10.1's null control as the
+    baseline incumbent BEFORE calling `run_cycle` — a step that lived inside
+    `run_promotion`, which called `run_cycle` itself.
 
-    def test_the_null_control_is_found_by_kind_not_by_the_control_flag(self) -> None:
-        from nousergon_lib.arena import ArmSeries
+    `alpha-engine-config-I10679` removed that call: `run_promotion` now acts
+    on a cycle `experiment.grade` already computed, and grade does not (yet)
+    apply the substitution (`crucible/slots/cycle.py::run_grade` calls
+    `run_cycle` with the real incumbent or `None`, unconditionally — see
+    `alpha-engine-config-I10687`, filed to move it there). So a slot with no
+    incumbent now reaches `run_promotion` with a raw `bootstrap` decision,
+    and `run_promotion` refuses it rather than silently reintroducing the
+    un-evidenced pointer I9759 exists to prevent. This is a real, documented
+    regression until I10693 lands — these tests pin the REFUSAL, not a win.
+    """
 
-        from crucible.promote import baseline_control_arm
-        from crucible.slots import get_slot
-
+    def test_a_cold_slot_bootstrap_cycle_is_refused_not_seated(self, tmp_path) -> None:
         spec = get_slot("u")
-        null_id = "u:control_null_u:0123456789ab"
-        planted_id = "u:control_planted_u:0123456789ab"
-        series = {
-            planted_id: ArmSeries(arm_id=planted_id, scores={}),
-            null_id: ArmSeries(arm_id=null_id, scores={}),
-            "u:real:0123456789ab": ArmSeries(arm_id="u:real:0123456789ab", scores={}),
+        dates = trading_days(40)
+        reg, ids = register_with("u", ["real_a", "real_b"], dates[0])
+        series_by_arm = {
+            ids["real_a"]: series(ids["real_a"], dates, 0.0),
+            ids["real_b"]: series(ids["real_b"], dates, 0.045),
         }
-        # The PLANTED control must never be the baseline: it reads
-        # next-period returns, so beating it is not a claim about noise.
-        assert baseline_control_arm(spec, series) == null_id
-
-    def test_no_null_control_scored_is_none_rather_than_a_guess(self) -> None:
-        from nousergon_lib.arena import ArmSeries
-
-        from crucible.promote import baseline_control_arm
-        from crucible.slots import get_slot
-
-        arm = "u:real:0123456789ab"
-        assert baseline_control_arm(get_slot("u"), {arm: ArmSeries(arm_id=arm, scores={})}) is None
+        cycle = _cycle_for(spec, dates[-1], reg, series_by_arm, incumbent=None)
+        assert cycle.decision.status == "bootstrap", (
+            "sanity: a raw `run_cycle` with no incumbent and no baseline "
+            "substitution takes the library's §9.1 cold start"
+        )
+        store = LocalStore(tmp_path)
+        with pytest.raises(PromotionRefused, match="bootstrap"):
+            run_promotion(spec=spec, register=reg, cycle=cycle, store=store, code_sha=CODE_SHA)
 
 
-class TestPromoteInheritsTheEligibilityGradeEvaluated:
-    """`alpha-engine-config-I9759`: `promote` and `experiment.grade` call the
-    same engine over the same series, and promote called it with
-    `preconditions=None` — so the M behavioural veto and the S contamination
-    attestation, both evaluated inside grade, did not exist for the job that
-    moves the pointer."""
+class TestReadGradedCycle:
+    """`alpha-engine-config-I10679`: `promote` no longer recomputes the
+    cycle `experiment.grade` already decided (`alpha-engine-config-I9759`
+    made the two agree by construction; this issue removes the second
+    computation entirely). `read_graded_cycle` is the read path, and it
+    refuses rather than acting on an artifact nothing vouches for."""
 
-    def _cycle(self, store, slot: str, day: str, ineligible: dict) -> None:
+    def _write_cycle(self, store, slot: str, day: str, ineligible: dict) -> None:
         """A REAL cycle artifact with `ineligible` substituted.
 
         Built by the library's own `run_cycle` rather than hand-written:
@@ -1376,38 +1459,88 @@ class TestPromoteInheritsTheEligibilityGradeEvaluated:
         validate_arena_cycle(payload)
         store.put_bytes(arena_cycle_key(slot, day), json.dumps(payload).encode())
 
-    def test_failed_checks_are_rehydrated_with_their_names_and_reasons(self, tmp_path) -> None:
-        from crucible.promote import graded_preconditions
+    def test_the_wholes_cycles_ineligible_map_is_rehydrated(self, tmp_path) -> None:
+        from crucible.promote import read_graded_cycle
         from crucible.store import LocalStore
+        from tests.support.manifests import write_grade_manifest
 
         store = LocalStore(tmp_path)
-        self._cycle(
+        self._write_cycle(
             store,
             "m",
             "2026-08-28",
             {"m:a:0123456789ab": [{"name": "behavioural_veto", "passed": False, "reason": "why"}]},
         )
-        got = graded_preconditions(store, "m", "2026-08-28")
-        assert list(got) == ["m:a:0123456789ab"]
-        (check,) = got["m:a:0123456789ab"]
+        write_grade_manifest(store, "m", "2026-08-28")
+        cycle = read_graded_cycle(store, "m", "2026-08-28")
+        assert list(cycle.decision.ineligible) == ["m:a:0123456789ab"]
+        (check,) = cycle.decision.ineligible["m:a:0123456789ab"]
         assert (check.name, check.passed, check.reason) == ("behavioural_veto", False, "why")
 
-    def test_an_arm_with_no_failed_check_is_absent_rather_than_empty(self, tmp_path) -> None:
-        """`_eligible` is `all(p.passed ...)`, so an arm with nothing against
-        it and an arm absent from the map are the same thing to the engine —
-        carried as absence so the map means "what grade refused"."""
-        from crucible.promote import graded_preconditions
+    def test_a_cycle_with_no_ineligible_arms_round_trips_an_empty_map(self, tmp_path) -> None:
+        """`decide_pointer` itself never puts an arm with an empty checks
+        list into `ineligible` (`_eligible(())` is vacuously `True`, so such
+        an arm is excluded from the map at construction) — this is now a
+        guarantee of the LIBRARY's decision, not a filter `read_graded_cycle`
+        applies on the way out, so a cycle with nothing ineligible round-trips
+        to an empty map with no special-casing here."""
+        from crucible.promote import read_graded_cycle
+        from crucible.store import LocalStore
+        from tests.support.manifests import write_grade_manifest
+
+        store = LocalStore(tmp_path)
+        self._write_cycle(store, "m", "2026-08-28", {})
+        write_grade_manifest(store, "m", "2026-08-28")
+        assert read_graded_cycle(store, "m", "2026-08-28").decision.ineligible == {}
+
+    def test_an_absent_graded_cycle_refuses_rather_than_deciding_blind(self, tmp_path) -> None:
+        from crucible.promote import PromotionRefused, read_graded_cycle
+        from crucible.store import LocalStore
+        from tests.support.manifests import write_grade_manifest
+
+        store = LocalStore(tmp_path)
+        write_grade_manifest(store, "m", "2026-08-28")
+        with pytest.raises(PromotionRefused, match="storage inconsistency"):
+            read_graded_cycle(store, "m", "2026-08-28")
+
+    def test_an_absent_grade_manifest_refuses_before_reading_the_cycle(self, tmp_path) -> None:
+        """The manifest is checked FIRST — a cycle document sitting at the
+        expected key, with no manifest attesting to it, is not proof any run
+        wrote it (`crucible/AGENTS.md` rule 1)."""
+        from crucible.promote import PromotionRefused, read_graded_cycle
         from crucible.store import LocalStore
 
         store = LocalStore(tmp_path)
-        self._cycle(store, "m", "2026-08-28", {"m:a:0123456789ab": []})
-        assert graded_preconditions(store, "m", "2026-08-28") == {}
+        self._write_cycle(store, "m", "2026-08-28", {})
+        with pytest.raises(PromotionRefused, match="experiment.grade` run manifest"):
+            read_graded_cycle(store, "m", "2026-08-28")
 
-    def test_an_absent_graded_cycle_refuses_rather_than_deciding_blind(self, tmp_path) -> None:
-        import pytest
+    def test_a_failed_grade_run_refuses(self, tmp_path) -> None:
+        from crucible.promote import PromotionRefused, read_graded_cycle
+        from crucible.store import LocalStore
+        from tests.support.manifests import write_grade_manifest
 
-        from crucible.promote import PromotionRefused, graded_preconditions
+        store = LocalStore(tmp_path)
+        self._write_cycle(store, "m", "2026-08-28", {})
+        write_grade_manifest(store, "m", "2026-08-28", status="failed", reason="crashed")
+        with pytest.raises(PromotionRefused, match="did not succeed"):
+            read_graded_cycle(store, "m", "2026-08-28")
+
+    def test_a_manifest_not_claiming_the_cycle_key_refuses(self, tmp_path) -> None:
+        """A manifest existing for the slot/day is not sufficient — it must
+        claim THIS cycle key among its outputs, or a stale artifact an
+        unrelated run left behind could be read as fresh."""
+        import json
+
+        from crucible.keys import manifest_key
+        from crucible.promote import PromotionRefused, read_graded_cycle
         from crucible.store import LocalStore
 
-        with pytest.raises(PromotionRefused, match="no graded arena cycle"):
-            graded_preconditions(LocalStore(tmp_path), "m", "2026-08-28")
+        store = LocalStore(tmp_path)
+        self._write_cycle(store, "m", "2026-08-28", {})
+        store.put_bytes(
+            manifest_key("experiment.grade", "2026-08-28", discriminator="m"),
+            json.dumps({"status": "ok", "run_id": "0" * 26, "outputs": []}).encode(),
+        )
+        with pytest.raises(PromotionRefused, match="does not claim"):
+            read_graded_cycle(store, "m", "2026-08-28")
