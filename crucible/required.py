@@ -37,13 +37,24 @@ the stack grew past the five roles it was extracted from
 `AWS::IAM::Role` resources instead). This module's "several values" is
 therefore topic names only; a value that can be read from a source the
 account itself keeps truthful belongs there, not here.
+
+**:func:`optional_env` is the OVERRIDE counterpart** (`alpha-engine-config-
+I10458`): a value that already has a correct, safe PRODUCTION default and
+exists to be overridden only by a dedicated caller — the integration tier
+pointing `crucible/morning.py` at a dedicated tracker repo and a non-
+notifying Telegram destination rather than Brian's real operator chat and
+the real `alpha-engine-config` tracker — belongs here too, so the override is
+a declared, greppable resolution rather than an `os.environ.get` open-coded
+at the call site. Unlike :func:`require_env`, an unset variable is not a
+refusal: it is the stated default, so a production invocation that declares
+nothing behaves exactly as it did before this function existed.
 """
 
 from __future__ import annotations
 
 import os
 
-__all__ = ["require_env"]
+__all__ = ["optional_env", "require_env"]
 
 
 def require_env(variable: str, *, refusing_to: str) -> str:
@@ -61,3 +72,17 @@ def require_env(variable: str, *, refusing_to: str) -> str:
             f"infrastructure identifier as a literal; refusing to {refusing_to}."
         )
     return value
+
+
+def optional_env(variable: str, *, default: str) -> str:
+    """The value of ``variable`` if set and non-empty, else ``default``.
+
+    The override counterpart to :func:`require_env`. An empty or unset
+    variable is not an error here — it is the caller's stated, safe default —
+    so a production invocation that declares nothing behaves exactly as it
+    did before the override existed. Use this only when ``default`` is
+    itself a correct value to run against; a variable with no safe default
+    belongs in :func:`require_env` instead.
+    """
+    value = os.environ.get(variable, "").strip()
+    return value if value else default
