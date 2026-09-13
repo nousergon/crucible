@@ -374,23 +374,40 @@ def _refuse_a_failure_that_is_not_the_fault(key: str, document: dict[str, Any]) 
 
     Keyed on the marker rather than on the job name, so a phase-5 job
     deliberately routed to a fault-injection class gets the same treatment the
-    moment it classifies its own failure the same way. The job name is still
-    checked in the other direction: a `fault.probe` manifest that carries NO
-    outcome never reached the classifier at all, and a run that did not reach
-    the router is not evidence about the router.
+    moment it classifies its own failure the same way — `crucible.llm.call`
+    now classifies on `ctx.fault_capability_class` alone, for every job, not
+    only `fault.probe` (`alpha-engine-config-I10446`).
+
+    The MISSING-marker case is checked two ways, not one: a `fault.probe`
+    manifest that carries NO outcome never reached the classifier at all (a
+    run that did not reach the router is not evidence about the router), and
+    — the hole this refusal used to leave open — a manifest for ANY OTHER
+    job that was nonetheless deliberately routed to a fault-injection class
+    (it carries `fault_capability_class`) and still carries no outcome marker
+    failed before its router call too, for the same reason. Only a manifest
+    that is neither of those — an ordinary job that was never routed to a
+    fault-injection class — is outside this refusal's business at all, and
+    returns.
     """
     reason = str(document.get("reason") or "")
     outcome = probe_outcome_from_reason(reason)
     if outcome is None:
-        if document.get("job") != FAULT_PROBE_JOB:
+        job_name = document.get("job")
+        fault_class = document.get("fault_capability_class")
+        if job_name != FAULT_PROBE_JOB and not fault_class:
             return
+        detail = (
+            f"a {FAULT_PROBE_JOB} manifest"
+            if job_name == FAULT_PROBE_JOB
+            else f"a {job_name!r} manifest carrying fault_capability_class {fault_class!r}"
+        )
         raise FaultRecordRefusedError(
-            f"{key} is a {FAULT_PROBE_JOB} manifest carrying no fault-probe outcome. "
-            "Every failure of that job that reached its router call is classified "
-            "(`crucible.fault_probe.classify_probe_failure`), so a manifest with no "
-            "outcome failed BEFORE the call — a missing capability class, a store "
-            "that would not open, a probe that served. None of those is evidence "
-            f"about the router. Reason recorded: {reason!r}"
+            f"{key} is {detail} carrying no fault-probe outcome. Every failure of a "
+            "run routed to a fault-injection capability class that reached its router "
+            "call is classified (`crucible.fault_probe.classify_probe_failure`), so a "
+            "manifest with no outcome failed BEFORE the call — a missing capability "
+            "class, a store that would not open, a probe that served. None of those is "
+            f"evidence about the router. Reason recorded: {reason!r}"
         )
     if outcome != PROBE_OUTCOME_UPSTREAM_TRANSPORT_FAILURE:
         raise FaultRecordRefusedError(

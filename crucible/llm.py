@@ -1551,14 +1551,37 @@ def call(
     from krepis.router import resolve_group_spec, route_is_degraded
 
     group = capability_group(asked)
-    spec, route = resolve_group_spec(
-        group,
-        exec_context=_exec_context(),
-        wire="openai",
-    )
-    client = LLMClient(spec, callsite_id=callsite_id, client_factory=client_factory)
-    system, user_content = _system_and_user_content(messages)
-    result = client.complete(system=system, user_content=user_content, **kwargs)
+    # `alpha-engine-config-I10446`: a run launched with a fault-injection
+    # override (`ctx.fault_capability_class` set — the same attribute
+    # `effective_capability_class` just read above) asks this door to
+    # classify what its one router call did, REGARDLESS of which job is
+    # asking. This used to live only in `crucible.fault_probe.probe_body`,
+    # which meant a job other than `fault.probe` routed to a fault-injection
+    # class the same way — the phase-5 shape this override exists for —
+    # produced a `status: failed` manifest with no outcome at all, because
+    # nothing outside `fault.probe`'s own body ever classified the failure.
+    # Moved to the one door every LLM call passes through so the guarantee
+    # does not depend on which job body remembered to wrap its own call.
+    try:
+        spec, route = resolve_group_spec(
+            group,
+            exec_context=_exec_context(),
+            wire="openai",
+        )
+        client = LLMClient(spec, callsite_id=callsite_id, client_factory=client_factory)
+        system, user_content = _system_and_user_content(messages)
+        result = client.complete(system=system, user_content=user_content, **kwargs)
+    except Exception as exc:
+        # `Exception`, deliberately NOT `BaseException`: `SpotInterruptionError`
+        # is a `BaseException` precisely so no handler on this path can
+        # swallow a reclamation and misclassify plan §10.7 fault 1 as fault 3
+        # (`crucible.fault_probe.probe_body`'s docstring, unchanged reasoning
+        # — the catch just moved here).
+        if getattr(ctx, FAULT_CAPABILITY_CLASS_ATTR, None) is not None:
+            from crucible.fault_probe import FaultProbeFailure, classify_probe_failure
+
+            raise FaultProbeFailure(classify_probe_failure(exc), exc) from exc
+        raise
     usage = result.usage
     usd = float(usage.provider_cost_usd or 0.0)
     # The manifest is written BEFORE the cap re-check, so an overrun that
