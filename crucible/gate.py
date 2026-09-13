@@ -6856,11 +6856,16 @@ def _promote_non_promotion(
 ) -> tuple[bool, list[str], list[str], list[str], list[str]]:
     """Whether a verdict-backed NON-promotion was filed for ``slot``.
 
-    Returns (found, evidence, problems, access_problems, silent). A promote
-    run files one manifest per trading day under `runs/promote/{day}/run.json`
-    with a `pointer_moved` metric per slot; the metric's `source_path` is that
-    slot's arena cycle key, which is how one manifest answers for four slots
-    without the key shape having to carry the slot.
+    Returns (found, evidence, problems, access_problems, silent). Since
+    `alpha-engine-config-I9759`, `promote` is a slot-scoped arc stage: four
+    slots, one job name, one trading day, four writers — the
+    `crucible.keys.manifest_key` discriminator case — so each slot files its
+    own manifest under `runs/promote/{day}/{slot}/run.json`, carrying a
+    `pointer_moved` metric whose `source_path` is that slot's arena cycle
+    key. Reading the bare, undiscriminated key here would either miss every
+    slot's manifest (if nothing ever wrote the bare key) or read whichever
+    slot's writer the bare key happened to collide with — the same collision
+    `I9781` fixed on the writer side.
 
     ``silent`` names every manifest that was FILED and read `ok` but carried
     no `pointer_moved` metric for this slot. "Nothing looked" and "promote ran
@@ -6874,7 +6879,7 @@ def _promote_non_promotion(
     silent: list[str] = []
     found = False
     for day in window:
-        key = manifest_key("promote", day.isoformat())
+        key = manifest_key("promote", day.isoformat(), discriminator=slot)
         evidence.append(key)
         read = _read_store_document(store, key)
         if read.problem is not None:

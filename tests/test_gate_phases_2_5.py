@@ -2053,7 +2053,7 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
         assert champion_key("r") in clause.detail
 
     def test_met_on_an_evidence_won_promotion_whose_run_reads_ok(self, store: LocalStore) -> None:
-        producing = manifest_key("promote", FRIDAY.isoformat())
+        producing = manifest_key("promote", FRIDAY.isoformat(), discriminator="r")
         _put(
             store,
             champion_key("r"),
@@ -2085,7 +2085,7 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
         runs on Saturday and files at the Friday close; over the raw render
         window the clause found `runs/promote/2026-08-28/run.json` on a
         Friday render only. Phase 3 is now in `WEEKLY_ANCHORED_GATES`."""
-        producing = manifest_key("promote", FRIDAY.isoformat())
+        producing = manifest_key("promote", FRIDAY.isoformat(), discriminator="r")
         _put(
             store,
             champion_key("r"),
@@ -2110,7 +2110,7 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
             {
                 "arm_id": "r:momentum:ab12cd",
                 "promotion_source": "bootstrap",
-                "manifest_key": manifest_key("promote", FRIDAY.isoformat()),
+                "manifest_key": manifest_key("promote", FRIDAY.isoformat(), discriminator="r"),
             },
         )
         clause = gate_module._clause_slot_promotion_or_non_promotion(store, "r", _window(4))
@@ -2125,7 +2125,7 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
 
         _put(
             store,
-            manifest_key("promote", FRIDAY.isoformat()),
+            manifest_key("promote", FRIDAY.isoformat(), discriminator="r"),
             {
                 "status": "ok",
                 "reason": "",
@@ -2147,7 +2147,7 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
 
         _put(
             store,
-            manifest_key("promote", FRIDAY.isoformat()),
+            manifest_key("promote", FRIDAY.isoformat(), discriminator="r"),
             {
                 "status": "ok",
                 "reason": "",
@@ -2178,7 +2178,7 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
         """
         from crucible.keys import arena_cycle_key
 
-        promote = manifest_key("promote", FRIDAY.isoformat())
+        promote = manifest_key("promote", FRIDAY.isoformat(), discriminator="r")
         _put(
             store,
             promote,
