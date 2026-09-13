@@ -60,8 +60,9 @@ This module holds the slot *shape* only, which is why it is publishable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import ModuleType
-from typing import Literal
+from typing import Any, Literal
 
 from nousergon_lib.arena import ArmRegister
 from nousergon_lib.arena.engine import (
@@ -87,6 +88,7 @@ __all__ = [
     "SlotSpec",
     "arena_config_for",
     "arm_name",
+    "attribution_factor_symbols",
     "declared_benchmark_symbols",
     "dispatchable_slots",
     "get_slot",
@@ -322,6 +324,63 @@ def declared_benchmark_symbols() -> frozenset[str]:
     liquidity gate for months).
     """
     return frozenset(spec.benchmark for spec in SLOTS.values() if spec.benchmark != "population")
+
+
+def attribution_factor_symbols(
+    *, store: Any | None = None, strategy_dir: Path | str | None = None
+) -> frozenset[str]:
+    """Every ticker the factor-neutral attribution spec proxies with, if one is declared.
+
+    Sibling of :func:`declared_benchmark_symbols` — a SECOND source of
+    symbols the compiled panel must carry a row for
+    (`alpha-engine-config-I10683`). `strategy/slots/attribution.yaml` names
+    ETF proxies (`SPY`, `IWM`, `XLK`, `XLV`, `XLF`, `XLE` today) for the
+    beta/sector/size factors `crucible.attribution.compute_factor_attribution`
+    regresses against; none of those five non-`SPY` tickers is any slot's own
+    `benchmark`, so `declared_benchmark_symbols` alone never carried them, and
+    `crucible.slots.strategy.grade`'s call into `compute_factor_attribution`
+    raises `MissingArtifactError` the moment one has no panel row.
+
+    Derived from `AttributionFactorParams.factors` — never a second hand-kept
+    literal list — the same discipline `declared_benchmark_symbols` applies to
+    `SLOTS`: a units-mismatch-shaped defect (`avg_volume_20d`, 901/903 tickers
+    silently failing a gate for months) is exactly what a hand-kept second
+    list would risk here too. Both a factor's raw ``proxy`` and, for a spread
+    factor, its ``short_proxy`` (`alpha-engine-config-I10592`) are included:
+    `crucible.attribution.factor_return_series` reads both legs.
+
+    Returns an empty set when **no** attribution spec is declared at all —
+    absence of `strategy/slots/attribution.yaml` (or its store key) is a
+    legitimate state for an environment that has not adopted factor
+    attribution (this repo's own unit fixtures, chiefly), unlike a slot's
+    `benchmark`, which every slot always declares. Once a spec IS declared,
+    `load_attribution_params_from_store` still raises on anything malformed
+    — this function adds no swallow beyond the "was one declared at all"
+    check.
+    """
+    if strategy_dir is not None:
+        spec_path = Path(strategy_dir) / "slots" / "attribution.yaml"
+        if not spec_path.exists():
+            return frozenset()
+    elif store is not None:
+        from crucible.keys import strategy_slot_key  # noqa: PLC0415 - avoids a cycle
+
+        if not store.exists(strategy_slot_key("attribution")):
+            return frozenset()
+    else:
+        raise ValueError("attribution_factor_symbols needs either a store or a strategy_dir")
+
+    from crucible.attribution import (
+        load_attribution_params_from_store,  # noqa: PLC0415 - avoids a cycle
+    )
+
+    params = load_attribution_params_from_store(store=store, strategy_dir=strategy_dir)
+    symbols: set[str] = set()
+    for fdef in params.factors.values():
+        symbols.add(fdef.proxy)
+        if fdef.short_proxy is not None:
+            symbols.add(fdef.short_proxy)
+    return frozenset(symbols)
 
 
 def arm_name(arm_id: str) -> str:
