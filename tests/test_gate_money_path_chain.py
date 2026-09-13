@@ -7,14 +7,15 @@ makes a hard precondition for phase 6 (real capital) was a control no gate
 graded — and phase 6's entry condition (5) is "the money-path artifacts
 hash-chained", a condition with no clause behind it.
 
-**`crucible-PR240` has landed** (verified 2026-09-13, merged onto this branch
-along with `origin/main`): `crucible.explain.verify_money_path_chain` exists,
-and `_clause_money_path_chain_verified` reads it with no edit to
-`crucible/gate.py` — the lazy import in the clause's own `try` block is what
-makes that true. `TestTheClauseReadsTheRealVerifier` asserts that against the
-real, empty tree; the readings below still drive a stand-in matching
-`ChainVerification`'s declared shape via `monkeypatch`, which remains valid
-now that the real attribute exists to patch.
+**`crucible-PR240` has landed** (`crucible-PR251` corrected the module for it
+after `PR248`'s self-expiring absent-verifier test fired as designed):
+`crucible.explain.verify_money_path_chain` exists, and the clause reads it
+with no edit to `crucible/gate.py` — the lazy import in the clause's own
+`try` block is what makes that true.
+`TestTheClauseMergesBeforeItsVerifier.test_the_live_verifier_reads_an_empty_store_as_unmet`
+asserts that against the real, empty tree; the readings below still drive a
+stand-in matching `ChainVerification`'s declared shape via `monkeypatch`,
+which remains valid now that the real attribute exists to patch.
 """
 
 from __future__ import annotations
@@ -92,27 +93,19 @@ def store(tmp_path: object) -> LocalStore:
     return LocalStore(tmp_path)  # type: ignore[arg-type]
 
 
-class TestTheClauseReadsTheRealVerifier:
-    def test_the_verifier_now_exists_and_the_clause_reads_it_with_no_edit(
-        self, store: LocalStore
-    ) -> None:
-        """`crucible-PR240` has landed (this is the notification the removed
-        stand-in test used to raise): `crucible.explain.verify_money_path_chain`
-        exists, and `_clause_money_path_chain_verified` reads it with no change
-        to `crucible/gate.py` — the lazy import in the clause's `try` block is
-        exactly what makes that true.
-
-        Measured against the real, empty tree: nothing has written a
-        money-path manifest to `store`, so the real verifier grades it `ok`
-        with an "empty" reason (`verify_money_path_chain`'s own contract), and
-        the clause reads that as UNMET rather than inheriting `ok` — see
-        `TestTheThreeReadingsAreDistinct.test_an_empty_chain_is_unmet_rather_than_inheriting_ok`
-        for the same decision against a stand-in.
-        """
+class TestTheClauseMergesBeforeItsVerifier:
+    def test_the_live_verifier_reads_an_empty_store_as_unmet(self, store: LocalStore) -> None:
+        """`crucible-PR240` landed: the clause now calls the REAL
+        `crucible.explain.verify_money_path_chain`. Against a store with no
+        money-path record the verifier grades `ok` over zero records and the
+        clause reads UNMET, never MET — an empty chain is not evidence the
+        money path is tamper-evident, it is evidence nothing has been written
+        — and never UNMEASURABLE, which is reserved for the verifier being
+        absent, a state that can no longer occur."""
         assert hasattr(explain_module, "verify_money_path_chain")
         clause = _clause_money_path_chain_verified(store)
-        assert not clause.met
         assert not clause.unmeasurable, clause.detail
+        assert not clause.met, clause.detail
         assert "empty" in clause.detail
 
     def test_the_clause_is_registered_on_phase_4(self, store: LocalStore) -> None:
