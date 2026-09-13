@@ -104,9 +104,11 @@ from crucible.slots.vocab import refuse_unknown_keys
 
 __all__ = [
     "CPCV_OOS_IC_METRIC",
+    "DEAD_SLOT_METRIC",
     "DISPERSION_METRICS",
     "FLOOR_VETO_METRICS",
     "MIN_DISPERSION_RATIO",
+    "UNPRODUCED_VETO_METRICS",
     "M_SELECTION_TOP_N",
     "OOS_METHOD",
     "SLOT",
@@ -171,6 +173,37 @@ ZERO_VETO_METRICS: tuple[str, ...] = ("n_high_confidence",)
 #: is the scale-DEPENDENT part by construction, and the scale is ASSERTED
 #: rather than assumed — see :data:`PROPORTION_METRICS`.
 FLOOR_VETO_METRICS: dict[str, float] = {"model_hit_rate_30d": 0.50}
+
+#: The veto inputs NOTHING IN THIS HARNESS PRODUCES, and the producer each
+#: one waits on (`alpha-engine-config-I9759`, from `crucible-PR149`'s note).
+#:
+#: `_serving_metrics` supplies `alpha_stdev` and deliberately nothing else:
+#: inventing a stand-in for any of these is the exact failure mode
+#: :func:`evaluate_behavioural_veto` exists against — a gate reporting a pass
+#: for a statistic nobody measured (`champion-challenger-policy.md` §5.1).
+#: So they are recorded in `uncomputable`, the veto reads `insufficient`, the
+#: precondition FAILS, and the M pointer cannot move. That is the honest
+#: reading of each cycle.
+#:
+#: It is NOT an honest reading of the SLOT. §5.1's rule is "an uncomputed
+#: gate is not a pass"; it is not "a gate that can never compute is a healthy
+#: slot". Every M cycle since the slot landed has produced the same
+#: `insufficient` for the same three metrics for the same reason, and the
+#: only surface saying so was a per-arm precondition reason inside the cycle
+#: artifact — so a slot that can never promote rendered identically to one
+#: that merely held its pointer this week. :data:`DEAD_SLOT_METRIC` is the
+#: difference: it is emitted on every `experiment.grade[m]` manifest that
+#: reaches this state, naming the metrics and their missing producers, so the
+#: gap is OBSERVED rather than rediscovered. A component emitting nothing
+#: about a permanent condition is unobserved, not healthy (principle 7).
+UNPRODUCED_VETO_METRICS: dict[str, str] = {
+    "stdev_p_up": "a calibrated up-probability; M arms predict alpha, not a probability",
+    "n_high_confidence": "a declared confidence threshold over the predicted cross-section",
+    "model_hit_rate_30d": "a realized trailing-30-session hit rate over settled M verdicts",
+}
+
+#: The metric name :data:`UNPRODUCED_VETO_METRICS` is reported under.
+DEAD_SLOT_METRIC = "serving_veto_has_no_producer"
 
 #: Metrics this module declares to be 0–1 proportions, range-checked on BOTH
 #: sides before any floor is applied.
@@ -2533,6 +2566,8 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             "veto": veto.status,
         }
 
+    _record_dead_slot_finding(ctx, grades, as_of=as_of)
+
     result = run_grade(
         ctx,
         slot=SLOT,
@@ -2546,6 +2581,55 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         {"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused
     ]
     return result
+
+
+def _record_dead_slot_finding(ctx: Any, grades: dict[str, dict[str, Any]], *, as_of: str) -> None:
+    """Emit :data:`DEAD_SLOT_METRIC` when no M arm can ever take the pointer.
+
+    `alpha-engine-config-I9759`. The condition is "every arm this cycle
+    evaluated reads `insufficient`", which is what
+    :data:`UNPRODUCED_VETO_METRICS` guarantees for as long as those three
+    producers do not exist: the veto cannot pass, so the slot cannot promote,
+    so the M pointer will never move on evidence no matter how many cycles
+    run. Without this row the only trace is a precondition reason buried per
+    arm in the cycle artifact, and the slot renders as one that held its
+    pointer — which is a different fact with a different owner.
+
+    `status: FAIL`, not `unmeasurable`: this IS a measurement, of a permanent
+    condition, and it is the reading that should keep the M slot off any
+    surface claiming the arena is complete. It does not fail the run — the
+    cycle's verdicts, ladders and ranking are all sound and the slot is being
+    graded correctly; what it cannot do is serve.
+
+    Silent when at least one arm's veto passed or vetoed on real values: the
+    slot is then alive and this row would be a false permanent finding.
+    """
+    statuses = {row.get("veto") for row in grades.values()}
+    if not statuses or statuses != {"insufficient"}:
+        return
+    missing = ", ".join(f"{name} (needs {why})" for name, why in UNPRODUCED_VETO_METRICS.items())
+    ctx.record_metric(
+        {
+            "name": DEAD_SLOT_METRIC,
+            "module": f"crucible.slots.{SLOT}",
+            "metric_type": "count",
+            "value": float(len(UNPRODUCED_VETO_METRICS)),
+            "unit": "count",
+            "n_floor": 1,
+            "status": "FAIL",
+            "status_reason": (
+                f"every one of {len(grades)} graded arm(s) read `insufficient` on the "
+                f"§5.3 behavioural veto, because nothing in this harness produces: "
+                f"{missing}. An uncomputed gate is not a pass "
+                "(champion-challenger-policy.md §5.1), so no M arm can take the pointer "
+                "— not this cycle and not any cycle until those producers exist. The "
+                "slot is graded correctly and cannot serve; `promote` will file a "
+                "verdict-backed non-promotion every week until then."
+            ),
+            "source_path": arena_cycle_key(SLOT, as_of),
+            "last_updated_utc": _utc_now(),
+        }
+    )
 
 
 def _incumbent_serving_metrics(store: Any, *, as_of: str) -> dict[str, Any]:

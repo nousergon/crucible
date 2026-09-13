@@ -176,7 +176,12 @@ def _promote(args: argparse.Namespace) -> int:
     """
     import os
 
-    from crucible.promote import load_slot_inputs, revert_champion, run_promotion
+    from crucible.promote import (
+        graded_preconditions,
+        load_slot_inputs,
+        revert_champion,
+        run_promotion,
+    )
     from crucible.runner import resolve_code_sha, run_job
     from crucible.slots import get_slot
 
@@ -200,6 +205,15 @@ def _promote(args: argparse.Namespace) -> int:
             "run writes nothing. Asking for both at once is refused rather than guessed."
         )
     store = _resolve_store(args)
+    # `alpha-engine-config-I9759`: four slots, one job name, one trading day,
+    # four writers — exactly `crucible.keys.manifest_key`'s discriminator case,
+    # and the one `experiment.run`/`experiment.grade` already take. Without it
+    # every slot's promote wrote `runs/promote/{day}/run.json` and the last one
+    # to run silently erased the other three; once promote became an arc stage
+    # (`crucible.weekly.ARC_SLOT_JOBS`) that collision would happen every
+    # Saturday. It is also what the pointer's own `manifest_key` must name, or
+    # `explain` walks a promotion back to a manifest belonging to another slot.
+    promote_manifest = _promote_manifest_key("promote", args.trading_day, discriminator=args.slot)
 
     def job(ctx) -> None:
         as_of = ctx.trading_day.isoformat()
@@ -221,7 +235,7 @@ def _promote(args: argparse.Namespace) -> int:
                 as_of=as_of,
                 operator=getattr(args, "operator", None) or os.environ.get("USER", "unknown"),
                 reason=args.reason,
-                manifest_key=_promote_manifest_key("promote", as_of),
+                manifest_key=promote_manifest,
                 run_id=ctx.run_id,
                 code_sha=code_sha,
             )
@@ -235,8 +249,17 @@ def _promote(args: argparse.Namespace) -> int:
             register=inputs.register,
             series_by_arm=inputs.series_by_arm,
             incumbent=inputs.incumbent,
+            # `alpha-engine-config-I9759`: the eligibility `experiment.grade`
+            # evaluated an hour earlier, read back off its own cycle artifact.
+            # Passing nothing here — which is what this call did until I9759 —
+            # ran the SAME engine over the SAME series with the M behavioural
+            # veto and the S contamination attestation silently empty, so the
+            # job that moves the pointer could serve an arm the job that
+            # grades it had refused.
+            preconditions=graded_preconditions(store, args.slot, as_of),
+            pointer_etag=inputs.pointer_etag,
             store=None if args.dry_run else store,
-            manifest_key=_promote_manifest_key("promote", as_of),
+            manifest_key=promote_manifest,
             run_id=ctx.run_id,
             code_sha=code_sha,
         )
@@ -284,6 +307,7 @@ def _promote(args: argparse.Namespace) -> int:
         trading_day=args.trading_day,
         dry_run=bool(args.dry_run),
         run_mode=getattr(args, "run_mode", None),
+        discriminator=args.slot,
     )
     return 0
 

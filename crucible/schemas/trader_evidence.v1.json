@@ -1,0 +1,57 @@
+{
+  "$comment": "trading_days MUST equal the number of distinct entries in days_served, and days_served MUST be strictly increasing. JSON Schema cannot state either, so a consumer validating against this file alone must check both itself.",
+  "$id": "https://github.com/nousergon/crucible/schemas/trader_evidence.v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The trader's rolling account of the trading days it served on the v2 champion, written at the key `crucible.keys.TRADER_EVIDENCE_KEY` and read by the phase-4 gate clause `trader_one_week_on_v2_champion`. Cumulative, not dated: the question the clause asks is cumulative, and a dated artifact would make the gate reconstruct the count by listing \u2014 a second implementation of a number the trader already knows. additionalProperties: false because a field this reader does not understand is a field the producer expected it to act on.",
+  "properties": {
+    "calendar_date": {
+      "description": "Wall-clock date this document was last written. Provenance only, never a key (\u00a74.12).",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "title": "Calendar Date",
+      "type": "string"
+    },
+    "champion": {
+      "description": "The arm id served across `days_served`. A promotion ENDS a run of days: the trader starts a new count under the new arm rather than carrying the old one forward, because 'a week on the v2 champion' is a week on ONE champion.",
+      "minLength": 1,
+      "title": "Champion",
+      "type": "string"
+    },
+    "days_served": {
+      "description": "The trading days themselves, strictly increasing. Carried beside the count so the count is checkable rather than asserted \u2014 the shape of a suite that only ever tests the happy path, one contract out.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Days Served",
+      "type": "array"
+    },
+    "schema_version": {
+      "const": "trader_evidence.v1",
+      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "slot": {
+      "const": "m",
+      "description": "The slot whose champion was served. Closed to `m`: `predictions/{trading_day}.json` is the M contract specifically, and the R and U champions serve their own keys.",
+      "title": "Slot",
+      "type": "string"
+    },
+    "trading_days": {
+      "description": "Count of NYSE trading days served on this champion (\u00a74.12) \u2014 five to a week, and a holiday week is still one week. The field the gate reads. It is required to equal len(days_served), so it cannot be inflated without inventing the days to support it.",
+      "minimum": 0,
+      "title": "Trading Days",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "slot",
+    "champion",
+    "trading_days",
+    "days_served",
+    "calendar_date"
+  ],
+  "title": "Crucible trader consumer evidence, v1",
+  "type": "object"
+}
