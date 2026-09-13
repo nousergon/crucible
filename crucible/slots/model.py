@@ -3132,7 +3132,7 @@ def _champion_arm(store: Any) -> str | None:
     key = champion_key(SLOT)
     if not store.exists(key):
         return None
-    champion = load_store_document(store, key).get("champion")
+    champion = load_store_document(store, key).get("arm_id")
     return str(champion) if champion else None
 
 

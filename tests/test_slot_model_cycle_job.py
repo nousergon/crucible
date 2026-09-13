@@ -704,7 +704,7 @@ class TestTheIncumbentsMetricsComeFromThePointer:
             for line in register.splitlines()
             if line.strip() and ":base:" in line
         )
-        store.put_bytes(champion_key(SLOT), json.dumps({"champion": champion}).encode("utf-8"))
+        store.put_bytes(champion_key(SLOT), json.dumps({"arm_id": champion}).encode("utf-8"))
         assert _champion_arm(store) == champion
         metrics, has_incumbent = _baseline_serving_metrics(
             store, champion=champion, candidates={}, as_of=GRADE_DAY
@@ -742,7 +742,7 @@ class TestTheIncumbentsMetricsComeFromThePointer:
         from crucible.slots.model import _baseline_serving_metrics
 
         store.put_bytes(
-            champion_key(SLOT), json.dumps({"champion": "m:absent:0123456789ab"}).encode("utf-8")
+            champion_key(SLOT), json.dumps({"arm_id": "m:absent:0123456789ab"}).encode("utf-8")
         )
         assert _baseline_serving_metrics(
             store, champion="m:absent:0123456789ab", candidates={}, as_of=GRADE_DAY
@@ -752,7 +752,7 @@ class TestTheIncumbentsMetricsComeFromThePointer:
         from crucible.keys import champion_key
         from crucible.slots.model import _baseline_serving_metrics, _champion_arm
 
-        store.put_bytes(champion_key(SLOT), json.dumps({"champion": ""}).encode("utf-8"))
+        store.put_bytes(champion_key(SLOT), json.dumps({"arm_id": ""}).encode("utf-8"))
         assert _champion_arm(store) is None
         assert _baseline_serving_metrics(store, champion=None, candidates={}, as_of=GRADE_DAY) == (
             {},
