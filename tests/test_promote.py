@@ -944,6 +944,7 @@ class TestControlArmsNeverServe:
         )
         with pytest.raises(PromotionRefused, match="control arm"):
             _write_pointer_if_moved(
+                baseline=None,
                 store=store,
                 spec=spec,
                 cycle=forged,
@@ -1035,6 +1036,7 @@ class TestIsControlArmIsRegisterBackedAtPromoteCallSites:
         )
 
         pointer = _write_pointer_if_moved(
+            baseline=None,
             store=store,
             spec=spec,
             cycle=forged,
@@ -1260,3 +1262,110 @@ class TestArmSeriesKeyUsesTheSharedSeparator:
         ):
             assert ":" not in key, f"a colon-bearing arm id leaked into {key!r}"
             assert segment in key, f"{key!r} does not route through arm_key_segment"
+
+
+class TestTheFirstChampionIsWonNotAssumed:
+    """`alpha-engine-config-I9759`. A slot with no incumbent used to take the
+    library's §9.1 cold start and write `promotion_source: bootstrap` — the
+    one value the §6 phase-3 gate rejects by name. §10.1's null control is
+    registered in every slot, every cycle, precisely so "better than noise?"
+    is a measured question, so it stands in as the baseline and the engine's
+    ordinary `decided`/`held` path runs unchanged."""
+
+    def test_the_null_control_is_found_by_kind_not_by_the_control_flag(self) -> None:
+        from nousergon_lib.arena import ArmSeries
+
+        from crucible.promote import baseline_control_arm
+        from crucible.slots import get_slot
+
+        spec = get_slot("u")
+        null_id = "u:control_null_u:0123456789ab"
+        planted_id = "u:control_planted_u:0123456789ab"
+        series = {
+            planted_id: ArmSeries(arm_id=planted_id, scores={}),
+            null_id: ArmSeries(arm_id=null_id, scores={}),
+            "u:real:0123456789ab": ArmSeries(arm_id="u:real:0123456789ab", scores={}),
+        }
+        # The PLANTED control must never be the baseline: it reads
+        # next-period returns, so beating it is not a claim about noise.
+        assert baseline_control_arm(spec, series) == null_id
+
+    def test_no_null_control_scored_is_none_rather_than_a_guess(self) -> None:
+        from nousergon_lib.arena import ArmSeries
+
+        from crucible.promote import baseline_control_arm
+        from crucible.slots import get_slot
+
+        arm = "u:real:0123456789ab"
+        assert baseline_control_arm(get_slot("u"), {arm: ArmSeries(arm_id=arm, scores={})}) is None
+
+
+class TestPromoteInheritsTheEligibilityGradeEvaluated:
+    """`alpha-engine-config-I9759`: `promote` and `experiment.grade` call the
+    same engine over the same series, and promote called it with
+    `preconditions=None` — so the M behavioural veto and the S contamination
+    attestation, both evaluated inside grade, did not exist for the job that
+    moves the pointer."""
+
+    def _cycle(self, store, slot: str, day: str, ineligible: dict) -> None:
+        """A REAL cycle artifact with `ineligible` substituted.
+
+        Built by the library's own `run_cycle` rather than hand-written:
+        `read_arena_cycle` validates against the published contract on every
+        read, so a hand-rolled stub would test the stub.
+        """
+        import json
+
+        from nousergon_lib.arena import ArmRegister
+        from nousergon_lib.arena.engine import run_cycle
+
+        from crucible.arena_io import validate_arena_cycle
+        from crucible.keys import arena_cycle_key
+        from crucible.slots import get_slot
+
+        payload = run_cycle(
+            config=get_slot(slot).arena,
+            as_of=day,
+            register=ArmRegister(),
+            series_by_arm={},
+            incumbent=None,
+        ).to_dict()
+        payload["decision"]["ineligible"] = ineligible
+        validate_arena_cycle(payload)
+        store.put_bytes(arena_cycle_key(slot, day), json.dumps(payload).encode())
+
+    def test_failed_checks_are_rehydrated_with_their_names_and_reasons(self, tmp_path) -> None:
+        from crucible.promote import graded_preconditions
+        from crucible.store import LocalStore
+
+        store = LocalStore(tmp_path)
+        self._cycle(
+            store,
+            "m",
+            "2026-08-28",
+            {"m:a:0123456789ab": [{"name": "behavioural_veto", "passed": False, "reason": "why"}]},
+        )
+        got = graded_preconditions(store, "m", "2026-08-28")
+        assert list(got) == ["m:a:0123456789ab"]
+        (check,) = got["m:a:0123456789ab"]
+        assert (check.name, check.passed, check.reason) == ("behavioural_veto", False, "why")
+
+    def test_an_arm_with_no_failed_check_is_absent_rather_than_empty(self, tmp_path) -> None:
+        """`_eligible` is `all(p.passed ...)`, so an arm with nothing against
+        it and an arm absent from the map are the same thing to the engine —
+        carried as absence so the map means "what grade refused"."""
+        from crucible.promote import graded_preconditions
+        from crucible.store import LocalStore
+
+        store = LocalStore(tmp_path)
+        self._cycle(store, "m", "2026-08-28", {"m:a:0123456789ab": []})
+        assert graded_preconditions(store, "m", "2026-08-28") == {}
+
+    def test_an_absent_graded_cycle_refuses_rather_than_deciding_blind(self, tmp_path) -> None:
+        import pytest
+
+        from crucible.promote import PromotionRefused, graded_preconditions
+        from crucible.store import LocalStore
+
+        with pytest.raises(PromotionRefused, match="no graded arena cycle"):
+            graded_preconditions(LocalStore(tmp_path), "m", "2026-08-28")
