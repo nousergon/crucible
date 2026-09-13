@@ -142,6 +142,7 @@ __all__ = [
     "LlmCallsiteRegistryDocument",
     "METRIC_STATUS_VALUES",
     "MetricRecordRow",
+    "MoneyPathLink",
     "NegativeResultEventRow",
     "NoComparisonEventRow",
     "PhaseClosingReadingDocument",
@@ -466,6 +467,162 @@ class ArtifactRef(_Strict):
             "cross-module artifact is the M0 contract violation."
         ),
     )
+
+
+def _money_path_link_json_schema_extra(schema: dict[str, object]) -> None:
+    """Mirrors :meth:`MoneyPathLink._genesis_is_the_only_linkless_record` into
+    the published schema's ``allOf``.
+
+    Same rule, and the same reason, as
+    :func:`_run_manifest_v2_json_schema_extra`: the model_validator is the
+    source of truth, and this is the one place that copies it, so a consumer
+    validating against `run_manifest.v2.json` with no Python import gets the
+    genesis rule rather than a chain whose first record can claim any
+    predecessor it likes.
+    """
+    schema["allOf"] = [
+        {
+            "description": (
+                "Record 0 is the genesis: it has no predecessor, so `prev_sha256` and "
+                "`prev_run_id` are both null."
+            ),
+            "if": {"properties": {"index": {"const": 0}}, "required": ["index"]},
+            "then": {
+                "properties": {"prev_sha256": {"type": "null"}, "prev_run_id": {"type": "null"}}
+            },
+        },
+        {
+            "description": (
+                "Every record after the genesis names its predecessor: `prev_sha256` and "
+                "`prev_run_id` are both present. A linkless record at index > 0 is an "
+                "unverifiable hop, which is the whole thing the chain exists to exclude."
+            ),
+            "if": {
+                "properties": {"index": {"minimum": 1}},
+                "required": ["index"],
+            },
+            "then": {
+                "properties": {
+                    "prev_sha256": {"type": "string"},
+                    "prev_run_id": {"type": "string"},
+                },
+                "required": ["prev_sha256", "prev_run_id"],
+            },
+        },
+    ]
+
+
+class MoneyPathLink(_Strict):
+    """One record's place in the money-path hash chain (plan §9.5, added
+    2026-09-10; `alpha-engine-config-I10414`).
+
+    Present on a run manifest **exactly when** that run wrote at least one
+    money-path artifact — the champion pointers, the champion serving feed,
+    and the sealed holdout plus its unseal records
+    (`crucible.manifest.MONEY_PATH_PREDICATES`). Absent from every other
+    manifest, the same "omitted entirely rather than written as null" shape
+    `discriminator` and `now_override_utc` use: a field present on every
+    manifest would make "this run is not on the money path" and "this run's
+    link was dropped" the same document.
+
+    **`prev_sha256` is the digest of the predecessor manifest's STORED
+    BYTES**, computed by the writer with `crucible.store.sha256_hex` over
+    exactly what `Store.get_bytes` returns for the predecessor's key — never
+    a backend version token. `nous-ergon-ops-I1145` is the incident: an
+    S3 ETag written into a field named `sha256` agreed with every local test
+    (where the ETag happened to be an MD5 of the whole body) and was wrong
+    the moment the object was multipart-uploaded. `Store.etag` exists and its
+    own docstring calls itself "an opaque version token"; a chain built on
+    one verifies the backend's bookkeeping, not the history.
+
+    **What this does and does not prove.** It proves that the money-path
+    history now in the store is the history that was written, record by
+    record: mutating any record breaks its successor's link, and overwriting
+    a record in place (a manifest key is `runs/{job}/{day}/run.json`, so a
+    rerun overwrites) breaks it too, which is the point. It does NOT prove
+    that the chain's own head or tail was not truncated — that needs a signed
+    or externally anchored chain, which plan §9.5's written delta names as a
+    phase-6-or-later decision rather than an omission.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra=_money_path_link_json_schema_extra,
+    )
+
+    index: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "This record's position in the money-path chain, from 0. Contiguous by "
+                "construction: `crucible.explain.verify_money_path_chain` fails on a gap, "
+                "because a missing index is a removed record and a chain that renumbered "
+                "around one would report the deletion as health."
+            ),
+        ),
+    ]
+    prev_sha256: Sha256 | None = Field(
+        description=(
+            "sha256 of the PREDECESSOR manifest's stored bytes — what `Store.get_bytes` "
+            "returns for its key, hashed with `crucible.store.sha256_hex`. NEVER a backend "
+            "version token: `Store.etag` is documented as opaque, and an ETag in a field "
+            "named sha256 passed every local test and was wrong on S3 "
+            "(nous-ergon-ops-I1145). Null only at `index` 0, the genesis record."
+        )
+    )
+    prev_run_id: str | None = Field(
+        pattern=r"^[0-9A-HJKMNP-TV-Z]{26}$",
+        description=(
+            "The predecessor's `run_id`, carried alongside the digest so a break names a "
+            "RUN an operator can go read, not only a hex string. Null only at `index` 0."
+        ),
+    )
+    money_path_writes: list[str] = Field(
+        min_length=1,
+        description=(
+            "The money-path store keys THIS run wrote, sorted. Never empty: a link on a "
+            "manifest that wrote nothing on the money path would put a record in the chain "
+            "with nothing to attest to, and the chain's membership rule "
+            "(`crucible.manifest.money_path_writes`) would no longer be derivable from the "
+            "manifests themselves."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _genesis_is_the_only_linkless_record(self) -> MoneyPathLink:
+        """A predecessor is absent exactly at index 0.
+
+        Both directions are errors and both matter. A record at index > 0 with
+        no `prev_sha256` is an unverifiable hop wearing a chain's clothes. A
+        genesis record that names a predecessor is claiming a link to
+        something the chain does not contain, which verifies against nothing
+        and reads as verified.
+
+        Mirrored into the published schema by
+        :func:`_money_path_link_json_schema_extra`.
+        """
+        linked = self.prev_sha256 is not None
+        named = self.prev_run_id is not None
+        if linked != named:
+            raise ValueError(
+                f"prev_sha256={self.prev_sha256!r} and prev_run_id={self.prev_run_id!r} "
+                "disagree about whether this record has a predecessor. Both are present "
+                "or both are null; one alone is half a link."
+            )
+        if self.index == 0 and linked:
+            raise ValueError(
+                f"index is 0 — the genesis record — but it names predecessor "
+                f"{self.prev_run_id!r}. A genesis that claims a predecessor the chain "
+                "does not contain verifies against nothing while reading as verified."
+            )
+        if self.index > 0 and not linked:
+            raise ValueError(
+                f"index is {self.index} but `prev_sha256` is null. Only the genesis "
+                "record has no predecessor; a linkless record anywhere else is an "
+                "unverifiable hop, which is exactly what the chain exists to exclude."
+            )
+        return self
 
 
 class LlmCallRow(_Strict):
@@ -1060,6 +1217,23 @@ class RunManifestV2(_Strict):
             "mistaken for a clean first-attempt run."
         ),
     )
+    #: `alpha-engine-config-I10414`: present exactly when this run wrote at
+    #: least one money-path artifact. Absent for every other run — the same
+    #: "omitted entirely rather than written as null" shape `discriminator`
+    #: and `now_override_utc` use.
+    money_path_link: MoneyPathLink | None = Field(
+        default=None,
+        description=(
+            "I10414 / plan §9.5: this run's record in the money-path hash chain. Present "
+            "exactly when the run wrote at least one money-path artifact — the champion "
+            "pointers, the champion serving feed, the sealed holdout and its unseal records "
+            "(`crucible.manifest.MONEY_PATH_PREDICATES`) — and absent otherwise, so "
+            "`not on the money path` and `link dropped` are not the same document. Written "
+            "by `crucible.manifest.write_manifest`, the single writer; verified by "
+            "`crucible.explain.verify_money_path_chain`, which reports a break as "
+            "`status: failed` naming the record index and both digests, never as a warning."
+        ),
+    )
 
     @model_validator(mode="after")
     def _status_and_reason_agree(self) -> RunManifestV2:
@@ -1084,6 +1258,35 @@ class RunManifestV2(_Strict):
                 f"status is `ok` but reason={self.reason!r}, not empty. An ok run "
                 "has nothing to explain, and a non-empty reason on success is a "
                 "degraded-SUCCEEDED in disguise."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _the_link_attests_only_to_keys_this_run_wrote(self) -> RunManifestV2:
+        """`alpha-engine-config-I10414`: a chain record attests to artifacts
+        its own run produced, or it attests to nothing.
+
+        The OTHER direction — a run that wrote a money-path artifact must
+        carry a link — deliberately is not checked here. It needs
+        `crucible.manifest`'s money-path predicates, and `crucible.manifest`
+        imports this module, so asserting it here would be the import cycle
+        this module's docstring exists to avoid. It is enforced where it can
+        be enforced against the whole store rather than one document:
+        `crucible.explain.verify_money_path_chain` fails on a money-path
+        manifest written after the genesis record that carries no link. That
+        is the stronger position anyway — a stripped link is invisible to the
+        document it was stripped from.
+        """
+        if self.money_path_link is None:
+            return self
+        written = {output.key for output in self.outputs}
+        orphans = sorted(set(self.money_path_link.money_path_writes) - written)
+        if orphans:
+            raise ValueError(
+                f"money_path_link.money_path_writes names {orphans}, which this run does "
+                f"not list among its outputs ({sorted(written)}). A chain record that "
+                "attests to an artifact its run did not write is a claim about somebody "
+                "else's bytes."
             )
         return self
 

@@ -2194,7 +2194,7 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
         assert arena_cycle_key("r", FRIDAY.isoformat()) in clause.detail
         assert "no promote run manifest was filed" not in clause.detail
 
-    def test_one_clause_per_registered_slot_plus_the_four_deliverable_clauses(
+    def test_one_clause_per_registered_slot_plus_the_five_deliverable_clauses(
         self, store: LocalStore
     ) -> None:
         clauses = gate_module._phase3(store, _window(4), {}, trading_day=FRIDAY)
@@ -2208,6 +2208,10 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
             # reads no `experiment.grade[s]` manifest at all: the holdout is a
             # STANDING reservation, not something a graded window produces.
             "sealed_holdout",
+            # alpha-engine-config-I10460. Registered on phase 3 alone — see
+            # `_phase3`'s own comment for why one nightly reading is not made
+            # a member of six phase aggregates.
+            "integration_tier_current_and_ok",
         ]
 
 
