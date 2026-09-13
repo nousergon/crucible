@@ -334,6 +334,68 @@ class TestPortfolioAlphaRow:
         with pytest.raises(ValueError, match="horizons"):
             build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
 
+    def test_a_below_floor_slot_folds_the_finding_into_the_row(self, tmp_path) -> None:
+        """`alpha-engine-config-I10636`: the row's own reason names the floor
+        breach rather than reporting a realized-return number as if the slot
+        were comparing anything."""
+        from crucible.keys import arena_cycle_key
+        from crucible.slots.cycle import MIN_ACTIVE_ARMS_FINDING_METRIC
+
+        store = _store(tmp_path)
+        _write_champion(store, "s", S_ARM)
+        _write_verdicts(
+            store,
+            S_ARM,
+            {"2026-07-01": 0.02, "2026-07-02": 0.01, "2026-07-06": 0.03},
+        )
+        store.put_bytes(
+            arena_cycle_key("s", DAY.isoformat()),
+            json.dumps(
+                {
+                    MIN_ACTIVE_ARMS_FINDING_METRIC: {
+                        "status": "BELOW_FLOOR",
+                        "min_active_arms": 3,
+                        "promotable_arm_count": 1,
+                        "promotable_arms": [S_ARM],
+                        "reason": "1 promotable arm(s) against a floor of 3",
+                    }
+                }
+            ).encode("utf-8"),
+        )
+        document, _ = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
+        row = next(r for r in document["rows"] if r["name"] == "portfolio_excess_return_s_ratio")
+        assert "min_active_arms" in row["status_reason"]
+        assert "1 promotable arm(s) against a floor of 3" in row["status_reason"]
+
+    def test_a_slot_at_the_floor_carries_no_min_active_arms_note(self, tmp_path) -> None:
+        from crucible.keys import arena_cycle_key
+        from crucible.slots.cycle import MIN_ACTIVE_ARMS_FINDING_METRIC
+
+        store = _store(tmp_path)
+        _write_champion(store, "s", S_ARM)
+        _write_verdicts(
+            store,
+            S_ARM,
+            {"2026-07-01": 0.02, "2026-07-02": 0.01, "2026-07-06": 0.03},
+        )
+        store.put_bytes(
+            arena_cycle_key("s", DAY.isoformat()),
+            json.dumps(
+                {
+                    MIN_ACTIVE_ARMS_FINDING_METRIC: {
+                        "status": "OK",
+                        "min_active_arms": 3,
+                        "promotable_arm_count": 3,
+                        "promotable_arms": [S_ARM, "s:b:x", "s:c:x"],
+                        "reason": "3 promotable arm(s) meets the floor of 3",
+                    }
+                }
+            ).encode("utf-8"),
+        )
+        document, _ = build_attribution(store, trading_day=DAY, now=NOW, run_id="R" * 26)
+        row = next(r for r in document["rows"] if r["name"] == "portfolio_excess_return_s_ratio")
+        assert "min_active_arms" not in row["status_reason"]
+
 
 class TestRankICRow:
     """R and M: reduced from `shadow.v2` settled cross-sections into a true
