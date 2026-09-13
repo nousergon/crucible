@@ -7,14 +7,14 @@ makes a hard precondition for phase 6 (real capital) was a control no gate
 graded — and phase 6's entry condition (5) is "the money-path artifacts
 hash-chained", a condition with no clause behind it.
 
-**The verifier lands in `crucible-PR240`, held as a draft until phase 2 exits,
-so both states are asserted here**: the clause reads UNMEASURABLE with a named
-reason while `crucible.explain.verify_money_path_chain` is absent, and grades
-the verdict the moment it exists — with no edit to `crucible/gate.py`. The
-present-verifier cases drive a stand-in matching `ChainVerification`'s declared
-shape; the absent-verifier case is measured against the real tree, so the day
-`PR240` lands the first test below starts failing and says so rather than
-quietly continuing to pass on a fake.
+**`crucible-PR240` has landed** (verified 2026-09-13, merged onto this branch
+along with `origin/main`): `crucible.explain.verify_money_path_chain` exists,
+and `_clause_money_path_chain_verified` reads it with no edit to
+`crucible/gate.py` — the lazy import in the clause's own `try` block is what
+makes that true. `TestTheClauseReadsTheRealVerifier` asserts that against the
+real, empty tree; the readings below still drive a stand-in matching
+`ChainVerification`'s declared shape via `monkeypatch`, which remains valid
+now that the real attribute exists to patch.
 """
 
 from __future__ import annotations
@@ -92,28 +92,28 @@ def store(tmp_path: object) -> LocalStore:
     return LocalStore(tmp_path)  # type: ignore[arg-type]
 
 
-class TestTheClauseMergesBeforeItsVerifier:
-    def test_an_absent_verifier_is_unmeasurable_with_a_named_reason(
+class TestTheClauseReadsTheRealVerifier:
+    def test_the_verifier_now_exists_and_the_clause_reads_it_with_no_edit(
         self, store: LocalStore
     ) -> None:
-        """Measured against the real tree. `crucible-PR240` is a draft, so
-        `crucible.explain` exposes no verifier yet and the clause must say
-        exactly that rather than raising, reading MET, or reading UNMET — no
-        statement has been made about the store at all.
+        """`crucible-PR240` has landed (this is the notification the removed
+        stand-in test used to raise): `crucible.explain.verify_money_path_chain`
+        exists, and `_clause_money_path_chain_verified` reads it with no change
+        to `crucible/gate.py` — the lazy import in the clause's `try` block is
+        exactly what makes that true.
 
-        When `PR240` lands this test fails, which is the point: it is the
-        notification that the clause went live, not a thing to keep green.
+        Measured against the real, empty tree: nothing has written a
+        money-path manifest to `store`, so the real verifier grades it `ok`
+        with an "empty" reason (`verify_money_path_chain`'s own contract), and
+        the clause reads that as UNMET rather than inheriting `ok` — see
+        `TestTheThreeReadingsAreDistinct.test_an_empty_chain_is_unmet_rather_than_inheriting_ok`
+        for the same decision against a stand-in.
         """
-        if hasattr(explain_module, "verify_money_path_chain"):
-            pytest.fail(
-                "`crucible.explain.verify_money_path_chain` now exists (crucible-PR240 "
-                "has landed). Delete this test and assert the live readings below "
-                "against the real verifier instead of the stand-in."
-            )
+        assert hasattr(explain_module, "verify_money_path_chain")
         clause = _clause_money_path_chain_verified(store)
-        assert clause.unmeasurable and not clause.met
-        assert "verify_money_path_chain" in clause.detail
-        assert "crucible-PR240" in clause.detail
+        assert not clause.met
+        assert not clause.unmeasurable, clause.detail
+        assert "empty" in clause.detail
 
     def test_the_clause_is_registered_on_phase_4(self, store: LocalStore) -> None:
         names = [c.name for c in _phase4(store, [FRIDAY], {}, trading_day=FRIDAY)]
