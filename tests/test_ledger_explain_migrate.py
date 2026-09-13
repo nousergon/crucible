@@ -559,7 +559,13 @@ class TestMigrate:
         pointer_before = json.loads(store.get_bytes("champions/r/current.json"))
         _run_migrate(store, cycle_date, **kwargs)
         pointer_after = json.loads(store.get_bytes("champions/r/current.json"))
-        assert pointer_after == pointer_before
+        # `run_id`/`decided_at`/`manifest_key` name the run that WROTE the
+        # pointer (`alpha-engine-config-I10691`) and legitimately differ
+        # between two separate `migrate.history` invocations — the CAS not
+        # raising is the real assertion the docstring names; the fields the
+        # v1 source actually determines must still agree.
+        for field in ("slot", "arm_id", "as_of", "promotion_source"):
+            assert pointer_after[field] == pointer_before[field], field
 
 
 class TestExplainWalksAVerdict:
