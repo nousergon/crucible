@@ -60,7 +60,7 @@ from pydantic import ValidationError
 
 from crucible.documents import load_store_document
 from crucible.keys import RUNS_ROOT, is_manifest_key
-from crucible.models import LlmCallsiteRegistryDocument
+from crucible.models import CostSinkRow, LlmCallsiteRegistryDocument
 from crucible.store import Store
 
 __all__ = [
@@ -1138,11 +1138,20 @@ def _cost_sink_jsonl_keys(
 def _cost_sink_row_usd(s3_client: Any, *, bucket: str, key: str) -> float:
     """The summed `cost_usd` of every row in one cost-sink JSONL object.
 
+    Each row is validated through `crucible.models.CostSinkRow`
+    (`alpha-engine-config-I10682`) before `cost_usd` is read off it — a row
+    that is valid JSON but not an object (a bare list, string or number) used
+    to reach `row.get(...)` and raise an unnamed `AttributeError`; it now
+    raises the same named `CostSinkReconciliationError` every other bad row
+    in this loop does.
+
     A row with no numeric `cost_usd` RAISES — `krepis.cost.record_llm_call`
     writes `cost_usd: None` for `cost_source == "usage_unreported"` (a
     provider that did not report usage), and summing `None` as zero would
     understate `sink_usd` by exactly the amount a mismatch is supposed to
-    catch.
+    catch. That check stays here, in the reader, rather than moving onto the
+    model: it is a judgement about what THIS reconciliation can price, not a
+    rule about the document's shape (`CostSinkRow`'s own docstring).
     """
     body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
     total = 0.0
@@ -1151,12 +1160,18 @@ def _cost_sink_row_usd(s3_client: Any, *, bucket: str, key: str) -> float:
         if not line:
             continue
         try:
-            row = json.loads(line)
+            parsed = json.loads(line)
         except json.JSONDecodeError as exc:
             raise CostSinkReconciliationError(
                 f"s3://{bucket}/{key} line {lineno} is not valid JSON: {exc}"
             ) from exc
-        usd = row.get("cost_usd")
+        try:
+            row = CostSinkRow.model_validate(parsed)
+        except ValidationError as exc:
+            raise CostSinkReconciliationError(
+                f"s3://{bucket}/{key} line {lineno} does not conform to a cost-sink row: {exc}"
+            ) from exc
+        usd = row.cost_usd
         if not isinstance(usd, (int, float)) or isinstance(usd, bool):
             raise CostSinkReconciliationError(
                 f"s3://{bucket}/{key} line {lineno} carries no numeric `cost_usd` "

@@ -46,7 +46,14 @@ from typing import Any
 
 from crucible.calendar import resolve_trading_day
 from crucible.documents import load_store_document, read_store_document
-from crucible.manifest import RUN_MANIFEST_SCHEMA_VERSION, manifest_key
+from crucible.manifest import (
+    RUN_MANIFEST_SCHEMA_VERSION,
+    ManifestValidationError,
+    manifest_key,
+)
+from crucible.manifest import (
+    validate as validate_manifest,
+)
 from crucible.release import (
     POINTER_KEY,
     ReleaseProvenance,
@@ -313,6 +320,23 @@ def _flip(args: argparse.Namespace, store: Store) -> int:
     # STRICT face of the one reader (`crucible.documents`): a smoke manifest
     # that is not an object stops the flip with the key named.
     smoke = load_store_document(store, key)
+    # alpha-engine-config-I10682: validate the smoke manifest WHOLE, through
+    # `crucible.manifest.validate`/`RunManifestV2`, before any field below is
+    # read off it by hand. Before this, a smoke manifest missing `status` (or
+    # any other required field) would read `.get("status")` as `None` a few
+    # lines down and fail the flip with a message that never named the real
+    # defect — the document, not the deploy, was broken. `smoke` stays the
+    # plain dict every reader below already expects (RunManifestV2 is the
+    # validator at this boundary, not a new return type, same as every other
+    # `run_manifest.v2` consumer per that model's own docstring).
+    try:
+        validate_manifest(smoke)
+    except ManifestValidationError as exc:
+        raise SystemExit(
+            f"smoke manifest at {key} does not conform to {RUN_MANIFEST_SCHEMA_VERSION}: "
+            f"{exc}. The gate is the smoke RUN producing a valid manifest; promoting on one "
+            "the schema itself refuses would flip the pointer on a document nobody can trust."
+        ) from exc
     before = current_release(store)
     # alpha-engine-config-I10069: same shape as the `release_sha` check
     # `flip_on_smoke` makes below — a smoke manifest that never proved the
