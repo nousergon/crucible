@@ -245,21 +245,81 @@ class TestEnforcement:
 
     def test_the_allowlist_reads_the_router_rather_than_restating_it(self) -> None:
         """A second copy of the router's groups is the copy that drifts, so
-        the router's tier groups are READ; the registry file declares only the
-        classes this deployment serves beyond them."""
-        from krepis.router import TIER_GROUPS
+        the registry's own declared groups are READ through
+        `krepis.router.registry_groups()`; the callsite registry file
+        declares only the classes this deployment serves beyond them."""
+        from krepis.router import registry_groups
 
         from crucible.llm import _capability_classes, load_capability_classes
 
         allowed = _capability_classes()
-        assert frozenset(TIER_GROUPS) <= allowed
-        assert frozenset(TIER_GROUPS.values()) <= allowed
+        assert frozenset(registry_groups()) <= allowed
         assert frozenset(load_capability_classes()) <= allowed
-        assert allowed == (
-            frozenset(TIER_GROUPS)
-            | frozenset(TIER_GROUPS.values())
-            | frozenset(load_capability_classes())
-        ), "nothing is askable that neither the router nor the registry declares"
+        assert allowed == (frozenset(registry_groups()) | frozenset(load_capability_classes())), (
+            "nothing is askable that neither the registry nor the callsite registry declares"
+        )
+
+    def test_ultra_is_askable_and_mid_is_not(self) -> None:
+        """alpha-engine-config-I9971: the OLD approximation (a union of
+        `krepis.router.TIER_GROUPS`'s keys and values) admitted `mid` — a
+        complexity TIER, never a registry group — and dropped `ultra`, a
+        real registry group serving the fleet's Director and a phase-5
+        judge. `registry_groups()` reads the registry's own declared set,
+        so this must invert."""
+        from crucible.llm import _capability_classes
+
+        allowed = _capability_classes()
+        assert "ultra" in allowed
+        assert "mid" not in allowed
+
+    def test_mid_is_refused_at_the_call_boundary(self, tmp_path) -> None:
+        """The tier name `mid` must be refused by membership before it ever
+        reaches the router — not admitted here and left to fail downstream
+        at `capability_group`/the router edge."""
+        store = LocalStore(tmp_path)
+
+        def body(ctx):
+            call(
+                ctx,
+                callsite_id="test.cap_probe",
+                capability_class="mid",
+                messages=[],
+                cap=SpendCap(cap_usd=100.0),
+                estimate_usd=0.0,
+                registry={SITE.callsite_id: SITE},
+            )
+
+        with pytest.raises(ValueError, match="not a router capability class"):
+            run_job("report", body, store=store, trading_day=DAY, now=NOW, transient_retry=False)
+
+    def test_an_unresolvable_registry_degrades_rather_than_crashing_import(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """`_capability_classes()` now reads `krepis.router.registry_groups()`,
+        which RAISES `FileNotFoundError` when no registry is reachable — the
+        correct contract for `registry_groups()` itself (an empty tuple would
+        make every membership check vacuously pass). But this function runs
+        at MODULE IMPORT (`LLM_CALLSITE_REGISTRY = load_registry()`), and
+        most environments that import `crucible.llm` — CI, a laptop outside
+        the private `alpha-engine-config` checkout — have no registry
+        reachable at all. Propagating the raise would make the package
+        unimportable there. It must instead degrade to the classes
+        `llm_callsites.yaml` declares on its own (registry-independent) and
+        defer the "not a router capability class" refusal to the point a
+        registry group is actually asked for."""
+        import crucible.llm as llm
+        from crucible.llm import load_capability_classes
+
+        monkeypatch.delenv("LLM_MODEL_REGISTRY_PATH", raising=False)
+        monkeypatch.chdir(tmp_path)  # no private-docs/ walk-up to find
+        llm._capability_classes.cache_clear()
+        try:
+            allowed = llm._capability_classes()
+            assert allowed == frozenset(load_capability_classes())
+            assert "low" not in allowed
+            assert "ultra" not in allowed
+        finally:
+            llm._capability_classes.cache_clear()
 
     def test_a_registry_row_naming_an_undeclared_class_is_refused_at_load(self, tmp_path) -> None:
         """The allowlist binds the REGISTRY too, not only the call.

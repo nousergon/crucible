@@ -70,16 +70,32 @@ def _write_registry(tmp_path, *, groups: dict, models: list[dict]):
 def routable(tmp_path, monkeypatch):
     """A registry in which every class this package can address resolves.
 
-    The group set is DERIVED from `capability_group` over the same classes the
-    function under test will iterate, so this fixture cannot fall behind a
-    class the package gains: a new class simply gets a member here too.
+    Since `alpha-engine-config-I9971`, `_capability_classes()` enumerates the
+    REGISTRY's own declared groups via `krepis.router.registry_groups()` —
+    which means it can no longer be called to BUILD the very registry file
+    it would read (there is nothing to resolve yet). This fixture instead
+    writes down the registry's real declared group set directly
+    (`krepis.router.TIER_GROUPS`'s values plus `ultra` — the one registry
+    group the tier mapping does not name) and adds a member for every extra
+    class `llm_callsites.yaml` declares, resolved through `capability_group`
+    — which stays a pure function of `TIER_GROUPS` /
+    `CAPABILITY_CLASS_GROUPS` and needs no registry file. A capability class
+    this package gains through `llm_callsites.yaml` still gets a member here
+    automatically; a class the REGISTRY gains is asserted directly, the way
+    a real deployment's registry document would be.
     """
-    from crucible.llm import _capability_classes
+    from krepis.router import TIER_GROUPS
 
-    classes = sorted(_capability_classes() - FAULT_INJECTION_CAPABILITY_CLASSES)
+    from crucible.llm import load_capability_classes
+
+    registry_group_names = set(TIER_GROUPS.values()) | {"ultra"}
     groups = {}
     models = []
-    for capability_class in classes:
+    for group in sorted(registry_group_names):
+        model_id = f"model-for-{group}"
+        groups[group] = [model_id]
+        models.append(_entry(model_id))
+    for capability_class in load_capability_classes():
         group = capability_group(capability_class)
         if group in groups:
             continue
@@ -146,13 +162,21 @@ class TestTheKrepisSeamsExist:
 class TestTheTierMappingIsReadNotCopied:
     """`alpha-engine-config-I10346`, second finding.
 
-    `_capability_classes` reads `krepis.router.TIER_GROUPS` to decide which
-    tier names a call site may ASK for, and `capability_group` did not read it
-    to decide what they RESOLVE to. `mid` was therefore askable and addressed
-    a group named `mid` — which the registry has never declared, and never
-    will: `TIER_GROUPS` maps `mid` to `med`. A call site declaring the tier
-    krepis itself names would have passed the allowlist and failed at the
-    router. Found by running this preflight, which is the preflight working.
+    `_capability_classes` used to read `krepis.router.TIER_GROUPS` to decide
+    which tier names a call site may ASK for, and `capability_group` did not
+    read it to decide what they RESOLVE to. `mid` was therefore askable and
+    addressed a group named `mid` — which the registry has never declared,
+    and never will: `TIER_GROUPS` maps `mid` to `med`. A call site declaring
+    the tier krepis itself names would have passed the allowlist and failed
+    at the router.
+
+    `alpha-engine-config-I9971` closed the ASK half from the other side:
+    `_capability_classes` now enumerates the registry's own declared groups
+    (`krepis.router.registry_groups()`) rather than unioning `TIER_GROUPS`,
+    so `mid` is refused at the allowlist and never reaches this function at
+    all. `capability_group` still reads `TIER_GROUPS` for RESOLUTION — a
+    tier that IS askable (`low`, `high`) still needs to resolve to the group
+    it addresses — which is the property this class asserts.
     """
 
     def test_a_tier_resolves_to_the_group_krepis_names(self) -> None:
@@ -304,16 +328,28 @@ class TestAStaleRegistryIsCaughtNotJustAnAbsentOne:
             registry_preflight()
         assert "deprecated" in str(excinfo.value)
 
-    def test_a_group_the_registry_never_declares_fails(self, tmp_path, monkeypatch) -> None:
-        """The `mid` case before `capability_group` read `TIER_GROUPS`, and the
-        general case of a registry that dropped a group this package still
-        addresses."""
-        path = _write_registry(tmp_path, groups={}, models=[])
+    def test_a_group_absent_from_the_registry_is_simply_not_askable(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The old `mid` finding, from the other side.
+
+        Before `alpha-engine-config-I9971`, `_capability_classes()` derived
+        its allowlist from `krepis.router.TIER_GROUPS` — a fixed dict
+        independent of the registry document — so a group the registry
+        stopped declaring stayed in the allowlist and this preflight FAILED
+        on it with "no live member" (the general case of `mid`, which the
+        registry has never declared at all). Now the allowlist IS the
+        registry's own declared set (`krepis.router.registry_groups()`): a
+        group absent from the registry document is simply not addressable,
+        so the preflight — which only asserts classes THIS package can
+        actually ask for — passes rather than failing on a class that was
+        never reachable in the first place."""
+        path = _write_registry(tmp_path, groups={"low": ["m1"]}, models=[_entry("m1")])
         monkeypatch.setenv(REGISTRY_ENV, str(path))
         monkeypatch.setenv(EXEC_CONTEXT_ENV, "ec2")
-        with pytest.raises(RegistryPreflightFailed) as excinfo:
-            registry_preflight()
-        assert "no live member" in str(excinfo.value)
+        summary = registry_preflight()
+        assert "low->" in summary
+        assert "med" not in summary and "high" not in summary and "ultra" not in summary
 
 
 class TestThePreflightRefusesToPassVacuously:
