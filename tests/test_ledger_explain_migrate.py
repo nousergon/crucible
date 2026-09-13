@@ -231,8 +231,70 @@ class TestExplain:
             explain(store, "runs/does-not-exist/2026-08-28/run.json")
 
     def test_an_empty_store_says_nothing_has_run_here(self, store) -> None:
-        with pytest.raises(FileNotFoundError, match="no run manifests"):
+        with pytest.raises(FileNotFoundError, match="no CONFORMANT run manifests"):
             explain(store, "anything")
+
+    def test_a_placeholder_code_sha_manifest_elsewhere_does_not_break_the_walk(
+        self, store, source, cycle_date
+    ) -> None:
+        """`alpha-engine-config-I10626`: one manifest under `runs/` carrying
+        the all-zero `code_sha` placeholder used to make `load_manifests`
+        raise on it, taking down a walk that never touches it. It must now
+        be named as unreadable, never elided, and the walk over the REST of
+        the store still completes."""
+        run_job(
+            "data.daily",
+            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            store=store,
+            trading_day=cycle_date,
+        )
+        from crucible.features import DEFAULT_FEATURE_VERSION
+        from crucible.keys import features_key
+        from crucible.manifest import RUN_MANIFEST_SCHEMA_VERSION
+
+        broken_key = manifest_key("smoke", "2026-08-20")
+        broken = {
+            "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+            "run_id": "01JG0000000000000000BR0KEN",
+            "job": "smoke",
+            "run_mode": "live",
+            "trading_day": "2026-08-20",
+            "calendar_date": "2026-08-20",
+            "status": "ok",
+            "reason": "",
+            "started": "2026-08-20T14:00:00Z",
+            "finished": "2026-08-20T14:01:00Z",
+            "code_sha": "0" * 40,
+            "release_sha": "0" * 40,
+            "seed": 20260820,
+            "inputs": [],
+            "outputs": [],
+            "rows_in": 0,
+            "rows_out": 0,
+            "rows_rejected": [],
+            "cost_usd": 0.0,
+            "llm_calls": [],
+            "resource": {
+                "instance_type": "c7i.xlarge",
+                "spot": True,
+                "escalated_to_on_demand": False,
+                "interruptions": 0,
+                "mem_peak_mb": 0.0,
+                "disk_free_mb": 0.0,
+            },
+            "metrics": [],
+            "attempts": [{"n": 1, "reason": "initial"}],
+        }
+        store.put_bytes(broken_key, json.dumps(broken).encode("utf-8"))
+
+        node = explain(store, features_key(DEFAULT_FEATURE_VERSION, cycle_date.isoformat()))
+
+        assert node.manifest is not None and node.manifest["job"] == "data.daily"
+        assert node.unreadable == {broken_key: node.unreadable[broken_key]}
+        assert "placeholder" in node.unreadable[broken_key]
+        rendered = render(node)
+        assert "1 manifest(s) in this store could not be validated." in rendered
+        assert broken_key in rendered
 
     def test_a_collision_keeps_the_later_run_and_names_the_earlier_one(
         self, store, cycle_date
