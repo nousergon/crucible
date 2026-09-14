@@ -66,7 +66,7 @@ from crucible.features.depth import (
 )
 from crucible.gate import LADDER_STATES, STANDING_SLOS, Ladder, PhaseRow
 from crucible.keys import ALERTS_ROOT
-from crucible.models import BoardDeclarationRow
+from crucible.models import BoardCurrentDocument, BoardDeclarationRow
 from crucible.store import Store
 
 __all__ = [
@@ -1947,7 +1947,16 @@ def _component_row(component: Component, classification: Classification | None) 
 
 
 def board_payload(board: Board) -> bytes:
-    return json.dumps(board.to_dict(), indent=2, sort_keys=True).encode() + b"\n"
+    """`board/current.json` and every dated board key — one producer for
+    both. Validated through `BoardCurrentDocument` before it is serialised
+    (`alpha-engine-config-I10697`): the document this writes is exactly the
+    one `_read_previous_board` hands back to the next render as `previous`,
+    so a shape this producer could not itself construct through the model
+    must never reach a store key that a later render treats as trustworthy.
+    """
+    body = board.to_dict()
+    BoardCurrentDocument.model_validate(body)
+    return json.dumps(body, indent=2, sort_keys=True).encode() + b"\n"
 
 
 # ── The digest: deltas, not absolute state ────────────────────────────────
@@ -2001,10 +2010,17 @@ def board_delta(previous: dict[str, Any] | None, current: Board) -> list[RowDelt
     A `previous` of `None` — the first ever run — yields no deltas rather than
     a full board's worth of `appeared` rows, which would be noise on the one
     day the board itself is the news.
+
+    `previous` is validated through `BoardCurrentDocument`
+    (`alpha-engine-config-I10697`) before anything is read off it: a row
+    missing `state` or carrying an unknown field now raises a named
+    `pydantic.ValidationError` here, at the boundary, rather than a bare
+    `KeyError` inside the dict comprehension below.
     """
     if previous is None:
         return []
-    before = {row["id"]: row["state"] for row in previous.get("rows", [])}
+    doc = BoardCurrentDocument.model_validate(previous)
+    before = {row.id: row.state for row in doc.rows}
     after = {row.id: row.state for row in current.rows}
     deltas = [
         RowDelta(row_id, before.get(row_id), after.get(row_id))
@@ -2255,17 +2271,19 @@ def pointer_may_move(previous: dict[str, Any] | None, board: Board) -> tuple[boo
 
     An unreadable incumbent does NOT license a move. "I could not read what is
     there" is not "what is there is older", and on a pointer those two want
-    opposite actions.
+    opposite actions. "Unreadable" is `previous is None` — `_read_previous_board`
+    already collapsed a missing key and a failed read to that one value, and
+    both are handled above. Once `previous` is an actual dict it was read
+    successfully, and `alpha-engine-config-I10697` routes it through
+    `BoardCurrentDocument` before anything is indexed off it: a document
+    missing `trading_day` (or carrying an unknown field) now raises a named
+    `pydantic.ValidationError` here, replacing the hand-rolled
+    `isinstance`/truthiness check this migration retires everywhere else.
     """
     if previous is None:
         return True, "no incumbent pointer"
-    incumbent = previous.get("trading_day")
-    if not isinstance(incumbent, str) or not incumbent:
-        return False, (
-            "the incumbent board/current.json carries no trading_day, so this board "
-            "cannot be shown to be newer. Refusing to move the pointer: an unreadable "
-            "incumbent is not evidence that it is stale."
-        )
+    doc = BoardCurrentDocument.model_validate(previous)
+    incumbent = doc.trading_day
     if incumbent > board.trading_day:
         return False, (
             f"the incumbent board/current.json is for {incumbent}, which is later than "

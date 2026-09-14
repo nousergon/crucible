@@ -112,6 +112,9 @@ __all__ = [
     "ArmRecipeDocument",
     "ArtifactRef",
     "AttemptRow",
+    "BoardCurrentDocument",
+    "BoardCurrentHumanTouchDocument",
+    "BoardCurrentRowDocument",
     "BoardDeclarationRow",
     "ChampionAttestation",
     "ClosingReadingClauseRow",
@@ -2640,6 +2643,83 @@ class BoardDeclarationRow(_Strict):
     section: str = ""
     clause_class: str = ""
     planned_because: str = ""
+
+
+# ── alpha-engine-config-I10697: the RUNTIME board document ─────────────────
+# Distinct from `BoardDeclarationRow` above: that types `board.yaml`, the
+# declaration INPUT. This types `board/current.json`
+# (`crucible.board.BOARD_CURRENT_KEY`), the rendered OUTPUT every dated board
+# key also carries — what `crucible.board.board_delta` and
+# `crucible.board.pointer_may_move` read back as the PREVIOUS board on the
+# next render.
+
+
+class BoardCurrentRowDocument(_Strict):
+    """One entry of `board/current.json`'s `rows` array —
+    `crucible.board.BoardRow.to_dict()`'s own output shape, `_Strict` so a
+    field the writer stops emitting or a reader does not know about is a
+    named validation error rather than a silently-ignored key.
+    """
+
+    id: str
+    source: str
+    section: str = ""
+    title: str
+    state: str
+    console_state: str
+    detail: str
+    surface: str
+    artifact: str
+    means_when_red: str
+    last_read: str | None = None
+    #: `None` = no reading taken; `[]` = read, no clauses. Both legal.
+    clauses: list[dict[str, Any]] | None = None
+    setback: dict[str, Any] | None = None
+
+
+class BoardCurrentHumanTouchDocument(_Strict):
+    """`crucible.board.HumanTouchReading.to_dict()`'s shape."""
+
+    month: str
+    count: int
+    measured: bool
+    detail: str
+    actions: list[dict[str, Any]]
+
+
+class BoardCurrentDocument(_Strict):
+    """`board/current.json` (`crucible.board.BOARD_CURRENT_KEY`) — the
+    runtime board `crucible.board.board_payload` writes from
+    `crucible.board.Board.to_dict()`, and the artifact
+    `crucible.track_c._read_previous_board` hands back to the NEXT render as
+    `previous`, `alpha-engine-config-I10697`.
+
+    Out-of-scope residue from `alpha-engine-config-I10682`/`-I10045` row 11:
+    that migration typed `board.yaml` (`BoardDeclarationRow` above) but left
+    this separate artifact — the one `crucible.board.board_delta` and
+    `crucible.board.pointer_may_move` read back as `previous` — indexed by
+    hand. `_read_previous_board` stays on the guarded raw-dict read by
+    design (it must return `None`, not raise, on a genuinely absent key);
+    validation happens here, once, at both call sites, before either reads
+    `rows`/`id`/`state`/`trading_day` off the result — replacing a bare
+    `KeyError` (missing/renamed row field) and a hand-rolled
+    `isinstance`/truthiness check (missing/malformed `trading_day`) with one
+    named boundary error, per the `alpha-engine-config-I9847` pattern.
+
+    `extra="forbid"`, matching the model's own writer: this is a
+    `crucible`-owned artifact, not a third-party payload, so an unknown key
+    is an edit somebody made and nothing performed — never something a
+    future producer is allowed to add silently.
+    """
+
+    schema_version: str
+    trading_day: str
+    generated_at: str
+    counts: dict[str, int]
+    red_count: int
+    row_count: int
+    rows: list[BoardCurrentRowDocument]
+    human_touch_count: BoardCurrentHumanTouchDocument | None = None
 
 
 # ── I10045 row 12: the CloudTrail partition payload ────────────────────────
