@@ -39,6 +39,7 @@ __all__ = [
     "DISPATCH_ROOT",
     "DRIFT_INPUTS",
     "FAULT_INJECTION_ROOT",
+    "INTEGRATION_STORE_SUBPREFIX",
     "MANIFEST_BASENAME",
     "POINTER_KEY",
     "PREDICTIONS_PREFIX",
@@ -85,6 +86,7 @@ __all__ = [
     "holdout_unseal_key",
     "holdout_unseal_prefix",
     "iac_conformance_key",
+    "integration_store_key",
     "is_manifest_key",
     "ledger_key",
     "legacy_dead_lambdas_key",
@@ -149,6 +151,34 @@ RUNS_ROOT = "runs/"
 #: listing agree by construction. Consumers should prefer
 #: :func:`is_manifest_key`, which additionally checks the root and the arity.
 MANIFEST_BASENAME = "run.json"
+
+#: The one declaration of where the dedicated integration store sits relative
+#: to the production store's root — `alpha-engine-config-I10706`. The
+#: nightly integration tier (`.github/workflows/integration-nightly.yml`)
+#: writes through `CRUCIBLE_INTEGRATION_STORE_URI`, a repository variable
+#: whose value is the production root plus this sub-prefix
+#: (`tests/integration/conftest.py::integration_store_uri` refuses any URI
+#: that does not carry an `integration` path segment, for the same reason
+#: this file forbids literal infrastructure identifiers: it cannot compare
+#: against the production prefix by name). Every reader of the tier's
+#: manifests FROM the production store — today, only
+#: `crucible.gate._clause_integration_tier_current` — narrows through this
+#: constant rather than restating `"integration/"` as a literal, so a future
+#: change to the sub-prefix has exactly one place to change.
+INTEGRATION_STORE_SUBPREFIX = "integration/"
+
+
+def integration_store_key(relative_key: str) -> str:
+    """Translate a key or prefix relative to the dedicated integration store
+    (the shape every other key function in this module already produces —
+    `runs/test.integration/{day}/run.json`, `runs/test.integration/`) into
+    the real key under :data:`INTEGRATION_STORE_SUBPREFIX` in the production
+    store the phase gate reads. The one call site,
+    `crucible.gate._DedicatedSubtreeView`, translates every `Store` call at
+    this boundary through here rather than restating the shape inline
+    (`tests/test_no_inline_store_keys.py`).
+    """
+    return f"{INTEGRATION_STORE_SUBPREFIX}{relative_key}"
 
 #: The root namespace segment every alert bus row lives under, narrowed by
 #: `crucible.alerts.bus_key` (an architectural exception — see

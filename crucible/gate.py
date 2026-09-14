@@ -69,6 +69,7 @@ from crucible.holdout import (
 from crucible.keys import (
     ALERTS_ROOT,
     FAULT_INJECTION_ROOT,
+    INTEGRATION_STORE_SUBPREFIX,
     acceptance_reading_key,
     arena_cycle_key,
     arm_register_key,
@@ -76,6 +77,7 @@ from crucible.keys import (
     gate_key,
     gate_prefix,
     holdout_unseal_prefix,
+    integration_store_key,
     is_manifest_key,
     legacy_dead_lambdas_key,
     legacy_weekly_executions_key,
@@ -7472,6 +7474,65 @@ def _clause_sealed_holdout(store: Store, window: list[dt.date]) -> Clause:
 INTEGRATION_JOB = "test.integration"
 
 
+class _DedicatedSubtreeView(Store):
+    """A read-only view of `store` rooted at `crucible.keys.INTEGRATION_STORE_SUBPREFIX`
+    (`alpha-engine-config-I10706`).
+
+    The integration tier writes through `CRUCIBLE_INTEGRATION_STORE_URI`, whose
+    value is the production root plus that sub-prefix — so a manifest this gate
+    read used to look for at `runs/test.integration/{day}/run.json` actually
+    lives at `integration/runs/test.integration/{day}/run.json` in the store the
+    gate is pointed at. `crucible.keys.parse_manifest_key`/`is_manifest_key`
+    check a key against `RUNS_ROOT` from the STORE ROOT, so listing the
+    dedicated prefix directly and handing the raw keys to
+    `read_manifests_under` would have every one of them silently filtered out
+    as "not a manifest key" rather than misread — a second, quieter instance of
+    the same detector blindness this clause exists to close. This view instead
+    translates every key at the boundary, so `read_manifests_under` sees the
+    SAME relative shape (`runs/{job}/{day}/run.json`) it already knows how to
+    parse, and the caller re-attaches `INTEGRATION_STORE_SUBPREFIX` to name the
+    real key in evidence and messages.
+
+    Read-only by construction: every mutator raises. This clause never writes,
+    and a view that silently wrote outside the dedicated sub-prefix would be
+    exactly the identity boundary `tests/integration/conftest.py` and the
+    tier's own IAM scope both exist to prevent.
+    """
+
+    def __init__(self, store: Store) -> None:
+        self._store = store
+
+    def put_bytes(
+        self,
+        key: str,
+        payload: bytes,
+        *,
+        object_lock_mode: str | None = None,
+        object_lock_retain_until: dt.datetime | None = None,
+    ) -> str:
+        raise NotImplementedError("_DedicatedSubtreeView is read-only: this clause never writes")
+
+    def get_bytes(self, key: str) -> bytes:
+        return self._store.get_bytes(integration_store_key(key))
+
+    def exists(self, key: str) -> bool:
+        return self._store.exists(integration_store_key(key))
+
+    def list_keys(self, prefix: str = "") -> Iterable[str]:
+        strip = len(INTEGRATION_STORE_SUBPREFIX)
+        for key in self._store.list_keys(integration_store_key(prefix)):
+            yield key[strip:]
+
+    def etag(self, key: str) -> str:
+        return self._store.etag(integration_store_key(key))
+
+    def compare_and_swap(self, key: str, expected: str, payload: bytes) -> str:
+        raise NotImplementedError("_DedicatedSubtreeView is read-only: this clause never writes")
+
+    def presigned_url(self, key: str, expires_s: int) -> str:
+        return self._store.presigned_url(integration_store_key(key), expires_s)
+
+
 def _clause_integration_tier_current(store: Store, window: list[dt.date]) -> Clause:
     """The integration tier produced a fresh `ok` reading
     (`alpha-engine-config-I10460`, from `-I10419`).
@@ -7501,19 +7562,32 @@ def _clause_integration_tier_current(store: Store, window: list[dt.date]) -> Cla
     window": a tier that passed on Monday and has failed every night since
     would otherwise read MET off the Monday. Listing order is the day, so the
     last key is the latest.
+
+    **Read under the dedicated sub-prefix, never the bare production
+    prefix** (`alpha-engine-config-I10706`). The tier writes through
+    `CRUCIBLE_INTEGRATION_STORE_URI`, the production root plus
+    `crucible.keys.INTEGRATION_STORE_SUBPREFIX` — a manifest at the bare
+    `runs/test.integration/{day}/run.json` was never written by the real
+    tier and satisfies nothing here.
     """
     name = "integration_tier_current_and_ok"
-    prefix = runs_prefix(INTEGRATION_JOB)
+    relative_prefix = runs_prefix(INTEGRATION_JOB)
+    prefix = f"{INTEGRATION_STORE_SUBPREFIX}{relative_prefix}"
     requirement = (
-        f"the most recent `{INTEGRATION_JOB}` run manifest under `{prefix}` is filed on a "
-        "trading day inside this gate's own window and reads status `ok`. No reading at "
-        "all is UNMET — the tier producing nothing is a finding about the system, not "
-        "about our access"
+        f"the most recent `{INTEGRATION_JOB}` run manifest under `{prefix}` (the "
+        "dedicated integration store's sub-prefix of the production store, "
+        "`crucible.keys.INTEGRATION_STORE_SUBPREFIX`) is filed on a trading day inside "
+        "this gate's own window and reads status `ok`. No reading at all is UNMET — the "
+        "tier producing nothing is a finding about the system, not about our access"
     )
-    read = read_manifests_under(store, prefix)
+    tier_store = _DedicatedSubtreeView(store)
+    read = read_manifests_under(tier_store, relative_prefix)
     if read.listing_problem is not None:
         return _unmeasurable(name, requirement, read.listing_problem, (prefix,))
-    evidence = tuple([key for key, _ in read.documents] + sorted(read.faults)) or (prefix,)
+    evidence = tuple(
+        [f"{INTEGRATION_STORE_SUBPREFIX}{key}" for key, _ in read.documents]
+        + sorted(f"{INTEGRATION_STORE_SUBPREFIX}{fault_key}" for fault_key in read.faults)
+    ) or (prefix,)
     if not read.documents:
         if read.faults:
             # Every manifest there is unreadable: we know nothing about the
@@ -7535,12 +7609,13 @@ def _clause_integration_tier_current(store: Store, window: list[dt.date]) -> Cla
             evidence,
         )
     key, document = read.documents[-1]
+    dedicated_key = f"{INTEGRATION_STORE_SUBPREFIX}{key}"
     parsed = parse_manifest_key(key)
     if parsed is None:
         # Unreachable via `read_manifests_under` (it keeps manifest keys only)
         # and asserted rather than assumed: the day comes from the KEY, which
         # is what the store actually holds.
-        return Clause(name, requirement, False, f"{key} is not a manifest key", evidence)
+        return Clause(name, requirement, False, f"{dedicated_key} is not a manifest key", evidence)
     day = parsed[1]
     faults_note = (
         f"; {len(read.faults)} other manifest(s) unreadable: "
@@ -7554,12 +7629,12 @@ def _clause_integration_tier_current(store: Store, window: list[dt.date]) -> Cla
             name,
             requirement,
             False,
-            f"{key} is the most recent {INTEGRATION_JOB} reading and is filed on {day}, "
-            f"before this gate's window opens on {oldest}. A stale pass is not a pass: "
-            f"nothing says the real-store path still works{faults_note}",
+            f"{dedicated_key} is the most recent {INTEGRATION_JOB} reading and is filed "
+            f"on {day}, before this gate's window opens on {oldest}. A stale pass is not "
+            f"a pass: nothing says the real-store path still works{faults_note}",
             evidence,
         )
-    status, problem = _status(key, document)
+    status, problem = _status(dedicated_key, document)
     if problem is not None:
         return Clause(name, requirement, False, problem + faults_note, evidence)
     if status != "ok":
@@ -7567,7 +7642,7 @@ def _clause_integration_tier_current(store: Store, window: list[dt.date]) -> Cla
             name,
             requirement,
             False,
-            f"{key}: the most recent {INTEGRATION_JOB} reading is `{status}` — "
+            f"{dedicated_key}: the most recent {INTEGRATION_JOB} reading is `{status}` — "
             f"{document['reason']}{faults_note}",
             evidence,
         )
@@ -7575,8 +7650,8 @@ def _clause_integration_tier_current(store: Store, window: list[dt.date]) -> Cla
         name,
         requirement,
         True,
-        f"{key}: {INTEGRATION_JOB} read `ok` on {day}, inside this gate's window opening "
-        f"on {oldest}{faults_note}",
+        f"{dedicated_key}: {INTEGRATION_JOB} read `ok` on {day}, inside this gate's "
+        f"window opening on {oldest}{faults_note}",
         evidence,
     )
 
