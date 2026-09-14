@@ -13,6 +13,13 @@ own window is UNMET however green it was; and NO reading at all is UNMET —
 never UNMEASURABLE, because a prefix we listed successfully and found empty is
 an answer about the system. Only a failed READING (a listing we could not take,
 manifests we could not parse) is UNMEASURABLE.
+
+**`alpha-engine-config-I10706`.** The tier writes through
+`CRUCIBLE_INTEGRATION_STORE_URI`, the production root plus
+`crucible.keys.INTEGRATION_STORE_SUBPREFIX` — never the bare production
+prefix. `_seed` below writes where the real writer writes; a dedicated
+mutation test below shows a manifest at the OLD bare-prefix location does
+not satisfy this clause.
 """
 
 from __future__ import annotations
@@ -27,7 +34,7 @@ from crucible.gate import (
     _clause_integration_tier_current,
     weekly_window,
 )
-from crucible.keys import runs_prefix
+from crucible.keys import INTEGRATION_STORE_SUBPREFIX, runs_prefix
 from crucible.manifest import manifest_key
 from crucible.store import LocalStore
 
@@ -55,7 +62,27 @@ def _manifest(day: dt.date, *, status: str = "ok", reason: str = "") -> bytes:
     ).encode()
 
 
+def _dedicated_key(day: dt.date, *, discriminator: str | None = None) -> str:
+    """Where the real `test.integration` writer files a manifest: the
+    dedicated integration store's sub-prefix of the production store."""
+    key = manifest_key(INTEGRATION_JOB, day.isoformat(), discriminator=discriminator)
+    return f"{INTEGRATION_STORE_SUBPREFIX}{key}"
+
+
 def _seed(store: LocalStore, day: dt.date, *, status: str = "ok", reason: str = "") -> str:
+    """Write a manifest exactly where the real integration-tier writer does:
+    under the dedicated sub-prefix of the production store this clause reads."""
+    key = _dedicated_key(day)
+    store.put_bytes(key, _manifest(day, status=status, reason=reason))
+    return key
+
+
+def _seed_bare_production_prefix(
+    store: LocalStore, day: dt.date, *, status: str = "ok", reason: str = ""
+) -> str:
+    """Write a manifest at the OLD, WRONG location — the bare production
+    `runs/test.integration/...` prefix the tier never writes to. Used only to
+    prove this location no longer satisfies the clause."""
     key = manifest_key(INTEGRATION_JOB, day.isoformat())
     store.put_bytes(key, _manifest(day, status=status, reason=reason))
     return key
@@ -123,7 +150,7 @@ class TestAbsenceIsUnmetAndUnreadabilityIsUnmeasurable:
         clause = _clause_integration_tier_current(store, _window())
         assert not clause.met
         assert not clause.unmeasurable, clause.detail
-        assert runs_prefix(INTEGRATION_JOB) in clause.detail
+        assert f"{INTEGRATION_STORE_SUBPREFIX}{runs_prefix(INTEGRATION_JOB)}" in clause.detail
 
     def test_a_listing_we_could_not_take_is_unmeasurable(self, tmp_path: object) -> None:
         store = _UnlistableStore(tmp_path)  # type: ignore[arg-type]
@@ -133,7 +160,7 @@ class TestAbsenceIsUnmetAndUnreadabilityIsUnmeasurable:
 
     def test_manifests_none_of_which_parse_is_unmeasurable(self, tmp_path: object) -> None:
         store = LocalStore(tmp_path)  # type: ignore[arg-type]
-        store.put_bytes(manifest_key(INTEGRATION_JOB, _window()[-1].isoformat()), b"not json")
+        store.put_bytes(_dedicated_key(_window()[-1]), b"not json")
         clause = _clause_integration_tier_current(store, _window())
         assert clause.unmeasurable and not clause.met, clause.detail
 
@@ -141,11 +168,61 @@ class TestAbsenceIsUnmetAndUnreadabilityIsUnmeasurable:
         self, tmp_path: object
     ) -> None:
         store = LocalStore(tmp_path)  # type: ignore[arg-type]
-        key = manifest_key(INTEGRATION_JOB, _window()[-1].isoformat())
+        key = _dedicated_key(_window()[-1])
         store.put_bytes(key, json.dumps({"job": INTEGRATION_JOB, "status": "degraded"}).encode())
         clause = _clause_integration_tier_current(store, _window())
         assert not clause.met and not clause.unmeasurable, clause.detail
         assert key in clause.detail
+
+
+class TestTheDedicatedSubprefixIsTheOnlyLocationThatCounts:
+    """`alpha-engine-config-I10706`. The tier writes under
+    `INTEGRATION_STORE_SUBPREFIX` of the production store; a manifest at the
+    old bare production prefix was never written by the real tier and must
+    not satisfy this clause — the mutation this fix exists to catch."""
+
+    def test_a_manifest_at_the_old_bare_prefix_does_not_satisfy_the_clause(
+        self, tmp_path: object
+    ) -> None:
+        store = LocalStore(tmp_path)  # type: ignore[arg-type]
+        _seed_bare_production_prefix(store, _window()[-1])
+        clause = _clause_integration_tier_current(store, _window())
+        assert not clause.met
+        assert not clause.unmeasurable, clause.detail
+        assert f"{INTEGRATION_STORE_SUBPREFIX}{runs_prefix(INTEGRATION_JOB)}" in clause.detail
+
+    def test_the_dedicated_prefix_reading_ignores_a_bare_prefix_decoy(
+        self, tmp_path: object
+    ) -> None:
+        """A manifest at BOTH locations reads MET off the dedicated one only —
+        the bare-prefix decoy is not evidence and is not consulted."""
+        store = LocalStore(tmp_path)  # type: ignore[arg-type]
+        _seed_bare_production_prefix(store, _window()[-1], status="failed", reason="decoy")
+        key = _seed(store, _window()[-1])
+        clause = _clause_integration_tier_current(store, _window())
+        assert clause.met, clause.detail
+        assert key in clause.evidence
+        assert "decoy" not in clause.detail
+
+
+def test_the_dedicated_subprefix_constant_matches_the_workflows_variable_shape() -> None:
+    """`alpha-engine-config-I10706`. `CRUCIBLE_INTEGRATION_STORE_URI`
+    (`.github/workflows/integration-nightly.yml`) is the production store's
+    root plus this sub-prefix — `tests/integration/conftest.py::
+    integration_store_uri` independently refuses any URI whose path does not
+    carry an `integration` segment, since this repo forbids naming the
+    production prefix literally to compare against. Both guards describe the
+    SAME shape; this asserts `crucible.keys.INTEGRATION_STORE_SUBPREFIX` is
+    that shape, so a future change to the separator has one place to change
+    rather than two independently-derived checks silently drifting apart."""
+    production_root = "s3://EXAMPLE-BUCKET/crucible"
+    dedicated_uri = f"{production_root}/{INTEGRATION_STORE_SUBPREFIX}".rstrip("/")
+    assert dedicated_uri.endswith(f"/{INTEGRATION_STORE_SUBPREFIX.rstrip('/')}")
+    segments = dedicated_uri.replace("s3://", "").strip("/").split("/")
+    assert "integration" in segments, segments
+    assert INTEGRATION_STORE_SUBPREFIX.endswith("/"), (
+        "must be a prefix (trailing slash), not a bare segment"
+    )
 
 
 @pytest.mark.parametrize("status", ["ok", "failed"])
