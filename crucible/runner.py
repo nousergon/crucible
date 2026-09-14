@@ -38,7 +38,7 @@ import sys
 import traceback
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from crucible.calendar import assert_trading_day, resolve_trading_day
@@ -63,6 +63,7 @@ __all__ = [
     "SpotInterruptionError",
     "TRANSIENT_CLASSIFIERS",
     "classify_transient",
+    "rebind_trading_day",
     "resolve_code_sha",
     "run_job",
     "spot_interruption_guard",
@@ -675,6 +676,26 @@ class RunContext:
             {"key": key, "sha256": sha256_hex(payload), "schema_version": schema_version}
         )
         return version
+
+
+def rebind_trading_day(ctx: RunContext, day: dt.date) -> RunContext:
+    """A view of ``ctx`` bound to another session, sharing its telemetry lists.
+
+    A RANGE job — `data.heal` over a gap, `experiment.backfill` over an arm's
+    history — is ONE job and writes ONE manifest, but each session inside the
+    range must key its artifacts to its own trading day. This returns a
+    shallow copy bound to ``day`` whose `inputs`, `outputs`, `metrics` and
+    `rows_rejected` are the SAME list objects by reference, so every
+    session's telemetry lands on the one manifest the range writes rather
+    than in per-day manifests nothing would read.
+
+    Lifted here on its second adoption (`policy-shared-code`;
+    `alpha-engine-config-I10696`) from `crucible.data.heal`, where it was
+    `_rebind`: the property it guarantees — shared lists, rebound day — is a
+    `RunContext` property, and a second private copy in a second module is
+    the shape that diverges the first time `RunContext` gains a list field.
+    """
+    return replace(ctx, trading_day=day)
 
 
 def run_job(

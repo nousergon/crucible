@@ -414,6 +414,16 @@ JOBS: dict[str, JobSpec] = {
     "experiment.new": JobSpec("experiment.new", "Register an immutable arm from a recipe", False),
     "experiment.run": JobSpec("experiment.run", "Score one arm for one trading day", True),
     "experiment.grade": JobSpec("experiment.grade", "Run one slot's arena cycle", True),
+    # alpha-engine-config-I10696 (Brian's ruling (a), 2026-09-14). On-demand,
+    # like `data.heal`: it repairs a HISTORY, and a schedule that produced an
+    # arm's past on a clock would be a second producer of the artifacts the
+    # weekly arc already writes. `deadline: null` in components.yaml follows
+    # from that — a dispatch record is what makes its absence gradeable.
+    "experiment.backfill": JobSpec(
+        "experiment.backfill",
+        "Produce one arm's history over a session range, point-in-time",
+        False,
+    ),
     "promote": JobSpec("promote", "Move a slot's champion pointer, evidence-gated", False),
     "report": JobSpec("report", "Reduce the week's manifests into the attribution table", True),
     "explain": JobSpec("explain", "Walk a run_id or verdict back to what produced it", False),
@@ -684,7 +694,13 @@ def build_parser() -> argparse.ArgumentParser:
             metavar="URI",
             help="Store root: an s3://bucket/prefix URI or a local directory path.",
         )
-        if spec.name in ("experiment.run", "experiment.grade", "promote", "experiment.new"):
+        if spec.name in (
+            "experiment.run",
+            "experiment.grade",
+            "experiment.backfill",
+            "promote",
+            "experiment.new",
+        ):
             sub.add_argument("--slot", choices=["u", "r", "m", "s"], required=True)
         if spec.name == "promote":
             # track-B. The revert is one command by design: a rollback that
@@ -709,17 +725,20 @@ def build_parser() -> argparse.ArgumentParser:
                 help="Why. Mandatory with --revert-to: an unexplained operator "
                 "override is the one pointer movement nobody can reconstruct later.",
             )
-        if spec.name in ("experiment.run", "experiment.new"):
+        if spec.name in ("experiment.run", "experiment.new", "experiment.backfill"):
             # track-A: NOT required for `experiment.run`. Policy §3 scores every
             # registered arm every cycle, so the default is "all of them"; naming
             # one narrows the run to it, which is a debugging affordance rather
             # than the normal path. `experiment.new` still requires it, because
             # registering "whichever arms happen to be on disk" is not a
-            # deliberate act.
+            # deliberate act — and `experiment.backfill` requires it for the
+            # same reason one layer on: a backfill of "every arm, for two
+            # years" is a bill and a blast radius nobody chose
+            # (alpha-engine-config-I10696).
             sub.add_argument(
                 "--arm",
                 metavar="NAME|ARM_ID",
-                required=spec.name == "experiment.new",
+                required=spec.name in ("experiment.new", "experiment.backfill"),
                 help=(
                     "Restrict to one arm, by bare name or by registered "
                     "`{slot}:{name}:{spec_hash}` id — `experiment.new` prints ids, so "

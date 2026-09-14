@@ -739,8 +739,17 @@ def _assert_base_predictions_present(
         f"{len(dates)} panel session(s) (first {missing[0]}, last {missing[-1]}). A "
         f"stacked arm reads {ref.text!r} on every row of its training window, so a gap is "
         "a refusal rather than a hole — a substituted zero is the 2026-08-28 hard-zeroed "
-        "condition by another door. Produce them with:\n"
-        f"    crucible experiment.run --slot m --arm {ref.ref} --trading-day <session>"
+        # The tracker for this instruction is alpha-engine-config-I10696
+        # (Brian's ruling (a), 2026-09-14); it is cited HERE, in a comment,
+        # never in the string — a literal issue number in operator-facing
+        # text is what tests/test_no_stale_tracker_literals.py forbids.
+        "condition by another door. Produce the whole range with ONE job:\n"
+        f"    crucible experiment.backfill --slot m --arm {ref.ref} "
+        f"--from {missing[0]} --to {missing[-1]} --run-mode replay\n"
+        "A per-session loop over `experiment.run` is NOT the instruction any "
+        "more: the weekly arc adds one base session per week, so a stacked "
+        "arm's training window is unreachable from the schedule alone and "
+        "reachable from one dispatch of the range."
     )
 
 

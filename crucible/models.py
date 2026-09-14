@@ -330,6 +330,7 @@ JOB_VALUES: tuple[str, ...] = (
     "data.heal",
     "experiment.new",
     "experiment.run",
+    "experiment.backfill",
     "experiment.grade",
     "promote",
     "report",

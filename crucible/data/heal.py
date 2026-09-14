@@ -39,6 +39,7 @@ from crucible.calendar import assert_trading_day, is_trading_day
 from crucible.data.daily import DEFAULT_LOOKBACK_DAYS, run_daily
 from crucible.data.sources import PriceSource
 from crucible.keys import data_panel_key, heal_key
+from crucible.runner import rebind_trading_day
 
 if TYPE_CHECKING:
     from crucible.runner import RunContext
@@ -165,7 +166,7 @@ def run_heal(
         # The day is recompiled either way. "Present" is not "correct": the
         # gap being healed may be a panel that exists and is wrong, and a
         # heal that skipped every existing key could never repair one.
-        day_ctx = _rebind(ctx, day)
+        day_ctx = rebind_trading_day(ctx, day)
         run_daily(
             day_ctx,
             source=source,
@@ -209,17 +210,3 @@ def run_heal(
         schema_version="heal.v1",
     )
     return result
-
-
-def _rebind(ctx: RunContext, day: dt.date) -> RunContext:
-    """A view of ``ctx`` bound to another session, sharing its telemetry lists.
-
-    The heal writes ONE manifest for the whole range — it is one job — but
-    each session's compile must key its artifacts to its own trading day.
-    The lists are shared by reference on purpose, so every session's inputs
-    and outputs land in the one manifest rather than in per-day manifests
-    that nothing would read.
-    """
-    from dataclasses import replace
-
-    return replace(ctx, trading_day=day)

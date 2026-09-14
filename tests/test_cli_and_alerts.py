@@ -30,10 +30,21 @@ UNIMPLEMENTED = sorted(job for job in JOBS if is_stub(HANDLERS[job]))
 def _minimal_argv(job: str) -> list[str]:
     """The fewest arguments that make ``job`` parse."""
     argv = [job]
-    if job in ("experiment.run", "experiment.grade", "promote", "experiment.new"):
+    if job in (
+        "experiment.run",
+        "experiment.grade",
+        "experiment.backfill",
+        "promote",
+        "experiment.new",
+    ):
         argv += ["--slot", "r"]
-    if job in ("experiment.run", "experiment.new"):
+    if job in ("experiment.run", "experiment.new", "experiment.backfill"):
         argv += ["--arm", "arm_abc"]
+    if job == "experiment.backfill":
+        # alpha-engine-config-I10696: a range job, like data.heal. Both bounds
+        # are required — a backfill that defaulted one end would produce a
+        # range nobody named.
+        argv += ["--from", "2026-08-24", "--to", "2026-08-28"]
     if job == "explain":
         argv += ["01JG0000000000000000000000"]
     if job == "release.pin":
@@ -115,6 +126,12 @@ class TestJobSurface:
             "data.heal",
             "experiment.new",
             "experiment.run",
+            # alpha-engine-config-I10696 (Brian's ruling (a), 2026-09-14):
+            # one arm's history over a session range, produced through the
+            # slot's OWN per-arm produce path. On-demand — it repairs a
+            # history, and a stacked arm's training window is unreachable
+            # from the weekly cadence alone.
+            "experiment.backfill",
             "experiment.grade",
             "promote",
             "report",
@@ -507,6 +524,10 @@ class TestDryRunNeverWrites:
         "alerts.sweep",
         "board",
         "console",
+        # alpha-engine-config-I10696: its --dry-run branch resolves the range
+        # and the host and prints, before `run_job` is reached — so a fresh
+        # store gains nothing, the same shape `data.heal`'s dry run has.
+        "experiment.backfill",
         "experiment.grade",
         "experiment.run",
         "gate",

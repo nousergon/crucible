@@ -189,6 +189,38 @@ components:
       cadence: weekly
       at: "12:00"
 
+  experiment.backfill:
+    description: >-
+      Produce one arm's history over a session range, point-in-time, through
+      the slot's own per-arm produce path (alpha-engine-config-I10696). A
+      stacked arm reads its base's prediction on every row of its training
+      window, and a weekly arc adds one base session per week, so a 504-session
+      window is unreachable from the schedule alone.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd,llm_calls
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs,rows_in,rows_out,rows_rejected
+      # A backfill produces no graded outcome of its own; the sessions it
+      # writes are scored by experiment.grade like any other session.
+      # Declared null rather than omitted.
+      outcome: null
+    log_location: /crucible/experiment.backfill
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/arms
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    # On-demand, like data.heal: it repairs a HISTORY. A schedule here would
+    # be a second producer of the artifacts the weekly arc already writes, so
+    # there is no cadence for the deadline table to grade — its absence is
+    # graded from the dispatcher's own record instead
+    # (crucible.alerts.evaluate_dispatch_absence).
+    schedule: null
+    dispatch: null
+    deadline: null
+
   experiment.grade:
     description: Run one slot's arena cycle — ladder, pairings, pointer, retirements.
     lifecycle: ACTIVE

@@ -29,6 +29,16 @@ DISPATCHED_AT = dt.datetime(2026, 8, 28, 4, 3, tzinfo=dt.UTC)
 #: Resolves to the PRIOR session (2026-08-27): before close on the 28th.
 DISPATCH_TRADING_DAY = dt.date(2026, 8, 27)
 
+#: The day the DEFAULT fixture dispatch's manifest actually lands under —
+#: `--to`, not the dispatch clock (`alpha-engine-config-I10696`). A range job
+#: (`data.heal`, `experiment.backfill`) passes `trading_day=end` to `run_job`
+#: and carries no `--date` at all, so grading it against the wall clock
+#: listed a prefix the manifest was never going to be written to and paged an
+#: ABSENCE for a run whose artifact exists. `experiment.backfill` is
+#: dispatched in chunks over historical ranges, so every one of them would
+#: have produced that false page.
+DISPATCH_TARGET_TRADING_DAY = dt.date(2025, 1, 21)
+
 #: Ten hours after DISPATCHED_AT — the exact gap the issue was filed over,
 #: comfortably past DISPATCH_ABSENCE_HORIZON.
 PAST_HORIZON = DISPATCHED_AT + dt.timedelta(hours=10)
@@ -79,7 +89,7 @@ class TestDispatchAbsence:
             Page(
                 condition="absence",
                 job="data.heal",
-                trading_day=DISPATCH_TRADING_DAY,
+                trading_day=DISPATCH_TARGET_TRADING_DAY,
                 reason=pages[0].reason,
             )
         ]
@@ -103,7 +113,7 @@ class TestDispatchAbsence:
         store = LocalStore(tmp_path)
         _write_dispatch(store)
         store.put_bytes(
-            manifest_key("data.heal", DISPATCH_TRADING_DAY.isoformat()),
+            manifest_key("data.heal", DISPATCH_TARGET_TRADING_DAY.isoformat()),
             json.dumps({"status": "ok"}).encode(),
         )
         assert (
@@ -119,7 +129,9 @@ class TestDispatchAbsence:
         store = LocalStore(tmp_path)
         _write_dispatch(store)
         store.put_bytes(
-            manifest_key("data.heal", DISPATCH_TRADING_DAY.isoformat(), discriminator="r1of4"),
+            manifest_key(
+                "data.heal", DISPATCH_TARGET_TRADING_DAY.isoformat(), discriminator="r1of4"
+            ),
             json.dumps({"status": "ok"}).encode(),
         )
         assert (
@@ -193,16 +205,22 @@ class TestDispatchAbsence:
         scheduled_page = Page(
             condition="absence",
             job="data.daily",
-            trading_day=DISPATCH_TRADING_DAY,
-            reason="no manifest under runs/data.daily/2026-08-27/; due ...",
+            trading_day=DISPATCH_TARGET_TRADING_DAY,
+            reason="no manifest under runs/data.daily/2025-01-21/; due ...",
         )
         assert cause_key(dispatch_page) == cause_key(scheduled_page)
 
     def test_dry_run_sweep_never_writes_a_bus_row_for_a_dispatch_absence(self, tmp_path) -> None:
         """Same `alpha-engine-config-I9922` R2-1 guarantee `sweep(dry_run=True)`
-        already gives scheduled absences: reading, never emitting."""
+        already gives scheduled absences: reading, never emitting.
+
+        An UNDATED dispatch (no `--date`, no `--to`) so this stays a
+        single-incident fixture: a dated or ranged one is graded against the
+        day it names, which is a different `cause_key` from the scheduled
+        absences the same sweep finds — correct, and beside the point here.
+        """
         store = LocalStore(tmp_path)
-        _write_dispatch(store)
+        _write_dispatch(store, args="--gap missing-panel")
         summary = sweep(
             store,
             now=PAST_HORIZON,
@@ -398,9 +416,14 @@ class TestTheGradedDayComesFromTheArgsNotTheClock:
 
     def test_an_undated_dispatch_still_grades_against_the_dispatch_clock(self, tmp_path) -> None:
         """The on-demand case `alpha-engine-config-I10134` was written for is
-        unchanged — this is a refinement of that behaviour, not a replacement."""
+        unchanged — this is a refinement of that behaviour, not a replacement.
+
+        A dispatch naming NEITHER `--date` nor `--to` — `alpha-engine-config-
+        I10696` added the second — is the case that genuinely has nothing but
+        the clock to be graded against.
+        """
         store = LocalStore(tmp_path)
-        _write_dispatch(store)
+        _write_dispatch(store, args="--gap missing-panel")
         [page] = evaluate_dispatch_absence(
             store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
         )
