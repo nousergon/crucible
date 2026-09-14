@@ -510,6 +510,79 @@ CATALOG: tuple[FeatureSpec, ...] = (
         inputs=("momentum_change_21d_log_return", "liquidity_pass_raw"),
         cross_sectional=True,
     ),
+    # -- the v3.0-meta L1 inputs (alpha-engine-config-I10695) -----------------
+    #
+    # The columns v1's serving model `v3.0-meta` reads for its momentum and
+    # volatility heads that this layer did not already produce. Each is the v1
+    # definition (`nousergon-data/features/feature_engineer.py`) re-expressed
+    # under this layer's rules: a units suffix, a finite window (so a value
+    # never depends on where the producer's panel starts), and a null where
+    # v1 substituted a constant. The deltas are named per column.
+    FeatureSpec(
+        name="momentum_5d_log_return",
+        market_wide=False,
+        unit="log_return",
+        expression="log(close) - log(close).shift(5)",
+        description=(
+            "Trailing 5-session log return. v1's `momentum_5d` was the simple return "
+            "over the same window."
+        ),
+        inputs=("close_raw",),
+        window_trading_days=5,
+    ),
+    FeatureSpec(
+        name="atr_14_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression=(
+            "mean(max(high - low, |high - close.shift(1)|, |low - close.shift(1)|), 14) / close"
+        ),
+        description=(
+            "14-session average true range over close. A simple mean rather than v1's "
+            "`atr_14_pct` EWM: an EWM has infinite memory, so its value would depend on "
+            "how deep a panel the producer was handed and a heal would not reproduce "
+            "a daily compile."
+        ),
+        inputs=("high_raw", "low_raw", "close_raw"),
+        window_trading_days=14,
+    ),
+    FeatureSpec(
+        name="vol_ratio_10_60_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression="std(return_1d_log_return, 10) / std(return_1d_log_return, 60)",
+        description=(
+            "Short over long realised volatility of daily log returns (sample std, "
+            "ddof=1, as v1). Null where the 60-session volatility is zero; v1 filled "
+            "that case with 1.0."
+        ),
+        inputs=("return_1d_log_return",),
+        window_trading_days=60,
+    ),
+    FeatureSpec(
+        name="dist_from_52w_high_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression="close / max(close, 252) - 1",
+        description=(
+            "Fractional distance below the 252-session closing high; 0 at the high, "
+            "negative below it."
+        ),
+        inputs=("close_raw",),
+        window_trading_days=252,
+    ),
+    FeatureSpec(
+        name="dist_from_52w_low_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression="close / min(close, 252) - 1",
+        description=(
+            "Fractional distance above the 252-session closing low; 0 at the low, "
+            "positive above it."
+        ),
+        inputs=("close_raw",),
+        window_trading_days=252,
+    ),
 )
 
 
