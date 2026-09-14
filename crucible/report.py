@@ -69,6 +69,14 @@ from crucible.aggregation import MemberRow, member_dicts, worst_member
 from crucible.calendar import previous_trading_day
 from crucible.data.daily import COVERAGE_FLOOR_RATIO
 from crucible.documents import load_store_document
+from crucible.execution import (
+    DECISION_PRICE_BASIS,
+    EXECUTION_N_FLOOR,
+    EXECUTION_SHORTFALL_SCHEMA_VERSION,
+    TRADER_EXECUTION_SHORTFALL_PREFIX,
+    reduce_execution_window,
+    weighted_shortfall_ci,
+)
 from crucible.keys import arena_cycle_key, attribution_key, champion_key, experiments_prefix
 from crucible.manifest import manifest_key
 from crucible.models import ArenaCycleDocument, ChampionPointerDocument
@@ -231,7 +239,7 @@ ROWS: tuple[RowSpec, ...] = (
     ),
     RowSpec(
         name="execution_shortfall_bps",
-        module="crucible.executor",
+        module="crucible_trader.execution_shortfall",
         unit="bps",
         metric_type="ratio",
         slot=None,
@@ -296,7 +304,7 @@ def build_attribution(
         elif spec.slot is not None:
             row = _slot_row(store, spec, trading_day=trading_day, now=now, sources=sources)
         else:
-            row = _execution_row(spec, now=now)
+            row = _execution_row(store, spec, trading_day=trading_day, now=now, sources=sources)
         rows.append(row)
 
     if len(rows) != len(ROWS):
@@ -773,34 +781,144 @@ def _rank_ic_row(
     )
 
 
-def _execution_row(spec: RowSpec, *, now: dt.datetime) -> dict[str, Any]:
-    """Execution shortfall — the trader's row, and the trader is not v2 phase 1.
+def _execution_row(
+    store: Store,
+    spec: RowSpec,
+    *,
+    trading_day: dt.date,
+    now: dt.datetime,
+    sources: list[str],
+) -> dict[str, Any]:
+    """Execution shortfall — the trader's row, reduced from what the trader filed.
 
-    ``N/A-NOT-IMPL`` rather than a zero or a silence: §4.5 lists this row as
-    "execution shortfall (trader, when present)", the harness must pass every
-    acceptance test with the trader switched off, and a row that vanished when
-    its producer was absent would make the table's shape depend on which
-    systems happened to be running.
+    `alpha-engine-config-I10652`. The row arrives the way every other
+    producer's does: the trader writes `execution_shortfall.v1` per session
+    (per-order implementation shortfall against the price at the SIZING
+    DECISION instant, plus a `MetricRecord`), and this reducer pools the
+    window's orders. The harness never reaches into the trader.
+
+    **"When present" is absence semantics, and each absence is named.**
+
+    * No artifact for any session in the window → ``N/A-NOT-RUN``: the trader
+      is switched off, which the harness must tolerate (plan §3).
+    * Artifacts, but every one says ``no_orders`` → ``N/A-LOW-N`` with the
+      reason saying no order was placed — a fact, not a failure.
+    * Any session says ``not_computed`` → ``RED``: orders were placed and
+      shortfall was not measured, which is a producer failure and must never
+      read as a quiet week.
+    * Otherwise the value is the NOTIONAL-WEIGHTED shortfall in bps, with a
+      weighted bootstrap CI, graded lower-is-better against the declared band
+      (``target`` = baseline, ``red_line`` = upper). The absolute companions —
+      filled notional and shortfall in dollars — ride on the row, because a
+      ratio alone renders healthy on a book that has collapsed to nothing.
     """
+    window = _window(trading_day)
+    days = [d.isoformat() for d in window]
+    reading = reduce_execution_window(store, days)
+    sources.extend(reading.sources)
+    first, last = days[0], days[-1]
+    extra: dict[str, Any] = {
+        "decision_price_basis": DECISION_PRICE_BASIS,
+        "notional_usd": reading.notional_usd,
+        "shortfall_usd": reading.shortfall_usd,
+        "n_orders_filled": reading.n_filled,
+        "band": reading.band,
+        "sessions_missing": list(reading.missing),
+        "sessions_no_orders": list(reading.no_orders),
+        "sessions_not_computed": [d for d, _ in reading.not_computed],
+    }
+    if not reading.filed_any:
+        return _row(
+            spec,
+            value=None,
+            ci=(None, None),
+            n_samples=0,
+            baseline=0.0,
+            now=now,
+            source_path=TRADER_EXECUTION_SHORTFALL_PREFIX,
+            ran=False,
+            window=window,
+            n_floor=EXECUTION_N_FLOOR,
+            extra=extra,
+            reason=(
+                f"the trader filed no {EXECUTION_SHORTFALL_SCHEMA_VERSION} artifact under "
+                f"{TRADER_EXECUTION_SHORTFALL_PREFIX} for any of the {len(days)} sessions "
+                f"{first}..{last}; the trader is a separate system and is not running into "
+                "this store, and the row is declared rather than omitted so the table's "
+                "shape does not change with which systems happen to be running"
+            ),
+        )
+    band = reading.band or {}
+    baseline = float(band["baseline_bps"])
+    upper = float(band["upper_bps"])
+    band_phrase = f"band [{baseline:+.2f}, {upper:+.2f}] bps" + (
+        " (PLACEHOLDER band, not a calibrated tolerance)" if reading.placeholder_band else ""
+    )
+    missing_phrase = (
+        f"; no artifact for session(s) {list(reading.missing)}" if reading.missing else ""
+    )
+    weighted = reading.weighted_bps
+    low, high = weighted_shortfall_ci(reading.order_bps, reading.order_notional)
+    if reading.not_computed:
+        failures = "; ".join(f"{d}: {why}" for d, why in reading.not_computed)
+        return _row(
+            spec,
+            value=weighted,
+            ci=(low, high),
+            n_samples=reading.n_filled,
+            baseline=baseline,
+            now=now,
+            source_path=TRADER_EXECUTION_SHORTFALL_PREFIX,
+            window=window,
+            n_floor=EXECUTION_N_FLOOR,
+            target=baseline,
+            red_line=upper,
+            forced_status="RED",
+            extra=extra,
+            reason=(
+                f"orders were placed and shortfall was NOT computed on "
+                f"{len(reading.not_computed)} session(s) in {first}..{last} — a producer "
+                f"failure, not an absence: {failures}; {band_phrase}{missing_phrase}"
+            ),
+        )
+    if weighted is None:
+        return _row(
+            spec,
+            value=None,
+            ci=(None, None),
+            n_samples=0,
+            baseline=baseline,
+            now=now,
+            source_path=TRADER_EXECUTION_SHORTFALL_PREFIX,
+            window=window,
+            n_floor=EXECUTION_N_FLOOR,
+            extra=extra,
+            reason=(
+                f"the trader placed no filled order in {first}..{last} "
+                f"(no_orders on {list(reading.no_orders)}); there is no execution to "
+                f"measure, which is a fact rather than a producer failure; "
+                f"{band_phrase}{missing_phrase}"
+            ),
+        )
     return _row(
         spec,
-        value=None,
-        ci=(None, None),
-        n_samples=0,
-        baseline=0.0,
+        value=weighted,
+        ci=(low, high),
+        n_samples=reading.n_filled,
+        baseline=baseline,
         now=now,
-        # Illustrative, unresolved template text, not a crucible store key:
-        # the trader is a separate system (module docstring) that publishes
-        # no `fills/` artifact into THIS store at all, so there is no
-        # `crucible.keys` function to own a shape nothing here ever writes
-        # or reads (alpha-engine-config-I9852).
-        source_path="fills/{trading_day}/fills.json",
-        implemented=False,
+        source_path=TRADER_EXECUTION_SHORTFALL_PREFIX,
+        window=window,
+        n_floor=EXECUTION_N_FLOOR,
+        target=baseline,
+        red_line=upper,
+        extra=extra,
         reason=(
-            "the trader is a separate system from this harness and publishes no fills "
-            "artifact into the v2 store; §4.5 lists this row as 'when present', and it is "
-            "declared here rather than omitted so the table's shape does not change with "
-            "which systems happen to be running"
+            f"notional-weighted implementation shortfall {weighted:+.3f} bps against the "
+            f"sizing-decision price over {reading.n_filled} filled order(s), "
+            f"${reading.notional_usd:,.0f} notional (${reading.shortfall_usd:+,.2f}), in "
+            f"{first}..{last}, {_ci_phrase(low, high)}; lower is better; "
+            f"{band_phrase}{missing_phrase}"
         ),
     )
 
@@ -826,8 +944,16 @@ def _row(
     ran: bool = True,
     input_present: bool = True,
     window: list[dt.date] | None = None,
+    forced_status: str | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble one row, and REFUSE to emit one that is not a MetricRecord.
+
+    ``forced_status`` exists for one case only: a producer that says it FAILED
+    (the execution row's ``not_computed``). `derive_status` grades a value, and
+    a failure is not a value — so the failure is stated rather than inferred
+    from whatever figure the healthy sessions happened to produce.
+    ``extra`` carries a row's absolute companions beside its ratio.
 
     Built as a `krepis.metrics.MetricRecord` and dumped back to a dict, so the
     row's status vocabulary, its unit-when-value rule and its required fields
@@ -848,6 +974,8 @@ def _row(
         ran=ran,
         input_present=input_present,
     )
+    if forced_status is not None:
+        status = forced_status
     record = MetricRecord(
         name=spec.name,
         module=spec.module,
@@ -879,6 +1007,11 @@ def _row(
     row["last_updated_utc"] = _utc(now)
     if horizon_trading_days is not None:
         row["horizon_trading_days"] = horizon_trading_days
+    if extra:
+        for name, value in extra.items():
+            if name in row:
+                raise ValueError(f"extra field {name!r} would overwrite the row's own field")
+            row[name] = value
     return row
 
 
