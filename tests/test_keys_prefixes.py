@@ -28,6 +28,7 @@ import json
 import pytest
 
 from crucible import keys as crucible_keys
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.keys import (
     ARM_PREDICTIONS_PREFIX,
     DRIFT_INPUTS,
@@ -306,7 +307,14 @@ class TestDriftHandlerKeyShape:
         for day in sessions_ending(FRIDAY, 2):
             run_job(
                 "data.daily",
-                lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+                lambda c: run_daily(
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    expected_symbols=source.symbols(),
+                ),
                 store=store,
                 trading_day=day,
             )

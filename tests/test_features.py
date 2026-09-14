@@ -6,6 +6,7 @@ import datetime as dt
 
 import pytest
 
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.features import (
     CATALOG,
     UNIT_SUFFIXES,
@@ -17,6 +18,14 @@ from crucible.features import (
     registry_payload,
 )
 from crucible.features.compute import LIQUIDITY_FLOOR_VAR, liquidity_floor_usd
+
+
+def _no_point_in_time(panel, as_of=None):
+    """No fundamentals for a synthetic panel: every point-in-time column null, by name."""
+    day = as_of if as_of is not None else max(panel["trading_day"])
+    return UnavailablePointInTimeSource(
+        reason="synthetic fixture market carries no fundamentals"
+    ).load(trading_day=day, symbols=sorted(set(panel["ticker"])))
 
 
 class TestUnits:
@@ -194,9 +203,13 @@ class TestNoLookAhead:
         full = source.load_panel(end=cycle_date, lookback_days=1200)
         earlier = sorted({d for d in full["trading_day"].unique()})[-15]
 
-        from_full, _ = build_features(full, as_of=earlier)
+        from_full, _ = build_features(
+            full, as_of=earlier, point_in_time=_no_point_in_time(full, earlier)
+        )
         truncated = full[full["trading_day"] <= earlier]
-        from_truncated, _ = build_features(truncated, as_of=earlier)
+        from_truncated, _ = build_features(
+            truncated, as_of=earlier, point_in_time=_no_point_in_time(truncated, earlier)
+        )
 
         import pandas.testing as pdt
 
@@ -208,7 +221,7 @@ class TestValues:
         self, source, cycle_date
     ) -> None:
         panel = source.load_panel(end=cycle_date, lookback_days=1200)
-        features, _ = build_features(panel)
+        features, _ = build_features(panel, point_in_time=_no_point_in_time(panel))
         liquid = features[features["liquidity_pass_raw"] == 1.0]
         assert (liquid["dollar_volume_20d_raw"] >= liquidity_floor_usd()).all()
         illiquid = features[features["liquidity_pass_raw"] == 0.0]
@@ -219,7 +232,7 @@ class TestValues:
         panel = source.load_panel(end=cycle_date, lookback_days=1200)
         days = sorted({d for d in panel["trading_day"].unique()})
         short = panel[panel["trading_day"] >= days[-30]]
-        features, _ = build_features(short)
+        features, _ = build_features(short, point_in_time=_no_point_in_time(short))
         assert features["mom_12_1_log_return"].isna().all(), (
             "a 252-session window over 30 sessions of history has no value; filling it "
             "would put a non-measurement into a column an arm ranks on"
@@ -227,7 +240,7 @@ class TestValues:
 
     def test_the_cross_section_is_one_trading_day(self, source, cycle_date) -> None:
         panel = source.load_panel(end=cycle_date, lookback_days=1200)
-        features, _ = build_features(panel)
+        features, _ = build_features(panel, point_in_time=_no_point_in_time(panel))
         assert set(features["trading_day"].unique()) == {cycle_date}
 
 
@@ -312,14 +325,14 @@ class TestPanelDepthIsDeclaredByTheProducer:
         panel = source.load_panel(end=cycle_date, lookback_days=1200)
         days = sorted({d for d in panel["trading_day"].unique()})
         short = panel[panel["trading_day"] >= days[-(min_panel_trading_days() - 1)]]
-        features, _ = build_features(short)
+        features, _ = build_features(short, point_in_time=_no_point_in_time(short))
         assert features["residual_momentum_252d_skip21d_ratio"].isna().all()
 
     def test_at_the_declared_depth_the_column_has_values(self, source, cycle_date) -> None:
         panel = source.load_panel(end=cycle_date, lookback_days=1200)
         days = sorted({d for d in panel["trading_day"].unique()})
         exact = panel[panel["trading_day"] >= days[-min_panel_trading_days()]]
-        features, _ = build_features(exact)
+        features, _ = build_features(exact, point_in_time=_no_point_in_time(exact))
         assert features["residual_momentum_252d_skip21d_ratio"].notna().any(), (
             "one more session than the test above, and the column measures something — "
             "which is the whole of the defect: the producer was asked for 275"

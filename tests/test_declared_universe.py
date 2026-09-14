@@ -18,6 +18,7 @@ import pytest
 from crucible.config import settings
 from crucible.data import run_daily
 from crucible.data.daily import UndeclaredUniverseError
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.data.universe import (
     DECLARED_UNIVERSE_SCHEMA_VERSION,
     MalformedUniverseError,
@@ -167,7 +168,12 @@ class TestResolutionOrder:
             run_job(
                 "data.daily",
                 lambda c: run_daily(
-                    c, source=source, expected_symbols=_expected_symbols(declared, c)
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    expected_symbols=_expected_symbols(declared, c),
                 ),
                 store=store,
                 trading_day=cycle_date,
@@ -194,6 +200,9 @@ class TestTheRunRecordsWhatItGradedAgainst:
             "data.daily",
             lambda c: run_daily(
                 c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
                 source=FramePriceSource({**frames, **benchmark_frames}),
                 expected_symbols=_expected_symbols(declared, c),
             ),

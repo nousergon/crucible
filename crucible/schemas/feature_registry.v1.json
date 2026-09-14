@@ -160,6 +160,8 @@
           "enum": [
             "USD",
             "beta",
+            "funds",
+            "gics_sector_label",
             "indicator",
             "log_return",
             "pct",

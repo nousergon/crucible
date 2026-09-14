@@ -23,6 +23,7 @@ from crucible.data.daily import (
     MIN_PANEL_TRADING_DAYS,
     PanelDepthError,
 )
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.features import min_panel_trading_days
 from crucible.keys import data_panel_key, features_key
 from crucible.manifest import read_manifest
@@ -54,6 +55,9 @@ class TestAShallowPanelFailsTheDayRatherThanWritingANullColumn:
                 "data.daily",
                 lambda c: run_daily(
                     c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
                     source=source,
                     expected_symbols=sorted(frames),
                     # 400 calendar days: the exact value that shipped, and the
@@ -71,7 +75,13 @@ class TestAShallowPanelFailsTheDayRatherThanWritingANullColumn:
             run_job(
                 "data.daily",
                 lambda c: run_daily(
-                    c, source=source, expected_symbols=sorted(frames), lookback_days=400
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    expected_symbols=sorted(frames),
+                    lookback_days=400,
                 ),
                 store=store,
                 trading_day=cycle_date,
@@ -84,7 +94,13 @@ class TestAShallowPanelFailsTheDayRatherThanWritingANullColumn:
             run_job(
                 "data.daily",
                 lambda c: run_daily(
-                    c, source=source, expected_symbols=sorted(frames), lookback_days=400
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    expected_symbols=sorted(frames),
+                    lookback_days=400,
                 ),
                 store=store,
                 trading_day=cycle_date,
@@ -102,7 +118,14 @@ class TestAShallowPanelFailsTheDayRatherThanWritingANullColumn:
         captured: dict[str, str] = {}
 
         def _compile(c):
-            coverage = run_daily(c, source=source, expected_symbols=sorted(frames))
+            coverage = run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=sorted(frames),
+            )
             captured["feature_version"] = coverage["feature_version"]
             return coverage
 
@@ -123,7 +146,14 @@ class TestAShallowPanelFailsTheDayRatherThanWritingANullColumn:
         """Principle 7: a component emitting nothing is unobserved, not healthy."""
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=sorted(frames)),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=sorted(frames),
+            ),
             store=store,
             trading_day=cycle_date,
         )

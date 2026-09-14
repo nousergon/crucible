@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 
 from crucible.calendar import assert_trading_day, is_trading_day
 from crucible.data.daily import DEFAULT_LOOKBACK_DAYS, run_daily
+from crucible.data.point_in_time import PointInTimeSource
 from crucible.data.sources import PriceSource
 from crucible.keys import data_panel_key
 
@@ -75,6 +76,7 @@ def run_weekly(
     ctx: RunContext,
     *,
     source: PriceSource,
+    point_in_time: PointInTimeSource,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     expected_symbols: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -93,6 +95,7 @@ def run_weekly(
     coverage = run_daily(
         ctx,
         source=source,
+        point_in_time=point_in_time,
         lookback_days=lookback_days,
         expected_symbols=expected_symbols,
     )

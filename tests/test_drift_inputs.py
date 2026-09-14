@@ -17,6 +17,7 @@ import random
 import pytest
 
 from crucible.data.daily import run_daily
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.drift import BANDS
 from crucible.drift_inputs import (
     DRIFT_INPUT_SCHEMA_VERSION,
@@ -54,7 +55,14 @@ def _compile(store, source, days):
     for day in days:
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=source.symbols(),
+            ),
             store=store,
             trading_day=day,
         )

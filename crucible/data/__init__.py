@@ -11,7 +11,10 @@ Three jobs and one adapter:
 * :func:`~crucible.data.heal.run_heal` — an idempotent in-region repair of a
   named range;
 * :mod:`crucible.data.sources` — the `PriceSource` adapter, of which
-  ArcticDB is one implementation and not the shape.
+  ArcticDB is one implementation and not the shape;
+* :mod:`crucible.data.point_in_time` — the `PointInTimeSource` adapter for the
+  non-price inputs (fundamentals, sector, 13F), admitted per session only
+  once they were known.
 
 The rule under all four: **a missing source is `status: failed`, never a
 zero-fill.** It is not stated as a policy anywhere in this package, because
@@ -22,6 +25,12 @@ from __future__ import annotations
 
 from crucible.data.daily import COVERAGE_FLOOR_RATIO, CoverageError, run_daily
 from crucible.data.heal import LAPTOP_SESSION_ALLOWANCE, NotInRegionError, run_heal
+from crucible.data.point_in_time import (
+    PointInTimeInputs,
+    PointInTimeSource,
+    SnapshotPointInTimeSource,
+    UnavailablePointInTimeSource,
+)
 from crucible.data.sources import (
     PANEL_COLUMNS,
     ArcticPriceSource,
@@ -41,7 +50,11 @@ __all__ = [
     "FramePriceSource",
     "MissingSourceError",
     "NotInRegionError",
+    "PointInTimeInputs",
+    "PointInTimeSource",
     "PriceSource",
+    "SnapshotPointInTimeSource",
+    "UnavailablePointInTimeSource",
     "run_daily",
     "run_heal",
     "run_weekly",

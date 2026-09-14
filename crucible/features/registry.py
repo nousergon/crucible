@@ -583,6 +583,300 @@ CATALOG: tuple[FeatureSpec, ...] = (
         inputs=("close_raw",),
         window_trading_days=252,
     ),
+    # -- the attractiveness inputs (alpha-engine-config-I10721) ---------------
+    #
+    # v1's `scanner_cut` arms rank on six within-sector percentile pillars
+    # (`crucible-research/scoring/factor_scoring.py::_BASELINE_COMPOSITE_DEFS`,
+    # mapped to pillars by `scoring/composite.py::_PILLAR_TO_FACTOR_KEY`) plus a
+    # 12-1 momentum variant (`_CHALLENGER_MOMENTUM_DEF`). The non-price inputs
+    # arrive through `crucible.data.point_in_time`, which admits a value only
+    # for sessions strictly after it became known and nulls a field that is
+    # non-null but uninformative. A column below is null on a session its
+    # input did not measure — never zero.
+    FeatureSpec(
+        name="sector_raw",
+        market_wide=False,
+        unit="gics_sector_label",
+        expression="constituents.sector_map[ticker], fetched before the session",
+        description=(
+            "GICS sector name from the newest constituents snapshot FETCHED before the "
+            "session (its recorded `fetched_at`, not its folder label). A label, not a "
+            "number: the pillars rank within it. Null when the snapshot covers under 90% "
+            "of the universe — every snapshot before 2026-04-30 carried the S&P 500 only."
+        ),
+        inputs=("point_in_time.sector.sector_map",),
+    ),
+    FeatureSpec(
+        name="roe_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression="fundamental.roe (TTM return on equity, decimal, clipped [-1, 1])",
+        description="Return on equity as v1 stores it.",
+        inputs=("point_in_time.fundamental.roe",),
+    ),
+    FeatureSpec(
+        name="debt_to_equity_div2_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression="fundamental.debt_to_equity (total debt / equity / 2, clipped [-3, 3])",
+        description=(
+            "Debt to equity DIVIDED BY TWO, as v1's collector normalises it. The divisor "
+            "is in the name because a consumer reading this as D/E is off by a factor of 2."
+        ),
+        inputs=("point_in_time.fundamental.debt_to_equity",),
+    ),
+    FeatureSpec(
+        name="gross_margin_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression="fundamental.gross_margin (TTM, 0-1 fraction)",
+        description="Gross margin as a 0-1 fraction.",
+        inputs=("point_in_time.fundamental.gross_margin",),
+    ),
+    FeatureSpec(
+        name="current_ratio_div3_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression="fundamental.current_ratio (current assets / liabilities / 3, clipped [0, 3])",
+        description="Current ratio DIVIDED BY THREE, as v1's collector normalises it.",
+        inputs=("point_in_time.fundamental.current_ratio",),
+    ),
+    FeatureSpec(
+        name="pe_div30_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression="fundamental.pe_ratio (trailing P/E / 30, clipped [-3, 3])",
+        description=(
+            "Trailing P/E DIVIDED BY THIRTY and clipped, as v1 stores it. Negative for a "
+            "loss-making name, which the value pillar's inverted rank reads as cheap — "
+            "v1's definition, carried unchanged."
+        ),
+        inputs=("point_in_time.fundamental.pe_ratio",),
+    ),
+    FeatureSpec(
+        name="pb_div5_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression="fundamental.pb_ratio (price / book / 5, clipped [-3, 3])",
+        description="Price to book DIVIDED BY FIVE and clipped, as v1 stores it.",
+        inputs=("point_in_time.fundamental.pb_ratio",),
+    ),
+    FeatureSpec(
+        name="fcf_yield_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression="fundamental.fcf_yield (TTM free cash flow / market cap, clipped [-0.5, 0.5])",
+        description=(
+            "Free-cash-flow yield. Unmeasured on every v1 snapshot before 2026-08-19, "
+            "where it carried one distinct value across the universe."
+        ),
+        inputs=("point_in_time.fundamental.fcf_yield",),
+    ),
+    FeatureSpec(
+        name="revenue_growth_3y_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression="fundamental.revenue_growth_3y (3-year revenue CAGR, decimal)",
+        description="Three-year revenue CAGR.",
+        inputs=("point_in_time.fundamental.revenue_growth_3y",),
+    ),
+    FeatureSpec(
+        name="eps_growth_3y_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression="fundamental.eps_growth_3y (3-year EPS CAGR, decimal)",
+        description="Three-year EPS CAGR.",
+        inputs=("point_in_time.fundamental.eps_growth_3y",),
+    ),
+    FeatureSpec(
+        name="capex_growth_5y_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression="fundamental.capex_growth_5y (5-year capex growth, decimal)",
+        description="Five-year capital-expenditure growth; reinvestment intensity.",
+        inputs=("point_in_time.fundamental.capex_growth_5y",),
+    ),
+    FeatureSpec(
+        name="payout_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression="fundamental.payout_ratio (TTM dividends / net income, clipped [0, 2])",
+        description="Dividend payout ratio as a decimal.",
+        inputs=("point_in_time.fundamental.payout_ratio",),
+    ),
+    FeatureSpec(
+        name="sustainable_growth_rate_ratio",
+        market_wide=False,
+        unit="ratio",
+        expression="roe_ratio * (1 - payout_ratio)",
+        description="Sustainable growth rate: return on equity retained. v1's derived factor.",
+        inputs=("roe_ratio", "payout_ratio"),
+    ),
+    FeatureSpec(
+        name="institutional_accumulation_raw",
+        market_wide=False,
+        unit="funds",
+        expression=(
+            "n_funds_increasing - n_funds_decreasing, 0 where fewer than 3 funds moved, "
+            "from the newest 13F quarter whose filing deadline precedes the session"
+        ),
+        description=(
+            "Net count of 13F filers adding to the position over the quarter. A count of "
+            "funds, not a ratio. v1 also multiplied by `institutional_boost`; a positive "
+            "scale does not change a percentile rank, so it is not carried. The quarter "
+            "is admitted from the day after its 45-day filing deadline."
+        ),
+        inputs=(
+            "point_in_time.institutional.n_funds_increasing",
+            "point_in_time.institutional.n_funds_decreasing",
+        ),
+    ),
+    FeatureSpec(
+        name="return_120d_log_return",
+        market_wide=False,
+        unit="log_return",
+        expression="log(close) - log(close).shift(120)",
+        description=(
+            "Trailing 120-session log return. v1's `return_120d` is the simple return "
+            "over the same window; the two are monotone in each other, so every rank the "
+            "pillars take of them is identical."
+        ),
+        inputs=("close_raw",),
+        window_trading_days=120,
+    ),
+    FeatureSpec(
+        name="quality_pillar_pct",
+        market_wide=False,
+        unit="pct",
+        expression=(
+            "wmean(sector_pct(roe_ratio) .30, 100 - sector_pct(debt_to_equity_div2_ratio) "
+            ".25, sector_pct(gross_margin_ratio) .25, sector_pct(current_ratio_div3_ratio) .20)"
+        ),
+        description=(
+            "v1 `quality_score`. Each component is a 0-100 percentile rank within the "
+            "session's GICS sector; the weighted mean renormalises over the components a "
+            "ticker has. Null for the whole session when the sector or any component is "
+            "unmeasured on it, so the pillar never silently changes composition."
+        ),
+        inputs=(
+            "sector_raw",
+            "roe_ratio",
+            "debt_to_equity_div2_ratio",
+            "gross_margin_ratio",
+            "current_ratio_div3_ratio",
+        ),
+        cross_sectional=True,
+    ),
+    FeatureSpec(
+        name="value_pillar_pct",
+        market_wide=False,
+        unit="pct",
+        expression=(
+            "wmean(100 - sector_pct(pe_div30_ratio) .40, 100 - sector_pct(pb_div5_ratio) .30, "
+            "sector_pct(fcf_yield_ratio) .30)"
+        ),
+        description="v1 `value_score`, within-sector, as the quality pillar.",
+        inputs=("sector_raw", "pe_div30_ratio", "pb_div5_ratio", "fcf_yield_ratio"),
+        cross_sectional=True,
+    ),
+    FeatureSpec(
+        name="momentum_pillar_pct",
+        market_wide=False,
+        unit="pct",
+        expression=(
+            "wmean(sector_pct(momentum_20d_log_return) .30, sector_pct(return_60d_log_return) "
+            ".25, sector_pct(return_120d_log_return) .20, sector_pct(dist_from_52w_high_ratio) "
+            ".15, sector_pct(momentum_5d_log_return) .10)"
+        ),
+        description=(
+            "v1 `momentum_score`, within-sector. The log returns rank identically to v1's "
+            "simple returns."
+        ),
+        inputs=(
+            "sector_raw",
+            "momentum_20d_log_return",
+            "return_60d_log_return",
+            "return_120d_log_return",
+            "dist_from_52w_high_ratio",
+            "momentum_5d_log_return",
+        ),
+        cross_sectional=True,
+    ),
+    FeatureSpec(
+        name="growth_pillar_pct",
+        market_wide=False,
+        unit="pct",
+        expression=(
+            "wmean(sector_pct(revenue_growth_3y_ratio) .30, sector_pct(eps_growth_3y_ratio) "
+            ".30, sector_pct(sustainable_growth_rate_ratio) .25, "
+            "sector_pct(capex_growth_5y_ratio) .15)"
+        ),
+        description="v1 `growth_score`, within-sector.",
+        inputs=(
+            "sector_raw",
+            "revenue_growth_3y_ratio",
+            "eps_growth_3y_ratio",
+            "sustainable_growth_rate_ratio",
+            "capex_growth_5y_ratio",
+        ),
+        cross_sectional=True,
+    ),
+    FeatureSpec(
+        name="stewardship_pillar_pct",
+        market_wide=False,
+        unit="pct",
+        expression=(
+            "wmean(100 - sector_pct(payout_ratio) .35, sector_pct(capex_growth_5y_ratio) .35, "
+            "sector_pct(institutional_accumulation_raw) .30)"
+        ),
+        description="v1 `stewardship_score` (config#2428 three-component form), within-sector.",
+        inputs=(
+            "sector_raw",
+            "payout_ratio",
+            "capex_growth_5y_ratio",
+            "institutional_accumulation_raw",
+        ),
+        cross_sectional=True,
+    ),
+    FeatureSpec(
+        name="defensiveness_pillar_pct",
+        market_wide=False,
+        unit="pct",
+        expression=(
+            "wmean(100 - sector_pct(volatility_20d_ratio) .50, "
+            "100 - sector_pct(vol_ratio_10_60_ratio) .30, 100 - sector_pct(atr_14_ratio) .20)"
+        ),
+        description=(
+            "v1 `low_vol_score`, the defensiveness pillar. Two declared deltas: realised "
+            "volatility is the std of daily LOG returns (v1: annualised std of simple "
+            "returns — a constant scale, rank-invariant, plus a second-order log/simple "
+            "difference), and ATR is a 14-session simple mean (v1: an EWM, whose value "
+            "depends on panel depth)."
+        ),
+        inputs=("sector_raw", "volatility_20d_ratio", "vol_ratio_10_60_ratio", "atr_14_ratio"),
+        cross_sectional=True,
+    ),
+    FeatureSpec(
+        name="momentum_12_1_pillar_pct",
+        market_wide=False,
+        unit="pct",
+        expression=(
+            "wmean(sector_pct(mom_12_1_log_return) .40, sector_pct(return_120d_log_return) "
+            ".25, sector_pct(dist_from_52w_high_ratio) .20, sector_pct(return_60d_log_return) "
+            ".15)"
+        ),
+        description=(
+            "v1's 12-1 momentum challenger pillar (`_CHALLENGER_MOMENTUM_DEF`), within-sector."
+        ),
+        inputs=(
+            "sector_raw",
+            "mom_12_1_log_return",
+            "return_120d_log_return",
+            "dist_from_52w_high_ratio",
+            "return_60d_log_return",
+        ),
+        cross_sectional=True,
+    ),
 )
 
 

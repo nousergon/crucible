@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any
 
 from crucible.calendar import assert_trading_day, is_trading_day
 from crucible.data.daily import DEFAULT_LOOKBACK_DAYS, run_daily
+from crucible.data.point_in_time import PointInTimeSource
 from crucible.data.sources import PriceSource
 from crucible.keys import data_panel_key, heal_key
 from crucible.runner import rebind_trading_day
@@ -125,6 +126,7 @@ def run_heal(
     ctx: RunContext,
     *,
     source: PriceSource,
+    point_in_time: PointInTimeSource,
     start: dt.date,
     end: dt.date,
     gap: str,
@@ -170,6 +172,7 @@ def run_heal(
         run_daily(
             day_ctx,
             source=source,
+            point_in_time=point_in_time,
             lookback_days=lookback_days,
             expected_symbols=expected_symbols,
         )
