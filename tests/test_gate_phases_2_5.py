@@ -2203,7 +2203,7 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
         assert arena_cycle_key("r", FRIDAY.isoformat()) in clause.detail
         assert "no promote run manifest was filed" not in clause.detail
 
-    def test_one_clause_per_registered_slot_plus_the_five_deliverable_clauses(
+    def test_one_clause_per_registered_slot_plus_the_six_deliverable_clauses(
         self, store: LocalStore
     ) -> None:
         clauses = gate_module._phase3(store, _window(4), {}, trading_day=FRIDAY)
@@ -2221,6 +2221,8 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
             # `_phase3`'s own comment for why one nightly reading is not made
             # a member of six phase aggregates.
             "integration_tier_current_and_ok",
+            # alpha-engine-config-I10716: v1 arms carried or excluded.
+            "v1_arms_carried_or_excluded",
         ]
 
 
