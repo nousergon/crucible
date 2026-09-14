@@ -47,13 +47,19 @@ from crucible.calendar import (
     resolve_trading_day,
 )
 from crucible.components import NYSE_TZ, Component, load_registry, scheduled_components
-from crucible.documents import load_store_document, read_listed_document, read_manifests_under
+from crucible.documents import (
+    load_store_document,
+    read_listed_document,
+    read_manifests_under,
+    read_store_document,
+)
 from crucible.keys import (
     ALERTS_ROOT,
     DISPATCH_ROOT,
     RUNS_ROOT,
     arena_cycle_key,
     is_manifest_key,
+    manifest_key,
     parse_bus_key,
     parse_dispatch_key,
     parse_manifest_key,
@@ -70,6 +76,7 @@ from crucible.synthetic import (
     manifest_synthetic_marker,
     synthetic_routing_active,
 )
+from crucible.weekly import ARC_JOB
 
 __all__ = [
     "ALERT_BUS_SCHEMA_VERSION",
@@ -586,6 +593,60 @@ def _list_manifest_keys(store: Store, prefix: str) -> _KeysRead:
     return _KeysRead(keys, None)
 
 
+def _arc_declared_members(
+    store: Store, trading_day: dt.date, access_faults: list[str] | None
+) -> frozenset[str] | None:
+    """The jobs the arc that RAN for ``trading_day`` declared, or ``None``
+    when the store holds no evidence of that declaration.
+
+    `alpha-engine-config-I10711`: `promote` joined the arc on 2026-09-13, a
+    day AFTER the arc for 2026-09-11 had run under a registry that declared
+    it on-demand, and the sweep graded that day against the CURRENT registry
+    — an absence page for a stage no dispatcher in force that day was ever
+    going to start. The arc's manifest is the dispatcher's own record: an
+    `ok` arc completed every stage it planned (`crucible.weekly.run_arc`
+    raises on the first that does not) and records each one as an input, so
+    its input jobs ARE its declared set.
+
+    Returns ``None`` — grade the member against the current registry, as
+    before — for every shape that is not that evidence: no arc manifest (not
+    run yet, or its own absence page), a `failed` arc (its inputs are the
+    stages that finished, not the ones planned), an unparseable one, or one
+    with no well-formed `inputs` list. Failing toward the page is the rule-5
+    direction; a narrowing that guessed would be a suppression.
+
+    A read that RAISES is an access fault, handled exactly as
+    :func:`evaluate_absence` handles an unlistable prefix: raised when the
+    caller collects none, otherwise carried out while the member is still
+    graded. Not a swallow — the recording surface is the sweep's own
+    `failed` manifest, which the FAILURE condition pages on.
+    """
+    key = manifest_key(ARC_JOB, trading_day.isoformat())
+    read = read_store_document(store, key)
+    if read.access_problem:
+        problem = str(read.problem)
+        if access_faults is None:
+            raise StoreAccessError(problem)
+        access_faults.append(problem)
+        return None
+    document = read.document
+    if document is None or document.get("status") != "ok":
+        return None
+    inputs = document.get("inputs")
+    if not isinstance(inputs, list):
+        return None
+    members: set[str] = set()
+    for entry in inputs:
+        parsed = parse_manifest_key(entry.get("key", "")) if isinstance(entry, dict) else None
+        if parsed is None:
+            # One malformed input means the declared set cannot be read
+            # whole; a partial set would narrow a member it merely failed to
+            # parse. Grade against the current registry instead.
+            return None
+        members.add(parsed[0])
+    return frozenset(members)
+
+
 # ── The two page conditions ───────────────────────────────────────────────
 
 
@@ -632,6 +693,10 @@ def evaluate_absence(
     reg = scheduled_components(registry)
     pages: list[Page] = []
     for trading_day in days_to_evaluate(store, moment):
+        # The arc's own record of what it declared for this day, read at most
+        # once and only when an arc row is due (`_arc_declared_members`).
+        arc_declared: frozenset[str] | None = None
+        arc_read = False
         for name, component in sorted(reg.items()):
             if component.absence_watched_by != watched_by:
                 continue
@@ -647,6 +712,18 @@ def evaluate_absence(
             due = component.deadline.due_at(trading_day)
             if moment < due:
                 continue
+            # WHICH DECLARATION. An arc member is due on a day only if the arc
+            # that ran that day declared it (alpha-engine-config-I10711):
+            # `promote` joined the arc a day after the 2026-09-11 arc ran, and
+            # grading that day against today's registry paged a stage no
+            # dispatcher in force was ever going to start. No evidence of the
+            # arc's declaration leaves the current registry in charge.
+            if component.dispatch == "arc":
+                if not arc_read:
+                    arc_declared = _arc_declared_members(store, trading_day, access_faults)
+                    arc_read = True
+                if arc_declared is not None and name not in arc_declared:
+                    continue
             # A prefix listing, not an exact-key check: a job that carries a
             # discriminator (experiment.run/grade by slot, alerts.sweep by
             # calendar_date) writes ANY number of manifests under this
