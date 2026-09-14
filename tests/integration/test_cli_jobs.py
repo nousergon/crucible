@@ -82,6 +82,15 @@ def test_experiment_new(integration_store_uri: str, integration_store: Store, st
             "experiment.new",
             "--slot",
             "u",
+            # `--arm` is required for `experiment.new` specifically
+            # (`crucible/cli.py`: `required=spec.name == "experiment.new"`) —
+            # the argv this test carried before named no arm and failed with
+            # `SystemExit: 2` ("the following arguments are required: --arm"),
+            # measured against run 34797033396 (`alpha-engine-config-I10701`).
+            # `momentum_sleeve` is one of `strategy_dir`'s three fixture
+            # recipes (see that fixture's own docstring).
+            "--arm",
+            "momentum_sleeve",
             "--store",
             integration_store_uri,
             "--strategy-dir",

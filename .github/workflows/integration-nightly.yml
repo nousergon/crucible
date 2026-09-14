@@ -97,6 +97,18 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # The fleet's ONE name for "where is this code running" (`krepis.router`,
+  # `crucible.llm.EXEC_CONTEXT_ENV`) — never inferred. Every `crucible`
+  # process that reaches `crucible.llm._exec_context` (the fault probe, any
+  # LLM call site) refuses with `KREPIS_EXEC_CONTEXT is not set` otherwise;
+  # measured against run 34797033396 (`alpha-engine-config-I10701`),
+  # `crucible.fault_probe.FaultProbeFailure: routing_refusal`. `ci` is
+  # `krepis.router.EXEC_CONTEXT_CI` — the value every other `crucible` test
+  # that sets this var uses for a GitHub Actions runner
+  # (`tests/test_llm_call_fails_closed.py`, `tests/test_chaos_probe_
+  # containment.py`, `tests/faults/*`) — never `ec2`, which would tell the
+  # router this runner can reach the trading box's local egress proxy.
+  KREPIS_EXEC_CONTEXT: ci
   AWS_REGION: us-east-1
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   CRUCIBLE_INTEGRATION_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.CRUCIBLE_ROLE_PREFIX }}-integration
