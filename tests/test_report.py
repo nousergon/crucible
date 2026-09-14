@@ -218,12 +218,15 @@ class TestShape:
         assert "champions/r/current.json" in reasons["signal_rank_ic_r"]
         assert "trader" in reasons["execution_shortfall_bps"]
 
-    def test_the_execution_row_is_not_implemented_rather_than_absent(self, tmp_path) -> None:
+    def test_the_execution_row_is_not_run_rather_than_absent(self, tmp_path) -> None:
+        """`alpha-engine-config-I10652`: with the trader switched off the row is
+        present, named, and N/A-NOT-RUN — never absent and never green."""
         document, _ = build_attribution(_store(tmp_path), trading_day=DAY, now=NOW, run_id="R" * 26)
         execution = document["rows"][-1]
         assert execution["name"] == "execution_shortfall_bps"
-        assert execution["status"] == "N/A-NOT-IMPL"
+        assert execution["status"] == "N/A-NOT-RUN"
         assert execution["unit"] is None
+        assert "execution_shortfall.v1" in execution["status_reason"]
 
 
 SESSIONS = [
@@ -569,7 +572,9 @@ class TestRankICRow:
         ), "the row that HAS a champion names its window in words too"
 
         execution = by_name["execution_shortfall_bps"]
-        assert execution["window_trading_days"] is None, "an unimplemented row grades no window"
+        assert execution["window_trading_days"] == REPORT_WINDOW_TRADING_DAYS, (
+            "the execution row reads the trader's per-session artifacts over row 1's week"
+        )
 
     def test_identical_ics_do_not_buy_a_zero_width_interval(self, tmp_path) -> None:
         store = _store(tmp_path)
