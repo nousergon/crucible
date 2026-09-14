@@ -53,6 +53,10 @@ __all__ = [
     "TRADER_BROKER_STATEMENTS_PREFIX",
     "TRADER_EVIDENCE_KEY",
     "TRADER_EXECUTION_SHORTFALL_PREFIX",
+    "TRADER_FIRE_DRILLS_PREFIX",
+    "TRADER_KILL_SWITCH_EVENTS_PREFIX",
+    "TRADER_KILL_SWITCH_KEY",
+    "TRADER_PAPER_SMOKE_PREFIX",
     "TRADER_PIN_KEY",
     "TRADER_RECONCILIATION_PREFIX",
     "TRADER_SHADOW_BOOKS_PREFIX",
@@ -129,6 +133,9 @@ __all__ = [
     "strategy_slot_key",
     "strategy_slots_prefix",
     "trader_broker_statement_key",
+    "trader_fire_drill_key",
+    "trader_kill_switch_event_key",
+    "trader_paper_smoke_key",
     "trader_reconciliation_key",
     "universe_members_key",
     "verdict_key",
@@ -1226,6 +1233,29 @@ TRADER_SHADOW_BOOKS_PREFIX = "trader/shadow_books/"
 TRADER_RECONCILIATION_PREFIX = "trader/reconciliation/"
 TRADER_BROKER_STATEMENTS_PREFIX = "trader/broker_statements/"
 
+#: The trader's IB-paper smoke, kill switch and fire drill artifacts
+#: (crucible-trader-PR7; `alpha-engine-config-I10649` deliverable 2 and
+#: `-I10650` deliverables 1, 2 and 5). Declared here, single-source, because
+#: PR7 shipped each shape as its own literal "only until `crucible.keys` owns
+#: it"; the trader's pin bump replaces those literals with these names.
+#:
+#: * :data:`TRADER_PAPER_SMOKE_PREFIX` — `trader_paper_smoke.v1`, one per
+#:   (session, release sha), an output of `trader.smoke`.
+#: * :data:`TRADER_KILL_SWITCH_KEY` — `kill_switch.v1`, the ONE rolling halt
+#:   document every trader session reads before it sends an order. Rolling on
+#:   purpose: the halt is state, not history; the history is the events below.
+#: * :data:`TRADER_KILL_SWITCH_EVENTS_PREFIX` — `kill_switch_outcome.v1`, one
+#:   per fire, keyed by the run that fired it.
+#: * :data:`TRADER_FIRE_DRILLS_PREFIX` — `fire_drill.v1`, one per drill, keyed by
+#:   the `trader.fire_drill` run; read by
+#:   `crucible.gate._clause_kill_switch_fire_drill_passed`.
+TRADER_PAPER_SMOKE_PREFIX = "trader/paper_smoke/"
+TRADER_KILL_SWITCH_KEY = "trader/kill_switch.json"
+TRADER_KILL_SWITCH_EVENTS_PREFIX = "trader/kill_switch/events/"
+TRADER_FIRE_DRILLS_PREFIX = "trader/fire_drills/"
+
+_RELEASE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
 
 def _require_iso_day(trading_day: str) -> None:
     try:
@@ -1235,6 +1265,36 @@ def _require_iso_day(trading_day: str) -> None:
             f"trading_day {trading_day!r} is not an ISO calendar date; a key built from it "
             "would orphan the artifact under a path no reader lists (§4.12)"
         ) from exc
+
+
+def _require_run_id(run_id: str) -> None:
+    if not run_id or "/" in run_id:
+        raise ValueError(
+            f"run_id {run_id!r} must be one non-empty key segment; an empty or slashed id "
+            "would collide with, or nest under, another run's artifact"
+        )
+
+
+def trader_paper_smoke_key(trading_day: str, sha: str) -> str:
+    """One `trader_paper_smoke.v1` document: the smoke of release ``sha`` on a session."""
+    _require_iso_day(trading_day)
+    if not _RELEASE_SHA_RE.match(sha):
+        raise ValueError(f"sha {sha!r} is not a 40-hex git sha")
+    return f"trader/paper_smoke/{trading_day}/{sha}.json"
+
+
+def trader_kill_switch_event_key(trading_day: str, run_id: str) -> str:
+    """One `kill_switch_outcome.v1` document: what the book did after one fire."""
+    _require_iso_day(trading_day)
+    _require_run_id(run_id)
+    return f"trader/kill_switch/events/{trading_day}/{run_id}.json"
+
+
+def trader_fire_drill_key(trading_day: str, run_id: str) -> str:
+    """One `fire_drill.v1` document, written by the `trader.fire_drill` run ``run_id``."""
+    _require_iso_day(trading_day)
+    _require_run_id(run_id)
+    return f"trader/fire_drills/{trading_day}/{run_id}.json"
 
 
 def execution_shortfall_key(trading_day: str) -> str:

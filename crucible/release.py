@@ -51,6 +51,7 @@ from crucible.models import (
     ReleasePointerDocument,
     ReleaseProvenanceDocument,
     ReleaseRecordDocument,
+    TraderReleasePinDocument,
 )
 from crucible.store import ETAG_ABSENT, PointerConflictError, S3Store, Store, sha256_hex
 
@@ -125,6 +126,7 @@ __all__ = [
     "assert_sha",
     "current_release",
     "parse_release_pointer",
+    "parse_trader_release_pin",
     "parse_release_record",
     "pin",
     "provenance_key",
@@ -785,8 +787,37 @@ def read_pointer(store: Store, key: str = POINTER_KEY) -> tuple[str | None, str]
     # `ReleasePointerDocument` rather than indexed straight off the raw
     # dict — a pointer written without `sha` used to reach this function's
     # caller as a bare `KeyError` naming neither the document nor the field.
-    pointer = parse_release_pointer(key, payload)
+    # The trader's pin is validated through its own model
+    # (`TraderReleasePinDocument`, alpha-engine-config-I10649), which carries
+    # the smoke evidence the pin was gated on.
+    pointer = _parse_pointer_for(key, payload)
     return pointer.sha, version
+
+
+def parse_trader_release_pin(source: str, payload: dict[str, Any]) -> TraderReleasePinDocument:
+    """Validate ``payload`` against `crucible.models.TraderReleasePinDocument`,
+    raising with every field named — the trader-pin sibling of
+    :func:`parse_release_pointer`."""
+    try:
+        return TraderReleasePinDocument.model_validate(payload)
+    except ValidationError as exc:
+        detail = "\n".join(
+            f"  - {'.'.join(str(p) for p in e['loc']) or '<root>'}: {e['msg']}"
+            for e in exc.errors()
+        )
+        raise ValueError(
+            f"{source}: document does not conform to a trader release pin:\n{detail}"
+        ) from exc
+
+
+def _parse_pointer_for(
+    key: str, payload: dict[str, Any]
+) -> ReleasePointerDocument | TraderReleasePinDocument:
+    """The one key -> model dispatch: `trader/release_pin` is a trader pin, every
+    other pointer key is a harness release pointer."""
+    if key == TRADER_PIN_KEY:
+        return parse_trader_release_pin(key, payload)
+    return parse_release_pointer(key, payload)
 
 
 def current_release(store: Store) -> str | None:
@@ -941,17 +972,25 @@ def pin(
         )
     key = POINTER_KEY if target == "current" else TRADER_PIN_KEY
     version = expect if expect is not None else store.etag(key)
-    payload = json.dumps(
-        {
-            "sha": sha,
-            "target": target,
-            "pinned_at": (now or dt.datetime.now(dt.UTC))
-            .astimezone(dt.UTC)
-            .strftime("%Y-%m-%dT%H:%M:%SZ"),
-        },
-        indent=2,
-        sort_keys=True,
-    ).encode("utf-8")
+    document: dict[str, Any] = {
+        "sha": sha,
+        "target": target,
+        "pinned_at": (now or dt.datetime.now(dt.UTC))
+        .astimezone(dt.UTC)
+        .strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if trader_smoke is not None:
+        # alpha-engine-config-I10649 deliverable 3: the trader pin names the
+        # smoke it was gated on, so the pin alone walks back to its evidence.
+        document |= {
+            "smoke_run_id": trader_smoke.run_id,
+            "smoke_status": trader_smoke.status,
+            "smoke_manifest_key": trader_smoke.manifest_key,
+        }
+    # Validated BEFORE the swap, through the same model its reader uses: a pin
+    # its own reader would refuse must never reach the store.
+    _parse_pointer_for(key, document)
+    payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
     return store.compare_and_swap(key, version, payload)
 
 

@@ -85,6 +85,7 @@ from crucible.keys import (
     FAULT_INJECTION_ROOT,
     INTEGRATION_STORE_SUBPREFIX,
     TRADER_EXECUTION_SHORTFALL_PREFIX,
+    TRADER_FIRE_DRILLS_PREFIX,
     acceptance_reading_key,
     arena_cycle_key,
     arm_register_key,
@@ -107,6 +108,7 @@ from crucible.keys import (
     shadow_books_key,
     strategy_arms_prefix,
     strategy_holdout_key,
+    trader_fire_drill_key,
     trader_reconciliation_key,
     v1_carryover_key,
     verdict_key,
@@ -116,6 +118,7 @@ from crucible.manifest import ManifestValidationError, load_schema, manifest_key
 from crucible.manifest import validate as _validate_manifest
 from crucible.models import (
     FaultRecordDocument,
+    FireDrillDocument,
     PhaseClosingReadingDocument,
     PhaseLadderDocument,
     TraderEvidenceDocument,
@@ -3566,8 +3569,7 @@ PHASE4_DELIVERABLES: tuple[Deliverable, ...] = (
     Deliverable(
         "kill_switch_fire_drill",
         "kill-switch fire drill on paper",
-        None,
-        "no clause reads any fire-drill artifact",
+        "kill_switch_fire_drill_passed",
     ),
     Deliverable(
         "broker_reconciliation",
@@ -4207,8 +4209,8 @@ PHASE2_SCRIPTED_FAULTS: tuple[str, ...] = (
 #: result, which `_clause_broker_reconciliation_control_arm_passed` reads.
 RECONCILIATION_FAULT = "reconciliation_planted_discrepancy"
 
-#: Every scripted fault `crucible fault.record` may file a record for: the
-#: four phase-2 faults plus fault 5.
+#: Every scripted fault in the register: the four phase-2 faults, fault 5 and
+#: its sibling, the fire drill (which `fault.record` refuses; see above).
 #:
 #: **Phase 2's clause grades :data:`PHASE2_SCRIPTED_FAULTS`, not this tuple.**
 #: Fault 5 is a PHASE 4 gate (plan §9.5 row: "Phase 4 gate; it is also fault 5
@@ -4218,7 +4220,22 @@ RECONCILIATION_FAULT = "reconciliation_planted_discrepancy"
 #: `_clause_integration_tier_current` was kept off phase 2. Widening the
 #: phase-2 clause to five would turn a phase whose four faults are recorded
 #: UNMET on a deliverable it never owned.
-SCRIPTED_FAULTS: tuple[str, ...] = (*PHASE2_SCRIPTED_FAULTS, RECONCILIATION_FAULT)
+#: The kill-switch and hold-book fire drill (`alpha-engine-config-I10650`
+#: deliverable 3): fault 5's SIBLING in the register. Like fault 5 it is a
+#: phase-4 gate whose producer is the trader, and like fault 5 its evidence is
+#: the trader's own artifact rather than a `fault_record.v1` a human files: the
+#: `fire_drill.v1` documents `_clause_kill_switch_fire_drill_passed` reads. The
+#: register entry naming that artifact is
+#: `crucible.faults.ARTIFACT_GRADED_FAULTS`, which also refuses a
+#: `fault.record` for this id (a record would be an attestation beside the
+#: evidence, and none of the three outcome kinds describes a drill).
+FIRE_DRILL_FAULT = "kill_switch_fire_drill"
+
+SCRIPTED_FAULTS: tuple[str, ...] = (
+    *PHASE2_SCRIPTED_FAULTS,
+    RECONCILIATION_FAULT,
+    FIRE_DRILL_FAULT,
+)
 
 #: The two fields an INDUCED fault-injection record must carry: the manifest
 #: the fault produced, and the bus row it produced. Both, because either alone
@@ -8263,6 +8280,190 @@ def _clause_shadow_books_cover_every_active_arm(store: Store, window: list[dt.da
     )
 
 
+#: The trader's fire-drill job — one of `crucible.models.TRADER_JOB_VALUES`
+#: (asserted by `tests/test_gate_phase4_fire_drill.py`).
+TRADER_FIRE_DRILL_JOB = "trader.fire_drill"
+
+#: The drill artifact's schema version, as crucible-trader-PR7 writes it.
+FIRE_DRILL_SCHEMA_VERSION = "fire_drill.v1"
+
+#: Plan §9.5 paper->live entry condition 4: "passed on paper twice, at least
+#: one of them unannounced" — required at phase 4 so phase 6 is not
+#: retroactively unmeetable (`alpha-engine-config-I10650` deliverable 5).
+FIRE_DRILL_REQUIRED_PASSED = 2
+FIRE_DRILL_REQUIRED_UNANNOUNCED = 1
+
+
+def _clause_kill_switch_fire_drill_passed(store: Store, window: list[dt.date]) -> Clause:
+    """Plan §9.5 kill-switch row: the fire drill passed on paper, twice, one unannounced.
+
+    `alpha-engine-config-I10650` deliverables 4 and 5. Reads every
+    `fire_drill.v1` document under `trader/fire_drills/` whose `trading_day` is
+    inside the phase window. A drill COUNTS only when all of these hold:
+
+    1. the document conforms to `crucible.models.FireDrillDocument` and sits at
+       exactly `trader_fire_drill_key(trading_day, run_id)`;
+    2. a `trader.fire_drill` manifest with that `run_id` exists, conforms to the
+       run-manifest schema, reads `run_mode: live` and `status: ok`, and records
+       the document as an OUTPUT whose digest the stored bytes still match — a
+       drill document with no run behind it, or edited after its run, is not
+       evidence;
+    3. the evidence fields, not the `passed` flag, say it passed: the book
+       settled (`settled_at` set), `settle_seconds <= bound_seconds`, and
+       `orders_accepted_after_fire` is empty — no order accepted at or after
+       the fire instant.
+
+    MET iff at least :data:`FIRE_DRILL_REQUIRED_PASSED` drills count and at least
+    :data:`FIRE_DRILL_REQUIRED_UNANNOUNCED` of those are unannounced. A failed
+    drill does not void later passes (it is what the drill exists to find, and
+    its run already paged); it is named in the detail.
+
+    **Absence is UNMET** (an undrilled switch). UNMEASURABLE only when the
+    store could not be read: a listing or a read that raised.
+    """
+    name = "kill_switch_fire_drill_passed"
+    start, end = window[0].isoformat(), window[-1].isoformat()
+    requirement = (
+        f">= {FIRE_DRILL_REQUIRED_PASSED} `{FIRE_DRILL_SCHEMA_VERSION}` drills between {start} "
+        f"and {end}, >= {FIRE_DRILL_REQUIRED_UNANNOUNCED} of them unannounced, each backed by "
+        f"a live `ok` `{TRADER_FIRE_DRILL_JOB}` manifest whose output digest still matches, "
+        "each settled inside its declared bound with zero orders accepted after the fire instant"
+    )
+    drills = _list_store_keys(store, TRADER_FIRE_DRILLS_PREFIX)
+    if drills.problem is not None:
+        return _unmeasurable(name, requirement, drills.problem, (TRADER_FIRE_DRILLS_PREFIX,))
+    runs_root = runs_prefix(TRADER_FIRE_DRILL_JOB)
+    listed_runs = _list_store_keys(store, runs_root)
+    if listed_runs.problem is not None:
+        return _unmeasurable(name, requirement, listed_runs.problem, (runs_root,))
+
+    findings: list[str] = []
+    evidence: list[str] = []
+    # run_id -> (manifest key, manifest), over every conforming drill manifest.
+    manifests: dict[str, tuple[str, dict[str, Any]]] = {}
+    for key in sorted(listed_runs.keys or ()):
+        parsed = parse_manifest_key(key)
+        if parsed is None or parsed[0] != TRADER_FIRE_DRILL_JOB:
+            continue
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            if read.access_problem:
+                return _unmeasurable(name, requirement, read.problem, (key,))
+            findings.append(read.problem)
+            continue
+        if read.absent:
+            findings.append(f"{key} was listed and is gone at read time")
+            continue
+        manifest = read.document or {}
+        try:
+            _validate_manifest(manifest)
+        except ManifestValidationError as exc:
+            findings.append(f"{key} does not conform to the run manifest schema: {exc}")
+            continue
+        manifests[manifest["run_id"]] = (key, manifest)
+
+    counted: list[FireDrillDocument] = []
+    failed: list[str] = []
+    in_window = 0
+    for key in sorted(drills.keys or ()):
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            if read.access_problem:
+                return _unmeasurable(name, requirement, read.problem, (key,))
+            findings.append(read.problem)
+            evidence.append(key)
+            continue
+        if read.absent:
+            findings.append(f"{key} was listed and is gone at read time")
+            continue
+        try:
+            drill = FireDrillDocument.model_validate(read.document)
+        except ValidationError as exc:
+            findings.append(
+                f"{key} does not conform to {FIRE_DRILL_SCHEMA_VERSION} "
+                f"({len(exc.errors())} error(s): {exc.errors()[0]['loc']} {exc.errors()[0]['msg']})"
+            )
+            evidence.append(key)
+            continue
+        if not start <= drill.trading_day <= end:
+            continue
+        in_window += 1
+        evidence.append(key)
+        if key != trader_fire_drill_key(drill.trading_day, drill.run_id):
+            findings.append(
+                f"{key} records trading_day {drill.trading_day} and run_id {drill.run_id}, "
+                f"which belong at {trader_fire_drill_key(drill.trading_day, drill.run_id)}"
+            )
+            continue
+        backing = manifests.get(drill.run_id)
+        if backing is None:
+            findings.append(
+                f"{key}: no conforming `{TRADER_FIRE_DRILL_JOB}` manifest carries run_id "
+                f"{drill.run_id} — a drill document with no run behind it is not evidence"
+            )
+            continue
+        manifest_key_, manifest = backing
+        evidence.append(manifest_key_)
+        refs = [ref for ref in manifest["outputs"] if ref["key"] == key]
+        if len(refs) != 1:
+            findings.append(
+                f"{manifest_key_} records {len(refs)} output(s) at {key}; exactly one is required"
+            )
+            continue
+        if sha256_hex(store.get_bytes(key)) != refs[0]["sha256"]:
+            findings.append(
+                f"{key} no longer hashes to the digest {manifest_key_} recorded — the drill "
+                "document was changed after the run that produced it"
+            )
+            continue
+        if manifest["run_mode"] != "live":
+            findings.append(
+                f"{manifest_key_}: run_mode `{manifest['run_mode']}` — a replayed drill fired "
+                "nothing at a live paper book"
+            )
+            continue
+        if not drill.evidence_passed():
+            failed.append(
+                f"{key} ({drill.kind}, {'announced' if drill.announced else 'unannounced'}): "
+                f"settled_at {drill.settled_at}, {drill.settle_seconds}s of "
+                f"{drill.bound_seconds:g}s, {len(drill.orders_accepted_after_fire)} order(s) "
+                "accepted after the fire"
+            )
+            continue
+        if manifest["status"] != "ok":
+            findings.append(
+                f"{key} reads passed but {manifest_key_} reads `{manifest['status']}` "
+                f"({manifest.get('reason') or 'no reason recorded'}); the two must agree"
+            )
+            continue
+        counted.append(drill)
+
+    if in_window == 0 and not findings:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"no `{FIRE_DRILL_SCHEMA_VERSION}` drill between {start} and {end}: the kill "
+            "switch is undrilled on paper",
+            (TRADER_FIRE_DRILLS_PREFIX,),
+        )
+    unannounced = [d for d in counted if not d.announced]
+    met = (
+        len(counted) >= FIRE_DRILL_REQUIRED_PASSED
+        and len(unannounced) >= FIRE_DRILL_REQUIRED_UNANNOUNCED
+    )
+    parts = [
+        f"{len(counted)} passed drill(s) counted of {in_window} in {start}..{end} "
+        f"({FIRE_DRILL_REQUIRED_PASSED} required), {len(unannounced)} unannounced "
+        f"({FIRE_DRILL_REQUIRED_UNANNOUNCED} required)"
+    ]
+    if failed:
+        parts.append(f"failed: {' | '.join(failed)}")
+    if findings:
+        parts.append(f"not counted: {' | '.join(findings)}")
+    return Clause(name, requirement, met, "; ".join(parts), tuple(dict.fromkeys(evidence)))
+
+
 def _clause_money_path_chain_verified(store: Store) -> Clause:
     """The money-path hash chain verifies (`alpha-engine-config-I10627`).
 
@@ -8374,6 +8575,7 @@ def _phase4(
         _clause_broker_reconciliation_control_arm_passed(store, window),
         _clause_execution_shortfall_row_graded(store, window),
         _clause_shadow_books_cover_every_active_arm(store, window),
+        _clause_kill_switch_fire_drill_passed(store, window),
         _clause_money_path_chain_verified(store),
         _clause_aws_cost_within_ceiling(
             window, name="aws_total_within_ceiling", ceiling_usd=PHASE4_MAX_TOTAL_USD, tagged=False

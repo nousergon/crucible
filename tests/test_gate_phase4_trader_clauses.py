@@ -450,8 +450,9 @@ class TestRegistration:
 
 class TestFaultFive:
     def test_fault_five_is_scripted_and_recordable(self) -> None:
-        assert SCRIPTED_FAULTS[-1] == RECONCILIATION_FAULT
-        assert len(SCRIPTED_FAULTS) == 5
+        assert RECONCILIATION_FAULT in SCRIPTED_FAULTS
+        # Fault 5 plus its sibling, the fire drill (`alpha-engine-config-I10650`).
+        assert len(SCRIPTED_FAULTS) == 6
 
     def test_phase_two_still_grades_its_own_four(self, store) -> None:
         """Fault 5 is a phase-4 gate. Phase 2's reading is in flight, and a

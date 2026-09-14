@@ -619,7 +619,9 @@
         "iac.conformance",
         "test.integration",
         "trader.reconcile",
-        "trader.smoke"
+        "trader.smoke",
+        "trader.kill_switch",
+        "trader.fire_drill"
       ],
       "title": "Job",
       "type": "string"
