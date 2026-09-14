@@ -40,11 +40,13 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ValidationError
 
-from crucible.documents import load_document_bytes, load_store_document
-from crucible.keys import POINTER_KEY, TRADER_PIN_KEY, manifest_key
+from crucible.calendar import is_trading_day as _nyse_is_trading_day
+from crucible.documents import load_document_bytes, load_store_document, read_manifests_under
+from crucible.keys import POINTER_KEY, TRADER_PIN_KEY, manifest_key, runs_prefix
 from crucible.models import (
     ReleasePointerDocument,
     ReleaseProvenanceDocument,
@@ -110,7 +112,16 @@ __all__ = [
     "ReleaseRecord",
     "ReleaseRecordMismatchError",
     "StaleReleasePointerError",
+    "TRADER_PIN_BLACKOUT_END_ET",
+    "TRADER_PIN_BLACKOUT_START_ET",
     "TRADER_PIN_KEY",
+    "TRADER_SMOKE_JOB",
+    "TraderPinRefusedError",
+    "TraderSmokeEvidence",
+    "passing_trader_smoke",
+    "pin_trader",
+    "select_trader_smoke",
+    "trader_pin_window_refusal",
     "assert_sha",
     "current_release",
     "parse_release_pointer",
@@ -877,8 +888,15 @@ def pin(
     target: str = "current",
     expect: str | None = None,
     now: dt.datetime | None = None,
+    trader_smoke: TraderSmokeEvidence | None = None,
 ) -> str:
     """Point ``target`` at ``sha`` by compare-and-swap. Returns the new version.
+
+    ``target="trader"`` is refused here unless ``trader_smoke`` is passing
+    evidence FOR ``sha`` (alpha-engine-config-I10649). Callers go through
+    :func:`pin_trader`, which reads that evidence from the store and enforces
+    the off-market-hours window; the check is repeated in this primitive so
+    no second caller can move the trader's pin around the gate.
 
     ``expect`` is the version token the caller read. Omitting it means "swap
     against whatever is there right now", which is correct for an operator
@@ -895,6 +913,25 @@ def pin(
     _assert_sha(sha)
     if target not in PIN_TARGETS:
         raise ValueError(f"pin target {target!r} not in {PIN_TARGETS}")
+    if target == "trader":
+        if trader_smoke is None:
+            raise TraderPinRefusedError(
+                f"refusing to pin the trader to {sha}: no trader smoke evidence was "
+                "presented. The trader's pin moves only through `pin_trader`, which reads a "
+                f"passing `{TRADER_SMOKE_JOB}` manifest for this sha from the store."
+            )
+        if trader_smoke.release_sha != sha or trader_smoke.status != "ok":
+            raise TraderPinRefusedError(
+                f"refusing to pin the trader to {sha}: the smoke evidence presented is "
+                f"{trader_smoke.status!r} for release {trader_smoke.release_sha!r}. "
+                "Promoting on another build's smoke, or on a smoke that did not pass, is "
+                "the gate failing open."
+            )
+    elif trader_smoke is not None:
+        raise ValueError(
+            "trader smoke evidence was passed for target 'current'. The harness pointer is "
+            "gated by the harness smoke (`flip_on_smoke`), never by the trader's."
+        )
     wheel = published_wheel_key(store, sha)
     if not store.exists(wheel):
         raise StaleReleasePointerError(
@@ -916,6 +953,173 @@ def pin(
         sort_keys=True,
     ).encode("utf-8")
     return store.compare_and_swap(key, version, payload)
+
+
+# ── the trader's pin: smoke-gated, off-market-hours (alpha-engine-config-I10649)
+
+#: The trader's own smoke job, written by `nousergon/crucible-trader`
+#: (`crucible_trader.paper_smoke`): install the pinned wheel, connect to the
+#: IB Gateway PAPER session, read the book, place no order. The harness's
+#: `smoke` job is a different thing — an end-to-end harness run — and reading
+#: its status here would promote a trader build nothing connected to a broker.
+TRADER_SMOKE_JOB = "trader.smoke"
+
+#: The window in which a trader pin is refused on an NYSE trading day, in
+#: America/New_York wall time: from the trader's pre-open work to after the
+#: close has settled (plan §4.11: "executed off-market-hours"). Half-open,
+#: `[05:00, 16:30)`. Whether a date is a trading day comes from
+#: `krepis.trading_calendar` — the one NYSE calendar in the fleet — and is
+#: never re-derived here; early-close sessions keep the full window, which is
+#: the conservative direction for a refusal.
+TRADER_PIN_BLACKOUT_START_ET = dt.time(5, 0)
+TRADER_PIN_BLACKOUT_END_ET = dt.time(16, 30)
+_ET = ZoneInfo("America/New_York")
+
+
+class TraderPinRefusedError(RuntimeError):
+    """The trader's pin was not moved, for a named reason.
+
+    A distinct type because each reason is a distinct operator action: run the
+    trader smoke for this sha, wait for the market to close, or look at why the
+    smoke failed. None of them is "retry the pin".
+    """
+
+
+@dataclass(frozen=True)
+class TraderSmokeEvidence:
+    """The one `trader.smoke` manifest a trader pin is gated on."""
+
+    manifest_key: str
+    run_id: str
+    release_sha: str
+    status: str
+    trading_day: str
+    finished: str
+
+
+def trader_pin_window_refusal(now: dt.datetime) -> str | None:
+    """The refusal reason when ``now`` is inside the trader-pin blackout, else None.
+
+    ``now`` must be timezone-aware: a naive instant has no answer to "is the
+    market open", and guessing UTC or local is how a pin lands at 09:31 ET.
+    """
+    if now.tzinfo is None:
+        raise ValueError(
+            f"{now!r} is naive. The trader-pin window is an America/New_York wall-clock "
+            "window and a naive instant cannot be placed in it."
+        )
+    local = now.astimezone(_ET)
+    if not _nyse_is_trading_day(local.date()):
+        return None
+    if TRADER_PIN_BLACKOUT_START_ET <= local.time() < TRADER_PIN_BLACKOUT_END_ET:
+        return (
+            f"market_hours: {local.strftime('%Y-%m-%d %H:%M')} ET is inside the trader-pin "
+            f"blackout [{TRADER_PIN_BLACKOUT_START_ET:%H:%M}, "
+            f"{TRADER_PIN_BLACKOUT_END_ET:%H:%M}) ET on an NYSE trading day. A trader pin "
+            "is an off-market-hours action (plan §4.11); an in-session incident is the kill "
+            "switch's, and the trader installs its wheel at session start, so a mid-session "
+            "pin would change nothing the running trader executes."
+        )
+    return None
+
+
+def select_trader_smoke(
+    documents: tuple[tuple[str, dict[str, Any]], ...] | list[tuple[str, dict[str, Any]]],
+    sha: str,
+) -> tuple[TraderSmokeEvidence | None, list[str]]:
+    """The newest passing trader smoke for ``sha``, plus a line per non-passing one.
+
+    Pure: ``documents`` are ``(key, manifest)`` pairs already validated by the
+    caller. A manifest for another sha is not evidence; a failed one for this
+    sha is returned as a reason line so a refusal can say WHY there is no pass
+    (a broker session that expired is a human action, a defect is not).
+    """
+    _assert_sha(sha)
+    passing: list[tuple[str, dict[str, Any]]] = []
+    failures: list[str] = []
+    for key, document in documents:
+        if document.get("job") != TRADER_SMOKE_JOB or document.get("release_sha") != sha:
+            continue
+        if document.get("status") == "ok":
+            passing.append((key, document))
+        else:
+            failures.append(
+                f"{key} ({document.get('run_id')}): {document.get('status')} — "
+                f"{document.get('reason')}"
+            )
+    if not passing:
+        return None, failures
+    key, document = max(passing, key=lambda pair: (pair[1]["finished"], pair[0]))
+    evidence = TraderSmokeEvidence(
+        manifest_key=key,
+        run_id=document["run_id"],
+        release_sha=sha,
+        status="ok",
+        trading_day=document["trading_day"],
+        finished=document["finished"],
+    )
+    return evidence, failures
+
+
+def passing_trader_smoke(store: Store, sha: str) -> TraderSmokeEvidence:
+    """Read every `trader.smoke` manifest and return the newest passing one for ``sha``.
+
+    Raises :class:`TraderPinRefusedError` when there is none, naming every
+    failed smoke for this sha. Every manifest under the prefix is validated
+    against the run-manifest schema before it counts: a document that does not
+    conform cannot certify a pin, and an unreadable key or an unlistable prefix
+    is a refusal — "we could not read the evidence" never reads as "there is
+    evidence".
+    """
+    from crucible.manifest import validate  # noqa: PLC0415 - cycle, as write_deploy_manifest
+
+    _assert_sha(sha)
+    prefix = runs_prefix(TRADER_SMOKE_JOB)
+    read = read_manifests_under(store, prefix)
+    if read.listing_problem is not None:
+        raise TraderPinRefusedError(f"refusing to pin the trader to {sha}: {read.listing_problem}")
+    if read.faults:
+        raise TraderPinRefusedError(
+            f"refusing to pin the trader to {sha}: {len(read.faults)} trader smoke manifest(s) "
+            f"under {prefix} could not be read: {sorted(read.faults.items())}"
+        )
+    for _key, document in read.documents:
+        validate(document)
+    evidence, failures = select_trader_smoke(read.documents, sha)
+    if evidence is None:
+        detail = (
+            f" Failed smokes for this sha: {' | '.join(failures)}"
+            if failures
+            else " No trader smoke has ever run for this sha."
+        )
+        raise TraderPinRefusedError(
+            f"no_passing_smoke: refusing to pin the trader to {sha}: no `{TRADER_SMOKE_JOB}` "
+            f"manifest under {prefix} reads status ok for this release.{detail} Run the "
+            "trader's paper smoke against this sha first."
+        )
+    return evidence
+
+
+def pin_trader(
+    store: Store,
+    sha: str,
+    *,
+    now: dt.datetime,
+    expect: str | None = None,
+) -> tuple[str, TraderSmokeEvidence]:
+    """Move `trader/release_pin` to ``sha`` iff it is off-market-hours and the
+    trader's own smoke passed for ``sha``. Returns ``(version, evidence)``.
+
+    The same rule serves a forward promotion and a rollback: a rollback to a
+    sha whose smoke already passed is allowed on that record, with no new
+    smoke — the smoke gates a build, not a direction (I10649 gotcha 2).
+    """
+    refusal = trader_pin_window_refusal(now)
+    if refusal is not None:
+        raise TraderPinRefusedError(f"refusing to pin the trader to {sha}: {refusal}")
+    evidence = passing_trader_smoke(store, sha)
+    version = pin(store, sha, target="trader", expect=expect, now=now, trader_smoke=evidence)
+    return version, evidence
 
 
 def write_deploy_manifest(

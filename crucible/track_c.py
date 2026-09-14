@@ -64,6 +64,7 @@ from crucible.keys import (
     drift_input_key,
     drift_metrics_key,
 )
+from crucible.manifest import RUN_MANIFEST_SCHEMA_VERSION
 from crucible.release_lock_sweep import release_lock_findings, release_lock_metric
 from crucible.runner import RunContext, run_job, spot_interruption_guard
 from crucible.store import Store, open_store, sha256_hex
@@ -108,34 +109,71 @@ def _store(args: argparse.Namespace) -> Store:
 # ── release.pin ───────────────────────────────────────────────────────────
 
 
+def _now() -> dt.datetime:
+    """The pin's wall clock. One seam, so the off-market-hours refusal is
+    verified by running the handler with a frozen clock (I10649 closes-when)."""
+    return dt.datetime.now(dt.UTC)
+
+
 def release_pin_handler(args: argparse.Namespace) -> int:
     """Repoint `releases/current`, or pin the trader. §4.11 rollback.
 
     Runs through the runner like every other job, so a rollback at 3am leaves
     a manifest saying who moved what and when — which is the difference
     between an incident with a timeline and one reconstructed from memory.
+
+    `--target trader` goes through :func:`crucible.release.pin_trader`
+    (alpha-engine-config-I10649): refused inside the market-hours blackout and
+    refused without a passing `trader.smoke` manifest for this sha. The smoke
+    manifest the pin was gated on is recorded as this run's INPUT (content
+    hash included) and named in the metric, so `crucible explain` walks from
+    the pin to the smoke that certified it.
     """
     dry_run = bool(getattr(args, "dry_run", False))
     store = _store(args)
+    target = args.target
 
     def body(ctx: RunContext) -> None:
-        before = release.current_release(store)
-        key = release.POINTER_KEY if args.target == "current" else release.TRADER_PIN_KEY
+        key = release.POINTER_KEY if target == "current" else release.TRADER_PIN_KEY
+        # The pointer being MOVED, not `releases/current` for both targets: a
+        # trader pin used to report current's sha as its "before".
+        before, _ = release.read_pointer(store, key)
+        evidence: release.TraderSmokeEvidence | None = None
+        if target == "trader":
+            now = _now()
+            refusal = release.trader_pin_window_refusal(now)
+            if refusal is not None:
+                raise release.TraderPinRefusedError(
+                    f"refusing to pin the trader to {args.sha}: {refusal}"
+                )
+            evidence = release.passing_trader_smoke(store, args.sha)
+            ctx.record_input(
+                evidence.manifest_key,
+                store.get_bytes(evidence.manifest_key),
+                schema_version=RUN_MANIFEST_SCHEMA_VERSION,
+            )
         # alpha-engine-config-I9922 R2-1: the store guard is the backstop —
         # `release.pin` MOVES A POINTER, so under `--dry-run` it never calls
         # `release.pin()` at all (rather than calling it and letting the
         # guard refuse mid-write, which is the wrong shape for a pointer
         # move specifically: `release.pin`'s own internals, not just
         # `ctx.record_output`, are what write). The preview is exactly the
-        # move it would make.
+        # move it would make — for the trader, after the window and the smoke
+        # evidence have both been checked, so a dry run answers "would it move".
         if dry_run:
             print(
-                f"release.pin --target {args.target}: {before or '(unset)'} would move to "
-                f"{args.sha}"
+                f"release.pin --target {target}: {before or '(unset)'} would move to "
+                f"{args.sha}" + (f" (gated on {evidence.run_id})" if evidence is not None else "")
             )
             return
-        release.pin(store, args.sha, target=args.target)
+        release.pin(store, args.sha, target=target, trader_smoke=evidence)
         ctx.record_output(key, store.get_bytes(key), schema_version=release.RELEASE_SCHEMA_VERSION)
+        gated = (
+            f" Gated on trader smoke {evidence.run_id} ({evidence.status}, "
+            f"{evidence.manifest_key})."
+            if evidence is not None
+            else ""
+        )
         ctx.record_metric(
             {
                 "name": "release_pointer_moved",
@@ -145,7 +183,9 @@ def release_pin_handler(args: argparse.Namespace) -> int:
                 "unit": "pointer_moves",
                 "n_floor": 0,
                 "status": "OK",
-                "status_reason": (f"{args.target} moved from {before or '(unset)'} to {args.sha}."),
+                "status_reason": (
+                    f"{target} moved from {before or '(unset)'} to {args.sha}.{gated}"
+                ),
                 "source_path": key,
                 "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
@@ -156,7 +196,7 @@ def release_pin_handler(args: argparse.Namespace) -> int:
         body,
         store=store,
         trading_day=args.trading_day,
-        dry_run=bool(getattr(args, "dry_run", False)),
+        dry_run=dry_run,
         run_mode=getattr(args, "run_mode", None),
     )
     return 0
