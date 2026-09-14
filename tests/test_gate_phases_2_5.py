@@ -2285,9 +2285,24 @@ class TestPortfolioEngineUsedByTheSSlot:
     `manifest_records_portfolio_engine` reader the producer ships beside."""
 
     def test_unmeasurable_when_no_s_slot_manifest_exists(self, store: LocalStore) -> None:
-        """No S cycle job exists yet (`crucible.slots.strategy` has no
-        `produce`/`grade`), so every real store reads this today. UNMEASURABLE,
-        never UNMET: nothing has graded a book for the engine to have built."""
+        """S is dispatchable but has graded no book (its `produce` needs an M
+        champion). UNMEASURABLE, never UNMET, and the detail names THAT cause
+        rather than asserting the entry points are missing."""
+        clause = gate_module._clause_portfolio_engine_used_by_s_slot(store, _window(4))
+        assert clause.unmeasurable and not clause.met
+        assert "S slot is dispatchable but has not graded a book" in clause.detail
+        assert "champions/m/current.json" in clause.detail
+        assert "has no `produce`/`grade` yet" not in clause.detail
+
+    def test_detail_names_missing_entry_points_only_when_they_are_missing(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import crucible.slots as slots_module
+
+        real = slots_module.dispatchable_slots()
+        monkeypatch.setattr(
+            slots_module, "dispatchable_slots", lambda: {k: v for k, v in real.items() if k != "s"}
+        )
         clause = gate_module._clause_portfolio_engine_used_by_s_slot(store, _window(4))
         assert clause.unmeasurable and not clause.met
         assert "S slot has no `produce`/`grade` yet" in clause.detail
