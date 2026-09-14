@@ -66,7 +66,30 @@ What makes a group unmeasured
    every v1 snapshot before 2026-08-19, `gross_margin` two, `roe` 14-19 and
    `capex_growth_5y` one.
 
-**Measured depth (2026-09-14).** Sector measured from 2026-05-01. Every
+Sector before the first full-universe snapshot: a flagged backfill
+------------------------------------------------------------------
+
+No free dated GICS history exists, and the first constituents snapshot that
+covers the declared universe was fetched for 2026-05-01. Brian's ruling
+(a) on `alpha-engine-config-I10733`, 2026-09-14: a session BEFORE that first
+adequate snapshot's knowledge date resolves the EARLIEST adequate snapshot's
+sector map instead of reading unmeasured. It is a declared, named source
+mode, not a silent fallback. The reading carries
+``source_mode="earliest_snapshot_backfill"`` (every other reading carries
+``"point_in_time"``), its ``knowledge_date`` is the snapshot's real fetch date
+(which is AFTER the session, stated rather than hidden), and
+``known_look_ahead`` lists, as data, every entry of
+:data:`KNOWN_GICS_RECLASSIFICATIONS` that took effect between the session and
+that knowledge date: those tickers carry their post-change sector on a
+session that pre-dates the change. The feature layer stamps the mode onto
+every row (`sector_earliest_snapshot_backfill_raw`), and `experiment.grade` carries it into
+each arm's series lineage, its `scores/` document and the `arena_cycle`
+artifact, so a reader can see which part of a score rests on backfilled
+sectors. A session at or after the first adequate snapshot's knowledge date
+is resolved strictly point-in-time exactly as before.
+
+**Measured depth (2026-09-14).** Sector measured point-in-time from 2026-05-01;
+backfilled (flagged) before it. Every
 fundamental field the pillars read is measured from 2026-08-20 (the first
 session after the 2026-08-19 snapshot). 13F accumulation is measured from
 2026-05-18 (2026Q1: 2026-03-31 + 45 days). So the four attractiveness arms
@@ -135,17 +158,21 @@ if TYPE_CHECKING:
     import pandas as pd
 
 __all__ = [
+    "EARLIEST_SNAPSHOT_BACKFILL_MODE",
     "EDGAR_SESSION_SCHEMA_VERSION",
     "FUNDAMENTAL_FIELD_COLUMNS",
     "FUNDAMENTAL_DISTINCTNESS_FLOOR",
     "GROUP_COVERAGE_FLOOR_RATIO",
     "INSTITUTIONAL_COLUMNS",
+    "KNOWN_GICS_RECLASSIFICATIONS",
     "MAX_FUNDAMENTAL_STALENESS_SESSIONS",
     "MAX_SECTOR_STALENESS_SESSIONS",
     "POINT_IN_TIME_COLUMNS",
+    "POINT_IN_TIME_MODE",
     "SECTOR_COLUMN",
     "THIRTEEN_F_FILING_LAG_DAYS",
     "FilingDatePointInTimeSource",
+    "GicsReclassification",
     "GroupReading",
     "MappingSnapshotReader",
     "PointInTimeInputs",
@@ -162,6 +189,85 @@ __all__ = [
 
 GroupName = Literal["fundamental", "sector", "institutional"]
 GroupState = Literal["measured", "predates_source", "stale", "below_coverage", "not_supplied"]
+SourceMode = Literal["point_in_time", "earliest_snapshot_backfill"]
+
+#: The mode of a reading resolved strictly from what was known before the session.
+POINT_IN_TIME_MODE: SourceMode = "point_in_time"
+#: The mode of a sector reading resolved from the earliest adequate constituents
+#: snapshot for a session that pre-dates it (Brian's ruling (a),
+#: `alpha-engine-config-I10733`). Carries a known look-ahead; never silent.
+EARLIEST_SNAPSHOT_BACKFILL_MODE: SourceMode = "earliest_snapshot_backfill"
+
+
+@dataclass(frozen=True)
+class GicsReclassification:
+    """One public GICS change that a backfilled sector map cannot see.
+
+    ``effective_session`` is the first NYSE session the new classification
+    applied to. A backfilled map for a session BEFORE it carries each
+    ticker's ``to_sector`` where the truth was ``from_sector``.
+    ``tickers`` are the symbols as the constituents snapshots key them today
+    (Fleetcor is `CPAY`, Fiserv is `FI`); the list is the S&P 500 members
+    named in the public notices and is NOT exhaustive for the S&P 400, nor
+    for single-company reclassifications, which no free source enumerates.
+    """
+
+    effective_session: dt.date
+    change: str
+    from_sector: str
+    to_sector: str
+    tickers: tuple[str, ...]
+    source: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "effective_session": self.effective_session.isoformat(),
+            "change": self.change,
+            "from_sector": self.from_sector,
+            "to_sector": self.to_sector,
+            "tickers": list(self.tickers),
+            "source": self.source,
+        }
+
+
+_GICS_2023_NOTICE = (
+    "S&P DJI / MSCI GICS structure change announced 2022-12, effective after the close of "
+    "2023-03-17 (S&P DJI Indexology, '2023 GICS Changes: S&P 500 Impact Analysis')"
+)
+
+#: Every GICS STRUCTURE change effective between the start of the v2 history
+#: (2022-01-03) and the first adequate constituents snapshot (2026-05-01).
+#: There is exactly one: the March 2023 change. The next structure review's
+#: consultation closes 2026-10-30, after the snapshots begin, so it is a
+#: point-in-time event the snapshots themselves record.
+KNOWN_GICS_RECLASSIFICATIONS: tuple[GicsReclassification, ...] = (
+    GicsReclassification(
+        effective_session=dt.date(2023, 3, 20),
+        change="Data Processing & Outsourced Services discontinued; Transaction & Payment "
+        "Processing Services created under Financials",
+        from_sector="Information Technology",
+        to_sector="Financials",
+        tickers=("V", "MA", "PYPL", "FIS", "FI", "GPN", "CPAY", "JKHY"),
+        source=_GICS_2023_NOTICE,
+    ),
+    GicsReclassification(
+        effective_session=dt.date(2023, 3, 20),
+        change="Data Processing & Outsourced Services remainder moved to Commercial & "
+        "Professional Services",
+        from_sector="Information Technology",
+        to_sector="Industrials",
+        tickers=("ADP", "PAYX", "BR"),
+        source=_GICS_2023_NOTICE,
+    ),
+    GicsReclassification(
+        effective_session=dt.date(2023, 3, 20),
+        change="General Merchandise Stores moved to Consumer Staples Merchandise Retail",
+        from_sector="Consumer Discretionary",
+        to_sector="Consumer Staples",
+        tickers=("DG", "DLTR", "TGT"),
+        source=_GICS_2023_NOTICE,
+    ),
+)
 
 #: v1 fundamental field -> feature column. The v1 values are carried AS STORED,
 #: including `nousergon-data/collectors/fundamentals.py`'s normalisations, and
@@ -295,6 +401,12 @@ class GroupReading:
     detail: str
     #: column -> reason, for fields unmeasured while the group itself measured.
     unmeasured_fields: dict[str, str] = field(default_factory=dict)
+    #: How the value was resolved. Only the sector group can read anything but
+    #: :data:`POINT_IN_TIME_MODE` (`alpha-engine-config-I10733`, ruling (a)).
+    source_mode: SourceMode = POINT_IN_TIME_MODE
+    #: The public reclassifications the resolved map is known to get wrong on
+    #: this session. Empty for a point-in-time reading, by construction.
+    known_look_ahead: tuple[GicsReclassification, ...] = ()
 
     @property
     def metric_status(self) -> str:
@@ -314,6 +426,8 @@ class GroupReading:
             "expected": self.expected,
             "detail": self.detail,
             "unmeasured_fields": dict(sorted(self.unmeasured_fields.items())),
+            "source_mode": self.source_mode,
+            "known_look_ahead": [r.to_dict() for r in self.known_look_ahead],
         }
 
 
@@ -336,8 +450,20 @@ class PointInTimeInputs:
             out.update(reading.unmeasured_fields)
         return frozenset(out)
 
+    @property
+    def sector_source_mode(self) -> SourceMode | None:
+        """The sector reading's mode, or None when sector measured nothing.
+
+        This is what `crucible.features.compute` stamps onto every feature row
+        as `sector_earliest_snapshot_backfill_raw`: a session whose sector is null has no
+        sector-derived value to qualify.
+        """
+        sector = next(r for r in self.readings if r.group == "sector")
+        return sector.source_mode if sector.state == "measured" else None
+
     def to_dict(self) -> dict[str, Any]:
         return {
+            "sector_source_mode": self.sector_source_mode,
             "source": self.source,
             "snapshot_id": self.snapshot_id,
             "trading_day": self.trading_day.isoformat(),
@@ -446,6 +572,7 @@ class SnapshotPointInTimeSource(PointInTimeSource):
         self._listing: dict[str, list[str]] = {}
         self._parquet_cache: dict[str, Any] = {}
         self._json_cache: dict[str, Any] = {}
+        self._sector_names_cache: dict[str, frozenset[str]] = {}
 
     def snapshot_id(self) -> str:
         return f"v1-snapshots:{self._label}"
@@ -621,8 +748,6 @@ class SnapshotPointInTimeSource(PointInTimeSource):
         )
 
     def _load_sector(self, day: dt.date, wanted: list[str], frame: pd.DataFrame) -> GroupReading:
-        import pandas as pd
-
         labels = sorted(
             dt.date.fromisoformat(m.group(1))
             for m in self._require_listing("market_data/weekly/", _CONSTITUENTS_KEY_RE)
@@ -634,21 +759,19 @@ class SnapshotPointInTimeSource(PointInTimeSource):
         chosen: tuple[str, dt.date, dict[str, Any]] | None = None
         for label in reversed(candidates):
             key = constituents_key(label)
-            document = self._json(key)
-            fetched = document.get("fetched_at")
-            if not isinstance(fetched, str) or not fetched:
-                raise MissingSourceError(
-                    f"{key!r} records no `fetched_at`, so when it became known cannot be "
-                    "established; a sector map of unknown knowledge time cannot be admitted "
-                    "to any session"
-                )
-            known = pd.Timestamp(fetched)
-            if known.tzinfo is None:
-                raise MissingSourceError(f"{key!r} `fetched_at`={fetched!r} carries no timezone")
-            knowledge_date = known.tz_convert(_NEW_YORK).date()
+            knowledge_date, document = self._sector_knowledge_date(key)
             if knowledge_date < day:
                 chosen = (key, knowledge_date, document)
                 break
+        backfill = self._earliest_adequate_sector_snapshot(labels, wanted)
+        if backfill is not None and backfill[1] >= day:
+            # Brian's ruling (a), `alpha-engine-config-I10733`: before the first
+            # snapshot that covers the universe became known, use that snapshot's
+            # map as a NAMED mode. `chosen` may exist here (an S&P-500-only map,
+            # which reads below_coverage) — it is superseded by the flagged
+            # backfill because the ruling covers every session before the first
+            # adequate map, not only sessions before any map at all.
+            return self._backfilled_sector(day, wanted, frame, *backfill)
         if chosen is None:
             return GroupReading(
                 group="sector",
@@ -692,6 +815,101 @@ class SnapshotPointInTimeSource(PointInTimeSource):
             covered=len(covered_names),
             expected=len(wanted),
             detail=f"{key} (fetched {document['fetched_at']}): {len(covered_names)} names",
+        )
+
+    def _sector_knowledge_date(self, key: str) -> tuple[dt.date, dict[str, Any]]:
+        import pandas as pd
+
+        document = self._json(key)
+        fetched = document.get("fetched_at")
+        if not isinstance(fetched, str) or not fetched:
+            raise MissingSourceError(
+                f"{key!r} records no `fetched_at`, so when it became known cannot be "
+                "established; a sector map of unknown knowledge time cannot be admitted "
+                "to any session"
+            )
+        known = pd.Timestamp(fetched)
+        if known.tzinfo is None:
+            raise MissingSourceError(f"{key!r} `fetched_at`={fetched!r} carries no timezone")
+        return known.tz_convert(_NEW_YORK).date(), document
+
+    def _earliest_adequate_sector_snapshot(
+        self, labels: list[dt.date], wanted: list[str]
+    ) -> tuple[str, dt.date, dict[str, Any]] | None:
+        """The earliest-FETCHED constituents snapshot covering the coverage floor.
+
+        "Adequate" is the same :data:`GROUP_COVERAGE_FLOOR_RATIO` a
+        point-in-time reading must meet: the earliest map in the store is an
+        S&P-500-only document that would rank half the universe within sector,
+        so it is not the map the ruling means. Ordered by knowledge date, not
+        folder label (the two disagree, see the module docstring).
+        """
+        wanted_set = frozenset(wanted)
+        best: tuple[str, dt.date, dict[str, Any]] | None = None
+        for label in labels:
+            # A document labelled L is fetched no earlier than the evening
+            # before L, so once labels pass the best knowledge date by a week
+            # no later label can be known earlier; stop reading.
+            if best is not None and label > best[1] + dt.timedelta(days=7):
+                break
+            key = constituents_key(label)
+            knowledge_date, document = self._sector_knowledge_date(key)
+            if best is not None and knowledge_date >= best[1]:
+                continue
+            covered = len(self._sector_names(key, document) & wanted_set)
+            if covered / len(wanted) >= GROUP_COVERAGE_FLOOR_RATIO:
+                best = (key, knowledge_date, document)
+        return best
+
+    def _sector_names(self, key: str, document: dict[str, Any]) -> frozenset[str]:
+        """The tickers a map labels, cached: a heal asks this once per session."""
+        if key not in self._sector_names_cache:
+            sector_map = document.get("sector_map")
+            if not isinstance(sector_map, dict):
+                raise MissingSourceError(f"{key!r} carries no `sector_map` object")
+            self._sector_names_cache[key] = frozenset(
+                t for t, v in sector_map.items() if isinstance(v, str) and v.strip()
+            )
+        return self._sector_names_cache[key]
+
+    def _backfilled_sector(
+        self,
+        day: dt.date,
+        wanted: list[str],
+        frame: pd.DataFrame,
+        key: str,
+        knowledge_date: dt.date,
+        document: dict[str, Any],
+    ) -> GroupReading:
+        sector_map = document["sector_map"]
+        covered_names = sorted(
+            t for t in wanted if isinstance(sector_map.get(t), str) and sector_map[t].strip()
+        )
+        frame.loc[covered_names, SECTOR_COLUMN] = [sector_map[t] for t in covered_names]
+        look_ahead = tuple(
+            r for r in KNOWN_GICS_RECLASSIFICATIONS if day < r.effective_session <= knowledge_date
+        )
+        named = "; ".join(
+            f"{r.from_sector}->{r.to_sector} effective {r.effective_session} "
+            f"({', '.join(r.tickers)})"
+            for r in look_ahead
+        )
+        return GroupReading(
+            group="sector",
+            state="measured",
+            snapshot=key,
+            knowledge_date=knowledge_date.isoformat(),
+            covered=len(covered_names),
+            expected=len(wanted),
+            detail=(
+                f"{EARLIEST_SNAPSHOT_BACKFILL_MODE}: no universe-covering sector map was "
+                f"fetched before {day}; {key} (fetched {document['fetched_at']}, AFTER the "
+                f"session) supplies {len(covered_names)} names. Known look-ahead: "
+                + (named or "no enumerated GICS structure change falls in the gap")
+                + ". Single-company reclassifications are not enumerated."
+            ),
+            source_mode=EARLIEST_SNAPSHOT_BACKFILL_MODE,
+            known_look_ahead=look_ahead,
         )
 
     def _load_institutional(

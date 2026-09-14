@@ -35,6 +35,7 @@ from nousergon_lib.arena.window import ArmSeries
 
 from crucible.calendar import assert_trading_day
 from crucible.config import Settings
+from crucible.data.point_in_time import EARLIEST_SNAPSHOT_BACKFILL_MODE, POINT_IN_TIME_MODE
 from crucible.documents import load_store_document
 from crucible.features import DEFAULT_FEATURE_VERSION, read_features
 from crucible.keys import (
@@ -95,6 +96,7 @@ __all__ = [
     "ARM_SERIES_SCHEMA_VERSION",
     "BASELINE_CONTROL_KIND",
     "INCUMBENT_SOURCE_FIELD",
+    "SECTOR_SOURCE_MODE_FIELD",
     "MIN_ACTIVE_ARMS_FINDING_METRIC",
     "MissingArtifactError",
     "baseline_control_arm",
@@ -131,6 +133,20 @@ BASELINE_CONTROL_KIND = "null"
 #: seated champion" are two different readings of the same `decided` status
 #: and no reader should have to recover the difference from an arm id.
 INCUMBENT_SOURCE_FIELD = "incumbent_source"
+
+#: `alpha-engine-config-I10733`, Brian's ruling (a). The crucible-owned key on
+#: `arena_cycle` and on each `scores/` series document naming, per arm, which
+#: SCORED dates rest on which sector source mode — read back off the feature
+#: row each day's shadow was produced from. Values: the mode the feature layer's
+#: `sector_earliest_snapshot_backfill_raw` encodes (`point_in_time`,
+#: `earliest_snapshot_backfill`),
+#: `sector_unmeasured` when that session's sector group measured nothing, and
+#: `unrecorded` when the shadow names no feature version or its layer predates
+#: the column. The same modes ride on `ArmSeries.lineage` under this name, so
+#: the library's ladders carry them too.
+SECTOR_SOURCE_MODE_FIELD = "sector_source_mode"
+SECTOR_MODE_UNMEASURED = "sector_unmeasured"
+SECTOR_MODE_UNRECORDED = "unrecorded"
 
 #: `alpha-engine-config-I10636`: the metric name the below-floor finding is
 #: recorded under on the grade job's own manifest, so an operator reading
@@ -202,6 +218,44 @@ def _read_features(store: Store, version: str, trading_day: dt.date) -> pd.DataF
             f"    crucible data.daily --date {trading_day}"
         )
     return read_features(store.get_bytes(key))
+
+
+def _sector_source_mode(store: Store, feature_version: str | None, day: str) -> str:
+    """The sector source mode the feature row behind one scored date carries.
+
+    Read from the feature layer, not from the shadow: the row is the one
+    place the mode is written, so the grade cannot disagree with it.
+    """
+    if not feature_version:
+        return SECTOR_MODE_UNRECORDED
+    key = features_key(feature_version, day)
+    if not store.exists(key):
+        # Not swallowed: an absent layer is recorded as `unrecorded` on the
+        # arm's series and the arena_cycle artifact (SECTOR_SOURCE_MODE_FIELD).
+        return SECTOR_MODE_UNRECORDED
+    frame = read_features(store.get_bytes(key))
+    column = "sector_earliest_snapshot_backfill_raw"
+    if column not in frame.columns:
+        return SECTOR_MODE_UNRECORDED
+    values = {float(v) for v in frame[column].dropna().unique()}
+    if not values:
+        return SECTOR_MODE_UNMEASURED
+    if len(values) != 1 or not values <= {0.0, 1.0}:
+        raise MissingArtifactError(
+            f"{key} carries {column} values {sorted(values)}; the column is one 0/1 value "
+            "per session by construction, so this layer is corrupt"
+        )
+    return EARLIEST_SNAPSHOT_BACKFILL_MODE if values.pop() == 1.0 else POINT_IN_TIME_MODE
+
+
+def _sector_mode_dates(
+    sector_modes_by_arm: dict[str, dict[str, list[str]]], arm_id: str
+) -> dict[str, list[str]]:
+    """mode -> sorted scored dates for one arm; `{}` for an arm with no shadow
+    scored here (a control, or a caller-supplied S series)."""
+    return {
+        mode: sorted(days) for mode, days in sorted(sector_modes_by_arm.get(arm_id, {}).items())
+    }
 
 
 def _read_panel(store: Store, trading_day: dt.date) -> pd.DataFrame:
@@ -609,6 +663,9 @@ def run_grade(
     # an arm whose whole series predates the field, which is the honest
     # reading and the one `ArmSeries` refuses to let be an empty claim.
     lineage_by_arm: dict[str, set[str]] = {}
+    # `alpha-engine-config-I10733`: arm -> mode -> scored dates.
+    sector_modes_by_arm: dict[str, dict[str, list[str]]] = {}
+    sector_mode_cache: dict[tuple[str | None, str], str] = {}
     unsettled: dict[str, list[str]] = {}
     misses: dict[str, list[str]] = {}
     label_control: dict[str, dict[str, Any]] = {}
@@ -714,6 +771,12 @@ def run_grade(
                 produced_under = shadow.get("feature_version")
                 if produced_under:
                     lineage_by_arm.setdefault(arm_id, set()).add(str(produced_under))
+                cache_key = (str(produced_under) if produced_under else None, day)
+                if cache_key not in sector_mode_cache:
+                    sector_mode_cache[cache_key] = _sector_source_mode(ctx.store, *cache_key)
+                sector_modes_by_arm.setdefault(arm_id, {}).setdefault(
+                    sector_mode_cache[cache_key], []
+                ).append(day)
                 # Claimed as an OUTPUT, not only written: `crucible explain
                 # <verdict key>` resolves a key through the manifest that
                 # claims it, and until 2026-09-05 no manifest claimed a
@@ -821,11 +884,18 @@ def run_grade(
             # from the settled returns — so it contributes no dimension and
             # its lineage is `{}`. That is "this arm declares none", which is
             # exactly right and is distinct from a missing key.
-            lineage=(
-                {"feature_version": tuple(sorted(lineage_by_arm[arm_id]))}
-                if lineage_by_arm.get(arm_id)
-                else {}
-            ),
+            lineage={
+                **(
+                    {"feature_version": tuple(sorted(lineage_by_arm[arm_id]))}
+                    if lineage_by_arm.get(arm_id)
+                    else {}
+                ),
+                **(
+                    {SECTOR_SOURCE_MODE_FIELD: tuple(sorted(sector_modes_by_arm[arm_id]))}
+                    if sector_modes_by_arm.get(arm_id)
+                    else {}
+                ),
+            },
         )
         for arm_id, scores in sorted({**{a: {} for a in supplied}, **verdicts}.items())
     }
@@ -865,6 +935,7 @@ def run_grade(
                     "arm_id": arm_series.arm_id,
                     "scores": {day: float(score) for day, score in arm_series.scores.items()},
                     "misses": sorted(arm_series.misses or ()),
+                    SECTOR_SOURCE_MODE_FIELD: _sector_mode_dates(sector_modes_by_arm, arm_id),
                 },
                 indent=2,
                 sort_keys=True,
@@ -1075,6 +1146,11 @@ def run_grade(
     # arm; this names WHERE it came from, which is the difference between a
     # slot measured against a seated champion and one measured against noise.
     cycle_payload[INCUMBENT_SOURCE_FIELD] = incumbent_source
+    # `alpha-engine-config-I10733`: which part of each arm's score rests on a
+    # backfilled sector map. Same crucible-owned-key shape as the two above.
+    cycle_payload[SECTOR_SOURCE_MODE_FIELD] = {
+        arm_id: _sector_mode_dates(sector_modes_by_arm, arm_id) for arm_id in sorted(series_by_arm)
+    }
     ctx.record_output(
         cycle_key,
         json.dumps(cycle_payload, indent=2, sort_keys=True).encode("utf-8"),

@@ -198,12 +198,17 @@ class TestUnmeasured:
             _source({}).load(trading_day=END, symbols=_tickers())
 
     def test_a_session_before_the_first_snapshot_is_unmeasurable_not_failed(self) -> None:
+        """Fundamentals and 13F still read `predates_source`. Sector does not:
+        Brian's ruling (a) on alpha-engine-config-I10733 backfills it, flagged
+        (`TestSectorBackfill`)."""
         tickers = _tickers()
         inputs = _source(_objects(tickers)).load(trading_day=dt.date(2026, 1, 5), symbols=tickers)
         for reading in inputs.readings:
+            if reading.group == "sector":
+                continue
             assert reading.state == "predates_source"
             assert reading.metric_status == "unmeasurable"
-        assert inputs.frame.drop(columns="ticker").isna().all().all()
+        assert inputs.frame.drop(columns=["ticker", "sector_raw"]).isna().all().all()
 
     def test_a_stale_fundamentals_snapshot_nulls_the_group_and_fails(self) -> None:
         tickers = _tickers()

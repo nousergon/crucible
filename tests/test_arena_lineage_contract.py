@@ -166,7 +166,11 @@ class TestTheCycleArtifactCarriesTheLineage:
         real = {a: e for a, e in ladders.items() if a not in control_ids}
         assert real, "the cycle graded no non-control arm; there is no lineage to read"
         for arm_id, entry in real.items():
-            assert entry["lineage"] == {"feature_version": [DEFAULT_FEATURE_VERSION]}, (
+            assert entry["lineage"] == {
+                "feature_version": [DEFAULT_FEATURE_VERSION],
+                # alpha-engine-config-I10733: the fixture market supplies no sector map.
+                "sector_source_mode": ["sector_unmeasured"],
+            }, (
                 f"{arm_id}: the ladder entry does not name the feature-layer version "
                 f"its scored dates were produced under: {entry['lineage']}"
             )
