@@ -19,7 +19,14 @@ dependencies = [
     # `uv lock --refresh` is the form that works in the minutes after a
     # publish — a plain `uv lock` reports "no version of nousergon-lib" out of
     # a stale index cache and reads like an unpublished pin.
-    "nousergon-lib[github-app]==0.124.124",
+    #
+    # 0.124.127 carries `nousergon_lib.gates` (nousergon-lib-PR413,
+    # alpha-engine-config-I10748 P-02): the clause/containment/fault-exclusion
+    # primitives and the phase-ladder document, lifted off this module's own
+    # copy on second adoption (`data_gate` in `nousergon-data` is the first).
+    # `[gates]` pulls in jsonschema, already a direct dependency here for the
+    # same `Draft202012Validator` this module imports.
+    "nousergon-lib[github-app,gates]==0.124.127",
     # Trading calendar, dual-date resolution, structured logging, alerts.
     #
     # `[openai]` is NOT optional here (alpha-engine-config-I10473). krepis
@@ -105,7 +112,7 @@ dependencies = [
 # path it never exercises. `crucible data.daily --source arctic` states the
 # missing extra by name when it is absent — it never falls back to a
 # different source, which would silently change what the run measured.
-arcticdb = ["nousergon-lib[arcticdb]==0.124.124"]
+arcticdb = ["nousergon-lib[arcticdb]==0.124.127"]
 
 [project.scripts]
 crucible = "crucible.cli:main"

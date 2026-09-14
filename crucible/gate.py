@@ -36,11 +36,23 @@ from calendar import monthrange
 from collections.abc import Callable, Iterable
 from contextlib import redirect_stderr
 from dataclasses import dataclass, field, replace
-from functools import lru_cache, wraps
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from jsonschema import Draft202012Validator
+from nousergon_lib.gates import CLAUSE_FUNCTION_PREFIX as _LIB_CLAUSE_FUNCTION_PREFIX
+from nousergon_lib.gates import CLAUSE_MEMBER_RANK as _LIB_CLAUSE_MEMBER_RANK
+from nousergon_lib.gates import FAULT_OUTCOME_INDUCED as _LIB_FAULT_OUTCOME_INDUCED
+from nousergon_lib.gates import LADDER_CONSOLE_STATE as _LIB_LADDER_CONSOLE_STATE
+from nousergon_lib.gates import LADDER_KEY as _LIB_LADDER_KEY
+from nousergon_lib.gates import LADDER_SCHEMA_VERSION as _LIB_LADDER_SCHEMA_VERSION
+from nousergon_lib.gates import LADDER_STATES as _LIB_LADDER_STATES
+from nousergon_lib.gates import Clause as _LibClause
+from nousergon_lib.gates import ClauseMisconfiguredError as _LibClauseMisconfiguredError
+from nousergon_lib.gates import clause_member_status as _lib_clause_member_status
+from nousergon_lib.gates import contained as _lib_contained
+from nousergon_lib.gates import unmeasurable as _lib_unmeasurable
 from pydantic import ValidationError
 
 from crucible.aggregation import MemberRow, member_dicts
@@ -134,7 +146,7 @@ from crucible.report import ROWS as _ATTRIBUTION_ROWS
 from crucible.report import _execution_row, attribution_key
 from crucible.runner import TRANSIENT_CLASSIFIERS
 from crucible.slots import SLOTS, dispatchable_slots, is_control_arm
-from crucible.store import S3Store, Store, sha256_hex
+from crucible.store import S3Store, Store, open_store, sha256_hex
 from crucible.synthetic import synthetic_routing_active
 from crucible.tags import (
     TAG_KEY,
@@ -256,78 +268,22 @@ __all__ = [
 GATE_SCHEMA_VERSION = "gate.v1"
 
 
-@dataclass(frozen=True)
-class Clause:
-    """One gate condition and what the store said about it.
-
-    A clause is met, unmet, or UNMEASURABLE, and unmeasurable is never met
-    (module docstring; `alpha-engine-config-I9869` round 2). ``unmeasurable``
-    is a fact about OUR READING, never about the system being graded, and it
-    renders distinctly rather than being folded into "unmet" so an operator
-    does not go fix a producer when the fault is on our side of the boundary.
-    Two things make a reading unmeasurable:
-
-    * a store read that raised — a permission denial, a transient
-      AccessDenied: we could not obtain the artifact;
-    * an artifact whose schema PREDATES the question the clause now asks —
-      we obtained it and it cannot answer (`_clause_old_weekly_within_cadence`
-      after the 2026-09-04 ruling, `alpha-engine-config-I9962`). Grading it
-      against the retired metric under the new clause's name would publish a
-      number nobody asked for; grading it unmet would report a finding against
-      a system behaving exactly as ruled.
-
-    Neither is "the system failed", and neither is ever met.
-    """
-
-    name: str
-    requirement: str
-    met: bool
-    detail: str
-    evidence: tuple[str, ...] = ()
-    unmeasurable: bool = False
-    #: The first render day on which THIS clause could next read MET, DERIVED
-    #: by the clause itself, never restated by a caller
-    #: (`alpha-engine-config-I10494` deliverable 1). `None` on every MET
-    #: clause (nothing to wait for) and on every clause — met, unmet or
-    #: unmeasurable — whose requirement carries no calendar floor at all, or
-    #: whose floor could not be derived this render (e.g. the underlying
-    #: `LastChangeUnreadableError`). A date here is a statement about WHEN,
-    #: never a softened statement about WHETHER: an unmet clause with
-    #: `earliest_satisfiable=None` is still unmet, exactly as it was before
-    #: this field existed.
-    earliest_satisfiable: dt.date | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "requirement": self.requirement,
-            "met": self.met,
-            "unmeasurable": self.unmeasurable,
-            "detail": self.detail,
-            # Ordered, not de-duplicated. Each arc stage now reads its own
-            # discriminated manifest key (alpha-engine-config-I9781), so a
-            # repeated key in this list is evidence of a real collision
-            # rather than an artifact of a bare, undiscriminated read that
-            # de-duplication would otherwise mask.
-            "evidence": sorted(self.evidence),
-            "earliest_satisfiable": (
-                None if self.earliest_satisfiable is None else self.earliest_satisfiable.isoformat()
-            ),
-        }
-
-
-#: `alpha-engine-config-I10417`: the rank a gate clause's member status is
-#: reduced under, HIGHER IS WORSE. `UNMEASURABLE` ranks worse than `UNMET`
-#: for the same reason `crucible.report.GRADE_RANK` ranks every `N/A-*`
-#: status worse than `RED` — "we could not read this" must never render
-#: better than "we read it and it said no".
-CLAUSE_MEMBER_RANK: dict[str, int] = {"MET": 0, "UNMET": 1, "UNMEASURABLE": 2}
-
-
-def _clause_member_status(clause: Clause) -> str:
-    if clause.unmeasurable:
-        return "UNMEASURABLE"
-    return "MET" if clause.met else "UNMET"
+# `Clause`, `CLAUSE_MEMBER_RANK` and `_clause_member_status` used to be
+# DEFINED here. They moved to `nousergon_lib.gates` under
+# `alpha-engine-config-I10777` (the data collector's `data_gate` module was
+# the first adopter, `alpha-engine-config-I10748` P-02) — second adoption,
+# `shared-code-policy`. `Clause` gained three fields on the move (`phase`,
+# `source`, `as_of`), all defaulting to `None` and all unset by every clause
+# in this module, so `to_dict()` now carries three additional always-`None`
+# keys; nothing in this repository schema-validates an individual clause
+# document (`gate.v1` has no JSON Schema — only the ladder and the closing
+# reading do), so the addition is inert here. Imported under the private
+# names this module already calls, so every one of this file's ~110
+# `Clause(...)` call sites and every `_clause_member_status(...)` call site
+# is untouched and the move is provably behaviour-preserving.
+Clause = _LibClause
+CLAUSE_MEMBER_RANK = _LIB_CLAUSE_MEMBER_RANK
+_clause_member_status = _lib_clause_member_status
 
 
 @dataclass
@@ -3602,6 +3558,14 @@ PHASE4_DELIVERABLES: tuple[Deliverable, ...] = (
         "old SFs disabled",
         "old_sf_execution_count_zero",
     ),
+    # data_cutover_ready: plan §6.2 step 5, alpha-engine-config-I10777.
+    Deliverable(
+        "data_cutover_ready",
+        "the standalone data-collection stack (component 1) has read its own "
+        "cutover-readiness gate as MET before the v1 SFs disable "
+        "(data_collection_plan_260914.md §6.2 step 5)",
+        "data_cutover_ready",
+    ),
     Deliverable(
         "lambdas_and_alarms_removed",
         "66 Lambdas + 153 alarms removed via IaC",
@@ -3806,99 +3770,18 @@ def _phase0(
 # ---------------------------------------------------------------------------
 
 
-def _unmeasurable(name: str, requirement: str, detail: str, evidence: Iterable[str] = ()) -> Clause:
-    """One clause that could not be read, with the reason.
-
-    `met=False` and `unmeasurable=True` together, always: `met` is what the
-    ladder and `met_ratio` count, and an unmeasurable clause that set `met`
-    True would be *no data* painted green — the single failure mode plan §6
-    rule 1 exists to forbid.
-    """
-    return Clause(name, requirement, False, detail, tuple(evidence), unmeasurable=True)
-
-
-#: The prefix every clause function in this module carries. The containment
-#: wrapper below is applied by walking this module's globals for it, so a clause
-#: added tomorrow is contained without anybody remembering to decorate it — the
-#: difference between a rule and a habit.
-CLAUSE_FUNCTION_PREFIX = "_clause_"
-
-
-class ClauseMisconfiguredError(ValueError):
-    """A clause was CALLED wrongly — the arguments cannot describe any system.
-
-    The one thing :func:`_contained` re-raises, and the distinction is between
-    a fact about the environment and a bug in this package. Every other
-    exception a clause can raise is a failed READING: a client that would not
-    build, a bucket that would not list, a document that would not parse. Those
-    are UNMEASURABLE, because the system was not observed.
-
-    This one is different in kind. `_clause_old_weekly_within_cadence` with
-    `minimum > maximum` is a clause list that asks an unanswerable question, and
-    the only place such a call can come from is this module's own phase
-    assemblers — never from an operator, a box, or a credential. Rendering it as
-    an UNMEASURABLE row would put a bug in our clause list behind a message that
-    reads like an AWS problem, and it would render that way every week forever.
-
-    Not a suppression list (AGENTS.md rule 4): one declared type, raised only by
-    argument validation, with the reason stated here. Adding a second type to
-    escape containment would be exactly the collection that rule forbids.
-    """
-
-
-def _contained(fn: Callable[..., Clause]) -> Callable[..., Clause]:
-    """``fn``, with any escaped exception turned into an UNMEASURABLE clause.
-
-    **No gate clause may raise into its caller** (`alpha-engine-config-I10328`,
-    and `-I9869`'s class recurring). A clause is one reading among dozens; a
-    reading that could not be taken is that clause's UNMEASURABLE, never the
-    death of the whole ladder. Measured 2026-09-09: `_clause_zero_human_
-    mutating_calls` gained a `DescribeStacks` call whose CLIENT CONSTRUCTION
-    raised `NoRegionError` on a box that exports no region — outside the try
-    block the read itself had — and every `weekly` arc failed at the `console`
-    stage that renders `gates/ladder.json`, which then regressed phase 1's
-    `arc_runs_ok`. One unguarded line in one clause darkened every phase gate
-    in the system and turned a gate READ into a system FAILURE.
-
-    Guarding each clause individually is what failed: `-I9869` fixed exactly
-    this for manifest reads, clause by clause, and the next clause to reach a
-    new AWS service reintroduced it. So the containment lives HERE, applied to
-    every `_clause_*` function by :func:`_contain_clause_exceptions`, and a
-    clause author cannot forget it.
-
-    **This is a deliberate swallow** (AGENTS.md rule 5), so, explicitly: the
-    failure mode swallowed is "a clause raised instead of returning a reading";
-    the primary deliverable — a gate result carrying every other clause —
-    survives; and the recording surface is the returned clause's own
-    UNMEASURABLE detail, which names the exception type and message and is
-    rendered on the ladder, the board and `crucible gate`'s output. `met=False`
-    always, via :func:`_unmeasurable`, so an uncontainable clause can never be
-    counted as passing. `Exception`, not `BaseException`: a KeyboardInterrupt or
-    a spot reclamation must still stop the process.
-    """
-
-    @wraps(fn)
-    def _guarded(*args: Any, **kwargs: Any) -> Clause:
-        try:
-            return fn(*args, **kwargs)
-        except ClauseMisconfiguredError:
-            # Re-raised, not contained: a clause called with arguments that
-            # cannot describe any system is a bug in this module's own clause
-            # list, and containing it would render our defect as an
-            # environment reading, every week, forever. See the class.
-            raise
-        except Exception as exc:
-            name = fn.__name__.removeprefix(CLAUSE_FUNCTION_PREFIX)
-            return _unmeasurable(
-                name,
-                f"{name} could be evaluated at all",
-                f"the clause raised {type(exc).__name__}: {exc}. A clause that raises has "
-                "learned nothing about the system, so this is UNMEASURABLE — it is not a "
-                "finding about the system, and it does not darken the other clauses",
-            )
-
-    _guarded._contained = True  # type: ignore[attr-defined]
-    return _guarded
+# `_unmeasurable`, `CLAUSE_FUNCTION_PREFIX`, `ClauseMisconfiguredError` and
+# `_contained` used to be DEFINED here too, on the same lift as `Clause`
+# above. `_contain_clause_exceptions` (below) stays LOCAL and byte-identical
+# — it is the one piece `tests/test_gate_clause_containment.py` asserts the
+# exact failure shape of (`RuntimeError`, "wrapped 0 functions"), which
+# differs from the lib's own `contain_clause_exceptions` (raises
+# `ClauseMisconfiguredError`, a different message) — so the per-function
+# wrapper moves and the module-level pass that calls it does not.
+_unmeasurable = _lib_unmeasurable
+CLAUSE_FUNCTION_PREFIX = _LIB_CLAUSE_FUNCTION_PREFIX
+ClauseMisconfiguredError = _LibClauseMisconfiguredError
+_contained = _lib_contained
 
 
 def _contain_clause_exceptions() -> None:
@@ -4266,8 +4149,15 @@ FAULT_RECORD_OUTCOME_FIELD = "outcome"
 #: The one outcome whose `run_id` excuses a failed manifest from
 #: `arc_runs_ok`/`replays_ok`. Named, because `_fault_excused_run_ids` filters
 #: on it and a string literal there would be the kind of unexplained
-#: comparison that gets "simplified" away.
-FAULT_OUTCOME_INDUCED = "induced"
+#: comparison that gets "simplified" away. Sourced from `nousergon_lib.gates`
+#: (identical value, `alpha-engine-config-I10777`); `_fault_excused_run_ids`
+#: itself stays LOCAL rather than calling the lib's `fault_excused_run_ids` —
+#: this module's version additionally discriminates keys through
+#: `parse_fault_injection_key` (this repo's own key-shape contract), where the
+#: lib's generic version only checks a `.json` suffix. Swapping the reader
+#: would silently loosen the filter behind the one mechanism in a gate capable
+#: of turning an arbitrary red clause green.
+FAULT_OUTCOME_INDUCED = _LIB_FAULT_OUTCOME_INDUCED
 
 #: The README the phase-2 runbook deliverable lives in. Not a store artifact,
 #: for the reason :data:`ACCEPTANCE_RATCHET_PATH` is not: the runbook's
@@ -8745,6 +8635,109 @@ def _clause_money_path_chain_verified(store: Store) -> Clause:
     )
 
 
+#: Where component 1's own artifact store lives — a DIFFERENT bucket/prefix
+#: than this module's own `store` (component 1 is the data collector,
+#: component 2 is this harness; `architecture.d/146`). Unset by default
+#: rather than hardcoded, per this repo's own rule against infrastructure
+#: identifiers in public code (`AGENTS.md`): component 1's own `data_gate`
+#: module names its store's `s3://` URI in ITS OWN repository, and an
+#: operator sets this variable to that same value.
+CRUCIBLE_DATA_COLLECTION_STORE_VAR = "CRUCIBLE_DATA_COLLECTION_STORE"
+
+#: The sub-gate name `data_gate.read.GATES` registers for component 1's
+#: cutover-readiness reading (`alpha-engine-config-I10777`, plan §6.2 step 3).
+_DATA_CUTOVER_READY_GATE = "data-cutover-ready"
+
+
+def _clause_data_cutover_ready(store: Store) -> Clause:
+    """Plan §6.2 step 5: this phase reads component 1's cutover-readiness gate
+    as a published artifact, never through code (`architecture.d/146` rule 3)
+    — the one coupling between the data collector (component 1) and this
+    harness (component 2, `alpha-engine-config-I10777`).
+
+    Reads `data_collection/gates/data-cutover-ready/*/gate.json`, the LATEST
+    dated reading under that prefix, written by
+    `python -m data_gate read --gate data-cutover-ready` in `nousergon-data`.
+    `store` here is deliberately unused — component 1 publishes to its own
+    bucket, named by :data:`CRUCIBLE_DATA_COLLECTION_STORE_VAR`, not this
+    harness's — so the argument exists only to keep this function's call
+    shape the same as every other `_clause_*` in :func:`_phase4`.
+    """
+    _unused((store,))
+    name = "data_cutover_ready"
+    requirement = (
+        "component 1's `data-cutover-ready` sub-gate reads MET — stack check-live "
+        "green, every SF-only unit has a standalone workload or a recorded retirement "
+        "decision, roles bootstrapped, pre-cutover parity published "
+        "(data_collection_plan_260914.md §6.2 step 3) — read from its own published "
+        "artifact, never re-derived here"
+    )
+    location = os.environ.get(CRUCIBLE_DATA_COLLECTION_STORE_VAR, "").strip()
+    if not location:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"{CRUCIBLE_DATA_COLLECTION_STORE_VAR} is not configured, so component 1's "
+            "gate store cannot be located",
+            (),
+        )
+    try:
+        data_store = open_store(location)
+    except Exception as exc:  # noqa: BLE001 - classified below; `_contained` also guards this
+        return _unmeasurable(
+            name,
+            requirement,
+            f"could not open {location!r}: {type(exc).__name__}: {exc}",
+            (location,),
+        )
+    read_on, access_problem = last_read(data_store, _DATA_CUTOVER_READY_GATE)
+    if access_problem:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"could not list {gate_prefix(_DATA_CUTOVER_READY_GATE)!r} at {location} — a "
+            "store access failure, not 'never read'",
+            (gate_prefix(_DATA_CUTOVER_READY_GATE),),
+        )
+    if read_on is None:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"no reading of {_DATA_CUTOVER_READY_GATE!r} has ever been filed at {location} "
+            f"under {gate_prefix(_DATA_CUTOVER_READY_GATE)!r}",
+            (gate_prefix(_DATA_CUTOVER_READY_GATE),),
+        )
+    key = gate_key(_DATA_CUTOVER_READY_GATE, read_on)
+    read = _read_store_document(data_store, key)
+    if read.problem is not None:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"could not read {key}: {read.problem}",
+            (key,),
+        )
+    if read.absent:
+        # `last_read` just listed this key; an absent GET immediately after is
+        # a race with a concurrent write, not "never measured" — the correct
+        # answer is still UNMEASURABLE, never UNMET, because nothing here
+        # confirms the gate said no.
+        return _unmeasurable(
+            name,
+            requirement,
+            f"{key} was listed but is not readable now (concurrent write?)",
+            (key,),
+        )
+    document = read.document or {}
+    met = bool(document.get("met"))
+    clauses_met = document.get("clauses_met")
+    clauses_total = document.get("clauses_total")
+    detail = (
+        f"{key}: met={met}, {clauses_met}/{clauses_total} of component 1's cutover-ready "
+        f"clauses met, code_sha={document.get('code_sha')}"
+    )
+    return Clause(name, requirement, met, detail, (key,))
+
+
 def _phase4(
     store: Store,
     window: list[dt.date],
@@ -8786,6 +8779,10 @@ def _phase4(
             # reading keeps counting every start where phase 0 stopped.
             skips_count_as_runs=True,
         ),
+        # `alpha-engine-config-I10777`, plan §6.2 step 5: component 1's own
+        # cutover-readiness gate, read as a published artifact rather than
+        # re-derived here (`architecture.d/146` rule 3).
+        _clause_data_cutover_ready(store),
     ]
 
 
@@ -9208,13 +9205,20 @@ def _unused(_: Iterable[Any]) -> None:
 # no state a gate did not measure.
 # ---------------------------------------------------------------------------
 
-LADDER_SCHEMA_VERSION = "phase_ladder.v1"
-
-#: Where the ladder is filed. ONE well-known object, rewritten by every reader,
-#: because the console renders current state and never owns history
-#: (`console-policy` §1). The ladder's history is the dated gate readings at
-#: `gate_key`, which are never overwritten.
-LADDER_KEY = "gates/ladder.json"
+#: `LADDER_SCHEMA_VERSION` and `LADDER_KEY` are sourced from
+#: `nousergon_lib.gates` (`alpha-engine-config-I10777`, second adoption) —
+#: identical values ("phase_ladder.v1", "gates/ladder.json"). `Phase`,
+#: `PhaseRow`, `Ladder` and `build_ladder` stay LOCAL: this module's `Phase`
+#: carries a raw `.issue` int field that `alpha-engine-config`'s
+#: `check_phase_tracker_consistency.py` reads directly
+#: (`{p.number: p.issue for p in PHASES}`), where the lib's generalized
+#: `Phase` stores only the derived `tracker`/`tracker_url` strings; and this
+#: module's `build_ladder` threads a `Component` registry and PHASES is a
+#: module-level constant rather than an injected parameter. Swapping either
+#: would be an API break for a cross-repo consumer this module cannot see
+#: from here — filed as the tracked follow-up (`alpha-engine-config-I10796`).
+LADDER_SCHEMA_VERSION = _LIB_LADDER_SCHEMA_VERSION
+LADDER_KEY = _LIB_LADDER_KEY
 
 #: The tracker every phase issue lives on. The alpha-engine ecosystem files to
 #: `alpha-engine-config` whatever repo the code lands in, so a phase row's
@@ -9379,21 +9383,14 @@ def missing_required_env() -> tuple[str, ...]:
 #: * `OUT_OF_ORDER`  — a later phase is being graded while an earlier phase's
 #:                     gate is not met. Brian's ruling of 2026-09-02: phase 0's
 #:                     gate must READ before phase 2 opens.
-LADDER_STATES: tuple[str, ...] = ("MET", "UNMET", "UNMEASURED", "UNMEASURABLE", "OUT_OF_ORDER")
-
-#: How a ladder state renders on the fleet console, in `observability-policy`
-#: §8.3's vocabulary. `UNMEASURED` maps to `UNREPORTED` and therefore counts
-#: against the transparency gap whose objective is zero — a phase nobody can
-#: read is unobserved, not healthy. `UNMEASURABLE` and `OUT_OF_ORDER` both map
-#: to `FAILED`: one is an access fault, the other an invariant breach, but
-#: neither is a slow phase or a plain shortfall.
-LADDER_CONSOLE_STATE: dict[str, str] = {
-    "MET": "HEALTHY",
-    "UNMET": "DEGRADED",
-    "UNMEASURED": "UNREPORTED",
-    "UNMEASURABLE": "FAILED",
-    "OUT_OF_ORDER": "FAILED",
-}
+#: Sourced from `nousergon_lib.gates` (`alpha-engine-config-I10777`) —
+#: identical values, five-state vocabulary and console mapping unchanged. The
+#: lib module runs its own `_check_ladder_console_coverage` equivalent at ITS
+#: import time against these same values, so re-running the check here would
+#: verify a fact already established; this module's local copy of that
+#: function is removed rather than duplicated.
+LADDER_STATES: tuple[str, ...] = _LIB_LADDER_STATES
+LADDER_CONSOLE_STATE: dict[str, str] = _LIB_LADDER_CONSOLE_STATE
 
 
 def _check_ladder_console_coverage(states: Iterable[str], console_map: dict[str, str]) -> None:
@@ -9405,6 +9402,13 @@ def _check_ladder_console_coverage(states: Iterable[str], console_map: dict[str,
     ladder state reaching a console surface with no declared rendering
     (`alpha-engine-config-I9826`). Called once at import time below, so the
     failure is still caught at import, not deferred to the first render.
+
+    Kept LOCAL rather than imported: the lib runs the equivalent check at ITS
+    OWN import time against these same constant values, but `crucible.gate.
+    _check_ladder_console_coverage` is itself a tested contract
+    (`tests/test_phase_ladder.py`) this module's callers reach directly, and
+    the function is glue around the shared constants above, not part of the
+    engine those constants were lifted from.
     """
     gap = set(states) - set(console_map)
     if gap:
