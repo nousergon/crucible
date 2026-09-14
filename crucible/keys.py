@@ -180,6 +180,7 @@ def integration_store_key(relative_key: str) -> str:
     """
     return f"{INTEGRATION_STORE_SUBPREFIX}{relative_key}"
 
+
 #: The root namespace segment every alert bus row lives under, narrowed by
 #: `crucible.alerts.bus_key` (an architectural exception — see
 #: `tests/test_key_construction_placement.py`). `crucible.alerts.pages_in_window`
