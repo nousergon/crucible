@@ -264,9 +264,7 @@ def resolve_dispatch_attempts() -> list[dict[str, Any]] | None:
     try:
         rows = json.loads(raw)
     except ValueError as exc:
-        raise DispatchAttemptsError(
-            f"{DISPATCH_ATTEMPTS_ENV}={raw!r} is not JSON: {exc}"
-        ) from exc
+        raise DispatchAttemptsError(f"{DISPATCH_ATTEMPTS_ENV}={raw!r} is not JSON: {exc}") from exc
     declared = {reason for reason, _types, _needles in TRANSIENT_CLASSIFIERS}
     if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_ATTEMPTS:
         raise DispatchAttemptsError(

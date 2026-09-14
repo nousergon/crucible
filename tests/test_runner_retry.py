@@ -549,7 +549,13 @@ class TestSubstrateOwnedRedispatch:
         store = LocalStore(tmp_path)
         calls = []
         with pytest.raises(DispatchAttemptsError):
-            run_job("data.daily", lambda ctx: calls.append(1), store=store, trading_day=FRIDAY, now=NOW)
+            run_job(
+                "data.daily",
+                lambda ctx: calls.append(1),
+                store=store,
+                trading_day=FRIDAY,
+                now=NOW,
+            )
         assert calls == []
         assert not self._key_exists(store)
 
