@@ -131,6 +131,51 @@ assert (
     "cuts against it, same as with only one fixed day."
 )
 
+#: The declared universe this tier seeds, writes and grades against — one
+#: named constant rather than a literal inside `integration_arctic_symbols`,
+#: because the ARM RECIPES `strategy_dir` writes have to be sized from it
+#: (`alpha-engine-config-I10705`: a recipe asking for more names than the
+#: universe holds makes the control arm's draw unsatisfiable, and
+#: `experiment.grade` refuses with "cannot draw a control selection of N from
+#: M settled names"). Synthetic tickers naming no real security.
+#:
+#: **Sixteen names, not three** (`alpha-engine-config-I10705`). Three was
+#: enough for `data.daily` to have something real to compile and is not
+#: enough to GRADE: `crucible.slots.grading.control_selection` draws
+#: `top_n` names, so a recipe whose `top_n` equals the universe makes the
+#: planted and the null control pick the identical set and
+#: `assert_controls_ordered` correctly refuses the cycle —
+#: `GraderControlError: the planted control did not outrank the null control
+#: ... margin 0.000000`. A cross-section is what the §10.1 controls measure
+#: against; sixteen is the smallest one that leaves a real selection at a
+#: `top_n` of :data:`INTEGRATION_ARM_TOP_N` while keeping the ArcticDB seed
+#: this fixture writes to a nightly-sized job.
+#:
+#: **APPEND-ONLY.** The dedicated store is durable across runs, and
+#: `experiment.run` writes a shadow whose recorded `population` is the
+#: universe as it stood that night; `experiment.grade` settles that shadow
+#: later against whatever panel exists then. Drop a ticker and every
+#: already-written shadow naming it is STRANDED — measured 2026-09-14,
+#: replacing the original three names outright left
+#: `PopulationIntegrityError: the population has 1 settled forward return(s)
+#: out of 4` on a shadow no later run could ever settle, permanently red. So
+#: the original three lead the tuple unchanged and the widening is added
+#: after them.
+INTEGRATION_UNIVERSE_SYMBOLS: tuple[str, ...] = ("INTGA", "INTGB", "INTGC") + tuple(
+    f"INTG{i:02d}" for i in range(13)
+)
+
+#: How many names each of this tier's fixture arm recipes selects. Strictly
+#: LESS than the universe (a selection of everything is not a selection) and
+#: at most the settled names `control_selection` can draw from.
+INTEGRATION_ARM_TOP_N = 4
+
+assert 0 < INTEGRATION_ARM_TOP_N < len(INTEGRATION_UNIVERSE_SYMBOLS), (
+    f"INTEGRATION_ARM_TOP_N={INTEGRATION_ARM_TOP_N} is not a strict selection from a "
+    f"universe of {len(INTEGRATION_UNIVERSE_SYMBOLS)} — the planted and null controls "
+    "would pick the same names and every graded cycle would read as a broken grader."
+)
+
 #: The three production ArcticDB library names this tier's dedicated library
 #: must never collide with — imported, not restated, so a future addition to
 #: `nousergon_lib.arcticdb` is caught by this comparison rather than needing
@@ -235,17 +280,164 @@ def integration_muted_topic() -> str:
     )
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _dedicated_topic_env(integration_pages_topic: str, integration_muted_topic: str) -> None:
-    """Point every job this session invokes at the dedicated topics.
+def _dedicated_topic_arn(name: str) -> str:
+    """The ARN of a topic this tier already knows by NAME.
 
-    `crucible.required.require_env` is what every live-paging job reads
-    `CRUCIBLE_PAGES_TOPIC`/`CRUCIBLE_MUTED_TOPIC` through — session-scoped
-    and autouse, so no test in this directory can forget it and no test
-    outside this directory (which never imports this conftest) is affected.
+    `crucible.alerts.topic_arn` is the one adapter that resolves an ARN, and
+    it reads it from the environment because the box's own user-data exports
+    it straight from the `crucible-v2` stack output
+    (`CRUCIBLE_PAGES_TOPIC_ARN`, then derives the NAME from it:
+    `export CRUCIBLE_PAGES_TOPIC=${CRUCIBLE_PAGES_TOPIC_ARN##*:}`). This tier
+    has the two halves the other way round — the repository variables carry
+    the dedicated topics' NAMES — and the integration identity holds neither
+    `cloudformation:DescribeStacks` nor `sns:ListTopics`/`GetTopicAttributes`
+    (see `crucible-v2.yaml`'s `IntegrationRole`, which grants `sns:Publish`
+    and `sns:ListSubscriptionsByTopic` and nothing else), so the ARN is
+    composed from the caller's OWN account and region plus the declared name.
+
+    Nothing here is a literal this repo forbids
+    (`tests/test_no_infra_literals.py`): the account comes from
+    `sts:GetCallerIdentity` at run time, the region from the session, and the
+    topic name from the repository variable. And nothing here can silently
+    resolve to a production topic — `crucible.alerts.topic_arn` re-reads the
+    composed value and REFUSES it unless its last segment equals the name
+    `CRUCIBLE_PAGES_TOPIC`/`CRUCIBLE_MUTED_TOPIC` carries, which
+    :func:`_dedicated_topic_env` sets from the same dedicated variables.
     """
-    os.environ["CRUCIBLE_PAGES_TOPIC"] = integration_pages_topic
-    os.environ["CRUCIBLE_MUTED_TOPIC"] = integration_muted_topic
+    import boto3  # noqa: PLC0415 - lazy, one call site
+
+    session = boto3.session.Session()
+    region = (session.region_name or os.environ.get("AWS_REGION") or "").strip()
+    if not region:
+        raise RuntimeError(
+            "no AWS region is configured, so the dedicated SNS topic ARNs cannot be "
+            "composed. Set AWS_REGION (integration-nightly.yml declares it) rather than "
+            "letting a default region decide which account's topic a page reaches."
+        )
+    account = session.client("sts").get_caller_identity()["Account"]
+    return f"arn:aws:sns:{region}:{account}:{name}"
+
+
+@pytest.fixture(scope="session")
+def dedicated_topic_arns(integration_pages_topic: str, integration_muted_topic: str) -> dict:
+    """Resolved once per session — one `sts:GetCallerIdentity` for the tier,
+    not one per test, while the environment that USES them is re-declared per
+    test by :func:`_dedicated_topic_env` below."""
+    return {
+        "CRUCIBLE_PAGES_TOPIC_ARN": _dedicated_topic_arn(integration_pages_topic),
+        "CRUCIBLE_MUTED_TOPIC_ARN": _dedicated_topic_arn(integration_muted_topic),
+    }
+
+
+@pytest.fixture(autouse=True)
+def _dedicated_topic_env(
+    integration_pages_topic: str,
+    integration_muted_topic: str,
+    dedicated_topic_arns: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Point every job this test invokes at the dedicated topics — names AND ARNs.
+
+    **Function-scoped, and that is the fix** (`alpha-engine-config-I10705`,
+    group B). This fixture was session-scoped and set `os.environ` directly,
+    which reads as sufficient and is not: `tests/conftest.py::declared_topics`
+    is an autouse FUNCTION-scoped fixture that `monkeypatch.setenv`s
+    `CRUCIBLE_PAGES_TOPIC`/`CRUCIBLE_MUTED_TOPIC` to the unit suite's two
+    SYNTHETIC names, and it applies to this directory too (a `tests/`
+    conftest is a parent of `tests/integration/`). Higher-scoped fixtures are
+    set up first, so the synthetic names overwrote this tier's dedicated ones
+    on every single case — silently, because no case asserted which topic
+    name was in the environment and the ARN half was unset, so
+    `TopicUnresolvedError` fired first and hid it. Re-declared here at
+    function scope, this fixture is set up AFTER its `tests/conftest.py`
+    counterpart and wins, and `monkeypatch` unwinds it exactly the same way.
+
+    The two `_ARN` variables are what `crucible.alerts._krepis_publish`
+    actually requires — the missing half that failed `test_alerts_sweep` and
+    `test_heartbeat` — and `crucible.alerts.topic_arn` cross-checks each
+    against the corresponding NAME, so the pair can never be half-dedicated.
+    """
+    monkeypatch.setenv("CRUCIBLE_PAGES_TOPIC", integration_pages_topic)
+    monkeypatch.setenv("CRUCIBLE_MUTED_TOPIC", integration_muted_topic)
+    for variable, arn in dedicated_topic_arns.items():
+        monkeypatch.setenv(variable, arn)
+
+
+#: Captured at COLLECTION time, before any fixture has run. The tracker
+#: credential this tier is granted (`alpha-engine-config-I10672`:
+#: this tier's own identity holds `ssm:GetParameter` on the fleet App's
+#: three tracker parameters) arrives as
+#: `CRUCIBLE_TRACKER_APP_SSM_PREFIX` in `integration-nightly.yml`'s `env:` —
+#: and `tests/conftest.py::no_tracker_credential` DELETES it, autouse, for
+#: every test in the tree including this directory. That deletion is correct
+#: for the unit suite (no test may post to the private tracker by accident)
+#: and wrong for exactly this one, whose whole contract is a REAL
+#: `report.morning` against a dedicated public tracker repo. Read from
+#: `os.environ` at import rather than inside the fixture because by then the
+#: variable is already gone.
+_WORKFLOW_TRACKER_ENV = {
+    name: os.environ.get(name)
+    for name in ("CRUCIBLE_TRACKER_APP_SSM_PREFIX", "CRUCIBLE_TRACKER_TOKEN")
+}
+
+
+@pytest.fixture(autouse=True)
+def _real_alert_delivery_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let this tier's publishes actually leave the process.
+
+    `alpha-engine-config-I10705`. `krepis.alerts.publish` carries a
+    cross-repo, defence-in-depth guard: with `PYTEST_CURRENT_TEST` set it
+    short-circuits BOTH channels to `ok=False, detail="suppressed in test env
+    (PYTEST_CURRENT_TEST set)"` before it reaches a transport, so no consumer
+    suite can page an operator by forgetting to stub it. Its declared escape
+    hatch is `ALPHA_ENGINE_ALLOW_TEST_ALERTS`.
+
+    That guard is right for every other suite in this repo and is the exact
+    negation of this one's contract. Two consequences, both measured
+    2026-09-14 against the dedicated store:
+
+    * `test_report_morning` FAILED on it — `UndeliveredError ... any_ok=False`
+      — because `deliver` refuses to record a report nobody received, and
+      under the guard nobody ever does.
+    * `test_alerts_sweep` and `test_heartbeat` PASSED under it, and that is
+      worse: their own docstrings claim a "real SNS publish path" and a real
+      heartbeat "to the dedicated pages topic", and every publish they made
+      was short-circuited before reaching SNS. A green case asserting a
+      delivery that structurally could not happen is the detection blindness
+      this tier exists to remove, not a passing test.
+
+    Safe to lift here and nowhere else: every destination this tier publishes
+    to is dedicated and non-notifying — the two zero-subscriber SNS topics
+    (`IntegrationRole` grants `sns:Publish` on exactly those two) and krepis'
+    `console_only` Telegram destination, which writes a named artifact and
+    sends nothing.
+
+    **`NOUSERGON_ALLOW_TEST_EVENTS` is deliberately NOT set.** That is the
+    separate switch over `krepis.fleet_events`, whose destination is the
+    PRODUCTION intake queue — there is no dedicated integration equivalent of
+    it, so the tier leaves `event_emitted` False rather than feeding synthetic
+    findings into the fleet's real response plane. `any_ok` reads the two
+    channels only, so this changes nothing about what the cases assert.
+    """
+    monkeypatch.setenv("ALPHA_ENGINE_ALLOW_TEST_ALERTS", "1")
+
+
+@pytest.fixture(autouse=True)
+def _tracker_credential_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give this tier back the tracker credential the root conftest removes.
+
+    `alpha-engine-config-I10705`, group D. `test_report_morning` failed with
+    `TrackerError: no tracker credential ($CRUCIBLE_TRACKER_APP_SSM_PREFIX
+    and $CRUCIBLE_TRACKER_TOKEN unset)` on run 34801438655 even though
+    `integration-nightly.yml` declares the prefix and the repository variable
+    has been set since 2026-09-06 — the variable reached the process and an
+    autouse fixture two directories up deleted it. Restored per test, from
+    what the WORKFLOW actually exported, so an unset prefix still fails this
+    case loudly rather than being papered over with a literal.
+    """
+    for name, value in _WORKFLOW_TRACKER_ENV.items():
+        if value:
+            monkeypatch.setenv(name, value)
 
 
 #: `report.morning`'s own dedicated destinations (`alpha-engine-config-
@@ -402,7 +594,7 @@ def integration_arctic_symbols(arctic_library: Any, strategy_dir: Path) -> list[
 
     import pandas as pd
 
-    symbols = ["INTGA", "INTGB", "INTGC"]
+    symbols = list(INTEGRATION_UNIVERSE_SYMBOLS)
     extra_symbols = sorted(
         (declared_benchmark_symbols() | attribution_factor_symbols(strategy_dir=strategy_dir))
         - set(symbols)
@@ -427,10 +619,23 @@ def integration_arctic_symbols(arctic_library: Any, strategy_dir: Path) -> list[
 
     rng = random.Random(20260908)
     for symbol in seeded_symbols:
+        # A PERSISTENT per-name drift and volatility, drawn once per symbol
+        # (`alpha-engine-config-I10705`), mirroring
+        # `tests/conftest.py::synthetic_frames` — whose own docstring states
+        # why: "that is what makes momentum a signal rather than noise:
+        # without persistent per-name drift, a momentum ranker is a random
+        # selector and the whole grading path would be tested against a
+        # market in which nothing is measurable". This fixture drew one
+        # shared (0.0003, 0.01) step distribution for every symbol, which was
+        # invisible while only `data.daily` read the panel and became the
+        # second half of `experiment.grade`'s refusal the moment the arena
+        # cycle ran against it.
+        drift = rng.gauss(0.0004, 0.0009)
+        vol = rng.uniform(0.008, 0.02)
         price = rng.uniform(20.0, 200.0)
         rows = []
         for _day in days:
-            price = max(1.0, price * math.exp(rng.gauss(0.0003, 0.01)))
+            price = max(1.0, price * math.exp(rng.gauss(drift, vol)))
             rows.append(
                 {
                     "Open": price * 0.998,
@@ -461,10 +666,19 @@ def strategy_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     root = tmp_path_factory.mktemp("integration-strategy") / "strategy"
     arms = root / "arms" / "u"
     arms.mkdir(parents=True)
+    # `top_n` comes from this tier's own declared constant, never the unit
+    # suite's literal `8` (`alpha-engine-config-I10705`): the unit fixture
+    # this one mirrors runs against `synthetic_frames`' 40-name cross-section,
+    # and a recipe asking for eight names out of a three-name universe failed
+    # `experiment.grade` with `ValueError: cannot draw a control selection of
+    # 8 from 4 settled names`. Named beside the universe it is drawn from, and
+    # asserted a strict subset there, so the two can never drift into either
+    # the too-large or the select-everything failure again.
+    top_n = INTEGRATION_ARM_TOP_N
     recipes = {
-        "momentum_sleeve": ("momentum_sleeve", {"top_n": 8}),
-        "tech_score_gate": ("tech_score_gate", {"top_n": 8}),
-        "mom_12_1_sleeve": ("mom_12_1_sleeve", {"top_n": 8}),
+        "momentum_sleeve": ("momentum_sleeve", {"top_n": top_n}),
+        "tech_score_gate": ("tech_score_gate", {"top_n": top_n}),
+        "mom_12_1_sleeve": ("mom_12_1_sleeve", {"top_n": top_n}),
     }
     for name, (ranker, params) in recipes.items():
         body = [
@@ -478,3 +692,104 @@ def strategy_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
         body.append(f"notes: integration-tier fixture recipe for {name}")
         (arms / f"{name}.yaml").write_text("\n".join(body) + "\n", encoding="utf-8")
     return root
+
+
+@pytest.fixture(scope="session", autouse=True)
+def seeded_strategy_tree(integration_store: Store, strategy_dir: Path) -> list[str]:
+    """Publish this tier's own arm recipes into the dedicated store.
+
+    `alpha-engine-config-I10705`, group A, second half. `crucible.slots.arms
+    .load_arm_specs` has two sources: a CHECKOUT (`--strategy-dir`, what a
+    developer editing `alpha-engine-config/strategy/` expects to win) and the
+    tree SYNCED INTO THE STORE at `strategy/current/arms/{slot}/*.yaml`,
+    which is what a spot instance reads because it has no checkout. Only
+    `test_experiment_new` passes `--strategy-dir`; `experiment.run`,
+    `experiment.grade` and `promote` deliberately do not — the production
+    dispatch passes none either — so every one of them read the store branch
+    against a prefix nothing had ever written and refused with
+    `FileNotFoundError: no arm recipes found for slot 'u'`. The dedicated
+    store had no strategy tree at all.
+
+    Seeded through the store keys `crucible.keys.strategy_arm_key` defines,
+    so the REAL loader path is what resolves them — this fixture writes
+    bytes, it does not teach the loader a second way to find a recipe. The
+    bytes are :func:`strategy_dir`'s own three fixture recipes, read back
+    from the files that fixture wrote: one source for both branches, so the
+    checkout case and the store case can never describe different arms, and
+    never a copy of the private `alpha-engine-config/strategy/` tree — these
+    are generic fixture recipes with no tuned parameter in them, which is
+    what lets them live in a public repo at all.
+
+    Not torn down. The dedicated prefix is disposable and every key here is
+    overwritten byte-for-byte by the next run; deleting them would need an
+    `s3:DeleteObject` grant on the store prefix that `IntegrationRole`
+    deliberately withholds ("an authority nothing exercises is one this
+    identity does not get").
+    """
+    from crucible.keys import strategy_arm_key
+
+    names: list[str] = []
+    for path in sorted((strategy_dir / "arms" / "u").glob("*.yaml")):
+        integration_store.put_bytes(strategy_arm_key("u", path.stem), path.read_bytes())
+        names.append(path.stem)
+    assert names, (
+        "the strategy_dir fixture wrote no U-slot recipes, so this fixture seeded an "
+        "empty strategy tree — every store-branch arm load would still refuse."
+    )
+    return names
+
+
+@pytest.fixture(scope="session")
+def compiled_week_panels(
+    integration_store_uri: str,
+    integration_arctic_library: str,
+    integration_arctic_symbols: list[str],
+) -> list[str]:
+    """Compile every OTHER session of `INTEGRATION_TRADING_DAY`'s trading week.
+
+    `alpha-engine-config-I10705`, group A. `crucible.data.weekly.run_weekly`
+    compiles only `ctx.trading_day` and then asserts that every other session
+    of that week already carries a compiled panel — a real production
+    invariant, because each weekday's own scheduled `data.daily` fires and
+    the week's denominator is otherwise undeclared. This tier compiled ONE
+    trading day, so `data.weekly` was always going to refuse the moment
+    `test_data_daily`'s own blocker cleared, and it did
+    (`DataGapError ... ['2026-09-02', '2026-09-03', '2026-09-04']`).
+
+    Option (a) of the issue's two: mirror production's daily cadence by
+    running the real `data.daily` job for each missing session, rather than
+    option (b), re-anchoring the fixture on a week whose first session is
+    `INTEGRATION_TRADING_DAY`. (b) would move a FIXED literal that
+    `SETTLED_TRADING_DAY` is pinned exactly `DEFAULT_HORIZON_TRADING_DAYS`
+    sessions after, and would buy the week's invariant a pass by choosing a
+    week where it says nothing — the opposite of exercising it.
+
+    The sessions come from `crucible.data.weekly.week_sessions`, the same
+    function `run_weekly` grades against, so this fixture cannot compile a
+    different week from the one the job checks.
+    """
+    from crucible.cli import main as cli_main
+    from crucible.data.weekly import week_sessions
+
+    anchor = dt.date.fromisoformat(INTEGRATION_TRADING_DAY)
+    compiled: list[str] = []
+    for session in week_sessions(anchor):
+        if session == anchor:
+            continue
+        cli_main(
+            [
+                "data.daily",
+                "--store",
+                integration_store_uri,
+                "--arctic-library",
+                integration_arctic_library,
+                "--symbols",
+                ",".join(integration_arctic_symbols),
+                "--run-mode",
+                "live",
+                "--date",
+                session.isoformat(),
+            ]
+        )
+        compiled.append(session.isoformat())
+    return compiled

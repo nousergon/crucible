@@ -39,6 +39,7 @@ from crucible.documents import load_store_document
 from crucible.features import DEFAULT_FEATURE_VERSION, read_features
 from crucible.keys import (
     arena_cycle_key,
+    arm_series_key,
     champion_key,
     data_panel_key,
     experiments_prefix,
@@ -91,6 +92,7 @@ if TYPE_CHECKING:
     from crucible.store import Store
 
 __all__ = [
+    "ARM_SERIES_SCHEMA_VERSION",
     "BASELINE_CONTROL_KIND",
     "INCUMBENT_SOURCE_FIELD",
     "MIN_ACTIVE_ARMS_FINDING_METRIC",
@@ -101,6 +103,16 @@ __all__ = [
     "run_grade",
     "run_produce",
 ]
+
+#: The version stamped on the per-arm score series `run_grade` writes and
+#: `crucible.promote.load_slot_inputs` reads (`alpha-engine-config-I10705`).
+#: `v1` because the document's field set — `arm_id`, `scores`, `misses` — is
+#: exactly what that loader has always parsed and what every `promote` unit
+#: test has always hand-written; this names and persists an existing shape
+#: rather than introducing a new one. A named constant, not a literal at the
+#: write site, so the producer's stamp and the manifest `outputs` row it is
+#: recorded under cannot drift apart.
+ARM_SERIES_SCHEMA_VERSION = "arm_series.v1"
 
 #: `alpha-engine-config-I9759` / `-I10687`: §10.1's control kind that stands
 #: in for an ABSENT incumbent. The null control is pure noise by
@@ -822,6 +834,43 @@ def run_grade(
     # every arm the register says to score, and the pairing happens per
     # comparison, so an arm with nothing to say cannot null another arm's
     # figure. That is I9745 closed by construction rather than by a rule.
+
+    # ── Persist the series, because the consumer reads it from the store ──
+    #
+    # `alpha-engine-config-I10705`. `crucible.keys.arm_series_key` declares
+    # this document "as produced by `experiment.grade`" and
+    # `crucible.promote.load_slot_inputs` reads it for EVERY arm in the
+    # register — and until this line nothing under `crucible/` wrote it. The
+    # gap was invisible from the unit suite because every `promote` test
+    # hand-writes the series before calling the loader; it surfaced the first
+    # time the two jobs ran in sequence against a real store (the integration
+    # tier, measured 2026-09-14): a grade that exited `ok` and wrote eleven
+    # verdicts left `scores/` empty, and `crucible promote` raised
+    # `KeyError: ... is registered in slot 'u' but has no series`.
+    #
+    # Written HERE, from the same `series_by_arm` the engine is about to be
+    # handed, rather than reconstructed by `promote` from the verdict
+    # documents: one producer, one artifact, and the score `promote` acts on
+    # is byte-identical to the score the cycle decided on. Every arm the
+    # register names gets a document, including an arm whose series is empty
+    # — an empty `scores` map is "this arm has nothing settled to say", which
+    # the loader must be able to read as such and cannot read from an absent
+    # key.
+    for arm_id, arm_series in series_by_arm.items():
+        ctx.record_output(
+            arm_series_key(slot, arm_id),
+            json.dumps(
+                {
+                    "schema_version": ARM_SERIES_SCHEMA_VERSION,
+                    "arm_id": arm_series.arm_id,
+                    "scores": {day: float(score) for day, score in arm_series.scores.items()},
+                    "misses": sorted(arm_series.misses or ()),
+                },
+                indent=2,
+                sort_keys=True,
+            ).encode(),
+            schema_version=ARM_SERIES_SCHEMA_VERSION,
+        )
 
     # §10.1: a control never serves. Expressed as a SERVING PRECONDITION —
     # the engine's own mechanism for "this arm may not take the pointer" —

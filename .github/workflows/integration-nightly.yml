@@ -153,6 +153,26 @@ env:
   # named `TrackerError` this job raises without it is already the loud
   # failure, not a silent one this step needs to duplicate.
   CRUCIBLE_TRACKER_APP_SSM_PREFIX: ${{ vars.CRUCIBLE_TRACKER_APP_SSM_PREFIX }}
+  # The SAME console base URL `morning-report.yml` declares, and for the same
+  # reason `CRUCIBLE_LIQUIDITY_FLOOR_USD` above reuses its production
+  # repository variable: a console host is not an isolation boundary (the
+  # store, the ArcticDB library and the two topics are), and this tier's
+  # `report.morning` isolation is entirely `conftest.py::
+  # _morning_destination_env`.
+  #
+  # Load-bearing, not cosmetic (`alpha-engine-config-I10705`): with it UNSET,
+  # `crucible.morning.read_inputs` falls back to a PRESIGNED S3 URL for the
+  # headline's "Board" link, and a presigned URL carries the full SigV4 query
+  # string — measured 2026-09-14 against this tier's own store, the links line
+  # came to 1393 wire characters against a 1165-character budget, so
+  # `render_message` refused the whole headline with "the headline is 1698
+  # wire characters, over the ... budget". Production sets this variable, so
+  # `morning-report.yml` never takes that branch; the tier did, and the case
+  # failed on a path production does not exercise. The presign fallback being
+  # structurally unable to fit the budget is a real defect in its own right
+  # and is filed separately — declaring the variable here is this tier's fix,
+  # not that one's.
+  CRUCIBLE_CONSOLE_URL: ${{ vars.CRUCIBLE_CONSOLE_URL }}
 
 jobs:
   integration:
