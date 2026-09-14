@@ -163,9 +163,14 @@ class TestMarketWideDeclaration:
         """`market_return_1d_log_return` is identical across every ticker on
         a day by construction (the equal-weighted cross-sectional mean); the
         rest of the phase-1 catalogue varies per ticker. A future column
-        that IS constant across tickers must say so explicitly here."""
+        that IS constant across tickers must say so explicitly here.
+        `sector_earliest_snapshot_backfill_raw` is one: the sector source mode
+        is a property of the session (alpha-engine-config-I10733)."""
         market_wide = {spec.name for spec in CATALOG if spec.market_wide}
-        assert market_wide == {"market_return_1d_log_return"}
+        assert market_wide == {
+            "market_return_1d_log_return",
+            "sector_earliest_snapshot_backfill_raw",
+        }
 
 
 class TestVersion:

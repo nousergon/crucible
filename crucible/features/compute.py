@@ -201,6 +201,7 @@ PILLAR_COMPONENTS: dict[str, tuple[tuple[str, float, bool], ...]] = {
 #: derived from it on the session row alone: one session of price history.
 _POINT_IN_TIME_FEATURE_COLUMNS: tuple[str, ...] = (
     "sector_raw",
+    "sector_earliest_snapshot_backfill_raw",
     "roe_ratio",
     "debt_to_equity_div2_ratio",
     "gross_margin_ratio",
@@ -461,6 +462,7 @@ def build_features(
     a caller could make disagree (`alpha-engine-config-I9816`).
     """
     import numpy as np
+    import pandas as pd
 
     if panel.empty:
         raise ValueError(
@@ -680,6 +682,20 @@ def build_features(
             cross[column] = mapped.astype("string")
         else:
             cross[column] = mapped.astype("float64")
+
+    # One value per session, on every row (`alpha-engine-config-I10733`): a
+    # reader of any single feature row can tell whether its sector and the
+    # within-sector pillars rest on a backfilled map.
+    from crucible.data.point_in_time import (  # noqa: PLC0415 - crucible.data imports this module
+        EARLIEST_SNAPSHOT_BACKFILL_MODE,
+    )
+
+    mode = point_in_time.sector_source_mode
+    cross["sector_earliest_snapshot_backfill_raw"] = pd.Series(
+        float("nan") if mode is None else float(mode == EARLIEST_SNAPSHOT_BACKFILL_MODE),
+        index=cross.index,
+        dtype="float64",
+    )
 
     unmeasured = set(point_in_time.unmeasured_columns())
     if {"roe_ratio", "payout_ratio"} & unmeasured:

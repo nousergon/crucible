@@ -607,6 +607,25 @@ CATALOG: tuple[FeatureSpec, ...] = (
         inputs=("point_in_time.sector.sector_map",),
     ),
     FeatureSpec(
+        name="sector_earliest_snapshot_backfill_raw",
+        market_wide=True,
+        unit="indicator",
+        expression=(
+            "1 if point_in_time.sector.source_mode == 'earliest_snapshot_backfill', "
+            "0 if 'point_in_time', null when the sector group measured nothing"
+        ),
+        description=(
+            "Whether `sector_raw` and every within-sector pillar on this session rest on a "
+            "BACKFILLED sector map (1) or on one fetched before the session (0). A backfill "
+            "is used when no universe-covering constituents snapshot existed yet (before "
+            "2026-05-01) and carries the known look-ahead of every GICS change between the "
+            "session and that snapshot, e.g. the 2023-03-20 move of V, MA and PYPL from "
+            "Information Technology to Financials. One value per session."
+        ),
+        # Brian's ruling (a) on alpha-engine-config-I10733 (2026-09-14).
+        inputs=("point_in_time.sector.source_mode",),
+    ),
+    FeatureSpec(
         name="roe_ratio",
         market_wide=False,
         unit="ratio",

@@ -77,6 +77,7 @@ below changes, and is recorded here as an illustration rather than a pin.
 | `dist_from_52w_high_ratio` | ratio | 252 | no | `close / max(close, 252) - 1` | `close_raw` |
 | `dist_from_52w_low_ratio` | ratio | 252 | no | `close / min(close, 252) - 1` | `close_raw` |
 | `sector_raw` | gics_sector_label | — | no | `constituents.sector_map[ticker], fetched before the session` | `point_in_time.sector.sector_map` |
+| `sector_earliest_snapshot_backfill_raw` | indicator | — | no | `1 if point_in_time.sector.source_mode == 'earliest_snapshot_backfill', 0 if 'point_in_time', null when the sector group measured nothing` | `point_in_time.sector.source_mode` |
 | `roe_ratio` | ratio | — | no | `fundamental.roe (TTM return on equity, decimal, clipped [-1, 1])` | `point_in_time.fundamental.roe` |
 | `debt_to_equity_div2_ratio` | ratio | — | no | `fundamental.debt_to_equity (total debt / equity / 2, clipped [-3, 3])` | `point_in_time.fundamental.debt_to_equity` |
 | `gross_margin_ratio` | ratio | — | no | `fundamental.gross_margin (TTM, 0-1 fraction)` | `point_in_time.fundamental.gross_margin` |
