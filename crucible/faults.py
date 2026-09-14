@@ -60,7 +60,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import ValidationError
@@ -71,17 +72,32 @@ from crucible.fault_probe import (
     PROBE_OUTCOME_UPSTREAM_TRANSPORT_FAILURE,
     probe_outcome_from_reason,
 )
-from crucible.gate import FAULT_RECORD_BUS_FIELD, FAULT_RECORD_MANIFEST_FIELD, SCRIPTED_FAULTS
-from crucible.keys import fault_injection_key, is_manifest_key, manifest_prefix, parse_bus_key
+from crucible.gate import (
+    FAULT_RECORD_BUS_FIELD,
+    FAULT_RECORD_MANIFEST_FIELD,
+    FIRE_DRILL_FAULT,
+    FIRE_DRILL_SCHEMA_VERSION,
+    SCRIPTED_FAULTS,
+    TRADER_FIRE_DRILL_JOB,
+)
+from crucible.keys import (
+    TRADER_FIRE_DRILLS_PREFIX,
+    fault_injection_key,
+    is_manifest_key,
+    manifest_prefix,
+    parse_bus_key,
+)
 from crucible.models import FAULT_OUTCOME_VALUES, FaultRecordDocument
 from crucible.runner import TRANSIENT_CLASSIFIERS, RunContext
 from crucible.store import Store
 
 __all__ = [
+    "ARTIFACT_GRADED_FAULTS",
     "FAULT_RECORD_JOB",
     "FAULT_RECORD_SCHEMA_VERSION",
     "TRANSIENT_RETRY_REASONS",
     "UNREACHABLE_PROBES",
+    "ArtifactGradedFault",
     "ClosedPath",
     "FaultRecordRefusedError",
     "record_fault",
@@ -280,6 +296,40 @@ UNREACHABLE_PROBES: dict[str, tuple[Callable[[Store], ClosedPath], ...]] = {
     "stale_release_pointer": (
         _probe_pin_refuses_an_unpublished_sha,
         _probe_published_release_objects_are_retained,
+    ),
+}
+
+
+@dataclass(frozen=True)
+class ArtifactGradedFault:
+    """A scripted fault whose evidence is its PRODUCER's own artifact, not a
+    `fault_record.v1` filed by `fault.record`.
+
+    `alpha-engine-config-I10650` deliverable 3: the fire drill joins the
+    register as fault 5's sibling. None of the three outcome kinds describes
+    it — the switch is fired on purpose (not induced into a failed run), the
+    run succeeds without a retry (not absorbed), and the state is entered
+    (not unreachable) — and the evidence already exists, content-hashed into
+    the drill run's manifest. A `fault_record.v1` beside it could only be an
+    attestation restating that evidence, so :func:`record_fault` refuses one.
+    """
+
+    producer_job: str
+    artifact_prefix: str
+    schema_version: str
+    graded_by: str
+
+
+#: The register entries graded from artifacts. The gate clause named by
+#: `graded_by` reads `artifact_prefix` documents of `schema_version`, each an
+#: output of a `producer_job` manifest; `tests/test_gate_phase4_fire_drill.py`
+#: asserts this entry and that clause read the same four things.
+ARTIFACT_GRADED_FAULTS: Mapping[str, ArtifactGradedFault] = {
+    FIRE_DRILL_FAULT: ArtifactGradedFault(
+        producer_job=TRADER_FIRE_DRILL_JOB,
+        artifact_prefix=TRADER_FIRE_DRILLS_PREFIX,
+        schema_version=FIRE_DRILL_SCHEMA_VERSION,
+        graded_by="kill_switch_fire_drill_passed",
     ),
 }
 
@@ -545,6 +595,15 @@ def record_fault(
             f"faults plan §10.7 names ({sorted(SCRIPTED_FAULTS)}). A record for a fault "
             "the gate does not grade would never move any clause and is not evidence of "
             "anything."
+        )
+    graded = ARTIFACT_GRADED_FAULTS.get(fault_id)
+    if graded is not None:
+        raise FaultRecordRefusedError(
+            f"fault_id {fault_id!r} is graded from its producer's own "
+            f"`{graded.schema_version}` artifacts under {graded.artifact_prefix} (each an "
+            f"output of a `{graded.producer_job}` run), read by the `{graded.graded_by}` "
+            "clause. A `fault_record.v1` for it would be an attestation beside that "
+            "evidence, so none is filed: run the drill instead."
         )
     if outcome not in FAULT_OUTCOME_VALUES:
         raise FaultRecordRefusedError(

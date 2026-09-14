@@ -1004,3 +1004,66 @@ components:
     schedule: null
     dispatch: null
     deadline: null
+
+  trader.kill_switch:
+    # alpha-engine-config-I10650 deliverable 1. The trader's kill switch
+    # (crucible-trader-PR7, `crucible_trader.kill_switch`): one command
+    # flattens or freezes the paper book, or releases the halt. Run by the
+    # TRADER under its own identity; admitted by
+    # `crucible.models.TRADER_JOB_VALUES` for the reason `trader.reconcile` is.
+    #
+    # On demand - a human or an incident fires it, never a clock - so no
+    # schedule and no deadline: a deadline would page ABSENCE on every day the
+    # switch was, correctly, not fired. ACTIVE so a fire whose book did not
+    # settle inside its bound, or that let an order through, pages
+    # (`KillSwitchNotSettledError` makes the run `failed`).
+    description: >-
+      Flatten or freeze the trader's paper book, or release the halt; a fire
+      that does not settle inside its bound is a page.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:outputs[trader/kill_switch.json,trader/kill_switch/events/*]
+      outcome: run.json:metrics[kill_switch_settle_seconds]
+    log_location: /crucible/trader.kill_switch
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
+  trader.fire_drill:
+    # alpha-engine-config-I10650 deliverables 2 and 5. The kill switch or the
+    # hold-book safeguard fired on purpose against the paper book during
+    # regular hours (crucible-trader-PR7, `crucible_trader.fire_drill`). Its
+    # `fire_drill.v1` output is what
+    # `crucible.gate._clause_kill_switch_fire_drill_passed` grades for phase 4.
+    #
+    # On demand - and deliberately never on a clock, since an unannounced
+    # drill that a schedule could predict is an announced one - so no
+    # schedule and no deadline. ACTIVE so a drill that did not pass pages
+    # (`FireDrillFailedError` makes the run `failed`).
+    description: >-
+      Fire the kill switch or hold-book safeguard on paper and record whether
+      the book reached its target inside the bound with no order let through.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:outputs[trader/kill_switch.json,trader/fire_drills/*]
+      outcome: run.json:metrics[fire_drill_passed]
+    log_location: /crucible/trader.fire_drill
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null

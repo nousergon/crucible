@@ -137,6 +137,7 @@ __all__ = [
     "ExperimentEventRow",
     "FaultRecordDocument",
     "FeatureRegistryDocument",
+    "FireDrillDocument",
     "FeatureRow",
     "GitHubCommit",
     "GitHubCommitDetail",
@@ -167,6 +168,7 @@ __all__ = [
     "RunManifestV2",
     "SignalsRow",
     "TraderEvidenceDocument",
+    "TraderReleasePinDocument",
     "TrialRow",
 ]
 
@@ -349,7 +351,22 @@ class ComponentsDocument(_Strict):
 #: The trader's shortfall and shadow-book producers (crucible-trader-PR6) are
 #: not run under `run_job` and so are not jobs; their artifacts are read by
 #: `crucible.execution`.
-TRADER_JOB_VALUES: tuple[str, ...] = ("trader.reconcile", "trader.smoke")
+#:
+#: * `trader.kill_switch` — one command flattens or freezes the paper book, or
+#:   releases the halt (crucible-trader-PR7, `alpha-engine-config-I10650`
+#:   deliverable 1). Its outputs are the halt document
+#:   (`crucible.keys.TRADER_KILL_SWITCH_KEY`) and one outcome per fire
+#:   (`crucible.keys.trader_kill_switch_event_key`).
+#: * `trader.fire_drill` — the kill switch or hold-book safeguard fired on
+#:   purpose against the paper book (I10650 deliverables 2 and 5); its
+#:   `fire_drill.v1` output (`crucible.keys.trader_fire_drill_key`) is what
+#:   `crucible.gate._clause_kill_switch_fire_drill_passed` grades.
+TRADER_JOB_VALUES: tuple[str, ...] = (
+    "trader.reconcile",
+    "trader.smoke",
+    "trader.kill_switch",
+    "trader.fire_drill",
+)
 
 JOB_VALUES: tuple[str, ...] = (
     "data.daily",
@@ -1686,6 +1703,112 @@ class ReleasePointerDocument(_Strict):
         pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
         description="UTC instant this pointer was written, for provenance only.",
     )
+
+
+class TraderReleasePinDocument(_Strict):
+    """`trader/release_pin` (:data:`crucible.keys.TRADER_PIN_KEY`) — the trader's
+    own release pointer, plan §4.11 Trader row (`alpha-engine-config-I10649`
+    deliverable 3).
+
+    A SEPARATE model from :class:`ReleasePointerDocument`, not the same shape
+    under a different key: a trader pin moves only on a passing `trader.smoke`
+    manifest for the sha it names (`crucible.release.pin_trader`), and a
+    pointer that does not carry that evidence cannot be walked back to it by
+    anyone reading the pin — the trader at session start, `crucible explain`,
+    a human after an incident. So the pin names the smoke run, its status and
+    its manifest key, written by `crucible.release.pin` from the
+    `TraderSmokeEvidence` it was gated on and read back strictly by
+    `crucible.release.read_pointer`.
+
+    `smoke_status` is `Literal["ok"]`: `pin` refuses any other status before it
+    writes, so a document carrying another value was not written by `pin` and
+    must not read as a pin. `smoke_manifest_key` must parse as a
+    `trader.smoke` run-manifest key, so a pin cannot cite another job's run as
+    its evidence.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sha: GitSha = Field(description="The release the trader installs at session start.")
+    target: Literal["trader"] = Field(
+        description="Always `trader`: this document lives only at `trader/release_pin`."
+    )
+    pinned_at: str = Field(
+        pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+        description="UTC instant the pin was written.",
+    )
+    smoke_run_id: str = Field(
+        min_length=1,
+        description="`run_id` of the `trader.smoke` manifest this pin was gated on.",
+    )
+    smoke_status: Literal["ok"] = Field(
+        description="That manifest's status. Only `ok` is ever written; see the class docstring."
+    )
+    smoke_manifest_key: str = Field(
+        description="Store key of that manifest: "
+        "`runs/trader.smoke/{day}/{discriminator}/run.json`."
+    )
+
+    @model_validator(mode="after")
+    def _smoke_manifest_is_a_trader_smoke_run(self) -> TraderReleasePinDocument:
+        from crucible.keys import parse_manifest_key  # noqa: PLC0415 - keys stays import-light
+
+        parsed = parse_manifest_key(self.smoke_manifest_key)
+        if parsed is None or parsed[0] != "trader.smoke":
+            raise ValueError(
+                f"smoke_manifest_key {self.smoke_manifest_key!r} is not a `trader.smoke` "
+                "run-manifest key; a trader pin cites the trader's own smoke or nothing"
+            )
+        return self
+
+
+class FireDrillDocument(_Strict):
+    """`fire_drill.v1`, at `trader/fire_drills/{trading_day}/{run_id}.json` —
+    written by the TRADER (`crucible_trader.fire_drill.drill_document`,
+    crucible-trader-PR7) as an output of its `trader.fire_drill` run.
+
+    `alpha-engine-config-I10650` deliverables 2, 4 and 5; plan §9.5 kill-switch
+    row and paper->live entry condition 4. Read by
+    `crucible.gate._clause_kill_switch_fire_drill_passed`. Every field the
+    producer writes is declared, so a field it adds tomorrow is a contract
+    change visible in both repositories rather than a key silently ignored.
+
+    `passed` is the producer's own verdict and is NEVER trusted alone: the
+    clause re-derives it from `settled_at`, `settle_seconds <= bound_seconds`
+    and an empty `orders_accepted_after_fire` (:meth:`evidence_passed`).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["fire_drill.v1"]
+    kind: Literal["kill_switch_flatten", "kill_switch_freeze", "hold_book"]
+    announced: bool = Field(
+        description="Self-reported by whoever fired the drill; nothing seals the drill "
+        "time in advance (I10650's 2026-09-14 comment)."
+    )
+    run_id: str = Field(min_length=1)
+    trading_day: IsoDate
+    account: str = Field(min_length=1)
+    mode: Literal["flatten", "freeze", "hold"]
+    fired_at: str = Field(min_length=1)
+    settled_at: str | None
+    settle_seconds: float | None
+    bound_seconds: float = Field(gt=0)
+    state_before: dict[str, Any]
+    state_after: dict[str, Any]
+    orders_accepted_after_fire: list[dict[str, Any]]
+    hold_decision: str | None
+    passed: bool
+
+    def evidence_passed(self) -> bool:
+        """Whether the evidence fields, not the `passed` flag, say the drill passed."""
+        return (
+            self.passed
+            and self.settled_at is not None
+            and self.settle_seconds is not None
+            and self.settle_seconds <= self.bound_seconds
+            and not self.orders_accepted_after_fire
+        )
 
 
 class ReleaseRecordDocument(_Strict):
