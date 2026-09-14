@@ -327,6 +327,30 @@ class ComponentsDocument(_Strict):
 #: from this module); `tests/test_components_registry.py`'s
 #: `test_the_manifest_schema_job_enum_matches_the_registry` is the drift
 #: guard, in both directions, exactly as it was before this migration.
+#: Jobs whose manifest is written by the TRADER (`nousergon/crucible-trader`)
+#: under its own identity, through `crucible.runner.run_job`, in this same
+#: schema — so a trader session appears beside a harness run on every surface
+#: that reads `run.json` (`crucible explain`, the console, the absence and
+#: failure pages). Not `crucible.cli.JOBS` entries: the harness may not reach
+#: into the trader (plan §3), so it cannot carry the trader's job bodies.
+#: Registered ALL AT ONCE for phase 4 (`alpha-engine-config-I10651`), because
+#: a trader job absent from this tuple cannot write its manifest at all —
+#: `run_job` raises `ManifestValidationError` on the `job` field. Each one has
+#: a `crucible/components.yaml` row; `tests/test_components_registry.py`
+#: derives registry coverage from `JOBS` plus this tuple, so a row for a job
+#: nobody declared here is still refused.
+#:
+#: * `trader.reconcile` — the daily broker reconciliation (crucible-trader-PR5).
+#: * `trader.smoke` — the trader's own IB-paper smoke, whose `ok` manifest for a
+#:   sha is the evidence `crucible release.pin --target trader` requires
+#:   (`crucible.release.TRADER_SMOKE_JOB`, crucible-PR294,
+#:   `alpha-engine-config-I10649`).
+#:
+#: The trader's shortfall and shadow-book producers (crucible-trader-PR6) are
+#: not run under `run_job` and so are not jobs; their artifacts are read by
+#: `crucible.execution`.
+TRADER_JOB_VALUES: tuple[str, ...] = ("trader.reconcile", "trader.smoke")
+
 JOB_VALUES: tuple[str, ...] = (
     "data.daily",
     "data.weekly",
@@ -357,6 +381,7 @@ JOB_VALUES: tuple[str, ...] = (
     "fault.probe",
     "iac.conformance",
     "test.integration",
+    *TRADER_JOB_VALUES,
 )
 
 #: The exhaustive `attempts[].reason` vocabulary: `initial` for the first

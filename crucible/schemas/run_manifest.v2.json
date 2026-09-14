@@ -617,7 +617,9 @@
         "fault.record",
         "fault.probe",
         "iac.conformance",
-        "test.integration"
+        "test.integration",
+        "trader.reconcile",
+        "trader.smoke"
       ],
       "title": "Job",
       "type": "string"

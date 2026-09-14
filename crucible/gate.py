@@ -51,7 +51,12 @@ from crucible.alerts import (
     pages_in_range,
 )
 from crucible.attribution import manifest_records_factor_attribution
-from crucible.calendar import TRADING_DAYS_PER_WEEK, is_trading_day, resolve_trading_day
+from crucible.calendar import (
+    TRADING_DAYS_PER_WEEK,
+    is_trading_day,
+    previous_trading_day,
+    resolve_trading_day,
+)
 from crucible.carryover import (
     V1_BUCKET_VAR,
     V1_SLOT_TO_V2_SLOT,
@@ -64,6 +69,7 @@ from crucible.components import Component, load_registry
 from crucible.documents import DocumentRead, read_manifests_under
 from crucible.documents import read_path_document as _read_path_document
 from crucible.documents import read_store_document as _read_store_document
+from crucible.execution import ExecutionArtifactError, shadow_book_coverage
 from crucible.holdout import (
     HOLDOUT_JOB,
     RULING_REFERENCE_PATTERN,
@@ -78,6 +84,7 @@ from crucible.keys import (
     ALERTS_ROOT,
     FAULT_INJECTION_ROOT,
     INTEGRATION_STORE_SUBPREFIX,
+    TRADER_EXECUTION_SHORTFALL_PREFIX,
     acceptance_reading_key,
     arena_cycle_key,
     arm_register_key,
@@ -97,24 +104,29 @@ from crucible.keys import (
     review_key,
     review_prefix,
     runs_prefix,
+    shadow_books_key,
     strategy_arms_prefix,
     strategy_holdout_key,
+    trader_reconciliation_key,
     v1_carryover_key,
     verdict_key,
 )  # noqa: F401 - re-exported
 from crucible.keys import TRADER_EVIDENCE_KEY as _TRADER_EVIDENCE_KEY
-from crucible.manifest import load_schema, manifest_key
+from crucible.manifest import ManifestValidationError, load_schema, manifest_key
+from crucible.manifest import validate as _validate_manifest
 from crucible.models import (
     FaultRecordDocument,
     PhaseClosingReadingDocument,
     PhaseLadderDocument,
+    TraderEvidenceDocument,
 )
 from crucible.portfolio import manifest_records_portfolio_engine
 from crucible.release import POINTER_KEY
-from crucible.report import attribution_key
+from crucible.report import ROWS as _ATTRIBUTION_ROWS
+from crucible.report import _execution_row, attribution_key
 from crucible.runner import TRANSIENT_CLASSIFIERS
 from crucible.slots import SLOTS, dispatchable_slots, is_control_arm
-from crucible.store import S3Store, Store
+from crucible.store import S3Store, Store, sha256_hex
 from crucible.synthetic import synthetic_routing_active
 from crucible.tags import (
     TAG_KEY,
@@ -3532,10 +3544,12 @@ PHASE3_DELIVERABLES: tuple[Deliverable, ...] = (
 #: `alpha-engine-config-I9760`'s (phase 4) deliverables, split at the
 #: semicolons of the issue's Deliverables paragraph plus its separate
 #: "Decommission:" paragraph under the same heading — 7 trader items, 5
-#: decommission items. Only two of twelve are gate-readable today:
-#: `old_sf_execution_count_zero` grades "old SFs disabled" exactly, and
-#: `trader_one_week_on_v2_champion` is the one consumer-evidence artifact the
-#: trader contract declares at all.
+#: decommission items. Five of twelve are gate-readable:
+#: `old_sf_execution_count_zero` grades "old SFs disabled" exactly,
+#: `trader_one_week_on_v2_champion` reads the trader's consumer evidence, and
+#: `alpha-engine-config-I10651`/`-I10746` wired the three trader artifacts —
+#: the broker reconciliation manifest and its control arm, the
+#: execution-shortfall row, and shadow-book coverage.
 PHASE4_DELIVERABLES: tuple[Deliverable, ...] = (
     Deliverable(
         "trader_reads_champion_contract",
@@ -3558,21 +3572,17 @@ PHASE4_DELIVERABLES: tuple[Deliverable, ...] = (
     Deliverable(
         "broker_reconciliation",
         "broker reconciliation emitting `run.json`",
-        None,
-        "`trader_one_week_on_v2_champion` reads only the `trading_days` field on the "
-        "trader's consumer-evidence artifact, not a broker-reconciliation manifest",
+        "broker_reconciliation_control_arm_passed",
     ),
     Deliverable(
         "execution_shortfall_attribution_row",
         "execution-shortfall attribution row",
-        None,
-        "no clause reads an execution-shortfall artifact",
+        "execution_shortfall_row_graded",
     ),
     Deliverable(
         "shadow_books_per_challenger",
         "shadow books per challenger (plan §10.6)",
-        None,
-        "no clause reads a shadow-book artifact",
+        "shadow_books_cover_every_active_arm",
     ),
     Deliverable(
         "portfolio_adopted_by_trader",
@@ -4181,12 +4191,34 @@ REPOSITORY_GRADED_CLAUSES: frozenset[str] = frozenset(
 #: test class. `tests/test_gate_phase2_coverage.py` parses that suite and
 #: asserts it defines exactly this many `TestFault*` cases, so the two cannot
 #: drift silently in the other direction either.
-SCRIPTED_FAULTS: tuple[str, ...] = (
+PHASE2_SCRIPTED_FAULTS: tuple[str, ...] = (
     "spot_terminated_mid_job",
     "data_source_withheld",
     "router_returns_500",
     "stale_release_pointer",
 )
+
+#: Fault 5 of plan §10.7, added by the §9.5 amendment of 2026-09-10: a
+#: planted discrepancy (a share delta, a cash delta, an unapplied split)
+#: replayed into every broker reconciliation, which the reconciler must detect
+#: and classify; a missed plant VOIDS the cycle. The trader runs it every cycle
+#: (`crucible_trader.reconciliation_control`, whose `FAULT_NAME` is this
+#: string) and records the verdict as `control_arm` on its reconciliation
+#: result, which `_clause_broker_reconciliation_control_arm_passed` reads.
+RECONCILIATION_FAULT = "reconciliation_planted_discrepancy"
+
+#: Every scripted fault `crucible fault.record` may file a record for: the
+#: four phase-2 faults plus fault 5.
+#:
+#: **Phase 2's clause grades :data:`PHASE2_SCRIPTED_FAULTS`, not this tuple.**
+#: Fault 5 is a PHASE 4 gate (plan §9.5 row: "Phase 4 gate; it is also fault 5
+#: of §10.7"), its producer is the trader, and phase 2's clause list is being
+#: graded first-attempt for the 2026-09-19 render — a member added mid-grading
+#: moves the denominator of a reading already in flight, the reason
+#: `_clause_integration_tier_current` was kept off phase 2. Widening the
+#: phase-2 clause to five would turn a phase whose four faults are recorded
+#: UNMET on a deliverable it never owned.
+SCRIPTED_FAULTS: tuple[str, ...] = (*PHASE2_SCRIPTED_FAULTS, RECONCILIATION_FAULT)
 
 #: The two fields an INDUCED fault-injection record must carry: the manifest
 #: the fault produced, and the bus row it produced. Both, because either alone
@@ -6192,7 +6224,7 @@ def _clause_fault_injection_against_scheduled_path(store: Store) -> Clause:
     """
     name = "fault_injection_against_scheduled_path"
     requirement = (
-        f"each of the {len(SCRIPTED_FAULTS)} scripted faults (plan §10.7) has a "
+        f"each of the {len(PHASE2_SCRIPTED_FAULTS)} phase-2 scripted faults (plan §10.7) has a "
         f"conforming record under {FAULT_INJECTION_ROOT} declaring an "
         f"`{FAULT_RECORD_OUTCOME_FIELD}` and carrying exactly that outcome's evidence — "
         f"`{FAULT_RECORD_MANIFEST_FIELD}` plus `{FAULT_RECORD_BUS_FIELD}` for `induced`, "
@@ -6229,7 +6261,7 @@ def _clause_fault_injection_against_scheduled_path(store: Store) -> Clause:
     missing: list[str] = []
     contradicted: list[str] = []
     parts: list[str] = []
-    for fault in SCRIPTED_FAULTS:
+    for fault in PHASE2_SCRIPTED_FAULTS:
         filed = records.get(fault) or []
         if not filed:
             missing.append(fault)
@@ -7908,6 +7940,329 @@ def _clause_trader_week_on_v2_champion(store: Store, window: list[dt.date]) -> C
     )
 
 
+#: The trader's reconciliation job — one of `crucible.models.TRADER_JOB_VALUES`,
+#: which `tests/test_gate_phase4_trader_clauses.py` asserts, so a rename there
+#: cannot leave this clause reading a prefix no manifest is ever written under.
+TRADER_RECONCILE_JOB = "trader.reconcile"
+
+#: The reconciliation result's schema version, as crucible-trader-PR5 writes it.
+BROKER_RECONCILIATION_SCHEMA_VERSION = "broker_reconciliation.v1"
+
+#: The execution-shortfall row of `crucible.report.ROWS`, resolved by name so a
+#: reorder of that tuple cannot point this clause at another row.
+_EXECUTION_ROW_SPEC = next(r for r in _ATTRIBUTION_ROWS if r.name == "execution_shortfall_bps")
+
+#: The row statuses the execution-shortfall clause reads as MET
+#: (`alpha-engine-config-I10746` deliverable 1). WATCH is inside the band's red
+#: line; every `N/A-*` status is a reading with nothing graded, never a pass.
+EXECUTION_ROW_MET_STATUSES: frozenset[str] = frozenset({"GREEN", "WATCH"})
+
+
+def _last_session(day: dt.date) -> dt.date:
+    """``day`` if it is an NYSE session, else the session before it."""
+    return day if is_trading_day(day) else previous_trading_day(day)
+
+
+def _sessions_ending(day: dt.date, count: int) -> list[dt.date]:
+    """The ``count`` sessions ending at ``day`` (a session), oldest first."""
+    days = [day]
+    while len(days) < count:
+        days.append(previous_trading_day(days[-1]))
+    return sorted(days)
+
+
+def _clause_broker_reconciliation_control_arm_passed(store: Store, window: list[dt.date]) -> Clause:
+    """Plan §9.5: broker reconciliation emits `run.json`, and its control arm passed.
+
+    `alpha-engine-config-I10651` (items 1-3 of its 2026-09-14 comment) and
+    `-I10413`. Reads, for each of the last :data:`TRADING_DAYS_PER_WEEK`
+    sessions ending at the window's last session — I10651's "five consecutive
+    trading days":
+
+    1. `runs/trader.reconcile/{day}/run.json`, validated against the CURRENT
+       manifest schema, reading `status: ok` and `run_mode: live`. A replay
+       reconciles nothing a broker holds today.
+    2. Exactly one OUTPUT at `trader/reconciliation/{day}.json`, whose stored
+       bytes still hash to the digest the manifest recorded — an edited
+       result is a different document from the one the run produced.
+    3. That result's `control_arm`: fault :data:`RECONCILIATION_FAULT`,
+       `passed: true`, and `void: false`. Read from the DOCUMENT, not inferred
+       from `status: ok`: the trader raises on a void cycle today, and a
+       producer that stopped raising would otherwise pass here on a
+       reconciler that cannot see a planted discrepancy.
+
+    **Absence is UNMET, not UNMEASURABLE.** The store answered: the trader
+    agreed to write these manifests, and a session with none is a
+    reconciliation that did not happen, which is also the §4.6 absence page.
+    UNMEASURABLE is kept for a store we could not read (the `Clause`
+    docstring: a fact about our reading, never about the system).
+    """
+    name = "broker_reconciliation_control_arm_passed"
+    sessions = _sessions_ending(_last_session(window[-1]), TRADING_DAYS_PER_WEEK)
+    first, last = sessions[0].isoformat(), sessions[-1].isoformat()
+    requirement = (
+        f"each of the {TRADING_DAYS_PER_WEEK} sessions ending at the window's last session "
+        f"has a live `{TRADER_RECONCILE_JOB}` manifest reading `ok`, whose one "
+        "`trader/reconciliation/{day}.json` output still hashes to the recorded digest and "
+        f"records `control_arm.fault` `{RECONCILIATION_FAULT}`, `control_arm.passed: true` "
+        "and `void: false`"
+    )
+    missing: list[str] = []
+    findings: list[str] = []
+    evidence: list[str] = []
+    for session in sessions:
+        day = session.isoformat()
+        key = manifest_key(TRADER_RECONCILE_JOB, day)
+        read = _read_store_document(store, key)
+        if read.problem is not None:
+            if read.access_problem:
+                return _unmeasurable(name, requirement, read.problem, (key,))
+            findings.append(read.problem)
+            evidence.append(key)
+            continue
+        if read.absent:
+            missing.append(day)
+            continue
+        evidence.append(key)
+        manifest = read.document or {}
+        try:
+            _validate_manifest(manifest)
+        except ManifestValidationError as exc:
+            findings.append(f"{key} does not conform to the run manifest schema: {exc}")
+            continue
+        if manifest["status"] != "ok":
+            findings.append(
+                f"{key}: status `{manifest['status']}` "
+                f"({manifest.get('reason') or 'the manifest recorded no reason'})"
+            )
+            continue
+        if manifest["run_mode"] != "live":
+            findings.append(
+                f"{key}: run_mode `{manifest['run_mode']}` — a replay reconciles no book a "
+                "broker holds today"
+            )
+            continue
+        result_key = trader_reconciliation_key(day)
+        refs = [ref for ref in manifest["outputs"] if ref["key"] == result_key]
+        if len(refs) != 1:
+            findings.append(
+                f"{key} records {len(refs)} output(s) at {result_key}; exactly one is required"
+            )
+            continue
+        if not store.exists(result_key):
+            findings.append(f"{key} claims output {result_key}, and the store does not hold it")
+            continue
+        evidence.append(result_key)
+        payload = store.get_bytes(result_key)
+        if sha256_hex(payload) != refs[0]["sha256"]:
+            findings.append(
+                f"{result_key} no longer hashes to the digest {key} recorded — the result was "
+                "changed after the run that produced it"
+            )
+            continue
+        result = _read_store_document(store, result_key)
+        if result.problem is not None:
+            findings.append(result.problem)
+            continue
+        document = result.document or {}
+        if document.get("schema_version") != BROKER_RECONCILIATION_SCHEMA_VERSION:
+            findings.append(
+                f"{result_key}: schema_version {document.get('schema_version')!r}, "
+                f"{BROKER_RECONCILIATION_SCHEMA_VERSION!r} required"
+            )
+            continue
+        control = document.get("control_arm")
+        if not isinstance(control, dict):
+            findings.append(f"{result_key}: no `control_arm` object — the control never ran")
+            continue
+        if control.get("fault") != RECONCILIATION_FAULT:
+            findings.append(
+                f"{result_key}: control_arm.fault {control.get('fault')!r}, "
+                f"{RECONCILIATION_FAULT!r} required"
+            )
+            continue
+        if control.get("passed") is not True:
+            findings.append(
+                f"{result_key}: control_arm.passed is {control.get('passed')!r} "
+                f"(missed {control.get('missed')!r}) — the cycle is VOID"
+            )
+            continue
+        if document.get("void") is not False:
+            findings.append(
+                f"{result_key}: void is {document.get('void')!r} beside a passing control arm; "
+                "the two must agree"
+            )
+            continue
+    if missing and len(missing) == len(sessions):
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"no `{TRADER_RECONCILE_JOB}` manifest for any of the {len(sessions)} sessions "
+            f"{first}..{last} — the trader's broker reconciliation is not running into this "
+            "store",
+            tuple(manifest_key(TRADER_RECONCILE_JOB, d.isoformat()) for d in sessions),
+        )
+    parts = list(findings)
+    if missing:
+        parts.append(f"no `{TRADER_RECONCILE_JOB}` manifest for session(s) {missing}")
+    if parts:
+        return Clause(name, requirement, False, "; ".join(parts), tuple(evidence))
+    return Clause(
+        name,
+        requirement,
+        True,
+        f"{len(sessions)} live reconciliation(s) {first}..{last}, each `ok` with the control "
+        "arm passed and the result intact",
+        tuple(evidence),
+    )
+
+
+def _clause_execution_shortfall_row_graded(store: Store, window: list[dt.date]) -> Clause:
+    """`alpha-engine-config-I10746` deliverable 1 (`-I10652` deliverable 5).
+
+    Reads the report's own fifth row (`crucible.report._execution_row`) over the
+    report window ending at the phase window's last session, so the gate and
+    the report card can never grade the same artifacts two ways. MET when the
+    row is GREEN or WATCH. UNMET, each with its own reason, when:
+
+    * the trader filed nothing for any session (the row's `N/A-NOT-RUN`);
+    * any session is `not_computed` (the row is forced RED: orders were placed
+      and not measured);
+    * every filed session says `no_orders`, so nothing was executed to grade —
+      distinct from "not computed", which is a producer failure;
+    * the row is RED or below its sample floor.
+
+    A non-conforming artifact raises `ExecutionArtifactError` out of the
+    reducer; it is caught HERE and read UNMET naming the key, per I10746's
+    gotcha, rather than contained as UNMEASURABLE — the store answered, and
+    what it holds is a producer defect.
+    """
+    name = "execution_shortfall_row_graded"
+    session = _last_session(window[-1])
+    requirement = (
+        "the execution-shortfall attribution row, reduced from the trader's "
+        f"`execution_shortfall.v1` artifacts over the report window ending {session.isoformat()}, "
+        f"reads {' or '.join(sorted(EXECUTION_ROW_MET_STATUSES))}"
+    )
+    sources: list[str] = []
+    try:
+        row = _execution_row(
+            store,
+            _EXECUTION_ROW_SPEC,
+            trading_day=session,
+            now=dt.datetime.now(dt.UTC),
+            sources=sources,
+        )
+    except ExecutionArtifactError as exc:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"a trader execution-shortfall artifact does not honour its contract: {exc}",
+            (TRADER_EXECUTION_SHORTFALL_PREFIX,),
+        )
+    evidence = tuple(sources) or (TRADER_EXECUTION_SHORTFALL_PREFIX,)
+    status = str(row["status"])
+    reason = str(row.get("status_reason") or "")
+    window_phrase = f"{row['window_start']}..{row['window_end']}"
+    if row["sessions_not_computed"]:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"shortfall NOT computed on session(s) {row['sessions_not_computed']} in "
+            f"{window_phrase} — a producer failure; the row reads {status}: {reason}",
+            evidence,
+        )
+    if status in EXECUTION_ROW_MET_STATUSES:
+        return Clause(name, requirement, True, f"row reads {status}: {reason}", evidence)
+    if not sources:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"the trader filed no execution-shortfall artifact for any session in {window_phrase}",
+            evidence,
+        )
+    if row["n_orders_filled"] == 0 and len(row["sessions_no_orders"]) == len(sources):
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"every filed session in {window_phrase} says `no_orders` "
+            f"({row['sessions_no_orders']}) — nothing was executed, so there is no shortfall "
+            "to grade; this is not a producer failure",
+            evidence,
+        )
+    return Clause(name, requirement, False, f"row reads {status}: {reason}", evidence)
+
+
+def _clause_shadow_books_cover_every_active_arm(store: Store, window: list[dt.date]) -> Clause:
+    """`alpha-engine-config-I10746` deliverable 2 (`-I10653` deliverable 4).
+
+    Reads `crucible.execution.shadow_book_coverage` for the window's last
+    session, with `days_served` from the trader's own evidence document
+    (`trader/evidence.json`, validated through `TraderEvidenceDocument`)
+    restricted to days on or before that session. An absent evidence
+    document is UNMET, not UNMEASURABLE (I10746): without it no served day can
+    be checked, which is a trader that has not run, not a store we could not
+    read. A corrupt shadow-book artifact raises out of the reader and is read
+    UNMET naming the key. Shadow books are evidence only — never a promotion
+    input (I10653 deliverable 5) — and nothing here feeds one.
+    """
+    name = "shadow_books_cover_every_active_arm"
+    session = _last_session(window[-1]).isoformat()
+    requirement = (
+        f"`{shadow_books_key(session)}` carries an advanced shadow book for every active arm "
+        "in the register, none failed, each advanced on every day the trader served "
+        f"(`days_served` in `{TRADER_EVIDENCE_KEY}`) since its inception"
+    )
+    evidence_key = TRADER_EVIDENCE_KEY
+    read = _read_store_document(store, evidence_key)
+    if read.problem is not None:
+        if read.access_problem:
+            return _unmeasurable(name, requirement, read.problem, (evidence_key,))
+        return Clause(name, requirement, False, read.problem, (evidence_key,))
+    if read.absent:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{evidence_key} is absent — without the trader's served days no shadow book can "
+            "be checked against them",
+            (evidence_key,),
+        )
+    try:
+        served = TraderEvidenceDocument.model_validate(read.document).days_served
+    except ValidationError as exc:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{evidence_key} does not conform to trader_evidence.v1 ({len(exc.errors())} error(s))",
+            (evidence_key,),
+        )
+    days_served = [day for day in served if day <= session]
+    try:
+        coverage = shadow_book_coverage(store, session, days_served=days_served)
+    except ExecutionArtifactError as exc:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{shadow_books_key(session)} does not honour its contract: {exc}",
+            (shadow_books_key(session), evidence_key),
+        )
+    return Clause(
+        name,
+        requirement,
+        coverage.met,
+        coverage.detail,
+        (*coverage.sources, evidence_key),
+    )
+
+
 def _clause_money_path_chain_verified(store: Store) -> Clause:
     """The money-path hash chain verifies (`alpha-engine-config-I10627`).
 
@@ -8016,6 +8371,9 @@ def _phase4(
     _unused((registry, trading_day))
     return [
         _clause_trader_week_on_v2_champion(store, window),
+        _clause_broker_reconciliation_control_arm_passed(store, window),
+        _clause_execution_shortfall_row_graded(store, window),
+        _clause_shadow_books_cover_every_active_arm(store, window),
         _clause_money_path_chain_verified(store),
         _clause_aws_cost_within_ceiling(
             window, name="aws_total_within_ceiling", ceiling_usd=PHASE4_MAX_TOTAL_USD, tagged=False
