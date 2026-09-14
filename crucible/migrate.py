@@ -44,7 +44,7 @@ from crucible.manifest import money_path_writes, validate
 from crucible.release import release_json_key
 from crucible.runner import resolve_code_sha
 from crucible.slots.arms import ArmSpec, read_register, register_arms, write_register
-from crucible.store import PointerConflictError, sha256_hex
+from crucible.store import ETAG_ABSENT, PointerConflictError, sha256_hex
 
 if TYPE_CHECKING:
     from crucible.store import Store
@@ -58,6 +58,7 @@ _PLACEHOLDER_CODE_SHA = "0" * 40
 __all__ = [
     "SOURCES",
     "CodeShaMigrationReport",
+    "MigrationPointerConflict",
     "MigrationSourceMissing",
     "V1Source",
     "read_v1_json",
@@ -70,6 +71,16 @@ class MigrationSourceMissing(RuntimeError):
     """A declared v1 source is absent. Its exact key is in the message."""
 
 
+class MigrationPointerConflict(RuntimeError):
+    """`champions/{slot}/current.json` already holds a pointer this migration did
+    not write, or one naming a different arm.
+
+    A migration seeds a pointer that does not exist yet. Overwriting one that
+    does would erase a promotion (evidence-won or an operator revert) with a v1
+    import, which is the opposite of carrying provenance across.
+    """
+
+
 @dataclass(frozen=True)
 class V1Source:
     """One v1 artifact the migration reads, and what it contributes."""
@@ -78,6 +89,15 @@ class V1Source:
     key: str
     slot: str | None
     contributes: str
+    #: The field of a champion-pointer document that carries the date the
+    #: v1 champion was installed, or ``None`` when the v1 document carries no
+    #: such date at all. Declared per source rather than assumed to be
+    #: `promoted_at` everywhere: measured 2026-09-14, the U pointer
+    #: (`config/scanner_spec_champion.json`) has `decided_on` (the date of the
+    #: latest HOLD, which is not an installation date) and
+    #: `last_promoted_on: null`, and no `promoted_at` — so reading
+    #: `promoted_at` there failed every real U import.
+    date_field: str | None = None
 
     def series_prefix(self) -> str:
         """The v1 listing prefix for a dated series: everything before the
@@ -103,12 +123,18 @@ SOURCES: tuple[V1Source, ...] = (
             "since 2026-07-13, which is the flag that makes a never-moved pointer "
             "render as a finding rather than as a settled result"
         ),
+        date_field="promoted_at",
     ),
     V1Source(
         name="scanner_spec_champion",
         key="config/scanner_spec_champion.json",
         slot="u",
-        contributes="U's champion pointer and the date it was last written.",
+        contributes=(
+            "U's champion pointer. It carries no installation date (its `decided_on` "
+            "is the latest hold), so the imported arm's clock starts at the published "
+            "recipe's own `registered_at` — the date the v2 register already holds."
+        ),
+        date_field=None,
     ),
     V1Source(
         name="producer_leaderboard",
@@ -182,6 +208,7 @@ def run_migrate_history(
     slots: tuple[str, ...] = ("u", "r"),
     arm_recipes: dict[str, ArmSpec] | None = None,
     allow_missing: bool = False,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Import v1 lineage into the v2 register and ledger.
 
@@ -189,6 +216,10 @@ def run_migrate_history(
     it. It is required rather than inferred: v1 named a producer, v2 names a
     ranker plus its parameters, and guessing the mapping would silently
     attach a v1 track record to a rule that is not the one that earned it.
+
+    ``dry_run`` resolves every source, recipe and existing pointer exactly as
+    a real run does and reports what it WOULD write, but writes nothing: not
+    the register, not a pointer, not the migration record.
     """
     recipes = arm_recipes or {}
     found: list[dict[str, Any]] = []
@@ -229,20 +260,24 @@ def run_migrate_history(
         )
 
     imported: dict[str, list[str]] = {}
+    pointers: dict[str, str] = {}
+    planned: list[tuple[Any, ...]] = []
     for slot in slots:
-        pointer = next(
+        match = next(
             (
-                f["document"]
+                (source, f["document"])
                 for f in found
-                if f.get("document") is not None
-                and next(s for s in SOURCES if s.name == f["source"]).slot == slot
-                and "champion" in f["document"]
+                if f.get("document") is not None and "champion" in f["document"]
+                for source in SOURCES
+                if source.name == f["source"] and source.slot == slot
             ),
             None,
         )
-        if pointer is None:
+        if match is None:
             imported[slot] = []
+            pointers[slot] = "no_v1_pointer"
             continue
+        source, pointer = match
         champion_name = pointer["champion"]
         recipe = recipes.get(champion_name)
         if recipe is None:
@@ -253,24 +288,92 @@ def run_migrate_history(
                 "record to a rule that is not the one that earned it would launder "
                 "provenance. Supply it in `arm_recipes`."
             )
+        if recipe.slot != slot:
+            raise MigrationSourceMissing(
+                f"v1 slot {slot!r} names champion {champion_name!r}, and the recipe "
+                f"supplied under that name is a slot-{recipe.slot!r} arm. Importing it "
+                f"would register `{slot}:{champion_name}` — an arm no published recipe "
+                "defines — and point the slot at it, which would launder provenance."
+            )
+        v1_promotion_source = pointer.get("promotion_source", "unknown")
+        registered_at, date_source = _date_of(pointer, source=source, recipe=recipe)
         spec = _bootstrap_spec(
             slot=slot,
             name=recipe.name,
-            registered_at=_date_of(pointer),
-            promotion_source=pointer.get("promotion_source", "unknown"),
+            registered_at=registered_at,
+            promotion_source=v1_promotion_source,
             ranker=recipe.ranker,
             params=recipe.params,
         )
+        if spec.arm_id != recipe.arm_id:
+            # `ArmSpec.spec` hashes slot/name/ranker/params/control/control_kind
+            # and no provenance, so these agree unless the recipe is a control
+            # arm — which can never hold a pointer (§10.1).
+            raise MigrationSourceMissing(
+                f"v1 slot {slot!r} champion {champion_name!r} resolves to recipe "
+                f"{recipe.arm_id}, but its import would register {spec.arm_id}; a "
+                "control arm cannot be a champion, and a pointer at an id no recipe "
+                "produces would never be scored."
+            )
+        pointer_key = champion_key(slot)
+        expected = ctx.store.etag(pointer_key)
+        if expected != ETAG_ABSENT:
+            existing = load_store_document(ctx.store, pointer_key)
+            existing_evidence = existing.get("evidence") or {}
+            if (
+                existing.get("arm_id") == spec.arm_id
+                and existing_evidence.get("status") == "migrated"
+            ):
+                # Idempotent rerun: this migration already seeded this exact
+                # pointer. Rewriting it would only change `run_id`/`decided_at`
+                # and make the pointer claim a run that decided nothing.
+                imported[slot] = [spec.arm_id]
+                pointers[slot] = "unchanged"
+                continue
+            raise MigrationPointerConflict(
+                f"{pointer_key} already holds arm {existing.get('arm_id')!r} "
+                f"(promotion_source {existing.get('promotion_source')!r}, evidence status "
+                f"{existing_evidence.get('status')!r}); this migration would point it at "
+                f"{spec.arm_id!r}. A v1 import seeds an ABSENT pointer and never "
+                "overwrites a promotion or an operator revert."
+            )
+        imported[slot] = [spec.arm_id]
+        pointers[slot] = "would_write" if dry_run else "written"
+        planned.append(
+            (
+                slot,
+                spec,
+                source,
+                registered_at,
+                date_source,
+                v1_promotion_source,
+                pointer_key,
+                expected,
+            )
+        )
+
+    # Every slot's sources, recipe, date and existing pointer are resolved
+    # above BEFORE anything is written: a refusal on R must not leave U
+    # already imported (measured in `tests/test_migrate_history_cli.py`: the
+    # single-pass loop wrote `champions/u/current.json` and then raised on R).
+    for (
+        slot,
+        spec,
+        source,
+        registered_at,
+        date_source,
+        v1_promotion_source,
+        pointer_key,
+        expected,
+    ) in [] if dry_run else planned:
         register = read_register(ctx.store, slot)
-        register, _ = register_arms(register, [spec])
-        write_register(ctx.store, slot, register)
-        key = champion_key(slot)
-        source_key = next(s.key for s in SOURCES if s.slot == slot)
-        v1_promotion_source = pointer.get("promotion_source", "unknown")
+        if spec.arm_id not in set(register.all_arms()):
+            register, _ = register_arms(register, [spec])
+            write_register(ctx.store, slot, register)
         champion_pointer = ChampionPointer(
             slot=slot,
             arm_id=spec.arm_id,
-            as_of=_date_of(pointer),
+            as_of=registered_at,
             decided_at=dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             run_id=ctx.run_id,
             code_sha=resolve_code_sha(),
@@ -279,8 +382,9 @@ def run_migrate_history(
             evidence={
                 "status": "migrated",
                 "reason": (
-                    f"imported from v1 key {source_key!r} by `crucible migrate.history` "
-                    f"(v1 promotion_source: {v1_promotion_source!r})"
+                    f"imported from v1 key {source.key!r} by `crucible migrate.history` "
+                    f"(v1 promotion_source: {v1_promotion_source!r}; as_of from "
+                    f"{date_source})"
                 ),
                 "moved": False,
             },
@@ -293,34 +397,26 @@ def run_migrate_history(
             attestation={
                 "kind": "pit_parity",
                 "status": "UNKNOWN",
-                "key": source_key,
+                "key": source.key,
                 "reason": "v1 import carries no contamination attestation.",
             },
         )
         payload = json.dumps(champion_pointer.to_dict(), indent=2, sort_keys=True).encode("utf-8")
-        # §4.2's outputs contract and §10.8's lineage walk both need this
-        # pointer, and `store.py` provides exactly one CAS primitive for the
-        # thing this key is: a pointer more than one actor can write.
-        # `ctx.record_output_cas` (not a bare `ctx.store.put_bytes`, and not
-        # a bare `compare_and_swap` either) is the one call that both writes
-        # conditionally AND enters this write into `outputs[]` — a bare PUT
-        # here was last-writer-wins on the one pointer the store has a CAS
-        # primitive for, and it never entered the manifest's lineage
-        # (`alpha-engine-config-I9757` defect #7).
-        # A migration is one-shot but not guaranteed single-attempt (the
-        # runner retries a transient failure with a fresh context, and the
-        # command itself is documented idempotent), so the expected version
-        # is read fresh immediately before the swap rather than assumed
-        # absent.
-        ctx.record_output_cas(key, ctx.store.etag(key), payload, schema_version="champion.v1")
-        imported[slot] = [spec.arm_id]
+        # `ctx.record_output_cas` is the one call that both writes
+        # conditionally AND enters this write into `outputs[]`
+        # (`alpha-engine-config-I9757` defect #7). `expected` was read
+        # immediately above, so a concurrent writer between that read and this
+        # swap raises `PointerConflictError` rather than being overwritten.
+        ctx.record_output_cas(pointer_key, expected, payload, schema_version="champion.v1")
 
     result = {
         "schema_version": "migration.v1",
         "sources_found": [{k: v for k, v in f.items() if k != "document"} for f in found],
         "sources_missing": missing,
         "arms_imported": imported,
+        "pointers": pointers,
         "allow_missing": allow_missing,
+        "dry_run": dry_run,
     }
     ctx.record_metric(
         {
@@ -352,29 +448,44 @@ def run_migrate_history(
             "last_updated_utc": dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
     )
-    ctx.record_output(
-        migration_key(ctx.trading_day.isoformat(), ctx.run_id),
-        json.dumps(result, indent=2, sort_keys=True).encode("utf-8"),
-        schema_version="migration.v1",
-    )
+    if not dry_run:
+        ctx.record_output(
+            migration_key(ctx.trading_day.isoformat(), ctx.run_id),
+            json.dumps(result, indent=2, sort_keys=True).encode("utf-8"),
+            schema_version="migration.v1",
+        )
     return result
 
 
-def _date_of(pointer: dict[str, Any]) -> str:
-    """The v1 pointer's own promotion date, as an ISO date.
+def _date_of(pointer: dict[str, Any], *, source: V1Source, recipe: ArmSpec) -> tuple[str, str]:
+    """The imported arm's start date as an ISO date, and where it came from.
 
-    Taken from the artifact rather than from today: the OOS clock starts
-    when the arm actually started, and starting it at cutover would give
-    every imported arm a fresh eligibility window it has not earned.
+    Taken from the v1 artifact when the source declares a date field: the OOS
+    clock starts when the arm actually started, and starting it at cutover
+    would give every imported arm a fresh eligibility window it has not
+    earned. A source that declares a field and lacks it FAILS — defaulting to
+    today would reset a clock that has been running for months.
+
+    A source that declares NO date field (U's pointer carries none) takes the
+    published recipe's own `registered_at`: a reviewed date in the strategy
+    tree, and the one the v2 register already holds for that arm. The
+    returned provenance string lands in the pointer's `evidence.reason`, so
+    which of the two was used is never implicit.
     """
-    raw = pointer.get("promoted_at")
+    if source.date_field is None:
+        return (
+            recipe.registered_at,
+            f"the recipe's registered_at ({recipe.source_key or recipe.name}); "
+            f"{source.key} carries no installation date",
+        )
+    raw = pointer.get(source.date_field)
     if not raw:
         raise MigrationSourceMissing(
-            "the v1 champion pointer carries no `promoted_at`, so there is no date to "
-            "start its OOS clock from. Defaulting to today would reset a clock that has "
-            "been running since 2026-07-13."
+            f"the v1 champion pointer at {source.key!r} carries no `{source.date_field}`, "
+            "so there is no date to start its OOS clock from. Defaulting to today would "
+            "reset a clock that has been running since the arm was installed."
         )
-    return str(raw)[:10]
+    return str(raw)[:10], f"{source.key}:{source.date_field}"
 
 
 def _map_promotion_source(v1_promotion_source: str) -> str:

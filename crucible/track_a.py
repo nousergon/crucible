@@ -1,4 +1,4 @@
-"""Track-A CLI handlers: the data, feature, U/R, ledger, explain and migrate jobs.
+"""Track-A CLI handlers: the data, feature, U/R, ledger and explain jobs.
 
 Normative source: plan §4.1. `crucible/cli.py` owns the argument surface and
 the dispatch table; the handler bodies live here so three tracks can land
@@ -23,7 +23,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-from crucible import migrate as migrate_module
 from crucible.backfill import run_backfill
 from crucible.calendar import is_trading_day
 from crucible.config import settings as resolve_settings
@@ -668,45 +667,6 @@ def _verify_chain_or_refuse(lineage: Any) -> None:
         chain.raise_if_broken()
 
 
-def handle_migrate_history(args: argparse.Namespace) -> int:
-    config = _settings(args)
-    store = config.store()
-    v1_config = resolve_settings(store_uri=getattr(args, "v1_store", None) or config.store_uri)
-    v1_store = v1_config.store()
-    recipes = {}
-    for slot in ("u", "r"):
-        try:
-            for spec in load_arm_specs(slot, store=store, strategy_dir=config.strategy_dir):
-                recipes[spec.name] = spec
-        except FileNotFoundError:
-            continue
-
-    def job(ctx: Any) -> None:
-        result = migrate_module.run_migrate_history(
-            ctx,
-            v1_store=v1_store,
-            arm_recipes=recipes,
-            allow_missing=getattr(args, "allow_missing", False),
-        )
-        print(json.dumps(result, indent=2, sort_keys=True))
-
-    # `migrate.history` never checked `--dry-run` at all (alpha-engine-config-
-    # I9922 N1): `store` is read-only under `dry_run` (via `_settings` above),
-    # so `job`'s writes now raise `DryRunWriteRefusedError` rather than
-    # landing for real, and `dry_run=` here means that raise replaces the
-    # write attempt cleanly rather than also failing the manifest write in
-    # `run_job`'s own `finally`.
-    run_job(
-        "migrate.history",
-        job,
-        store=store,
-        trading_day=args.trading_day,
-        dry_run=bool(getattr(args, "dry_run", False)),
-        run_mode=getattr(args, "run_mode", None),
-    )
-    return 0
-
-
 HANDLERS = {
     "data.daily": handle_data_daily,
     "data.weekly": handle_data_weekly,
@@ -716,7 +676,6 @@ HANDLERS = {
     "experiment.backfill": handle_experiment_backfill,
     "experiment.grade": handle_experiment_grade,
     "explain": handle_explain,
-    "migrate.history": handle_migrate_history,
 }
 
 
@@ -795,24 +754,11 @@ def add_track_a_arguments(name: str, sub: argparse.ArgumentParser) -> None:
         "experiment.run",
         "experiment.backfill",
         "experiment.grade",
-        "migrate.history",
     ):
         sub.add_argument(
             "--strategy-dir",
             help=(
                 "Checkout of alpha-engine-config/strategy/. Absent, arms are read from "
                 "the strategy tree synced into the store."
-            ),
-        )
-    if name == "migrate.history":
-        sub.add_argument(
-            "--v1-store", help="Store URI of the v1 artifacts. Read-only; nothing is written there."
-        )
-        sub.add_argument(
-            "--allow-missing",
-            action="store_true",
-            help=(
-                "Import the sources that are present. Every absent source is named in the "
-                "result; without this flag an absent source fails the run."
             ),
         )

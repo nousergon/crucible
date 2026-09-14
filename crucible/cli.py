@@ -394,6 +394,103 @@ def _migrate_code_sha(args: argparse.Namespace) -> int:
     return 0
 
 
+#: The slots whose v1 champion pointer `migrate.history` imports. M's v1
+#: promotions are a dated lineage series, read and counted but never turned
+#: into a pointer (see `crucible.migrate.SOURCES`), and S has no v1 pointer.
+_MIGRATE_HISTORY_SLOTS: tuple[str, ...] = ("u", "r")
+
+
+def _migrate_history(args: argparse.Namespace) -> int:
+    """`crucible migrate.history [--v1-store URI] [--strategy-dir DIR] [--allow-missing]`.
+
+    Imports v1's U and R champion pointers into the v2 register and
+    `champions/{slot}/current.json` (plan §9.8, `alpha-engine-config-I10713`).
+
+    * **Recipes come from the published strategy tree**, through the same
+      `load_arm_specs` the U/R cycle uses (`--strategy-dir` checkout first,
+      else `strategy/current/arms/{slot}/` in the store). A v1 champion name
+      maps to the recipe of the same name — `momentum_sleeve` for U,
+      `scanner_predictor_direct` for R — and a champion with no recipe fails
+      the run (`MigrationSourceMissing`). A recipe directory that cannot be
+      read is not skipped: the previous handler swallowed it, which turned a
+      missing tree into a "no recipe supplied" error naming the wrong cause.
+    * **v1 is read through a read-only store.** `--v1-store` wins; absent, the
+      data bucket setting (`CRUCIBLE_ARCTIC_BUCKET`, which the box exports
+      from the stack's `DataBucketName` — the bucket v1 writes its `config/`
+      pointers to) is read at its root. Neither resolved is a usage error,
+      and so is a v1 store equal to the v2 store: that was the previous
+      handler's default, under which every v1 source read as absent.
+    * `--dry-run` resolves every source, recipe and existing pointer and
+      prints what would be written; nothing is written, including the
+      manifest.
+    """
+    from crucible.config import settings as resolve_settings
+    from crucible.config import store_from_uri
+    from crucible.migrate import run_migrate_history
+    from crucible.runner import run_job
+    from crucible.slots.arms import load_arm_specs
+    from crucible.store import read_only
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    config = resolve_settings(
+        store_uri=getattr(args, "store", None),
+        strategy_dir=getattr(args, "strategy_dir", None),
+        dry_run=dry_run,
+    )
+    try:
+        store = config.store()
+    except ValueError as exc:
+        raise UsageError(str(exc)) from exc
+    v1_uri = getattr(args, "v1_store", None) or (
+        f"s3://{config.arctic_bucket}" if config.arctic_bucket else None
+    )
+    if not v1_uri:
+        raise UsageError(
+            "crucible migrate.history needs the v1 source: pass --v1-store URI, or set "
+            "CRUCIBLE_ARCTIC_BUCKET (the data bucket v1 writes its champion pointers to). "
+            "There is no default — reading v1 from the v2 store finds nothing and reports "
+            "every source absent."
+        )
+    if v1_uri.rstrip("/") == str(config.store_uri).rstrip("/"):
+        raise UsageError(
+            f"crucible migrate.history: --v1-store {v1_uri!r} is the v2 store itself. The "
+            "v1 pointers live in the v1 data bucket; reading them here finds nothing."
+        )
+    v1_store = read_only(store_from_uri(v1_uri), reason="migrate.history reads v1 read-only")
+
+    recipes = {}
+    for slot in _MIGRATE_HISTORY_SLOTS:
+        for recipe in load_arm_specs(slot, store=store, strategy_dir=config.strategy_dir):
+            if recipe.name in recipes:
+                raise ValueError(
+                    f"recipe name {recipe.name!r} is published in both slot "
+                    f"{recipes[recipe.name].slot!r} and slot {slot!r}; a v1 champion name "
+                    "cannot be mapped to one of them without guessing."
+                )
+            recipes[recipe.name] = recipe
+
+    def job(ctx) -> None:
+        result = run_migrate_history(
+            ctx,
+            v1_store=v1_store,
+            slots=_MIGRATE_HISTORY_SLOTS,
+            arm_recipes=recipes,
+            allow_missing=bool(getattr(args, "allow_missing", False)),
+            dry_run=dry_run,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+
+    run_job(
+        "migrate.history",
+        job,
+        store=store,
+        trading_day=args.trading_day,
+        dry_run=dry_run,
+        run_mode=getattr(args, "run_mode", None),
+    )
+    return 0
+
+
 def _record_written(ctx, store, keys) -> None:
     """Record artifacts the job wrote through the store directly.
 
@@ -601,12 +698,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
         "§10.8: walks the manifest lineage from a verdict to the arms, features, data "
         "snapshot, code sha, cost and LLM calls that produced it.",
     ),
-    "migrate.history": _todo(
-        "migrate.history",
-        "track A",
-        "Carries R's `operator_bootstrap` champion flag into v2 so the first "
-        "evidence-won promotion is visible as such.",
-    ),
+    "migrate.history": _migrate_history,
     # Not in `JOBS` (see the note beside its subparser in `build_parser`),
     # but `dest="job"` is shared across every subparser this module builds,
     # so `migrate.code_sha` reaches `main`'s `HANDLERS[args.job](args)`
@@ -831,6 +923,31 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if spec.name == "data.heal":
             sub.add_argument("--gap", required=True, help="The named gap to repair.")
+        if spec.name == "migrate.history":
+            sub.add_argument(
+                "--strategy-dir",
+                help=(
+                    "Checkout of alpha-engine-config/strategy/. Absent, recipes are read "
+                    "from the strategy tree published into the store."
+                ),
+            )
+            sub.add_argument(
+                "--v1-store",
+                metavar="URI",
+                help=(
+                    "Store URI of the v1 artifacts, opened read-only. Absent, the data "
+                    "bucket setting (CRUCIBLE_ARCTIC_BUCKET) is read at its root; neither "
+                    "set, or a URI equal to --store, is refused."
+                ),
+            )
+            sub.add_argument(
+                "--allow-missing",
+                action="store_true",
+                help=(
+                    "Import the sources that are present. Every absent source is named in "
+                    "the result; without this flag an absent source fails the run."
+                ),
+            )
         if spec.name == HOLDOUT_JOB:
             add_holdout_arguments(sub)
         if spec.name == FAULT_RECORD_JOB:

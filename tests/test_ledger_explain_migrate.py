@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -397,7 +398,11 @@ class TestMigrate:
                 }
             ).encode(),
         )
-        recipes = {s.name: s for s in load_arm_specs("u", strategy_dir=strategy_dir)}
+        # The fixture tree holds U recipes and the v1 source here is R's pointer;
+        # a recipe for another slot is refused, so the same recipe is declared R.
+        recipes = {
+            s.name: replace(s, slot="r") for s in load_arm_specs("u", strategy_dir=strategy_dir)
+        }
         ctx, result = _run_migrate(
             store,
             cycle_date,
@@ -457,7 +462,11 @@ class TestMigrate:
                 }
             ).encode(),
         )
-        recipes = {s.name: s for s in load_arm_specs("u", strategy_dir=strategy_dir)}
+        # The fixture tree holds U recipes and the v1 source here is R's pointer;
+        # a recipe for another slot is refused, so the same recipe is declared R.
+        recipes = {
+            s.name: replace(s, slot="r") for s in load_arm_specs("u", strategy_dir=strategy_dir)
+        }
         ctx, result = _run_migrate(
             store,
             cycle_date,
@@ -515,7 +524,11 @@ class TestMigrate:
             "config/producer_champion.json",
             json.dumps({"champion": "momentum_sleeve"}).encode(),
         )
-        recipes = {s.name: s for s in load_arm_specs("u", strategy_dir=strategy_dir)}
+        # The fixture tree holds U recipes and the v1 source here is R's pointer;
+        # a recipe for another slot is refused, so the same recipe is declared R.
+        recipes = {
+            s.name: replace(s, slot="r") for s in load_arm_specs("u", strategy_dir=strategy_dir)
+        }
         with pytest.raises(MigrationSourceMissing, match="no `promoted_at`"):
             _run_migrate(
                 store,
@@ -549,7 +562,11 @@ class TestMigrate:
         )
         from crucible.slots.arms import load_arm_specs
 
-        recipes = {s.name: s for s in load_arm_specs("u", strategy_dir=strategy_dir)}
+        # The fixture tree holds U recipes and the v1 source here is R's pointer;
+        # a recipe for another slot is refused, so the same recipe is declared R.
+        recipes = {
+            s.name: replace(s, slot="r") for s in load_arm_specs("u", strategy_dir=strategy_dir)
+        }
         kwargs = dict(v1_store=v1, slots=("r",), arm_recipes=recipes, allow_missing=True)
         _run_migrate(store, cycle_date, **kwargs)
         # A second run reuses the same store; run_job refuses a second
