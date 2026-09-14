@@ -34,6 +34,8 @@ import pytest
 
 from crucible.calendar import assert_trading_day
 from crucible.cli import main as cli_main
+from crucible.documents import read_manifests_under
+from crucible.keys import manifest_prefix
 from crucible.manifest import read_manifest
 from crucible.store import Store
 from tests.integration.conftest import INTEGRATION_TRADING_DAY, SETTLED_TRADING_DAY
@@ -65,6 +67,43 @@ def _assert_ok(
     # a helper that stayed hardcoded to the one module constant would read
     # back the WRONG manifest (or none at all) for every one of them.
     manifest = _manifest(store, job, discriminator=discriminator, trading_day=trading_day)
+    assert manifest["status"] == "ok", (
+        f"{job}: expected status ok against the dedicated store, got "
+        f"{manifest['status']!r}: {manifest.get('reason')}"
+    )
+    return manifest
+
+
+def _assert_latest_ok(
+    store: Store,
+    job: str,
+    *,
+    trading_day: str = INTEGRATION_TRADING_DAY,
+) -> dict[str, Any]:
+    """`_assert_ok` for a job whose discriminator is its own CALENDAR date.
+
+    `alerts.sweep` (`track_c.sweep_handler`) and `report.morning`
+    (`morning_handler`) both pass
+    `discriminator=lambda ctx: ctx.calendar_date.isoformat()` to `run_job`, so
+    a job firing more than once between two trading-day rollovers cannot
+    overwrite its own record. Both cases read the UNDISCRIMINATED key and
+    failed with `KeyError: 'runs/<job>/2026-09-08/run.json' is not present`
+    (`alpha-engine-config-I10705`) — the same defect `test_release_lock`
+    carried, in the same shape, and both hidden until this session behind an
+    earlier failure in the same case.
+
+    Read through the prefix rather than by reconstructing the discriminator:
+    `calendar_date` is the run's own UTC wall-clock date, and a test that
+    recomputed it would be asserting against the clock across a midnight
+    boundary. `read_manifests_under` is the sanctioned reader (AGENTS.md rule
+    1) and preserves sorted listing order, so the LAST document under the
+    day's prefix is this run's.
+    """
+    prefix = manifest_prefix(job, trading_day)
+    read = read_manifests_under(store, prefix)
+    read.raise_if_unlistable()
+    assert read.documents, f"{job} wrote no manifest under {prefix!r}"
+    _key, manifest = read.documents[-1]
     assert manifest["status"] == "ok", (
         f"{job}: expected status ok against the dedicated store, got "
         f"{manifest['status']!r}: {manifest.get('reason')}"
@@ -141,7 +180,18 @@ def test_data_weekly(
     integration_store: Store,
     integration_arctic_library: str,
     integration_arctic_symbols: list[str],
+    compiled_week_panels: list[str],
 ) -> None:
+    """`compiled_week_panels` (`alpha-engine-config-I10705`) is the whole
+    difference between this case and a `DataGapError`: `run_weekly` compiles
+    only its own session and requires the week's other sessions to already
+    carry a panel, exactly as production's per-weekday `data.daily` schedule
+    supplies them. The fixture runs that real job for each of them."""
+    assert compiled_week_panels, (
+        "the week backfill compiled nothing — `week_sessions` named no session besides "
+        f"{INTEGRATION_TRADING_DAY}, so this case would pass without exercising the "
+        "week-gap invariant at all"
+    )
     cli_main(
         [
             "data.weekly",
@@ -228,6 +278,7 @@ def test_weekly(
     integration_store: Store,
     integration_arctic_library: str,
     integration_arctic_symbols: list[str],
+    compiled_week_panels: list[str],
 ) -> None:
     """`crucible.weekly.Stage.argv`/`run_arc` now thread `--arctic-library`
     onto every `ARCTIC_LIBRARY_JOBS` stage. Before this, an arc run here
@@ -303,6 +354,14 @@ def test_experiment_grade(
         ]
     )
     _assert_ok(integration_store, "data.daily", trading_day=SETTLED_TRADING_DAY)
+    # DRAIN the capture before the invocation whose stdout is parsed below
+    # (`alpha-engine-config-I10705`). `capsys` accumulates across both
+    # `cli_main` calls in this case, and every handler prints a JSON document,
+    # so `json.loads(capsys.readouterr().out)` was parsing `data.daily`'s
+    # document followed by `experiment.grade`'s and raising
+    # `JSONDecodeError: Extra data: line 11 column 1`. Dead code until now:
+    # this case had never once reached the parse.
+    capsys.readouterr()
 
     cli_main(
         [
@@ -352,7 +411,12 @@ def test_promote(integration_store_uri: str, integration_store: Store) -> None:
             SETTLED_TRADING_DAY,
         ]
     )
-    _assert_ok(integration_store, "promote", trading_day=SETTLED_TRADING_DAY)
+    # `discriminator=args.slot` (`crucible/cli.py::_promote`) — one job name,
+    # four slots, one trading day. This case read the undiscriminated key and
+    # failed with `KeyError: 'runs/promote/2026-10-07/run.json' is not
+    # present` (`alpha-engine-config-I10705`), the fourth instance in this
+    # module of the same missing-discriminator defect.
+    _assert_ok(integration_store, "promote", discriminator="u", trading_day=SETTLED_TRADING_DAY)
 
 
 # ── explain — walks the lineage of the register experiment.new just wrote ──
@@ -491,7 +555,15 @@ def test_release_lock(
         ]
     )
     assert rc == 0
-    _assert_ok(integration_store, RELEASE_LOCK_JOB)
+    # `discriminator=published_release_sha`, not the bare key
+    # (`alpha-engine-config-I10705`): `release_lock_handler` passes
+    # `discriminator=sha` to `run_job` on purpose, so two repairs on one
+    # trading day cannot overwrite one another's manifest. This case read
+    # back `runs/release.lock/{day}/run.json` — a key the job never writes —
+    # and failed with `KeyError: 'runs/release.lock/2026-09-08/run.json' is
+    # not present`, which the issue grouped with the `data.weekly` cascade
+    # and is in fact an independent defect in this assertion.
+    _assert_ok(integration_store, RELEASE_LOCK_JOB, discriminator=published_release_sha)
 
 
 def test_smoke(
@@ -593,7 +665,7 @@ def test_alerts_sweep(integration_store_uri: str, integration_store: Store) -> N
             INTEGRATION_TRADING_DAY,
         ]
     )
-    _assert_ok(integration_store, "alerts.sweep")
+    _assert_latest_ok(integration_store, "alerts.sweep")
 
 
 def test_heartbeat(integration_store_uri: str, integration_store: Store) -> None:
@@ -649,7 +721,7 @@ def test_report_morning(integration_store_uri: str, integration_store: Store) ->
             INTEGRATION_TRADING_DAY,
         ]
     )
-    manifest = _assert_ok(integration_store, "report.morning")
+    manifest = _assert_latest_ok(integration_store, "report.morning")
     assert manifest["outputs"], (
         "report.morning wrote no outputs — the message/update/history rows never landed"
     )
@@ -730,14 +802,56 @@ def test_migrate_history(integration_store_uri: str, integration_store: Store) -
 # ── fault.record / fault.probe — plan §10.7's own exercise machinery ───────
 
 
-def test_fault_record(integration_store_uri: str, integration_store: Store) -> None:
+def test_fault_record(
+    integration_store_uri: str, integration_store: Store, published_release_sha: str
+) -> None:
+    """Record an `unreachable` fault against a fault the evidence registry
+    actually covers, selected FROM that registry.
+
+    **Was `SCRIPTED_FAULTS[0]`** (`alpha-engine-config-I10705`, group C),
+    which resolves to `spot_terminated_mid_job` and failed with
+    `FaultRecordRefusedError: no machine-checkable evidence is declared ...
+    Registered: ['stale_release_pointer']`. Two things were wrong with that
+    argv and only one of them is the index:
+
+    * **`unreachable` is the wrong OUTCOME for that fault.** Read read-only
+      2026-09-14 with `AWS_PROFILE=ne-admin`, the production record
+      `faults/2026-08-11/spot_terminated_mid_job.json` carries
+      `outcome: absorbed` with `attempt: {n: 2, reason: spot_interruption}`
+      against `runs/data.daily/2026-08-11/run.json`. A spot reclamation
+      demonstrably REACHES the system and is absorbed by the declared
+      transient retry — so registering an `unreachable` probe for it would
+      be registering a claim the production evidence contradicts, which is
+      the attestation-a-human-typed shape `crucible.faults` exists to refuse.
+      `crucible.faults.UNREACHABLE_PROBES` is right to omit it.
+    * **A positional index picks whichever fault happens to be first.**
+      `SCRIPTED_FAULTS` is ordered by plan §10.7's narration, not by what is
+      recordable, so `[0]` silently re-selects a different fault the day that
+      tuple is reordered. Selecting from `UNREACHABLE_PROBES` instead makes
+      the case structurally incapable of naming a fault with no registered
+      evidence — the class fix, not this instance's.
+
+    `published_release_sha` is requested for ordering, not for its value:
+    `stale_release_pointer`'s two probes are executed for real against this
+    store, and `_probe_published_release_objects_are_retained` refuses a
+    record when not one published release object is found ("vacuously true
+    and evidence of nothing"). The fixture is what puts one there.
+    """
+    from crucible.faults import UNREACHABLE_PROBES
     from crucible.gate import SCRIPTED_FAULTS
+
+    recordable = [fault for fault in SCRIPTED_FAULTS if fault in UNREACHABLE_PROBES]
+    assert recordable, (
+        "no scripted fault has registered machine-checkable evidence, so no `unreachable` "
+        "record can be filed at all — a finding about `crucible.faults`, not a reason to "
+        "skip this case"
+    )
 
     cli_main(
         [
             "fault.record",
             "--fault",
-            SCRIPTED_FAULTS[0],
+            recordable[0],
             "--outcome",
             "unreachable",
             "--store",
