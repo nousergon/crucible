@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ast
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -169,7 +170,11 @@ class TestKnownWritersRoundTrip:
             ).encode(),
         )
         store = LocalStore(tmp_path / "store")
-        recipes = {s.name: s for s in load_arm_specs("u", strategy_dir=strategy_dir)}
+        # The fixture tree holds U recipes and the v1 source here is R's pointer;
+        # a recipe for another slot is refused, so the same recipe is declared R.
+        recipes = {
+            s.name: replace(s, slot="r") for s in load_arm_specs("u", strategy_dir=strategy_dir)
+        }
 
         def job(ctx: Any) -> None:
             run_migrate_history(
@@ -209,7 +214,11 @@ class TestKnownWritersRoundTrip:
             ).encode(),
         )
         store = LocalStore(tmp_path / "store")
-        recipes = {s.name: s for s in load_arm_specs("u", strategy_dir=strategy_dir)}
+        # The fixture tree holds U recipes and the v1 source here is R's pointer;
+        # a recipe for another slot is refused, so the same recipe is declared R.
+        recipes = {
+            s.name: replace(s, slot="r") for s in load_arm_specs("u", strategy_dir=strategy_dir)
+        }
 
         def job(ctx: Any) -> None:
             run_migrate_history(

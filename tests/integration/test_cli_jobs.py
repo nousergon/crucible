@@ -786,7 +786,10 @@ def test_migrate_history(integration_store_uri: str, integration_store: Store) -
         [
             "migrate.history",
             "--v1-store",
-            integration_store_uri,
+            # A sub-prefix of the dedicated store, not the store itself: the
+            # handler refuses a v1 store equal to the v2 store, which is how
+            # every source used to read as absent in production.
+            f"{integration_store_uri.rstrip('/')}/v1-source",
             "--allow-missing",
             "--store",
             integration_store_uri,
