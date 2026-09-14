@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from crucible import migrate as migrate_module
+from crucible.backfill import run_backfill
 from crucible.calendar import is_trading_day
 from crucible.config import settings as resolve_settings
 from crucible.data import ArcticPriceSource, PriceSource, run_daily, run_heal, run_weekly
@@ -466,6 +467,76 @@ def handle_experiment_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_experiment_backfill(args: argparse.Namespace) -> int:
+    """`experiment.backfill` — one arm's history over a session range.
+
+    `alpha-engine-config-I10696`. The whole job body is
+    :func:`crucible.backfill.run_backfill`, handed the slot's OWN per-arm
+    produce callable — the same one `experiment.run` dispatches to. This
+    handler resolves what that function cannot see for itself (the settings,
+    the store, the slot module and the slot's registered specs) and nothing
+    else: a second fitting path is the one thing this job must never grow.
+
+    The manifest is keyed to ``--to`` and discriminated by `{slot}.{arm}`, so
+    two arms backfilled to the same session are two manifests rather than one
+    overwriting the other.
+    """
+    config = _settings(args)
+    store = config.store()
+    module = _slot_module(args.slot)
+    start = dt.date.fromisoformat(args.from_date)
+    end = dt.date.fromisoformat(args.to_date)
+    if args.dry_run:
+        from crucible.backfill import in_region, sessions_in_range
+
+        on_ec2, evidence = in_region()
+        sessions = sessions_in_range(start, end)
+        print(
+            f"experiment.backfill --slot {args.slot} --arm {args.arm} would produce "
+            f"{len(sessions)} session(s) {start}..{end} through {module.__name__}.produce. "
+            f"Host: {evidence} (in region: {on_ec2})."
+        )
+        return 0
+    specs = _recipes_for_registration(args.slot, config=config, store=store)
+    result: dict[str, Any] = {}
+    ctx = run_job(
+        "experiment.backfill",
+        lambda c: result.update(
+            run_backfill(
+                c,
+                produce=module.produce,
+                specs=specs,
+                settings=config,
+                slot=args.slot,
+                arm=name_component(args.arm),
+                start=start,
+                end=end,
+                force=bool(getattr(args, "force", False)),
+                i_am_in_region=bool(getattr(args, "i_am_in_region", False)),
+            )
+        ),
+        store=store,
+        trading_day=end,
+        run_mode=getattr(args, "run_mode", None),
+        # One job name, four slots and many arms, all legitimately keyed to
+        # the same `--to` session (alpha-engine-config-I9781's shape).
+        discriminator=f"{args.slot}.{name_component(args.arm)}",
+    )
+    print(
+        json.dumps(
+            {
+                "run_id": ctx.run_id,
+                "arm_id": result.get("arm_id"),
+                "produced": len(result.get("produced", [])),
+                "already_present": len(result.get("already_present", [])),
+                "refused": result.get("refused", []),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def handle_experiment_grade(args: argparse.Namespace) -> int:
     config = _settings(args)
     store = config.store()
@@ -642,6 +713,7 @@ HANDLERS = {
     "data.heal": handle_data_heal,
     "experiment.new": handle_experiment_new,
     "experiment.run": handle_experiment_run,
+    "experiment.backfill": handle_experiment_backfill,
     "experiment.grade": handle_experiment_grade,
     "explain": handle_explain,
     "migrate.history": handle_migrate_history,
@@ -698,7 +770,33 @@ def add_track_a_arguments(name: str, sub: argparse.ArgumentParser) -> None:
                 "operator in a hurry."
             ),
         )
-    if name in ("experiment.new", "experiment.run", "experiment.grade", "migrate.history"):
+    if name == "experiment.backfill":
+        sub.add_argument("--from", dest="from_date", required=True, metavar="YYYY-MM-DD")
+        sub.add_argument("--to", dest="to_date", required=True, metavar="YYYY-MM-DD")
+        sub.add_argument(
+            "--force",
+            action="store_true",
+            help=(
+                "Reproduce a session whose three artifacts already exist. Without it "
+                "an already-produced session is skipped and reported as such, which is "
+                "what makes an interrupted backfill resumable by rerunning it."
+            ),
+        )
+        sub.add_argument(
+            "--i-am-in-region",
+            action="store_true",
+            help=(
+                "Override the in-region guard. The ONLY override — same rule and same "
+                "reason as `data.heal`: the failure mode is an operator in a hurry."
+            ),
+        )
+    if name in (
+        "experiment.new",
+        "experiment.run",
+        "experiment.backfill",
+        "experiment.grade",
+        "migrate.history",
+    ):
         sub.add_argument(
             "--strategy-dir",
             help=(

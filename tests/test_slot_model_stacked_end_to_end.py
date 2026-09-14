@@ -282,7 +282,12 @@ class TestTheGapCannotReopen:
             )
         message = str(excinfo.value)
         assert f"{_SESSIONS} of {_SESSIONS} panel session(s)" in message
-        assert "crucible experiment.run --slot m --arm base" in message
+        # alpha-engine-config-I10696: the instruction is the RANGE job now.
+        # A per-session `experiment.run` loop is unreachable from the weekly
+        # cadence for a 504-session window, so naming it was an operator
+        # instruction nobody could follow.
+        assert "crucible experiment.backfill --slot m --arm base" in message
+        assert "--run-mode replay" in message
 
     def test_a_partial_base_history_is_refused_with_the_count_of_what_is_missing(
         self, layer, recipes

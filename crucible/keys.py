@@ -59,6 +59,7 @@ __all__ = [
     "arm_register_key",
     "arm_series_key",
     "attribution_key",
+    "backfill_key",
     "board_html_key",
     "board_key",
     "champion_key",
@@ -1037,6 +1038,20 @@ def heal_key(trading_day: str, run_id: str) -> str:
     if not run_id:
         raise ValueError("run_id must be non-empty — see manifest_key's discriminator for why.")
     return f"heals/{trading_day}/{run_id}.json"
+
+
+def backfill_key(trading_day: str, run_id: str) -> str:
+    """Where `crucible experiment.backfill` files its own result, per attempt.
+
+    Keyed by `run_id` for the same reason as :func:`heal_key`: a backfill is
+    rerun idempotently (a chunk interrupted by a spot reclamation is resumed
+    by running it again), and each attempt's own record — which sessions were
+    produced, which were already present, which refused — is worth keeping
+    distinct from the attempt before it.
+    """
+    if not run_id:
+        raise ValueError("run_id must be non-empty — see manifest_key's discriminator for why.")
+    return f"backfills/{trading_day}/{run_id}.json"
 
 
 # -- fleet ledger -----------------------------------------------------------

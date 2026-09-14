@@ -952,14 +952,28 @@ def _dispatch_target_trading_day(args: Any, dispatched_at: dt.datetime) -> dt.da
     die without an artifact would have been reported against a trading day
     nobody could go and look at.
 
-    Falls back to the wall clock when `--date` is absent or unparseable — the
+    `--to` is read the same way, after `--date` (`alpha-engine-config-I10696`).
+    A RANGE job binds its one manifest to the END of the range — `data.heal`
+    and `experiment.backfill` both pass `trading_day=end` to `run_job` — and
+    neither carries `--date` at all, so this function resolved both from the
+    wall clock and would have paged an ABSENCE for every historical range
+    dispatch whose manifest exists. `experiment.backfill` is dispatched in
+    chunks over two years of sessions, so the very first use of it would have
+    produced the false page; `data.heal` has carried the same latent defect
+    since I10134 and is fixed by the same line. `--date` still wins where a
+    dispatch somehow carries both: it is the flag `crucible.cli.resolve_date`
+    actually reads.
+
+    Falls back to the wall clock when neither is present or parseable — the
     original behaviour, which is correct for a dispatch that named no day.
     A `--date` that is not a date is not silently substituted with a guess
     here; it is a malformed dispatch, and `crucible.cli` refuses it at the box
     with the usage exit code the wrapper reports as one.
     """
-    explicit = _flag_value(args, "--date")
-    if explicit is not None:
+    for flag in ("--date", "--to"):
+        explicit = _flag_value(args, flag)
+        if explicit is None:
+            continue
         try:
             return dt.date.fromisoformat(explicit)
         except ValueError:

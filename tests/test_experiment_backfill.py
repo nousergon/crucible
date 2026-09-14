@@ -1,0 +1,390 @@
+"""`crucible experiment.backfill` — a base arm's prediction history, on demand.
+
+`alpha-engine-config-I10696`. A stacked M arm reads
+`predictions[<base>]` on every row of its training window, so it refuses at
+registration until the base has an `arm_predictions` artifact for every
+session of that window. A weekly arc adds ONE base session per week, so a
+504-session window is 504 weeks away — a stacked arm could never register
+from weekly runs alone. This job produces the missing sessions the only way
+that is honest: the SAME per-arm produce path `experiment.run` calls, once
+per session, point-in-time.
+
+Every test drives the real path — a real feature layer on disk, the real
+loader, the real `crucible.runner.run_job` wrapper and a real manifest in a
+real store. A test that asserted a call site would pass over a job whose
+rows reached nothing.
+
+Dates are fixed literals off a pinned session axis, never `today` arithmetic
+(AGENTS.md test discipline).
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+
+import numpy as np
+import pytest
+
+from crucible.backfill import (
+    BackfillProducedNothingError,
+    UnknownArmError,
+    run_backfill,
+)
+from crucible.calendar import is_trading_day
+from crucible.data.heal import LAPTOP_SESSION_ALLOWANCE, NotInRegionError
+from crucible.features import DEFAULT_FEATURE_VERSION
+from crucible.keys import (
+    arm_predictions_key,
+    backfill_key,
+    cross_section_key,
+    data_panel_key,
+    manifest_key,
+    shadow_key,
+)
+from crucible.runner import run_job
+from crucible.slots.model import (
+    FEATURE_COMPLETENESS_METRIC,
+    SLOT,
+    load_model_recipes,
+    produce,
+    registration_specs,
+)
+from crucible.store import LocalStore
+
+BASE_COLUMN = "momentum_20d_zscore"
+SECOND_COLUMN = "volatility_20d_ratio"
+
+_START = dt.date(2026, 6, 1)
+_SESSIONS = 60
+_NAMES = (
+    "AAA",
+    "BBB",
+    "CCC",
+    "DDD",
+    "EEE",
+    "FFF",
+    "GGG",
+    "HHH",
+    "III",
+    "JJJ",
+    "KKK",
+    "LLL",
+)
+
+
+def _sessions() -> tuple[str, ...]:
+    days: list[str] = []
+    day = _START
+    while len(days) < _SESSIONS:
+        if is_trading_day(day):
+            days.append(day.isoformat())
+        day += dt.timedelta(days=1)
+    return tuple(days)
+
+
+SESSIONS = _sessions()
+
+#: The window a stacked arm on `min_trading_days: 10` + a 2-session label
+#: horizon needs its base to have already predicted, and the anchor it is
+#: then producible on.
+WARMUP_FROM = SESSIONS[32]
+WARMUP_TO = SESSIONS[45]
+RUN_DAY = SESSIONS[45]
+
+
+@pytest.fixture
+def store(tmp_path):
+    import pandas as pd
+
+    backing = LocalStore(tmp_path / "store")
+    rng = np.random.default_rng(20260914)
+    rows = []
+    for i, day in enumerate(SESSIONS):
+        closes = 100.0 + i * 0.5 + rng.normal(0.0, 1.0, len(_NAMES))
+        frame = pd.DataFrame(
+            {
+                "ticker": list(_NAMES),
+                "close_raw": closes,
+                BASE_COLUMN: rng.normal(0.0, 1.0, len(_NAMES)),
+                SECOND_COLUMN: rng.normal(1.0, 0.3, len(_NAMES)),
+            }
+        )
+        backing.put_bytes(
+            f"features/{DEFAULT_FEATURE_VERSION}/{day}.parquet", frame.to_parquet(index=False)
+        )
+        rows.extend(
+            {"trading_day": dt.date.fromisoformat(day), "ticker": t, "close_raw": float(c)}
+            for t, c in zip(_NAMES, closes, strict=True)
+        )
+    panel = pd.DataFrame(rows)
+    for day in SESSIONS:
+        backing.put_bytes(data_panel_key(day), panel.to_parquet(index=False))
+    return backing
+
+
+def _write_recipe(directory, name, *, features, inputs=(), min_days=10):
+    directory.mkdir(parents=True, exist_ok=True)
+    lines = ["slot: m", f"name: {name}", "spec:", f"  features: [{', '.join(features)}]"]
+    if inputs:
+        lines.append("  inputs:")
+        lines += [f"    - {entry}" for entry in inputs]
+    lines += [
+        "  estimator: {kind: ridge, alpha: 1.0}",
+        "  label_horizon_trading_days: 2",
+        "  refit_cadence_trading_days: 5",
+        f"  training_window: {{kind: expanding, min_trading_days: {min_days}}}",
+        "  cpcv: {n_groups: 4, k_test: 1, embargo_trading_days: 1}",
+        f"registered_at: '{SESSIONS[0]}'",
+    ]
+    (directory / f"{name}.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class _Settings:
+    def __init__(self, strategy_dir=None):
+        self.strategy_dir = strategy_dir
+
+
+@pytest.fixture
+def strategy(tmp_path):
+    arms = tmp_path / "strategy" / "arms" / SLOT
+    _write_recipe(arms, "base", features=[BASE_COLUMN])
+    _write_recipe(arms, "stacked", features=[SECOND_COLUMN], inputs=["predictions[base]"])
+    return _Settings(tmp_path / "strategy")
+
+
+def _specs(settings):
+    loaded = load_model_recipes(settings.strategy_dir / "arms" / SLOT)
+    return registration_specs(loaded)
+
+
+def _backfill(store, settings, *, arm="base", start=WARMUP_FROM, end=WARMUP_TO, **kwargs):
+    result: dict = {}
+    ctx = run_job(
+        "experiment.backfill",
+        lambda c: result.update(
+            run_backfill(
+                c,
+                produce=produce,
+                specs=_specs(settings),
+                settings=settings,
+                slot=SLOT,
+                arm=arm,
+                start=dt.date.fromisoformat(start),
+                end=dt.date.fromisoformat(end),
+                i_am_in_region=kwargs.pop("i_am_in_region", True),
+                **kwargs,
+            )
+        ),
+        store=store,
+        trading_day=dt.date.fromisoformat(end),
+        run_mode="replay",
+        discriminator=f"{SLOT}.{arm}",
+    )
+    return ctx, result
+
+
+def _manifest(store, arm, day):
+    key = manifest_key("experiment.backfill", day, discriminator=f"{SLOT}.{arm}")
+    return json.loads(store.get_bytes(key).decode("utf-8"))
+
+
+class TestTheRangeIsProducedThroughTheRealProducePath:
+    def test_every_session_in_the_range_gets_the_three_per_session_artifacts(
+        self, store, strategy
+    ) -> None:
+        _, result = _backfill(store, strategy)
+        arm_id = result["arm_id"]
+        assert len(result["sessions"]) == len(result["produced"]) > 10
+        for day in result["sessions"]:
+            assert store.exists(arm_predictions_key(arm_id, day))
+            assert store.exists(shadow_key(arm_id, day))
+            assert store.exists(cross_section_key(arm_id, day))
+
+    def test_the_backfilled_history_is_what_lets_a_stacked_arm_produce(
+        self, store, strategy
+    ) -> None:
+        """The issue's own closes-when, end to end: before the backfill the
+        stacked arm refuses on its base's missing history; after it, the
+        slot produces both arms on the same session."""
+        _backfill(store, strategy)
+        produced: dict = {}
+        run_job(
+            "experiment.run",
+            lambda c: produced.update(produce(c, settings=strategy)),
+            store=store,
+            trading_day=dt.date.fromisoformat(RUN_DAY),
+            run_mode="replay",
+            discriminator=SLOT,
+        )
+        assert len(produced["arms"]) == 2, produced
+
+
+class TestOneManifestForTheWholeRange:
+    def test_the_manifest_is_keyed_to_to_and_counts_sessions(self, store, strategy) -> None:
+        _, result = _backfill(store, strategy)
+        document = _manifest(store, "base", WARMUP_TO)
+        assert document["status"] == "ok", document["reason"]
+        assert document["job"] == "experiment.backfill"
+        assert document["trading_day"] == WARMUP_TO
+        assert document["run_mode"] == "replay"
+        assert document["rows_in"] == len(result["sessions"])
+        assert document["rows_out"] == len(result["sessions"])
+        assert document["rows_rejected"] == []
+
+    def test_the_per_session_feature_completeness_records_are_on_it(self, store, strategy) -> None:
+        _, result = _backfill(store, strategy)
+        document = _manifest(store, "base", WARMUP_TO)
+        rows = [m for m in document["metrics"] if m["name"] == FEATURE_COMPLETENESS_METRIC]
+        assert len(rows) >= len(result["sessions"])
+
+    def test_the_result_document_is_written_and_named_on_the_manifest(
+        self, store, strategy
+    ) -> None:
+        ctx, result = _backfill(store, strategy)
+        key = backfill_key(WARMUP_TO, ctx.run_id)
+        assert store.exists(key)
+        document = json.loads(store.get_bytes(key).decode("utf-8"))
+        assert document["schema_version"] == "backfill.v1"
+        assert document["arm"] == "base"
+        assert document["produced"] == result["produced"]
+        assert key in {o["key"] for o in _manifest(store, "base", WARMUP_TO)["outputs"]}
+
+
+class TestIdempotence:
+    def test_a_session_whose_artifacts_exist_is_skipped(self, store, strategy) -> None:
+        _backfill(store, strategy)
+        _, second = _backfill(store, strategy)
+        assert second["produced"] == []
+        assert second["already_present"] == second["sessions"]
+
+    def test_force_reproduces_every_session(self, store, strategy) -> None:
+        _backfill(store, strategy)
+        _, second = _backfill(store, strategy, force=True)
+        assert second["already_present"] == []
+        assert second["produced"] == second["sessions"]
+
+
+class TestItRefusesRatherThanGuesses:
+    def test_a_bulk_range_off_ec2_refuses_and_names_this_job(
+        self, store, strategy, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            "crucible.backfill.in_region", lambda: (False, "IMDSv2 did not answer: a laptop")
+        )
+        with pytest.raises(NotInRegionError) as excinfo:
+            _backfill(store, strategy, i_am_in_region=False)
+        message = str(excinfo.value)
+        assert "crucible experiment.backfill" in message
+        assert f"--from {WARMUP_FROM} --to {WARMUP_TO}" in message
+        assert str(LAPTOP_SESSION_ALLOWANCE) in message
+
+    def test_an_arm_the_slot_does_not_register_is_refused(self, store, strategy) -> None:
+        with pytest.raises(UnknownArmError) as excinfo:
+            _backfill(store, strategy, arm="nowhere")
+        assert "nowhere" in str(excinfo.value)
+        assert "base" in str(excinfo.value)
+
+    def test_a_non_trading_day_bound_is_refused(self, store, strategy) -> None:
+        with pytest.raises(ValueError, match="2026-07-03"):
+            _backfill(store, strategy, start="2026-07-03", end=WARMUP_TO)
+
+    def test_a_range_where_every_session_refuses_fails_the_job(self, store, strategy) -> None:
+        """`stacked` with NO base history: nothing can be produced, so the
+        job fails rather than reporting a completed backfill of nothing."""
+        with pytest.raises(BackfillProducedNothingError):
+            _backfill(store, strategy, arm="stacked", start=SESSIONS[40], end=SESSIONS[45])
+        document = _manifest(store, "stacked", SESSIONS[45])
+        assert document["status"] == "failed"
+        assert document["rows_rejected"], document
+
+
+class TestAPartiallySatisfiableRangeIsNamedNotSwallowed:
+    def test_sessions_that_refuse_are_counted_in_rows_rejected(self, store, strategy) -> None:
+        """The base is warmed over 32..45, so `stacked` can produce on the
+        late sessions of 40..45 and cannot on the early ones. The refusals
+        are rows_rejected on the one manifest, and the run is `ok`."""
+        _backfill(store, strategy)
+        _, result = _backfill(store, strategy, arm="stacked", start=SESSIONS[40], end=SESSIONS[45])
+        assert result["produced"], result
+        assert result["refused"], result
+        document = _manifest(store, "stacked", SESSIONS[45])
+        assert document["status"] == "ok", document["reason"]
+        assert len(document["rows_rejected"]) == len(result["refused"])
+        assert document["rows_out"] == len(result["produced"])
+
+
+class TestTheRefusalTextNamesThisJob:
+    def test_a_missing_base_history_sends_the_operator_to_experiment_backfill(
+        self, store, strategy
+    ) -> None:
+        from crucible.slots.inputs import BasePredictionsUnavailableError
+        from crucible.slots.model import FeatureLayerSource, design_panel
+
+        loaded = load_model_recipes(strategy.strategy_dir / "arms" / SLOT)
+        by_name = {r.name: r for r in loaded.registered}
+        with pytest.raises(BasePredictionsUnavailableError) as excinfo:
+            design_panel(
+                by_name["stacked"],
+                source=FeatureLayerSource(store=store),
+                trading_day=RUN_DAY,
+                recipes=loaded.registered,
+                lookback_trading_days=12,
+                store=store,
+            )
+        message = str(excinfo.value)
+        assert "crucible experiment.backfill --slot m --arm base" in message
+        assert "--run-mode replay" in message
+        assert "experiment.run --slot m --arm base --trading-day" not in message
+
+
+class TestTheCliHandler:
+    """The production entry point, driven through `crucible.cli.main`.
+
+    A test that called `run_backfill` only would pass over a handler that
+    resolved the wrong store, the wrong slot module or the wrong specs —
+    which is every way this job can be wired wrong and none of the ways its
+    body can.
+    """
+
+    def _argv(self, store_root, strategy, **flags):
+        argv = [
+            "experiment.backfill",
+            "--slot",
+            SLOT,
+            "--arm",
+            "base",
+            "--from",
+            WARMUP_FROM,
+            "--to",
+            WARMUP_TO,
+            "--store",
+            str(store_root),
+            "--strategy-dir",
+            str(strategy.strategy_dir),
+            "--run-mode",
+            "replay",
+        ]
+        return argv + list(flags.get("extra", []))
+
+    def test_the_handler_backfills_the_range_and_writes_the_manifest(
+        self, store, strategy, monkeypatch
+    ) -> None:
+        from crucible.cli import main
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        assert main(self._argv(store.root, strategy, extra=["--i-am-in-region"])) == 0
+        document = _manifest(store, "base", WARMUP_TO)
+        assert document["status"] == "ok", document["reason"]
+        assert document["rows_out"] == document["rows_in"] > 10
+
+    def test_a_dry_run_reports_the_range_and_writes_nothing(
+        self, store, strategy, monkeypatch, capsys
+    ) -> None:
+        from crucible.cli import main
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        before = sorted(store.list_keys())
+        assert main(self._argv(store.root, strategy, extra=["--dry-run"])) == 0
+        assert "experiment.backfill --slot m --arm base would produce" in capsys.readouterr().out
+        assert sorted(store.list_keys()) == before
