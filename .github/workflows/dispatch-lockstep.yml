@@ -211,13 +211,23 @@ jobs:
 
       # CRUCIBLE_ROOT is THIS repository's own checkout, not a second clone of
       # `crucible`.
+      #
+      # Two guards, one step (alpha-engine-config-I10708). The second file is
+      # the store-prefix grant lockstep: every top-level prefix
+      # `crucible/keys.py` declares is granted to the runtime role in ops
+      # main's stack template, or declared as another identity's in
+      # that file's `OTHER_WRITERS`. It used to run ONLY in nous-ergon-ops CI,
+      # so a crucible merge adding a prefix landed ungranted and the first box
+      # job to write it died AccessDenied — `arm_predictions/` (I10694) and
+      # `backfills/` (I10708) on the same day. The ops test module is invoked
+      # rather than re-implemented here: one extractor, never two.
       - name: Lockstep guard
         env:
           CRUCIBLE_ROOT: ${{ github.workspace }}
         run: |
           set -euo pipefail
           cd nous-ergon-ops-checkout
-          python3 -m pytest tests/crossrepo/test_crucible_dispatch_lockstep.py -q
+          python3 -m pytest tests/crossrepo/test_crucible_dispatch_lockstep.py tests/crossrepo/test_crucible_store_prefix_grants.py -q
 
   crucible-dispatch-lockstep-pr:
     name: crucible-dispatch-lockstep-pr
@@ -256,6 +266,22 @@ jobs:
         run: |
           set -euo pipefail
           gh api "repos/nousergon/crucible/contents/crucible/components.yaml?ref=${HEAD_SHA}" --jq '.content' | base64 -d > crucible/components.yaml
+
+      # The PR's `crucible/keys.py`, same documented-safe shape as the step
+      # above: DATA over the read-only Contents API at the PR head,
+      # base64-decoded straight to a file. The prefix-grant guard reads it
+      # with `ast.parse` and never imports or executes it
+      # (`test_crucible_store_prefix_grants.py::_extract_prefixes`). Without
+      # this step the guard would grade MAIN's keys.py, so the PR adding an
+      # ungranted prefix would pass and main would go red after it merged —
+      # the exact gap alpha-engine-config-I10708 closes.
+      - name: Fetch the PR's keys.py as data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/nousergon/crucible/contents/crucible/keys.py?ref=${HEAD_SHA}" --jq '.content' | base64 -d > crucible/keys.py
 
       # The SECOND piece, and the reason it exists: the guard compares
       # `components.yaml` against the workflows that declare an `on.schedule`
@@ -365,10 +391,14 @@ jobs:
       # half of the guard) is main's, unmodified by the PR — the guard grades
       # the one file this job actually needs to grade as the PR's diff, and
       # nothing else is trusted from the PR.
+      #
+      # The PR's keys.py is overlaid the same way, for the store-prefix grant
+      # guard (alpha-engine-config-I10708): RED on the PR that declares a
+      # prefix ops main's RuntimeRole does not grant, before it merges.
       - name: Lockstep guard against the PR's components.yaml
         env:
           CRUCIBLE_ROOT: ${{ github.workspace }}
         run: |
           set -euo pipefail
           cd nous-ergon-ops-checkout
-          python3 -m pytest tests/crossrepo/test_crucible_dispatch_lockstep.py -q
+          python3 -m pytest tests/crossrepo/test_crucible_dispatch_lockstep.py tests/crossrepo/test_crucible_store_prefix_grants.py -q
