@@ -52,6 +52,14 @@ from crucible.alerts import (
 )
 from crucible.attribution import manifest_records_factor_attribution
 from crucible.calendar import TRADING_DAYS_PER_WEEK, is_trading_day, resolve_trading_day
+from crucible.carryover import (
+    V1_BUCKET_VAR,
+    V1_SLOT_TO_V2_SLOT,
+    LedgerError,
+    grade_carryover,
+    parse_ledger,
+    read_v1_arm_sets,
+)
 from crucible.components import Component, load_registry
 from crucible.documents import DocumentRead, read_manifests_under
 from crucible.documents import read_path_document as _read_path_document
@@ -91,6 +99,7 @@ from crucible.keys import (
     runs_prefix,
     strategy_arms_prefix,
     strategy_holdout_key,
+    v1_carryover_key,
     verdict_key,
 )  # noqa: F401 - re-exported
 from crucible.keys import TRADER_EVIDENCE_KEY as _TRADER_EVIDENCE_KEY
@@ -7656,6 +7665,129 @@ def _clause_integration_tier_current(store: Store, window: list[dt.date]) -> Cla
     )
 
 
+def _clause_v1_arms_carried_or_excluded(
+    store: Store, window: list[dt.date], *, v1_store: Store | None = None
+) -> Clause:
+    """Every arm v1 serves has a v2 disposition (`alpha-engine-config-I10716`).
+
+    The class fix for `-I10714`: phase 1 counted verdicts for every REGISTERED
+    arm, so an arm never registered was invisible on every surface, and v1's
+    serving M model, its whole `scanner_cut` universe slot and an R challenger
+    failed to cross unnoticed. This clause reads v1's LIVE arm set
+    (`crucible.carryover.read_v1_arm_sets`), the published ledger
+    (`strategy/current/v1_carryover.yaml`) and the v2 registers, and is:
+
+    * UNMEASURABLE when v1's store location is unset or any v1 source cannot be
+      read — an unknown arm set never grades MET — or a v2 read is denied;
+    * UNMET when a live v1 arm has no ledger row, any row is `pending`, a
+      `carried` row names an arm absent from its v2 register, or the ledger is
+      absent or malformed;
+    * MET otherwise.
+
+    ``v1_store`` is for tests; the phase assembler passes none and the store is
+    resolved from `CRUCIBLE_ARCTIC_BUCKET` (no default — a bucket name may not
+    live in this repo).
+    """
+    _unused(window)
+    name = "v1_arms_carried_or_excluded"
+    requirement = (
+        "every arm in v1's live artifacts (zoo leaderboard + model arena, producer arena + "
+        "champion, scanner_spec and scanner_cut champions, the S serving chain) has a row in "
+        "the published carry-over ledger; no row is `pending`; and every `carried` row names "
+        "an active arm in its v2 slot's register"
+    )
+    ledger_key = v1_carryover_key()
+    if v1_store is None:
+        bucket = os.environ.get(V1_BUCKET_VAR, "").strip()
+        if not bucket:
+            return _unmeasurable(
+                name,
+                requirement,
+                f"`{V1_BUCKET_VAR}` is not set, so v1's live arm set was not read at all. "
+                "It carries no default (a bucket name may not live in this repository); set it "
+                "to the data bucket v1 writes to. UNMEASURABLE, never met: nothing was compared",
+                (ledger_key,),
+            )
+        from crucible.config import store_from_uri  # noqa: PLC0415 - only when a bucket is set
+
+        v1_store = store_from_uri(f"s3://{bucket}")
+    v1 = read_v1_arm_sets(v1_store)
+    evidence: list[str] = [ledger_key, *v1.evidence]
+    if v1.problems:
+        return _unmeasurable(
+            name,
+            requirement,
+            "v1's live arm set could not be read, so it is unknown rather than partial: "
+            + "; ".join(v1.problems),
+            evidence,
+        )
+    read = _read_store_bytes(store, ledger_key)
+    if read.problem is not None:
+        if read.access_problem:
+            return _unmeasurable(name, requirement, read.problem, evidence)
+        return Clause(name, requirement, False, read.problem, tuple(evidence))
+    if read.absent or read.raw is None:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{ledger_key} is absent — the carry-over ledger is authored in the private strategy "
+            "tree and published into the store; until it is, no v1 arm has a recorded disposition",
+            tuple(evidence),
+        )
+    try:
+        rows = parse_ledger(read.raw, source=ledger_key)
+    except LedgerError as exc:
+        return Clause(name, requirement, False, str(exc), tuple(evidence))
+    registers: dict[str, frozenset[str] | None] = {}
+    register_keys: dict[str, str] = {}
+    for v2_slot in sorted(set(V1_SLOT_TO_V2_SLOT.values())):
+        arm_ids, key, problem, access_problem, register = _register_arms(store, v2_slot)
+        evidence.append(key)
+        register_keys[v2_slot] = key
+        if problem is not None:
+            if access_problem:
+                return _unmeasurable(name, requirement, problem, evidence)
+            return Clause(name, requirement, False, problem, tuple(evidence))
+        registers[v2_slot] = (
+            None if register is None else frozenset(arm_name(arm_id) for arm_id in arm_ids)
+        )
+    findings = grade_carryover(v1.arm_sets, rows, registers, register_keys)
+    n_live = sum(len(s.arms) for s in v1.arm_sets)
+    counts = ", ".join(f"{n} {d}" for d, n in findings.counts.items())
+    if findings.met:
+        return Clause(
+            name,
+            requirement,
+            True,
+            f"all {n_live} live v1 arm(s) have a ledger row ({counts}); every carried arm is "
+            "registered in its v2 slot",
+            tuple(evidence),
+        )
+    parts: list[str] = []
+    if findings.unlisted:
+        parts.append(
+            f"{len(findings.unlisted)} live v1 arm(s) with no ledger row: "
+            + ", ".join(findings.unlisted)
+        )
+    if findings.pending:
+        parts.append(
+            f"{len(findings.pending)} pending row(s): "
+            + ", ".join(f"{r.label} ({r.reference})" for r in findings.pending)
+        )
+    if findings.carried_unregistered:
+        parts.append(
+            f"{len(findings.carried_unregistered)} carried row(s) naming an arm absent from its "
+            "v2 register: "
+            + ", ".join(
+                f"{r.label} -> {V1_SLOT_TO_V2_SLOT[r.v1_slot]}:{r.v2_arm} ({why})"
+                for r, why in findings.carried_unregistered
+            )
+        )
+    parts.append(f"{n_live} live v1 arm(s) read; ledger: {counts}")
+    return Clause(name, requirement, False, "; ".join(parts), tuple(evidence))
+
+
 def _phase3(
     store: Store,
     window: list[dt.date],
@@ -7692,6 +7824,13 @@ def _phase3(
         # engine, factor-neutral attribution, the sealed holdout) are the
         # real-store paths the integration tier is evidence for.
         _clause_integration_tier_current(store, window),
+        # `alpha-engine-config-I10716` (G5 of `-I10714`). Phase 3 is "all three
+        # slots", and a slot is not complete while an arm v1 serves in it has no
+        # recorded disposition — the blindness that let v1's serving M model and
+        # its `scanner_cut` slot fail to cross. Not a PHASE3_DELIVERABLES row:
+        # the table is split from `-I9759`'s own Deliverables line, which this
+        # class fix postdates.
+        _clause_v1_arms_carried_or_excluded(store, window),
     ]
 
 

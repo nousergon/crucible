@@ -728,6 +728,19 @@ def experiments_prefix(arm_id: str) -> str:
     return f"experiments/{arm_key_segment(arm_id)}/"
 
 
+def v1_carryover_key() -> str:
+    """The v1 carry-over ledger, inside the synced strategy tree.
+
+    `alpha-engine-config-I10716`. A sibling of :func:`strategy_holdout_key`:
+    one row per v1 arm per v1 slot (`carried`/`excluded`/`pending`), AUTHORED in
+    the private strategy tree (`alpha-engine-config/strategy/v1_carryover.yaml`)
+    and published under `strategy/current/`, read by
+    `crucible.carryover.parse_ledger` for the phase-3 clause
+    `v1_arms_carried_or_excluded`.
+    """
+    return "strategy/current/v1_carryover.yaml"
+
+
 def strategy_holdout_key() -> str:
     """The sealed holdout document, inside the synced strategy tree (plan §9.4).
 

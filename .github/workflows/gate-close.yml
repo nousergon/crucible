@@ -122,6 +122,9 @@ env:
   # `CRUCIBLE_LIQUIDITY_FLOOR_USD is unset`. It now resolves through
   # `crucible.required.require_env`, which is what puts it in this list.
   CRUCIBLE_LIQUIDITY_FLOOR_USD: ${{ vars.CRUCIBLE_LIQUIDITY_FLOOR_USD }}
+  # alpha-engine-config-I10716: phase 3's `v1_arms_carried_or_excluded` reads v1's
+  # live arm set from the data bucket; unset, the clause reads UNMEASURABLE.
+  CRUCIBLE_ARCTIC_BUCKET: ${{ vars.CRUCIBLE_ARCTIC_BUCKET }}
   # alpha-engine-config-I9928, and the same variable board.yml reads. This job
   # evaluates every registered phase's gate, so phase 2's
   # `zero_human_mutating_calls` clause is one of the clauses it reads — and an
