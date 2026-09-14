@@ -103,6 +103,19 @@ def _published(store, sha=SHA_A):
     )
 
 
+def _trader_evidence(sha=SHA_A, status="ok"):
+    from crucible.release import TraderSmokeEvidence
+
+    return TraderSmokeEvidence(
+        manifest_key=f"runs/trader.smoke/2026-08-28/{sha[:12]}/run.json",
+        run_id="01JG0000000000000000000000",
+        release_sha=sha,
+        status=status,
+        trading_day="2026-08-28",
+        finished="2026-08-28T23:00:00Z",
+    )
+
+
 def _smoke_manifest(sha=SHA_A, status="ok"):
     return {
         "job": "smoke",
@@ -374,7 +387,7 @@ class TestPointer:
         store = LocalStore(tmp_path)
         _published(store)
         _published(store, SHA_B)
-        pin(store, SHA_A, target="trader")
+        pin(store, SHA_A, target="trader", trader_smoke=_trader_evidence(SHA_A))
         pin(store, SHA_B, target="current")
         assert json.loads(store.get_bytes(TRADER_PIN_KEY))["sha"] == SHA_A
         assert json.loads(store.get_bytes(POINTER_KEY))["sha"] == SHA_B
