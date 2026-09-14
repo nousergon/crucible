@@ -29,6 +29,7 @@ import pytest
 from crucible.calendar import is_trading_day
 from crucible.features import min_panel_trading_days
 from crucible.required import require_env
+from crucible.slots import attribution_factor_symbols, declared_benchmark_symbols
 from crucible.slots.grading import DEFAULT_HORIZON_TRADING_DAYS
 from crucible.store import Store, open_store
 
@@ -332,7 +333,7 @@ def _declared_universe_env(
 
 
 @pytest.fixture(scope="session")
-def integration_arctic_symbols(arctic_library: Any) -> list[str]:
+def integration_arctic_symbols(arctic_library: Any, strategy_dir: Path) -> list[str]:
     """Synthetic OHLCV rows for three symbols, written into the DEDICATED
     library so `data.daily`/`data.weekly`/`data.heal`
     (`alpha-engine-config-I10457`) have something real to read through
@@ -363,6 +364,38 @@ def integration_arctic_symbols(arctic_library: Any) -> list[str]:
     changes. Torn down after the session so a rerun starts from the same
     clean state, mirroring `test_arctic_connectivity.py`'s own idempotent
     teardown.
+
+    **Also seeds every symbol `data.daily`'s producer reads BEYOND the
+    declared universe** (`alpha-engine-config-I10701`, measured against run
+    34797908861: `test_data_daily`/`weekly`/`heal`/`experiment_run`/`weekly`/
+    `experiment_grade` all failed `MissingSourceError: ... returned zero
+    symbols`, and the captured `WARNING` this tier's own log never surfaced —
+    `crucible.integration_summary.integration_test_body` captures the pytest
+    subprocess's stdout/stderr and keeps only the last 40 lines as the
+    manifest `reason` — read `... failed for SPY: ... E_NO_SUCH_VERSION ...`).
+    `crucible.data.daily.run_daily` fetches TWO declared sources of panel
+    symbols beyond the universe it was handed — every slot's non-`"population"`
+    `benchmark` (`crucible.slots.declared_benchmark_symbols`, today just S's
+    `"SPY"`, `alpha-engine-config-I10635`) and every factor-attribution proxy
+    ticker (`crucible.slots.attribution_factor_symbols`, `-I10683`) — and
+    raises if either has no panel row, exactly like a ticker missing from the
+    universe itself. This fixture predates both: it seeded only the three
+    declared-universe tickers, so the very first `data.daily` run in this
+    tier's history was always going to fail the moment either producer clause
+    landed, and did. Fixed at THIS layer (the seed), not by removing the
+    producer's own guard: the guard is correct (a compile-time gap here would
+    otherwise surface only as a grading refusal on a box, per that function's
+    own comment) and `crucible.slots.strategy_dir` here declares no
+    `attribution.yaml`, so `attribution_factor_symbols` returns the same
+    empty set it always has — only the benchmark set is non-empty today.
+    Derived from the producer's own two functions, never a second hand-kept
+    literal (the exact discipline `declared_benchmark_symbols`'s own
+    docstring names as this repo's reason for existing), so this fixture
+    cannot fall behind a THIRD extra-symbol source the same way it fell
+    behind these two. Extra symbols are written into the library — so the
+    producer's read finds them — but never returned from this fixture: they
+    are not part of the declared UNIVERSE (`CRUCIBLE_UNIVERSE_URI`), the same
+    distinction the producer itself draws.
     """
     import math
     import random
@@ -370,6 +403,11 @@ def integration_arctic_symbols(arctic_library: Any) -> list[str]:
     import pandas as pd
 
     symbols = ["INTGA", "INTGB", "INTGC"]
+    extra_symbols = sorted(
+        (declared_benchmark_symbols() | attribution_factor_symbols(strategy_dir=strategy_dir))
+        - set(symbols)
+    )
+    seeded_symbols = symbols + extra_symbols
     anchor = dt.date.fromisoformat(INTEGRATION_TRADING_DAY)
     settled = dt.date.fromisoformat(SETTLED_TRADING_DAY)
     days: list[dt.date] = []
@@ -388,7 +426,7 @@ def integration_arctic_symbols(arctic_library: Any) -> list[str]:
             days.append(day)
 
     rng = random.Random(20260908)
-    for symbol in symbols:
+    for symbol in seeded_symbols:
         price = rng.uniform(20.0, 200.0)
         rows = []
         for _day in days:
@@ -405,7 +443,7 @@ def integration_arctic_symbols(arctic_library: Any) -> list[str]:
         frame = pd.DataFrame(rows, index=pd.DatetimeIndex(days))
         arctic_library.write(symbol, frame)
     yield symbols
-    for symbol in symbols:
+    for symbol in seeded_symbols:
         if arctic_library.has_symbol(symbol):
             arctic_library.delete(symbol)
 
