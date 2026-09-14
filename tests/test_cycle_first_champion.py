@@ -31,6 +31,7 @@ from crucible.champion import (
 )
 from crucible.config import Settings
 from crucible.data import run_daily
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.keys import arena_cycle_key
 from crucible.runner import run_job
 from crucible.slots import get_slot, universe
@@ -113,7 +114,14 @@ class TestRunGradeSubstitutesTheBaseline:
         for day in decision_days + [cycle_date]:
             run_job(
                 "data.daily",
-                lambda c, day=day: run_daily(c, source=source, expected_symbols=source.symbols()),
+                lambda c, day=day: run_daily(
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    expected_symbols=source.symbols(),
+                ),
                 store=store,
                 trading_day=day,
             )

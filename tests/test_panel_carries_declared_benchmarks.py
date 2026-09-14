@@ -18,6 +18,7 @@ import pandas as pd
 import pytest
 
 from crucible.data import FramePriceSource, MissingSourceError, run_daily
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.keys import data_panel_key
 from crucible.manifest import read_manifest
 from crucible.runner import run_job
@@ -49,7 +50,14 @@ class TestPanelCarriesEveryDeclaredBenchmark:
     ) -> None:
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=sorted(frames)),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=sorted(frames),
+            ),
             store=store,
             trading_day=cycle_date,
         )
@@ -75,7 +83,14 @@ class TestPanelCarriesEveryDeclaredBenchmark:
 
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=sorted(frames)),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=sorted(frames),
+            ),
             store=store,
             trading_day=cycle_date,
         )
@@ -94,7 +109,14 @@ class TestPanelCarriesEveryDeclaredBenchmark:
         with pytest.raises(MissingSourceError, match="SPY"):
             run_job(
                 "data.daily",
-                lambda c: run_daily(c, source=no_benchmark_source, expected_symbols=sorted(frames)),
+                lambda c: run_daily(
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=no_benchmark_source,
+                    expected_symbols=sorted(frames),
+                ),
                 store=store,
                 trading_day=cycle_date,
             )
@@ -125,7 +147,14 @@ class TestPanelCarriesEveryDeclaredBenchmark:
 
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=real_source, expected_symbols=expected),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=real_source,
+                expected_symbols=expected,
+            ),
             store=store,
             trading_day=cycle_date,
         )

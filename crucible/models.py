@@ -2103,7 +2103,17 @@ class FeatureRow(_Strict):
         "for months. There is no grandfather list -- this layer has no history to "
         "grandfather.",
     )
-    unit: Literal["USD", "beta", "indicator", "log_return", "pct", "ratio", "zscore"] = Field(
+    unit: Literal[
+        "USD",
+        "beta",
+        "funds",
+        "gics_sector_label",
+        "indicator",
+        "log_return",
+        "pct",
+        "ratio",
+        "zscore",
+    ] = Field(
         description="The concrete unit, from a CLOSED vocabulary. Pinned by the suffix "
         "for every NORMALIZED suffix (see the allOf below: ratio, pct, zscore, "
         "log_return); the _raw set is open in MEANING but still enumerated rather than "

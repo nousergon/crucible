@@ -28,11 +28,15 @@ from crucible.features.registry import CATALOG, FeatureSpec, feature_version
 if TYPE_CHECKING:
     import pandas as pd
 
+    from crucible.data.point_in_time import PointInTimeInputs
+
 __all__ = [
     "BETA_WINDOW_TRADING_DAYS",
     "LIQUIDITY_FLOOR_VAR",
     "liquidity_floor_usd",
     "MOMENTUM_CHANGE_WINDOW_TRADING_DAYS",
+    "PILLAR_COMPONENTS",
+    "RETURN_120D_WINDOW_TRADING_DAYS",
     "RESIDUAL_MOMENTUM_CUM_TRADING_DAYS",
     "RESIDUAL_MOMENTUM_SKIP_TRADING_DAYS",
     "RESIDUAL_MOMENTUM_WINDOW_TRADING_DAYS",
@@ -138,6 +142,83 @@ VOL_RATIO_SHORT_WINDOW_TRADING_DAYS = 10
 VOL_RATIO_LONG_WINDOW_TRADING_DAYS = 60
 FIFTY_TWO_WEEK_WINDOW_TRADING_DAYS = 252
 
+#: v1's `return_120d` window (`nousergon-data/features/feature_engineer.py`).
+RETURN_120D_WINDOW_TRADING_DAYS = 120
+
+#: The attractiveness pillars (`alpha-engine-config-I10721`): pillar column ->
+#: `(component column, weight, invert)`. v1's definitions, component for
+#: component and weight for weight —
+#: `crucible-research/scoring/factor_scoring.py::_BASELINE_COMPOSITE_DEFS` for the
+#: six champion pillars (mapped by `scoring/composite.py::_PILLAR_TO_FACTOR_KEY`,
+#: `defensiveness` <- `low_vol_score`) and `_CHALLENGER_MOMENTUM_DEF` for the
+#: 12-1 variant. Measured 2026-09-14: the private override v1 actually runs
+#: (`alpha-engine-config` `factor_composites`) is identical to this baseline.
+#: `invert` ranks low-is-better components as `100 - percentile`.
+PILLAR_COMPONENTS: dict[str, tuple[tuple[str, float, bool], ...]] = {
+    "quality_pillar_pct": (
+        ("roe_ratio", 0.30, False),
+        ("debt_to_equity_div2_ratio", 0.25, True),
+        ("gross_margin_ratio", 0.25, False),
+        ("current_ratio_div3_ratio", 0.20, False),
+    ),
+    "value_pillar_pct": (
+        ("pe_div30_ratio", 0.40, True),
+        ("pb_div5_ratio", 0.30, True),
+        ("fcf_yield_ratio", 0.30, False),
+    ),
+    "momentum_pillar_pct": (
+        ("momentum_20d_log_return", 0.30, False),
+        ("return_60d_log_return", 0.25, False),
+        ("return_120d_log_return", 0.20, False),
+        ("dist_from_52w_high_ratio", 0.15, False),
+        ("momentum_5d_log_return", 0.10, False),
+    ),
+    "growth_pillar_pct": (
+        ("revenue_growth_3y_ratio", 0.30, False),
+        ("eps_growth_3y_ratio", 0.30, False),
+        ("sustainable_growth_rate_ratio", 0.25, False),
+        ("capex_growth_5y_ratio", 0.15, False),
+    ),
+    "stewardship_pillar_pct": (
+        ("payout_ratio", 0.35, True),
+        ("capex_growth_5y_ratio", 0.35, False),
+        ("institutional_accumulation_raw", 0.30, False),
+    ),
+    "defensiveness_pillar_pct": (
+        ("volatility_20d_ratio", 0.50, True),
+        ("vol_ratio_10_60_ratio", 0.30, True),
+        ("atr_14_ratio", 0.20, True),
+    ),
+    "momentum_12_1_pillar_pct": (
+        ("mom_12_1_log_return", 0.40, False),
+        ("return_120d_log_return", 0.25, False),
+        ("dist_from_52w_high_ratio", 0.20, False),
+        ("return_60d_log_return", 0.15, False),
+    ),
+}
+
+#: The catalogue columns read straight from `crucible.data.point_in_time` or
+#: derived from it on the session row alone: one session of price history.
+_POINT_IN_TIME_FEATURE_COLUMNS: tuple[str, ...] = (
+    "sector_raw",
+    "roe_ratio",
+    "debt_to_equity_div2_ratio",
+    "gross_margin_ratio",
+    "current_ratio_div3_ratio",
+    "pe_div30_ratio",
+    "pb_div5_ratio",
+    "fcf_yield_ratio",
+    "revenue_growth_3y_ratio",
+    "eps_growth_3y_ratio",
+    "capex_growth_5y_ratio",
+    "payout_ratio",
+    "sustainable_growth_rate_ratio",
+    "institutional_accumulation_raw",
+)
+
+#: v1's gate on a net 13F accumulation: fewer funds moving than this is noise.
+INSTITUTIONAL_MIN_MOVING_FUNDS = 3
+
 #: Guards the information-ratio division. v1's `_EPS`, carried across so the
 #: two implementations do not disagree on a near-zero denominator.
 _EPS = 1e-8
@@ -223,7 +304,13 @@ def catalog_column_depths() -> dict[str, int]:
         + VOL_RATIO_LONG_WINDOW_TRADING_DAYS,
         "dist_from_52w_high_ratio": FIFTY_TWO_WEEK_WINDOW_TRADING_DAYS,
         "dist_from_52w_low_ratio": FIFTY_TWO_WEEK_WINDOW_TRADING_DAYS,
+        "return_120d_log_return": RETURN_120D_WINDOW_TRADING_DAYS + 1,
     }
+    for column in _POINT_IN_TIME_FEATURE_COLUMNS:
+        # Read on the session row alone. How far back its INPUT reaches is a
+        # property of the point-in-time source, not of the price panel, and is
+        # declared in `crucible.data.point_in_time`'s module docstring.
+        depths[column] = 1
     depths["momentum_20d_zscore"] = depths["momentum_20d_log_return"]
     depths["return_60d_zscore"] = depths["return_60d_log_return"]
     depths["mom_12_1_zscore"] = depths["mom_12_1_log_return"]
@@ -235,6 +322,10 @@ def catalog_column_depths() -> dict[str, int]:
         depths["close_to_sma200_ratio"],
         depths["momentum_20d_log_return"],
     )
+    for pillar, components in PILLAR_COMPONENTS.items():
+        # A pillar is null on a session any component is unmeasured on, so it
+        # is as deep as its deepest component.
+        depths[pillar] = max(depths[column] for column, _, _ in components)
     return depths
 
 
@@ -295,13 +386,68 @@ def _wilder_rsi(close: pd.Series, window: int) -> pd.Series:
     return 100.0 - (100.0 / (1.0 + rs))
 
 
+def _sector_percentile(cross: pd.DataFrame, column: str, *, invert: bool) -> pd.Series:
+    """0-100 percentile rank of ``column`` within each ``sector_raw``, v1's way.
+
+    `rank(pct=True)` with average ties, exactly as v1's `_within_sector_pct_rank`;
+    a row with no sector, or no value, has no rank.
+    """
+    ranks = (
+        cross.groupby("sector_raw", sort=False, dropna=True)[column].rank(
+            pct=True, na_option="keep"
+        )
+        * 100.0
+    )
+    ranks = ranks.reindex(cross.index)
+    return 100.0 - ranks if invert else ranks
+
+
+def _pillars(cross: pd.DataFrame, unmeasured: frozenset[str]) -> None:
+    """Add every :data:`PILLAR_COMPONENTS` column to ``cross`` in place.
+
+    Per ticker, a missing component re-weights over the components the ticker
+    has (v1's partial-coverage rule). Per SESSION, a pillar whose sector or any
+    component measured nothing — declared unmeasured by the point-in-time
+    source, or carrying fewer than two values across the ranked population —
+    is null for every ticker. v1 renormalised over a dead component too, which
+    is how three of its pillars rode a saturated placeholder for weeks
+    (`alpha-engine-config-I8255`); here the pillar is absent instead, and the
+    ranker that reads it refuses by name.
+    """
+    population = cross["sector_raw"].notna()
+    for pillar, components in PILLAR_COMPONENTS.items():
+        dead = "sector_raw" in unmeasured or not population.any()
+        for column, _, _ in components:
+            if column in unmeasured or int(cross.loc[population, column].notna().sum()) < 2:
+                dead = True
+        if dead:
+            cross[pillar] = float("nan")
+            continue
+        numerator = None
+        denominator = None
+        for column, weight, invert in components:
+            ranks = _sector_percentile(cross, column, invert=invert)
+            term = ranks.fillna(0.0) * weight
+            present = ranks.notna().astype(float) * weight
+            numerator = term if numerator is None else numerator + term
+            denominator = present if denominator is None else denominator + present
+        assert numerator is not None and denominator is not None  # components never empty
+        cross[pillar] = numerator / denominator.where(denominator > 0)
+
+
 def build_features(
     panel: pd.DataFrame,
     *,
+    point_in_time: PointInTimeInputs,
     catalog: tuple[FeatureSpec, ...] = CATALOG,
     as_of: object = None,
 ) -> tuple[pd.DataFrame, tuple[FeatureSpec, ...]]:
     """The feature cross-section for ``as_of`` (default: the panel's last day).
+
+    ``point_in_time`` carries the session's non-price inputs
+    (`crucible.data.point_in_time`) and must be the reading for this very
+    session: a reading for another day raises, because joining it would put a
+    different day's fundamentals on this day's prices.
 
     Returns the frame and the catalogue it was built from, so the caller
     writes the registry that matches the columns rather than one that
@@ -324,6 +470,12 @@ def build_features(
 
     resolved_version = feature_version(catalog)
     day = as_of if as_of is not None else max(panel["trading_day"])
+    if point_in_time.trading_day != day:
+        raise ValueError(
+            f"point-in-time inputs were resolved for {point_in_time.trading_day} and the "
+            f"cross-section is {day}; joining them would put one session's fundamentals on "
+            "another session's prices"
+        )
 
     frame = panel.sort_values(["ticker", "trading_day"]).copy()
     grouped = frame.groupby("ticker", sort=False)["close_raw"]
@@ -360,6 +512,7 @@ def build_features(
 
     # -- the v3.0-meta L1 inputs (alpha-engine-config-I10695) --------------
     frame["momentum_5d_log_return"] = log_grouped.diff(MOMENTUM_SHORT_WINDOW_TRADING_DAYS)
+    frame["return_120d_log_return"] = log_grouped.diff(RETURN_120D_WINDOW_TRADING_DAYS)
 
     # `np.maximum` propagates a null rather than skipping it, so a ticker's
     # first session (no prior close) has no true range instead of a partial
@@ -512,6 +665,38 @@ def build_features(
         + _rank01(cross["close_to_sma200_ratio"])
         + _rank01(cross["momentum_20d_log_return"])
     ) / 4.0
+
+    # -- the attractiveness inputs and pillars (alpha-engine-config-I10721) --
+    from crucible.data.point_in_time import (  # noqa: PLC0415 - crucible.data imports this module
+        INSTITUTIONAL_COLUMNS,
+        POINT_IN_TIME_COLUMNS,
+        SECTOR_COLUMN,
+    )
+
+    inputs = point_in_time.frame.drop_duplicates("ticker").set_index("ticker")
+    for column in POINT_IN_TIME_COLUMNS:
+        mapped = cross["ticker"].map(inputs[column])
+        if column == SECTOR_COLUMN:
+            cross[column] = mapped.astype("string")
+        else:
+            cross[column] = mapped.astype("float64")
+
+    unmeasured = set(point_in_time.unmeasured_columns())
+    if {"roe_ratio", "payout_ratio"} & unmeasured:
+        unmeasured.add("sustainable_growth_rate_ratio")
+    cross["sustainable_growth_rate_ratio"] = cross["roe_ratio"] * (1.0 - cross["payout_ratio"])
+
+    increasing = cross[INSTITUTIONAL_COLUMNS["n_funds_increasing"]]
+    decreasing = cross[INSTITUTIONAL_COLUMNS["n_funds_decreasing"]]
+    if set(INSTITUTIONAL_COLUMNS.values()) & unmeasured:
+        unmeasured.add("institutional_accumulation_raw")
+    net = increasing - decreasing
+    moving = increasing.fillna(0.0) + decreasing.fillna(0.0)
+    cross["institutional_accumulation_raw"] = net.where(
+        moving >= INSTITUTIONAL_MIN_MOVING_FUNDS, 0.0
+    ).mask(net.isna())
+
+    _pillars(cross, frozenset(unmeasured))
 
     columns = ["trading_day", "ticker"] + [spec.name for spec in catalog]
     out = cross[columns].sort_values("ticker").reset_index(drop=True)

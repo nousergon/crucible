@@ -28,6 +28,7 @@ from typing import Any
 import pytest
 
 from crucible.data import run_daily
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.features import CATALOG, DEFAULT_FEATURE_VERSION
 from crucible.keys import features_key
 from crucible.runner import run_job
@@ -95,7 +96,14 @@ class TestTheTwoSlotsRecordTheSameInput:
     ) -> None:
         run_job(
             "data.daily",
-            lambda ctx: run_daily(ctx, source=source, expected_symbols=source.symbols()),
+            lambda ctx: run_daily(
+                ctx,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=source.symbols(),
+            ),
             store=store,
             trading_day=cycle_date,
         )

@@ -20,6 +20,7 @@ from crucible.data import (
 )
 from crucible.data.daily import UndeclaredUniverseError
 from crucible.data.heal import LAPTOP_SESSION_ALLOWANCE
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.keys import coverage_key, data_panel_key, feature_registry_key, features_key
 from crucible.manifest import read_manifest
 from crucible.runner import run_job
@@ -33,7 +34,14 @@ class TestMissingSourceIsFailedNeverZeroFilled:
         with pytest.raises(MissingSourceError):
             run_job(
                 "data.daily",
-                lambda c: run_daily(c, source=source, expected_symbols=["AAA"]),
+                lambda c: run_daily(
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    expected_symbols=["AAA"],
+                ),
                 store=store,
                 trading_day=cycle_date,
             )
@@ -120,7 +128,13 @@ class TestCoverage:
         with pytest.raises(UndeclaredUniverseError, match="no --symbols"):
             run_job(
                 "data.daily",
-                lambda c: run_daily(c, source=source),
+                lambda c: run_daily(
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                ),
                 store=store,
                 trading_day=cycle_date,
             )
@@ -138,7 +152,14 @@ class TestCoverage:
         with pytest.raises(UndeclaredUniverseError):
             run_job(
                 "data.daily",
-                lambda c: run_daily(c, source=source, expected_symbols=[]),
+                lambda c: run_daily(
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    expected_symbols=[],
+                ),
                 store=store,
                 trading_day=cycle_date,
             )
@@ -149,7 +170,14 @@ class TestCoverage:
         with pytest.raises(MissingSourceError, match="absent from the source"):
             run_job(
                 "data.daily",
-                lambda c: run_daily(c, source=thin, expected_symbols=expected),
+                lambda c: run_daily(
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=thin,
+                    expected_symbols=expected,
+                ),
                 store=store,
                 trading_day=cycle_date,
             )
@@ -164,7 +192,12 @@ class TestCoverage:
             run_job(
                 "data.daily",
                 lambda c: run_daily(
-                    c, source=FramePriceSource(holed), expected_symbols=sorted(holed)
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=FramePriceSource(holed),
+                    expected_symbols=sorted(holed),
                 ),
                 store=store,
                 trading_day=cycle_date,
@@ -177,7 +210,14 @@ class TestArtifacts:
     ) -> None:
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=sorted(frames)),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=sorted(frames),
+            ),
             store=store,
             trading_day=cycle_date,
         )
@@ -196,7 +236,14 @@ class TestArtifacts:
     ) -> None:
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=sorted(frames)),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=sorted(frames),
+            ),
             store=store,
             trading_day=cycle_date,
         )
@@ -269,7 +316,14 @@ class TestFeatureVersionIsDerivedNeverCallerSupplied:
         produced, the way the reviewer demonstrated the original defect."""
         ctx = run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=sorted(frames)),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=sorted(frames),
+            ),
             store=store,
             trading_day=cycle_date,
         )
@@ -307,7 +361,14 @@ class TestWeekly:
         with pytest.raises(DataGapError) as excinfo:
             run_job(
                 "data.weekly",
-                lambda c: run_weekly(c, source=source, expected_symbols=sorted(frames)),
+                lambda c: run_weekly(
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    expected_symbols=sorted(frames),
+                ),
                 store=store,
                 trading_day=cycle_date,
             )
@@ -331,7 +392,14 @@ class TestWeekly:
         with pytest.raises(DataGapError):
             run_job(
                 "data.weekly",
-                lambda c: run_weekly(c, source=source, expected_symbols=sorted(frames)),
+                lambda c: run_weekly(
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    expected_symbols=sorted(frames),
+                ),
                 store=store,
                 trading_day=cycle_date,
             )
@@ -346,13 +414,27 @@ class TestWeekly:
         for day in week_sessions(cycle_date)[:-1]:
             run_job(
                 "data.daily",
-                lambda c: run_daily(c, source=source, expected_symbols=sorted(frames)),
+                lambda c: run_daily(
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    expected_symbols=sorted(frames),
+                ),
                 store=store,
                 trading_day=day,
             )
         ctx = run_job(
             "data.weekly",
-            lambda c: run_weekly(c, source=source, expected_symbols=sorted(frames)),
+            lambda c: run_weekly(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=sorted(frames),
+            ),
             store=store,
             trading_day=cycle_date,
         )
@@ -372,7 +454,14 @@ class TestHeal:
             run_job(
                 "data.heal",
                 lambda c: run_heal(
-                    c, source=source, start=sessions[0], end=sessions[-1], gap="test"
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    start=sessions[0],
+                    end=sessions[-1],
+                    gap="test",
                 ),
                 store=store,
                 trading_day=cycle_date,
@@ -390,7 +479,14 @@ class TestHeal:
             run_job(
                 "data.heal",
                 lambda c: run_heal(
-                    c, source=source, start=sessions[0], end=sessions[-1], gap="test"
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    start=sessions[0],
+                    end=sessions[-1],
+                    gap="test",
                 ),
                 store=store,
                 trading_day=cycle_date,
@@ -405,6 +501,9 @@ class TestHeal:
             "data.heal",
             lambda c: run_heal(
                 c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
                 source=source,
                 start=sessions[0],
                 end=sessions[-1],
@@ -427,6 +526,9 @@ class TestHeal:
             "data.heal",
             lambda c: run_heal(
                 c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
                 source=source,
                 start=sessions[0],
                 end=sessions[-1],
@@ -443,6 +545,9 @@ class TestHeal:
             "data.heal",
             lambda c: run_heal(
                 c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
                 source=source,
                 start=sessions[0],
                 end=sessions[-1],

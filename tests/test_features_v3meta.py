@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.features import CATALOG, build_features, catalog_column_depths
 
 V3META_COLUMNS = (
@@ -24,6 +25,14 @@ V3META_COLUMNS = (
     "dist_from_52w_high_ratio",
     "dist_from_52w_low_ratio",
 )
+
+
+def _no_point_in_time(panel, as_of=None):
+    """No fundamentals for a synthetic panel: every point-in-time column null, by name."""
+    day = as_of if as_of is not None else max(panel["trading_day"])
+    return UnavailablePointInTimeSource(
+        reason="synthetic fixture market carries no fundamentals"
+    ).load(trading_day=day, symbols=sorted(set(panel["ticker"])))
 
 
 @pytest.fixture(autouse=True)
@@ -85,7 +94,7 @@ def test_every_v3meta_column_is_catalogued_with_a_units_suffix_and_a_depth() -> 
 
 def test_each_value_is_the_declared_expression() -> None:
     panel = _panel()
-    features, _ = build_features(panel)
+    features, _ = build_features(panel, point_in_time=_no_point_in_time(panel))
     for ticker in ("AAA", "BBB"):
         history = panel[panel["ticker"] == ticker].reset_index(drop=True)
         row = features[features["ticker"] == ticker].iloc[0]
@@ -98,13 +107,18 @@ def test_the_first_value_lands_on_the_declared_depth(column: str) -> None:
     depth = catalog_column_depths()[column]
     panel = _panel(n_sessions=depth)
     days = sorted(panel["trading_day"].unique())
-    short, _ = build_features(panel[panel["trading_day"] <= days[depth - 2]])
-    full, _ = build_features(panel)
+    short, _ = build_features(
+        panel[panel["trading_day"] <= days[depth - 2]],
+        point_in_time=_no_point_in_time(panel[panel["trading_day"] <= days[depth - 2]]),
+    )
+    full, _ = build_features(panel, point_in_time=_no_point_in_time(panel))
     assert short[column].isna().all(), f"{column} has a value one session before its depth"
     assert full[column].notna().all(), f"{column} has no value at its declared depth"
 
 
 def test_a_zero_long_window_volatility_is_null_not_one() -> None:
     """v1 filled it with 1.0 — a substituted constant, refused here."""
-    features, _ = build_features(_panel(flat_from=200))
+    features, _ = build_features(
+        _panel(flat_from=200), point_in_time=_no_point_in_time(_panel(flat_from=200))
+    )
     assert features["vol_ratio_10_60_ratio"].isna().all()
