@@ -3,14 +3,9 @@ paper smoke for that exact sha — asserted by refusals, not described.
 
 Normative source: `alpha-engine-config-I10649`; plan §4.11 (Trader row).
 
-**One recorded contract dependency.** `trader.smoke` is not yet a member of
-`crucible.models.JOB_VALUES` (that file belongs to the contract change that
-registers the trader's jobs). Until it is, every `trader.smoke` manifest on a
-store fails `crucible.manifest.validate`, so `passing_trader_smoke` refuses
-EVERY trader pin — fail-closed, which is the safe direction for a gate.
-`TestContractDependency` pins that fact and flips red the moment the job is
-registered; the success-path tests below stand the validator in for the
-missing enum member ONLY, through `_admit_trader_smoke`, and say so.
+`trader.smoke` is a registered job (`crucible.models.JOB_VALUES`,
+alpha-engine-config-I10651), so every success-path test below reads the real
+manifest validator.
 """
 
 from __future__ import annotations
@@ -23,8 +18,6 @@ import pytest
 
 from crucible import track_c
 from crucible.keys import TRADER_PIN_KEY, manifest_key
-from crucible.manifest import ManifestValidationError
-from crucible.models import JOB_VALUES
 from crucible.release import (
     TRADER_SMOKE_JOB,
     TraderPinRefusedError,
@@ -96,21 +89,6 @@ def _trader_smoke_manifest(store, sha, *, status="ok", day="2026-09-04", finishe
     key = manifest_key(TRADER_SMOKE_JOB, day, discriminator=f"{sha[:12]}-{finished_hour}")
     store.put_bytes(key, json.dumps(document).encode())
     return key, document
-
-
-@pytest.fixture
-def _admit_trader_smoke(monkeypatch):
-    """Stands in for `trader.smoke`'s `JOB_VALUES` membership and nothing else:
-    the real validator runs on a copy whose `job` is an admitted name, so every
-    OTHER field of the manifest is still held to the schema."""
-    import crucible.manifest as manifest
-
-    real = manifest.validate
-
-    def validate(document):
-        real({**document, "job": "smoke"} if document.get("job") == TRADER_SMOKE_JOB else document)
-
-    monkeypatch.setattr(manifest, "validate", validate)
 
 
 class TestWindow:
@@ -205,20 +183,6 @@ class TestPinPrimitiveRefusesTheTraderWithoutEvidence:
             pin(store, SHA_A, target="current", trader_smoke=self._evidence())
 
 
-class TestContractDependency:
-    def test_trader_smoke_is_not_yet_an_admitted_job(self, tmp_path) -> None:
-        assert TRADER_SMOKE_JOB not in JOB_VALUES, (
-            "crucible now admits trader.smoke: delete this test and the "
-            "`_admit_trader_smoke` fixture, and let the success-path tests read the "
-            "real validator"
-        )
-        store = LocalStore(tmp_path)
-        _published(store)
-        _trader_smoke_manifest(store, SHA_A)
-        with pytest.raises(ManifestValidationError, match="job"):
-            passing_trader_smoke(store, SHA_A)
-
-
 class TestPassingTraderSmokeFromTheStore:
     def test_no_smoke_ever_is_refused_by_name(self, tmp_path) -> None:
         with pytest.raises(TraderPinRefusedError, match="no_passing_smoke.*has ever run"):
@@ -238,15 +202,13 @@ class TestPassingTraderSmokeFromTheStore:
         with pytest.raises(TraderPinRefusedError, match="could not be read: PermissionError"):
             passing_trader_smoke(Denied(tmp_path), SHA_A)
 
-    def test_a_failed_smoke_names_itself_in_the_refusal(
-        self, tmp_path, _admit_trader_smoke
-    ) -> None:
+    def test_a_failed_smoke_names_itself_in_the_refusal(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
         _trader_smoke_manifest(store, SHA_A, status="failed")
         with pytest.raises(TraderPinRefusedError, match="broker_session_unavailable"):
             passing_trader_smoke(store, SHA_A)
 
-    def test_a_passing_smoke_for_this_sha_is_evidence(self, tmp_path, _admit_trader_smoke) -> None:
+    def test_a_passing_smoke_for_this_sha_is_evidence(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
         key, document = _trader_smoke_manifest(store, SHA_A)
         evidence = passing_trader_smoke(store, SHA_A)
@@ -261,7 +223,7 @@ class TestPinTrader:
             pin_trader(store, SHA_A, now=IN_SESSION)
         assert not store.exists(TRADER_PIN_KEY)
 
-    def test_without_a_passing_smoke_it_is_refused(self, tmp_path, _admit_trader_smoke) -> None:
+    def test_without_a_passing_smoke_it_is_refused(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
         _published(store)
         _trader_smoke_manifest(store, SHA_B)
@@ -269,9 +231,7 @@ class TestPinTrader:
             pin_trader(store, SHA_A, now=AFTER_CLOSE)
         assert not store.exists(TRADER_PIN_KEY)
 
-    def test_with_a_passing_smoke_it_moves_and_a_rollback_reuses_the_record(
-        self, tmp_path, _admit_trader_smoke
-    ) -> None:
+    def test_with_a_passing_smoke_it_moves_and_a_rollback_reuses_the_record(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
         _published(store)
         _published(store, SHA_B)
@@ -317,9 +277,7 @@ class TestHandler:
             track_c.release_pin_handler(self._args(tmp_path))
         assert "no_passing_smoke" in self._manifest(tmp_path)["reason"]
 
-    def test_a_gated_pin_records_the_smoke_as_its_input(
-        self, tmp_path, monkeypatch, _admit_trader_smoke
-    ) -> None:
+    def test_a_gated_pin_records_the_smoke_as_its_input(self, tmp_path, monkeypatch) -> None:
         store = LocalStore(tmp_path)
         _published(store)
         key, document = _trader_smoke_manifest(store, SHA_A)
@@ -333,7 +291,7 @@ class TestHandler:
         assert metric["status_reason"].startswith("trader moved from (unset)")
 
     def test_a_dry_run_checks_the_gate_and_moves_nothing(
-        self, tmp_path, monkeypatch, capsys, _admit_trader_smoke
+        self, tmp_path, monkeypatch, capsys
     ) -> None:
         store = LocalStore(tmp_path)
         _published(store)
