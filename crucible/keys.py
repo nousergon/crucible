@@ -54,6 +54,7 @@ __all__ = [
     "TRADER_EVIDENCE_KEY",
     "TRADER_EXECUTION_SHORTFALL_PREFIX",
     "TRADER_FIRE_DRILLS_PREFIX",
+    "TRADER_FIRE_DRILL_SCHEDULE_PREFIX",
     "TRADER_KILL_SWITCH_EVENTS_PREFIX",
     "TRADER_KILL_SWITCH_KEY",
     "TRADER_PAPER_SMOKE_PREFIX",
@@ -134,6 +135,7 @@ __all__ = [
     "strategy_slots_prefix",
     "trader_broker_statement_key",
     "trader_fire_drill_key",
+    "trader_fire_drill_schedule_key",
     "trader_kill_switch_event_key",
     "trader_paper_smoke_key",
     "trader_reconciliation_key",
@@ -1254,6 +1256,16 @@ TRADER_KILL_SWITCH_KEY = "trader/kill_switch.json"
 TRADER_KILL_SWITCH_EVENTS_PREFIX = "trader/kill_switch/events/"
 TRADER_FIRE_DRILLS_PREFIX = "trader/fire_drills/"
 
+#: `fire_drill_schedule.v1` — one SEALED drill schedule per document
+#: (`alpha-engine-config-I10761`), written BEFORE the drill it seals by the
+#: operator identity, never by the trader. Nested under
+#: :data:`TRADER_FIRE_DRILLS_PREFIX` on purpose so the drill and its seal share
+#: one read grant, and denied to the trader's WRITE by an explicit IAM Deny in
+#: the operated stack: a trader that could write its own seal could seal a
+#: drill a minute before firing it. Every reader of the drill prefix skips this
+#: sub-prefix (a schedule is not a drill).
+TRADER_FIRE_DRILL_SCHEDULE_PREFIX = f"{TRADER_FIRE_DRILLS_PREFIX}schedule/"
+
 _RELEASE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -1295,6 +1307,22 @@ def trader_fire_drill_key(trading_day: str, run_id: str) -> str:
     _require_iso_day(trading_day)
     _require_run_id(run_id)
     return f"trader/fire_drills/{trading_day}/{run_id}.json"
+
+
+def trader_fire_drill_schedule_key(window_start: str, window_end: str, schedule_id: str) -> str:
+    """One `fire_drill_schedule.v1` document: a drill sealed for ``[window_start, window_end]``.
+
+    Both window bounds are in the key (so a listing of one window finds every
+    seal for it, and the §4.12 walk sees two dates it can hold to the calendar);
+    ``schedule_id`` is one key segment.
+    """
+    _require_iso_day(window_start)
+    _require_iso_day(window_end)
+    if window_end < window_start:
+        raise ValueError(f"window {window_start}..{window_end} ends before it starts")
+    if not schedule_id or "/" in schedule_id:
+        raise ValueError(f"schedule_id {schedule_id!r} must be one non-empty key segment")
+    return f"{TRADER_FIRE_DRILL_SCHEDULE_PREFIX}{window_start}_{window_end}/{schedule_id}.json"
 
 
 def execution_shortfall_key(trading_day: str) -> str:

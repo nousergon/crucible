@@ -381,6 +381,7 @@ def strategy_dir(tmp_path):
 # grading loop that ran for months while measuring nothing.
 # ──────────────────────────────────────────────────────────────────────────
 
+from collections.abc import Callable  # noqa: E402
 from dataclasses import dataclass, field  # noqa: E402
 from typing import Any  # noqa: E402
 
@@ -458,6 +459,12 @@ class FakeS3:
         self.objects: dict[str, bytes] = {}
         self.page_size = page_size
         self.denied: set[str] = set()
+        #: The SERVICE-set write time of each object, as `HeadObject` returns it
+        #: in `LastModified`. Stamped by the fake from `now` on every put, never
+        #: by the caller's payload, so a test controls it only the way the real
+        #: service does — by when it writes (`alpha-engine-config-I10761`).
+        self.last_modified: dict[str, dt.datetime] = {}
+        self.now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC)
 
     # -- the boto3 surface the store uses -------------------------------
     def put_object(self, **kw: Any) -> dict[str, Any]:
@@ -467,6 +474,7 @@ class FakeS3:
         if "IfMatch" in kw and self._etag(key) != kw["IfMatch"]:
             raise self._client_error("PreconditionFailed")
         self.objects[key] = body
+        self.last_modified[key] = self.now()
         return {"ETag": f'"{self._etag(key)}"'}
 
     def get_object(self, **kw: Any) -> dict[str, Any]:
@@ -481,7 +489,7 @@ class FakeS3:
         self._guard(key)
         if key not in self.objects:
             raise self._client_error("404")
-        return {"ETag": f'"{self._etag(key)}"'}
+        return {"ETag": f'"{self._etag(key)}"', "LastModified": self.last_modified[key]}
 
     def get_paginator(self, name: str) -> Any:
         assert name == "list_objects_v2"
