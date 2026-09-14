@@ -753,30 +753,79 @@ def test_fault_record(integration_store_uri: str, integration_store: Store) -> N
 
 def test_fault_probe(integration_store_uri: str, integration_store: Store) -> None:
     """Deliberately induces a real router transport failure on the real
-    dispatched path (plan §10.7 fault 3) — the manifest is expected to
-    record the induced failure; that IS the job succeeding at its purpose.
+    dispatched path (plan §10.7 fault 3). `run_job` always re-raises a job's
+    own exception after writing the manifest (`crucible.runner.run_job`,
+    "Re-raises on failure") and `fault_probe_handler`'s own docstring says
+    the same ("Exits non-zero, always, by design") — so `cli_main` raising
+    `FaultProbeFailure` here, on EVERY exec context, IS the job succeeding at
+    its purpose; the manifest underneath it still records the induced
+    failure, and this case reads THAT record, never the process's own exit
+    path.
+
+    **Was a bare `cli_main([...])` call with no `pytest.raises`**
+    (`alpha-engine-config-I10701`, third measurement, run 34797908861): given
+    the paragraph above, `cli_main` raises for `fault.probe` on every
+    environment this tier has ever run in, so the `manifest["status"]`
+    assertion that used to follow it was dead code from the day this case
+    was written — never reached, on any exec context. Caught here for the
+    first time.
+
+    `classify_probe_failure`'s outcome legitimately differs by exec context.
+    `chaos_probe`'s two registered members declare `reachable_from: [ec2]`
+    only (`alpha-engine-config/private-docs/LLM_MODEL_REGISTRY.yaml`) — the
+    group targets the dashboard box's OWN loopback always-503 listener
+    (`nous-ergon-ops-PR1178`), a property of that one spot box, not of the
+    fault-injection capability in the abstract. From `ci`
+    (`KREPIS_EXEC_CONTEXT=ci`, no such listener, no local LiteLLM proxy
+    either) the router cannot even attempt the call, which
+    `classify_probe_failure` correctly reads as `routing_refusal` rather than
+    the `upstream_transport_failure` an `ec2`/`laptop` run produces — both
+    are real outcomes, both write a `status: failed` manifest, and either is
+    what this case exists to prove happened. Widening `chaos_probe`'s
+    `reachable_from` to include `ci` was considered and rejected (this
+    issue's own second option): it would either still point CI at a box it
+    cannot reach (no change) or require standing up a second, CI-local
+    always-503 listener purely to fake reachability — proving a mock 503
+    gets classified correctly, not that this tier's real dispatched path
+    works, which is `test.integration`'s actual contract. So `routing_refusal`
+    is accepted here by name, not silently swallowed: this assertion is the
+    recorded reason a CI run cannot produce `upstream_transport_failure`.
     """
+    from crucible.fault_probe import (
+        PROBE_OUTCOME_ROUTING_REFUSAL,
+        PROBE_OUTCOME_UPSTREAM_TRANSPORT_FAILURE,
+        FaultProbeFailure,
+        probe_outcome_from_reason,
+    )
     from crucible.llm import FAULT_INJECTION_CAPABILITY_CLASSES
 
-    cli_main(
-        [
-            "fault.probe",
-            "--fault-capability-class",
-            sorted(FAULT_INJECTION_CAPABILITY_CLASSES)[0],
-            "--store",
-            integration_store_uri,
-            "--run-mode",
-            "live",
-            "--date",
-            INTEGRATION_TRADING_DAY,
-        ]
-    )
+    with pytest.raises(FaultProbeFailure):
+        cli_main(
+            [
+                "fault.probe",
+                "--fault-capability-class",
+                sorted(FAULT_INJECTION_CAPABILITY_CLASSES)[0],
+                "--store",
+                integration_store_uri,
+                "--run-mode",
+                "live",
+                "--date",
+                INTEGRATION_TRADING_DAY,
+            ]
+        )
     # Not `_assert_ok`: a chaos probe's whole purpose is inducing a router
     # failure on the real dispatched path, so `status` legitimately reads
     # `failed` here with the induced cause as `reason` — the manifest simply
     # has to EXIST, the same durable telemetry every other job produces.
     manifest = _manifest(integration_store, "fault.probe")
-    assert manifest["status"] in ("ok", "failed"), manifest
+    assert manifest["status"] == "failed", manifest
+    outcome = probe_outcome_from_reason(manifest.get("reason", ""))
+    assert outcome in (PROBE_OUTCOME_ROUTING_REFUSAL, PROBE_OUTCOME_UPSTREAM_TRANSPORT_FAILURE), (
+        f"fault.probe's manifest recorded outcome {outcome!r}, not one of the two this tier "
+        "can legitimately produce — see this test's own docstring for why routing_refusal "
+        "(ci, chaos_probe structurally unreachable) and upstream_transport_failure (ec2/"
+        f"laptop, the real induced fault) are both acceptable here: {manifest.get('reason')!r}"
+    )
 
 
 def test_the_trading_day_used_by_this_module_is_real() -> None:
