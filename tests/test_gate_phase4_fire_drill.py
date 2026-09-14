@@ -33,6 +33,7 @@ from crucible.gate import (
     TRADER_FIRE_DRILL_JOB,
     _clause_kill_switch_fire_drill_passed,
     _phase4,
+    kill_switch_fire_drill_reading,
 )
 from crucible.keys import (
     TRADER_FIRE_DRILL_SCHEDULE_PREFIX,
@@ -540,6 +541,17 @@ class TestRegistration:
         readings = {c.name: c for c in _phase4(store, WINDOW, {}, trading_day=FRIDAY)}
         assert not readings["kill_switch_fire_drill_passed"].met
         assert not readings["kill_switch_fire_drill_passed"].unmeasurable
+
+    def test_the_public_reading_is_the_contained_clause(self, store) -> None:
+        _two_good(store)
+        reading = kill_switch_fire_drill_reading(store, WINDOW[0], WINDOW[-1])
+        assert reading == _clause(store) and reading.met
+
+        def exploding(prefix: str):
+            raise RuntimeError("the store fell over")
+
+        store.list_keys = exploding
+        assert kill_switch_fire_drill_reading(store, WINDOW[0], WINDOW[-1]).unmeasurable
 
     def test_the_fixture_is_the_model(self) -> None:
         """The test fixture above mirrors crucible-trader's writer field for field."""

@@ -8532,6 +8532,22 @@ def _parse_utc_instant(text: str) -> dt.datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
+def kill_switch_fire_drill_reading(
+    store: Store, window_start: dt.date, window_end: dt.date
+) -> Clause:
+    """The phase-4 fire-drill clause over ``[window_start, window_end]``, as a
+    public reader (`alpha-engine-config-I10761`).
+
+    For crucible-trader's `fire-drill status`, which used to count unannounced
+    drills by their self-reported flag and would have read DONE where this
+    clause reads UNMET. The trader CALLS the harness rather than re-implementing
+    the grade (its AGENTS.md rule 2), so there is one reading of the evidence.
+    Resolves the clause at call time, so it is the contained (never-raising)
+    clause the ladder evaluates.
+    """
+    return _clause_kill_switch_fire_drill_passed(store, [window_start, window_end])
+
+
 def _verify_drill_seal(store: Store, drill: FireDrillDocument) -> _SealReading:
     """An unannounced drill counts as unannounced only on a verified seal
     (`alpha-engine-config-I10761`). Every condition below is one way an
