@@ -7149,13 +7149,29 @@ def _s_slot_evidence_unmeasurable_no_manifests(
     *,
     unbuilt: str = "`crucible.portfolio` to have built",
 ) -> str:
-    return (
+    # The cause is DERIVED, never asserted: this detail said "the S slot has
+    # no `produce`/`grade` yet" long after both landed, so the gate named a
+    # cause that was false while the real one (S constructs its book on the M
+    # champion's predictions and there is no M champion) went unstated.
+    from crucible.keys import champion_key  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots import dispatchable_slots  # noqa: PLC0415 - avoids a cycle
+
+    head = (
         f"no `experiment.grade[{PORTFOLIO_GRADED_SLOT}]` manifest exists under "
         f"{runs_prefix('experiment.grade')} over {window[0].isoformat()}.."
-        f"{window[-1].isoformat()}. The S slot has no `produce`/`grade` yet "
-        f"(`crucible.slots.dispatchable_slots`), so nothing has graded a book for "
-        f"{unbuilt} — this is UNMEASURABLE, not UNMET, until "
-        "the S cycle job lands"
+        f"{window[-1].isoformat()}"
+    )
+    if PORTFOLIO_GRADED_SLOT not in dispatchable_slots():
+        cause = "The S slot has no `produce`/`grade` yet (`crucible.slots.dispatchable_slots`)"
+    else:
+        cause = (
+            "The S slot is dispatchable but has not graded a book in the window; its "
+            f"`produce` constructs the book on the M champion's predictions "
+            f"({champion_key('m')}), so it cannot run before an M champion exists"
+        )
+    return (
+        f"{head}. {cause}, so nothing has graded a book for {unbuilt} — this is "
+        "UNMEASURABLE, not UNMET, until an S grade lands"
     )
 
 
