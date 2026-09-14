@@ -103,6 +103,7 @@ from crucible.keys import arm_predictions_key
 
 if TYPE_CHECKING:
     from crucible.slots.model import FeaturePanel
+    from crucible.slots.strategy import BookUniverse, ResolvedSession, SessionInputs
     from crucible.store import Store
 
 __all__ = [
@@ -124,6 +125,9 @@ __all__ = [
     "prediction_column",
     "read_arm_predictions",
     "resolve_declared_inputs",
+    "resolve_strategy_sessions",
+    "StrategySessionInputs",
+    "UNSETTLED_RETURN",
     "stack_prediction_columns",
     "write_arm_predictions",
 ]
@@ -851,3 +855,236 @@ def resolve_declared_inputs(
             panel, store=store, recipe=recipe, base_arm_ids=base_arm_ids, ctx=ctx
         )
     return panel
+
+
+# ---------------------------------------------------------------------------
+# S-slot construction inputs: ONE resolution for the grade and the trader.
+# ---------------------------------------------------------------------------
+#
+# `alpha-engine-config-I10654` (plan §10.6 row 2): "the S-slot grade and the
+# trader call the same function on the same inputs." `construct_book` is the
+# function; these two resolvers are the inputs. They compose EXACTLY the calls
+# `crucible.slots.strategy.grade` makes, in the order it makes them — the
+# recorded `session_inputs.v1` document per decision day (never a
+# re-resolution), the day's price panel through `_close_returns`, the book
+# universe through `_universe_for`, ADV through `_adv_by_day`, and the session
+# arrays through `_build_sessions` — so a consumer outside this repository
+# (the trader, its shadow books) never re-implements any of them. A second
+# implementation of the join would be a second answer to "what did the arm
+# see", which is the backtest/live parity failure the row exists to remove.
+#
+# `tests/test_strategy_session_resolution.py` asserts the equivalence against
+# the grade's own manifest, not against this module's reading of the grade.
+
+
+#: What an UNSETTLED decision session carries for its realized return and its
+#: benchmark return: NaN, never zero. At the decision the session has not been
+#: held through its successor, so the return does not exist yet; a zero would
+#: be a plausible-looking number nobody measured. `construct_book`'s solve and
+#: its cost charge read neither field, so the target weights and the charge of
+#: an unsettled construction are exactly the settled one's — asserted by test.
+UNSETTLED_RETURN = float("nan")
+
+
+@dataclass(frozen=True)
+class StrategySessionInputs:
+    """One S arm's construction inputs, as `construct_book` takes them.
+
+    ``settled`` separates the two things a caller can hold: a walk of sessions
+    each joined onto the return it earned (the grade, a shadow book), or ONE
+    decision session whose return does not exist yet (the trader's target
+    book). ``session_inputs_keys`` are the recorded documents read, in session
+    order, so the provenance of every array is a store key.
+    """
+
+    arm_id: str
+    universe: BookUniverse
+    sessions: tuple[SessionInputs, ...]
+    resolved: tuple[ResolvedSession, ...]
+    session_inputs_keys: tuple[str, ...]
+    settled: bool
+
+
+def _read_recorded_sessions(
+    store: Any, *, arm_id: str, decision_days: Sequence[str]
+) -> tuple[list[ResolvedSession], list[str]]:
+    from crucible.documents import load_store_document  # noqa: PLC0415 - avoids a cycle
+    from crucible.keys import session_inputs_key  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots.strategy import ResolvedSession  # noqa: PLC0415 - avoids a cycle
+
+    if not decision_days:
+        raise ValueError(
+            f"arm {arm_id!r}: no decision days to resolve. An empty walk constructs no "
+            "book, and returning one would put a shape on a comparison that never happened."
+        )
+    if list(decision_days) != sorted(set(decision_days)):
+        raise ValueError(
+            f"arm {arm_id!r}: decision days {list(decision_days)} are not unique and "
+            "ascending; `construct_book` walks sessions in order from the previous weights."
+        )
+    resolved: list[ResolvedSession] = []
+    keys: list[str] = []
+    for day in decision_days:
+        key = session_inputs_key(arm_id, day)
+        if not store.exists(key):
+            raise MissingArtifactError(
+                f"arm {arm_id!r} recorded no construction inputs at {key}. The S slot "
+                "constructs on what `experiment.run --slot s` recorded at the decision date, "
+                "never on a re-resolution of today's upstream artifacts — so with no record "
+                f"there is no book. Record it with:\n    crucible experiment.run --slot s "
+                f"--date {day}"
+            )
+        session = ResolvedSession.from_dict(load_store_document(store, key))
+        if session.trading_day != day:
+            raise ArmPredictionsContractError(
+                f"{key} carries trading_day {session.trading_day!r}, not {day!r}. A session "
+                "document filed under another day's key is look-ahead if it is later and a "
+                "stale input if it is earlier."
+            )
+        resolved.append(session)
+        keys.append(key)
+    return resolved, keys
+
+
+def _returns_as_of(store: Any, as_of: str) -> Any:
+    import datetime as _dt  # noqa: PLC0415 - local, keeps the module header M-slot only
+
+    from crucible.slots.cycle import _read_panel  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots.strategy import _close_returns  # noqa: PLC0415 - avoids a cycle
+
+    return _close_returns(_read_panel(store, _dt.date.fromisoformat(as_of)))
+
+
+def _assert_benchmark_priced(returns: Any, *, arm_id: str, benchmark: str, as_of: str) -> None:
+    from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
+
+    if benchmark not in returns.columns:
+        raise MissingArtifactError(
+            f"arm {arm_id!r} declares benchmark {benchmark!r}, which the price panel at "
+            f"{as_of} carries no rows for. The benchmark is a position in the book and no "
+            "proxy is substituted for it."
+        )
+
+
+def resolve_strategy_sessions(
+    store: Any,
+    *,
+    arm_id: str,
+    benchmark: str,
+    decision_days: Sequence[str],
+    as_of: str,
+    feature_version: str | None = None,
+    returns: Any = None,
+    adv_cache: dict[str, dict[str, float]] | None = None,
+    unsettled_last: bool = False,
+) -> StrategySessionInputs:
+    """One S arm's construction inputs over ``decision_days`` — THE S-slot resolution.
+
+    `crucible.slots.strategy.grade` constructs every arm's book on this, and the
+    trader constructs its book and its shadow books on it
+    (`alpha-engine-config-I10654`), so "the same inputs" is one code path rather
+    than two that a test compares. The grade passes the cycle's ``returns``
+    (the `_close_returns` frame of the panel at ``as_of``) and its shared
+    ``adv_cache`` so a cycle reads the panel once and each day's features once;
+    a caller outside a grade cycle passes neither and the panel is read here.
+
+    **Settlement.** A decision is held through the NEXT session in the panel
+    compiled for ``as_of``, and that session's return is what it earned. A day
+    with no successor is UNSETTLED and raises rather than entering as a zero —
+    unless it is the day being decided and the caller says so:
+
+    ``unsettled_last=True`` is the trader's target book. The last decision day
+    must then be ``as_of`` and the panel's final session (a panel reaching past
+    it means the day already settled and this is a replay), and its realized
+    return and benchmark return are :data:`UNSETTLED_RETURN`. Every other array
+    — alpha, eligibility, caps, covariance window, ADV — comes from the same
+    join as a settled day, and `construct_book` reads neither return field when
+    it solves or charges, so the weights and the charge are the settled twin's
+    exactly (asserted in `tests/test_strategy_session_resolution.py`).
+    """
+    from dataclasses import replace  # noqa: PLC0415 - local
+
+    import numpy as _np  # noqa: PLC0415 - local, keeps the module header M-slot only
+    import pandas as _pd  # noqa: PLC0415 - local, keeps the module header M-slot only
+
+    from crucible.features import DEFAULT_FEATURE_VERSION  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots.strategy import (  # noqa: PLC0415 - avoids a cycle
+        _adv_by_day,
+        _build_sessions,
+        _universe_for,
+    )
+
+    resolved, keys = _read_recorded_sessions(store, arm_id=arm_id, decision_days=decision_days)
+    if returns is None:
+        returns = _returns_as_of(store, as_of)
+    _assert_benchmark_priced(returns, arm_id=arm_id, benchmark=benchmark, as_of=as_of)
+    index = [str(d) for d in returns.index]
+    next_session = dict(zip(index[:-1], index[1:], strict=True))
+
+    placeholder: str | None = None
+    if unsettled_last:
+        last = decision_days[-1]
+        if last != as_of or not index or index[-1] != as_of:
+            raise MissingArtifactError(
+                f"arm {arm_id!r}: the decision day {last} must be the last session of the "
+                f"price panel compiled for it; the panel at {as_of} ends at "
+                f"{index[-1] if index else 'no session'}. A decision is taken over the panel "
+                "that closes on the decision day; any other panel sizes the book on a "
+                "covariance window that is not the one the grade will walk."
+            )
+        # The successor does not exist. `_build_sessions` stays the one join, so
+        # it settles against a single all-NaN placeholder row appended strictly
+        # after the last session — outside every `returns.loc[:day]` covariance
+        # window — and the realized half is then overwritten below.
+        placeholder = f"{last}~unsettled"
+        returns = _pd.concat(
+            [
+                returns,
+                _pd.DataFrame(
+                    [[_np.nan] * len(returns.columns)],
+                    index=[placeholder],
+                    columns=returns.columns,
+                ),
+            ]
+        )
+        next_session[last] = placeholder
+
+    unsettled = [day for day in decision_days if day not in next_session]
+    if unsettled:
+        raise MissingArtifactError(
+            f"arm {arm_id!r}: decision day(s) {unsettled} have no successor session in the "
+            f"price panel at {as_of}, so they are unsettled. An unsettled session is a state, "
+            "not a zero-return day; only the day being decided may be resolved unsettled "
+            "(`unsettled_last=True`)."
+        )
+    universe = _universe_for(resolved, benchmark=benchmark)
+    adv = _adv_by_day(
+        store,
+        feature_version=feature_version or DEFAULT_FEATURE_VERSION,
+        days=decision_days,
+        cache={} if adv_cache is None else adv_cache,
+    )
+    sessions = _build_sessions(
+        resolved,
+        returns=returns,
+        benchmark=benchmark,
+        universe=universe,
+        next_session=next_session,
+        adv_by_day=adv,
+    )
+    if placeholder is not None:
+        sessions[-1] = replace(
+            sessions[-1],
+            realized_returns=_np.full(len(universe.tickers), UNSETTLED_RETURN),
+            benchmark_return=UNSETTLED_RETURN,
+        )
+    return StrategySessionInputs(
+        arm_id=arm_id,
+        universe=universe,
+        sessions=tuple(sessions),
+        resolved=tuple(resolved),
+        session_inputs_keys=tuple(keys),
+        settled=placeholder is None,
+    )
