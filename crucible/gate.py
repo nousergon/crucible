@@ -85,6 +85,7 @@ from crucible.keys import (
     FAULT_INJECTION_ROOT,
     INTEGRATION_STORE_SUBPREFIX,
     TRADER_EXECUTION_SHORTFALL_PREFIX,
+    TRADER_FIRE_DRILL_SCHEDULE_PREFIX,
     TRADER_FIRE_DRILLS_PREFIX,
     acceptance_reading_key,
     arena_cycle_key,
@@ -109,6 +110,7 @@ from crucible.keys import (
     strategy_arms_prefix,
     strategy_holdout_key,
     trader_fire_drill_key,
+    trader_fire_drill_schedule_key,
     trader_reconciliation_key,
     v1_carryover_key,
     verdict_key,
@@ -117,11 +119,14 @@ from crucible.keys import TRADER_EVIDENCE_KEY as _TRADER_EVIDENCE_KEY
 from crucible.manifest import ManifestValidationError, load_schema, manifest_key
 from crucible.manifest import validate as _validate_manifest
 from crucible.models import (
+    FIRE_DRILL_SEAL_TOLERANCE_SECONDS,
     FaultRecordDocument,
     FireDrillDocument,
+    FireDrillScheduleDocument,
     PhaseClosingReadingDocument,
     PhaseLadderDocument,
     TraderEvidenceDocument,
+    fire_drill_commitment,
 )
 from crucible.portfolio import manifest_records_portfolio_engine
 from crucible.release import POINTER_KEY
@@ -4708,33 +4713,44 @@ def _pointer_flip_time(store: Store) -> dt.datetime:
     window off it would be an answer about the workbench — the defect this
     whole clause was rewritten to stop.
     """
+    return _store_write_instant(store, POINTER_KEY, what="the release pointer's flip instant")
+
+
+def _store_write_instant(store: Store, key: str, *, what: str) -> dt.datetime:
+    """When ``key`` was last written, as the STORE recorded it (S3 `LastModified`).
+
+    The one reader of a store-set write time, shared by the release pointer's
+    flip instant and the sealed fire-drill schedule
+    (`alpha-engine-config-I10761`): in both, a time the WRITER supplies would
+    be a claim, and the object's own modification time is the only instant
+    nobody writing the object can set. Rules in :func:`_pointer_flip_time`'s
+    docstring: `HeadObject` off the store's own client, only `LastModified`
+    trusted, and a non-S3 backend raises.
+    """
     if not isinstance(store, S3Store):
         raise LastChangeUnreadableError(
-            f"the store backend is {type(store).__name__}, not S3, so the release "
-            f"pointer {POINTER_KEY} has no flip instant to read. A local directory's "
-            "mtime is a fact about a filesystem, not a deploy"
+            f"the store backend is {type(store).__name__}, not S3, so {key} has no store-set "
+            f"write time to read for {what}. A local directory's mtime is a fact about a "
+            "filesystem, not a deploy"
         )
     try:
-        head = store.client.head_object(Bucket=store.bucket, Key=store._s3_key(POINTER_KEY))
+        head = store.client.head_object(Bucket=store.bucket, Key=store._s3_key(key))
     except Exception as exc:
-        # Broader than `ClientError` on purpose, and NOT a swallow: the caller
-        # renders every branch of this function as UNMEASURABLE, and the
-        # failures that actually happen here are as often `NoCredentialsError`
-        # or an endpoint resolution error as they are a 403 or a 404. Catching
-        # only `ClientError` would take `crucible gate`, `build_ladder` and the
-        # board render down together over an expired credential — the same
-        # reasoning `_clause_zero_human_mutating_calls`'s archive read carries,
-        # and the exception class is named in the message either way.
+        # Broader than `ClientError` on purpose, and NOT a swallow: every caller
+        # renders this as UNMEASURABLE, and the failures that actually happen
+        # here are as often `NoCredentialsError` or an endpoint resolution error
+        # as a 403 or a 404 (see `_clause_zero_human_mutating_calls`'s archive
+        # read); the exception class is named in the message either way.
         code = getattr(exc, "response", None) and store._error_code(exc)
         raise LastChangeUnreadableError(
-            f"head_object({POINTER_KEY}) failed: {code or type(exc).__name__}: {exc}. That "
-            "is a statement about our access or about the pointer being unset, not about "
+            f"head_object({key}) failed: {code or type(exc).__name__}: {exc}. That "
+            "is a statement about our access or about the object being unset, not about "
             "the system being measured"
         ) from exc
     last_modified = head.get("LastModified")
     if last_modified is None:
         raise LastChangeUnreadableError(
-            f"head_object({POINTER_KEY}) returned no LastModified, so the flip instant is unknown"
+            f"head_object({key}) returned no LastModified, so {what} is unknown"
         )
     return _as_utc(last_modified)
 
@@ -8314,7 +8330,15 @@ def _clause_kill_switch_fire_drill_passed(store: Store, window: list[dt.date]) -
        the fire instant.
 
     MET iff at least :data:`FIRE_DRILL_REQUIRED_PASSED` drills count and at least
-    :data:`FIRE_DRILL_REQUIRED_UNANNOUNCED` of those are unannounced. A failed
+    :data:`FIRE_DRILL_REQUIRED_UNANNOUNCED` of those are unannounced. **`announced:
+    false` is a claim, not a reading** (`alpha-engine-config-I10761`): a counted
+    drill is unannounced only when :func:`_verify_drill_seal` verifies the sealed
+    schedule it reveals — the seal existed, was written (by the store's clock)
+    before the sealed fire instant, and its commitment opens to the revealed
+    instant. A drill whose claim fails is still a passed drill; its claim is named
+    under "unannounced claim not counted". Keys under
+    `crucible.keys.TRADER_FIRE_DRILL_SCHEDULE_PREFIX` are seals, not drills, and
+    are skipped by the drill listing. A failed
     drill does not void later passes (it is what the drill exists to find, and
     its run already paged); it is named in the detail.
 
@@ -8365,7 +8389,12 @@ def _clause_kill_switch_fire_drill_passed(store: Store, window: list[dt.date]) -
     counted: list[FireDrillDocument] = []
     failed: list[str] = []
     in_window = 0
+    unsealed: list[str] = []
+    unannounced: list[FireDrillDocument] = []
+    seals_used: set[str] = set()
     for key in sorted(drills.keys or ()):
+        if key.startswith(TRADER_FIRE_DRILL_SCHEDULE_PREFIX):
+            continue  # a sealed schedule, read below through the drill that reveals it
         read = _read_store_document(store, key)
         if read.problem is not None:
             if read.access_problem:
@@ -8437,6 +8466,23 @@ def _clause_kill_switch_fire_drill_passed(store: Store, window: list[dt.date]) -
             )
             continue
         counted.append(drill)
+        if drill.announced:
+            continue
+        seal = _verify_drill_seal(store, drill)
+        evidence.extend(seal.evidence)
+        if seal.access_problem:
+            return _unmeasurable(name, requirement, seal.problem or "", (key, *seal.evidence))
+        if seal.problem is None and drill.schedule is not None:
+            if drill.schedule.schedule_id in seals_used:
+                unsealed.append(
+                    f"{key}: schedule {drill.schedule.schedule_id} already opened by another "
+                    "drill — one seal seals one fire"
+                )
+                continue
+            seals_used.add(drill.schedule.schedule_id)
+            unannounced.append(drill)
+        else:
+            unsealed.append(f"{key}: {seal.problem}")
 
     if in_window == 0 and not findings:
         return Clause(
@@ -8447,7 +8493,6 @@ def _clause_kill_switch_fire_drill_passed(store: Store, window: list[dt.date]) -
             "switch is undrilled on paper",
             (TRADER_FIRE_DRILLS_PREFIX,),
         )
-    unannounced = [d for d in counted if not d.announced]
     met = (
         len(counted) >= FIRE_DRILL_REQUIRED_PASSED
         and len(unannounced) >= FIRE_DRILL_REQUIRED_UNANNOUNCED
@@ -8457,11 +8502,150 @@ def _clause_kill_switch_fire_drill_passed(store: Store, window: list[dt.date]) -
         f"({FIRE_DRILL_REQUIRED_PASSED} required), {len(unannounced)} unannounced "
         f"({FIRE_DRILL_REQUIRED_UNANNOUNCED} required)"
     ]
+    if unsealed:
+        parts.append(f"unannounced claim not counted: {' | '.join(unsealed)}")
     if failed:
         parts.append(f"failed: {' | '.join(failed)}")
     if findings:
         parts.append(f"not counted: {' | '.join(findings)}")
     return Clause(name, requirement, met, "; ".join(parts), tuple(dict.fromkeys(evidence)))
+
+
+@dataclass(frozen=True)
+class _SealReading:
+    """Whether one unannounced drill's sealed schedule checks out.
+
+    ``problem`` is None only when it does; ``access_problem`` marks a problem
+    that is about our read of the store rather than about the seal.
+    """
+
+    problem: str | None
+    access_problem: bool = False
+    evidence: tuple[str, ...] = ()
+
+
+def _parse_utc_instant(text: str) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def kill_switch_fire_drill_reading(
+    store: Store, window_start: dt.date, window_end: dt.date
+) -> Clause:
+    """The phase-4 fire-drill clause over ``[window_start, window_end]``, as a
+    public reader (`alpha-engine-config-I10761`).
+
+    For crucible-trader's `fire-drill status`, which used to count unannounced
+    drills by their self-reported flag and would have read DONE where this
+    clause reads UNMET. The trader CALLS the harness rather than re-implementing
+    the grade (its AGENTS.md rule 2), so there is one reading of the evidence.
+    Resolves the clause at call time, so it is the contained (never-raising)
+    clause the ladder evaluates.
+    """
+    return _clause_kill_switch_fire_drill_passed(store, [window_start, window_end])
+
+
+def _verify_drill_seal(store: Store, drill: FireDrillDocument) -> _SealReading:
+    """An unannounced drill counts as unannounced only on a verified seal
+    (`alpha-engine-config-I10761`). Every condition below is one way an
+    "unannounced" drill could be an announced one recorded as unannounced:
+
+    1. it reveals a schedule at all, for a window containing its trading day,
+       with a sealed instant ON that trading day;
+    2. a conforming `fire_drill_schedule.v1` exists at exactly the key the
+       reveal names;
+    3. `fire_drill_commitment(fire_instant, nonce)` equals the sealed
+       commitment — the reveal is the instant that was sealed, not one chosen
+       after the fact;
+    4. the schedule object's STORE write time (`LastModified`, which no writer
+       sets) is strictly before the sealed instant — a seal written at or after
+       the fire proves nothing about the fire being unannounced;
+    5. the drill actually fired at or after the sealed instant and within
+       :data:`crucible.models.FIRE_DRILL_SEAL_TOLERANCE_SECONDS` of it.
+
+    Who may WRITE a seal is not checkable from the store; it is the operated
+    stack's IAM (the trader's session identity is denied the schedule prefix
+    and the nonce location), asserted by that repository's tests.
+    """
+    reveal = drill.schedule
+    if reveal is None:
+        return _SealReading(
+            "claims unannounced but reveals no sealed schedule; an unsealed claim is "
+            "indistinguishable from an announced drill recorded as unannounced"
+        )
+    if not reveal.window_start <= drill.trading_day <= reveal.window_end:
+        return _SealReading(
+            f"trading_day {drill.trading_day} is outside its seal's window "
+            f"{reveal.window_start}..{reveal.window_end}"
+        )
+    if reveal.fire_instant[:10] != drill.trading_day:
+        return _SealReading(
+            f"sealed instant {reveal.fire_instant} is not on trading_day {drill.trading_day}"
+        )
+    key = trader_fire_drill_schedule_key(reveal.window_start, reveal.window_end, reveal.schedule_id)
+    read = _read_store_document(store, key)
+    if read.problem is not None:
+        return _SealReading(read.problem, read.access_problem, (key,))
+    if read.absent:
+        return _SealReading(f"no sealed schedule at {key}", evidence=(key,))
+    try:
+        sealed = FireDrillScheduleDocument.model_validate(read.document)
+    except ValidationError as exc:
+        return _SealReading(
+            f"{key} does not conform to fire_drill_schedule.v1 "
+            f"({exc.errors()[0]['loc']} {exc.errors()[0]['msg']})",
+            evidence=(key,),
+        )
+    if (sealed.schedule_id, sealed.window_start, sealed.window_end) != (
+        reveal.schedule_id,
+        reveal.window_start,
+        reveal.window_end,
+    ):
+        return _SealReading(
+            f"{key} records schedule {sealed.schedule_id} for "
+            f"{sealed.window_start}..{sealed.window_end}, not the schedule its key names",
+            evidence=(key,),
+        )
+    if fire_drill_commitment(reveal.fire_instant, reveal.nonce) != sealed.commitment:
+        return _SealReading(
+            f"sha256(fire_instant || nonce) of the revealed {reveal.fire_instant} does not match "
+            f"the commitment sealed at {key} — the revealed instant is not the sealed one",
+            evidence=(key,),
+        )
+    if not isinstance(store, S3Store):
+        return _SealReading(
+            f"the store backend is {type(store).__name__}, so {key} has no store-set write "
+            "time; a seal whose write time nobody but its writer recorded proves nothing",
+            evidence=(key,),
+        )
+    try:
+        written = _store_write_instant(store, key, what="the fire-drill seal's write time")
+    except LastChangeUnreadableError as exc:
+        return _SealReading(str(exc), True, (key,))
+    fire_at = dt.datetime.fromisoformat(reveal.fire_instant)
+    if written >= fire_at:
+        return _SealReading(
+            f"{key} was written {written.isoformat()}, not before its sealed fire instant "
+            f"{reveal.fire_instant} — a seal written after the fire seals nothing",
+            evidence=(key,),
+        )
+    fired = _parse_utc_instant(drill.fired_at)
+    if fired is None:
+        return _SealReading(
+            f"fired_at {drill.fired_at!r} is not a timezone-aware ISO instant", evidence=(key,)
+        )
+    late = (fired - fire_at).total_seconds()
+    if late < 0 or late > FIRE_DRILL_SEAL_TOLERANCE_SECONDS:
+        return _SealReading(
+            f"fired at {drill.fired_at}, {late:+.0f}s from its sealed instant "
+            f"{reveal.fire_instant} (0..{FIRE_DRILL_SEAL_TOLERANCE_SECONDS}s admitted) — "
+            "not the fire this seal committed to",
+            evidence=(key,),
+        )
+    return _SealReading(None, evidence=(key,))
 
 
 def _clause_money_path_chain_verified(store: Store) -> Clause:

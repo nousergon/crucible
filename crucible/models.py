@@ -138,6 +138,8 @@ __all__ = [
     "FaultRecordDocument",
     "FeatureRegistryDocument",
     "FireDrillDocument",
+    "FireDrillScheduleDocument",
+    "FireDrillScheduleReveal",
     "FeatureRow",
     "GitHubCommit",
     "GitHubCommitDetail",
@@ -1762,6 +1764,82 @@ class TraderReleasePinDocument(_Strict):
         return self
 
 
+#: How long after its sealed fire instant a drill may actually fire and still
+#: be the drill that seal committed to (`alpha-engine-config-I10761`). The
+#: operator fires by hand at the sealed minute; ten minutes admits a slow
+#: gateway connect and nothing like "later that session".
+FIRE_DRILL_SEAL_TOLERANCE_SECONDS = 600
+
+#: The one commitment scheme a `fire_drill_schedule.v1` document may name.
+FIRE_DRILL_COMMITMENT_SCHEME = "sha256(fire_instant || nonce)"
+
+_FIRE_INSTANT_PATTERN = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+_NONCE_PATTERN = r"^[0-9a-f]{64}$"
+_SCHEDULE_ID_PATTERN = r"^[0-9a-f]{32}$"
+
+
+def fire_drill_commitment(fire_instant: str, nonce: str) -> str:
+    """`sha256(fire_instant || nonce)`, hex — the ONE implementation of the seal.
+
+    ``fire_instant`` is the canonical `YYYY-MM-DDTHH:MM:SSZ` UTC string and
+    ``nonce`` 64 lowercase hex characters (256 bits); both are UTF-8 encoded
+    and concatenated with no separator. The nonce is what makes the commitment
+    HIDING: a session has only ~23,400 regular-hours seconds, so a hash of the
+    instant alone is inverted by enumeration in milliseconds. The sealer
+    (crucible-trader `fire-drill seal`) and the gate
+    (`crucible.gate._clause_kill_switch_fire_drill_passed`) both call this.
+    """
+    import hashlib  # noqa: PLC0415 - models stays import-light
+
+    return hashlib.sha256(f"{fire_instant}{nonce}".encode()).hexdigest()
+
+
+class FireDrillScheduleDocument(_Strict):
+    """`fire_drill_schedule.v1`, at
+    `trader/fire_drills/schedule/{window_start}_{window_end}/{schedule_id}.json`
+    (`crucible.keys.trader_fire_drill_schedule_key`) — a drill SEALED before it
+    fires (`alpha-engine-config-I10761`).
+
+    It holds a commitment to the fire instant, never the instant and never the
+    nonce: the nonce lives where the trader's session identity cannot read it
+    (the operated stack names the location and denies it), so nothing the trader
+    can see before the fire says when the fire is.
+
+    **No field records when the seal was written, deliberately.** A writer sets
+    every field it writes; the gate reads the object's store-set write time
+    (S3 `LastModified`) instead, which no writer controls.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["fire_drill_schedule.v1"]
+    schedule_id: str = Field(pattern=_SCHEDULE_ID_PATTERN)
+    window_start: IsoDate
+    window_end: IsoDate
+    commitment_scheme: Literal["sha256(fire_instant || nonce)"]
+    commitment: Sha256
+
+    @model_validator(mode="after")
+    def _window_is_ordered(self) -> FireDrillScheduleDocument:
+        if self.window_end < self.window_start:
+            raise ValueError(f"window {self.window_start}..{self.window_end} ends before it starts")
+        return self
+
+
+class FireDrillScheduleReveal(_Strict):
+    """What an unannounced `fire_drill.v1` document reveals after firing: the
+    schedule it fired under, its sealed instant and the nonce that opens the
+    commitment (`alpha-engine-config-I10761`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schedule_id: str = Field(pattern=_SCHEDULE_ID_PATTERN)
+    window_start: IsoDate
+    window_end: IsoDate
+    fire_instant: str = Field(pattern=_FIRE_INSTANT_PATTERN)
+    nonce: str = Field(pattern=_NONCE_PATTERN)
+
+
 class FireDrillDocument(_Strict):
     """`fire_drill.v1`, at `trader/fire_drills/{trading_day}/{run_id}.json` —
     written by the TRADER (`crucible_trader.fire_drill.drill_document`,
@@ -1783,8 +1861,8 @@ class FireDrillDocument(_Strict):
     schema_version: Literal["fire_drill.v1"]
     kind: Literal["kill_switch_flatten", "kill_switch_freeze", "hold_book"]
     announced: bool = Field(
-        description="Self-reported by whoever fired the drill; nothing seals the drill "
-        "time in advance (I10650's 2026-09-14 comment)."
+        description="Self-reported by whoever fired the drill. `false` is a CLAIM the gate "
+        "honours only with a verified `schedule` reveal."
     )
     run_id: str = Field(min_length=1)
     trading_day: IsoDate
@@ -1799,6 +1877,21 @@ class FireDrillDocument(_Strict):
     orders_accepted_after_fire: list[dict[str, Any]]
     hold_decision: str | None
     passed: bool
+    schedule: FireDrillScheduleReveal | None = Field(
+        default=None,
+        description="The reveal of the sealed schedule this drill fired under. "
+        "Required for the drill to count as unannounced; "
+        "refused on an announced drill, which was never sealed.",
+    )
+
+    @model_validator(mode="after")
+    def _an_announced_drill_reveals_no_seal(self) -> FireDrillDocument:
+        if self.announced and self.schedule is not None:
+            raise ValueError(
+                "an announced drill carries a `schedule` reveal; a sealed schedule exists only "
+                "to make an UNANNOUNCED claim checkable, so the two together contradict"
+            )
+        return self
 
     def evidence_passed(self) -> bool:
         """Whether the evidence fields, not the `passed` flag, say the drill passed."""
