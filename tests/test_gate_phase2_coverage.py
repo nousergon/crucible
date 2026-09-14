@@ -39,8 +39,8 @@ from crucible.gate import (
     FAULT_RECORD_BUS_FIELD,
     FAULT_RECORD_MANIFEST_FIELD,
     MANIFEST_ATTEMPT_INITIAL,
+    PHASE2_SCRIPTED_FAULTS,
     RUNBOOK_PROCEDURES,
-    SCRIPTED_FAULTS,
     UNSEAL_RESERVATION_ISSUE,
     ReservedMechanism,
 )
@@ -340,34 +340,34 @@ class TestFaultInjectionAgainstScheduledPath:
         exactly which key it looked for, per fault."""
         clause = gate_module._clause_fault_injection_against_scheduled_path(store)
         assert clause.unmeasurable and not clause.met
-        for fault in SCRIPTED_FAULTS:
+        for fault in PHASE2_SCRIPTED_FAULTS:
             assert f"{FAULT_INJECTION_ROOT}<trading-day>/{fault}.json" in clause.detail
 
     def test_met_when_every_scripted_fault_has_a_record_whose_keys_exist(
         self, store: LocalStore
     ) -> None:
-        for index, fault in enumerate(SCRIPTED_FAULTS):
+        for index, fault in enumerate(PHASE2_SCRIPTED_FAULTS):
             _induced(store, fault, discriminator=f"f{index}")
         clause = gate_module._clause_fault_injection_against_scheduled_path(store)
         assert clause.met and not clause.unmeasurable, clause.detail
 
     def test_one_fault_short_is_unmeasurable_not_met(self, store: LocalStore) -> None:
-        for index, fault in enumerate(SCRIPTED_FAULTS[:-1]):
+        for index, fault in enumerate(PHASE2_SCRIPTED_FAULTS[:-1]):
             _induced(store, fault, discriminator=f"f{index}")
         clause = gate_module._clause_fault_injection_against_scheduled_path(store)
         assert clause.unmeasurable and not clause.met
-        assert SCRIPTED_FAULTS[-1] in clause.detail
+        assert PHASE2_SCRIPTED_FAULTS[-1] in clause.detail
 
     def test_a_record_naming_a_manifest_the_store_does_not_hold_is_unmet(
         self, store: LocalStore
     ) -> None:
         """A claim the store contradicts is evidence, read positively — never
         the same reading as no record at all."""
-        for index, fault in enumerate(SCRIPTED_FAULTS):
+        for index, fault in enumerate(PHASE2_SCRIPTED_FAULTS):
             _induced(store, fault, discriminator=f"f{index}")
         _fault_record(
             store,
-            SCRIPTED_FAULTS[0],
+            PHASE2_SCRIPTED_FAULTS[0],
             **{
                 FAULT_RECORD_MANIFEST_FIELD: manifest_key("weekly", "2026-08-07"),
                 FAULT_RECORD_BUS_FIELD: _bus_key("failure", "f0"),
@@ -378,11 +378,11 @@ class TestFaultInjectionAgainstScheduledPath:
         assert "which the store does not hold" in clause.detail
 
     def test_a_record_naming_a_key_of_the_wrong_shape_is_unmet(self, store: LocalStore) -> None:
-        for index, fault in enumerate(SCRIPTED_FAULTS):
+        for index, fault in enumerate(PHASE2_SCRIPTED_FAULTS):
             _induced(store, fault, discriminator=f"f{index}")
         _fault_record(
             store,
-            SCRIPTED_FAULTS[1],
+            PHASE2_SCRIPTED_FAULTS[1],
             **{
                 FAULT_RECORD_MANIFEST_FIELD: manifest_key("weekly", DAY),
                 FAULT_RECORD_BUS_FIELD: manifest_key("weekly", DAY),
@@ -395,9 +395,11 @@ class TestFaultInjectionAgainstScheduledPath:
     def test_a_record_missing_a_field_is_unmet(self, store: LocalStore) -> None:
         """A non-conforming record is UNMET naming the field, never graded on
         whichever fields happen to be populated."""
-        for index, fault in enumerate(SCRIPTED_FAULTS):
+        for index, fault in enumerate(PHASE2_SCRIPTED_FAULTS):
             _induced(store, fault, discriminator=f"f{index}")
-        _put(store, fault_injection_key(SCRIPTED_FAULTS[2], DAY), {FAULT_RECORD_BUS_FIELD: ""})
+        _put(
+            store, fault_injection_key(PHASE2_SCRIPTED_FAULTS[2], DAY), {FAULT_RECORD_BUS_FIELD: ""}
+        )
         clause = gate_module._clause_fault_injection_against_scheduled_path(store)
         assert not clause.met
         assert "does not conform to fault_record.v1" in clause.detail
@@ -408,9 +410,9 @@ class TestFaultInjectionAgainstScheduledPath:
         fires. This clause required a `bus_key` of every record, which made it
         unsatisfiable for exactly the fault whose point is that the system
         survived."""
-        for index, fault in enumerate(SCRIPTED_FAULTS[1:], start=1):
+        for index, fault in enumerate(PHASE2_SCRIPTED_FAULTS[1:], start=1):
             _induced(store, fault, discriminator=f"f{index}")
-        _absorbed(store, SCRIPTED_FAULTS[0])
+        _absorbed(store, PHASE2_SCRIPTED_FAULTS[0])
         clause = gate_module._clause_fault_injection_against_scheduled_path(store)
         assert clause.met and not clause.unmeasurable, clause.detail
         assert "(absorbed)" in clause.detail
@@ -421,13 +423,13 @@ class TestFaultInjectionAgainstScheduledPath:
         reader reports rather than tolerates — and it is the route by which a
         bus row borrowed from an unrelated incident would have satisfied this
         clause."""
-        for index, fault in enumerate(SCRIPTED_FAULTS[1:], start=1):
+        for index, fault in enumerate(PHASE2_SCRIPTED_FAULTS[1:], start=1):
             _induced(store, fault, discriminator=f"f{index}")
         manifest = _manifest(store, "weekly")
         bus = _row(store, "failure", discriminator="borrowed")
         _fault_record(
             store,
-            SCRIPTED_FAULTS[0],
+            PHASE2_SCRIPTED_FAULTS[0],
             outcome="absorbed",
             **{FAULT_RECORD_MANIFEST_FIELD: manifest, FAULT_RECORD_BUS_FIELD: bus},
         )
@@ -438,9 +440,9 @@ class TestFaultInjectionAgainstScheduledPath:
     def test_met_for_an_unreachable_fault_naming_no_store_key(self, store: LocalStore) -> None:
         """Fault 4's state cannot be entered, so there is no manifest and no
         page. The evidence is the executed probes, and the reading names them."""
-        for index, fault in enumerate(SCRIPTED_FAULTS[:-1]):
+        for index, fault in enumerate(PHASE2_SCRIPTED_FAULTS[:-1]):
             _induced(store, fault, discriminator=f"f{index}")
-        _fault_record(store, SCRIPTED_FAULTS[-1], outcome="unreachable")
+        _fault_record(store, PHASE2_SCRIPTED_FAULTS[-1], outcome="unreachable")
         clause = gate_module._clause_fault_injection_against_scheduled_path(store)
         assert clause.met and not clause.unmeasurable, clause.detail
         assert "pin_refuses_an_unpublished_sha" in clause.detail
@@ -448,9 +450,9 @@ class TestFaultInjectionAgainstScheduledPath:
     def test_an_unreachable_record_with_no_closed_paths_is_unmet(self, store: LocalStore) -> None:
         """The evidence cannot be empty: a record claiming a state is
         unreachable while naming not one closed path is an attestation."""
-        for index, fault in enumerate(SCRIPTED_FAULTS[:-1]):
+        for index, fault in enumerate(PHASE2_SCRIPTED_FAULTS[:-1]):
             _induced(store, fault, discriminator=f"f{index}")
-        _fault_record(store, SCRIPTED_FAULTS[-1], outcome="unreachable", closed_paths=[])
+        _fault_record(store, PHASE2_SCRIPTED_FAULTS[-1], outcome="unreachable", closed_paths=[])
         clause = gate_module._clause_fault_injection_against_scheduled_path(store)
         assert not clause.met and not clause.unmeasurable
         assert "does not conform to fault_record.v1" in clause.detail
@@ -458,15 +460,15 @@ class TestFaultInjectionAgainstScheduledPath:
     def test_an_unreachable_record_carrying_a_run_id_is_unmet(self, store: LocalStore) -> None:
         """It must be STRUCTURALLY incapable of excusing a manifest, and the
         reader refuses the shape rather than trusting the producer to have."""
-        for index, fault in enumerate(SCRIPTED_FAULTS[:-1]):
+        for index, fault in enumerate(PHASE2_SCRIPTED_FAULTS[:-1]):
             _induced(store, fault, discriminator=f"f{index}")
-        _fault_record(store, SCRIPTED_FAULTS[-1], outcome="unreachable", run_id=_RUN_ID)
+        _fault_record(store, PHASE2_SCRIPTED_FAULTS[-1], outcome="unreachable", run_id=_RUN_ID)
         clause = gate_module._clause_fault_injection_against_scheduled_path(store)
         assert not clause.met and not clause.unmeasurable
         assert "must not carry `run_id`" in clause.detail
 
     def test_the_declared_fault_list_matches_the_suite_that_exercises_them(self) -> None:
-        """`SCRIPTED_FAULTS` is the plan's list, not a scan of the suite — so
+        """`PHASE2_SCRIPTED_FAULTS` is the plan's list, not a scan of the suite — so
         this is the guard that stops the two drifting apart silently."""
         tree = ast.parse(FAULT_SUITE.read_text(encoding="utf-8"))
         cases = [
@@ -474,9 +476,9 @@ class TestFaultInjectionAgainstScheduledPath:
             for node in tree.body
             if isinstance(node, ast.ClassDef) and node.name.startswith("TestFault")
         ]
-        assert len(cases) == len(SCRIPTED_FAULTS), (
+        assert len(cases) == len(PHASE2_SCRIPTED_FAULTS), (
             f"{FAULT_SUITE.name} defines {cases}, which is not the "
-            f"{len(SCRIPTED_FAULTS)} scripted faults the gate grades"
+            f"{len(PHASE2_SCRIPTED_FAULTS)} scripted faults the gate grades"
         )
 
 

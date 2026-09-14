@@ -933,3 +933,74 @@ components:
     schedule: null
     dispatch: null
     deadline: null
+
+  trader.reconcile:
+    # alpha-engine-config-I10651 / -I10413. The daily broker reconciliation,
+    # run by the TRADER (nousergon/crucible-trader, crucible-trader-PR5) under
+    # its own identity through `crucible.runner.run_job`. NOT a
+    # `crucible.cli.JOBS` entry - the harness may not reach into the trader
+    # (plan section 3) - so this row is admitted by
+    # `crucible.models.TRADER_JOB_VALUES`, the declared set of trader jobs,
+    # and `tests/test_components_registry.py` derives coverage from JOBS plus
+    # that tuple rather than exempting a name.
+    #
+    # ACTIVE, so the FAILURE page is live the moment a manifest lands: a
+    # discrepancy or a missed planted discrepancy makes the run `failed`,
+    # which is the page (section 4.6), naming instrument, delta and side.
+    #
+    # `schedule`/`dispatch`/`deadline` are null ON PURPOSE, today: nothing
+    # starts this job yet (I10651's 2026-09-14 comment - no box entry point, no
+    # fills source, no genesis run). A daily `close_plus` deadline declared
+    # before anything dispatches the job would page ABSENCE every trading day
+    # for a job nobody started, which is how a channel gets muted. The change
+    # that schedules it sets `schedule: daily`, its `dispatch`, and the
+    # deadline in the same edit; `test_a_scheduled_job_declares_a_deadline`
+    # refuses the schedule without the deadline.
+    description: >-
+      Reconcile the trader's positions and cash against the broker, with a
+      planted-discrepancy control arm (fault 5); any discrepancy is a page.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[trader/broker_statements/**],outputs[trader/broker_statements/*,trader/reconciliation/*]
+      outcome: run.json:metrics[broker_reconciliation_match_rate,broker_reconciliation_discrepancies,broker_reconciliation_position_count_delta,broker_reconciliation_cash_residual_usd,broker_reconciliation_control_detected]
+    log_location: /crucible/trader.reconcile
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
+  trader.smoke:
+    # alpha-engine-config-I10649. The trader's own IB-paper smoke (install the
+    # pinned wheel, connect to the paper gateway, read the book, place no
+    # order), run by the TRADER under its own identity. Its `ok` manifest for a
+    # sha is the evidence `crucible release.pin --target trader` requires
+    # (crucible-PR294, `crucible.release.TRADER_SMOKE_JOB`). Admitted by
+    # `crucible.models.TRADER_JOB_VALUES` for the reason `trader.reconcile`
+    # above is. On demand - it runs before a pin, never on a clock - so no
+    # schedule and no deadline; ACTIVE so a failed smoke pages.
+    description: >-
+      The trader's IB-paper smoke for one release sha; its ok manifest gates
+      the trader release pin.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: null
+      outcome: null
+    log_location: /crucible/trader.smoke
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null

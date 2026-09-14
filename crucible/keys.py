@@ -50,9 +50,11 @@ __all__ = [
     "RELEASES_ROOT",
     "REVIEWER_PATTERN",
     "RUNS_ROOT",
+    "TRADER_BROKER_STATEMENTS_PREFIX",
     "TRADER_EVIDENCE_KEY",
     "TRADER_EXECUTION_SHORTFALL_PREFIX",
     "TRADER_PIN_KEY",
+    "TRADER_RECONCILIATION_PREFIX",
     "TRADER_SHADOW_BOOKS_PREFIX",
     "TRIGGER_RE",
     "TRIGGER_UNKNOWN",
@@ -125,6 +127,8 @@ __all__ = [
     "strategy_holdout_key",
     "strategy_slot_key",
     "strategy_slots_prefix",
+    "trader_broker_statement_key",
+    "trader_reconciliation_key",
     "universe_members_key",
     "verdict_key",
 ]
@@ -1206,6 +1210,21 @@ TRADER_EVIDENCE_KEY = "trader/evidence.json"
 TRADER_EXECUTION_SHORTFALL_PREFIX = "trader/execution_shortfall/"
 TRADER_SHADOW_BOOKS_PREFIX = "trader/shadow_books/"
 
+#: The trader's daily broker reconciliation (`broker_reconciliation.v1`,
+#: `alpha-engine-config-I10651`) and the broker statement it reconciled
+#: (`broker_statement.v1`), both written as OUTPUTS of the `trader.reconcile`
+#: run manifest (`crucible.models.TRADER_JOB_VALUES`). Under `trader/` for the
+#: reason :data:`TRADER_EVIDENCE_KEY` is: artifacts the trader agreed to write,
+#: under its own identity. The statement is also tomorrow's reconciliation
+#: ANCHOR — the trader reads the newest one strictly before the session — so it
+#: is a dated key the trader lists, not a rolling document it overwrites.
+#:
+#: Declared here, single-source, because `crucible-trader-PR5` shipped both
+#: shapes as its own literals pending this module; the trader's pin bump
+#: replaces them with these helpers.
+TRADER_RECONCILIATION_PREFIX = "trader/reconciliation/"
+TRADER_BROKER_STATEMENTS_PREFIX = "trader/broker_statements/"
+
 
 def _require_iso_day(trading_day: str) -> None:
     try:
@@ -1227,6 +1246,18 @@ def shadow_books_key(trading_day: str) -> str:
     """One session's `shadow_books.v1` document, written by the trader."""
     _require_iso_day(trading_day)
     return f"trader/shadow_books/{trading_day}.json"
+
+
+def trader_reconciliation_key(trading_day: str) -> str:
+    """One session's `broker_reconciliation.v1` result, written by `trader.reconcile`."""
+    _require_iso_day(trading_day)
+    return f"trader/reconciliation/{trading_day}.json"
+
+
+def trader_broker_statement_key(trading_day: str) -> str:
+    """One session's `broker_statement.v1` (the broker's positions and cash)."""
+    _require_iso_day(trading_day)
+    return f"trader/broker_statements/{trading_day}.json"
 
 
 def board_key(trading_day: str) -> str:

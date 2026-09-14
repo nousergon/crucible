@@ -57,12 +57,14 @@ from crucible.documents import load_store_document
 from crucible.keys import (  # noqa: F401 - manifest_key/manifest_prefix re-exported
     RUNS_ROOT,
     champion_key,
+    execution_shortfall_key,
     holdout_unseal_prefix,
     is_manifest_key,
     manifest_key,
     manifest_prefix,
     predictions_key,
     strategy_holdout_key,
+    trader_reconciliation_key,
 )
 from crucible.models import RunManifestV2
 from crucible.store import Store, sha256_hex
@@ -264,17 +266,29 @@ def read_manifest(
 #: started chaining every arm's predictions along with the serving feed.
 #:
 #: **The set as it stands, and what is deliberately not in it.** Plan §9.5
-#: names orders, fills, reconciliation results and the NAV series. None of
-#: those has a key in `crucible.keys` yet — the trader is a separate system
-#: and phase 4 is where it lands — so chaining them is not something this
-#: change can do, and pretending otherwise by inventing their keys here would
-#: put a shape in the chain that no producer writes. What exists today and
-#: decides where money goes is the champion contract the trader reads
-#: (`champions/{slot}/current.json` plus `predictions/{trading_day}.json`,
-#: this repo's `AGENTS.md`) and the sealed holdout that bounds what may be
-#: graded into it. Those are chained here; each order/fill/NAV key joins by
-#: adding one predicate below, and `tests/test_money_path_chain.py` pins the
-#: membership so an addition is a deliberate edit rather than a silent widen.
+#: names orders, fills, reconciliation results and the NAV series. What
+#: decides where money goes on the harness side is the champion contract the
+#: trader reads (`champions/{slot}/current.json` plus
+#: `predictions/{trading_day}.json`, this repo's `AGENTS.md`) and the sealed
+#: holdout that bounds what may be graded into it. Phase 4 adds the trader's
+#: side as its keys land in `crucible.keys` (`alpha-engine-config-I10651`):
+#:
+#: * the daily broker RECONCILIATION result — plan §9.5 by name;
+#: * the per-session EXECUTION SHORTFALL document — the one artifact carrying
+#:   the trader's real fills (decision price, fill price, filled quantity per
+#:   order), so it is the fills record §9.5 names until a separate order/fill
+#:   log exists.
+#:
+#: **Deliberately NOT chained:** the shadow books (`trader/shadow_books/`) are
+#: SIMULATED paper books per challenger — evidence beside a promotion, never
+#: an input to one (`alpha-engine-config-I10653` deliverable 5) — and a chain
+#: that claims tamper-evidence over money must not grow a record for a book no
+#: money follows. The broker STATEMENT is the reconciliation's input and is
+#: content-hashed into the reconciliation run's manifest already; chaining the
+#: result is what §9.5 asks. The NAV series has no key yet and joins by one
+#: predicate when it does. `tests/test_money_path_chain.py` pins the
+#: membership, both directions, so an addition is a deliberate edit rather
+#: than a silent widen.
 #:
 #: This is NOT a suppression collection (`AGENTS.md` rule 4): it is a
 #: positive membership rule that only ever ADMITS keys to a check. A key
@@ -298,7 +312,26 @@ MONEY_PATH_PREDICATES: tuple[Callable[[str], bool], ...] = (
     lambda key: key == strategy_holdout_key(),
     # Every unseal audit record: WHO ruled, on WHICH session, unsealing WHAT.
     lambda key: key.startswith(holdout_unseal_prefix()),
+    # The trader's daily broker reconciliation and its per-session fills
+    # (execution shortfall). Matched by rebuilding the key from the day the
+    # candidate claims, like the serving feed, so a sibling artifact under
+    # `trader/` (the shadow books, the evidence document) never matches by
+    # sharing a prefix. `_day_key_matches` refuses a non-date day rather than
+    # letting the helper's ISO-date check raise out of a membership test.
+    lambda key: _day_key_matches(key, trader_reconciliation_key),
+    lambda key: _day_key_matches(key, execution_shortfall_key),
 )
+
+
+def _day_key_matches(key: str, helper: Callable[[str], str]) -> bool:
+    """Whether ``key`` is exactly ``helper(day)`` for the day its basename names."""
+    if not key.endswith(".json"):
+        return False
+    day = key.rsplit("/", 1)[-1].removesuffix(".json")
+    try:
+        return key == helper(day)
+    except ValueError:
+        return False
 
 
 class MoneyPathChainError(RuntimeError):

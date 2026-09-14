@@ -36,11 +36,16 @@ from crucible.explain import (
     verify_money_path_chain,
 )
 from crucible.keys import (
+    TRADER_EVIDENCE_KEY,
     champion_key,
+    execution_shortfall_key,
     holdout_unseal_key,
     manifest_key,
     predictions_key,
+    shadow_books_key,
     strategy_holdout_key,
+    trader_broker_statement_key,
+    trader_reconciliation_key,
 )
 from crucible.manifest import (
     RUN_MANIFEST_SCHEMA_VERSION,
@@ -135,6 +140,10 @@ class TestWhatIsOnTheMoneyPath:
             predictions_key(TRADING_DAY),
             strategy_holdout_key(),
             holdout_unseal_key(TRADING_DAY, "I10414"),
+            # Phase 4, `alpha-engine-config-I10651`: the broker reconciliation
+            # result (plan §9.5 by name) and the per-session fills record.
+            trader_reconciliation_key(TRADING_DAY),
+            execution_shortfall_key(TRADING_DAY),
         ],
     )
     def test_the_money_path_members(self, key: str) -> None:
@@ -152,6 +161,17 @@ class TestWhatIsOnTheMoneyPath:
             "report/2026-08-28/attribution.json",
             "board/current.json",
             "releases/current",
+            # SIMULATED paper books: evidence beside a promotion, never money
+            # (`alpha-engine-config-I10653` deliverable 5).
+            shadow_books_key(TRADING_DAY),
+            # The reconciliation's INPUT, content-hashed into that run's
+            # manifest already; the result is what §9.5 chains.
+            trader_broker_statement_key(TRADING_DAY),
+            TRADER_EVIDENCE_KEY,
+            # Not a day: the predicate rebuilds the key from the basename and
+            # must refuse rather than let the key helper's date check raise.
+            "trader/reconciliation/notaday.json",
+            "trader/reconciliation/2026-08-28.json.bak",
         ],
     )
     def test_what_is_not_on_the_money_path(self, key: str) -> None:

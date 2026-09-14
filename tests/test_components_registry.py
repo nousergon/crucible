@@ -22,6 +22,7 @@ import yaml
 
 from crucible.cli import JOBS
 from crucible.manifest import SCHEMA_PATH
+from crucible.models import TRADER_JOB_VALUES
 
 COMPONENTS_PATH = Path(__file__).resolve().parents[1] / "crucible" / "components.yaml"
 
@@ -64,8 +65,20 @@ class TestCoverage:
         the registry look complete while covering something that never runs —
         and its absence deadline can never fire, so it is a permanently
         silent monitor."""
-        extra = sorted(set(components["components"]) - set(JOBS))
-        assert not extra, f"components.yaml rows with no CLI job: {extra}"
+        extra = sorted(set(components["components"]) - set(JOBS) - set(TRADER_JOB_VALUES))
+        assert not extra, f"components.yaml rows with no CLI job or declared trader job: {extra}"
+
+    def test_every_declared_trader_job_has_a_registry_row(self, components: dict) -> None:
+        """`crucible.models.TRADER_JOB_VALUES` jobs are written by the trader,
+        not the CLI, and are observed exactly like CLI jobs: a trader job with
+        no row would write manifests no failure page reads."""
+        missing = sorted(set(TRADER_JOB_VALUES) - set(components["components"]))
+        assert not missing, f"trader jobs with no components.yaml row: {missing}"
+
+    def test_a_trader_job_is_never_also_a_cli_job(self) -> None:
+        """Disjoint by construction. A name in both would let the harness run a
+        trader job body, which plan §3 forbids."""
+        assert not set(TRADER_JOB_VALUES) & set(JOBS)
 
 
 class TestRowShape:
@@ -245,5 +258,5 @@ class TestSignalClassesAreDeclaredForEveryRow:
         from crucible.components import load_registry
 
         registry = load_registry()
-        assert set(registry) == set(JOBS)
+        assert set(registry) == set(JOBS) | set(TRADER_JOB_VALUES)
         assert all(c.lifecycle == "ACTIVE" for c in registry.values())
