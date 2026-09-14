@@ -79,6 +79,7 @@ __all__ = [
     "dispatch_prefix",
     "drift_input_key",
     "drift_metrics_key",
+    "edgar_fundamentals_session_key",
     "execution_shortfall_key",
     "experiments_key",
     "experiments_prefix",
@@ -1581,6 +1582,7 @@ DATA_BUCKET_KEY_HELPERS: tuple[str, ...] = (
     "fundamental_snapshot_key",
     "constituents_key",
     "inst_ownership_key",
+    "edgar_fundamentals_session_key",
 )
 
 
@@ -1594,3 +1596,18 @@ def constituents_key(label: dt.date) -> str:
 
 def inst_ownership_key(year: int, quarter: int) -> str:
     return f"data/inst_ownership/{year}Q{quarter}/latest.parquet"
+
+
+def edgar_fundamentals_session_key(label: dt.date) -> str:
+    """One SEC EDGAR XBRL companyfacts-derived fundamentals session, keyed by
+    the NYSE session label it is admissible for the day after
+    (`alpha-engine-config-I10733`).
+
+    A sibling of :func:`fundamental_snapshot_key` in a different producer's
+    namespace, never a replacement of it in place: the v1 `features/{date}/`
+    tree stays read-only for manifests already written against it (the same
+    reason `crucible/schemas/run_manifest.v1.json` is frozen rather than
+    edited), while `crucible.data.point_in_time.FilingDatePointInTimeSource`
+    reads this new tree instead.
+    """
+    return f"fundamentals_pit/edgar/v1/sessions/{label.isoformat()}.parquet"

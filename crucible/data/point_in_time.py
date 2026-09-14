@@ -73,6 +73,23 @@ session after the 2026-08-19 snapshot). 13F accumulation is measured from
 have point-in-time pillars from **2026-08-20** onward; before it, the pillars
 are null and the rankers refuse by name.
 
+A second fundamentals source, keyed by filing date
+===================================================
+
+:class:`FilingDatePointInTimeSource` reads a different producer's tree —
+SEC EDGAR XBRL `companyfacts`, at
+`fundamentals_pit/edgar/v1/sessions/{date}.parquet`
+(`crucible.keys.edgar_fundamentals_session_key`) — for the fundamental group
+only; sector and 13F are the same reads :class:`SnapshotPointInTimeSource`
+already makes. The knowledge rule is identical: the file labelled ``L`` uses
+only EDGAR facts with `filed` <= ``L`` and ``L``'s own split-adjusted close,
+and it is admissible for session ``S`` only when ``L < S``. Every row also
+declares its own `schema_version`, `knowledge_date` and `latest_filed`, and
+:class:`FilingDatePointInTimeSource` refuses (rather than silently reads) a
+snapshot whose self-declaration is inconsistent with its own key — a
+look-ahead in the producer stops the compile, never gets averaged into a
+pillar.
+
 Why these snapshots and not ArcticDB
 ====================================
 
@@ -83,11 +100,15 @@ the collection day's value onto every historical row. That is look-ahead by
 construction, so it is not a point-in-time source and is not read here.
 
 **SOTA:** a filing-date-indexed fundamentals store (SEC EDGAR XBRL
-`companyfacts`, whose every fact carries its `filed` date, plus 13F by filing
-date and a dated GICS history) — point-in-time back to 2009. **Delta:** v1's
-dated snapshots give 17 fully measured sessions today, growing one per
-session; the deeper source is filed as a follow-up in the PR that introduced
-this module.
+`companyfacts`, whose every fact carries its `filed` date) now EXISTS as
+:class:`FilingDatePointInTimeSource`, reaching back as far as the producer's
+backfill (planned from 2022-01-03). **Delta:** sector still has no free
+dated GICS history and is measured only from 2026-05-01 (constituents
+`fetched_at`), and 13F is still bound by its 45-day quarterly filing
+deadline — so the fundamental pillar's own depth grows with the EDGAR
+backfill while sector and institutional remain the shallower bound on the
+seven attractiveness pillars until a dated GICS source and a filing-date 13F
+feed exist too.
 """
 
 from __future__ import annotations
@@ -103,12 +124,18 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from crucible.data.sources import MissingSourceError
 from crucible.documents import read_document
-from crucible.keys import constituents_key, fundamental_snapshot_key, inst_ownership_key
+from crucible.keys import (
+    constituents_key,
+    edgar_fundamentals_session_key,
+    fundamental_snapshot_key,
+    inst_ownership_key,
+)
 
 if TYPE_CHECKING:
     import pandas as pd
 
 __all__ = [
+    "EDGAR_SESSION_SCHEMA_VERSION",
     "FUNDAMENTAL_FIELD_COLUMNS",
     "FUNDAMENTAL_DISTINCTNESS_FLOOR",
     "GROUP_COVERAGE_FLOOR_RATIO",
@@ -118,6 +145,7 @@ __all__ = [
     "POINT_IN_TIME_COLUMNS",
     "SECTOR_COLUMN",
     "THIRTEEN_F_FILING_LAG_DAYS",
+    "FilingDatePointInTimeSource",
     "GroupReading",
     "MappingSnapshotReader",
     "PointInTimeInputs",
@@ -126,6 +154,7 @@ __all__ = [
     "UnavailablePointInTimeSource",
     "constituents_key",
     "distinctness_floor",
+    "edgar_fundamentals_session_key",
     "fundamental_snapshot_key",
     "inst_ownership_key",
     "quarter_knowledge_date",
@@ -188,8 +217,18 @@ FUNDAMENTAL_DISTINCTNESS_FLOOR = 100
 #: imports this module.
 GROUP_COVERAGE_FLOOR_RATIO = 0.90
 
+#: The `schema_version` every row of an EDGAR filing-date session must carry
+#: (`alpha-engine-config-I10733`). A row at any other version, or with the
+#: column absent, is a producer contract violation and stops the compile
+#: (`FilingDatePointInTimeSource._validate_fundamental_snapshot`) rather than
+#: being silently admitted — the same "refuse an outage, never guess" rule
+#: `SnapshotPointInTimeSource._require_listing` already keeps for an empty
+#: source.
+EDGAR_SESSION_SCHEMA_VERSION = 1
+
 _ISO = r"(\d{4}-\d{2}-\d{2})"
 _FUNDAMENTAL_KEY_RE = re.compile(rf"^features/{_ISO}/fundamental\.parquet$")
+_EDGAR_SESSION_KEY_RE = re.compile(rf"^fundamentals_pit/edgar/v1/sessions/{_ISO}\.parquet$")
 _CONSTITUENTS_KEY_RE = re.compile(rf"^market_data/weekly/{_ISO}/constituents\.json$")
 _INST_KEY_RE = re.compile(r"^data/inst_ownership/(\d{4})Q([1-4])/latest\.parquet$")
 
@@ -474,12 +513,42 @@ class SnapshotPointInTimeSource(PointInTimeSource):
             )
         return matches
 
+    # -- fundamental-group resolution parameters, overridable per source ----
+    #
+    # `SnapshotPointInTimeSource` and `FilingDatePointInTimeSource` share ONE
+    # resolution path — listing prefix, key regex and key function are the
+    # only things that differ between v1's dated snapshots and the EDGAR
+    # filing-date tree, and the knowledge-time rule (`label < day`), the
+    # staleness bound, the coverage floor and the per-field distinctness
+    # floor are identical for both (`alpha-engine-config-I10733`). A
+    # subclass wanting a fourth source implements these four hooks rather
+    # than re-copying `_load_fundamentals`.
+
+    def _fundamental_source_prefix(self) -> str:
+        return "features/"
+
+    def _fundamental_key_pattern(self) -> re.Pattern[str]:
+        return _FUNDAMENTAL_KEY_RE
+
+    def _fundamental_key(self, label: dt.date) -> str:
+        return fundamental_snapshot_key(label)
+
+    def _validate_fundamental_snapshot(
+        self, key: str, label: dt.date, snapshot: pd.DataFrame
+    ) -> None:
+        """A hook for a subclass to refuse a snapshot beyond the base shape
+        checks (`ticker` present) `_load_fundamentals` already makes. A no-op
+        for v1's dated snapshots, which carry no `schema_version` or
+        `knowledge_date` self-declaration to check.
+        """
+
     def _load_fundamentals(
         self, day: dt.date, wanted: list[str], frame: pd.DataFrame
     ) -> GroupReading:
+        prefix = self._fundamental_source_prefix()
+        pattern = self._fundamental_key_pattern()
         labels = sorted(
-            dt.date.fromisoformat(m.group(1))
-            for m in self._require_listing("features/", _FUNDAMENTAL_KEY_RE)
+            dt.date.fromisoformat(m.group(1)) for m in self._require_listing(prefix, pattern)
         )
         admissible = [label for label in labels if label < day]
         if not admissible:
@@ -496,7 +565,7 @@ class SnapshotPointInTimeSource(PointInTimeSource):
                 ),
             )
         label = admissible[-1]
-        key = fundamental_snapshot_key(label)
+        key = self._fundamental_key(label)
         age = _sessions_between(label, day)
         if age > MAX_FUNDAMENTAL_STALENESS_SESSIONS:
             return GroupReading(
@@ -512,6 +581,7 @@ class SnapshotPointInTimeSource(PointInTimeSource):
                 ),
             )
         snapshot = self._parquet(key)
+        self._validate_fundamental_snapshot(key, label, snapshot)
         missing = [c for c in ("ticker", *FUNDAMENTAL_FIELD_COLUMNS) if c not in snapshot.columns]
         # A snapshot written before a field existed (the growth and payout
         # fields arrived 2026-05-21) does not carry it: that field is
@@ -697,6 +767,82 @@ class SnapshotPointInTimeSource(PointInTimeSource):
             detail=f"{key} (public from {known}): {len(covered_names)} of {len(wanted)} names",
             unmeasured_fields=unmeasured,
         )
+
+
+class FilingDatePointInTimeSource(SnapshotPointInTimeSource):
+    """The SOTA fundamentals source: SEC EDGAR XBRL `companyfacts`, keyed by
+    the filing date every fact carries (`alpha-engine-config-I10733`).
+
+    Sector and institutional (13F) are UNCHANGED from
+    :class:`SnapshotPointInTimeSource` — this class narrows only the
+    fundamental group's resolution to a different producer's key shape
+    (:func:`crucible.keys.edgar_fundamentals_session_key`), by way of the
+    four ``_fundamental_*`` hooks that method defines. The knowledge rule is
+    identical to v1's: the file labelled ``L`` uses only facts with EDGAR
+    ``filed`` <= ``L`` and ``L``'s own close, and it is admissible for
+    session ``S`` only when ``L < S``.
+
+    A row that fails the producer's own declared contract stops the compile
+    rather than being read as if it were valid: a `schema_version` other
+    than :data:`EDGAR_SESSION_SCHEMA_VERSION`, a `knowledge_date` that does
+    not equal the file's own label, or a `latest_filed` that is null or
+    later than the label (a look-ahead) all raise :class:`MissingSourceError`
+    naming the key and the reason — never a `stale`/`below_coverage` reading,
+    which would let a corrupt producer write pass as an ordinary outage.
+    """
+
+    name = "edgar-filing-date"
+
+    def snapshot_id(self) -> str:
+        return f"edgar-filing-date:{self._label}"
+
+    def _fundamental_source_prefix(self) -> str:
+        return "fundamentals_pit/edgar/v1/sessions/"
+
+    def _fundamental_key_pattern(self) -> re.Pattern[str]:
+        return _EDGAR_SESSION_KEY_RE
+
+    def _fundamental_key(self, label: dt.date) -> str:
+        return edgar_fundamentals_session_key(label)
+
+    def _validate_fundamental_snapshot(
+        self, key: str, label: dt.date, snapshot: pd.DataFrame
+    ) -> None:
+        if "schema_version" not in snapshot.columns:
+            raise MissingSourceError(f"{key!r} carries no `schema_version` column")
+        versions = snapshot["schema_version"]
+        if versions.isna().any() or set(versions.dropna().unique().tolist()) != {
+            EDGAR_SESSION_SCHEMA_VERSION
+        }:
+            raise MissingSourceError(
+                f"{key!r} `schema_version` is not exactly [{EDGAR_SESSION_SCHEMA_VERSION}] "
+                f"for every row (found {sorted(versions.dropna().unique().tolist())!r}, "
+                f"{int(versions.isna().sum())} null)"
+            )
+        if "knowledge_date" not in snapshot.columns:
+            raise MissingSourceError(f"{key!r} carries no `knowledge_date` column")
+        knowledge = snapshot["knowledge_date"]
+        label_iso = label.isoformat()
+        if knowledge.isna().any() or set(knowledge.dropna().unique().tolist()) != {label_iso}:
+            raise MissingSourceError(
+                f"{key!r} `knowledge_date` does not equal its own label {label_iso} for "
+                f"every row (found {sorted(knowledge.dropna().unique().tolist())!r})"
+            )
+        if "latest_filed" not in snapshot.columns:
+            raise MissingSourceError(f"{key!r} carries no `latest_filed` column")
+        filed = snapshot["latest_filed"]
+        if filed.isna().any():
+            raise MissingSourceError(
+                f"{key!r} carries a null `latest_filed` for at least one row — a filing "
+                "date of unknown knowledge time cannot be admitted to any session"
+            )
+        look_ahead = filed[filed > label_iso]
+        if not look_ahead.empty:
+            raise MissingSourceError(
+                f"{key!r} carries `latest_filed` > its own label {label_iso} "
+                f"(e.g. {look_ahead.iloc[0]!r}) — a look-ahead in the producer, refused "
+                "rather than silently admitted"
+            )
 
 
 def _quarter_offset(year: int, quarter: int, offset: int) -> tuple[int, int]:
