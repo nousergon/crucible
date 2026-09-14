@@ -11,13 +11,18 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+import signal
+import time
 
 import pytest
 
 from crucible.manifest import TRANSIENT_RETRY_REASONS, manifest_key
 from crucible.runner import (
+    DISPATCH_ATTEMPTS_ENV,
     MAX_ATTEMPTS,
     TRANSIENT_CLASSIFIERS,
+    DispatchAttemptsError,
     RunContext,
     SpotInterruptionError,
     classify_transient,
@@ -385,3 +390,177 @@ class TestSpotGuard:
         with spot_interruption_guard():
             pass
         assert signal.getsignal(signal.SIGTERM) is before
+
+
+class TestSubstrateOwnedRedispatch:
+    """`alpha-engine-config-I10732`. Measured 2026-09-14: two `data.heal`
+    spot boxes (`i-0b1b6f9b3d815f536`, `i-09d65be6660176a64`) were reclaimed
+    ten minutes into the job. The in-process retry deferred the manifest to
+    a second attempt on the SAME box, the box went away, and the store held
+    no manifest, no log and no retry. On a dispatched spot box the dispatcher
+    now re-launches the job from the EventBridge interruption warning, and
+    the runner's half is: write nothing for the reclaimed attempt, and record
+    the declared ladder on the attempt that can finish.
+    """
+
+    FIRST = '[{"n": 1, "reason": "initial"}]'
+    REDISPATCHED = '[{"n": 1, "reason": "initial"}, {"n": 2, "reason": "spot_interruption"}]'
+
+    @staticmethod
+    def _key_exists(store, job="data.daily") -> bool:
+        try:
+            store.get_bytes(manifest_key(job, FRIDAY.isoformat()))
+        except Exception:  # noqa: BLE001 - absence is the assertion
+            return False
+        return True
+
+    def test_an_in_job_interruption_on_a_dispatched_spot_box_writes_nothing_and_is_not_retried(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("CRUCIBLE_DISPATCH_ATTEMPTS", self.FIRST)
+        monkeypatch.setenv("CRUCIBLE_LIFECYCLE", "spot")
+        store = LocalStore(tmp_path)
+        calls = []
+
+        def reclaimed(ctx: RunContext) -> None:
+            calls.append(1)
+            raise SpotInterruptionError("spot_interruption: the instance is being reclaimed")
+
+        with pytest.raises(SpotInterruptionError):
+            run_job("data.daily", reclaimed, store=store, trading_day=FRIDAY, now=NOW)
+        assert calls == [1], "a box being reclaimed must not start a second attempt"
+        assert not self._key_exists(store), (
+            "a manifest written by the reclaimed attempt would page for an absorbed fault "
+            "and then be overwritten by the re-dispatched run at the same key"
+        )
+
+    def test_a_real_sigterm_mid_job_takes_the_same_path(self, tmp_path, monkeypatch) -> None:
+        """Through the real guard, not a hand-raised exception: the box's
+        IMDS watcher delivers SIGTERM, and that must reach the same branch."""
+        monkeypatch.setenv("CRUCIBLE_DISPATCH_ATTEMPTS", self.FIRST)
+        monkeypatch.setenv("CRUCIBLE_LIFECYCLE", "spot")
+        store = LocalStore(tmp_path)
+
+        def signalled(ctx: RunContext) -> None:
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(5)
+
+        with pytest.raises(SpotInterruptionError):
+            run_job("data.daily", signalled, store=store, trading_day=FRIDAY, now=NOW)
+        assert not self._key_exists(store)
+
+    def test_the_redispatched_attempt_records_the_interruption_and_the_escalation(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The issue's closes-when, on the runner's side: an `ok` manifest,
+        `attempts[]` carrying the n=2 `spot_interruption` row,
+        `resource.interruptions == 1` and `escalated_to_on_demand: true`."""
+        monkeypatch.setenv("CRUCIBLE_DISPATCH_ATTEMPTS", self.REDISPATCHED)
+        monkeypatch.setenv("CRUCIBLE_LIFECYCLE", "on-demand")
+        store = LocalStore(tmp_path)
+
+        run_job("data.daily", lambda ctx: None, store=store, trading_day=FRIDAY, now=NOW)
+        manifest = _manifest(store)
+        assert manifest["status"] == "ok"
+        assert manifest["attempts"] == [
+            {"n": 1, "reason": "initial"},
+            {"n": 2, "reason": "spot_interruption"},
+        ]
+        assert manifest["resource"]["interruptions"] == 1
+        assert manifest["resource"]["spot"] is False
+        assert manifest["resource"]["escalated_to_on_demand"] is True
+
+    def test_a_signal_on_the_last_rung_writes_the_terminal_failed_manifest(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The dispatcher does not re-launch a box whose ladder is full, so
+        the runner must be the one that writes — exactly one of the two."""
+        monkeypatch.setenv("CRUCIBLE_DISPATCH_ATTEMPTS", self.REDISPATCHED)
+        monkeypatch.setenv("CRUCIBLE_LIFECYCLE", "on-demand")
+        store = LocalStore(tmp_path)
+
+        def reclaimed(ctx: RunContext) -> None:
+            raise SpotInterruptionError("spot_interruption: the instance is being reclaimed")
+
+        with pytest.raises(SpotInterruptionError):
+            run_job("data.daily", reclaimed, store=store, trading_day=FRIDAY, now=NOW)
+        manifest = _manifest(store)
+        assert manifest["status"] == "failed"
+        assert manifest["resource"]["interruptions"] == 2
+
+    def test_an_on_demand_first_dispatch_is_not_handed_to_the_dispatcher(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """An escalated on-demand box receives no interruption warning, so
+        nothing would re-launch it — the runner keeps the in-process retry."""
+        monkeypatch.setenv("CRUCIBLE_DISPATCH_ATTEMPTS", self.FIRST)
+        monkeypatch.setenv("CRUCIBLE_LIFECYCLE", "on-demand")
+        store = LocalStore(tmp_path)
+        calls = []
+
+        def flaky(ctx: RunContext) -> None:
+            calls.append(1)
+            if len(calls) == 1:
+                raise SpotInterruptionError("spot_interruption: signal 15")
+
+        run_job("data.daily", flaky, store=store, trading_day=FRIDAY, now=NOW)
+        assert _manifest(store)["status"] == "ok"
+        assert len(calls) == 2
+
+    def test_other_transient_classes_still_retry_in_process_on_a_dispatched_box(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("CRUCIBLE_DISPATCH_ATTEMPTS", self.FIRST)
+        monkeypatch.setenv("CRUCIBLE_LIFECYCLE", "spot")
+        store = LocalStore(tmp_path)
+        calls = []
+
+        def flaky(ctx: RunContext) -> None:
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("HTTP 503 service unavailable")
+
+        run_job("data.daily", flaky, store=store, trading_day=FRIDAY, now=NOW)
+        manifest = _manifest(store)
+        assert manifest["status"] == "ok"
+        assert manifest["attempts"] == [
+            {"n": 1, "reason": "initial"},
+            {"n": 2, "reason": "provider_5xx"},
+        ]
+        assert manifest["resource"]["interruptions"] == 0
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "not json",
+            "[]",
+            '[{"n": 2, "reason": "initial"}]',
+            '[{"n": 1, "reason": "spot_interruption"}]',
+            '[{"n": 1, "reason": "initial"}, {"n": 2, "reason": "made_up"}]',
+            '[{"n": 1, "reason": "initial"}, {"n": 2, "reason": "spot_interruption"},'
+            ' {"n": 3, "reason": "spot_interruption"}]',
+            '[{"n": 1, "reason": "initial", "extra": true}]',
+        ],
+    )
+    def test_a_malformed_ladder_is_refused_before_the_job_runs(
+        self, tmp_path, monkeypatch, raw
+    ) -> None:
+        monkeypatch.setenv("CRUCIBLE_DISPATCH_ATTEMPTS", raw)
+        store = LocalStore(tmp_path)
+        calls = []
+        with pytest.raises(DispatchAttemptsError):
+            run_job(
+                "data.daily",
+                lambda ctx: calls.append(1),
+                store=store,
+                trading_day=FRIDAY,
+                now=NOW,
+            )
+        assert calls == []
+        assert not self._key_exists(store)
+
+    def test_the_env_name_is_the_one_the_box_shell_exports(self) -> None:
+        """Lockstepped from the other side by nous-ergon-ops
+        `tests/crossrepo/test_crucible_spot_redispatch_lockstep.py`."""
+        assert DISPATCH_ATTEMPTS_ENV == "CRUCIBLE_DISPATCH_ATTEMPTS"
+        assert MAX_ATTEMPTS == 2
