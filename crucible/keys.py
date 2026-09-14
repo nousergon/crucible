@@ -37,6 +37,7 @@ __all__ = [
     "BOARD_HTML_KEY",
     "CONSOLE_JSON_KEY",
     "CONSOLE_KEY",
+    "DATA_BUCKET_KEY_HELPERS",
     "DISPATCH_ROOT",
     "DRIFT_INPUTS",
     "FAULT_INJECTION_ROOT",
@@ -1529,6 +1530,20 @@ def parse_acceptance_reading(document: Any) -> AcceptanceReading | None:
 #
 # Read-only key shapes of the v1 producer's dated snapshots, read by
 # `crucible.data.point_in_time`. Relative to the data bucket root, not the store.
+
+
+#: Key helpers that name objects in the DATA bucket (`CRUCIBLE_ARCTIC_BUCKET`),
+#: not the crucible store. v1's dated point-in-time snapshots are READ as
+#: feature inputs (alpha-engine-config-I10721); nothing in crucible writes
+#: them, so they are no store prefix for the runtime role to be granted. The
+#: ops store-prefix grant guard (`tests/crossrepo/test_crucible_store_prefix_grants.py`)
+#: reads this literal and skips these helpers; a name here that is not a
+#: module-level function fails that guard.
+DATA_BUCKET_KEY_HELPERS: tuple[str, ...] = (
+    "fundamental_snapshot_key",
+    "constituents_key",
+    "inst_ownership_key",
+)
 
 
 def fundamental_snapshot_key(label: dt.date) -> str:
