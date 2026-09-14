@@ -15,6 +15,7 @@ import datetime as dt
 import io
 import json
 import math
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -22,8 +23,13 @@ import pytest
 
 import tests.test_slot_strategy_cycle_job as cycle_job
 from crucible.documents import load_store_document
-from crucible.keys import data_panel_key, session_inputs_key
-from crucible.portfolio import load_portfolio_params, manifest_records_portfolio_engine
+from crucible.keys import arm_predictions_key, data_panel_key, session_inputs_key
+from crucible.portfolio import (
+    CostModel,
+    CostModelInputError,
+    load_portfolio_params,
+    manifest_records_portfolio_engine,
+)
 from crucible.slots.cycle import MissingArtifactError
 from crucible.slots.inputs import (
     UNSETTLED_RETURN,
@@ -209,3 +215,199 @@ class TestTheResolverRefusesRatherThanGuesses:
         store.put_bytes(session_inputs_key(arm.arm_id, day), json.dumps(document).encode("utf-8"))
         with pytest.raises(ArmPredictionsContractError, match="filed under another day"):
             _decide(store, arm.arm_id, "SPY", day)
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I10754: a held name leaving the M cross-section.
+# ---------------------------------------------------------------------------
+
+
+def _write_panel_through(store, day: dt.date) -> None:
+    """The panel compiled FOR ``day``: every AS_OF row on or before it."""
+    panel = pd.read_parquet(io.BytesIO(store.get_bytes(data_panel_key(AS_OF.isoformat()))))
+    through = panel[pd.to_datetime(panel["trading_day"]).dt.date <= day]
+    store.put_bytes(data_panel_key(day.isoformat()), through.to_parquet(index=False))
+
+
+def _drop_from_m_predictions(store, day: dt.date, ticker: str) -> None:
+    key = arm_predictions_key(cycle_job.M_CHAMPION, day.isoformat())
+    document = load_store_document(store, key)
+    del document["predicted_alpha"][ticker]
+    store.put_bytes(key, json.dumps(document, indent=2, sort_keys=True).encode("utf-8"))
+
+
+def _weights_vector(universe, weights: dict[str, float]) -> np.ndarray:
+    return np.array([float(weights.get(t, 0.0)) for t in universe.tickers], dtype=np.float64)
+
+
+def _held(universe, weights) -> list[str]:
+    sentinels = {universe.tickers[universe.benchmark_idx], universe.tickers[universe.cash_idx]}
+    return [
+        t for t, w in zip(universe.tickers, weights, strict=True) if w != 0.0 and t not in sentinels
+    ]
+
+
+def _impact_recipe(recipe):
+    return replace(
+        recipe,
+        cost_model=CostModel(
+            name="sqrt_impact_v1",
+            placeholder=False,
+            params={
+                "half_spread_bps": 2.5,
+                "commission_bps": 0.5,
+                "impact_coef_bps": 12.0,
+                "min_cost_bps": 1.0,
+            },
+        ),
+    )
+
+
+class TestAHeldNameLeavingTheUniverseIsExitedNotRefused:
+    """The trader decides two consecutive days from its own carried book; the
+    grade walks the same two days from cash. On the second day the M champion
+    stops pricing the name the first day's book held most of."""
+
+    def _two_days(self, world):
+        store, settings, _root, days = world
+        arm = _arm(settings)
+        params = _params(settings)
+        d_prev = days[-2]
+        _run_produce(store, settings, days[:-1])
+        _write_panel_through(store, d_prev)
+
+        day1 = _decide(store, arm.arm_id, arm.recipe.benchmark, d_prev.isoformat())
+        (w1,) = construct_book(
+            recipe=arm.recipe,
+            params=params,
+            universe=day1.universe,
+            sessions=day1.sessions,
+            portfolio_notional=params.book_notional_usd,
+            w_initial=_cash(day1.universe),
+        ).weights
+        held = _held(day1.universe, w1)
+        assert held, "the fixture's first book holds no name; nothing can leave the universe"
+        dropped = max(held, key=lambda t: w1[day1.universe.tickers.index(t)])
+        _drop_from_m_predictions(store, AS_OF, dropped)
+        _run_produce(store, settings, [AS_OF])
+        previous = dict(zip(day1.universe.tickers, w1, strict=True))
+        return store, arm, params, d_prev, previous, held, dropped
+
+    def test_without_the_held_names_the_dropped_name_is_not_in_the_universe(self, world) -> None:
+        store, arm, _params_, _d_prev, _previous, _held_names, dropped = self._two_days(world)
+        decision = _decide(store, arm.arm_id, arm.recipe.benchmark, AS_OF.isoformat())
+        assert dropped not in decision.universe.tickers
+
+    def test_the_trader_and_the_settled_grade_walk_construct_the_same_exit(self, world) -> None:
+        store, arm, params, d_prev, previous, held, dropped = self._two_days(world)
+        nxt = _extend_panel_one_session(store)
+
+        trader = resolve_strategy_sessions(
+            store,
+            arm_id=arm.arm_id,
+            benchmark=arm.recipe.benchmark,
+            decision_days=[AS_OF.isoformat()],
+            as_of=AS_OF.isoformat(),
+            unsettled_last=True,
+            held_tickers=held,
+        )
+        grade_walk = resolve_strategy_sessions(
+            store,
+            arm_id=arm.arm_id,
+            benchmark=arm.recipe.benchmark,
+            decision_days=[d_prev.isoformat(), AS_OF.isoformat()],
+            as_of=nxt.isoformat(),
+        )
+        assert trader.universe == grade_walk.universe
+        assert trader.held_tickers == tuple(sorted(held))
+        i = trader.universe.tickers.index(dropped)
+        (t_session,) = trader.sessions
+        assert not t_session.eligibility[i] and t_session.alpha_hat[i] == 0.0
+        for field in ("alpha_hat", "eligibility", "stance_caps", "returns_panel", "adv_usd"):
+            np.testing.assert_array_equal(
+                getattr(t_session, field), getattr(grade_walk.sessions[1], field)
+            )
+
+        traded = construct_book(
+            recipe=arm.recipe,
+            params=params,
+            universe=trader.universe,
+            sessions=trader.sessions,
+            portfolio_notional=params.book_notional_usd,
+            w_initial=_weights_vector(trader.universe, previous),
+        )
+        graded = construct_book(
+            recipe=arm.recipe,
+            params=params,
+            universe=grade_walk.universe,
+            sessions=grade_walk.sessions,
+            portfolio_notional=params.book_notional_usd,
+            w_initial=_cash(grade_walk.universe),
+        )
+        assert graded.weights[0] == tuple(previous[t] for t in grade_walk.universe.tickers)
+        assert traded.weights[0] == graded.weights[1]
+        assert traded.book.cost_bps[0] == graded.book.cost_bps[1]
+        assert traded.book.turnover[0] == graded.book.turnover[1]
+        assert traded.weights[0][i] < previous[dropped], "the dropped name was not exited"
+        assert traded.book.cost_bps[0] > 0.0
+
+    def test_a_participation_aware_exit_is_priced_from_the_days_adv(self, world) -> None:
+        store, arm, params, _d_prev, previous, held, dropped = self._two_days(world)
+        population = [t for t in previous if t not in {"SPY", "__CASH__"}]
+        cycle_job._write_features(store, days=[AS_OF], tickers=population, dollar_volume_usd=4e8)
+        trader = resolve_strategy_sessions(
+            store,
+            arm_id=arm.arm_id,
+            benchmark=arm.recipe.benchmark,
+            decision_days=[AS_OF.isoformat()],
+            as_of=AS_OF.isoformat(),
+            unsettled_last=True,
+            held_tickers=held,
+        )
+        i = trader.universe.tickers.index(dropped)
+        assert trader.sessions[0].adv_usd[i] == 4e8
+        book = construct_book(
+            recipe=_impact_recipe(arm.recipe),
+            params=params,
+            universe=trader.universe,
+            sessions=trader.sessions,
+            portfolio_notional=params.book_notional_usd,
+            w_initial=_weights_vector(trader.universe, previous),
+        )
+        assert book.book.cost_bps[0] > 0.0
+
+    def test_a_participation_aware_exit_with_no_adv_raises(self, world) -> None:
+        store, arm, params, _d_prev, previous, held, dropped = self._two_days(world)
+        population = [t for t in previous if t not in {"SPY", "__CASH__", dropped}]
+        cycle_job._write_features(store, days=[AS_OF], tickers=population)
+        trader = resolve_strategy_sessions(
+            store,
+            arm_id=arm.arm_id,
+            benchmark=arm.recipe.benchmark,
+            decision_days=[AS_OF.isoformat()],
+            as_of=AS_OF.isoformat(),
+            unsettled_last=True,
+            held_tickers=held,
+        )
+        with pytest.raises(CostModelInputError, match=dropped):
+            construct_book(
+                recipe=_impact_recipe(arm.recipe),
+                params=params,
+                universe=trader.universe,
+                sessions=trader.sessions,
+                portfolio_notional=params.book_notional_usd,
+                w_initial=_weights_vector(trader.universe, previous),
+            )
+
+    def test_a_held_name_with_no_price_at_all_raises(self, world) -> None:
+        store, arm, _params_, _d_prev, _previous, held, _dropped = self._two_days(world)
+        with pytest.raises(MissingArtifactError, match="no proxy is substituted"):
+            resolve_strategy_sessions(
+                store,
+                arm_id=arm.arm_id,
+                benchmark=arm.recipe.benchmark,
+                decision_days=[AS_OF.isoformat()],
+                as_of=AS_OF.isoformat(),
+                unsettled_last=True,
+                held_tickers=[*held, "NOPRICE"],
+            )
