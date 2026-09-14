@@ -263,6 +263,31 @@ jobs:
       - name: Acceptance clauses still import
         run: uv run --frozen pytest tests/acceptance --collect-only -q
 
+      # The TREE-ONLY acceptance reading, on the PR path
+      # (alpha-engine-config-I10735). Collection alone was not enough:
+      # crucible-PR244 changed a data contract, every PR check was green, and
+      # four MET plan §2 clauses read UNMET on every main push for ~23 hours,
+      # attributed to whoever merged next.
+      #
+      # This stays on the correct side of scm-platform-policy.md §3.1: this
+      # job holds NO AWS credential (`contents: read` only, no `id-token` —
+      # pinned by tests/test_workflow_triggers.py::
+      # test_the_pr_reachable_ci_test_job_holds_no_cloud_credential), so no
+      # clause here can read live infrastructure. A clause whose subject IS
+      # live infrastructure reads UNMEASURABLE by construction, and
+      # `--tree-only` tolerates exactly that; every other movement of the
+      # reading fails the PR that caused it. The credentialed reading and its
+      # publication remain the `acceptance` job's, on push: [main].
+      - name: Acceptance reading, tree-only (pull_request)
+        if: github.event_name == 'pull_request'
+        run: |
+          set +e
+          uv run --frozen pytest tests/acceptance -p no:cacheprovider --tb=line \
+            -o junit_family=legacy --junitxml=acceptance-tree.xml > acceptance-tree.txt 2>&1
+          set -e
+          tail -30 acceptance-tree.txt
+          uv run --frozen python tests/acceptance/check_reading.py --tree-only acceptance-tree.xml
+
   acceptance:
     name: acceptance gate (RED until the phase exits — reporting only)
     runs-on: ubuntu-latest

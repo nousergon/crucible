@@ -97,11 +97,15 @@ def _exclusions_for(events: frozenset[str]) -> set[str]:
 #: `<workflow>:<job>` pairs that may run on a PR because their subject is the
 #: tree, or the pull request itself. Every entry names why.
 PR_REACHABLE_JOBS: dict[str, str] = {
+    # The tree-only acceptance reading: alpha-engine-config-I10735.
     "ci.yml:test": (
-        "lint, format, the foundation suite, and `--collect-only` over "
-        "tests/acceptance. Every step reads the checkout and nothing else; "
-        "--collect-only imports the clause modules without executing a body, "
-        "so it touches no live AWS."
+        "lint, format, the foundation suite, `--collect-only` over "
+        "tests/acceptance, and the TREE-ONLY "
+        "acceptance reading graded by `check_reading.py --tree-only`. Every "
+        "step reads the checkout and nothing else: the job holds no cloud "
+        "credential (`test_the_pr_reachable_ci_test_job_holds_no_cloud_credential`), "
+        "so a clause whose subject is live AWS reads UNMEASURABLE here by "
+        "construction and `--tree-only` tolerates exactly that."
     ),
     "ci.yml:notify-main-failure": (
         "sends a notification; it grades nothing and posts no check. It also "
@@ -1456,3 +1460,31 @@ def test_the_filing_step_records_a_fail_under_its_own_key(tmp_path: pathlib.Path
     )
     filed = sorted(LocalStore(tmp_path / "store").list_keys("reviews/"))
     assert filed and filed[0].endswith("/fail.json"), filed
+
+
+def test_the_pr_reachable_ci_test_job_holds_no_cloud_credential() -> None:
+    """`ci.yml:test` runs the tree-only acceptance reading on every PR
+    (alpha-engine-config-I10735), which is legitimate under §3.1 ONLY because
+    the job cannot read live infrastructure: a clause needing AWS reads
+    UNMEASURABLE there by construction, and `check_reading.py --tree-only`
+    tolerates exactly that. Granting this job `id-token` (or any write) would
+    turn that tolerance into a live-state check on the PR path — assert the
+    property, not the allowlist entry's prose."""
+    job = Workflow.load(WORKFLOW_DIR / "ci.yml").jobs["test"]
+    granted = job.model_extra.get("permissions")
+    assert granted == {"contents": "read"}, (
+        f"ci.yml:test now holds permissions {granted!r}. It runs the acceptance "
+        "clauses on pull_request under `--tree-only`, which is only sound while "
+        "the job holds no credential (no `id-token`). Move any credentialed step "
+        "to the push-only `acceptance` job instead."
+    )
+    runs = "\n".join(str(step.get("run", "")) for step in job.steps)
+    assert "--tree-only" in runs, (
+        "ci.yml:test no longer grades the acceptance reading with --tree-only; "
+        "a tree-only MET clause can again regress with every PR check green."
+    )
+    uses = [str(step.get("uses", "")) for step in job.steps]
+    assert not any("configure-aws-credentials" in u for u in uses), (
+        "ci.yml:test configures AWS credentials; the tree-only reading's "
+        "tolerance for UNMEASURABLE clauses assumes it cannot."
+    )
