@@ -95,9 +95,13 @@ RUN_DAY = SESSIONS[45]
 
 @pytest.fixture
 def store(tmp_path):
+    return _seeded_store(tmp_path / "store")
+
+
+def _seeded_store(root):
     import pandas as pd
 
-    backing = LocalStore(tmp_path / "store")
+    backing = LocalStore(root)
     rng = np.random.default_rng(20260914)
     rows = []
     for i, day in enumerate(SESSIONS):
@@ -388,3 +392,79 @@ class TestTheCliHandler:
         assert main(self._argv(store.root, strategy, extra=["--dry-run"])) == 0
         assert "experiment.backfill --slot m --arm base would produce" in capsys.readouterr().out
         assert sorted(store.list_keys()) == before
+
+
+#: The prefix the backfill's own result document lands under, derived from
+#: the key builder so a rename cannot leave this test excluding nothing.
+_BACKFILLS_PREFIX = backfill_key(SESSIONS[0], "run").split("/", 1)[0] + "/"
+
+
+class TestABackfilledSessionCarriesTheSameArtifactsAsALiveOne:
+    """`alpha-engine-config-I10709`, deliverable 1 — the CLASS: two producers
+    of the same session artifacts, free to diverge.
+
+    They cannot diverge today, and this test is what keeps that true: this
+    module owns no fitting code and reaches the slot only through the
+    ``produce`` argument, so a backfilled session is written by the same call
+    `experiment.run --slot m --arm <a>` makes. The test compares the KEY SETS
+    two independently seeded stores carry after one session — the backfill's
+    own manifest and result document excepted, because one job writing one
+    manifest for a whole range is this job's declared shape.
+
+    The three §5.3 veto inputs are deliberately NOT in either set: they are
+    not per-session artifacts at all. `serving_metrics` derives them at GRADE
+    time off the arm's settled walk-forward
+    (`crucible.slots.model.grade_arm`), which is why I10709's read-side half
+    lives in that function and not here.
+    """
+
+    SESSION = SESSIONS[45]
+
+    def _live(self, store, strategy):
+        run_job(
+            "experiment.run",
+            lambda c: produce(c, settings=strategy, arm_name="base"),
+            store=store,
+            trading_day=dt.date.fromisoformat(self.SESSION),
+            run_mode="replay",
+            discriminator=SLOT,
+        )
+
+    def _written(self, store, seeded):
+        return {
+            key
+            for key in store.list_keys("")
+            if key not in seeded and not key.startswith(("runs/", _BACKFILLS_PREFIX))
+        }
+
+    def test_the_key_sets_are_identical_for_the_same_arm_and_date(
+        self, store, strategy, tmp_path
+    ) -> None:
+        seeded = set(store.list_keys(""))
+        _backfill(store, strategy, start=self.SESSION, end=self.SESSION)
+        backfilled = self._written(store, seeded)
+
+        live_store = _seeded_store(tmp_path / "live")
+        live_seeded = set(live_store.list_keys(""))
+        self._live(live_store, strategy)
+        live = self._written(live_store, live_seeded)
+
+        assert backfilled, "the backfill wrote nothing outside the seed"
+        assert backfilled == live, {
+            "only_backfilled": sorted(backfilled - live),
+            "only_live": sorted(live - backfilled),
+        }
+
+    def test_the_set_is_the_three_per_session_artifacts_plus_the_register(
+        self, store, strategy
+    ) -> None:
+        """Named, so a key silently dropped from BOTH producers still fails:
+        an equality between two empty-ish sets proves nothing."""
+        seeded = set(store.list_keys(""))
+        _, result = _backfill(store, strategy, start=self.SESSION, end=self.SESSION)
+        arm_id = result["arm_id"]
+        assert self._written(store, seeded) >= {
+            arm_predictions_key(arm_id, self.SESSION),
+            shadow_key(arm_id, self.SESSION),
+            cross_section_key(arm_id, self.SESSION),
+        }
