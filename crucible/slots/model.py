@@ -2233,7 +2233,7 @@ class SettledCrossSections:
     """An arm's out-of-sample predictions beside the labels that REALIZED.
 
     `alpha-engine-config-I10680`. The walk-forward grader already builds a
-    predicted and a realized vector for every date it scores, and used to
+    predicted and a realized vector for every date it WALKS, and used to
     keep only the rank IC of the pair. Three of the §5.3 veto's four inputs
     are statistics of exactly this block — a realized directional hit rate,
     and the up-probability calibration that `stdev_p_up` and
@@ -2246,6 +2246,13 @@ class SettledCrossSections:
     is realized on or before the cycle's `as_of` (:func:`settled_training_
     days`). A date whose label has not settled has a prediction and no
     outcome, and counting it would put an unresolved bet in a hit rate.
+
+    **Not gated by `registered_at`** (`alpha-engine-config-I10709`). Every
+    date here is still walked forward and still predicted by a fit trained
+    only on days that had settled before it — it is the arm's measurable
+    BEHAVIOUR, not its track record. The track record is `ModelGrade.series`
+    and that one opens at registration; nothing read off this block reaches
+    a ladder rung, a paired window or `promote_min_weeks`.
 
     **Cross-sectional excess, not raw return.** Both sides are demeaned per
     date. M declares `population` as its benchmark — the scored cross-section
@@ -2314,9 +2321,12 @@ class ModelGrade:
     unrankable_dates: tuple[str, ...] = ()
     oos_method: str = OOS_METHOD
     benchmark: str = "population"
-    #: The scored dates whose labels have REALIZED, with both sides of each
+    #: The WALKED dates whose labels have REALIZED, with both sides of each
     #: cross-section. The §5.3 veto's realized inputs are read off this and
-    #: nothing else — see :class:`SettledCrossSections`.
+    #: nothing else — see :class:`SettledCrossSections`. Deliberately a wider
+    #: window than ``series``, which opens at ``registered_at``: see
+    #: :func:`grade_arm`'s "two windows" paragraph
+    #: (`alpha-engine-config-I10709`).
     settled: SettledCrossSections = field(default_factory=SettledCrossSections)
 
     def __post_init__(self) -> None:
@@ -2364,7 +2374,30 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
     * refits happen on the recipe's declared ``refit_cadence_trading_days``,
       which is the cadence the arm actually runs at; a fit carried forward
       between refits is older than the day it scores and so still strictly
-      out-of-sample.
+      out-of-sample. The cadence is anchored at the END OF THE WARM-UP — the
+      first day the arm has a fit that could have existed — not at
+      ``registered_at``, so one arm has one walk-forward whatever date it was
+      filed on.
+
+    **Two windows, and only one of them is the registration clock**
+    (`alpha-engine-config-I10709`). ``series`` — the track record the arena
+    pairs, and so everything ``promote_min_weeks`` measures — opens at
+    ``registered_at`` and nothing widens it. ``settled`` — the block the §5.3
+    behavioural veto's realized inputs are read off (:func:`serving_metrics`)
+    — is every walked date whose label has realized, registration or no
+    registration. The veto is a SERVING PRECONDITION about how the arm behaves
+    (dispersion, a directional hit rate), not evidence of edge: it can refuse
+    an arm and can never promote one, and each of its dates is predicted by a
+    fit trained only on days settled before it, so widening it backfills no
+    track record and clears no age bar.
+
+    Measured 2026-09-14, which is why this distinction is written down: with
+    one window for both, ``residual_momentum`` — registered 2026-09-01, 68
+    backfilled sessions behind it, 47 paired dates in the arena — carried 0
+    settled dates, the veto read "could not be computed" for three of its four
+    inputs, and the arm was INELIGIBLE for a reason no amount of accumulated
+    history could resolve inside :func:`_grade_lookback`'s window. A gate dark
+    for a new arm's first ~50 sessions is dark exactly where it is needed.
 
     **Nothing is backfilled.** Too little OOS history is ``status ==
     "unmeasurable"`` with an empty series and a reason. A day whose
@@ -2420,12 +2453,6 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
             # is what makes "OOS N = 4" legible beside "panel N = 160".
             in_sample_n += 1
             continue
-        if day < recipe.registered_at:
-            # Before registration the arm did not exist to be scored. Plan
-            # §9.1: the OOS window BEGINS at registration, so these dates are
-            # training substrate and nothing else.
-            in_sample_n += 1
-            continue
         if coefficients is None or last_refit is None or (i - last_refit) >= cadence:
             coefficients, intercept, _, _ = _fit_rows(recipe, panel, train_days)
             last_refit = i
@@ -2439,9 +2466,37 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
             # settled observation — it is a miss on the SERIES because "no
             # ordering" is not "zero skill", which says nothing about whether
             # the day's directions were right.
-            settled_dates.append(day)
-            settled_predicted.append(predicted - predicted.mean())
-            settled_realized.append(actual - actual.mean())
+            #
+            # Collected BEFORE the registration gate below, and that placement
+            # is the whole of `alpha-engine-config-I10709`. See the
+            # "two windows" paragraph in this function's docstring.
+            #
+            # Demeaned over the names carrying BOTH sides, and only them
+            # (`alpha-engine-config-I10709`, the second half). A plain `.mean()`
+            # over a cross-section holding one non-finite name returns NaN and
+            # writes NaN into every one of that date's 900-odd entries, so a
+            # single unpriced ticker silently voided the whole date — and, on
+            # the real universe, all 30 of them: measured 2026-09-14, 0 of
+            # 27,240 name-date pairs finite, `model_hit_rate_30d` absent and
+            # the up-probability calibration refusing a block it read as
+            # constant. Both downstream readers mask non-finite pairs already
+            # (:func:`realized_hit_rate`, :func:`calibrate_up_probability`), so
+            # the mask belongs here, where the population being demeaned is
+            # decided: the excess is measured against the names actually
+            # scored, which is the same population both sides describe.
+            usable = np.isfinite(predicted) & np.isfinite(actual)
+            if usable.any():
+                settled_dates.append(day)
+                settled_predicted.append(
+                    np.where(usable, predicted - predicted[usable].mean(), np.nan)
+                )
+                settled_realized.append(np.where(usable, actual - actual[usable].mean(), np.nan))
+        if day < recipe.registered_at:
+            # Before registration the arm did not exist to be SCORED. Plan
+            # §9.1: the track record BEGINS at registration, so these dates
+            # reach no series, no ladder rung and no paired window.
+            in_sample_n += 1
+            continue
         ic = _rank_ic(predicted, actual)
         if ic is None:
             unrankable.append(day)

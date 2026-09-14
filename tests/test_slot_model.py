@@ -1594,3 +1594,140 @@ class TestTheRecordIsBoundedOnTheManifest:
         assert record["excluded_session_count"] >= 1
         assert record["excluded_first_session"] in panel.dates
         assert record["excluded_last_session"] in panel.dates
+
+
+# --------------------------------------------------------------------------
+# The registration clock gated the VETO's window as well as the track record
+# (alpha-engine-config-I10709).
+# --------------------------------------------------------------------------
+
+
+class TestTheVetoWindowIsNotGatedByTheRegistrationClock:
+    """Measured 2026-09-14 on the first live M grade over a backfilled history
+    (`arena/m/2026-09-11/arena_cycle.json`): `residual_momentum` — registered
+    2026-09-01, 68 backfilled sessions behind it, 47 paired dates in the arena
+    — read `behavioural veto could not be computed for stdev_p_up,
+    n_high_confidence, model_hit_rate_30d`, and the run manifest's
+    `serving_veto_window` row read `0 settled out-of-sample decision date(s)`.
+
+    `_grade_lookback` was sized by `alpha-engine-config-I10680` to read
+    `min_trading_days + 2 * label_horizon + SETTLED_WINDOW_DECISION_DATES`
+    sessions precisely so the settled window could fill — and then `grade_arm`
+    dropped every walked date before `registered_at` from the settled block as
+    well as from the scored series, so the window could not fill until the arm
+    was older than the whole extended lookback. A gate that reads
+    `insufficient` for its first ~51 sessions is dark exactly where a new arm
+    is riskiest.
+
+    Plan §9.1's clock governs the arm's TRACK RECORD — the series the arena
+    pairs, and so `promote_min_weeks`. It is not a bound on whether the arm's
+    BEHAVIOUR is measurable. Both halves are asserted here together, because
+    the fix is only correct if it leaves the first one untouched.
+    """
+
+    def _recent(self, panel, *, back: int = 8):
+        return _recipe(registered_at=panel.dates[-back - 1]), panel.dates[-1]
+
+    def test_a_recently_registered_arm_still_computes_every_veto_input(self, panel) -> None:
+        from crucible.slots.model import (
+            DISPERSION_METRICS,
+            FLOOR_VETO_METRICS,
+            SETTLED_WINDOW_DECISION_DATES,
+            ZERO_VETO_METRICS,
+            grade_arm,
+            predict_cross_section,
+            serving_metrics,
+        )
+
+        recipe, as_of = self._recent(panel)
+        graded = grade_arm(recipe, panel, as_of=as_of)
+        assert graded.settled.n_dates >= SETTLED_WINDOW_DECISION_DATES, (
+            f"{graded.settled.n_dates} settled date(s) on a panel that carries "
+            f"{len(panel.dates)}: the veto's window is bounded by the registration clock"
+        )
+        metrics, reason = serving_metrics(
+            predict_cross_section(graded.fit, panel, trading_day=as_of), settled=graded.settled
+        )
+        assert reason == "", reason
+        for name in (*DISPERSION_METRICS, *ZERO_VETO_METRICS, *FLOOR_VETO_METRICS):
+            assert name in metrics, name
+
+    def test_the_veto_reaches_a_verdict_rather_than_could_not_be_computed(self, panel) -> None:
+        from crucible.slots.model import (
+            evaluate_behavioural_veto,
+            grade_arm,
+            predict_cross_section,
+            serving_metrics,
+        )
+
+        recipe, as_of = self._recent(panel)
+        graded = grade_arm(recipe, panel, as_of=as_of)
+        metrics, _ = serving_metrics(
+            predict_cross_section(graded.fit, panel, trading_day=as_of), settled=graded.settled
+        )
+        veto = evaluate_behavioural_veto(metrics, metrics, has_incumbent=True)
+        assert veto.status in ("pass", "veto"), veto.reason
+        assert "could not be computed" not in veto.as_precondition().reason
+
+    def test_the_settled_block_is_out_of_sample_and_realized(self, panel) -> None:
+        """Every date in the block is walked forward and has a settled label,
+        registration or no registration: the veto's inputs are measurements,
+        never a fit scoring its own training rows."""
+        from crucible.slots.model import grade_arm, settled_training_days
+
+        recipe, as_of = self._recent(panel)
+        graded = grade_arm(recipe, panel, as_of=as_of)
+        realized = set(
+            settled_training_days(
+                panel, as_of=as_of, label_horizon=recipe.label_horizon_trading_days
+            )
+        )
+        indexes = {day: i for i, day in enumerate(panel.dates)}
+        assert graded.settled.dates
+        for day in graded.settled.dates:
+            assert indexes[day] in realized, day
+
+    def test_the_track_record_is_still_gated_at_registration(self, panel) -> None:
+        """Plan §9.1, untouched: the series the arena pairs — and so
+        `promote_min_weeks` — still opens at `registered_at`. Widening the
+        veto's window must not hand a nine-session-old arm a track record."""
+        from crucible.slots.model import grade_arm
+
+        recipe, as_of = self._recent(panel)
+        graded = grade_arm(recipe, panel, as_of=as_of)
+        assert graded.oos_n <= 9, f"a nine-session-old arm was handed {graded.oos_n} dates"
+        assert min(graded.series.scores) >= recipe.registered_at
+        assert graded.settled.n_dates > graded.oos_n
+
+    def test_one_unpriced_name_does_not_void_the_whole_settled_date(self, panel) -> None:
+        """The second half of `alpha-engine-config-I10709`, and the defect the
+        first half was hiding: the block was demeaned with a plain `.mean()`,
+        so ONE non-finite name wrote NaN across that date's whole
+        cross-section. Measured 2026-09-14 on the real 908-name universe once
+        the window filled — 0 of 27,240 name-date pairs finite, the hit rate
+        absent and the calibration refusing a block it read as constant.
+        """
+        import dataclasses
+
+        import numpy as np
+
+        from crucible.slots.model import grade_arm, predict_cross_section, serving_metrics
+
+        forward = panel.forward_returns.copy()
+        forward[:, 0] = np.nan
+        holed = dataclasses.replace(panel, forward_returns=forward)
+        recipe, as_of = self._recent(holed)
+        graded = grade_arm(recipe, holed, as_of=as_of)
+
+        assert graded.settled.n_dates > 0
+        finite = np.isfinite(graded.settled.realized)
+        assert finite.any(), "one unpriced name voided every settled cross-section"
+        # Exactly the holed column is absent, and every other name survives.
+        assert not finite[:, 0].any()
+        assert finite[:, 1:].all()
+
+        metrics, reason = serving_metrics(
+            predict_cross_section(graded.fit, holed, trading_day=as_of), settled=graded.settled
+        )
+        assert reason == "", reason
+        assert "model_hit_rate_30d" in metrics
