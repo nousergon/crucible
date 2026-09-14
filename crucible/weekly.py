@@ -34,7 +34,13 @@ from dataclasses import dataclass
 from crucible.components import Component, load_registry
 from crucible.slots import SLOTS, dispatchable_slots
 
-__all__ = ["ARC_SLOT_JOBS", "ARCTIC_LIBRARY_JOBS", "Stage", "arc_stages", "run_arc"]
+__all__ = ["ARC_JOB", "ARC_SLOT_JOBS", "ARCTIC_LIBRARY_JOBS", "Stage", "arc_stages", "run_arc"]
+
+#: The job name the arc itself runs and files its manifest under. That
+#: manifest records every stage it completed as an input, which is what
+#: `crucible.alerts.evaluate_absence` reads to grade an arc member against the
+#: declaration in force on the day the arc ran (`alpha-engine-config-I10711`).
+ARC_JOB = "weekly"
 
 #: The arc jobs that are run once per slot rather than once. Derived from the
 #: CLI's own `--slot` requirement in `tests/test_weekly.py`, so a new
