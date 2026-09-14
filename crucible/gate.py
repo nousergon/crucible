@@ -53,8 +53,8 @@ from crucible.alerts import (
 from crucible.attribution import manifest_records_factor_attribution
 from crucible.calendar import TRADING_DAYS_PER_WEEK, is_trading_day, resolve_trading_day
 from crucible.carryover import (
-    V1_SLOT_TO_V2_SLOT,
     V1_BUCKET_VAR,
+    V1_SLOT_TO_V2_SLOT,
     LedgerError,
     grade_carryover,
     parse_ledger,

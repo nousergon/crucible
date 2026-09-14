@@ -24,13 +24,13 @@ import yaml
 
 from crucible import carryover
 from crucible.carryover import (
+    V1_BUCKET_VAR,
     V1_MODEL_ARENA_KEY,
     V1_PRODUCER_ARENA_KEY,
     V1_PRODUCER_CHAMPION_KEY,
     V1_S_SERVING_KEY,
     V1_SCANNER_CUT_KEY,
     V1_SCANNER_SPEC_KEY,
-    V1_BUCKET_VAR,
     V1_ZOO_LEADERBOARD_KEY,
     LedgerError,
     parse_ledger,
