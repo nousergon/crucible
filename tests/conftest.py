@@ -310,11 +310,23 @@ def benchmark_frames(cycle_date):
     the benchmark row is merged into a `FramePriceSource` explicitly wherever
     a test builds its own, exactly like production fetches it separately.
     """
+    return benchmark_synthetic_frames(end=cycle_date)
+
+
+def benchmark_synthetic_frames(*, end: dt.date) -> dict[str, object]:
+    """The ONE constructor of every declared benchmark's synthetic frame.
+
+    A plain function, not only a fixture, because `tests/acceptance` builds
+    its own `FramePriceSource` from a module-level helper that cannot request
+    a fixture. crucible-PR244 added the benchmark fetch to `run_daily` and
+    merged SPY into this directory's `source` fixture only, so the acceptance
+    suite's own source kept serving no SPY and four MET plan §2 clauses read
+    UNMET on main for a day (alpha-engine-config-I10735). Every source that
+    feeds `run_daily` merges this — never a second literal.
+    """
     from crucible.slots import declared_benchmark_symbols
 
-    return synthetic_frames(
-        end=cycle_date, names=sorted(declared_benchmark_symbols()), seed=20260902
-    )
+    return synthetic_frames(end=end, names=sorted(declared_benchmark_symbols()), seed=20260902)
 
 
 @pytest.fixture

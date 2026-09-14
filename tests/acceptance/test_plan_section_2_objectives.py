@@ -1035,7 +1035,7 @@ def _seeded_slot(tmp_path: Any, cycle_date: dt.date) -> tuple[Any, Any, list[dt.
     import sys
 
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from conftest import sessions_ending, synthetic_frames
+    from conftest import benchmark_synthetic_frames, sessions_ending, synthetic_frames
 
     from crucible.config import Settings
     from crucible.data import FramePriceSource, run_daily
@@ -1047,7 +1047,11 @@ def _seeded_slot(tmp_path: Any, cycle_date: dt.date) -> tuple[Any, Any, list[dt.
     decisions = 6
     store = LocalStore(tmp_path / "store")
     frames = synthetic_frames(end=cycle_date)
-    source = FramePriceSource(frames)
+    # `run_daily` fetches every slot's declared benchmark (S's SPY) through
+    # the source as well as the universe (crucible-PR244), and refuses a
+    # panel missing it — so the source carries it, while `frames` stays
+    # exactly the declared population passed as `expected_symbols` below.
+    source = FramePriceSource({**frames, **benchmark_synthetic_frames(end=cycle_date)})
     # The coverage DENOMINATOR, passed explicitly. Without it `coverage_ratio`
     # is None, the metric reports OK, and the 0.90 floor is skipped — which is
     # the `901 of 903` bug class restored, and is what crucible-PR9 makes a
