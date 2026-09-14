@@ -1001,22 +1001,14 @@ class _ArcRegistryHistory:
         return self._by_sha[sha]
 
     def _read_release(self, sha: str) -> tuple[_ReleaseFacts | None, str | None]:
-        from crucible.release import published_wheel_key  # noqa: PLC0415 - cycle
+        from crucible.release_history import read_release_wheel  # noqa: PLC0415 - cycle
 
-        try:
-            wheel = published_wheel_key(self.store, sha)
-        except Exception as exc:  # noqa: BLE001 - reported, never suppressed
-            return None, (
-                f"release {sha} could not be resolved to a published wheel: "
-                f"{type(exc).__name__}: {exc}"
-            )
-        read = _read_store_bytes(self.store, wheel)
-        if read.problem is not None:
+        read = read_release_wheel(self.store, sha)
+        if read.raw is None:
             return None, read.problem
-        if read.absent:
-            return None, f"{wheel} is absent, so what that release declared cannot be read"
+        wheel = f"release {sha}'s wheel"
         try:
-            with zipfile.ZipFile(io.BytesIO(read.raw or b"")) as archive:
+            with zipfile.ZipFile(io.BytesIO(read.raw)) as archive:
                 raw = archive.read(_RELEASE_REGISTRY_MEMBER)
                 slots = _slots_declared_by(archive)
             return _ReleaseFacts(_arc_jobs_declared_by(raw), slots), None
