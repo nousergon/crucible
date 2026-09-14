@@ -28,6 +28,7 @@ from abc import ABC
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from crucible.board import (
     BOARD_CONSOLE_STATE,
@@ -55,6 +56,7 @@ from crucible.console.classify import STATES as COMPONENT_STATES
 from crucible.console.classify import Classification
 from crucible.gate import LADDER_STATES, PHASES, evaluate
 from crucible.keys import acceptance_reading_key, gate_key
+from crucible.models import BoardCurrentDocument
 from crucible.store import LocalStore, Store
 
 ACCEPTANCE_SUITE = (
@@ -782,6 +784,18 @@ class TestTheBoardIsRedOnDayOne:
         assert document["schema_version"] == "board.v1"
         assert len(document["rows"]) == document["row_count"]
 
+    def test_the_payload_round_trips_through_the_typed_document(self, store) -> None:
+        """`alpha-engine-config-I10697`: `board_payload` validates its own
+        output through `BoardCurrentDocument` before writing; this proves the
+        SAME artifact, read back as JSON exactly as `_read_previous_board`
+        reads it, also validates — the shape the next render's `previous`
+        will actually be handed.
+        """
+        document = json.loads(board_payload(build_board(store)))
+        parsed = BoardCurrentDocument.model_validate(document)
+        assert parsed.trading_day == document["trading_day"]
+        assert len(parsed.rows) == document["row_count"]
+
 
 # ── The digest reports deltas ─────────────────────────────────────────────
 
@@ -850,6 +864,19 @@ class TestTheDigestReportsDeltas:
         before = _board(a="MET", b="UNMET").to_dict()
         deltas = board_delta(before, _board(a="UNMET", b="MET"))
         assert {d.id for d in deltas} == {"a", "b"}
+
+    def test_a_row_missing_state_raises_named_rather_than_a_bare_keyerror(self) -> None:
+        """`alpha-engine-config-I10697`: the previous board's `rows` used to
+        be indexed by hand (`row["id"]`, `row["state"]`), so a malformed or
+        older-shape row raised a bare `KeyError` deep inside the list
+        comprehension. Routed through `BoardCurrentDocument`, the same
+        document now raises a named `pydantic.ValidationError` at the
+        boundary, before either field is read.
+        """
+        before = _board(a="UNMET").to_dict()
+        del before["rows"][0]["state"]
+        with pytest.raises(ValidationError, match="state"):
+            board_delta(before, _board(a="MET"))
 
 
 def _refusing_store(tmp_path) -> LocalStore:
@@ -971,28 +998,45 @@ class TestAReplayDoesNotClobberThePointer:
         assert may
 
     def test_a_newer_board_may_move_the_pointer(self) -> None:
-        may, _ = pointer_may_move({"trading_day": "2026-08-28"}, self._board("2026-09-01"))
+        may, _ = pointer_may_move(self._board("2026-08-28").to_dict(), self._board("2026-09-01"))
         assert may
 
     def test_the_same_day_may_move_the_pointer(self) -> None:
         """A same-day re-render is a refresh, not a regression."""
-        may, _ = pointer_may_move({"trading_day": "2026-09-01"}, self._board("2026-09-01"))
+        may, _ = pointer_may_move(self._board("2026-09-01").to_dict(), self._board("2026-09-01"))
         assert may
 
     def test_a_replay_may_not_move_the_pointer_backwards(self) -> None:
-        may, reason = pointer_may_move({"trading_day": "2026-09-01"}, self._board("2026-08-28"))
+        may, reason = pointer_may_move(
+            self._board("2026-09-01").to_dict(), self._board("2026-08-28")
+        )
         assert not may
         assert "2026-09-01" in reason and "2026-08-28" in reason
 
-    def test_an_unreadable_incumbent_does_not_license_a_move(self) -> None:
-        """ "I could not read what is there" is not "what is there is older".
-
-        On a pointer those two want opposite actions, and defaulting to move
-        would let one corrupt read overwrite a good pointer with a replay.
+    def test_a_malformed_incumbent_raises_named_rather_than_moving_or_refusing_silently(
+        self,
+    ) -> None:
+        """`alpha-engine-config-I10697`: a document missing `trading_day` is
+        not "unreadable" (that is `previous is None`, handled above) — it was
+        read fine and is the wrong shape. The old hand-rolled
+        `isinstance`/truthiness check downgraded that to a quiet "refuse to
+        move" `False`; routed through `BoardCurrentDocument` it is now a
+        named `pydantic.ValidationError` naming the missing field, the same
+        boundary every other typed-boundary migration raises at.
         """
-        may, reason = pointer_may_move({"generated_at": "x"}, self._board("2026-08-28"))
-        assert not may
-        assert "no trading_day" in reason
+        incumbent = self._board("2026-08-28").to_dict()
+        del incumbent["trading_day"]
+        with pytest.raises(ValidationError, match="trading_day"):
+            pointer_may_move(incumbent, self._board("2026-08-28"))
+
+    def test_an_unknown_field_on_the_incumbent_raises(self) -> None:
+        """`extra="forbid"`, matching the model's own writer: a key this
+        producer never wrote is an edit somebody made, not a future field to
+        pass through silently."""
+        incumbent = self._board("2026-08-28").to_dict()
+        incumbent["not_a_real_field"] = True
+        with pytest.raises(ValidationError, match="not_a_real_field"):
+            pointer_may_move(incumbent, self._board("2026-08-28"))
 
 
 class TestTheDeclarationsFileItself:
