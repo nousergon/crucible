@@ -1727,3 +1727,69 @@ def test_write_json_swallowing_the_report_path_fails_with_usage(
     result = _run_with_args(report, ratchet, "--write-json")
     assert result.returncode == 1
     assert "usage:" in result.stderr
+
+
+# --- `--tree-only`: the pull_request reading (alpha-engine-config-I10735) ---
+#
+# crucible-PR244 broke four tree-only MET clauses with every PR check green,
+# because the PR path only COLLECTED tests/acceptance. `--tree-only` grades a
+# credential-less run on the PR: it must stay exactly as strict as the main
+# reading on everything the tree decides, and tolerate only what a job with no
+# credential cannot read.
+
+
+def test_tree_only_a_regression_is_red(tmp_path: Path, ratchet: Path) -> None:
+    """The PR244 shape: a MET clause reading plain UNMET fails the PR."""
+    report = _report(tmp_path / "r.xml", met=["T::c"], unmet=["T::a", "T::b"])
+    result = _run_with_args(report, ratchet, "--tree-only")
+    assert result.returncode == 1
+    assert "REGRESSION" in result.stderr
+    assert "T::b" in result.stderr
+
+
+def test_tree_only_a_met_clause_unreadable_without_a_credential_is_green(
+    tmp_path: Path, ratchet: Path
+) -> None:
+    """`TestCost` reads CloudFormation; the PR job holds no credential, so it
+    reads UNMEASURABLE there. The same report WITHOUT `--tree-only` is red —
+    the tolerance exists only in the mode that cannot hold a credential."""
+    report = _report(tmp_path / "r.xml", met=["T::c"], unmet=["T::a"], unmeasurable=["T::b"])
+    tree = _run_with_args(report, ratchet, "--tree-only")
+    assert tree.returncode == 0, tree.stderr
+    assert "T::b" in tree.stdout
+    assert _run(report, ratchet).returncode == 1
+
+
+def test_tree_only_a_regression_beside_a_tolerated_clause_is_still_red(
+    tmp_path: Path, ratchet: Path
+) -> None:
+    """The tolerance for one clause must not license a regression in another."""
+    report = _report(tmp_path / "r.xml", met=[], unmet=["T::a", "T::c"], unmeasurable=["T::b"])
+    result = _run_with_args(report, ratchet, "--tree-only")
+    assert result.returncode == 1
+    assert "REGRESSION" in result.stderr
+    assert "T::c" in result.stderr
+
+
+def test_tree_only_unrecorded_progress_is_red(tmp_path: Path, ratchet: Path) -> None:
+    report = _report(tmp_path / "r.xml", met=["T::a", "T::b", "T::c"], unmet=[])
+    result = _run_with_args(report, ratchet, "--tree-only")
+    assert result.returncode == 1
+    assert "not recorded" in result.stderr
+
+
+def test_tree_only_a_removed_clause_is_red(tmp_path: Path, ratchet: Path) -> None:
+    report = _report(tmp_path / "r.xml", met=["T::b"], unmet=["T::a"])
+    result = _run_with_args(report, ratchet, "--tree-only")
+    assert result.returncode == 1
+    assert "no longer collects" in result.stderr
+
+
+def test_tree_only_refuses_to_publish_a_reading(tmp_path: Path, ratchet: Path) -> None:
+    """A credential-less reading is not the phase gate's reading."""
+    report = _report(tmp_path / "r.xml", met=["T::b", "T::c"], unmet=["T::a"])
+    out = tmp_path / "reading.json"
+    result = _run_with_args(report, ratchet, "--tree-only", "--write-json", str(out))
+    assert result.returncode == 1
+    assert "cannot be combined" in result.stderr
+    assert not out.exists()

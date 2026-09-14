@@ -423,9 +423,26 @@ def main(argv: list[str]) -> int:
             return _fail("--store-versioning requires a value")
         store_versioning = args[idx + 1]
         del args[idx : idx + 2]
+    # `--tree-only` (alpha-engine-config-I10735): the pull_request reading.
+    # The PR job holds NO AWS credential, so a clause whose subject is live
+    # infrastructure reads UNMEASURABLE there by construction — that, and only
+    # that, is tolerated. Everything the tree alone decides stays exactly as
+    # strict as the main reading: collection drift, a MET clause reading plain
+    # UNMET, and unrecorded progress. crucible-PR244 broke four tree-only MET
+    # clauses with every PR check green because nothing executed them before
+    # merge; main then read red for ~23 hours.
+    tree_only = "--tree-only" in args
+    if tree_only:
+        args.remove("--tree-only")
+        if write_json_path is not None:
+            return _fail(
+                "--tree-only cannot be combined with --write-json: a reading taken "
+                "without credentials is not the phase gate's reading and must never "
+                "be published as one."
+            )
     if len(args) != 1:
         return _fail(
-            f"usage: {argv[0]} [--write-json <path>] [--commit <sha>] "
+            f"usage: {argv[0]} [--tree-only] [--write-json <path>] [--commit <sha>] "
             f"[--store-versioning <status>] <junit-xml>"
         )
     reading = read_report(pathlib.Path(args[0]))
@@ -492,6 +509,42 @@ def main(argv: list[str]) -> int:
             + ", ".join(regressed)
             + (f" (and {', '.join(earned)} now passes)" if earned else "")
         )
+    if tree_only:
+        # The ONLY tolerance `--tree-only` grants, and it is not a suppression:
+        # the reading is not published, the main job still grades these
+        # clauses with credentials, and each is named on stdout. A clause
+        # whose read needs a credential cannot be read by a job that holds
+        # none; whether the ratchet's `unmeasurable` bucket or its family
+        # still describes the CREDENTIALED read is the main reading's question.
+        tolerated = sorted(
+            set(turned_unmeasurable) | set(reclassified_to_unmeasurable) | reading.unmeasurable
+        )
+        if earned:
+            return _fail(
+                "clauses now pass that ratchet.json still lists as unmet: "
+                + ", ".join(earned)
+                + ". Progress is not recorded until the ratchet moves with it — drop "
+                "them from `unmet` (and `unmeasurable`, and bump `last_moved`) in the "
+                "PR that earns them."
+            )
+        if reclassified_to_unmet:
+            return _fail(
+                "a clause the ratchet records as unmeasurable now reads plain UNMET "
+                "with no credential at all: "
+                + ", ".join(reclassified_to_unmet)
+                + ". A property the tree decides no longer holds — update "
+                "tests/acceptance/ratchet.json in this PR."
+            )
+        print(
+            "tree-only reading matches the ratchet: no MET clause reads UNMET, no "
+            "clause appeared or vanished"
+            + (
+                f"; unreadable without a credential (graded on main): {', '.join(tolerated)}"
+                if tolerated
+                else ""
+            )
+        )
+        return 0
     if turned_unmeasurable:
         return _fail(
             "a plan §2 objective that was satisfied can no longer be READ: "
