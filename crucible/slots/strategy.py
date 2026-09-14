@@ -2194,13 +2194,12 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     reason they are recorded on the produce manifest: a slot that became
     unservable between the two jobs must page from whichever one ran.
     """
-    from crucible.documents import load_store_document  # noqa: PLC0415 - avoids a cycle
-    from crucible.keys import session_inputs_key  # noqa: PLC0415 - avoids a cycle
     from crucible.slots.cycle import (  # noqa: PLC0415 - avoids a cycle
         MissingArtifactError,
         _read_panel,
         run_grade,
     )
+    from crucible.slots.inputs import resolve_strategy_sessions  # noqa: PLC0415 - avoids a cycle
 
     loaded, specs = _registered_arms(ctx, settings=settings)
     as_of = ctx.trading_day.isoformat()
@@ -2265,39 +2264,27 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             series[spec.arm_id] = ArmSeries(arm_id=spec.arm_id, scores={})
             continue
 
-        resolved = [
-            ResolvedSession.from_dict(
-                load_store_document(ctx.store, session_inputs_key(spec.arm_id, day))
-            )
-            for day in settleable
-        ]
-        universe = _universe_for(resolved, benchmark=recipe.benchmark)
-        if recipe.benchmark not in returns.columns:
-            raise MissingArtifactError(
-                f"arm {recipe.name!r} declares benchmark {recipe.benchmark!r}, which the "
-                f"price panel at {as_of} carries no rows for. S is the one slot graded "
-                "against a market index, so the benchmark's own return is not optional "
-                "and no proxy is substituted for it — grading against a benchmark the "
-                "recipe did not declare inverts wins and losses outright. Compile the "
-                f"panel with {recipe.benchmark!r} in the universe."
-            )
+        # The ONE S-slot input resolution, shared with the trader
+        # (`alpha-engine-config-I10654`): the recorded documents, the universe,
+        # the benchmark check, ADV and the session join all happen inside
+        # `resolve_strategy_sessions`, handed this cycle's already-loaded returns
+        # and shared ADV cache so nothing is re-read per arm.
+        arm_inputs = resolve_strategy_sessions(
+            ctx.store,
+            arm_id=spec.arm_id,
+            benchmark=recipe.benchmark,
+            decision_days=settleable,
+            as_of=as_of,
+            feature_version=feature_version,
+            returns=returns,
+            adv_cache=adv_cache,
+        )
+        resolved = list(arm_inputs.resolved)
+        universe = arm_inputs.universe
+        built = list(arm_inputs.sessions)
         w_initial = np.zeros(len(universe.tickers))
         w_initial[universe.cash_idx] = 1.0
 
-        _adv_by_day(
-            ctx.store,
-            feature_version=feature_version,
-            days=(s.trading_day for s in resolved),
-            cache=adv_cache,
-        )
-        built = _build_sessions(
-            resolved,
-            returns=returns,
-            benchmark=recipe.benchmark,
-            universe=universe,
-            next_session=next_session,
-            adv_by_day=adv_cache,
-        )
         constructed = construct_book(
             recipe=recipe,
             params=params,
