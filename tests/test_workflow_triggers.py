@@ -122,9 +122,10 @@ PR_REACHABLE_JOBS: dict[str, str] = {
         "default base ref), executes no PR-supplied code, and mints a "
         "GitHub App token narrowed with `repositories=['nous-ergon-ops']` "
         "(nousergon-lib-PR388) to read only the trusted ops test module. The "
-        "one piece of PR content it reads — `crucible/components.yaml` — "
-        "arrives over the read-only Contents API as data and is parsed as "
-        "YAML by that trusted test, never executed. "
+        "PR content it reads — `crucible/components.yaml`, `crucible/keys.py` "
+        "and `.github/workflows/` — arrives over the read-only Contents API as "
+        "data and is parsed (YAML, or `ast.parse` for keys.py) by that trusted "
+        "test, never imported or executed. "
         "`test_the_lockstep_pr_job_checks_out_no_pr_head_and_executes_no_pr_supplied_code` "
         "below is the structural guard that a later edit cannot quietly "
         "reintroduce a PR-head checkout or PR-code execution here."
@@ -486,6 +487,45 @@ def test_the_lockstep_pr_job_fetches_components_yaml_as_data_not_via_checkout() 
         assert forbidden not in body, forbidden
 
 
+def test_the_lockstep_pr_job_fetches_keys_py_as_data_not_via_checkout() -> None:
+    """alpha-engine-config-I10708: the store-prefix grant guard grades the PR's
+    `crucible/keys.py`, which reaches the job as DATA only — decoded to a file
+    the ops test reads with `ast.parse`, never imported, piped or executed."""
+    job = _lockstep_pr_job()
+    fetch_steps = [s for s in job.steps if "crucible/keys.py" in s.get("run", "")]
+    assert len(fetch_steps) == 1, fetch_steps
+    body = fetch_steps[0]["run"]
+    assert "repos/nousergon/crucible/contents/crucible/keys.py" in body, body
+    assert "base64 -d > crucible/keys.py" in body, (
+        "the fetched keys.py must be decoded straight to a file, never piped "
+        "into a shell or an interpreter"
+    )
+    for forbidden in ("| bash", "| sh", "| python", "eval ", "import crucible"):
+        assert forbidden not in body, forbidden
+
+
+@pytest.mark.parametrize(
+    "job_name", ["crucible-dispatch-lockstep", "crucible-dispatch-lockstep-pr"]
+)
+def test_both_lockstep_jobs_run_the_store_prefix_grant_guard(job_name: str) -> None:
+    """alpha-engine-config-I10708: the prefix-grant contract ran only in
+    nous-ergon-ops CI, so `backfills/` (crucible-PR272) and `arm_predictions/`
+    (I10694) each merged here ungranted and died AccessDenied on the first box
+    job. Both paths — the PR (before merge) and push-to-main (backstop) — must
+    invoke the ops test module itself, never a restated copy of its extractor."""
+    job = Workflow.load(WORKFLOW_DIR / "dispatch-lockstep.yml").jobs[job_name]
+    guard_steps = [
+        s
+        for s in job.steps
+        if "tests/crossrepo/test_crucible_store_prefix_grants.py" in s.get("run", "")
+    ]
+    assert len(guard_steps) == 1, guard_steps
+    step = guard_steps[0]
+    assert "cd nous-ergon-ops-checkout" in step["run"], step["run"]
+    assert "pytest" in step["run"], step["run"]
+    assert step.get("env", {}).get("CRUCIBLE_ROOT") == "${{ github.workspace }}", step
+
+
 def test_the_lockstep_pr_job_mints_a_token_narrowed_to_nous_ergon_ops() -> None:
     job = _lockstep_pr_job()
     mint_steps = [s for s in job.steps if "installation_token(" in s.get("run", "")]
@@ -552,6 +592,8 @@ done
 case "$url" in
   repos/nousergon/crucible/contents/crucible/components.yaml\?ref=*)
     cat "$FAKE_COMPONENTS_B64" ;;
+  repos/nousergon/crucible/contents/crucible/keys.py\?ref=*)
+    cat "$FAKE_KEYS_B64" ;;
   repos/nousergon/crucible/contents/.github/workflows\?ref=*)
     cat "$FAKE_LISTING" ;;
   repos/nousergon/crucible/contents/.github/workflows/*\?ref=*)
@@ -635,6 +677,42 @@ def _run_pr_job_data_fetch(
         )
     assert result is not None
     return result
+
+
+def test_the_lockstep_pr_job_grades_the_prs_keys_py_not_mains(tmp_path: pathlib.Path) -> None:
+    """alpha-engine-config-I10708, the mutation case: a PR head whose keys.py
+    declares a NEW store prefix must be the keys.py on disk when the prefix
+    grant guard runs. Were the base copy graded instead, the guard would pass
+    the PR and go red only on main after the merge — too late, the gap this
+    issue closes. Runs the real `run:` body against a fake Contents API."""
+    base_keys = 'def run_key(job):\n    return f"runs/{job}/run.json"\n'
+    head_keys = base_keys + (
+        '\n\ndef ungranted_key(day):\n    return f"brand_new_prefix/{day}.json"\n'
+    )
+    (tmp_path / "crucible").mkdir()
+    (tmp_path / "crucible" / "keys.py").write_text(base_keys)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gh").write_text(_FAKE_GH_CONTENTS_API)
+    (bin_dir / "gh").chmod(0o755)
+    keys_fixture = tmp_path / "keys.b64"
+    keys_fixture.write_text(_b64(head_keys))
+    result = subprocess.run(
+        ["bash", "-c", _pr_job_step("Fetch the PR's keys.py as data")],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "GH_TOKEN": "fake-token",
+            "HEAD_SHA": "d" * 40,
+            "FAKE_KEYS_B64": str(keys_fixture),
+        },
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    graded = (tmp_path / "crucible" / "keys.py").read_text()
+    assert graded == head_keys, "the guard must grade the PR's keys.py, not main's"
+    assert 'f"brand_new_prefix/' in graded
 
 
 _BASE_BOARD_YML = "name: Board\non:\n  workflow_dispatch:\n"
