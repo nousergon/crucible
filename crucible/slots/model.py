@@ -868,7 +868,71 @@ def assert_units_suffixes(columns: tuple[str, ...]) -> None:
 # The recipe — the immutable unit (policy §3.1).
 # ---------------------------------------------------------------------------
 
-_ESTIMATORS: tuple[str, ...] = ("ridge", "ols")
+_ESTIMATORS: tuple[str, ...] = ("ridge", "ols", "bayesian_ridge", "fixed_linear", "lightgbm")
+
+#: `{kind: (required params, optional params)}`, exhaustive over
+#: :data:`_ESTIMATORS` (`alpha-engine-config-I10695`). A parameter outside a
+#: kind's set is refused at construction: a key the fitter never reads is a
+#: recipe describing a fit that did not happen, and LightGBM in particular
+#: accepts and silently ignores a misspelled parameter.
+#:
+#: Defaults below are LIBRARY defaults (LightGBM's and scikit-learn's
+#: `BayesianRidge`'s), never tuned values — those live in the private
+#: `alpha-engine-config/strategy/` recipes.
+_ESTIMATOR_PARAMS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "ridge": (frozenset(), frozenset({"alpha"})),
+    "ols": (frozenset(), frozenset()),
+    "bayesian_ridge": (
+        frozenset(),
+        frozenset({"max_iter", "tol", "alpha_1", "alpha_2", "lambda_1", "lambda_2"}),
+    ),
+    "fixed_linear": (frozenset({"weights"}), frozenset({"intercept"})),
+    "lightgbm": (
+        frozenset({"num_boost_round", "seed"}),
+        frozenset(
+            {
+                "objective",
+                "num_leaves",
+                "max_depth",
+                "min_child_samples",
+                "learning_rate",
+                "feature_fraction",
+                "bagging_fraction",
+                "bagging_freq",
+                "lambda_l1",
+                "lambda_l2",
+                "min_split_gain",
+                "max_bin",
+            }
+        ),
+    ),
+}
+
+#: LightGBM parameters the HARNESS sets and a recipe may not. Each one is what
+#: makes a refit reproducible byte for byte (plan §9.1): one thread, the
+#: deterministic code path, row-wise histograms, and every internal seed
+#: derived from the recipe's one declared `seed`.
+_LIGHTGBM_HARNESS_PARAMS: frozenset[str] = frozenset(
+    {
+        "num_threads",
+        "deterministic",
+        "force_row_wise",
+        "force_col_wise",
+        "bagging_seed",
+        "feature_fraction_seed",
+        "data_random_seed",
+        "drop_seed",
+        "extra_seed",
+        "objective_seed",
+        "verbosity",
+    }
+)
+
+#: The regression objectives an M arm may declare. Each predicts a conditional
+#: location of the label, which is what the slot grades; a ranking or
+#: classification objective would produce a score on a different scale from
+#: the one `grade_arm` and the stacked-input contract consume.
+_LIGHTGBM_OBJECTIVES: frozenset[str] = frozenset({"regression", "regression_l1", "huber"})
 
 
 @dataclass(frozen=True)
@@ -885,6 +949,48 @@ class EstimatorSpec:
                 "An estimator resolved by name at runtime rather than from this closed "
                 "set is an arm whose recipe does not describe what it fits."
             )
+        required, optional = _ESTIMATOR_PARAMS[self.kind]
+        declared = set(self.params)
+        harness_owned = sorted(declared & _LIGHTGBM_HARNESS_PARAMS)
+        if self.kind == "lightgbm" and harness_owned:
+            raise ValueError(
+                f"estimator 'lightgbm' declares harness-owned parameter(s) {harness_owned}. "
+                "Threads, the deterministic path and the derived seeds are fixed by the "
+                "harness so a replayed date refits to the same trees; a recipe that could "
+                "set them could declare a fit no rerun reproduces."
+            )
+        missing = sorted(required - declared)
+        if missing:
+            raise ValueError(
+                f"estimator {self.kind!r} requires parameter(s) {missing}; declared "
+                f"{sorted(declared)}."
+            )
+        unknown = sorted(declared - required - optional)
+        if unknown:
+            raise ValueError(
+                f"estimator {self.kind!r} does not read parameter(s) {unknown}; it reads "
+                f"{sorted(required | optional)}. A parameter the fitter ignores is a recipe "
+                "describing a fit that did not happen."
+            )
+        if self.kind == "lightgbm":
+            rounds = self.params["num_boost_round"]
+            if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 1:
+                raise ValueError(f"lightgbm num_boost_round must be an int >= 1; got {rounds!r}")
+            seed = self.params["seed"]
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise ValueError(f"lightgbm seed must be an int; got {seed!r}")
+            objective = self.params.get("objective", "regression")
+            if objective not in _LIGHTGBM_OBJECTIVES:
+                raise ValueError(
+                    f"lightgbm objective {objective!r} is not one of {sorted(_LIGHTGBM_OBJECTIVES)}"
+                )
+        if self.kind == "fixed_linear":
+            weights = self.params["weights"]
+            if not isinstance(weights, dict) or not weights:
+                raise ValueError(
+                    "fixed_linear weights must be a non-empty {column: weight} mapping; "
+                    f"got {weights!r}"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": self.kind, "params": dict(self.params)}
@@ -962,6 +1068,14 @@ class ModelRecipe:
     #: of the harness. It is read here, defaulted here, and set in
     #: `alpha-engine-config/strategy/`.
     max_incomplete_row_ratio: float | None = None
+    #: What the arm is FITTED to (`alpha-engine-config-I10695`). `None` is the
+    #: slot's forward return, which every arm is graded against; the one
+    #: alternative, `abs_forward_return`, is a MAGNITUDE head — v1's volatility
+    #: L1, whose output is a stacked input and never a directional ranking.
+    #: Grading is unchanged by this field: it scores every arm against the
+    #: signed forward return, so a magnitude head cannot win the slot on the
+    #: strength of predicting how far a name moves.
+    target: str | None = None
     supersedes: str | None = None
     slot: str = "m"
     #: Where these bytes were read from — a checkout path or a store key.
@@ -992,6 +1106,19 @@ class ModelRecipe:
                 "collinear, and the normal equations answer it with an arbitrary split of "
                 "one coefficient across two."
             )
+        if self.target is not None and self.target not in TARGETS:
+            raise ValueError(
+                f"arm {self.name!r}: target={self.target!r} is not one of {list(TARGETS)}"
+            )
+        if self.estimator.kind == "fixed_linear":
+            weighted = set(self.estimator.params["weights"])
+            if weighted != set(self.design_columns):
+                raise ValueError(
+                    f"arm {self.name!r}: fixed_linear weights name {sorted(weighted)} but the "
+                    f"design columns are {sorted(self.design_columns)}. A column with no "
+                    "weight, or a weight on a column the arm does not read, is a formula "
+                    "the recipe does not describe."
+                )
         if self.label_horizon_trading_days < 1:
             raise ValueError("label_horizon_trading_days must be >= 1 (trading days, §4.12)")
         if self.refit_cadence_trading_days < 1:
@@ -1075,6 +1202,10 @@ class ModelRecipe:
             # what the arm is, so changing it is a different arm — but an arm
             # that declares none keeps the id it registered under.
             payload["max_incomplete_row_ratio"] = float(self.max_incomplete_row_ratio)
+        if self.target is not None:
+            # Same rule again: an arm fitted to the forward return keeps the
+            # id it registered under before this field existed.
+            payload["target"] = self.target
         return payload
 
     @property
@@ -1107,7 +1238,7 @@ REQUIRED_RECIPE_FIELDS: tuple[str, ...] = (
 #: ignored nowhere: it is a guarantee the loader cannot honour, and the
 #: loader refuses it by name.
 M_SPEC_KEYS: frozenset[str] = frozenset(
-    {*REQUIRED_RECIPE_FIELDS, "inputs", "max_incomplete_row_ratio"}
+    {*REQUIRED_RECIPE_FIELDS, "inputs", "max_incomplete_row_ratio", "target"}
 )
 
 #: Every top-level key a filed M recipe may declare (`alpha-engine-config-
@@ -1264,6 +1395,7 @@ def _parse_model_recipe(payload: bytes, origin: str) -> ModelRecipe:
             if spec.get("max_incomplete_row_ratio") is None
             else float(spec["max_incomplete_row_ratio"])
         ),
+        target=None if spec.get("target") is None else str(spec["target"]),
         supersedes=document.get("supersedes"),
         source_key=origin,
     )
@@ -1464,8 +1596,7 @@ class Fit:
 
     arm_id: str
     recipe: ModelRecipe
-    coefficients: np.ndarray
-    intercept: float
+    fitted: FittedEstimator
     fitted_at: str
     n_rows: int
     training_status: TrainingStatus
@@ -1477,6 +1608,26 @@ class Fit:
     #: function would have to be optional and would then be absent exactly
     #: where it mattered.
     completeness: FeatureCompleteness | None = None
+
+    @property
+    def coefficients(self) -> np.ndarray:
+        """The linear weights, for a linear estimator only."""
+        if self.fitted.coefficients is None:
+            raise AttributeError(
+                f"arm {self.recipe.name!r} is fitted by {self.fitted.kind!r}, which has no "
+                "coefficient vector; read `fit.fitted` instead"
+            )
+        return self.fitted.coefficients
+
+    @property
+    def intercept(self) -> float:
+        """The linear intercept, for a linear estimator only."""
+        if self.fitted.coefficients is None:
+            raise AttributeError(
+                f"arm {self.recipe.name!r} is fitted by {self.fitted.kind!r}, which has no "
+                "intercept; read `fit.fitted` instead"
+            )
+        return self.fitted.intercept
 
 
 def _design(recipe: ModelRecipe, panel: FeaturePanel, rows: np.ndarray) -> np.ndarray:
@@ -1781,7 +1932,7 @@ def settled_training_days(panel: FeaturePanel, *, as_of: str, label_horizon: int
 
 def _fit_rows(
     recipe: ModelRecipe, panel: FeaturePanel, day_indices: list[int]
-) -> tuple[np.ndarray, float, int, FeatureCompleteness]:
+) -> tuple[FittedEstimator, int, FeatureCompleteness]:
     """Fit the recipe on the named panel days. Raises on an unsound fit.
 
     One implementation, three callers — :func:`train_arm`, :func:`_fold_ic`
@@ -1817,10 +1968,12 @@ def _fit_rows(
         )
     matrix = matrix[complete]
     labels = labels[complete]
+    if recipe.target == "abs_forward_return":
+        labels = np.abs(labels)
 
     _assert_trainable(recipe, matrix, labels)
-    coefficients, intercept = _fit_linear(recipe.estimator, matrix, labels)
-    return coefficients, intercept, int(matrix.shape[0]), record
+    fitted = _fit_estimator(recipe, matrix, labels)
+    return fitted, int(matrix.shape[0]), record
 
 
 def train_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> Fit:
@@ -1851,12 +2004,11 @@ def train_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> Fit:
     if recipe.training_window.kind == "rolling":
         usable = usable[-recipe.training_window.min_trading_days :]
 
-    coefficients, intercept, n_rows, completeness = _fit_rows(recipe, panel, usable)
+    fitted, n_rows, completeness = _fit_rows(recipe, panel, usable)
     return Fit(
         arm_id=recipe.arm_id,
         recipe=recipe,
-        coefficients=coefficients,
-        intercept=intercept,
+        fitted=fitted,
         fitted_at=as_of,
         n_rows=n_rows,
         training_status=TrainingStatus(arm_id=recipe.arm_id, ok=True),
@@ -1910,7 +2062,7 @@ def score_cross_section(
             "graded against."
         )
 
-    values = matrix @ fit.coefficients + fit.intercept
+    values = fit.fitted.predict(matrix)
     unscored = [
         n
         for n, v, ok in zip(panel.names, values, scorable, strict=True)
@@ -1955,6 +2107,154 @@ def produce_arm_predictions(ctx: Any, *, fit: Fit, panel: FeaturePanel, trading_
         feature_version=panel.feature_version,
         predicted_alpha=predict_cross_section(fit, panel, trading_day=trading_day),
     )
+
+
+#: The fit targets a recipe may declare. `None` on the recipe means the first.
+TARGETS: tuple[str, ...] = ("forward_return", "abs_forward_return")
+
+
+@dataclass(frozen=True)
+class FittedEstimator:
+    """One fitted estimator: the thing a design matrix is scored through.
+
+    Linear kinds carry `coefficients`/`intercept`; `lightgbm` carries its
+    booster. ONE `predict`, called by the serving path, the CPCV folds and the
+    walk-forward grader alike, so no caller multiplies weights by hand and a
+    non-linear kind cannot be scored by code that assumes a linear one.
+    """
+
+    kind: str
+    coefficients: np.ndarray | None = None
+    intercept: float = 0.0
+    booster: Any = None
+
+    def predict(self, matrix: np.ndarray) -> np.ndarray:
+        if self.kind == "lightgbm":
+            # One thread at predict time as at fit time: a tree ensemble's
+            # prediction is a sum, and the harness does not let a thread count
+            # choose the order floating-point terms are added in.
+            return np.asarray(self.booster.predict(matrix, num_threads=1), dtype="float64")
+        return matrix @ self.coefficients + self.intercept
+
+
+def _fit_estimator(recipe: ModelRecipe, matrix: np.ndarray, labels: np.ndarray) -> FittedEstimator:
+    """Dispatch on the recipe's closed estimator vocabulary."""
+    estimator = recipe.estimator
+    if estimator.kind in ("ridge", "ols"):
+        coefficients, intercept = _fit_linear(estimator, matrix, labels)
+        return FittedEstimator(kind=estimator.kind, coefficients=coefficients, intercept=intercept)
+    if estimator.kind == "bayesian_ridge":
+        coefficients, intercept = _fit_bayesian_ridge(recipe, matrix, labels)
+        return FittedEstimator(kind=estimator.kind, coefficients=coefficients, intercept=intercept)
+    if estimator.kind == "fixed_linear":
+        weights = estimator.params["weights"]
+        return FittedEstimator(
+            kind=estimator.kind,
+            coefficients=np.array([float(weights[c]) for c in recipe.design_columns]),
+            intercept=float(estimator.params.get("intercept", 0.0)),
+        )
+    # `EstimatorSpec` refuses any kind outside `_ESTIMATORS` at construction,
+    # so the one kind left is `lightgbm`; `test_every_estimator_kind_has_a_fitter`
+    # fails the moment a kind is added to the vocabulary without a branch here.
+    return FittedEstimator(kind="lightgbm", booster=_fit_lightgbm(estimator, matrix, labels))
+
+
+def _fit_lightgbm(estimator: EstimatorSpec, matrix: np.ndarray, labels: np.ndarray) -> Any:
+    """A gradient-boosted tree ensemble, deterministic by construction.
+
+    A FIXED number of rounds, no early stopping. Early stopping needs a
+    validation block carved out of the training rows, and inside a walk-forward
+    fit that block must itself be purged by the label horizon or the stopping
+    round is chosen on labels that overlap the training rows. A declared round
+    count is the pre-registered form: the recipe says how many trees, and every
+    refit, fold and replay grows exactly that many.
+
+    Imported here rather than at module load so the U and R slots, which never
+    fit a tree, do not pay for the native library on cold start.
+    """
+    import lightgbm  # noqa: PLC0415
+
+    params = {k: v for k, v in estimator.params.items() if k != "num_boost_round"}
+    seed = int(params["seed"])
+    params.setdefault("objective", "regression")
+    params.update(
+        {
+            "num_threads": 1,
+            "deterministic": True,
+            "force_row_wise": True,
+            "bagging_seed": seed,
+            "feature_fraction_seed": seed,
+            "data_random_seed": seed,
+            "drop_seed": seed,
+            "extra_seed": seed,
+            "objective_seed": seed,
+            "verbosity": -1,
+        }
+    )
+    dataset = lightgbm.Dataset(matrix, label=labels, params=params, free_raw_data=True)
+    return lightgbm.train(params, dataset, num_boost_round=int(estimator.params["num_boost_round"]))
+
+
+def _fit_bayesian_ridge(
+    recipe: ModelRecipe, matrix: np.ndarray, labels: np.ndarray
+) -> tuple[np.ndarray, float]:
+    """Bayesian ridge by evidence maximisation (MacKay), centred.
+
+    The algorithm and the defaults are scikit-learn's `BayesianRidge` — the
+    estimator v1's `v3.0-meta` L2 stacker is fitted with
+    (`crucible-predictor/model/meta_model.py`) — written out over one SVD
+    rather than imported, because this module depends on numpy alone. The
+    precision of the weights (`lambda`) and of the noise (`alpha`) are
+    re-estimated until the coefficients stop moving; the penalty is therefore
+    learned from the training block rather than declared.
+
+    **Non-convergence raises.** The iteration's result at `max_iter` is a
+    ridge fit at whatever penalty it had reached, which is a model nobody
+    declared; the fit fails rather than serving it.
+    """
+    params = recipe.estimator.params
+    max_iter = int(params.get("max_iter", 300))
+    tol = float(params.get("tol", 1.0e-3))
+    alpha_1 = float(params.get("alpha_1", 1.0e-6))
+    alpha_2 = float(params.get("alpha_2", 1.0e-6))
+    lambda_1 = float(params.get("lambda_1", 1.0e-6))
+    lambda_2 = float(params.get("lambda_2", 1.0e-6))
+
+    centre = matrix.mean(axis=0)
+    centred = matrix - centre
+    label_mean = float(labels.mean())
+    target = labels - label_mean
+    n_samples = centred.shape[0]
+
+    _, singular, vt = np.linalg.svd(centred, full_matrices=False)
+    eigen = singular**2
+    xty = centred.T @ target
+    alpha = 1.0 / (float(np.var(target)) + float(np.finfo(np.float64).eps))
+    lam = 1.0
+
+    def _coefficients(alpha: float, lam: float) -> np.ndarray:
+        return vt.T @ ((vt @ xty) / (eigen + lam / alpha))
+
+    previous: np.ndarray | None = None
+    converged = False
+    for _ in range(max_iter):
+        coefficients = _coefficients(alpha, lam)
+        residual = float(np.sum((target - centred @ coefficients) ** 2))
+        gamma = float(np.sum((alpha * eigen) / (lam + alpha * eigen)))
+        lam = (gamma + 2.0 * lambda_1) / (float(np.sum(coefficients**2)) + 2.0 * lambda_2)
+        alpha = (n_samples - gamma + 2.0 * alpha_1) / (residual + 2.0 * alpha_2)
+        if previous is not None and float(np.sum(np.abs(previous - coefficients))) < tol:
+            converged = True
+            break
+        previous = coefficients
+    if not converged:
+        raise TrainingIntegrityError(
+            f"arm {recipe.name}: bayesian_ridge did not converge in {max_iter} iteration(s) "
+            f"(tol {tol}). The coefficients at the last iteration are a ridge fit at a "
+            "penalty the evidence never settled on — a model nobody declared."
+        )
+    coefficients = _coefficients(alpha, lam)
+    return coefficients, label_mean - float(centre @ coefficients)
 
 
 def _fit_linear(
@@ -2138,9 +2438,9 @@ def _fold_ic(
 ) -> float | None:
     """One fold's out-of-sample rank IC, or ``None`` when it cannot be ranked."""
     n_names = len(panel.names)
-    coefficients, intercept, _, _ = _fit_rows(recipe, panel, [int(i) for i in train_idx])
+    fitted, _, _ = _fit_rows(recipe, panel, [int(i) for i in train_idx])
     test_rows = _flatten(test_idx, n_names)
-    predicted = _design(recipe, panel, test_rows) @ coefficients + intercept
+    predicted = fitted.predict(_design(recipe, panel, test_rows))
     actual = panel.forward_returns.reshape(-1)[test_rows]
     return _rank_ic(predicted, actual)
 
@@ -2438,8 +2738,7 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
     in_sample_n = 0
     scores: dict[str, float] = {}
     unrankable: list[str] = []
-    coefficients: np.ndarray | None = None
-    intercept = 0.0
+    fitted: FittedEstimator | None = None
     last_refit: int | None = None
 
     for i in scorable:
@@ -2453,11 +2752,11 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
             # is what makes "OOS N = 4" legible beside "panel N = 160".
             in_sample_n += 1
             continue
-        if coefficients is None or last_refit is None or (i - last_refit) >= cadence:
-            coefficients, intercept, _, _ = _fit_rows(recipe, panel, train_days)
+        if fitted is None or last_refit is None or (i - last_refit) >= cadence:
+            fitted, _, _ = _fit_rows(recipe, panel, train_days)
             last_refit = i
         rows = i * n_names + np.arange(n_names)
-        predicted = _design(recipe, panel, rows) @ coefficients + intercept
+        predicted = fitted.predict(_design(recipe, panel, rows))
         actual = panel.forward_returns.reshape(-1)[rows]
         if i in realized_by_as_of:
             # Demeaned per date: M's benchmark is the cross-section it scored

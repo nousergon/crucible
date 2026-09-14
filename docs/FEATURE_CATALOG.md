@@ -71,6 +71,11 @@ below changes, and is recorded here as an illustration rather than a pin.
 | `residual_momentum_252d_skip21d_zscore` | zscore | — | yes | `zscore(residual_momentum_252d_skip21d_ratio)` | `residual_momentum_252d_skip21d_ratio`, `liquidity_pass_raw` |
 | `momentum_change_21d_log_return` | log_return | 42 | no | `sum(return_1d_log_return, 21) - sum(return_1d_log_return, 21).shift(21)` | `return_1d_log_return` |
 | `momentum_change_21d_zscore` | zscore | — | yes | `zscore(momentum_change_21d_log_return)` | `momentum_change_21d_log_return`, `liquidity_pass_raw` |
+| `momentum_5d_log_return` | log_return | 5 | no | `log(close) - log(close).shift(5)` | `close_raw` |
+| `atr_14_ratio` | ratio | 14 | no | `mean(max(high - low, |high - close.shift(1)|, |low - close.shift(1)|), 14) / close` | `high_raw`, `low_raw`, `close_raw` |
+| `vol_ratio_10_60_ratio` | ratio | 60 | no | `std(return_1d_log_return, 10) / std(return_1d_log_return, 60)` | `return_1d_log_return` |
+| `dist_from_52w_high_ratio` | ratio | 252 | no | `close / max(close, 252) - 1` | `close_raw` |
+| `dist_from_52w_low_ratio` | ratio | 252 | no | `close / min(close, 252) - 1` | `close_raw` |
 <!-- END GENERATED CATALOG TABLE -->
 
 ## Adding a column

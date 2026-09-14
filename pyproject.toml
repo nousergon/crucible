@@ -94,6 +94,7 @@ dependencies = [
     # used here (put_object/head_object/get_paginator, IfMatch/IfNoneMatch)
     # is stable, so a pin would be a weekly Dependabot PR buying nothing.
     "boto3>=1.43.89",
+    "lightgbm>=4.7.0",
 ]
 
 [project.optional-dependencies]

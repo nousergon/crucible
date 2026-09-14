@@ -128,6 +128,16 @@ SMA_LONG_WINDOW_TRADING_DAYS = 200
 #: Wilder's RSI window.
 RSI_WINDOW_TRADING_DAYS = 14
 
+#: The v3.0-meta L1 input windows (alpha-engine-config-I10695), lifted from
+#: v1's `crucible-predictor/config/predictor.sample.yaml::features`
+#: (`momentum_short`, `atr_period`, `vol_short_window`, `vol_long_window`) and
+#: `nousergon-data/features/feature_engineer.py` (the 252-session year).
+MOMENTUM_SHORT_WINDOW_TRADING_DAYS = 5
+ATR_WINDOW_TRADING_DAYS = 14
+VOL_RATIO_SHORT_WINDOW_TRADING_DAYS = 10
+VOL_RATIO_LONG_WINDOW_TRADING_DAYS = 60
+FIFTY_TWO_WEEK_WINDOW_TRADING_DAYS = 252
+
 #: Guards the information-ratio division. v1's `_EPS`, carried across so the
 #: two implementations do not disagree on a near-zero denominator.
 _EPS = 1e-8
@@ -204,6 +214,15 @@ def catalog_column_depths() -> dict[str, int]:
         "residual_vol_20d_ratio": residual_vol,
         "residual_momentum_252d_skip21d_ratio": _RESIDUAL_MOMENTUM_DEPTH_TRADING_DAYS,
         "momentum_change_21d_log_return": momentum_change,
+        "momentum_5d_log_return": MOMENTUM_SHORT_WINDOW_TRADING_DAYS + 1,
+        # A true range needs the PRIOR close, so the first one is on a
+        # ticker's second session; the mean then consumes the window of them.
+        "atr_14_ratio": ATR_WINDOW_TRADING_DAYS + 1,
+        "vol_ratio_10_60_ratio": _RETURN_DEPTH_TRADING_DAYS
+        - 1
+        + VOL_RATIO_LONG_WINDOW_TRADING_DAYS,
+        "dist_from_52w_high_ratio": FIFTY_TWO_WEEK_WINDOW_TRADING_DAYS,
+        "dist_from_52w_low_ratio": FIFTY_TWO_WEEK_WINDOW_TRADING_DAYS,
     }
     depths["momentum_20d_zscore"] = depths["momentum_20d_log_return"]
     depths["return_60d_zscore"] = depths["return_60d_log_return"]
@@ -338,6 +357,54 @@ def build_features(
         )
         / 100.0
     )
+
+    # -- the v3.0-meta L1 inputs (alpha-engine-config-I10695) --------------
+    frame["momentum_5d_log_return"] = log_grouped.diff(MOMENTUM_SHORT_WINDOW_TRADING_DAYS)
+
+    # `np.maximum` propagates a null rather than skipping it, so a ticker's
+    # first session (no prior close) has no true range instead of a partial
+    # one computed from high - low alone.
+    prior_close = grouped.shift(1)
+    frame["_true_range"] = np.maximum(
+        np.maximum(frame["high_raw"] - frame["low_raw"], (frame["high_raw"] - prior_close).abs()),
+        (frame["low_raw"] - prior_close).abs(),
+    )
+    frame["atr_14_ratio"] = (
+        frame.groupby("ticker", sort=False)["_true_range"].transform(
+            lambda s: s.rolling(ATR_WINDOW_TRADING_DAYS, min_periods=ATR_WINDOW_TRADING_DAYS).mean()
+        )
+        / frame["close_raw"]
+    )
+
+    returns_by_ticker = frame.groupby("ticker", sort=False)["return_1d_log_return"]
+    short_vol = returns_by_ticker.transform(
+        lambda s: s.rolling(
+            VOL_RATIO_SHORT_WINDOW_TRADING_DAYS, min_periods=VOL_RATIO_SHORT_WINDOW_TRADING_DAYS
+        ).std(ddof=1)
+    )
+    long_vol = returns_by_ticker.transform(
+        lambda s: s.rolling(
+            VOL_RATIO_LONG_WINDOW_TRADING_DAYS, min_periods=VOL_RATIO_LONG_WINDOW_TRADING_DAYS
+        ).std(ddof=1)
+    )
+    # A zero long-window volatility is an unmeasurable ratio, not a ratio of
+    # one — v1's `fillna(1.0)` is the substituted constant this layer refuses.
+    frame["vol_ratio_10_60_ratio"] = short_vol / long_vol.where(long_vol > 0)
+
+    rolling_high = grouped.transform(
+        lambda s: s.rolling(
+            FIFTY_TWO_WEEK_WINDOW_TRADING_DAYS, min_periods=FIFTY_TWO_WEEK_WINDOW_TRADING_DAYS
+        ).max()
+    )
+    rolling_low = grouped.transform(
+        lambda s: s.rolling(
+            FIFTY_TWO_WEEK_WINDOW_TRADING_DAYS, min_periods=FIFTY_TWO_WEEK_WINDOW_TRADING_DAYS
+        ).min()
+    )
+    frame["dist_from_52w_high_ratio"] = (
+        frame["close_raw"] / rolling_high.where(rolling_high > 0) - 1.0
+    )
+    frame["dist_from_52w_low_ratio"] = frame["close_raw"] / rolling_low.where(rolling_low > 0) - 1.0
 
     notional = frame["close_raw"] * frame["volume_raw"]
     frame["_notional"] = notional
