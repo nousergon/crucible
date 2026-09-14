@@ -51,7 +51,9 @@ __all__ = [
     "REVIEWER_PATTERN",
     "RUNS_ROOT",
     "TRADER_EVIDENCE_KEY",
+    "TRADER_EXECUTION_SHORTFALL_PREFIX",
     "TRADER_PIN_KEY",
+    "TRADER_SHADOW_BOOKS_PREFIX",
     "TRIGGER_RE",
     "TRIGGER_UNKNOWN",
     "acceptance_reading_key",
@@ -77,6 +79,7 @@ __all__ = [
     "dispatch_prefix",
     "drift_input_key",
     "drift_metrics_key",
+    "execution_shortfall_key",
     "experiments_key",
     "experiments_prefix",
     "fault_injection_key",
@@ -114,6 +117,7 @@ __all__ = [
     "review_prefix",
     "runs_prefix",
     "session_inputs_key",
+    "shadow_books_key",
     "shadow_key",
     "signals_key",
     "strategy_arm_key",
@@ -1189,6 +1193,40 @@ TRADER_PIN_KEY = "trader/release_pin"
 #: the spot-box runtime role's PutObject grants from — granting the box a
 #: write on the one prefix it must not have.
 TRADER_EVIDENCE_KEY = "trader/evidence.json"
+
+#: The trader's per-session execution-shortfall artifact (`execution_shortfall.v1`,
+#: `alpha-engine-config-I10652`) and its per-session shadow books
+#: (`shadow_books.v1`, `alpha-engine-config-I10653`). Under `trader/` beside
+#: :data:`TRADER_EVIDENCE_KEY` for the same reason: artifacts the trader AGREED
+#: to write, written under its own identity, read by the harness
+#: (`crucible.execution`). The shadow BOOK is deliberately not under
+#: `experiments/` — :func:`shadow_key` there is an arm's grading SELECTION, a
+#: different object, and two shapes sharing one word under one prefix is how
+#: `predictions/` once held two artifacts distinguishable only by path depth.
+TRADER_EXECUTION_SHORTFALL_PREFIX = "trader/execution_shortfall/"
+TRADER_SHADOW_BOOKS_PREFIX = "trader/shadow_books/"
+
+
+def _require_iso_day(trading_day: str) -> None:
+    try:
+        dt.date.fromisoformat(trading_day)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"trading_day {trading_day!r} is not an ISO calendar date; a key built from it "
+            "would orphan the artifact under a path no reader lists (§4.12)"
+        ) from exc
+
+
+def execution_shortfall_key(trading_day: str) -> str:
+    """One session's `execution_shortfall.v1` document, written by the trader."""
+    _require_iso_day(trading_day)
+    return f"trader/execution_shortfall/{trading_day}.json"
+
+
+def shadow_books_key(trading_day: str) -> str:
+    """One session's `shadow_books.v1` document, written by the trader."""
+    _require_iso_day(trading_day)
+    return f"trader/shadow_books/{trading_day}.json"
 
 
 def board_key(trading_day: str) -> str:

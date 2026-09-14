@@ -1,0 +1,220 @@
+{
+  "$id": "https://github.com/nousergon/crucible/schemas/shadow_books.v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "shadow_books.v1",
+  "description": "One trading session's simulated paper book per ACTIVE registered arm, written by the trader (`nousergon/crucible-trader`) at `crucible.execution.shadow_books_key(trading_day)` (plan §10.6 row 6; `alpha-engine-config-I10653`). Fills at close, constructed by `crucible.slots.strategy.construct_book` and charged by the arm's own `crucible.portfolio.CostModel` — the same engine and charge the S grade applies. NOT `crucible.keys.shadow_key` (an arm's grading-cycle SELECTION); the distinct `trader/shadow_books/` prefix keeps the two objects from sharing a key shape. Cross-field rules JSON Schema cannot state (every active arm carries exactly one book; cost_model is a registered model with exactly its declared parameters; net = gross − cost; sessions = len(days_advanced); one metric per advanced book equal to its cumulative return) are enforced by `crucible.execution.validate_shadow_books`. Evidence only: shadow books are not a promotion input in phase 4.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "trading_day",
+    "calendar_date",
+    "fill_basis",
+    "slot",
+    "active_arms",
+    "books",
+    "metrics"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "shadow_books.v1"
+    },
+    "trading_day": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "calendar_date": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "fill_basis": {
+      "const": "close",
+      "description": "Every simulated fill is at the session close."
+    },
+    "slot": {
+      "enum": [
+        "u",
+        "r",
+        "m",
+        "s"
+      ],
+      "description": "The register the active arms were read from."
+    },
+    "active_arms": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "The register's active arms AS THE TRADER READ THEM for this session. An active arm with no book is a finding, never a silent exclusion (alpha-engine-config-I10636)."
+    },
+    "books": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Book"
+      }
+    },
+    "metrics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "name",
+          "module",
+          "metric_type",
+          "n_floor",
+          "status",
+          "status_reason",
+          "source_path",
+          "last_updated_utc"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "CostModelRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "kind",
+        "placeholder",
+        "params"
+      ],
+      "description": "`crucible.portfolio.CostModel.record()`, verbatim.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "placeholder": {
+          "type": "boolean"
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "Book": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "arm_id",
+        "status",
+        "failure_reason",
+        "cost_model",
+        "inception_trading_day",
+        "days_advanced",
+        "sessions",
+        "portfolio_notional_usd",
+        "gross_return_ratio",
+        "cost_bps",
+        "net_return_ratio",
+        "cumulative_net_return_ratio",
+        "turnover_one_way_ratio",
+        "weights"
+      ],
+      "properties": {
+        "arm_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "advanced",
+            "failed"
+          ],
+          "description": "`failed` is recorded and the producer then exits non-zero: the book is a finding, not an absence."
+        },
+        "failure_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cost_model": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/CostModelRecord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "inception_trading_day": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        },
+        "days_advanced": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+          },
+          "description": "Every session this book has advanced, strictly increasing. The day count a gate compares with the trader's own."
+        },
+        "sessions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "portfolio_notional_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0
+        },
+        "gross_return_ratio": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "cost_bps": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "net_return_ratio": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "cumulative_net_return_ratio": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "turnover_one_way_ratio": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "weights": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number"
+          },
+          "description": "The book's closing weights, per ticker. What the next session advances from."
+        }
+      }
+    }
+  }
+}

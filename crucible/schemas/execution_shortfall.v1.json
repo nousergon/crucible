@@ -1,0 +1,283 @@
+{
+  "$id": "https://github.com/nousergon/crucible/schemas/execution_shortfall.v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "execution_shortfall.v1",
+  "description": "One trading session's per-order implementation shortfall against the DECISION price, written by the trader (`nousergon/crucible-trader`) at `crucible.execution.execution_shortfall_key(trading_day)` and reduced by `crucible.report` into the fifth attribution row, `execution_shortfall_bps` (plan §4.5, §9.5; `alpha-engine-config-I10652`). The harness never reaches into the trader: this document is the artifact the trader agreed to write. Cross-field rules JSON Schema cannot state (decided_at <= submitted_at; shortfall_bps re-derivable from side, decision_price and fill_price; the summary equal to the sum of its orders; outcome/orders agreement; the daily metric equal to the summary) are enforced by `crucible.execution.validate_execution_shortfall`, which every consumer calls.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "trading_day",
+    "calendar_date",
+    "champion",
+    "decision_price_basis",
+    "shortfall_scope",
+    "outcome",
+    "outcome_reason",
+    "band",
+    "orders",
+    "summary",
+    "metrics"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "execution_shortfall.v1",
+      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing."
+    },
+    "trading_day": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "description": "The NYSE session the orders were placed in (§4.12). The key."
+    },
+    "calendar_date": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "description": "Wall-clock date the document was written. Provenance only, never a key."
+    },
+    "champion": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The arm id whose cross-section the orders were sized from."
+    },
+    "decision_price_basis": {
+      "const": "sizing_decision",
+      "description": "WHICH price shortfall is measured against, recorded rather than implied by code: the price observed at the instant the sizing decision was taken — not the arrival price at submission and not the previous close. A producer measuring against anything else cannot write this document."
+    },
+    "shortfall_scope": {
+      "const": "filled_quantity_vs_decision_price",
+      "description": "What the bps figure covers: the filled quantity's execution price against the decision price. The opportunity cost of an unfilled remainder (the Perold implementation-shortfall residual) is NOT in the figure; unfilled orders are carried with a null shortfall so the gap is visible rather than averaged away."
+    },
+    "outcome": {
+      "enum": [
+        "computed",
+        "no_orders",
+        "not_computed"
+      ],
+      "description": "`no_orders` is a FACT (the trader placed nothing this session). `not_computed` is a PRODUCER FAILURE (orders were placed and shortfall was not measured) and renders the attribution row RED. The two are never collapsed: an absent row on a traded day is the defect this field exists to name."
+    },
+    "outcome_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Required (non-empty) when outcome is `not_computed` or `no_orders`; null when `computed`."
+    },
+    "band": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseline_bps",
+        "upper_bps",
+        "placeholder"
+      ],
+      "description": "The declared band (plan §9.5 paper→live entry condition 2). Lower is better. The row is RED when the window's notional-weighted shortfall, or its CI's upper bound, reaches `upper_bps`.",
+      "properties": {
+        "baseline_bps": {
+          "type": "number",
+          "description": "The fill a perfect execution would get: the decision price itself."
+        },
+        "upper_bps": {
+          "type": "number",
+          "description": "The red line. Must exceed baseline_bps."
+        },
+        "placeholder": {
+          "type": "boolean",
+          "description": "True when the band is a declared stand-in rather than a calibrated tolerance. Rendered in the row's reason so a stand-in is never read as a calibration."
+        }
+      }
+    },
+    "orders": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Order"
+      }
+    },
+    "summary": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "n_orders",
+        "n_filled",
+        "notional_usd",
+        "decision_notional_usd",
+        "shortfall_usd",
+        "shortfall_bps_notional_weighted"
+      ],
+      "description": "Null only when outcome is `not_computed`. `notional_usd` is the ABSOLUTE companion to the bps ratio: a ratio cannot catch a book that has collapsed to nothing (measured 2026-09-08, xsec_variance_share).",
+      "properties": {
+        "n_orders": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_filled": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "notional_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "shortfall_usd": {
+          "type": "number"
+        },
+        "shortfall_bps_notional_weighted": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "shortfall_usd / decision_notional_usd × 1e4. Null iff nothing filled."
+        },
+        "decision_notional_usd": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "metrics": {
+      "type": "array",
+      "description": "MetricRecord-shaped rows (`crucible.models.MetricRecordRow`). A `computed` document carries exactly one named `execution_shortfall_bps` whose value is the summary's notional-weighted bps.",
+      "items": {
+        "$ref": "#/$defs/MetricRecordRow"
+      }
+    }
+  },
+  "$defs": {
+    "Order": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "order_id",
+        "symbol",
+        "side",
+        "quantity",
+        "decided_at_utc",
+        "decision_price",
+        "submitted_at_utc",
+        "filled_quantity",
+        "fill_price",
+        "notional_usd",
+        "decision_notional_usd",
+        "shortfall_bps",
+        "shortfall_usd"
+      ],
+      "properties": {
+        "order_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "symbol": {
+          "type": "string",
+          "minLength": 1
+        },
+        "side": {
+          "enum": [
+            "buy",
+            "sell"
+          ]
+        },
+        "quantity": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "decided_at_utc": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+          "description": "The sizing-decision instant the decision price was observed at."
+        },
+        "decision_price": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "submitted_at_utc": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+          "description": "Never earlier than decided_at_utc."
+        },
+        "filled_quantity": {
+          "type": "number",
+          "minimum": 0
+        },
+        "fill_price": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0,
+          "description": "Volume-weighted fill price; null iff filled_quantity is 0."
+        },
+        "notional_usd": {
+          "type": "number",
+          "minimum": 0,
+          "description": "filled_quantity × fill_price."
+        },
+        "shortfall_bps": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "side_sign × (fill_price − decision_price) / decision_price × 1e4; positive is a cost. Null iff unfilled."
+        },
+        "shortfall_usd": {
+          "type": "number",
+          "description": "side_sign × (fill_price − decision_price) × filled_quantity; 0 when unfilled."
+        },
+        "decision_notional_usd": {
+          "type": "number",
+          "minimum": 0,
+          "description": "filled_quantity × decision_price — the weight a notional-weighted shortfall uses, so the weighted figure over identical orders equals each order's own bps."
+        }
+      }
+    },
+    "MetricRecordRow": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "name",
+        "module",
+        "metric_type",
+        "n_floor",
+        "status",
+        "status_reason",
+        "source_path",
+        "last_updated_utc"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "module": {
+          "type": "string",
+          "minLength": 1
+        },
+        "metric_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "n_floor": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "status": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}
