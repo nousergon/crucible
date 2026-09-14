@@ -896,6 +896,52 @@ class ConstructedBook:
     diagnostics: tuple[dict[str, Any], ...]
 
 
+def _refuse_an_unpriceable_forced_exit(
+    *,
+    recipe: StrategyRecipe,
+    universe: BookUniverse,
+    session: SessionInputs,
+    w_prev: np.ndarray,
+) -> None:
+    """A participation-aware model RAISES on a forced exit it has no ADV for.
+
+    A held name that is ineligible this session is pinned to zero by the
+    solver, so its whole holding WILL trade. `CostModel.cost_bps_for_trades`
+    prices a traded name with no usable ADV through the library's no-coverage
+    branch — a charge that does not come from the model the recipe named. For
+    a trade the optimizer chose that is a pre-existing boundary; for a trade
+    the harness FORCED it is a known-at-construction gap, so it is refused here
+    with the name and the source it was looked for in
+    (`alpha-engine-config-I10754`, `-I10503`). A flat model reads no ADV and is
+    never refused for this.
+    """
+    if recipe.cost_model.kind == "flat":
+        return
+    eligible = np.asarray(session.eligibility, dtype=bool)
+    adv = (
+        np.full(len(universe.tickers), np.nan)
+        if session.adv_usd is None
+        else np.asarray(session.adv_usd, dtype=np.float64)
+    )
+    unpriced = [
+        universe.tickers[i]
+        for i in range(len(universe.tickers))
+        if i not in (universe.benchmark_idx, universe.cash_idx)
+        and not eligible[i]
+        and w_prev[i] != 0.0
+        and not (math.isfinite(float(adv[i])) and float(adv[i]) > 0.0)
+    ]
+    if unpriced:
+        raise CostModelInputError(
+            f"arm {recipe.name!r} on {session.trading_day}: held name(s) {unpriced} are "
+            "ineligible this session, so the solver must exit them, and cost model "
+            f"{recipe.cost_model.name!r} prices every exit against the name's "
+            f"`{ADV_FEATURE_COLUMN}` on the decision day — which the compiled feature "
+            "layer does not carry for them. Charging the exit through a no-coverage "
+            "branch would put a number on the book that the named model did not price."
+        )
+
+
 def construct_book(
     *,
     recipe: StrategyRecipe,
@@ -947,6 +993,9 @@ def construct_book(
     all_diagnostics: list[dict[str, Any]] = []
 
     for session in sessions:
+        _refuse_an_unpriceable_forced_exit(
+            recipe=recipe, universe=universe, session=session, w_prev=w_prev
+        )
         result = solve_target_weights(
             list(universe.tickers),
             np.asarray(session.alpha_hat, dtype=np.float64),
@@ -2087,6 +2136,16 @@ def _build_sessions(
         ):
             i = index[ticker]
             alpha[i], eligible[i], caps[i] = a, e, c
+        # ADV is a property of the NAME on the day, read from the day's compiled
+        # feature layer — not of whether the M champion priced it. A name in the
+        # universe but not in this session (held from an earlier session, or
+        # carried in by the caller's book) is ineligible and its whole holding is
+        # a forced exit; the participation-aware cost model prices that exit off
+        # this same point-in-time `dollar_volume_20d_raw`, never off a carried-
+        # forward value (`alpha-engine-config-I10754`). Sentinels stay NaN.
+        for ticker, i in index.items():
+            if i in (universe.benchmark_idx, universe.cash_idx):
+                continue
             value = day_adv.get(ticker)
             if value is not None:
                 adv[i] = value
@@ -2123,8 +2182,19 @@ def _build_sessions(
     return out
 
 
-def _universe_for(resolved: Sequence[ResolvedSession], *, benchmark: str) -> BookUniverse:
-    """The union of every session's priced names, plus the two sentinels.
+def _universe_for(
+    resolved: Sequence[ResolvedSession], *, benchmark: str, held: Iterable[str] = ()
+) -> BookUniverse:
+    """The union of every session's priced names and the held names, plus the two sentinels.
+
+    ``held`` is the book carried INTO the first session (`alpha-engine-config-
+    I10754`). A held name the recorded sessions did not price still enters the
+    universe, and `_build_sessions` gives it alpha 0 and eligibility False on
+    every session that did not price it — so the solver's ineligibility pin
+    exits it and the recipe's cost model charges the exit. This is exactly what
+    a multi-session walk already does for a name priced on an earlier session
+    and dropped on a later one; passing ``held`` makes a walk that STARTS from
+    a held book resolve that case identically.
 
     A union rather than an intersection, with the per-session eligibility mask
     carrying which names were actually priced on each day. `BookUniverse` is
@@ -2133,7 +2203,10 @@ def _universe_for(resolved: Sequence[ResolvedSession], *, benchmark: str) -> Boo
     turnover between two of them meaningless — so the shape is fixed here and
     the MOVEMENT is expressed where it belongs, in `eligibility`.
     """
-    names = sorted({t for session in resolved for t in session.tickers} - {benchmark, CASH_TICKER})
+    names = sorted(
+        ({t for session in resolved for t in session.tickers} | {str(t) for t in held})
+        - {benchmark, CASH_TICKER}
+    )
     tickers = (*names, benchmark, CASH_TICKER)
     return BookUniverse(
         tickers=tickers,

@@ -903,6 +903,10 @@ class StrategySessionInputs:
     resolved: tuple[ResolvedSession, ...]
     session_inputs_keys: tuple[str, ...]
     settled: bool
+    #: The names the caller's book held INTO the first decision day, as
+    #: reconciled into the universe (`alpha-engine-config-I10754`). Empty for a
+    #: walk that starts from cash, which is every grade.
+    held_tickers: tuple[str, ...] = ()
 
 
 def _read_recorded_sessions(
@@ -978,6 +982,7 @@ def resolve_strategy_sessions(
     returns: Any = None,
     adv_cache: dict[str, dict[str, float]] | None = None,
     unsettled_last: bool = False,
+    held_tickers: Iterable[str] | None = None,
 ) -> StrategySessionInputs:
     """One S arm's construction inputs over ``decision_days`` — THE S-slot resolution.
 
@@ -1002,6 +1007,23 @@ def resolve_strategy_sessions(
     join as a settled day, and `construct_book` reads neither return field when
     it solves or charges, so the weights and the charge are the settled twin's
     exactly (asserted in `tests/test_strategy_session_resolution.py`).
+
+    **Held names** (`alpha-engine-config-I10754`). The universe is resolved from
+    the recorded sessions, which carry only the names the M champion priced on
+    those days — so a book carried in from an earlier day can hold a name no
+    session here priced. ``held_tickers`` is that book's non-zero support (the
+    sentinels are ignored). Each held name enters the universe INELIGIBLE with
+    alpha 0 wherever the sessions did not price it, so the solver's
+    ineligibility pin exits it; its ADV is the decision day's own
+    `dollar_volume_20d_raw` from the compiled feature layer, the same read every
+    priced name gets, and `construct_book` refuses a participation-aware exit
+    that read found nothing for. A settled walk that priced the name on an
+    earlier session and dropped it on a later one resolves the later session
+    identically — the parity `tests/test_strategy_session_resolution.py`
+    asserts. A held name the price panel carries no return for on the first
+    decision day RAISES: an exit with no price is not a trade anyone can fill.
+    Pass only non-zero holdings: a zero-weight name adds a column the grade's
+    universe would not have.
     """
     from dataclasses import replace  # noqa: PLC0415 - local
 
@@ -1011,6 +1033,7 @@ def resolve_strategy_sessions(
     from crucible.features import DEFAULT_FEATURE_VERSION  # noqa: PLC0415 - avoids a cycle
     from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
     from crucible.slots.strategy import (  # noqa: PLC0415 - avoids a cycle
+        CASH_TICKER,
         _adv_by_day,
         _build_sessions,
         _universe_for,
@@ -1059,7 +1082,21 @@ def resolve_strategy_sessions(
             "not a zero-return day; only the day being decided may be resolved unsettled "
             "(`unsettled_last=True`)."
         )
-    universe = _universe_for(resolved, benchmark=benchmark)
+    held = tuple(sorted({str(t) for t in held_tickers or ()} - {benchmark, CASH_TICKER}))
+    first = decision_days[0]
+    unpriced = [
+        t
+        for t in held
+        if t not in returns.columns or not _np.isfinite(float(returns.loc[first, t]))
+    ]
+    if unpriced:
+        raise MissingArtifactError(
+            f"arm {arm_id!r}: the book held into {first} carries {unpriced}, which the price "
+            f"panel at {as_of} has no {first} return for. A held name leaving the M "
+            "champion's cross-section is exited at the session's price; a held name with "
+            "no price at all cannot be exited, sized or marked, and no proxy is substituted."
+        )
+    universe = _universe_for(resolved, benchmark=benchmark, held=held)
     adv = _adv_by_day(
         store,
         feature_version=feature_version or DEFAULT_FEATURE_VERSION,
@@ -1087,4 +1124,5 @@ def resolve_strategy_sessions(
         resolved=tuple(resolved),
         session_inputs_keys=tuple(keys),
         settled=placeholder is None,
+        held_tickers=held,
     )
