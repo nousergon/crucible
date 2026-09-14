@@ -66,6 +66,7 @@ from crucible.keys import (
 )
 from crucible.manifest import manifest_prefix
 from crucible.models import ArenaCycleDocument, DispatchRecordDocument
+from crucible.release_history import UNDECLARED, ReleaseInForce
 from crucible.required import require_env
 from crucible.slots import SLOTS
 from crucible.slots.cycle import MIN_ACTIVE_ARMS_FINDING_METRIC
@@ -657,8 +658,14 @@ def evaluate_absence(
     registry: dict[str, Component] | None = None,
     watched_by: str = SWEEP_JOB,
     access_faults: list[str] | None = None,
+    release_history: ReleaseInForce | None = None,
 ) -> list[Page]:
     """Page for every scheduled job whose manifest is missing past its deadline.
+
+    ``release_history``: which release was in force at a deadline, and what
+    it declared (:mod:`crucible.release_history`). Defaults to the store's
+    own pointer history; a backend with none grades every row against the
+    current registry.
 
     Reads the deadline table from `components.yaml` through
     :mod:`crucible.components` — never a second copy — and resolves each
@@ -692,6 +699,7 @@ def evaluate_absence(
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     reg = scheduled_components(registry)
     pages: list[Page] = []
+    history: ReleaseInForce | None = None
     for trading_day in days_to_evaluate(store, moment):
         # The arc's own record of what it declared for this day, read at most
         # once and only when an arc row is due (`_arc_declared_members`).
@@ -751,6 +759,24 @@ def evaluate_absence(
                 continue
             if any(is_manifest_key(k) for k in read.keys or ()):
                 continue
+            # WHICH RELEASE. A `scheduler` / `github-actions` row is due on a
+            # day only if the release in force at its deadline declared it
+            # (alpha-engine-config-I10718): `gate.close` paged for 2026-09-03
+            # though its starter was declared 2026-09-06. Consulted only once
+            # the manifest is known missing, so a delivering row costs no
+            # read. Anything short of a readable declaration grades the row
+            # against the current registry, as before.
+            if component.dispatch in ("scheduler", "github-actions"):
+                if history is None:
+                    history = release_history or ReleaseInForce.for_store(store)
+                declaration = history.declaration(name, due)
+                if declaration.access_problem:
+                    if access_faults is None:
+                        raise StoreAccessError(declaration.detail)
+                    if declaration.detail not in access_faults:
+                        access_faults.append(declaration.detail)
+                if declaration.verdict == UNDECLARED:
+                    continue
             pages.append(
                 Page(
                     condition="absence",
