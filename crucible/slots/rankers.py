@@ -28,6 +28,7 @@ asserts no module outside this one imports a ranking function by name.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -36,7 +37,10 @@ if TYPE_CHECKING:
     import pandas as pd
 
 __all__ = [
+    "ATTRACTIVENESS_PILLAR_COLUMNS",
+    "MOMENTUM_12_1_PILLAR_COLUMN",
     "RANKERS",
+    "DegenerateFeatureError",
     "MissingFeatureError",
     "RankerSpec",
     "get_ranker",
@@ -50,6 +54,19 @@ class MissingFeatureError(RuntimeError):
 
     A hard raise. A ranker whose input is missing produces an all-null
     ranking, which sorts stably and looks exactly like a considered ordering.
+    """
+
+
+class DegenerateFeatureError(MissingFeatureError):
+    """A declared input column is present and carries no cross-sectional information.
+
+    A subclass of :class:`MissingFeatureError` so the produce loop routes it the
+    same way — `TrainingIntegrityError`, slot-wide (plan §4.4). Non-null is not
+    the same as informative: v1's attractiveness board carried three pillars
+    that rode near-constant for at least 18 days with coverage reading 897-903
+    of 903 (`alpha-engine-config-I8255`). Z-scoring a constant divides by zero,
+    and quietly dropping the pillar would re-weight the composite into a
+    different arm under the same name.
     """
 
 
@@ -181,6 +198,191 @@ def _thinktank_rating_direct(features: pd.DataFrame, params: Mapping[str, Any]) 
     return block["thinktank_rating_ratio"].dropna()
 
 
+# ---------------------------------------------------------------------------
+# The attractiveness family — v1's `scanner_cut` slot (`alpha-engine-config-I10715`).
+#
+# v1 ran two universe decisions over the SAME scanned population at the SAME
+# width: `scanner_spec` (momentum_sleeve / mom_12_1_sleeve / tech_score_gate)
+# and `scanner_cut` (attractiveness_top_60 and its variants), each graded
+# against the population it drew from, count-matched at 60. They are one
+# decision — "which 60 names advance" — ranked by different rules, so v2
+# carries the cut's arms as U arms (plan §4.4 row U; policy §2: one slot, one
+# decision) rather than as a second stage whose output nothing but the first
+# stage's population could explain.
+#
+# v1 method (`crucible-research/scoring/universe_board.py`, schema_version 3):
+#   z_{i,p}  = clip((pillar_{i,p} - mean_p) / sd_p, -3, +3)
+#   blend_i  = sum_{p in avail} w_p * z_{i,p} / sum_{p in avail} w_p
+# then a terminal percentile rank, which is monotone and so changes no top-N.
+# The six pillars are within-sector percentile composites of raw factors,
+# computed upstream of any ranking — so here they are FEATURE-LAYER columns
+# and these rankers only blend them. Until the catalogue declares them, every
+# arm below is refused BY NAME at registration
+# (`crucible.slots.cycle.partition_by_catalog`), never ranked on nulls.
+#
+# **Each variant is its own callable, deliberately.** The vacuity guard
+# (`crucible.slots.arms._assert_applicable`) compares callables, so a single
+# parameterised blend would make `momzero` and the champion "not two arms".
+# And the variant's defining property is STRUCTURAL: `momzero` does not read
+# the momentum pillar at all, rather than reading it at weight zero, so a
+# broken momentum column cannot fail an arm whose hypothesis is that momentum
+# does not belong. The per-pillar weights stay parameters, supplied by the
+# private recipe; each must be strictly positive, because a zero weight is a
+# different ranker wearing this one's name.
+# ---------------------------------------------------------------------------
+
+#: Pillar -> feature column. v1 `PILLAR_ORDER_FOR_WEIGHTS` order; v1 maps
+#: `defensiveness` to its `low_vol_score` composite
+#: (`crucible-research/scoring/composite.py::_PILLAR_TO_FACTOR_KEY`).
+ATTRACTIVENESS_PILLAR_COLUMNS: dict[str, str] = {
+    "quality": "quality_pillar_pct",
+    "value": "value_pillar_pct",
+    "momentum": "momentum_pillar_pct",
+    "growth": "growth_pillar_pct",
+    "stewardship": "stewardship_pillar_pct",
+    "defensiveness": "defensiveness_pillar_pct",
+}
+
+#: The momentum pillar re-composed on the 12-1 skip-month horizon — v1's
+#: `mom121` challenger, which differs from the champion in this pillar ONLY.
+MOMENTUM_12_1_PILLAR_COLUMN = "momentum_12_1_pillar_pct"
+
+#: v1's winsorisation bound on the per-pillar cross-sectional z.
+_PILLAR_Z_CLIP = 3.0
+
+
+def _columns_for(pillars: tuple[str, ...], **overrides: str) -> dict[str, str]:
+    return {p: overrides.get(p, ATTRACTIVENESS_PILLAR_COLUMNS[p]) for p in pillars}
+
+
+def _pillar_weight_params(pillars: Mapping[str, str]) -> tuple[str, ...]:
+    return tuple(f"{p}_weight" for p in pillars)
+
+
+def _resolved_pillar_weights(
+    ranker: str, params: Mapping[str, Any], pillars: Mapping[str, str]
+) -> dict[str, float]:
+    missing = [key for key in _pillar_weight_params(pillars) if key not in params]
+    if missing:
+        raise ValueError(
+            f"ranker {ranker!r} requires an explicit weight per pillar it reads; the arm "
+            f"omits {missing}. A defaulted weight is a tuned value the recipe does not "
+            "declare, and the spec hash would not see it."
+        )
+    weights: dict[str, float] = {}
+    for pillar in pillars:
+        raw = params[f"{pillar}_weight"]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
+            raise ValueError(
+                f"ranker {ranker!r}: {pillar}_weight must be a finite number; got {raw!r}"
+            )
+        if raw <= 0:
+            raise ValueError(
+                f"ranker {ranker!r}: {pillar}_weight must be strictly positive; got {raw!r}. "
+                "A pillar at weight zero is a different arm (see the momzero and hard3 "
+                "rankers, which do not read the pillar at all)."
+            )
+        weights[pillar] = float(raw)
+    return weights
+
+
+def _attractiveness_pillar_blend(
+    features: pd.DataFrame,
+    params: Mapping[str, Any],
+    *,
+    ranker: str,
+    pillars: Mapping[str, str],
+) -> pd.Series:
+    """Coverage-renormalised weighted mean of winsorised pillar z-scores.
+
+    Z-scores are taken over the LIQUID set, i.e. the population being ranked,
+    before any selection: v1 measured that scoring a wider population and
+    filtering afterwards moved 860 of 902 scores and the ordering from rank 26
+    (`alpha-engine-config-I7844`). A name with no pillar available is dropped —
+    unrankable, never coerced to the bottom.
+    """
+    weights = _resolved_pillar_weights(ranker, params, pillars)
+    block = _liquid(features)
+    numerator = None
+    denominator = None
+    for pillar, column in pillars.items():
+        values = block[column].astype(float)
+        present = values.dropna()
+        spread = float(present.std(ddof=0)) if len(present) else 0.0
+        if not len(present) or not spread > 0.0:
+            raise DegenerateFeatureError(
+                f"ranker {ranker!r}: pillar {pillar!r} ({column}) has "
+                f"{len(present)} non-null value(s) and dispersion {spread!r} over the "
+                f"{len(block)}-name liquid set. A pillar with no cross-sectional spread "
+                "carries no ordering, and dropping it would silently re-weight the "
+                "composite into a different arm."
+            )
+        z = ((values - float(present.mean())) / spread).clip(-_PILLAR_Z_CLIP, _PILLAR_Z_CLIP)
+        weighted = z.fillna(0.0) * weights[pillar]
+        available = z.notna().astype(float) * weights[pillar]
+        numerator = weighted if numerator is None else numerator + weighted
+        denominator = available if denominator is None else denominator + available
+    assert numerator is not None and denominator is not None  # pillars is never empty
+    rankable = denominator > 0.0
+    return (numerator[rankable] / denominator[rankable]).dropna()
+
+
+_ATTRACTIVENESS_SIX = _columns_for(
+    ("quality", "value", "momentum", "growth", "stewardship", "defensiveness")
+)
+_ATTRACTIVENESS_MOMZERO = _columns_for(
+    ("quality", "value", "growth", "stewardship", "defensiveness")
+)
+_ATTRACTIVENESS_MOM121 = _columns_for(
+    ("quality", "value", "momentum", "growth", "stewardship", "defensiveness"),
+    momentum=MOMENTUM_12_1_PILLAR_COLUMN,
+)
+_ATTRACTIVENESS_HARD3 = _columns_for(("value", "momentum", "defensiveness"))
+
+
+def _attractiveness_blend(features: pd.DataFrame, params: Mapping[str, Any]) -> pd.Series:
+    """v1 `attractiveness_top_60`: all six pillars. The `scanner_cut` champion."""
+    return _attractiveness_pillar_blend(
+        features, params, ranker="attractiveness_blend", pillars=_ATTRACTIVENESS_SIX
+    )
+
+
+def _attractiveness_momzero_blend(features: pd.DataFrame, params: Mapping[str, Any]) -> pd.Series:
+    """v1 `attractiveness_momzero_top_60`: the five non-momentum pillars. Isolates EXPOSURE."""
+    return _attractiveness_pillar_blend(
+        features, params, ranker="attractiveness_momzero_blend", pillars=_ATTRACTIVENESS_MOMZERO
+    )
+
+
+def _attractiveness_mom121_blend(features: pd.DataFrame, params: Mapping[str, Any]) -> pd.Series:
+    """v1 `attractiveness_mom121_top_60`: momentum pillar on the 12-1 horizon. Isolates HORIZON."""
+    return _attractiveness_pillar_blend(
+        features, params, ranker="attractiveness_mom121_blend", pillars=_ATTRACTIVENESS_MOM121
+    )
+
+
+def _attractiveness_hard3_blend(features: pd.DataFrame, params: Mapping[str, Any]) -> pd.Series:
+    """v1 `attractiveness_hard3_top_60`: value, momentum, defensiveness only.
+
+    The vendor-fundamental half (quality, growth, stewardship) is not read.
+    """
+    return _attractiveness_pillar_blend(
+        features, params, ranker="attractiveness_hard3_blend", pillars=_ATTRACTIVENESS_HARD3
+    )
+
+
+def _attractiveness_spec(
+    name: str, fn: RankFn, pillars: Mapping[str, str], description: str
+) -> RankerSpec:
+    return RankerSpec(
+        name=name,
+        fn=fn,
+        reads=("liquidity_pass_raw", *pillars.values()),
+        params=("top_n", *_pillar_weight_params(pillars)),
+        description=description,
+    )
+
+
 RANKERS: dict[str, RankerSpec] = {
     spec.name: spec
     for spec in (
@@ -247,6 +449,31 @@ RANKERS: dict[str, RankerSpec] = {
                 "when the M slot materializes predicted_alpha_ratio into the feature "
                 "layer (track B)."
             ),
+        ),
+        _attractiveness_spec(
+            "attractiveness_blend",
+            _attractiveness_blend,
+            _ATTRACTIVENESS_SIX,
+            "Six-pillar attractiveness composite (v1 scanner_cut champion). Servable when "
+            "the feature layer declares the pillar columns.",
+        ),
+        _attractiveness_spec(
+            "attractiveness_momzero_blend",
+            _attractiveness_momzero_blend,
+            _ATTRACTIVENESS_MOMZERO,
+            "Attractiveness without the momentum pillar (v1 momzero challenger).",
+        ),
+        _attractiveness_spec(
+            "attractiveness_mom121_blend",
+            _attractiveness_mom121_blend,
+            _ATTRACTIVENESS_MOM121,
+            "Attractiveness with a 12-1 skip-month momentum pillar (v1 mom121 challenger).",
+        ),
+        _attractiveness_spec(
+            "attractiveness_hard3_blend",
+            _attractiveness_hard3_blend,
+            _ATTRACTIVENESS_HARD3,
+            "Value, momentum and defensiveness pillars only (v1 hard3 challenger).",
         ),
     )
 }
