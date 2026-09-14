@@ -27,6 +27,7 @@ from crucible.backfill import run_backfill
 from crucible.calendar import is_trading_day
 from crucible.config import settings as resolve_settings
 from crucible.data import ArcticPriceSource, PriceSource, run_daily, run_heal, run_weekly
+from crucible.data.point_in_time import PointInTimeSource, SnapshotPointInTimeSource
 from crucible.data.universe import DeclaredUniverse, load_declared_universe, universe_from_argv
 from crucible.explain import explain as explain_lineage
 from crucible.explain import render as render_lineage
@@ -103,6 +104,31 @@ def _source(args: argparse.Namespace, config: Any) -> PriceSource:
         "`arctic`; a test supplies its own `PriceSource` by calling the job function "
         "directly, which is the same code path."
     )
+
+
+def _point_in_time_source(config: Any) -> PointInTimeSource:
+    """The fundamentals / sector / 13F source every feature compile reads.
+
+    Rooted at the same data bucket the price source reads
+    (`CRUCIBLE_ARCTIC_BUCKET`), opened READ-ONLY: this job never writes the
+    bucket it reads inputs from. No bucket name lives in this package, and an
+    unset setting refuses by name rather than reading from nowhere
+    (`alpha-engine-config-I10721`).
+    """
+    from crucible.config import store_from_uri  # noqa: PLC0415 - one call site
+    from crucible.store import read_only  # noqa: PLC0415 - one call site
+
+    if not config.arctic_bucket:
+        raise SystemExit(
+            "the point-in-time source reads the data bucket named by CRUCIBLE_ARCTIC_BUCKET, "
+            "which is unset; the feature layer's fundamentals, sector and 13F columns have "
+            "no other source and are never zero-filled"
+        )
+    reader = read_only(
+        store_from_uri(f"s3://{config.arctic_bucket}"),
+        reason="point-in-time inputs are read from the data bucket, never written",
+    )
+    return SnapshotPointInTimeSource(reader, label=config.arctic_bucket)
 
 
 def _declared_universe(args: argparse.Namespace, config: Any) -> DeclaredUniverse | None:
@@ -203,6 +229,7 @@ def handle_data_daily(args: argparse.Namespace) -> int:
         print(json.dumps({"run_id": ctx.run_id, "outputs": [], "detail": detail}, indent=2))
         return 0
     source = _source(args, config)
+    point_in_time = _point_in_time_source(config)
     declared = _declared_universe(args, config)
     if args.dry_run:
         print(
@@ -220,6 +247,7 @@ def handle_data_daily(args: argparse.Namespace) -> int:
         lambda c: run_daily(
             c,
             source=source,
+            point_in_time=point_in_time,
             expected_symbols=_expected_symbols(declared, c),
         ),
         store=store,
@@ -234,6 +262,7 @@ def handle_data_weekly(args: argparse.Namespace) -> int:
     config = _settings(args)
     store = config.store()
     source = _source(args, config)
+    point_in_time = _point_in_time_source(config)
     declared = _declared_universe(args, config)
     if args.dry_run:
         print(
@@ -251,6 +280,7 @@ def handle_data_weekly(args: argparse.Namespace) -> int:
         lambda c: run_weekly(
             c,
             source=source,
+            point_in_time=point_in_time,
             expected_symbols=_expected_symbols(declared, c),
         ),
         store=store,
@@ -265,6 +295,7 @@ def handle_data_heal(args: argparse.Namespace) -> int:
     config = _settings(args)
     store = config.store()
     source = _source(args, config)
+    point_in_time = _point_in_time_source(config)
     start = dt.date.fromisoformat(args.from_date)
     end = dt.date.fromisoformat(args.to_date)
     declared = _declared_universe(args, config)
@@ -283,6 +314,7 @@ def handle_data_heal(args: argparse.Namespace) -> int:
         lambda c: run_heal(
             c,
             source=source,
+            point_in_time=point_in_time,
             start=start,
             end=end,
             gap=args.gap,

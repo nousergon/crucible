@@ -17,6 +17,7 @@ import pytest
 
 from crucible.data import CoverageError, FramePriceSource, run_daily
 from crucible.data.heal import run_heal, sessions_in_range
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.keys import data_panel_key
 from crucible.runner import run_job
 
@@ -49,6 +50,9 @@ class TestSymbolsUnlistedInWindowMetric:
             "data.daily",
             lambda c: run_daily(
                 c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
                 source=FramePriceSource({**with_newco, **benchmark_frames}),
                 expected_symbols=expected,
             ),
@@ -78,7 +82,14 @@ class TestSymbolsUnlistedInWindowMetric:
     ) -> None:
         ctx = run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=sorted(frames)),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=sorted(frames),
+            ),
             store=store,
             trading_day=cycle_date,
         )
@@ -105,7 +116,12 @@ class TestSymbolsUnlistedInWindowMetric:
             run_job(
                 "data.daily",
                 lambda c: run_daily(
-                    c, source=FramePriceSource(with_newco), expected_symbols=expected
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=FramePriceSource(with_newco),
+                    expected_symbols=expected,
                 ),
                 store=store,
                 trading_day=cycle_date,
@@ -134,6 +150,9 @@ class TestHealAcrossAListingBoundary:
             "data.heal",
             lambda c: run_heal(
                 c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
                 source=FramePriceSource({**with_midlist, **benchmark_frames}),
                 start=first,
                 end=last,

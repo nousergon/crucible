@@ -76,6 +76,28 @@ below changes, and is recorded here as an illustration rather than a pin.
 | `vol_ratio_10_60_ratio` | ratio | 60 | no | `std(return_1d_log_return, 10) / std(return_1d_log_return, 60)` | `return_1d_log_return` |
 | `dist_from_52w_high_ratio` | ratio | 252 | no | `close / max(close, 252) - 1` | `close_raw` |
 | `dist_from_52w_low_ratio` | ratio | 252 | no | `close / min(close, 252) - 1` | `close_raw` |
+| `sector_raw` | gics_sector_label | — | no | `constituents.sector_map[ticker], fetched before the session` | `point_in_time.sector.sector_map` |
+| `roe_ratio` | ratio | — | no | `fundamental.roe (TTM return on equity, decimal, clipped [-1, 1])` | `point_in_time.fundamental.roe` |
+| `debt_to_equity_div2_ratio` | ratio | — | no | `fundamental.debt_to_equity (total debt / equity / 2, clipped [-3, 3])` | `point_in_time.fundamental.debt_to_equity` |
+| `gross_margin_ratio` | ratio | — | no | `fundamental.gross_margin (TTM, 0-1 fraction)` | `point_in_time.fundamental.gross_margin` |
+| `current_ratio_div3_ratio` | ratio | — | no | `fundamental.current_ratio (current assets / liabilities / 3, clipped [0, 3])` | `point_in_time.fundamental.current_ratio` |
+| `pe_div30_ratio` | ratio | — | no | `fundamental.pe_ratio (trailing P/E / 30, clipped [-3, 3])` | `point_in_time.fundamental.pe_ratio` |
+| `pb_div5_ratio` | ratio | — | no | `fundamental.pb_ratio (price / book / 5, clipped [-3, 3])` | `point_in_time.fundamental.pb_ratio` |
+| `fcf_yield_ratio` | ratio | — | no | `fundamental.fcf_yield (TTM free cash flow / market cap, clipped [-0.5, 0.5])` | `point_in_time.fundamental.fcf_yield` |
+| `revenue_growth_3y_ratio` | ratio | — | no | `fundamental.revenue_growth_3y (3-year revenue CAGR, decimal)` | `point_in_time.fundamental.revenue_growth_3y` |
+| `eps_growth_3y_ratio` | ratio | — | no | `fundamental.eps_growth_3y (3-year EPS CAGR, decimal)` | `point_in_time.fundamental.eps_growth_3y` |
+| `capex_growth_5y_ratio` | ratio | — | no | `fundamental.capex_growth_5y (5-year capex growth, decimal)` | `point_in_time.fundamental.capex_growth_5y` |
+| `payout_ratio` | ratio | — | no | `fundamental.payout_ratio (TTM dividends / net income, clipped [0, 2])` | `point_in_time.fundamental.payout_ratio` |
+| `sustainable_growth_rate_ratio` | ratio | — | no | `roe_ratio * (1 - payout_ratio)` | `roe_ratio`, `payout_ratio` |
+| `institutional_accumulation_raw` | funds | — | no | `n_funds_increasing - n_funds_decreasing, 0 where fewer than 3 funds moved, from the newest 13F quarter whose filing deadline precedes the session` | `point_in_time.institutional.n_funds_increasing`, `point_in_time.institutional.n_funds_decreasing` |
+| `return_120d_log_return` | log_return | 120 | no | `log(close) - log(close).shift(120)` | `close_raw` |
+| `quality_pillar_pct` | pct | — | yes | `wmean(sector_pct(roe_ratio) .30, 100 - sector_pct(debt_to_equity_div2_ratio) .25, sector_pct(gross_margin_ratio) .25, sector_pct(current_ratio_div3_ratio) .20)` | `sector_raw`, `roe_ratio`, `debt_to_equity_div2_ratio`, `gross_margin_ratio`, `current_ratio_div3_ratio` |
+| `value_pillar_pct` | pct | — | yes | `wmean(100 - sector_pct(pe_div30_ratio) .40, 100 - sector_pct(pb_div5_ratio) .30, sector_pct(fcf_yield_ratio) .30)` | `sector_raw`, `pe_div30_ratio`, `pb_div5_ratio`, `fcf_yield_ratio` |
+| `momentum_pillar_pct` | pct | — | yes | `wmean(sector_pct(momentum_20d_log_return) .30, sector_pct(return_60d_log_return) .25, sector_pct(return_120d_log_return) .20, sector_pct(dist_from_52w_high_ratio) .15, sector_pct(momentum_5d_log_return) .10)` | `sector_raw`, `momentum_20d_log_return`, `return_60d_log_return`, `return_120d_log_return`, `dist_from_52w_high_ratio`, `momentum_5d_log_return` |
+| `growth_pillar_pct` | pct | — | yes | `wmean(sector_pct(revenue_growth_3y_ratio) .30, sector_pct(eps_growth_3y_ratio) .30, sector_pct(sustainable_growth_rate_ratio) .25, sector_pct(capex_growth_5y_ratio) .15)` | `sector_raw`, `revenue_growth_3y_ratio`, `eps_growth_3y_ratio`, `sustainable_growth_rate_ratio`, `capex_growth_5y_ratio` |
+| `stewardship_pillar_pct` | pct | — | yes | `wmean(100 - sector_pct(payout_ratio) .35, sector_pct(capex_growth_5y_ratio) .35, sector_pct(institutional_accumulation_raw) .30)` | `sector_raw`, `payout_ratio`, `capex_growth_5y_ratio`, `institutional_accumulation_raw` |
+| `defensiveness_pillar_pct` | pct | — | yes | `wmean(100 - sector_pct(volatility_20d_ratio) .50, 100 - sector_pct(vol_ratio_10_60_ratio) .30, 100 - sector_pct(atr_14_ratio) .20)` | `sector_raw`, `volatility_20d_ratio`, `vol_ratio_10_60_ratio`, `atr_14_ratio` |
+| `momentum_12_1_pillar_pct` | pct | — | yes | `wmean(sector_pct(mom_12_1_log_return) .40, sector_pct(return_120d_log_return) .25, sector_pct(dist_from_52w_high_ratio) .20, sector_pct(return_60d_log_return) .15)` | `sector_raw`, `mom_12_1_log_return`, `return_120d_log_return`, `dist_from_52w_high_ratio`, `return_60d_log_return` |
 <!-- END GENERATED CATALOG TABLE -->
 
 ## Adding a column

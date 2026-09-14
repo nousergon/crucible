@@ -24,6 +24,7 @@ import json
 import pytest
 
 from crucible.data.daily import run_daily
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.keys import arm_register_key, manifest_key, shadow_key
 from crucible.runner import run_job
 from crucible.slots import research
@@ -121,7 +122,14 @@ class TestTheSlotRunsAroundTheRefusedArm:
         settings = _settings(r_strategy_dir, tmp_path / "store")
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=source.symbols(),
+            ),
             store=store,
             trading_day=cycle_date,
         )
@@ -168,7 +176,14 @@ class TestTheSlotRunsAroundTheRefusedArm:
         settings = _settings(strategy_dir, tmp_path / "store")
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=source.symbols(),
+            ),
             store=store,
             trading_day=cycle_date,
         )

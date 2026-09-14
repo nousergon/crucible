@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from crucible.calendar import assert_trading_day
+from crucible.data.point_in_time import GROUP_COVERAGE_FLOOR_RATIO, PointInTimeSource
 from crucible.data.sources import MissingSourceError, PriceSource
 from crucible.features import (
     build_features,
@@ -172,6 +173,7 @@ def run_daily(
     ctx: RunContext,
     *,
     source: PriceSource,
+    point_in_time: PointInTimeSource,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     expected_symbols: list[str] | None = None,
     coverage_floor: float = COVERAGE_FLOOR_RATIO,
@@ -394,7 +396,31 @@ def run_daily(
     # written to `feature_registry_key`, and `registry["feature_version"]`
     # is the exact string used to build BOTH keys below. There is no second
     # source that could name a different version — see the docstring above.
-    features, catalog = build_features(panel)
+    # The session's non-price inputs, resolved for the DECLARED universe only
+    # (benchmark and attribution proxies carry no fundamentals), with one
+    # metric per input group so a pillar that is null on a session says why.
+    point_in_time_inputs = point_in_time.load(trading_day=trading_day, symbols=expected)
+    for reading in point_in_time_inputs.readings:
+        reason = f"{reading.state}: {reading.detail}"
+        if reading.unmeasured_fields:
+            reason += f"; unmeasured field(s): {reading.unmeasured_fields}"
+        ctx.record_metric(
+            {
+                "name": f"point_in_time_{reading.group}_coverage_ratio",
+                "module": "crucible.data.daily",
+                "metric_type": "coverage",
+                "value": reading.covered / reading.expected if reading.expected else 0.0,
+                "unit": "ratio",
+                "n_floor": 0,
+                "status": reading.metric_status,
+                "status_reason": reason,
+                "source_path": reading.snapshot or point_in_time_inputs.snapshot_id,
+                "last_updated_utc": _utc_now(),
+                "baseline": GROUP_COVERAGE_FLOOR_RATIO,
+            }
+        )
+
+    features, catalog = build_features(panel, point_in_time=point_in_time_inputs)
     registry = registry_payload(catalog)
     feature_version = registry["feature_version"]
 
@@ -423,6 +449,7 @@ def run_daily(
         "panel_key": panel_key,
         "features_key": feature_key,
         "feature_version": feature_version,
+        "point_in_time": point_in_time_inputs.to_dict(),
     }
     ctx.record_output(
         coverage_key(trading_day.isoformat()),

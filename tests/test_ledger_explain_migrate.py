@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from crucible.data import run_daily
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.explain import explain, render
 from crucible.keys import manifest_key
 from crucible.ledger import append_trials, n_trials, read_trials
@@ -139,7 +140,14 @@ class TestExplain:
     ) -> None:
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=source.symbols(),
+            ),
             store=store,
             trading_day=cycle_date,
         )
@@ -169,7 +177,14 @@ class TestExplain:
         day = sessions_ending(cycle_date, 1)[0]
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=source.symbols(),
+            ),
             store=store,
             trading_day=day,
         )
@@ -224,7 +239,14 @@ class TestExplain:
     ) -> None:
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=source.symbols(),
+            ),
             store=store,
             trading_day=cycle_date,
         )
@@ -245,7 +267,14 @@ class TestExplain:
         the store still completes."""
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=source.symbols(),
+            ),
             store=store,
             trading_day=cycle_date,
         )
@@ -615,7 +644,14 @@ class TestExplainWalksAVerdict:
         for day in [*decision_days, cycle_date]:
             run_job(
                 "data.daily",
-                lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+                lambda c: run_daily(
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    expected_symbols=source.symbols(),
+                ),
                 store=store,
                 trading_day=day,
             )
@@ -710,7 +746,14 @@ class TestExplainWalksAVerdict:
         monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=source.symbols(),
+            ),
             store=store,
             trading_day=cycle_date,
         )
@@ -978,7 +1021,14 @@ class TestExplainDryRunRecordsZeroMutations:
         recorder = RecordingStore(tmp_path / "store")
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=source.symbols(),
+            ),
             store=recorder,
             trading_day=cycle_date,
         )

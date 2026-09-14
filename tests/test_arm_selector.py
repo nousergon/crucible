@@ -23,6 +23,7 @@ from conftest import sessions_ending
 from crucible.cli import main
 from crucible.config import Settings
 from crucible.data import run_daily
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.keys import shadow_key
 from crucible.runner import run_job
 from crucible.slots import universe
@@ -115,7 +116,14 @@ class TestExperimentRunTakesEitherForm:
         for day in sessions_ending(cycle_date, 1):
             run_job(
                 "data.daily",
-                lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+                lambda c: run_daily(
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    expected_symbols=source.symbols(),
+                ),
                 store=store,
                 trading_day=day,
             )

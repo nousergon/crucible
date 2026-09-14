@@ -26,6 +26,7 @@ import pytest
 
 from crucible.alerts import sweep
 from crucible.data.daily import run_daily
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.data.sources import FramePriceSource
 from crucible.llm import CallSite, SpendCap
 from crucible.llm import call as llm_call
@@ -132,6 +133,9 @@ class TestFaultTwoDataSourceWithheld:
         def withheld(ctx: RunContext) -> None:
             run_daily(
                 ctx,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
                 source=FramePriceSource({}),
                 expected_symbols=["AAA", "BBB", "CCC"],
             )

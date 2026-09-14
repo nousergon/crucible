@@ -17,6 +17,7 @@ from nousergon_lib.arena.window import ArmSeries, pair_on_common_window
 
 from crucible.config import Settings
 from crucible.data import run_daily
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.keys import arena_cycle_key, shadow_key, verdict_key
 from crucible.runner import run_job
 from crucible.slots import universe
@@ -77,7 +78,14 @@ def _seed_cycle(store, source, strategy_dir, cycle_date, tmp_path):
     for day in decision_days + [cycle_date]:
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=source.symbols(),
+            ),
             store=store,
             trading_day=day,
         )
@@ -572,7 +580,14 @@ class TestKeysAndRefusals:
         settings = _settings(strategy_dir, tmp_path / "store")
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=source.symbols()),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=source.symbols(),
+            ),
             store=store,
             trading_day=cycle_date,
         )

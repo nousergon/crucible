@@ -35,6 +35,7 @@ from typing import Any, NoReturn
 
 import pytest
 
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.gate import PHASES
 
 #: The producer this clause waits on landed under phase 1
@@ -130,7 +131,14 @@ class TestFeatureLayerBinding:
         # Track A's producer writes the artifact; nothing here recomputes it.
         run_job(
             "data.daily",
-            lambda ctx: run_daily(ctx, source=source, expected_symbols=source.symbols()),
+            lambda ctx: run_daily(
+                ctx,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=source.symbols(),
+            ),
             store=store,
             trading_day=cycle_date,
         )
@@ -165,7 +173,14 @@ class TestFeatureLayerBinding:
         features = _features_module()
         run_job(
             "data.daily",
-            lambda ctx: run_daily(ctx, source=source, expected_symbols=source.symbols()),
+            lambda ctx: run_daily(
+                ctx,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=source.symbols(),
+            ),
             store=store,
             trading_day=cycle_date,
         )

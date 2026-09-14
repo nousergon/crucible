@@ -20,6 +20,7 @@ under the old one without failing.
 
 from __future__ import annotations
 
+import datetime as dt
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -65,6 +66,7 @@ __all__ = [
     "board_key",
     "champion_key",
     "closing_record_key",
+    "constituents_key",
     "coverage_key",
     "cross_section_key",
     "cross_section_settled_key",
@@ -80,12 +82,14 @@ __all__ = [
     "feature_registry_key",
     "features_key",
     "features_prefix",
+    "fundamental_snapshot_key",
     "gate_key",
     "gate_prefix",
     "heal_key",
     "holdout_unseal_key",
     "holdout_unseal_prefix",
     "iac_conformance_key",
+    "inst_ownership_key",
     "integration_store_key",
     "is_manifest_key",
     "ledger_key",
@@ -1519,3 +1523,21 @@ def parse_acceptance_reading(document: Any) -> AcceptanceReading | None:
         met_clauses=_clause_ids(document, "met_clauses"),
         store_versioning=versioning if isinstance(versioning, str) and versioning else None,
     )
+
+
+# -- v1 point-in-time snapshots in the DATA bucket (alpha-engine-config-I10721) --
+#
+# Read-only key shapes of the v1 producer's dated snapshots, read by
+# `crucible.data.point_in_time`. Relative to the data bucket root, not the store.
+
+
+def fundamental_snapshot_key(label: dt.date) -> str:
+    return f"features/{label.isoformat()}/fundamental.parquet"
+
+
+def constituents_key(label: dt.date) -> str:
+    return f"market_data/weekly/{label.isoformat()}/constituents.json"
+
+
+def inst_ownership_key(year: int, quarter: int) -> str:
+    return f"data/inst_ownership/{year}Q{quarter}/latest.parquet"

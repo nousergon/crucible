@@ -24,6 +24,7 @@ from typing import Any, NoReturn
 
 import pytest
 
+from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.gate import PHASES
 from crucible.slots import SLOTS, get_slot
 
@@ -1075,7 +1076,14 @@ def _seeded_slot(tmp_path: Any, cycle_date: dt.date) -> tuple[Any, Any, list[dt.
     for day in decision_days + [cycle_date]:
         run_job(
             "data.daily",
-            lambda c: run_daily(c, source=source, expected_symbols=sorted(frames)),
+            lambda c: run_daily(
+                c,
+                point_in_time=UnavailablePointInTimeSource(
+                    reason="synthetic fixture market carries no fundamentals"
+                ),
+                source=source,
+                expected_symbols=sorted(frames),
+            ),
             store=store,
             trading_day=day,
         )
