@@ -59,7 +59,7 @@ __all__ = [
     "REFERENCE_PATTERN",
     "V1_EVIDENCE_PREFIX",
     "V1_SLOT_TO_V2_SLOT",
-    "V1_STORE_URI_VAR",
+    "V1_BUCKET_VAR",
     "V1_S_DECLARED_ARMS",
     "CarryoverFindings",
     "LedgerError",
@@ -72,11 +72,14 @@ __all__ = [
     "v1_carryover_key",
 ]
 
-#: Where v1's artifact store is. An environment variable with NO default: a
-#: bucket name is an infrastructure identifier this public repo may not carry
-#: (AGENTS.md, "Visibility"), and a silent default would grade whatever store
-#: it happened to point at. Unset reads UNMEASURABLE, naming this variable.
-V1_STORE_URI_VAR = "CRUCIBLE_V1_STORE_URI"
+#: Where v1's artifact store is: the data bucket setting every other v1 read
+#: already resolves (`crucible.config.Settings.arctic_bucket`, which the box
+#: exports from the stack's `DataBucketName` and `migrate.history` reads v1's
+#: pointers from). One name for one bucket — a second variable naming the same
+#: store is two settings that can disagree. NO default: a bucket name is an
+#: infrastructure identifier this public repo may not carry, so unset reads
+#: UNMEASURABLE, naming this variable.
+V1_BUCKET_VAR = "CRUCIBLE_ARCTIC_BUCKET"
 
 LEDGER_SCHEMA_VERSION = "v1_carryover.v1"
 

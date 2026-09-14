@@ -54,7 +54,7 @@ from crucible.attribution import manifest_records_factor_attribution
 from crucible.calendar import TRADING_DAYS_PER_WEEK, is_trading_day, resolve_trading_day
 from crucible.carryover import (
     V1_SLOT_TO_V2_SLOT,
-    V1_STORE_URI_VAR,
+    V1_BUCKET_VAR,
     LedgerError,
     grade_carryover,
     parse_ledger,
@@ -7685,7 +7685,7 @@ def _clause_v1_arms_carried_or_excluded(
     * MET otherwise.
 
     ``v1_store`` is for tests; the phase assembler passes none and the store is
-    resolved from `CRUCIBLE_V1_STORE_URI` (no default — a bucket name may not
+    resolved from `CRUCIBLE_ARCTIC_BUCKET` (no default — a bucket name may not
     live in this repo).
     """
     _unused(window)
@@ -7698,19 +7698,19 @@ def _clause_v1_arms_carried_or_excluded(
     )
     ledger_key = v1_carryover_key()
     if v1_store is None:
-        uri = os.environ.get(V1_STORE_URI_VAR, "").strip()
-        if not uri:
+        bucket = os.environ.get(V1_BUCKET_VAR, "").strip()
+        if not bucket:
             return _unmeasurable(
                 name,
                 requirement,
-                f"`{V1_STORE_URI_VAR}` is not set, so v1's live arm set was not read at all. "
+                f"`{V1_BUCKET_VAR}` is not set, so v1's live arm set was not read at all. "
                 "It carries no default (a bucket name may not live in this repository); set it "
-                "to v1's artifact store. UNMEASURABLE, never met: nothing was compared",
+                "to the data bucket v1 writes to. UNMEASURABLE, never met: nothing was compared",
                 (ledger_key,),
             )
-        from crucible.config import store_from_uri  # noqa: PLC0415 - only when a URI is set
+        from crucible.config import store_from_uri  # noqa: PLC0415 - only when a bucket is set
 
-        v1_store = store_from_uri(uri)
+        v1_store = store_from_uri(f"s3://{bucket}")
     v1 = read_v1_arm_sets(v1_store)
     evidence: list[str] = [ledger_key, *v1.evidence]
     if v1.problems:

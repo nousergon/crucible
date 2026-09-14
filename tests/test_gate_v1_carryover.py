@@ -30,7 +30,7 @@ from crucible.carryover import (
     V1_S_SERVING_KEY,
     V1_SCANNER_CUT_KEY,
     V1_SCANNER_SPEC_KEY,
-    V1_STORE_URI_VAR,
+    V1_BUCKET_VAR,
     V1_ZOO_LEADERBOARD_KEY,
     LedgerError,
     parse_ledger,
@@ -323,16 +323,26 @@ class TestUnreadableSourcesAreUnmeasurable:
         assert "AccessDenied" in clause.detail
 
     def test_an_unset_v1_location(self, v2: LocalStore, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv(V1_STORE_URI_VAR, raising=False)
+        monkeypatch.delenv(V1_BUCKET_VAR, raising=False)
         clause = clause_fn(v2, _window())
         assert clause.unmeasurable and not clause.met
-        assert V1_STORE_URI_VAR in clause.detail
+        assert V1_BUCKET_VAR in clause.detail
 
     def test_the_location_is_read_from_the_environment(
         self, v2: LocalStore, v1: LocalStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv(V1_STORE_URI_VAR, str(v1.root))
+        import crucible.config as config
+
+        opened: list[str] = []
+
+        def fake_store_from_uri(uri: str) -> LocalStore:
+            opened.append(uri)
+            return v1
+
+        monkeypatch.setenv(V1_BUCKET_VAR, "v1-data-bucket")
+        monkeypatch.setattr(config, "store_from_uri", fake_store_from_uri)
         clause = clause_fn(v2, _window())
+        assert opened == ["s3://v1-data-bucket"]
         assert clause.met, clause.detail
 
 
