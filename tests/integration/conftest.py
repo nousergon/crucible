@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 
 from crucible.calendar import is_trading_day
+from crucible.features import min_panel_trading_days
 from crucible.required import require_env
 from crucible.slots.grading import DEFAULT_HORIZON_TRADING_DAYS
 from crucible.store import Store, open_store
@@ -34,6 +35,7 @@ from crucible.store import Store, open_store
 __all__ = [
     "INTEGRATION_TRADING_DAY",
     "SETTLED_TRADING_DAY",
+    "integration_seed_trading_days",
 ]
 
 #: Fixed literal, never wall-clock (AGENTS.md, Test discipline). A Tuesday,
@@ -68,6 +70,37 @@ assert is_trading_day(dt.date.fromisoformat(SETTLED_TRADING_DAY)), (
     f"SETTLED_TRADING_DAY={SETTLED_TRADING_DAY!r} is not a real NYSE trading day per "
     "crucible.calendar — every key this tier writes binds to it (plan §4.12)."
 )
+
+
+#: Sessions of headroom above the feature catalogue's own minimum
+#: (`crucible.features.min_panel_trading_days`) this tier seeds beyond what
+#: `data.daily`'s producer guard strictly requires — never zero: the guard
+#: compares the PRODUCER's trailing panel (sized from
+#: `crucible.data.daily.DEFAULT_LOOKBACK_DAYS`, itself a calendar-day margin
+#: over the same minimum) against this constant's session count, and a seed
+#: pinned exactly at the minimum would start failing again the moment either
+#: margin shifted by one session.
+_SEED_DEPTH_MARGIN_TRADING_DAYS = 20
+
+
+def integration_seed_trading_days() -> int:
+    """Sessions of price history this tier seeds before `INTEGRATION_TRADING_DAY`.
+
+    **Was a literal `300`** (`alpha-engine-config-I10701`, measured against
+    run 34797033396): `crucible-PR266` sized the producer's own guard —
+    `crucible.data.daily.PanelDepthError` — from
+    `crucible.features.min_panel_trading_days()` (313 sessions today), and a
+    fixture that still hand-counted 300 failed `test_data_daily`,
+    `test_data_weekly` and `test_data_heal` with "the trailing panel ...
+    carries 300 session(s), below the 313 the feature catalogue's deepest
+    column needs" — a literal that could not notice the catalogue's deepest
+    column changing under it, the exact class `DEFAULT_LOOKBACK_DAYS`'s own
+    docstring warns against for the producer side. Derived from the same
+    producer function the guard itself calls, plus a fixed margin, so this
+    tier's seed can never again fall behind that guard without both moving
+    together.
+    """
+    return min_panel_trading_days() + _SEED_DEPTH_MARGIN_TRADING_DAYS
 
 
 def _sessions_between(start: dt.date, end: dt.date) -> int:
@@ -311,11 +344,15 @@ def integration_arctic_symbols(arctic_library: Any) -> list[str]:
     shape `tests/conftest.py::synthetic_frames` produces for the unit suite's
     `FramePriceSource` fixtures, which is a different contract.
 
-    ~300 trading sessions BEFORE `INTEGRATION_TRADING_DAY`, comfortably above
-    `data.daily`'s default 400 CALENDAR-day lookback
-    (`crucible.data.daily.DEFAULT_LOOKBACK_DAYS`, roughly 275 trading
-    sessions) so the feature layer's longest window (252-session momentum) is
-    never starved — plus every session THROUGH `SETTLED_TRADING_DAY`
+    `integration_seed_trading_days()` sessions BEFORE `INTEGRATION_TRADING_DAY`
+    — derived from `crucible.features.min_panel_trading_days()` (the same
+    function `crucible.data.daily.MIN_PANEL_TRADING_DAYS` calls to size the
+    producer's own `PanelDepthError` guard) plus a fixed margin, never a
+    literal session count (`alpha-engine-config-I10701`; see
+    `integration_seed_trading_days`'s own docstring for the literal-300
+    defect this replaced) — so the feature layer's deepest column (today,
+    252-session residual momentum composed over a 61-session residual
+    stream) is never starved — plus every session THROUGH `SETTLED_TRADING_DAY`
     (`alpha-engine-config-I10633`), one continuous random walk rather than
     two independent ones, so a `data.daily`/`data.weekly` run at either fixed
     day reads the same coherent series and a shadow produced at
@@ -337,7 +374,7 @@ def integration_arctic_symbols(arctic_library: Any) -> list[str]:
     settled = dt.date.fromisoformat(SETTLED_TRADING_DAY)
     days: list[dt.date] = []
     day = anchor
-    while len(days) < 300:
+    while len(days) < integration_seed_trading_days():
         if is_trading_day(day):
             days.append(day)
         day -= dt.timedelta(days=1)
