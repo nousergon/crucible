@@ -33,6 +33,12 @@ from crucible.release import (
     wheel_key,
 )
 from crucible.store import LocalStore, S3Store, sha256_hex
+from tests.support.releases import (
+    SYNTHETIC_DIGEST,
+    publish_v4,
+    release_json_v4,
+    write_wheelhouse,
+)
 
 
 class _FakeS3Client:
@@ -74,9 +80,12 @@ DEPLOY_YML = WORKFLOWS / "deploy.yml"
 WHEEL_BYTES = b"PK\x03\x04 a wheel"
 
 
-def _release_json(sha=SHA, *, wheel: bytes = WHEEL_BYTES, wheel_sha256: str | None = None) -> str:
+def _release_json(
+    sha=SHA, *, wheel: bytes = WHEEL_BYTES, wheel_sha256: str | None = None, wheelhouse=None
+) -> str:
     """The DETERMINISTIC identity record (alpha-engine-config-I9786) that
-    DESCRIBES its wheel.
+    DESCRIBES its wheel — release.v4, carrying its wheelhouse
+    (alpha-engine-config-I10812).
 
     `wheel_sha256` is derived from the bytes rather than stubbed, because a
     fixture that pre-supplies a placeholder digest is a fixture in which the
@@ -84,17 +93,7 @@ def _release_json(sha=SHA, *, wheel: bytes = WHEEL_BYTES, wheel_sha256: str | No
     to be absent and nothing noticed. `wheel_sha256=` is here only so a test
     can deliberately break the correspondence.
     """
-    return json.dumps(
-        {
-            "schema_version": "release.v3",
-            "sha": sha,
-            "lockfile_sha256": "0" * 64,
-            "wheel_sha256": wheel_sha256 or sha256_hex(wheel),
-            "wheel_filename": wheel_filename_for(sha),
-            "python_requires": ">=3.12,<3.13",
-            "extra": {},
-        }
-    )
+    return release_json_v4(sha, wheel=wheel, wheel_sha256=wheel_sha256, wheelhouse=wheelhouse)
 
 
 def _provenance_json(sha=SHA, *, run_id: str = "1", run_attempt: str = "1") -> str:
@@ -122,7 +121,15 @@ def _token(tmp_path, store, name="pointer.token") -> str:
     return str(path)
 
 
-def _write_smoke(store, sha=SHA, status="ok", *, trading_day=None, smoked_extras=("arcticdb",)):
+def _write_smoke(
+    store,
+    sha=SHA,
+    status="ok",
+    *,
+    trading_day=None,
+    smoked_extras=("arcticdb",),
+    wheelhouse_digest=SYNTHETIC_DIGEST,
+):
     """A conformant `run_manifest.v2` document (alpha-engine-config-I10682):
     `crucible.deploy._flip` now validates the smoke manifest whole through
     `crucible.manifest.validate`/`RunManifestV2` before reading any field off
@@ -167,6 +174,11 @@ def _write_smoke(store, sha=SHA, status="ok", *, trading_day=None, smoked_extras
         "metrics": [],
         "attempts": [{"n": 1, "reason": "initial"}],
     }
+    # alpha-engine-config-I10812: the smoke ran from the offline install of
+    # the published wheelhouse, so its manifest names that digest. None
+    # models a smoke that ran from anything else.
+    if wheelhouse_digest is not None:
+        manifest["wheelhouse_digest"] = wheelhouse_digest
     # alpha-engine-config-I10069: every flip test writes a manifest that
     # already covers the required extras (pyproject.toml declares
     # `arcticdb` today) unless a test deliberately asks for a different set
@@ -201,15 +213,25 @@ class TestPublish:
         provenance_json=None,
         run_id="1",
         suffix="",
+        wheelhouse_dir=None,
     ):
         # Named exactly what release.json's `wheel_filename` declares
         # (alpha-engine-config-I9908) — `_publish` now refuses a `--wheel`
         # whose basename disagrees with the record it is publishing.
         wheel_path = tmp_path / wheel_filename_for(sha)
         wheel_path.write_bytes(wheel)
+        if wheelhouse_dir is None:
+            wheelhouse_dir = tmp_path / f"wheelhouse-{sha[:6]}{suffix}"
+            manifest = write_wheelhouse(wheelhouse_dir)
+        else:
+            from crucible.wheelhouse import build_manifest
+
+            manifest = build_manifest(wheelhouse_dir, extras=["arcticdb"])
         meta = tmp_path / f"{sha[:6]}{suffix}-release.json"
         meta.write_text(
-            release_json if release_json is not None else _release_json(sha, wheel=wheel)
+            release_json
+            if release_json is not None
+            else _release_json(sha, wheel=wheel, wheelhouse=manifest)
         )
         prov = tmp_path / f"{sha[:6]}{suffix}-provenance.json"
         prov.write_text(
@@ -228,6 +250,8 @@ class TestPublish:
                 str(meta),
                 "--provenance-json",
                 str(prov),
+                "--wheelhouse",
+                str(wheelhouse_dir),
             ]
         )
 
@@ -324,14 +348,20 @@ class TestPublish:
         actually drives in CI."""
         wheel_path = tmp_path / wheel_filename_for(SHA)
         wheel_path.write_bytes(WHEEL_BYTES)
+        wheelhouse_dir = tmp_path / "wheelhouse"
+        manifest = write_wheelhouse(wheelhouse_dir)
         meta = tmp_path / "a-release.json"
-        meta.write_text(_release_json(SHA, wheel=WHEEL_BYTES))
+        meta.write_text(_release_json(SHA, wheel=WHEEL_BYTES, wheelhouse=manifest))
         prov = tmp_path / "a-provenance.json"
         prov.write_text(_provenance_json(SHA))
         client = _FakeS3Client()
         store = S3Store("bucket", "crucible", client=client)
         args = argparse.Namespace(
-            sha=SHA, wheel=str(wheel_path), release_json=str(meta), provenance_json=str(prov)
+            sha=SHA,
+            wheel=str(wheel_path),
+            release_json=str(meta),
+            provenance_json=str(prov),
+            wheelhouse=str(wheelhouse_dir),
         )
         assert _publish(args, store) == 0
         for key in (wheel_key(SHA), release_json_key(SHA)):
@@ -399,7 +429,7 @@ class TestPublish:
                 provenance_json=bad_provenance_json,
             )
         message = str(excinfo.value)
-        assert "release.v3.json" in message
+        assert "release.v4.json" in message
         assert "lockfile_sha256" in message
         assert "python_requires" in message
         # The store must be untouched: the CLI's own construction of
@@ -437,14 +467,7 @@ class TestPublish:
 class TestFlip:
     def _published(self, tmp_path, sha=SHA):
         store = LocalStore(tmp_path)
-        publish_release(
-            store,
-            sha=sha,
-            wheel=b"w" + sha[:1].encode(),
-            lockfile=b"l",
-            test_summary="",
-            workflow_run_url="",
-        )
+        publish_v4(store, sha=sha)
         return store
 
     def test_an_ok_smoke_flips_the_pointer(self, tmp_path) -> None:
@@ -596,9 +619,7 @@ class TestFlip:
 class TestCapture:
     def test_it_writes_the_token_the_flip_will_swap_against(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
-        publish_release(
-            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
-        )
+        publish_v4(store, sha=SHA)
         out = tmp_path / "t" / "pointer.token"
         assert (
             deploy_main(["capture", "--sha", SHA, "--store", str(tmp_path), "--out", str(out)]) == 0
@@ -612,9 +633,7 @@ class TestCapture:
         from crucible.store import ETAG_ABSENT
 
         store = LocalStore(tmp_path)
-        publish_release(
-            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
-        )
+        publish_v4(store, sha=SHA)
         out = tmp_path / "pointer.token"
         deploy_main(["capture", "--sha", SHA, "--store", str(tmp_path), "--out", str(out)])
         assert out.read_bytes().decode("utf-8") == ETAG_ABSENT
@@ -630,9 +649,7 @@ class TestRecord:
         """§4.11: the deploy writes its own manifest in the run-manifest
         schema, so §4.5's page shows deploys beside runs."""
         store = LocalStore(tmp_path)
-        publish_release(
-            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
-        )
+        publish_v4(store, sha=SHA)
         _write_smoke(store)
         token = tmp_path / "pointer.token"
         deploy_main(["capture", "--sha", SHA, "--store", str(tmp_path), "--out", str(token)])
@@ -863,6 +880,8 @@ class TestAMalformedShaIsRefusedBeforeAnyStep:
                     str(tmp_path / "does-not-exist.whl"),
                     "--release-json",
                     str(tmp_path / "does-not-exist.json"),
+                    "--wheelhouse",
+                    str(tmp_path / "no-wheelhouse"),
                     "--provenance-json",
                     str(tmp_path / "does-not-exist.json"),
                 ]
@@ -1037,27 +1056,20 @@ class TestTheWorkflowItself:
         `/tmp/crucible-install-proof.whl` and pip refused it — `is not a
         valid wheel filename` — which is the I9908 defect re-created inside
         the step that proves its fix. pip validates the FILENAME (PEP 427),
-        so a renamed wheel is a different artifact. The `pip install` target
-        must be the build's own `wheel_filename` output, and the download
-        destination must carry it too."""
+        so a renamed wheel is a different artifact. Since
+        alpha-engine-config-I10812 pip reaches the wheel through a hashed
+        requirement built from the PUBLISHED record's own `wheel_filename`,
+        and the download destination keeps the build's filename."""
         names = [json.dumps(s) for s in self._release_steps(workflow)]
         install_proof = next(i for i, s in enumerate(names) if "pip install" in s)
-        script = self._release_steps(workflow)[install_proof]["run"]
-        wheel_ref = "${{ needs.build.outputs.wheel_filename }}"
-        pip_lines = [ln for ln in script.splitlines() if "pip install" in ln]
-        assert pip_lines, "the proof must call pip install"
-        for line in pip_lines:
-            # alpha-engine-config-I10069: the target now carries the required
-            # extra(s) in brackets right after the published filename — e.g.
-            # `.../{wheel_ref}[${EXTRAS}]"` — so the wheel_ref itself must sit
-            # immediately before that bracket, not be the line's tail.
-            assert f"{wheel_ref}[${{EXTRAS}}]" in line, (
-                f"pip install must target the wheel under its PUBLISHED filename, with "
-                f"the required extra(s) appended, got: {line!r}"
-            )
-        cp_lines = [ln for ln in script.splitlines() if "aws s3 cp" in ln]
-        assert cp_lines and all(ln.rstrip().rstrip('"').endswith(wheel_ref) for ln in cp_lines), (
+        step = self._release_steps(workflow)[install_proof]
+        script = step["run"]
+        assert step["env"]["WHEEL_FILENAME"] == "${{ needs.build.outputs.wheel_filename }}"
+        assert '"${proof}/${WHEEL_FILENAME}"' in script, (
             "the download destination must keep the published wheel filename"
+        )
+        assert 'r["wheel_filename"]' in script and "--hash=sha256:" in script, (
+            "pip must install the wheel by the record's own filename, hash-checked"
         )
         assert "crucible-install-proof.whl" not in script, (
             "a renamed wheel is what pip refused on 2026-09-03"
@@ -1065,24 +1077,26 @@ class TestTheWorkflowItself:
 
     def test_the_install_proof_smokes_the_extras_pyproject_declares(self, workflow) -> None:
         """alpha-engine-config-I10069: the smoke greened a wheel whose data
-        layer could not import — `No module named 'arcticdb'` — because
-        nothing installed the `[arcticdb]` extra before verifying the wheel.
-        The extra NAME must be derived from `pyproject.toml`'s own
-        `[project.optional-dependencies]`, never restated as a literal
-        (crucible/AGENTS.md: no suppression collections), and the import
-        must actually be exercised before the flip can trust it."""
+        layer could not import — `No module named 'arcticdb'`. The extra
+        NAMES are derived from `pyproject.toml` at build time (never restated,
+        crucible/AGENTS.md: no suppression collections), recorded on the
+        release, installed from that record, and the import is exercised
+        before the flip can trust it."""
+        build = next(
+            s
+            for s in workflow["jobs"]["build"]["steps"]
+            if "crucible.wheelhouse" in s.get("run", "")
+        )
+        assert "tomllib" in build["run"] and "optional-dependencies" in build["run"]
         names = [json.dumps(s) for s in self._release_steps(workflow)]
         install_proof = next(i for i, s in enumerate(names) if "pip install" in s)
         smoke = next(i for i, s in enumerate(names) if "crucible smoke" in s)
         script = self._release_steps(workflow)[install_proof]["run"]
-        assert "tomllib" in script and "optional-dependencies" in script, (
-            "the extras must be DERIVED from pyproject.toml, not hardcoded as a restated literal"
-        )
-        assert '"[arcticdb]"' not in script and "[arcticdb]" not in script, (
+        assert "[arcticdb]" not in script and "[arcticdb]" not in build["run"], (
             "the extra name must never be restated as a literal in the workflow — "
             "it belongs in exactly one place, pyproject.toml"
         )
-        assert "import nousergon_lib.arcticdb, arcticdb" in script, (
+        assert "nousergon_lib.arcticdb, arcticdb" in script, (
             "the proof must actually import the module the data layer needs, not "
             "just install the extra's dependency"
         )
@@ -1104,6 +1118,13 @@ class TestTheSmokeGate:
     in this class is a state in which the smoke used to report `ok` with
     `smoke_ok` value 1.0 and an empty `inputs[]`.
     """
+
+    @pytest.fixture(autouse=True)
+    def _installed_from_the_synthetic_wheelhouse(self, monkeypatch):
+        """`deploy.yml` runs the smoke from the offline install of the
+        published wheelhouse and exports its digest (alpha-engine-config-
+        I10812); every smoke here models that, unless a test unsets it."""
+        monkeypatch.setenv("CRUCIBLE_WHEELHOUSE_DIGEST", SYNTHETIC_DIGEST)
 
     def _args(self, tmp_path, sha=SHA):
         import argparse
@@ -1147,23 +1168,14 @@ class TestTheSmokeGate:
         """A truncated or clobbered upload. Nothing downstream re-hashes, so
         the first symptom would be an install failure on a box at 06:30."""
         store = LocalStore(tmp_path)
-        publish_release(
-            store,
-            sha=SHA,
-            wheel=b"the tested wheel",
-            lockfile=b"l",
-            test_summary="",
-            workflow_run_url="",
-        )
+        publish_v4(store, sha=SHA)
         store.put_bytes(wheel_key(SHA), b"something else entirely")
         with pytest.raises(ValueError, match="hashes to"):
             self._run(tmp_path)
 
     def test_a_release_json_describing_another_build_fails(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
-        publish_release(
-            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
-        )
+        publish_v4(store, sha=SHA)
         publish_release(
             store, sha=OTHER, wheel=b"w2", lockfile=b"l", test_summary="", workflow_run_url=""
         )
@@ -1190,9 +1202,7 @@ class TestTheSmokeGate:
         document boundary, with the SAME "does not conform" message shape
         every other boundary in this migration raises."""
         store = LocalStore(tmp_path)
-        publish_release(
-            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
-        )
+        publish_v4(store, sha=SHA)
         store.put_bytes(
             POINTER_KEY,
             json.dumps(
@@ -1211,9 +1221,7 @@ class TestTheSmokeGate:
         """`inputs: []` on a gate is the signature of a gate that read
         nothing."""
         store = LocalStore(tmp_path)
-        publish_release(
-            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
-        )
+        publish_v4(store, sha=SHA)
         assert self._run(tmp_path) == 0
         manifest = self._manifest(tmp_path)
         assert manifest["status"] == "ok"
@@ -1229,9 +1237,7 @@ class TestTheSmokeGate:
         which is a fact about the system a constant cannot express.
         """
         store = LocalStore(tmp_path)
-        publish_release(
-            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
-        )
+        publish_v4(store, sha=SHA)
         publish_release(
             store, sha=OTHER, wheel=b"w2", lockfile=b"l", test_summary="", workflow_run_url=""
         )
@@ -1247,9 +1253,7 @@ class TestTheSmokeGate:
         """A value that is the same number on a bootstrap store and on a
         populated one is not a measurement."""
         store = LocalStore(tmp_path)
-        publish_release(
-            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
-        )
+        publish_v4(store, sha=SHA)
         self._run(tmp_path)
         bootstrap = self._metric(self._manifest(tmp_path))["value"]
 
@@ -1268,9 +1272,7 @@ class TestTheSmokeGate:
         other end, recorded on the manifest `crucible.deploy._flip` reads."""
         monkeypatch.setenv("CRUCIBLE_SMOKED_EXTRAS", "arcticdb")
         store = LocalStore(tmp_path)
-        publish_release(
-            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
-        )
+        publish_v4(store, sha=SHA)
         assert self._run(tmp_path) == 0
         metric = self._metric(self._manifest(tmp_path))
         assert metric["smoked_extras"] == ["arcticdb"]
@@ -1284,9 +1286,7 @@ class TestTheSmokeGate:
         pass the flip's extras check."""
         monkeypatch.delenv("CRUCIBLE_SMOKED_EXTRAS", raising=False)
         store = LocalStore(tmp_path)
-        publish_release(
-            store, sha=SHA, wheel=b"w", lockfile=b"l", test_summary="", workflow_run_url=""
-        )
+        publish_v4(store, sha=SHA)
         assert self._run(tmp_path) == 0
         metric = self._metric(self._manifest(tmp_path))
         assert metric["smoked_extras"] == []
@@ -1352,6 +1352,8 @@ class TestOpenStoreRejectsAnUnknownScheme:
                     str(meta),
                     "--provenance-json",
                     str(prov),
+                    "--wheelhouse",
+                    str(tmp_path / "no-wheelhouse"),
                 ]
             )
         assert not (tmp_path / "file:").exists()

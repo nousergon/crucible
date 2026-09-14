@@ -26,7 +26,11 @@ import pytest
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
-from crucible.models import ReleaseProvenanceDocument, ReleaseRecordDocument
+from crucible.models import (
+    ReleaseProvenanceDocument,
+    ReleaseRecordDocument,
+    ReleaseRecordV3Document,
+)
 from crucible.release import (
     ReleaseProvenance,
     ReleaseRecord,
@@ -73,7 +77,8 @@ class TestTheCommittedSchemasAreGeneratedFromTheModels:
     @pytest.mark.parametrize(
         ("filename", "model"),
         [
-            ("release.v3.json", ReleaseRecordDocument),
+            ("release.v3.json", ReleaseRecordV3Document),
+            ("release.v4.json", ReleaseRecordDocument),
             ("release_provenance.v1.json", ReleaseProvenanceDocument),
         ],
     )
@@ -117,11 +122,11 @@ class TestTheCommittedSchemasAreGeneratedFromTheModels:
 class TestAMalformedDocumentNamesTheFieldAtTheModelLevel:
     def test_a_bad_sha_pattern_is_refused_by_name(self) -> None:
         with pytest.raises(ValidationError, match="sha"):
-            ReleaseRecordDocument.model_validate(_record_payload(sha="not-a-sha"))
+            ReleaseRecordV3Document.model_validate(_record_payload(sha="not-a-sha"))
 
     def test_an_unknown_top_level_key_is_refused(self) -> None:
         with pytest.raises(ValidationError, match="bogus_field"):
-            ReleaseRecordDocument.model_validate(_record_payload(bogus_field="nope"))
+            ReleaseRecordV3Document.model_validate(_record_payload(bogus_field="nope"))
 
     def test_a_wrong_schema_version_is_refused(self) -> None:
         with pytest.raises(ValidationError, match="schema_version"):

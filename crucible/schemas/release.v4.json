@@ -1,0 +1,150 @@
+{
+  "$defs": {
+    "WheelhouseManifestDocument": {
+      "additionalProperties": false,
+      "description": "The `wheelhouse` object of a release.v4 `release.json` (I10812).\n\nValidated whole on construction: the digest must be the one\n`crucible.wheelhouse.wheelhouse_digest` computes from the wheels and the\nlock hash, and the wheels are sorted and unique, so two records describing\nthe same wheelhouse are byte-identical (`assert_immutable_write`).",
+      "properties": {
+        "digest": {
+          "description": "sha256 over sha256sum-format lines for every wheel (sorted) then the lock. The value a run manifest records as wheelhouse_digest.",
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Digest",
+          "type": "string"
+        },
+        "extras": {
+          "description": "The crucible extras the lock was exported with, and the box installs the crucible wheel with. Read from pyproject.toml at build time.",
+          "items": {
+            "pattern": "^[a-z0-9][a-z0-9-]*$",
+            "type": "string"
+          },
+          "title": "Extras",
+          "type": "array"
+        },
+        "lock_filename": {
+          "const": "requirements.lock.txt",
+          "description": "The `uv export` lock, with hashes, at releases/{sha}/wheelhouse/requirements.lock.txt. A literal so a record cannot point the box's `-r` at another object.",
+          "title": "Lock Filename",
+          "type": "string"
+        },
+        "lock_sha256": {
+          "description": "The lock file's own hash.",
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Lock Sha256",
+          "type": "string"
+        },
+        "platform": {
+          "description": "What the wheels were resolved for: the box's OS image, architecture and interpreter tag.",
+          "minLength": 1,
+          "title": "Platform",
+          "type": "string"
+        },
+        "wheels": {
+          "description": "Every dependency wheel, sorted by filename. Excludes the crucible wheel itself, which the record names in wheel_filename/wheel_sha256.",
+          "items": {
+            "$ref": "#/$defs/WheelhouseWheel"
+          },
+          "minItems": 1,
+          "title": "Wheels",
+          "type": "array"
+        }
+      },
+      "required": [
+        "lock_filename",
+        "lock_sha256",
+        "extras",
+        "platform",
+        "wheels",
+        "digest"
+      ],
+      "title": "WheelhouseManifestDocument",
+      "type": "object"
+    },
+    "WheelhouseWheel": {
+      "additionalProperties": false,
+      "description": "One dependency wheel in a release's wheelhouse.",
+      "properties": {
+        "filename": {
+          "description": "The wheel's object name under releases/{sha}/wheelhouse/. No path separator: the box interpolates it into a local path.",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+!-]*\\.whl$",
+          "title": "Filename",
+          "type": "string"
+        },
+        "sha256": {
+          "description": "The wheel's own hash, over the bytes published.",
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "filename",
+        "sha256"
+      ],
+      "title": "WheelhouseWheel",
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/nousergon/crucible/schemas/release.v4.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "What release.json carries at releases/{sha}/release.json. Deterministic across every rebuild of the same commit (I9786) -- nothing in this document can differ between two builds of the same sha, which is what makes assert_immutable_write's byte comparison a correctness check rather than a false-alarm generator. v3 replaces v2 (I9908): adds wheel_filename, the PEP-440-legal name the wheel was actually published under. Every release published before I9908 was named crucible-{sha}-py3-none-any.whl, which pip refuses outright (a 40-hex git sha is not a PEP 440 version) -- no wheel this pipeline ever published was installable. v3's wheel_filename lets a bash bootstrap on a spot box download the exact object by name without reimplementing crucible.release.wheel_filename_for's version derivation. v4 replaces v3 (I10812): adds wheelhouse, the hash-locked dependency set a box installs offline from releases/{sha}/wheelhouse/ with no index access. A v3 release carries none, and a box refuses it rather than resolving from PyPI. additionalProperties: false because a field a reader does not understand is a field the producer expected it to act on.",
+  "properties": {
+    "extra": {
+      "additionalProperties": true,
+      "description": "Reserved for future identity-bearing fields. Empty on every release today -- anything that would vary per run belongs in release_provenance.v1, not here.",
+      "title": "Extra",
+      "type": "object"
+    },
+    "lockfile_sha256": {
+      "description": "The resolved dependency tree's hash. The wheel does not pin its own transitive tree, so two wheels from one commit against two lockfiles are two different artifacts, and only this says which.",
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Lockfile Sha256",
+      "type": "string"
+    },
+    "python_requires": {
+      "description": "The interpreter constraint this wheel was built against.",
+      "minLength": 1,
+      "title": "Python Requires",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "release.v4",
+      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "sha": {
+      "description": "The commit this release is built from. Content-addresses the release prefix.",
+      "pattern": "^[0-9a-f]{40}$",
+      "title": "Sha",
+      "type": "string"
+    },
+    "wheel_filename": {
+      "description": "The exact object name the wheel is published under, at releases/{sha}/{wheel_filename}. PEP-440-legal (crucible-{version}-py3-none-any.whl), so pip can install it by name -- unlike every release published before I9908, which pip refused under both the download name and the store's own filename.",
+      "pattern": "^crucible-.+-py3-none-any\\.whl$",
+      "title": "Wheel Filename",
+      "type": "string"
+    },
+    "wheel_sha256": {
+      "description": "The wheel's own hash, checked against the bytes actually uploaded by both the publisher and the smoke.",
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Wheel Sha256",
+      "type": "string"
+    },
+    "wheelhouse": {
+      "$ref": "#/$defs/WheelhouseManifestDocument",
+      "description": "Every dependency wheel this release installs, for the box platform, with the lock pinning them by hash. Required: a release without one cannot be installed without an index, and I10812 removed index access from the box."
+    }
+  },
+  "required": [
+    "schema_version",
+    "sha",
+    "lockfile_sha256",
+    "wheel_sha256",
+    "wheel_filename",
+    "python_requires",
+    "wheelhouse",
+    "extra"
+  ],
+  "title": "Crucible release identity, v4",
+  "type": "object"
+}

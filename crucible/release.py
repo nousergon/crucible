@@ -51,6 +51,7 @@ from crucible.models import (
     ReleasePointerDocument,
     ReleaseProvenanceDocument,
     ReleaseRecordDocument,
+    ReleaseRecordV3Document,
     TraderReleasePinDocument,
 )
 from crucible.store import ETAG_ABSENT, PointerConflictError, S3Store, Store, sha256_hex
@@ -65,7 +66,8 @@ from crucible.store import ETAG_ABSENT, PointerConflictError, S3Store, Store, sh
 #: published schema say" (`tests/test_typed_boundary_release.py`'s byte-identity
 #: test is what keeps the committed `.json` files honest about it).
 _RELEASE_ARTIFACT_MODELS: dict[str, type[BaseModel]] = {
-    "release.v3.json": ReleaseRecordDocument,
+    "release.v4.json": ReleaseRecordDocument,
+    "release.v3.json": ReleaseRecordV3Document,
     "release_provenance.v1.json": ReleaseProvenanceDocument,
 }
 
@@ -112,6 +114,9 @@ __all__ = [
     "ReleaseProvenance",
     "ReleaseRecord",
     "ReleaseRecordMismatchError",
+    "ReleaseHasNoWheelhouseError",
+    "require_wheelhouse",
+    "wheelhouse_object_key",
     "StaleReleasePointerError",
     "TRADER_PIN_BLACKOUT_END_ET",
     "TRADER_PIN_BLACKOUT_START_ET",
@@ -168,7 +173,13 @@ __all__ = [
 #: version segment — see `wheel_filename_for`) and records that filename so
 #: a bash bootstrap on a spot box can download it by name without
 #: reimplementing the version derivation in shell.
-RELEASE_SCHEMA_VERSION = "release.v3"
+#:
+#: Bumped to v4 by alpha-engine-config-I10812: adds `wheelhouse`, every
+#: dependency wheel the release installs (built for the box platform) and the
+#: hash-locked lock pinning them, published under `releases/{sha}/wheelhouse/`.
+#: A box installs from it with no index access; a v3 release, which has none,
+#: is refused at boot rather than resolved from PyPI.
+RELEASE_SCHEMA_VERSION = "release.v4"
 
 #: The base PEP 440 version `pyproject.toml` declares. `deploy.yml` appends
 #: `+g<sha12>` at BUILD time (a local version segment, never committed —
@@ -440,6 +451,21 @@ def wheel_key_for(sha: str, wheel_filename: str) -> str:
     return f"{release_prefix(sha)}/{wheel_filename}"
 
 
+def wheelhouse_object_key(sha: str, filename: str) -> str:
+    """The key one wheelhouse object (a dependency wheel, or the lock) lives at.
+
+    `releases/{sha}/wheelhouse/{filename}` (alpha-engine-config-I10812). The
+    directory name is `crucible.wheelhouse.WHEELHOUSE_DIRNAME`, which the box
+    bootstrap is lockstep-tested against; a filename carrying a separator is
+    refused, because the box interpolates it into a local path.
+    """
+    from crucible.wheelhouse import WHEELHOUSE_DIRNAME  # noqa: PLC0415 - leaf module
+
+    if not filename or "/" in filename:
+        raise ValueError(f"{filename!r} is not a wheelhouse object name")
+    return f"{release_prefix(sha)}/{WHEELHOUSE_DIRNAME}/{filename}"
+
+
 def release_json_key(sha: str) -> str:
     return f"{release_prefix(sha)}/release.json"
 
@@ -497,6 +523,20 @@ class ReleaseRecord:
     wheel_filename: str
     python_requires: str = ">=3.12,<3.13"
     extra: dict[str, Any] = field(default_factory=dict)
+    #: release.v4 (alpha-engine-config-I10812): the hash-locked dependency set,
+    #: as `crucible.wheelhouse.build_manifest` produced it. `None` only on a
+    #: release.v3 record read back (or written by the pre-wheelhouse helper
+    #: :func:`publish_release`) — never on a record `crucible.deploy` publishes.
+    wheelhouse: dict[str, Any] | None = None
+
+    def _payload(self) -> dict[str, Any]:
+        """The document, with `wheelhouse` omitted on a v3 record: a v3 record
+        must serialise to the exact bytes it was published as, or re-reading
+        and re-publishing one would trip `assert_immutable_write`."""
+        payload = asdict(self)
+        if payload["wheelhouse"] is None:
+            del payload["wheelhouse"]
+        return payload
 
     def __post_init__(self) -> None:
         # Validated on CONSTRUCTION, not only inside `publish_release`
@@ -505,10 +545,37 @@ class ReleaseRecord:
         # `publish_release`, `crucible.deploy._publish`, or one that does not
         # exist yet — is refused the moment it builds one, with no second
         # call site to remember or forget.
-        _validate_release_artifact("release.v3.json", asdict(self))
+        # The schema FILE is chosen by the record's own version, never by a
+        # default: a v4 record missing its wheelhouse must be refused by the v4
+        # schema, not quietly accepted by v3's.
+        # An UNKNOWN version is validated against the current schema, which
+        # refuses the version AND names every other violation in one message —
+        # a refusal that stopped at the version would hide the rest.
+        schema_file = _RECORD_SCHEMA_FILES.get(
+            self.schema_version, _RECORD_SCHEMA_FILES[RELEASE_SCHEMA_VERSION]
+        )
+        _validate_release_artifact(schema_file, self._payload())
 
     def to_json(self) -> bytes:
-        return json.dumps(asdict(self), indent=2, sort_keys=True).encode("utf-8")
+        return json.dumps(self._payload(), indent=2, sort_keys=True).encode("utf-8")
+
+    @property
+    def wheelhouse_keys(self) -> list[tuple[str, str]]:
+        """`(key, sha256)` for every wheelhouse object this record names — each
+        dependency wheel, then the lock. Empty for a v3 record; callers that
+        need one go through :func:`require_wheelhouse` first."""
+        if self.wheelhouse is None:
+            return []
+        from crucible.wheelhouse import LOCK_FILENAME  # noqa: PLC0415 - leaf module
+
+        pairs = [
+            (wheelhouse_object_key(self.sha, w["filename"]), w["sha256"])
+            for w in self.wheelhouse["wheels"]
+        ]
+        pairs.append(
+            (wheelhouse_object_key(self.sha, LOCK_FILENAME), self.wheelhouse["lock_sha256"])
+        )
+        return pairs
 
     @property
     def wheel_key(self) -> str:
@@ -524,6 +591,34 @@ class ReleaseRecord:
         sha: it only knows its own.
         """
         return wheel_key_for(self.sha, self.wheel_filename)
+
+
+class ReleaseHasNoWheelhouseError(ValueError):
+    """A release carries no hash-locked wheelhouse, so nothing can install it
+    without an index — and alpha-engine-config-I10812 removed index access from
+    the box. Raised by name so the smoke and the flip refuse it, never degrade."""
+
+
+def require_wheelhouse(record: ReleaseRecord) -> dict[str, Any]:
+    """Return ``record``'s wheelhouse, or raise naming the fix.
+
+    The same refusal the box bootstrap prints, in the same words, so an
+    operator meets one message whichever surface reached it first.
+    """
+    if record.wheelhouse is None:
+        raise ReleaseHasNoWheelhouseError(
+            f"release {record.sha} ({record.schema_version}) publishes no wheelhouse. Boxes "
+            "install offline from a hash-locked wheelhouse only and never fall back to "
+            "PyPI. Fix: redeploy that release so it publishes one "
+            "(crucible deploy.yml), or `crucible release.pin` a release that carries one."
+        )
+    return record.wheelhouse
+
+
+#: schema_version -> the generated schema file a `ReleaseRecord` of that version
+#: validates against. v2 is never constructed directly: `parse_release_record`
+#: normalises it to v3 first.
+_RECORD_SCHEMA_FILES = {"release.v3": "release.v3.json", "release.v4": "release.v4.json"}
 
 
 @dataclass(frozen=True)
@@ -568,13 +663,21 @@ _RETIRED_SCHEMA_VERSION_V1 = "release.v1"
 #: to a key nothing wrote.
 _PREDECESSOR_SCHEMA_VERSION_V2 = "release.v2"
 
+#: The schema `release.json` carried before alpha-engine-config-I10812 — no
+#: `wheelhouse`. Still READ (rollback addressing, the smoke's pointed-release
+#: branch), never published by `crucible.deploy`, and refused by every
+#: installer: see :func:`require_wheelhouse`.
+_PREDECESSOR_SCHEMA_VERSION_V3 = "release.v3"
+
 
 def parse_release_record(payload: dict[str, Any]) -> ReleaseRecord:
     """Parse a `release.json` payload into a :class:`ReleaseRecord`.
 
-    Accepts `release.v2` (this schema's predecessor) and `release.v3` (this
-    module's current :data:`RELEASE_SCHEMA_VERSION`); refuses `release.v1`
-    by name. alpha-engine-config-I9908: every reader of a possibly-old
+    Accepts `release.v2`, `release.v3` (both pre-wheelhouse) and `release.v4`
+    (this module's current :data:`RELEASE_SCHEMA_VERSION`); refuses `release.v1`
+    by name. A v2 or v3 record parses with `wheelhouse=None`: readable, and
+    refused by anything that would install it (:func:`require_wheelhouse`).
+    alpha-engine-config-I9908: every reader of a possibly-old
     `release.json` — `crucible.deploy._publish`'s idempotent-republish
     check, `crucible.track_c._verify_release_artifacts`'s smoke gate — goes
     through here rather than constructing `ReleaseRecord` directly, so a
@@ -583,13 +686,13 @@ def parse_release_record(payload: dict[str, Any]) -> ReleaseRecord:
     the time.
     """
     version = payload.get("schema_version")
-    if version == RELEASE_SCHEMA_VERSION:
+    if version in (RELEASE_SCHEMA_VERSION, _PREDECESSOR_SCHEMA_VERSION_V3):
         return ReleaseRecord(**payload)
     if version == _PREDECESSOR_SCHEMA_VERSION_V2:
         normalized = dict(payload)
         sha = normalized.get("sha", "")
         normalized["wheel_filename"] = f"crucible-{sha}-py3-none-any.whl"
-        normalized["schema_version"] = RELEASE_SCHEMA_VERSION
+        normalized["schema_version"] = _PREDECESSOR_SCHEMA_VERSION_V3
         return ReleaseRecord(**normalized)
     if version == _RETIRED_SCHEMA_VERSION_V1:
         # Retired by the issue named in this module's RELEASE_SCHEMA_VERSION
@@ -604,7 +707,8 @@ def parse_release_record(payload: dict[str, Any]) -> ReleaseRecord:
         )
     raise ValueError(
         f"release.json schema_version {version!r} is not recognized; expected "
-        f"{_PREDECESSOR_SCHEMA_VERSION_V2!r} or {RELEASE_SCHEMA_VERSION!r}."
+        f"{_PREDECESSOR_SCHEMA_VERSION_V2!r}, {_PREDECESSOR_SCHEMA_VERSION_V3!r} or "
+        f"{RELEASE_SCHEMA_VERSION!r}."
     )
 
 
@@ -656,7 +760,15 @@ def publish_release(
     run_attempt: str = "1",
     now: dt.datetime | None = None,
 ) -> ReleaseRecord:
-    """Write the immutable half of a release. Does NOT touch the pointer.
+    """Write the immutable half of a PRE-WHEELHOUSE (release.v3) release.
+    Does NOT touch the pointer.
+
+    alpha-engine-config-I10812: this helper has no production caller — the
+    publisher is `crucible.deploy._publish`, which requires a release.v4
+    record and uploads its wheelhouse. It is kept writing v3 because it is
+    what the pointer, rollback and history tests lay releases down with, and a
+    v3 release is exactly what those need to exercise: published, pinnable,
+    and refused by every installer.
 
     Separated from the flip on purpose: uploading the artifact is safe and
     repeatable, and moving the pointer is the act with consequences. A single
@@ -692,7 +804,7 @@ def publish_release(
         raise ValueError(f"refusing to publish an empty wheel for {sha}")
     stamp = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     record = ReleaseRecord(
-        schema_version=RELEASE_SCHEMA_VERSION,
+        schema_version=_PREDECESSOR_SCHEMA_VERSION_V3,
         sha=sha,
         lockfile_sha256=sha256_hex(lockfile),
         wheel_sha256=sha256_hex(wheel),

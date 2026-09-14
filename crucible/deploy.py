@@ -2,7 +2,7 @@
 
 Normative source: plan §4.11.
 
-    publish   upload the wheel and release.json under releases/{sha}/
+    publish   upload the wheelhouse, the wheel and release.json under releases/{sha}/
     capture   write the pointer's version token to a file, BEFORE the smoke
     flip      read the smoke MANIFEST and, only on `ok`, repoint current
     record    write the deploy's own run manifest, on BOTH paths
@@ -56,8 +56,11 @@ from crucible.manifest import (
 )
 from crucible.release import (
     POINTER_KEY,
+    RELEASE_SCHEMA_VERSION,
+    ReleaseHasNoWheelhouseError,
     ReleaseProvenance,
     ReleaseRecord,
+    StaleReleasePointerError,
     assert_immutable_write,
     current_release,
     flip_on_smoke,
@@ -65,10 +68,17 @@ from crucible.release import (
     read_pointer,
     release_json_key,
     release_object_lock_params,
+    require_wheelhouse,
+    resolve_published_wheel,
     write_deploy_manifest,
 )
 from crucible.runmode import RUN_MODES, resolve_run_mode
 from crucible.store import PointerConflictError, Store, open_store, sha256_hex
+from crucible.wheelhouse import (
+    LOCK_FILENAME,
+    WheelhouseLockMismatchError,
+    verify_against_lock,
+)
 
 __all__ = ["main"]
 
@@ -176,7 +186,9 @@ def _publish(args: argparse.Namespace, store: Store) -> int:
     try:
         record = ReleaseRecord(**json.loads(Path(args.release_json).read_text(encoding="utf-8")))
     except (TypeError, ValueError) as exc:
-        raise SystemExit(f"{args.release_json} does not conform to release.v3.json: {exc}") from exc
+        raise SystemExit(
+            f"{args.release_json} does not conform to {RELEASE_SCHEMA_VERSION}.json: {exc}"
+        ) from exc
     try:
         provenance = ReleaseProvenance(
             **json.loads(Path(args.provenance_json).read_text(encoding="utf-8"))
@@ -217,12 +229,15 @@ def _publish(args: argparse.Namespace, store: Store) -> int:
             "under a name release.json does not describe would make it undiscoverable "
             "to any reader that trusts the record — which is every reader."
         )
-    # Both identity keys are checked before either is written: a refusal
-    # must not be able to leave a wheel from one build beside a release.json
-    # from another.
+    wheelhouse_objects = _wheelhouse_objects(record, Path(args.wheelhouse), args.sha)
+    # Every identity key is checked before any is written: a refusal must not
+    # be able to leave a wheel from one build beside a release.json from
+    # another. release.json goes LAST, so a record is never durable naming a
+    # wheelhouse object that has not landed (alpha-engine-config-I10812).
     writes = [
         (key, payload)
         for key, payload in (
+            *wheelhouse_objects,
             # `record.sha == args.sha` was asserted above, so the record's own
             # key IS this sha's key (alpha-engine-config-I9932: one pairing of
             # sha and wheel_filename, stated on the record).
@@ -257,8 +272,67 @@ def _publish(args: argparse.Namespace, store: Store) -> int:
             f"{provenance_key(args.sha, provenance.run_id, provenance.run_attempt)}."
         )
         return 0
-    print(f"published releases/{args.sha}/ ({len(wheel)} bytes)")
+    print(
+        f"published releases/{args.sha}/ ({len(wheel)} byte wheel, "
+        f"{len(wheelhouse_objects)} wheelhouse objects, digest {record.wheelhouse['digest']})"
+    )
     return 0
+
+
+def _wheelhouse_objects(
+    record: ReleaseRecord, directory: Path, sha: str
+) -> list[tuple[str, bytes]]:
+    """The wheelhouse objects to publish, each verified against the record.
+
+    alpha-engine-config-I10812. Refused, before anything is written, when:
+
+    * the record is not the current schema or carries no wheelhouse — the
+      publisher never writes a release a box cannot install;
+    * a file the record names is missing, or hashes to something else — the
+      record's manifest is the only statement a box has about these bytes;
+    * the directory holds a wheel the record does NOT name — publishing it
+      would put an object under the release prefix nothing vouches for;
+    * the wheels do not satisfy the lock (:func:`verify_against_lock`) — the
+      box's `--require-hashes` install would refuse them at 06:30 instead.
+    """
+    if record.schema_version != RELEASE_SCHEMA_VERSION:
+        raise SystemExit(
+            f"release.json for {sha} is {record.schema_version}; the publisher writes only "
+            f"{RELEASE_SCHEMA_VERSION}, the first schema a box can install offline."
+        )
+    try:
+        manifest = require_wheelhouse(record)
+    except ReleaseHasNoWheelhouseError as exc:
+        raise SystemExit(str(exc)) from exc
+    if not directory.is_dir():
+        raise SystemExit(f"--wheelhouse {directory} is not a directory")
+    named = {w["filename"] for w in manifest["wheels"]} | {LOCK_FILENAME}
+    stray = sorted(p.name for p in directory.iterdir() if p.name not in named)
+    if stray:
+        raise SystemExit(
+            f"--wheelhouse {directory} holds {stray}, which release.json for {sha} does not "
+            "name. Every object under the release prefix is one the record vouches for."
+        )
+    objects: list[tuple[str, bytes]] = []
+    for key, expected in record.wheelhouse_keys:
+        path = directory / key.rsplit("/", 1)[1]
+        if not path.is_file():
+            raise SystemExit(f"release.json for {sha} names {path.name}, absent from {directory}")
+        payload = path.read_bytes()
+        digest = sha256_hex(payload)
+        if digest != expected:
+            raise SystemExit(
+                f"{path} hashes to {digest}, but release.json for {sha} records {expected}. "
+                "Publishing a wheelhouse its own record does not describe makes the box's "
+                "hash check the first place the mismatch is found."
+            )
+        objects.append((key, payload))
+    lock_text = (directory / LOCK_FILENAME).read_bytes().decode("utf-8")
+    try:
+        verify_against_lock(manifest["wheels"], lock_text)
+    except WheelhouseLockMismatchError as exc:
+        raise SystemExit(str(exc)) from exc
+    return objects
 
 
 def _capture(args: argparse.Namespace, store: Store) -> int:
@@ -338,6 +412,27 @@ def _flip(args: argparse.Namespace, store: Store) -> int:
             "the schema itself refuses would flip the pointer on a document nobody can trust."
         ) from exc
     before = current_release(store)
+    # alpha-engine-config-I10812: the smoke must have graded THIS release's
+    # dependency set. A box installs exactly the wheelhouse the record names;
+    # a smoke that ran against any other set (a `uv sync`, a PyPI resolve, a
+    # different release's wheelhouse) proves nothing about what the box runs,
+    # which is the reproducibility half of the defect this closes.
+    try:
+        published_wheelhouse = require_wheelhouse(resolve_published_wheel(store, args.sha).record)
+    except (ReleaseHasNoWheelhouseError, StaleReleasePointerError, ValueError) as exc:
+        raise SystemExit(
+            f"refusing to flip releases/current to {args.sha}: {exc} releases/current is "
+            f"untouched at {before or '(unset)'}."
+        ) from exc
+    smoked_digest = smoke.get("wheelhouse_digest")
+    if smoked_digest != published_wheelhouse["digest"]:
+        raise SystemExit(
+            f"the smoke manifest for {args.sha} records wheelhouse_digest={smoked_digest!r}, "
+            f"but the release's wheelhouse is {published_wheelhouse['digest']}. The smoke must "
+            "run from the offline install of the published wheelhouse, or it graded a "
+            "dependency set no box installs. releases/current "
+            f"is untouched at {before or '(unset)'}."
+        )
     # alpha-engine-config-I10069: same shape as the `release_sha` check
     # `flip_on_smoke` makes below — a smoke manifest that never proved the
     # box's required extras install and import is a smoke that passed
@@ -512,7 +607,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="step", required=True)
 
     for name, help_text in (
-        ("publish", "Upload the wheel and release.json. Promotes nothing."),
+        ("publish", "Upload the wheelhouse, wheel and release.json. Promotes nothing."),
         ("capture", "Write the releases/current version token, BEFORE the smoke."),
         ("flip", "Read the smoke manifest and repoint releases/current on `ok`."),
         ("record", "Write the deploy's own run manifest, on both paths."),
@@ -524,6 +619,9 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--wheel", required=True)
             p.add_argument("--release-json", required=True)
             p.add_argument("--provenance-json", required=True)
+            # alpha-engine-config-I10812: the directory `deploy.yml` built the
+            # wheelhouse into. Required: a release without one is not published.
+            p.add_argument("--wheelhouse", required=True)
         if name == "capture":
             p.add_argument("--out", required=True)
         if name == "flip":

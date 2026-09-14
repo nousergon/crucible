@@ -1073,23 +1073,30 @@ def test_deploy_smoke_gate_installs_and_imports_the_arcticdb_extra() -> None:
     green and died on its first replay arc with `No module named
     'arcticdb'` — the smoke installed and imported the harness without the
     `[arcticdb]` extra, so the one dependency the data layer cannot run
-    without was outside what "smoked" measured. `deploy.yml`'s install-proof
-    step (the same step `test_the_flip_is_gated_on_a_real_pip_install...` in
-    `tests/test_deploy.py` extracts) must install the extra pyproject.toml
-    declares and actually import it, before the smoke that gates the flip
-    runs — and the extra name must be DERIVED from pyproject.toml, never
-    restated (crucible/AGENTS.md: no suppression collections)."""
+    without was outside what "smoked" measured.
+
+    Since alpha-engine-config-I10812 the extras are resolved into the release
+    at BUILD time: the build job exports the lock with every extra
+    pyproject.toml declares (DERIVED with tomllib, never restated) and records
+    them on release.json, and the install-proof step installs from that
+    record offline and must actually import the modules, before the smoke that
+    gates the flip runs."""
     workflow = Workflow.load(WORKFLOW_DIR / "deploy.yml")
+    build = next(
+        s for s in workflow.jobs["build"].steps if "crucible.wheelhouse" in s.get("run", "")
+    )
+    assert "tomllib" in build["run"] and "optional-dependencies" in build["run"], (
+        "the extra names must be read out of pyproject.toml's own "
+        "[project.optional-dependencies], not hardcoded in the workflow"
+    )
+    assert "[arcticdb]" not in build["run"]
     steps = workflow.jobs["release"].steps
     proof = next(s for s in steps if "pip install" in s.get("run", ""))
     script = proof["run"]
-    assert "tomllib" in script and "optional-dependencies" in script, (
-        "the extra name must be read out of pyproject.toml's own "
-        "[project.optional-dependencies], not hardcoded in the workflow"
-    )
-    assert "import nousergon_lib.arcticdb, arcticdb" in script, (
-        "the proof must actually import the module the data layer needs on this "
-        "x86_64 runner — the box's architecture after nous-ergon-ops-PR1054"
+    assert '["extras"]' in script, "the proof installs the extras the release RECORDS"
+    assert "[arcticdb]" not in script
+    assert "nousergon_lib.arcticdb, arcticdb" in script, (
+        "the proof must actually import the module the data layer needs"
     )
     smoke = next(i for i, s in enumerate(steps) if "crucible smoke" in s.get("run", ""))
     assert steps.index(proof) < smoke, (

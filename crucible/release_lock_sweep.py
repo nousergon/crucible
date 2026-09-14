@@ -90,6 +90,12 @@ ReleaseLockState = Literal["MET", "UNMET", "UNMEASURABLE"]
 #: covering every release object ever published, old naming and new, with
 #: one pattern rather than two.
 #:
+#: `wheelhouse/[^/]+` (alpha-engine-config-I10812): a release.v4 release also
+#: publishes its dependency wheels and their lock, one level down, and a box
+#: installs them as trusted as the crucible wheel itself — so they are
+#: identity objects, locked on publish and graded here. Exactly one level:
+#: the same `[^/]+` rule as below.
+#:
 #: The filename half is `[^/]+`, never `.+` (alpha-engine-config-I9917 item
 #: 2): `.` matches `/`, so `.+` made the pattern match at ANY depth below the
 #: sha prefix as long as the first segment started with `crucible-` — e.g.
@@ -100,7 +106,8 @@ ReleaseLockState = Literal["MET", "UNMET", "UNMEASURABLE"]
 #: grade something the release contract does not own and inflate the sweep's
 #: denominator with it.
 _RELEASE_OBJECT_RE = re.compile(
-    r"^releases/(?P<sha>[0-9a-f]{40})/(?:release\.json|crucible-[^/]+\.whl)$"
+    r"^releases/(?P<sha>[0-9a-f]{40})/"
+    r"(?:release\.json|crucible-[^/]+\.whl|wheelhouse/[^/]+)$"
 )
 
 #: `GetObjectRetention`'s error code for "this object has no Object Lock

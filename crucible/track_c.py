@@ -277,7 +277,71 @@ def _verify_release_artifacts(store: Store, sha: str, ctx: RunContext) -> list[s
         )
     ctx.record_input(meta_k, meta_bytes, schema_version=release.RELEASE_SCHEMA_VERSION)
     ctx.record_input(wheel_k, wheel_bytes, schema_version=release.RELEASE_SCHEMA_VERSION)
-    return [meta_k, wheel_k]
+    lock_k = _verify_release_wheelhouse(store, record, ctx)
+    return [meta_k, wheel_k, lock_k]
+
+
+def _verify_release_wheelhouse(store: Store, record: release.ReleaseRecord, ctx: RunContext) -> str:
+    """The wheelhouse half of the gate (alpha-engine-config-I10812). Raises.
+
+    A box installs a release offline from `releases/{sha}/wheelhouse/` and
+    nothing else, so a release whose wheelhouse is absent, incomplete, or
+    disagrees with its lock is a release no box can install — promoting it is
+    the outage, not a degraded deploy. Checked here:
+
+    * the record carries a wheelhouse at all;
+    * every object it names exists in the store;
+    * the lock in the store is the lock the record hashed, and the recorded
+      wheels satisfy it (the same check the publisher applies);
+    * THIS process was installed from that wheelhouse — `deploy.yml` runs the
+      smoke from the offline install and exports its digest, so a smoke run
+      from any other dependency set fails here rather than grading one no box
+      installs.
+
+    The wheel bytes themselves are not re-hashed here: `deploy.yml`'s install
+    proof installs every one with `--require-hashes` before this job starts.
+    Returns the lock key, for lineage.
+    """
+    from crucible.runner import WHEELHOUSE_DIGEST_ENV  # noqa: PLC0415 - one call site
+    from crucible.wheelhouse import (  # noqa: PLC0415 - one call site
+        WheelhouseLockMismatchError,
+        verify_against_lock,
+    )
+
+    try:
+        manifest = release.require_wheelhouse(record)
+    except release.ReleaseHasNoWheelhouseError as exc:
+        raise ValueError(f"smoke: {exc}") from exc
+    *wheel_keys, (lock_k, lock_sha256) = record.wheelhouse_keys
+    missing = [key for key, _ in wheel_keys if not store.exists(key)]
+    if missing or not store.exists(lock_k):
+        raise FileNotFoundError(
+            f"smoke: release {record.sha}'s wheelhouse is incomplete in the store — "
+            f"{len(missing)} of {len(wheel_keys)} wheels absent"
+            + ("" if store.exists(lock_k) else f", and no lock at {lock_k}")
+            + f" (first: {(missing or [lock_k])[0]}). A box installing it would fail offline."
+        )
+    lock_bytes = store.get_bytes(lock_k)
+    if sha256_hex(lock_bytes) != lock_sha256:
+        raise ValueError(
+            f"smoke: the lock at {lock_k} hashes to {sha256_hex(lock_bytes)}, but the release "
+            f"record claims {lock_sha256}. The box's `--require-hashes` install would trust a "
+            "lock the release never vouched for."
+        )
+    try:
+        verify_against_lock(manifest["wheels"], lock_bytes.decode("utf-8"))
+    except WheelhouseLockMismatchError as exc:
+        raise ValueError(f"smoke: {exc}") from exc
+    installed = os.environ.get(WHEELHOUSE_DIGEST_ENV, "")
+    if installed != manifest["digest"]:
+        raise ValueError(
+            f"smoke: this process names wheelhouse {installed or '(none)'} in "
+            f"${WHEELHOUSE_DIGEST_ENV}, but release {record.sha}'s wheelhouse is "
+            f"{manifest['digest']}. The smoke must run from the offline install of the "
+            "published wheelhouse, or it grades a dependency set no box installs."
+        )
+    ctx.record_input(lock_k, lock_bytes, schema_version=release.RELEASE_SCHEMA_VERSION)
+    return lock_k
 
 
 def smoke_handler(args: argparse.Namespace) -> int:
@@ -390,7 +454,9 @@ def smoke_handler(args: argparse.Namespace) -> int:
                         "job resolving the pointer is broken until this flip lands"
                     )
 
-        attempted = 2 + len(SMOKE_READS)  # the two release artifacts, plus the ambient paths
+        # The three release artifacts (release.json, wheel, wheelhouse lock),
+        # plus the ambient paths.
+        attempted = 3 + len(SMOKE_READS)
         # alpha-engine-config-I10069: the smoke job runs `uv sync --frozen`
         # against this checkout, which never installs an optional extra —
         # this process cannot `import arcticdb` itself and prove anything.
@@ -420,7 +486,8 @@ def smoke_handler(args: argparse.Namespace) -> int:
                 "status_reason": (
                     f"{len(read)} of {attempted} live read paths returned data for "
                     f"release {args.release}; wheel and release.json verified "
-                    f"byte-for-byte." + (f" Degraded: {'; '.join(degraded)}." if degraded else "")
+                    f"byte-for-byte, wheelhouse complete and graded."
+                    + (f" Degraded: {'; '.join(degraded)}." if degraded else "")
                 ),
                 "source_path": "runs/smoke/{trading_day}/run.json",
                 "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
