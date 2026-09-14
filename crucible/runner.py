@@ -27,6 +27,7 @@ that would happen.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import random
 import re
@@ -58,12 +59,15 @@ __all__ = [
     "MAX_ATTEMPTS",
     "CODE_SHA_ENV",
     "CodeShaError",
+    "DISPATCH_ATTEMPTS_ENV",
+    "DispatchAttemptsError",
     "RunContext",
     "SPOT_INTERRUPTION_REASON",
     "SpotInterruptionError",
     "TRANSIENT_CLASSIFIERS",
     "classify_transient",
     "rebind_trading_day",
+    "resolve_dispatch_attempts",
     "resolve_code_sha",
     "run_job",
     "spot_interruption_guard",
@@ -113,6 +117,18 @@ def spot_interruption_guard() -> Iterator[None]:
     `_user_data`). The guard is therefore correct and the wiring is what
     was missing; stated here because a docstring naming the wrong signal
     source is how the gap survived being read.
+
+    **What the raise leads to on a dispatched spot box, corrected
+    2026-09-14 (`alpha-engine-config-I10732`).** Retrying on the SAME box
+    inside the notice window only ever fit a job shorter than two minutes.
+    Two `data.heal` boxes reclaimed ten minutes in retried in-process,
+    deferred their manifest to that retry, and lost it with the box: no
+    manifest, no log, no retry anywhere. On a box whose shell declares
+    :data:`DISPATCH_ATTEMPTS_ENV`, a spot interruption is therefore not
+    retried here at all — the dispatcher re-launches the job from the
+    EventBridge interruption warning, outside the failure domain of the box
+    being reclaimed, and the next box's manifest records this attempt (see
+    :func:`run_job`).
 
     Restores the previous handler on exit, including on the raise, so a
     caller that wraps two runs does not leave the second one holding the
@@ -208,6 +224,69 @@ def classify_transient(exc: BaseException) -> str | None:
 
 
 _ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32
+
+
+#: The box shell's declaration of THIS dispatch's attempt ladder
+#: (`alpha-engine-config-I10732`), exported by
+#: `nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml`'s
+#: `_user_data` as the JSON the dispatcher recorded:
+#: `[{"n": 1, "reason": "initial"}]` on a first dispatch, and
+#: `[..., {"n": 2, "reason": "spot_interruption"}]` on the box the dispatcher
+#: re-launched after the first one was reclaimed. Its PRESENCE is also the
+#: declaration that the substrate owns re-dispatch of a reclaimed spot box, so
+#: :func:`run_job` does not retry a spot interruption in-process on such a box.
+#: Absent on a laptop or CI run, where nothing re-dispatches anything.
+DISPATCH_ATTEMPTS_ENV = "CRUCIBLE_DISPATCH_ATTEMPTS"
+
+
+class DispatchAttemptsError(RuntimeError):
+    """`$CRUCIBLE_DISPATCH_ATTEMPTS` is set but is not a well-formed ladder.
+
+    Raised before the job body runs, like :class:`CodeShaError`: a ladder
+    this process cannot read is a claim about prior attempts that would land
+    on the manifest as `attempts[]` — refusing is free here and a guessed
+    history is not.
+    """
+
+
+def resolve_dispatch_attempts() -> list[dict[str, Any]] | None:
+    """The attempt rows the dispatcher declared for this box, or None.
+
+    None means no dispatcher launched this process (a laptop, CI). Anything
+    else is validated to the manifest's own `AttemptRow` shape — `n` counting
+    from 1 with no gap, `initial` first, a declared transient class after —
+    and bounded by :data:`MAX_ATTEMPTS`, since a ladder longer than the
+    runner's own would be a loop the runner refuses everywhere else.
+    """
+    raw = os.environ.get(DISPATCH_ATTEMPTS_ENV)
+    if raw is None:
+        return None
+    try:
+        rows = json.loads(raw)
+    except ValueError as exc:
+        raise DispatchAttemptsError(
+            f"{DISPATCH_ATTEMPTS_ENV}={raw!r} is not JSON: {exc}"
+        ) from exc
+    declared = {reason for reason, _types, _needles in TRANSIENT_CLASSIFIERS}
+    if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_ATTEMPTS:
+        raise DispatchAttemptsError(
+            f"{DISPATCH_ATTEMPTS_ENV}={raw!r} must be a list of 1..{MAX_ATTEMPTS} attempt rows"
+        )
+    for n, row in enumerate(rows, start=1):
+        well_formed = (
+            isinstance(row, dict)
+            and set(row) == {"n", "reason"}
+            and row["n"] == n
+            and (row["reason"] == "initial" if n == 1 else row["reason"] in declared)
+        )
+        if not well_formed:
+            raise DispatchAttemptsError(
+                f"{DISPATCH_ATTEMPTS_ENV}={raw!r}: row {n} is {row!r}; expected "
+                f"{{'n': {n}, 'reason': "
+                + ("'initial'" if n == 1 else f"one of {sorted(declared)}")
+                + "}"
+            )
+    return [dict(row) for row in rows]
 
 
 def _new_run_id(now: dt.datetime) -> str:
@@ -742,6 +821,21 @@ def run_job(
     retried success is visibly a retried success rather than a clean first
     attempt, and a page fires only when the retry also fails.
 
+    **A spot interruption on a dispatched spot box is the exception**
+    (`alpha-engine-config-I10732`). When the box shell declares
+    :data:`DISPATCH_ATTEMPTS_ENV`, the instance is spot and the ladder has
+    room, the interruption is NOT retried on the box being reclaimed and NO
+    manifest is written: the dispatcher re-launches the job on demand from
+    the EventBridge interruption warning, and that box's shell declares the
+    ladder `[initial, spot_interruption]`, so the ONE manifest — written by
+    the attempt that can actually finish — carries both attempts,
+    `resource.interruptions: 1` and `escalated_to_on_demand: true`. Writing
+    a `failed` manifest here first would page for a fault that is being
+    absorbed and then be overwritten at the same key, the last-writer-wins
+    shape this function refuses. This holds whatever ``transient_retry``
+    says: that flag governs retries on THIS process, and the re-dispatch is
+    a property of the compute, not of the job.
+
     The retry rests on jobs being idempotent, which is what content-addressed
     outputs are for: a rerun producing identical bytes is a no-op. A job that
     is not idempotent is a defect in that job, not a reason to remove the
@@ -844,13 +938,18 @@ def run_job(
     # never deferred to the write path, where a raise would collide with
     # "manifest or it did not happen" (see `CodeShaError`).
     resolved_code_sha = resolve_code_sha()
+    # Same shape again (alpha-engine-config-I10732): a ladder the box
+    # declared but this process cannot read is refused before any work.
+    dispatch_attempts = resolve_dispatch_attempts()
     if trading_day is None:
         trading_day = resolve_trading_day(started)
     else:
         assert_trading_day(trading_day, context=manifest_key(job, trading_day.isoformat()))
 
     resolved_seed = seed if seed is not None else int(trading_day.strftime("%Y%m%d"))
-    attempts: list[dict[str, Any]] = [{"n": 1, "reason": "initial"}]
+    attempts: list[dict[str, Any]] = (
+        dispatch_attempts if dispatch_attempts is not None else [{"n": 1, "reason": "initial"}]
+    )
 
     while True:
         ctx = RunContext(
@@ -889,6 +988,7 @@ def run_job(
         status = "ok"
         reason = ""
         transient: str | None = None
+        redispatched = False
         try:
             # The guard is installed HERE, inside the runner, rather than left
             # to each call site. `spot_interruption_guard` is defined in this
@@ -915,7 +1015,19 @@ def run_job(
             # a terminal spot interruption can be recorded even when it will
             # not be retried (`alpha-engine-config-I10520`).
             exc_class = classify_transient(exc)
-            if transient_retry and len(attempts) < MAX_ATTEMPTS:
+            if (
+                exc_class == SPOT_INTERRUPTION_REASON
+                and dispatch_attempts is not None
+                and ctx.resource["spot"]
+                and len(attempts) < MAX_ATTEMPTS
+            ):
+                # alpha-engine-config-I10732: the dispatcher's interruption
+                # rule owns the next attempt, on a box that is not being
+                # reclaimed. Its predicate is this one — a spot box with
+                # room on the ladder — so exactly one of the two writes the
+                # terminal manifest, never both and never neither.
+                redispatched = True
+            elif transient_retry and len(attempts) < MAX_ATTEMPTS:
                 transient = exc_class
             elif exc_class == SPOT_INTERRUPTION_REASON:
                 # Terminal: no further attempt will run to append a
@@ -933,7 +1045,14 @@ def run_job(
             # `ok` one for attempt 2 at the same key would leave the store's
             # answer to "did this run work" decided by write ordering, which is
             # the last-writer-wins shape this system is built to refuse.
-            if transient is None:
+            if redispatched:
+                print(
+                    f"spot_interruption: {job} {ctx.trading_day.isoformat()} attempt "
+                    f"{len(attempts)} was reclaimed on a spot box; no manifest written by "
+                    f"this attempt — the dispatcher re-launches it ({DISPATCH_ATTEMPTS_ENV})",
+                    file=sys.stderr,
+                )
+            elif transient is None:
                 if dry_run:
                     # No manifest, no outputs record — `dry_run` means this
                     # function makes exactly zero writes of its own. `fn` may
