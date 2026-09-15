@@ -136,10 +136,7 @@ def test_schema_conformant_rows_flow_through_the_real_institutional_source(schem
     """The real consumer path: schema-conformant rows -> parquet bytes ->
     SnapshotPointInTimeSource.load() -> a measured `institutional` GroupReading."""
     tickers = [f"T{i:03d}" for i in range(40)]
-    rows = [
-        _row(t, n_inc=(7 * i) % 41, n_dec=(11 * i) % 37)
-        for i, t in enumerate(tickers)
-    ]
+    rows = [_row(t, n_inc=(7 * i) % 41, n_dec=(11 * i) % 37) for i, t in enumerate(tickers)]
     for row in rows:
         jsonschema.validate(instance=row, schema=schema)
     objects = {**_base_objects(tickers), inst_ownership_key(2026, 1): _frame_from_rows(rows)}
