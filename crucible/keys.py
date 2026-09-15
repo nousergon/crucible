@@ -40,6 +40,7 @@ __all__ = [
     "DATA_BUCKET_KEY_HELPERS",
     "DISPATCH_ROOT",
     "DRIFT_INPUTS",
+    "EXPERIMENTS_ROOT",
     "FAULT_INJECTION_ROOT",
     "INTEGRATION_STORE_SUBPREFIX",
     "MANIFEST_BASENAME",
@@ -155,6 +156,14 @@ ARM_SEGMENT_SEPARATOR = "~"
 #: week-cost/deploys loop, `crucible.alerts._week_summary`) — lists this
 #: constant directly rather than hardcoding `"runs/"` at the call site.
 RUNS_ROOT = "runs/"
+
+#: The root namespace segment every dated arm artifact lives under —
+#: `experiments_prefix` narrows it to one arm. A caller with no arm at all —
+#: an existential "every settled verdict, across every slot and arm" scan
+#: (`crucible.explain.select_newest_settled_verdict`,
+#: `alpha-engine-config-I10858`) — lists this constant directly rather than
+#: hardcoding `"experiments/"` at the call site.
+EXPERIMENTS_ROOT = "experiments/"
 
 #: The basename EVERY run manifest is written under, and the only object under
 #: a manifest prefix that is a manifest.

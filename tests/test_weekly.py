@@ -220,12 +220,13 @@ class TestRunsTheRealCommand:
             return 0
 
         run_arc(FRIDAY, store="/tmp/store", run_mode=RUN_MODE_REPLAY, main=fake_main, dry_run=True)
-        # 5 unscoped stages (data.weekly, drift, report, console,
-        # iac.conformance) + one stage per ARC_SLOT_JOB x every DISPATCHABLE
-        # slot. Derived from `ARC_SLOT_JOBS` rather than written as a literal
-        # so a job joining the slot-scoped set (`promote`,
+        # 6 unscoped stages (data.weekly, drift, report, console,
+        # iac.conformance, explain — the last joined the arc at
+        # alpha-engine-config-I10858) + one stage per ARC_SLOT_JOB x every
+        # DISPATCHABLE slot. Derived from `ARC_SLOT_JOBS` rather than written
+        # as a literal so a job joining the slot-scoped set (`promote`,
         # `alpha-engine-config-I9759`) does not need this arithmetic edited.
-        assert len(seen) == 5 + len(ARC_SLOT_JOBS) * len(dispatchable_slots())
+        assert len(seen) == 6 + len(ARC_SLOT_JOBS) * len(dispatchable_slots())
         for argv in seen:
             assert "--dry-run" in argv, argv
             assert "--run-mode" in argv, argv
@@ -241,9 +242,35 @@ class TestRunsTheRealCommand:
             return 0
 
         run_arc(FRIDAY, store="/tmp/store", run_mode=RUN_MODE_REPLAY, main=fake_main, dry_run=False)
-        assert len(seen) == 5 + len(ARC_SLOT_JOBS) * len(dispatchable_slots())
+        assert len(seen) == 6 + len(ARC_SLOT_JOBS) * len(dispatchable_slots())
         for argv in seen:
             assert "--dry-run" not in argv, argv
+
+    def test_the_explain_stage_carries_select_newest_verdict_and_no_target(self) -> None:
+        """`alpha-engine-config-I10858`: the arc names no operator target for
+        `explain` — it names the flag that makes the selection deterministic
+        instead (`crucible.explain.select_newest_settled_verdict`)."""
+        seen: list[list[str]] = []
+
+        def fake_main(argv: list[str]) -> int:
+            seen.append(argv)
+            return 0
+
+        run_arc(FRIDAY, store="/tmp/store", run_mode=RUN_MODE_REPLAY, main=fake_main)
+        explain_calls = [a for a in seen if a[0] == "explain"]
+        assert len(explain_calls) == 1, explain_calls
+        argv = explain_calls[0]
+        assert "--select-newest-verdict" in argv, argv
+        # No bare positional target: every other token is either the job
+        # name, a flag, or that flag's own value.
+        flags = {"--date", "--run-mode", "--store", "--select-newest-verdict", "--dry-run"}
+        i = 1
+        while i < len(argv):
+            token = argv[i]
+            assert token in flags, f"unexpected positional {token!r} in {argv}"
+            if token != "--select-newest-verdict" and token != "--dry-run":
+                i += 1  # skip the flag's value
+            i += 1
 
     def test_a_failed_stage_stops_the_arc_and_names_itself(self) -> None:
         """No `continue`, no partial success. The stages after a failure read

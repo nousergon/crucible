@@ -319,9 +319,55 @@ components:
     console_surface: crucible/runs
     artifact_retention: forever
     absence_watched_by: alerts.sweep
-    schedule: null
-    dispatch: null
-    deadline: null
+    # alpha-engine-config-I10858. `_clause_explain_walks_a_verdict`
+    # (`crucible/gate.py`) reads a ROLLING phase-1 window
+    # (`_session_span`, currently ~31 calendar days) for an `explain` run
+    # whose manifest walked a `verdict.json`. Until this row said `dispatch:
+    # arc`, `explain` was purely on-demand (plan §10.8): nothing refreshed
+    # the evidence, so the one manifest that ever qualified (2026-08-07)
+    # aged out of the window with nothing behind it and phase 1 read UNMET
+    # 5/6 on the 2026-09-15 07:30Z ladder. A rolling-window clause needs a
+    # producer on a cadence SHORTER than its window — weekly, joining the
+    # arc like `experiment.grade` and `promote`, is comfortably inside a
+    # ~31-day span. `dispatch: arc` (not a standalone GHA workflow) mirrors
+    # the established pattern for a weekly cadence
+    # (`crucible.weekly.arc_stages` — six other rows already join this way)
+    # rather than inventing a second scheduling mechanism, and it runs
+    # under the SAME identity every other arc stage does (`RuntimeRole`,
+    # the spot-job identity), which already holds read+list over
+    # `crucible/experiments/*` (it WRITES the verdicts `experiment.grade`
+    # produces) and read+write over `crucible/runs/*` — so this needed no
+    # new IAM grant (verified against
+    # nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml
+    # `RuntimeRole`'s `WriteEverythingThatIsNotARelease` and
+    # `ListItsOwnPrefix` statements).
+    #
+    # `crucible.weekly.Stage.argv` appends `--select-newest-verdict`
+    # (`crucible.weekly.SELECT_NEWEST_VERDICT_JOBS`) rather than naming a
+    # target: `crucible.explain.select_newest_settled_verdict` picks the
+    # newest SETTLED verdict.json across every slot deterministically and
+    # raises `NoSettledVerdictError` (caught by `run_job`, filed as a
+    # `failed` manifest) if none exists — never a silently empty walk.
+    #
+    # 17:15, after `console` (17:00, the arc's other last stage before this
+    # one joined it) and before the arc's own 17:30 deadline
+    # (`components.yaml`'s `weekly:` row — an arc deadline earlier than a
+    # stage it runs would page for a run that was still working): the
+    # freshest verdicts this week's `experiment.grade` run just wrote should
+    # already be selectable, and `explain` reads no artifact any later stage
+    # produces, so ordering it last costs nothing and avoids racing the
+    # verdict it is about to select.
+    #
+    # `explain` remains callable on demand exactly as before — an operator
+    # or agent target still runs `crucible explain <target>` with no
+    # `--select-newest-verdict` — this row only adds a SECOND, scheduled
+    # invocation shape; it does not narrow the first.
+    schedule: weekly, Saturday
+    dispatch: arc
+    deadline:
+      anchor: next_calendar_day_at
+      cadence: weekly
+      at: "17:15"
 
   migrate.history:
     description: Import v1 arm history, flagged with its provenance.

@@ -39,11 +39,12 @@ what makes the difference machine-checkable.
 
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from crucible.documents import read_manifests_under
-from crucible.keys import RUNS_ROOT, manifest_key
+from crucible.documents import load_store_document, read_manifests_under
+from crucible.keys import EXPERIMENTS_ROOT, RUNS_ROOT, manifest_key
 from crucible.manifest import (
     ManifestValidationError,
     MoneyPathChainError,
@@ -63,11 +64,69 @@ __all__ = [
     "Lineage",
     "ManifestLoad",
     "MoneyPathChainError",
+    "NoSettledVerdictError",
     "explain",
     "load_manifests",
     "render",
+    "select_newest_settled_verdict",
     "verify_money_path_chain",
 ]
+
+
+class NoSettledVerdictError(RuntimeError):
+    """No `verdict.json` exists anywhere under `experiments/` — nothing for
+    a scheduled `explain --select-newest-verdict` refresh to walk.
+
+    Raised inside the job body (`crucible.track_a.handle_explain`), not
+    before it, so `crucible.runner.run_job` still files a `failed` manifest
+    naming this — rule 1 (manifest or it did not happen): a scheduled run
+    that found nothing to walk is a fact about the system, not a fact this
+    command is entitled to leave unrecorded.
+    """
+
+
+def select_newest_settled_verdict(store: Store) -> str:
+    """The key of the most recently SETTLED `verdict.json`, across every
+    slot and arm — deterministic, for the scheduled `explain` arc stage
+    (`alpha-engine-config-I10858`).
+
+    "Newest" is the verdict document's own `trading_day` field, not the S3
+    key's lexical order (an arm's hashed segment sorts arbitrarily relative
+    to another arm's) and not object last-modified (`experiment.backfill`
+    can write an old decision date's verdict long after a newer one already
+    exists). A tie — two verdicts settling the same `trading_day` in
+    different slots — breaks on the key itself, which is a stable total
+    order and keeps the selection reproducible for the same store state
+    rather than depending on iteration order.
+
+    Every verdict this store holds is by construction SETTLED: a slot never
+    writes `verdict.json` before its horizon has passed
+    (`crucible.slots.grading`), so there is no separate "is it settled" test
+    here — reading the key at all is the settlement fact.
+
+    Raises :class:`NoSettledVerdictError` rather than returning `None` —
+    §5 (fail loud): a caller silently walking nothing would file an `explain`
+    manifest whose `inputs` never include a verdict, which is exactly the
+    gap `explain_walks_a_verdict` exists to detect, and swallowing it here
+    would hide that detector's own failure mode from itself.
+    """
+    best_key: str | None = None
+    best_day: dt.date | None = None
+    for key in sorted(store.list_keys(EXPERIMENTS_ROOT)):
+        if not key.endswith("/verdict.json"):
+            continue
+        document = load_store_document(store, key)
+        day = dt.date.fromisoformat(document["trading_day"])
+        if best_day is None or day > best_day or (day == best_day and key > (best_key or "")):
+            best_day = day
+            best_key = key
+    if best_key is None:
+        raise NoSettledVerdictError(
+            "no settled verdict.json exists anywhere under experiments/ in this store — "
+            "nothing for a scheduled explain refresh to walk"
+        )
+    return best_key
+
 
 #: How deep the walk goes before it stops. A cycle in the input/output graph
 #: is impossible by construction (a key has one producer, and a run cannot

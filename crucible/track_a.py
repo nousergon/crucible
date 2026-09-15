@@ -31,6 +31,7 @@ from crucible.data.point_in_time import FilingDatePointInTimeSource, PointInTime
 from crucible.data.universe import DeclaredUniverse, load_declared_universe, universe_from_argv
 from crucible.explain import explain as explain_lineage
 from crucible.explain import render as render_lineage
+from crucible.explain import select_newest_settled_verdict
 from crucible.gate import PHASES
 from crucible.keys import arm_register_key
 from crucible.manifest import manifest_key
@@ -658,13 +659,38 @@ def handle_explain(args: argparse.Namespace) -> int:
     `--verify-chain` calls `chain.raise_if_broken()` when a chain was
     computed, which is a no-op on an intact chain and a non-zero exit naming
     the break otherwise.
+
+    **`--select-newest-verdict`** (`alpha-engine-config-I10858`) is the
+    scheduled arc stage's own affordance: `components.yaml`'s `explain` row
+    joined the Saturday arc (`dispatch: arc`, after `experiment.grade`) so
+    the phase-1 clause `explain_walks_a_verdict` — a ROLLING window — has a
+    producer on a cadence shorter than its window, instead of relying on an
+    operator's memory the way its one qualifying manifest (2026-08-07) did
+    before it aged out. Mutually exclusive with a positional `target`: an
+    arc stage names no target on its own argv (`crucible.weekly.Stage.argv`),
+    and an operator who typed both meant one or the other, not "pick
+    whichever". `crucible.explain.select_newest_settled_verdict` does the
+    selection and raises `NoSettledVerdictError` when the store holds no
+    verdict at all — inside `job()` below, so that failure still files a
+    `failed` manifest (rule 1) rather than dying before `run_job` opens one.
     """
     config = _settings(args)
     store = config.store()
+    select_newest = bool(getattr(args, "select_newest_verdict", False))
+    target = args.target
+    if select_newest and target:
+        raise SystemExit("--select-newest-verdict and an explicit target are mutually exclusive")
+    if not select_newest and not target:
+        raise SystemExit(
+            "explain requires a target (RUN_ID|VERDICT_KEY) or --select-newest-verdict"
+        )
     captured: dict[str, Any] = {}
 
     def job(ctx: Any) -> None:
-        lineage = explain_lineage(store, args.target)
+        walk_target = select_newest_settled_verdict(store) if select_newest else target
+        if select_newest:
+            print(f"selected newest settled verdict: {walk_target}")
+        lineage = explain_lineage(store, walk_target)
         captured["lineage"] = lineage
         for key in _lineage_keys(lineage):
             if store.exists(key):

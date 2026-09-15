@@ -10,7 +10,7 @@ import pytest
 
 from crucible.data import run_daily
 from crucible.data.point_in_time import UnavailablePointInTimeSource
-from crucible.explain import explain, render
+from crucible.explain import NoSettledVerdictError, explain, render, select_newest_settled_verdict
 from crucible.keys import manifest_key
 from crucible.ledger import append_trials, n_trials, read_trials
 from crucible.migrate import SOURCES, MigrationSourceMissing, run_migrate_history
@@ -614,6 +614,66 @@ class TestMigrate:
             assert pointer_after[field] == pointer_before[field], field
 
 
+class TestSelectNewestSettledVerdict:
+    """`crucible.explain.select_newest_settled_verdict`
+    (`alpha-engine-config-I10858`) — the deterministic target the scheduled
+    weekly `explain` arc stage walks, since an arc stage names no operator
+    target on its own argv (`crucible.weekly.Stage.argv`)."""
+
+    def test_the_newest_trading_day_wins_across_slots_and_arms(self, store) -> None:
+        store.put_bytes(
+            "experiments/r~arm_a~aaa/2026-07-31/verdict.json",
+            json.dumps({"trading_day": "2026-07-31"}).encode(),
+        )
+        store.put_bytes(
+            "experiments/u~arm_b~bbb/2026-08-12/verdict.json",
+            json.dumps({"trading_day": "2026-08-12"}).encode(),
+        )
+        store.put_bytes(
+            "experiments/m~arm_c~ccc/2026-08-05/verdict.json",
+            json.dumps({"trading_day": "2026-08-05"}).encode(),
+        )
+        expected = "experiments/u~arm_b~bbb/2026-08-12/verdict.json"
+        assert select_newest_settled_verdict(store) == expected
+
+    def test_a_tie_on_trading_day_breaks_on_the_key_deterministically(self, store) -> None:
+        store.put_bytes(
+            "experiments/r~arm_a~aaa/2026-08-12/verdict.json",
+            json.dumps({"trading_day": "2026-08-12"}).encode(),
+        )
+        store.put_bytes(
+            "experiments/u~arm_z~zzz/2026-08-12/verdict.json",
+            json.dumps({"trading_day": "2026-08-12"}).encode(),
+        )
+        # The larger key string wins, both ways round — the selection does
+        # not depend on write order or store iteration order.
+        assert (
+            select_newest_settled_verdict(store)
+            == "experiments/u~arm_z~zzz/2026-08-12/verdict.json"
+        )
+
+    def test_a_non_verdict_document_under_experiments_is_never_selected(self, store) -> None:
+        store.put_bytes(
+            "experiments/r~arm_a~aaa/2026-08-12/shadow.json",
+            json.dumps({"trading_day": "2026-09-01"}).encode(),
+        )
+        store.put_bytes(
+            "experiments/r~arm_a~aaa/2026-08-05/verdict.json",
+            json.dumps({"trading_day": "2026-08-05"}).encode(),
+        )
+        expected = "experiments/r~arm_a~aaa/2026-08-05/verdict.json"
+        assert select_newest_settled_verdict(store) == expected
+
+    def test_no_verdict_anywhere_raises_rather_than_returning_none(self, store) -> None:
+        store.put_bytes("experiments/r~arm_a~aaa/2026-08-12/shadow.json", b"{}")
+        with pytest.raises(NoSettledVerdictError, match="no settled verdict.json"):
+            select_newest_settled_verdict(store)
+
+    def test_an_empty_store_raises_rather_than_returning_none(self, store) -> None:
+        with pytest.raises(NoSettledVerdictError):
+            select_newest_settled_verdict(store)
+
+
 class TestExplainWalksAVerdict:
     """Plan §10.8, as the phase-1 gate measures it (`explain_walks_a_verdict`):
     an `explain` RUN whose manifest records a verdict.json as an input.
@@ -708,6 +768,91 @@ class TestExplainWalksAVerdict:
         walked = [i["key"] for i in manifest["inputs"]]
         assert verdict in walked, walked
         assert any("verdict.json" in k for k in walked)
+
+    def test_select_newest_verdict_walks_the_deterministic_target(
+        self, store, source, strategy_dir, cycle_date, tmp_path, monkeypatch
+    ) -> None:
+        """`alpha-engine-config-I10858`: `--select-newest-verdict` (the
+        scheduled arc stage's own flag, `crucible.weekly.
+        SELECT_NEWEST_VERDICT_JOBS`) is equivalent, end to end, to an
+        operator naming the same key explicitly — it walks it, records it as
+        an input, and the manifest reads exactly as
+        `test_explain_runs_through_run_job_and_records_the_verdict_it_walked`
+        does for an explicit target."""
+        import json
+
+        from crucible.cli import main
+        from crucible.explain import select_newest_settled_verdict
+        from crucible.keys import manifest_key
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        grade, _days = self._graded_cycle(store, source, strategy_dir, cycle_date, tmp_path)
+        assert any(o["key"].endswith("/verdict.json") for o in grade.outputs)
+        # The grade wrote more than one arm's verdict; the selection is by
+        # `trading_day`, never "the first output listed" — computed
+        # independently, the same way the scheduled arc stage's own call
+        # will resolve it against this same store state.
+        expected = select_newest_settled_verdict(store)
+        day = cycle_date.isoformat()
+
+        rc = main(
+            [
+                "explain",
+                "--date",
+                day,
+                "--run-mode",
+                "replay",
+                "--store",
+                str(store.root),
+                "--select-newest-verdict",
+            ]
+        )
+
+        assert rc == 0
+        manifest = json.loads(store.get_bytes(manifest_key("explain", day)))
+        assert manifest["status"] == "ok"
+        walked = [i["key"] for i in manifest["inputs"]]
+        assert expected in walked, walked
+
+    def test_select_newest_verdict_and_an_explicit_target_are_mutually_exclusive(
+        self, store, tmp_path, monkeypatch, cycle_date
+    ) -> None:
+        from crucible.cli import main
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        with pytest.raises(SystemExit, match="mutually exclusive"):
+            main(
+                [
+                    "explain",
+                    "--date",
+                    cycle_date.isoformat(),
+                    "--run-mode",
+                    "replay",
+                    "--store",
+                    str(store.root),
+                    "--select-newest-verdict",
+                    "some/verdict.json",
+                ]
+            )
+
+    def test_neither_a_target_nor_select_newest_verdict_is_refused(
+        self, store, tmp_path, monkeypatch, cycle_date
+    ) -> None:
+        from crucible.cli import main
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        with pytest.raises(SystemExit, match="requires a target"):
+            main(
+                [
+                    "explain",
+                    "--date",
+                    cycle_date.isoformat(),
+                    "--run-mode",
+                    "replay",
+                    "--store",
+                    str(store.root),
+                ]
+            )
 
     def test_dry_run_explain_prints_the_walk_and_files_nothing(
         self, store, source, strategy_dir, cycle_date, tmp_path, monkeypatch, capsys

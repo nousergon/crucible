@@ -840,7 +840,7 @@ def build_parser() -> argparse.ArgumentParser:
                 ),
             )
         if spec.name == "explain":
-            sub.add_argument("target", metavar="RUN_ID|VERDICT_KEY")
+            sub.add_argument("target", metavar="RUN_ID|VERDICT_KEY", nargs="?")
             sub.add_argument(
                 "--verify-chain",
                 action="store_true",
@@ -848,6 +848,21 @@ def build_parser() -> argparse.ArgumentParser:
                     "Verify the money-path hash chain (plan §9.5, "
                     f"{_money_path_chain_tracker()}) and exit non-zero on a break. A "
                     "no-op when the walk never crossed the money path."
+                ),
+            )
+            # The scheduled Saturday arc stage's own flag; see
+            # `crucible.weekly.SELECT_NEWEST_VERDICT_JOBS` and this file's own
+            # tracker note there (alpha-engine-config-I10858) — never restated
+            # in a runtime string per `tests/test_no_stale_tracker_literals.py`.
+            sub.add_argument(
+                "--select-newest-verdict",
+                action="store_true",
+                help=(
+                    "Walk the newest SETTLED verdict.json across every slot/arm "
+                    "(`crucible.explain.select_newest_settled_verdict`), deterministically "
+                    "— for the scheduled Saturday arc stage, "
+                    "never for an operator holding a specific target. Mutually exclusive "
+                    "with the positional target; exactly one is required."
                 ),
             )
         if spec.name == "release.pin":
