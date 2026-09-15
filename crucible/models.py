@@ -3090,6 +3090,10 @@ class BoardCurrentRowDocument(_Strict):
     #: `None` = no reading taken; `[]` = read, no clauses. Both legal.
     clauses: list[dict[str, Any]] | None = None
     setback: dict[str, Any] | None = None
+    #: `alpha-engine-config-I10872`: the classifier state behind a component
+    #: row. Defaulted, because every board written before the field existed
+    #: must still validate as a `previous`.
+    component_state: str | None = None
 
 
 class BoardCurrentHumanTouchDocument(_Strict):

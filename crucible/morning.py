@@ -95,8 +95,9 @@ from zoneinfo import ZoneInfo
 
 from crucible import tracker
 from crucible.calendar import previous_trading_day
+from crucible.console.classify import not_yet_due
 from crucible.documents import load_store_document, read_document
-from crucible.gate import PHASES, TRACKER_REPO
+from crucible.gate import LADDER_KEY, PHASES, TRACKER_REPO
 from crucible.keys import (
     BOARD_CURRENT_KEY,
     BOARD_HTML_KEY,
@@ -633,6 +634,13 @@ class MorningInputs:
     #: page above is the link and its caveat is rendered. Never both: two links
     #: to one board is a reader deciding which to trust.
     board_console_url: str | None = None
+    #: `alpha-engine-config-I10872`: `gates/ladder.json`'s `generated_utc`,
+    #: or `None` when the ladder could not be read, in which case
+    #: `ladder_reason` says why (absent, corrupt, or the denied code). The
+    #: board is compared against it: a board rendered BEFORE the day's gate
+    #: reading is stale however young it is.
+    ladder_generated_utc: str | None = None
+    ladder_reason: str = "the ladder was not read by this caller"
 
 
 def _client_error_code(exc: BaseException) -> str | None:
@@ -824,6 +832,25 @@ def read_inputs(
                 f"{run.get('reason') or 'no reason recorded'}"
             )
 
+    # FAILURE MODE SWALLOWED: an absent, corrupt or denied ladder. The report
+    # still goes out — it is the surface that says the ladder is unreadable.
+    # RECORDING SURFACE: `ladder_reason`, rendered under the Ladder section of
+    # the full update (`_ladder_comparison_line`).
+    ladder_read = _read_json(store, LADDER_KEY)
+    ladder_generated_utc: str | None = None
+    if ladder_read.document is None:
+        ladder_reason = (
+            f"unreadable ({ladder_read.denied_code})"
+            if ladder_read.denied_code
+            else ladder_read.reason
+        )
+    else:
+        stamp = ladder_read.document.get("generated_utc")
+        if isinstance(stamp, str) and stamp.strip():
+            ladder_generated_utc, ladder_reason = stamp, ""
+        else:
+            ladder_reason = f"{LADDER_KEY} carries no generated_utc"
+
     acceptance_read = _read_json(store, acceptance_reading_key(board_day))
     board_console_url: str | None = None
     if console_url:
@@ -850,6 +877,72 @@ def read_inputs(
         operator_action=operator_action,
         acceptance=acceptance_read.document,
         acceptance_denied_code=acceptance_read.denied_code,
+        ladder_generated_utc=ladder_generated_utc,
+        ladder_reason=ladder_reason,
+    )
+
+
+def _parse_utc(stamp: str) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=dt.UTC)
+
+
+def _predates_ladder(generated_at: str, ladder_generated_utc: str | None) -> str | None:
+    """The headline when the board is older than the gate reading it summarises.
+
+    `alpha-engine-config-I10872`: on 2026-09-15 the report delivered a
+    14-hour-old board reading phase0 UNMET 4/5 while `gates/ladder.json`,
+    written seven hours before delivery, read MET 5/5. :func:`_staleness`
+    keys on absolute age alone and said nothing. Age is not the property; the
+    ORDER of the two readings is.
+
+    `None` when there is no ladder to compare against (the full update names
+    why) or when the board's own stamp is unparseable (:func:`_staleness`
+    already heads with that).
+    """
+    if ladder_generated_utc is None:
+        return None
+    board_moment = _parse_utc(generated_at)
+    if board_moment is None:
+        return None
+    ladder_moment = _parse_utc(ladder_generated_utc)
+    if ladder_moment is None:
+        return (
+            f"STALE BOARD: {LADDER_KEY} generated_utc={ladder_generated_utc!r} is not a "
+            "timestamp, so whether this board predates the live gate reading is unknown."
+        )
+    if board_moment >= ladder_moment:
+        return None
+    return (
+        f"STALE BOARD: board/current.json was generated {generated_at}, BEFORE the gate "
+        f"reading in {LADDER_KEY} ({ladder_generated_utc}). The phase states below predate "
+        "the live ladder."
+    )
+
+
+def _headline(inputs: MorningInputs, now: dt.datetime) -> str | None:
+    """Every staleness finding, as one headline, or `None`."""
+    generated_at = str(inputs.board.get("generated_at", ""))
+    parts = [
+        part
+        for part in (
+            _staleness(generated_at, now),
+            _predates_ladder(generated_at, inputs.ladder_generated_utc),
+        )
+        if part
+    ]
+    return " ".join(parts) or None
+
+
+def _ladder_comparison_line(inputs: MorningInputs) -> str:
+    if inputs.ladder_generated_utc is None:
+        return f"board-to-ladder order: cannot say — {LADDER_KEY} is {inputs.ladder_reason}"
+    return (
+        f"board generated {inputs.board.get('generated_at')}; "
+        f"{LADDER_KEY} generated {inputs.ladder_generated_utc}"
     )
 
 
@@ -954,26 +1047,58 @@ def _moved_lines_plain(inputs: MorningInputs) -> list[str]:
     """
     if inputs.previous is None:
         return [f"cannot say — the {inputs.previous_day} board is {inputs.previous_reason}"]
-    before = {row["id"]: row["state"] for row in inputs.previous.get("rows", [])}
-    after = {row["id"]: row["state"] for row in inputs.board.get("rows", [])}
-    moved = [
-        f"- {row_id}: {before.get(row_id, 'ABSENT')} -> {after.get(row_id, 'VANISHED')}"
-        for row_id in sorted(set(before) | set(after))
-        if before.get(row_id) != after.get(row_id)
-    ]
-    return moved or ["nothing moved"]
+    moved, not_due = _moves(inputs.previous, inputs.board)
+    lines = [f"- {row_id}: {was} -> {now}" for row_id, was, now in moved] or ["nothing moved"]
+    if not_due:
+        lines.append("")
+        lines.append(
+            f"not yet due ({len(not_due)}) — RUNNING or ARMED in either board, so the "
+            "change is schedule phase, not a move:"
+        )
+        lines += [f"- {row_id}: {was} -> {now}" for row_id, was, now in not_due]
+    return lines
+
+
+def _moves(
+    previous: dict[str, Any], current: dict[str, Any]
+) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str]]]:
+    """`(moved, not_yet_due)`, each `(row_id, was, now)`, sorted by id.
+
+    `alpha-engine-config-I10872`: a blind state diff counted 30 component rows
+    that were RUNNING at a 23:55Z render as "moved" against a board rendered
+    after the Saturday arc. A row whose `component_state` is RUNNING or ARMED
+    in EITHER board goes to the second list — through
+    `crucible.console.classify.not_yet_due`, the same predicate the board
+    page's own digest uses. A row with no `component_state` (a non-component
+    row, or a board written before the field existed) is always a move.
+    """
+    before = {row["id"]: row for row in previous.get("rows", [])}
+    after = {row["id"]: row for row in current.get("rows", [])}
+    moved: list[tuple[str, str, str]] = []
+    not_due: list[tuple[str, str, str]] = []
+    for row_id in sorted(set(before) | set(after)):
+        was_row, now_row = before.get(row_id), after.get(row_id)
+        was = was_row["state"] if was_row else "ABSENT"
+        now = now_row["state"] if now_row else "VANISHED"
+        if was_row and now_row and was == now:
+            continue
+        states = (
+            was_row.get("component_state") if was_row else None,
+            now_row.get("component_state") if now_row else None,
+        )
+        (not_due if not_yet_due(*states) else moved).append((row_id, was, now))
+    return moved, not_due
 
 
 def _moved_count(inputs: MorningInputs) -> str:
     """The headline's version of :func:`_moved_lines_plain`: a bare count,
     since the headline states none of the row ids that moved — the full
-    update carries those."""
+    update carries those. Not-yet-due rows are never in the count; their
+    number follows it when there are any."""
     if inputs.previous is None:
         return f"cannot say ({_escape_html(inputs.previous_reason)})"
-    before = {row["id"]: row["state"] for row in inputs.previous.get("rows", [])}
-    after = {row["id"]: row["state"] for row in inputs.board.get("rows", [])}
-    moved = sum(1 for row_id in set(before) | set(after) if before.get(row_id) != after.get(row_id))
-    return str(moved)
+    moved, not_due = _moves(inputs.previous, inputs.board)
+    return f"{len(moved)} (+{len(not_due)} not yet due)" if not_due else str(len(moved))
 
 
 def _acceptance_line(reading: dict[str, Any] | None, *, denied_code: str | None) -> str:
@@ -1089,7 +1214,7 @@ def render_full_update(inputs: MorningInputs, *, now: dt.datetime) -> str:
     commit = inputs.board_code_sha or f"UNKNOWN ({inputs.board_run_note})"
     lines: list[str] = []
 
-    headline = _staleness(str(board.get("generated_at", "")), now)
+    headline = _headline(inputs, now)
     if headline:
         lines += [f"**{headline}**", ""]
 
@@ -1103,6 +1228,8 @@ def render_full_update(inputs: MorningInputs, *, now: dt.datetime) -> str:
     lines.append("| phase | state | clauses met | holding |")
     lines.append("|---|---|---|---|")
     lines += _phase_table_rows(board)
+    lines.append("")
+    lines.append(_ladder_comparison_line(inputs))
     lines.append("")
 
     lines.append("## Schedule (plan §6.1)")
@@ -1182,7 +1309,7 @@ def render_message(
     board = inputs.board
     lines: list[str] = []
 
-    headline = _staleness(str(board.get("generated_at", "")), now)
+    headline = _headline(inputs, now)
     if headline:
         lines.append(f"<b>{_escape_html(headline)}</b>")
 

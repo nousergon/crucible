@@ -28,7 +28,7 @@ from typing import Any
 from crucible.calendar import resolve_trading_day
 from crucible.components import Component
 
-__all__ = ["STATES", "Classification", "classify"]
+__all__ = ["NOT_YET_DUE_STATES", "STATES", "Classification", "classify", "not_yet_due"]
 
 #: The closed vocabulary, exhaustive and add-by-PR-only. Ordered as the policy
 #: lists them so a reader can check this against §8.3 line by line.
@@ -48,6 +48,26 @@ STATES: tuple[str, ...] = (
     "UNREPORTED",
     "ARMED",
 )
+
+#: The states that are SCHEDULE PHASE rather than a reading
+#: (`alpha-engine-config-I10872`). `RUNNING` is "the deadline has not passed";
+#: `ARMED` is "on-demand, silence claims nothing". Both render `UNMEASURED` on
+#: the board, which is true about today, but a row going MET -> UNMEASURED
+#: because it is 21:30Z and the job is due at 02:00Z is not a change in the
+#: system. The 2026-09-15 morning report counted 30 such rows as "moved".
+NOT_YET_DUE_STATES: tuple[str, ...] = ("RUNNING", "ARMED")
+
+
+def not_yet_due(*component_states: str | None) -> bool:
+    """True when any of the given classifier states is not yet due.
+
+    The ONE predicate every board-to-board comparison uses
+    (`crucible.board.board_delta`, `crucible.morning`), so the page digest and
+    the morning count cannot disagree about what a move is. `None` — a row that
+    is not a component, or a board rendered before the field existed — is never
+    not-yet-due: an unknown is counted, never excused.
+    """
+    return any(state in NOT_YET_DUE_STATES for state in component_states)
 
 
 @dataclass(frozen=True)

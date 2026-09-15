@@ -585,6 +585,11 @@ components:
     # its whole life), which is why `absence_watched_by: alerts.sweep` above
     # is load-bearing on this row - the page fires on the missing artifact,
     # never on trusting the cron.
+    #
+    # Since alpha-engine-config-I10872 the cron is a FLOOR: board.yml also
+    # renders on completion of `gate-close.yml` (`workflow_run`), so the board
+    # `report.morning` delivers postdates the day's gate reading. `dispatch`
+    # stays `github-actions` / `board.yml`; both starters live in that file.
     schedule: daily
     dispatch: github-actions
     dispatch_workflow: board.yml
@@ -811,7 +816,7 @@ components:
       execution: run.json
       cost: run.json:cost_usd
       resource: run.json:resource
-      lineage: run.json:inputs[board/current.json,board/**,runs/board/**],outputs[runs/report.morning/**]
+      lineage: run.json:inputs[board/current.json,board/**,runs/board/**,gates/ladder.json],outputs[runs/report.morning/**]
       outcome: run.json:metrics[morning_report_delivered]
     log_location: /crucible/report.morning
     log_retention_days: 90

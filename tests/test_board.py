@@ -878,6 +878,80 @@ class TestTheDigestReportsDeltas:
         with pytest.raises(ValidationError, match="state"):
             board_delta(before, _board(a="MET"))
 
+    def test_a_row_running_or_armed_in_either_board_is_not_a_delta(self) -> None:
+        """`alpha-engine-config-I10872`. RUNNING and ARMED render UNMEASURED;
+        a board rendered before a job's deadline must not report every such
+        row as lost, and one rendered after must not report it as earned."""
+
+        def component(row_id: str, state: str, component_state: str | None) -> BoardRow:
+            return BoardRow(
+                id=row_id,
+                source="component",
+                title="t",
+                state=state,
+                detail="d",
+                surface="s",
+                artifact="a",
+                means_when_red="r",
+                component_state=component_state,
+            )
+
+        def board(*rows: BoardRow) -> Board:
+            return Board(
+                trading_day="2026-09-02", generated_at="2026-09-02T00:00:00Z", rows=list(rows)
+            )
+
+        before = board(
+            component("running", "MET", "HEALTHY"),
+            component("armed", "UNMEASURED", "ARMED"),
+            component("real", "MET", "HEALTHY"),
+            component("legacy", "MET", None),
+        ).to_dict()
+        after = board(
+            component("running", "UNMEASURED", "RUNNING"),
+            component("armed", "MET", "HEALTHY"),
+            component("real", "UNMET", "FAILED"),
+            component("legacy", "UNMEASURED", None),
+        )
+        assert [(d.id, d.kind) for d in board_delta(before, after)] == [
+            ("legacy", "lost"),
+            ("real", "lost"),
+        ]
+
+    def test_a_component_row_carries_its_classifier_state_through_the_document(
+        self,
+    ) -> None:
+        row = BoardRow(
+            id="component:gate",
+            source="component",
+            title="t",
+            state="UNMEASURED",
+            detail="d",
+            surface="s",
+            artifact="a",
+            means_when_red="r",
+            component_state="RUNNING",
+        )
+        document = Board(
+            trading_day="2026-09-02", generated_at="2026-09-02T00:00:00Z", rows=[row]
+        ).to_dict()
+        assert document["rows"][0]["component_state"] == "RUNNING"
+        assert BoardCurrentDocument.model_validate(document).rows[0].component_state == "RUNNING"
+
+    def test_a_component_state_outside_the_classifier_vocabulary_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="not a classifier state"):
+            BoardRow(
+                id="component:gate",
+                source="component",
+                title="t",
+                state="UNMEASURED",
+                detail="d",
+                surface="s",
+                artifact="a",
+                means_when_red="r",
+                component_state="PENDING",
+            )
+
 
 def _refusing_store(tmp_path) -> LocalStore:
     """A store whose every declared mutator raises, installed FROM the declaration.
@@ -1203,6 +1277,43 @@ class TestTheProducerRunsWithoutTheWeeklyArc:
             "the `board` row declares `dispatch: github-actions`; board.yml is "
             f"the workflow that has to carry the cron, and it has {crons}"
         )
+
+    def test_the_board_re_renders_after_the_workflow_that_publishes_the_gate_reading(
+        self,
+    ) -> None:
+        """`alpha-engine-config-I10872`: the board the morning report delivers
+        must postdate the day's gate reading.
+
+        Asserted against the REGISTRY, not a restated name: the workflow_run
+        trigger must name the `name:` of whichever workflow the `gate` row
+        declares as its dispatcher, and that workflow must still carry the
+        `gate-publish` job. A rename on either side disconnects `workflow_run`
+        silently — GitHub reports nothing for a trigger naming no workflow.
+        """
+        import yaml
+
+        workflows = pathlib.Path(__file__).resolve().parent.parent / ".github" / "workflows"
+        registry = load_registry()
+        board = yaml.safe_load((workflows / registry["board"].dispatch_workflow).read_text())
+        gate_workflow_file = registry["gate"].dispatch_workflow
+        assert registry["gate"].dispatch == "github-actions"
+        gate = yaml.safe_load((workflows / gate_workflow_file).read_text())
+
+        trigger = board[True]["workflow_run"]
+        assert trigger["workflows"] == [gate["name"]]
+        assert trigger["types"] == ["completed"], (
+            "`completed` covers every conclusion: a failed gate publish must still "
+            "produce a board that says so"
+        )
+        assert "gate-publish" in gate["jobs"]
+        # The cron is kept as the floor, and the render stays serialised and
+        # never cancelled, so a floor render and a chained render cannot race.
+        assert [entry["cron"] for entry in board[True]["schedule"]] == ["30 21 * * *"]
+        assert board["concurrency"] == {"group": "board", "cancel-in-progress": False}
+        # No trigger a pull request can reach: workflow_run from `Gate close`
+        # only, which itself has no pull_request trigger.
+        assert set(board[True]) == {"schedule", "workflow_run", "workflow_dispatch"}
+        assert not {"pull_request", "pull_request_target"} & set(gate[True])
 
     def test_a_red_board_is_not_a_failed_run(self, tmp_path) -> None:
         """The forcing-function inversion this instrument has to get right.

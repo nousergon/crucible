@@ -43,6 +43,7 @@ from botocore.exceptions import ClientError
 
 from crucible.cli import HANDLERS, JOBS
 from crucible.components import load_registry
+from crucible.gate import LADDER_KEY
 from crucible.keys import (
     BOARD_CURRENT_KEY,
     BOARD_HTML_KEY,
@@ -545,6 +546,115 @@ class TestTheFullUpdate:
         previous = _board(rows=[*_board()["rows"], _row("obj:gone", "objective", "MET", "was")])
         store = _seed(tmp_path, previous=previous)
         assert "obj:gone: MET -> VANISHED" in run_report(store, trading_day=DAY, now=FIRED_AT)
+
+    # ── alpha-engine-config-I10872: not-yet-due rows are not moves ─────────
+
+    def test_a_running_or_armed_transition_is_not_a_move_but_met_to_unmet_is(self, tmp_path):
+        def component(row_id: str, state: str, component_state: str) -> dict[str, Any]:
+            return {**_row(row_id, "component", state, "d"), "component_state": component_state}
+
+        base = _board()["rows"]
+        previous = _board(
+            rows=[
+                *base,
+                component("component:data.daily", "MET", "HEALTHY"),
+                component("component:data.heal", "MET", "HEALTHY"),
+                component("component:gate", "MET", "HEALTHY"),
+            ]
+        )
+        current = _board(
+            rows=[
+                *base,
+                component("component:data.daily", "UNMEASURED", "RUNNING"),
+                component("component:data.heal", "UNMEASURED", "ARMED"),
+                component("component:gate", "UNMET", "FAILED"),
+            ]
+        )
+        store = _seed(tmp_path, board=current, previous=previous)
+        inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT)
+        from crucible.morning import _moved_count
+
+        assert _moved_count(inputs) == "1 (+2 not yet due)"
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        moved_section = update.split(f"## Moved since {PREVIOUS}")[1].split("## Silence")[0]
+        head, _, not_due = moved_section.partition("not yet due (2)")
+        assert "component:gate: MET -> UNMET" in head
+        assert "component:data.daily" not in head and "component:data.heal" not in head
+        assert "component:data.daily: MET -> UNMEASURED" in not_due
+        assert "component:data.heal: MET -> UNMEASURED" in not_due
+
+    def test_a_row_leaving_running_is_not_a_move_either(self, tmp_path):
+        row = _row("component:data.daily", "component", "UNMEASURED", "d")
+        previous = _board(rows=[{**row, "component_state": "RUNNING"}])
+        current = _board(rows=[{**row, "state": "MET", "component_state": "HEALTHY"}])
+        store = _seed(tmp_path, board=current, previous=previous)
+        from crucible.morning import _moved_count
+
+        assert (
+            _moved_count(read_inputs(store, trading_day=DAY, now=FIRED_AT)) == "0 (+1 not yet due)"
+        )
+
+    def test_a_board_written_before_the_field_existed_still_counts_its_moves(self, tmp_path):
+        """An unknown component_state is counted, never excused."""
+        previous = _board(rows=[_row("component:gate", "component", "MET", "d")])
+        current = _board(rows=[_row("component:gate", "component", "UNMEASURED", "d")])
+        store = _seed(tmp_path, board=current, previous=previous)
+        from crucible.morning import _moved_count
+
+        assert _moved_count(read_inputs(store, trading_day=DAY, now=FIRED_AT)) == "1"
+
+    # ── alpha-engine-config-I10872: a board older than the ladder is stale ─
+
+    def test_a_board_rendered_before_the_gate_reading_is_the_stale_headline(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        ladder_at = (GENERATED_AT + dt.timedelta(hours=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        store.put_bytes(LADDER_KEY, json.dumps({"generated_utc": ladder_at}).encode())
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        first = update.splitlines()[0]
+        assert first.startswith("**STALE BOARD:")
+        assert "BEFORE the gate reading" in first
+        assert ladder_at in first and GENERATED in first
+        inputs = read_inputs(store, trading_day=DAY, now=FIRED_AT)
+        message = render_message(
+            inputs, now=FIRED_AT, update_url=UPDATE_URL, history_url=HISTORY_URL
+        )
+        assert message.splitlines()[0].startswith("<b>STALE BOARD:")
+        assert LADDER_KEY in message.splitlines()[0]
+
+    def test_a_board_rendered_after_the_gate_reading_carries_no_stale_headline(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        ladder_at = (GENERATED_AT - dt.timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        store.put_bytes(LADDER_KEY, json.dumps({"generated_utc": ladder_at}).encode())
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "STALE BOARD" not in update
+        assert f"{LADDER_KEY} generated {ladder_at}" in update
+
+    def test_an_old_board_that_also_predates_the_ladder_says_both(self, tmp_path):
+        store = _seed(tmp_path, board=_board(generated_at=STALE_GENERATED), previous=_board())
+        ladder_at = GENERATED
+        store.put_bytes(LADDER_KEY, json.dumps({"generated_utc": ladder_at}).encode())
+        first = run_report(store, trading_day=DAY, now=FIRED_AT).splitlines()[0]
+        assert "h ago" in first and "BEFORE the gate reading" in first
+
+    def test_a_denied_ladder_is_named_and_never_a_stale_claim_or_a_crash(self, tmp_path):
+        store = _DeniedKeyStore(tmp_path, denied={LADDER_KEY: "AccessDenied"})
+        store.put_bytes(BOARD_CURRENT_KEY, json.dumps(_board()).encode())
+        store.put_bytes(
+            manifest_key("board", DAY.isoformat()),
+            json.dumps({"status": "ok", "code_sha": SHA, "reason": ""}).encode(),
+        )
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "STALE BOARD" not in update
+        assert f"board-to-ladder order: cannot say — {LADDER_KEY} is unreadable (AccessDenied)" in (
+            update
+        )
+
+    def test_a_ladder_with_no_stamp_is_named_rather_than_assumed_older(self, tmp_path):
+        store = _seed(tmp_path, previous=_board())
+        store.put_bytes(LADDER_KEY, json.dumps({"phases": []}).encode())
+        update = run_report(store, trading_day=DAY, now=FIRED_AT)
+        assert "STALE BOARD" not in update
+        assert f"{LADDER_KEY} carries no generated_utc" in update
 
     def test_an_unreadable_previous_board_is_never_reported_as_nothing_moved(self, tmp_path):
         store = _seed(tmp_path)  # no previous board at all

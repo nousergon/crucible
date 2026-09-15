@@ -58,6 +58,35 @@ on:
     # diverge from the calendar the artifacts are keyed by, and nothing would
     # say so.
     - cron: '30 21 * * *'
+  # ── The render that the morning report delivers (alpha-engine-config-I10872)
+  #
+  # The cron above is now the FLOOR, not the render anyone reads. On
+  # 2026-09-15 the report delivered the 23:55Z board (phase0 UNMET 4/5) while
+  # `gates/ladder.json`, published hours later, read MET 5/5: the board
+  # rendered BEFORE the gate it summarises.
+  #
+  # The day's gate reading is published by `gate-close.yml`'s `gate-publish`
+  # job (the `gate` row in components.yaml: `dispatch: github-actions`), so
+  # the render is chained to that workflow's completion. Three options were
+  # weighed:
+  #
+  # * `workflow_run` (CHOSEN). Event-ordered: the render starts after the
+  #   ladder is written whatever GitHub's scheduler lag is that night
+  #   (measured +2h to +5h on this account, alpha-engine-config-I9966), and it
+  #   runs under this workflow's own BoardRole — no new identity, no dispatcher
+  #   hop. It fires on any conclusion: a failed gate publish still gets a board
+  #   that says so.
+  # * a later cron. Two lagged crons cannot be ordered: 23:00Z and 01:00Z can
+  #   land in either order, which is the defect restated with new numbers.
+  # * the AWS dispatcher. Its launch template carries RuntimeRole, which may
+  #   write the artifacts the board grades — the separation this workflow's
+  #   header exists to keep.
+  #
+  # Absence is still paged from the artifact (`deadline` on the `board` row),
+  # never from trusting either trigger to fire.
+  workflow_run:
+    workflows: ['Gate close']
+    types: [completed]
   workflow_dispatch:
 
 permissions: {}
