@@ -257,8 +257,11 @@ class TestReleaseRecordVersioning:
         }
 
     def test_v3_round_trips(self) -> None:
+        """A pre-wheelhouse record still reads back byte-for-byte: rollback
+        addressing and the smoke's pointed-release branch read v3 releases
+        (alpha-engine-config-I10812 kept v3 readable, refused to install)."""
         record = ReleaseRecord(
-            schema_version=RELEASE_SCHEMA_VERSION,
+            schema_version="release.v3",
             sha=SHA_A,
             lockfile_sha256="0" * 64,
             wheel_sha256="1" * 64,
@@ -267,6 +270,34 @@ class TestReleaseRecordVersioning:
         )
         parsed = parse_release_record(json.loads(record.to_json()))
         assert parsed == record
+        assert parsed.wheelhouse is None
+        assert "wheelhouse" not in json.loads(record.to_json()), (
+            "a v3 record must serialise to the bytes it was published as"
+        )
+
+    def test_v4_round_trips_with_its_wheelhouse(self) -> None:
+        from tests.support.releases import synthetic_manifest
+
+        record = ReleaseRecord(
+            schema_version=RELEASE_SCHEMA_VERSION,
+            sha=SHA_A,
+            lockfile_sha256="0" * 64,
+            wheel_sha256="1" * 64,
+            wheel_filename=wheel_filename_for(SHA_A),
+            wheelhouse=synthetic_manifest(),
+        )
+        assert RELEASE_SCHEMA_VERSION == "release.v4"
+        assert parse_release_record(json.loads(record.to_json())) == record
+
+    def test_a_v4_record_without_a_wheelhouse_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="wheelhouse"):
+            ReleaseRecord(
+                schema_version=RELEASE_SCHEMA_VERSION,
+                sha=SHA_A,
+                lockfile_sha256="0" * 64,
+                wheel_sha256="1" * 64,
+                wheel_filename=wheel_filename_for(SHA_A),
+            )
 
     def test_v2_is_accepted_and_gets_the_legacy_wheel_filename_synthesized(self) -> None:
         """A v2 record's wheel was published under
@@ -276,7 +307,10 @@ class TestReleaseRecordVersioning:
         the v3 path for a v2 release."""
         record = parse_release_record(self._v2_payload())
         assert record.wheel_filename == f"crucible-{SHA_A}-py3-none-any.whl"
-        assert record.schema_version == RELEASE_SCHEMA_VERSION
+        # Normalised to v3, the last pre-wheelhouse schema — never to v4, which
+        # would claim a wheelhouse no v2 release ever published.
+        assert record.schema_version == "release.v3"
+        assert record.wheelhouse is None
 
     def test_v1_is_refused_by_name(self) -> None:
         payload = self._v2_payload()
@@ -847,7 +881,10 @@ class TestIdentityProvenanceSplit:
                 "— its presence is exactly what made two builds of the same commit "
                 "byte-unequal."
             )
-        assert payload["schema_version"] == RELEASE_SCHEMA_VERSION == "release.v3"
+        # `publish_release` is the pre-wheelhouse helper (alpha-engine-config-
+        # I10812); the production publisher writes RELEASE_SCHEMA_VERSION.
+        assert payload["schema_version"] == "release.v3"
+        assert RELEASE_SCHEMA_VERSION == "release.v4"
 
     def test_provenance_carries_the_three_fields_that_moved(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
@@ -955,7 +992,7 @@ class TestValidationIsStructuralNotPerCaller:
         """The structural guard must not become a suppression collection of
         its own — a correct document still constructs cleanly."""
         record = ReleaseRecord(
-            schema_version=RELEASE_SCHEMA_VERSION,
+            schema_version="release.v3",
             sha=SHA_A,
             lockfile_sha256="0" * 64,
             wheel_sha256="1" * 64,

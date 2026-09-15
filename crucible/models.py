@@ -1155,6 +1155,19 @@ class RunManifestV2(_Strict):
             "from one that actually happened live."
         ),
     )
+    #: `alpha-engine-config-I10812`: present only when this process was
+    #: installed from a release's hash-locked wheelhouse. Absent for a laptop
+    #: or CI run, which installed from no wheelhouse.
+    wheelhouse_digest: Sha256 | None = Field(
+        default=None,
+        description=(
+            "I10812: the digest of the hash-locked wheelhouse this process was installed from "
+            "(release.v4 `wheelhouse.digest`), so a run names the dependency set it executed "
+            "against and not only its code. Present on every run a dispatched box installs "
+            "offline from `releases/{release_sha}/wheelhouse/`; absent for a laptop or CI run, "
+            "which installed from no wheelhouse and so has no digest to name."
+        ),
+    )
     #: `alpha-engine-config-I10343`: present only when this run's LLM routing
     #: was deliberately redirected to a fault-injection capability class.
     #: Absent for every natural run.
@@ -1904,8 +1917,169 @@ class FireDrillDocument(_Strict):
         )
 
 
+class WheelhouseWheel(_Strict):
+    """One dependency wheel in a release's wheelhouse."""
+
+    filename: str = Field(
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._+!-]*\.whl$",
+        description="The wheel's object name under releases/{sha}/wheelhouse/. No path "
+        "separator: the box interpolates it into a local path.",
+    )
+    sha256: Sha256 = Field(description="The wheel's own hash, over the bytes published.")
+
+
+class WheelhouseManifestDocument(_Strict):
+    """The `wheelhouse` object of a release.v4 `release.json` (I10812).
+
+    Validated whole on construction: the digest must be the one
+    `crucible.wheelhouse.wheelhouse_digest` computes from the wheels and the
+    lock hash, and the wheels are sorted and unique, so two records describing
+    the same wheelhouse are byte-identical (`assert_immutable_write`).
+    """
+
+    lock_filename: Literal["requirements.lock.txt"] = Field(
+        description="The `uv export` lock, with hashes, at "
+        "releases/{sha}/wheelhouse/requirements.lock.txt. A literal so a record cannot "
+        "point the box's `-r` at another object."
+    )
+    lock_sha256: Sha256 = Field(description="The lock file's own hash.")
+    extras: list[Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]*$")]] = Field(
+        description="The crucible extras the lock was exported with, and the box installs "
+        "the crucible wheel with. Read from pyproject.toml at build time."
+    )
+    platform: str = Field(
+        min_length=1,
+        description="What the wheels were resolved for: the box's OS image, architecture "
+        "and interpreter tag.",
+    )
+    wheels: list[WheelhouseWheel] = Field(
+        min_length=1,
+        description="Every dependency wheel, sorted by filename. Excludes the crucible "
+        "wheel itself, which the record names in wheel_filename/wheel_sha256.",
+    )
+    digest: Sha256 = Field(
+        description="sha256 over sha256sum-format lines for every wheel (sorted) then the "
+        "lock. The value a run manifest records as wheelhouse_digest."
+    )
+
+    @model_validator(mode="after")
+    def _digest_and_order_hold(self) -> WheelhouseManifestDocument:
+        from crucible.wheelhouse import wheelhouse_digest  # noqa: PLC0415 - leaf module
+
+        names = [w.filename for w in self.wheels]
+        if names != sorted(names) or len(set(names)) != len(names):
+            raise ValueError("wheelhouse.wheels must be sorted by filename and unique")
+        if self.extras != sorted(set(self.extras)):
+            raise ValueError("wheelhouse.extras must be sorted and unique")
+        expected = wheelhouse_digest(self.lock_sha256, [w.model_dump() for w in self.wheels])
+        if self.digest != expected:
+            raise ValueError(
+                f"wheelhouse.digest is {self.digest}, but its wheels and lock hash to "
+                f"{expected}. A digest that does not describe its own manifest makes every "
+                "run manifest that records it name a dependency set nobody installed."
+            )
+        return self
+
+
 class ReleaseRecordDocument(_Strict):
-    """`release.json`, at `releases/{sha}/release.json` — plan §4.11.
+    """`release.json`, at `releases/{sha}/release.json` — plan §4.11. release.v4.
+
+    `crucible.release.ReleaseRecord` (a frozen dataclass; unchanged by this
+    PR — its `.wheel_key` property and `.to_json()` method are domain
+    behaviour this module does not carry, the same reason
+    `crucible.slots.arms.ArmSpec` stayed a dataclass beside row 2's
+    `ArmRecipeDocument`) validates its own constructed payload against THIS
+    model in `__post_init__`, via `crucible.release._validate_release_artifact`
+    — replacing that function's previous hand-rolled `jsonschema`
+    `Draft202012Validator` machinery with this model, while keeping its
+    public signature, its "does not conform" message text, and both of its
+    existing direct tests (`tests/test_release.py`) unchanged.
+
+    Deterministic across every rebuild of the same commit
+    (`alpha-engine-config-I9786`) — nothing here can differ between two
+    builds of the same sha, which is what makes
+    `crucible.release.assert_immutable_write`'s byte comparison a
+    correctness check rather than a false-alarm generator. `extra="forbid"`:
+    a field a reader does not understand is a field the producer expected it
+    to act on.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://github.com/nousergon/crucible/schemas/release.v4.json",
+            "title": "Crucible release identity, v4",
+            "description": (
+                "What release.json carries at releases/{sha}/release.json. "
+                "Deterministic across every rebuild of the same commit "
+                "(I9786) -- nothing in this document can differ "
+                "between two builds of the same sha, which is what makes "
+                "assert_immutable_write's byte comparison a correctness check rather "
+                "than a false-alarm generator. v3 replaces v2 (I9908): "
+                "adds wheel_filename, the PEP-440-legal name the wheel was actually "
+                "published under. Every release published before I9908 was named "
+                "crucible-{sha}-py3-none-any.whl, which pip refuses outright (a 40-hex "
+                "git sha is not a PEP 440 version) -- no wheel this pipeline ever "
+                "published was installable. v3's wheel_filename lets a bash bootstrap on "
+                "a spot box download the exact object by name without reimplementing "
+                "crucible.release.wheel_filename_for's version derivation. "
+                "v4 replaces v3 (I10812): adds wheelhouse, the hash-locked dependency set "
+                "a box installs offline from releases/{sha}/wheelhouse/ with no index access. "
+                "A v3 release carries none, and a box refuses it rather than resolving from "
+                "PyPI. "
+                "additionalProperties: false because a field a reader does not "
+                "understand is a field the producer expected it to act on."
+            ),
+        },
+    )
+
+    schema_version: Literal["release.v4"] = Field(
+        description="Version of THIS schema. A consumer that cannot read the version "
+        "refuses the document rather than guessing."
+    )
+    sha: GitSha = Field(
+        description="The commit this release is built from. Content-addresses the release prefix."
+    )
+    lockfile_sha256: Sha256 = Field(
+        description="The resolved dependency tree's hash. The wheel does not pin its "
+        "own transitive tree, so two wheels from one commit against two lockfiles are "
+        "two different artifacts, and only this says which."
+    )
+    wheel_sha256: Sha256 = Field(
+        description="The wheel's own hash, checked against the bytes actually uploaded "
+        "by both the publisher and the smoke."
+    )
+    wheel_filename: str = Field(
+        pattern=r"^crucible-.+-py3-none-any\.whl$",
+        description="The exact object name the wheel is published under, at "
+        "releases/{sha}/{wheel_filename}. PEP-440-legal "
+        "(crucible-{version}-py3-none-any.whl), so pip can install it by name -- "
+        "unlike every release published before I9908, which pip "
+        "refused under both the download name and the store's own filename.",
+    )
+    python_requires: str = Field(
+        min_length=1, description="The interpreter constraint this wheel was built against."
+    )
+    wheelhouse: WheelhouseManifestDocument = Field(
+        description="Every dependency wheel this release installs, for the box platform, "
+        "with the lock pinning them by hash. Required: a release without one cannot be "
+        "installed without an index, and I10812 removed index access from the box."
+    )
+    extra: dict[str, Any] = Field(
+        description="Reserved for future identity-bearing fields. Empty on every "
+        "release today -- anything that would vary per run belongs in "
+        "release_provenance.v1, not here."
+    )
+
+
+class ReleaseRecordV3Document(_Strict):
+    """`release.json` as published before `alpha-engine-config-I10812` — READ only.
+
+    Kept so a release published before the wheelhouse existed stays readable
+    (rollback addressing, the smoke's pointed-release branch). Nothing writes
+    this version any more except the pre-wheelhouse test helper
+    `crucible.release.publish_release`; a box refuses to install it.
 
     `crucible.release.ReleaseRecord` (a frozen dataclass; unchanged by this
     PR — its `.wheel_key` property and `.to_json()` method are domain

@@ -319,6 +319,14 @@ _REAL_SHA_RE = re.compile(r"^(?!0{40}$)[0-9a-f]{40}$")
 #: does not exist there.
 CODE_SHA_ENV = "CRUCIBLE_CODE_SHA"
 
+#: alpha-engine-config-I10812: the digest of the hash-locked wheelhouse this
+#: process was installed from (`crucible.wheelhouse.wheelhouse_digest`). The
+#: box bootstrap exports it from `release.json`'s `wheelhouse.digest` in the
+#: same step that installs offline from that wheelhouse, and `deploy.yml`
+#: exports it for the smoke, so a run manifest names its dependency set and
+#: not only its code.
+WHEELHOUSE_DIGEST_ENV = "CRUCIBLE_WHEELHOUSE_DIGEST"
+
 
 class CodeShaError(RuntimeError):
     """`code_sha` could not be resolved to a real, measured commit sha.
@@ -1200,6 +1208,16 @@ def _write_manifest(
         # distinguishable from a natural one — a hand-chosen historical
         # window must never read as though it were observed live.
         manifest["now_override_utc"] = _utc(ctx.now_override)
+    wheelhouse_digest = os.environ.get(WHEELHOUSE_DIGEST_ENV, "")
+    if wheelhouse_digest:
+        # Same "omitted entirely" shape (alpha-engine-config-I10812). The box
+        # exports the digest of the wheelhouse it installed from, read out of
+        # the release record it installed; a laptop or CI run installed from
+        # no wheelhouse and names none rather than a value it did not measure.
+        # A malformed value fails validation, loud. Carried on the fallback
+        # manifest too: it is runner-measured identity, not a job-contributed
+        # field the validator could have rejected.
+        manifest["wheelhouse_digest"] = wheelhouse_digest
     if ctx.fault_capability_class is not None:
         # Same "omitted entirely" shape, same reason (alpha-engine-config-I10343).
         # This is the field that makes an INDUCED router failure distinguishable
@@ -1385,6 +1403,16 @@ def _minimal_failed_manifest(
         rebuilt["discriminator"] = ctx.discriminator
     if ctx.now_override is not None:
         rebuilt["now_override_utc"] = _utc(ctx.now_override)
+    wheelhouse_digest = os.environ.get(WHEELHOUSE_DIGEST_ENV, "")
+    if wheelhouse_digest:
+        # Same "omitted entirely" shape (alpha-engine-config-I10812). The box
+        # exports the digest of the wheelhouse it installed from, read out of
+        # the release record it installed; a laptop or CI run installed from
+        # no wheelhouse and names none rather than a value it did not measure.
+        # A malformed value fails validation, loud. Carried on the fallback
+        # manifest too: it is runner-measured identity, not a job-contributed
+        # field the validator could have rejected.
+        rebuilt["wheelhouse_digest"] = wheelhouse_digest
     if ctx.fault_capability_class is not None:
         rebuilt["fault_capability_class"] = ctx.fault_capability_class
     return rebuilt

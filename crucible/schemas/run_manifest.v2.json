@@ -759,6 +759,20 @@
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
       "title": "Trading Day",
       "type": "string"
+    },
+    "wheelhouse_digest": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "I10812: the digest of the hash-locked wheelhouse this process was installed from (release.v4 `wheelhouse.digest`), so a run names the dependency set it executed against and not only its code. Present on every run a dispatched box installs offline from `releases/{release_sha}/wheelhouse/`; absent for a laptop or CI run, which installed from no wheelhouse and so has no digest to name.",
+      "title": "Wheelhouse Digest"
     }
   },
   "required": [

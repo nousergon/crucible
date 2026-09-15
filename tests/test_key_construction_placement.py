@@ -159,6 +159,7 @@ _KNOWN_ARCHITECTURAL_EXCEPTIONS: dict[str, dict[str, str]] = {
         # reason string: test_no_stale_tracker_literals.py permits a tracker
         # number in prose only.
         "release_json_key": "built on release_prefix; same reason as release_prefix.",
+        "wheelhouse_object_key": "built on release_prefix; same reason as release_prefix.",
         "provenance_key": "built on release_prefix; same reason as release_prefix.",
     },
 }
