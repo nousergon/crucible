@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/fundamental_snapshot_columns.schema.json",
+  "title": "nousergon-data features/{date}/fundamental.parquet -- columns crucible.data.point_in_time reads (v1)",
+  "description": "Column-name/dtype contract for the 11 fundamental-group columns crucible.data.point_in_time.PointInTimeSource actually reads from nousergon-data's CATALOG-governed feature-store snapshot (grep-verified against crucible/data/point_in_time.py::FUNDAMENTAL_FIELD_COLUMNS keys, 2026-09-14). Each key here is a features/registry.py::FeatureEntry.name in nousergon-data, all in that repo's GRANDFATHERED_BARE_FIELDS (bare -- pre-dates the units-suffix contract, alpha-engine-config#10781/#9772). Pinned copy per the P-07 pattern (metron-PR457, crucible-PR302): nousergon-data has no importable dependency into crucible, so this file -- not a live schema fetch -- is the coupling. If nousergon-data renames a column (adds a units suffix, per its own new-field rule) or changes its declared dtype, re-pin this file AND crucible/data/point_in_time.py::FUNDAMENTAL_FIELD_COLUMNS in the SAME crucible PR, or this contract goes stale silently.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["roe", "debt_to_equity", "gross_margin", "current_ratio", "pe_ratio", "pb_ratio", "fcf_yield", "revenue_growth_3y", "eps_growth_3y", "capex_growth_5y", "payout_ratio"],
+  "properties": {
+    "roe": {"type": "string", "const": "float32"},
+    "debt_to_equity": {"type": "string", "const": "float32"},
+    "gross_margin": {"type": "string", "const": "float32"},
+    "current_ratio": {"type": "string", "const": "float32"},
+    "pe_ratio": {"type": "string", "const": "float32"},
+    "pb_ratio": {"type": "string", "const": "float32"},
+    "fcf_yield": {"type": "string", "const": "float32"},
+    "revenue_growth_3y": {"type": "string", "const": "float32"},
+    "eps_growth_3y": {"type": "string", "const": "float32"},
+    "capex_growth_5y": {"type": "string", "const": "float32"},
+    "payout_ratio": {"type": "string", "const": "float32"}
+  }
+}
