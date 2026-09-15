@@ -22,6 +22,109 @@ makes §11.1 structural rather than a rule someone has to remember.
 a non-conformant document defeats the schema, and the failure path — where
 fields are missing because the job never reached them — is exactly where
 that would happen.
+
+THE `nousergon_lib.run_manifest` RE-IMPORT: DECIDED, AND DECLINED FOR NOW
+=========================================================================
+
+`nousergon_lib.run_manifest` was lifted FROM this module plus
+`run_manifest.v2` as their second adoption (`shared-code-policy` §2, the
+data collector being the second consumer; `alpha-engine-config-I10773`).
+The follow-up that lift recorded — crucible re-importing onto the shared
+module — is `alpha-engine-config-I10810` deliverable 4, and this is its
+answer. It is a decision, not a deferral: the pieces that may be swapped
+and the pieces that never may are enumerated below, so the next session
+does not re-derive the comparison or swap one of the second kind.
+
+The library module is a **sibling** of this one, not a copy of it, and its
+own docstring says so. It writes `data_run_manifest.v1`, keyed by a
+collector `unit_id` matching `^D[0-9]{2}[A-Z]?$`, identifies published
+objects by S3 **ETag**, and carries a **third status**. This module writes
+`run_manifest.v2`, keyed by `job`, identifies outputs by the sha256 of the
+bytes, and has exactly two statuses. Those are four contract differences,
+not four implementation differences.
+
+**Blocked today by the pin, and the pin is not this change's to move.**
+This repository pins `nousergon-lib==0.124.124`; `nousergon_lib.run_manifest`
+first ships in 0.124.128 (verified 2026-09-14: the module is absent from the
+0.124.127 install in this tree). So nothing here can import it at all yet.
+The pin is lockstep-guarded across several repositories, so bumping it is
+its own change with its own blast radius — never a side effect of a
+re-import. That is a scheduling fact, and it is the *weaker* half of this
+decision: everything below holds after the pin moves.
+
+**What stays LOCAL permanently, and why a swap would silently change
+behaviour or break a contract:**
+
+* :func:`run_job` itself, against the library's `run_unit`. `run_unit` has
+  no retry ladder (:data:`MAX_ATTEMPTS`, :data:`TRANSIENT_CLASSIFIERS`), no
+  spot-interruption guard, no dispatcher-owned re-dispatch
+  (:data:`DISPATCH_ATTEMPTS_ENV`, `alpha-engine-config-I10732`), no
+  pre-write schema validation, no `_minimal_failed_manifest` fallback
+  (`alpha-engine-config-I10410`), no trading-day assertion, no `run_mode`
+  (`alpha-engine-config-I9918`) and no `write_manifest=False` read carve-out
+  (`alpha-engine-config-I10576`). Every one of those is a measured incident's
+  fix. A swap would drop all of them at once and nothing would go red.
+* `NotApplicable`, `NOT_APPLICABLE_REASONS`, and the `not_applicable`
+  status. Repo rule 2 and plan §11.1: two statuses, exhaustively, and
+  :meth:`RunContext.set_status` exists only to raise so that the attempt is
+  greppable. Importing a third status would BE the API for a third status —
+  the structural property this module is built to lack. This one is refused
+  on the contract, not on the pin, and no library version changes it.
+* :class:`RunContext`, against the library's `UnitRun`. `UnitRun.record_output`
+  identifies an output by `etag=`. Writing a backend **version token** into a
+  field the schema reads as a content digest is `nous-ergon-ops-I1145` /
+  `alpha-engine-config-I9967` — it agreed with every local test, because
+  `LocalStore`'s etag happens to be a content hash, and was wrong on S3 the
+  moment an object went multipart, killing `gate.close` on the first day the
+  phase-exit loop ever succeeded. `record_output`/`record_output_cas` here
+  hash the bytes for exactly that reason. An output vocabulary spelled
+  `etag` re-opens it. `UnitRun` also has no `llm_calls`, no `scoring_arm`
+  attribution (`alpha-engine-config-I9920`), no `attempts[]`, no
+  `discriminator`, no CAS write and no `set_status` refusal.
+* `manifest_key`, `DEFAULT_MANIFEST_PREFIX` and `SCHEMA_VERSION`. Different
+  addresses under a different contract; this repository's key shapes are
+  `crucible.keys`' to own (`tests/test_no_inline_store_keys.py`,
+  `tests/test_key_construction_placement.py`).
+* `ManifestSink` / `S3ManifestSink` / `LocalDirManifestSink`. This module
+  writes through `crucible.manifest.write_manifest` over a
+  :class:`~crucible.store.Store`, which is the single writer and the only
+  place a `money_path_link` is produced (`alpha-engine-config-I10414`, plan
+  §9.5). A sink protocol whose whole contract is "put these bytes at this
+  key" routes around the hash chain.
+* `_resolve_compute`, against :func:`_initial_resource`. Different declared
+  environment variables, and this module's `resource` block carries
+  `mem_peak_mb`/`disk_free_mb` measured at WRITE time
+  (`alpha-engine-config-I10328`) and an `interruptions` count DERIVED from
+  `attempts[]` plus `spot_interruption_observed` (`alpha-engine-config-I10463`,
+  `-I10520`). The library's block hardcodes `interruptions: 0`, which is the
+  precise defect I10463 fixed here.
+
+**What becomes importable the moment the pin moves, and nothing else:**
+
+* :func:`resolve_code_sha` and :class:`CodeShaError`. Same precedence
+  (env var, then `git rev-parse HEAD`), same `_REAL_SHA_RE` including the
+  all-zero exclusion, same refusal rather than a placeholder. The library's
+  version parameterises `env_var` and `cwd` where this one fixes them, so
+  the swap is `resolve_code_sha(env_var=CODE_SHA_ENV, cwd=<repo root>)`, and
+  `tests/test_runner.py`'s `match="CRUCIBLE_CODE_SHA"` stays green because
+  the library interpolates the variable name into every message it raises.
+* :func:`_new_run_id`, against the library's `new_run_id`. The same ULID
+  over the same Crockford alphabet, differing only in that the library's
+  `now` defaults rather than being required.
+
+**What would have to change in `nousergon_lib` for even those two to be
+CORRECT rather than merely possible.** They live in a module named for
+`data_run_manifest.v1` and imported as `nousergon_lib.run_manifest`. Neither
+function has anything to do with that contract: one measures the running
+tree's commit, the other mints a sortable id. Importing them from there
+would couple this harness's provenance to a schema it does not write and
+must never write, and the next reader of `crucible.runner`'s imports would
+reasonably conclude crucible writes `data_run_manifest.v1`. The correct
+shape is to lift `resolve_code_sha`, `new_run_id` and `_REAL_SHA_RE` into a
+contract-neutral module — `nousergon_lib.run_identity` — which
+`nousergon_lib.run_manifest` then imports like anyone else. Recommended as
+the library-side change; recorded here so the recommendation survives
+whether or not it is taken.
 """
 
 from __future__ import annotations
@@ -292,6 +395,12 @@ def _new_run_id(now: dt.datetime) -> str:
 
     Lexically sortable by creation time, which is what makes a listing of
     run ids readable without parsing them.
+
+    One of the two pieces `nousergon_lib.run_manifest` genuinely shares with
+    this module (`new_run_id` there, same alphabet, same construction). See
+    this module's docstring, `alpha-engine-config-I10810`: swappable once the
+    library pin moves and the function lives somewhere that is not a module
+    named for a schema this repository does not write.
     """
     ms = int(now.timestamp() * 1000)
     rand = random.getrandbits(80)
@@ -356,6 +465,12 @@ def resolve_code_sha() -> str:
     lowercase git sha — unset and no git, a malformed export, a detached
     checkout with no commits — is refused rather than written as the
     all-zero placeholder that used to validate and answer nothing.
+
+    The second of the two pieces `nousergon_lib.run_manifest` genuinely
+    shares with this module (`resolve_code_sha` there, same precedence, same
+    pattern, same refusal). See this module's docstring,
+    `alpha-engine-config-I10810`, for the conditions under which the swap
+    becomes correct and for why the rest of that module stays local.
     """
     env = os.environ.get(CODE_SHA_ENV)
     if env is not None:
