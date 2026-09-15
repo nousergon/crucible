@@ -23,17 +23,17 @@ a non-conformant document defeats the schema, and the failure path — where
 fields are missing because the job never reached them — is exactly where
 that would happen.
 
-THE `nousergon_lib.run_manifest` RE-IMPORT: DECIDED, AND DECLINED FOR NOW
-=========================================================================
+THE `nousergon_lib.run_manifest` RE-IMPORT: DECIDED, AND PARTIALLY LANDED
+==========================================================================
 
 `nousergon_lib.run_manifest` was lifted FROM this module plus
 `run_manifest.v2` as their second adoption (`shared-code-policy` §2, the
 data collector being the second consumer; `alpha-engine-config-I10773`).
 The follow-up that lift recorded — crucible re-importing onto the shared
-module — is `alpha-engine-config-I10810` deliverable 4, and this is its
-answer. It is a decision, not a deferral: the pieces that may be swapped
-and the pieces that never may are enumerated below, so the next session
-does not re-derive the comparison or swap one of the second kind.
+module — is `alpha-engine-config-I10810` deliverable 4. crucible-PR305
+answered it as a decision, not a deferral: the pieces that may be swapped
+and the pieces that never may are enumerated below, so a later session does
+not re-derive the comparison or swap one of the second kind.
 
 The library module is a **sibling** of this one, not a copy of it, and its
 own docstring says so. It writes `data_run_manifest.v1`, keyed by a
@@ -41,16 +41,17 @@ collector `unit_id` matching `^D[0-9]{2}[A-Z]?$`, identifies published
 objects by S3 **ETag**, and carries a **third status**. This module writes
 `run_manifest.v2`, keyed by `job`, identifies outputs by the sha256 of the
 bytes, and has exactly two statuses. Those are four contract differences,
-not four implementation differences.
+not four implementation differences, and this module never imports
+`nousergon_lib.run_manifest` itself for exactly that reason.
 
-**Blocked today by the pin, and the pin is not this change's to move.**
-This repository pins `nousergon-lib==0.124.124`; `nousergon_lib.run_manifest`
-first ships in 0.124.128 (verified 2026-09-14: the module is absent from the
-0.124.127 install in this tree). So nothing here can import it at all yet.
-The pin is lockstep-guarded across several repositories, so bumping it is
-its own change with its own blast radius — never a side effect of a
-re-import. That is a scheduling fact, and it is the *weaker* half of this
-decision: everything below holds after the pin moves.
+**The pin-gated half has landed.** This repository now pins
+`nousergon-lib==0.124.130`, which ships the contract-neutral
+`nousergon_lib.run_identity` module recommended below (nousergon-lib-PR416,
+`alpha-engine-config-I10831` deliverable 2) — re-exported unchanged from
+`nousergon_lib.run_manifest`, but importable on its own with no reference to
+that module's schema. `resolve_code_sha` and `new_run_id` (below) import
+from `nousergon_lib.run_identity`, never from `nousergon_lib.run_manifest`.
+Everything else in this module stays LOCAL, for the reasons below.
 
 **What stays LOCAL permanently, and why a swap would silently change
 behaviour or break a contract:**
@@ -99,32 +100,31 @@ behaviour or break a contract:**
   `-I10520`). The library's block hardcodes `interruptions: 0`, which is the
   precise defect I10463 fixed here.
 
-**What becomes importable the moment the pin moves, and nothing else:**
+**What now imports from the library, and why it is safe:**
 
-* :func:`resolve_code_sha` and :class:`CodeShaError`. Same precedence
-  (env var, then `git rev-parse HEAD`), same `_REAL_SHA_RE` including the
-  all-zero exclusion, same refusal rather than a placeholder. The library's
-  version parameterises `env_var` and `cwd` where this one fixes them, so
-  the swap is `resolve_code_sha(env_var=CODE_SHA_ENV, cwd=<repo root>)`, and
-  `tests/test_runner.py`'s `match="CRUCIBLE_CODE_SHA"` stays green because
+* :func:`resolve_code_sha` and :class:`CodeShaError`, from
+  `nousergon_lib.run_identity`, never from `nousergon_lib.run_manifest`.
+  Same precedence (env var, then `git rev-parse HEAD`), same real-sha
+  pattern including the all-zero exclusion, same refusal rather than a
+  placeholder. The library's version parameterises `env_var` and `cwd`
+  where this module's old local one fixed them, so this module keeps a
+  thin wrapper — `resolve_code_sha()` here calls the library's function
+  with `env_var=CODE_SHA_ENV, cwd=<repo root>` — so every call site keeps
+  calling `resolve_code_sha()` with no arguments and
+  `tests/test_runner.py`'s `match="CRUCIBLE_CODE_SHA"` stays green, since
   the library interpolates the variable name into every message it raises.
-* :func:`_new_run_id`, against the library's `new_run_id`. The same ULID
-  over the same Crockford alphabet, differing only in that the library's
-  `now` defaults rather than being required.
+* `new_run_id`, called as `_run_identity.new_run_id` (no local wrapper
+  needed): the same ULID over the same Crockford alphabet, differing only
+  in that the library's `now` defaults to `None` rather than being
+  required — this module still always passes one explicitly.
 
-**What would have to change in `nousergon_lib` for even those two to be
-CORRECT rather than merely possible.** They live in a module named for
-`data_run_manifest.v1` and imported as `nousergon_lib.run_manifest`. Neither
-function has anything to do with that contract: one measures the running
-tree's commit, the other mints a sortable id. Importing them from there
-would couple this harness's provenance to a schema it does not write and
-must never write, and the next reader of `crucible.runner`'s imports would
-reasonably conclude crucible writes `data_run_manifest.v1`. The correct
-shape is to lift `resolve_code_sha`, `new_run_id` and `_REAL_SHA_RE` into a
-contract-neutral module — `nousergon_lib.run_identity` — which
-`nousergon_lib.run_manifest` then imports like anyone else. Recommended as
-the library-side change; recorded here so the recommendation survives
-whether or not it is taken.
+**Why this was safe to do the moment the pin moved.**
+`nousergon_lib.run_identity` lives in a module named for neither contract:
+it has nothing to do with `data_run_manifest.v1`, so importing from it does
+not couple this harness's provenance to a schema it does not write, and a
+reader of `crucible.runner`'s imports sees `run_identity`, not
+`run_manifest`. This is the module recommended in the prior revision of
+this docstring, shipped as `nousergon_lib.run_identity` (nousergon-lib-PR416).
 """
 
 from __future__ import annotations
@@ -132,18 +132,17 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
-import random
-import re
 import resource as posix_resource
 import shutil
 import signal
-import subprocess
 import sys
 import traceback
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any
+
+from nousergon_lib import run_identity as _run_identity
 
 from crucible.calendar import assert_trading_day, resolve_trading_day
 from crucible.manifest import (
@@ -326,9 +325,6 @@ def classify_transient(exc: BaseException) -> str | None:
     return None
 
 
-_ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32
-
-
 #: The box shell's declaration of THIS dispatch's attempt ladder
 #: (`alpha-engine-config-I10732`), exported by
 #: `nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml`'s
@@ -390,36 +386,6 @@ def resolve_dispatch_attempts() -> list[dict[str, Any]] | None:
     return [dict(row) for row in rows]
 
 
-def _new_run_id(now: dt.datetime) -> str:
-    """A ULID: 48 bits of millisecond timestamp then 80 bits of randomness.
-
-    Lexically sortable by creation time, which is what makes a listing of
-    run ids readable without parsing them.
-
-    One of the two pieces `nousergon_lib.run_manifest` genuinely shares with
-    this module (`new_run_id` there, same alphabet, same construction). See
-    this module's docstring, `alpha-engine-config-I10810`: swappable once the
-    library pin moves and the function lives somewhere that is not a module
-    named for a schema this repository does not write.
-    """
-    ms = int(now.timestamp() * 1000)
-    rand = random.getrandbits(80)
-    value = (ms << 80) | rand
-    out = []
-    for _ in range(26):
-        out.append(_ULID_ALPHABET[value & 0x1F])
-        value >>= 5
-    return "".join(reversed(out))
-
-
-#: A real, non-placeholder git sha: forty lowercase hex characters, and
-#: explicitly NOT the all-zero placeholder (`alpha-engine-config-I10454`).
-#: `run_manifest.v2`'s `code_sha` pattern mirrors this exactly
-#: (`crucible.models._CODE_SHA_PATTERN`) — the two are asserted equal by
-#: `tests/test_runner.py`, so this module and the schema cannot drift into
-#: two different ideas of "real".
-_REAL_SHA_RE = re.compile(r"^(?!0{40}$)[0-9a-f]{40}$")
-
 #: The box's dispatcher exports this from the SAME `releases/current` sha it
 #: already reads `CRUCIBLE_RELEASE_SHA` from
 #: (`nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml`) — a
@@ -437,18 +403,21 @@ CODE_SHA_ENV = "CRUCIBLE_CODE_SHA"
 WHEELHOUSE_DIGEST_ENV = "CRUCIBLE_WHEELHOUSE_DIGEST"
 
 
-class CodeShaError(RuntimeError):
-    """`code_sha` could not be resolved to a real, measured commit sha.
-
-    Raised, never defaulted around (repo rule 5): a `0`*40 placeholder used
-    to validate and answer nothing (`alpha-engine-config-I10454`) — half of
-    `explain`'s answer to "why did it do that" was silently absent on every
-    manifest a dispatched box ever wrote. Raised BEFORE `run_job` writes
-    anything, mirroring `crucible.runmode.RunModeError`'s shape: refusing
-    here, before any work starts, is what keeps this refusal from colliding
-    with "manifest or it did not happen" — the process never reaches a job
-    that would need one.
-    """
+#: `code_sha` could not be resolved to a real, measured commit sha.
+#:
+#: Re-exported from `nousergon_lib.run_identity` (`alpha-engine-config-I10831`
+#: deliverable 2): raised, never defaulted around (repo rule 5) — a `0`*40
+#: placeholder used to validate and answer nothing
+#: (`alpha-engine-config-I10454`) — half of `explain`'s answer to "why did it
+#: do that" was silently absent on every manifest a dispatched box ever
+#: wrote. Raised BEFORE `run_job` writes anything, mirroring
+#: `crucible.runmode.RunModeError`'s shape: refusing here, before any work
+#: starts, is what keeps this refusal from colliding with "manifest or it
+#: did not happen" — the process never reaches a job that would need one.
+#: `CodeShaError` binds the library's class rather than a local subclass so
+#: `resolve_code_sha` below (a thin wrapper over the library's function) and
+#: this name always agree on what they raise.
+CodeShaError = _run_identity.CodeShaError
 
 
 def resolve_code_sha() -> str:
@@ -466,46 +435,16 @@ def resolve_code_sha() -> str:
     checkout with no commits — is refused rather than written as the
     all-zero placeholder that used to validate and answer nothing.
 
-    The second of the two pieces `nousergon_lib.run_manifest` genuinely
-    shares with this module (`resolve_code_sha` there, same precedence, same
-    pattern, same refusal). See this module's docstring,
-    `alpha-engine-config-I10810`, for the conditions under which the swap
-    becomes correct and for why the rest of that module stays local.
+    A thin wrapper over `nousergon_lib.run_identity.resolve_code_sha`
+    (`alpha-engine-config-I10831` deliverable 2, this module's own docstring
+    above), fixing `env_var` and `cwd` to this module's own constant and
+    tree root so every call site keeps calling `resolve_code_sha()` with no
+    arguments.
     """
-    env = os.environ.get(CODE_SHA_ENV)
-    if env is not None:
-        if not _REAL_SHA_RE.match(env):
-            raise CodeShaError(
-                f"${CODE_SHA_ENV}={env!r} is not a real 40-character lowercase git sha (or "
-                "is the all-zero placeholder). The box's dispatcher exports this from the "
-                "sha under `releases/current`; a malformed value there is a deploy-time "
-                "defect, and code_sha cannot be written as a value nobody measured "
-                "(repo rule 5)."
-            )
-        return env
-    try:
-        out = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise CodeShaError(
-            f"${CODE_SHA_ENV} is unset and `git rev-parse HEAD` could not run ({exc}). "
-            "code_sha cannot be written as a value nobody measured (repo rule 5) — export "
-            f"${CODE_SHA_ENV} on a box with no git checkout, or run from inside one."
-        ) from exc
-    sha = out.stdout.strip()
-    if out.returncode != 0 or not _REAL_SHA_RE.match(sha):
-        raise CodeShaError(
-            f"${CODE_SHA_ENV} is unset and `git rev-parse HEAD` did not return a real sha "
-            f"(exit {out.returncode}, stdout {sha!r}). code_sha cannot be written as a value "
-            "nobody measured (repo rule 5)."
-        )
-    return sha
+    return _run_identity.resolve_code_sha(
+        env_var=CODE_SHA_ENV,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
 
 
 def _utc(now: dt.datetime) -> str:
@@ -1074,7 +1013,7 @@ def run_job(
 
     while True:
         ctx = RunContext(
-            run_id=_new_run_id(dt.datetime.now(dt.UTC) if now is None else now),
+            run_id=_run_identity.new_run_id(dt.datetime.now(dt.UTC) if now is None else now),
             job=job,
             trading_day=trading_day,
             calendar_date=started.date(),

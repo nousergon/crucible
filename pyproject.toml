@@ -26,7 +26,16 @@ dependencies = [
     # copy on second adoption (`data_gate` in `nousergon-data` is the first).
     # `[gates]` pulls in jsonschema, already a direct dependency here for the
     # same `Draft202012Validator` this module imports.
-    "nousergon-lib[github-app,gates]==0.124.127",
+    #
+    # 0.124.130 carries `nousergon_lib.run_identity` (`resolve_code_sha`,
+    # `new_run_id`; nousergon-lib-PR416, re-exported unchanged from
+    # `nousergon_lib.run_manifest`) — the contract-neutral module
+    # `crucible/runner.py`'s own docstring recommended
+    # (`alpha-engine-config-I10810`), so those two pieces import from a
+    # module named for no schema this repository does not write, without
+    # coupling to `nousergon_lib.run_manifest`'s `data_run_manifest.v1`
+    # contract.
+    "nousergon-lib[github-app,gates]==0.124.130",
     # Trading calendar, dual-date resolution, structured logging, alerts.
     #
     # `[openai]` is NOT optional here (alpha-engine-config-I10473). krepis
@@ -112,7 +121,7 @@ dependencies = [
 # path it never exercises. `crucible data.daily --source arctic` states the
 # missing extra by name when it is absent — it never falls back to a
 # different source, which would silently change what the run measured.
-arcticdb = ["nousergon-lib[arcticdb]==0.124.127"]
+arcticdb = ["nousergon-lib[arcticdb]==0.124.130"]
 
 [project.scripts]
 crucible = "crucible.cli:main"
