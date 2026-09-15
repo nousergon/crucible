@@ -57,7 +57,7 @@ from pydantic import ValidationError
 from crucible.calendar import resolve_trading_day
 from crucible.components import Component, load_registry
 from crucible.console.classify import STATES as COMPONENT_STATES
-from crucible.console.classify import Classification
+from crucible.console.classify import Classification, not_yet_due
 from crucible.documents import read_store_document
 from crucible.features.depth import (
     FEATURES_PREFIX,
@@ -749,10 +749,20 @@ class BoardRow:
     #: page condition (deliberately not wired yet — see the PR body) reads it
     #: rather than parsing an English sentence back out.
     setback: dict[str, Any] | None = None
+    #: `alpha-engine-config-I10872`: the classifier state behind a
+    #: `component:*` row (`crucible.console.classify.STATES`), or `None` on
+    #: every other row. `state` collapses `RUNNING`, `ARMED`, `MISSED` and
+    #: `NEVER_RAN` onto one `UNMEASURED`; a board-to-board comparison has to
+    #: tell "not yet due" from "no reading" without parsing `detail`.
+    component_state: str | None = None
 
     def __post_init__(self) -> None:
         if self.state not in BOARD_STATES:
             raise ValueError(f"{self.id}: {self.state!r} is not a board state")
+        if self.component_state is not None and self.component_state not in COMPONENT_STATES:
+            raise ValueError(
+                f"{self.id}: component_state {self.component_state!r} is not a classifier state"
+            )
         if not self.detail.strip():
             raise ValueError(f"{self.id} carries no detail — a dot that cannot say how")
         if not self.artifact.strip():
@@ -788,6 +798,7 @@ class BoardRow:
             # consumer print 0/0 over a render that measured nothing.
             "clauses": None if self.clauses is None else [dict(c) for c in self.clauses],
             "setback": self.setback,
+            "component_state": self.component_state,
         }
 
 
@@ -1943,6 +1954,7 @@ def _component_row(component: Component, classification: Classification | None) 
             f"{component.absence_watched_by}; alerts reach {component.alert_channel}."
         ),
         last_read=day,
+        component_state=None if classification is None else classification.state,
     )
 
 
@@ -2022,10 +2034,17 @@ def board_delta(previous: dict[str, Any] | None, current: Board) -> list[RowDelt
     doc = BoardCurrentDocument.model_validate(previous)
     before = {row.id: row.state for row in doc.rows}
     after = {row.id: row.state for row in current.rows}
+    # `alpha-engine-config-I10872`: a component row that is RUNNING or ARMED in
+    # EITHER board is schedule phase, not a move. A board rendered at 21:30Z
+    # reads most components RUNNING; against one rendered after the arc, every
+    # one of them would otherwise be reported as a regression.
+    before_component = {row.id: row.component_state for row in doc.rows}
+    after_component = {row.id: row.component_state for row in current.rows}
     deltas = [
         RowDelta(row_id, before.get(row_id), after.get(row_id))
         for row_id in sorted(set(before) | set(after))
         if before.get(row_id) != after.get(row_id)
+        and not not_yet_due(before_component.get(row_id), after_component.get(row_id))
     ]
     return deltas
 

@@ -59,10 +59,12 @@ on:
     # would diverge from the calendar the artifacts are keyed by, and nothing
     # would say so.
     #
-    # After the board rather than before it for a reader's benefit, not a
-    # data dependency: this job reads no board artifact. Ordering them means
-    # the morning report's board and the closing records it references were
-    # taken from the same evening.
+    # This job reads no board artifact. The BOARD depends on THIS job, not the
+    # other way round: board.yml re-renders on this workflow's completion
+    # (`workflow_run`, alpha-engine-config-I10872), so the board the morning
+    # report delivers postdates the `gate-publish` ladder below. Renaming this
+    # workflow's `name:` silently disconnects that trigger —
+    # tests/test_board.py asserts the two names agree.
     - cron: '0 23 * * *'
   workflow_dispatch:
 
