@@ -34,7 +34,15 @@ from dataclasses import dataclass
 from crucible.components import Component, load_registry
 from crucible.slots import SLOTS, dispatchable_slots
 
-__all__ = ["ARC_JOB", "ARC_SLOT_JOBS", "ARCTIC_LIBRARY_JOBS", "Stage", "arc_stages", "run_arc"]
+__all__ = [
+    "ARC_JOB",
+    "ARC_SLOT_JOBS",
+    "ARCTIC_LIBRARY_JOBS",
+    "SELECT_NEWEST_VERDICT_JOBS",
+    "Stage",
+    "arc_stages",
+    "run_arc",
+]
 
 #: The job name the arc itself runs and files its manifest under. That
 #: manifest records every stage it completed as an input, which is what
@@ -60,6 +68,16 @@ ARC_SLOT_JOBS: frozenset[str] = frozenset({"experiment.run", "experiment.grade",
 #: takes the identical flag for the identical reason and a future arc row
 #: for it must not need a second edit here (`alpha-engine-config-I10633`).
 ARCTIC_LIBRARY_JOBS: frozenset[str] = frozenset({"data.daily", "data.weekly"})
+
+#: The arc jobs that carry `--select-newest-verdict` rather than a positional
+#: target (`alpha-engine-config-I10858`). `explain` takes `target
+#: RUN_ID|VERDICT_KEY` as an on-demand CLI job, but the arc dispatches no
+#: operator holding a specific target — it names the flag that makes the
+#: selection deterministic instead, so `explain_walks_a_verdict` (a ROLLING
+#: phase-1 window) has a producer on a cadence shorter than its window rather
+#: than depending on an operator's memory, the way its one qualifying
+#: manifest (2026-08-07) did before it aged out.
+SELECT_NEWEST_VERDICT_JOBS: frozenset[str] = frozenset({"explain"})
 
 
 @dataclass(frozen=True)
@@ -114,6 +132,8 @@ class Stage:
             argv += ["--slot", self.slot]
         if arctic_library and self.job in ARCTIC_LIBRARY_JOBS:
             argv += ["--arctic-library", arctic_library]
+        if self.job in SELECT_NEWEST_VERDICT_JOBS:
+            argv.append("--select-newest-verdict")
         if dry_run:
             # alpha-engine-config-I9922 N1: `weekly --dry-run` used to ignore
             # the flag entirely and dispatch every stage for real. Each stage

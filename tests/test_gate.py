@@ -377,6 +377,56 @@ class TestPhaseOne:
         result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
         assert not next(c for c in result.clauses if c.name == "explain_walks_a_verdict").met
 
+    def test_the_scheduled_explains_manifest_with_no_verdict_input_withholds_the_clause(
+        self, tmp_path
+    ) -> None:
+        """`alpha-engine-config-I10858`'s scheduled arc stage runs `crucible
+        explain --select-newest-verdict`. When the store it runs against
+        holds no settled verdict at all, `select_newest_settled_verdict`
+        raises `NoSettledVerdictError` INSIDE the job body, so `run_job`
+        still files a `failed` manifest (rule 1) — with no `inputs` at all,
+        since nothing was ever selected to walk. That manifest must not
+        satisfy `explain_walks_a_verdict`: a failed run recording nothing is
+        exactly the absence the clause exists to detect, not a walk that
+        happened to skip a verdict.
+        """
+        from crucible.cli import main
+        from crucible.explain import NoSettledVerdictError
+
+        store = _seed_met(tmp_path)
+        # `_seed_met` records a verdict.json KEY in each day's manifest
+        # `inputs` (satisfying the clause artificially) but never writes an
+        # actual `verdict.json` document — so a real scheduled call against
+        # this store finds none, exactly the gap this test exists to cover.
+        # Overwrite EVERY window day the way a real weekly cadence would,
+        # rather than one, so nothing else in the window can satisfy the
+        # clause instead.
+        for day in WINDOW:
+            # `run_job` files the `failed` manifest and then re-raises (rule
+            # 1 — AGENTS.md "the exception continues to propagate so the
+            # process exits non-zero"), so each scheduled call fails loud too.
+            with pytest.raises(NoSettledVerdictError, match="no settled verdict.json"):
+                main(
+                    [
+                        "explain",
+                        "--date",
+                        day.isoformat(),
+                        "--run-mode",
+                        "replay",
+                        "--store",
+                        str(store.root),
+                        "--select-newest-verdict",
+                    ]
+                )
+            manifest = json.loads(store.get_bytes(manifest_key("explain", day.isoformat())))
+            assert manifest["status"] == "failed"
+            assert manifest["inputs"] == []
+            assert "no settled verdict.json" in manifest["reason"]
+
+        result = evaluate(store, gate="phase1", trading_day=RENDER_DAY)
+        clause = next(c for c in result.clauses if c.name == "explain_walks_a_verdict")
+        assert not clause.met
+
     def test_a_pointer_with_no_matching_smoke_fails(self, tmp_path) -> None:
         """The pointer must have flipped ON a smoke. A pointer moved by hand
         and a pointer moved on evidence are the same bytes."""
