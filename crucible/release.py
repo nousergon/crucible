@@ -609,8 +609,9 @@ def require_wheelhouse(record: ReleaseRecord) -> dict[str, Any]:
         raise ReleaseHasNoWheelhouseError(
             f"release {record.sha} ({record.schema_version}) publishes no wheelhouse. Boxes "
             "install offline from a hash-locked wheelhouse only and never fall back to "
-            "PyPI. Fix: redeploy that release so it publishes one "
-            "(crucible deploy.yml), or `crucible release.pin` a release that carries one."
+            "PyPI. Fix: `crucible release.pin` a release that carries one (any release "
+            "deployed since the wheelhouse landed), or merge to main so deploy.yml publishes a "
+            "new one. Re-deploying THIS sha cannot add one: its release.json is immutable."
         )
     return record.wheelhouse
 
