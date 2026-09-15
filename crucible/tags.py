@@ -73,6 +73,27 @@ UNTAGGABLE_TYPES: dict[str, str] = {
         "schedules carry no tags of their own; their schedule GROUP does, and it "
         "is a resource of this stack"
     ),
+    # `alpha-engine-config-I10671` (`nous-ergon-ops-PR1275`) added the public
+    # CloudFront surface, and the acceptance clause read three of its four new
+    # resource types as untagged from 2026-09-14 (commit 1cb0a72): the
+    # `PublicDistribution` carries `Tags` and reads correctly, but
+    # `AWS::CloudFront::CachePolicy`, `AWS::CloudFront::OriginAccessControl`
+    # and `AWS::CloudFront::ResponseHeadersPolicy` have NO `Tags` property in
+    # their CloudFormation resource schema at all — measured live 2026-09-14
+    # via `aws cloudformation describe-type` against each type name, the same
+    # check that grounds the Scheduler and SNS-subscription entries above.
+    # This is the same class the module docstring already names: a checker
+    # that reports a genuinely untaggable resource as untagged looks like
+    # diligence and is actually a false positive with no remedy an operator
+    # can apply — there is no `Tags:` property CloudFormation would accept
+    # here.
+    "AWS::CloudFront::CachePolicy": "CloudFront cache policies expose no `Tags` property",
+    "AWS::CloudFront::OriginAccessControl": (
+        "CloudFront origin access controls expose no `Tags` property"
+    ),
+    "AWS::CloudFront::ResponseHeadersPolicy": (
+        "CloudFront response headers policies expose no `Tags` property"
+    ),
     # An instance profile is a container for a role; the role carries the tag
     # and the profile has no tag surface in IAM.
     "AWS::IAM::InstanceProfile": "IAM instance profiles have no tag surface",

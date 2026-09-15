@@ -286,6 +286,37 @@ class TestEveryChannelIsRead:
         )
         assert not untagged_topic.met
 
+    @pytest.mark.parametrize(
+        "resource_type",
+        [
+            "AWS::CloudFront::CachePolicy",
+            "AWS::CloudFront::OriginAccessControl",
+            "AWS::CloudFront::ResponseHeadersPolicy",
+        ],
+    )
+    def test_a_cloudfront_policy_type_is_untaggable_by_type(self, resource_type: str) -> None:
+        """`alpha-engine-config-I10671` (`nous-ergon-ops-PR1275`) added the
+        public CloudFront surface. Measured live 2026-09-14 via `aws
+        cloudformation describe-type` against each of these three type names:
+        none exposes a `Tags` property, unlike `AWS::CloudFront::Distribution`
+        (which does, and is tagged in the template). Before this entry, the
+        audit reported all three as untagged with no remedy an operator could
+        apply — the same false-positive class the Scheduler and SNS-subscription
+        entries above already guard against — and took the phase-0
+        `v2_resources_tagged_and_versioned` clause down with them (measured
+        2026-09-14: the §2 acceptance reading regressed from 22 met / 2 unmet
+        on commit 88f6e24 to 21 met / 3 unmet on commit 1cb0a72, with
+        `TestCost::test_every_v2_resource_is_tagged_for_cost_attribution`
+        newly in `unmet_clauses`)."""
+        audit = audit_stack_tags(
+            stack=STACK,
+            cfn=_FakeCfn([_summary("PublicPolicy", resource_type, "test-physical-id")]),
+            tagging=_FakeTagging([]),
+            iam=_FakeIam(set()),
+        )
+        assert audit.met, audit.untagged
+        assert audit.skipped == (("PublicPolicy", UNTAGGABLE_TYPES[resource_type]),)
+
 
 class _FakeCe:
     """`ce:ListCostAllocationTags`'s own shape — distinct from Cost Explorer's
