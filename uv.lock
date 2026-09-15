@@ -229,7 +229,7 @@ dependencies = [
     { name = "jsonschema" },
     { name = "krepis", extra = ["openai"] },
     { name = "lightgbm" },
-    { name = "nousergon-lib", extra = ["github-app"] },
+    { name = "nousergon-lib", extra = ["gates", "github-app"] },
     { name = "numpy" },
     { name = "pandas" },
     { name = "pyarrow" },
@@ -256,8 +256,8 @@ requires-dist = [
     { name = "jsonschema", specifier = ">=4.26.0" },
     { name = "krepis", extras = ["openai"], specifier = "==0.59.59" },
     { name = "lightgbm", specifier = ">=4.7.0" },
-    { name = "nousergon-lib", extras = ["arcticdb"], marker = "extra == 'arcticdb'", specifier = "==0.124.124" },
-    { name = "nousergon-lib", extras = ["github-app"], specifier = "==0.124.124" },
+    { name = "nousergon-lib", extras = ["arcticdb"], marker = "extra == 'arcticdb'", specifier = "==0.124.127" },
+    { name = "nousergon-lib", extras = ["github-app", "gates"], specifier = "==0.124.127" },
     { name = "numpy", specifier = ">=2.5.3" },
     { name = "pandas", specifier = ">=2.0" },
     { name = "pyarrow", specifier = ">=25.0.1" },
@@ -593,7 +593,7 @@ wheels = [
 
 [[package]]
 name = "nousergon-lib"
-version = "0.124.124"
+version = "0.124.127"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -602,15 +602,18 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/76/c9/edc352d7ce7388fef91bdcbf6d546505ebed1d99f1672bd31ab4a77d094d/nousergon_lib-0.124.124.tar.gz", hash = "sha256:f2cbdf1671e3937eddd38aa009206d6b466b48ac9976aee0187567119454220d", size = 873487, upload-time = "2026-09-13T20:21:35.473Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/be/ca/7ad1b4f73725e66e7d19854b33afd4cb5742ebfd8a133042ede02c50fd39/nousergon_lib-0.124.127.tar.gz", hash = "sha256:41e8198963450754267baa2f69edca93814fe62c2d0adf8f982f3a7eae12aac1", size = 901015, upload-time = "2026-09-14T21:27:16.153Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f3/c0/54fe736c46bea84a1937e490d68c36d3ccd9283b77031742f11096f6509a/nousergon_lib-0.124.124-py3-none-any.whl", hash = "sha256:9be5fa4a892b883921f1162ca22a90f0fea1fdd04fd0cf6db91a94fddcbb939d", size = 598541, upload-time = "2026-09-13T20:21:33.513Z" },
+    { url = "https://files.pythonhosted.org/packages/14/bf/47c28d90beb69f87f6ec5871e0876973fbfe6dd2f8e0be17eb5785c31994/nousergon_lib-0.124.127-py3-none-any.whl", hash = "sha256:1c93cfd9b38476becc91f78f08af612695f99aca02a92d7f0ae3ba49ae1ec99b", size = 623714, upload-time = "2026-09-14T21:27:14.391Z" },
 ]
 
 [package.optional-dependencies]
 arcticdb = [
     { name = "arcticdb" },
     { name = "pandas" },
+]
+gates = [
+    { name = "jsonschema" },
 ]
 github-app = [
     { name = "pyjwt", extra = ["crypto"] },
