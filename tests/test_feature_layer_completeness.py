@@ -27,10 +27,12 @@ import pytest
 
 from crucible.board import build_board
 from crucible.features.depth import (
+    COMPLETENESS_SAMPLE_SIZE,
     FEATURES_PREFIX,
     NULL_RATIO_CEILING,
     check_feature_layer_completeness,
     check_feature_layer_depth,
+    sample_sessions,
 )
 from crucible.features.registry import feature_names, feature_version
 from crucible.store import LocalStore
@@ -137,7 +139,16 @@ class TestCheckFeatureLayerCompleteness:
         assert reading.null_ratios[col] == pytest.approx(0.25)
         assert reading.state == "GREEN"
 
-    def test_reads_the_most_recent_session_of_the_live_version(self, store) -> None:
+    def test_a_dead_column_behind_a_clean_newest_session_is_caught(self, store) -> None:
+        """The blindness `alpha-engine-config-I10733` walked through, as a test.
+
+        A degenerate `data/inst_ownership/2025Q3/latest.parquet` was live for
+        under two hours on 2026-09-14; every feature session healed inside that
+        window took `institutional_accumulation_raw` null for 903 of 903
+        tickers, ~50 sessions of them. The newest session was healed after the
+        window and is fine — so a reading that looked only there was GREEN over
+        the whole band. It is the older session that must decide the verdict.
+        """
         dead = ("beta_60d_raw",)
         _put_session(
             store,
@@ -154,8 +165,35 @@ class TestCheckFeatureLayerCompleteness:
 
         reading = check_feature_layer_completeness(store, live_version=LIVE_VERSION)
 
-        assert reading.session == "2026-09-11"
+        assert reading.state == "RED"
+        assert reading.session == "2026-09-10"
+        assert reading.dead_columns == dead
+        assert reading.dead_sessions == ("2026-09-10",)
+
+    def test_a_clean_layer_reports_the_newest_session_and_what_it_sampled(self, store) -> None:
+        for day in ("2026-09-10", "2026-09-11"):
+            _put_session(store, LIVE_VERSION, day, _session_frame(tickers=("AAA",)))
+
+        reading = check_feature_layer_completeness(store, live_version=LIVE_VERSION)
+
         assert reading.state == "GREEN"
+        assert reading.session == "2026-09-11"
+        assert reading.sessions_read == ("2026-09-10", "2026-09-11")
+        assert reading.sessions_total == 2
+
+    def test_the_reading_states_the_sample_rather_than_implying_a_sweep(self, store) -> None:
+        """Measurability, one layer up: a sample reported as a full read is the
+        same false green the sample exists to catch. The detail has to say how
+        many sessions were read of how many exist, and how long a band can
+        hide between two of them.
+        """
+        for day in ("2026-09-10", "2026-09-11"):
+            _put_session(store, LIVE_VERSION, day, _session_frame(tickers=("AAA",)))
+
+        reading = check_feature_layer_completeness(store, live_version=LIVE_VERSION)
+
+        assert "2 of 2 session(s) sampled" in reading.detail
+        assert "can sit between two samples unseen" in reading.detail
 
     def test_red_when_the_live_version_has_no_session_at_all(self, store) -> None:
         reading = check_feature_layer_completeness(store, live_version=LIVE_VERSION)
@@ -262,3 +300,47 @@ class TestTheBoardRow:
         assert row.state == "UNMEASURABLE"
         assert row.red
         assert "simulated listing failure" in row.detail
+
+
+class TestSampleSessions:
+    """The sampler's guarantee is the whole basis of the reading's claim, so it
+    is asserted here rather than left to the caller's comment.
+    """
+
+    def test_a_layer_at_or_under_the_sample_size_is_read_whole(self) -> None:
+        sessions = [f"2026-01-{day:02d}" for day in range(1, 11)]
+        assert sample_sessions(sessions, size=40) == sessions
+
+    def test_the_newest_and_oldest_are_always_sampled(self) -> None:
+        sessions = [str(i) for i in range(1181)]
+        picked = sample_sessions(sessions)
+        assert picked[0] == sessions[0]
+        assert picked[-1] == sessions[-1]
+        assert picked == sorted(picked, key=sessions.index)
+
+    def test_no_band_longer_than_the_stride_can_hide(self) -> None:
+        """The claim the detail makes, checked against every window of that
+        length rather than one example — an off-by-one in the stride would
+        otherwise show up only on the band that happens to be missed.
+        """
+        sessions = [str(i) for i in range(1181)]
+        picked = sample_sessions(sessions)
+        positions = [sessions.index(candidate) for candidate in picked]
+        widest_gap = max(b - a for a, b in zip(positions, positions[1:], strict=False))
+        # The guarantee the reading states, checked over every window of that
+        # length rather than one example — an off-by-one in the stride would
+        # otherwise show up only on the band that happens to be missed.
+        chosen = set(picked)
+        for start in range(len(sessions) - widest_gap + 1):
+            window = sessions[start : start + widest_gap]
+            assert chosen.intersection(window), f"band at {start} sampled nothing"
+        assert widest_gap <= len(sessions) // COMPLETENESS_SAMPLE_SIZE + 2
+
+    def test_it_is_reproducible(self) -> None:
+        """Two board runs over an unchanged layer must not disagree about it."""
+        sessions = [str(i) for i in range(500)]
+        assert sample_sessions(sessions) == sample_sessions(sessions)
+
+    def test_a_non_positive_sample_size_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="sample size must be positive"):
+            sample_sessions(["2026-01-02"], size=0)
