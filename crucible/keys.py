@@ -25,7 +25,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from crucible.calendar import assert_trading_day
+from crucible.calendar import ISO_DATE_RE, assert_trading_day
 
 __all__ = [
     "ACCEPTANCE_REQUIRED_FIELDS",
@@ -75,6 +75,7 @@ __all__ = [
     "backfill_key",
     "board_html_key",
     "board_key",
+    "calendar_day_discriminator",
     "champion_key",
     "closing_record_key",
     "constituents_key",
@@ -108,8 +109,10 @@ __all__ = [
     "ledger_key",
     "legacy_dead_lambdas_key",
     "legacy_weekly_executions_key",
+    "manifest_calendar_day",
     "manifest_key",
     "manifest_prefix",
+    "manifest_ran_on",
     "migration_key",
     "morning_history_row_key",
     "morning_report_key",
@@ -597,6 +600,14 @@ def manifest_key(job: str, trading_day: str, *, discriminator: str | None = None
     ``discriminator`` is never an arm id, so it does not go through
     :func:`arm_key_segment` — it is validated directly against a plain
     path-segment charset instead.
+
+    **The date segment is the trading day, for every job, including an
+    on-demand run given `--trading-day`.** Which day a key encodes, why the
+    segment does not become the calendar date, and how an on-demand run's own
+    calendar day becomes answerable from `runs/` anyway, are decided and
+    written down immediately below :func:`is_manifest_key` — see
+    :func:`calendar_day_discriminator` and :func:`manifest_ran_on`
+    (alpha-engine-config-I10999).
     """
     if not job:
         raise ValueError("job must be non-empty")
@@ -661,6 +672,147 @@ def parse_manifest_key(key: str) -> tuple[str, str, str | None] | None:
         _, job, trading_day, discriminator, _ = parts
         return job, trading_day, discriminator
     return None
+
+
+# ── Which day a manifest key encodes (alpha-engine-config-I10999) ───────────
+#
+# THE DECISION, at the construction site, with its rationale.
+#
+# A manifest carries two days: `trading_day` (what the run is ABOUT) and
+# `calendar_date` (when the process actually ran). Only the first has ever
+# been in the key, and for a job graded on the trading-day axis that is
+# right. For an ON-DEMAND run given `--trading-day` it is not enough, and the
+# measured cost is this: the seven arm registrations of 2026-09-17 ran
+# `experiment.new --trading-day 2026-09-11`, so every manifest landed under
+# `runs/experiment.new/2026-09-11/`, `runs/experiment.new/2026-09-17/` does
+# not exist, and "what mutated the store on 2026-09-17" had no answer in
+# `runs/` at all — recovering the real day took S3 object-version
+# `LastModified` archaeology.
+#
+# **The decision: the date SEGMENT stays the trading day for every job, and
+# an on-demand job additionally leads its discriminator with the calendar day
+# it ran on.** The manifest is therefore discoverable under the day it is
+# about (the prefix, unchanged) and under the day it ran (the discriminator,
+# via `manifest_ran_on`), from `runs/` keys alone.
+#
+# **Why the segment does not become the calendar day.** `crucible.alerts`
+# grades ABSENCE off a predictable manifest key per trading day: it asks
+# whether `runs/{job}/{trading_day}/` has anything under it for each session
+# in its catch-up window. Move the segment for a scheduled job and the
+# absence checker reads nothing where the job in fact ran — it is blinded in
+# exactly the direction that never pages. That is `alpha-engine-config-I10981`
+# one step over, and it is why this is an ASYMMETRY rather than a uniform
+# change:
+#
+# * a job with a `schedule`/`deadline` in `components.yaml` keeps its key
+#   shape untouched, because something grades its absence at that key;
+# * an on-demand job (`experiment.new`: `schedule: null`, `deadline: null`)
+#   has no absence grading keyed off it, so its discriminator is free.
+#
+# The asymmetry is written HERE, where the key is built, rather than left
+# implicit at the one call site that uses it. A second on-demand job wanting
+# the same property calls `calendar_day_discriminator` and inherits the
+# reasoning; a scheduled job that calls it is making a visible mistake with
+# the reason it is a mistake three lines above.
+#
+# **Why the calendar day leads the discriminator.** `manifest_calendar_day`
+# reads it back off the key by position, which also — for free — reads the
+# BARE calendar-date discriminators three jobs already write for the same
+# "when did this actually fire" purpose (`alerts.sweep` and `report.morning`
+# via `ctx.calendar_date`, `data.daily`'s holiday no-op via the wall-clock
+# date). One predicate answers for all four rather than one per writer.
+
+
+def calendar_day_discriminator(calendar_date: dt.date, *, suffix: str | None = None) -> str:
+    """The manifest discriminator for an ON-DEMAND run: the calendar day it
+    ran on, optionally followed by whatever else distinguishes the writer.
+
+    See the block above for why this exists and why it is only for a job
+    with no `schedule` and no `deadline`.
+
+    ``suffix`` is the discriminator the caller would otherwise have passed
+    (`experiment.new`'s `{slot}-{run_id}`, which keeps seven registrations on
+    one day from overwriting each other, `alpha-engine-config-I10967`). It is
+    appended, never replaced: this adds an axis rather than taking one away.
+
+    The result is validated by :func:`manifest_key` like any other
+    discriminator, so an unusable ``suffix`` is refused there, in the one
+    place that refusal lives.
+    """
+    day = calendar_date.isoformat()
+    return f"{day}-{suffix}" if suffix else day
+
+
+def manifest_calendar_day(key: str) -> dt.date | None:
+    """The calendar day ``key`` says its run happened on, or ``None``.
+
+    ``None`` means the KEY does not state one — a bare manifest key, or one
+    whose discriminator is a slot letter or a release sha. It is not a claim
+    that the run has no calendar date (every manifest body carries one); it
+    is the honest answer that this key does not encode it, and
+    :func:`manifest_ran_on` is where that is turned into a reading.
+
+    Returns ``None`` for a key that is not a manifest key at all, for the
+    same reason :func:`parse_manifest_key` does: what a caller does about a
+    foreign key is the caller's decision.
+    """
+    parsed = parse_manifest_key(key)
+    if parsed is None:
+        return None
+    _job, _trading_day, discriminator = parsed
+    if discriminator is None:
+        return None
+    candidate = discriminator[:10]
+    if not ISO_DATE_RE.fullmatch(candidate):
+        return None
+    if len(discriminator) > 10 and discriminator[10] != "-":
+        # `2026-09-1x...` — a ten-character prefix that parses but is not a
+        # whole segment. Reading it as the calendar day would invent a fact
+        # out of a discriminator that never claimed one.
+        return None
+    try:
+        return dt.date.fromisoformat(candidate)
+    except ValueError:
+        # `2026-13-45` satisfies the shape and is not a date. The key states
+        # no calendar day, which is what `None` says — reading it as one
+        # would invent a fact out of a malformed segment.
+        return None
+
+
+def manifest_ran_on(key: str, calendar_date: dt.date) -> bool:
+    """Whether ``key`` names a run that happened on ``calendar_date``.
+
+    This is the answer to "what mutated the store on day X", computed from
+    `runs/` KEYS alone — no manifest bodies read, and no S3 object-version
+    metadata (`alpha-engine-config-I10999`).
+
+    Two readings, and the second is the one that keeps every pre-existing key
+    answerable:
+
+    * the key STATES a calendar day (:func:`manifest_calendar_day`) — it is
+      compared directly;
+    * the key states none — the run is taken to have happened on its own
+      trading day, which is true by construction for every writer that does
+      not carry a calendar discriminator: a job that ran on some OTHER day is
+      exactly a job that was given `--trading-day`, and an on-demand job given
+      `--trading-day` now carries the day it ran in its discriminator.
+
+    The second reading is an inference and is deliberately not silent about
+    it: a scheduled job backfilled with `--trading-day` (the one shape it
+    still gets wrong) keeps its key unchanged BECAUSE moving it would blind
+    `crucible.alerts`' absence grading — see the block above this function.
+    """
+    stated = manifest_calendar_day(key)
+    if stated is not None:
+        return stated == calendar_date
+    parsed = parse_manifest_key(key)
+    if parsed is None:
+        return False
+    _job, trading_day, _discriminator = parsed
+    try:
+        return dt.date.fromisoformat(trading_day) == calendar_date
+    except ValueError:
+        return False
 
 
 def is_manifest_key(key: str) -> bool:

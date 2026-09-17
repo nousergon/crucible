@@ -155,7 +155,7 @@ from crucible.manifest import (
     write_manifest,
 )
 from crucible.runmode import resolve_run_mode
-from crucible.store import Store, sha256_hex
+from crucible.store import Store, capture_ledger_of, is_capturing, sha256_hex
 
 __all__ = [
     "MAX_ATTEMPTS",
@@ -593,6 +593,18 @@ class RunContext:
     #: broken group is structurally distinguishable from one that failed on
     #: its own.
     fault_capability_class: str | None = None
+    #: This run's provider-call ledger, or `None` on a real run
+    #: (alpha-engine-config-I11012). Set by `run_job` from whether the STORE
+    #: is a capturing one, never by a job body. `crucible.llm.call` reads it
+    #: to decide whether to build a real client or one with no transport —
+    #: which is what makes "a dry run reaches no provider" a property of the
+    #: door rather than of each job body remembering.
+    #:
+    #: Typed `Any` rather than `ProviderCaptureLedger` on purpose: importing
+    #: `crucible.llm` here at module scope would make `runner` depend on the
+    #: LLM package for a field it never reads, and this module is imported by
+    #: every job including the ones that have no model in them at all.
+    provider_capture: Any = None
 
     inputs: list[dict[str, Any]] = field(default_factory=list)
     outputs: list[dict[str, Any]] = field(default_factory=list)
@@ -906,21 +918,29 @@ def run_job(
     failure — the fault-injection suite asserts the no-retry path as well as
     the retry path.
 
-    ``dry_run=True`` runs ``fn`` exactly as a real invocation would — a caller
-    still needs the rendered/resolved result to report it — but skips the
-    write path entirely: no `run.json` is written and nothing `fn` recorded
-    is folded into a manifest, since there is no manifest. One line is
-    printed instead, naming the job and trading day, so a dry run is visibly
-    a dry run in the operator's own terminal rather than silent. This is the
-    fix for alpha-engine-config-I9922: `report.morning --dry-run` is
-    documented as "renders and files nothing", but before this flag existed
-    the write below ran unconditionally, so a dry run against the production
-    store left a real `ok` firing in `runs/` for `alerts.sweep` and the board
-    to read. `fn` itself must still avoid any OTHER real write (a store put
-    outside `ctx.record_output`, an external delivery) — this flag only
-    covers the one write `run_job` itself makes; the store every CLI handler
-    resolves is ALSO read-only under `--dry-run` (`crucible.store.read_only`),
-    which is what actually stops `fn`'s own writes.
+    ``dry_run=True`` runs ``fn`` exactly as a real invocation would, and what
+    happens to the manifest depends on the STORE it was handed, not on this
+    flag alone (alpha-engine-config-I11012):
+
+    * a **capturing** store (`crucible.store.capturing`, which is what every
+      CLI `--dry-run` resolves) takes the ordinary write path — the manifest
+      is assembled, validated and handed to the store, which RECORDS it
+      instead of performing it. The run then prints the captured key set. A
+      dry run that skipped its own manifest could never report the key set a
+      real run writes, because the manifest is one of those keys;
+    * any other store skips the write path entirely, exactly as before: no
+      `run.json`, nothing folded into a manifest, one line printed instead.
+      This is the path a direct library/test `run_job(dry_run=True)` takes.
+
+    Zero real writes on both paths. On the first that is STRUCTURAL rather
+    than a promise: the capturing subclass has no code path to the backend's
+    write at all, so there is no flag to get wrong. This supersedes the
+    alpha-engine-config-I9922 arrangement, where `--dry-run` resolved a
+    `crucible.store.read_only` store that RAISED at the first write — safe,
+    but it meant no job body ever ran far enough for a rehearsal to fail the
+    way its run fails. `fn` must still avoid any real write that does not go
+    through `store` (an external delivery, a broker call); this function and
+    the store together cover everything that does.
 
     ``write_manifest=False`` suppresses the manifest write for an invocation
     that publishes NOTHING — `alpha-engine-config-I10576`. It is deliberately
@@ -1026,6 +1046,22 @@ def run_job(
         ctx.discriminator = discriminator(ctx) if callable(discriminator) else discriminator
         ctx.now_override = now_override
         ctx.fault_capability_class = fault_capability_class
+        # The EGRESS half of the rehearsal (alpha-engine-config-I11012).
+        # Keyed off the STORE, not off `dry_run`: a rehearsal is a rehearsal
+        # on both axes, and one decision in one place is what keeps them from
+        # drifting apart. A capturing store means `--dry-run` resolved it
+        # (`crucible.store.open_store`, `Settings.store`), and from here
+        # `crucible.llm.call` yields a client with no transport — so a job
+        # that knows nothing about rehearsal cannot spend, and cannot make an
+        # outbound request, during one. Set by `run_job` and never by a job
+        # body, the same discipline `fault_capability_class` carries.
+        if is_capturing(store):
+            # Imported lazily: `crucible.llm` imports `crucible.models` and
+            # `crucible.documents`, and a module-scope import here would put
+            # the whole LLM package on the import path of every job.
+            from crucible.llm import begin_provider_capture
+
+            ctx.provider_capture = begin_provider_capture()
 
         # `alpha-engine-config-I9986` deliverable 1: the fleet cost-sink
         # partitions every row under `{prefix}/{date}/{run_id}/`
@@ -1113,14 +1149,51 @@ def run_job(
                     file=sys.stderr,
                 )
             elif transient is None:
-                if dry_run:
-                    # No manifest, no outputs record — `dry_run` means this
-                    # function makes exactly zero writes of its own. `fn` may
-                    # still have returned data for the caller to print; what
-                    # it must not have done is write to `store` itself, which
-                    # is the caller's obligation (mirrored in `report.morning`
-                    # and `board`, both of which branch on the same flag
-                    # before touching the store).
+                if dry_run and is_capturing(store):
+                    # A REHEARSAL (alpha-engine-config-I11012). The store
+                    # records writes instead of performing them, so the
+                    # manifest is assembled and validated exactly as a real
+                    # run assembles and validates it — and lands in the
+                    # ledger rather than in the backend. That is what makes
+                    # the reported key set EQUAL the set a real run writes:
+                    # the manifest is one of those keys, and a dry run that
+                    # skipped it would report a set no real run ever produces.
+                    #
+                    # `_write_manifest` is called through the same branch a
+                    # real run takes, not a copy of it, so the assembly, the
+                    # schema validation and the `_minimal_failed_manifest`
+                    # fallback are all rehearsed too.
+                    _write_manifest(
+                        ctx,
+                        store=store,
+                        status=status,
+                        reason=reason,
+                        started=started,
+                        now=now,
+                        release_sha=release_sha,
+                        code_sha=resolved_code_sha,
+                    )
+                    # The one line, not the ledger: the ledger belongs to
+                    # the whole INVOCATION and is rendered once by whoever
+                    # opened it (`crucible.cli.main`). A `weekly` arc runs
+                    # twelve stages through this function in one process, and
+                    # rendering here would print twelve partial ledgers, each
+                    # a prefix of the next.
+                    print(
+                        f"dry_run: {job} {ctx.trading_day.isoformat()} — nothing written "
+                        f"(status would have been {status!r}); "
+                        f"{len(capture_ledger_of(store).writes)} write(s) captured so far"
+                    )
+                elif dry_run:
+                    # A dry run whose store is NOT capturing: a direct
+                    # `run_job(dry_run=True)` from library code or a test,
+                    # holding a plain backend. Refusing here would be wrong —
+                    # this path predates the capturing store and its contract
+                    # is unchanged: this function makes exactly zero writes of
+                    # its own, and `fn`'s own writes are the caller's
+                    # obligation. Every CLI job reaches the branch above,
+                    # because `--dry-run` resolves a capturing store
+                    # (`crucible.store.open_store`, `Settings.store`).
                     print(
                         f"dry_run: {job} {ctx.trading_day.isoformat()} — no manifest written, "
                         f"no outputs recorded (status would have been {status!r})"

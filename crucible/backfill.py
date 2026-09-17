@@ -203,6 +203,7 @@ def run_backfill(
     end: dt.date,
     force: bool = False,
     i_am_in_region: bool = False,
+    rehearsal: bool = False,
 ) -> dict[str, Any]:
     """Produce ``arm`` for every NYSE session in ``[start, end]``. Idempotent.
 
@@ -219,6 +220,22 @@ def run_backfill(
     here, because a backfill of a NON-champion arm never produces the
     champion. Running it made every challenger unbackfillable and so
     unpromotable (`alpha-engine-config-I11005`, measured live 2026-09-17).
+
+    ``rehearsal`` is set by `--dry-run`, whose store RECORDS writes instead of
+    performing them (`crucible.store.capturing`, alpha-engine-config-I11012).
+    It changes exactly one thing: the in-region guard is REPORTED rather than
+    raised. That guard is a property of the HOST, not of the command, and a
+    laptop dry run of a range that will be dispatched in region is the normal
+    case — raising would refuse to rehearse exactly the dispatch the operator
+    is checking. The carve-out is the one PR323 already made in the handler's
+    own dry-run branch, moved here now that the branch executes the body.
+
+    (a) The failure mode absorbed: the in-region guard, and only that guard,
+    and only under `--dry-run`. (b) Why the deliverable survives: nothing else
+    about the rehearsal depends on where it runs; every other refusal in this
+    function still raises. (c) The recording surface: `in_region_verdict` in
+    the returned dict, which the handler prints on its own line, named as a
+    refusal. The real run still raises — `rehearsal` defaults to `False`.
     """
     sessions = sessions_in_range(start, end)
     if not sessions:
@@ -229,9 +246,16 @@ def run_backfill(
         )
     arm_id = arm_id_for(specs, slot=slot, arm=arm)
 
-    on_ec2, evidence = assert_in_region(
-        sessions, slot=slot, arm=arm, start=start, end=end, i_am_in_region=i_am_in_region
-    )
+    try:
+        _on_ec2, evidence = assert_in_region(
+            sessions, slot=slot, arm=arm, start=start, end=end, i_am_in_region=i_am_in_region
+        )
+        in_region_verdict = f"would proceed on this host ({evidence})"
+    except NotInRegionError as exc:
+        if not rehearsal:
+            raise
+        evidence = str(exc)
+        in_region_verdict = f"WOULD REFUSE on this host — {exc}"
 
     produced: list[str] = []
     already: list[str] = []
@@ -290,6 +314,7 @@ def run_backfill(
         "from": start.isoformat(),
         "to": end.isoformat(),
         "host": evidence,
+        "in_region_verdict": in_region_verdict,
         "forced": bool(force),
         "sessions": [d.isoformat() for d in sessions],
         "produced": produced,
