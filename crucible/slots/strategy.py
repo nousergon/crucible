@@ -107,6 +107,7 @@ __all__ = [
     "parse_strategy_document",
     "pit_parity",
     "produce",
+    "produce_history",
     "registration_specs",
     "render_verdict",
     "resolve_session",
@@ -2008,6 +2009,26 @@ def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         "champion": None,
         "feed_key": None,
     }
+
+
+def produce_history(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
+    """Record what the selected S arm SAW on ONE historical session.
+
+    `experiment.backfill`'s per-session entry point for S
+    (`alpha-engine-config-I11005`), and deliberately :func:`produce` itself
+    rather than a second body: S has no serving half to omit. It writes no
+    champion feed on a production cycle either — the S feed
+    (`strategies/current`) has no key builder and no schema in this
+    repository and is tracked separately — so the produce and the history
+    paths are the same path, and the equality is declared here rather than
+    inherited from a silent fallback in the resolver.
+
+    U, R and M do NOT get to do this: each of those has a serving half that a
+    backfill must not enter, which is why
+    :func:`crucible.slots.history_producer` raises for a module that declares
+    no ``produce_history`` instead of quietly using ``produce``.
+    """
+    return produce(ctx, settings=settings, **kwargs)
 
 
 def _close_returns(panel: Any) -> Any:

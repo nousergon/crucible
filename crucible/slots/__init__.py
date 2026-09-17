@@ -91,6 +91,7 @@ __all__ = [
     "attribution_factor_symbols",
     "declared_benchmark_symbols",
     "dispatchable_slots",
+    "history_producer",
     "get_slot",
     "is_control_arm",
     "load_arm_specs",
@@ -312,6 +313,38 @@ def dispatchable_slots() -> dict[str, ModuleType]:
             "run no experiment at all and report `ok`"
         )
     return found
+
+
+def history_producer(module: ModuleType) -> Any:
+    """``module.produce_history`` — the per-session entry point a BACKFILL uses.
+
+    `alpha-engine-config-I11005`. A slot module's ``produce`` is a production
+    SERVING cycle: for U and R it resolves the champion pointer and writes the
+    slot's feed, and for M it republishes the champion's predictions under the
+    trader's key. Both refuse when the pointer names an arm that produced no
+    artifact this cycle, which is correct for production — a pointer to an arm
+    that did not produce means production has no feed today — and wrong for a
+    historical backfill, which feeds nothing and serves nothing. Running it
+    anyway made every NON-champion arm unbackfillable, so no challenger could
+    accumulate the history it needs to become champion: measured live
+    2026-09-17 on `experiment.backfill --slot u --arm attractiveness`, which
+    failed in two minutes on the first of 205 sessions.
+
+    **Raises rather than falling back to ``produce``.** A silent fallback is
+    the whole defect wearing a resolver's clothes: it would put the serving
+    path back under the backfill for exactly the module that forgot to
+    declare its history entry point, and nothing would say so. S declares one
+    explicitly even though it equals ``produce``, because S has no serving
+    half — a fact worth stating, not inferring.
+    """
+    producer = getattr(module, "produce_history", None)
+    if not callable(producer):
+        raise RuntimeError(
+            f"slot module {module.__name__!r} declares no `produce_history`, so a "
+            "backfill has no entry point that skips the serving path. Falling back to "
+            "`produce` would re-enter it and refuse every non-champion arm."
+        )
+    return producer
 
 
 def get_slot(slot: str) -> SlotSpec:

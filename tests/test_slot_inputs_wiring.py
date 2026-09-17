@@ -384,6 +384,15 @@ STILL_ORPHANED_M_CALLABLES: list[str] = [
     "predict_cross_section",
     "produce",
     "produce_arm_predictions",
+    # The history entry point `experiment.backfill` runs, reached through
+    # `crucible.slots.history_producer(module)` — the same dynamic,
+    # read-off-the-module dispatch that puts `produce` and `grade` on this
+    # list, and invisible to a static import-graph scan for the same reason.
+    # That it is declared on every dispatchable slot module, and that it is
+    # NOT the serving `produce`, is pinned where a static scan cannot see:
+    # `tests/test_backfill_serving_boundary.py::
+    # TestTheHistoryProducerIsResolvedAndNeverInferred`.
+    "produce_history",
     "realized_hit_rate",
     # `alpha-engine-config-I10688`: the recording form of
     # `predict_cross_section`, which returns the served cross-section AND the

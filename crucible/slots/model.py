@@ -153,6 +153,7 @@ __all__ = [
     "grade_arm",
     "load_model_recipes",
     "produce",
+    "produce_history",
     "realized_hit_rate",
     "registration_specs",
     "serving_metrics",
@@ -3103,8 +3104,13 @@ def _registered_arms(ctx: Any, *, settings: Any) -> tuple[SlotRecipes, list[Regi
     return loaded, registration_specs(loaded)
 
 
-def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
-    """Fit every registered M arm for one trading day and write its cross-section.
+def _produce_arms(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
+    """Fit every selected M arm for one trading day and write its cross-section.
+
+    The PRODUCE mechanics and nothing else. The SERVING half — republishing
+    the champion pointer's own `arm_predictions.v1` document under the
+    trader's key — lives in :func:`produce`, which is the only M entry point
+    that reads the pointer (`alpha-engine-config-I11005`).
 
     The M half of `experiment.run`. Same signature as
     `crucible.slots.research.produce`, because `crucible.track_a` dispatches
@@ -3135,7 +3141,6 @@ def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     "this arm's inputs were broken" must never render alike.
     """
     from crucible.calendar import assert_trading_day  # noqa: PLC0415 - avoids a cycle
-    from crucible.serving import publish_predictions_feed  # noqa: PLC0415 - avoids a cycle
     from crucible.slots import get_slot  # noqa: PLC0415 - avoids a cycle
     from crucible.slots.arms import (  # noqa: PLC0415 - avoids a cycle
         control_specs,
@@ -3298,18 +3303,6 @@ def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         # produced no cross-section did not have nothing to do.
         raise SlotUnservableError(tuple(warming))
 
-    # The SERVING half of this job, and the second half of the trader contract
-    # (`crucible/AGENTS.md`: the trader reads `champions/{slot}/current.json`
-    # PLUS `predictions/{trading_day}.json`). A republication of exactly the
-    # `arm_predictions.v1` document the champion pointer resolves to — never a
-    # fourth derivation of the same numbers — so the trader's cross-section and
-    # the one `crucible explain` walks are the same bytes. Returns None and
-    # writes nothing while the slot has no champion, which is every cycle
-    # before the M slot's first promotion; refuses outright for a pointer whose
-    # producing run was not `ok`, and raises when the pointer names an arm that
-    # produced nothing this cycle. `alpha-engine-config-I10129`.
-    feed_written = publish_predictions_feed(ctx.store, trading_day=trading_day, ctx=ctx)
-
     ctx.record_rows(rows_in=len(specs), rows_out=len(produced))
     ctx.record_metric(
         {
@@ -3339,10 +3332,67 @@ def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         # metric, and a payload that restated it would be a second copy free
         # to disagree with the first.
         "training_rows_excluded": excluded_rows,
-        # `None` when the slot has no champion, which is a true statement and
-        # deliberately a different one from a key that was written.
-        "champion_feed": feed_written,
     }
+
+
+def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
+    """One PRODUCTION M cycle: fit every registered arm, then serve.
+
+    The M half of `experiment.run`. Same signature as
+    `crucible.slots.research.produce`, because `crucible.track_a` dispatches
+    both through one call and `crucible.slots.dispatchable_slots` reads this
+    name off the module.
+
+    The second statement is the SERVING half and the second half of the
+    trader contract (`crucible/AGENTS.md`: the trader reads
+    `champions/{slot}/current.json` PLUS `predictions/{trading_day}.json`). A
+    republication of exactly the `arm_predictions.v1` document the champion
+    pointer resolves to — never a fourth derivation of the same numbers — so
+    the trader's cross-section and the one `crucible explain` walks are the
+    same bytes. It returns None and writes nothing while the slot has no
+    champion, which is every cycle before the M slot's first promotion;
+    refuses outright for a pointer whose producing run was not `ok`; and
+    raises when the pointer names an arm that produced nothing this cycle.
+    `alpha-engine-config-I10129`.
+    """
+    from crucible.serving import publish_predictions_feed  # noqa: PLC0415 - avoids a cycle
+
+    result = _produce_arms(ctx, settings=settings, **kwargs)
+    # `None` when the slot has no champion, which is a true statement and
+    # deliberately a different one from a key that was written.
+    result["champion_feed"] = publish_predictions_feed(
+        ctx.store, trading_day=result["trading_day"], ctx=ctx
+    )
+    return result
+
+
+def produce_history(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
+    """Fit the selected M arm for ONE historical session. Serves nothing.
+
+    `experiment.backfill`'s per-session entry point
+    (`alpha-engine-config-I11005`). The same :func:`_produce_arms` call
+    `experiment.run` makes — one fitting path, and a backfilled session is
+    byte-for-byte the artifact the weekly arc would have written — and then
+    it stops.
+
+    **It never publishes the predictions feed.** A backfill produces one
+    arm's history for past sessions to establish a track record; it feeds
+    nothing and serves nothing, so requiring that TODAY's champion also
+    produced on each of those past days would make every non-champion arm
+    unbackfillable — the closed loop in which only the incumbent can
+    accumulate history. The M slot has no champion at all today
+    (`champions/m/current.json` is absent, and `publish_predictions_feed`
+    answers an absent pointer with `None`), so this path is not what unblocks
+    the M backfill TODAY; it is what keeps the M backfill working the day
+    after the M slot wins its first champion.
+
+    The result deliberately carries no ``champion_feed`` field: the slot may
+    have a champion and this run simply did not serve, which a ``None``
+    there would misreport as "the slot has no pointer".
+    """
+    result = _produce_arms(ctx, settings=settings, **kwargs)
+    result["served"] = False
+    return result
 
 
 #: IRLS iterations the up-probability calibration is allowed. A logistic fit

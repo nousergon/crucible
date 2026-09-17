@@ -15,14 +15,23 @@ a stacked arm can never register from the scheduled cadence alone. Measured
 `residual_momentum` holding predictions for 1 of 526 panel sessions.
 
 **Why this is evidence and not leakage.** Nothing here is a shortcut. Each
-session is produced by the SAME per-arm produce path `experiment.run` calls
-(`crucible.slots.model.produce`, reached through the ``produce`` argument, so
-this module owns no fitting code and can never grow a second one): the fit
+session is produced by the SAME per-arm fitting path `experiment.run` calls,
+reached through the ``produce`` argument as the slot's ``produce_history``
+(`crucible.slots.history_producer`), so this module owns no fitting code and
+can never grow a second one: the fit
 sees the panel and the features as of that session and nothing after it. A
 backfilled session is byte-for-byte the artifact the weekly arc would have
 written had it run that week, which is what makes the accumulated history
 walk-forward — and what lets `experiment.grade` score these sessions like any
 other, with no backfill-aware grading code anywhere.
+
+**It produces, and it serves nothing.** ``produce_history`` is the produce
+half of the slot's cycle without the serving half: a backfilled session feeds
+nothing, so the champion pointer is neither resolved nor required to have
+produced on that past session. Requiring it — which `experiment.backfill` did
+until `alpha-engine-config-I11005` — made every non-champion arm
+unbackfillable, and therefore unpromotable, since a challenger cannot
+accumulate a track record it is forbidden to produce.
 
 **In region, or it refuses** — the same guard, the same allowance and the
 same single override as `crucible data.heal`, reused rather than restated
@@ -63,6 +72,9 @@ __all__ = [
     "BackfillProducedNothingError",
     "SESSION_REFUSALS",
     "UnknownArmError",
+    "NotInRegionError",
+    "arm_id_for",
+    "assert_in_region",
     "run_backfill",
 ]
 
@@ -110,13 +122,18 @@ class _Produce(Protocol):
     def __call__(self, ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]: ...
 
 
-def _arm_id(specs: Sequence[Any], *, slot: str, arm: str) -> str:
+def arm_id_for(specs: Sequence[Any], *, slot: str, arm: str) -> str:
     """The registered id of ``arm``, or a refusal naming what the slot carries.
 
     Resolved ONCE, before any session runs: the id is what the three
     per-session artifact keys are built from, so a backfill that resolved it
     per session could skip a session against one id and write it under
     another.
+
+    Public because `crucible experiment.backfill --dry-run` resolves the arm
+    through THIS function rather than restating the lookup: a rehearsal that
+    accepted an arm the job would refuse is not a rehearsal
+    (`alpha-engine-config-I11005`).
     """
     for spec in specs:
         if spec.name == arm:
@@ -143,6 +160,37 @@ def _session_keys(arm_id: str, session: str) -> tuple[str, str, str]:
     )
 
 
+def assert_in_region(
+    sessions: Sequence[dt.date],
+    *,
+    slot: str,
+    arm: str,
+    start: dt.date,
+    end: dt.date,
+    i_am_in_region: bool = False,
+) -> tuple[bool, str]:
+    """``(on_ec2, evidence)``, or :class:`NotInRegionError` for a laptop range.
+
+    One implementation, called by the job AND by ``--dry-run``
+    (`alpha-engine-config-I11005`). The dry run existed to tell an operator
+    whether the command they are about to dispatch will work; a dry run that
+    skipped the guard the job applies answered a question nobody asked.
+    """
+    on_ec2, evidence = in_region()
+    if len(sessions) > LAPTOP_SESSION_ALLOWANCE and not on_ec2 and not i_am_in_region:
+        raise NotInRegionError(
+            f"refusing to backfill {len(sessions)} session(s) ({start}..{end}) of "
+            f"{slot}:{arm} from this host: {evidence}. Each session is a full "
+            "point-in-time fit against the store, so the range is dominated by S3 "
+            "round-trip latency the same way a heal is. Run it in region:\n"
+            f"    crucible experiment.backfill --slot {slot} --arm {arm} "
+            f"--from {start} --to {end} --run-mode replay\n"
+            f"Ranges of up to {LAPTOP_SESSION_ALLOWANCE} sessions are allowed locally "
+            "as a diagnostic. `--i-am-in-region` overrides this and nothing else does."
+        )
+    return on_ec2, evidence
+
+
 def run_backfill(
     ctx: RunContext,
     *,
@@ -158,10 +206,19 @@ def run_backfill(
 ) -> dict[str, Any]:
     """Produce ``arm`` for every NYSE session in ``[start, end]``. Idempotent.
 
-    ``produce`` is the slot's own per-arm produce callable — the one
-    `experiment.run` dispatches to. Passing it in rather than importing a
-    slot module here is what keeps this job from becoming a second fitting
-    path: there is no code in this module that could fit anything.
+    ``produce`` is the slot's own per-session HISTORY producer, resolved by
+    :func:`crucible.slots.history_producer` — the same fitting code
+    `experiment.run` reaches, minus the serving half. Passing it in rather
+    than importing a slot module here is what keeps this job from becoming a
+    second fitting path: there is no code in this module that could fit
+    anything.
+
+    **Never the slot's ``produce``.** That is a production serving cycle: it
+    resolves the champion pointer and refuses when the pointer names an arm
+    that produced nothing this cycle — correct for production, and fatal
+    here, because a backfill of a NON-champion arm never produces the
+    champion. Running it made every challenger unbackfillable and so
+    unpromotable (`alpha-engine-config-I11005`, measured live 2026-09-17).
     """
     sessions = sessions_in_range(start, end)
     if not sessions:
@@ -170,20 +227,11 @@ def run_backfill(
             "backfill, and a backfill that reported success over an empty range would "
             "be a no-op wearing a completed job's clothes"
         )
-    arm_id = _arm_id(specs, slot=slot, arm=arm)
+    arm_id = arm_id_for(specs, slot=slot, arm=arm)
 
-    on_ec2, evidence = in_region()
-    if len(sessions) > LAPTOP_SESSION_ALLOWANCE and not on_ec2 and not i_am_in_region:
-        raise NotInRegionError(
-            f"refusing to backfill {len(sessions)} session(s) ({start}..{end}) of "
-            f"{slot}:{arm} from this host: {evidence}. Each session is a full "
-            "point-in-time fit against the store, so the range is dominated by S3 "
-            "round-trip latency the same way a heal is. Run it in region:\n"
-            f"    crucible experiment.backfill --slot {slot} --arm {arm} "
-            f"--from {start} --to {end} --run-mode replay\n"
-            f"Ranges of up to {LAPTOP_SESSION_ALLOWANCE} sessions are allowed locally "
-            "as a diagnostic. `--i-am-in-region` overrides this and nothing else does."
-        )
+    on_ec2, evidence = assert_in_region(
+        sessions, slot=slot, arm=arm, start=start, end=end, i_am_in_region=i_am_in_region
+    )
 
     produced: list[str] = []
     already: list[str] = []

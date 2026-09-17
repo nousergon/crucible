@@ -27,12 +27,12 @@ from typing import TYPE_CHECKING, Any
 
 from crucible.config import Settings
 from crucible.keys import universe_members_key
-from crucible.slots.cycle import run_grade, run_produce
+from crucible.slots.cycle import run_grade, run_produce, run_produce_history
 
 if TYPE_CHECKING:
     from crucible.runner import RunContext
 
-__all__ = ["SLOT", "grade", "produce"]
+__all__ = ["SLOT", "grade", "produce", "produce_history"]
 
 SLOT = "u"
 
@@ -43,9 +43,20 @@ def produce(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> dict[str, 
         ctx,
         slot=SLOT,
         settings=settings,
-        feed_key_for=universe_members_key,
+        feed_key=universe_members_key,
         **kwargs,
     )
+
+
+def produce_history(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> dict[str, Any]:
+    """Produce the selected U arm for ONE historical session. Serves nothing.
+
+    `experiment.backfill`'s per-session entry point
+    (`alpha-engine-config-I11005`). Deliberately does not pass
+    ``feed_key``: a backfilled session is history, not a serving cycle,
+    so the champion pointer is neither read nor required to have produced.
+    """
+    return run_produce_history(ctx, slot=SLOT, settings=settings, **kwargs)
 
 
 def grade(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> dict[str, Any]:
