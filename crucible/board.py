@@ -1749,8 +1749,9 @@ def _feature_layer_depth_row(store: Store) -> BoardRow:
 
 def _feature_layer_completeness_row(store: Store) -> BoardRow:
     """`alpha-engine-config-I10693`: red when a catalogue column is null on
-    half or more rows of the live version's most recent session — the completeness
-    gap `_feature_layer_depth_row` cannot see, since depth counts objects,
+    half or more rows of a sampled session of the live version, past that
+    column's declared source boundary — the completeness gap
+    `_feature_layer_depth_row` cannot see, since depth counts objects,
     never contents. Sibling row, same posture: a read failure renders
     `UNMEASURABLE`, never folded into a false green.
 
@@ -1758,6 +1759,12 @@ def _feature_layer_completeness_row(store: Store) -> BoardRow:
     GREEN over `features/v6df3c0a27b70` while
     `residual_momentum_252d_skip21d_ratio` was null for 903 of 903 tickers on
     all 536 sessions the layer held. This row is what would have caught it.
+
+    Measured 2026-09-17 (`alpha-engine-config-I10721`): this row was UNMET
+    naming session 2022-01-03, a head-of-history band no heal can repair,
+    while 92 sessions of dead fundamentals sat inside the same reading. A red
+    that cannot go green carries no information, and the hole surviving three
+    days is the proof. Declared source boundaries are what separate the two.
     """
     try:
         reading = check_feature_layer_completeness(store)
@@ -1779,17 +1786,21 @@ def _feature_layer_completeness_row(store: Store) -> BoardRow:
         source="component",
         section="§10 component 4 — feature registry",
         title=(
-            "no catalogue column is null on half or more rows of the live feature layer's most "
-            "recent session"
+            "no catalogue column is null on half or more rows of any sampled session of "
+            "the live feature layer, past its declared source boundary"
         ),
         state=state,
         detail=detail,
         surface="crucible board",
         artifact=f"{FEATURES_PREFIX}<version>/<most recent session>.parquet (per-column nulls)",
         means_when_red=(
-            "a catalogue column measured nothing on every ticker of the most recent "
-            "session — a column that looks computed and is dead, invisible to the "
-            "depth row because depth counts objects, never contents"
+            "a catalogue column measured nothing for most of the universe on a session "
+            "AT OR AFTER the first session its source can cover — a column that looks "
+            "computed and is dead, invisible to the depth row because depth counts "
+            "objects, never contents. A band before a declared source boundary "
+            "(`crucible.features.boundaries`) is named in the detail and does not "
+            "redden this row: grading the two the same made this row permanently red "
+            "for an unfixable reason, and a 92-session hole sat inside that red unseen"
         ),
         last_read=last_read,
     )

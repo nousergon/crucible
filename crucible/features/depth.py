@@ -17,12 +17,23 @@ producer bug is fixed (`crucible-PR266`: `min_panel_trading_days`,
 object in the store at the time of measurement — still reads GREEN on depth
 alone, and nothing about depth catches the *next* column shaped the same
 way. `check_feature_layer_completeness` is the sibling reading that closes
-that blindness: it reads the live version's most recent session and grades
-each catalogue column on what fraction of its rows are null, RED only when a
-column is null on **every** row — `catalog_column_depths()` already explains
+that blindness: it samples the live version's sessions and grades each
+catalogue column on what fraction of its rows are null, RED only when a
+column is null on half or more — `catalog_column_depths()` already explains
 an ordinary head-of-history null (a ticker younger than a column's declared
 depth), so the only ratio no per-ticker depth can explain is every ticker at
 once.
+
+**A dead band before a DECLARED SOURCE BOUNDARY is not a defect**
+(`crucible.features.boundaries`, `alpha-engine-config-I10721`). Fundamentals
+cannot exist before the EDGAR producer's first session file and 13F
+accumulation cannot exist before the first quarter's 45-day filing deadline;
+grading those bands RED made this row permanently, correctly and
+unactionably red, and — measured 2026-09-17 — made it report session
+2022-01-03 while a real 92-session hole (2025-07-09..2025-11-14) sat inside
+the same RED unnamed. RED is now reserved for a column dead at or after every
+boundary that could cover it; a boundary band reads GREEN and is STATED in
+the detail, never dropped in silence.
 
 The feature layer is content-addressed: `feature_version()` hashes the whole
 `registry.py::CATALOG` (see `crucible.features.registry`), so a catalog edit
@@ -57,12 +68,14 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from crucible.documents import UnreadableDocumentError, read_store_document
+from crucible.features.boundaries import DECLARED_SOURCE_BOUNDARIES, explain_dead_columns
 from crucible.features.compute import catalog_column_depths, read_features
 from crucible.features.registry import feature_names, feature_version
 from crucible.keys import coverage_key, features_key, features_prefix
 from crucible.store import Store
 
 __all__ = [
+    "DECLARED_SOURCE_BOUNDARIES",
     "FEATURES_PREFIX",
     "PARQUET_SUFFIX",
     "NULL_RATIO_CEILING",
@@ -260,6 +273,13 @@ class FeatureLayerCompletenessReading:
     the newest when everything is clean, the offending one when a column is
     dead somewhere in the layer. `sessions_read` and `sessions_total` are
     what makes the sample honest at the point of reading it.
+
+    `dead_sessions` are the DEFECT sessions only: sampled sessions carrying a
+    dead column that no declared source boundary explains. `boundary_sessions`
+    are sampled sessions whose every dead column IS explained by a boundary —
+    reported rather than discarded, because a band with no data is not a band
+    that is healthy, it is one whose emptiness has a written reason
+    (`crucible.features.boundaries`).
     """
 
     state: DepthState
@@ -271,6 +291,7 @@ class FeatureLayerCompletenessReading:
     sessions_read: tuple[str, ...] = field(default_factory=tuple)
     sessions_total: int = 0
     dead_sessions: tuple[str, ...] = field(default_factory=tuple)
+    boundary_sessions: tuple[str, ...] = field(default_factory=tuple)
 
 
 def sample_sessions(sessions: list[str], size: int = COMPLETENESS_SAMPLE_SIZE) -> list[str]:
@@ -370,7 +391,8 @@ def check_feature_layer_completeness(
     catalogue = feature_names()
 
     empty_sessions: list[str] = []
-    per_session: list[tuple[str, dict[str, float], tuple[str, ...], int]] = []
+    #: (session, null ratios, UNEXPLAINED dead columns, row count, all dead columns)
+    per_session: list[tuple[str, dict[str, float], tuple[str, ...], int, tuple[str, ...]]] = []
     for candidate in sampled:
         frame = read_features(store.get_bytes(features_key(version, candidate)))
         if len(frame) == 0:
@@ -379,7 +401,13 @@ def check_feature_layer_completeness(
         columns = [c for c in catalogue if c in frame.columns]
         ratios = {col: float(frame[col].isna().mean()) for col in columns}
         dead = tuple(sorted(col for col, ratio in ratios.items() if ratio >= NULL_RATIO_CEILING))
-        per_session.append((candidate, ratios, dead, len(frame)))
+        # A dead column BEFORE its group's declared source boundary is a
+        # boundary, not a defect (`crucible.features.boundaries`). Only what
+        # is left unexplained may turn this reading RED — and a session at or
+        # after every boundary keeps every dead column, so a boundary can
+        # never excuse a downstream band.
+        unexplained, _explained, _applied = explain_dead_columns(candidate, dead)
+        per_session.append((candidate, ratios, unexplained, len(frame), dead))
 
     if empty_sessions:
         # A session with no tickers measured nothing, wherever it sits in the
@@ -400,12 +428,36 @@ def check_feature_layer_completeness(
 
     coverage = sample_coverage_sentence(sessions, sampled)
 
+    # A session dead ONLY before a declared source boundary is a boundary
+    # reading, never a defect — but it is stated, never silent: "no data" is
+    # not rendered as green by omission (principle 7).
+    boundary_sessions = tuple(
+        reading[0] for reading in per_session if reading[4] and not reading[2]
+    )
+    boundary_note = ""
+    if boundary_sessions:
+        declared = "; ".join(
+            f"{b.group} from {b.first_measurable_session.isoformat()}"
+            for b in DECLARED_SOURCE_BOUNDARIES
+        )
+        boundary_note = (
+            f" {len(boundary_sessions)} sampled session(s) are dead ONLY before a declared "
+            f"source boundary ({declared}) and are boundaries, not defects: "
+            f"{', '.join(boundary_sessions[:6])} — see crucible.features.boundaries, where "
+            "each carries its derivation and what would deepen it."
+        )
+
     dead_readings = [reading for reading in per_session if reading[2]]
     if dead_readings:
         # The WORST sampled session is the one reported, not the newest: the
         # newest is exactly the session that read green over
-        # `alpha-engine-config-I10733`'s band.
-        worst_session, null_ratios, dead_columns, row_count = max(
+        # `alpha-engine-config-I10733`'s band. Chosen among DEFECT sessions
+        # only: a head-of-history boundary has every source-derived column
+        # dead at once, so before boundaries were declared this max() picked
+        # 2022-01-03 every single time and the operator-visible detail named
+        # an unfixable band while a real 92-session hole sat in the same RED
+        # (`alpha-engine-config-I10721`, measured 2026-09-17).
+        worst_session, null_ratios, dead_columns, row_count, _all_dead = max(
             dead_readings, key=lambda reading: (len(reading[2]), max(reading[1].values()))
         )
         named = ", ".join(
@@ -415,13 +467,14 @@ def check_feature_layer_completeness(
         dead_sessions = tuple(reading[0] for reading in dead_readings)
         detail = (
             f"{features_key(version, worst_session)!r}: catalogue column(s) null on >= "
-            f"{NULL_RATIO_CEILING:.0%} of {row_count} row(s) of session {worst_session}: "
+            f"{NULL_RATIO_CEILING:.0%} of {row_count} row(s) of session {worst_session}, "
+            f"with no declared source boundary to explain them: "
             f"{named} — a column that looks computed and measured nothing for most of "
             "the universe, the avg_volume_20d/residual_momentum class. "
             "catalog_column_depths() explains an ordinary null for one ticker younger "
             "than a column's declared depth; it never explains every ticker null at once. "
-            f"{len(dead_sessions)} of the sampled session(s) read dead: "
-            f"{', '.join(dead_sessions[:6])}. {coverage}"
+            f"{len(dead_sessions)} of the sampled session(s) read dead past a boundary: "
+            f"{', '.join(dead_sessions[:6])}.{boundary_note} {coverage}"
         )
         return FeatureLayerCompletenessReading(
             state="RED",
@@ -433,11 +486,12 @@ def check_feature_layer_completeness(
             sessions_read=tuple(sampled),
             sessions_total=len(sessions),
             dead_sessions=dead_sessions,
+            boundary_sessions=boundary_sessions,
         )
 
-    newest_session, null_ratios, _, row_count = per_session[-1]
+    newest_session, null_ratios, _, row_count, _all_dead = per_session[-1]
     worst_col, worst_ratio, worst_where = None, 0.0, newest_session
-    for candidate, ratios, _, _ in per_session:
+    for candidate, ratios, _unexplained, _rows, _dead in per_session:
         if not ratios:
             continue
         col, ratio = max(ratios.items(), key=lambda kv: kv[1])
@@ -446,7 +500,7 @@ def check_feature_layer_completeness(
     detail = (
         f"no catalogue column is null on >= {NULL_RATIO_CEILING:.0%} of rows on any "
         f"sampled session of {version!r}; worst null ratio {worst_ratio:.2%} on "
-        f"{worst_col!r} (session {worst_where}). {coverage}"
+        f"{worst_col!r} (session {worst_where}).{boundary_note} {coverage}"
     )
     return FeatureLayerCompletenessReading(
         state="GREEN",
@@ -457,6 +511,7 @@ def check_feature_layer_completeness(
         dead_columns=(),
         sessions_read=tuple(sampled),
         sessions_total=len(sessions),
+        boundary_sessions=boundary_sessions,
     )
 
 
