@@ -130,6 +130,10 @@ from crucible.keys import (
 from crucible.keys import TRADER_EVIDENCE_KEY as _TRADER_EVIDENCE_KEY
 from crucible.manifest import ManifestValidationError, load_schema, manifest_key
 from crucible.manifest import validate as _validate_manifest
+from crucible.metron_consumers import METRON_CONSUMER_REGISTER_PATH
+from crucible.metron_consumers import load_register as load_metron_consumer_register
+from crucible.metron_consumers import orphaned_by_phase4 as metron_reads_orphaned_by_phase4
+from crucible.metron_consumers import paused_rows as metron_reads_paused
 from crucible.models import (
     FIRE_DRILL_SEAL_TOLERANCE_SECONDS,
     FaultRecordDocument,
@@ -3565,6 +3569,18 @@ PHASE4_DELIVERABLES: tuple[Deliverable, ...] = (
         "cutover-readiness gate as MET before the v1 SFs disable "
         "(data_collection_plan_260914.md §6.2 step 5)",
         "data_cutover_ready",
+    ),
+    # metron_reads_have_surviving_producer: `alpha-engine-config-I10739`.
+    # Not one of I9760's own bullets - it is the precondition the "old SFs
+    # disabled" bullet turned out to carry, found while phase 4 was being
+    # built. Recorded here rather than left implicit, because a deliverable
+    # nothing grades and no table names is exactly how "the gate is met" comes
+    # to mean less than a reader assumes.
+    Deliverable(
+        "metron_reads_survive_the_decommission",
+        "no artifact component 4 (Metron) reads loses its only producer schedule to "
+        "this phase (`architecture.d/146` rule 2)",
+        "metron_read_artifacts_have_surviving_producer",
     ),
     Deliverable(
         "lambdas_and_alarms_removed",
@@ -8847,6 +8863,85 @@ def _clause_data_cutover_ready(store: Store) -> Clause:
     return Clause(name, requirement, met, detail, (key,))
 
 
+def _clause_metron_reads_have_surviving_producer() -> Clause:
+    """`alpha-engine-config-I10739` deliverable 3: phase 4 may not disable the
+    only producer schedule of something component 4 reads.
+
+    The finding, measured 2026-09-14: Metron's end-of-day market-data spine
+    ran only through the v1 postclose pipeline, which this phase disables, and
+    no successor was declared. Nothing in this gate would have said so —
+    `old_sf_execution_count_zero` grades the pipelines going quiet, which is
+    phase 4 SUCCEEDING, and it is the same reading whether a successor exists
+    or the product just went dark.
+
+    Reads `crucible/metron_consumers.yaml`, the declared register. Two
+    failure conditions (:func:`crucible.metron_consumers.orphaned_by_phase4`):
+    a producer whose schedule this phase disables with no ruling retiring the
+    feature, and any row nobody has decided about. The second is the one that
+    survives the class — a Metron read added later defaults to `unresolved`
+    and lands here without an edit.
+
+    **Retirement needs a ruling with a name in it.** `architecture.d/146`
+    rule 4 reserves retiring a Metron feature to Brian, and the register's
+    model refuses a `retired_by_ruling` row that cannot cite one, so this
+    clause cannot be cleared by an agent deciding a product feature is
+    expendable.
+
+    A register that cannot be read is UNMEASURABLE, never met. `store` is not
+    a parameter because nothing here is a store reading: the register is a
+    committed artifact, and the point is that it is reviewable in the diff
+    that changes it.
+    """
+    name = "metron_read_artifacts_have_surviving_producer"
+    requirement = (
+        "every artifact component 4 (Metron) reads has a producer schedule this "
+        "phase does not disable, or a ruling retiring the feature "
+        "(`architecture.d/146` rule 4). Declared in `crucible/metron_consumers.yaml`; "
+        "an undecided artifact grades UNMET, never met by omission"
+    )
+    evidence = (str(METRON_CONSUMER_REGISTER_PATH.name),)
+    try:
+        register = load_metron_consumer_register()
+    except Exception as exc:  # noqa: BLE001 - classified into the reading below
+        return _unmeasurable(
+            name,
+            requirement,
+            f"the Metron consumer register could not be read: {type(exc).__name__}: {exc}",
+            evidence,
+        )
+    orphans = metron_reads_orphaned_by_phase4(register)
+    paused = metron_reads_paused(register)
+    provenance = (
+        f"{len(register.reads)} declared Metron read(s), swept "
+        f"{register.reviewed_on.isoformat()} against metron@{register.metron_commit}"
+    )
+    # Named on EVERY reading, met or not. A paused feed is not this phase's
+    # defect and is not evidence of health either; folding it into a green
+    # line is how `crypto/holdings.json` came to be served as current for five
+    # weeks (principle 7).
+    if paused:
+        provenance += "; paused outside this phase's reach: " + ", ".join(
+            f"{row.object_key} ({row.note.strip().splitlines()[0] if row.note else 'no note'})"
+            for row in paused
+        )
+    if orphans:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{len(orphans)} of {len(register.reads)} Metron-read artifact(s) lose their "
+            "only producer to this phase: "
+            + "; ".join(
+                f"{row.object_key} (producer {row.producer or 'NONE FOUND'}, schedule owner "
+                f"{row.schedule_owner}, disposition {row.phase4_disposition})"
+                for row in orphans
+            )
+            + f". {provenance}",
+            evidence,
+        )
+    return Clause(name, requirement, True, provenance, evidence)
+
+
 def _phase4(
     store: Store,
     window: list[dt.date],
@@ -8892,6 +8987,13 @@ def _phase4(
         # cutover-readiness gate, read as a published artifact rather than
         # re-derived here (`architecture.d/146` rule 3).
         _clause_data_cutover_ready(store),
+        # `alpha-engine-config-I10739`: this phase may not disable the only
+        # producer schedule of something component 4 reads. A DIFFERENT
+        # question from `data_cutover_ready` above, which asks whether
+        # component 1's successor stack is ready to run — this one asks
+        # whether a successor was ever declared, and it covers components 2
+        # and 3's products too, which component 1's gate never sees.
+        _clause_metron_reads_have_surviving_producer(),
     ]
 
 
