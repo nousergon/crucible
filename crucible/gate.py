@@ -72,10 +72,14 @@ from crucible.calendar import (
 from crucible.carryover import (
     V1_BUCKET_VAR,
     V1_SLOT_TO_V2_SLOT,
+    ChampionPointerReading,
     LedgerError,
+    ProductionReading,
+    V2Evidence,
     grade_carryover,
     parse_ledger,
-    read_v1_arm_sets,
+    read_production,
+    read_v1_live,
 )
 from crucible.components import Component, load_registry
 from crucible.documents import DocumentRead, read_manifests_under
@@ -7738,36 +7742,81 @@ def _clause_integration_tier_current(store: Store, window: list[dt.date]) -> Cla
     )
 
 
+def _carryover_champion(store: Store, v2_slot: str) -> ChampionPointerReading:
+    """What `champions/{v2_slot}/current.json` names, for the carry-over clause.
+
+    The pointer is read as a DOCUMENT and reduced to an arm NAME: the ledger
+    records names (a hash changes when a recipe's params change, and the
+    carry-over question is about the rule, not the build). Absent is a real
+    state — no slot pointer has ever been written by an arena cycle, every
+    live one is an import — and is distinguished from unreadable, which is
+    never a pass.
+    """
+    key = champion_key(v2_slot)
+    read = _read_store_document(store, key)
+    if read.problem is not None:
+        return ChampionPointerReading(None, key, read.problem)
+    if read.absent or read.document is None:
+        return ChampionPointerReading(None, key)
+    arm_id = read.document.get("arm_id")
+    if not isinstance(arm_id, str) or arm_id.count(":") != 2:
+        return ChampionPointerReading(
+            None, key, f"`arm_id` is {arm_id!r}, not a `slot:name:hash` arm id"
+        )
+    return ChampionPointerReading(arm_name(arm_id), key)
+
+
 def _clause_v1_arms_carried_or_excluded(
     store: Store, window: list[dt.date], *, v1_store: Store | None = None
 ) -> Clause:
-    """Every arm v1 serves has a v2 disposition (`alpha-engine-config-I10716`).
+    """Everything v1 SERVES has a v2 disposition (`alpha-engine-config-I10716`,
+    `-I10960`, `-I10961`, `-I10962`, `-I10963`, `-I10964`).
 
     The class fix for `-I10714`: phase 1 counted verdicts for every REGISTERED
     arm, so an arm never registered was invisible on every surface, and v1's
     serving M model, its whole `scanner_cut` universe slot and an R challenger
-    failed to cross unnoticed. This clause reads v1's LIVE arm set
-    (`crucible.carryover.read_v1_arm_sets`), the published ledger
-    (`strategy/current/v1_carryover.yaml`) and the v2 registers, and is:
+    failed to cross unnoticed. That fix inverted the completeness question for
+    ARMS. This clause carries the same inversion across every dimension
+    `crucible.carryover.DIMENSIONS` declares — arms, CHAMPIONS and v1's live
+    TUNED PARAMETERS — and asks of a carried arm not only whether it
+    registered but whether it has ever emitted.
 
-    * UNMEASURABLE when v1's store location is unset or any v1 source cannot be
-      read — an unknown arm set never grades MET — or a v2 read is denied;
-    * UNMET when a live v1 arm has no ledger row, any row is `pending`, a
-      `carried` row names an arm absent from its v2 register, or the ledger is
-      absent or malformed;
+    ONE clause, because it is one question: did v1's serving state cross? A
+    second clause per dimension would be a second source list to keep
+    complete, which is the defect itself. The clause keeps its original NAME
+    (rather than widening it to `v1_serving_state_carried_or_excluded`) so the
+    ladder, the console and every recorded phase-3 reading still resolve the
+    same identifier; the requirement string below is what says what it grades.
+
+    Readings:
+
+    * UNMEASURABLE when v1's store location is unset, any v1 source cannot be
+      read — an unknown served set never grades MET — or a v2 read is denied;
+    * UNMET when a live v1 item has no ledger row, a row records no decision,
+      a row's v2 claim is not confirmed by the store, a carried arm has
+      produced nothing past its slot's settle window, a deferral's condition
+      has cleared, a carried tuned value has been re-tuned in v1, or the
+      ledger is absent or malformed;
     * MET otherwise.
 
     ``v1_store`` is for tests; the phase assembler passes none and the store is
     resolved from `CRUCIBLE_ARCTIC_BUCKET` (no default — a bucket name may not
     live in this repo).
     """
-    _unused(window)
+    from crucible.slots.grading import (  # noqa: PLC0415 - heavy import, one call site
+        DEFAULT_HORIZON_TRADING_DAYS,
+    )
+
     name = "v1_arms_carried_or_excluded"
     requirement = (
-        "every arm in v1's live artifacts (zoo leaderboard + model arena, producer arena + "
-        "champion, scanner_spec and scanner_cut champions, the S serving chain) has a row in "
-        "the published carry-over ledger; no row is `pending`; and every `carried` row names "
-        "an active arm in its v2 slot's register"
+        "every arm, CHAMPION and tuned PARAMETER in v1's live artifacts (zoo leaderboard + "
+        "model arena, producer arena + champion, the scanner_spec and scanner_cut champions, "
+        "the S serving chain, and config/scanner_params.json + config/executor_params.json + "
+        "config/factor_attractiveness_weights.json) has a row in the published carry-over "
+        "ledger; no row records no decision; every row claiming a v2 home is confirmed by the "
+        "v2 store (a register row, a champion pointer); every carried arm has produced at "
+        "least once past its slot's settle window; and no deferral's condition has cleared "
+        "while its import is still outstanding"
     )
     ledger_key = v1_carryover_key()
     if v1_store is None:
@@ -7776,22 +7825,23 @@ def _clause_v1_arms_carried_or_excluded(
             return _unmeasurable(
                 name,
                 requirement,
-                f"`{V1_BUCKET_VAR}` is not set, so v1's live arm set was not read at all. "
-                "It carries no default (a bucket name may not live in this repository); set it "
-                "to the data bucket v1 writes to. UNMEASURABLE, never met: nothing was compared",
+                f"`{V1_BUCKET_VAR}` is not set, so v1's live serving state was not read at "
+                "all. It carries no default (a bucket name may not live in this repository); "
+                "set it to the data bucket v1 writes to. UNMEASURABLE, never met: nothing "
+                "was compared",
                 (ledger_key,),
             )
         from crucible.config import store_from_uri  # noqa: PLC0415 - only when a bucket is set
 
         v1_store = store_from_uri(f"s3://{bucket}")
-    v1 = read_v1_arm_sets(v1_store)
+    v1 = read_v1_live(v1_store)
     evidence: list[str] = [ledger_key, *v1.evidence]
     if v1.problems:
         return _unmeasurable(
             name,
             requirement,
-            "v1's live arm set could not be read, so it is unknown rather than partial: "
-            + "; ".join(v1.problems),
+            "v1's live serving state could not be read, so it is unknown rather than "
+            "partial: " + "; ".join(v1.problems),
             evidence,
         )
     read = _read_store_bytes(store, ledger_key)
@@ -7804,8 +7854,9 @@ def _clause_v1_arms_carried_or_excluded(
             name,
             requirement,
             False,
-            f"{ledger_key} is absent — the carry-over ledger is authored in the private strategy "
-            "tree and published into the store; until it is, no v1 arm has a recorded disposition",
+            f"{ledger_key} is absent — the carry-over ledger is authored in the private "
+            "strategy tree and published into the store; until it is, nothing v1 serves has "
+            "a recorded disposition",
             tuple(evidence),
         )
     try:
@@ -7814,6 +7865,8 @@ def _clause_v1_arms_carried_or_excluded(
         return Clause(name, requirement, False, str(exc), tuple(evidence))
     registers: dict[str, frozenset[str] | None] = {}
     register_keys: dict[str, str] = {}
+    champions: dict[str, ChampionPointerReading] = {}
+    production: dict[tuple[str, str], ProductionReading] = {}
     for v2_slot in sorted(set(V1_SLOT_TO_V2_SLOT.values())):
         arm_ids, key, problem, access_problem, register = _register_arms(store, v2_slot)
         evidence.append(key)
@@ -7825,40 +7878,112 @@ def _clause_v1_arms_carried_or_excluded(
         registers[v2_slot] = (
             None if register is None else frozenset(arm_name(arm_id) for arm_id in arm_ids)
         )
-    findings = grade_carryover(v1.arm_sets, rows, registers, register_keys)
-    n_live = sum(len(s.arms) for s in v1.arm_sets)
-    counts = ", ".join(f"{n} {d}" for d, n in findings.counts.items())
+        pointer = _carryover_champion(store, v2_slot)
+        evidence.append(pointer.key)
+        champions[v2_slot] = pointer
+        filed_on = _register_filing_dates(register)
+        for arm_id in arm_ids:
+            production[(v2_slot, arm_name(arm_id))] = read_production(
+                store, arm_id, filed_on.get(arm_id)
+            )
+    findings = grade_carryover(
+        v1,
+        rows,
+        V2Evidence(
+            registers=registers,
+            register_keys=register_keys,
+            champions=champions,
+            production=production,
+            trading_day=window[-1],
+            settle_window_sessions=DEFAULT_HORIZON_TRADING_DAYS,
+        ),
+    )
     if findings.met:
         return Clause(
             name,
             requirement,
             True,
-            f"all {n_live} live v1 arm(s) have a ledger row ({counts}); every carried arm is "
-            "registered in its v2 slot",
+            "; ".join(
+                f"{found.dimension}: all {found.n_live} live v1 item(s) disposed of "
+                f"({_carryover_counts(found)})"
+                for found in findings.dimensions
+            ),
             tuple(evidence),
         )
     parts: list[str] = []
-    if findings.unlisted:
+    for found in findings.dimensions:
+        if found.met:
+            continue
         parts.append(
-            f"{len(findings.unlisted)} live v1 arm(s) with no ledger row: "
-            + ", ".join(findings.unlisted)
+            f"{found.dimension} [{', '.join(found.conditions)}]: "
+            + "; ".join(_carryover_detail(found))
         )
-    if findings.pending:
-        parts.append(
-            f"{len(findings.pending)} pending row(s): "
-            + ", ".join(f"{r.label} ({r.reference})" for r in findings.pending)
+    parts.append(
+        "ledger: "
+        + ", ".join(
+            f"{found.dimension} {found.n_live} live / {_carryover_counts(found)}"
+            for found in findings.dimensions
         )
-    if findings.carried_unregistered:
-        parts.append(
-            f"{len(findings.carried_unregistered)} carried row(s) naming an arm absent from its "
-            "v2 register: "
-            + ", ".join(
-                f"{r.label} -> {V1_SLOT_TO_V2_SLOT[r.v1_slot]}:{r.v2_arm} ({why})"
-                for r, why in findings.carried_unregistered
-            )
+    )
+    return Clause(name, requirement, False, " | ".join(parts), tuple(evidence))
+
+
+def _register_filing_dates(register: ArmRegister | None) -> dict[str, str]:
+    """arm id -> the date its register row was filed on.
+
+    Read off the register's own events rather than a second read of the same
+    key. It is what the settle window is measured from: an arm registered
+    three days ago has not failed to produce.
+    """
+    if register is None:
+        return {}
+    dates: dict[str, str] = {}
+    for event in register.to_dicts():
+        arm_id = event.get("arm_id")
+        record = event.get("record") or {}
+        date = record.get("created_date") or event.get("date")
+        if isinstance(arm_id, str) and isinstance(date, str):
+            dates.setdefault(arm_id, date)
+    return dates
+
+
+def _carryover_counts(found: Any) -> str:
+    return ", ".join(f"{n} {d}" for d, n in sorted(found.counts.items()))
+
+
+def _carryover_detail(found: Any) -> list[str]:
+    """One phrase per condition that fired, each naming the rows it fired on.
+
+    An operator reading UNMET must not have to diff the store to learn whether
+    an item is missing, undecided, unconfirmed, or mute (`-I10964`).
+    """
+    detail: list[str] = []
+    if found.unlisted:
+        detail.append(
+            f"{len(found.unlisted)} live v1 item(s) with no ledger row: "
+            + ", ".join(found.unlisted)
         )
-    parts.append(f"{n_live} live v1 arm(s) read; ledger: {counts}")
-    return Clause(name, requirement, False, "; ".join(parts), tuple(evidence))
+    if found.undecided:
+        detail.append(
+            f"{len(found.undecided)} row(s) recording no decision: "
+            + ", ".join(f"{r.label} ({r.reference})" for r in found.undecided)
+        )
+    if found.unsatisfied:
+        detail.append(
+            f"{len(found.unsatisfied)} row(s) the v2 store does not confirm: "
+            + ", ".join(f"{r.label} -> {r.target} ({why})" for r, why in found.unsatisfied)
+        )
+    if found.unproduced:
+        detail.append(
+            f"{len(found.unproduced)} carried row(s) registered and MUTE: "
+            + ", ".join(f"{r.label} ({why})" for r, why in found.unproduced)
+        )
+    if found.drifted:
+        detail.append(
+            f"{len(found.drifted)} carried value(s) v1 has since re-tuned: "
+            + ", ".join(f"{r.label} ({why})" for r, why in found.drifted)
+        )
+    return detail
 
 
 def _clause_every_recipe_registered(store: Store, window: list[dt.date]) -> Clause:

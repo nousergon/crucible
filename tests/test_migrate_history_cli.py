@@ -26,7 +26,7 @@ import pytest
 
 from crucible import cli, track_a
 from crucible.cli import HANDLERS, is_stub, main
-from crucible.keys import champion_key, manifest_key
+from crucible.keys import champion_key, manifest_key, shadow_key
 from crucible.migrate import MigrationPointerConflict, MigrationSourceMissing
 from crucible.slots.arms import load_arm_specs, read_register
 from crucible.store import LocalStore
@@ -83,6 +83,17 @@ def v2_root(tmp_path: Path) -> Path:
     store.put_bytes("strategy/current/arms/u/momentum_sleeve.yaml", U_RECIPE.encode())
     store.put_bytes("strategy/current/arms/u/tech_score_gate.yaml", U_CHALLENGER.encode())
     store.put_bytes("strategy/current/arms/r/scanner_predictor_direct.yaml", R_RECIPE.encode())
+    # The migration ADMITS a slot only once the arm the v1 champion resolves to
+    # has PRODUCED (`crucible.migrate.admission_refusal`,
+    # `alpha-engine-config-I10961`): a pointer seated on an arm that emits
+    # nothing points the trader's contract at silence. Seeded, not waived —
+    # production is what the predicate reads, so a fixture without it is a
+    # fixture of a slot that is genuinely not admissible.
+    for slot, name in (("u", "momentum_sleeve"), ("r", "scanner_predictor_direct")):
+        arm_id = next(
+            spec.arm_id for spec in load_arm_specs(slot, store=store) if spec.name == name
+        )
+        store.put_bytes(shadow_key(arm_id, "2026-09-11"), json.dumps({"names": []}).encode())
     return root
 
 
@@ -119,6 +130,20 @@ def v1_root(tmp_path: Path) -> Path:
     store.put_bytes(
         "research/producer_leaderboard/2026-09-11.json",
         json.dumps({"champion": "scanner_predictor_direct", "date": "2026-09-11"}).encode(),
+    )
+    store.put_bytes(
+        "predictor/model_zoo/leaderboard/latest.json",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "champion_arch": {"version_id": "v3.0-meta-2026-09-11-a214ae0a"},
+                "serving_champion": {"served_version": "v3.0-meta-2026-08-14-119e069b"},
+                # v1's leaderboard `champion` is a METRICS block, not a name —
+                # the source declares how it names its champion for exactly
+                # this reason (`alpha-engine-config-I10961`).
+                "champion": {"forward_days": 21, "cpcv_mean_ic": 0.105001},
+            }
+        ).encode(),
     )
     store.put_bytes(
         "predictor/model_zoo/promotions/2026-09-11.json",

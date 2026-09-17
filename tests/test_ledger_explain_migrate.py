@@ -396,6 +396,19 @@ def _run_migrate(store, cycle_date, **kwargs):
     return ctx, captured.get("result")
 
 
+def _seed_produced(store: Any, recipe: Any) -> None:
+    """One shadow for ``recipe``, so the migration will ADMIT its slot.
+
+    `crucible.migrate.admission_refusal` seats a slot only once the arm the v1
+    champion resolves to has PRODUCED (`alpha-engine-config-I10961`,
+    `-I10964`): registration is the weaker fact, and an imported pointer on a
+    mute arm points the trader's contract at silence.
+    """
+    from crucible.keys import shadow_key
+
+    store.put_bytes(shadow_key(recipe.arm_id, "2026-07-13"), json.dumps({"names": []}).encode())
+
+
 class TestMigrate:
     def test_an_absent_source_is_named_by_key_and_fails_the_run(
         self, store, tmp_path, cycle_date
@@ -432,6 +445,7 @@ class TestMigrate:
         recipes = {
             s.name: replace(s, slot="r") for s in load_arm_specs("u", strategy_dir=strategy_dir)
         }
+        _seed_produced(store, recipes["momentum_sleeve"])
         ctx, result = _run_migrate(
             store,
             cycle_date,
@@ -597,6 +611,7 @@ class TestMigrate:
             s.name: replace(s, slot="r") for s in load_arm_specs("u", strategy_dir=strategy_dir)
         }
         kwargs = dict(v1_store=v1, slots=("r",), arm_recipes=recipes, allow_missing=True)
+        _seed_produced(store, recipes["momentum_sleeve"])
         _run_migrate(store, cycle_date, **kwargs)
         # A second run reuses the same store; run_job refuses a second
         # manifest at the same key on the same trading day only if the CALLER

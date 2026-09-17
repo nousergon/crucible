@@ -32,10 +32,12 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from crucible.calendar import resolve_trading_day
+from crucible.carryover import V1_ZOO_CHAMPION_NAME, V1_ZOO_LEADERBOARD_KEY, read_production
 from crucible.champion import PROMOTION_SOURCES, ChampionPointer
 from crucible.documents import load_document_bytes, load_store_document, read_manifests_under
 from crucible.keys import RUNS_ROOT, arm_register_key, champion_key, migration_key
@@ -57,6 +59,7 @@ _PLACEHOLDER_CODE_SHA = "0" * 40
 
 __all__ = [
     "ARM_FILING_CORRECTIONS",
+    "MIGRATABLE_SLOTS",
     "SOURCES",
     "ArmFilingCorrection",
     "ArmFilingMigrationReport",
@@ -64,6 +67,7 @@ __all__ = [
     "MigrationPointerConflict",
     "MigrationSourceMissing",
     "V1Source",
+    "admission_refusal",
     "read_v1_json",
     "run_migrate_arm_filed_on",
     "run_migrate_code_sha",
@@ -93,6 +97,13 @@ class V1Source:
     key: str
     slot: str | None
     contributes: str
+    #: How this artifact names the v1 CHAMPION, or ``None`` when it carries no
+    #: pointer at all (a dated history series). Declared per source rather
+    #: than sniffed with `"champion" in document`: the zoo leaderboard HAS a
+    #: `champion` key and it is a metrics block, not a name, so the sniff
+    #: would have read `{"forward_days": 21, ...}` as an arm the moment M was
+    #: admitted (measured 2026-09-17, `alpha-engine-config-I10961`).
+    champion: Callable[[dict[str, Any]], str | None] | None = None
     #: The field of a champion-pointer document that carries the date the
     #: v1 champion was installed, or ``None`` when the v1 document carries no
     #: such date at all. Declared per source rather than assumed to be
@@ -113,6 +124,40 @@ class V1Source:
         return self.key.split("{date}")[0]
 
 
+def _pointer_champion(document: dict[str, Any]) -> str | None:
+    """A v1 champion POINTER document names its champion in `champion`."""
+    champion = document.get("champion")
+    if champion is None:
+        return None
+    if not isinstance(champion, str) or not champion:
+        raise MigrationSourceMissing(
+            f"a v1 champion pointer names `champion` as {champion!r}, which is not an arm "
+            "name. Importing it would point a v2 slot at something that is not an arm."
+        )
+    return champion
+
+
+def _zoo_champion_arch(document: dict[str, Any]) -> str | None:
+    """v1's M champion, which is not a pointer document but a FIELD of the zoo
+    leaderboard (`alpha-engine-config-I10961` deliverable 2).
+
+    `champion_arch` is the serving architecture and
+    `serving_champion.served_version` the exact model it resolves to; the NAME
+    v2 maps to a recipe is the architecture. The leaderboard's own `champion`
+    key is a metrics block and is deliberately not read here.
+    """
+    if document.get("champion_arch") is None:
+        return None
+    serving = document.get("serving_champion")
+    if not isinstance(serving, dict) or not isinstance(serving.get("served_version"), str):
+        raise MigrationSourceMissing(
+            "the v1 zoo leaderboard declares a `champion_arch` and no "
+            "`serving_champion.served_version`, so the model v1 actually serves cannot be "
+            "named and its lineage cannot be carried."
+        )
+    return V1_ZOO_CHAMPION_NAME
+
+
 #: The exhaustive source list, with the literal v1 keys as they appear in the
 #: v1 code. They are literals HERE, in the migration, on purpose: a migration
 #: reads a system that no longer changes, and pointing it at a configurable
@@ -128,6 +173,7 @@ SOURCES: tuple[V1Source, ...] = (
             "render as a finding rather than as a settled result"
         ),
         date_field="promoted_at",
+        champion=_pointer_champion,
     ),
     V1Source(
         name="scanner_spec_champion",
@@ -139,6 +185,7 @@ SOURCES: tuple[V1Source, ...] = (
             "recipe's own `registered_at` — the date the v2 register already holds."
         ),
         date_field=None,
+        champion=_pointer_champion,
     ),
     V1Source(
         name="producer_leaderboard",
@@ -159,6 +206,27 @@ SOURCES: tuple[V1Source, ...] = (
             "arms to point at would be a champion with no register row."
         ),
     ),
+    V1Source(
+        name="model_zoo_leaderboard",
+        key=V1_ZOO_LEADERBOARD_KEY,
+        slot="m",
+        contributes=(
+            "M's champion: the serving architecture `champion_arch`, resolving to the model "
+            "v1 actually serves (`serving_champion.served_version`). Not a standalone "
+            "pointer like R's and U's — it is a field of the leaderboard, and it carries no "
+            "installation date, so the imported arm's clock starts at the published recipe's "
+            "own `registered_at`, exactly as U's does."
+        ),
+        date_field=None,
+        champion=_zoo_champion_arch,
+    ),
+)
+
+#: Every slot this migration CAN import a champion for: one declared champion
+#: source each. Not a list of slots it WILL import — that is resolved per run
+#: by :func:`admit_slot`, against the state of the v2 store.
+MIGRATABLE_SLOTS: tuple[str, ...] = tuple(
+    dict.fromkeys(source.slot for source in SOURCES if source.champion is not None and source.slot)
 )
 
 
@@ -205,11 +273,51 @@ def _bootstrap_spec(
     )
 
 
+def admission_refusal(store: Store, *, slot: str, arm_id: str) -> str | None:
+    """Why ``slot`` may NOT be seated from v1 yet, or ``None`` when it may.
+
+    The deferral that left M out of the first import was a DEFAULT ARGUMENT —
+    `slots=("u","r")` — with no trigger: it was correct on 2026-09-14, expired
+    when M's arms landed on 2026-09-17, and nothing anywhere went red or ran
+    (`alpha-engine-config-I10961`). A default cannot expire; a predicate can,
+    so the deferral is one, evaluated against the v2 store on every run.
+
+    The predicate is PRODUCTION, not registration. Registration is the weaker
+    fact and the one that already misled every earlier surface
+    (`alpha-engine-config-I10964`): `m:v3meta_stack` is registered and cannot
+    emit on any date while `-I10947` is unruled, and seating the M slot on it
+    would point the trader's whole contract at an arm that produces nothing.
+    An arm that has produced has necessarily arrived; an arm that has not is
+    refused whether or not it is in the register, and the refusal says which,
+    because "the slot's arms have not arrived" and "the arm is mute" are
+    different problems with different owners.
+
+    An unreadable production listing refuses admission too — an unknown is
+    never an admission.
+    """
+    production = read_production(store, arm_id)
+    if production.produced is None:
+        return (
+            f"whether {arm_id} has produced could not be read ({production.problem}); an "
+            "unknown is never an admission"
+        )
+    if production.produced:
+        return None
+    registered = arm_id in set(read_register(store, slot).all_arms())
+    where = arm_register_key(slot)
+    return (
+        f"{arm_id} has produced nothing under {production.key}; it is "
+        + (f"registered in {where}" if registered else f"not in {where}")
+        + ". Seating the slot on it would point the trader's contract at an arm that "
+        "emits nothing"
+    )
+
+
 def run_migrate_history(
     ctx: Any,
     *,
     v1_store: Store,
-    slots: tuple[str, ...] = ("u", "r"),
+    slots: tuple[str, ...] | None = None,
     arm_recipes: dict[str, ArmSpec] | None = None,
     allow_missing: bool = False,
     dry_run: bool = False,
@@ -224,6 +332,19 @@ def run_migrate_history(
     ``dry_run`` resolves every source, recipe and existing pointer exactly as
     a real run does and reports what it WOULD write, but writes nothing: not
     the register, not a pointer, not the migration record.
+
+    ``slots`` defaults to :data:`MIGRATABLE_SLOTS` — every slot with a declared
+    v1 champion source — and each is admitted or DEFERRED by
+    :func:`admission_refusal` against the live v2 store. A deferred slot is
+    reported with its reason in ``deferred`` and never silently omitted, and
+    the run still succeeds: a slot whose arms have not arrived is a by-design
+    state, and a stage that raised on it would kill every later stage of the
+    arc (`crucible-PR317` / `alpha-engine-config-I10927`).
+
+    Passing ``slots`` explicitly ASSERTS those slots: a named slot with no
+    champion source or no recipe raises rather than defers, because the caller
+    said it was there. The admission predicate still applies to every slot —
+    an explicit request cannot seat a pointer on an arm that emits nothing.
     """
     recipes = arm_recipes or {}
     found: list[dict[str, Any]] = []
@@ -265,24 +386,34 @@ def run_migrate_history(
 
     imported: dict[str, list[str]] = {}
     pointers: dict[str, str] = {}
+    deferred: dict[str, str] = {}
     planned: list[tuple[Any, ...]] = []
-    for slot in slots:
-        match = next(
-            (
-                (source, f["document"])
-                for f in found
-                if f.get("document") is not None and "champion" in f["document"]
-                for source in SOURCES
-                if source.name == f["source"] and source.slot == slot
-            ),
-            None,
+    asserted = slots is not None
+    documents_by_source = {
+        f["source"]: f["document"] for f in found if f.get("document") is not None
+    }
+    for slot in slots if slots is not None else MIGRATABLE_SLOTS:
+        source = next((s for s in SOURCES if s.slot == slot and s.champion is not None), None)
+        pointer = documents_by_source.get(source.name) if source is not None else None
+        champion_name = (
+            source.champion(pointer) if source is not None and pointer is not None else None
         )
-        if match is None:
+        if champion_name is None:
+            why = (
+                f"no v1 champion source is declared for slot {slot!r}"
+                if source is None
+                else f"{source.key} is absent or declares no champion"
+            )
+            if asserted:
+                raise MigrationSourceMissing(
+                    f"v1 slot {slot!r} was named explicitly and {why}. A named slot is an "
+                    "assertion that its champion is there; reporting it as deferred would "
+                    "turn a caller's mistake into a quiet no-op."
+                )
             imported[slot] = []
             pointers[slot] = "no_v1_pointer"
+            deferred[slot] = why
             continue
-        source, pointer = match
-        champion_name = pointer["champion"]
         recipe = recipes.get(champion_name)
         if recipe is None:
             raise MigrationSourceMissing(
@@ -341,6 +472,16 @@ def run_migrate_history(
                 f"{spec.arm_id!r}. A v1 import seeds an ABSENT pointer and never "
                 "overwrites a promotion or an operator revert."
             )
+        # The pointer is ABSENT, so this run would SEAT the slot. That is the
+        # moment the deferral predicate applies — and only that moment: a
+        # pointer this migration already wrote is `unchanged` above, and never
+        # re-litigated against today's production state.
+        refusal = admission_refusal(ctx.store, slot=slot, arm_id=spec.arm_id)
+        if refusal is not None:
+            imported[slot] = []
+            pointers[slot] = "deferred"
+            deferred[slot] = refusal
+            continue
         imported[slot] = [spec.arm_id]
         pointers[slot] = "would_write" if dry_run else "written"
         planned.append(
@@ -419,6 +560,8 @@ def run_migrate_history(
         "sources_missing": missing,
         "arms_imported": imported,
         "pointers": pointers,
+        "slots_considered": list(slots if slots is not None else MIGRATABLE_SLOTS),
+        "deferred": deferred,
         "allow_missing": allow_missing,
         "dry_run": dry_run,
     }
@@ -446,6 +589,12 @@ def run_migrate_history(
                 f"{len(found)} of {len(SOURCES)} v1 sources read; "
                 f"{sum(len(v) for v in imported.values())} arm(s) imported with their v1 "
                 "registration dates and promotion_source"
+                + (
+                    "; DEFERRED: "
+                    + "; ".join(f"{slot}: {why}" for slot, why in sorted(deferred.items()))
+                    if deferred
+                    else ""
+                )
                 + (f"; ABSENT: {[m['key'] for m in missing]}" if missing else "")
             ),
             "source_path": "arms/*/register.jsonl",
