@@ -116,9 +116,11 @@ __all__ = [
     "BaseCoverage",
     "BaseCoverageBelowFloorError",
     "BasePredictionsUnavailableError",
+    "EmptyDesignMatrixError",
     "InputCycleError",
     "InputRef",
     "InputRefusal",
+    "PER_ARM_REFUSALS",
     "SlotUnservableError",
     "UnproducibleInputError",
     "UnresolvedInputError",
@@ -201,6 +203,46 @@ class BaseCoverageBelowFloorError(ArmPredictionsContractError):
     universe that moved under the arm — and is never fixed by substituting a
     value for the names it skipped.
     """
+
+
+class EmptyDesignMatrixError(UnproducibleInputError):
+    """An arm's design matrix resolves to NO columns at panel-build time.
+
+    `alpha-engine-config-I11021`. :meth:`ModelRecipe.__post_init__` refuses a
+    recipe declaring neither `features` nor `inputs` at registration, so this
+    is the same property asserted at the seam that builds the panel — and,
+    unlike the bare `ValueError` it replaces, it is a TYPED per-arm refusal
+    (:data:`PER_ARM_REFUSALS`), which is what keeps one arm's empty design
+    matrix from ending the whole slot's produce or grade.
+
+    It carries the arm and what could not be resolved so the loop absorbing
+    it files an :class:`InputRefusal` from the exception rather than
+    re-deriving one from the recipe — a re-derivation is how a refusal comes
+    to name a different cause than the one that was raised.
+    """
+
+    def __init__(self, message: str, *, arm: str, unresolvable: Sequence[str]) -> None:
+        super().__init__(message)
+        self.arm = arm
+        self.unresolvable: tuple[str, ...] = tuple(unresolvable)
+
+
+#: The typed refusals a slot's per-arm loop absorbs, EXHAUSTIVE and named
+#: once so the produce loop and the grade loop absorb the same set.
+#:
+#: `alpha-engine-config-I11021`. Membership is a deliberate, per-type
+#: decision and never a widening: each member is a condition of ONE arm's
+#: inputs whose remedy touches that arm alone, and each is recorded by name
+#: with :data:`crucible.slots.model.ARM_REFUSED_METRIC`. A condition that is
+#: evidence the slot's shared substrate is compromised — a defective feature
+#: layer, a non-finite prediction, a `TrainingIntegrityError`,
+#: :class:`BaseCoverageBelowFloorError` — is NOT a member and still fails the
+#: whole slot. This tuple exists so that stays a decision someone made rather
+#: than a `except Exception` nobody wrote down.
+PER_ARM_REFUSALS: tuple[type[Exception], ...] = (
+    BasePredictionsUnavailableError,
+    EmptyDesignMatrixError,
+)
 
 
 class UnresolvedInputError(UnproducibleInputError):
