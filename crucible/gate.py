@@ -7751,6 +7751,107 @@ def _clause_v1_arms_carried_or_excluded(
     return Clause(name, requirement, False, "; ".join(parts), tuple(evidence))
 
 
+def _clause_every_recipe_registered(store: Store, window: list[dt.date]) -> Clause:
+    """Every recipe the release in force declares has a row in its register
+    (`alpha-engine-config-I10927`, deliverable 3).
+
+    The gap this grades was found by diffing two listings BY HAND on
+    2026-09-16: ten recipes merged into `strategy/arms/` had never been
+    registered — four U rankers merged 2026-09-14, three M heads, both S
+    recipes, with `arms/s/register.jsonl` not existing at all — and no
+    surface anywhere said so. Every reading that looked at arms looked at the
+    REGISTER, so an arm that never reached it was invisible to all of them:
+    the same blindness `v1_arms_carried_or_excluded` closed for v1's arms,
+    one source earlier. A detector that cannot see the thing it is for is
+    worse than no detector, because it reads green.
+
+    Read from two durable artifacts and no producer state: the pinned
+    release's strategy tree (`crucible.keys.strategy_arms_prefix`, the tree
+    `crucible.registration.load_registrable_recipes` resolves) and each
+    slot's `arms/{slot}/register.jsonl`. The join is on ARM ID — the hash of
+    the recipe's own spec — because an edited recipe is a NEW arm
+    (§3.1 lineage), so joining on the file name would read MET over a
+    register holding only the superseded version.
+
+    * UNMEASURABLE when a register or a recipe tree cannot be READ (a denial,
+      a transport failure). Nothing was compared, and an unknown set never
+      grades MET.
+    * UNMET while any registrable recipe has no register row, and while any
+      recipe tree is absent or malformed.
+    * MET otherwise.
+
+    **A REFUSED recipe is not a gap.** An arm whose declared inputs no
+    producer can resolve (`sota_directional_combine`) does not register, by
+    ruling (`alpha-engine-config-I10695`) — it is reported in the detail and
+    excluded from the requirement, because a clause that stayed red over a
+    ruled outcome would be muted within a week and would then be red over
+    nothing.
+    """
+    _unused(window)
+    name = "every_recipe_in_the_release_is_registered"
+    requirement = (
+        "every arm recipe in the strategy tree of the release in force has a row in its "
+        "slot's register, except a recipe refused at registration, which registers by "
+        "ruling and not by omission"
+    )
+    from crucible.registration import (  # noqa: PLC0415 - one call site
+        load_registrable_recipes,
+    )
+    from crucible.slots import dispatchable_slots  # noqa: PLC0415 - one call site
+
+    evidence: list[str] = []
+    access: list[str] = []
+    missing: list[str] = []
+    refused: list[str] = []
+    n_recipes = 0
+    for slot in sorted(dispatchable_slots()):
+        key = arm_register_key(slot)
+        prefix = strategy_arms_prefix(slot)
+        evidence.extend((key, prefix))
+        _, _, problem, access_problem, register = _register_arms(store, slot)
+        if problem is not None:
+            (access if access_problem else missing).append(problem)
+            continue
+        try:
+            load = load_registrable_recipes(slot, store=store)
+        except (FileNotFoundError, ValueError) as exc:
+            # An absent or malformed recipe tree is a READING, not a crash:
+            # the release declares arms that cannot be resolved at all, which
+            # is UNMET naming why — the same treatment
+            # `_clause_every_llm_arm_has_a_verdict` gives the same failure.
+            missing.append(f"{prefix}: {exc}")
+            continue
+        except Exception as exc:  # noqa: BLE001 - classified into the reading below
+            # Any other failure to list or read the tree (a permissions
+            # denial, a transport error) is UNMEASURABLE naming the class.
+            access.append(f"{prefix}: {type(exc).__name__}: {exc}")
+            continue
+        n_recipes += len(load.specs)
+        refused.extend(f"{slot}:{arm}" for arm in load.refused_names)
+        rows = set() if register is None else set(register.all_arms())
+        for spec in load.specs:
+            if spec.arm_id not in rows:
+                missing.append(
+                    f"{slot}:{spec.name} is declared by the release in force and has no row "
+                    f"in {key}, so it is in no arena and is scored by nothing"
+                )
+    note = (
+        f"; {len(refused)} refused at registration: {', '.join(sorted(refused))}" if refused else ""
+    )
+    if access and not missing:
+        return _unmeasurable(name, requirement, "; ".join(access) + note, evidence)
+    if missing:
+        return Clause(name, requirement, False, "; ".join(missing[:6]) + note, tuple(evidence))
+    return Clause(
+        name,
+        requirement,
+        True,
+        f"all {n_recipes} registrable recipe(s) across "
+        f"{len(sorted(dispatchable_slots()))} slot(s) have a register row{note}",
+        tuple(evidence),
+    )
+
+
 def _phase3(
     store: Store,
     window: list[dt.date],
@@ -7794,6 +7895,14 @@ def _phase3(
         # the table is split from `-I9759`'s own Deliverables line, which this
         # class fix postdates.
         _clause_v1_arms_carried_or_excluded(store, window),
+        # `alpha-engine-config-I10927` deliverable 3. Registered on phase 3
+        # for the reason the neighbouring `_clause_integration_tier_current`
+        # comment already states: phase 3 is the lowest phase that has
+        # neither exited nor begun grading, so adding a member here moves no
+        # reading already in flight. It is also the phase this clause is
+        # ABOUT — "all three slots" is not true of a slot whose merged
+        # recipes never reached its register.
+        _clause_every_recipe_registered(store, window),
     ]
 
 

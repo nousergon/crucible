@@ -167,6 +167,32 @@ components:
     dispatch: null
     deadline: null
 
+  experiment.register:
+    description: >-
+      Register every arm recipe the release in force declares and the slot's
+      register lacks. The set is DERIVED from the pinned release's strategy
+      tree, never a hand-written list of arms; pinning the release is the
+      deliberate act (alpha-engine-config-I10927).
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:outputs[arms/{slot}/register.jsonl],rows_in,rows_out,rows_rejected
+      outcome: run.json:metrics[arm_recipes_registered]
+    log_location: /crucible/experiment.register
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/arms
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: weekly, Saturday
+    dispatch: arc
+    deadline:
+      anchor: next_calendar_day_at
+      cadence: weekly
+      at: "11:00"
+
   experiment.run:
     description: Score one arm for one trading day.
     lifecycle: ACTIVE

@@ -509,6 +509,19 @@ JOBS: dict[str, JobSpec] = {
     "data.weekly": JobSpec("data.weekly", "Weekly data refresh and coverage pass", True),
     "data.heal": JobSpec("data.heal", "Repair a named gap in the store, idempotently", False),
     "experiment.new": JobSpec("experiment.new", "Register an immutable arm from a recipe", False),
+    # alpha-engine-config-I10927. The DERIVED sibling of `experiment.new`: it
+    # registers every recipe the pinned release declares and the slot's
+    # register lacks, and it is an arc stage (11:00, before `experiment.run`
+    # at 12:00) so a recipe merged during the week is scored on the next
+    # Saturday with no operator in the path. `experiment.new --arm` keeps its
+    # required flag and its meaning — see `crucible.registration` for why
+    # deriving from the release pin is a deliberate act and a list of arms
+    # would not be.
+    "experiment.register": JobSpec(
+        "experiment.register",
+        "Register every recipe the release in force declares and the register lacks",
+        True,
+    ),
     "experiment.run": JobSpec("experiment.run", "Score one arm for one trading day", True),
     "experiment.grade": JobSpec("experiment.grade", "Run one slot's arena cycle", True),
     # alpha-engine-config-I10696 (Brian's ruling (a), 2026-09-14). On-demand,
@@ -679,6 +692,11 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
         "track A",
         "Arm id is the hash of its spec; an edited recipe is a NEW arm carrying `supersedes`.",
     ),
+    "experiment.register": _todo(
+        "experiment.register",
+        "track A",
+        "Derives the set from the release in force; never a hand-written list of arms.",
+    ),
     "experiment.run": _todo(
         "experiment.run",
         "track A",
@@ -792,6 +810,7 @@ def build_parser() -> argparse.ArgumentParser:
             "experiment.backfill",
             "promote",
             "experiment.new",
+            "experiment.register",
         ):
             sub.add_argument("--slot", choices=["u", "r", "m", "s"], required=True)
         if spec.name == "promote":

@@ -9,6 +9,7 @@ and started by nobody.
 from __future__ import annotations
 
 import datetime as dt
+import re
 
 import pytest
 
@@ -282,7 +283,14 @@ class TestRunsTheRealCommand:
             seen.append(argv[0])
             return 0 if argv[0] == "data.weekly" else 3
 
-        with pytest.raises(ArcStageFailed, match="experiment.run"):
+        # DERIVED, not named: the arc's shape is the deadline table, and a
+        # new stage inserted between `data.weekly` and the one this test used
+        # to name would make it assert against a stage the arc never reached
+        # — green while covering nothing. `experiment.register` was inserted
+        # at exactly that position (`alpha-engine-config-I10927`).
+        first_failing = next(s for s in arc_stages(FRIDAY) if s.job != "data.weekly")
+
+        with pytest.raises(ArcStageFailed, match=re.escape(first_failing.label)):
             run_arc(FRIDAY, store=None, run_mode=RUN_MODE_LIVE, main=fake_main)
         assert "report" not in seen, "the arc must not continue past a failed stage"
 

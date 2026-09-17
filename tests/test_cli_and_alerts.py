@@ -37,6 +37,7 @@ def _minimal_argv(job: str) -> list[str]:
         "experiment.backfill",
         "promote",
         "experiment.new",
+        "experiment.register",
     ):
         argv += ["--slot", "r"]
     if job in ("experiment.run", "experiment.new", "experiment.backfill"):
@@ -126,6 +127,13 @@ class TestJobSurface:
             "data.weekly",
             "data.heal",
             "experiment.new",
+            # alpha-engine-config-I10927: the DERIVED sibling of
+            # `experiment.new`. An arc stage at 11:00, before
+            # `experiment.run` at 12:00, registering every recipe the pinned
+            # release declares and the slot's register lacks. Not a
+            # relaxation of `experiment.new --arm`, which stays required: the
+            # deliberate act moves up a layer, to the release pin.
+            "experiment.register",
             "experiment.run",
             # alpha-engine-config-I10696 (Brian's ruling (a), 2026-09-14):
             # one arm's history over a session range, produced through the
@@ -559,6 +567,13 @@ class TestDryRunNeverWrites:
     #: `JOBS` itself.
     _EXCLUDED_WITH_REASON = {
         "experiment.new": "needs a synced strategy tree with real arm recipes",
+        "experiment.register": (
+            "needs a synced strategy tree with real arm recipes, same as "
+            "`experiment.new` — its dry-run property (the diff is reported and the "
+            "store gains no key at all, not even a manifest) is asserted directly, "
+            "against a seeded LocalStore, by tests/test_experiment_register.py::"
+            "TestDryRun::test_a_dry_run_reports_the_diff_and_writes_nothing"
+        ),
         "migrate.history": "needs seeded v1 sources",
         "holdout": (
             "its READ form writes no manifest at all and exits 1 on a fresh store (no "

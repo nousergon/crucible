@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-from pathlib import Path
 from typing import Any
 
 from crucible.backfill import run_backfill
@@ -35,12 +34,12 @@ from crucible.explain import select_newest_settled_verdict
 from crucible.gate import PHASES
 from crucible.keys import arm_register_key
 from crucible.manifest import manifest_key
+from crucible.registration import load_registrable_recipes
 from crucible.runner import run_job
 from crucible.slots import arm_name as name_component
 from crucible.slots import dispatchable_slots
 from crucible.slots.arms import (
     ForeignRecipeSchemaError,
-    load_arm_specs,
     read_register,
     register_arms,
     write_register,
@@ -349,7 +348,11 @@ def _recipes_for_registration(slot: str, *, config: Any, store: Any) -> list[Any
     """The slot's loaded recipes, in the shape `register_arms` reads.
 
     One entry point over three recipe SCHEMAS (`alpha-engine-config-I9957`,
-    `-I10512`). U and R recipes are `ArmSpec`s; an M recipe is a
+    `-I10512`), and since `alpha-engine-config-I10927` that entry point is
+    `crucible.registration.load_registrable_recipes` — shared with
+    `experiment.register` and with the gate clause that grades the
+    recipe-to-register gap, so the three cannot disagree about what a
+    registrable recipe is. U and R recipes are `ArmSpec`s; an M recipe is a
     `ModelRecipe`, wrapped in `crucible.slots.model.RegisteredModelArm`; an S
     recipe is a `StrategyRecipe`, wrapped in
     `crucible.slots.strategy.RegisteredStrategyArm`. Each wrapper carries its
@@ -358,41 +361,24 @@ def _recipes_for_registration(slot: str, *, config: Any, store: Any) -> list[Any
     identities, and the register, the shadow/session-inputs artifacts and the
     series would each speak about a different one.
 
-    Both M and S are here: `load_arm_specs` still raises
-    `ForeignRecipeSchemaError` for either slot name (it serves U and R only),
-    but neither slot reaches that call any more — each is dispatched to its
-    own loader below, before `load_arm_specs` is ever asked for it.
+    The refusals are PRINTED here and returned nowhere, because this is
+    `experiment.new`'s reader and `experiment.new` is an operator command
+    whose reader is a terminal. `experiment.register` calls the shared loader
+    directly and records each refusal on its manifest instead.
     """
-    if slot == "m":
-        from crucible.slots.model import (  # noqa: PLC0415 - heavy import, one call site
-            load_model_recipes,
-            registration_specs,
+    load = load_registrable_recipes(slot, strategy_dir=config.strategy_dir, store=store)
+    if load.refusals:
+        print(
+            json.dumps(
+                {
+                    "refused": [
+                        {"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in load.refusals
+                    ]
+                },
+                indent=2,
+            )
         )
-
-        directory = Path(config.strategy_dir) / "arms" / slot if config.strategy_dir else None
-        loaded = load_model_recipes(directory, store=None if directory is not None else store)
-    elif slot == "s":
-        from crucible.slots.strategy import (  # noqa: PLC0415 - heavy import, one call site
-            load_strategy_slot,
-            registration_specs,
-        )
-
-        loaded = load_strategy_slot(
-            store=None if config.strategy_dir else store, strategy_dir=config.strategy_dir
-        )
-    else:
-        return list(load_arm_specs(slot, store=store, strategy_dir=config.strategy_dir))
-    print(
-        json.dumps(
-            {
-                "refused": [
-                    {"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused
-                ]
-            },
-            indent=2,
-        )
-    )
-    return registration_specs(loaded)
+    return list(load.specs)
 
 
 def handle_experiment_new(args: argparse.Namespace) -> int:
@@ -471,6 +457,132 @@ def handle_experiment_new(args: argparse.Namespace) -> int:
         run_mode=getattr(args, "run_mode", None),
     )
     return 0 if ctx else 0
+
+
+#: The metric `experiment.register` files every run, on every slot, whether or
+#: not it registered anything. Four numbers rather than one: "registered 0"
+#: and "read 0" are opposite facts that a single count renders identically,
+#: and the second is a broken release while the first is a quiet week.
+REGISTER_COVERAGE_METRIC = "arm_recipes_registered"
+
+
+def handle_experiment_register(args: argparse.Namespace) -> int:
+    """Register every recipe the release in force declares and the slot's
+    register lacks (`alpha-engine-config-I10927`).
+
+    **Not a relaxation of `experiment.new --arm`.** That flag stays required
+    and that job's meaning is unchanged: naming one arm is how an operator
+    registers one arm deliberately. This job's deliberate act is a different
+    one, one layer up — **pinning the release**. What the pinned release
+    declares under `strategy/current/arms/{slot}/` is then DERIVED from that
+    pin, exactly as `crucible.slots.dispatchable_slots` derives the
+    dispatchable slots from the modules and `crucible.weekly.arc_stages`
+    derives the arc from the registry. Nobody keeps a list of arms current,
+    because there is no list.
+
+    **A registration is never a promotion.** This job appends `registered`
+    events to `arms/{slot}/register.jsonl` and touches nothing else: no
+    `champions/` pointer, no serving contract. It makes an arm SCORED — the
+    arena decides, later and on evidence, whether it is ever served.
+
+    **Idempotent, and it says so per recipe.** Re-running appends nothing —
+    `crucible.slots.arms.register_arms` skips an id already in the fold — and
+    the run reports `registered` against `already_present` the way `data.heal`
+    reports `repaired` against `already_present`, so "nothing to do" is
+    legible rather than indistinguishable from "did not look".
+
+    **A refusal is recorded, not swallowed, and does not fail the stage.** An
+    arm whose declared inputs no producer can resolve
+    (`sota_directional_combine`, ruled expected behaviour in
+    `alpha-engine-config-I10695`) comes back as a
+    `crucible.slots.inputs.InputRefusal` value, is recorded as a rejection
+    with its reason and as an `unservable` MetricRecord, and its siblings
+    still register. Anything else — an unreadable tree, a malformed recipe, a
+    slot where NOTHING registers — raises, and the manifest carries the cause
+    (AGENTS.md rule 5).
+    """
+    config = _settings(args)
+    store = config.store()
+    load = load_registrable_recipes(args.slot, strategy_dir=config.strategy_dir, store=store)
+    register = read_register(store, args.slot)
+    before = set(register.all_arms())
+    register, _ = register_arms(register, list(load.specs))
+    added = sorted(set(register.all_arms()) - before)
+    already_present = sorted(spec.arm_id for spec in load.specs if spec.arm_id in before)
+    refused = [
+        {"arm": r.arm, "unresolvable": list(r.unresolvable), "reason": r.reason}
+        for r in load.refusals
+    ]
+    report = {
+        "slot": args.slot,
+        "read": load.n_read,
+        "registered": added,
+        "already_present": already_present,
+        "refused": refused,
+    }
+    if args.dry_run:
+        print(json.dumps({**report, "registered": [], "would_register": added}, indent=2))
+        return 0
+
+    def job(ctx: Any) -> None:
+        # Recorded FIRST, before the write that can raise: a refusal that only
+        # reaches the manifest of a run that succeeded is a refusal nobody
+        # sees on the day it mattered.
+        for metric in load.refusal_metrics:
+            ctx.record_metric(metric)
+        for refusal in load.refusals:
+            ctx.record_rejected(
+                _refusal_reason(args.slot, refusal),
+                1,
+            )
+        payload = write_register(store, args.slot, register)
+        ctx.record_output(arm_register_key(args.slot), payload, schema_version="arm_register.v1")
+        ctx.record_rows(rows_in=load.n_read, rows_out=len(added))
+        ctx.record_metric(
+            {
+                "name": REGISTER_COVERAGE_METRIC,
+                "module": "crucible.track_a",
+                "metric_type": "coverage",
+                "value": float(len(added)),
+                "unit": "arms",
+                "n_floor": 0,
+                "status": "OK",
+                "status_reason": (
+                    f"slot {args.slot}: {load.n_read} recipe(s) read from the release in "
+                    f"force, {len(added)} registered, {len(already_present)} already "
+                    f"present, {len(load.refusals)} refused at registration"
+                ),
+                "source_path": arm_register_key(args.slot),
+                "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+        print(json.dumps(report, indent=2))
+
+    run_job(
+        "experiment.register",
+        job,
+        store=store,
+        trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
+        # Four slots share one job name and one trading day; the slot is the
+        # discriminator that keeps `--slot u` and `--slot m` from writing the
+        # same manifest (alpha-engine-config-I9781).
+        discriminator=args.slot,
+    )
+    return 0
+
+
+def _refusal_reason(slot: str, refusal: Any) -> str:
+    """The rejection string, fitted at the call site.
+
+    `RunContext.record_rejected` RAISES over 200 characters rather than
+    truncating (`alpha-engine-config-I10484`), and the overflow would cost the
+    manifest its inputs, outputs, metrics and every row count. The job authors
+    this string, so the job is what fits it — the arm and its unresolvable
+    inputs are what make it actionable, and they come first.
+    """
+    detail = f"{slot}:{refusal.arm} unresolvable inputs {sorted(refusal.unresolvable)}"
+    return detail[:200]
 
 
 def handle_experiment_run(args: argparse.Namespace) -> int:
@@ -730,6 +842,7 @@ HANDLERS = {
     "data.weekly": handle_data_weekly,
     "data.heal": handle_data_heal,
     "experiment.new": handle_experiment_new,
+    "experiment.register": handle_experiment_register,
     "experiment.run": handle_experiment_run,
     "experiment.backfill": handle_experiment_backfill,
     "experiment.grade": handle_experiment_grade,
@@ -809,6 +922,7 @@ def add_track_a_arguments(name: str, sub: argparse.ArgumentParser) -> None:
         )
     if name in (
         "experiment.new",
+        "experiment.register",
         "experiment.run",
         "experiment.backfill",
         "experiment.grade",

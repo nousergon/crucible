@@ -82,6 +82,29 @@ class _StubSlotModule:
         return {"arena_cycle_key": key}
 
 
+class _StubRecipeLoad:
+    """Stands in for the strategy tree `experiment.register` reads.
+
+    The same kind of stub `_StubSlotModule` is: the recipe SET is the
+    business logic this contract does not need — a synced tree of real
+    `ArmSpec`/`ModelRecipe`/`StrategyRecipe` documents — while the register
+    write and the manifest write, which are what this file is about, run
+    unmodified. An empty registrable set is the honest stub here: the two
+    arms `_seed_slot_for_promote` filed are already in the register, so a
+    real run against that store would register nothing either, and appending
+    a third arm with no series would break the `promote` writer that reads
+    the same register three stages later.
+    """
+
+    specs: tuple[Any, ...] = ()
+    refusals: tuple[Any, ...] = ()
+    refusal_metrics: tuple[dict[str, Any], ...] = ()
+    n_read = 0
+
+    def __init__(self, slot: str) -> None:
+        self.slot = slot
+
+
 def _experiment_args(job: str, slot: str, store_uri: str) -> argparse.Namespace:
     return argparse.Namespace(
         job=job,
@@ -187,12 +210,19 @@ class TestGateReadsWhatTheRealWriterWrote:
         asks the real `_clause_arc_runs_ok` to read the same store. Only the
         business logic inside each slot module is stubbed; the manifest
         write path and the gate's read path are both exercised unmodified."""
-        assert ARC_SLOT_JOBS == frozenset({"experiment.run", "experiment.grade", "promote"}), (
+        assert ARC_SLOT_JOBS == frozenset(
+            {"experiment.register", "experiment.run", "experiment.grade", "promote"}
+        ), (
             "this test enumerates ARC_SLOT_JOBS explicitly below — a new "
             "slot-scoped job needs a writer added here too, or this test "
             "would silently stop covering the class it exists for"
         )
         monkeypatch.setattr(track_a, "_slot_module", lambda slot: _StubSlotModule(slot))
+        monkeypatch.setattr(
+            track_a,
+            "load_registrable_recipes",
+            lambda slot, **_: _StubRecipeLoad(slot),
+        )
         store_uri = str(tmp_path)
         store = LocalStore(tmp_path)
         registry = load_registry()
@@ -249,6 +279,11 @@ class TestGateReadsWhatTheRealWriterWrote:
         discriminator argument in the gate's read is load-bearing, not
         decorative."""
         monkeypatch.setattr(track_a, "_slot_module", lambda slot: _StubSlotModule(slot))
+        monkeypatch.setattr(
+            track_a,
+            "load_registrable_recipes",
+            lambda slot, **_: _StubRecipeLoad(slot),
+        )
         store_uri = str(tmp_path)
         store = LocalStore(tmp_path)
         registry = load_registry()
