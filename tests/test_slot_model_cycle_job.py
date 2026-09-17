@@ -41,6 +41,7 @@ from crucible.slots.model import (
     CPCV_OOS_IC_METRIC,
     FEATURE_COMPLETENESS_METRIC,
     SLOT,
+    FeatureLayerSource,
     ModelRecipe,
     RegisteredModelArm,
     SlotRecipes,
@@ -952,3 +953,112 @@ class TestTheCompletenessRecordReachesARealManifest:
             _run_produce(store, strategy, arm_name="base")
         document = _manifest(store, "experiment.run", RUN_DAY)
         assert document["status"] == "failed"
+
+
+class TestAPureStackerDoesNotEndTheSlot:
+    """`alpha-engine-config-I11021`, on the real job over a real store.
+
+    Measured in production 2026-09-17, run `35273950392`,
+    `experiment.grade --slot m --date 2026-09-09`, release `947f2c0`::
+
+        ValueError: panel() needs at least one column; a panel of no features
+        would train an arm on an empty design matrix at model.py:797
+
+    `status: failed` for the WHOLE M slot, after three of its arms had already
+    been scored. The arm that raised is `v3meta_stack` — `features: []` plus
+    two `predictions[...]` inputs, the canonical pure meta-learner shape that
+    `alpha-engine-config-I9821` had already established is a real, intended
+    arm and corrected `ModelRecipe.__post_init__` to admit. The correction was
+    never made one frame down, in `design_panel`, which still handed `()` to
+    `FeatureLayerSource.panel()`.
+
+    Two properties, and they are different properties. The first is that a
+    pure stacker GRADES — refusing it would be wrong, because it is
+    producible. The second is the class: when one arm's own inputs do refuse
+    it, the refusal is TYPED, named on the manifest, and costs the slot
+    nothing, which is `alpha-engine-config-I10927`'s "a slot with nothing
+    registrable must not stop the arc" applied at the arm level.
+    """
+
+    @pytest.fixture
+    def pure_stack_strategy(self, tmp_path):
+        """`base`, and a stacker whose every design column is `base`'s output."""
+        arms = tmp_path / "strategy" / "arms" / SLOT
+        _write_recipe(arms, "base", features=[BASE_COLUMN])
+        _write_recipe(arms, "pure_stack", features=[], inputs=["predictions[base]"])
+        return _Settings(tmp_path / "strategy")
+
+    @pytest.fixture
+    def cold_stack_strategy(self, tmp_path):
+        """The same pair, with the stacker asking for more of `base`'s history
+        than `base` has run — the warm-up condition, on a featureless arm."""
+        arms = tmp_path / "strategy" / "arms" / SLOT
+        _write_recipe(arms, "base", features=[BASE_COLUMN])
+        _write_recipe(arms, "pure_stack", features=[], inputs=["predictions[base]"], min_days=40)
+        return _Settings(tmp_path / "strategy")
+
+    def _grade(self, store, settings, day):
+        result: dict = {}
+        run_job(
+            "experiment.grade",
+            lambda c: result.update(grade(c, settings=settings)),
+            store=store,
+            trading_day=dt.date.fromisoformat(day),
+            run_mode="replay",
+            discriminator=SLOT,
+        )
+        return result
+
+    def test_the_slot_grades_a_featureless_arm_rather_than_failing(
+        self, store, pure_stack_strategy
+    ) -> None:
+        """The production condition, end to end: both arms score, slot is `ok`."""
+        _warm_the_base(store, pure_stack_strategy)
+        for day in SESSIONS[46:52]:
+            _run_produce(store, pure_stack_strategy, day=day)
+        result = self._grade(store, pure_stack_strategy, GRADE_DAY)
+        document = _manifest(store, "experiment.grade", GRADE_DAY)
+        assert document["status"] == "ok", document["reason"]
+        assert store.exists(result["arena_cycle_key"])
+        graded = {
+            m["status_reason"].split("'")[1]
+            for m in document["metrics"]
+            if m["name"] == CPCV_OOS_IC_METRIC
+        }
+        assert graded == {"base", "pure_stack"}
+
+    def test_one_arms_unusable_input_costs_the_slot_nothing(
+        self, store, cold_stack_strategy
+    ) -> None:
+        """The CLASS. The stacker's window reaches further back than `base`
+        has run, so its input does not exist — a per-arm refusal. The slot
+        still grades `base`, and the stacker is named on the manifest as
+        `unservable` rather than reading as an arm that scored badly."""
+        for day in [*WARMUP, *SESSIONS[46:52]]:
+            _run_produce(store, cold_stack_strategy, day=day, arm_name="base")
+        self._grade(store, cold_stack_strategy, GRADE_DAY)
+        document = _manifest(store, "experiment.grade", GRADE_DAY)
+        assert document["status"] == "ok", document["reason"]
+        scored = [m for m in document["metrics"] if m["name"] == CPCV_OOS_IC_METRIC]
+        assert len(scored) == 1
+        assert "'base'" in scored[0]["status_reason"]
+        refusals = [m for m in document["metrics"] if m["name"] == ARM_REFUSED_METRIC]
+        assert len(refusals) == 1
+        assert "'pure_stack'" in refusals[0]["status_reason"]
+        assert refusals[0]["status"] == "unservable"
+        assert refusals[0]["value"] > 0, "a refusal row naming no input is unactionable"
+
+    def test_the_layer_itself_still_refuses_a_read_that_names_nothing(self, store) -> None:
+        """`label_panel` is not an opt-out of `panel`'s guard. A caller that
+        resolved no columns still gets the refusal; the featureless read has
+        its own name, and it carries the date axis and the label."""
+        source = FeatureLayerSource(store=store)
+        with pytest.raises(ValueError, match="at least one column"):
+            source.panel(trading_day=RUN_DAY, columns=())
+        panel = source.label_panel(
+            trading_day=RUN_DAY, lookback_trading_days=3, label_horizon_trading_days=2
+        )
+        assert panel.features == {}
+        assert panel.names == tuple(sorted(_NAMES))
+        assert panel.forward_returns.shape == (len(panel.dates), len(_NAMES))
+        assert np.isfinite(panel.forward_returns[0]).all(), "the label is read, not skipped"

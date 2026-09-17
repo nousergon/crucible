@@ -90,8 +90,10 @@ from crucible.keys import (
 )
 from crucible.slots.arms import SupersededArmUndeclaredError, resolve_declared_lineage
 from crucible.slots.inputs import (
+    PER_ARM_REFUSALS,
     BaseCoverage,
     BasePredictionsUnavailableError,
+    EmptyDesignMatrixError,
     InputRef,
     InputRefusal,
     SlotUnservableError,
@@ -789,15 +791,85 @@ class FeatureLayerSource:
         whose horizon has not settled NULL rather than zero — an unsettled
         return is not a flat one, and training raises on the null instead of
         banking it.
-        """
-        import numpy as np  # noqa: PLC0415
 
+        A panel of NO columns is refused here and is never this method's
+        answer: a caller reading the feature layer for nothing named is a
+        caller that resolved no columns, not one that wants the date axis.
+        The one shape that legitimately reads the layer without naming a
+        feature is a PURE meta-learner, whose every design column is a
+        `predictions[...]` input — it calls :meth:`label_panel`, which says
+        so in its name (`alpha-engine-config-I11021`).
+        """
         requested = tuple(columns)
         if not requested:
             raise ValueError(
                 "panel() needs at least one column; a panel of no features would train "
-                "an arm on an empty design matrix"
+                "an arm on an empty design matrix. An arm whose design matrix is entirely "
+                "`spec.inputs` reads `label_panel()` instead"
             )
+        return self._panel(
+            trading_day=trading_day,
+            columns=requested,
+            lookback_trading_days=lookback_trading_days,
+            label_horizon_trading_days=label_horizon_trading_days,
+            ctx=ctx,
+        )
+
+    def label_panel(
+        self,
+        *,
+        trading_day: str,
+        lookback_trading_days: int = 0,
+        label_horizon_trading_days: int | None = None,
+        ctx: Any = None,
+    ) -> FeaturePanel:
+        """The panel's date axis, names and forward returns, carrying NO feature.
+
+        `alpha-engine-config-I11021`. `alpha-engine-config-I9821` established
+        that a PURE meta-learner — `features == ()`, every design column a
+        `predictions[...]` input — is a real, intended arm shape, and
+        corrected :meth:`ModelRecipe.__post_init__` to test
+        :attr:`ModelRecipe.design_columns` rather than `features`. The same
+        correction was never made one frame down, in :func:`design_panel`,
+        which still handed `()` to :meth:`panel` — so `v3meta_stack` (two
+        prediction inputs, no features) raised `panel() needs at least one
+        column` and, being an untyped `ValueError`, took the WHOLE M slot's
+        grade down with it on run `35273950392`.
+
+        This is not an opt-out of :meth:`panel`'s refusal: the refusal is
+        about a DESIGN MATRIX, which the feature layer cannot see, and the
+        arm asking for this panel has one — it is completed by
+        :func:`crucible.slots.inputs.resolve_declared_inputs`, and
+        :func:`_assert_inputs_resolved` refuses a fit on a panel where that
+        did not happen. What this method removes is a featureless READ being
+        mistaken for an empty design matrix.
+        """
+        return self._panel(
+            trading_day=trading_day,
+            columns=(),
+            lookback_trading_days=lookback_trading_days,
+            label_horizon_trading_days=label_horizon_trading_days,
+            ctx=ctx,
+        )
+
+    def _panel(
+        self,
+        *,
+        trading_day: str,
+        columns: tuple[str, ...],
+        lookback_trading_days: int,
+        label_horizon_trading_days: int | None,
+        ctx: Any,
+    ) -> FeaturePanel:
+        """The read itself, for the two public entry points above.
+
+        Deliberately one implementation: two readers is how the panel a
+        stacked arm trains on and the panel every other arm trains on come to
+        differ in their date axis or their label.
+        """
+        import numpy as np  # noqa: PLC0415
+
+        requested = tuple(columns)
         unknown = sorted(set(requested) - set(self.columns))
         if unknown:
             raise KeyError(
@@ -1555,12 +1627,39 @@ def design_panel(
     feature layer needs no graph and passes none.
     """
     columns = tuple(recipe.features)
-    panel = source.panel(
-        trading_day=trading_day,
-        columns=columns,
-        lookback_trading_days=lookback_trading_days,
-        label_horizon_trading_days=recipe.label_horizon_trading_days,
-        ctx=ctx,
+    if not columns and not recipe.inputs:
+        # `ModelRecipe.__post_init__` already refuses this at registration.
+        # Asserted again HERE, typed, because until `alpha-engine-config
+        # -I11021` the condition arrived as `FeatureLayerSource.panel()`'s
+        # bare `ValueError` — untyped, so no per-arm loop could tell it from
+        # a broken feature layer, so it ended the whole slot.
+        raise EmptyDesignMatrixError(
+            f"arm {recipe.name!r} resolves no design column: it declares neither "
+            "`spec.features` nor `spec.inputs`, so there is nothing to fit. The arm is "
+            "refused and named; the slot's remaining arms are unaffected.",
+            arm=recipe.name,
+            unresolvable=("spec.features", "spec.inputs"),
+        )
+    panel = (
+        source.label_panel(
+            trading_day=trading_day,
+            lookback_trading_days=lookback_trading_days,
+            label_horizon_trading_days=recipe.label_horizon_trading_days,
+            ctx=ctx,
+        )
+        if not columns
+        # A PURE meta-learner (`alpha-engine-config-I9821`): every design
+        # column is a `predictions[...]` input, so the layer is read for the
+        # date axis and the label alone. `resolve_declared_inputs` below
+        # completes the design matrix and `_assert_inputs_resolved` refuses a
+        # fit where it did not.
+        else source.panel(
+            trading_day=trading_day,
+            columns=columns,
+            lookback_trading_days=lookback_trading_days,
+            label_horizon_trading_days=recipe.label_horizon_trading_days,
+            ctx=ctx,
+        )
     )
     if not recipe.inputs:
         return panel
@@ -3104,6 +3203,26 @@ def _registered_arms(ctx: Any, *, settings: Any) -> tuple[SlotRecipes, list[Regi
     return loaded, registration_specs(loaded)
 
 
+def _per_arm_refusal(recipe: ModelRecipe, exc: Exception) -> InputRefusal:
+    """One :class:`InputRefusal` for an arm whose own inputs refused it.
+
+    `alpha-engine-config-I11021`. The produce loop and the grade loop absorb
+    the SAME named set (:data:`crucible.slots.inputs.PER_ARM_REFUSALS`) and
+    render it through this one function, so the two manifests cannot describe
+    the same condition differently.
+
+    ``unresolvable`` comes off the exception when it carries one and from the
+    recipe's declared prediction inputs otherwise — which is what a
+    :class:`~crucible.slots.inputs.BasePredictionsUnavailableError` is always
+    about. It is never empty: a refusal row naming no input is a row an
+    operator cannot act on.
+    """
+    unresolvable = tuple(getattr(exc, "unresolvable", ()) or ()) or tuple(
+        r.text for r in recipe.inputs if r.kind == "predictions"
+    )
+    return InputRefusal(arm=recipe.name, unresolvable=unresolvable, reason=str(exc))
+
+
 def _produce_arms(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     """Fit every selected M arm for one trading day and write its cross-section.
 
@@ -3208,8 +3327,15 @@ def _produce_arms(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
                 ),
                 ctx=ctx,
             )
-        except BasePredictionsUnavailableError as exc:
+        except PER_ARM_REFUSALS as exc:
             # A DELIBERATE per-arm refusal, and the only swallow in this loop.
+            #
+            # The set absorbed is `crucible.slots.inputs.PER_ARM_REFUSALS` —
+            # typed, named and exhaustive, never a bare `except Exception`.
+            # It gained `EmptyDesignMatrixError` in `alpha-engine-config
+            # -I11021`, where an arm resolving no design column raised an
+            # untyped `ValueError` out of `FeatureLayerSource.panel()` and
+            # ended the whole slot's run.
             #
             # Failure mode absorbed: a stacked arm's base has not produced a
             # prediction for every session of the stack's training window yet.
@@ -3232,13 +3358,7 @@ def _produce_arms(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             # What is NOT absorbed: a defective feature layer, a non-finite
             # prediction, or a training window the layer cannot supply. Those
             # are `TrainingIntegrityError` and still fail the whole slot.
-            warming.append(
-                InputRefusal(
-                    arm=recipe.name,
-                    unresolvable=tuple(r.text for r in recipe.inputs if r.kind == "predictions"),
-                    reason=str(exc),
-                )
-            )
+            warming.append(_per_arm_refusal(recipe, exc))
             continue
         fit = train_arm(recipe, panel, as_of=trading_day)
         if fit.completeness is not None:
@@ -3722,8 +3842,11 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         recipe = spec.recipe
         try:
             panel = _grade_panel(recipe, source=source, as_of=as_of, loaded=loaded, ctx=ctx)
-        except BasePredictionsUnavailableError as exc:
-            # The produce-side warm-up, seen again here. Same failure mode,
+        except PER_ARM_REFUSALS as exc:
+            # The produce-side warm-up, seen again here — and, since
+            # `alpha-engine-config-I11021`, every other TYPED per-arm input
+            # refusal beside it, from the one named set the produce loop
+            # absorbs. Same failure mode,
             # same reason it is per-arm rather than slot-wide (see `produce`),
             # and the same recording surface: an `unservable` row on this
             # run's manifest naming the arm and its unresolvable input. An
@@ -3734,16 +3857,7 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             # or the fit — those still fail the whole slot.
             ctx.record_metric(
                 SlotRecipes(
-                    registered=(),
-                    refused=(
-                        InputRefusal(
-                            arm=recipe.name,
-                            unresolvable=tuple(
-                                r.text for r in recipe.inputs if r.kind == "predictions"
-                            ),
-                            reason=str(exc),
-                        ),
-                    ),
+                    registered=(), refused=(_per_arm_refusal(recipe, exc),)
                 ).refusal_metrics(slot=SLOT)[0]
             )
             continue

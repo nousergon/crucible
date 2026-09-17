@@ -38,12 +38,19 @@ from crucible.alerts import evaluate_failure
 from crucible.manifest import read_manifest
 from crucible.runner import run_job
 from crucible.slots.inputs import (
+    PER_ARM_REFUSALS,
+    EmptyDesignMatrixError,
     InputCycleError,
     InputRefusal,
     SlotUnservableError,
     UnproducibleInputError,
 )
-from crucible.slots.model import ARM_REFUSED_METRIC, SlotRecipes, load_model_recipes
+from crucible.slots.model import (
+    ARM_REFUSED_METRIC,
+    SlotRecipes,
+    design_panel,
+    load_model_recipes,
+)
 from crucible.store import LocalStore
 
 _LAYER = ("mom_21d_ratio", "vol_21d_ratio")
@@ -395,3 +402,48 @@ class TestTheRefusalValueRefusesToBeEmpty:
                     ),
                 ),
             )
+
+
+class TestAnArmWithNoDesignMatrixIsRefusedByType:
+    """`alpha-engine-config-I11021`: the refusal that took the slot with it.
+
+    An arm resolving no design column used to arrive as
+    `FeatureLayerSource.panel()`'s bare `ValueError`. Untyped, so neither
+    slot loop could tell it from a broken feature layer, so it could only be
+    allowed to end the run — and on 2026-09-17 it ended one that had already
+    scored three of its arms.
+
+    Registration refuses this arm too (`alpha-engine-config-I9821` guards
+    `design_columns`), and that is deliberately not the only guard: the two
+    are asserted independently here so removing one cannot quietly remove
+    both.
+    """
+
+    def test_registration_refuses_an_arm_that_declares_no_design_column(
+        self, tmp_path: Path
+    ) -> None:
+        _write(tmp_path, "featureless", features="[]")
+        with pytest.raises(ValueError, match="no design columns"):
+            load_model_recipes(tmp_path, feature_columns=_LAYER)
+
+    def test_the_panel_seam_refuses_it_again_and_by_TYPE(self, tmp_path: Path) -> None:
+        """The same property at the seam that builds the panel, so the
+        condition reaches a slot loop as a member of the set it absorbs
+        per-arm rather than as an exception it can only die on."""
+        _write(tmp_path, "ok_arm", features=f"[{_LAYER[0]}]")
+        recipe = load_model_recipes(tmp_path, feature_columns=_LAYER).registered[0]
+        # `ModelRecipe.__post_init__` makes this state unconstructible, which
+        # is the point: the seam's own guard is reached only if that one is
+        # ever weakened, and a guard nobody has seen fire is a guard nobody
+        # knows works.
+        object.__setattr__(recipe, "features", ())
+        with pytest.raises(EmptyDesignMatrixError) as exc:
+            design_panel(recipe, source=object(), trading_day="2026-08-28")
+        assert exc.value.arm == "ok_arm"
+        assert exc.value.unresolvable == ("spec.features", "spec.inputs")
+
+    def test_the_type_is_in_the_set_both_slot_loops_absorb(self) -> None:
+        """Membership of `PER_ARM_REFUSALS` is what makes the refusal per-arm.
+        A typed exception nobody catches fails the slot exactly as the
+        `ValueError` did."""
+        assert EmptyDesignMatrixError in PER_ARM_REFUSALS
