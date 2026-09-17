@@ -197,9 +197,11 @@ def handle_data_daily(args: argparse.Namespace) -> int:
             f"{today.isoformat()} is not an NYSE trading day; the schedule fired on a "
             f"holiday. Nothing to compile for trading_day {args.trading_day.isoformat()}."
         )
-        if args.dry_run:
-            print(f"data.daily --date {args.trading_day} would record a holiday no-op: {detail}")
-            return 0
+        # No `--dry-run` branch here either: the holiday no-op writes one
+        # manifest and nothing else, and under a capturing store that
+        # manifest is recorded rather than written — so a dry run of a
+        # holiday firing reports the exact key the real firing files
+        # (alpha-engine-config-I11012).
 
         def _holiday_noop(ctx: Any) -> None:
             ctx.record_metric(
@@ -225,6 +227,7 @@ def handle_data_daily(args: argparse.Namespace) -> int:
             store=store,
             trading_day=args.trading_day,
             run_mode=getattr(args, "run_mode", None),
+            dry_run=bool(getattr(args, "dry_run", False)),
             discriminator=today.isoformat(),
         )
         print(json.dumps({"run_id": ctx.run_id, "outputs": [], "detail": detail}, indent=2))
@@ -232,17 +235,13 @@ def handle_data_daily(args: argparse.Namespace) -> int:
     source = _source(args, config)
     point_in_time = _point_in_time_source(config)
     declared = _declared_universe(args, config)
-    if args.dry_run:
-        print(
-            f"data.daily --date {args.trading_day} would read {source.name} and write to "
-            f"{config.store_uri}; universe: "
-            + (
-                f"{len(declared.symbols)} symbols from {declared.source_uri}"
-                if declared
-                else "NONE declared"
-            )
-        )
-        return 0
+    # NO `--dry-run` branch (alpha-engine-config-I11012). `data.daily` is the
+    # job whose dry run most needed to be a rehearsal: the compile is where a
+    # missing feature column, an unsatisfiable declared input or a refusing
+    # store grant lives, and every one of those was invisible to a print that
+    # only named the source and the store URI. The READS below are real — a
+    # dry run of this job talks to ArcticDB and to the point-in-time source,
+    # which is the point — and every WRITE is recorded rather than performed.
     ctx = run_job(
         "data.daily",
         lambda c: run_daily(
@@ -254,6 +253,7 @@ def handle_data_daily(args: argparse.Namespace) -> int:
         store=store,
         trading_day=args.trading_day,
         run_mode=getattr(args, "run_mode", None),
+        dry_run=bool(getattr(args, "dry_run", False)),
     )
     print(json.dumps({"run_id": ctx.run_id, "outputs": [o["key"] for o in ctx.outputs]}, indent=2))
     return 0
@@ -784,19 +784,24 @@ def handle_experiment_run(args: argparse.Namespace) -> int:
     config = _settings(args)
     store = config.store()
     module = _slot_module(getattr(args, "slot", None) or "r")
-    if args.dry_run:
-        print(
-            f"experiment.run --slot {args.slot} would call {module.__name__}.produce and "
-            f"write its feed under the store at {config.store_uri}. Resolve inputs and "
-            "report what would be written; write nothing."
-        )
-        return 0
+    # NO `--dry-run` branch (alpha-engine-config-I11012). The one this
+    # replaces printed "would call produce and write its feed" — a sentence
+    # restating the handler's own source, which could not be wrong and could
+    # not be right. Under `--dry-run` the store RECORDS writes instead of
+    # performing them (`crucible.store.capturing`), so the body below runs
+    # for real against real inputs, fails exactly where the real run fails,
+    # and `crucible.cli.main` prints the key set it would have written.
     ctx = run_job(
         "experiment.run",
         lambda c: module.produce(c, settings=config, arm_name=getattr(args, "arm", None)),
         store=store,
         trading_day=args.trading_day,
         run_mode=getattr(args, "run_mode", None),
+        # Passed so the run says out loud that it wrote nothing. The manifest
+        # is captured either way — the store decides that, not this flag —
+        # but a rehearsal that printed nothing would look like a real run
+        # until the captured key set lands at the end of the invocation.
+        dry_run=bool(getattr(args, "dry_run", False)),
         # Four slots share one job name and one trading day; the slot is the
         # discriminator that keeps `--slot u` and `--slot r` from writing the
         # same manifest (alpha-engine-config-I9781).
@@ -832,21 +837,18 @@ def handle_experiment_backfill(args: argparse.Namespace) -> int:
     start = dt.date.fromisoformat(args.from_date)
     end = dt.date.fromisoformat(args.to_date)
     specs = _recipes_for_registration(args.slot, config=config, store=store)
-    if args.dry_run:
-        # Every check the real run makes that does NOT write, made here
-        # through the SAME functions the job calls, in the job's order — a
-        # dry run that could only succeed is not a rehearsal, and the one
-        # this replaces reported "would produce 205 session(s)" for a command
-        # that failed in two minutes in production
-        # (alpha-engine-config-I11005).
-        # What is still NOT rehearsed — the per-session produce call, which
-        # cannot execute without writing — is named in the printed line and
-        # tracked as its own change (a write-capturing store for every job's
-        # dry run, alpha-engine-config-I11012). It is not half-done here.
+    dry_run = bool(getattr(args, "dry_run", False))
+    if dry_run:
+        # PR323's PRE-FLIGHT, kept and extended rather than replaced
+        # (alpha-engine-config-I11005 then -I11012). Everything here is
+        # resolved through the SAME functions the job calls, in the job's
+        # order, so a rehearsal refuses what the job refuses — and then the
+        # body below EXECUTES, against a store that records its writes
+        # instead of performing them. The gap PR323 named in its printed line
+        # ("NOT rehearsed: the per-session produce call itself") is what this
+        # closes: that call is exactly where the measured failure lived.
         from crucible.backfill import (  # noqa: PLC0415 - one call site
-            NotInRegionError,
             arm_id_for,
-            assert_in_region,
             sessions_in_range,
         )
 
@@ -856,37 +858,15 @@ def handle_experiment_backfill(args: argparse.Namespace) -> int:
         # a dry run that accepted an arm the job would refuse is wrong here
         # and not merely optimistic.
         arm_id = arm_id_for(specs, slot=args.slot, arm=name_component(args.arm))
-        try:
-            on_ec2, evidence = assert_in_region(
-                sessions,
-                slot=args.slot,
-                arm=name_component(args.arm),
-                start=start,
-                end=end,
-                i_am_in_region=bool(getattr(args, "i_am_in_region", False)),
-            )
-            region_verdict = f"would proceed on this host ({evidence})"
-        except NotInRegionError as exc:
-            # The ONE caught refusal in this handler, and it is REPORTED, not
-            # swallowed. (a) The failure mode absorbed: the in-region guard,
-            # and only that guard. (b) Why the deliverable survives: this
-            # guard is the one check whose answer is a property of the HOST
-            # rather than of the command, and a dry run is routinely run from
-            # the laptop for a range that will be dispatched in region —
-            # raising here would refuse to rehearse exactly the dispatch the
-            # operator is checking. (c) The recording surface: the verdict is
-            # printed on the line below, named as a refusal, with the guard's
-            # own message. The real run still raises.
-            region_verdict = f"WOULD REFUSE on this host — {exc}"
-            on_ec2 = False
         print(
-            f"experiment.backfill --slot {args.slot} --arm {args.arm} ({arm_id}) would "
-            f"produce {len(sessions)} session(s) {start}..{end} through "
+            f"experiment.backfill --slot {args.slot} --arm {args.arm} ({arm_id}) will "
+            f"rehearse {len(sessions)} session(s) {start}..{end} through "
             f"{module.__name__}.produce_history, which does not enter the serving path. "
-            f"In region: {on_ec2}; {region_verdict}. NOT rehearsed: the per-session "
-            "produce call itself, which cannot run without writing."
+            "Every read is real; every write is recorded, not performed. The in-region "
+            "guard is REPORTED rather than raised — it is a property of the host, and a "
+            "laptop rehearsal of a range that will be dispatched in region is the normal "
+            "case."
         )
-        return 0
     result: dict[str, Any] = {}
     ctx = run_job(
         "experiment.backfill",
@@ -902,11 +882,13 @@ def handle_experiment_backfill(args: argparse.Namespace) -> int:
                 end=end,
                 force=bool(getattr(args, "force", False)),
                 i_am_in_region=bool(getattr(args, "i_am_in_region", False)),
+                rehearsal=dry_run,
             )
         ),
         store=store,
         trading_day=end,
         run_mode=getattr(args, "run_mode", None),
+        dry_run=dry_run,
         # One job name, four slots and many arms, all legitimately keyed to
         # the same `--to` session (alpha-engine-config-I9781's shape).
         discriminator=f"{args.slot}.{name_component(args.arm)}",
@@ -919,6 +901,7 @@ def handle_experiment_backfill(args: argparse.Namespace) -> int:
                 "produced": len(result.get("produced", [])),
                 "already_present": len(result.get("already_present", [])),
                 "refused": result.get("refused", []),
+                "in_region_verdict": result.get("in_region_verdict"),
             },
             indent=2,
         )

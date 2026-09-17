@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from crucible.llm import DEFAULT_LLM_CAP_USD, DEFAULT_LLM_CAP_USD_MEASURED
-from crucible.store import LocalStore, S3Store, Store, parse_store_scheme, read_only
+from crucible.store import LocalStore, S3Store, Store, capturing, parse_store_scheme
 
 __all__ = [
     "CLOUDTRAIL_ARCHIVE_VAR",
@@ -247,10 +247,12 @@ class Settings:
         entry points into the same decision that disagreed is what let a
         `--dry-run` reach a production bucket through one of them.
 
-        Wrapped by :func:`crucible.store.read_only` when :attr:`dry_run` is
+        Wrapped by :func:`crucible.store.capturing` when :attr:`dry_run` is
         set — the same wrapping `open_store(..., dry_run=True)` does, so a
         caller cannot get a real write out of `--dry-run` by resolving its
-        store through this method instead of that function.
+        store through this method instead of that function, and both entry
+        points give a dry run the same REHEARSAL rather than one refusing and
+        the other recording (alpha-engine-config-I11012).
         """
         if not self.store_uri:
             raise ValueError(
@@ -260,7 +262,7 @@ class Settings:
                 "production because a flag was missing is noticed once."
             )
         resolved = store_from_uri(self.store_uri)
-        return read_only(resolved) if self.dry_run else resolved
+        return capturing(resolved) if self.dry_run else resolved
 
     def cloudtrail_bucket_prefix(self) -> tuple[str, str]:
         """The archive URI split into bucket and prefix, or ("", "") if unset."""

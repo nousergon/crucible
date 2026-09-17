@@ -1276,6 +1276,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     and the original exception is chained.
     """
     args = build_parser().parse_args(argv)
+    # The invocation's capture ledger (alpha-engine-config-I11012). Opened
+    # here, around EVERY handler, so the report is the same whether the job
+    # goes through `run_job` or returns from its own `--dry-run` branch
+    # first, and so a raise on the way through still reports the writes the
+    # rehearsal got as far as.
+    #
+    # `owns_ledger` is what makes `crucible weekly --dry-run` report once:
+    # `weekly` re-enters this function per stage in the same process, and a
+    # nested call sees the ledger already open, adds to it, and leaves both
+    # the render and the reset to the outermost call.
+    from crucible.store import active_capture_ledger, begin_capture, end_capture
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    owns_ledger = dry_run and active_capture_ledger() is None
+    ledger = begin_capture() if dry_run else None
     try:
         return _resolve_operator_input(args)
     except UsageError as exc:
@@ -1291,6 +1306,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         # once instead of only `python -m crucible.cli`.
         print(str(exc), file=sys.stderr)
         return USAGE_EXIT_CODE
+    finally:
+        if owns_ledger:
+            # Rendered on the failure path too, deliberately: a rehearsal
+            # that got three keys in and then raised is telling the operator
+            # both things, and printing only on success would hide the half
+            # the failing command most needs to explain.
+            print(ledger.render())
+            end_capture()
 
 
 def _resolve_operator_input(args: argparse.Namespace) -> int:

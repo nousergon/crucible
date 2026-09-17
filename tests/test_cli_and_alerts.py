@@ -534,7 +534,6 @@ class TestDryRunNeverWrites:
         "board",
         "console",
         "experiment.grade",
-        "experiment.run",
         "gate",
         # alpha-engine-config-I10095, verified 2026-09-06 the same way: on a
         # fresh store every registered gate reads UNMET or UNMEASURABLE, so
@@ -546,6 +545,12 @@ class TestDryRunNeverWrites:
         "release.pin",
         "report",
     )
+    # NOTE (alpha-engine-config-I11012): `experiment.run` left this set. Its
+    # dry run no longer prints a sentence restating its own source and
+    # returns — it EXECUTES `produce` against a write-capturing store, and on
+    # a fresh store that raises `MissingArtifactError` for the absent feature
+    # layer, which is precisely the rehearsal fidelity this issue bought. It
+    # is covered by a seeded row below instead.
 
     #: The jobs each covered by their own one-off SEEDED row below rather
     #: than the shared fresh-store parametrisation above -- each needs
@@ -559,6 +564,7 @@ class TestDryRunNeverWrites:
             "data.heal",
             "data.weekly",
             "drift",
+            "experiment.run",
             "explain",
             # alpha-engine-config-I11005: its dry run now RESOLVES the arm
             # against the slot's registered recipes, the way the job does, so
@@ -708,13 +714,19 @@ class TestDryRunNeverWrites:
 
         self._assert_no_new_keys(tmp_path, [])
 
-    @pytest.mark.parametrize("job", ["data.daily", "data.heal", "data.weekly"])
+    @pytest.mark.parametrize("job", ["data.heal", "data.weekly"])
     def test_dry_run_completes_cleanly_with_an_arctic_bucket_configured(
         self, job: str, tmp_path, monkeypatch
     ) -> None:
-        """These three construct an `ArcticPriceSource` (which needs a
+        """These two construct an `ArcticPriceSource` (which needs a
         bucket NAME, never a real connection) before their own dry-run
-        branch prints and returns — a `CRUCIBLE_ARCTIC_BUCKET` config gap,
+        branch prints and returns.
+
+        `data.daily` was a third row here until alpha-engine-config-I11012
+        removed its dry-run branch: its dry run now runs the real compile
+        against a write-capturing store, so a bucket NAME is no longer
+        enough — it reaches ArcticDB for real, which is the point. It has its
+        own seeded row below — a `CRUCIBLE_ARCTIC_BUCKET` config gap,
         not a store-write concern, and unrelated to `--dry-run` itself
         (the same `ValueError` fires with `--dry-run` omitted). Also asserted
         as a clean return, not a two-outcome one — same reasoning as above:
@@ -737,23 +749,260 @@ class TestDryRunNeverWrites:
 
         self._assert_no_new_keys(tmp_path, [])
 
-    def test_dry_run_experiment_backfill_resolves_the_arm_and_writes_nothing(
+    # ── alpha-engine-config-I11012 ─────────────────────────────────────────
+    #
+    # `--dry-run` used to resolve a `crucible.store.read_only` store, which
+    # made a dry run safe by RAISING at the first write. Safe, and not a
+    # rehearsal: no job body ever ran far enough to fail the way its run
+    # fails. Measured cost — a laptop dry run of `experiment.backfill --slot u
+    # --arm attractiveness --from 2025-11-17 --to 2026-09-09` reported "would
+    # produce 205 session(s)" for a command that died on the FIRST session in
+    # production, two minutes in.
+    #
+    # It now resolves a `crucible.store.capturing` store: real reads, writes
+    # RECORDED. The rows below assert the two halves — every job's dry run
+    # gets one of those stores, and the reported key set is the set the real
+    # run writes.
+
+    @staticmethod
+    def _capturing_stores_resolved_during(monkeypatch, run):
+        """Every store ``run()`` resolved, and whether each was capturing.
+
+        Spies on BOTH resolution sites, because there are two and they have
+        disagreed before: `crucible.store.open_store` (the CLI's own
+        `_resolve_store`) and `crucible.config.Settings.store` (which
+        track-A's eight handlers reach through `_settings`). A spy on one
+        would read green over a handler wired to the other.
+        """
+        from crucible import config as config_module
+        from crucible import store as store_module
+
+        resolved: list[object] = []
+
+        def _spy(original):
+            def _wrapped(store, **kwargs):
+                wrapped = original(store, **kwargs)
+                resolved.append(wrapped)
+                return wrapped
+
+            return _wrapped
+
+        monkeypatch.setattr(store_module, "capturing", _spy(store_module.capturing))
+        monkeypatch.setattr(config_module, "capturing", _spy(config_module.capturing))
+        run()
+        return resolved
+
+    @pytest.mark.parametrize("job", sorted(_CLEAN_ON_A_FRESH_STORE))
+    def test_every_dry_run_resolves_a_write_capturing_store(
+        self, job: str, tmp_path, monkeypatch
+    ) -> None:
+        """The property `--dry-run`'s help text has always claimed and only
+        the capturing store makes structural: the object every handler writes
+        through cannot reach the backend's write path at all.
+
+        Asserted per job rather than once on `open_store`, because what makes
+        a handler safe is which store IT resolved — the measured defect this
+        class exists for was a handler reaching the real backend while the
+        runner printed "no outputs recorded".
+        """
+        from crucible.store import is_capturing
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        argv = [
+            *_minimal_argv(job),
+            "--date",
+            FRIDAY.isoformat(),
+            "--store",
+            str(tmp_path),
+            "--dry-run",
+        ]
+
+        resolved = self._capturing_stores_resolved_during(monkeypatch, lambda: main(argv))
+
+        assert resolved, f"{job} --dry-run resolved no store through either wrap point"
+        assert all(is_capturing(store) for store in resolved)
+        self._assert_no_new_keys(tmp_path, [])
+
+    def test_dry_run_experiment_run_executes_produce_and_writes_nothing(
+        self, tmp_path, monkeypatch, source, strategy_dir
+    ) -> None:
+        """`experiment.run --dry-run` runs the slot's real `produce`.
+
+        The version this replaces printed "would call produce and write its
+        feed" — a sentence restating the handler's own source, which could
+        not be wrong and could not be right. Seeded with two compiled days
+        because `produce` reads the feature layer and nothing else (§10.4).
+        """
+        from conftest import sessions_ending
+
+        from crucible.data.daily import run_daily
+        from crucible.runner import run_job
+        from crucible.store import LocalStore, begin_capture, end_capture
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        store = LocalStore(tmp_path / "store")
+        for day in sessions_ending(FRIDAY, 2):
+            run_job(
+                "data.daily",
+                lambda c: run_daily(
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    expected_symbols=source.symbols(),
+                ),
+                store=store,
+                trading_day=day,
+            )
+        before = sorted(store.list_keys())
+
+        ledger = begin_capture()
+        try:
+            main(
+                [
+                    "experiment.run",
+                    "--slot",
+                    "u",
+                    "--date",
+                    FRIDAY.isoformat(),
+                    "--store",
+                    str(tmp_path / "store"),
+                    "--strategy-dir",
+                    str(strategy_dir),
+                    "--run-mode",
+                    "replay",
+                    "--dry-run",
+                ]
+            )
+        finally:
+            end_capture()
+
+        assert sorted(store.list_keys()) == before  # nothing NEW landed
+        # It reached the WRITE, which the print it replaces never did.
+        assert any(key.startswith("runs/experiment.run/") for key in ledger.keys)
+
+    def test_dry_run_data_daily_compiles_for_real_and_writes_nothing(
+        self, tmp_path, monkeypatch, source
+    ) -> None:
+        """`data.daily --dry-run` runs the real compile.
+
+        This is the job whose dry run most needed to become a rehearsal: a
+        missing feature column, an unsatisfiable declared input or a refusing
+        store grant all live inside the compile, and every one of them was
+        invisible to a print naming only the source and the store URI.
+
+        The price and point-in-time sources are substituted because the CLI
+        has no flag for a test source — `--source` admits `arctic` alone, on
+        purpose. Nothing else about the handler is faked.
+        """
+        from crucible import track_a
+        from crucible.store import LocalStore, begin_capture, end_capture
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        monkeypatch.setattr(track_a, "_source", lambda args, config: source)
+        monkeypatch.setattr(
+            track_a,
+            "_point_in_time_source",
+            lambda config: UnavailablePointInTimeSource(
+                reason="synthetic fixture market carries no fundamentals"
+            ),
+        )
+        store_root = tmp_path / "store"
+
+        ledger = begin_capture()
+        try:
+            main(
+                [
+                    "data.daily",
+                    "--date",
+                    FRIDAY.isoformat(),
+                    "--store",
+                    str(store_root),
+                    "--run-mode",
+                    "replay",
+                    "--symbols",
+                    ",".join(source.symbols()),
+                    "--dry-run",
+                ]
+            )
+        finally:
+            end_capture()
+
+        assert sorted(LocalStore(store_root).list_keys()) == []
+        assert len(ledger.keys) > 1, "the compile recorded no artifact beyond its manifest"
+
+    def test_the_reported_key_set_is_the_set_a_real_data_daily_writes(
+        self, tmp_path, monkeypatch, source
+    ) -> None:
+        """The Closes-when property, on a second job shape
+        (`alpha-engine-config-I11012`): what the rehearsal REPORTS is what the
+        run WRITES.
+
+        Two separate store roots rather than one run after the other, so the
+        real run cannot see anything the rehearsal left and the rehearsal
+        cannot see anything the real run left — there is nothing for either to
+        skip as already present.
+        """
+        from crucible import track_a
+        from crucible.store import LocalStore, begin_capture, end_capture
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        monkeypatch.setattr(track_a, "_source", lambda args, config: source)
+        monkeypatch.setattr(
+            track_a,
+            "_point_in_time_source",
+            lambda config: UnavailablePointInTimeSource(
+                reason="synthetic fixture market carries no fundamentals"
+            ),
+        )
+
+        def _argv(root, *extra):
+            return [
+                "data.daily",
+                "--date",
+                FRIDAY.isoformat(),
+                "--store",
+                str(root),
+                "--run-mode",
+                "replay",
+                "--symbols",
+                ",".join(source.symbols()),
+                *extra,
+            ]
+
+        ledger = begin_capture()
+        try:
+            main(_argv(tmp_path / "rehearsal", "--dry-run"))
+        finally:
+            end_capture()
+        assert sorted(LocalStore(tmp_path / "rehearsal").list_keys()) == []
+
+        main(_argv(tmp_path / "real"))
+        really_written = sorted(LocalStore(tmp_path / "real").list_keys())
+
+        assert sorted(ledger.keys) == really_written
+
+    def test_dry_run_experiment_backfill_fails_the_way_the_run_fails(
         self, tmp_path, monkeypatch, strategy_dir
     ) -> None:
-        """`experiment.backfill --dry-run` resolves the slot module, its
-        history producer, the session range, the registered arm and the
-        in-region guard — every check the job makes that does not write —
-        and files neither an artifact nor a manifest.
+        """The property `alpha-engine-config-I11012` bought, stated as
+        plainly as it can be: on a store with no feature layer, the REHEARSAL
+        raises the same `MissingArtifactError` the real run raises, from
+        inside the per-session produce call — and still writes nothing.
+
+        The version this replaces returned 0 here. It resolved the slot
+        module, the history producer, the range, the arm and the in-region
+        guard (`alpha-engine-config-I11005`) and then printed "NOT rehearsed:
+        the per-session produce call itself", which is where the measured
+        production failure lived. This is the row that would have caught it.
 
         The store is a subdirectory, not ``tmp_path`` itself, because the
         `strategy_dir` fixture writes its recipe tree there and a store
         rooted above it would count those files as store keys.
-
-        `alpha-engine-config-I11005`: the version this replaces printed
-        "would produce 205 session(s)" for a command that failed in two
-        minutes in production. A rehearsal that cannot fail the way the run
-        fails is not a rehearsal.
         """
+        from crucible.slots.cycle import MissingArtifactError
+
         monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
         argv = [
             "experiment.backfill",
@@ -772,7 +1021,9 @@ class TestDryRunNeverWrites:
             "--dry-run",
         ]
 
-        main(argv)  # must not raise at all -- see the class docstring
+        with pytest.raises(MissingArtifactError) as excinfo:
+            main(argv)
+        assert "the feature layer is absent" in str(excinfo.value)
 
         self._assert_no_new_keys(tmp_path / "store", [])
 

@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -34,14 +36,23 @@ from crucible.calendar import (
 )
 
 __all__ = [
+    "CAPTURED_URL_SCHEME",
     "ETAG_ABSENT",
     "PRESIGN_MAX_S",
     "DEFAULT_READ_ONLY_REASON",
+    "CaptureLedger",
+    "CapturedWrite",
     "DryRunWriteRefusedError",
     "LocalStore",
     "PointerConflictError",
     "S3Store",
     "Store",
+    "active_capture_ledger",
+    "begin_capture",
+    "capture_ledger_of",
+    "capturing",
+    "end_capture",
+    "is_capturing",
     "open_store",
     "parse_store_scheme",
     "read_only",
@@ -300,6 +311,29 @@ class Store(ABC):
         :data:`READERS` accordingly.
         """
 
+    def _assert_writable_key(self, key: str) -> None:
+        """Raise whatever this backend would raise for ``key`` on a WRITE,
+        without writing.
+
+        Exists for :func:`capturing`, which never reaches the backend's own
+        write path and would otherwise report a key the real run refuses —
+        a rehearsal that cannot fail the way the run fails, which is the
+        whole defect the capturing store exists to remove
+        (alpha-engine-config-I11012).
+
+        Private on purpose. :data:`MUTATORS` and :data:`READERS` must
+        PARTITION this interface's public surface
+        (`tests/test_board.py::test_the_mutator_declaration_partitions_the_
+        interface`), and this is neither: it writes nothing and reads
+        nothing, it only refuses. A public name here would have to be
+        classified as one or the other, and both classifications would be
+        false.
+
+        The base implementation refuses nothing because :class:`S3Store` has
+        no key refusal today; :class:`LocalStore` does, and overrides.
+        """
+        return None
+
     @staticmethod
     def _validated_expiry(expires_s: int) -> int:
         """``expires_s``, or a refusal naming the bound it broke."""
@@ -361,6 +395,16 @@ class LocalStore(Store):
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+
+    def _assert_writable_key(self, key: str) -> None:
+        """The same refusal :meth:`put_bytes` takes, reached without writing.
+
+        `_path` is where an absolute or traversing key is refused, and a
+        capturing dry run never calls it — so without this override a dry run
+        would report `"/etc/passwd"` as a key it would write and the real run
+        would raise on it.
+        """
+        self._path(key)
 
     def _path(self, key: str) -> Path:
         if key.startswith("/") or ".." in key.split("/"):
@@ -677,6 +721,324 @@ class S3Store(Store):
         return str(resp.get("ETag", "")).strip('"')
 
 
+# ── The write-capturing store (alpha-engine-config-I11012) ──────────────────
+
+#: The scheme :meth:`presigned_url` returns for a key that exists only as a
+#: CAPTURED write. Deliberately not a `file://` or `https://` URL: a dry run
+#: that handed back something that looked openable would put a dead link in
+#: front of whoever is reading the rehearsal.
+CAPTURED_URL_SCHEME = "crucible-dry-run://captured/"
+
+
+@dataclass(frozen=True)
+class CapturedWrite:
+    """One write a dry run would have made, recorded instead of performed.
+
+    ``schema_version`` is read out of the payload itself when the payload is
+    a JSON object declaring one, and is ``None`` otherwise. It is NOT taken
+    from `RunContext.record_output`'s `schema_version` argument: that value
+    never reaches the store (see `crucible.runner.RunContext.record_output`,
+    which hands `put_bytes` the bytes alone), and inventing a default here
+    would put a version on a parquet blob that declares none.
+    """
+
+    key: str
+    method: str
+    size_bytes: int
+    sha256: str
+    schema_version: str | None
+    object_lock_mode: str | None = None
+
+
+class CaptureLedger:
+    """The ordered record of what a dry run would have written.
+
+    One ledger spans a whole invocation, not one store: a job that resolves
+    the store once and a `weekly` arc that runs twelve stages in one process
+    both answer "which keys would this command write" from the same object.
+    """
+
+    def __init__(self) -> None:
+        self._writes: list[CapturedWrite] = []
+
+    def record(self, write: CapturedWrite) -> None:
+        self._writes.append(write)
+
+    @property
+    def writes(self) -> tuple[CapturedWrite, ...]:
+        """Every captured write, in the order the job made it. A key written
+        twice appears twice — a job that overwrites its own output inside one
+        run is a fact about that job, not noise to deduplicate away."""
+        return tuple(self._writes)
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        """The distinct keys, first-write order. This is the set the
+        Closes-when property compares against a real run's written keys."""
+        seen: dict[str, None] = {}
+        for write in self._writes:
+            seen.setdefault(write.key, None)
+        return tuple(seen)
+
+    def render(self) -> str:
+        """The operator-facing report. One line per write, key first."""
+        if not self._writes:
+            return "dry_run: no store writes captured — this command would write nothing."
+        lines = [f"dry_run: {len(self._writes)} store write(s) captured, none performed:"]
+        for write in self._writes:
+            schema = write.schema_version or "-"
+            lock = f" object_lock={write.object_lock_mode}" if write.object_lock_mode else ""
+            lines.append(
+                f"  {write.key}  ({write.method}, {write.size_bytes} bytes, schema {schema}){lock}"
+            )
+        return "\n".join(lines)
+
+
+#: The ledger every :func:`capturing` store built during THIS invocation
+#: records into, when one invocation has declared itself
+#: (:func:`begin_capture`). ``None`` outside one, in which case each capturing
+#: store gets a private ledger — a library caller wrapping a store by hand
+#: still gets a complete record of its own.
+_ACTIVE_LEDGER: CaptureLedger | None = None
+
+
+def begin_capture() -> CaptureLedger:
+    """Declare this invocation's capture ledger and return it.
+
+    Re-entrant by returning the ledger already active rather than replacing
+    it: `crucible weekly --dry-run` re-enters `crucible.cli.main` once per
+    stage in the same process, and a nested `begin_capture` that started a
+    fresh ledger would throw away every stage before it.
+
+    The caller that actually STARTED the ledger — the one that saw
+    :func:`active_capture_ledger` return ``None`` — is the one that calls
+    :func:`end_capture`.
+    """
+    global _ACTIVE_LEDGER
+    if _ACTIVE_LEDGER is None:
+        _ACTIVE_LEDGER = CaptureLedger()
+    return _ACTIVE_LEDGER
+
+
+def active_capture_ledger() -> CaptureLedger | None:
+    """This invocation's ledger, or ``None`` outside a declared capture."""
+    return _ACTIVE_LEDGER
+
+
+def end_capture() -> None:
+    """Clear the invocation ledger. Idempotent."""
+    global _ACTIVE_LEDGER
+    _ACTIVE_LEDGER = None
+
+
+def _schema_version_of(payload: bytes) -> str | None:
+    """The `schema_version` a JSON payload declares, or ``None``.
+
+    ``None`` is a real answer, not a swallowed failure: parquet blobs, the
+    strategy YAML tree and the release pointer all legitimately declare no
+    schema version at the top level, and a payload this cannot parse is a
+    payload with no declaration to report. Nothing downstream treats ``None``
+    as a pass — it is printed as `-` and compared as `None`.
+    """
+    if payload[:1] != b"{":
+        return None
+    try:
+        document = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    version = document.get("schema_version")
+    return version if isinstance(version, str) else None
+
+
+_CAPTURING_CLASS_CACHE: dict[type, type] = {}
+
+
+def _capturing_class(base: type) -> type:
+    """A subclass of ``base`` that RECORDS every :data:`Store.MUTATORS` call
+    and serves its own recorded bytes back to the readers.
+
+    A dynamic **subclass**, for the same measured reason
+    :func:`_read_only_class` is one: `release_retention.py`, `release.py` and
+    `release_lock_sweep.py` each do `isinstance(store, S3Store)`, and a
+    composition wrapper would fail every one of those checks under
+    `--dry-run`.
+
+    **There is no flag on this class.** Its `put_bytes` does not call
+    `super().put_bytes`; there is no branch on which a production write could
+    be reached, because the code that reaches the backend is not present in
+    the override at all. That is the difference between "a real Store with
+    writes disabled" — one `if` away from a production write — and this.
+
+    **The reads are real, and they see the run's own writes.** A job that
+    writes something and then reads it back is the ordinary shape (the arm
+    register, the board, every pointer), and a rehearsal whose read raised
+    `KeyError` where the real run succeeds would fail in a way the run does
+    not — the mirror image of the defect this closes. So `get_bytes`,
+    `exists`, `etag`, `list_keys` and `presigned_url` consult the captured
+    overlay first and fall through to the real backend, which is untouched.
+
+    **`compare_and_swap` still conflicts.** It checks ``expected`` against the
+    overlay-aware version exactly as the backend would and raises
+    :class:`PointerConflictError` on a mismatch, so a dry run of a job racing
+    a pointer it did not re-read fails the way the run fails.
+    """
+    cached = _CAPTURING_CLASS_CACHE.get(base)
+    if cached is not None:
+        return cached
+
+    def _capture(
+        self: Any,
+        key: str,
+        payload: bytes,
+        *,
+        method: str,
+        object_lock_mode: str | None = None,
+    ) -> None:
+        # The backend's own refusal, reached without writing: a key the real
+        # run would reject must not be reported as a key it would write.
+        self._assert_writable_key(key)
+        self._captured_bytes[key] = payload
+        self._capture_ledger.record(
+            CapturedWrite(
+                key=key,
+                method=method,
+                size_bytes=len(payload),
+                sha256=sha256_hex(payload),
+                schema_version=_schema_version_of(payload),
+                object_lock_mode=object_lock_mode,
+            )
+        )
+
+    def put_bytes(
+        self: Any,
+        key: str,
+        payload: bytes,
+        *,
+        object_lock_mode: str | None = None,
+        object_lock_retain_until: dt.datetime | None = None,
+    ) -> str:
+        _capture(self, key, payload, method="put_bytes", object_lock_mode=object_lock_mode)
+        # The content digest, which is what every backend's `put_bytes`
+        # returns and what `record_output` re-derives for itself anyway.
+        return sha256_hex(payload)
+
+    def compare_and_swap(self: Any, key: str, expected: str, payload: bytes) -> str:
+        current = self.etag(key)
+        if current != expected:
+            raise PointerConflictError(
+                f"{key!r} is at version {current[:12]!r}, not the expected "
+                f"{expected[:12]!r}. This is a DRY RUN: the conflict is real — the "
+                "pointer in the store really is at another version — and the real run "
+                "would take it too."
+            )
+        _capture(self, key, payload, method="compare_and_swap")
+        return sha256_hex(payload)
+
+    def get_bytes(self: Any, key: str) -> bytes:
+        staged = self._captured_bytes.get(key)
+        if staged is not None:
+            return staged
+        return base.get_bytes(self, key)
+
+    def exists(self: Any, key: str) -> bool:
+        return key in self._captured_bytes or base.exists(self, key)
+
+    def etag(self: Any, key: str) -> str:
+        staged = self._captured_bytes.get(key)
+        if staged is not None:
+            # The content digest, not the backend's own token shape. Within
+            # one dry run it is only ever compared to itself — it is handed
+            # to `compare_and_swap` above and nowhere else — and a dry run
+            # cannot know what ETag S3 would have minted for bytes it never
+            # sent.
+            return sha256_hex(staged)
+        return base.etag(self, key)
+
+    def list_keys(self: Any, prefix: str = "") -> Iterator[str]:
+        seen: set[str] = set()
+        for key in base.list_keys(self, prefix):
+            seen.add(key)
+            yield key
+        for key in sorted(self._captured_bytes):
+            if key.startswith(prefix) and key not in seen:
+                yield key
+
+    def presigned_url(self: Any, key: str, expires_s: int) -> str:
+        if key in self._captured_bytes:
+            # Validated exactly as the backend validates it, so a caller
+            # whose arithmetic production would refuse is refused here too.
+            self._validated_expiry(expires_s)
+            return f"{CAPTURED_URL_SCHEME}{key}"
+        return base.presigned_url(self, key, expires_s)
+
+    namespace = {
+        "put_bytes": put_bytes,
+        "compare_and_swap": compare_and_swap,
+        "get_bytes": get_bytes,
+        "exists": exists,
+        "etag": etag,
+        "list_keys": list_keys,
+        "presigned_url": presigned_url,
+    }
+    missing = set(Store.MUTATORS) - set(namespace)
+    if missing:
+        # A third mutator added to the interface without a capture override
+        # here would reach the real backend under `--dry-run`. Refused at
+        # class construction, which is the first moment it can be seen.
+        raise RuntimeError(
+            f"crucible.store.capturing has no override for {sorted(missing)}, which "
+            "Store.MUTATORS declares. A mutator with no capture override writes to the "
+            "real backend under --dry-run."
+        )
+    cls = type(f"Capturing{base.__name__}", (base,), namespace)
+    _CAPTURING_CLASS_CACHE[base] = cls
+    return cls
+
+
+def capturing(store: Store, *, ledger: CaptureLedger | None = None) -> Store:
+    """``store``, with its writes RECORDED instead of performed.
+
+    This is what `--dry-run` resolves (alpha-engine-config-I11012). It
+    subsumes :func:`read_only` for that caller: `read_only` made a dry run
+    safe by making it stop at the first write, which meant no job body ever
+    ran far enough for the rehearsal to fail the way the run fails. The
+    measured cost of that: a laptop dry run of `experiment.backfill --slot u
+    --arm attractiveness` reported "would produce 205 session(s)" for a
+    command that died on the FIRST session in production two minutes in.
+
+    `read_only` is NOT retired — `crucible gate` without `--publish`,
+    `migrate.history`'s v1 source and `crucible.faults`' unpublishable pin
+    are real runs that must not write, where a refusal is the correct answer
+    and a captured write would be a fiction.
+
+    ``ledger`` defaults to this invocation's ledger when one is active
+    (:func:`begin_capture`) and to a fresh private one otherwise.
+    """
+    cls = _capturing_class(type(store))
+    wrapped = object.__new__(cls)
+    wrapped.__dict__.update(store.__dict__)
+    wrapped._captured_bytes = {}
+    wrapped._capture_ledger = ledger or active_capture_ledger() or CaptureLedger()
+    return wrapped
+
+
+def is_capturing(store: Any) -> bool:
+    """Whether ``store`` records its writes rather than performing them.
+
+    The predicate `crucible.runner.run_job` asks before letting a dry run
+    assemble and record its own manifest.
+    """
+    return isinstance(getattr(store, "_capture_ledger", None), CaptureLedger)
+
+
+def capture_ledger_of(store: Any) -> CaptureLedger | None:
+    """``store``'s ledger, or ``None`` when it is not a capturing store."""
+    ledger = getattr(store, "_capture_ledger", None)
+    return ledger if isinstance(ledger, CaptureLedger) else None
+
+
 def resolve_store_uri(uri: str | None) -> str:
     """The store URI a caller actually gets, `--store` or `$CRUCIBLE_STORE`.
 
@@ -741,12 +1103,19 @@ def open_store(uri: str | None, *, dry_run: bool = False) -> Store:
     fallback — a job that silently wrote to production because a flag was
     missing is the kind of default that is only noticed once.
 
-    ``dry_run=True`` returns the backend wrapped by :func:`read_only`
-    (alpha-engine-config-I9922) — every CLI handler resolves its store
-    through this function (or `crucible.config.Settings.store`, which wraps
-    the same way) with `dry_run=bool(args.dry_run)`, so `--dry-run` is now
-    true of every job regardless of whether that job's own handler body
-    checks the flag.
+    ``dry_run=True`` returns the backend wrapped by :func:`capturing`
+    (alpha-engine-config-I11012, superseding the :func:`read_only` wrap of
+    -I9922) — every CLI handler resolves its store through this function (or
+    `crucible.config.Settings.store`, which wraps the same way) with
+    `dry_run=bool(args.dry_run)`, so `--dry-run` is true of every job
+    regardless of whether that job's own handler body checks the flag.
+
+    The wrap CHANGED rather than moved. `read_only` made a dry run safe by
+    refusing at the first write, so no job body ever ran past it and no
+    rehearsal could fail the way its run fails; `capturing` runs the real
+    body against real reads and records the key set it would have written.
+    A dry run still performs zero writes — that is structural, not a flag:
+    the capturing subclass has no code path to the backend's write at all.
     """
     target = resolve_store_uri(uri)
     kind, rest = parse_store_scheme(target)
@@ -755,4 +1124,4 @@ def open_store(uri: str | None, *, dry_run: bool = False) -> Store:
         store: Store = S3Store(bucket, prefix)
     else:
         store = LocalStore(target)
-    return read_only(store) if dry_run else store
+    return capturing(store) if dry_run else store

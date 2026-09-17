@@ -383,23 +383,84 @@ class TestTheCliHandler:
         assert document["status"] == "ok", document["reason"]
         assert document["rows_out"] == document["rows_in"] > 10
 
-    def test_a_dry_run_reports_the_range_and_writes_nothing(
+    def test_a_dry_run_executes_the_body_and_writes_nothing(
         self, store, strategy, monkeypatch, capsys
     ) -> None:
+        """`alpha-engine-config-I11012`. PR323's pre-flight still runs and
+        still prints — the arm RESOLVED (not merely named) and the history
+        entry point named — and then the body EXECUTES, per session, against
+        a store that records its writes instead of performing them.
+
+        The sentence this used to assert, "NOT rehearsed: the per-session
+        produce call itself", is gone because the thing it named is no longer
+        true. That call is exactly where the measured failure lived.
+        """
         from crucible.cli import main
+        from crucible.store import begin_capture, end_capture
 
         monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
         before = sorted(store.list_keys())
-        assert main(self._argv(store.root, strategy, extra=["--dry-run"])) == 0
+        # The test opens the ledger, so `main` sees one already active, adds
+        # to it and leaves it — the same re-entrancy `crucible weekly` uses.
+        ledger = begin_capture()
+        try:
+            assert main(self._argv(store.root, strategy, extra=["--dry-run"])) == 0
+        finally:
+            end_capture()
         printed = capsys.readouterr().out
-        # The arm RESOLVED (not merely named), the history entry point named,
-        # and the one thing the rehearsal cannot cover said out loud
-        # (alpha-engine-config-I11005 deliverable 3).
         assert "experiment.backfill --slot m --arm base (m:base:" in printed
         assert "produce_history" in printed
         assert "does not enter the serving path" in printed
-        assert "NOT rehearsed" in printed
+        assert "NOT rehearsed" not in printed
         assert sorted(store.list_keys()) == before
+        # It got as far as producing sessions, which is the whole point.
+        assert len(ledger.keys) > 1
+        assert any(key.startswith("runs/experiment.backfill/") for key in ledger.keys)
+
+    def test_the_reported_key_set_is_the_set_the_real_run_writes(
+        self, store, strategy, monkeypatch
+    ) -> None:
+        """The Closes-when property (`alpha-engine-config-I11012`): the keys a
+        dry run REPORTS are the keys a real run of the same command WRITES.
+
+        Run in this order on purpose — the rehearsal first, against the store
+        the real run has not touched yet, because a rehearsal run second
+        would see its own outputs already present and skip every session as
+        `already_present`.
+        """
+        from crucible.cli import main
+        from crucible.store import begin_capture, end_capture
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        before = set(store.list_keys())
+
+        ledger = begin_capture()
+        try:
+            assert main(self._argv(store.root, strategy, extra=["--dry-run"])) == 0
+        finally:
+            end_capture()
+        assert set(store.list_keys()) == before  # the rehearsal wrote nothing
+
+        assert main(self._argv(store.root, strategy, extra=["--i-am-in-region"])) == 0
+        really_written = set(store.list_keys()) - before
+
+        # The backfill's own result document is keyed by `run_id`, which is
+        # fresh per run by construction, so the two runs name different keys
+        # under that ONE prefix and are compared by prefix there. Every other
+        # key is compared exactly.
+        # Derived from the key builder, so a rename cannot leave this
+        # normalisation matching nothing and the comparison vacuously exact.
+        result_prefix = backfill_key(WARMUP_TO, "run").rsplit("/", 1)[0] + "/"
+
+        def _normalise(keys):
+            return {
+                (result_prefix + "<run_id>.json" if key.startswith(result_prefix) else key)
+                for key in keys
+            }
+
+        assert any(key.startswith(result_prefix) for key in ledger.keys)
+
+        assert _normalise(ledger.keys) == _normalise(really_written)
 
 
 #: The prefix the backfill's own result document lands under, derived from
