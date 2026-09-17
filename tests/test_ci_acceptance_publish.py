@@ -83,37 +83,86 @@ def test_the_reading_is_computed_with_write_json_and_a_commit() -> None:
     )
 
 
-def test_a_publish_step_exists_and_writes_the_acceptance_prefix() -> None:
-    """The producer must resolve the key through `crucible.keys.
-    acceptance_reading_key` — never restate the path as a literal — so the
-    producer (this workflow) and the consumer (`crucible/morning.py`) cannot
-    diverge on the shape (alpha-engine-config-I9902 adversarial review)."""
+def test_a_publish_step_exists_and_runs_the_registered_job() -> None:
+    """The publisher is `crucible acceptance.publish`, not a copy.
+
+    `alpha-engine-config-I10968`: this was a raw `aws s3 cp` of the local
+    reading file, preceded by two shell steps that resolved the trading day
+    and the store key through `python -c` one-liners. None of it went through
+    `crucible.store.Store`, so the producer of the one plan §12 rule-3
+    progress figure wrote no run manifest — while `crucible report.morning`,
+    `crucible board` and phase 0's own gate clause all read that artifact as
+    evidence.
+
+    The key shape is still resolved through `crucible.keys.
+    acceptance_reading_key` and the day through `crucible.calendar` — but
+    INSIDE the job body now, which is the stronger form of the property
+    `alpha-engine-config-I9902`'s review asked for: a value resolved in the
+    process that performs the write cannot drift from the value the consumer
+    reads, and there is no shell step left in which to restate either.
+    """
     job = _acceptance_job()
     names = _step_names(job)
     assert any("publish" in name.lower() for name in names), (
         "no step in ci.yml's acceptance job publishes the acceptance reading"
     )
-    bodies = "\n".join(_step_bodies(job))
-    assert "acceptance_reading_key" in bodies, (
-        "the workflow must resolve the publish key by calling "
-        "crucible.keys.acceptance_reading_key, not restating the path"
-    )
     steps = job["steps"]
     publish_idx = next(i for i, s in enumerate(steps) if "publish" in s.get("name", "").lower())
     publish_body = steps[publish_idx].get("run", "")
-    assert "report/acceptance/" not in publish_body, (
-        "the publish step must not hand-write the report/acceptance/ literal "
-        "— it must use the key resolved from keys.acceptance_reading_key"
+    assert "crucible acceptance.publish" in publish_body, (
+        "the publish step must run the registered job, so the write goes "
+        "through crucible.runner.run_job and files a manifest (rule 1)"
+    )
+    assert "--run-mode" in publish_body, (
+        "a crucible job's invocation declares its run mode; omitted, it falls "
+        "back to $CRUCIBLE_RUN_MODE and a replay could file a live key"
+    )
+    assert "aws s3" not in publish_body, (
+        "the reading is published through the store, never copied around it"
     )
 
 
-def test_the_trading_day_is_resolved_through_the_calendar_not_the_wall_clock_date() -> None:
-    """§4.12: every store key is an NYSE trading day, resolved through
-    `crucible.calendar`, never a raw calendar date."""
+def test_no_step_copies_anything_into_the_store_behind_the_cli() -> None:
+    """The class, not the instance (`engagement-protocol-policy` §5).
+
+    A second hand-rolled copy anywhere in this job would file no manifest for
+    exactly the same reason the first one did. The `aws s3api
+    get-bucket-versioning` READ stays legal; a write does not.
+    """
+    for step in _acceptance_job()["steps"]:
+        body = step.get("run", "")
+        for line in body.splitlines():
+            if "aws s3 cp" in line or "aws s3 sync" in line or "aws s3api put-object" in line:
+                assert "STORE_URI" not in line, (
+                    f"step {step.get('name')!r} writes to the store with the AWS CLI: "
+                    f"{line.strip()!r}. A store write is a job, so that it files a "
+                    "manifest (rule 1)."
+                )
+
+
+def test_the_key_and_the_trading_day_are_never_restated_in_the_shell() -> None:
+    """§4.12 plus `alpha-engine-config-I9902`, asserted as an ABSENCE now.
+
+    The two `python -c` resolution steps are gone: the job resolves both, so a
+    workflow edit has nothing left to get wrong. A step that reintroduced
+    either would be resolving a value a second time, in a second place, which
+    is the drift both issues were about.
+    """
     bodies = "\n".join(_step_bodies(_acceptance_job()))
-    assert "resolve_trading_day" in bodies, (
-        "the trading day used in the published key must come from "
-        "crucible.calendar.resolve_trading_day, not date(1)/UTC-now"
+    assert "acceptance_reading_key" not in bodies, (
+        "the publish key is resolved inside `crucible acceptance.publish`, not "
+        "in a shell step that hands it to a copy command"
+    )
+    steps = _acceptance_job()["steps"]
+    publish_body = next(s.get("run", "") for s in steps if "publish" in s.get("name", "").lower())
+    # Scoped to the publishing step: the identity step's REFUSAL MESSAGE names
+    # the prefix its OIDC role is scoped to, which is documentation of a grant,
+    # not a key being restated to write to.
+    assert "report/acceptance/" not in publish_body, (
+        "the publish step must not hand-write the report/acceptance/ literal"
+    )
+    assert "resolve_trading_day" not in bodies, (
+        "the trading day is resolved inside the job, through crucible.calendar"
     )
 
 

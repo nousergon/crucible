@@ -98,6 +98,18 @@ env:
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   REVIEW_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.CRUCIBLE_ROLE_PREFIX }}-review
   STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
+  # ── every value the package refuses to run without ─────────────────────
+  # `crucible review.record` (alpha-engine-config-I10968) is a real crucible
+  # job run with `--run-mode live`, which `tests/test_workflow_required_env.py`
+  # reads as "reaches the production store" and requires every `require_env`
+  # call site under `crucible/` to be declared here. This job reaches none of
+  # them — it files one document and its manifest — but declaring a variable a
+  # job never reads costs nothing, and the reverse is the dark board that test
+  # exists to prevent (alpha-engine-config-I10156). Same repository VARIABLES
+  # board.yml and gate-close.yml resolve.
+  CRUCIBLE_MUTED_TOPIC: ${{ vars.CRUCIBLE_MUTED_TOPIC }}
+  CRUCIBLE_PAGES_TOPIC: ${{ vars.CRUCIBLE_PAGES_TOPIC }}
+  CRUCIBLE_LIQUIDITY_FLOOR_USD: ${{ vars.CRUCIBLE_LIQUIDITY_FLOOR_USD }}
 
 jobs:
   record-verdict:
@@ -231,7 +243,15 @@ jobs:
           # The key, the trading-day resolution and the document shape all come
           # from `crucible` — the same module the gate clause reads back — so
           # there is nothing here for a workflow edit to restate incorrectly.
-          key="$(uv run python -m crucible.review record \
+          #
+          # `crucible review.record`, not the module entry point it used to
+          # reach (alpha-engine-config-I10968): the recording path is a
+          # registered job, so it writes `runs/review.record/{day}/run.json`
+          # in a `try/finally` alongside the verdict. A refused self-review
+          # therefore leaves a `failed` manifest naming the refusal, where it
+          # previously left nothing at all — "a review was attempted and
+          # refused" and "no review was attempted" are different facts.
+          key="$(uv run --frozen crucible review.record \
             --commits commits.json \
             --reviewer "$REVIEWER" \
             --phase "$PHASE" \
@@ -239,6 +259,7 @@ jobs:
             --head-sha "$REVIEW_SHA" \
             --pr-number "$PR_NUM" \
             --summary "$SUMMARY" \
+            --run-mode live \
             --store "$STORE_URI")"
           echo "Filed $key"
           echo "Filed \`$key\`" >> "$GITHUB_STEP_SUMMARY"

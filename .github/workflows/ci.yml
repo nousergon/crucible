@@ -73,6 +73,19 @@ env:
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   ACCEPTANCE_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.CRUCIBLE_ROLE_PREFIX }}-acceptance
   STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
+  # -- every value the package refuses to run without ---------------------
+  # `crucible acceptance.publish` (alpha-engine-config-I10968) is a real
+  # crucible job run with `--run-mode live`, which
+  # `tests/test_workflow_required_env.py` reads as "reaches the production
+  # store" and requires every `require_env` call site under `crucible/` to be
+  # declared here. This job reaches none of them - it publishes one document
+  # and its manifest - but declaring a variable a job never reads costs
+  # nothing, and the reverse is the dark board that test exists to prevent
+  # (alpha-engine-config-I10156). The same repository VARIABLES board.yml and
+  # gate-close.yml resolve.
+  CRUCIBLE_MUTED_TOPIC: ${{ vars.CRUCIBLE_MUTED_TOPIC }}
+  CRUCIBLE_PAGES_TOPIC: ${{ vars.CRUCIBLE_PAGES_TOPIC }}
+  CRUCIBLE_LIQUIDITY_FLOOR_USD: ${{ vars.CRUCIBLE_LIQUIDITY_FLOOR_USD }}
   # The CloudFormation TEMPLATE upload bucket the operator remedy below
   # prints — a separate bucket from CRUCIBLE_STORE_URI's store, and a bucket
   # name is still an infrastructure identifier `crucible/AGENTS.md`
@@ -457,29 +470,28 @@ jobs:
             --write-json acceptance-reading.json --commit "${GITHUB_SHA}" \
             --store-versioning "${{ steps.versioning.outputs.status }}" acceptance.xml
 
-      - name: Resolve the trading day
-        id: trading_day
-        run: |
-          day="$(uv run --frozen python -c 'from crucible.calendar import resolve_trading_day; print(resolve_trading_day())')"
-          echo "day=${day}" >> "$GITHUB_OUTPUT"
-
-      # Plan §12 rule 3 — the acceptance count is the only progress figure —
-      # and `alpha-engine-config-I9902`'s whole point: this is the ONE place
-      # that files `crucible.keys.acceptance_reading_key`'s producer
-      # contract, so `crucible report.morning` and the board can read it from
-      # a store artifact instead of a git checkout of `main`. The key is
-      # resolved through `crucible.keys.acceptance_reading_key` itself —
-      # never restated as a literal — so the producer and the consumer
-      # (`crucible/morning.py`) cannot diverge on the shape.
-      - name: Resolve the acceptance reading key
-        id: reading_key
-        run: |
-          key="$(uv run --frozen python -c 'from crucible.keys import acceptance_reading_key; print(acceptance_reading_key("${{ steps.trading_day.outputs.day }}"))')"
-          echo "key=${key}" >> "$GITHUB_OUTPUT"
-
+      # Plan section 12 rule 3 - the acceptance count is the only progress
+      # figure - and `alpha-engine-config-I9902`'s whole point: this is the ONE
+      # place that files `crucible.keys.acceptance_reading_key`'s producer
+      # contract, so `crucible report.morning` and the board can read it from a
+      # store artifact instead of a git checkout of `main`.
+      #
+      # `crucible acceptance.publish`, not `aws s3 cp`
+      # (`alpha-engine-config-I10968`). The copy went nowhere near
+      # `crucible.store.Store`, so the producer of the one progress figure
+      # wrote no run manifest on either path: no lineage, no spend, no code
+      # sha, and nothing that said it had run. The job resolves the trading day
+      # through `crucible.calendar` and the store key through
+      # `crucible.keys.acceptance_reading_key` INSIDE the job body - the two
+      # shell steps that used to resolve both are gone, because a value
+      # resolved in the process that writes it cannot drift from the value the
+      # consumer (`crucible/morning.py`) reads.
       - name: Publish the acceptance reading
         run: |
-          aws s3 cp acceptance-reading.json "${STORE_URI}/${{ steps.reading_key.outputs.key }}" --only-show-errors
+          uv run --frozen crucible acceptance.publish \
+            --reading acceptance-reading.json \
+            --run-mode live \
+            --store "$STORE_URI"
 
       - name: Fail the job if the reading moved
         if: steps.check.outcome != 'success'

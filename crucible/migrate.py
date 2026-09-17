@@ -345,6 +345,19 @@ def run_migrate_history(
     champion source or no recipe raises rather than defers, because the caller
     said it was there. The admission predicate still applies to every slot —
     an explicit request cannot seat a pointer on an arm that emits nothing.
+
+    **One rule, two renderings** (`alpha-engine-config-I10961` deliverable 4):
+    on the ASSERTED path every refusal raises; on the scheduled path — which
+    asserts nothing, because the arc dispatches this job with no `--slots`
+    equivalent at all — EVERY refusal is a recorded `deferred` reason and the
+    run exits `ok`. Exhaustively: a slot whose arm has not produced, a declared
+    v1 source that is absent, a champion name with no v2 recipe supplied, a
+    recipe belonging to another slot, a recipe whose id the bootstrap cannot
+    reproduce, and a pointer already held by another writer. An arc stage that
+    raised on any of them would kill every stage after it, which is the defect
+    `crucible-PR317` closed one stage earlier — and every one of those states
+    is reachable on an ordinary Saturday: `promote` writes the same pointer an
+    hour later, and v1 is being decommissioned underneath the sources.
     """
     recipes = arm_recipes or {}
     found: list[dict[str, Any]] = []
@@ -374,7 +387,19 @@ def run_migrate_history(
             continue
         found.append({"source": source.name, "key": source.key, "document": document})
 
-    if missing and not allow_missing:
+    asserted = slots is not None
+    # ASSERTED only (`alpha-engine-config-I10961` deliverable 4). A caller that
+    # named its slots said the sources were there, and a partial import under
+    # that claim is the provenance laundering this refusal exists to stop. The
+    # SCHEDULED path names nothing: it is an arc stage now, and an arc stage
+    # that raises on a by-design state kills every stage after it
+    # (`crucible-PR317` / `-I10927`). v1 is being decommissioned, so a source
+    # that has stopped existing is the expected end state, not a Saturday
+    # failure — and the hazard the refusal names is already prevented per slot
+    # below, where a slot whose own champion source is absent is DEFERRED with
+    # `no_v1_pointer` rather than imported from a cutover-day clock. Every
+    # absence stays in `sources_missing` and in the metric's `status_reason`.
+    if missing and not allow_missing and asserted:
         detail = "\n".join(f"  - {m['source']}: {m['key']} ({m['reason']})" for m in missing)
         raise MigrationSourceMissing(
             f"{len(missing)} of {len(SOURCES)} declared v1 sources are absent:\n{detail}\n"
@@ -388,7 +413,6 @@ def run_migrate_history(
     pointers: dict[str, str] = {}
     deferred: dict[str, str] = {}
     planned: list[tuple[Any, ...]] = []
-    asserted = slots is not None
     documents_by_source = {
         f["source"]: f["document"] for f in found if f.get("document") is not None
     }
@@ -416,20 +440,32 @@ def run_migrate_history(
             continue
         recipe = recipes.get(champion_name)
         if recipe is None:
-            raise MigrationSourceMissing(
+            why = (
                 f"v1 slot {slot!r} names champion {champion_name!r} and no v2 recipe was "
                 "supplied for it. The mapping from a v1 producer name to a v2 ranker "
                 "plus parameters is a judgement, not an inference: attaching a v1 track "
                 "record to a rule that is not the one that earned it would launder "
                 "provenance. Supply it in `arm_recipes`."
             )
+            if asserted:
+                raise MigrationSourceMissing(why)
+            imported[slot] = []
+            pointers[slot] = "deferred"
+            deferred[slot] = why
+            continue
         if recipe.slot != slot:
-            raise MigrationSourceMissing(
+            why = (
                 f"v1 slot {slot!r} names champion {champion_name!r}, and the recipe "
                 f"supplied under that name is a slot-{recipe.slot!r} arm. Importing it "
-                f"would register `{slot}:{champion_name}` — an arm no published recipe "
-                "defines — and point the slot at it, which would launder provenance."
+                f"would register `{slot}:{champion_name}` - an arm no published recipe "
+                "defines - and point the slot at it, which would launder provenance."
             )
+            if asserted:
+                raise MigrationSourceMissing(why)
+            imported[slot] = []
+            pointers[slot] = "deferred"
+            deferred[slot] = why
+            continue
         v1_promotion_source = pointer.get("promotion_source", "unknown")
         registered_at, date_source = _date_of(pointer, source=source, recipe=recipe)
         spec = _bootstrap_spec(
@@ -443,13 +479,19 @@ def run_migrate_history(
         if spec.arm_id != recipe.arm_id:
             # `ArmSpec.spec` hashes slot/name/ranker/params/control/control_kind
             # and no provenance, so these agree unless the recipe is a control
-            # arm — which can never hold a pointer (§10.1).
-            raise MigrationSourceMissing(
+            # arm - which can never hold a pointer (section 10.1).
+            why = (
                 f"v1 slot {slot!r} champion {champion_name!r} resolves to recipe "
                 f"{recipe.arm_id}, but its import would register {spec.arm_id}; a "
                 "control arm cannot be a champion, and a pointer at an id no recipe "
                 "produces would never be scored."
             )
+            if asserted:
+                raise MigrationSourceMissing(why)
+            imported[slot] = []
+            pointers[slot] = "deferred"
+            deferred[slot] = why
+            continue
         pointer_key = champion_key(slot)
         expected = ctx.store.etag(pointer_key)
         if expected != ETAG_ABSENT:
@@ -465,13 +507,26 @@ def run_migrate_history(
                 imported[slot] = [spec.arm_id]
                 pointers[slot] = "unchanged"
                 continue
-            raise MigrationPointerConflict(
+            conflict = (
                 f"{pointer_key} already holds arm {existing.get('arm_id')!r} "
                 f"(promotion_source {existing.get('promotion_source')!r}, evidence status "
                 f"{existing_evidence.get('status')!r}); this migration would point it at "
                 f"{spec.arm_id!r}. A v1 import seeds an ABSENT pointer and never "
                 "overwrites a promotion or an operator revert."
             )
+            if asserted:
+                raise MigrationPointerConflict(conflict)
+            # The scheduled path DEFERS the same fact. Once `promote` moves a
+            # pointer on the arena's own evidence — which is the normal end
+            # state, and `promote` is an arc stage an hour after this one —
+            # every later run of this stage would otherwise raise and kill the
+            # rest of the arc behind it (`crucible-PR317` / `-I10927`). The
+            # refusal is unchanged in substance: nothing is written, and the
+            # reason is on the manifest rather than in a traceback.
+            imported[slot] = []
+            pointers[slot] = "deferred"
+            deferred[slot] = conflict
+            continue
         # The pointer is ABSENT, so this run would SEAT the slot. That is the
         # moment the deferral predicate applies — and only that moment: a
         # pointer this migration already wrote is `unchanged` above, and never

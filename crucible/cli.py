@@ -33,6 +33,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from crucible import __version__, morning, track_c, track_e, track_f  # track-C, track-E, track-F
+from crucible.acceptance_publish import ACCEPTANCE_PUBLISH_JOB, acceptance_publish_handler
 from crucible.calendar import resolve_trading_day
 from crucible.fault_probe import FAULT_PROBE_JOB, fault_probe_handler
 from crucible.faults import FAULT_RECORD_JOB, record_fault
@@ -49,6 +50,7 @@ from crucible.keys import manifest_key as _promote_manifest_key
 from crucible.llm import FAULT_INJECTION_CAPABILITY_CLASSES
 from crucible.models import FAULT_OUTCOME_VALUES
 from crucible.release_retention import RELEASE_LOCK_JOB, release_lock_handler
+from crucible.review import REVIEW_RECORD_JOB, review_record_handler
 from crucible.runmode import RUN_MODES, RunModeError, resolve_run_mode
 from crucible.track_a import HANDLERS as TRACK_A_HANDLERS
 from crucible.track_a import add_track_a_arguments
@@ -152,10 +154,13 @@ def _resolve_store(args: argparse.Namespace):
     adds is the CLI's exit convention: a missing store is a usage error, and
     a traceback for one is noise in front of a one-line fix.
 
-    Read-only when `--dry-run` is set (alpha-engine-config-I9922 N1) — the
-    store this returns is the one every handler writes through, so this is
-    where `--dry-run`'s own CLI help ("write nothing") becomes true for every
-    job rather than only the ones whose handler body happened to check it.
+    WRITE-CAPTURING when `--dry-run` is set (alpha-engine-config-I9922 N1,
+    then -I11012) — the store this returns is the one every handler writes
+    through, so this is where `--dry-run`'s own CLI help ("write nothing")
+    becomes true for every job rather than only the ones whose handler body
+    happened to check it. A capturing store RECORDS each write instead of
+    performing it, so a rehearsal exercises the real body and fails the way
+    the run fails, rather than raising on the first write it attempts.
     """
     from crucible.store import open_store
 
@@ -421,17 +426,15 @@ def _migrate_arm_filed_on(args: argparse.Namespace) -> int:
     return 0
 
 
-#: The slots whose v1 champion pointer `migrate.history` imports. M's v1
-#: promotions are a dated lineage series, read and counted but never turned
-#: into a pointer (see `crucible.migrate.SOURCES`), and S has no v1 pointer.
-_MIGRATE_HISTORY_SLOTS: tuple[str, ...] = ("u", "r")
-
-
 def _migrate_history(args: argparse.Namespace) -> int:
     """`crucible migrate.history [--v1-store URI] [--strategy-dir DIR] [--allow-missing]`.
 
-    Imports v1's U and R champion pointers into the v2 register and
-    `champions/{slot}/current.json` (plan §9.8, `alpha-engine-config-I10713`).
+    Imports v1's champion pointers into the v2 register and
+    `champions/{slot}/current.json` (plan §9.8, `alpha-engine-config-I10713`),
+    for every slot `crucible.migrate.MIGRATABLE_SLOTS` declares a v1 champion
+    source for — each admitted or DEFERRED against the live v2 store by
+    `crucible.migrate.admission_refusal`, never by a hardcoded slot list
+    (`alpha-engine-config-I10961`).
 
     * **Recipes come from the published strategy tree**, through the same
       `load_arm_specs` the U/R cycle uses (`--strategy-dir` checkout first,
@@ -453,9 +456,9 @@ def _migrate_history(args: argparse.Namespace) -> int:
     """
     from crucible.config import settings as resolve_settings
     from crucible.config import store_from_uri
-    from crucible.migrate import run_migrate_history
+    from crucible.migrate import MIGRATABLE_SLOTS, run_migrate_history
     from crucible.runner import run_job
-    from crucible.slots.arms import load_arm_specs
+    from crucible.slots.arms import FOREIGN_RECIPE_LOADERS, load_arm_specs
     from crucible.store import read_only
 
     dry_run = bool(getattr(args, "dry_run", False))
@@ -486,7 +489,26 @@ def _migrate_history(args: argparse.Namespace) -> int:
     v1_store = read_only(store_from_uri(v1_uri), reason="migrate.history reads v1 read-only")
 
     recipes = {}
-    for slot in _MIGRATE_HISTORY_SLOTS:
+    # `MIGRATABLE_SLOTS`, never a literal: `("u", "r")` was hardcoded here and
+    # in the `run_migrate_history` call below, so the production path could not
+    # resolve M on the day M's arms arrived and nothing anywhere went red
+    # (`alpha-engine-config-I10961`). A default cannot expire; the predicate
+    # `crucible.migrate.admission_refusal` evaluates against the live store on
+    # every run, and `slots=None` below is what reaches it.
+    for slot in MIGRATABLE_SLOTS:
+        if slot in FOREIGN_RECIPE_LOADERS:
+            # M and S recipes are a different kind of document and
+            # `load_arm_specs` refuses them BY NAME (`crucible.slots.arms.
+            # FOREIGN_RECIPE_LOADERS`). The slot is still CONSIDERED - it stays
+            # in `MIGRATABLE_SLOTS`, reaches `run_migrate_history`, and is
+            # recorded `deferred` naming the recipe that was not supplied -
+            # which is the whole difference from the hardcoded `("u", "r")`
+            # this replaced: the state is on the manifest every week instead of
+            # being invisible. Supplying an M recipe here means mapping v1's
+            # `champion_arch` onto a `ModelRecipe`, whose id is the hash of a
+            # different spec shape than `_bootstrap_spec` builds
+            # (`alpha-engine-config-I10961` deliverable 2, still open).
+            continue
         for recipe in load_arm_specs(slot, store=store, strategy_dir=config.strategy_dir):
             if recipe.name in recipes:
                 raise ValueError(
@@ -500,7 +522,10 @@ def _migrate_history(args: argparse.Namespace) -> int:
         result = run_migrate_history(
             ctx,
             v1_store=v1_store,
-            slots=_MIGRATE_HISTORY_SLOTS,
+            # None, not a tuple: passing slots ASSERTS them, and an asserted
+            # slot whose champion source or recipe is absent RAISES rather
+            # than deferring. The scheduled arc path asserts nothing.
+            slots=None,
             arm_recipes=recipes,
             allow_missing=bool(getattr(args, "allow_missing", False)),
             dry_run=dry_run,
@@ -574,8 +599,11 @@ JOBS: dict[str, JobSpec] = {
         "Read the sealed holdout's seal state, or unseal it under a ruling",
         False,
     ),
+    # SCHEDULED as of `alpha-engine-config-I10961` deliverable 4: the import
+    # is a weekly arc stage (`components.yaml`, 14:30), so the deferral that
+    # left M out has a trigger rather than waiting on an operator remembering.
     "migrate.history": JobSpec(
-        "migrate.history", "Import v1 arm history with its provenance", False
+        "migrate.history", "Import v1 arm history with its provenance", True
     ),
     "release.pin": JobSpec("release.pin", "Repoint a release, or pin the trader to one", False),
     # alpha-engine-config-I9898: the repair for a release published before
@@ -671,6 +699,26 @@ JOBS: dict[str, JobSpec] = {
     INTEGRATION_TEST_JOB: JobSpec(
         INTEGRATION_TEST_JOB,
         "Run tests/integration (real S3 + real ArcticDB) and report pass/fail",
+        False,
+    ),
+    # alpha-engine-config-I10968, the same class one call site on:
+    # `alpha-engine-config-I10459` promoted the nightly integration summary out
+    # of a hand-rolled `store.put_bytes` in a workflow and left the other two
+    # writers of this shape untouched. Both are registered here.
+    #
+    # NOT scheduled, either of them: each is triggered by the workflow that
+    # already owns its event — `adversarial-review-record.yml`'s
+    # `workflow_dispatch` and `ci.yml`'s `push`/`pull_request` — never a clock.
+    # A deadline on either would page for a day on which nobody reviewed or
+    # merged anything.
+    REVIEW_RECORD_JOB: JobSpec(
+        REVIEW_RECORD_JOB,
+        "File one independent adversarial review verdict in the store",
+        False,
+    ),
+    ACCEPTANCE_PUBLISH_JOB: JobSpec(
+        ACCEPTANCE_PUBLISH_JOB,
+        "Publish the plan §12 rule-3 acceptance reading this commit measured",
         False,
     ),
 }
@@ -771,6 +819,8 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     FAULT_PROBE_JOB: fault_probe_handler,
     IAC_CONFORMANCE_JOB: iac_conformance_handler,
     INTEGRATION_TEST_JOB: integration_test_handler,
+    REVIEW_RECORD_JOB: review_record_handler,
+    ACCEPTANCE_PUBLISH_JOB: acceptance_publish_handler,
 }
 
 
@@ -986,6 +1036,30 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if spec.name == "data.heal":
             sub.add_argument("--gap", required=True, help="The named gap to repair.")
+        if spec.name == REVIEW_RECORD_JOB:
+            # The same inputs `python -m crucible.review record` took before
+            # this became a job (alpha-engine-config-I10968). The `authors`
+            # and `check` verbs stay on `python -m crucible.review`: they
+            # write nothing, and the recording workflow runs `check` BEFORE it
+            # asks for AWS credentials.
+            sub.add_argument("--commits", required=True, help="GET /pulls/{n}/commits, as JSON")
+            sub.add_argument("--reviewer", required=True)
+            sub.add_argument("--phase", required=True)
+            sub.add_argument("--verdict", required=True, choices=("pass", "fail"))
+            sub.add_argument("--head-sha", required=True)
+            sub.add_argument("--pr-number", required=True, type=int)
+            sub.add_argument("--summary", required=True)
+        if spec.name == ACCEPTANCE_PUBLISH_JOB:
+            sub.add_argument(
+                "--reading",
+                required=True,
+                metavar="PATH",
+                help=(
+                    "The reading `tests/acceptance/check_reading.py --write-json` just "
+                    "wrote. Published as-is: this job records a measurement, it does not "
+                    "take a second one."
+                ),
+            )
         if spec.name == "migrate.history":
             sub.add_argument(
                 "--strategy-dir",

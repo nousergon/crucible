@@ -974,7 +974,14 @@ def test_the_workflow_calls_crucible_review_rather_than_reimplementing_it() -> N
     producer and consumer is impossible rather than merely unlikely."""
     script = "\n".join(_record_steps())
     assert "python -m crucible.review check" in script
-    assert "python -m crucible.review record" in script
+    # The FILING half is a registered job now (`alpha-engine-config-I10968`),
+    # so it writes `runs/review.record/{trading_day}/run.json` beside the
+    # verdict instead of reaching `store.put_bytes` from a module `__main__`
+    # that filed no manifest on either path. The `check` half deliberately
+    # stays on `python -m crucible.review`: it writes nothing, and it runs
+    # BEFORE the credential step.
+    assert "crucible review.record" in script
+    assert "python -m crucible.review record" not in script
 
 
 def test_the_self_review_refusal_runs_before_any_credential_is_issued() -> None:
@@ -1255,10 +1262,30 @@ def _run_step(
     bin_dir.mkdir()
     (bin_dir / "gh").write_text(_FAKE_GH)
     (bin_dir / "gh").chmod(0o755)
+    # `uv run [--frozen ...] <command>`: the flags between `run` and the
+    # command are `uv`'s own and must be dropped, not exec'd. The stub used to
+    # `shift` once and exec the rest, which worked only while every workflow
+    # step happened to call `uv run python ...` with no flags —
+    # `alpha-engine-config-I10968` made the filing step `uv run --frozen
+    # crucible review.record`, exactly as integration-nightly.yml already
+    # invokes its own job, and the stub then tried to execute `--frozen`.
     (bin_dir / "uv").write_text(
-        '#!/usr/bin/env bash\nset -euo pipefail\n[ "$1" = "run" ] || exit 0\nshift\nexec "$@"\n'
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        '[ "$1" = "run" ] || exit 0\n'
+        "shift\n"
+        'while [ $# -gt 0 ] && [ "${1#-}" != "$1" ]; do shift; done\n'
+        'exec "$@"\n'
     )
     (bin_dir / "uv").chmod(0o755)
+    # The `crucible` console script, supplied the same way and for the same
+    # reason as the `python` shim below: the workflow text under test names
+    # the entry point CI has, and the harness provides it rather than the
+    # workflow being rewritten to something CI does not run.
+    (bin_dir / "crucible").write_text(
+        f'#!/usr/bin/env bash\nexec {sys.executable!r} -m crucible.cli "$@"\n'
+    )
+    (bin_dir / "crucible").chmod(0o755)
     # The workflow text under test calls `uv run python ...`, which is what CI
     # runs — a machine that only has `python3` on PATH (this laptop, measured)
     # must still exercise that exact text rather than a rewritten one. The
@@ -1450,10 +1477,18 @@ def test_the_filing_step_writes_the_artifact_the_gate_clause_reads(
         {},
     )
     assert step.result.returncode == 0, step.result.stdout + step.result.stderr
-    filed = sorted(LocalStore(tmp_path / "store").list_keys("reviews/"))
+    store = LocalStore(tmp_path / "store")
+    filed = sorted(store.list_keys("reviews/"))
     assert len(filed) == 1, filed
     assert filed[0].startswith("reviews/phase1/")
     assert filed[0].endswith(f"/{_REVIEWER_SESSION.lower()}/pass.json")
+    # ...and rule 1 holds on the real workflow path (alpha-engine-config-
+    # I10968): the run that filed the verdict filed a manifest naming it.
+    manifests = sorted(store.list_keys("runs/review.record/"))
+    assert len(manifests) == 1, manifests
+    manifest = json.loads(store.get_bytes(manifests[0]))
+    assert manifest["status"] == "ok"
+    assert [row["key"] for row in manifest["outputs"]] == filed
 
 
 def test_the_filing_step_records_a_fail_under_its_own_key(tmp_path: pathlib.Path) -> None:

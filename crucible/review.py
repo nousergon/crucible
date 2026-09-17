@@ -73,20 +73,26 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from crucible.calendar import resolve_trading_day
 from crucible.gate import REVIEW_SCHEMA_VERSION
 from crucible.keys import REVIEWER_PATTERN, review_key
 from crucible.models import GitHubCommit, ReviewDocument
-from crucible.store import Store, open_store
 
 __all__ = [
     "COMMITS_ENDPOINT_CAP",
+    "REVIEW_RECORD_JOB",
     "ReviewError",
     "author_identities",
     "check_reviewer",
     "record",
     "review_document",
+    "review_record_handler",
 ]
+
+#: The job name registered in `crucible.cli.JOBS`, `crucible/components.yaml`
+#: and `crucible.models.JOB_VALUES` — a constant imported by `cli.py` rather
+#: than a literal restated at each of those sites, the same shape
+#: `crucible.integration_summary.INTEGRATION_TEST_JOB` uses.
+REVIEW_RECORD_JOB = "review.record"
 
 #: The reviewer identity shape, imported from `crucible.keys` rather than
 #: restated. The first version of this control had two copies with different
@@ -246,31 +252,114 @@ def review_document(
     return document
 
 
-def record(
-    store: Store,
-    *,
-    document: dict[str, Any],
-    trading_day: dt.date,
-) -> str:
-    """File ``document`` and return its key.
+def record(ctx: Any, *, document: dict[str, Any]) -> str:
+    """File ``document`` through ``ctx`` and return its key.
+
+    Takes a :class:`~crucible.runner.RunContext`, not a bare
+    :class:`~crucible.store.Store` (`alpha-engine-config-I10968`). This was a
+    raw `store.put_bytes` reached from this module's own `__main__`, so the
+    one producer of the artifact `crucible.gate._clause_independently_reviewed`
+    grades wrote no run manifest on either path: no lineage, no spend, no code
+    sha, and nothing that said it had run. `ctx.record_output` performs the
+    same single write AND enters it into `outputs[]`, so the write is the
+    manifest's own evidence rather than a side effect beside it.
 
     No read-modify-write and no overwrite guard, deliberately: the verdict is
     a key segment, so a `pass` cannot land on a `fail`'s object under any
     caller, including one that never imports this module. See the module
     docstring.
+
+    The trading day comes from ``ctx``, never from a second resolution here: a
+    run launched on a Saturday binds to Friday's close (rule 3), and the
+    manifest and the artifact it records must name the same day.
     """
     key = review_key(
         document["phase"],
-        trading_day.isoformat(),
+        ctx.trading_day.isoformat(),
         document["reviewer"],
         document["verdict"],
     )
-    store.put_bytes(key, json.dumps(document, indent=2, sort_keys=True).encode("utf-8"))
+    ctx.record_output(
+        key,
+        json.dumps(document, indent=2, sort_keys=True).encode("utf-8"),
+        schema_version=REVIEW_SCHEMA_VERSION,
+    )
     return key
 
 
+def review_record_handler(args: argparse.Namespace) -> int:
+    """`crucible review.record --commits F --reviewer S --phase P ...`.
+
+    The independence comparison happens INSIDE the job body, so a self-review
+    produces a `failed` manifest naming the refusal rather than no record at
+    all: "a review was attempted and refused" and "no review was attempted"
+    are different facts, and only the manifest can tell them apart. The
+    workflow still runs `python -m crucible.review check` BEFORE it asks for
+    AWS credentials — that verb writes nothing and is what keeps a session
+    that may not record a verdict from ever holding a token that could write
+    one.
+    """
+    from crucible.cli import _resolve_store
+    from crucible.runner import run_job
+
+    store = _resolve_store(args)
+    commits = json.loads(Path(args.commits).read_text(encoding="utf-8"))
+    printed: list[str] = []
+
+    def job(ctx: Any) -> None:
+        document = review_document(
+            phase=args.phase,
+            verdict=args.verdict,
+            reviewer=args.reviewer,
+            commits=commits,
+            head_sha=args.head_sha,
+            pr_number=args.pr_number,
+            summary=args.summary,
+            reviewed_at=dt.datetime.now(dt.UTC),
+        )
+        printed.append(record(ctx, document=document))
+
+    try:
+        run_job(
+            REVIEW_RECORD_JOB,
+            job,
+            store=store,
+            trading_day=args.trading_day,
+            dry_run=bool(getattr(args, "dry_run", False)),
+            run_mode=getattr(args, "run_mode", None),
+        )
+    except ReviewError as exc:
+        # NOT a swallow: `run_job` has already written `status: failed` with
+        # this cause in its `try/finally`, and the refusal is what the exit
+        # code and the `::error::` annotation report. Translating it here is
+        # what keeps the workflow's own contract — exit 2, one annotated line,
+        # no traceback — while the manifest carries the full record. Any other
+        # exception propagates untouched.
+        print(f"::error::{exc}", file=sys.stderr)
+        return 2
+    print(printed[0])
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="record an independent adversarial review")
+    """The two verbs that WRITE NOTHING, and only those.
+
+    `record` used to live here too, reached as `python -m crucible.review
+    record` with its own `open_store` call — a store writer outside
+    `crucible.cli.JOBS` that filed no run manifest
+    (`alpha-engine-config-I10968`). It is now the registered job
+    :data:`REVIEW_RECORD_JOB`, so the one path that writes the review artifact
+    is the one path that writes a manifest, and there is no second entry point
+    that could drift from it.
+
+    These two stay here rather than becoming jobs of their own for the reason
+    the recording workflow's own step comment states: they must be runnable
+    BEFORE the workflow asks for AWS credentials, and a `crucible` job
+    resolves a store on the way in.
+    """
+    parser = argparse.ArgumentParser(
+        description="read the identities under review, and prove independence. Writes nothing"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     authors = sub.add_parser("authors", help="identities read out of the commits under review")
@@ -283,49 +372,16 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--commits", required=True)
     check.add_argument("--reviewer", required=True)
 
-    file_it = sub.add_parser("record", help="file the review artifact in the store")
-    file_it.add_argument("--commits", required=True)
-    file_it.add_argument("--reviewer", required=True)
-    file_it.add_argument("--phase", required=True)
-    file_it.add_argument("--verdict", required=True, choices=("pass", "fail"))
-    file_it.add_argument("--head-sha", required=True)
-    file_it.add_argument("--pr-number", required=True, type=int)
-    file_it.add_argument("--summary", required=True)
-    file_it.add_argument("--store", default=None)
-
     args = parser.parse_args(argv)
     try:
         commits = json.loads(Path(args.commits).read_text(encoding="utf-8"))
         if args.command == "authors":
             print("\n".join(author_identities(commits)))
             return 0
-        if args.command == "check":
-            # A separate verb so the recording workflow can refuse a
-            # self-review BEFORE it asks for AWS credentials: a session that
-            # may not record a verdict has no business holding a token that
-            # could write one.
-            print(check_reviewer(args.reviewer, author_identities(commits)))
-            return 0
-        now = dt.datetime.now(dt.UTC)
-        document = review_document(
-            phase=args.phase,
-            verdict=args.verdict,
-            reviewer=args.reviewer,
-            commits=commits,
-            head_sha=args.head_sha,
-            pr_number=args.pr_number,
-            summary=args.summary,
-            reviewed_at=now,
-        )
-        # A run launched on a Saturday binds to Friday's close (rule 3). The
-        # calendar resolves it; a raw `date.today()` would file a key the §4.12
-        # store walk refuses.
-        key = record(
-            open_store(args.store),
-            document=document,
-            trading_day=resolve_trading_day(now.replace(tzinfo=None)),
-        )
-        print(key)
+        # A separate verb so the recording workflow can refuse a self-review
+        # BEFORE it asks for AWS credentials: a session that may not record a
+        # verdict has no business holding a token that could write one.
+        print(check_reviewer(args.reviewer, author_identities(commits)))
         return 0
     except ReviewError as exc:
         print(f"::error::{exc}", file=sys.stderr)

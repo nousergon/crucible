@@ -543,6 +543,8 @@ JOB_VALUES: tuple[str, ...] = (
     "fault.probe",
     "iac.conformance",
     "test.integration",
+    "review.record",
+    "acceptance.publish",
     *TRADER_JOB_VALUES,
 )
 
