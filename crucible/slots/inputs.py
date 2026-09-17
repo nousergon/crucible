@@ -88,6 +88,7 @@ graph rather than of a member: a dependency cycle
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -111,6 +112,9 @@ __all__ = [
     "INPUT_KINDS",
     "INPUT_RESOLVERS",
     "ArmPredictionsContractError",
+    "BASE_COVERAGE_METRIC",
+    "BaseCoverage",
+    "BaseCoverageBelowFloorError",
     "BasePredictionsUnavailableError",
     "InputCycleError",
     "InputRef",
@@ -120,6 +124,8 @@ __all__ = [
     "UnresolvedInputError",
     "arm_name_from_id",
     "arm_predictions_key",
+    "arm_slot_from_id",
+    "base_coverage_floor",
     "parse_input_ref",
     "partition_producible",
     "prediction_column",
@@ -178,6 +184,25 @@ class BasePredictionsUnavailableError(ArmPredictionsContractError):
     """
 
 
+class BaseCoverageBelowFloorError(ArmPredictionsContractError):
+    """A base arm had an opinion on too little of the panel to stack on.
+
+    Brian's ruling 2026-09-17 (`alpha-engine-config-I10947`, option (a)) made
+    a SHORTFALL ordinary and a COLLAPSE a refusal, where every shortfall used
+    to be a refusal. The base model drops the rows whose features are null —
+    a young listing has no 252-session window — so it has never scored the
+    whole panel on any session in its history, and demanding 100% made every
+    stacked arm unproducible on every date rather than on a bad date.
+
+    Separate from :class:`BasePredictionsUnavailableError` because the two
+    remedies share nothing: that one means the base never RAN over these
+    sessions and is fixed by running it, this one means the base ran and had
+    an opinion on too few names, which is a broken feature layer or a
+    universe that moved under the arm — and is never fixed by substituting a
+    value for the names it skipped.
+    """
+
+
 class UnresolvedInputError(UnproducibleInputError):
     """A declared input was never materialised onto the panel being trained on.
 
@@ -220,6 +245,18 @@ def prediction_column(arm_name: str) -> str:
     return _PREDICTION_COLUMN_TEMPLATE.format(name=arm_name)
 
 
+def _arm_id_parts(arm_id: str) -> tuple[str, str, str]:
+    """`m:gbm_directional:ab12cd` -> `("m", "gbm_directional", "ab12cd")`."""
+    parts = str(arm_id).split(":")
+    if len(parts) != 3 or not all(parts):
+        raise UnproducibleInputError(
+            f"arm id {arm_id!r} is not `{{slot}}:{{name}}:{{spec_hash}}`. A stacked arm "
+            "binds a declared base NAME to a resolved arm ID; an id whose name cannot be "
+            "read is an id that cannot be checked against the name that asked for it."
+        )
+    return (parts[0], parts[1], parts[2])
+
+
 def arm_name_from_id(arm_id: str) -> str:
     """`m:gbm_directional:ab12cd` -> `gbm_directional`.
 
@@ -228,14 +265,17 @@ def arm_name_from_id(arm_id: str) -> str:
     arm's cross-section could be stacked under any declared base's column
     and the design matrix would be wrong while every surface stayed quiet.
     """
-    parts = str(arm_id).split(":")
-    if len(parts) != 3 or not all(parts):
-        raise UnproducibleInputError(
-            f"arm id {arm_id!r} is not `{{slot}}:{{name}}:{{spec_hash}}`. A stacked arm "
-            "binds a declared base NAME to a resolved arm ID; an id whose name cannot be "
-            "read is an id that cannot be checked against the name that asked for it."
-        )
-    return parts[1]
+    return _arm_id_parts(arm_id)[1]
+
+
+def arm_slot_from_id(arm_id: str) -> str:
+    """`m:gbm_directional:ab12cd` -> `m`.
+
+    The slot is read off the id rather than passed in, so the coverage floor
+    a stacked read is held to is the floor of the slot whose artifact it is
+    reading — never a floor a caller chose.
+    """
+    return _arm_id_parts(arm_id)[0]
 
 
 def parse_input_ref(text: str) -> InputRef:
@@ -643,6 +683,157 @@ def read_arm_predictions(
     return {str(k): float(v) for k, v in document["predicted_alpha"].items()}
 
 
+#: The metric name a stacked arm's base coverage is filed under on the run
+#: manifest. Named once so a console adapter, a test and the producer read
+#: the same literal (the shape `FEATURE_COMPLETENESS_METRIC` already has).
+BASE_COVERAGE_METRIC = "stacked_base_coverage_ratio"
+
+#: How many excluded ticker names a coverage record names outright. The full
+#: COUNT is always carried; the sample is a place for a reader to start, and
+#: is bounded because a manifest is loaded whole by every consumer of it — an
+#: unbounded list of ~900 names on a ~500-session panel is the 200KB metric
+#: row `FeatureCompleteness.to_dict` was already fixed for.
+_COVERAGE_NAME_SAMPLE = 20
+
+
+def base_coverage_floor(base_arm_id: str) -> float:
+    """The declared coverage floor for the slot ``base_arm_id`` belongs to.
+
+    The ONE reader of `SlotSpec.stacked_base_coverage_floor`. The floor is
+    never spelled at a call site and never defaulted here: a second literal
+    is a second place the value can be changed, which is how two readers of
+    one rule drift apart (`AGENTS.md`, the `avg_volume_20d` units defect).
+    """
+    from crucible.slots import get_slot  # noqa: PLC0415 - lazy: the package imports this module
+
+    return float(get_slot(arm_slot_from_id(base_arm_id)).stacked_base_coverage_floor)
+
+
+@dataclass(frozen=True)
+class BaseCoverage:
+    """How much of the panel a stacked arm's base model actually had an opinion on.
+
+    The published half of `alpha-engine-config-I10947`'s ruling. The stacked
+    arm scores the INTERSECTION of the panel and the names its base scored,
+    and this record is what makes that intersection a figure on the board
+    rather than something a reader has to infer from a cross-section that
+    came out shorter than the panel.
+
+    Per SESSION, not per panel: the base's scored set moves with the
+    universe, and one panel-wide average would hide a single session on
+    which the base collapsed — exactly the reading the floor exists to
+    refuse. :attr:`scored_by_session` carries every session's count and is
+    NOT emitted whole (see :meth:`to_dict`).
+    """
+
+    arm_name: str
+    base_arm_id: str
+    ref_text: str
+    column: str
+    floor: float
+    panel_names: int
+    scored_by_session: Mapping[str, int]
+    missing_names: tuple[str, ...]
+
+    @property
+    def sessions(self) -> int:
+        return len(self.scored_by_session)
+
+    def scored_on(self, trading_day: str) -> int:
+        """Names the base scored on ``trading_day``. Raises on a session the
+        panel did not carry — a coverage figure for a day nobody read is a
+        fabrication, not a default."""
+        try:
+            return self.scored_by_session[trading_day]
+        except KeyError as exc:
+            raise KeyError(
+                f"base {self.base_arm_id!r} coverage was not measured on {trading_day}; "
+                f"this panel carries {self.sessions} session(s). A coverage number for a "
+                "session that was never read would be invented."
+            ) from exc
+
+    def missing_on(self, trading_day: str) -> int:
+        return self.panel_names - self.scored_on(trading_day)
+
+    def coverage_on(self, trading_day: str) -> float:
+        if not self.panel_names:
+            return 0.0
+        return self.scored_on(trading_day) / self.panel_names
+
+    @property
+    def worst_session(self) -> str:
+        return min(self.scored_by_session, key=lambda d: (self.scored_by_session[d], d))
+
+    @property
+    def worst_coverage(self) -> float:
+        return self.coverage_on(self.worst_session)
+
+    def to_dict(self) -> dict[str, Any]:
+        """The manifest form: COUNTS in full, identifier lists BOUNDED."""
+        worst = self.worst_session
+        return {
+            "arm_name": self.arm_name,
+            "base_arm_id": self.base_arm_id,
+            "input": self.ref_text,
+            "column": self.column,
+            "floor": self.floor,
+            "panel_names": self.panel_names,
+            "sessions": self.sessions,
+            "worst_session": worst,
+            "worst_session_scored": self.scored_on(worst),
+            "worst_session_missing": self.missing_on(worst),
+            "worst_session_coverage_ratio": self.worst_coverage,
+            "excluded_name_count": len(self.missing_names),
+            "excluded_names_sample": list(self.missing_names[:_COVERAGE_NAME_SAMPLE]),
+        }
+
+    def as_metric(
+        self,
+        *,
+        slot: str,
+        trading_day: str | None = None,
+        phase: str = "design",
+        now: dt.datetime | None = None,
+    ) -> dict[str, Any]:
+        """The manifest row: scored / panel / missing, against the floor.
+
+        ``trading_day`` selects ONE produced session — what the M produce
+        path files, so the figure on the board is the coverage of the
+        cross-section that run actually published. Without it the row is the
+        panel's WORST session, which is the number the refusal is decided on.
+
+        `run_manifest.v2.json`'s `MetricRecordRow` is `additionalProperties:
+        true` on purpose, so the whole record rides beside the number rather
+        than being flattened into prose nobody can query.
+        """
+        stamp = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        day = trading_day or self.worst_session
+        scored = self.scored_on(day)
+        missing = self.missing_on(day)
+        ratio = self.coverage_on(day)
+        return {
+            "name": BASE_COVERAGE_METRIC,
+            "module": f"crucible.slots.{slot}",
+            "metric_type": "coverage",
+            "value": float(ratio),
+            "unit": "ratio",
+            "n_floor": 1,
+            "status": "BREACH" if ratio < self.floor else "OK",
+            "phase": phase,
+            "status_reason": (
+                f"arm {self.arm_name!r} ({phase}, {day}): base {self.base_arm_id!r} scored "
+                f"{scored} of {self.panel_names} panel name(s), {missing} missing "
+                f"({ratio:.4f} against a floor of {self.floor}). The stacked arm scores "
+                "the intersection; a missing base opinion is an EXCLUDED name, never a "
+                "substituted zero."
+            ),
+            "source_path": arm_predictions_key(self.base_arm_id, day),
+            "last_updated_utc": stamp,
+            "baseline": float(self.floor),
+            "base_coverage": {**self.to_dict(), "trading_day": day, "phase": phase},
+        }
+
+
 def stack_prediction_columns(
     panel: FeaturePanel,
     *,
@@ -667,10 +858,27 @@ def stack_prediction_columns(
     loaded recipe set so a caller cannot supply one at all; this assertion is
     what makes that the only reachable outcome rather than the usual one.
 
-    A base arm that did not score every name the panel carries is a refusal,
-    not a hole: a stacked arm's design row is only meaningful when every base
-    model expressed an opinion about that name, and a substituted zero is the
-    2026-08-28 hard-zeroed-features condition arriving by a different door.
+    **The stacked arm scores the INTERSECTION** — Brian's ruling 2026-09-17
+    (`alpha-engine-config-I10947`, option (a)). A name the base model has no
+    opinion on is left NOT-A-NUMBER in the stacked column, which is what
+    excludes it: the training design already selects complete rows
+    (:func:`crucible.slots.model.feature_completeness`) and the serving path
+    already drops a name whose design row is incomplete
+    (:func:`crucible.slots.model.score_cross_section`), so the cross-section
+    this arm publishes IS the panel intersected with the names its base
+    scored. **Nothing is substituted.** A zero here would be an OPINION —
+    "this base model rates that name exactly average" — invented by the
+    consumer for a model that said nothing, which is the 2026-08-28
+    hard-zeroed-features condition arriving by a different door.
+
+    The shortfall is published (:class:`BaseCoverage`, one record per base,
+    per session) and refused only BELOW the slot's declared floor
+    (:func:`base_coverage_floor`). Requiring 100% instead — which this
+    function did until the ruling — made every stacked arm unproducible on
+    every date rather than on a bad one: measured over
+    2024-05-01..2026-06-04, `residual_momentum` never once scored the full
+    panel, because it correctly drops the null-feature rows of listings too
+    young to have a window.
     """
     import numpy as np  # noqa: PLC0415
 
@@ -678,27 +886,106 @@ def stack_prediction_columns(
     if not refs:
         return panel
 
+    arm_name = str(getattr(recipe, "name", "<unnamed>"))
     blocks = dict(panel.features)
+    coverage: list[BaseCoverage] = []
     for ref in refs:
         arm_id = _resolved_base_arm_id(recipe, ref, base_arm_ids)
         _assert_base_predictions_present(store, arm_id=arm_id, ref=ref, dates=panel.dates)
+        floor = base_coverage_floor(arm_id)
         block = np.full((len(panel.dates), len(panel.names)), np.nan, dtype="float64")
+        scored_by_session: dict[str, int] = {}
+        missing_names: set[str] = set()
         for row, day in enumerate(panel.dates):
             scores = read_arm_predictions(store, arm_id=arm_id, trading_day=day, ctx=ctx)
-            absent = [n for n in panel.names if n not in scores]
-            if absent:
-                raise ArmPredictionsContractError(
-                    f"base arm {arm_id!r} scored {len(scores)} name(s) on {day} but the "
-                    f"panel carries {len(panel.names)}; {len(absent)} missing, first "
-                    f"five {absent[:5]}. A stacked arm needs its base model's opinion on "
-                    "every name it scores — nothing is substituted, because a "
-                    "substituted zero is a hard-zeroed feature column with a friendlier "
-                    "name."
-                )
-            block[row, :] = np.array([scores[n] for n in panel.names], dtype="float64")
+            # The intersection, name by name. `np.nan` for an absent name is
+            # not a fill and not a default: it is the ABSENCE, carried in the
+            # one encoding every downstream selector already treats as "this
+            # row cannot be used". `scores.get(n, 0.0)` would be the
+            # substitution the ruling forbids, and it would read identically
+            # on every surface.
+            present = [n for n in panel.names if n in scores]
+            scored_by_session[day] = len(present)
+            missing_names.update(n for n in panel.names if n not in scores)
+            _assert_above_floor(
+                arm_name=arm_name,
+                arm_id=arm_id,
+                ref=ref,
+                day=day,
+                scored=len(present),
+                panel_names=panel.names,
+                absent=[n for n in panel.names if n not in scores],
+                floor=floor,
+            )
+            block[row, :] = np.array(
+                [scores[n] if n in scores else np.nan for n in panel.names], dtype="float64"
+            )
         blocks[ref.column] = block
+        coverage.append(
+            BaseCoverage(
+                arm_name=arm_name,
+                base_arm_id=arm_id,
+                ref_text=ref.text,
+                column=ref.column,
+                floor=floor,
+                panel_names=len(panel.names),
+                scored_by_session=scored_by_session,
+                missing_names=tuple(sorted(missing_names)),
+            )
+        )
 
-    return _with_resolved(panel, features=blocks, refs=refs)
+    resolved = _with_resolved(panel, features=blocks, refs=refs)
+    return _with_coverage(resolved, coverage)
+
+
+def _assert_above_floor(
+    *,
+    arm_name: str,
+    arm_id: str,
+    ref: InputRef,
+    day: str,
+    scored: int,
+    panel_names: Sequence[str],
+    absent: Sequence[str],
+    floor: float,
+) -> None:
+    """Refuse a session the base had an opinion on too little of.
+
+    The comparison is against the panel of the session being READ, never
+    against some other day's universe: the refusal this replaced reported
+    887 names against a 908-name panel while 2024-05-01's own panel carried
+    903, so the number an operator was handed did not describe any day
+    (`alpha-engine-config-I10947`, the non-inferable gotcha). `panel.names`
+    is one axis for the whole panel here, and the count it carries is the
+    count every session is measured against.
+    """
+    total = len(panel_names)
+    ratio = (scored / total) if total else 0.0
+    if ratio >= floor:
+        return
+    raise BaseCoverageBelowFloorError(
+        f"arm {arm_name!r}: base arm {arm_id!r} scored {scored} of the {total} name(s) "
+        f"the panel carries on {day} — {len(absent)} missing, first five "
+        f"{list(absent[:5])} — a coverage of {ratio:.4f}, below the {floor} floor its "
+        f"slot declares. A stacked arm scores the INTERSECTION of the panel and the "
+        f"names its base actually scored, and publishes the shortfall; below the floor "
+        f"the intersection is a different universe from the one this arm is graded "
+        f"against, so the session is refused. Nothing is substituted either way: a "
+        f"missing base opinion is an excluded name, never a zero. Input {ref.text!r}."
+    )
+
+
+def _with_coverage(panel: FeaturePanel, coverage: Sequence[BaseCoverage]) -> FeaturePanel:
+    """``panel`` carrying the coverage records the stacked read measured.
+
+    Attached to the panel rather than only recorded here because the metric
+    belongs to the PRODUCED SESSION: `crucible.slots.model.produce_arm_predictions`
+    files one row per base naming that day's scored / panel / missing, and it
+    can only do that from a figure the panel carries.
+    """
+    from dataclasses import replace  # noqa: PLC0415
+
+    return replace(panel, input_coverage=tuple(panel.input_coverage) + tuple(coverage))
 
 
 def _resolved_base_arm_id(recipe: Any, ref: InputRef, base_arm_ids: Mapping[str, str]) -> str:

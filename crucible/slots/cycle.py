@@ -71,6 +71,7 @@ from crucible.slots.grading import (
     cross_section_key,
     forward_returns,
     grade_slot,
+    pair_on_common_names,
     produce_cross_section,
     produce_shadow,
     raise_training_integrity,
@@ -726,6 +727,15 @@ def run_grade(
     for day in settled_dates or ():
         _returns_for(day)
 
+    # PASS 1 — read every real arm's settled shadows. Nothing is scored yet,
+    # because a score is only comparable once the NAME universe it was
+    # benchmarked against is known, and that is a property of the date rather
+    # than of the arm (`alpha-engine-config-I10947`, deliverable 3). A stacked
+    # arm's population is the intersection of the panel and the names its base
+    # model had an opinion on, so populations genuinely differ between arms on
+    # one date, and `score_selection` measures a selection against the mean of
+    # the population it drew from.
+    shadows_by_arm: dict[str, dict[str, dict[str, Any]]] = {}
     for arm_id in scored_arms:
         if arm_id in control_ids:
             continue
@@ -741,11 +751,33 @@ def run_grade(
             if window is None:
                 unsettled.setdefault(arm_id, []).append(day)
                 continue
-            shadow = load_store_document(ctx.store, shadow_key(arm_id, day))
+            shadows_by_arm.setdefault(arm_id, {})[day] = load_store_document(
+                ctx.store, shadow_key(arm_id, day)
+            )
+
+    # The common-name universe per settled date, over the REAL arms scored on
+    # it. The controls are scored on it too, below: a planted control drawing
+    # from names no real arm could pick would not be the positive control for
+    # the comparison this cycle publishes.
+    pairing_by_day = pair_on_common_names(
+        {
+            day: {
+                arm_id: tuple(by_day[day]["population"])
+                for arm_id, by_day in shadows_by_arm.items()
+                if day in by_day
+            }
+            for day in sorted({d for by_day in shadows_by_arm.values() for d in by_day})
+        }
+    )
+
+    # PASS 2 — score every arm on the common names of its date.
+    for arm_id, by_day in shadows_by_arm.items():
+        for day, shadow in by_day.items():
+            window = returns_cache[day]
+            pairing = pairing_by_day[day]
+            paired_selection, dropped_picks = pairing.restrict(tuple(shadow["selection"]))
             try:
-                score, detail = score_selection(
-                    tuple(shadow["selection"]), tuple(shadow["population"]), window.returns
-                )
+                score, detail = score_selection(paired_selection, pairing.common, window.returns)
             except SelectionMissError:
                 # plan §4.4 / policy §3: "a cycle in which an arm legitimately
                 # selects nothing is a MISS", and a miss is data. Every name
@@ -767,6 +799,13 @@ def run_grade(
                 # against it, so the cycle's shared inputs are compromised.
                 raise_training_integrity(arm_id, exc)
             else:
+                # The universe this number is comparable ON, carried beside the
+                # number. A verdict whose benchmark population is not stated is
+                # a figure a later reader cannot pair with any other
+                # (`alpha-engine-config-I10947`).
+                detail["n_common_names"] = len(pairing.common)
+                detail["n_union_names"] = pairing.union_size
+                detail["n_selection_outside_common"] = dropped_picks
                 verdicts[arm_id][day] = score
                 produced_under = shadow.get("feature_version")
                 if produced_under:
@@ -840,9 +879,23 @@ def run_grade(
             window = returns_cache[day]
             returns = window.returns
             top_n = _control_top_n(loaded_specs)
+            # The controls draw from, and are benchmarked on, the SAME common
+            # names the real arms were scored on that date
+            # (`alpha-engine-config-I10947`). §10.1's claim is that the grader
+            # ranks planted > real > null; a control drawing from names no real
+            # arm could pick would be ranked against a different universe, and
+            # the ordering assertion would be measuring two things at once. A
+            # date with no real-arm shadow (a caller-supplied series) has no
+            # pairing, and the settled returns are then the whole universe.
+            pairing = pairing_by_day.get(day)
+            control_returns = (
+                {t: r for t, r in returns.items() if t in set(pairing.common)}
+                if pairing is not None and pairing.common
+                else returns
+            )
             selection = control_selection(
                 control.control_kind,
-                returns,
+                control_returns,
                 top_n=top_n,
                 seed=int(day.replace("-", "")),
             )
@@ -851,9 +904,12 @@ def run_grade(
             # construction; a `SelectionMissError` on a control would be a
             # defect in the harness itself and must reach the operator as a
             # failed run rather than as a control that quietly missed.
-            score, detail = score_selection(selection, tuple(sorted(returns)), returns)
+            score, detail = score_selection(
+                selection, tuple(sorted(control_returns)), control_returns
+            )
             verdicts[control.arm_id][day] = score
             detail["control_kind"] = control.control_kind
+            detail["n_common_names"] = len(control_returns)
             control_payload = write_verdict(
                 ctx.store,
                 arm_id=control.arm_id,
@@ -1218,6 +1274,20 @@ def run_grade(
             "baseline": 0.0,
         }
     )
+    # `alpha-engine-config-I10947`, deliverable 3: the name axis of the
+    # pairing, on the manifest. The WORST date is the row — the narrowest
+    # common universe any date of this cycle was scored on — because an
+    # average over dates is exactly where one date on which the arms shared
+    # almost nothing disappears. `n_floor: 0` and a row filed even when every
+    # arm ranked the same names: a component emitting nothing is unobserved,
+    # not healthy.
+    narrowest = min(
+        pairing_by_day.values(),
+        key=lambda p: (p.coverage_ratio, p.trading_day),
+        default=None,
+    )
+    if narrowest is not None:
+        ctx.record_metric(narrowest.as_metric(slot=slot, source_path=cycle_key, now=_utc_now()))
     ctx.record_metric(
         {
             # A miss is DATA, so it gets a surface. Policy §3: silent absence

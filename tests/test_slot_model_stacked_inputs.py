@@ -16,14 +16,18 @@ anything (AGENTS.md, test discipline).
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from crucible.slots import SLOTS, get_slot
 from crucible.slots.inputs import (
     ARM_PREDICTIONS_SCHEMA_VERSION,
+    BASE_COVERAGE_METRIC,
     ArmPredictionsContractError,
+    BaseCoverageBelowFloorError,
     InputCycleError,
     InputRef,
     UnproducibleInputError,
@@ -377,9 +381,15 @@ class TestStackingOntoAPanel:
         ], "every read is a manifest input, so `crucible explain` walks to the base arm"
         assert {i["schema_version"] for i in ctx.inputs} == {ARM_PREDICTIONS_SCHEMA_VERSION}
 
-    def test_a_base_arm_that_did_not_score_every_name_is_a_refusal_not_a_hole(
+    def test_a_base_arm_far_below_the_coverage_floor_is_a_refusal_not_a_hole(
         self, tmp_path
     ) -> None:
+        """One name of two is a 50% shortfall — a collapse, not a young listing.
+
+        The general case moved with `alpha-engine-config-I10947` (see
+        `TestTheStackScoresTheIntersection`); what stays a refusal is a base
+        whose opinion covers too little of the panel to be the same universe.
+        """
         store = LocalStore(tmp_path)
         panel = _panel()
         for day in panel.dates:
@@ -450,3 +460,196 @@ def _panel() -> FeaturePanel:
         forward_returns=np.zeros(shape),
         feature_version="v1",
     )
+
+
+def _wide_panel(n_names: int = 20) -> FeaturePanel:
+    """A panel wide enough for a one-name shortfall to sit ABOVE the floor.
+
+    `_panel` carries two names, so dropping one of them is a 50% shortfall
+    and every case it can express is a refusal. The ruling's ordinary case —
+    a young listing the base model has no window for — is a shortfall of a
+    few names in nine hundred, and a fixture that cannot express it would
+    test the floor and call it the intersection.
+    """
+    dates = ("2026-08-26", "2026-08-27", "2026-08-28")
+    names = tuple(f"N{i:02d}" for i in range(n_names))
+    shape = (len(dates), len(names))
+    return FeaturePanel(
+        dates=dates,
+        names=names,
+        features={"mom_21d_ratio": np.zeros(shape)},
+        forward_returns=np.zeros(shape),
+        feature_version="v1",
+    )
+
+
+def _write_base(store, panel, *, scored, arm_id="m:base:abc123", value=0.1):
+    """``scored`` names get an opinion on every session; the rest get none."""
+    for day in panel.dates:
+        write_arm_predictions(
+            _Ctx(store),
+            arm_id=arm_id,
+            trading_day=day,
+            feature_version="v1",
+            predicted_alpha={n: value for n in scored},
+        )
+
+
+def _stack(store, panel, *, ctx=None):
+    return stack_prediction_columns(
+        panel,
+        store=store,
+        recipe=_StubRecipe((InputRef(kind="predictions", ref="base"),)),
+        base_arm_ids={"base": "m:base:abc123"},
+        ctx=ctx,
+    )
+
+
+class TestTheStackScoresTheIntersection:
+    """Brian's ruling 2026-09-17, `alpha-engine-config-I10947` option (a).
+
+    The contract these tests replace demanded the base's opinion on 100% of
+    the panel. Measured over 2024-05-01..2026-06-04 the base scored the whole
+    panel on NO date — it correctly drops the rows whose features are null —
+    so every stacked arm was unproducible on every date, and the M slot could
+    never win a champion.
+
+    What is asserted here is the pair of properties that make the relaxation
+    safe: the missing name is EXCLUDED (never substituted), and the shortfall
+    is a published number checked against a floor the slot declares.
+    """
+
+    def test_a_name_the_base_did_not_score_is_excluded_never_substituted(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        panel = _wide_panel()
+        _write_base(store, panel, scored=panel.names[1:])
+
+        column = _stack(store, panel).column(prediction_column("base"))
+
+        assert np.isnan(column[:, 0]).all(), (
+            "the unscored name carries NOT-A-NUMBER on every session — the one "
+            "encoding the training design and the serving path already read as "
+            "'this row cannot be used'"
+        )
+        assert (column[:, 0] != 0.0).all() | np.isnan(column[:, 0]).all(), (
+            "and it is not a zero: a zero is an OPINION ('exactly average') invented "
+            "for a model that said nothing — the 2026-08-28 hard-zeroed-features "
+            "condition through a different door"
+        )
+        assert np.isfinite(column[:, 1:]).all(), "every scored name keeps its value"
+
+    def test_the_panel_carries_a_coverage_record_naming_scored_panel_and_missing(
+        self, tmp_path
+    ) -> None:
+        store = LocalStore(tmp_path)
+        panel = _wide_panel()
+        _write_base(store, panel, scored=panel.names[2:])
+
+        (coverage,) = _stack(store, panel).input_coverage
+
+        assert coverage.panel_names == 20
+        assert coverage.scored_on("2026-08-28") == 18
+        assert coverage.missing_on("2026-08-28") == 2
+        assert coverage.coverage_on("2026-08-28") == pytest.approx(0.9)
+        assert coverage.missing_names == ("N00", "N01")
+        assert coverage.floor == get_slot("m").stacked_base_coverage_floor
+        assert coverage.base_arm_id == "m:base:abc123"
+
+    def test_the_coverage_figure_is_per_session_never_one_panel_average(self, tmp_path) -> None:
+        """One collapsed session inside a healthy window must not average away."""
+        store = LocalStore(tmp_path)
+        panel = _wide_panel()
+        for day in panel.dates:
+            scored = panel.names if day != "2026-08-27" else panel.names[:19]
+            write_arm_predictions(
+                _Ctx(store),
+                arm_id="m:base:abc123",
+                trading_day=day,
+                feature_version="v1",
+                predicted_alpha={n: 0.1 for n in scored},
+            )
+
+        (coverage,) = _stack(store, panel).input_coverage
+
+        assert coverage.worst_session == "2026-08-27"
+        assert coverage.coverage_on("2026-08-26") == 1.0
+        assert coverage.worst_coverage == pytest.approx(0.95)
+
+    def test_a_coverage_figure_for_a_session_never_read_is_refused(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        panel = _wide_panel()
+        _write_base(store, panel, scored=panel.names)
+        (coverage,) = _stack(store, panel).input_coverage
+
+        with pytest.raises(KeyError, match="was not measured"):
+            coverage.coverage_on("2026-08-25")
+
+    def test_the_metric_row_satisfies_the_manifest_schema(self, tmp_path) -> None:
+        from jsonschema import Draft202012Validator
+
+        store = LocalStore(tmp_path)
+        panel = _wide_panel()
+        _write_base(store, panel, scored=panel.names[1:])
+        (coverage,) = _stack(store, panel).input_coverage
+
+        row = coverage.as_metric(slot="m", trading_day="2026-08-28")
+        schema = json.loads(
+            Path("crucible/schemas/run_manifest.v2.json").read_text(encoding="utf-8")
+        )
+        validator = Draft202012Validator(schema["$defs"]["MetricRecordRow"])
+
+        assert sorted(validator.iter_errors(row), key=lambda e: list(e.path)) == []
+        assert row["name"] == BASE_COVERAGE_METRIC
+        assert row["value"] == pytest.approx(0.95)
+        assert row["baseline"] == coverage.floor
+        assert row["base_coverage"]["worst_session_missing"] == 1
+        assert "19 of 20" in row["status_reason"]
+
+
+class TestTheFloorIsDeclaredOnTheSlot:
+    def test_a_session_below_the_floor_is_refused_rather_than_produced(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        panel = _wide_panel()
+        _write_base(store, panel, scored=panel.names[:5])
+
+        with pytest.raises(BaseCoverageBelowFloorError, match="below the 0.9 floor"):
+            _stack(store, panel)
+
+    def test_the_floor_read_is_the_one_the_slot_declares(self, tmp_path, monkeypatch) -> None:
+        """Move the slot's declared value and the behaviour moves with it.
+
+        The floor is a property of the slot, and a literal at this call site
+        would be a second declaration of it — the shape that lets two readers
+        of one rule drift apart. Nineteen of twenty names PRODUCES under the
+        declared 0.90 and REFUSES under 0.99, with nothing else changed.
+        """
+        store = LocalStore(tmp_path)
+        panel = _wide_panel()
+        _write_base(store, panel, scored=panel.names[1:])
+
+        assert _stack(store, panel).input_coverage, "0.95 coverage clears the 0.90 floor"
+
+        monkeypatch.setitem(SLOTS, "m", replace(SLOTS["m"], stacked_base_coverage_floor=0.99))
+        with pytest.raises(BaseCoverageBelowFloorError, match="below the 0.99 floor"):
+            _stack(store, panel)
+
+    def test_the_refusal_measures_against_the_panel_of_the_day_being_read(self, tmp_path) -> None:
+        """The non-inferable gotcha of `alpha-engine-config-I10947`.
+
+        The refusal this replaced reported 887 scored names against a
+        908-name panel while the session it named carried 903 — a count that
+        described no day, so an operator could not tell which universe was
+        short. The message names the DAY and the count that day was measured
+        against.
+        """
+        store = LocalStore(tmp_path)
+        panel = _wide_panel()
+        _write_base(store, panel, scored=panel.names[:5])
+
+        with pytest.raises(BaseCoverageBelowFloorError) as raised:
+            _stack(store, panel)
+
+        message = str(raised.value)
+        assert "scored 5 of the 20 name(s) the panel carries on 2026-08-26" in message
+        assert "15 missing" in message
+        assert "excluded name, never a zero" in message
