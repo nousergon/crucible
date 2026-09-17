@@ -3907,3 +3907,176 @@ class TraderEvidenceDocument(_Strict):
                 "supported by the days that produced it."
             )
         return self
+
+
+# ---------------------------------------------------------------------------
+# metron_consumers.yaml — alpha-engine-config-I10739
+# ---------------------------------------------------------------------------
+
+
+#: The schedule owners a producer can run under, as SYMBOLS rather than AWS
+#: resource names. This repository forbids infrastructure identifiers
+#: (`AGENTS.md`, "Visibility"), and a symbol is also the more durable fact: a
+#: state machine gets renamed, "the v1 orchestration stack" does not.
+#:
+#: `v1_orchestration` is the one phase 4 tears down
+#: (`alpha-engine-config-I9760` deliverable "old SFs disabled"). Every other
+#: value names something phase 4 leaves running.
+ScheduleOwnerLiteral = Literal[
+    # The three v1 Step Functions in the v1 orchestration stack. PHASE 4
+    # DISABLES THESE. A Metron-read artifact whose only producer runs here is
+    # exactly the defect this register exists to catch.
+    "v1_orchestration",
+    # The standalone data-collection stack component 1 owns (nousergon-data,
+    # shipped DISABLED, cut over in one maintenance window —
+    # `data_collection_plan_260914.md` section 6.2).
+    "data_collection_stack",
+    # A systemd timer on the shared application host. Outside every stack.
+    "host_timer",
+    # The trader's own box (component 3), which keeps running past phase 4.
+    "trader_host",
+    # This harness's own scheduler (component 2).
+    "v2_dispatcher",
+    # A trigger that exists, sits OUTSIDE the v1 orchestration stack, and is
+    # administratively disabled. Phase 4 neither causes nor fixes this, so it
+    # is not a failure of THIS clause — but it is not `none` either, and it is
+    # never silently folded into a green reading: the clause names every
+    # paused row in its detail. The staleness itself is somebody else's
+    # detector (the artifact freshness registry).
+    "paused_outside_v1",
+    # Nothing starts it. A producer with no trigger is not a producer, and
+    # saying so is the whole point of writing this value down.
+    "none",
+]
+
+#: What phase 4 leaves behind for one Metron-read artifact.
+Phase4DispositionLiteral = Literal[
+    # Its producer schedule is not in `v1_orchestration` and never was.
+    "survives",
+    # Its producer schedule moved off `v1_orchestration` onto a surviving
+    # owner. `schedule_owner` already names where it moved TO.
+    "rehomed",
+    # Brian ruled the Metron feature retires rather than acquiring a new
+    # producer (`architecture.d/146` rule 4). Requires `ruling`.
+    "retired_by_ruling",
+    # Neither. This is the value that FAILS the gate, and it is the value a
+    # new row carries until someone decides — an artifact nobody has thought
+    # about must read as undecided, never as fine.
+    "unresolved",
+]
+
+#: The owners phase 4 disables. A frozenset rather than a bare comparison so
+#: that adding a second retired owner is one edit in one place.
+PHASE4_RETIRED_SCHEDULE_OWNERS: frozenset[str] = frozenset({"v1_orchestration"})
+
+
+class MetronConsumerRow(_Strict):
+    """One artifact Metron reads, and what produces it.
+
+    A row is a DECLARATION, not a derivation: this package cannot enumerate
+    another repository's readers, and pretending otherwise would be the
+    "registry checked against itself" defect `llm_callsites.yaml` names. What
+    keeps it honest is provenance — `reader` cites the Metron file and line
+    the read happens at, and the document as a whole carries the commit the
+    sweep was taken against.
+    """
+
+    object_key: str = Field(
+        description="the object key Metron reads, relative to the shared research "
+        "bucket. The BUCKET is never named here (`AGENTS.md`, 'Visibility')."
+    )
+    reader: str = Field(
+        description="the Metron `path:line` that reads it — the provenance a later "
+        "reader re-verifies the row against."
+    )
+    producer: str = Field(
+        description="`repo:path` of the code that writes it, or the empty string when "
+        "the sweep found no writer at all."
+    )
+    schedule_owner: ScheduleOwnerLiteral = Field(
+        description="WHO starts the producer, as a symbol. `none` is a legitimate "
+        "value and is not the same as an unresolved disposition."
+    )
+    phase4_disposition: Phase4DispositionLiteral = Field(
+        description="what phase 4 leaves behind for this artifact."
+    )
+    ruling: str = Field(
+        default="",
+        description="the ruling that retired the feature. Required when "
+        "`phase4_disposition` is `retired_by_ruling`, because a retirement nobody "
+        "can trace back to Brian is an agent retiring a product feature.",
+    )
+    note: str = Field(default="", description="anything a later reader would need.")
+
+    @model_validator(mode="after")
+    def _disposition_agrees_with_owner(self) -> MetronConsumerRow:
+        if self.phase4_disposition == "retired_by_ruling" and not self.ruling.strip():
+            raise ValueError(
+                f"{self.object_key!r} is `retired_by_ruling` with no `ruling`. Retiring "
+                "a Metron feature is Brian's call (`architecture.d/146` rule 4); a row "
+                "may not clear this gate by asserting a ruling it cannot name."
+            )
+        if self.phase4_disposition == "rehomed" and self.schedule_owner in (
+            PHASE4_RETIRED_SCHEDULE_OWNERS | {"none"}
+        ):
+            raise ValueError(
+                f"{self.object_key!r} is `rehomed` but `schedule_owner` is "
+                f"{self.schedule_owner!r}. Rehomed means the schedule moved to an owner "
+                "phase 4 leaves running; this row says it did not move."
+            )
+        if self.phase4_disposition == "survives" and self.schedule_owner in (
+            PHASE4_RETIRED_SCHEDULE_OWNERS
+        ):
+            raise ValueError(
+                f"{self.object_key!r} is `survives` but its schedule owner "
+                f"{self.schedule_owner!r} is one phase 4 disables."
+            )
+        return self
+
+
+class MetronConsumerRegisterDocument(_Strict):
+    """``metron_consumers.yaml`` — `alpha-engine-config-I10739` deliverable 1.
+
+    Its gate clause is `metron_read_artifacts_have_surviving_producer`
+    (`crucible.gate`, phase 4).
+    """
+
+    schema_version: Literal["metron_consumer_register.v1"] = Field(
+        description="version of THIS schema."
+    )
+    reviewed_on: dt.date = Field(
+        description="the date the sweep behind these rows was taken. Reported in the "
+        "clause detail so a reading is never separated from the age of what it read."
+    )
+    metron_commit: str = Field(
+        min_length=7,
+        description="the Metron commit the `reader` citations were resolved against. "
+        "Without it a row's provenance is unverifiable and the register is prose.",
+    )
+    inventory_doc: str = Field(
+        min_length=1,
+        description="the private-docs inventory this register is the machine-readable "
+        "half of. The analysis lives there; only what the gate reads lives here.",
+    )
+    reads: list[MetronConsumerRow] = Field(
+        description="every artifact Metron reads. WRITES are out of scope: Metron's own "
+        "writes cannot be orphaned by phase 4."
+    )
+
+    @model_validator(mode="after")
+    def _non_empty_and_unique(self) -> MetronConsumerRegisterDocument:
+        # EMPTY IS NOT A VALID REGISTER. The clause treats an empty list as
+        # UNMEASURABLE rather than MET, but a document that ships empty is a
+        # broken build, not a measurement — Metron demonstrably reads things.
+        if not self.reads:
+            raise ValueError(
+                "the Metron consumer register is empty. A property over an empty set "
+                "is vacuously true, which is precisely how this guard would read green "
+                "over the gap it exists for."
+            )
+        seen: set[str] = set()
+        for row in self.reads:
+            if row.object_key in seen:
+                raise ValueError(f"duplicate row for {row.object_key!r}")
+            seen.add(row.object_key)
+        return self

@@ -1,0 +1,263 @@
+# METRON_CONSUMER_REGISTER — every artifact component 4 (Metron) reads, and
+# what produces it. `alpha-engine-config-I10739` deliverable 1; graded by
+# `crucible.gate`'s phase-4 clause
+# `metron_read_artifacts_have_surviving_producer` (deliverable 3).
+#
+# WHY IT EXISTS. Phase 4 disables the three v1 Step Functions. Measured
+# 2026-09-14 and re-swept 2026-09-17: every Metron-read artifact but the two
+# intraday files was produced only inside those pipelines. Disabling them
+# without a successor freezes the product's prices, technicals and rating
+# track record at the last run while every freshness row goes red — a
+# component-2 decommission silently breaking component 4, which is the exact
+# failure `architecture.d/146` rule 2 was ruled to prevent.
+#
+# WHAT IT IS NOT. It is a DECLARATION, not a derivation. This package cannot
+# enumerate another repository's readers, and a register checked against
+# itself measures nothing (`llm_callsites.yaml` says the same about its own).
+# Three things keep it honest instead:
+#   * every row cites the Metron `path:line` the read happens at;
+#   * `metron_commit` pins what those citations were resolved against, so a
+#     stale register is visible rather than merely wrong;
+#   * `inventory_doc` points at the private-docs inventory carrying the
+#     analysis. Only what the gate READS lives here.
+#
+# NO BUCKET NAMES, NO STATE MACHINE NAMES, NO ARNs. This repository is
+# public at phase-1 exit and forbids infrastructure identifiers (`AGENTS.md`,
+# "Visibility"). `schedule_owner` is therefore a SYMBOL — and the symbol is
+# also the more durable fact, since a state machine gets renamed and "the v1
+# orchestration stack" does not. The values are declared in
+# `crucible.models.ScheduleOwnerLiteral`, each with the reason it exists.
+#
+# ADDING A ROW. A new Metron read defaults to `phase4_disposition:
+# unresolved`, which reads UNMET. An artifact nobody has decided about must
+# grade as undecided; the alternative is that forgetting to think about one
+# is indistinguishable from it being fine.
+#
+# RETIRING A FEATURE IS BRIAN'S CALL (`architecture.d/146` rule 4), so
+# `retired_by_ruling` may not be written without a `ruling` naming it — the
+# model refuses the row otherwise. No agent clears this gate by deciding a
+# product feature is expendable.
+
+schema_version: metron_consumer_register.v1
+
+# The sweep behind these rows. Two passes: 2026-09-14 (the finding on
+# `alpha-engine-config-I10739`) and 2026-09-17 (this file), which found four
+# reads the first pass missed — `market_data/analyst/latest.json`,
+# `market_data/sentiment/latest.json`, `market_data/fundamentals/latest.json`
+# and the per-currency `market_data/fx_history/` series.
+reviewed_on: 2026-09-17
+metron_commit: d7da2a3b58d7
+inventory_doc: alpha-engine-config/private-docs/metron_consumer_inventory_260917.md
+
+reads:
+  # ── The EOD market-data spine ──────────────────────────────────────────
+  # One producer, one workload: the `post-market-data` collection run. It
+  # moved off the v1 postclose pipeline onto component 1's own standalone
+  # stack in nousergon-data-PR1701 + nous-ergon-ops-PR1269 (both merged
+  # 2026-09-14), which ships DISABLED and is enabled in the same maintenance
+  # window that disables the v1 pipelines
+  # (`data_collection_plan_260914.md` §6.2 cutover step b). `rehomed` is
+  # therefore the state of the CODE PATH; the enable is the cutover, and
+  # component 1's own `data-cutover-ready` sub-gate — read by this phase's
+  # `data_cutover_ready` clause — is what grades the enable. Two clauses,
+  # two different questions: "does a successor schedule exist" and "is it
+  # ready to run".
+  - object_key: market_data/eod_closes/latest.json
+    reader: portfolio_analytics/prices/spine_source.py:37
+    producer: nousergon-data:collectors/metron_market_data.py::collect
+    schedule_owner: data_collection_stack
+    phase4_disposition: rehomed
+    note: >-
+      the key Metron prices from. Raised warning -> critical at cutover by
+      Brian's ruling R4/R3 on 2026-09-14, because after cutover it is the only
+      never-started detector for the spine.
+  - object_key: market_data/fx/latest.json
+    reader: portfolio_analytics/prices/spine_source.py:38
+    producer: nousergon-data:collectors/metron_market_data.py::collect
+    schedule_owner: data_collection_stack
+    phase4_disposition: rehomed
+  - object_key: market_data/close_history/consolidated.json
+    reader: portfolio_analytics/prices/spine_source.py:43
+    producer: nousergon-data:collectors/metron_market_data.py::collect_history
+    schedule_owner: data_collection_stack
+    phase4_disposition: rehomed
+  - object_key: market_data/close_history/
+    reader: portfolio_analytics/prices/spine_source.py:39
+    producer: nousergon-data:collectors/metron_market_data.py::collect_history
+    schedule_owner: data_collection_stack
+    phase4_disposition: rehomed
+    note: >-
+      a PREFIX, not one object - one document per symbol, read as the
+      per-symbol fallback when the consolidated file misses a ticker. Metron
+      builds each name from its own symbol list and never lists the prefix.
+  - object_key: market_data/fx_history/
+    reader: portfolio_analytics/prices/spine_source.py:44
+    producer: nousergon-data:collectors/metron_market_data.py::collect_history
+    schedule_owner: data_collection_stack
+    phase4_disposition: rehomed
+    note: >-
+      a PREFIX, one document per currency. Missed by the 2026-09-14 pass.
+  - object_key: market_data/macro/latest.json
+    reader: portfolio_analytics/macro/spine_source.py:24
+    producer: nousergon-data:collectors/metron_market_data.py::collect_macro
+    schedule_owner: data_collection_stack
+    phase4_disposition: rehomed
+  - object_key: market_data/sectors/latest.json
+    reader: portfolio_analytics/sectors/spine_source.py:22
+    producer: nousergon-data:collectors/metron_market_data.py::collect_reference
+    schedule_owner: data_collection_stack
+    phase4_disposition: rehomed
+  - object_key: market_data/earnings/latest.json
+    reader: portfolio_analytics/calendar/spine_source.py:22
+    producer: nousergon-data:collectors/metron_market_data.py::collect_reference
+    schedule_owner: data_collection_stack
+    phase4_disposition: rehomed
+  - object_key: market_data/fundamentals/latest.json
+    reader: api/services/fundamentals.py:19
+    producer: nousergon-data:collectors/metron_market_data.py::collect_fundamentals
+    schedule_owner: data_collection_stack
+    phase4_disposition: rehomed
+    note: missed by the 2026-09-14 pass.
+  - object_key: market_data/technicals/latest.json
+    reader: api/services/technicals.py:22
+    producer: nousergon-data:collectors/metron_market_data.py::collect_technicals
+    schedule_owner: data_collection_stack
+    phase4_disposition: rehomed
+    note: >-
+      carries the per-stock `rating`. Brian's binding constraint of
+      2026-09-14 - "metron should be telling me on a daily basis the
+      attractiveness of each stock from a technical analysis perspective" -
+      rests on this key and on `market_data/intraday/technical_ratings.json`.
+      Both are component-1 products and neither is touched by R4.
+  - object_key: market_data/technicals/rating_performance.json
+    reader: api/services/technical_rating_performance.py:27
+    producer: nousergon-data:collectors/technical_rating_ledger.py::collect_rating_performance
+    schedule_owner: data_collection_stack
+    phase4_disposition: rehomed
+    note: the rating track record. Also raised to critical at cutover (ruling R3).
+  - object_key: market_data/security_performance/latest.json
+    reader: api/services/security_performance.py:21
+    producer: nousergon-data:collectors/metron_market_data.py::collect_security_performance
+    schedule_owner: data_collection_stack
+    phase4_disposition: rehomed
+  - object_key: market_data/analyst/latest.json
+    reader: api/services/analyst.py:28
+    producer: nousergon-data:collectors/metron_market_data.py::collect_analyst
+    schedule_owner: data_collection_stack
+    phase4_disposition: rehomed
+    note: >-
+      missed by the 2026-09-14 pass. Distinct from the RETIRED
+      `data/analyst_snapshots/` unit, which Metron does not read.
+  - object_key: market_data/sentiment/latest.json
+    reader: api/services/sentiment.py:23
+    producer: nousergon-data:collectors/metron_market_data.py::collect_sentiment
+    schedule_owner: data_collection_stack
+    phase4_disposition: rehomed
+    note: missed by the 2026-09-14 pass.
+
+  # ── The weekly leg of the spine ────────────────────────────────────────
+  - object_key: market_data/valuation_medians/latest.json
+    reader: api/services/valuation_medians.py:23
+    producer: nousergon-data:collectors/metron_market_data.py::collect_valuation_medians
+    schedule_owner: data_collection_stack
+    phase4_disposition: rehomed
+    note: >-
+      phase 1 of the collector, not the EOD run. Its successor is the
+      standalone stack's weekly schedule, through the `weekly-phase-one`
+      workload nousergon-data-PR1701 added.
+
+  # ── Outside every stack: survives phase 4 with no action ───────────────
+  - object_key: market_data/intraday/latest.json
+    reader: api/services/market_snapshot.py:27
+    producer: nousergon-data:collectors/metron_market_data.py::collect_intraday
+    schedule_owner: host_timer
+    phase4_disposition: survives
+    note: a systemd timer on the shared application host, outside every stack.
+  - object_key: market_data/intraday/technical_ratings.json
+    reader: api/services/technical_rating.py:38
+    producer: nousergon-data:collectors/metron_market_data.py::collect_intraday
+    schedule_owner: host_timer
+    phase4_disposition: survives
+
+  # ── Ruled retired (`architecture.d/146` rule 4, ruling R4) ─────────────
+  - object_key: factors/profiles/latest.json
+    reader: api/services/factor_profiles.py:20
+    producer: crucible-research:scoring/factor_scoring.py::write_factor_profiles_to_s3
+    schedule_owner: v1_orchestration
+    phase4_disposition: retired_by_ruling
+    ruling: >-
+      Brian 2026-09-14, data_collection_plan_260914.md §7 R4 option (c):
+      retire the Metron FACTOR-PILLAR score until a v2 R-slot arm emits a
+      per-ticker pillar profile, then (a). Today's R-slot `signals.json` is
+      not schema-compatible.
+    note: >-
+      This is the only row whose producer schedule is inside the set phase 4
+      disables AND that the gate lets pass, and it passes on a RULING rather
+      than on a successor. It retires the factor score, NOT the technical
+      rating: those are two different columns in Metron Holdings, and the
+      technical one is a component-1 product (see
+      `market_data/technicals/latest.json` above).
+  - object_key: config/factor_attractiveness_weights.json
+    reader: api/services/factor_profiles.py:21
+    producer: ""
+    schedule_owner: none
+    phase4_disposition: retired_by_ruling
+    ruling: >-
+      Brian 2026-09-14, R4 (c) - it is the weights half of the factor-pillar
+      score retired above and has no independent reader in Metron.
+    note: >-
+      Swept 2026-09-17 across every fleet repo: NOTHING has ever written this
+      key. It is hand-maintained. `crucible-backtester`'s
+      analysis/attractiveness_eval.py states in its own docstring that its
+      suggested weights stay inside its eval artifact and are never published
+      here.
+  - object_key: research_intel/latest.json
+    reader: portfolio_analytics/ingestion/research_intel_connector.py:39
+    producer: ""
+    schedule_owner: none
+    phase4_disposition: retired_by_ruling
+    ruling: >-
+      Brian 2026-09-14, R4 (c): the LLM research graph retires in phase 4 and
+      LLM arms re-enter only in v2 phase 5, with no stable producer.
+    note: >-
+      MEASURED 2026-09-17, and it sharpens the ruling rather than restating
+      it - this artifact has had NO PRODUCER SINCE 2026-07-23. Its writer
+      (`crucible-research:archive/manager.py::write_research_intel`) still
+      exists with zero callers: the SignalsEnvelope cutover removed the agent
+      research graph (`alpha-engine-config-I3290`) and the registry row was
+      deleted to stop false pages. Metron has been reading a two-month-old
+      object as current ever since. Phase 4 cannot break this; it is already
+      broken, and the Metron-side removal is filed separately.
+
+  # ── Outside the v1 stack, administratively paused ──────────────────────
+  - object_key: crypto/holdings.json
+    reader: api/services/crypto.py:158
+    producer: nousergon-data:collectors/crypto_balances.py
+    schedule_owner: paused_outside_v1
+    phase4_disposition: survives
+    note: >-
+      its own EventBridge Scheduler rate schedule, never a Step Function, so
+      phase 4 does not reach it. DISABLED since 2026-08-12 under the
+      automation pause; Brian ruled on 2026-08-27 that it stays disabled, and
+      on 2026-09-14 (R2) that the (re-enable / retire) fork is asked once at
+      the unit's re-exam date. Metron serves a file that last moved
+      2026-08-07. Named in this clause's detail every reading so the pause is
+      never folded into a green line.
+
+  # ── UNRESOLVED: the row that holds this gate red ───────────────────────
+  - object_key: metron/reference_rate.json
+    reader: portfolio_analytics/ingestion/reference_connector.py:43
+    producer: crucible-executor:executor/reference_rate.py::publish
+    schedule_owner: v1_orchestration
+    phase4_disposition: unresolved
+    note: >-
+      Brian ruled R4 option (b) on 2026-09-14 - component 3 (the trader)
+      publishes it, "an execution output of a trader that keeps running". The
+      RULING is settled; the WORK is not. Measured 2026-09-17: `publish` is
+      called from `executor/eod_reconcile.py` inside the postclose reconcile
+      run, and that run is started by the v1 postclose pipeline. The trader
+      keeps running, but this write does not have a schedule of its own, so
+      phase 4 stops it. `unresolved` until the trader publishes it from a
+      schedule phase 4 leaves standing; then this row becomes `rehomed` with
+      `schedule_owner: trader_host`. This is the Showcase Portfolio's
+      benchmark rate.
