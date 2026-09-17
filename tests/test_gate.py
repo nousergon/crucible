@@ -2343,6 +2343,7 @@ class TestEveryLlmArmClauseIsControlArmIsRegisterBacked:
             name="control_planted_r_actual",
             spec={"kind": "planted"},
             created_date="2026-01-02",
+            filed_on="2026-01-02",
             control=True,
         )
         # The FILED collider: a real, non-control recipe whose generated NAME
@@ -2361,6 +2362,7 @@ class TestEveryLlmArmClauseIsControlArmIsRegisterBacked:
             name=filed.name,
             spec=filed.spec,
             created_date=filed.registered_at,
+            filed_on=filed.registered_at,
             control=real_control,
         )
         write_register(store, "r", register)

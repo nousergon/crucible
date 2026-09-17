@@ -23,7 +23,7 @@ import json
 from typing import Any
 
 from crucible.backfill import run_backfill
-from crucible.calendar import is_trading_day
+from crucible.calendar import is_trading_day, resolve_trading_day
 from crucible.config import settings as resolve_settings
 from crucible.data import ArcticPriceSource, PriceSource, run_daily, run_heal, run_weekly
 from crucible.data.point_in_time import FilingDatePointInTimeSource, PointInTimeSource
@@ -438,17 +438,42 @@ def handle_experiment_new(args: argparse.Namespace) -> int:
             )
     register = read_register(store, args.slot)
     before = set(register.all_arms())
-    register, _ = register_arms(register, specs)
+    # The trading day this run binds to, resolved the same way `run_job`
+    # resolves it (`crucible.runner.run_job`: explicit when passed, else the
+    # last completed session). It is what each new `registered` event is dated
+    # with — never the recipe's own `registered_at`
+    # (`alpha-engine-config-I10948`).
+    filed_on = (args.trading_day or resolve_trading_day()).isoformat()
+    register, _ = register_arms(register, specs, filed_on=filed_on)
     added = sorted(set(register.all_arms()) - before)
     if args.dry_run:
-        print(json.dumps({"would_register": added, "already_present": sorted(before)}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "would_register": added,
+                    "already_present": sorted(before),
+                    "filed_on": filed_on,
+                },
+                indent=2,
+            )
+        )
         return 0
 
     def job(ctx: Any) -> None:
         payload = write_register(store, args.slot, register)
         ctx.record_output(arm_register_key(args.slot), payload, schema_version="arm_register.v1")
         ctx.record_rows(rows_in=len(specs), rows_out=len(added))
-        print(json.dumps({"registered": added, "already_present": sorted(before)}, indent=2))
+        ctx.record_metric(
+            _arms_appended_metric(
+                slot=args.slot, added=added, filed_on=filed_on, now=ctx.started
+            )
+        )
+        print(
+            json.dumps(
+                {"registered": added, "already_present": sorted(before), "filed_on": filed_on},
+                indent=2,
+            )
+        )
 
     ctx = run_job(
         "experiment.new",
@@ -456,8 +481,60 @@ def handle_experiment_new(args: argparse.Namespace) -> int:
         store=store,
         trading_day=args.trading_day,
         run_mode=getattr(args, "run_mode", None),
+        # One manifest per INVOCATION, not per trading day
+        # (`alpha-engine-config-I10948`). This is an operator command that
+        # registers one named arm at a time, so registering seven arms is
+        # seven invocations — and with the slot alone as the discriminator
+        # (or none at all, which is what it had) they all write the same key
+        # and each overwrites the last. Measured 2026-09-17: seven runs, one
+        # surviving manifest, `rows_out: 1`, and the other six recoverable
+        # only from S3 object versions. `experiment.new` is on-demand
+        # (`components.yaml`: `schedule: null`, `deadline: null`), so no
+        # absence grading keys off a predictable manifest key here.
+        discriminator=lambda ctx: f"{args.slot}-{ctx.run_id}",
     )
     return 0 if ctx else 0
+
+
+#: The metric both registration jobs file naming WHICH arms they appended and
+#: on which trading day (`alpha-engine-config-I10948`).
+#:
+#: `rows_out` counts them; this names them. A count is not a durable record of
+#: an append: measured 2026-09-17, seven arms were appended across two slots
+#: and the only surviving manifest said `rows_out: 1` and named one register
+#: key, because each invocation overwrote the last at the same manifest key.
+#: Reconstructing which seven arms they were, and when, took S3 object-version
+#: archaeology — which is precisely the reconstruction "manifest or it did not
+#: happen" exists to make unnecessary.
+ARMS_APPENDED_METRIC = "arms_appended"
+
+
+def _arms_appended_metric(*, slot: str, added: list[str], filed_on: str, now: dt.datetime) -> dict:
+    """The `arms_appended` MetricRecord for one registration run.
+
+    `filed_on` is carried as its own field, not only inside the prose: it is
+    the value stamped onto each new `ArmEvent.date`, and a reader checking
+    that the register agrees with the manifest must not have to parse a
+    sentence to find it.
+    """
+    return {
+        "name": ARMS_APPENDED_METRIC,
+        "module": "crucible.track_a",
+        "metric_type": "provenance",
+        "value": float(len(added)),
+        "unit": "arms",
+        "n_floor": 0,
+        "status": "OK",
+        "status_reason": (
+            f"slot {slot}: {len(added)} arm(s) appended to the register on trading day "
+            f"{filed_on}: {', '.join(added) if added else '(none)'}"
+        ),
+        "source_path": arm_register_key(slot),
+        "last_updated_utc": now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        # Structured provenance a reader keys off without parsing prose.
+        "arms_appended": list(added),
+        "filed_on": filed_on,
+    }
 
 
 #: The metric `experiment.register` files every run, on every slot, whether or
@@ -538,7 +615,10 @@ def handle_experiment_register(args: argparse.Namespace) -> int:
         return _register_nothing_registrable(args, store, unservable)
     register = read_register(store, args.slot)
     before = set(register.all_arms())
-    register, _ = register_arms(register, list(load.specs))
+    # See `handle_experiment_new` for why this is the run's trading day and
+    # not the recipe's `registered_at` (`alpha-engine-config-I10948`).
+    filed_on = (args.trading_day or resolve_trading_day()).isoformat()
+    register, _ = register_arms(register, list(load.specs), filed_on=filed_on)
     added = sorted(set(register.all_arms()) - before)
     already_present = sorted(spec.arm_id for spec in load.specs if spec.arm_id in before)
     refused = [
@@ -551,6 +631,7 @@ def handle_experiment_register(args: argparse.Namespace) -> int:
         "registered": added,
         "already_present": already_present,
         "refused": refused,
+        "filed_on": filed_on,
     }
     if args.dry_run:
         print(json.dumps({**report, "registered": [], "would_register": added}, indent=2))
@@ -570,6 +651,11 @@ def handle_experiment_register(args: argparse.Namespace) -> int:
         payload = write_register(store, args.slot, register)
         ctx.record_output(arm_register_key(args.slot), payload, schema_version="arm_register.v1")
         ctx.record_rows(rows_in=load.n_read, rows_out=len(added))
+        ctx.record_metric(
+            _arms_appended_metric(
+                slot=args.slot, added=added, filed_on=filed_on, now=ctx.started
+            )
+        )
         ctx.record_metric(
             {
                 "name": REGISTER_COVERAGE_METRIC,

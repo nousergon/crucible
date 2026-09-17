@@ -441,7 +441,9 @@ def run_produce(
         raise SlotUnservableError(tuple(refused))
 
     register = read_register(ctx.store, slot)
-    register, _ = register_arms(register, specs + control_specs(slot_spec))
+    register, _ = register_arms(
+        register, specs + control_specs(slot_spec), filed_on=ctx.trading_day.isoformat()
+    )
     write_register(ctx.store, slot, register)
 
     produced: list[ShadowSelection] = []
@@ -622,7 +624,7 @@ def run_grade(
     )
     controls = control_specs(slot_spec)
     register = read_register(ctx.store, slot)
-    register, _ = register_arms(register, loaded_specs + controls)
+    register, _ = register_arms(register, loaded_specs + controls, filed_on=as_of.isoformat())
     write_register(ctx.store, slot, register)
 
     # Kind -> REGISTERED arm id. A control is addressed by the same

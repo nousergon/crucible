@@ -156,7 +156,11 @@ def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
     baseline = ""
     for name, value in seeded:
         register, record = register.register(
-            slot=slot, name=name, spec={"name": name}, created_date=dates[0]
+            slot=slot,
+            name=name,
+            spec={"name": name},
+            created_date=dates[0],
+            filed_on=dates[0],
         )
         if name.startswith("control_null_"):
             baseline = record.arm_id

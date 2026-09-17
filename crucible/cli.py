@@ -394,6 +394,33 @@ def _migrate_code_sha(args: argparse.Namespace) -> int:
     return 0
 
 
+def _migrate_arm_filed_on(args: argparse.Namespace) -> int:
+    """`crucible migrate.arm_filed_on [--dry-run] [--store URI]`.
+
+    One-time, audited, DATE-ONLY repair of the `registered` rows whose event
+    date was stamped from the recipe's `created_date` instead of the day the
+    append happened. Not run through `run_job`, for the same reason
+    `migrate.code_sha` is not: it corrects documents another job wrote and
+    claims no manifest of its own. See
+    `crucible.migrate.run_migrate_arm_filed_on` and the table above it for
+    the derivation and the refusal rules; this is the printed report only.
+    """
+    from crucible.migrate import run_migrate_arm_filed_on
+
+    store = _resolve_store(args)
+    report = run_migrate_arm_filed_on(store, dry_run=bool(getattr(args, "dry_run", False)))
+    print(f"crucible migrate.arm_filed_on: {report.summary_line()}")
+    for row in report.corrected:
+        print(
+            f"  corrected {row['arm_id']} in {row['key']}: {row['old_date']} -> "
+            f"{row['new_date']} (evidence: object version {row['evidence_version_id']} "
+            f"LastModified {row['evidence_last_modified']})"
+        )
+    for row in report.refused:
+        print(f"  refused {row['arm_id']}: {row['reason']}")
+    return 0
+
+
 #: The slots whose v1 champion pointer `migrate.history` imports. M's v1
 #: promotions are a dated lineage series, read and counted but never turned
 #: into a pointer (see `crucible.migrate.SOURCES`), and S has no v1 pointer.
@@ -676,7 +703,7 @@ FAULT_CAPABILITY_CLASS_JOBS: frozenset[str] = frozenset({FAULT_PROBE_JOB})
 #: reads this set rather than requiring `set(HANDLERS) == set(JOBS)`, so a
 #: FUTURE handler that silently drops out of `JOBS` by accident is still
 #: caught — only a name listed here is exempt.
-NON_JOB_HANDLERS: frozenset[str] = frozenset({"migrate.code_sha"})
+NON_JOB_HANDLERS: frozenset[str] = frozenset({"migrate.code_sha", "migrate.arm_filed_on"})
 
 
 HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
@@ -722,6 +749,8 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     # so `migrate.code_sha` reaches `main`'s `HANDLERS[args.job](args)`
     # dispatch the same way every real job does.
     "migrate.code_sha": _migrate_code_sha,
+    # alpha-engine-config-I10948 — same shape, same reason (see NON_JOB_HANDLERS).
+    "migrate.arm_filed_on": _migrate_arm_filed_on,
     # track-C handlers live in crucible/track_c.py so three tracks can land
     # code in parallel without editing one another's lines.
     HOLDOUT_JOB: holdout_handler,
@@ -1123,6 +1152,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Report what would be rewritten and refused; write nothing.",
     )
     migrate_code_sha_sub.add_argument(
+        "--store",
+        metavar="URI",
+        help="Store root: an s3://bucket/prefix URI or a local directory path.",
+    )
+
+    # `migrate.arm_filed_on`: the same NON-job shape as `migrate.code_sha`
+    # directly above, for the same reason — it corrects a field on rows
+    # another job already wrote and writes no run-manifest document of its
+    # own, so it is deliberately not in `JOBS` and has no `components.yaml`
+    # row. Its durable record is the migration report it files under
+    # `migrations/{trading_day}/{run_id}.json`, the same artifact
+    # `migrate.code_sha` and `migrate.history` file.
+    # Tracker: alpha-engine-config-I10948 (cited here, not in the help
+    # string — tests/test_no_stale_tracker_literals.py forbids a hardcoded
+    # tracker reference in any non-docstring string).
+    migrate_arm_filed_on_help = (
+        "One-off: correct the registered-event date on the arm-register rows that were "
+        "stamped from the recipe's created_date instead of the day they were filed"
+    )
+    migrate_arm_filed_on_sub = subparsers.add_parser(
+        "migrate.arm_filed_on",
+        help=migrate_arm_filed_on_help,
+        description=migrate_arm_filed_on_help,
+    )
+    migrate_arm_filed_on_sub.add_argument(
+        "--run-mode",
+        choices=list(RUN_MODES),
+        default=None,
+        help=(
+            "Required by every `crucible` invocation (see `crucible.runmode`); unused by "
+            "this repair, which writes no run-manifest-schema document of its own."
+        ),
+    )
+    migrate_arm_filed_on_sub.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be corrected and refused; write nothing.",
+    )
+    migrate_arm_filed_on_sub.add_argument(
         "--store",
         metavar="URI",
         help="Store root: an s3://bucket/prefix URI or a local directory path.",

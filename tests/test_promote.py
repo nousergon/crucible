@@ -186,6 +186,7 @@ def register_with(
             name=name,
             spec={"name": name},
             created_date=created,
+            filed_on=created,
             control=name in control_names,
         )
         ids[name] = record.arm_id

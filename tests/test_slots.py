@@ -254,7 +254,7 @@ class TestIsControlArmIsRegisterBacked:
             registered_at="2026-09-01",
             control=False,
         )
-        register, _ = register_arms(ArmRegister(), [filed])
+        register, _ = register_arms(ArmRegister(), [filed], filed_on="2026-08-28")
         registered_id = filed.arm_id
 
         assert is_control_arm(spec, registered_id), (
@@ -274,7 +274,7 @@ class TestIsControlArmIsRegisterBacked:
 
         spec = get_slot("m")
         controls = control_specs(spec)
-        register, _ = register_arms(ArmRegister(), controls)
+        register, _ = register_arms(ArmRegister(), controls, filed_on="2026-08-28")
         emptied = dataclasses.replace(spec, control_arms=())
 
         for control in controls:
@@ -316,7 +316,7 @@ class TestControlArmsExcludedFromRetirementMath:
 
         spec = get_slot("r")
         controls = control_specs(spec)
-        register, _ = register_arms(ArmRegister(), controls)
+        register, _ = register_arms(ArmRegister(), controls, filed_on="2026-08-28")
         for control in controls:
             assert register.state(control.arm_id).record.control is True, (
                 f"{control.arm_id} was registered with control=False; register_arms "
@@ -354,7 +354,7 @@ class TestControlArmsExcludedFromRetirementMath:
             for name in real_names
         ]
         controls = control_specs(spec)
-        register, by_id = register_arms(ArmRegister(), real_specs + controls)
+        register, by_id = register_arms(ArmRegister(), real_specs + controls, filed_on="2026-08-28")
         control_by_kind = {c.control_kind: c.arm_id for c in controls}
 
         dates = [d.isoformat() for d in sessions_ending(dt.date(2026, 8, 28), 3)]

@@ -67,7 +67,11 @@ def _seed(tmp_path, arms: tuple[tuple[str, float], ...]):
     ids: dict[str, str] = {}
     for name, value in arms:
         register, record = register.register(
-            slot="m", name=name, spec={"name": name}, created_date=dates[0]
+            slot="m",
+            name=name,
+            spec={"name": name},
+            created_date=dates[0],
+            filed_on=dates[0],
         )
         ids[name] = record.arm_id
         series = ArmSeries(arm_id=record.arm_id, scores={d: value for d in dates})

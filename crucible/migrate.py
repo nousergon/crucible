@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Any
 from crucible.calendar import resolve_trading_day
 from crucible.champion import PROMOTION_SOURCES, ChampionPointer
 from crucible.documents import load_document_bytes, load_store_document, read_manifests_under
-from crucible.keys import RUNS_ROOT, champion_key, migration_key
+from crucible.keys import RUNS_ROOT, arm_register_key, champion_key, migration_key
 from crucible.keys import manifest_key as run_manifest_key
 from crucible.manifest import money_path_writes, validate
 from crucible.release import release_json_key
@@ -56,12 +56,16 @@ if TYPE_CHECKING:
 _PLACEHOLDER_CODE_SHA = "0" * 40
 
 __all__ = [
+    "ARM_FILING_CORRECTIONS",
     "SOURCES",
+    "ArmFilingCorrection",
+    "ArmFilingMigrationReport",
     "CodeShaMigrationReport",
     "MigrationPointerConflict",
     "MigrationSourceMissing",
     "V1Source",
     "read_v1_json",
+    "run_migrate_arm_filed_on",
     "run_migrate_code_sha",
     "run_migrate_history",
 ]
@@ -368,7 +372,7 @@ def run_migrate_history(
     ) in [] if dry_run else planned:
         register = read_register(ctx.store, slot)
         if spec.arm_id not in set(register.all_arms()):
-            register, _ = register_arms(register, [spec])
+            register, _ = register_arms(register, [spec], filed_on=ctx.trading_day.isoformat())
             write_register(ctx.store, slot, register)
         champion_pointer = ChampionPointer(
             slot=slot,
@@ -865,6 +869,337 @@ def run_migrate_code_sha(store: Store, *, dry_run: bool = False) -> CodeShaMigra
         migration_run_id=migration_run_id,
         dry_run=dry_run,
         rewritten=tuple(rewritten),
+        refused=tuple(refused),
+    )
+    if not dry_run:
+        trading_day = resolve_trading_day(now)
+        store.put_bytes(
+            migration_key(trading_day.isoformat(), migration_run_id),
+            json.dumps(report.as_dict(), indent=2, sort_keys=True).encode("utf-8"),
+        )
+    return report
+
+
+# ---------------------------------------------------------------------------
+# `crucible migrate.arm_filed_on` — the one-time repair of the seven rows
+# whose `registered` event was dated from the recipe, not from the append.
+# ---------------------------------------------------------------------------
+#
+# A DATE-ONLY repair of rows that already exist, not a mutation channel. It
+# changes `ArmEvent.date` on a `registered` row and NOTHING else: no `arm_id`,
+# no `kind`, no `reason`, no `record` — so no `spec_hash`, no `created_date`,
+# no `control`, no `supersedes`. `ImmutableArmError` and every other guard in
+# `nousergon_lib.arena.arms` are untouched, and this module gains no general
+# "edit a register row" function: the exhaustive set of rows it may touch is
+# the literal table below, so a rerun after the table is exhausted rewrites
+# nothing and a row that is not in the table cannot be reached at all.
+#
+# The store is versioned, so the pre-repair object stays retrievable and the
+# correction is reconstructible from the bucket alone; the compare-and-swap
+# below means a concurrent append is detected rather than clobbered.
+#
+# **Why the filing days are literals here.** They cannot be derived from the
+# store: the appends wrote their register rows but the only run manifest that
+# survives them is `runs/experiment.new/2026-09-11/run.json`, which seven
+# successive invocations overwrote at one key (measured 2026-09-17 — see
+# `crucible.track_a.ARMS_APPENDED_METRIC` for the producer fix). The true
+# filing day was recovered from S3 object-version metadata on
+# `crucible/arms/{u,m}/register.jsonl`, and each row below carries the exact
+# version id and `LastModified` that introduced it, so the derivation is
+# reviewable in the diff rather than asserted. This mirrors `SOURCES` above:
+# a migration reads a system that no longer changes, and a configurable
+# source would let a rerun read somewhere else and report the same success.
+
+
+@dataclass(frozen=True)
+class ArmFilingCorrection:
+    """One `registered` row whose event date is being corrected, with the
+    S3 object version that is the evidence for the new value."""
+
+    slot: str
+    arm_id: str
+    #: The date the row carries today — the recipe's `created_date`, copied
+    #: into the event by the pre-fix `ArmRegister.register`. Asserted before
+    #: the rewrite: a row carrying anything else is refused, never coerced.
+    wrong_date: str
+    #: The corrected value.
+    filed_on: str
+    #: The object version of `arms/{slot}/register.jsonl` whose last line IS
+    #: this row — i.e. the version the append created.
+    evidence_version_id: str
+    #: That version's `LastModified`, verbatim.
+    evidence_last_modified: str
+
+
+#: The exhaustive set. Seven rows: four U (the scanner_cut ports) and three M
+#: (the v3.0-meta heads), appended 2026-09-17T00:23:40Z-00:24:28Z UTC.
+#:
+#: `filed_on` is 2026-09-17, the calendar date of every one of those appends
+#: and itself an NYSE session, so it is a legal trading-day value. It is
+#: deliberately the LATER of the two defensible readings:
+#: `crucible.calendar.resolve_trading_day` maps those instants to 2026-09-16
+#: (they land at ~20:23 ET on the 16th, after that session's close), but the
+#: 2026-09-16 arena cycle had already run when the appends happened, so
+#: dating the rows 2026-09-16 would demand the arms on a day whose cycle
+#: could not have scored them — the exact false gap this repair exists to
+#: remove. The first cycle that can score them is the 2026-09-19 arc, keyed
+#: to 2026-09-18, and 2026-09-17 < 2026-09-18 either way.
+ARM_FILING_CORRECTIONS: tuple[ArmFilingCorrection, ...] = (
+    ArmFilingCorrection(
+        slot="u",
+        arm_id="u:attractiveness:a1ecc956fea0",
+        wrong_date="2026-07-27",
+        filed_on="2026-09-17",
+        evidence_version_id="_NDUEanrMme58GBoNtuIrwj7LRok_wu1",
+        evidence_last_modified="2026-09-17T00:23:40+00:00",
+    ),
+    ArmFilingCorrection(
+        slot="u",
+        arm_id="u:attractiveness_hard3:57af7b69c3d5",
+        wrong_date="2026-08-24",
+        filed_on="2026-09-17",
+        evidence_version_id="lfd6amUgcK9P7gLQz.kyOeAditNhWQbt",
+        evidence_last_modified="2026-09-17T00:24:13+00:00",
+    ),
+    ArmFilingCorrection(
+        slot="u",
+        arm_id="u:attractiveness_mom121:0a7286997a8d",
+        wrong_date="2026-08-17",
+        filed_on="2026-09-17",
+        evidence_version_id="JT1tOqfpAabw34EZPbowEA2BSw_HHRJW",
+        evidence_last_modified="2026-09-17T00:24:16+00:00",
+    ),
+    ArmFilingCorrection(
+        slot="u",
+        arm_id="u:attractiveness_momzero:c46adedc32e2",
+        wrong_date="2026-08-17",
+        filed_on="2026-09-17",
+        evidence_version_id="ILMPbMldqI0XQB_4ybb0OOIFkBn0Xh.B",
+        evidence_last_modified="2026-09-17T00:24:19+00:00",
+    ),
+    ArmFilingCorrection(
+        slot="m",
+        arm_id="m:v3meta_momentum_head:ccfb2e608dd0",
+        wrong_date="2026-09-14",
+        filed_on="2026-09-17",
+        evidence_version_id="PPCOBBIO2KaAZO1gu4gl79rjuCvRp14_",
+        evidence_last_modified="2026-09-17T00:24:22+00:00",
+    ),
+    ArmFilingCorrection(
+        slot="m",
+        arm_id="m:v3meta_stack:1bb8d3646649",
+        wrong_date="2026-09-14",
+        filed_on="2026-09-17",
+        evidence_version_id="qG9BDdrDNFwGI7IFpU.j1MMEQS.kVLGq",
+        evidence_last_modified="2026-09-17T00:24:25+00:00",
+    ),
+    ArmFilingCorrection(
+        slot="m",
+        arm_id="m:v3meta_volatility_head:97645d421bea",
+        wrong_date="2026-09-14",
+        filed_on="2026-09-17",
+        evidence_version_id="6TDZwG.18wBvGPKv8zBtAMKgQXLLzEEB",
+        evidence_last_modified="2026-09-17T00:24:28+00:00",
+    ),
+)
+
+
+@dataclass(frozen=True)
+class ArmFilingMigrationReport:
+    """What one `crucible migrate.arm_filed_on` attempt did, in full.
+
+    Exhaustive over :data:`ARM_FILING_CORRECTIONS`: every declared row appears
+    in exactly one of ``corrected`` or ``refused``, named by arm id, never
+    silently dropped. `len(corrected) + len(refused) == len(...)` is asserted
+    before the report is returned.
+    """
+
+    migration_run_id: str
+    dry_run: bool
+    corrected: tuple[dict[str, Any], ...] = ()
+    refused: tuple[dict[str, Any], ...] = ()
+
+    @property
+    def counts(self) -> dict[str, int]:
+        return {"corrected": len(self.corrected), "refused": len(self.refused)}
+
+    def summary_line(self) -> str:
+        suffix = " (dry run — nothing written)" if self.dry_run else ""
+        return f"{len(self.corrected)} corrected, {len(self.refused)} refused{suffix}"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "migrate_arm_filed_on.v1",
+            "migration_run_id": self.migration_run_id,
+            "dry_run": self.dry_run,
+            "corrected": list(self.corrected),
+            "refused": list(self.refused),
+            "counts": self.counts,
+        }
+
+
+def _register_rows(raw: bytes, key: str) -> list[dict[str, Any]]:
+    """The register's rows, parsed. Raises on anything unreadable.
+
+    Not `read_register`: the fold would hand back `ArmEvent` objects and this
+    repair rewrites LINES, so that every field it is not correcting survives
+    byte-for-byte rather than being re-serialized from a reconstruction.
+    """
+    rows: list[dict[str, Any]] = []
+    for lineno, line in enumerate(raw.decode("utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        parsed = json.loads(line)
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{key}:{lineno} parsed to {type(parsed).__name__}, not an object")
+        rows.append(parsed)
+    return rows
+
+
+def _serialize_register_rows(rows: list[dict[str, Any]]) -> bytes:
+    """The same bytes shape `crucible.slots.arms.write_register` produces."""
+    return ("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n").encode("utf-8")
+
+
+def _apply_filing_correction(
+    rows: list[dict[str, Any]], correction: ArmFilingCorrection
+) -> tuple[bool, str]:
+    """Correct ``correction``'s row IN ``rows``. Returns ``(changed, detail)``.
+
+    Refuses rather than coerces: the row must exist, be the `registered`
+    event for that arm id, and still carry ``wrong_date``. A row already
+    carrying ``filed_on`` is reported as an idempotent no-op, which is what a
+    rerun after a partial apply must look like.
+    """
+    from nousergon_lib.arena.arms import (  # noqa: PLC0415 - heavy import, one call site
+        EVENT_REGISTERED,
+    )
+
+    matches = [
+        row
+        for row in rows
+        if row.get("arm_id") == correction.arm_id and row.get("kind") == EVENT_REGISTERED
+    ]
+    if not matches:
+        return False, (
+            f"no `{EVENT_REGISTERED}` row for {correction.arm_id} in the register; this "
+            "repair corrects a row that exists and never creates one."
+        )
+    if len(matches) > 1:
+        return False, (
+            f"{len(matches)} `{EVENT_REGISTERED}` rows for {correction.arm_id}; the register "
+            "is already inconsistent and a date repair would hide which one is authoritative."
+        )
+    row = matches[0]
+    current = row.get("date")
+    if current == correction.filed_on:
+        return False, (
+            f"already carries date={correction.filed_on}; nothing left for this attempt to do."
+        )
+    if current != correction.wrong_date:
+        return False, (
+            f"carries date={current!r}, not the {correction.wrong_date!r} this repair was "
+            "derived against; refusing to overwrite a value this session did not measure."
+        )
+    row["date"] = correction.filed_on
+    return True, f"date {correction.wrong_date} -> {correction.filed_on}"
+
+
+def run_migrate_arm_filed_on(
+    store: Store, *, dry_run: bool = False
+) -> ArmFilingMigrationReport:
+    """Correct the `registered` event dates listed in
+    :data:`ARM_FILING_CORRECTIONS`. One-time, audited, date-only.
+
+    See the module comment above this function's table for the derivation and
+    for why the values are literals. Safe to re-run: a row already carrying
+    its corrected date is refused as a no-op rather than rewritten.
+    """
+    now = dt.datetime.now(dt.UTC)
+    migration_run_id = now.strftime("%Y%m%dT%H%M%S%fZ")
+    corrected: list[dict[str, Any]] = []
+    refused: list[dict[str, Any]] = []
+
+    by_slot: dict[str, list[ArmFilingCorrection]] = {}
+    for correction in ARM_FILING_CORRECTIONS:
+        by_slot.setdefault(correction.slot, []).append(correction)
+
+    for slot, corrections in sorted(by_slot.items()):
+        key = arm_register_key(slot)
+        if not store.exists(key):
+            for correction in corrections:
+                refused.append(
+                    {
+                        "slot": slot,
+                        "arm_id": correction.arm_id,
+                        "key": key,
+                        "reason": f"{key} does not exist; there is no row to correct.",
+                    }
+                )
+            continue
+        expected_version = store.etag(key)
+        raw = store.get_bytes(key)
+        rows = _register_rows(raw, key)
+        applied: list[ArmFilingCorrection] = []
+        for correction in corrections:
+            changed, detail = _apply_filing_correction(rows, correction)
+            if not changed:
+                refused.append(
+                    {
+                        "slot": slot,
+                        "arm_id": correction.arm_id,
+                        "key": key,
+                        "reason": detail,
+                    }
+                )
+                continue
+            applied.append(correction)
+        if not applied:
+            continue
+        payload = _serialize_register_rows(rows)
+        if not dry_run:
+            try:
+                store.compare_and_swap(key, expected_version, payload)
+            except PointerConflictError as exc:
+                for correction in applied:
+                    refused.append(
+                        {
+                            "slot": slot,
+                            "arm_id": correction.arm_id,
+                            "key": key,
+                            "reason": (
+                                f"concurrent write detected (compare-and-swap conflict): {exc}. "
+                                "Nothing was written for this slot; re-run to re-evaluate."
+                            ),
+                        }
+                    )
+                continue
+        for correction in applied:
+            corrected.append(
+                {
+                    "slot": slot,
+                    "arm_id": correction.arm_id,
+                    "key": key,
+                    "old_date": correction.wrong_date,
+                    "new_date": correction.filed_on,
+                    "evidence_version_id": correction.evidence_version_id,
+                    "evidence_last_modified": correction.evidence_last_modified,
+                    "dry_run": dry_run,
+                }
+            )
+
+    if len(corrected) + len(refused) != len(ARM_FILING_CORRECTIONS):
+        raise RuntimeError(
+            f"{len(corrected)} corrected + {len(refused)} refused != "
+            f"{len(ARM_FILING_CORRECTIONS)} declared corrections; a declared row was "
+            "neither applied nor accounted for, and a repair that loses track of a row "
+            "is worse than one that refuses it."
+        )
+
+    report = ArmFilingMigrationReport(
+        migration_run_id=migration_run_id,
+        dry_run=dry_run,
+        corrected=tuple(corrected),
         refused=tuple(refused),
     )
     if not dry_run:

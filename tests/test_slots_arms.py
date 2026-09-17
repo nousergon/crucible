@@ -142,7 +142,7 @@ class TestAnArmDeclaresItsLlmCallSite:
         # The register carries the spec HASH, never the spec — so the join
         # from "active arm id" back to "this recipe declares that site" is the
         # id itself, which the gate reproduces by loading the synced recipes.
-        register, _ = register_arms(ArmRegister(), [spec])
+        register, _ = register_arms(ArmRegister(), [spec], filed_on="2026-08-28")
         (event,) = register.to_dicts()
         assert event["arm_id"] == spec.arm_id
         assert event["record"]["spec_hash"] == spec.arm_id.rsplit(":", 1)[-1]
@@ -170,11 +170,11 @@ class TestVacuityGuard:
 class TestRegister:
     def test_registration_is_the_gate_and_is_idempotent(self, store, strategy_dir) -> None:
         specs = load_arm_specs("u", strategy_dir=strategy_dir)
-        register, _ = register_arms(ArmRegister(), specs)
+        register, _ = register_arms(ArmRegister(), specs, filed_on="2026-08-28")
         write_register(store, "u", register)
         first = store.get_bytes("arms/u/register.jsonl")
 
-        again, _ = register_arms(read_register(store, "u"), specs)
+        again, _ = register_arms(read_register(store, "u"), specs, filed_on="2026-08-28")
         write_register(store, "u", again)
         second = store.get_bytes("arms/u/register.jsonl")
         assert first == second, (
@@ -184,11 +184,11 @@ class TestRegister:
 
     def test_a_rewrite_is_a_strict_prefix_extension(self, store, strategy_dir) -> None:
         specs = load_arm_specs("u", strategy_dir=strategy_dir)
-        register, _ = register_arms(ArmRegister(), specs[:2])
+        register, _ = register_arms(ArmRegister(), specs[:2], filed_on="2026-08-28")
         write_register(store, "u", register)
         before = store.get_bytes("arms/u/register.jsonl").decode().splitlines()
 
-        register, _ = register_arms(read_register(store, "u"), specs)
+        register, _ = register_arms(read_register(store, "u"), specs, filed_on="2026-08-28")
         write_register(store, "u", register)
         after = store.get_bytes("arms/u/register.jsonl").decode().splitlines()
 
@@ -199,7 +199,7 @@ class TestRegister:
         specs = load_arm_specs("u", strategy_dir=strategy_dir)
         orphan = ArmSpec(**{**specs[0].__dict__, "supersedes": "u:ghost:deadbeef"})
         with pytest.raises(ValueError, match="not in the register"):
-            register_arms(ArmRegister(), [orphan])
+            register_arms(ArmRegister(), [orphan], filed_on="2026-08-28")
 
 
 class TestControls:

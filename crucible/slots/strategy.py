@@ -1953,7 +1953,9 @@ def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     loaded, specs = _registered_arms(ctx, settings=settings)
 
     register = read_register(ctx.store, SLOT)
-    register, _ = register_arms(register, specs + control_specs(get_slot(SLOT)))
+    register, _ = register_arms(
+        register, specs + control_specs(get_slot(SLOT)), filed_on=trading_day
+    )
     write_register(ctx.store, SLOT, register)
 
     # Resolved ONCE for the session, not once per arm. The alpha vector, the
