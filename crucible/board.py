@@ -63,6 +63,7 @@ from crucible.features.depth import (
     FEATURES_PREFIX,
     check_feature_layer_completeness,
     check_feature_layer_depth,
+    check_feature_layer_provenance,
 )
 from crucible.gate import LADDER_STATES, STANDING_SLOS, Ladder, PhaseRow
 from crucible.keys import ALERTS_ROOT
@@ -1055,6 +1056,7 @@ def build_board(
 
     rows.append(_feature_layer_depth_row(store))
     rows.append(_feature_layer_completeness_row(store))
+    rows.append(_feature_layer_provenance_row(store))
 
     touch = human_touch if human_touch is not None else _read_human_touch_count(moment.date())
     rows.extend(_standing_rows(store, day, touch))
@@ -1790,6 +1792,54 @@ def _feature_layer_completeness_row(store: Store) -> BoardRow:
             "depth row because depth counts objects, never contents"
         ),
         last_read=last_read,
+    )
+
+
+def _feature_layer_provenance_row(store: Store) -> BoardRow:
+    """`alpha-engine-config-I10733`: red when the live feature layer was not
+    compiled end to end by the production point-in-time source. Third sibling
+    of the depth and completeness rows, same posture: a read failure renders
+    `UNMEASURABLE`, never folded into a false green.
+
+    Measured 2026-09-17: `features/v553618c991dd` held 1,180 sessions, 92 of
+    which (2025-07-09..2025-11-14) were compiled by `v1-snapshots` while every
+    neighbour used `edgar-filing-date` — a heal chunk that booted a release
+    predating the EDGAR switch. Those 92 sessions carry 11 unmeasured columns
+    and four null attractiveness pillars each. `data/{day}/coverage.json`
+    recorded the source correctly for every one of them from the moment they
+    were written; nothing read it. This row is what reads it.
+    """
+    try:
+        reading = check_feature_layer_provenance(store)
+    except Exception as exc:  # noqa: BLE001 - the failure IS the reading
+        state, detail = (
+            "UNMEASURABLE",
+            f"could not read the live feature layer's per-session coverage records to "
+            f"grade point-in-time provenance: {type(exc).__name__}: {exc}. This is a "
+            "statement about our access, not about which source compiled the layer.",
+        )
+    else:
+        state = "UNMET" if reading.state == "RED" else "MET"
+        detail = reading.detail
+
+    return BoardRow(
+        id="component:feature_layer_provenance",
+        source="component",
+        section="§10 component 4 — feature registry",
+        title=(
+            "every session of the live feature layer was compiled by the production "
+            "point-in-time source"
+        ),
+        state=state,
+        detail=detail,
+        surface="crucible board",
+        artifact="data/<session>/coverage.json (point_in_time.source)",
+        means_when_red=(
+            "part of the live feature layer was compiled from a different, shallower "
+            "point-in-time source — a well-formed parquet with plausible columns that "
+            "is only wrong relative to its neighbours, which is exactly what the depth "
+            "and completeness rows structurally cannot see"
+        ),
     )
 
 
