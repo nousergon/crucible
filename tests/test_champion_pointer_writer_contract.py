@@ -135,6 +135,24 @@ def _from_dict_accepts(store: LocalStore, slot: str) -> ChampionPointer:
     return ChampionPointer.from_dict(payload)
 
 
+def _seed_admissible(store: LocalStore, recipe: Any, *, slot: str = "r") -> None:
+    """Make ``recipe`` a slot the migration will ADMIT.
+
+    `crucible.migrate.admission_refusal` seats a slot only once its arms have
+    arrived and the arm the v1 champion resolves to has PRODUCED
+    (`alpha-engine-config-I10961`/`-I10964`): a pointer seated on an arm that
+    emits nothing points the trader's contract at silence. Both conditions are
+    seeded here rather than waived, because both are what production has.
+    """
+    from crucible.keys import shadow_key
+    from crucible.slots.arms import read_register, register_arms, write_register
+
+    seated = recipe
+    register, _ = register_arms(read_register(store, slot), [seated], filed_on="2026-07-13")
+    write_register(store, slot, register)
+    store.put_bytes(shadow_key(seated.arm_id, "2026-07-13"), json.dumps({"names": []}).encode())
+
+
 class TestKnownWritersRoundTrip:
     def test_write_champion_produces_a_document_from_dict_accepts(self, tmp_path) -> None:
         store = LocalStore(tmp_path / "store")
@@ -175,6 +193,12 @@ class TestKnownWritersRoundTrip:
         recipes = {
             s.name: replace(s, slot="r") for s in load_arm_specs("u", strategy_dir=strategy_dir)
         }
+        # The migration ADMITS a slot only once its arms have arrived and the
+        # arm the v1 champion resolves to has produced (`admission_refusal`,
+        # `alpha-engine-config-I10961`/`-I10964`): a pointer seated on an arm
+        # that emits nothing points the trader's contract at silence. Both are
+        # seeded here rather than waived, because both are what production has.
+        _seed_admissible(store, recipes["momentum_sleeve"])
 
         def job(ctx: Any) -> None:
             run_migrate_history(
@@ -219,6 +243,7 @@ class TestKnownWritersRoundTrip:
         recipes = {
             s.name: replace(s, slot="r") for s in load_arm_specs("u", strategy_dir=strategy_dir)
         }
+        _seed_admissible(store, recipes["momentum_sleeve"])
 
         def job(ctx: Any) -> None:
             run_migrate_history(
