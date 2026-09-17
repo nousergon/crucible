@@ -2894,6 +2894,7 @@ class TestAnEmptyArmSetIsNeverAPass:
                 name=control.name,
                 spec=control.spec,
                 created_date=control.registered_at,
+                filed_on=control.registered_at,
                 control=True,
             )
         arm_id = ""
@@ -2908,7 +2909,11 @@ class TestAnEmptyArmSetIsNeverAPass:
                 registered_at="2026-01-02",
             )
             register, _ = register.register(
-                slot=slot, name=name, spec=spec.spec, created_date=spec.registered_at
+                slot=slot,
+                name=name,
+                spec=spec.spec,
+                created_date=spec.registered_at,
+                filed_on=spec.registered_at,
             )
             arm_id = spec.arm_id
             if sync:

@@ -573,6 +573,8 @@ def resolve_declared_lineage(
 def register_arms(
     register: ArmRegister,
     specs: list[ArmSpec],
+    *,
+    filed_on: str,
 ) -> tuple[ArmRegister, dict[str, ArmSpec]]:
     """Fold every recipe into ``register``, appending only what is new.
 
@@ -580,7 +582,23 @@ def register_arms(
     registered is not re-registered — that would append a second `registered`
     event for one id and break the fold — and its recipe is still returned,
     because the cycle needs the recipe of every arm it scores.
+
+    ``filed_on`` is the TRADING DAY of the run doing the append, and it is
+    required (`alpha-engine-config-I10948`). It is not
+    `ArmSpec.registered_at`: that is the recipe's declared date, which may be
+    weeks or months before anything wrote a row, and passing it here is
+    exactly the defect this parameter exists to make impossible. The library
+    would accept its omission with a `DeprecationWarning`; this wrapper is
+    the fleet's producer, so it refuses instead — every caller here has a
+    `ctx.trading_day` in scope.
+
+    The two dates go to two places and must stay distinguishable:
+    ``ArmRecord.created_date`` starts the arm's out-of-sample clock, and
+    ``ArmEvent.date`` is the only durable answer to "was this arm in the
+    register on day D" — which `crucible.gate._clause_arms_all_scored` asks
+    of every day in its window.
     """
+    assert_trading_day(filed_on, context="register_arms(filed_on=...)")
     by_id: dict[str, ArmSpec] = {}
     known = set(register.all_arms())
     for spec in specs:
@@ -614,6 +632,9 @@ def register_arms(
             # correct despite the library carrying the fix
             # (`alpha-engine-config-I9993`).
             control=spec.control,
+            # The day the row is APPENDED — never `spec.registered_at`, which
+            # is already going to `created_date` above.
+            filed_on=filed_on,
         )
         known.add(spec.arm_id)
     return register, by_id

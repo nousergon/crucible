@@ -1112,6 +1112,17 @@ _UNDISPATCHABLE_REASON = (
 )
 
 
+#: Why the ARM axis narrowed one (`alpha-engine-config-I10948`). Its own
+#: sentence for the same reason `_UNDISPATCHABLE_REASON` is not
+#: `_UNREGISTERED_REASON`: "the slot could not be dispatched" and "the arm was
+#: not in the register yet" send a reader to different places — the release's
+#: slot modules in the first case, `arms/{slot}/register.jsonl` in the second.
+_NOT_YET_FILED_REASON = (
+    "that arm was not in the slot's register on that day — its `registered` event was "
+    "filed later, and that day's arena cycle is a historical artifact that is not recomputed"
+)
+
+
 def _unregistered_note(unregistered: list[str], *, reason: str = _UNREGISTERED_REASON) -> str:
     """How a narrowed requirement is REPORTED — always, and named one by one.
 
@@ -1130,15 +1141,60 @@ def _unregistered_note(unregistered: list[str], *, reason: str = _UNREGISTERED_R
     return f"{len(unregistered)} not required ({reason}): {shown}"
 
 
+def _arm_filing_days(key: str, register: ArmRegister) -> tuple[dict[str, dt.date], list[str]]:
+    """Each arm id mapped to the day its `registered` event was FILED, plus
+    one malformed-reading string per row whose date cannot be used.
+
+    `nousergon_lib.arena.ArmEvent.date` is the day the row was appended;
+    `ArmRecord.created_date` is the date the RECIPE declares and may be months
+    earlier. Only the first answers "was this arm in the register on day D".
+
+    A row whose event date is missing, empty or not an ISO-8601 date is a
+    MALFORMED register reading, named and red — never a silent skip and never
+    "assume it was always there". Both of those would restore
+    `alpha-engine-config-I10948` for exactly the rows whose provenance is
+    already broken: the arm would be demanded on every day in the window
+    again, or it would be demanded on none of them and a genuinely unscored
+    arm would go unreported.
+    """
+    from nousergon_lib.arena.arms import (  # noqa: PLC0415 - heavy import, one call site
+        EVENT_REGISTERED,
+    )
+
+    filed: dict[str, dt.date] = {}
+    problems: list[str] = []
+    for event in register.events:
+        if event.kind != EVENT_REGISTERED:
+            continue
+        raw = event.date
+        if not isinstance(raw, str) or not raw.strip():
+            problems.append(
+                f"{key}: `registered` event for {event.arm_id} carries no usable `date` "
+                f"({raw!r}); the day an arm was filed is what decides which days it is "
+                "demanded on, so a row without one cannot be graded"
+            )
+            continue
+        try:
+            filed[event.arm_id] = dt.date.fromisoformat(raw)
+        except ValueError as exc:
+            problems.append(
+                f"{key}: `registered` event for {event.arm_id} has `date` {raw!r}, which is "
+                f"not an ISO-8601 date: {exc}"
+            )
+    return filed, problems
+
+
 def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
     requirement = (
         "each slot's arena cycle scored every ACTIVE registered arm and both control "
-        "arms, on every trading day in the window, on every slot the release that ran "
-        "that day's arc could dispatch"
+        "arms, on every trading day in the window at or after the day that arm's "
+        "`registered` event was filed, on every slot the release that ran that day's arc "
+        "could dispatch"
     )
     gaps: list[str] = []
     unmeasurable: list[str] = []
     undispatchable: list[str] = []
+    not_yet_filed: list[str] = []
     evidence: list[str] = []
     # Each slot's register is read ONCE, before the day loop. `_register_arms`
     # reads a single key per SLOT, not per day — re-reading it inside the day
@@ -1147,6 +1203,15 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
     # duplicates of it and hiding a genuinely missing arena cycle for an
     # unrelated slot/day (`alpha-engine-config-I9869` round 3, finding 5).
     registers: dict[str, tuple[set[str], str | None, str | None, bool]] = {}
+    # arm id -> the day its `registered` event was filed, per slot. The THIRD
+    # axis of this clause (`alpha-engine-config-I10948`), alongside the job
+    # axis of `_clause_arc_runs_ok` and the slot axis below: an arm is
+    # demanded only on days at or after the day its row entered the register.
+    # Without it, registering an arm retroactively demands it on every day in
+    # the window — the same "grading past days against the present tree"
+    # defect the slot axis fixed one axis over, surviving as "by a
+    # REGISTRATION that names neither".
+    filing_days: dict[str, dict[str, dt.date]] = {}
     # The CANDIDATE slots are the ones the CLI can run TODAY — unchanged from
     # before. What changed is that a MISSING arena cycle for one of them is no
     # longer an automatic gap: whether a past day's release could have
@@ -1164,14 +1229,27 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
     # names neither.
     slots = {slot: SLOTS[slot] for slot in SLOTS if slot in dispatchable_slots()}
     for slot in slots:
-        registered, register_key, register_problem, register_access, _register_unused = (
-            _register_arms(store, slot)
+        registered, register_key, register_problem, register_access, _register = _register_arms(
+            store, slot
         )
         registers[slot] = (registered, register_key, register_problem, register_access)
         if register_key is not None:
             evidence.append(register_key)
         if register_problem is not None:
             (unmeasurable if register_access else gaps).append(register_problem)
+        if _register is None:
+            # No register to read filing days from. The `register_problem`
+            # above already carries why (unreadable), or the register is
+            # simply absent and `registered` is empty — either way there is
+            # no arm to narrow, so an empty map is the honest answer and not
+            # a swallow.
+            filing_days[slot] = {}
+            continue
+        filed, filing_problems = _arm_filing_days(register_key, _register)
+        filing_days[slot] = filed
+        # A CONTENT gap, never `unmeasurable`: the register was read fine, its
+        # rows are malformed.
+        gaps.extend(filing_problems)
     history = _ArcRegistryHistory(store)
     for day in window:
         for slot, spec in slots.items():
@@ -1214,7 +1292,18 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
                 # This day's contribution to the SAME problem is not a
                 # second independent finding.
                 continue
-            unscored = registered - scored
+            filed = filing_days[slot]
+            # An arm with NO filing-day entry is not silently demanded and not
+            # silently excused: `_arm_filing_days` already filed a malformed
+            # reading naming it, which is in `gaps` above, and the clause is
+            # red regardless of what this comparison says.
+            demanded = {arm for arm in registered if arm in filed and filed[arm] <= day}
+            deferred = sorted(arm for arm in registered if arm in filed and filed[arm] > day)
+            not_yet_filed.extend(
+                f"{slot}:{arm}@{day.isoformat()} (filed {filed[arm].isoformat()})"
+                for arm in deferred
+            )
+            unscored = demanded - scored
             if unscored:
                 gaps.append(f"{slot}@{day.isoformat()}: {sorted(unscored)} registered but unscored")
             controls = {c.arm_id for c in spec.control_arms}
@@ -1229,6 +1318,7 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
     # a distinct finding out of the `[:4]` window.
     gaps = list(dict.fromkeys(gaps))
     unmeasurable = list(dict.fromkeys(unmeasurable))
+    not_yet_filed = list(dict.fromkeys(not_yet_filed))
     if gaps or unmeasurable:
         parts = []
         if unmeasurable:
@@ -1237,6 +1327,8 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
             parts.append("; ".join(gaps[:4]))
         if undispatchable:
             parts.append(_unregistered_note(undispatchable, reason=_UNDISPATCHABLE_REASON))
+        if not_yet_filed:
+            parts.append(_unregistered_note(not_yet_filed, reason=_NOT_YET_FILED_REASON))
         return Clause(
             "arms_all_scored",
             requirement,
@@ -1253,6 +1345,8 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
     )
     if undispatchable:
         detail += f"; {_unregistered_note(undispatchable, reason=_UNDISPATCHABLE_REASON)}"
+    if not_yet_filed:
+        detail += f"; {_unregistered_note(not_yet_filed, reason=_NOT_YET_FILED_REASON)}"
     return Clause(
         "arms_all_scored",
         requirement,

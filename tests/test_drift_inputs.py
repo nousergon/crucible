@@ -346,7 +346,11 @@ class TestPredictionsInput:
         _compile(store, source, [cycle_date])
         register = ArmRegister()
         register, record = register.register(
-            slot="u", name="probe", spec={"x": 1}, created_date="2026-06-01"
+            slot="u",
+            name="probe",
+            spec={"x": 1},
+            created_date="2026-06-01",
+            filed_on="2026-06-01",
         )
         arm_id = record.arm_id
         write_register(store, "u", register)
@@ -417,7 +421,11 @@ class TestICInput:
         _compile(store, source, [cycle_date])
         register = ArmRegister()
         register, record = register.register(
-            slot="u", name="probe", spec={"x": 1}, created_date="2026-06-01"
+            slot="u",
+            name="probe",
+            spec={"x": 1},
+            created_date="2026-06-01",
+            filed_on="2026-06-01",
         )
         arm_id = record.arm_id
         write_register(store, "u", register)
@@ -437,7 +445,11 @@ class TestICInput:
         _compile(store, source, [cycle_date])
         register = ArmRegister()
         register, record = register.register(
-            slot="u", name="probe", spec={"x": 1}, created_date="2026-06-01"
+            slot="u",
+            name="probe",
+            spec={"x": 1},
+            created_date="2026-06-01",
+            filed_on="2026-06-01",
         )
         arm_id = record.arm_id
         write_register(store, "u", register)

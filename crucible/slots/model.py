@@ -3171,7 +3171,7 @@ def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             )
 
     register = read_register(ctx.store, SLOT)
-    register, _ = register_arms(register, [*specs, *control_specs(slot_spec)])
+    register, _ = register_arms(register, [*specs, *control_specs(slot_spec)], filed_on=trading_day)
     write_register(ctx.store, SLOT, register)
 
     source = FeatureLayerSource(store=ctx.store, version=feature_version)
