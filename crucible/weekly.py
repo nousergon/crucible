@@ -60,7 +60,17 @@ ARC_JOB = "weekly"
 #: every week since phase 1 and never once written a champion pointer or a
 #: promote run. Every §6 phase-3 promotion clause therefore read UNMEASURABLE:
 #: not "the slot held its pointer", but "nothing looked".
-ARC_SLOT_JOBS: frozenset[str] = frozenset({"experiment.run", "experiment.grade", "promote"})
+#: `experiment.register` joined at `alpha-engine-config-I10927`, at 11:00 —
+#: before `experiment.run`'s 12:00, because the arm it registers is the arm
+#: that stage is supposed to score. Until it did, `experiment.new` was the
+#: only path from "a recipe is merged" to "an arm is scored" and it was
+#: scheduled nowhere: ten recipes merged into the strategy tree had never
+#: been registered, the U slot had graded the same three arms every cycle
+#: since 2026-09-12, and no surface said so. The same defect this module's
+#: header names for the arc, one step upstream.
+ARC_SLOT_JOBS: frozenset[str] = frozenset(
+    {"experiment.register", "experiment.run", "experiment.grade", "promote"}
+)
 
 #: The arc jobs that read ArcticDB directly and therefore accept
 #: `--arctic-library` (`crucible.track_a._source`). Only `data.weekly` is a

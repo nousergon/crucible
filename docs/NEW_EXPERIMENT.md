@@ -12,7 +12,10 @@ Two facts decide the shape of everything below:
   its score series, and the new one starts its own.
 - **Registration is the gate.** An arm that writes output without a row in
   its slot's register is a defect, not an experiment. There is no path from
-  a recipe to a score that skips `crucible experiment.new`.
+  a recipe to a score that skips registration — by hand with
+  `crucible experiment.new --arm`, or on the weekly arc with
+  `crucible experiment.register`, which registers whatever the release in
+  force declares and the register lacks (§5a).
 
 ## 0. Which slot
 
@@ -23,11 +26,15 @@ Two facts decide the shape of everything below:
 | `m` | What predicts the label | `spec.features`, `spec.estimator`, `spec.cpcv`, … |
 | `s` | How a ranking becomes positions | `spec.rules`, `spec.cost_model` |
 
-U and R recipes are `ArmSpec`s and are what `experiment.new` registers.
-**M and S recipes are a different document**, read by
-`crucible.slots.load_model_recipes` and `crucible.slots.load_strategy_recipes`;
-`experiment.new --slot m|s` refuses by name, and says which loader reads the
-slot. The rest of this runbook is the U/R path.
+U and R recipes are `ArmSpec`s. **M and S recipes are a different
+document**, read by `crucible.slots.model.load_model_recipes` and
+`crucible.slots.strategy.load_strategy_slot`. All four slots register:
+`crucible.registration.load_registrable_recipes` dispatches each slot to its
+own loader, and is the one entry point `experiment.new`,
+`experiment.register` and the phase-3 gate clause all read (corrected
+`alpha-engine-config-I10927` — this paragraph previously said
+`experiment.new --slot m|s` refuses by name, which `-I9957` and `-I10512`
+made false). The rest of this runbook is the U/R path.
 
 ## 1. Make sure the ranker exists
 
@@ -170,6 +177,32 @@ from the tree synced into the store under `strategy/current/arms/{slot}/`.
 Which source was used is recorded on each spec and is reported by
 `crucible explain`, so "why did this box register these arms" is answerable
 after the fact.
+
+## 5a. Or let the arc register it
+
+```
+uv run crucible experiment.register --slot r --date 2026-09-04 --run-mode live
+```
+
+An arc stage at 11:00, before `experiment.run` at 12:00, one run per
+dispatchable slot. It registers **every** recipe the release in force
+declares and the slot's register lacks, so a recipe merged during the week
+is scored on the next Saturday with nobody in the path.
+
+This is not `experiment.new --arm` with the flag dropped — that flag stays
+required, for the reason §5 gives. The deliberate act moves up a layer, to
+**pinning the release**: what the pinned tree declares is then derived from
+it, the way the dispatchable slots are derived from the slot modules. Until
+this stage existed, `experiment.new` was scheduled nowhere and ten merged
+recipes had never been registered (measured 2026-09-16,
+`alpha-engine-config-I10927`).
+
+It is idempotent — a second run appends nothing and reports
+`already_present` per recipe — and it is never a promotion: it makes an arm
+*scored*, and the arena decides later, on evidence, whether it is served. A
+recipe refused at registration (unresolvable inputs) is recorded on the
+manifest as a rejection with its reason and does not fail the stage; its
+siblings still register.
 
 ## 6. Score it, grade it, promote it
 
