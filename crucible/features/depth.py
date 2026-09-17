@@ -56,9 +56,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from crucible.documents import UnreadableDocumentError, read_store_document
 from crucible.features.compute import catalog_column_depths, read_features
 from crucible.features.registry import feature_names, feature_version
-from crucible.keys import features_key, features_prefix
+from crucible.keys import coverage_key, features_key, features_prefix
 from crucible.store import Store
 
 __all__ = [
@@ -69,9 +70,13 @@ __all__ = [
     "FeatureLayerCompletenessReading",
     "check_feature_layer_depth",
     "sample_sessions",
+    "sample_coverage_sentence",
     "COMPLETENESS_SAMPLE_SIZE",
     "check_feature_layer_completeness",
     "count_session_objects_by_version",
+    "FeatureLayerProvenanceReading",
+    "check_feature_layer_provenance",
+    "PROVENANCE_SAMPLE_SIZE",
 ]
 
 #: Where every version of the feature layer is filed, one sub-prefix per
@@ -289,6 +294,35 @@ def sample_sessions(sessions: list[str], size: int = COMPLETENESS_SAMPLE_SIZE) -
     return [sessions[i] for i in sorted(picked)]
 
 
+def sample_coverage_sentence(sessions: list[str], sampled: list[str]) -> str:
+    """The one sentence every sampled reading ends with: how much of the
+    layer was actually read, and the exact length of band the sample could
+    still miss.
+
+    DERIVED from the sample actually taken, never from `len // size`: with
+    1,181 sessions and 40 samples the stride is 30.3, so the widest gap is 31
+    and `len // size` would claim 29 — an under-statement of the blind
+    window, which is the one direction this sentence must never be wrong in.
+
+    Shared by :func:`check_feature_layer_completeness` and
+    :func:`check_feature_layer_provenance` rather than written twice: two
+    readings over the same layer that state their coverage differently is
+    how one of them quietly stops being true (`policy-shared-code`, second
+    adoption).
+    """
+    positions = {session_name: index for index, session_name in enumerate(sessions)}
+    picked_positions = [positions[candidate] for candidate in sampled]
+    widest_gap = max(
+        (b - a for a, b in zip(picked_positions, picked_positions[1:], strict=False)),
+        default=1,
+    )
+    return (
+        f"{len(sampled)} of {len(sessions)} session(s) sampled evenly across the layer "
+        f"({sampled[0]}..{sampled[-1]}); any contiguous band of {widest_gap} session(s) "
+        "or more is sampled, a shorter one can sit between two samples unseen"
+    )
+
+
 def check_feature_layer_completeness(
     store: Store, *, live_version: str | None = None
 ) -> FeatureLayerCompletenessReading:
@@ -364,21 +398,7 @@ def check_feature_layer_completeness(
             sessions_total=len(sessions),
         )
 
-    # DERIVED from the sample actually taken, never from `len // size`: with
-    # 1,181 sessions and 40 samples the stride is 30.3, so the widest gap is
-    # 31 and `len // size` would claim 29 — an under-statement of the blind
-    # window, which is the one direction this sentence must never be wrong in.
-    positions = {session_name: index for index, session_name in enumerate(sessions)}
-    picked_positions = [positions[candidate] for candidate in sampled]
-    widest_gap = max(
-        (b - a for a, b in zip(picked_positions, picked_positions[1:], strict=False)),
-        default=1,
-    )
-    coverage = (
-        f"{len(sampled)} of {len(sessions)} session(s) sampled evenly across the layer "
-        f"({sampled[0]}..{sampled[-1]}); any contiguous band of {widest_gap} session(s) "
-        "or more is sampled, a shorter one can sit between two samples unseen"
-    )
+    coverage = sample_coverage_sentence(sessions, sampled)
 
     dead_readings = [reading for reading in per_session if reading[2]]
     if dead_readings:
@@ -436,5 +456,183 @@ def check_feature_layer_completeness(
         null_ratios=null_ratios,
         dead_columns=(),
         sessions_read=tuple(sampled),
+        sessions_total=len(sessions),
+    )
+
+
+#: Sessions sampled for the provenance reading. The same stride argument as
+#: :data:`COMPLETENESS_SAMPLE_SIZE`, and deliberately the same number: the two
+#: readings grade the same layer from two sides, and a reader comparing them
+#: should not have to hold two different coverage guarantees in mind. Over a
+#: ~1,180-session layer the stride is near 29, so any contiguous band of 30
+#: sessions or more is certain to be sampled -- the measured `-I10733` band is
+#: 92 and could not hide.
+PROVENANCE_SAMPLE_SIZE = COMPLETENESS_SAMPLE_SIZE
+
+
+@dataclass(frozen=True)
+class FeatureLayerProvenanceReading:
+    """Which point-in-time source(s) actually compiled the live feature layer.
+
+    `sources` maps each source name found to the sampled sessions that
+    carry it, so a mixed layer names its own bands rather than reporting a
+    bare count. `missing` is the sampled sessions with no coverage record at
+    all -- unobserved, which is its own state and never folded into green.
+    """
+
+    state: DepthState
+    detail: str
+    live_version: str
+    expected_source: str
+    sources: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    missing: tuple[str, ...] = field(default_factory=tuple)
+    unreadable: tuple[str, ...] = field(default_factory=tuple)
+    sessions_read: tuple[str, ...] = field(default_factory=tuple)
+    sessions_total: int = 0
+
+
+def check_feature_layer_provenance(
+    store: Store,
+    *,
+    live_version: str | None = None,
+    expected_source: str | None = None,
+) -> FeatureLayerProvenanceReading:
+    """RED when the live feature layer was not compiled, end to end, by the
+    one production point-in-time source; GREEN when every sampled session
+    names it.
+
+    Depth asks how many sessions exist. Completeness asks whether their
+    columns measured anything. This asks **what produced them** -- and it is
+    the reading the other two structurally cannot give, because a session
+    compiled from a shallower source is a well-formed parquet with plausible
+    columns. It is only wrong relative to its neighbours.
+
+    Measured 2026-09-17 (`alpha-engine-config-I10733`): `v553618c991dd` held
+    1,180 sessions of which 92 (2025-07-09..2025-11-14) were compiled by
+    `v1-snapshots`, each carrying 11 unmeasured columns and four null
+    attractiveness pillars, inside a layer whose every other session used
+    `edgar-filing-date`. The cause was a heal chunk that booted a release
+    predating the EDGAR switch. `data/{day}/coverage.json` recorded
+    `point_in_time.source` correctly for every one of those sessions from the
+    day they were written -- the fact was never missing, only unread, which is
+    the `-I10733` blindness one level up from the null band itself.
+
+    Keys on the PROPERTY (the layer is single-sourced, by the declared
+    production source) rather than on the MECHANISM that produced any one
+    band, so a future third source is caught by the same predicate without
+    an edit. `expected_source` defaults to
+    :data:`crucible.data.point_in_time.PRODUCTION_FUNDAMENTALS_SOURCE`, the
+    single declaration of which source production compiles from.
+
+    Reads a listing plus at most :data:`PROVENANCE_SAMPLE_SIZE` small JSON
+    objects. A genuine read failure propagates to the caller exactly as in
+    the sibling readings, so `crucible.board` renders it `UNMEASURABLE`
+    rather than folding it into a false green. A coverage record that is
+    ABSENT is not a read failure -- it is a measured fact about that session
+    and is reported as `missing`.
+    """
+    from crucible.data.point_in_time import (  # noqa: PLC0415 - avoids an import cycle
+        PRODUCTION_FUNDAMENTALS_SOURCE,
+    )
+
+    wanted = expected_source if expected_source is not None else PRODUCTION_FUNDAMENTALS_SOURCE
+    version = live_version if live_version is not None else feature_version()
+    prefix = features_prefix(version)
+    sessions = sorted(
+        key[len(prefix) : -len(PARQUET_SUFFIX)]
+        for key in store.list_keys(prefix)
+        if key.endswith(PARQUET_SUFFIX)
+    )
+
+    if not sessions:
+        return FeatureLayerProvenanceReading(
+            state="RED",
+            detail=(
+                f"no session parquet exists under {prefix!r} — the live "
+                f"feature_version() {version!r} has never been built, so no session's "
+                "point-in-time provenance can be read"
+            ),
+            live_version=version,
+            expected_source=wanted,
+            sessions_total=0,
+        )
+
+    read = sample_sessions(sessions, PROVENANCE_SAMPLE_SIZE)
+    found: dict[str, list[str]] = {}
+    missing: list[str] = []
+    unreadable: list[str] = []
+    for day in read:
+        key = coverage_key(day)
+        # Through the ONE guarded reader (`crucible.documents`), never
+        # `json.loads` over `get_bytes` here: three outcomes, not two.
+        # ABSENT is a fact about that session (`missing`), UNREADABLE is a
+        # fact about that artifact (`unreadable`), and an ACCESS problem is a
+        # statement about us — which is the caller's to render, so it is
+        # raised rather than graded (`alpha-engine-config-I9931`).
+        outcome = read_store_document(store, key)
+        if outcome.absent:
+            missing.append(day)
+            continue
+        if outcome.problem is not None:
+            if outcome.access_problem:
+                raise UnreadableDocumentError(outcome.problem)
+            unreadable.append(day)
+            continue
+        record = outcome.document or {}
+        source = (record.get("point_in_time") or {}).get("source")
+        found.setdefault(str(source), []).append(day)
+
+    sources = {name: tuple(days) for name, days in sorted(found.items())}
+    sampled = sample_coverage_sentence(sessions, read)
+
+    wrong = {name: days for name, days in sources.items() if name != wanted}
+    if wrong or missing or unreadable:
+        parts: list[str] = []
+        for name, days in sorted(wrong.items()):
+            parts.append(
+                f"{len(days)} sampled session(s) were compiled by {name!r} "
+                f"(e.g. {', '.join(days[:6])})"
+            )
+        if unreadable:
+            parts.append(
+                f"{len(unreadable)} sampled session(s) carry a coverage record that "
+                f"could not be parsed, so what compiled them cannot be read "
+                f"(e.g. {', '.join(unreadable[:6])})"
+            )
+        if missing:
+            parts.append(
+                f"{len(missing)} sampled session(s) carry no "
+                f"{coverage_key('{day}')!r} record at all, so what compiled them cannot "
+                f"be read (e.g. {', '.join(missing[:6])})"
+            )
+        return FeatureLayerProvenanceReading(
+            state="RED",
+            detail=(
+                f"the live feature_version() {version!r} was not compiled end to end by "
+                f"the production point-in-time source {wanted!r}: "
+                + "; ".join(parts)
+                + ". A session compiled by a shallower source is a well-formed parquet "
+                "with plausible columns — neither the depth nor the completeness reading "
+                "can see it, because it is only wrong relative to its neighbours. " + sampled
+            ),
+            live_version=version,
+            expected_source=wanted,
+            sources=sources,
+            missing=tuple(missing),
+            unreadable=tuple(unreadable),
+            sessions_read=tuple(read),
+            sessions_total=len(sessions),
+        )
+
+    return FeatureLayerProvenanceReading(
+        state="GREEN",
+        detail=(
+            f"every sampled session of the live feature_version() {version!r} was "
+            f"compiled by the production point-in-time source {wanted!r}. " + sampled
+        ),
+        live_version=version,
+        expected_source=wanted,
+        sources=sources,
+        sessions_read=tuple(read),
         sessions_total=len(sessions),
     )

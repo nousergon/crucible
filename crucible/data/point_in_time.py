@@ -166,6 +166,7 @@ __all__ = [
     "INSTITUTIONAL_COLUMNS",
     "KNOWN_GICS_RECLASSIFICATIONS",
     "MAX_FUNDAMENTAL_STALENESS_SESSIONS",
+    "PRODUCTION_FUNDAMENTALS_SOURCE",
     "MAX_SECTOR_STALENESS_SESSIONS",
     "POINT_IN_TIME_COLUMNS",
     "POINT_IN_TIME_MODE",
@@ -1061,6 +1062,27 @@ class FilingDatePointInTimeSource(SnapshotPointInTimeSource):
                 f"(e.g. {look_ahead.iloc[0]!r}) — a look-ahead in the producer, refused "
                 "rather than silently admitted"
             )
+
+
+#: The point-in-time source PRODUCTION compiles the feature layer from.
+#:
+#: Declared here, beside the implementations, so that "which source is the
+#: production one" is ONE fact in the tree rather than a string repeated at
+#: every reader. `crucible.features.depth.check_feature_layer_provenance`
+#: defaults to it, so a future switch of the production source moves this
+#: line and the detector follows -- it is not a source NAME literal sitting
+#: in a detector, which is the shape that cannot be changed safely.
+#:
+#: Why it exists (`alpha-engine-config-I10733`, measured 2026-09-17): the
+#: live layer `features/v553618c991dd` holds 1,180 sessions, and 92 of them
+#: (2025-07-09..2025-11-14) were compiled by `v1-snapshots` while every
+#: neighbouring session was compiled by `edgar-filing-date`. Each of those 92
+#: sessions carries 11 unmeasured columns and all four attractiveness pillars
+#: null. The per-session `coverage.json` recorded the source correctly the
+#: whole time -- nothing READ it, so a heal chunk that booted a release
+#: predating the EDGAR switch wrote a shallow-source band into an
+#: EDGAR-source layer and no reading went red.
+PRODUCTION_FUNDAMENTALS_SOURCE = FilingDatePointInTimeSource.name
 
 
 def _quarter_offset(year: int, quarter: int, offset: int) -> tuple[int, int]:
