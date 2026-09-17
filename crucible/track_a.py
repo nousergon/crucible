@@ -37,7 +37,7 @@ from crucible.manifest import manifest_key
 from crucible.registration import load_registrable_recipes
 from crucible.runner import run_job
 from crucible.slots import arm_name as name_component
-from crucible.slots import dispatchable_slots
+from crucible.slots import dispatchable_slots, history_producer
 from crucible.slots.arms import (
     ForeignRecipeSchemaError,
     read_register,
@@ -810,8 +810,9 @@ def handle_experiment_backfill(args: argparse.Namespace) -> int:
     """`experiment.backfill` — one arm's history over a session range.
 
     `alpha-engine-config-I10696`. The whole job body is
-    :func:`crucible.backfill.run_backfill`, handed the slot's OWN per-arm
-    produce callable — the same one `experiment.run` dispatches to. This
+    :func:`crucible.backfill.run_backfill`, handed the slot's OWN per-session
+    history producer — the same fitting path `experiment.run` reaches, minus
+    the serving half (`alpha-engine-config-I11005`). This
     handler resolves what that function cannot see for itself (the settings,
     the store, the slot module and the slot's registered specs) and nothing
     else: a second fitting path is the one thing this job must never grow.
@@ -823,27 +824,76 @@ def handle_experiment_backfill(args: argparse.Namespace) -> int:
     config = _settings(args)
     store = config.store()
     module = _slot_module(args.slot)
+    # Resolved for the dry run TOO, and by the same call: `produce_history`
+    # rather than `produce` is what keeps a backfill out of the serving path
+    # (alpha-engine-config-I11005), and a dry run that resolved a different
+    # entry point from the real run would be rehearsing a different job.
+    produce = history_producer(module)
     start = dt.date.fromisoformat(args.from_date)
     end = dt.date.fromisoformat(args.to_date)
+    specs = _recipes_for_registration(args.slot, config=config, store=store)
     if args.dry_run:
-        from crucible.backfill import in_region, sessions_in_range
+        # Every check the real run makes that does NOT write, made here
+        # through the SAME functions the job calls, in the job's order — a
+        # dry run that could only succeed is not a rehearsal, and the one
+        # this replaces reported "would produce 205 session(s)" for a command
+        # that failed in two minutes in production
+        # (alpha-engine-config-I11005).
+        # What is still NOT rehearsed — the per-session produce call, which
+        # cannot execute without writing — is named in the printed line and
+        # tracked as its own change (a write-capturing store for every job's
+        # dry run, alpha-engine-config-I11012). It is not half-done here.
+        from crucible.backfill import (  # noqa: PLC0415 - one call site
+            NotInRegionError,
+            arm_id_for,
+            assert_in_region,
+            sessions_in_range,
+        )
 
-        on_ec2, evidence = in_region()
         sessions = sessions_in_range(start, end)
+        # RAISES, exactly as the job does: whether the arm is registered is a
+        # property of the store and the recipes, identical on every host, so
+        # a dry run that accepted an arm the job would refuse is wrong here
+        # and not merely optimistic.
+        arm_id = arm_id_for(specs, slot=args.slot, arm=name_component(args.arm))
+        try:
+            on_ec2, evidence = assert_in_region(
+                sessions,
+                slot=args.slot,
+                arm=name_component(args.arm),
+                start=start,
+                end=end,
+                i_am_in_region=bool(getattr(args, "i_am_in_region", False)),
+            )
+            region_verdict = f"would proceed on this host ({evidence})"
+        except NotInRegionError as exc:
+            # The ONE caught refusal in this handler, and it is REPORTED, not
+            # swallowed. (a) The failure mode absorbed: the in-region guard,
+            # and only that guard. (b) Why the deliverable survives: this
+            # guard is the one check whose answer is a property of the HOST
+            # rather than of the command, and a dry run is routinely run from
+            # the laptop for a range that will be dispatched in region —
+            # raising here would refuse to rehearse exactly the dispatch the
+            # operator is checking. (c) The recording surface: the verdict is
+            # printed on the line below, named as a refusal, with the guard's
+            # own message. The real run still raises.
+            region_verdict = f"WOULD REFUSE on this host — {exc}"
+            on_ec2 = False
         print(
-            f"experiment.backfill --slot {args.slot} --arm {args.arm} would produce "
-            f"{len(sessions)} session(s) {start}..{end} through {module.__name__}.produce. "
-            f"Host: {evidence} (in region: {on_ec2})."
+            f"experiment.backfill --slot {args.slot} --arm {args.arm} ({arm_id}) would "
+            f"produce {len(sessions)} session(s) {start}..{end} through "
+            f"{module.__name__}.produce_history, which does not enter the serving path. "
+            f"In region: {on_ec2}; {region_verdict}. NOT rehearsed: the per-session "
+            "produce call itself, which cannot run without writing."
         )
         return 0
-    specs = _recipes_for_registration(args.slot, config=config, store=store)
     result: dict[str, Any] = {}
     ctx = run_job(
         "experiment.backfill",
         lambda c: result.update(
             run_backfill(
                 c,
-                produce=module.produce,
+                produce=produce,
                 specs=specs,
                 settings=config,
                 slot=args.slot,

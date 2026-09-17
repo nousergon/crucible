@@ -48,6 +48,7 @@ from crucible.slots.model import (
     SLOT,
     load_model_recipes,
     produce,
+    produce_history,
     registration_specs,
 )
 from crucible.store import LocalStore
@@ -169,7 +170,7 @@ def _backfill(store, settings, *, arm="base", start=WARMUP_FROM, end=WARMUP_TO, 
         lambda c: result.update(
             run_backfill(
                 c,
-                produce=produce,
+                produce=produce_history,
                 specs=_specs(settings),
                 settings=settings,
                 slot=SLOT,
@@ -390,7 +391,14 @@ class TestTheCliHandler:
         monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
         before = sorted(store.list_keys())
         assert main(self._argv(store.root, strategy, extra=["--dry-run"])) == 0
-        assert "experiment.backfill --slot m --arm base would produce" in capsys.readouterr().out
+        printed = capsys.readouterr().out
+        # The arm RESOLVED (not merely named), the history entry point named,
+        # and the one thing the rehearsal cannot cover said out loud
+        # (alpha-engine-config-I11005 deliverable 3).
+        assert "experiment.backfill --slot m --arm base (m:base:" in printed
+        assert "produce_history" in printed
+        assert "does not enter the serving path" in printed
+        assert "NOT rehearsed" in printed
         assert sorted(store.list_keys()) == before
 
 
@@ -468,3 +476,139 @@ class TestABackfilledSessionCarriesTheSameArtifactsAsALiveOne:
             shadow_key(arm_id, self.SESSION),
             cross_section_key(arm_id, self.SESSION),
         }
+
+
+class TestTheBackfillNeverEntersTheServingPath:
+    """`alpha-engine-config-I11005` — the M half.
+
+    Measured live 2026-09-17 on the U slot: a single-arm backfill of a
+    NON-champion arm failed in two minutes on the first of 205 sessions,
+    because the backfill ran the slot's production `produce`, whose serving
+    half asserts that the arm the CHAMPION pointer names produced this cycle.
+    Correct for production — a pointer to an arm that did not produce means
+    production has no feed today — and fatal for a historical backfill, which
+    feeds nothing: no challenger could ever accumulate the history it needs
+    to become champion.
+
+    M's serving half is `crucible.serving.publish_predictions_feed` rather
+    than `cycle._serve_champion_feed`, and it answers an ABSENT pointer with
+    `None` — so the M backfill was not blocked on 2026-09-17, when
+    `champions/m/current.json` did not exist. Both shapes are covered here,
+    because the absent pointer is a fact about today and the
+    present-but-unproduced pointer is what M gets the day it wins its first
+    champion — which is the very thing the blocked backfill exists to enable.
+    """
+
+    SESSION = SESSIONS[45]
+
+    def _seat_champion(self, store, arm_id: str) -> None:
+        """A USABLE M pointer naming ``arm_id``: an `ok` producing manifest
+        (`crucible.champion._assert_producing_run_ok`) and no attestation,
+        since `ATTESTED_SLOTS` is S alone."""
+        from crucible.champion import (
+            CHAMPION_SCHEMA_VERSION,
+            ChampionPointer,
+            read_champion_etag,
+            write_champion,
+        )
+
+        promote_manifest = f"runs/promote/{self.SESSION}/run.json"
+        store.put_bytes(
+            promote_manifest,
+            json.dumps({"status": "ok", "job": "promote"}).encode("utf-8"),
+        )
+        write_champion(
+            store,
+            ChampionPointer(
+                schema_version=CHAMPION_SCHEMA_VERSION,
+                slot=SLOT,
+                arm_id=arm_id,
+                as_of=self.SESSION,
+                decided_at=f"{self.SESSION}T02:00:00Z",
+                run_id="01JG0000000000000000000000",
+                code_sha="a" * 40,
+                promotion_source="evidence",
+                manifest_key=promote_manifest,
+                evidence={"status": "decided", "moved": True, "paired_dates": 40},
+                attestation=None,
+            ),
+            expected=read_champion_etag(store, SLOT),
+        )
+
+    def test_a_non_champion_arm_backfills_while_the_pointer_names_another_arm(
+        self, store, strategy
+    ) -> None:
+        """The blocker, in the M shape: a seated champion that produces
+        nothing on the backfilled session must not stop the session."""
+        self._seat_champion(store, "m:momentum_sleeve:2a5526115a4c")
+        _, result = _backfill(store, strategy, start=self.SESSION, end=self.SESSION)
+        assert result["produced"] == [self.SESSION], result
+        assert store.exists(arm_predictions_key(result["arm_id"], self.SESSION))
+
+    def test_a_serving_cycle_with_an_unproduced_champion_still_refuses(
+        self, store, strategy
+    ) -> None:
+        """The other half, unchanged: `experiment.run` is a serving cycle and
+        still fails when the pointer resolves to nothing produced — and the
+        refusal still names the pointer's slot and the arm."""
+        from crucible.slots.cycle import MissingArtifactError
+
+        self._seat_champion(store, "m:momentum_sleeve:2a5526115a4c")
+        with pytest.raises(MissingArtifactError) as excinfo:
+            run_job(
+                "experiment.run",
+                lambda c: produce(c, settings=strategy, arm_name="base"),
+                store=store,
+                trading_day=dt.date.fromisoformat(self.SESSION),
+                run_mode="replay",
+                discriminator=SLOT,
+            )
+        message = str(excinfo.value)
+        assert "'m'" in message
+        assert "m:momentum_sleeve:2a5526115a4c" in message
+        assert "The serving path resolves the pointer" in message
+
+    def test_an_absent_pointer_owes_no_feed_on_either_path(self, store, strategy) -> None:
+        """Today's M store: `champions/m/current.json` does not exist. The
+        serving cycle reports `champion_feed: None` — a true statement about
+        a slot that has never promoted — and the history path reports
+        `served: False`, which is a DIFFERENT statement and deliberately so."""
+        from crucible.keys import champion_key
+
+        assert not store.exists(champion_key(SLOT))
+        served: dict = {}
+        run_job(
+            "experiment.run",
+            lambda c: served.update(produce(c, settings=strategy, arm_name="base")),
+            store=store,
+            trading_day=dt.date.fromisoformat(self.SESSION),
+            run_mode="replay",
+            discriminator=SLOT,
+        )
+        assert served["champion_feed"] is None
+
+        history: dict = {}
+        run_job(
+            "experiment.backfill",
+            lambda c: history.update(produce_history(c, settings=strategy, arm_name="base")),
+            store=store,
+            trading_day=dt.date.fromisoformat(self.SESSION),
+            run_mode="replay",
+            discriminator=f"{SLOT}.base.history",
+        )
+        assert history["served"] is False
+        assert "champion_feed" not in history
+
+    def test_the_history_path_publishes_no_feed_even_with_a_produced_champion(
+        self, store, strategy
+    ) -> None:
+        """The strongest form: the champion IS the arm being backfilled, so
+        the serving path would have succeeded. The history path still writes
+        no trader feed — a backfill of a past session must never republish
+        one under today's contract key."""
+        from crucible.keys import predictions_key
+
+        specs = {spec.name: spec.arm_id for spec in _specs(strategy)}
+        self._seat_champion(store, specs["base"])
+        _backfill(store, strategy, start=self.SESSION, end=self.SESSION)
+        assert not store.exists(predictions_key(self.SESSION))

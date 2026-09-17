@@ -105,6 +105,7 @@ __all__ = [
     "partition_by_catalog",
     "run_grade",
     "run_produce",
+    "run_produce_history",
 ]
 
 #: The version stamped on the per-arm score series `run_grade` writes and
@@ -389,16 +390,27 @@ def _refusal_metric(slot: str, refusal: InputRefusal) -> dict[str, Any]:
     }
 
 
-def run_produce(
+def _produce_arms(
     ctx: RunContext,
     *,
     slot: str,
     settings: Settings,
-    feed_key_for: Any,
     arm_name: str | None = None,
     feature_version: str = DEFAULT_FEATURE_VERSION,
-) -> dict[str, Any]:
-    """Run every registered arm's recipe for one trading day and write the shadows."""
+) -> tuple[list[ShadowSelection], list[InputRefusal], int]:
+    """Run every selected arm's recipe for one trading day and write the shadows.
+
+    The PRODUCE mechanics and nothing else: it registers the arms, fits and
+    writes each one's shadow and cross-section, and knows nothing about which
+    arm the slot's pointer names. The serving obligation lives in
+    :func:`_serve_champion_feed`, which is the only place that reads the
+    pointer (`alpha-engine-config-I11005`).
+
+    Both halves run for a production cycle (:func:`run_produce`). A
+    historical backfill (:func:`run_produce_history`) runs THIS half alone,
+    because it feeds nothing: the split is what makes a non-champion arm
+    backfillable without any check being disarmed by a flag.
+    """
     slot_spec = get_slot(slot)
     trading_day = ctx.trading_day
     assert_trading_day(trading_day, context=f"experiment.run --slot {slot} --date {trading_day}")
@@ -479,35 +491,79 @@ def run_produce(
             )
             produced.append(shadow)
 
-    champion = _incumbent(ctx.store, slot)
-    feed_written = None
-    if champion is not None:
-        served = next((s for s in produced if s.arm_id == champion), None)
-        if served is None:
-            raise MissingArtifactError(
-                f"the champion pointer for slot {slot!r} names {champion!r}, which produced "
-                "no shadow this cycle. The serving path resolves the pointer — it never "
-                "imports a ranking function directly — so a pointer to an arm that did "
-                "not produce means production has no feed today."
-            )
-        feed_written = feed_key_for(trading_day.isoformat())
-        ctx.record_output(
-            feed_written,
-            json.dumps(
-                {
-                    "schema_version": "feed.v1",
-                    "slot": slot,
-                    "trading_day": trading_day.isoformat(),
-                    "champion": champion,
-                    "members": list(served.selection),
-                },
-                indent=2,
-                sort_keys=True,
-            ).encode("utf-8"),
-            schema_version="feed.v1",
-        )
+    return produced, refused, int(len(features))
 
-    ctx.record_rows(rows_in=int(len(features)), rows_out=len(produced))
+
+def _serve_champion_feed(
+    ctx: RunContext,
+    *,
+    slot: str,
+    trading_day: dt.date,
+    produced: Sequence[ShadowSelection],
+    feed_key: Any,
+) -> tuple[str | None, str | None]:
+    """Publish the champion's selection as the slot's feed. The SERVING half.
+
+    The invariant here is a serving-path invariant and is stated as one: the
+    serving path RESOLVES the champion pointer — it never imports a ranking
+    function directly — so a pointer naming an arm that produced nothing this
+    cycle means production has no feed today, and that is a failure rather
+    than an empty feed.
+
+    It is reached from :func:`run_produce` only. A historical backfill never
+    calls it, because a backfill serves nothing; that is the whole of the
+    distinction, and it is expressed by which function the caller enters
+    rather than by a boolean that could disarm the check from argv
+    (`alpha-engine-config-I11005`).
+
+    ``(champion, feed_key)``. Both ``None`` when the slot has no pointer —
+    which is a true statement about a slot that has never promoted, and
+    deliberately a different one from a feed that was written.
+    """
+    champion = _incumbent(ctx.store, slot)
+    if champion is None:
+        return None, None
+    served = next((s for s in produced if s.arm_id == champion), None)
+    if served is None:
+        raise MissingArtifactError(
+            f"the champion pointer for slot {slot!r} names {champion!r}, which produced "
+            "no shadow this cycle. The serving path resolves the pointer — it never "
+            "imports a ranking function directly — so a pointer to an arm that did "
+            "not produce means production has no feed today."
+        )
+    feed_written = feed_key(trading_day.isoformat())
+    ctx.record_output(
+        feed_written,
+        json.dumps(
+            {
+                "schema_version": "feed.v1",
+                "slot": slot,
+                "trading_day": trading_day.isoformat(),
+                "champion": champion,
+                "members": list(served.selection),
+            },
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8"),
+        schema_version="feed.v1",
+    )
+    return champion, feed_written
+
+
+def _record_produced(
+    ctx: RunContext,
+    *,
+    slot: str,
+    trading_day: dt.date,
+    produced: Sequence[ShadowSelection],
+    rows_in: int,
+) -> None:
+    """The per-cycle telemetry both produce entry points owe.
+
+    One implementation, so a backfilled session and a production session are
+    described by the same metric rather than by two that are free to drift.
+    """
+    ctx.record_rows(rows_in=rows_in, rows_out=len(produced))
     ctx.record_metric(
         {
             "name": "arms_produced",
@@ -519,7 +575,7 @@ def run_produce(
             "status": "OK",
             "status_reason": (
                 f"slot {slot}: {len(produced)} registered arm(s) produced a shadow for "
-                f"{trading_day}; population {len(features)} names"
+                f"{trading_day}; population {rows_in} names"
             ),
             # Not `experiments_prefix(arm_id)`: this metric is about every arm
             # PRODUCED this cycle, not one arm — the `*` stands in for "any of
@@ -530,6 +586,39 @@ def run_produce(
             "last_updated_utc": _utc_now(),
         }
     )
+
+
+def run_produce(
+    ctx: RunContext,
+    *,
+    slot: str,
+    settings: Settings,
+    feed_key: Any,
+    arm_name: str | None = None,
+    feature_version: str = DEFAULT_FEATURE_VERSION,
+) -> dict[str, Any]:
+    """One PRODUCTION cycle for ``slot``: produce every arm, then serve.
+
+    `experiment.run`'s body. Both halves, in that order — the serving half
+    asserts the champion pointer resolves to an arm that produced, because
+    production has to have a feed today.
+    """
+    trading_day = ctx.trading_day
+    produced, refused, rows_in = _produce_arms(
+        ctx,
+        slot=slot,
+        settings=settings,
+        arm_name=arm_name,
+        feature_version=feature_version,
+    )
+    champion, feed_written = _serve_champion_feed(
+        ctx,
+        slot=slot,
+        trading_day=trading_day,
+        produced=produced,
+        feed_key=feed_key,
+    )
+    _record_produced(ctx, slot=slot, trading_day=trading_day, produced=produced, rows_in=rows_in)
     return {
         "slot": slot,
         "trading_day": trading_day.isoformat(),
@@ -537,6 +626,53 @@ def run_produce(
         "refused": [{"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in refused],
         "champion": champion,
         "feed_key": feed_written,
+        "feature_version": feature_version,
+    }
+
+
+def run_produce_history(
+    ctx: RunContext,
+    *,
+    slot: str,
+    settings: Settings,
+    arm_name: str | None = None,
+    feature_version: str = DEFAULT_FEATURE_VERSION,
+) -> dict[str, Any]:
+    """One HISTORICAL session for ``slot``: produce, and serve nothing.
+
+    `experiment.backfill`'s per-session body, reached through each slot
+    module's ``produce_history``. It writes byte-for-byte the shadow and
+    cross-section :func:`run_produce` writes for that session — the same
+    `_produce_arms` call, no second fitting path — and then stops.
+
+    **It never enters the serving path**, and that is the fix for
+    `alpha-engine-config-I11005`. A backfill produces one arm's history for
+    past sessions to establish a track record; it feeds nothing and serves
+    nothing, so requiring that TODAY's champion also produced on each of
+    those past days made every non-champion arm unbackfillable — a closed
+    loop in which only the incumbent could accumulate history. Note there is
+    no `feed_key` parameter to pass: the serving key is not reachable
+    from here, so this path cannot write a feed even by mistake.
+
+    The result deliberately carries no ``champion`` or ``feed_key`` field.
+    The slot may well have a champion; this run simply did not serve, and a
+    ``None`` in those fields would say the slot has no pointer.
+    """
+    trading_day = ctx.trading_day
+    produced, refused, rows_in = _produce_arms(
+        ctx,
+        slot=slot,
+        settings=settings,
+        arm_name=arm_name,
+        feature_version=feature_version,
+    )
+    _record_produced(ctx, slot=slot, trading_day=trading_day, produced=produced, rows_in=rows_in)
+    return {
+        "slot": slot,
+        "trading_day": trading_day.isoformat(),
+        "arms": [s.arm_id for s in produced],
+        "refused": [{"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in refused],
+        "served": False,
         "feature_version": feature_version,
     }
 

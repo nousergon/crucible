@@ -533,10 +533,6 @@ class TestDryRunNeverWrites:
         "alerts.sweep",
         "board",
         "console",
-        # alpha-engine-config-I10696: its --dry-run branch resolves the range
-        # and the host and prints, before `run_job` is reached — so a fresh
-        # store gains nothing, the same shape `data.heal`'s dry run has.
-        "experiment.backfill",
         "experiment.grade",
         "experiment.run",
         "gate",
@@ -558,7 +554,22 @@ class TestDryRunNeverWrites:
     #: jobs, drift's three input keys, promote's empty register, morning's
     #: seeded board).
     _COVERED_BY_A_SEEDED_ROW = frozenset(
-        {"data.daily", "data.heal", "data.weekly", "drift", "explain", "promote", "report.morning"}
+        {
+            "data.daily",
+            "data.heal",
+            "data.weekly",
+            "drift",
+            "explain",
+            # alpha-engine-config-I11005: its dry run now RESOLVES the arm
+            # against the slot's registered recipes, the way the job does, so
+            # it needs a strategy tree exactly as `experiment.new` does. It
+            # moved out of the fresh-store set for that reason rather than
+            # into the excluded set: a dry run that could not refuse an arm
+            # the job would refuse is the gap this issue closed.
+            "experiment.backfill",
+            "promote",
+            "report.morning",
+        }
     )
 
     #: Every job in `JOBS` NOT covered by a row above, each with the reason
@@ -725,6 +736,74 @@ class TestDryRunNeverWrites:
         main(argv)  # must not raise at all -- see the docstring above
 
         self._assert_no_new_keys(tmp_path, [])
+
+    def test_dry_run_experiment_backfill_resolves_the_arm_and_writes_nothing(
+        self, tmp_path, monkeypatch, strategy_dir
+    ) -> None:
+        """`experiment.backfill --dry-run` resolves the slot module, its
+        history producer, the session range, the registered arm and the
+        in-region guard — every check the job makes that does not write —
+        and files neither an artifact nor a manifest.
+
+        The store is a subdirectory, not ``tmp_path`` itself, because the
+        `strategy_dir` fixture writes its recipe tree there and a store
+        rooted above it would count those files as store keys.
+
+        `alpha-engine-config-I11005`: the version this replaces printed
+        "would produce 205 session(s)" for a command that failed in two
+        minutes in production. A rehearsal that cannot fail the way the run
+        fails is not a rehearsal.
+        """
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        argv = [
+            "experiment.backfill",
+            "--slot",
+            "u",
+            "--arm",
+            "momentum_sleeve",
+            "--from",
+            "2026-08-24",
+            "--to",
+            "2026-08-28",
+            "--store",
+            str(tmp_path / "store"),
+            "--strategy-dir",
+            str(strategy_dir),
+            "--dry-run",
+        ]
+
+        main(argv)  # must not raise at all -- see the class docstring
+
+        self._assert_no_new_keys(tmp_path / "store", [])
+
+    def test_dry_run_experiment_backfill_refuses_an_arm_the_job_would_refuse(
+        self, tmp_path, monkeypatch, strategy_dir
+    ) -> None:
+        """The property the row above cannot show: the rehearsal REFUSES.
+        `alpha-engine-config-I11005`."""
+        from crucible.backfill import UnknownArmError
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        argv = [
+            "experiment.backfill",
+            "--slot",
+            "u",
+            "--arm",
+            "not_a_registered_arm",
+            "--from",
+            "2026-08-24",
+            "--to",
+            "2026-08-28",
+            "--store",
+            str(tmp_path / "store"),
+            "--strategy-dir",
+            str(strategy_dir),
+            "--dry-run",
+        ]
+        with pytest.raises(UnknownArmError) as excinfo:
+            main(argv)
+        assert "not_a_registered_arm" in str(excinfo.value)
+        self._assert_no_new_keys(tmp_path / "store", [])
 
     def test_dry_run_drift_computes_its_inputs_and_writes_nothing(
         self, tmp_path, monkeypatch, source
