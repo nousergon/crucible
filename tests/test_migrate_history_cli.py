@@ -18,6 +18,7 @@ the production ones measured 2026-09-14:
 
 from __future__ import annotations
 
+import datetime as dt
 import inspect
 import json
 from pathlib import Path
@@ -181,6 +182,41 @@ def _printed_result(capsys: pytest.CaptureFixture[str]) -> dict:
     return document
 
 
+def _run_asserted(v2_root: Path, v1_root: Path, slots: tuple[str, ...]) -> None:
+    """`run_migrate_history` with slots NAMED, which is the operator path.
+
+    The CLI names none (`slots=None`), so every refusal it meets is recorded
+    as a `deferred` reason and the run exits `ok` - `migrate.history` is an arc
+    stage and `run_arc` stops at the first raise
+    (`alpha-engine-config-I10961`). The refusals are still refusals, and this
+    is where they are shown RAISING: a caller that named its slots asserted
+    they were importable.
+    """
+    from crucible.migrate import run_migrate_history
+    from crucible.runner import run_job
+    from crucible.store import read_only
+
+    store = LocalStore(v2_root)
+    recipes = {
+        recipe.name: recipe for slot in ("u", "r") for recipe in load_arm_specs(slot, store=store)
+    }
+
+    def job(ctx: object) -> None:
+        run_migrate_history(
+            ctx,
+            v1_store=read_only(LocalStore(v1_root), reason="test reads v1 read-only"),
+            slots=slots,
+            arm_recipes=recipes,
+        )
+
+    run_job(
+        "migrate.history",
+        job,
+        store=store,
+        trading_day=dt.date.fromisoformat(TRADING_DAY),
+    )
+
+
 def _recipe_id(v2_root: Path, slot: str, name: str) -> str:
     specs = load_arm_specs(slot, store=LocalStore(v2_root))
     return next(spec.arm_id for spec in specs if spec.name == name)
@@ -224,7 +260,14 @@ class TestEndToEnd:
         assert any(k.startswith(f"migrations/{TRADING_DAY}/") for k in outputs)
 
         result = _printed_result(capsys)
-        assert result["pointers"] == {"u": "written", "r": "written"}
+        # M is CONSIDERED and DEFERRED rather than absent from the map
+        # (`alpha-engine-config-I10961`): its v1 champion source is declared
+        # (`predictor/model_zoo/leaderboard/latest.json`) and the mapping from
+        # v1's `champion_arch` onto an M `ModelRecipe` is not built, so the
+        # reason is on the manifest every run instead of the slot being
+        # invisible, which is what the hardcoded `("u", "r")` made it.
+        assert result["pointers"] == {"u": "written", "r": "written", "m": "deferred"}
+        assert "no v2 recipe was supplied" in result["deferred"]["m"]
         assert result["sources_missing"] == [], (
             "the dated M promotions series must count as found, not fail the run"
         )
@@ -250,6 +293,7 @@ class TestEndToEnd:
         assert _printed_result(capsys)["pointers"] == {
             "u": "unchanged",
             "r": "unchanged",
+            "m": "deferred",
         }
 
     def test_a_dry_run_writes_nothing(
@@ -262,22 +306,43 @@ class TestEndToEnd:
         assert _printed_result(capsys)["pointers"] == {
             "u": "would_write",
             "r": "would_write",
+            "m": "deferred",
         }
 
 
 class TestRefusals:
-    def test_a_missing_recipe_raises(self, v2_root: Path, v1_root: Path) -> None:
-        store = LocalStore(v2_root)
+    def _drop_the_r_champions_recipe(self, v2_root: Path) -> None:
         # The slot still has a recipe; just not the one v1 names as champion.
-        store.put_bytes(
+        LocalStore(v2_root).put_bytes(
             "strategy/current/arms/r/scanner_top20_predictor.yaml",
             R_RECIPE.replace("scanner_predictor_direct", "scanner_top20_predictor").encode(),
         )
         (v2_root / "strategy/current/arms/r/scanner_predictor_direct.yaml").unlink()
+
+    def test_a_missing_recipe_raises_when_the_slot_was_NAMED(
+        self, v2_root: Path, v1_root: Path
+    ) -> None:
+        self._drop_the_r_champions_recipe(v2_root)
+        store = LocalStore(v2_root)
         with pytest.raises(MigrationSourceMissing, match="scanner_predictor_direct"):
-            main(_argv(v2_root, v1_root))
+            _run_asserted(v2_root, v1_root, ("u", "r"))
         assert not store.exists(champion_key("r"))
         assert not store.exists(champion_key("u")), "nothing is written before the refusal"
+
+    def test_a_missing_recipe_DEFERS_on_the_scheduled_path(
+        self, v2_root: Path, v1_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The same refusal, recorded rather than raised. The CLI names no
+        slots, and `migrate.history` is a weekly arc stage: a raise here would
+        kill every stage after it (`crucible-PR317` / `-I10927`). Nothing is
+        written either way - that is the guarantee, and it is unchanged."""
+        self._drop_the_r_champions_recipe(v2_root)
+        store = LocalStore(v2_root)
+        assert main(_argv(v2_root, v1_root)) == 0
+        result = _printed_result(capsys)
+        assert result["pointers"]["r"] == "deferred"
+        assert "scanner_predictor_direct" in result["deferred"]["r"]
+        assert not store.exists(champion_key("r"))
 
     def test_an_unpublished_slot_is_not_swallowed(self, v2_root: Path, v1_root: Path) -> None:
         """The previous handler caught `FileNotFoundError` per slot and carried
@@ -286,15 +351,35 @@ class TestRefusals:
         with pytest.raises(FileNotFoundError, match="slot 'r'"):
             main(_argv(v2_root, v1_root))
 
-    def test_an_existing_pointer_is_never_overwritten(self, v2_root: Path, v1_root: Path) -> None:
-        store = LocalStore(v2_root)
+    def _seat_a_foreign_r_pointer(self, v2_root: Path) -> bytes:
         evidence_pointer = json.dumps(
             {"arm_id": "r:scanner_top20_predictor:abcdefabcdef", "promotion_source": "evidence"}
         ).encode()
-        store.put_bytes(champion_key("r"), evidence_pointer)
+        LocalStore(v2_root).put_bytes(champion_key("r"), evidence_pointer)
+        return evidence_pointer
+
+    def test_an_existing_pointer_raises_when_the_slot_was_NAMED(
+        self, v2_root: Path, v1_root: Path
+    ) -> None:
+        evidence_pointer = self._seat_a_foreign_r_pointer(v2_root)
         with pytest.raises(MigrationPointerConflict, match="scanner_top20_predictor"):
-            main(_argv(v2_root, v1_root))
-        assert store.get_bytes(champion_key("r")) == evidence_pointer
+            _run_asserted(v2_root, v1_root, ("u", "r"))
+        assert LocalStore(v2_root).get_bytes(champion_key("r")) == evidence_pointer
+
+    def test_an_existing_pointer_DEFERS_on_the_scheduled_path_and_is_never_overwritten(
+        self, v2_root: Path, v1_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """This is the state an ORDINARY Saturday reaches: `promote` runs an
+        hour after this stage and moves the same pointer on the arena's own
+        evidence, so from the following week every run of this stage would
+        have raised - and taken `promote`, `report`, `console`, `explain`,
+        `iac.conformance` and `drift` down with it."""
+        evidence_pointer = self._seat_a_foreign_r_pointer(v2_root)
+        assert main(_argv(v2_root, v1_root)) == 0
+        result = _printed_result(capsys)
+        assert result["pointers"]["r"] == "deferred"
+        assert "scanner_top20_predictor" in result["deferred"]["r"]
+        assert LocalStore(v2_root).get_bytes(champion_key("r")) == evidence_pointer
 
     def test_a_v1_store_equal_to_the_v2_store_is_refused(self, v2_root: Path) -> None:
         argv = _argv(v2_root, v2_root)

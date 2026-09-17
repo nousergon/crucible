@@ -72,6 +72,30 @@ def _minimal_argv(job: str) -> list[str]:
         # picked its own fault-injection class would be a job that could
         # induce a fault nobody asked for.
         argv += ["--fault-capability-class", "chaos_probe"]
+    if job == "review.record":
+        # alpha-engine-config-I10968: every field of the verdict is required.
+        # A recording call that defaulted any of them would file a review
+        # naming something other than what was reviewed.
+        argv += [
+            "--commits",
+            "commits.json",
+            "--reviewer",
+            "session_01Reviewer00",
+            "--phase",
+            "phase1",
+            "--verdict",
+            "pass",
+            "--head-sha",
+            "b" * 40,
+            "--pr-number",
+            "48",
+            "--summary",
+            "no findings",
+        ]
+    if job == "acceptance.publish":
+        # The reading is the whole input: this job records a measurement, it
+        # does not take one, so there is nothing to default.
+        argv += ["--reading", "acceptance-reading.json"]
     if job == "fault.record":
         # `--outcome` is required, and which of the remaining flags are legal
         # is decided by it — inside `crucible.faults.record_fault`, not the
@@ -192,6 +216,15 @@ class TestJobSurface:
             # `iac.conformance`'s `dispatch: arc` sibling -- no schedule or
             # deadline of its own.
             "test.integration",
+            # alpha-engine-config-I10968: the two remaining writers of the
+            # `test.integration` class -- a store write reached from outside
+            # the job table, filing no manifest. `review.record` was
+            # `python -m crucible.review record`'s own `store.put_bytes`;
+            # `acceptance.publish` was a raw `aws s3 cp` in ci.yml that never
+            # went through `crucible.store.Store` at all. Both
+            # workflow-triggered, neither scheduled.
+            "review.record",
+            "acceptance.publish",
         }
 
     @pytest.mark.parametrize("job", sorted(JOBS))
@@ -639,6 +672,20 @@ class TestDryRunNeverWrites:
             "--dry-run property (the readings still compute; the store gains no output "
             "key) is asserted directly, against fake clients, by "
             "tests/test_iac_conformance.py"
+        ),
+        "review.record": (
+            "its input is a commits payload the workflow fetches from the GitHub API, "
+            "and its dry-run property (the document is built, the independence "
+            "comparison runs, and the store gains no key at all) is asserted directly, "
+            "against a seeded LocalStore, by tests/test_review_record_job.py::"
+            "TestDryRun"
+        ),
+        "acceptance.publish": (
+            "its input is the reading file `tests/acceptance/check_reading.py "
+            "--write-json` just wrote, which no shared fresh-store row supplies; its "
+            "dry-run property (the reading is read and validated, and the store gains "
+            "no key at all) is asserted directly by tests/test_acceptance_publish_job.py"
+            "::TestDryRun"
         ),
         "test.integration": (
             "shells out to a real `pytest tests/integration` subprocess on every "

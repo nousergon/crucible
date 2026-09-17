@@ -438,15 +438,46 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs,outputs[arms/**]
       outcome: run.json:metrics[arms_migrated]
-    log_location: cloudwatch:/crucible/migrate.history
+    log_location: cloudwatch:/crucible/weekly
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/arms
     artifact_retention: forever
     absence_watched_by: alerts.sweep
-    schedule: null
-    dispatch: null
-    deadline: null
+    # `alpha-engine-config-I10961` deliverable 4. This was `schedule: null` /
+    # `dispatch: null` — scheduled nowhere — so the `slots=("u","r")` deferral
+    # that left M out had no trigger at all: it expired on 2026-09-17 when M's
+    # arms arrived, and nothing went red and nothing ran. A default cannot
+    # expire; an arc stage evaluating `crucible.migrate.admission_refusal`
+    # against the live store every Saturday can.
+    #
+    # 14:30, between `experiment.grade` at 14:00 and `promote` at 15:00,
+    # because the deadline table IS the dependency order
+    # (`crucible.weekly.arc_stages`). Both sides are real dependencies, not a
+    # preference:
+    #
+    #   * AFTER grade — the admission predicate is PRODUCTION, not
+    #     registration (`crucible.migrate.admission_refusal`): a slot is seated
+    #     only once its arm has actually produced, and `experiment.run` at
+    #     12:00 plus `experiment.grade` at 14:00 are what make that true for
+    #     the week. Running earlier would defer every slot whose first
+    #     production is this cycle's.
+    #   * BEFORE promote — `champions/{slot}/current.json` has exactly two
+    #     writers, this job and `promote`, and this one only ever seats an
+    #     ABSENT pointer. Seating v1's lineage after promote had written its
+    #     own would be refused (correctly), and v1's served chain would be
+    #     unrecoverable from the v2 store — which is the loss this job exists
+    #     to prevent.
+    #
+    # A slot that is not admissible is recorded `deferred` with its reason and
+    # the run still exits `ok`, so this stage cannot kill the nine after it
+    # (`crucible-PR317` / `alpha-engine-config-I10927`).
+    schedule: weekly, Saturday
+    dispatch: arc
+    deadline:
+      anchor: next_calendar_day_at
+      cadence: weekly
+      at: "14:30"
 
   release.pin:
     description: Repoint releases/current, or pin the trader to a release.
@@ -1036,6 +1067,72 @@ components:
       lineage: null
       outcome: run.json:metrics[tests_integration_exit_code]
     log_location: github-actions:integration-nightly.yml
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
+  review.record:
+    # alpha-engine-config-I10968, the same class as `test.integration`
+    # (-I10459) one call site on. `python -m crucible.review record` wrote
+    # `reviews/{phase}/{day}/{reviewer}/{verdict}.json` from a raw
+    # `store.put_bytes` in its own `__main__` — no manifest on either path and
+    # no row here — while `crucible.gate._clause_independently_reviewed` reads
+    # that artifact as phase-exit evidence. It is a registered job now, and
+    # `crucible/review.py`'s own entry point keeps only the two verbs that
+    # write nothing (`authors`, `check`), which is what lets the recording
+    # workflow refuse a self-review BEFORE it asks for AWS credentials.
+    #
+    # `schedule`/`dispatch`/`deadline` all null: the verdict is recorded when a
+    # review happens, which is an operator dispatch of
+    # `adversarial-review-record.yml`, never a clock. A deadline would page for
+    # a day nobody reviewed anything.
+    description: File one independent adversarial review verdict in the store.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:outputs[reviews/{phase}/{day}/{reviewer}/{verdict}.json]
+      # The job records a verdict; it does not grade one. What it can fail on
+      # is the independence comparison, and that is the manifest's own
+      # `status`/`reason` — a metric restating it would be a second rendering
+      # of one fact.
+      outcome: null
+    log_location: github-actions:adversarial-review-record.yml
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
+  acceptance.publish:
+    # alpha-engine-config-I10968, the second writer. `ci.yml` copied the plan
+    # §12 rule-3 acceptance reading to the store with a raw `aws s3 cp` — not
+    # through `crucible.store.Store` at all — so the ONE producer of the figure
+    # the plan names as progress filed no manifest, while `crucible
+    # report.morning`, `crucible board` and phase 0's own gate clause all read
+    # it as evidence.
+    #
+    # `schedule`/`dispatch`/`deadline` all null: it runs on `ci.yml`'s
+    # `push`/`pull_request` triggers. A deadline would page for a day nobody
+    # merged anything, which is a fact about the week, not about this job.
+    description: Publish the plan section 12 rule-3 acceptance reading a commit measured.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:outputs[report/acceptance/{day}.json]
+      outcome: run.json:metrics[acceptance_clauses_met]
+    log_location: github-actions:ci.yml
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs

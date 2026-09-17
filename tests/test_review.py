@@ -22,16 +22,19 @@ import json
 
 import pytest
 
+from crucible.cli import main as cli_main
 from crucible.gate import REVIEW_SCHEMA_VERSION
-from crucible.keys import review_key
+from crucible.keys import manifest_key, review_key
 from crucible.review import (
     COMMITS_ENDPOINT_CAP,
+    REVIEW_RECORD_JOB,
     ReviewError,
     author_identities,
     check_reviewer,
     record,
     review_document,
 )
+from crucible.runner import run_job
 from crucible.store import LocalStore
 
 AUTHOR = "session_01AuthorAAAAAAAA"
@@ -191,6 +194,26 @@ class TestTheDocument:
         assert document()["authors"] == author_identities([commit()])
 
 
+def _record(store: LocalStore, document_: dict) -> str:
+    """File one verdict the way the job does - through `run_job`.
+
+    `crucible.review.record` takes a `RunContext`, not a bare `Store`
+    (`alpha-engine-config-I10968`): the write is `ctx.record_output`, so it
+    enters `outputs[]` and the artifact is its own manifest's evidence rather
+    than a side effect beside it. These tests go through the runner for the
+    same reason `tests/test_ledger_explain_migrate.py::_run_migrate` does - a
+    hand-rolled fake ctx would exercise the fake.
+    """
+    filed: list[str] = []
+    run_job(
+        REVIEW_RECORD_JOB,
+        lambda ctx: filed.append(record(ctx, document=document_)),
+        store=store,
+        trading_day=FRIDAY,
+    )
+    return filed[0]
+
+
 class TestAnAdverseVerdictIsDurable:
     def test_a_pass_cannot_overwrite_a_fail_from_the_same_reviewer(self, tmp_path) -> None:
         """The defect: with the verdict only in the BODY, a reviewer that
@@ -199,27 +222,34 @@ class TestAnAdverseVerdictIsDurable:
         green on a change nobody re-reviewed. The verdict is a key segment, so
         the two are different objects."""
         store = LocalStore(tmp_path)
-        failed = record(store, document=document(verdict="fail"), trading_day=FRIDAY)
-        passed = record(store, document=document(verdict="pass"), trading_day=FRIDAY)
+        failed = _record(store, document(verdict="fail"))
+        passed = _record(store, document(verdict="pass"))
         assert failed != passed
         assert store.exists(failed)
         assert json.loads(store.get_bytes(failed))["verdict"] == "fail"
 
     def test_two_reviewers_on_one_session_do_not_overwrite_each_other(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
-        first = record(store, document=document(), trading_day=FRIDAY)
-        second = record(
-            store,
-            document=document(reviewer="session_01ThirdCCCCCCCC"),
-            trading_day=FRIDAY,
-        )
+        first = _record(store, document())
+        second = _record(store, document(reviewer="session_01ThirdCCCCCCCC"))
         assert first != second
         assert store.exists(first) and store.exists(second)
 
     def test_the_filed_document_carries_the_schema_the_gate_reads(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
-        key = record(store, document=document(), trading_day=FRIDAY)
+        key = _record(store, document())
         assert json.loads(store.get_bytes(key))["schema_version"] == REVIEW_SCHEMA_VERSION
+
+    def test_the_write_is_recorded_as_an_output_of_its_own_run(self, tmp_path) -> None:
+        """Rule 1, the point of `alpha-engine-config-I10968`: the artifact the
+        phase gate reads is named in the manifest of the run that wrote it.
+        Before this it was a raw `store.put_bytes` from a module `__main__`,
+        so the producer of phase-exit evidence filed no lineage at all."""
+        store = LocalStore(tmp_path)
+        key = _record(store, document())
+        manifest = json.loads(store.get_bytes(manifest_key(REVIEW_RECORD_JOB, FRIDAY.isoformat())))
+        assert manifest["status"] == "ok"
+        assert [row["key"] for row in manifest["outputs"]] == [key]
 
 
 class TestTheCommandLine:
@@ -250,12 +280,18 @@ class TestTheCommandLine:
         assert capsys.readouterr().out.strip() == REVIEWER.lower()
 
     def test_record_files_the_artifact_and_prints_its_key(self, tmp_path, capsys) -> None:
-        from crucible.review import main
+        """Through `crucible.cli`, not `python -m crucible.review`
+        (`alpha-engine-config-I10968`): recording is a registered job now, so
+        there is one entry point that writes the artifact and it is the one
+        that writes a manifest."""
+        main = cli_main
 
         store_dir = tmp_path / "store"
         code = main(
             [
-                "record",
+                REVIEW_RECORD_JOB,
+                "--date",
+                FRIDAY.isoformat(),
                 "--commits",
                 self._commits(tmp_path, [commit()]),
                 "--reviewer",
@@ -280,13 +316,15 @@ class TestTheCommandLine:
         assert key.endswith(f"/{REVIEWER.lower()}/pass.json")
         assert LocalStore(store_dir).exists(key)
 
-    def test_record_refuses_a_self_review_before_touching_the_store(self, tmp_path, capsys) -> None:
-        from crucible.review import main
+    def test_record_refuses_a_self_review_and_records_the_refusal(self, tmp_path, capsys) -> None:
+        main = cli_main
 
         store_dir = tmp_path / "store"
         code = main(
             [
-                "record",
+                REVIEW_RECORD_JOB,
+                "--date",
+                FRIDAY.isoformat(),
                 "--commits",
                 self._commits(tmp_path, [commit()]),
                 "--reviewer",
@@ -307,4 +345,11 @@ class TestTheCommandLine:
         )
         assert code == 2
         assert "independent of the author" in capsys.readouterr().err
-        assert not list(LocalStore(store_dir).list_keys("reviews/"))
+        store = LocalStore(store_dir)
+        assert not list(store.list_keys("reviews/"))
+        # ...and the attempt IS recorded (alpha-engine-config-I10968). "A
+        # review was attempted and refused" and "no review was attempted" used
+        # to be indistinguishable: the refusing path wrote nothing anywhere.
+        manifest = json.loads(store.get_bytes(manifest_key(REVIEW_RECORD_JOB, FRIDAY.isoformat())))
+        assert manifest["status"] == "failed"
+        assert "independent of the author" in manifest["reason"]

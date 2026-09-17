@@ -21,6 +21,23 @@ from crucible.weekly import ARC_SLOT_JOBS, ARCTIC_LIBRARY_JOBS, ArcStageFailed, 
 FRIDAY = dt.date(2026, 8, 28)
 
 
+def _expected_stage_count() -> int:
+    """How many stages the arc must dispatch, derived from the registry.
+
+    Unscoped rows count once; a row in `ARC_SLOT_JOBS` counts once per
+    dispatchable slot. Nothing here is a literal: a row joining or leaving
+    `dispatch: arc` changes this number without an edit, which is the whole
+    point of `crucible.weekly`'s derivation.
+    """
+    arc_rows = [
+        name
+        for name, row in load_registry().items()
+        if row.dispatch == "arc" and row.lifecycle == "ACTIVE"
+    ]
+    scoped = [name for name in arc_rows if name in ARC_SLOT_JOBS]
+    return (len(arc_rows) - len(scoped)) + len(scoped) * len(dispatchable_slots())
+
+
 class TestDerivation:
     def test_the_arc_is_every_row_that_declares_it(self) -> None:
         """Not a list in this file, and not a list in `weekly.py`. Both would
@@ -221,13 +238,14 @@ class TestRunsTheRealCommand:
             return 0
 
         run_arc(FRIDAY, store="/tmp/store", run_mode=RUN_MODE_REPLAY, main=fake_main, dry_run=True)
-        # 6 unscoped stages (data.weekly, drift, report, console,
-        # iac.conformance, explain — the last joined the arc at
-        # alpha-engine-config-I10858) + one stage per ARC_SLOT_JOB x every
-        # DISPATCHABLE slot. Derived from `ARC_SLOT_JOBS` rather than written
-        # as a literal so a job joining the slot-scoped set (`promote`,
-        # `alpha-engine-config-I9759`) does not need this arithmetic edited.
-        assert len(seen) == 6 + len(ARC_SLOT_JOBS) * len(dispatchable_slots())
+        # One stage per unscoped arc row + one per ARC_SLOT_JOB x every
+        # DISPATCHABLE slot. BOTH terms derived (`alpha-engine-config-I10961`):
+        # the unscoped count was the literal `6` and went stale the moment
+        # `migrate.history` joined the arc at 14:30 — the arithmetic it was
+        # meant to spare an editor is exactly the arithmetic that broke, and a
+        # count written from the rows someone remembered is the class
+        # `weekly.py`'s own header names.
+        assert len(seen) == _expected_stage_count()
         for argv in seen:
             assert "--dry-run" in argv, argv
             assert "--run-mode" in argv, argv
@@ -243,7 +261,7 @@ class TestRunsTheRealCommand:
             return 0
 
         run_arc(FRIDAY, store="/tmp/store", run_mode=RUN_MODE_REPLAY, main=fake_main, dry_run=False)
-        assert len(seen) == 6 + len(ARC_SLOT_JOBS) * len(dispatchable_slots())
+        assert len(seen) == _expected_stage_count()
         for argv in seen:
             assert "--dry-run" not in argv, argv
 

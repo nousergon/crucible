@@ -410,17 +410,37 @@ def _seed_produced(store: Any, recipe: Any) -> None:
 
 
 class TestMigrate:
-    def test_an_absent_source_is_named_by_key_and_fails_the_run(
+    def test_an_absent_source_is_named_by_key_and_fails_an_ASSERTED_run(
         self, store, tmp_path, cycle_date
     ) -> None:
+        """The operator path: a caller that NAMED its slots said the sources
+        were there, so a partial import under that claim is refused loudly."""
         from crucible.store import LocalStore
 
         v1 = LocalStore(tmp_path / "v1")
         with pytest.raises(MigrationSourceMissing) as excinfo:
-            _run_migrate(store, cycle_date, v1_store=v1)
+            _run_migrate(store, cycle_date, v1_store=v1, slots=("u", "r"))
         message = str(excinfo.value)
         for source in SOURCES:
             assert source.key in message, "every absent source must be named by its key"
+
+    def test_an_absent_source_is_recorded_and_the_SCHEDULED_run_still_exits_ok(
+        self, store, tmp_path, cycle_date
+    ) -> None:
+        """`alpha-engine-config-I10961` deliverable 4. `migrate.history` is an
+        arc stage now, and `run_arc` stops at the first raise - so a stage that
+        raised because v1 (a system being decommissioned) had stopped writing a
+        source would kill every stage after it. The absence is recorded, every
+        slot defers, and nothing is written."""
+        from crucible.keys import champion_key
+        from crucible.store import LocalStore
+
+        v1 = LocalStore(tmp_path / "v1")
+        _ctx, result = _run_migrate(store, cycle_date, v1_store=v1)
+        assert [m["key"] for m in result["sources_missing"]] == [s.key for s in SOURCES]
+        assert set(result["deferred"]) == set(result["slots_considered"])
+        for slot in result["slots_considered"]:
+            assert not store.exists(champion_key(slot))
 
     def test_the_operator_bootstrap_flag_is_carried_across(
         self, store, tmp_path, strategy_dir, cycle_date
