@@ -32,7 +32,7 @@ from crucible.explain import explain as explain_lineage
 from crucible.explain import render as render_lineage
 from crucible.explain import select_newest_settled_verdict
 from crucible.gate import PHASES
-from crucible.keys import arm_register_key
+from crucible.keys import arm_register_key, calendar_day_discriminator
 from crucible.manifest import manifest_key
 from crucible.registration import load_registrable_recipes
 from crucible.runner import run_job
@@ -489,7 +489,21 @@ def handle_experiment_new(args: argparse.Namespace) -> int:
         # only from S3 object versions. `experiment.new` is on-demand
         # (`components.yaml`: `schedule: null`, `deadline: null`), so no
         # absence grading keys off a predictable manifest key here.
-        discriminator=lambda ctx: f"{args.slot}-{ctx.run_id}",
+        #
+        # Led by the CALENDAR day this process ran on
+        # (`alpha-engine-config-I10999`). Those same seven registrations ran
+        # on 2026-09-17 with `--trading-day 2026-09-11`, so every manifest
+        # landed under `runs/experiment.new/2026-09-11/`,
+        # `runs/experiment.new/2026-09-17/` did not exist, and "what mutated
+        # the store today" was answerable only from S3 object-version
+        # metadata. The trading-day SEGMENT is unchanged — moving it is what
+        # would blind `crucible.alerts`' absence grading for a scheduled job,
+        # which is why this is the on-demand half of a deliberate asymmetry.
+        # The whole decision is written at
+        # `crucible.keys.calendar_day_discriminator`.
+        discriminator=lambda ctx: calendar_day_discriminator(
+            ctx.calendar_date, suffix=f"{args.slot}-{ctx.run_id}"
+        ),
     )
     return 0 if ctx else 0
 
