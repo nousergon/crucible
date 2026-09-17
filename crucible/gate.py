@@ -1298,9 +1298,7 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
             # reading naming it, which is in `gaps` above, and the clause is
             # red regardless of what this comparison says.
             demanded = {arm for arm in registered if arm in filed and filed[arm] <= day}
-            deferred = sorted(
-                arm for arm in registered if arm in filed and filed[arm] > day
-            )
+            deferred = sorted(arm for arm in registered if arm in filed and filed[arm] > day)
             not_yet_filed.extend(
                 f"{slot}:{arm}@{day.isoformat()} (filed {filed[arm].isoformat()})"
                 for arm in deferred

@@ -464,9 +464,7 @@ def handle_experiment_new(args: argparse.Namespace) -> int:
         ctx.record_output(arm_register_key(args.slot), payload, schema_version="arm_register.v1")
         ctx.record_rows(rows_in=len(specs), rows_out=len(added))
         ctx.record_metric(
-            _arms_appended_metric(
-                slot=args.slot, added=added, filed_on=filed_on, now=ctx.started
-            )
+            _arms_appended_metric(slot=args.slot, added=added, filed_on=filed_on, now=ctx.started)
         )
         print(
             json.dumps(
@@ -652,9 +650,7 @@ def handle_experiment_register(args: argparse.Namespace) -> int:
         ctx.record_output(arm_register_key(args.slot), payload, schema_version="arm_register.v1")
         ctx.record_rows(rows_in=load.n_read, rows_out=len(added))
         ctx.record_metric(
-            _arms_appended_metric(
-                slot=args.slot, added=added, filed_on=filed_on, now=ctx.started
-            )
+            _arms_appended_metric(slot=args.slot, added=added, filed_on=filed_on, now=ctx.started)
         )
         ctx.record_metric(
             {

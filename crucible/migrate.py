@@ -1105,9 +1105,7 @@ def _apply_filing_correction(
     return True, f"date {correction.wrong_date} -> {correction.filed_on}"
 
 
-def run_migrate_arm_filed_on(
-    store: Store, *, dry_run: bool = False
-) -> ArmFilingMigrationReport:
+def run_migrate_arm_filed_on(store: Store, *, dry_run: bool = False) -> ArmFilingMigrationReport:
     """Correct the `registered` event dates listed in
     :data:`ARM_FILING_CORRECTIONS`. One-time, audited, date-only.
 
