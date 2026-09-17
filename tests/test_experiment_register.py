@@ -356,3 +356,78 @@ class TestTheGapIsGradeable:
         monkeypatch.setattr(gate_module, "_register_arms", _denied)
         clause = self._clause(store, monkeypatch)
         assert clause.unmeasurable and not clause.met
+
+
+class TestASlotWhereNothingIsRegistrableDoesNotStopTheArc:
+    """`crucible.weekly.run_arc` stops at the FIRST stage that raises, and
+    `experiment.register` runs at 11:00 — ahead of `experiment.run`,
+    `experiment.grade`, `promote`, `report`, `console` and `explain`.
+
+    S refuses every recipe outside a cycle BY DESIGN: an S arm declares no
+    `registered_at`, and `experiment.run --slot s` stamps it from the first
+    run that registers the arm. Measured against the live store on
+    2026-09-17, `experiment.register --slot s` raised `SlotUnservableError`
+    uncaught — which on 2026-09-19 would have taken the whole Saturday arc
+    down over a slot behaving exactly as designed, including the producer
+    phase 1's `explain_walks_a_verdict` depends on.
+    """
+
+    def test_it_files_a_reading_instead_of_raising(self, tmp_path, monkeypatch) -> None:
+        from crucible import track_a
+        from crucible.slots.inputs import InputRefusal, SlotUnservableError
+
+        def refuse(*_args, **_kwargs):
+            raise SlotUnservableError(
+                (
+                    InputRefusal(
+                        arm="stock_registry",
+                        unresolvable=("registered_at",),
+                        reason=(
+                            "declares no `registered_at`, so it has no out-of-sample clock "
+                            "and no cycle trading day was supplied to stamp one from"
+                        ),
+                    ),
+                )
+            )
+
+        monkeypatch.setattr(track_a, "load_registrable_recipes", refuse)
+        store = LocalStore(tmp_path)
+
+        assert HANDLERS["experiment.register"](_args(str(tmp_path), slot="s")) == 0
+
+        manifest = _manifest(store, "s")
+        assert manifest["status"] == "ok"
+        assert manifest["rows_out"] == 0
+        # RECORDED, not swallowed.
+        assert len(manifest["rows_rejected"]) == 1
+        coverage = [m for m in manifest["metrics"] if m["name"] == track_a.REGISTER_COVERAGE_METRIC]
+        assert coverage, manifest["metrics"]
+        assert coverage[-1]["status"] == "unservable"
+        assert "did not fail the arc" in coverage[-1]["status_reason"]
+
+    def test_the_refusals_are_read_structured_not_off_the_message(self) -> None:
+        """`SlotUnservableError.args[0]` is the FORMATTED message, and
+        iterating a str yields characters — one rejection per character, a
+        reading-shaped artifact containing nothing that `record_rejected`
+        raises over at 200. The structured `.refusals` field is what carries
+        the arms.
+        """
+        from crucible.slots.inputs import InputRefusal, SlotUnservableError
+        from crucible.track_a import _refusals_from
+
+        error = SlotUnservableError(
+            (
+                InputRefusal(
+                    arm="stock_registry", unresolvable=("registered_at",), reason="no registered_at"
+                ),
+                InputRefusal(
+                    arm="stock_registry_sqrt_impact",
+                    unresolvable=("registered_at",),
+                    reason="ditto",
+                ),
+            )
+        )
+        assert _refusals_from(error) == [
+            "stock_registry: no registered_at",
+            "stock_registry_sqrt_impact: ditto",
+        ]

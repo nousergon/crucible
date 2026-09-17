@@ -44,6 +44,7 @@ from crucible.slots.arms import (
     register_arms,
     write_register,
 )
+from crucible.slots.inputs import SlotUnservableError
 
 __all__ = ["HANDLERS", "add_track_a_arguments"]
 
@@ -497,13 +498,44 @@ def handle_experiment_register(args: argparse.Namespace) -> int:
     `alpha-engine-config-I10695`) comes back as a
     `crucible.slots.inputs.InputRefusal` value, is recorded as a rejection
     with its reason and as an `unservable` MetricRecord, and its siblings
-    still register. Anything else — an unreadable tree, a malformed recipe, a
-    slot where NOTHING registers — raises, and the manifest carries the cause
-    (AGENTS.md rule 5).
+    still register. An unreadable tree or a malformed recipe still raises,
+    and the manifest carries the cause (AGENTS.md rule 5).
+
+    **A slot where NOTHING registers outside a cycle is a state, not a
+    failure** — the one deviation from the raise-by-default rule above, and
+    the reason is measured rather than assumed. `load_strategy_slot` refuses
+    every S recipe outside a cycle by design: an S arm declares no
+    `registered_at`, and `experiment.run --slot s` stamps that field from the
+    first run that registers it. So `experiment.register --slot s` finds
+    nothing registrable *whenever S has not yet cycled*, which today is
+    always, because S's `produce` builds its book on the M champion and there
+    is no M champion (`alpha-engine-config-I10924`).
+
+    `crucible.weekly.run_arc` stops at the first stage that RAISES, and this
+    stage runs at 11:00 — ahead of `experiment.run`, `experiment.grade`,
+    `promote`, `report`, `console` and `explain`. Raising here would
+    therefore take down the whole Saturday arc, including the producer phase
+    1's `explain_walks_a_verdict` depends on, over a slot behaving exactly as
+    designed. Measured 2026-09-17 against the live store, before it could
+    happen on 2026-09-19.
+
+    Per the fail-loud deviation rule, naming the three things it requires:
+    (a) the failure mode swallowed is `SlotUnservableError` — every arm in one
+    slot refused; (b) the primary deliverable survives because this stage's
+    deliverable is "register what the release declares and report the rest",
+    and a slot with nothing registrable has nothing to register, while every
+    other slot's stage is unaffected; (c) the recording surface is this run's
+    own manifest — each refusal as a rejection, an `unservable` MetricRecord,
+    `rows_out=0` — plus `gate._clause_every_recipe_registered`, which reads
+    RED over precisely this state and is what makes it visible rather than
+    quiet. The condition is not lost; only the arc-killing raise is.
     """
     config = _settings(args)
     store = config.store()
-    load = load_registrable_recipes(args.slot, strategy_dir=config.strategy_dir, store=store)
+    try:
+        load = load_registrable_recipes(args.slot, strategy_dir=config.strategy_dir, store=store)
+    except SlotUnservableError as unservable:
+        return _register_nothing_registrable(args, store, unservable)
     register = read_register(store, args.slot)
     before = set(register.all_arms())
     register, _ = register_arms(register, list(load.specs))
@@ -567,6 +599,87 @@ def handle_experiment_register(args: argparse.Namespace) -> int:
         # Four slots share one job name and one trading day; the slot is the
         # discriminator that keeps `--slot u` and `--slot m` from writing the
         # same manifest (alpha-engine-config-I9781).
+        discriminator=args.slot,
+    )
+    return 0
+
+
+def _refusals_from(unservable: SlotUnservableError) -> list[str]:
+    """One rejection string per refused arm, read from the STRUCTURED field.
+
+    `SlotUnservableError` carries `.refusals` — a tuple of
+    `crucible.slots.inputs.InputRefusal`, each with `.arm` and `.reason`.
+    Reading `args[0]` instead would hand back the formatted message, and
+    iterating a str yields CHARACTERS: one rejection per character, which is
+    a reading-shaped artifact containing nothing and which
+    `record_rejected` raises over at 200.
+    """
+    return [
+        f"{refusal.arm}: {refusal.reason}" for refusal in getattr(unservable, "refusals", ())
+    ] or [str(unservable)]
+
+
+def _register_nothing_registrable(
+    args: argparse.Namespace, store: Any, unservable: SlotUnservableError
+) -> int:
+    """The `SlotUnservableError` branch of :func:`handle_experiment_register`.
+
+    Files a real manifest for a real reading — `status ok`, `rows_out=0`, one
+    rejection per refused arm and one `unservable` MetricRecord — rather than
+    raising and stopping the arc. See that function's docstring for why this
+    is the one sanctioned deviation from raise-by-default.
+    """
+    # `SlotUnservableError` is constructed with a TUPLE of refusal strings,
+    # but it is also raised with a single formatted string by other call
+    # sites. Iterating a str yields characters, so the shape is normalised
+    # here rather than assumed — a refusal list of 60 one-character rows is
+    # not a reading, and `record_rejected` would file every one of them.
+    refusals = _refusals_from(unservable)
+    reason = str(unservable)
+    report = {
+        "slot": args.slot,
+        "read": len(refusals),
+        "registered": [],
+        "already_present": [],
+        "refused": refusals,
+        "nothing_registrable": True,
+    }
+    if args.dry_run:
+        print(json.dumps({**report, "would_register": []}, indent=2))
+        return 0
+
+    def job(ctx: Any) -> None:
+        for refusal in refusals:
+            ctx.record_rejected(f"{args.slot}: {refusal}"[:200], 1)
+        ctx.record_rows(rows_in=len(refusals), rows_out=0)
+        ctx.record_metric(
+            {
+                "name": REGISTER_COVERAGE_METRIC,
+                "module": "crucible.track_a",
+                "metric_type": "coverage",
+                "value": 0.0,
+                "unit": "arms",
+                "n_floor": 0,
+                # `unservable` and not `OK`: nothing registered, and a slot
+                # that registers nothing must not read like one that had
+                # nothing left to do (plan 5.3, 7).
+                "status": "unservable",
+                "status_reason": (
+                    f"slot {args.slot}: no recipe is registrable outside a cycle, so this "
+                    f"stage registered nothing and did not fail the arc. {reason}"
+                )[:800],
+                "source_path": arm_register_key(args.slot),
+                "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+        print(json.dumps(report, indent=2))
+
+    run_job(
+        "experiment.register",
+        job,
+        store=store,
+        trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
         discriminator=args.slot,
     )
     return 0
