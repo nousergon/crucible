@@ -68,6 +68,8 @@ __all__ = [
     "FeatureLayerDepthReading",
     "FeatureLayerCompletenessReading",
     "check_feature_layer_depth",
+    "sample_sessions",
+    "COMPLETENESS_SAMPLE_SIZE",
     "check_feature_layer_completeness",
     "count_session_objects_by_version",
 ]
@@ -223,13 +225,36 @@ def check_feature_layer_depth(
 NULL_RATIO_CEILING = 0.5
 
 
+#: Sessions sampled across the live version, newest and oldest always among
+#: them. Reading ONLY the newest session is what let
+#: `alpha-engine-config-I10733`'s null band sit unreported: on 2026-09-14 a
+#: degenerate `data/inst_ownership/2025Q3/latest.parquet` was live between
+#: 19:32Z and 21:23Z, every feature session healed inside that window read it,
+#: and `institutional_accumulation_raw` came out null for 903 of 903 tickers
+#: on the ~50 sessions of 2025-11-17..2026-01-30. This reading was GREEN over
+#: all of it, because the newest session (2026-09-15) was healed afterwards
+#: and is fine. A layer is not its last day.
+#:
+#: 40 over a ~1,180-session layer is a stride near 29, so any contiguous band
+#: of 30 sessions or more is certain to be sampled. The number is a
+#: cost/coverage trade and the reading STATES it (below) rather than implying
+#: the whole layer was read -- a sample reported as a sweep is the same
+#: false-green shape one layer up.
+COMPLETENESS_SAMPLE_SIZE = 40
+
+
 @dataclass(frozen=True)
 class FeatureLayerCompletenessReading:
-    """The result of one column-completeness comparison over the live
-    version's most recent session. `state` is the board's whole verdict;
-    `null_ratios` carries every catalogue column's null fraction so a
-    partial degradation is visible on the reading before it reaches
-    :data:`NULL_RATIO_CEILING`.
+    """The result of one column-completeness comparison over a sample of the
+    live version's sessions. `state` is the board's whole verdict;
+    `null_ratios` carries every catalogue column's null fraction on the WORST
+    sampled session, so a partial degradation is visible on the reading
+    before it reaches :data:`NULL_RATIO_CEILING`.
+
+    `session` is the session the ratios and the verdict were taken from --
+    the newest when everything is clean, the offending one when a column is
+    dead somewhere in the layer. `sessions_read` and `sessions_total` are
+    what makes the sample honest at the point of reading it.
     """
 
     state: DepthState
@@ -238,21 +263,46 @@ class FeatureLayerCompletenessReading:
     session: str | None
     null_ratios: dict[str, float] = field(default_factory=dict)
     dead_columns: tuple[str, ...] = field(default_factory=tuple)
+    sessions_read: tuple[str, ...] = field(default_factory=tuple)
+    sessions_total: int = 0
+    dead_sessions: tuple[str, ...] = field(default_factory=tuple)
+
+
+def sample_sessions(sessions: list[str], size: int = COMPLETENESS_SAMPLE_SIZE) -> list[str]:
+    """`size` sessions spread evenly across `sessions`, newest and oldest
+    included, in chronological order and without duplicates.
+
+    Evenly spaced rather than random: a random sample makes the reading
+    non-reproducible, so two consecutive board runs can disagree about a
+    layer that did not change, and nobody can tell which run was unlucky.
+    An even stride has a stated guarantee instead -- any band at least
+    `len(sessions) / size` long is hit.
+    """
+    if size <= 0:
+        raise ValueError(f"sample size must be positive; got {size}")
+    if len(sessions) <= size:
+        return list(sessions)
+    step = (len(sessions) - 1) / (size - 1)
+    picked = {round(i * step) for i in range(size)}
+    picked.add(0)
+    picked.add(len(sessions) - 1)
+    return [sessions[i] for i in sorted(picked)]
 
 
 def check_feature_layer_completeness(
     store: Store, *, live_version: str | None = None
 ) -> FeatureLayerCompletenessReading:
     """RED when any catalogue column is null on at least :data:`NULL_RATIO_CEILING`
-    of the rows of the live
-    version's most recent session parquet; GREEN otherwise.
+    of the rows of ANY sampled session of the live version; GREEN otherwise.
 
     Depth (:func:`check_feature_layer_depth`) asks how many sessions exist.
     This asks whether the deepest catalogue column measured anything on the
     most recent one — the two are complementary, never a replacement for
     each other, and both render as separate `crucible board` rows.
 
-    Reads two objects at most (a listing, then one session parquet); never
+    Reads a listing plus :data:`COMPLETENESS_SAMPLE_SIZE` session parquets at
+    most -- it used to read exactly one, the newest, and that is the blindness
+    `alpha-engine-config-I10733` walked through. Never
     calls out to AWS on its own account beyond that and never raises for an
     ordinary outcome. A genuine read failure (a denied credential, a store
     that cannot be reached, a corrupt parquet) propagates to the caller
@@ -281,55 +331,110 @@ def check_feature_layer_completeness(
             session=None,
         )
 
-    session = sessions[-1]
-    key = features_key(version, session)
-    frame = read_features(store.get_bytes(key))
+    sampled = sample_sessions(sessions)
+    depths = catalog_column_depths()
+    catalogue = feature_names()
 
-    if len(frame) == 0:
+    empty_sessions: list[str] = []
+    per_session: list[tuple[str, dict[str, float], tuple[str, ...], int]] = []
+    for candidate in sampled:
+        frame = read_features(store.get_bytes(features_key(version, candidate)))
+        if len(frame) == 0:
+            empty_sessions.append(candidate)
+            continue
+        columns = [c for c in catalogue if c in frame.columns]
+        ratios = {col: float(frame[col].isna().mean()) for col in columns}
+        dead = tuple(sorted(col for col, ratio in ratios.items() if ratio >= NULL_RATIO_CEILING))
+        per_session.append((candidate, ratios, dead, len(frame)))
+
+    if empty_sessions:
+        # A session with no tickers measured nothing, wherever it sits in the
+        # layer. Reported before the column verdict because a zero-row parquet
+        # has no column ratios to weigh against anything.
         return FeatureLayerCompletenessReading(
             state="RED",
-            detail=(f"{key!r} holds zero rows — a session with no tickers measured nothing"),
+            detail=(
+                f"{len(empty_sessions)} sampled session parquet(s) under {prefix!r} hold "
+                f"zero rows: {', '.join(empty_sessions[:4])} — a session with no tickers "
+                "measured nothing"
+            ),
             live_version=version,
-            session=session,
+            session=empty_sessions[0],
+            sessions_read=tuple(sampled),
+            sessions_total=len(sessions),
         )
 
-    depths = catalog_column_depths()
-    columns = [c for c in feature_names() if c in frame.columns]
-    null_ratios = {col: float(frame[col].isna().mean()) for col in columns}
-    dead_columns = tuple(
-        sorted(col for col, ratio in null_ratios.items() if ratio >= NULL_RATIO_CEILING)
+    # DERIVED from the sample actually taken, never from `len // size`: with
+    # 1,181 sessions and 40 samples the stride is 30.3, so the widest gap is
+    # 31 and `len // size` would claim 29 — an under-statement of the blind
+    # window, which is the one direction this sentence must never be wrong in.
+    positions = {session_name: index for index, session_name in enumerate(sessions)}
+    picked_positions = [positions[candidate] for candidate in sampled]
+    widest_gap = max(
+        (b - a for a, b in zip(picked_positions, picked_positions[1:], strict=False)),
+        default=1,
+    )
+    coverage = (
+        f"{len(sampled)} of {len(sessions)} session(s) sampled evenly across the layer "
+        f"({sampled[0]}..{sampled[-1]}); any contiguous band of {widest_gap} session(s) "
+        "or more is sampled, a shorter one can sit between two samples unseen"
     )
 
-    if dead_columns:
+    dead_readings = [reading for reading in per_session if reading[2]]
+    if dead_readings:
+        # The WORST sampled session is the one reported, not the newest: the
+        # newest is exactly the session that read green over
+        # `alpha-engine-config-I10733`'s band.
+        worst_session, null_ratios, dead_columns, row_count = max(
+            dead_readings, key=lambda reading: (len(reading[2]), max(reading[1].values()))
+        )
         named = ", ".join(
             f"{col!r} (declared depth {depths.get(col, 'unknown')} session(s))"
             for col in dead_columns
         )
+        dead_sessions = tuple(reading[0] for reading in dead_readings)
         detail = (
-            f"{key!r}: catalogue column(s) null on >= {NULL_RATIO_CEILING:.0%} of "
-            f"{len(frame)} row(s) of the most recent session ({session}): {named} — a "
-            "column that looks computed and measured nothing for most of the universe, "
-            "the avg_volume_20d/residual_momentum class. "
+            f"{features_key(version, worst_session)!r}: catalogue column(s) null on >= "
+            f"{NULL_RATIO_CEILING:.0%} of {row_count} row(s) of session {worst_session}: "
+            f"{named} — a column that looks computed and measured nothing for most of "
+            "the universe, the avg_volume_20d/residual_momentum class. "
             "catalog_column_depths() explains an ordinary null for one ticker younger "
-            "than a column's declared depth; it never explains every ticker null at once"
+            "than a column's declared depth; it never explains every ticker null at once. "
+            f"{len(dead_sessions)} of the sampled session(s) read dead: "
+            f"{', '.join(dead_sessions[:6])}. {coverage}"
         )
-        state: DepthState = "RED"
-    else:
-        worst_col, worst_ratio = (
-            max(null_ratios.items(), key=lambda kv: kv[1]) if null_ratios else (None, 0.0)
+        return FeatureLayerCompletenessReading(
+            state="RED",
+            detail=detail,
+            live_version=version,
+            session=worst_session,
+            null_ratios=null_ratios,
+            dead_columns=dead_columns,
+            sessions_read=tuple(sampled),
+            sessions_total=len(sessions),
+            dead_sessions=dead_sessions,
         )
-        detail = (
-            f"{key!r}: no catalogue column is null on >= {NULL_RATIO_CEILING:.0%} of rows "
-            f"of the most recent session ({session}, {len(frame)} row(s)); worst null ratio "
-            f"{worst_ratio:.2%} on {worst_col!r}"
-        )
-        state = "GREEN"
 
+    newest_session, null_ratios, _, row_count = per_session[-1]
+    worst_col, worst_ratio, worst_where = None, 0.0, newest_session
+    for candidate, ratios, _, _ in per_session:
+        if not ratios:
+            continue
+        col, ratio = max(ratios.items(), key=lambda kv: kv[1])
+        if ratio >= worst_ratio:
+            worst_col, worst_ratio, worst_where = col, ratio, candidate
+    detail = (
+        f"no catalogue column is null on >= {NULL_RATIO_CEILING:.0%} of rows on any "
+        f"sampled session of {version!r}; worst null ratio {worst_ratio:.2%} on "
+        f"{worst_col!r} (session {worst_where}). {coverage}"
+    )
     return FeatureLayerCompletenessReading(
-        state=state,
+        state="GREEN",
         detail=detail,
         live_version=version,
-        session=session,
+        session=newest_session,
         null_ratios=null_ratios,
-        dead_columns=dead_columns,
+        dead_columns=(),
+        sessions_read=tuple(sampled),
+        sessions_total=len(sessions),
     )
