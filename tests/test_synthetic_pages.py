@@ -258,7 +258,21 @@ class TestTheDispatchAbsenceReadsTheDispatchsOwnDate:
         _write_dispatch(store, job="fault.probe", args=self.ARGS, dispatch_id="01probe")
         store.put_bytes(
             manifest_key("fault.probe", "2026-09-11"),
-            json.dumps({"status": "failed", "run_mode": "replay"}).encode(),
+            # `started` after the dispatch: a manifest clears a dispatch only
+            # when it is THAT dispatch's manifest (alpha-engine-config-I10981).
+            # This fixture's subject is WHERE the detector looks, not what
+            # clears it, so it supplies the identity the detector now requires
+            # rather than relying on mere key existence.
+            json.dumps(
+                {
+                    "status": "failed",
+                    "run_mode": "replay",
+                    "run_id": "01PROBE",
+                    "started": (DISPATCHED_AT + dt.timedelta(minutes=2)).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                }
+            ).encode(),
         )
         pages = evaluate_dispatch_absence(
             store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason

@@ -576,6 +576,39 @@ def sweep_handler(args: argparse.Namespace) -> int:
         # page conditions above, and a release object with no retention is a
         # console row (plan §4.6), not a page — it does not name an
         # operator's next action the way an absent or failed manifest does.
+        # alpha-engine-config-I10967. The same read-only, piggybacked shape
+        # as the release-lock sweep below, for the class one level in from
+        # the two page conditions: a manifest KEY that N runs overwrite. An
+        # on-demand job that passes no discriminator records only its last
+        # invocation for a trading day, and every earlier run is
+        # indistinguishable from a run that never happened - which is what
+        # `experiment.new` did seven times on 2026-09-17. Derived over the
+        # whole registry, never an enumerated list, and recorded as
+        # `unmeasurable` rather than paged: the condition is standing, not
+        # eventful, and `unmeasurable` is its own state that never renders as
+        # green.
+        graded_jobs = alerts.on_demand_graded_jobs()
+        # The same window the sweep's own two page conditions are graded
+        # over, from the same function - a finding window narrower or wider
+        # than the pages' would report a different store than the one the
+        # pages were computed from.
+        graded_days = alerts.days_to_evaluate(store, now_override or ctx.started)
+        invocation_findings = alerts.indistinguishable_invocation_findings(store, days=graded_days)
+        result["indistinguishable_invocations"] = [
+            {
+                "job": f.job,
+                "trading_day": f.trading_day,
+                "manifest": f.key,
+                "run_id": f.run_id,
+            }
+            for f in invocation_findings
+        ]
+        ctx.record_metric(
+            alerts.indistinguishable_invocation_metric(
+                invocation_findings, graded_jobs=graded_jobs, now=ctx.started
+            )
+        )
+
         lock_findings = release_lock_findings(store)
         lock_metric = release_lock_metric(lock_findings, now=ctx.started)
         result["release_lock_findings"] = [

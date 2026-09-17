@@ -85,6 +85,10 @@ __all__ = [
     "CAUSE_MATCHERS",
     "CEILING_WINDOW_TRADING_DAYS",
     "DISPATCH_ABSENCE_HORIZON",
+    "IndistinguishableInvocation",
+    "indistinguishable_invocation_findings",
+    "indistinguishable_invocation_metric",
+    "on_demand_graded_jobs",
     "MUTED_TOPIC_VAR",
     "muted_topic",
     "MUTED_TOPIC_ARN_VAR",
@@ -867,6 +871,251 @@ def _classify_dispatch_absence(
     return f"no termination reason available for {instance_id} — investigate the box directly"
 
 
+@dataclass(frozen=True)
+class _ClearingVerdict:
+    """Whether a dispatch's own manifest is at the key — and if not, why not.
+
+    THREE outcomes, never two. `cleared` is the only one that silences a
+    dispatch; a manifest that exists but is not this dispatch's, and a
+    manifest that cannot be read at all, are both reasons to page, with
+    different text. Folding "unreadable" into "cleared" would reintroduce
+    `alpha-engine-config-I10981` in a new shape — a clearing predicate that
+    is satisfied by something other than evidence of this run.
+    """
+
+    cleared: bool
+    detail: str
+    listing_problem: str | None = None
+
+
+def _manifest_clears_dispatch(
+    store: Store, prefix: str, dispatched_at: dt.datetime
+) -> _ClearingVerdict:
+    """Does a manifest under ``prefix`` belong to the dispatch made at
+    ``dispatched_at``?
+
+    **The defect this replaces** (`alpha-engine-config-I10981`). The
+    predicate was `any(is_manifest_key(k) for k in listed)` — pure key
+    existence. A crucible manifest key is `runs/{job}/{trading_day}/run.json`
+    and an undiscriminated job overwrites it, so on a RE-DISPATCH of a range
+    that was healed before, an earlier run's `status: ok` manifest already
+    occupies that exact key. Measured 2026-09-17: dispatch
+    `441e55ef…` (`data.heal`, instance `i-02d1de19…`, 2026-09-15T01:20:57Z)
+    wrote six feature objects and died ~4 minutes in, while
+    `runs/data.heal/2026-01-30/run.json` still held the PRIOR heal's success
+    (`run_id 01M2GPZ…`). `alerts/2026-01-30/` is empty and both the
+    2026-09-15→16 and 2026-09-16→17 sweeps report `pages_emitted = 0.0`. And
+    because nothing ever marks a dispatch record satisfied (this module's own
+    docstring: "written once and never rewritten"), every FUTURE sweep skipped
+    it too.
+
+    **The rule is lifted, not invented** (`policy-shared-code`'s
+    second-adoption trigger). `nous-ergon-ops/scripts/lib/crucible_manifest_wait.sh`
+    already grades exactly this: it captures the run_id sitting at the key
+    BEFORE dispatching and waits for a manifest whose run_id DIFFERS — "a
+    manifest already sits at this key … this run is graded only on a manifest
+    whose run_id DIFFERS from it". The identity-based semantics existed in
+    the fleet; this detector was the one consumer still testing existence.
+
+    **Time ordering, not a dispatch id, and why.** The strongest form is for
+    the dispatcher to write its `dispatch_id` into the record and the runner
+    to echo it into the manifest, then match on identity. That needs a
+    producer change on both sides — the dispatcher lives in `nous-ergon-ops`
+    and the echo in `crucible.runner` — so it is not this change. `started`
+    is REQUIRED on every `run_manifest.v2` document, and a manifest whose run
+    began before the dispatch was made cannot be that dispatch's, which is
+    the whole of what the waiter's run_id comparison establishes. A manifest
+    that carries a `dispatch_id` matching the record is honoured first, so
+    the stronger form needs no change here when it lands.
+
+    **`started` absent or unparseable does not clear.** The same posture
+    `check_feature_layer_provenance` takes for UNREADABLE: a manifest we
+    cannot age is a manifest we cannot use to clear anything, and it pages
+    saying so.
+    """
+    read = read_manifests_under(store, prefix)
+    if read.listing_problem is not None:
+        return _ClearingVerdict(
+            False, "the manifest prefix could not be listed", read.listing_problem
+        )
+    if not read.documents and not read.faults:
+        return _ClearingVerdict(False, "no manifest")
+    stale: list[str] = []
+    unreadable: list[str] = [f"{key} ({why})" for key, why in sorted(read.faults.items())]
+    for key, document in read.documents:
+        started = _parse_dispatch_time(document.get("started"))
+        if started is None:
+            unreadable.append(
+                f"{key} (started {document.get('started')!r} is absent or unparseable)"
+            )
+            continue
+        if started >= dispatched_at:
+            return _ClearingVerdict(True, f"{key} was written by this dispatch")
+        stale.append(
+            f"{key} (run_id {document.get('run_id', '<none>')}, status "
+            f"{document.get('status', '<none>')}, started "
+            f"{started.strftime('%Y-%m-%dT%H:%M:%SZ')})"
+        )
+    if unreadable:
+        return _ClearingVerdict(
+            False,
+            "a manifest exists but could not be aged against this dispatch — "
+            + "; ".join(unreadable)
+            + " — an unreadable manifest is not a clear",
+        )
+    return _ClearingVerdict(
+        False,
+        "the only manifest(s) here PREDATE this dispatch and were written by an "
+        "earlier run — " + "; ".join(stale),
+    )
+
+
+@dataclass(frozen=True)
+class IndistinguishableInvocation:
+    """One manifest key that cannot tell N invocations of a job apart."""
+
+    job: str
+    trading_day: str
+    key: str
+    run_id: str
+
+
+def indistinguishable_invocation_findings(
+    store: Store,
+    *,
+    days: Sequence[dt.date],
+    registry: dict[str, Component] | None = None,
+) -> list[IndistinguishableInvocation]:
+    """Every manifest key in the window that N runs of one job overwrite.
+
+    **The class** (`alpha-engine-config-I10967`, re-scoped on its own
+    measurement). `crucible.keys.manifest_key` writes
+    `runs/{job}/{trading_day}/run.json` when a job passes no
+    ``discriminator``, so a job invoked twice on one trading day records only
+    its LAST invocation and every earlier run becomes indistinguishable from
+    a run that never happened. Measured 2026-09-17:
+    `runs/experiment.new/2026-09-11/run.json` carries SEVEN object versions
+    at 00:23:41–00:24:29Z, matching seven arm-register appends second for
+    second; the surviving version reads `rows_out: 1` and names one register.
+    Six runs' lineage was overwritten by the seventh, and the appends did go
+    through `run_job` — what defeated the record was the key, not a missing
+    manifest.
+
+    **Derived over the whole registry, never an enumerated list.** The domain
+    is every ACTIVE row whose `dispatch` is `null`: a clock-started row is
+    fired once per trading day by its cron or by the arc, so its single key
+    is bounded by the thing that starts it, while nothing bounds how often an
+    on-demand row is invoked. There is no allowlist of jobs exempt from this
+    — a new on-demand row joins the domain the moment it is added to
+    `components.yaml`, which is what `alpha-engine-config-I10969`'s bare
+    `{"deploy"}` literal is the counter-example to.
+
+    **`no data` is not a pass.** A prefix that cannot be listed raises
+    through :class:`StoreAccessError`: a finding here is only honest over a
+    window in which the store was fully readable, and an empty listing taken
+    from a denial would report "nothing overwrites anything" about a store
+    nobody could read.
+    """
+    reg = registry if registry is not None else load_registry()
+    findings: list[IndistinguishableInvocation] = []
+    for name, component in sorted(reg.items()):
+        if component.lifecycle != "ACTIVE" or component.dispatch is not None:
+            continue
+        for day in days:
+            read = read_manifests_under(store, manifest_prefix(name, day.isoformat()))
+            if read.listing_problem is not None:
+                raise StoreAccessError(read.listing_problem)
+            if read.faults:
+                raise StoreAccessError(
+                    f"manifests under {manifest_prefix(name, day.isoformat())!r} could not "
+                    f"be read: {sorted(read.faults)}. A key that cannot be read cannot be "
+                    "graded, and grading it as 'not overwritten' would be no data rendered "
+                    "as green"
+                )
+            for key, document in read.documents:
+                parsed = parse_manifest_key(key)
+                if parsed is None or parsed[2] is not None:
+                    continue
+                findings.append(
+                    IndistinguishableInvocation(
+                        job=name,
+                        trading_day=day.isoformat(),
+                        key=key,
+                        run_id=str(document.get("run_id", "<none>")),
+                    )
+                )
+    return findings
+
+
+def indistinguishable_invocation_metric(
+    findings: Sequence[IndistinguishableInvocation],
+    *,
+    graded_jobs: Sequence[str],
+    now: dt.datetime,
+) -> dict[str, Any]:
+    """A MetricRecord over :func:`indistinguishable_invocation_findings`.
+
+    `unmeasurable`, not OK and not BREACH, and that is the whole point. A key
+    N runs overwrite does not tell us that anything went wrong — it tells us
+    the record cannot answer the question, which is its own state and is
+    never folded into green (`observability-policy` §8.3; the status value is
+    the arena's own lowercase spelling, forwarded by the manifest schema's
+    closed `metricRecord.status` enum, exactly as
+    `crucible.release_lock_sweep.release_lock_metric` uses it).
+
+    It is deliberately NOT a page. The condition is standing rather than
+    eventful — it holds for as long as those jobs pass no discriminator — and
+    a nightly page for a condition nobody can clear tonight is how a channel
+    gets muted. It renders on the console as `unmeasurable` every night until
+    the producers are discriminated.
+    """
+    jobs = sorted({f.job for f in findings})
+    if findings:
+        status = "unmeasurable"
+        excerpt = ", ".join(f"{f.key} (run_id {f.run_id})" for f in findings[:5])
+        status_reason = (
+            f"{len(findings)} undiscriminated manifest key(s) across {len(jobs)} "
+            f"on-demand job(s) {jobs}: each holds only its LAST invocation for that "
+            f"trading day, so how many runs wrote it is unknowable from the store. "
+            f"Keys: {excerpt}"
+        )
+    else:
+        status = "OK"
+        status_reason = (
+            f"{len(graded_jobs)} on-demand job(s) graded; every manifest key in the "
+            "window distinguishes the invocation that wrote it"
+        )
+    return {
+        "name": "indistinguishable_invocations",
+        "module": "crucible.alerts",
+        "metric_type": "operational",
+        "value": float(len(findings)),
+        "unit": "manifest_keys",
+        "n_floor": 0,
+        "n_samples": len(graded_jobs),
+        "status": status,
+        "status_reason": status_reason,
+        "source_path": "runs/{job}/{trading_day}/run.json",
+        "last_updated_utc": now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def on_demand_graded_jobs(registry: dict[str, Component] | None = None) -> list[str]:
+    """The domain of :func:`indistinguishable_invocation_findings`, derived.
+
+    Exposed so the metric's ``n_samples`` is the number of rows really
+    graded rather than a constant that keeps reading as coverage after the
+    registry grows — a component emitting nothing is not healthy, it is
+    unobserved.
+    """
+    reg = registry if registry is not None else load_registry()
+    return sorted(
+        name
+        for name, component in reg.items()
+        if component.lifecycle == "ACTIVE" and component.dispatch is None
+    )
+
+
 def evaluate_dispatch_absence(
     store: Store,
     *,
@@ -890,8 +1139,19 @@ def evaluate_dispatch_absence(
     (`crucible.keys.dispatch_key`) — job, args, instance id, requester,
     dispatch time. This function lists every one of them, resolves the
     trading day THAT DISPATCH'S RUN will bind to
-    (:func:`_dispatch_target_trading_day`), and pages when that trading day's
-    manifest prefix is still empty past the horizon.
+    (:func:`_dispatch_target_trading_day`), and pages when no manifest THIS
+    DISPATCH wrote is there past the horizon.
+
+    **Identity, not existence** (`alpha-engine-config-I10981`). The clearing
+    predicate used to be the mere existence of a manifest key, and an
+    undiscriminated job's key is reused by every run for the same trading
+    day — so a re-dispatch over a range that was healed before was cleared by
+    the PREVIOUS run's `status: ok` manifest, and a chunk that died four
+    minutes in was invisible at precisely the artifact anyone would check.
+    :func:`_manifest_clears_dispatch` is the predicate now, and it has three
+    outcomes rather than two: a manifest that predates the dispatch pages,
+    and a manifest that cannot be read pages, because only evidence of THIS
+    run is a clear.
 
     **Bounded by the same catch-up window as everything else.** A record
     older than :data:`CATCH_UP_TRADING_DAYS` trading days is not graded: a
@@ -1001,13 +1261,13 @@ def evaluate_dispatch_absence(
             continue
         trading_day = _dispatch_target_trading_day(args, dispatched_at)
         prefix = manifest_prefix(job, trading_day.isoformat())
-        manifest_listed = _list_manifest_keys(store, prefix)
-        if manifest_listed.problem is not None:
+        verdict = _manifest_clears_dispatch(store, prefix, dispatched_at)
+        if verdict.listing_problem is not None:
             if access_faults is None:
-                raise StoreAccessError(manifest_listed.problem)
-            access_faults.append(manifest_listed.problem)
+                raise StoreAccessError(verdict.listing_problem)
+            access_faults.append(verdict.listing_problem)
             continue
-        if any(is_manifest_key(k) for k in manifest_listed.keys or ()):
+        if verdict.cleared:
             continue
         instance_id = dispatch.instance_id or "unknown"
         if instance_id == "unknown":
@@ -1025,7 +1285,7 @@ def evaluate_dispatch_absence(
                 reason=(
                     f"dispatched {dispatched_at.strftime('%Y-%m-%dT%H:%M:%SZ')} "
                     f"(instance {instance_id}, args {args!r}, dispatch record {key}); "
-                    f"no manifest under {prefix} after "
+                    f"{verdict.detail} under {prefix} after "
                     f"{horizon.total_seconds() / 3600:.0f}h, now "
                     f"{moment.strftime('%Y-%m-%dT%H:%M:%SZ')}; {classification}"
                 ),
