@@ -21,12 +21,15 @@ arithmetic (AGENTS.md test discipline).
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
 from crucible.features import DEFAULT_FEATURE_VERSION
+from crucible.slots import SLOTS
 from crucible.slots.inputs import (
+    BASE_COVERAGE_METRIC,
     BasePredictionsUnavailableError,
     UnproducibleInputError,
     UnresolvedInputError,
@@ -34,6 +37,7 @@ from crucible.slots.inputs import (
     prediction_column,
     read_arm_predictions,
     stack_prediction_columns,
+    write_arm_predictions,
 )
 from crucible.slots.model import (
     FeatureLayerSource,
@@ -96,12 +100,13 @@ def layer(tmp_path):
     return store
 
 
-def _write_recipe(directory, name, *, features, inputs=()):
+def _write_recipe(directory, name, *, features, inputs=(), spec_extra=()):
     directory.mkdir(parents=True, exist_ok=True)
     lines = ["slot: m", f"name: {name}", "spec:", f"  features: [{', '.join(features)}]"]
     if inputs:
         lines.append("  inputs:")
         lines += [f"    - {entry}" for entry in inputs]
+    lines += [f"  {entry}" for entry in spec_extra]
     lines += [
         "  estimator: {kind: ridge, alpha: 1.0}",
         "  label_horizon_trading_days: 2",
@@ -131,6 +136,7 @@ class _Ctx:
         self.store = store
         self.inputs: list[dict] = []
         self.outputs: list[dict] = []
+        self.metrics: list[dict] = []
 
     def record_input(self, key, payload, schema_version="v1") -> None:
         self.inputs.append({"key": key, "schema_version": schema_version})
@@ -138,6 +144,9 @@ class _Ctx:
     def record_output(self, key, payload, schema_version="v1") -> None:
         self.store.put_bytes(key, payload)
         self.outputs.append({"key": key, "schema_version": schema_version})
+
+    def record_metric(self, metric) -> None:
+        self.metrics.append(metric)
 
 
 def _base_panel(layer, base, ctx=None):
@@ -362,3 +371,119 @@ class TestTheDeclaredNameBindsToTheArmActuallyRead:
                 recipe=by_name["stacked"],
                 base_arm_ids={"base": "base"},
             )
+
+
+class TestTheIntersectionReachesTheArtifactAndTheManifest:
+    """`alpha-engine-config-I10947` deliverables 1 and 2, on the real path.
+
+    A base model drops the rows whose features are null, so on any real
+    session it has an opinion on slightly fewer names than the panel carries.
+    Here one name is taken out of the base's cross-section for the served
+    session, and the two properties the ruling turns on are read off what the
+    production path actually wrote: the stacked arm published a cross-section
+    over the INTERSECTION, and the shortfall is a number on the manifest.
+    """
+
+    @pytest.fixture
+    def wide_ceiling_recipes(self, tmp_path):
+        """The same two arms, with a completeness ceiling this 8-name fixture
+        can express. One excluded name of eight is 12.5% — above the 10%
+        default `max_incomplete_row_ratio`, which on the real ~900-name panel
+        a three-name shortfall is nowhere near. The ceiling under test here is
+        the COVERAGE floor, so the unrelated one is widened rather than the
+        fixture being made to look like production."""
+        arms = tmp_path / "wide" / "arms" / "m"
+        _write_recipe(arms, "base", features=[BASE_COLUMN])
+        _write_recipe(
+            arms,
+            "stacked",
+            features=[STACKED_COLUMN],
+            inputs=("predictions[base]",),
+            spec_extra=("max_incomplete_row_ratio: 0.2",),
+        )
+        loaded = load_model_recipes(arms)
+        assert loaded.refused == ()
+        return {r.name: r for r in loaded.registered}, loaded.registered
+
+    def test_the_stacked_cross_section_is_the_panel_intersected_with_the_base(
+        self, layer, wide_ceiling_recipes, monkeypatch
+    ) -> None:
+        by_name, loaded = wide_ceiling_recipes
+        # Eight names: one unscored name is a 12.5% shortfall, so the declared
+        # 0.90 floor would refuse a fixture that is fine in production (three
+        # names of nine hundred). The floor is moved, not bypassed — and the
+        # move is what shows the slot's declared value is the one being read.
+        monkeypatch.setitem(SLOTS, "m", replace(SLOTS["m"], stacked_base_coverage_floor=0.80))
+
+        ctx = _Ctx(layer)
+        _, base_fit, _ = _produce_base_history(layer, by_name["base"], ctx=ctx)
+        served = _sessions()[-1]
+        full = read_arm_predictions(layer, arm_id=base_fit.arm_id, trading_day=served)
+        write_arm_predictions(
+            _Ctx(layer),
+            arm_id=base_fit.arm_id,
+            trading_day=served,
+            feature_version=DEFAULT_FEATURE_VERSION,
+            predicted_alpha={n: v for n, v in full.items() if n != "AAA"},
+        )
+
+        panel = design_panel(
+            by_name["stacked"],
+            source=FeatureLayerSource(store=layer),
+            trading_day=served,
+            lookback_trading_days=_SESSIONS - 1,
+            recipes=loaded,
+        )
+        fit = train_arm(by_name["stacked"], panel, as_of=served)
+        produce_ctx = _Ctx(layer)
+        key = produce_arm_predictions(produce_ctx, fit=fit, panel=panel, trading_day=served)
+
+        published = read_arm_predictions(layer, arm_id=fit.arm_id, trading_day=served)
+        assert "AAA" not in published, (
+            "the name the base had no opinion on is absent from the stacked arm's "
+            "cross-section — excluded, which is what 'no opinion' means"
+        )
+        assert set(published) == set(_NAMES) - {"AAA"}
+        assert all(v == v for v in published.values()), "no NaN reaches the artifact"
+        assert key.endswith(f"{served}.json")
+
+        (row,) = [m for m in produce_ctx.metrics if m["name"] == BASE_COVERAGE_METRIC]
+        assert row["base_coverage"]["trading_day"] == served
+        assert row["value"] == pytest.approx(7 / 8)
+        assert row["status"] == "OK"
+        assert "7 of 8 panel name(s), 1 missing" in row["status_reason"]
+
+    def test_the_excluded_name_is_never_substituted_with_a_zero(
+        self, layer, wide_ceiling_recipes, monkeypatch
+    ) -> None:
+        by_name, loaded = wide_ceiling_recipes
+        monkeypatch.setitem(SLOTS, "m", replace(SLOTS["m"], stacked_base_coverage_floor=0.80))
+        ctx = _Ctx(layer)
+        _, base_fit, _ = _produce_base_history(layer, by_name["base"], ctx=ctx)
+        served = _sessions()[-1]
+        full = read_arm_predictions(layer, arm_id=base_fit.arm_id, trading_day=served)
+        write_arm_predictions(
+            _Ctx(layer),
+            arm_id=base_fit.arm_id,
+            trading_day=served,
+            feature_version=DEFAULT_FEATURE_VERSION,
+            predicted_alpha={n: v for n, v in full.items() if n != "AAA"},
+        )
+
+        panel = design_panel(
+            by_name["stacked"],
+            source=FeatureLayerSource(store=layer),
+            trading_day=served,
+            lookback_trading_days=_SESSIONS - 1,
+            recipes=loaded,
+        )
+        column = panel.column(prediction_column("base"))
+        row = panel.dates.index(served)
+        cell = column[row, panel.names.index("AAA")]
+
+        assert np.isnan(cell), (
+            "the design cell for a name with no base opinion is NOT-A-NUMBER. A zero "
+            "would assert the base model rated it exactly average — an opinion nobody "
+            "expressed, and the 2026-08-28 hard-zeroed-features condition by another door"
+        )
+        assert np.isfinite(column[row, panel.names.index("BBB")])

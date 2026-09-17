@@ -174,6 +174,21 @@ class SlotSpec:
     #: sequence, or the point estimate. Brian ruling 2026-09-12
     #: (`alpha-engine-config-I10546`) puts the U slot on `point`.
     promote_evidence: str = EVIDENCE_ANYTIME_VALID
+    #: The fraction of a session's panel a STACKED arm's base model must have
+    #: expressed an opinion on before that session may be built. Brian's
+    #: ruling 2026-09-17 (`alpha-engine-config-I10947`, option (a)): a stacked
+    #: arm scores the INTERSECTION of the panel and the names its base
+    #: actually scored, publishes the coverage, and refuses only BELOW this
+    #: floor. Nothing is ever substituted -- a name the base has no opinion on
+    #: is an EXCLUDED name, never a zero.
+    #:
+    #: Declared here, on the slot, because it is a property of what the slot
+    #: grades rather than of one arm's recipe: two arms held to two different
+    #: coverage floors are graded over two different universes while every
+    #: surface renders one number. `crucible.slots.inputs.base_coverage_floor`
+    #: is the ONLY reader; a literal at a call site would be a second
+    #: declaration of a value that already has one.
+    stacked_base_coverage_floor: float = 0.90
     control_arms: tuple[ControlArm, ...] = field(default_factory=tuple)
 
     @property
@@ -245,6 +260,15 @@ SLOTS: dict[str, SlotSpec] = {
         # swaps one predictor among a scored set, not the whole universe.
         promote_min_weeks=4,
         promote_evidence=EVIDENCE_POINT,
+        # `alpha-engine-config-I10947`: measured over 2024-05-01..2026-06-04,
+        # `residual_momentum`'s scored set ran from 887/903 names (98.2%) on
+        # the oldest session to 905/908 (99.7%) on the newest -- it drops the
+        # rows whose features are null, which young listings always have. The
+        # floor sits below the measured worst so a normal history of fresh
+        # listings produces, and far above a collapse: at 0.90 a base that
+        # lost a tenth of the panel refuses rather than publishing a book
+        # over a universe nobody chose.
+        stacked_base_coverage_floor=0.90,
         control_arms=_controls("m"),
     ),
     "s": SlotSpec(

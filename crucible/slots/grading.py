@@ -74,6 +74,7 @@ import enum
 import json
 import math
 import random
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -107,6 +108,8 @@ __all__ = [
     "LABEL_CONTROL_REL_TOL",
     "ForwardReturnWindow",
     "GraderControlError",
+    "NAME_PAIRING_METRIC",
+    "NamePairing",
     "PopulationIntegrityError",
     "RankICSkip",
     "ScoredCrossSection",
@@ -118,6 +121,7 @@ __all__ = [
     "forward_returns",
     "grade_slot",
     "produce_cross_section",
+    "pair_on_common_names",
     "produce_shadow",
     "reference_forward_returns",
     "score_selection",
@@ -958,6 +962,127 @@ def control_selection(
         raise ValueError(f"unknown control kind {kind!r}; the controls are planted and null")
     scored.sort(reverse=True)
     return tuple(name for _, name in scored[:top_n])
+
+
+#: The metric name the common-name pairing is filed under on a grade run's
+#: manifest. Named once so the console adapter, the test and the producer read
+#: the same literal.
+NAME_PAIRING_METRIC = "arena_common_name_ratio"
+
+
+@dataclass(frozen=True)
+class NamePairing:
+    """The COMMON NAME universe every arm scored on one date is benchmarked on.
+
+    `alpha-engine-config-I10947`, deliverable 3. The arena pairs challengers
+    on common DATES — :func:`nousergon_lib.arena.pair_on_common_window` — and
+    that was sufficient while every arm ranked the same cross-section. A
+    stacked arm scores the intersection of the panel and the names its base
+    model had an opinion on, so it no longer does: its population is a SUBSET,
+    and :func:`score_selection` measures a selection against the mean of the
+    population it drew from. Two arms benchmarked against two different
+    populations produce two numbers the engine then compares as if they were
+    one measurement — and the arm that skipped the hard names is silently
+    favoured whenever the names it skipped are the ones that moved.
+
+    So the SCORES are made comparable here, before they ever reach a series:
+    every arm on a date is benchmarked against the names EVERY arm on that
+    date could have picked, and a pick outside that set is excluded from the
+    arm's own selection rather than credited against a universe its rivals
+    never saw. The ladder, the paired window, the confidence sequence and the
+    pointer are still entirely the library's; nothing here re-implements
+    policy §§3-6 (`AGENTS.md`, "the arena is called, never re-implemented").
+
+    The intersection is over the arms scored on the DATE, not per pairwise
+    comparison, because a series carries one scalar per date and a pairwise
+    universe would need one score per (arm, rival, date). The cost is
+    recorded rather than hidden: :attr:`dropped_by_arm` names how many of each
+    arm's own population fell outside the common set, so an arm narrowing the
+    whole slot's benchmark is visible on the manifest instead of being
+    inferred from a number that quietly moved.
+    """
+
+    trading_day: str
+    common: tuple[str, ...]
+    union_size: int
+    dropped_by_arm: dict[str, int]
+
+    @property
+    def arms(self) -> tuple[str, ...]:
+        return tuple(sorted(self.dropped_by_arm))
+
+    @property
+    def coverage_ratio(self) -> float:
+        """Common names as a fraction of every name any arm ranked."""
+        if not self.union_size:
+            return 0.0
+        return len(self.common) / self.union_size
+
+    def restrict(self, selection: Sequence[str]) -> tuple[tuple[str, ...], int]:
+        """``selection`` narrowed to the common names, and how many it lost.
+
+        A pick outside the common set is EXCLUDED, never scored: it is a name
+        at least one rival on this date could not have chosen, and counting
+        its return would grade this arm on a universe the comparison does not
+        cover. Excluded, never zeroed — a zero would assert the pick earned
+        the population mean, which is an outcome nobody observed.
+        """
+        common = set(self.common)
+        kept = tuple(name for name in selection if name in common)
+        return kept, len(selection) - len(kept)
+
+    def as_metric(self, *, slot: str, source_path: str, now: str) -> dict[str, Any]:
+        worst = max(self.dropped_by_arm.items(), key=lambda kv: (kv[1], kv[0]), default=("", 0))
+        return {
+            "name": NAME_PAIRING_METRIC,
+            "module": f"crucible.slots.{slot}",
+            "metric_type": "coverage",
+            "value": float(self.coverage_ratio),
+            "unit": "ratio",
+            "n_floor": 1,
+            "status": "OK",
+            "status_reason": (
+                f"{self.trading_day}: {len(self.arms)} arm(s) scored on "
+                f"{len(self.common)} common name(s) of the {self.union_size} any of them "
+                f"ranked; the narrowest arm {worst[0]!r} lost {worst[1]} of its own "
+                "population to the intersection. Arms are paired on common NAMES as well "
+                "as common dates, so an arm that skipped the hard names is not favoured."
+            ),
+            "source_path": source_path,
+            "last_updated_utc": now,
+            "name_pairing": {
+                "trading_day": self.trading_day,
+                "common_name_count": len(self.common),
+                "union_name_count": self.union_size,
+                "arms": list(self.arms),
+                "dropped_by_arm": dict(sorted(self.dropped_by_arm.items())),
+            },
+        }
+
+
+def pair_on_common_names(
+    populations_by_day: Mapping[str, Mapping[str, Sequence[str]]],
+) -> dict[str, NamePairing]:
+    """`{day: {arm: population}}` -> `{day: NamePairing}`.
+
+    The name-axis companion to the engine's date-axis pairing, and the whole
+    of it: one intersection per date, computed from the populations the arms
+    themselves recorded at produce time. Nothing is read from the store here
+    and nothing is re-ranked — a second reading of what an arm ranked would be
+    a second answer to what it saw.
+    """
+    pairings: dict[str, NamePairing] = {}
+    for day, by_arm in populations_by_day.items():
+        sets = {arm: set(pop) for arm, pop in by_arm.items()}
+        union: set[str] = set().union(*sets.values()) if sets else set()
+        common: set[str] = set.intersection(*sets.values()) if sets else set()
+        pairings[day] = NamePairing(
+            trading_day=day,
+            common=tuple(sorted(common)),
+            union_size=len(union),
+            dropped_by_arm={arm: len(pop - common) for arm, pop in sets.items()},
+        )
+    return pairings
 
 
 def series_from_verdicts(verdicts: dict[str, dict[str, float]]) -> dict[str, ArmSeries]:

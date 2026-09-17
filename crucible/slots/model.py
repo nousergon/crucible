@@ -90,6 +90,7 @@ from crucible.keys import (
 )
 from crucible.slots.arms import SupersededArmUndeclaredError, resolve_declared_lineage
 from crucible.slots.inputs import (
+    BaseCoverage,
     BasePredictionsUnavailableError,
     InputRef,
     InputRefusal,
@@ -619,6 +620,14 @@ class FeaturePanel:
     #: remedies have nothing in common and which used to raise the same
     #: `KeyError` (`alpha-engine-config-I9777`).
     resolved_inputs: tuple[str, ...] = ()
+    #: One :class:`~crucible.slots.inputs.BaseCoverage` per `predictions[...]`
+    #: input materialised onto this panel — how much of the panel each base
+    #: model actually had an opinion on, per session
+    #: (`alpha-engine-config-I10947`). Empty on a panel with no stacked
+    #: inputs. :func:`produce_arm_predictions` files it as a metric for the
+    #: session it produces, which is what makes the intersection a figure on
+    #: the board rather than a cross-section a reader notices is short.
+    input_coverage: tuple[BaseCoverage, ...] = ()
 
     def __post_init__(self) -> None:
         shape = (len(self.dates), len(self.names))
@@ -649,6 +658,7 @@ class FeaturePanel:
             forward_returns=self.forward_returns[:n],
             feature_version=self.feature_version,
             resolved_inputs=self.resolved_inputs,
+            input_coverage=self.input_coverage,
         )
 
     def with_zeroed(self, columns: tuple[str, ...]) -> FeaturePanel:
@@ -2100,6 +2110,15 @@ def produce_arm_predictions(ctx: Any, *, fit: Fit, panel: FeaturePanel, trading_
     code that trains the arm which consumes it, and neither half of the
     contract is reachable only from a test.
     """
+    # §9.2 class 5, one row per stacked base: scored / panel / missing on the
+    # session being published, against the floor its slot declares
+    # (`alpha-engine-config-I10947`). Filed HERE rather than at the read
+    # because the figure that belongs on the board is the coverage of the
+    # cross-section this run actually wrote — a panel-wide average would hide
+    # the session, and an intersection nobody published a number for is a
+    # universe change nobody can see.
+    for coverage in panel.input_coverage:
+        ctx.record_metric(coverage.as_metric(slot=SLOT, trading_day=trading_day, phase="serving"))
     return write_arm_predictions(
         ctx,
         arm_id=fit.arm_id,
