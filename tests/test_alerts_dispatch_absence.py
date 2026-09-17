@@ -78,6 +78,28 @@ def _write_dispatch(
     )
 
 
+#: A manifest that this dispatch's own run wrote: `started` at or after the
+#: dispatch. `started` is REQUIRED on every `run_manifest.v2` document, which
+#: is what makes it usable as the identity test (`alpha-engine-config-I10981`).
+AFTER_DISPATCH = DISPATCHED_AT + dt.timedelta(minutes=4)
+#: A manifest an EARLIER run left at the same key. This is the I10981 shape:
+#: `runs/data.heal/2026-01-30/run.json` held the prior heal's success while
+#: the dispatch that was supposed to write there died four minutes in.
+BEFORE_DISPATCH = DISPATCHED_AT - dt.timedelta(days=1)
+
+
+def _manifest_body(
+    started: dt.datetime | None,
+    *,
+    run_id: str = "01M2GPZ56BVJRBJHHSMHZRQSEM",
+    status: str = "ok",
+) -> bytes:
+    body: dict[str, object] = {"status": status, "run_id": run_id}
+    if started is not None:
+        body["started"] = started.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return json.dumps(body).encode()
+
+
 class TestDispatchAbsence:
     def test_a_dispatch_past_horizon_with_no_manifest_pages_absence(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
@@ -109,12 +131,24 @@ class TestDispatchAbsence:
             == []
         )
 
-    def test_a_manifest_at_the_expected_key_clears_the_dispatch(self, tmp_path) -> None:
+    def test_a_manifest_this_dispatch_wrote_clears_it(self, tmp_path) -> None:
+        """AMENDED, not deleted (`alpha-engine-config-I10981` deliverable 4).
+
+        This assertion used to write a bare `{"status": "ok"}` with no run_id
+        and no timestamp and assert that it cleared the dispatch — mere key
+        existence. Its original case is still served and still asserted here:
+        a dispatch whose run really did write the manifest at the expected key
+        is cleared and does not page. That case was the SCHEDULED one
+        (`alpha-engine-config-I10134`), where a stale manifest from a prior
+        dispatch of the same slot cannot normally exist; the rule was never
+        designed against the on-demand RE-DISPATCH, where a genuinely older
+        unrelated run's manifest already sits at the target key. The sibling
+        below is that case."""
         store = LocalStore(tmp_path)
         _write_dispatch(store)
         store.put_bytes(
             manifest_key("data.heal", DISPATCH_TARGET_TRADING_DAY.isoformat()),
-            json.dumps({"status": "ok"}).encode(),
+            _manifest_body(AFTER_DISPATCH),
         )
         assert (
             evaluate_dispatch_absence(
@@ -132,7 +166,7 @@ class TestDispatchAbsence:
             manifest_key(
                 "data.heal", DISPATCH_TARGET_TRADING_DAY.isoformat(), discriminator="r1of4"
             ),
-            json.dumps({"status": "ok"}).encode(),
+            _manifest_body(AFTER_DISPATCH),
         )
         assert (
             evaluate_dispatch_absence(
@@ -387,7 +421,7 @@ class TestTheGradedDayComesFromTheArgsNotTheClock:
         _write_dispatch(store, args=self.REPLAY_ARGS)
         store.put_bytes(
             manifest_key("data.heal", self.REPLAY_TARGET.isoformat()),
-            json.dumps({"status": "ok"}).encode(),
+            _manifest_body(AFTER_DISPATCH),
         )
         assert (
             evaluate_dispatch_absence(
@@ -406,7 +440,7 @@ class TestTheGradedDayComesFromTheArgsNotTheClock:
         _write_dispatch(store, args=self.REPLAY_ARGS)
         store.put_bytes(
             manifest_key("data.heal", DISPATCH_TRADING_DAY.isoformat()),
-            json.dumps({"status": "ok"}).encode(),
+            _manifest_body(AFTER_DISPATCH),
         )
         [page] = evaluate_dispatch_absence(
             store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
@@ -441,6 +475,129 @@ class TestTheGradedDayComesFromTheArgsNotTheClock:
         assert (
             evaluate_dispatch_absence(
                 store, now=long_after, describe_instance_state_reason=_no_reason
+            )
+            == []
+        )
+
+
+class TestAManifestClearsOnlyItsOwnDispatch:
+    """`alpha-engine-config-I10981`.
+
+    The clearing predicate was the mere EXISTENCE of a manifest key. A
+    crucible manifest key is `runs/{job}/{trading_day}/run.json` and an
+    undiscriminated job overwrites it, so on a re-dispatch over a range that
+    was healed before, an earlier run's `status: ok` manifest already occupies
+    that exact key — and a dispatched job that dies mid-range is invisible at
+    precisely the artifact anyone would check.
+
+    The rule these tests pin is lifted from
+    `nous-ergon-ops/scripts/lib/crucible_manifest_wait.sh`, which already
+    grades a dispatch against a manifest whose identity DIFFERS from the one
+    that was at the key before (`policy-shared-code`'s second adoption). Three
+    outcomes, never two: only evidence of THIS run is a clear.
+    """
+
+    def test_a_manifest_that_predates_the_dispatch_pages(self, tmp_path) -> None:
+        """The guard firing. Seen failing before the fix: under the old
+        predicate this returned `[]`."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        store.put_bytes(
+            manifest_key("data.heal", DISPATCH_TARGET_TRADING_DAY.isoformat()),
+            _manifest_body(BEFORE_DISPATCH),
+        )
+        [page] = evaluate_dispatch_absence(
+            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+        )
+        assert page.condition == "absence"
+        assert page.job == "data.heal"
+        assert "PREDATE" in page.reason, "the page says WHY the manifest did not clear"
+        assert "01M2GPZ56BVJRBJHHSMHZRQSEM" in page.reason, (
+            "the page names the run_id sitting at the key, so an operator can tell "
+            "the stale manifest from the one that never arrived"
+        )
+
+    def test_the_i10981_instance_shape_pages(self, tmp_path) -> None:
+        """The measured instance, reproduced: dispatch `441e55ef…` for
+        `data.heal --date 2026-01-30 --from 2025-07-01 --to 2026-01-30`, made
+        2026-09-15T01:20:57Z on instance `i-02d1de194ea8420d5`, against the
+        prior I10703 heal's `status: ok` manifest (`run_id
+        01M2GPZ56BVJRBJHHSMHZRQSEM`) already sitting at
+        `runs/data.heal/2026-01-30/run.json`.
+
+        The real dispatch is outside the catch-up window now, so the shape is
+        reproduced on a fixture rather than re-graded live — which is what the
+        issue's third closes-when clause asks for."""
+        dispatched_at = dt.datetime(2026, 8, 28, 1, 20, 57, tzinfo=dt.UTC)
+        store = LocalStore(tmp_path)
+        _write_dispatch(
+            store,
+            dispatch_id="441e55ef6f6d6478f42e84919b81a960",
+            args="--date 2026-01-30 --from 2025-07-01 --to 2026-01-30 --run-mode live",
+            instance_id="i-02d1de194ea8420d5",
+            dispatched_at=dispatched_at,
+        )
+        store.put_bytes(
+            manifest_key("data.heal", "2026-01-30"),
+            _manifest_body(dispatched_at - dt.timedelta(hours=4)),
+        )
+        [page] = evaluate_dispatch_absence(
+            store,
+            now=dispatched_at + dt.timedelta(hours=10),
+            describe_instance_state_reason=_no_reason,
+        )
+        assert page.trading_day == dt.date(2026, 1, 30)
+        assert "i-02d1de194ea8420d5" in page.reason
+        assert "01M2GPZ56BVJRBJHHSMHZRQSEM" in page.reason
+
+    def test_a_manifest_with_no_started_does_not_clear(self, tmp_path) -> None:
+        """Fail loud. A manifest we cannot age against the dispatch is not a
+        clear — the posture `check_feature_layer_provenance` takes for
+        UNREADABLE. Treating unparseable as cleared reintroduces this bug in a
+        new shape, and it is exactly the bare `{"status": "ok"}` blob the
+        amended test used to write."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        store.put_bytes(
+            manifest_key("data.heal", DISPATCH_TARGET_TRADING_DAY.isoformat()),
+            _manifest_body(None),
+        )
+        [page] = evaluate_dispatch_absence(
+            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+        )
+        assert "could not be aged" in page.reason
+        assert "not a clear" in page.reason
+
+    def test_a_manifest_with_an_unparseable_started_does_not_clear(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        store.put_bytes(
+            manifest_key("data.heal", DISPATCH_TARGET_TRADING_DAY.isoformat()),
+            json.dumps({"status": "ok", "run_id": "01X", "started": "not a time"}).encode(),
+        )
+        [page] = evaluate_dispatch_absence(
+            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+        )
+        assert "could not be aged" in page.reason
+
+    def test_a_stale_manifest_beside_a_fresh_one_still_clears(self, tmp_path) -> None:
+        """The other direction, so the fix cannot become a source of false
+        pages: a discriminated job writes several manifests under one prefix,
+        and one of them being older than the dispatch is normal."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        day = DISPATCH_TARGET_TRADING_DAY.isoformat()
+        store.put_bytes(
+            manifest_key("data.heal", day, discriminator="chunk1"),
+            _manifest_body(BEFORE_DISPATCH, run_id="01OLD"),
+        )
+        store.put_bytes(
+            manifest_key("data.heal", day, discriminator="chunk2"),
+            _manifest_body(AFTER_DISPATCH, run_id="01NEW"),
+        )
+        assert (
+            evaluate_dispatch_absence(
+                store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
             )
             == []
         )
