@@ -282,6 +282,14 @@ class Component:
     #: watcher living inside it. Declared per row so the exception is
     #: visible in the file rather than being a name embedded in the
     #: alerter, and so a row can never end up watching itself.
+    #:
+    #: REQUIRED IN THE FILE (`alpha-engine-config-I10970`). The default here
+    #: is `dispatch`'s precedent and nothing more: the YAML is the declaration
+    #: surface and `crucible.models.ComponentRow` refuses a row that omits the
+    #: key, while this dataclass stays a value object a test may construct for
+    #: one narrow purpose. Until I10970 the default lived on BOTH, `holdout`
+    #: omitted the key, and the board and the console rendered a coverage
+    #: claim the file never made.
     absence_watched_by: str = "alerts.sweep"
 
     @property

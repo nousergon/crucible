@@ -5,7 +5,7 @@
       "description": "One CLI job's observability declaration.\n\nA component with no row is unobserved, not healthy: its absence cannot\npage (\u00a74.6 reads `deadline` from this file), its logs have no declared\nlocation or retention, and the console has no surface to render it on.",
       "properties": {
         "absence_watched_by": {
-          "default": "alerts.sweep",
+          "minLength": 1,
           "title": "Absence Watched By",
           "type": "string"
         },
@@ -120,6 +120,7 @@
         "artifact_retention",
         "schedule",
         "dispatch",
+        "absence_watched_by",
         "deadline"
       ],
       "title": "ComponentRow",

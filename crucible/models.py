@@ -243,6 +243,15 @@ class ComponentRow(_Strict):
     description: str = Field(min_length=1)
     lifecycle: Literal["ACTIVE", "DISABLED", "RETIRED"] = "ACTIVE"
     signals: SignalsRow
+    #: `<scheme>:<locator>` — see :data:`LOG_LOCATION_SCHEMES` and
+    #: :func:`derived_log_location`. The scheme exists because this one field
+    #: had one grammar (`/crucible/<job>`) for four different realities, and
+    #: 20 of 33 rows named a CloudWatch group no dispatch path can ever
+    #: create (`alpha-engine-config-I10971`). The value is DERIVED from the
+    #: row's own `dispatch`, so it cannot drift from the thing it names;
+    #: `ComponentsDocument._every_row_declares_the_log_location_its_dispatch_produces`
+    #: is where that derivation is enforced, because the rule needs the row's
+    #: NAME and a row does not know its own key.
     log_location: str = Field(min_length=1)
     #: CALENDAR days — one of §4.12's exhaustive exceptions, because retention
     #: is an AWS property billed by calendar time.
@@ -259,7 +268,15 @@ class ComponentRow(_Strict):
     #: key out.
     dispatch: Literal["arc", "scheduler", "github-actions"] | None
     dispatch_workflow: str | None = None
-    absence_watched_by: str = "alerts.sweep"
+    #: WHAT would notice this component is missing. Required and NOT
+    #: defaulted, for exactly the reason stated three fields above for
+    #: `dispatch`: a coverage claim must not be spellable by leaving the key
+    #: out. It was defaulted to `"alerts.sweep"` until
+    #: `alpha-engine-config-I10970`, and `holdout` omitted it — so the board
+    #: and the console both told an operator that `holdout` was watched by
+    #: `alerts.sweep`, a claim nobody had made. `observability-policy` §2.2:
+    #: coverage is derived, never assumed.
+    absence_watched_by: str = Field(min_length=1)
     deadline: DeadlineRow | None
 
     @model_validator(mode="after")
@@ -303,6 +320,63 @@ class RegistryDefaults(_Strict):
     quiet_channel: str = Field(min_length=1)
 
 
+#: The closed scheme vocabulary for `components.yaml`'s `log_location`
+#: (`alpha-engine-config-I10971`). Matches the scheme set the fleet's own
+#: observability registry already passes (`alpha-engine-config-I7088`), minus
+#: `s3:` — no crucible component ships its logs to S3, and a scheme nothing
+#: uses is a value a future row can be wrong in.
+#:
+#: * `cloudwatch:` — a CloudWatch Logs group, created AT RUNTIME by the box
+#:   shell (`log_group = "/crucible/" + job`, then `aws logs create-log-group`).
+#: * `github-actions:` — a workflow in this repository's own
+#:   `.github/workflows/`. A workflow's logs live in the Actions run, not in
+#:   CloudWatch, and there is no path by which they reach a log group.
+LOG_LOCATION_SCHEMES: tuple[str, ...] = ("cloudwatch", "github-actions")
+
+#: The CloudWatch group the weekly arc really writes to. Every `dispatch: arc`
+#: row lands HERE and cannot land anywhere else: the box shell derives the
+#: group from the DISPATCHED job, the arc dispatches as the single job
+#: `weekly`, and `crucible.weekly.run_arc` re-enters `crucible.cli.main`
+#: in-process for each stage — so no code path can create `/crucible/<stage>`
+#: for a stage of the arc. Saying so is the honest reading; declaring
+#: `/crucible/promote` was a location an operator could be sent to and find
+#: nothing (`alpha-engine-config-I10971`).
+ARC_LOG_GROUP = "/crucible/weekly"
+
+
+def derived_log_location(
+    name: str, dispatch: str | None, dispatch_workflow: str | None
+) -> str | None:
+    """The `log_location` a row's OWN `dispatch` forces, or ``None`` when the
+    row is on-demand and two shapes are legitimately open to it.
+
+    Derivation, not declaration: for every clock-started row this returns the
+    one string that is true, so the field cannot drift from the thing it
+    names. An on-demand row returns ``None`` because nothing in the registry
+    says whether a person will dispatch it to a box (`cloudwatch:`) or a
+    workflow will run it (`github-actions:`) — for those the grammar is
+    checked and the CloudWatch form is pinned to the group the box shell
+    would create, which is as far as derivation honestly reaches.
+    """
+    if dispatch == "arc":
+        return f"cloudwatch:{ARC_LOG_GROUP}"
+    if dispatch == "scheduler":
+        return f"cloudwatch:/crucible/{name}"
+    if dispatch == "github-actions":
+        if not dispatch_workflow:
+            # Unreachable through `ComponentsDocument` (the cross-repo lockstep
+            # guard requires a `dispatch_workflow` on every `github-actions`
+            # row), and it RAISES rather than returning None: a silent None
+            # here would make the caller skip the check for exactly the row
+            # whose declaration is already incomplete.
+            raise ValueError(
+                f"{name} declares dispatch 'github-actions' with no dispatch_workflow; "
+                "its log location cannot be derived and must not be guessed."
+            )
+        return f"github-actions:{dispatch_workflow}"
+    return None
+
+
 class ComponentsDocument(_Strict):
     """`crucible/components.yaml`, whole.
 
@@ -318,6 +392,58 @@ class ComponentsDocument(_Strict):
     version: Literal[1]
     defaults: RegistryDefaults
     components: dict[str, ComponentRow] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _every_row_declares_the_log_location_its_dispatch_produces(self) -> ComponentsDocument:
+        """`log_location` is DERIVED from the row, never asserted by hand.
+
+        `alpha-engine-config-I10971`: 20 of 33 rows named a CloudWatch group
+        that does not exist in the account, and for most of them no dispatch
+        path could ever create one — `crucible/board.py` and
+        `crucible/console/render.py` render that string to an operator as the
+        place to look. The fix is not to manufacture 20 log groups; it is to
+        make the declaration honest, and then to make the honest value the
+        only spellable one.
+
+        Lives on the DOCUMENT rather than on :class:`ComponentRow` because
+        the rule needs the row's name, and a row does not know its own key.
+        """
+        problems: list[str] = []
+        for name, row in self.components.items():
+            scheme, _, locator = row.log_location.partition(":")
+            if scheme not in LOG_LOCATION_SCHEMES or not locator:
+                problems.append(
+                    f"{name}: log_location {row.log_location!r} is not "
+                    f"'<scheme>:<locator>' with scheme in {list(LOG_LOCATION_SCHEMES)}"
+                )
+                continue
+            expected = derived_log_location(name, row.dispatch, row.dispatch_workflow)
+            if expected is not None:
+                if row.log_location != expected:
+                    problems.append(
+                        f"{name}: dispatch {row.dispatch!r} puts its output in "
+                        f"{expected!r}, and the row declares {row.log_location!r}"
+                    )
+                continue
+            # On-demand. The scheme is open, the locator is not: a dispatched
+            # run lands in the group the box shell derives from the job name,
+            # and nothing else.
+            if scheme == "cloudwatch" and locator != f"/crucible/{name}":
+                problems.append(
+                    f"{name}: an on-demand row dispatched to a box logs to "
+                    f"'/crucible/{name}' (the box shell derives the group from the "
+                    f"job name); the row declares {locator!r}"
+                )
+            if scheme == "github-actions" and not locator.endswith(".yml"):
+                problems.append(
+                    f"{name}: a github-actions log location names a workflow file "
+                    f"in .github/workflows/; the row declares {locator!r}"
+                )
+        if problems:
+            raise ValueError(
+                "log_location must be what the row's own dispatch produces: " + "; ".join(problems)
+            )
+        return self
 
 
 # ── The run manifest (`alpha-engine-config-I10045` row 1) ─────────────────
@@ -370,6 +496,22 @@ TRADER_JOB_VALUES: tuple[str, ...] = (
     "trader.fire_drill",
 )
 
+#: Jobs whose manifest is written by a GitHub Actions WORKFLOW rather than by
+#: a `crucible.cli.JOBS` entry. `deploy` is the whole set and the reason is in
+#: `crucible/deploy.py`'s module docstring: putting it behind `crucible <job>`
+#: would give every runtime identity a subcommand it must never be able to
+#: execute. It still writes a real `run_manifest.v2` document at
+#: `runs/deploy/{trading_day}/run.json` on both paths, it still carries a
+#: `crucible/components.yaml` row, and `tests/test_components_registry.py`
+#: derives registry coverage from `JOBS` plus this tuple plus
+#: :data:`TRADER_JOB_VALUES` — in BOTH directions, exactly as the trader half
+#: is derived. A bare `- {"deploy"}` literal in that test is what this tuple
+#: replaces (`alpha-engine-config-I10969`): an exemption spelled as a literal
+#: in a test is a suppression collection with one member, and the one-member
+#: case is the one that reads as harmless.
+WORKFLOW_JOB_VALUES: tuple[str, ...] = ("deploy",)
+
+
 JOB_VALUES: tuple[str, ...] = (
     "data.daily",
     "data.weekly",
@@ -392,7 +534,7 @@ JOB_VALUES: tuple[str, ...] = (
     "drift",
     "console",
     "board",
-    "deploy",
+    *WORKFLOW_JOB_VALUES,
     "weekly",
     "gate",
     "gate.close",

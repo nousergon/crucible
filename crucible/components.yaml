@@ -38,6 +38,32 @@
 # shell parser, and a partial shell parser is a denylist of the syntax
 # someone thought of, which rule 4 forbids.
 #
+# `log_location` is `<scheme>:<locator>`, and the value is DERIVED from the
+# row's own `dispatch` rather than written by hand
+# (`crucible.models.derived_log_location`, alpha-engine-config-I10971). It had
+# one grammar for four different realities and 20 of these 33 rows named a
+# CloudWatch group that does not exist in the account - most of them
+# unsatisfiable by construction, not merely unfilled:
+#
+#   dispatch: scheduler       -> cloudwatch:/crucible/<job>
+#       the group the box shell creates at runtime (`log_group = "/crucible/"
+#       + job`), for the job it was DISPATCHED as.
+#   dispatch: arc             -> cloudwatch:/crucible/weekly
+#       the arc dispatches as the single job `weekly` and re-enters
+#       `crucible.cli.main` in-process for each stage, so every stage's output
+#       lands in the arc's group. No code path can create `/crucible/<stage>`.
+#   dispatch: github-actions  -> github-actions:<dispatch_workflow>
+#       a workflow's logs live in its Actions run. There is no path by which
+#       they reach CloudWatch, so naming a log group for one was a place an
+#       operator could be sent to and find nothing.
+#   dispatch: null            -> the scheme it would use WHEN dispatched, with
+#       no claim the location exists yet. A row dispatched to a box logs to
+#       `/crucible/<job>` and nothing else, because that is what the box shell
+#       derives; a row a workflow runs names the workflow.
+#
+# `ComponentsDocument._every_row_declares_the_log_location_its_dispatch_produces`
+# refuses any other value, so this cannot drift back.
+#
 # `deadline` is expressed relative to the TRADING calendar (§4.12): "present
 # by T after the close of trading day d". A Monday holiday therefore raises no
 # page, without anyone muting anything.
@@ -64,7 +90,7 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs,outputs,rows_in,rows_out,rows_rejected
       outcome: run.json:metrics[data_freshness_trading_days]
-    log_location: /crucible/data.daily
+    log_location: cloudwatch:/crucible/data.daily
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
@@ -86,7 +112,7 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs,outputs,rows_in,rows_out,rows_rejected
       outcome: run.json:metrics[universe_coverage_ratio]
-    log_location: /crucible/data.weekly
+    log_location: cloudwatch:/crucible/weekly
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
@@ -110,7 +136,7 @@ components:
       # A heal produces no graded outcome; it repairs an input. Declared null
       # rather than omitted.
       outcome: null
-    log_location: /crucible/data.heal
+    log_location: cloudwatch:/crucible/data.heal
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
@@ -135,11 +161,19 @@ components:
       # An unseal releases data; it grades nothing. Declared null rather than
       # omitted, same as data.heal's outcome.
       outcome: null
-    log_location: /crucible/holdout
+    log_location: cloudwatch:/crucible/holdout
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
     artifact_retention: forever
+    # Declared, not defaulted (alpha-engine-config-I10970). It says exactly
+    # what the sweep does for this row and no more: it grades this job's
+    # FAILURES. Its absence is not graded and is not a defect - unsealing is a
+    # reserved matter with no cadence - which is why `deadline` below is null.
+    # This key was OMITTED until I10970 and the default manufactured the
+    # string the board and the console rendered, so an operator was told
+    # `holdout` was watched by a component nobody had named as its watcher.
+    absence_watched_by: alerts.sweep
     # NEVER scheduled, and `deadline: null` is the load-bearing half: unsealing
     # is a RESERVED matter (principles.md 3.2), so there is no cadence this job
     # is expected to keep and no absence of it that is a defect. A deadline here
@@ -157,7 +191,7 @@ components:
       resource: run.json:resource
       lineage: run.json:outputs[arms/{slot}/register.jsonl],rows_in,rows_out
       outcome: run.json:metrics[arms_appended]
-    log_location: /crucible/experiment.new
+    log_location: cloudwatch:/crucible/experiment.new
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/arms
@@ -180,7 +214,7 @@ components:
       resource: run.json:resource
       lineage: run.json:outputs[arms/{slot}/register.jsonl],rows_in,rows_out,rows_rejected
       outcome: run.json:metrics[arm_recipes_registered]
-    log_location: /crucible/experiment.register
+    log_location: cloudwatch:/crucible/weekly
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/arms
@@ -202,7 +236,7 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs,outputs
       outcome: run.json:metrics[arm_score]
-    log_location: /crucible/experiment.run
+    log_location: cloudwatch:/crucible/weekly
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/arms
@@ -232,7 +266,7 @@ components:
       # writes are scored by experiment.grade like any other session.
       # Declared null rather than omitted.
       outcome: null
-    log_location: /crucible/experiment.backfill
+    log_location: cloudwatch:/crucible/experiment.backfill
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/arms
@@ -256,7 +290,7 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs,outputs[arena_cycle]
       outcome: run.json:metrics[slot_leader_bound]
-    log_location: /crucible/experiment.grade
+    log_location: cloudwatch:/crucible/weekly
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/slots
@@ -278,7 +312,7 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs[arena_cycle],outputs[champions/{slot}/current.json]
       outcome: run.json:metrics[pointer_moved]
-    log_location: /crucible/promote
+    log_location: cloudwatch:/crucible/weekly
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/slots
@@ -316,7 +350,7 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs[runs/**],outputs[report/{trading_day}/attribution.json]
       outcome: run.json:metrics[attribution_rows_complete]
-    log_location: /crucible/report
+    log_location: cloudwatch:/crucible/weekly
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/report
@@ -339,7 +373,7 @@ components:
       lineage: run.json:inputs[runs/**]
       # A read-only lineage walk grades nothing.
       outcome: null
-    log_location: /crucible/explain
+    log_location: cloudwatch:/crucible/weekly
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
@@ -404,7 +438,7 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs,outputs[arms/**]
       outcome: run.json:metrics[arms_migrated]
-    log_location: /crucible/migrate.history
+    log_location: cloudwatch:/crucible/migrate.history
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/arms
@@ -423,7 +457,7 @@ components:
       resource: run.json:resource
       lineage: run.json:outputs[releases/current]
       outcome: null
-    log_location: /crucible/release.pin
+    log_location: cloudwatch:/crucible/release.pin
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/releases
@@ -445,7 +479,7 @@ components:
       resource: run.json:resource
       lineage: run.json:metrics[release_object_retention]
       outcome: run.json:metrics[release_objects_locked]
-    log_location: /crucible/release.lock
+    log_location: cloudwatch:/crucible/release.lock
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/releases
@@ -464,7 +498,7 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs,outputs
       outcome: run.json:metrics[smoke_ok]
-    log_location: /crucible/smoke
+    log_location: cloudwatch:/crucible/smoke
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/releases
@@ -494,7 +528,7 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs[runs/**],outputs[alerts/**]
       outcome: run.json:metrics[pages_emitted]
-    log_location: /crucible/alerts.sweep
+    log_location: cloudwatch:/crucible/alerts.sweep
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/alerts
@@ -527,7 +561,7 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs[runs/**],outputs[alerts/**]
       outcome: run.json:metrics[pages_last_28_trading_days]
-    log_location: /crucible/heartbeat
+    log_location: cloudwatch:/crucible/heartbeat
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/alerts
@@ -556,7 +590,7 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs[features/**,predictions/**],outputs[drift/**]
       outcome: run.json:metrics[feature_psi_max_ratio]
-    log_location: /crucible/drift
+    log_location: cloudwatch:/crucible/weekly
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/drift
@@ -585,7 +619,7 @@ components:
       # date is a graded figure on this row rather than only a text detail
       # inside `board_rows_red`.
       outcome: run.json:metrics[board_rows_unmeasurable,schedule_milestones_overdue]
-    log_location: /crucible/board
+    log_location: github-actions:board.yml
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/board
@@ -641,7 +675,7 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs[runs/**,gates/**,gates/ladder.json,board/current.json,arena/**,champions/**,report/**],outputs[console/index.html,public/index.html]
       outcome: run.json:metrics[components_unreported]
-    log_location: /crucible/console
+    log_location: cloudwatch:/crucible/weekly
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/index
@@ -668,7 +702,7 @@ components:
       resource: run.json:resource
       lineage: run.json:outputs[iac/{trading_day}/conformance.json]
       outcome: run.json:metrics[iac_conformance_persisted]
-    log_location: /crucible/iac.conformance
+    log_location: cloudwatch:/crucible/weekly
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
@@ -697,7 +731,7 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs[runs/**]
       outcome: run.json:metrics[arc_stages_completed]
-    log_location: /crucible/weekly
+    log_location: cloudwatch:/crucible/weekly
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
@@ -724,7 +758,7 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs[runs/**,report/**,arena/**],outputs[gates/**]
       outcome: run.json:metrics[gate_clauses_met_ratio]
-    log_location: /crucible/gate
+    log_location: github-actions:gate-close.yml
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/gates
@@ -791,7 +825,7 @@ components:
       # an AccessDenied rather than a grading surface authoring what it grades.
       lineage: run.json:inputs[runs/**,report/**,arena/**,gates/**],outputs[gates/*/closing.json]
       outcome: run.json:metrics[closing_records_filed,phases_met_without_a_record]
-    log_location: /crucible/gate.close
+    log_location: github-actions:gate-close.yml
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/gates
@@ -844,7 +878,7 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs[board/current.json,board/**,runs/board/**,gates/ladder.json],outputs[runs/report.morning/**]
       outcome: run.json:metrics[morning_report_delivered]
-    log_location: /crucible/report.morning
+    log_location: github-actions:morning-report.yml
     log_retention_days: 90
     # NOT the pages channel, and this is the whole design constraint. Plan
     # §4.6 admits exactly two page conditions - absence and failure - and a
@@ -943,7 +977,7 @@ components:
       # No graded outcome of its own — the fault RECORD carries the claim, and
       # this job is the event the record is about.
       outcome: null
-    log_location: /crucible/fault.probe
+    log_location: cloudwatch:/crucible/fault.probe
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
@@ -971,7 +1005,7 @@ components:
       # evidence ABOUT a run, not a verdict. Declared null rather than
       # omitted, same as data.heal.
       outcome: null
-    log_location: /crucible/fault.record
+    log_location: cloudwatch:/crucible/fault.record
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
@@ -1001,7 +1035,7 @@ components:
       # this summarizing job's.
       lineage: null
       outcome: run.json:metrics[tests_integration_exit_code]
-    log_location: /crucible/test.integration
+    log_location: github-actions:integration-nightly.yml
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
@@ -1043,7 +1077,7 @@ components:
       resource: run.json:resource
       lineage: run.json:inputs[trader/broker_statements/**],outputs[trader/broker_statements/*,trader/reconciliation/*]
       outcome: run.json:metrics[broker_reconciliation_match_rate,broker_reconciliation_discrepancies,broker_reconciliation_position_count_delta,broker_reconciliation_cash_residual_usd,broker_reconciliation_control_detected]
-    log_location: /crucible/trader.reconcile
+    log_location: cloudwatch:/crucible/trader.reconcile
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
@@ -1072,7 +1106,7 @@ components:
       resource: run.json:resource
       lineage: null
       outcome: null
-    log_location: /crucible/trader.smoke
+    log_location: cloudwatch:/crucible/trader.smoke
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
@@ -1104,7 +1138,7 @@ components:
       resource: run.json:resource
       lineage: run.json:outputs[trader/kill_switch.json,trader/kill_switch/events/*]
       outcome: run.json:metrics[kill_switch_settle_seconds]
-    log_location: /crucible/trader.kill_switch
+    log_location: cloudwatch:/crucible/trader.kill_switch
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
@@ -1135,11 +1169,61 @@ components:
       resource: run.json:resource
       lineage: run.json:outputs[trader/kill_switch.json,trader/fire_drills/*]
       outcome: run.json:metrics[fire_drill_passed]
-    log_location: /crucible/trader.fire_drill
+    log_location: cloudwatch:/crucible/trader.fire_drill
     log_retention_days: 90
     alert_channel: telegram:crucible-pages
     console_surface: crucible/runs
     artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
+  deploy:
+    # alpha-engine-config-I10969. The component that moves `releases/current`
+    # - the single most consequential mutation in the v2 system, and the one
+    # thing that decides which code every spot box and the trader actually
+    # run. It writes a real `run_manifest.v2` document at
+    # `runs/deploy/{trading_day}/run.json` on both paths and had NO row here
+    # until I10969: the manifest schema's `job` enum carried it, this file did
+    # not, and the difference was asserted as a bare literal in
+    # `tests/test_components_registry.py`. That literal is now
+    # `crucible.models.WORKFLOW_JOB_VALUES`, checked in both directions the
+    # way the trader half already was.
+    #
+    # NOT a `crucible.cli.JOBS` entry and must never become one -
+    # `crucible/deploy.py`'s module docstring states why: putting it behind
+    # `crucible <job>` would give every runtime identity a subcommand it must
+    # never be able to execute.
+    #
+    # `dispatch: null` is the honest value and `dispatch: github-actions` is
+    # the wrong reach: a deploy is triggered by a MERGE to main, which is
+    # neither a cron nor the arc, and
+    # `nous-ergon-ops/tests/crossrepo/test_crucible_dispatch_lockstep.py`
+    # requires every `github-actions` row to name a `dispatch_workflow` that
+    # declares an `on.schedule` cron. `deploy.yml` has none.
+    description: >-
+      Flip releases/current to a pinned, smoke-gated sha - the mutation that
+      decides which code every box and the trader run.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs[releases/current,releases/history/*]
+      # A deploy grades nothing; the smoke that gates it does. Declared null
+      # rather than omitted, same as data.heal's outcome.
+      outcome: null
+    log_location: github-actions:deploy.yml
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/releases
+    artifact_retention: forever
+    # The sweep grades this row's FAILURES. Its absence is not graded and is
+    # not a defect: there is no cadence at which a deploy is owed, because a
+    # deploy happens when a merge happens.
+    # `test_exactly_one_row_is_watched_by_a_human_and_it_is_the_heartbeat`
+    # forbids `operator` here.
     absence_watched_by: alerts.sweep
     schedule: null
     dispatch: null
