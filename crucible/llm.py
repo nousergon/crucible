@@ -82,13 +82,22 @@ __all__ = [
     "LlmSpendOverrun",
     "PACE_OVERRUN_MARGIN",
     "PACING_PERIOD",
+    "PROVIDER_CAPTURE_ATTR",
     "PROVIDER_MODULES",
+    "DryRunProviderCallRefused",
+    "ProviderCallRecord",
+    "ProviderCaptureLedger",
     "RECONCILIATION_METRIC",
     "RECONCILIATION_TOLERANCE_USD",
     "RegistryPreflightFailed",
     "SpendCap",
+    "active_provider_ledger",
     "audit_call_sites",
+    "begin_provider_capture",
     "call",
+    "end_provider_capture",
+    "provider_capture_of",
+    "provider_methods",
     "capability_group",
     "effective_capability_class",
     "load_capability_classes",
@@ -1430,6 +1439,253 @@ def _system_and_user_content(messages: list[dict[str, str]]) -> tuple[str, str]:
     return "\n\n".join(system_parts), rest[0]["content"]
 
 
+# ── The provider-call capture (alpha-engine-config-I11012, egress half) ─────
+#
+# A `--dry-run` must never reach a provider and must never spend, and that is
+# a HARDER guarantee than "writes nothing" rather than a softer one. Two
+# reasons, and each fails on its own:
+#
+# 1. Brian's standing instruction: no pipeline makes provider calls it was not
+#    commissioned to make. A rehearsal that reaches a model violates it on a
+#    path nobody would think to check, which is exactly where that kind of
+#    violation survives.
+# 2. A rehearsal with side effects OUTSIDE the store is the same defect class
+#    as a rehearsal that writes — one axis over. `crucible.store.capturing`
+#    seals writes BY TYPE; a capturing store sitting above an LLM client that
+#    really calls out is a half-sealed boundary, and the half that leaks is
+#    the expensive, externally visible one.
+#
+# **This RECORDS and then REFUSES; it does not record and continue.** That is
+# the one place this deliberately differs from the store, and the difference
+# is forced. A captured `put_bytes` can return the digest it would have
+# returned and a captured read can serve the bytes back, so the body carries
+# on truthfully. A completion has no such answer: its TEXT is what the rest
+# of the body reasons about, and any synthetic completion sends the rehearsal
+# down a path no real run takes, to a verdict about words nobody generated.
+# A fabricated rehearsal is strictly worse than an honest stop — it is the
+# "green over a gap" shape the whole issue exists to remove. So the request
+# is recorded in full, and the run stops, loudly, naming the call site.
+#
+# **Sealed by type, not by branch.** :func:`call` resolves its client through
+# one point; under capture that point yields a :class:`_CapturingLLMClient`,
+# which has no transport, no `krepis.llm.LLMClient` base and no code path to
+# a network at all — and `krepis.router.resolve_group_spec` is never reached
+# either, since resolving a route for a call that will not be made is itself
+# an authenticated round trip. Same construction, and the same reasoning, as
+# `crucible.store.capturing`.
+#
+# **Addressed as a capability class, never a provider.** Nothing here names a
+# vendor, a model id, a base URL or an SDK client: the record carries the
+# declared capability class and the router GROUP it maps to, which is the
+# same addressing `call` itself uses (principle 8).
+
+
+class DryRunProviderCallRefused(RuntimeError):
+    """A job body tried to reach a model during a `--dry-run`.
+
+    Raised by :class:`_CapturingLLMClient` AFTER the request is recorded, so
+    the rehearsal reports what it would have asked for and then stops. Never
+    caught inside this package — in particular it is re-raised ahead of the
+    fault-injection classification in :func:`call`, because "we declined to
+    call" is not "the router failed", and recording it as the latter would be
+    a false statement about production on the one surface fault 3 is graded
+    from.
+
+    It is deliberately NOT in `crucible.backfill.SESSION_REFUSALS`: a
+    per-session refusal that skipped the offending sessions and reported a
+    completed rehearsal would be a silent skip of exactly the sessions the
+    operator is checking.
+    """
+
+
+@dataclass(frozen=True)
+class ProviderCallRecord:
+    """One provider call a dry run would have made, recorded instead."""
+
+    callsite_id: str
+    capability_class: str
+    capability_group: str
+    method: str
+    messages: int
+    prompt_chars: int
+    #: The call site's own declared per-call ceiling — the worst case this
+    #: call was ADMITTED to spend, which is the number `SpendCap.reserve`
+    #: reserved a moment earlier. Recorded rather than a token estimate
+    #: derived here: a token count this package computed for a model it never
+    #: sent to would be a guess wearing a measurement's clothes.
+    admitted_usd: float
+    #: What the call site estimated for itself, as passed to :func:`call`.
+    estimate_usd: float
+
+
+class ProviderCaptureLedger:
+    """The ordered record of the provider calls a dry run would have made.
+
+    Invocation-scoped, exactly like `crucible.store.CaptureLedger`, and for
+    the same reason: `crucible weekly --dry-run` re-enters the CLI once per
+    stage in one process and must report once.
+    """
+
+    def __init__(self) -> None:
+        self._calls: list[ProviderCallRecord] = []
+
+    def record(self, record: ProviderCallRecord) -> None:
+        self._calls.append(record)
+
+    @property
+    def calls(self) -> tuple[ProviderCallRecord, ...]:
+        return tuple(self._calls)
+
+    def render(self) -> str:
+        if not self._calls:
+            return "dry_run: no provider calls captured — this command would reach no model."
+        lines = [
+            f"dry_run: {len(self._calls)} provider call(s) captured, NONE issued "
+            "(the run stopped at the first one):"
+        ]
+        for record in self._calls:
+            lines.append(
+                f"  {record.callsite_id}  (capability {record.capability_class} "
+                f"-> group {record.capability_group}, {record.method}, "
+                f"{record.messages} message(s), {record.prompt_chars} prompt chars, "
+                f"admitted up to ${record.admitted_usd:.4f})"
+            )
+        return "\n".join(lines)
+
+
+_ACTIVE_PROVIDER_LEDGER: ProviderCaptureLedger | None = None
+
+
+def begin_provider_capture() -> ProviderCaptureLedger:
+    """Declare this invocation's provider ledger. Re-entrant, like its
+    store counterpart — the outermost caller owns the render and the reset."""
+    global _ACTIVE_PROVIDER_LEDGER
+    if _ACTIVE_PROVIDER_LEDGER is None:
+        _ACTIVE_PROVIDER_LEDGER = ProviderCaptureLedger()
+    return _ACTIVE_PROVIDER_LEDGER
+
+
+def active_provider_ledger() -> ProviderCaptureLedger | None:
+    """This invocation's provider ledger, or ``None`` outside a capture."""
+    return _ACTIVE_PROVIDER_LEDGER
+
+
+def end_provider_capture() -> None:
+    """Clear the invocation provider ledger. Idempotent."""
+    global _ACTIVE_PROVIDER_LEDGER
+    _ACTIVE_PROVIDER_LEDGER = None
+
+
+def provider_methods() -> tuple[str, ...]:
+    """Every public callable on `krepis.llm.LLMClient` that can reach a model.
+
+    DERIVED from the class krepis actually ships, never a literal list kept
+    in step by hand — the same construction, for the same measured reason, as
+    `crucible.store.Store.MUTATORS`. Measured 2026-09-17 against the pinned
+    krepis: `complete`, `complete_grounded`, `structured`. This package calls
+    only `complete` today; a capturing client that overrode that one alone
+    would leak the moment a call site reached for either of the others, and
+    would leak silently the day krepis adds a fourth.
+    """
+    from krepis.llm import LLMClient
+
+    return tuple(
+        sorted(
+            name
+            for name in dir(LLMClient)
+            if not name.startswith("_") and callable(getattr(LLMClient, name, None))
+        )
+    )
+
+
+def _refuse_provider_call(method: str):
+    """The body every captured provider method gets: record, then raise."""
+
+    def _refuse(self: Any, *, system: str = "", user_content: str = "", **kwargs: Any) -> Any:
+        record = ProviderCallRecord(
+            callsite_id=self._callsite_id,
+            capability_class=self._capability_class,
+            capability_group=self._capability_group,
+            method=method,
+            messages=self._messages,
+            prompt_chars=len(system) + len(user_content),
+            admitted_usd=self._admitted_usd,
+            estimate_usd=self._estimate_usd,
+        )
+        self._ledger.record(record)
+        raise DryRunProviderCallRefused(
+            f"--dry-run: refusing to call a model for call site {self._callsite_id!r} "
+            f"(capability class {self._capability_class!r}, router group "
+            f"{self._capability_group!r}, {method}, {record.prompt_chars} prompt chars, "
+            f"admitted up to ${self._admitted_usd:.4f}). A rehearsal that reached a "
+            "provider would spend real money and make a real outbound request; one that "
+            "answered with a synthetic completion would send the rest of this job down a "
+            "path no real run takes. The request is recorded and the run stops here — "
+            "this is the rehearsal's honest end, not a failure of the job."
+        )
+
+    return _refuse
+
+
+def _build_capturing_client_class() -> type:
+    """The capturing client class, refusing every method krepis can call out on.
+
+    Built fresh per construction rather than cached, so the derivation runs
+    against the krepis actually imported in THIS process — a cached class
+    built before an upgrade would keep a stale refusal set, which is the one
+    way this guard could go blind.
+    """
+    methods = provider_methods()
+    if not methods:
+        raise RuntimeError(
+            "krepis.llm.LLMClient exposes no public callable — crucible.llm's provider "
+            "capture derives its refusal set from that surface, and an empty derivation "
+            "is a blind guard, not a client that cannot call out."
+        )
+    namespace: dict[str, Any] = {name: _refuse_provider_call(name) for name in methods}
+    namespace["__doc__"] = (
+        "A client with no transport. It does not subclass `krepis.llm.LLMClient` "
+        "and holds no spec, no credential and no session: there is no code path "
+        "from here to a provider, which is what makes a dry run's zero-egress "
+        "guarantee structural rather than a flag nobody re-reads."
+    )
+    return type("_CapturingLLMClient", (object,), namespace)
+
+
+def _capturing_client(
+    ledger: ProviderCaptureLedger,
+    *,
+    callsite_id: str,
+    capability_class: str,
+    capability_group: str,
+    messages: int,
+    admitted_usd: float,
+    estimate_usd: float,
+) -> Any:
+    client = object.__new__(_build_capturing_client_class())
+    client._ledger = ledger
+    client._callsite_id = callsite_id
+    client._capability_class = capability_class
+    client._capability_group = capability_group
+    client._messages = messages
+    client._admitted_usd = admitted_usd
+    client._estimate_usd = estimate_usd
+    return client
+
+
+#: The attribute `crucible.runner.run_job` sets on a :class:`RunContext` when
+#: this run's store is a capturing one — never by a job body, the same
+#: discipline as `fault_capability_class`. `call` reads it off the context,
+#: which is what lets a job that knows nothing about rehearsal be rehearsed.
+PROVIDER_CAPTURE_ATTR = "provider_capture"
+
+
+def provider_capture_of(ctx: Any) -> ProviderCaptureLedger | None:
+    """``ctx``'s provider ledger, or ``None`` on a real run."""
+    ledger = getattr(ctx, PROVIDER_CAPTURE_ATTR, None)
+    return ledger if isinstance(ledger, ProviderCaptureLedger) else None
+
+
 def call(
     ctx: Any,
     *,
@@ -1610,15 +1866,43 @@ def call(
     # nothing outside `fault.probe`'s own body ever classified the failure.
     # Moved to the one door every LLM call passes through so the guarantee
     # does not depend on which job body remembered to wrap its own call.
+    # THE ONE RESOLUTION POINT (alpha-engine-config-I11012, egress half).
+    # Under a rehearsal this yields a client with no transport and
+    # `resolve_group_spec` is never reached — resolving a route for a call
+    # that will not be made is itself an authenticated round trip. The
+    # decision is taken HERE, once; after it, the object in hand either can
+    # reach a provider or structurally cannot, exactly as a resolved store
+    # either can write or structurally cannot.
+    provider_capture = provider_capture_of(ctx)
     try:
-        spec, route = resolve_group_spec(
-            group,
-            exec_context=_exec_context(),
-            wire="openai",
-        )
-        client = LLMClient(spec, callsite_id=callsite_id, client_factory=client_factory)
+        if provider_capture is not None:
+            route = None
+            client = _capturing_client(
+                provider_capture,
+                callsite_id=callsite_id,
+                capability_class=asked,
+                capability_group=group,
+                messages=len(messages),
+                admitted_usd=reserved_usd,
+                estimate_usd=estimate_usd,
+            )
+        else:
+            spec, route = resolve_group_spec(
+                group,
+                exec_context=_exec_context(),
+                wire="openai",
+            )
+            client = LLMClient(spec, callsite_id=callsite_id, client_factory=client_factory)
         system, user_content = _system_and_user_content(messages)
         result = client.complete(system=system, user_content=user_content, **kwargs)
+    except DryRunProviderCallRefused:
+        # Re-raised AHEAD of the fault-injection classification below, and
+        # ahead of everything else. "We declined to call" is not "the router
+        # failed": folding it into `FaultProbeFailure` would write a manifest
+        # claiming plan §10.7 fault 3 was observed on a run that never left
+        # the process — a false statement about production on the one surface
+        # that fault is graded from.
+        raise
     except Exception as exc:
         # `Exception`, deliberately NOT `BaseException`: `SpotInterruptionError`
         # is a `BaseException` precisely so no handler on this path can

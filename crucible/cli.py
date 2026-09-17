@@ -1286,11 +1286,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     # `weekly` re-enters this function per stage in the same process, and a
     # nested call sees the ledger already open, adds to it, and leaves both
     # the render and the reset to the outermost call.
+    from crucible.llm import begin_provider_capture, end_provider_capture
     from crucible.store import active_capture_ledger, begin_capture, end_capture
 
     dry_run = bool(getattr(args, "dry_run", False))
     owns_ledger = dry_run and active_capture_ledger() is None
     ledger = begin_capture() if dry_run else None
+    # The EGRESS ledger, opened beside the store ledger and owned by the same
+    # caller (alpha-engine-config-I11012). A rehearsal makes two promises —
+    # it writes nothing and it reaches no provider — and both are reported,
+    # because a promise with no surface is one nobody can check.
+    provider_ledger = begin_provider_capture() if dry_run else None
     try:
         return _resolve_operator_input(args)
     except UsageError as exc:
@@ -1311,9 +1317,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Rendered on the failure path too, deliberately: a rehearsal
             # that got three keys in and then raised is telling the operator
             # both things, and printing only on success would hide the half
-            # the failing command most needs to explain.
+            # the failing command most needs to explain. That applies twice
+            # over to the provider ledger, whose whole normal shape is
+            # "recorded one call, then stopped".
             print(ledger.render())
+            print(provider_ledger.render())
             end_capture()
+            end_provider_capture()
 
 
 def _resolve_operator_input(args: argparse.Namespace) -> int:

@@ -593,6 +593,18 @@ class RunContext:
     #: broken group is structurally distinguishable from one that failed on
     #: its own.
     fault_capability_class: str | None = None
+    #: This run's provider-call ledger, or `None` on a real run
+    #: (alpha-engine-config-I11012). Set by `run_job` from whether the STORE
+    #: is a capturing one, never by a job body. `crucible.llm.call` reads it
+    #: to decide whether to build a real client or one with no transport —
+    #: which is what makes "a dry run reaches no provider" a property of the
+    #: door rather than of each job body remembering.
+    #:
+    #: Typed `Any` rather than `ProviderCaptureLedger` on purpose: importing
+    #: `crucible.llm` here at module scope would make `runner` depend on the
+    #: LLM package for a field it never reads, and this module is imported by
+    #: every job including the ones that have no model in them at all.
+    provider_capture: Any = None
 
     inputs: list[dict[str, Any]] = field(default_factory=list)
     outputs: list[dict[str, Any]] = field(default_factory=list)
@@ -1034,6 +1046,22 @@ def run_job(
         ctx.discriminator = discriminator(ctx) if callable(discriminator) else discriminator
         ctx.now_override = now_override
         ctx.fault_capability_class = fault_capability_class
+        # The EGRESS half of the rehearsal (alpha-engine-config-I11012).
+        # Keyed off the STORE, not off `dry_run`: a rehearsal is a rehearsal
+        # on both axes, and one decision in one place is what keeps them from
+        # drifting apart. A capturing store means `--dry-run` resolved it
+        # (`crucible.store.open_store`, `Settings.store`), and from here
+        # `crucible.llm.call` yields a client with no transport — so a job
+        # that knows nothing about rehearsal cannot spend, and cannot make an
+        # outbound request, during one. Set by `run_job` and never by a job
+        # body, the same discipline `fault_capability_class` carries.
+        if is_capturing(store):
+            # Imported lazily: `crucible.llm` imports `crucible.models` and
+            # `crucible.documents`, and a module-scope import here would put
+            # the whole LLM package on the import path of every job.
+            from crucible.llm import begin_provider_capture
+
+            ctx.provider_capture = begin_provider_capture()
 
         # `alpha-engine-config-I9986` deliverable 1: the fleet cost-sink
         # partitions every row under `{prefix}/{date}/{run_id}/`
