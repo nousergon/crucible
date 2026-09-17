@@ -256,8 +256,8 @@ requires-dist = [
     { name = "jsonschema", specifier = ">=4.26.0" },
     { name = "krepis", extras = ["openai"], specifier = "==0.59.60" },
     { name = "lightgbm", specifier = ">=4.7.0" },
-    { name = "nousergon-lib", extras = ["arcticdb"], marker = "extra == 'arcticdb'", specifier = "==0.124.130" },
-    { name = "nousergon-lib", extras = ["github-app", "gates"], specifier = "==0.124.130" },
+    { name = "nousergon-lib", extras = ["arcticdb"], marker = "extra == 'arcticdb'", specifier = "==0.124.134" },
+    { name = "nousergon-lib", extras = ["github-app", "gates"], specifier = "==0.124.134" },
     { name = "numpy", specifier = ">=2.5.3" },
     { name = "pandas", specifier = ">=2.0" },
     { name = "pyarrow", specifier = ">=25.0.1" },
@@ -593,7 +593,7 @@ wheels = [
 
 [[package]]
 name = "nousergon-lib"
-version = "0.124.130"
+version = "0.124.134"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -602,9 +602,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/62/b7/8dc2b336223e49dbfd0523c793c99eefbd2aa9f64ecbd36de2246c7c14f6/nousergon_lib-0.124.130.tar.gz", hash = "sha256:93462073f8c3bedcf2ec6e9abaf442ec191a3503876124e69761f1e694662471", size = 926474, upload-time = "2026-09-15T02:54:08.72Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f5/4d/84416611509d09ba97cd6d25d45a728dca55bc6e82c9affbe75585bf6ca2/nousergon_lib-0.124.134.tar.gz", hash = "sha256:d45b1625c6556f00b3aa856a1b785b18a9d2d0b64b7480c04c329f9990b2c95f", size = 959312, upload-time = "2026-09-17T17:46:35.974Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3d/ef/06139aaca1170b13fd54dcc62664a62323cba48373470bdbfbe76dd5aa60/nousergon_lib-0.124.130-py3-none-any.whl", hash = "sha256:72b1028e1c5b6897bb397d71100b9b364c7f7fbdd6cd4d186b9813d4e38a8e3f", size = 644129, upload-time = "2026-09-15T02:54:06.825Z" },
+    { url = "https://files.pythonhosted.org/packages/e7/31/4f08c859e52a65f799e217fead4463e6aef22313b88b49651956491d5f5c/nousergon_lib-0.124.134-py3-none-any.whl", hash = "sha256:9665af02ff937d5b1d1f611c1b9945ccc49df8eb9c3dad21ab0b3dd901417a4f", size = 665881, upload-time = "2026-09-17T17:46:34.331Z" },
 ]
 
 [package.optional-dependencies]
