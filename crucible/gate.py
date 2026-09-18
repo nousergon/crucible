@@ -4183,7 +4183,20 @@ LLM_ARM_CALLSITE_FIELD: str | None = "llm_callsite"
 #: inside it is met against this checkout — so it cannot become a place to
 #: park a clause that merely happens to be green.
 REPOSITORY_GRADED_CLAUSES: frozenset[str] = frozenset(
-    {"acceptance_suite_committed", "runbook_in_readme"}
+    {
+        "acceptance_suite_committed",
+        "runbook_in_readme",
+        # Reads `crucible/metron_consumers.yaml` only — no store dependency
+        # (`_clause_metron_reads_have_surviving_producer`). Added
+        # `alpha-engine-config-I11007`: before that issue landed the register
+        # always carried at least one `unresolved` row (`metron/
+        # reference_rate.json`), so this clause happened to read UNMET
+        # against an empty store too and the gap in this set went unnoticed.
+        # Once every row reads `rehomed`/`retired_by_ruling`, the clause is
+        # MET purely from the checkout, exactly like the two clauses above —
+        # an empty store says nothing about it either.
+        "metron_read_artifacts_have_surviving_producer",
+    }
 )
 
 #: The four scripted faults of plan §10.7, in the order the plan names them,

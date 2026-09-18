@@ -247,17 +247,24 @@ reads:
   # ── UNRESOLVED: the row that holds this gate red ───────────────────────
   - object_key: metron/reference_rate.json
     reader: portfolio_analytics/ingestion/reference_connector.py:43
-    producer: crucible-executor:executor/reference_rate.py::publish
-    schedule_owner: v1_orchestration
-    phase4_disposition: unresolved
+    producer: crucible-executor:executor/publish_reference_rate.py::run
+    schedule_owner: trader_host
+    phase4_disposition: rehomed
     note: >-
       Brian ruled R4 option (b) on 2026-09-14 - component 3 (the trader)
-      publishes it, "an execution output of a trader that keeps running". The
-      RULING is settled; the WORK is not. Measured 2026-09-17: `publish` is
-      called from `executor/eod_reconcile.py` inside the postclose reconcile
-      run, and that run is started by the v1 postclose pipeline. The trader
-      keeps running, but this write does not have a schedule of its own, so
-      phase 4 stops it. `unresolved` until the trader publishes it from a
-      schedule phase 4 leaves standing; then this row becomes `rehomed` with
-      `schedule_owner: trader_host`. This is the Showcase Portfolio's
-      benchmark rate.
+      publishes it, "an execution output of a trader that keeps running"
+      (`alpha-engine-config-I11007`). The publish used to ride inside
+      `executor/eod_reconcile.py`'s `run()`, reachable only via the v1
+      postclose pipeline (`ne-postclose-trading-pipeline`, which phase 4
+      disables). `crucible-executor-PR565` gives it its own schedule
+      instead - `infrastructure/systemd/alpha-engine-reference-rate-
+      publish.timer`, a weekday timer on the trading box itself, force-
+      enabled by that repo's `boot-pull.sh` reconciliation on every boot,
+      independent of any Step Function. `rehomed` here is the state of the
+      CODE PATH (same pattern already accepted above for
+      `data_collection_stack`): the schedule is committed, not yet verified
+      against a live trading day. This row's `rehomed` state, plus a
+      confirmed live write, plus `crucible gate --gate phase4` no longer
+      naming this key, are what `alpha-engine-config-I11007`'s own
+      closes-when requires before that issue is closed by hand - not this
+      register edit alone. This is the Showcase Portfolio's benchmark rate.
