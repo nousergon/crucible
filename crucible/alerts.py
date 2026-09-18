@@ -56,6 +56,7 @@ from crucible.documents import (
 from crucible.keys import (
     ALERTS_ROOT,
     DISPATCH_ROOT,
+    MIGRATIONS_ROOT,
     RANGE_BOUND_JOBS,
     RUNS_ROOT,
     arena_cycle_key,
@@ -67,6 +68,7 @@ from crucible.keys import (
     parse_bus_key,
     parse_dispatch_key,
     parse_manifest_key,
+    parse_migration_key,
 )
 from crucible.manifest import manifest_prefix
 from crucible.models import (
@@ -1197,6 +1199,70 @@ def _manifest_clears_dispatch(
     )
 
 
+#: `crucible.migrate.run_migrate_code_sha`/`run_migrate_arm_filed_on` stamp
+#: `migration_run_id` from `dt.datetime.now(dt.UTC)` at the START of the run,
+#: in this exact format — the one thing about a `NON_JOB_HANDLERS` record
+#: that is time-ordered, since it carries no `started` field the way a
+#: `run_manifest.v2` document does.
+_MIGRATION_RUN_ID_FORMAT = "%Y%m%dT%H%M%S%fZ"
+
+
+def _parse_migration_run_id(run_id: str) -> dt.datetime | None:
+    """``run_id`` as the UTC instant it encodes, or ``None`` for a shape this
+    does not recognise — e.g. `migrate.history`'s own `ctx.run_id` (a ULID),
+    which shares :data:`crucible.keys.MIGRATIONS_ROOT` but is not a record
+    from either non-job handler."""
+    try:
+        return dt.datetime.strptime(run_id, _MIGRATION_RUN_ID_FORMAT).replace(tzinfo=dt.UTC)
+    except ValueError:
+        return None
+
+
+def _migration_clears_dispatch(store: Store, dispatched_at: dt.datetime) -> _ClearingVerdict:
+    """Does ANY migration record under :data:`crucible.keys.MIGRATIONS_ROOT`
+    postdate ``dispatched_at``?
+
+    `alpha-engine-config-I11022`'s residual finding, posted after the
+    dispatch-script fix landed (`nous-ergon-ops-PR1322`):
+    `evaluate_dispatch_absence` graded every dispatch against
+    `manifest_prefix(job, trading_day)`, which a `crucible.cli.NON_JOB_HANDLERS`
+    member (`migrate.code_sha`, `migrate.arm_filed_on`) never writes — same
+    premise error as the waiter's, one repair layer over. Both handlers file
+    their only durable record at `migrations/{trading_day}/{run_id}.json`,
+    keyed by a `trading_day` the box resolves from ITS OWN CLOCK at run time
+    (see the module comment above `run_migrate_arm_filed_on`), which this
+    sweep cannot predict from the dispatch record alone — so this lists the
+    whole root rather than guessing one day.
+
+    **The rule is lifted, not invented** (`policy-shared-code`'s
+    second-adoption trigger): identical identity rule to
+    `nous-ergon-ops/scripts/lib/crucible_manifest_wait.sh`'s
+    `crucible_wait_for_new_migration_record` — a record is this dispatch's
+    evidence only if it postdates the dispatch, over the whole prefix rather
+    than one key.
+
+    **Not per-job, and that ambiguity is inherited, not introduced here.** A
+    migration record carries no `job` field — both handlers write the
+    identical document shape to the identical prefix — so a page for
+    `migrate.code_sha` clears on evidence that `migrate.arm_filed_on`
+    produced, and vice versa, exactly as the synchronous shell waiter would.
+    """
+    listed = _list_manifest_keys(store, MIGRATIONS_ROOT)
+    if listed.problem is not None:
+        return _ClearingVerdict(False, "the migrations prefix could not be listed", listed.problem)
+    for key in sorted(listed.keys or ()):
+        parsed = parse_migration_key(key)
+        if parsed is None:
+            continue
+        _trading_day, run_id = parsed
+        written_at = _parse_migration_run_id(run_id)
+        if written_at is None:
+            continue
+        if written_at >= dispatched_at:
+            return _ClearingVerdict(True, f"{key} was written after this dispatch")
+    return _ClearingVerdict(False, "no migration record newer than this dispatch")
+
+
 @dataclass(frozen=True)
 class IndistinguishableInvocation:
     """One manifest key that cannot tell N invocations of a job apart."""
@@ -1425,6 +1491,12 @@ def evaluate_dispatch_absence(
     siblings landed, so seven of eight healing stops being indistinguishable
     from eight of eight.
     """
+    # `crucible.cli` imports `crucible.gate`, which imports this module — a
+    # module-level import here would cycle (`alpha-engine-config-I11022`
+    # residual finding). Same handler-shape source of truth the dispatch
+    # script and its lockstep guard already read.
+    from crucible.cli import NON_JOB_HANDLERS  # noqa: PLC0415 - avoids an import cycle
+
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     oldest_graded_day = resolve_trading_day(moment)
     for _ in range(CATCH_UP_TRADING_DAYS):
@@ -1498,8 +1570,12 @@ def evaluate_dispatch_absence(
         if resolve_trading_day(dispatched_at) < oldest_graded_day:
             continue
         trading_day = _dispatch_target_trading_day(job, args, dispatched_at)
-        prefix = manifest_prefix(job, trading_day.isoformat())
-        verdict = _manifest_clears_dispatch(store, prefix, dispatched_at)
+        if job in NON_JOB_HANDLERS:
+            prefix = MIGRATIONS_ROOT
+            verdict = _migration_clears_dispatch(store, dispatched_at)
+        else:
+            prefix = manifest_prefix(job, trading_day.isoformat())
+            verdict = _manifest_clears_dispatch(store, prefix, dispatched_at)
         if verdict.listing_problem is not None:
             if access_faults is None:
                 raise StoreAccessError(verdict.listing_problem)

@@ -45,6 +45,7 @@ __all__ = [
     "FAULT_INJECTION_ROOT",
     "INTEGRATION_STORE_SUBPREFIX",
     "MANIFEST_BASENAME",
+    "MIGRATIONS_ROOT",
     "POINTER_KEY",
     "PREDICTIONS_PREFIX",
     "PUBLIC_JSON_KEY",
@@ -127,6 +128,7 @@ __all__ = [
     "parse_dispatch_key",
     "parse_fault_injection_key",
     "parse_manifest_key",
+    "parse_migration_key",
     "predictions_key",
     "retirement_log_key",
     "review_key",
@@ -1314,6 +1316,17 @@ def iac_conformance_key(trading_day: str) -> str:
 
 # -- one-shot / repair jobs --------------------------------------------------
 
+#: The root every :func:`migration_key` record lives under. Shared by
+#: `migrate.history` (a real `JOBS` member, which files one of these
+#: *beside* its own `run_manifest.v2` document) and the two
+#: `crucible.cli.NON_JOB_HANDLERS` (`migrate.code_sha`, `migrate.arm_filed_on`),
+#: for whom this is the ONLY durable record — they claim no `job` enum slot
+#: and write no manifest. A caller that does not know in advance which shape
+#: a name has — `crucible.alerts.evaluate_dispatch_absence`, chiefly — lists
+#: this root rather than guessing a trading day the box resolved from its
+#: own clock at run time (`alpha-engine-config-I11022`).
+MIGRATIONS_ROOT = "migrations/"
+
 
 def migration_key(trading_day: str, run_id: str) -> str:
     """Where `crucible migrate.history` files its own result, per attempt.
@@ -1326,7 +1339,24 @@ def migration_key(trading_day: str, run_id: str) -> str:
     """
     if not run_id:
         raise ValueError("run_id must be non-empty — see manifest_key's discriminator for why.")
-    return f"migrations/{trading_day}/{run_id}.json"
+    return f"{MIGRATIONS_ROOT}{trading_day}/{run_id}.json"
+
+
+def parse_migration_key(key: str) -> tuple[str, str] | None:
+    """The inverse of :func:`migration_key`: ``(trading_day, run_id)``.
+
+    Returns ``None`` for anything not under :data:`MIGRATIONS_ROOT` in this
+    exact two-segment-under-the-root shape, so a caller listing the whole
+    root decides what an unrecognised key means rather than this function
+    guessing — same convention as :func:`parse_dispatch_key`.
+    """
+    if not key.startswith(MIGRATIONS_ROOT) or not key.endswith(".json"):
+        return None
+    parts = key.split("/")
+    if len(parts) != 3:
+        return None
+    _, trading_day, filename = parts
+    return trading_day, filename[: -len(".json")]
 
 
 def heal_key(trading_day: str, run_id: str) -> str:

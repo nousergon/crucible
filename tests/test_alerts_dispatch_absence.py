@@ -21,7 +21,7 @@ from crucible.alerts import (
     evaluate_dispatch_absence,
     sweep,
 )
-from crucible.keys import dispatch_exit_key, dispatch_key, manifest_key
+from crucible.keys import dispatch_exit_key, dispatch_key, manifest_key, migration_key
 from crucible.store import LocalStore
 
 #: A Friday, well after that trading day's close (~20:00 UTC — see
@@ -299,6 +299,105 @@ class TestDispatchAbsence:
         assert summary["pages_emitted"] == 0
         assert summary["incidents_open"] == 1
         assert list(store.list_keys("alerts/")) == []
+
+
+#: `migrate.arm_filed_on`/`migrate.code_sha` stamp `migration_run_id` from
+#: `dt.datetime.now(dt.UTC)` at the START of the run, in this exact format
+#: (`crucible.migrate.run_migrate_arm_filed_on`).
+_MIGRATION_RUN_ID_FORMAT = "%Y%m%dT%H%M%S%fZ"
+
+
+class TestANonJobHandlerClearsOnTheMigrationsPrefix:
+    """`alpha-engine-config-I11022` residual finding, posted after the
+    dispatch-script fix landed (`nous-ergon-ops-PR1322`).
+
+    `crucible.cli.NON_JOB_HANDLERS` (`migrate.code_sha`, `migrate.arm_filed_on`)
+    write no `run_manifest.v2` document, so grading them against
+    `manifest_prefix(job, trading_day)` — the premise `evaluate_dispatch_absence`
+    used for every job — pages every one of them, every night, even after a
+    correction runs successfully. Their only durable record is
+    `migrations/{trading_day}/{run_id}.json`, and this class asserts the
+    sweep reads it instead.
+    """
+
+    def test_a_non_job_handler_dispatch_with_no_migration_record_pages_absence(
+        self, tmp_path
+    ) -> None:
+        store = LocalStore(tmp_path)
+        _write_dispatch(store, job="migrate.arm_filed_on", args="--dry-run")
+        pages = evaluate_dispatch_absence(
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
+        )
+        assert len(pages) == 1
+        assert pages[0].job == "migrate.arm_filed_on"
+        assert "migrations/" in pages[0].reason
+
+    def test_a_migration_record_written_after_the_dispatch_clears_it(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _write_dispatch(store, job="migrate.arm_filed_on", args="")
+        run_id = AFTER_DISPATCH.strftime(_MIGRATION_RUN_ID_FORMAT)
+        store.put_bytes(
+            migration_key(DISPATCH_TARGET_TRADING_DAY.isoformat(), run_id),
+            json.dumps(
+                {"migration_run_id": run_id, "dry_run": False, "corrected": [], "refused": []}
+            ).encode(),
+        )
+        assert (
+            evaluate_dispatch_absence(
+                store,
+                now=PAST_HORIZON,
+                describe_instance_state_reason=_no_reason,
+                read_box_log_tail=_no_log,
+            )
+            == []
+        )
+
+    def test_a_migration_record_written_before_the_dispatch_does_not_clear_it(
+        self, tmp_path
+    ) -> None:
+        """The I10981 shape, in the migration prefix: a record left by an
+        earlier attempt is not evidence of THIS dispatch."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(store, job="migrate.arm_filed_on", args="")
+        run_id = BEFORE_DISPATCH.strftime(_MIGRATION_RUN_ID_FORMAT)
+        store.put_bytes(
+            migration_key(DISPATCH_TARGET_TRADING_DAY.isoformat(), run_id),
+            json.dumps(
+                {"migration_run_id": run_id, "dry_run": False, "corrected": [], "refused": []}
+            ).encode(),
+        )
+        pages = evaluate_dispatch_absence(
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
+        )
+        assert len(pages) == 1
+        assert pages[0].job == "migrate.arm_filed_on"
+
+    def test_a_ulid_migration_record_from_migrate_history_does_not_falsely_clear(
+        self, tmp_path
+    ) -> None:
+        """`migrate.history` (a real `JOBS` member) writes to the SAME
+        `migrations/` root, keyed by `ctx.run_id` — a ULID, not a UTC
+        timestamp. That record must not be misread as evidence for an
+        unrelated non-job-handler dispatch."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(store, job="migrate.arm_filed_on", args="")
+        store.put_bytes(
+            migration_key(DISPATCH_TARGET_TRADING_DAY.isoformat(), "01M2GPZ56BVJRBJHHSMHZRQSEM"),
+            json.dumps({"schema_version": "migration.v1"}).encode(),
+        )
+        pages = evaluate_dispatch_absence(
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
+        )
+        assert len(pages) == 1
 
 
 def test_the_horizon_is_stated_and_bounded() -> None:
