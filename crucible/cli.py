@@ -755,13 +755,29 @@ NON_JOB_HANDLERS: frozenset[str] = frozenset({"migrate.code_sha", "migrate.arm_f
 
 
 HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
-    "data.daily": _todo("data.daily", "track A", "Lifts the ingest core from nousergon-data."),
-    "data.weekly": _todo("data.weekly", "track A", "Weekly refresh + coverage MetricRecords."),
-    "data.heal": _todo(
-        "data.heal",
-        "track A",
-        "Must record what it repaired in rows_in/rows_out/rows_rejected, not just log it.",
-    ),
+    # `data.daily` / `data.weekly` / `data.heal` are deliberately ABSENT here,
+    # not stubbed: `crucible.track_a.HANDLERS` (`handle_data_daily`,
+    # `handle_data_weekly`, `handle_data_heal`) already implements all three
+    # and overwrites this table via `HANDLERS.update(TRACK_A_HANDLERS)` below,
+    # so a `_todo(...)` entry for any of them was dead on arrival — silently
+    # overwritten at import time, never reachable, never checked by
+    # `is_stub`. Keeping one anyway is worse than the staleness that made it
+    # a defect: `alpha-engine-config-I10979` found the dead entries here still
+    # describing the PRE-ruling-146 shape — "Lifts the ingest core from
+    # nousergon-data" — a year after `architecture.d/146` rule 1 replaced it:
+    # collection (vendor ingest, ArcticDB writes, the `market_data/*` spine)
+    # lives ONLY in `nousergon-data`. `data.daily` / `data.weekly` READ that
+    # component's published contracts and compile crucible's OWN read-side
+    # panel (`crucible.data.daily`, `crucible.keys.data_panel_key`) plus the
+    # data-quality gate; `data.heal` repairs a range of THAT panel, in
+    # region, idempotently (`crucible.data.heal`) — it does not touch
+    # `nousergon-data`'s ArcticDB/`market_data/*` store, which is healed by
+    # that component's own `weekly_collector.py` self-heal functions. See
+    # `crucible/data/__init__.py`, `crucible/data/daily.py` and
+    # `crucible/data/heal.py` for the real behaviour; see
+    # `tests/test_no_stale_component_boundary_claims.py` for the guard that
+    # keeps this comment, `README.md` and every job description honest about
+    # rule 1 going forward.
     "experiment.new": _todo(
         "experiment.new",
         "track A",
