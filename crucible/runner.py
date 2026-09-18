@@ -140,6 +140,7 @@ import traceback
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 from nousergon_lib import run_identity as _run_identity
@@ -163,7 +164,9 @@ __all__ = [
     "CodeShaError",
     "DISPATCH_ATTEMPTS_ENV",
     "DispatchAttemptsError",
+    "EXPECTED_MANIFEST_KEY_FILE",
     "RunContext",
+    "STATE_DIR_ENV",
     "SPOT_INTERRUPTION_REASON",
     "SpotInterruptionError",
     "TRANSIENT_CLASSIFIERS",
@@ -849,6 +852,48 @@ def rebind_trading_day(ctx: RunContext, day: dt.date) -> RunContext:
     return replace(ctx, trading_day=day)
 
 
+#: Where the box's bootstrap keeps its per-run scratch (the log-shipper
+#: offset, the spot-notice marker, the job pid) — set by the launch
+#: template's user data in `nous-ergon-ops/infrastructure/cloudformation/
+#: crucible-v2.yaml`. Unset everywhere else, which is what keeps this file
+#: a box-only artifact.
+STATE_DIR_ENV = "CRUCIBLE_STATE_DIR"
+
+#: The basename `crucible.dispatch_exit` reads back out of that directory.
+EXPECTED_MANIFEST_KEY_FILE = "manifest-key"
+
+
+def _record_expected_manifest_key(ctx: RunContext) -> None:
+    """Leave the key this attempt binds to where the box's exit trap can read it.
+
+    `alpha-engine-config-I11050`. No-op off a box.
+
+    **A recorded swallow** (`crucible/AGENTS.md` rule 5). (a) The failure
+    mode swallowed is "the breadcrumb could not be written" — a full or
+    read-only state dir. (b) The primary deliverable survives because this
+    file is a diagnostic, never an output: a job that cannot write it still
+    writes its manifest, and `crucible.alerts` falls back to deriving the key
+    from argv, which is the path every dispatch took before this existed.
+    (c) The recording surface is stderr, which the box's log shipper sends to
+    the same CloudWatch stream the absence page names. Raising here would
+    fail a RUN over a note about the run.
+    """
+    state_dir = os.environ.get(STATE_DIR_ENV)
+    if not state_dir:
+        return
+    key = manifest_key(ctx.job, ctx.trading_day.isoformat(), discriminator=ctx.discriminator)
+    try:
+        Path(state_dir).mkdir(parents=True, exist_ok=True)
+        (Path(state_dir) / EXPECTED_MANIFEST_KEY_FILE).write_text(key, encoding="utf-8")
+    except OSError as exc:  # noqa: BLE001 - see docstring
+        print(
+            f"could not record the expected manifest key at {state_dir}: {exc!r}; the "
+            "exit record will carry no expected_manifest_key and the absence detector "
+            "will derive it from argv",
+            file=sys.stderr,
+        )
+
+
 def run_job(
     job: str,
     fn: Callable[[RunContext], Any],
@@ -1080,6 +1125,15 @@ def run_job(
         # too (`ctx` above is rebuilt each iteration) and the two attempts'
         # cost rows must not be joined to the same key.
         os.environ["KREPIS_RUN_ID"] = ctx.run_id
+
+        # `alpha-engine-config-I11050`: the key this attempt binds to, left
+        # where the box's EXIT trap can read it. The trap runs after the
+        # process is over — including on the reclaimed path, where the
+        # manifest is deliberately never written — so the only party that can
+        # state WHICH manifest was owed is this one, here, before the body
+        # runs. Written to the box's state dir and nowhere else: a laptop or
+        # CI run has no `CRUCIBLE_STATE_DIR` and writes nothing.
+        _record_expected_manifest_key(ctx)
 
         status = "ok"
         reason = ""

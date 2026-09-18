@@ -101,7 +101,7 @@ still holds because that derivation happens here, not in a second copy.
 from __future__ import annotations
 
 import datetime as dt
-from typing import Annotated, Any, ClassVar, Literal, get_args
+from typing import Annotated, Any, ClassVar, Final, Literal, get_args
 
 from krepis.metrics import StatusLiteral
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
@@ -4223,4 +4223,182 @@ class MetronConsumerRegisterDocument(_Strict):
             if row.object_key in seen:
                 raise ValueError(f"duplicate row for {row.object_key!r}")
             seen.add(row.object_key)
+        return self
+
+
+# -- The dispatch's terminal record (alpha-engine-config-I11050) -------------
+# Appended after the prior rows' markers for the same rebase reason as every
+# block above. `DispatchRecordDocument` a few blocks up is the REQUEST; this
+# is how that request ENDED, written by the box's own exit path.
+
+
+#: `exit_class` — five values, and the set is closed. The split that matters
+#: is `spot_reclaimed` (re-dispatch is the fix) against everything else
+#: (investigate), which is the split `crucible.alerts._classify_dispatch_
+#: absence` existed to make and could not (`alpha-engine-config-I11049`:
+#: EC2 purges a terminated instance ~1h after termination and the absence
+#: horizon is 3h, so the marker it read was gone before any page it fires).
+#: `refused` is argparse's exit 2 — a malformed DISPATCH, where the box, the
+#: wheel, the store and the data were all fine and `run_job` was never
+#: entered; `bootstrap_failed` is the box dying before `crucible` was
+#: installed, which is the one class the wheel cannot write for itself.
+DISPATCH_EXIT_CLASSES: Final[tuple[str, ...]] = (
+    "ok",
+    "failed",
+    "spot_reclaimed",
+    "bootstrap_failed",
+    "refused",
+)
+
+#: The one `exit_class` for which another attempt is owed
+#: (`alpha-engine-config-I11051`). The box suppresses its manifest on this
+#: path on the ground that the dispatcher re-launches the job; that promise
+#: is what `redispatch_expected` records, and an unkept one is what
+#: `crucible.alerts` now pages about instead of reporting a bare absence.
+DISPATCH_EXIT_CLASS_RECLAIMED: Final[str] = "spot_reclaimed"
+
+#: How much of the box console the record carries. Bounded on purpose: this
+#: document is read by a detector on every sweep, and an unbounded tail would
+#: make the sweep's cost a function of how noisy the failing box was. The
+#: full console is in CloudWatch under `log_group`/`log_stream`, which the
+#: record names precisely so the tail never has to be complete.
+DISPATCH_EXIT_CONSOLE_TAIL_MAX = 4000
+
+
+class DispatchExitDocument(_Strict):
+    """`dispatch_exit.v1`, at
+    `runs/_dispatch/{job}/{dispatch_id}.exit.json` (`crucible.keys.
+    dispatch_exit_key`), written by `crucible.dispatch_exit` from the box's
+    EXIT trap — and by the bootstrap shell when the box died before the wheel
+    was installed.
+
+    **Why this document exists** (`alpha-engine-config-I11050`). An absence
+    page could say *no manifest*; it could not say *why*, and it ended by
+    telling a human to go and look at a box that EC2 had already purged. The
+    evidence was never missing — every dispatched instance shipped a complete
+    CloudWatch stream — but nothing joined the three surfaces that each knew
+    the instance id. This is the join, written by the only party that knows
+    its own exit code before the process ends.
+
+    **It does not replace the manifest.** `crucible/AGENTS.md` rule 1
+    ("manifest or it did not happen") is unchanged: a run that produced
+    something writes a manifest, and `manifest_written` here RECORDS whether
+    it did rather than standing in for it. The one path that deliberately
+    writes no manifest — a spot-reclaimed attempt, suppressed so two attempts
+    cannot both claim one key — is exactly the path this document makes
+    honest.
+
+    Every field is required and nullable rather than optional with a default,
+    the same rule `SignalsRow` states: an omitted field is indistinguishable
+    from a forgotten one.
+    """
+
+    schema_version: Literal["dispatch_exit.v1"]
+    dispatch_id: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.-]+$",
+        description="the dispatch this record terminates — the same path segment "
+        "`crucible.keys.dispatch_key` writes the REQUEST under, which is what joins "
+        "the two documents.",
+    )
+    instance_id: str = Field(
+        min_length=1,
+        description="the box. It is also the CloudWatch stream name, which is how a "
+        "reader gets from this record to the full console without deriving anything.",
+    )
+    job: str = Field(min_length=1)
+    argv: str = Field(
+        description="what the box was actually told to run, verbatim. Empty is legal "
+        "(a handler taking no arguments); absent is not."
+    )
+    exit_code: int = Field(
+        description="the process exit status the trap observed. 143 is a signal exit "
+        "(128+SIGTERM), which on this substrate is a reclaim or a shutdown."
+    )
+    exit_class: Literal["ok", "failed", "spot_reclaimed", "bootstrap_failed", "refused"]
+    last_error_line: str | None = Field(
+        description="the last line of the console that names a failure, or `null` when "
+        "the box exited clean. This is what an absence page renders, so a page names a "
+        "cause in the words the box used rather than in the detector's."
+    )
+    console_tail: str | None = Field(
+        description="the last "
+        f"{DISPATCH_EXIT_CONSOLE_TAIL_MAX} characters of the box console, or `null` "
+        "when there was none. Bounded — see DISPATCH_EXIT_CONSOLE_TAIL_MAX."
+    )
+    log_group: str | None
+    log_stream: str | None
+    expected_manifest_key: str | None = Field(
+        # `alpha-engine-config-I11048` is what a second derivation of this
+        # costs: a range job graded against a key nothing writes.
+        description="the key this dispatch's manifest binds to, as the BOX resolved it "
+        "— the authoritative answer to 'which manifest', written by the party that "
+        "actually wrote (or did not write) it."
+    )
+    manifest_written: bool = Field(
+        description="did this attempt write its manifest? `false` with "
+        "`exit_class: spot_reclaimed` is the DECLARED suppression; `false` with any "
+        "other class is a run that died before it could record itself."
+    )
+    redispatch_expected: bool = Field(
+        # `alpha-engine-config-I11051`: the reclaimed path suppresses its
+        # manifest on exactly this promise, and until this field existed an
+        # unkept promise was indistinguishable from a successful re-dispatch.
+        description="did this attempt end declaring that another attempt is owed? A "
+        "reclaimed attempt writes no manifest because another one will; this is that "
+        "promise, recorded where a detector can check whether it was kept."
+    )
+    next_attempt_dispatch_id: str | None = Field(
+        description="the dispatch id the successor attempt will be recorded under when "
+        "`redispatch_expected` is true and this attempt could name it, else `null`. A "
+        "detector that has it checks one key instead of listing a prefix."
+    )
+    attempts: list[AttemptRow] | None = Field(
+        description="this dispatch's attempt ladder as the box was told it "
+        "(`CRUCIBLE_DISPATCH_ATTEMPTS`), or `null` on a bootstrap failure that never "
+        "read it."
+    )
+    finished_at_utc: str = Field(
+        pattern=_UTC_TIMESTAMP_PATTERN,
+        description="RFC 3339, UTC, `Z`. When the trap ran — which is the only instant "
+        "a reader can age this record against.",
+    )
+
+    @model_validator(mode="after")
+    def _the_class_and_the_code_must_agree(self) -> DispatchExitDocument:
+        # A record whose class and code disagree is worse than no record:
+        # every consumer of this document splits on `exit_class`, and a
+        # `ok`-classed non-zero exit would silence a page for a run that
+        # failed. Raised, never repaired — repairing it here would decide
+        # which of the two fields was the lie.
+        if self.exit_class == "ok" and self.exit_code != 0:
+            raise ValueError(
+                f"exit_class 'ok' with exit_code {self.exit_code}: an exit record whose "
+                "class contradicts its code cannot be graded, and every consumer splits "
+                "on the class."
+            )
+        if self.exit_class != "ok" and self.exit_code == 0:
+            raise ValueError(
+                f"exit_class {self.exit_class!r} with exit_code 0: same contradiction, "
+                "the other way round."
+            )
+        if self.exit_class == "refused" and self.exit_code != 2:
+            raise ValueError(
+                "exit_class 'refused' is argparse's usage exit and is exit_code 2; "
+                f"got {self.exit_code}."
+            )
+        if self.redispatch_expected and self.exit_class != DISPATCH_EXIT_CLASS_RECLAIMED:
+            raise ValueError(
+                "redispatch_expected is true only on the reclaimed path: it is the "
+                "promise the manifest suppression is made on, and declaring it "
+                f"anywhere else would owe an attempt nothing launches. Class was "
+                f"{self.exit_class!r}."
+            )
+        if self.exit_class == "ok" and not self.manifest_written:
+            raise ValueError(
+                "exit_class 'ok' with manifest_written false: a job that succeeded and "
+                "recorded nothing is repo rule 1's failure ('manifest or it did not "
+                "happen'), and an exit record must not be the thing that excuses it."
+            )
         return self

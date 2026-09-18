@@ -16,11 +16,12 @@ import pytest
 
 from crucible.alerts import (
     DISPATCH_ABSENCE_HORIZON,
+    InstanceReading,
     Page,
     evaluate_dispatch_absence,
     sweep,
 )
-from crucible.keys import dispatch_key, manifest_key
+from crucible.keys import dispatch_exit_key, dispatch_key, manifest_key
 from crucible.store import LocalStore
 
 #: A Friday, well after that trading day's close (~20:00 UTC — see
@@ -47,11 +48,22 @@ PAST_HORIZON = DISPATCHED_AT + dt.timedelta(hours=10)
 WITHIN_HORIZON = DISPATCHED_AT + dt.timedelta(hours=1)
 
 
-def _no_reason(instance_id: str) -> None:
+def _no_log(job: str, instance_id: str) -> None:
+    """A fake `read_box_log_tail` that finds no stream — the default for
+    every test that is not exercising the CloudWatch rung, so a unit test
+    never makes a real `logs:GetLogEvents` call."""
+    return None
+
+
+def _no_reason(instance_id: str) -> InstanceReading:
     """A fake `describe_instance_state_reason` that finds nothing — the
     default for every test that is not exercising classification itself, so
-    a unit test never makes a real `ec2:DescribeInstances` call."""
-    return None
+    a unit test never makes a real `ec2:DescribeInstances` call.
+
+    `known=False` is the PRODUCTION reading (`alpha-engine-config-I11049`):
+    EC2 purges a terminated instance about an hour after termination, and no
+    page this detector fires is younger than three hours."""
+    return InstanceReading(False, None)
 
 
 def _write_dispatch(
@@ -105,7 +117,10 @@ class TestDispatchAbsence:
         store = LocalStore(tmp_path)
         _write_dispatch(store)
         pages = evaluate_dispatch_absence(
-            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
         )
         assert pages == [
             Page(
@@ -126,7 +141,10 @@ class TestDispatchAbsence:
         _write_dispatch(store)
         assert (
             evaluate_dispatch_absence(
-                store, now=WITHIN_HORIZON, describe_instance_state_reason=_no_reason
+                store,
+                now=WITHIN_HORIZON,
+                describe_instance_state_reason=_no_reason,
+                read_box_log_tail=_no_log,
             )
             == []
         )
@@ -152,7 +170,10 @@ class TestDispatchAbsence:
         )
         assert (
             evaluate_dispatch_absence(
-                store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+                store,
+                now=PAST_HORIZON,
+                describe_instance_state_reason=_no_reason,
+                read_box_log_tail=_no_log,
             )
             == []
         )
@@ -170,7 +191,10 @@ class TestDispatchAbsence:
         )
         assert (
             evaluate_dispatch_absence(
-                store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+                store,
+                now=PAST_HORIZON,
+                describe_instance_state_reason=_no_reason,
+                read_box_log_tail=_no_log,
             )
             == []
         )
@@ -191,7 +215,10 @@ class TestDispatchAbsence:
             ).encode(),
         )
         pages = evaluate_dispatch_absence(
-            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
         )
         assert len(pages) == 1
         assert "cannot be graded against the absence horizon" in pages[0].reason
@@ -222,7 +249,10 @@ class TestDispatchAbsence:
         )
         with pytest.raises(StoreAccessError, match="does not conform"):
             evaluate_dispatch_absence(
-                store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+                store,
+                now=PAST_HORIZON,
+                describe_instance_state_reason=_no_reason,
+                read_box_log_tail=_no_log,
             )
 
     def test_this_is_the_evidence_a_matching_scheduled_absence_groups_with(self, tmp_path) -> None:
@@ -234,7 +264,10 @@ class TestDispatchAbsence:
         store = LocalStore(tmp_path)
         _write_dispatch(store)
         [dispatch_page] = evaluate_dispatch_absence(
-            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
         )
         scheduled_page = Page(
             condition="absence",
@@ -261,6 +294,7 @@ class TestDispatchAbsence:
             sweep_run_id="run1",
             dry_run=True,
             describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
         )
         assert summary["pages_emitted"] == 0
         assert summary["incidents_open"] == 1
@@ -286,12 +320,17 @@ class TestDispatchAbsenceClassification:
         store = LocalStore(tmp_path)
         _write_dispatch(store, instance_id="i-096d52ca7a0c2ff21")
 
-        def reclaimed(instance_id: str) -> str:
+        def reclaimed(instance_id: str) -> InstanceReading:
             assert instance_id == "i-096d52ca7a0c2ff21"
-            return "Server.SpotInstanceTermination: Spot instance termination"
+            return InstanceReading(
+                True, "Server.SpotInstanceTermination: Spot instance termination"
+            )
 
         [page] = evaluate_dispatch_absence(
-            store, now=PAST_HORIZON, describe_instance_state_reason=reclaimed
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=reclaimed,
+            read_box_log_tail=_no_log,
         )
         assert "reclaimed by AWS" in page.reason
         assert "Server.SpotInstanceTermination" in page.reason
@@ -304,11 +343,14 @@ class TestDispatchAbsenceClassification:
         store = LocalStore(tmp_path)
         _write_dispatch(store, instance_id="i-0deadbox00000000")
 
-        def user_terminated(instance_id: str) -> str:
-            return "Client.UserInitiatedShutdown: User initiated shutdown"
+        def user_terminated(instance_id: str) -> InstanceReading:
+            return InstanceReading(True, "Client.UserInitiatedShutdown: User initiated shutdown")
 
         [page] = evaluate_dispatch_absence(
-            store, now=PAST_HORIZON, describe_instance_state_reason=user_terminated
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=user_terminated,
+            read_box_log_tail=_no_log,
         )
         assert "reclaimed" not in page.reason
         assert "Client.UserInitiatedShutdown" in page.reason
@@ -322,11 +364,14 @@ class TestDispatchAbsenceClassification:
         store = LocalStore(tmp_path)
         _write_dispatch(store, instance_id="i-0accessdenied0000")
 
-        def denied(instance_id: str) -> str:
+        def denied(instance_id: str) -> InstanceReading:
             raise Exception("AccessDenied: not authorized to perform ec2:DescribeInstances")
 
         pages = evaluate_dispatch_absence(
-            store, now=PAST_HORIZON, describe_instance_state_reason=denied
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=denied,
+            read_box_log_tail=_no_log,
         )
         assert len(pages) == 1
         assert pages[0].condition == "absence"
@@ -350,49 +395,89 @@ class TestDispatchAbsenceClassification:
             ).encode(),
         )
 
-        def fail_if_called(instance_id: str) -> str:
+        def fail_if_called(instance_id: str) -> InstanceReading:
             raise AssertionError("must not be called for a record with no instance_id")
 
         [page] = evaluate_dispatch_absence(
-            store, now=PAST_HORIZON, describe_instance_state_reason=fail_if_called
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=fail_if_called,
+            read_box_log_tail=_no_log,
         )
         assert "no instance_id recorded" in page.reason
 
 
-def test_classify_dispatch_absence_never_raises_on_a_lookup_failure() -> None:
+def test_classify_dispatch_absence_never_raises_on_a_lookup_failure(tmp_path) -> None:
     """Self-test of the classifier's own fail-safety, at the unit under it:
-    `_classify_dispatch_absence` is the one place a describe-instances
-    failure is folded into text rather than propagated."""
+    `_classify_dispatch_absence` is the one place a transport failure on any
+    rung of the ladder is folded into text rather than propagated."""
     from crucible.alerts import _classify_dispatch_absence
 
-    def boom(instance_id: str) -> str:
+    def boom(instance_id: str) -> InstanceReading:
         raise RuntimeError("boom")
 
-    text = _classify_dispatch_absence("i-0x", boom)
+    text = _classify_dispatch_absence(
+        LocalStore(tmp_path), "data.heal", "01abc", "i-0x", boom, _no_log
+    )
     assert "termination cause unknown" in text
     assert "boom" in text
 
 
-def test_classify_dispatch_absence_names_a_reclamation() -> None:
+def test_classify_dispatch_absence_names_a_reclamation(tmp_path) -> None:
     from crucible.alerts import _classify_dispatch_absence
 
     text = _classify_dispatch_absence(
-        "i-0x", lambda _: "Server.SpotInstanceTermination: Spot instance termination"
+        LocalStore(tmp_path),
+        "data.heal",
+        "01abc",
+        "i-0x",
+        lambda _: InstanceReading(
+            True, "Server.SpotInstanceTermination: Spot instance termination"
+        ),
+        _no_log,
     )
     assert "reclaimed by AWS" in text
     assert "re-dispatch" in text
 
 
-def test_classify_dispatch_absence_with_no_reason_at_all() -> None:
+def test_classify_dispatch_absence_when_ec2_described_it_with_no_reason(tmp_path) -> None:
     """The instance describes cleanly but carries no `StateReason.Message`
     — still running under a different lifecycle state, or terminated with
     nothing recorded. Neither "reclaimed" nor a swallowed lookup failure."""
     from crucible.alerts import _classify_dispatch_absence
 
-    text = _classify_dispatch_absence("i-0x", lambda _: None)
+    text = _classify_dispatch_absence(
+        LocalStore(tmp_path),
+        "data.heal",
+        "01abc",
+        "i-0x",
+        lambda _: InstanceReading(True, None),
+        _no_log,
+    )
     assert "reclaimed" not in text
-    assert "no termination reason available" in text
-    assert "investigate" in text
+    assert "EC2 knows i-0x and recorded no state reason" in text
+
+
+def test_classify_dispatch_absence_when_ec2_no_longer_knows_the_instance(tmp_path) -> None:
+    """`alpha-engine-config-I11049`, the PRODUCTION case. Measured
+    2026-09-18 under `ne-admin`: `describe-instances` returned
+    `{"Reservations": []}` for all six instances named by that night's pages.
+    That is "EC2 cannot answer a question this old", which the old text
+    ("no termination reason available … investigate the box directly")
+    reported as "the box died without saying why"."""
+    from crucible.alerts import _classify_dispatch_absence
+
+    text = _classify_dispatch_absence(
+        LocalStore(tmp_path),
+        "data.heal",
+        "01abc",
+        "i-02d1de194ea8420d5",
+        lambda _: InstanceReading(False, None),
+        _no_log,
+    )
+    assert "EC2 no longer knows i-02d1de194ea8420d5" in text
+    assert "purged from DescribeInstances" in text
+    assert "no termination reason available" not in text
 
 
 class TestTheGradedDayComesFromTheArgsNotTheClock:
@@ -425,7 +510,10 @@ class TestTheGradedDayComesFromTheArgsNotTheClock:
         )
         assert (
             evaluate_dispatch_absence(
-                store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+                store,
+                now=PAST_HORIZON,
+                describe_instance_state_reason=_no_reason,
+                read_box_log_tail=_no_log,
             )
             == []
         )
@@ -443,7 +531,10 @@ class TestTheGradedDayComesFromTheArgsNotTheClock:
             _manifest_body(AFTER_DISPATCH),
         )
         [page] = evaluate_dispatch_absence(
-            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
         )
         assert page.trading_day == self.REPLAY_TARGET
         assert self.REPLAY_TARGET.isoformat() in page.reason
@@ -459,7 +550,10 @@ class TestTheGradedDayComesFromTheArgsNotTheClock:
         store = LocalStore(tmp_path)
         _write_dispatch(store, args="--gap missing-panel")
         [page] = evaluate_dispatch_absence(
-            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
         )
         assert page.trading_day == DISPATCH_TRADING_DAY
 
@@ -474,7 +568,10 @@ class TestTheGradedDayComesFromTheArgsNotTheClock:
         long_after = DISPATCHED_AT + dt.timedelta(days=30)
         assert (
             evaluate_dispatch_absence(
-                store, now=long_after, describe_instance_state_reason=_no_reason
+                store,
+                now=long_after,
+                describe_instance_state_reason=_no_reason,
+                read_box_log_tail=_no_log,
             )
             == []
         )
@@ -507,7 +604,10 @@ class TestAManifestClearsOnlyItsOwnDispatch:
             _manifest_body(BEFORE_DISPATCH),
         )
         [page] = evaluate_dispatch_absence(
-            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
         )
         assert page.condition == "absence"
         assert page.job == "data.heal"
@@ -545,6 +645,7 @@ class TestAManifestClearsOnlyItsOwnDispatch:
             store,
             now=dispatched_at + dt.timedelta(hours=10),
             describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
         )
         assert page.trading_day == dt.date(2026, 1, 30)
         assert "i-02d1de194ea8420d5" in page.reason
@@ -563,7 +664,10 @@ class TestAManifestClearsOnlyItsOwnDispatch:
             _manifest_body(None),
         )
         [page] = evaluate_dispatch_absence(
-            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
         )
         assert "could not be aged" in page.reason
         assert "not a clear" in page.reason
@@ -576,7 +680,10 @@ class TestAManifestClearsOnlyItsOwnDispatch:
             json.dumps({"status": "ok", "run_id": "01X", "started": "not a time"}).encode(),
         )
         [page] = evaluate_dispatch_absence(
-            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
         )
         assert "could not be aged" in page.reason
 
@@ -597,7 +704,418 @@ class TestAManifestClearsOnlyItsOwnDispatch:
         )
         assert (
             evaluate_dispatch_absence(
-                store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+                store,
+                now=PAST_HORIZON,
+                describe_instance_state_reason=_no_reason,
+                read_box_log_tail=_no_log,
             )
             == []
         )
+
+
+# -- alpha-engine-config-I11048: the range-job rebinding ---------------------
+#
+# The REAL records, copied verbatim out of the v2 store on 2026-09-18
+# rather than invented: the defect was that the tests were written
+# from the docstring's premise ("a range job carries no `--date` at all"),
+# which was false for every dispatch the fleet has ever made.
+
+#: `runs/_dispatch/data.heal/a6e08e3207b59295f0d34c13d6aa84c3.json`, verbatim.
+#: Its manifest is at `runs/data.heal/2026-02-02/run.json` (`--to`), status
+#: ok; the detector looked under `runs/data.heal/2026-08-14/` (`--date`) and
+#: paged.
+REAL_HEAL_RECORD = {
+    "args": (
+        "--date 2026-08-14 --run-mode live --from 2025-11-17 --to 2026-02-02 "
+        "--gap i10733-inst-ownership-null-band-v553618c991dd"
+    ),
+    "attempts": [{"n": 1, "reason": "initial"}],
+    "dispatched_at_utc": "2026-09-17T00:24:50Z",
+    "instance_id": "i-07d9f2bbdc6ee5843",
+    "job": "data.heal",
+    "placed": {"instance_type": "r5a.large", "market": "spot", "subnet_id": "subnet-c670118d"},
+    "schema_version": "dispatch_record.v1",
+}
+
+REAL_HEAL_DISPATCHED_AT = dt.datetime(2026, 9, 17, 0, 24, 50, tzinfo=dt.UTC)
+
+
+def _write_real_record(store: LocalStore, record: dict) -> None:
+    store.put_bytes(
+        dispatch_key(record["job"], "a6e08e3207b59295f0d34c13d6aa84c3"),
+        json.dumps(record).encode(),
+    )
+
+
+def _write_manifest(
+    store: LocalStore, job: str, day: str, started: dt.datetime, *, discriminator: str | None = None
+) -> None:
+    store.put_bytes(
+        manifest_key(job, day, discriminator=discriminator)
+        if discriminator
+        else manifest_key(job, day),
+        json.dumps(
+            {
+                "run_id": "01M2PC6SMMCM6VEMFBGMQZQ5A2",
+                "status": "ok",
+                "started": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        ).encode(),
+    )
+
+
+class TestARangeJobIsGradedAgainstTheKeyItsManifestBindsTo:
+    """`alpha-engine-config-I11048`. `--date` is injected UNCONDITIONALLY by
+    `nous-ergon-ops/scripts/dispatch_crucible_v2_job.sh`, so the tie-break
+    written as unreachable is the one that fires on every range dispatch."""
+
+    def test_the_real_record_with_both_flags_does_not_page_when_its_manifest_exists(
+        self, tmp_path
+    ) -> None:
+        """The issue's own `Closes-when`, on the real record."""
+        store = LocalStore(tmp_path)
+        _write_real_record(store, REAL_HEAL_RECORD)
+        _write_manifest(
+            store, "data.heal", "2026-02-02", REAL_HEAL_DISPATCHED_AT + dt.timedelta(hours=2)
+        )
+        assert (
+            evaluate_dispatch_absence(
+                store,
+                now=REAL_HEAL_DISPATCHED_AT + dt.timedelta(hours=10),
+                describe_instance_state_reason=_no_reason,
+                read_box_log_tail=_no_log,
+            )
+            == []
+        )
+
+    def test_a_manifest_under_the_date_flag_does_NOT_clear_a_range_job(self, tmp_path) -> None:
+        """The other direction, and the one that matters: a range job that
+        really did die must page, named against the day its manifest WOULD
+        have been written under — a day somebody can go and look at."""
+        store = LocalStore(tmp_path)
+        _write_real_record(store, REAL_HEAL_RECORD)
+        _write_manifest(
+            store, "data.heal", "2026-08-14", REAL_HEAL_DISPATCHED_AT + dt.timedelta(hours=2)
+        )
+        [page] = evaluate_dispatch_absence(
+            store,
+            now=REAL_HEAL_DISPATCHED_AT + dt.timedelta(hours=10),
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
+        )
+        assert page.trading_day == dt.date(2026, 2, 2)
+        assert "runs/data.heal/2026-02-02/" in page.reason
+
+    def test_a_non_range_job_still_reads_its_date(self, tmp_path) -> None:
+        """`alpha-engine-config-I10696`'s fix, which this must not undo:
+        `fault.probe` binds to `--date`, and a `--to` in its argv (there is
+        none today) must never outrank it."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(
+            store,
+            job="fault.probe",
+            args="--date 2026-09-11 --run-mode replay --to 2026-09-01",
+        )
+        [page] = evaluate_dispatch_absence(
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
+        )
+        assert page.trading_day == dt.date(2026, 9, 11)
+
+    def test_the_arm_discriminator_still_clears_a_backfill(self, tmp_path) -> None:
+        """Deliverable 3: the detector lists `manifest_prefix(job, day)` and
+        accepts any manifest beneath it, so an arm-scoped key
+        (`m.residual_momentum`) clears — asserted so it stays true now that
+        the day underneath it changed."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(
+            store,
+            job="experiment.backfill",
+            args=(
+                "--date 2026-09-11 --run-mode replay --slot m --arm residual_momentum "
+                "--from 2024-05-01 --to 2026-06-04"
+            ),
+        )
+        _write_manifest(
+            store,
+            "experiment.backfill",
+            "2026-06-04",
+            DISPATCHED_AT + dt.timedelta(hours=1),
+            discriminator="m.residual_momentum",
+        )
+        assert (
+            evaluate_dispatch_absence(
+                store,
+                now=PAST_HORIZON,
+                describe_instance_state_reason=_no_reason,
+                read_box_log_tail=_no_log,
+            )
+            == []
+        )
+
+
+# -- alpha-engine-config-I11049/-I11050/-I11051 -----------------------------
+
+
+def _exit_record(**overrides) -> dict:
+    document = {
+        "schema_version": "dispatch_exit.v1",
+        "dispatch_id": "01abc",
+        "instance_id": "i-0cb52a780eb7eb90c",
+        "job": "data.heal",
+        "argv": "--date 2025-01-21 --from 2025-01-21 --to 2025-01-21",
+        "exit_code": 1,
+        "exit_class": "failed",
+        "last_error_line": (
+            "crucible.data.heal.MissingArtifactError: no fundamentals for 2025-01-21"
+        ),
+        "console_tail": "…\ncrucible data.heal exited 1",
+        "log_group": "/crucible/data.heal",
+        "log_stream": "i-0cb52a780eb7eb90c",
+        "expected_manifest_key": "runs/data.heal/2025-01-21/run.json",
+        "manifest_written": False,
+        "redispatch_expected": False,
+        "next_attempt_dispatch_id": None,
+        "attempts": [{"n": 1, "reason": "initial"}],
+        "finished_at_utc": "2026-08-28T04:30:00Z",
+    }
+    document.update(overrides)
+    return document
+
+
+def _write_exit_record(store: LocalStore, record: dict) -> None:
+    store.put_bytes(
+        dispatch_exit_key(record["job"], record["dispatch_id"]), json.dumps(record).encode()
+    )
+
+
+class TestThePageNamesTheCauseFromTheBoxsOwnExitRecord:
+    """`alpha-engine-config-I11050`'s `Closes-when`: an absence page names
+    the exit code and the failing line WITHOUT any human reading a log."""
+
+    def test_the_exit_record_is_read_before_any_aws_api(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        _write_exit_record(store, _exit_record())
+
+        def fail_if_called(instance_id: str) -> InstanceReading:
+            raise AssertionError("the EC2 rung must not be reached when an exit record exists")
+
+        def no_logs(job: str, instance_id: str) -> str | None:
+            raise AssertionError("the CloudWatch rung must not be reached either")
+
+        [page] = evaluate_dispatch_absence(
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=fail_if_called,
+            read_box_log_tail=no_logs,
+        )
+        assert "the box recorded its own exit: failed (code 1)" in page.reason
+        assert "MissingArtifactError" in page.reason
+        assert "/crucible/data.heal :: i-0cb52a780eb7eb90c" in page.reason
+        assert "investigate the box directly" not in page.reason
+
+    def test_an_argparse_refusal_reads_as_a_malformed_dispatch(self, tmp_path) -> None:
+        """Measured 2026-09-17 on `i-04653230d4780dede`: `unrecognized
+        arguments: --date 2026-09-17`, exit 2 — the box, the wheel, the store
+        and the data were all fine."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        _write_exit_record(
+            store,
+            _exit_record(
+                exit_code=2,
+                exit_class="refused",
+                last_error_line="crucible: error: unrecognized arguments: --date 2026-09-17",
+            ),
+        )
+        [page] = evaluate_dispatch_absence(
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
+        )
+        assert "refused (code 2)" in page.reason
+        assert "unrecognized arguments" in page.reason
+
+    def test_an_unreadable_exit_record_is_not_silently_a_missing_one(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        store.put_bytes(dispatch_exit_key("data.heal", "01abc"), b"{not json")
+        [page] = evaluate_dispatch_absence(
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
+        )
+        assert "could not be read" in page.reason
+        assert "01abc.exit.json" in page.reason
+
+
+class TestTheCloudWatchRungIsReadWhenThereIsNoExitRecord:
+    """`alpha-engine-config-I11050`: the evidence was never missing. Every
+    one of the six instances measured on 2026-09-18 had a complete stream."""
+
+    def test_the_last_error_line_of_the_stream_is_rendered(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _write_dispatch(store, instance_id="i-025a6e0286a1bc4d0")
+
+        def stream(job: str, instance_id: str) -> str:
+            assert (job, instance_id) == ("data.heal", "i-025a6e0286a1bc4d0")
+            return (
+                "starting crucible data.heal\n"
+                "crucible.weekly.ArcStageFailed: experiment.run[r] raised "
+                "MissingArtifactError\n"
+                "crucible data.heal exited 1\n"
+            )
+
+        [page] = evaluate_dispatch_absence(
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=stream,
+        )
+        assert "ArcStageFailed" in page.reason
+        assert "/crucible/data.heal :: i-025a6e0286a1bc4d0" in page.reason
+
+    def test_nothing_anywhere_is_its_own_louder_page(self, tmp_path) -> None:
+        """Deliverable 4: no manifest AND no exit record AND no stream means
+        the box never reached its trap — a boot failure or a hard reclaim,
+        which is a genuinely different remediation."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        [page] = evaluate_dispatch_absence(
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
+        )
+        assert "NOTHING recorded this box's exit" in page.reason
+        assert "died before reaching its trap" in page.reason
+
+
+class TestAnUnkeptRedispatchIsNamedAsOne:
+    """`alpha-engine-config-I11051`. The reclaimed path suppresses its
+    manifest on the promise that the dispatcher re-launches the job. On
+    2026-09-15 that promise was not kept for one of eight EDGAR re-heal
+    chunks and nothing said so for three days."""
+
+    RECLAIMED = dict(
+        exit_code=1,
+        exit_class="spot_reclaimed",
+        last_error_line=(
+            "crucible.runner.SpotInterruptionError: spot_interruption: received signal 15"
+        ),
+        redispatch_expected=True,
+        next_attempt_dispatch_id="01abc-r2",
+    )
+
+    def test_a_reclaimed_attempt_with_no_successor_pages_as_unkept(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        _write_exit_record(store, _exit_record(**self.RECLAIMED))
+        [page] = evaluate_dispatch_absence(
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
+        )
+        assert "RECLAIMED AND THE RE-DISPATCH WAS NOT KEPT" in page.reason
+        assert "01abc-r2" in page.reason
+
+    def test_a_reclaimed_attempt_whose_successor_exists_says_so(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        _write_exit_record(store, _exit_record(**self.RECLAIMED))
+        store.put_bytes(
+            dispatch_key("data.heal", "01abc-r2"),
+            json.dumps(
+                {
+                    "job": "data.heal",
+                    "args": "--from 2025-01-21 --to 2025-01-21",
+                    "instance_id": "i-0successor",
+                    "dispatched_at_utc": (DISPATCHED_AT + dt.timedelta(minutes=8)).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                    "attempts": [{"n": 1, "reason": "initial"}, {"n": 2, "reason": "spot"}],
+                }
+            ).encode(),
+        )
+        pages = evaluate_dispatch_absence(
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
+        )
+        first = next(page for page in pages if "01abc.json" in page.reason)
+        assert "re-dispatched as 01abc-r2" in first.reason
+        assert "NOT KEPT" not in first.reason
+
+    def test_the_attempt_ceiling_matches_the_runners(self) -> None:
+        """Two constants, one fact — asserted rather than left to agree."""
+        from crucible.alerts import MAX_DISPATCH_ATTEMPTS
+        from crucible.runner import MAX_ATTEMPTS
+
+        assert MAX_DISPATCH_ATTEMPTS == MAX_ATTEMPTS
+
+
+class TestAHoleInAFannedOutGapIsVisibleAsAHole:
+    """`alpha-engine-config-I11051` deliverable 4: seven of eight succeeding
+    was indistinguishable from eight of eight on every surface."""
+
+    def test_the_page_names_how_many_siblings_landed(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        gap = "i10733-edgar-fundamentals-reheal-v553618c991dd"
+        landed = [("2022-07-29", "chunk1"), ("2023-09-29", "chunk2")]
+        for day, dispatch_id in landed:
+            _write_dispatch(
+                store,
+                dispatch_id=dispatch_id,
+                args=f"--date {day} --from 2022-01-03 --to {day} --gap {gap} --run-mode live",
+            )
+            _write_manifest(store, "data.heal", day, DISPATCHED_AT + dt.timedelta(hours=1))
+        _write_dispatch(
+            store,
+            dispatch_id="chunk3",
+            args=f"--date 2026-01-30 --from 2025-07-01 --to 2026-01-30 --gap {gap} --run-mode live",
+        )
+        pages = evaluate_dispatch_absence(
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
+        )
+        [page] = [page for page in pages if page.trading_day == dt.date(2026, 1, 30)]
+        assert f"one of 3 chunks fanned out for gap {gap!r}" in page.reason
+        assert "2 of them have a manifest" in page.reason
+        assert "INCONSISTENT" in page.reason
+
+    def test_a_dispatch_with_no_gap_says_nothing_about_fan_out(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        [page] = evaluate_dispatch_absence(
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
+        )
+        assert "chunks fanned out" not in page.reason
+
+
+def test_an_exit_record_is_never_read_back_as_a_dispatch_record(tmp_path) -> None:
+    """The trap this key shape sets: both documents live under
+    `runs/_dispatch/{job}/` and both end `.json`. An exit record parsed as a
+    dispatch record would be a dispatch with no manifest anywhere near it —
+    the detector meant to explain absences would MANUFACTURE one per box."""
+    store = LocalStore(tmp_path)
+    _write_dispatch(store)
+    _write_exit_record(store, _exit_record(exit_code=0, exit_class="ok", manifest_written=True))
+    pages = evaluate_dispatch_absence(
+        store,
+        now=PAST_HORIZON,
+        describe_instance_state_reason=_no_reason,
+        read_box_log_tail=_no_log,
+    )
+    assert len(pages) == 1
