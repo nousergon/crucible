@@ -1,0 +1,204 @@
+{
+  "$defs": {
+    "AttemptRow": {
+      "additionalProperties": false,
+      "description": "\u00a711 risk 2: one attempt this run made, including the declared\ntransient-class retry. A run that executed once records one attempt, so a\nretried run cannot be mistaken for a clean first-attempt run.",
+      "properties": {
+        "n": {
+          "minimum": 1,
+          "title": "N",
+          "type": "integer"
+        },
+        "reason": {
+          "description": "Why THIS attempt happened. `initial` for the first; otherwise the declared transient class that caused the retry. The class grows only by PR with the failure named.",
+          "enum": [
+            "initial",
+            "spot_interruption",
+            "provider_5xx",
+            "provider_timeout",
+            "s3_throttling"
+          ],
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "n",
+        "reason"
+      ],
+      "title": "AttemptRow",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "`dispatch_exit.v1`, at\n`runs/_dispatch/{job}/{dispatch_id}.exit.json` (`crucible.keys.\ndispatch_exit_key`), written by `crucible.dispatch_exit` from the box's\nEXIT trap \u2014 and by the bootstrap shell when the box died before the wheel\nwas installed.\n\n**Why this document exists** (`alpha-engine-config-I11050`). An absence\npage could say *no manifest*; it could not say *why*, and it ended by\ntelling a human to go and look at a box that EC2 had already purged. The\nevidence was never missing \u2014 every dispatched instance shipped a complete\nCloudWatch stream \u2014 but nothing joined the three surfaces that each knew\nthe instance id. This is the join, written by the only party that knows\nits own exit code before the process ends.\n\n**It does not replace the manifest.** `crucible/AGENTS.md` rule 1\n(\"manifest or it did not happen\") is unchanged: a run that produced\nsomething writes a manifest, and `manifest_written` here RECORDS whether\nit did rather than standing in for it. The one path that deliberately\nwrites no manifest \u2014 a spot-reclaimed attempt, suppressed so two attempts\ncannot both claim one key \u2014 is exactly the path this document makes\nhonest.\n\nEvery field is required and nullable rather than optional with a default,\nthe same rule `SignalsRow` states: an omitted field is indistinguishable\nfrom a forgotten one.",
+  "properties": {
+    "argv": {
+      "description": "what the box was actually told to run, verbatim. Empty is legal (a handler taking no arguments); absent is not.",
+      "title": "Argv",
+      "type": "string"
+    },
+    "attempts": {
+      "anyOf": [
+        {
+          "items": {
+            "$ref": "#/$defs/AttemptRow"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "this dispatch's attempt ladder as the box was told it (`CRUCIBLE_DISPATCH_ATTEMPTS`), or `null` on a bootstrap failure that never read it.",
+      "title": "Attempts"
+    },
+    "console_tail": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "the last 4000 characters of the box console, or `null` when there was none. Bounded \u2014 see DISPATCH_EXIT_CONSOLE_TAIL_MAX.",
+      "title": "Console Tail"
+    },
+    "dispatch_id": {
+      "description": "the dispatch this record terminates \u2014 the same path segment `crucible.keys.dispatch_key` writes the REQUEST under, which is what joins the two documents.",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_.-]+$",
+      "title": "Dispatch Id",
+      "type": "string"
+    },
+    "exit_class": {
+      "enum": [
+        "ok",
+        "failed",
+        "spot_reclaimed",
+        "bootstrap_failed",
+        "refused"
+      ],
+      "title": "Exit Class",
+      "type": "string"
+    },
+    "exit_code": {
+      "description": "the process exit status the trap observed. 143 is a signal exit (128+SIGTERM), which on this substrate is a reclaim or a shutdown.",
+      "title": "Exit Code",
+      "type": "integer"
+    },
+    "expected_manifest_key": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "the key this dispatch's manifest binds to, as the BOX resolved it \u2014 the authoritative answer to 'which manifest', written by the party that actually wrote (or did not write) it.",
+      "title": "Expected Manifest Key"
+    },
+    "finished_at_utc": {
+      "description": "RFC 3339, UTC, `Z`. When the trap ran \u2014 which is the only instant a reader can age this record against.",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+      "title": "Finished At Utc",
+      "type": "string"
+    },
+    "instance_id": {
+      "description": "the box. It is also the CloudWatch stream name, which is how a reader gets from this record to the full console without deriving anything.",
+      "minLength": 1,
+      "title": "Instance Id",
+      "type": "string"
+    },
+    "job": {
+      "minLength": 1,
+      "title": "Job",
+      "type": "string"
+    },
+    "last_error_line": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "the last line of the console that names a failure, or `null` when the box exited clean. This is what an absence page renders, so a page names a cause in the words the box used rather than in the detector's.",
+      "title": "Last Error Line"
+    },
+    "log_group": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Log Group"
+    },
+    "log_stream": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Log Stream"
+    },
+    "manifest_written": {
+      "description": "did this attempt write its manifest? `false` with `exit_class: spot_reclaimed` is the DECLARED suppression; `false` with any other class is a run that died before it could record itself.",
+      "title": "Manifest Written",
+      "type": "boolean"
+    },
+    "next_attempt_dispatch_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "the dispatch id the successor attempt will be recorded under when `redispatch_expected` is true and this attempt could name it, else `null`. A detector that has it checks one key instead of listing a prefix.",
+      "title": "Next Attempt Dispatch Id"
+    },
+    "redispatch_expected": {
+      "description": "did this attempt end declaring that another attempt is owed? A reclaimed attempt writes no manifest because another one will; this is that promise, recorded where a detector can check whether it was kept.",
+      "title": "Redispatch Expected",
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": "dispatch_exit.v1",
+      "title": "Schema Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "dispatch_id",
+    "instance_id",
+    "job",
+    "argv",
+    "exit_code",
+    "exit_class",
+    "last_error_line",
+    "console_tail",
+    "log_group",
+    "log_stream",
+    "expected_manifest_key",
+    "manifest_written",
+    "redispatch_expected",
+    "next_attempt_dispatch_id",
+    "attempts",
+    "finished_at_utc"
+  ],
+  "title": "DispatchExitDocument",
+  "type": "object"
+}

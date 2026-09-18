@@ -56,8 +56,12 @@ from crucible.documents import (
 from crucible.keys import (
     ALERTS_ROOT,
     DISPATCH_ROOT,
+    RANGE_BOUND_JOBS,
     RUNS_ROOT,
     arena_cycle_key,
+    dispatch_exit_key,
+    dispatch_key,
+    dispatch_prefix,
     is_manifest_key,
     manifest_key,
     parse_bus_key,
@@ -65,7 +69,12 @@ from crucible.keys import (
     parse_manifest_key,
 )
 from crucible.manifest import manifest_prefix
-from crucible.models import ArenaCycleDocument, DispatchRecordDocument
+from crucible.models import (
+    DISPATCH_EXIT_CLASS_RECLAIMED,
+    ArenaCycleDocument,
+    DispatchExitDocument,
+    DispatchRecordDocument,
+)
 from crucible.release_history import UNDECLARED, ReleaseInForce
 from crucible.required import require_env
 from crucible.slots import SLOTS
@@ -85,6 +94,7 @@ __all__ = [
     "CAUSE_MATCHERS",
     "CEILING_WINDOW_TRADING_DAYS",
     "DISPATCH_ABSENCE_HORIZON",
+    "InstanceReading",
     "IndistinguishableInvocation",
     "indistinguishable_invocation_findings",
     "indistinguishable_invocation_metric",
@@ -813,12 +823,42 @@ def evaluate_absence(
 DISPATCH_ABSENCE_HORIZON = dt.timedelta(hours=3)
 
 
-def _default_describe_instance_state_reason(instance_id: str) -> str | None:
-    """`ec2:DescribeInstances`'s `StateReason.Message` for ``instance_id``, or
-    ``None`` if the instance describes with no reason (still running, or
-    terminated with nothing recorded). Constructed lazily — same reason as
-    `_default_sns` — and this is the ONLY place in this module that touches
-    EC2."""
+@dataclass(frozen=True)
+class InstanceReading:
+    """What `ec2:DescribeInstances` actually said about one instance.
+
+    **Two facts, not one** (`alpha-engine-config-I11049`). The old return
+    type was `str | None`, and `None` meant BOTH "EC2 described the instance
+    and recorded no reason" and "EC2 does not know this instance any more".
+    Those are different findings with different remediations, and folding
+    them produced the sentence every page on 2026-09-18 ended with — *no
+    termination reason available … investigate the box directly* — for six
+    instances EC2 had simply purged. `known` is the discriminator, and it is
+    a field rather than a sentinel string so a caller cannot read past it.
+    """
+
+    known: bool
+    reason: str | None
+
+
+def _default_describe_instance_state_reason(instance_id: str) -> InstanceReading:
+    """`ec2:DescribeInstances`'s `StateReason.Message` for ``instance_id``.
+
+    Constructed lazily — same reason as `_default_sns` — and this is the ONLY
+    place in this module that touches EC2.
+
+    **It is the LAST rung of the ladder now, and cannot be the first.**
+    Measured 2026-09-18 under `ne-admin`: all six instances named by that
+    night's pages returned `{"Reservations": []}` — not AccessDenied, not
+    throttled, simply gone. EC2 keeps a terminated instance visible for about
+    an hour; :data:`DISPATCH_ABSENCE_HORIZON` is three, and the sweep is
+    daily on top of that, so `Server.SpotInstanceTermination` — the marker
+    the classifier was built on — is unreachable for every page this detector
+    can fire. The transport is the defect, not the horizon
+    (`alpha-engine-config-I11032` owns the horizon and it is not widened to
+    chase this window): the durable evidence is the exit record and the
+    CloudWatch stream, and both are read before this.
+    """
     import boto3  # noqa: PLC0415 - lazy on purpose
 
     ec2 = boto3.client("ec2")
@@ -826,9 +866,51 @@ def _default_describe_instance_state_reason(instance_id: str) -> str | None:
     for reservation in response.get("Reservations", ()):
         for instance in reservation.get("Instances", ()):
             message = instance.get("StateReason", {}).get("Message")
-            if message:
-                return message
-    return None
+            return InstanceReading(True, message or None)
+    return InstanceReading(False, None)
+
+
+#: The log group a dispatched box ships its console to; the stream is the
+#: instance id. Both are stated in the exit record, and this is the shape to
+#: fall back to when there is no exit record to read them from.
+BOX_LOG_GROUP_TEMPLATE = "/crucible/{job}"
+
+
+def _default_read_box_log_tail(job: str, instance_id: str) -> str | None:
+    """The tail of the box's CloudWatch stream, or ``None`` if there is none.
+
+    `alpha-engine-config-I11050`'s second rung. Measured 2026-09-18: every
+    one of the six instances named by that night's pages HAD a complete
+    stream at `/crucible/{job}` :: `{instance_id}` stating the real outcome —
+    `SpotInterruptionError: received signal 15`, `unrecognized arguments:
+    --date 2026-09-17`, `ArmPredictionsContractError`, `ArcStageFailed …
+    MissingArtifactError`. The page printed the instance id and told a human
+    to go and read exactly this.
+
+    It is the FALLBACK, never the mechanism: CloudWatch is a second system
+    with its own retention and its own IAM, and the box is the only party
+    that knows its exit code before the process ends. The exit record is read
+    first.
+    """
+    import boto3  # noqa: PLC0415 - lazy on purpose
+
+    logs = boto3.client("logs")
+    response = logs.get_log_events(
+        logGroupName=BOX_LOG_GROUP_TEMPLATE.format(job=job),
+        logStreamName=instance_id,
+        limit=_BOX_LOG_TAIL_EVENTS,
+        startFromHead=False,
+    )
+    lines = [event.get("message", "").rstrip() for event in response.get("events", ())]
+    text = "\n".join(line for line in lines if line)
+    return text or None
+
+
+#: How many trailing console events the CloudWatch fallback reads. The box
+#: ships one event per console line; the last few dozen carry the traceback
+#: and the wrapper's own `exited N`, and reading the whole stream would make
+#: a sweep's cost a function of how noisy the failing box was.
+_BOX_LOG_TAIL_EVENTS = 60
 
 
 #: `ec2:DescribeInstances`' own `StateReason.Message` for a spot-reclaimed
@@ -841,34 +923,179 @@ def _default_describe_instance_state_reason(instance_id: str) -> str | None:
 _SPOT_RECLAMATION_MARKER = "Server.SpotInstanceTermination"
 
 
+def _read_dispatch_exit_record(store: Store, job: str, dispatch_id: str) -> Any:
+    """The dispatch's own terminal record, or ``None`` when there is none.
+
+    Returns a validated :class:`crucible.models.DispatchExitDocument`, a
+    ``str`` describing why the record could not be used, or ``None`` when the
+    box wrote none. Three outcomes rather than two for the same reason
+    :class:`_ClearingVerdict` has three: "there is no record" and "there is a
+    record I cannot read" are different findings, and the second is a defect
+    in the writer that must not read as the first.
+    """
+    key = dispatch_exit_key(job, dispatch_id)
+    # `read_store_document`, never `json.loads(store.get_bytes(...))`: one
+    # reader owns every read of stored JSON in this package
+    # (`alpha-engine-config-I9931`), and it is what separates ABSENT — the
+    # ordinary case here, since most dispatches predate this document — from
+    # UNREADABLE, which is a defect in the writer.
+    read = read_store_document(store, key)
+    if read.absent:
+        return None
+    if read.problem is not None or read.document is None:
+        return f"the exit record {key} could not be read: {read.problem}"
+    try:
+        return DispatchExitDocument.model_validate(read.document)
+    except ValidationError as exc:
+        return f"the exit record {key} does not conform ({exc})"
+
+
+def _exit_record_classification(record: Any, successor_present: bool | None) -> str:
+    """An absence page's cause sentence, built from the box's own account."""
+    detail = (
+        f"the box recorded its own exit: {record.exit_class} (code {record.exit_code}), "
+        f"manifest_written={str(record.manifest_written).lower()}"
+    )
+    if record.last_error_line:
+        detail += f'; last error line: "{record.last_error_line}"'
+    if record.log_group and record.log_stream:
+        detail += f"; full console {record.log_group} :: {record.log_stream}"
+    if record.exit_class == DISPATCH_EXIT_CLASS_RECLAIMED:
+        if not record.redispatch_expected:
+            detail += (
+                " — reclaimed with the attempt ladder exhausted; this dispatch is "
+                "genuinely over and the work did not happen"
+            )
+        elif successor_present is True:
+            detail += (
+                f" — reclaimed and re-dispatched as {record.next_attempt_dispatch_id}; "
+                "grade the successor, not this record"
+            )
+        elif successor_present is False:
+            # `alpha-engine-config-I11051`. THE finding this ladder exists
+            # for: the reclaimed path suppresses its manifest on the promise
+            # that the dispatcher re-launches the job, and on 2026-09-15 that
+            # promise was not kept for one of eight EDGAR re-heal chunks —
+            # the re-dispatch raised `InvalidParameterValue: User data is
+            # limited to 16384 bytes` — leaving seven months of sessions
+            # un-re-healed with nothing saying so for three days.
+            detail += (
+                f" — RECLAIMED AND THE RE-DISPATCH WAS NOT KEPT: this attempt declared "
+                f"a successor ({record.next_attempt_dispatch_id}) and no dispatch record "
+                "for it exists. The manifest suppression was made on that promise, so "
+                "the work did not happen and nothing else says so; re-dispatch it"
+            )
+        else:
+            detail += (
+                " — reclaimed; the successor could not be looked up, so whether the "
+                "re-dispatch was kept is unknown"
+            )
+    return detail
+
+
 def _classify_dispatch_absence(
-    instance_id: str, describe_instance_state_reason: Callable[[str], str | None]
+    store: Store,
+    job: str,
+    dispatch_id: str,
+    instance_id: str,
+    describe_instance_state_reason: Callable[[str], InstanceReading],
+    read_box_log_tail: Callable[[str, str], str | None],
+    successor_present: bool | None = None,
 ) -> str:
     """The text folded into an absence page's ``reason`` naming WHICH kind of
     gone the dispatched instance is.
 
     Deliberately a **string**, not a new field or a third page condition:
     §4.6's two conditions stand, and this only adds words to the existing
-    ABSENCE page. Never raises — `ec2:DescribeInstances` denied, throttled,
-    or the instance already gone from the API entirely all fold into the
-    "could not classify" branch, because a classifier that can also silence
-    the page it enriches is worse than no classifier at all (`crucible/AGENTS.md`
-    rule 5: this is a deliberate swallow, and it is recorded here — the
-    failure mode swallowed is "the describe-instances call itself failed",
-    and the page still fires, with this exact text as its recording surface).
+    ABSENCE page.
+
+    **A ladder over three sources, durable first**
+    (`alpha-engine-config-I11049`/`-I11050`):
+
+      1. the **exit record** the box wrote from its own EXIT trap
+         (`crucible.dispatch_exit`) — authoritative, because the box is the
+         only party that knows its exit code before the process ends, and
+         durable, because it is an object in the store;
+      2. the **CloudWatch stream** `/crucible/{job}` :: `{instance_id}` —
+         present for every one of the six instances measured on 2026-09-18,
+         and a second system with its own retention, so a fallback rather
+         than the mechanism;
+      3. `ec2:DescribeInstances` — which, measured the same day, knew none of
+         those six instances. It keeps a terminated instance for ~1h and this
+         detector cannot page before 3h, so it is LAST and its silence is
+         reported as what it is.
+
+    Never raises. Every rung's transport failure folds into text, because a
+    classifier that can also silence the page it enriches is worse than no
+    classifier at all (`crucible/AGENTS.md` rule 5: a deliberate swallow,
+    recorded here — the failure mode swallowed is "a rung of the ladder could
+    not be read", the primary deliverable (the page) still fires, and this
+    text is the recording surface).
     """
+    record = _read_dispatch_exit_record(store, job, dispatch_id)
+    if isinstance(record, DispatchExitDocument):
+        return _exit_record_classification(record, successor_present)
+    unreadable_exit_record = record if isinstance(record, str) else None
+
     try:
-        reason = describe_instance_state_reason(instance_id)
-    except Exception as exc:  # noqa: BLE001 - see docstring: enrichment, not detection
-        return (
+        tail = read_box_log_tail(job, instance_id)
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        tail = None
+        log_problem: str | None = f"its CloudWatch stream could not be read ({exc!r})"
+    else:
+        log_problem = None
+    if tail:
+        from crucible.dispatch_exit import last_error_line  # noqa: PLC0415 - import cycle
+
+        named = last_error_line(tail)
+        said = f'last error line: "{named}"' if named else "no line in it names an error"
+        prefix = (
+            "no exit record (the box died before its trap, or is running an older "
+            "release); its CloudWatch stream "
+            f"{BOX_LOG_GROUP_TEMPLATE.format(job=job)} :: {instance_id} says: {said}"
+        )
+        return f"{unreadable_exit_record}; {prefix}" if unreadable_exit_record else prefix
+
+    try:
+        reading = describe_instance_state_reason(instance_id)
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        ec2_text = (
             f"termination cause unknown ({instance_id}): ec2:DescribeInstances failed "
             f"({exc!r}); classify by hand"
         )
-    if reason and _SPOT_RECLAMATION_MARKER in reason:
-        return f"reclaimed by AWS ({reason}) — re-dispatch is the fix, not investigation"
-    if reason:
-        return f"instance state reason: {reason} — investigate the box directly"
-    return f"no termination reason available for {instance_id} — investigate the box directly"
+    else:
+        if reading.reason and _SPOT_RECLAMATION_MARKER in reading.reason:
+            ec2_text = (
+                f"reclaimed by AWS ({reading.reason}) — re-dispatch is the fix, not investigation"
+            )
+        elif reading.reason:
+            ec2_text = f"instance state reason: {reading.reason} — investigate the box directly"
+        elif reading.known:
+            ec2_text = (
+                f"EC2 knows {instance_id} and recorded no state reason — it is still "
+                "running, or it terminated with nothing recorded"
+            )
+        else:
+            # The production case, and the whole of `alpha-engine-config-
+            # I11049`: EC2 purges a terminated instance after ~1h and this
+            # page cannot fire before 3h. Saying "no reason available" made
+            # that read as "the box died without saying why".
+            ec2_text = (
+                f"EC2 no longer knows {instance_id} (an instance is purged from "
+                "DescribeInstances roughly an hour after termination, and this page "
+                "cannot fire before 3h) — EC2 cannot classify a page this old"
+            )
+    missing = [
+        "no exit record",
+        log_problem or "no CloudWatch stream",
+    ]
+    if unreadable_exit_record:
+        missing[0] = unreadable_exit_record
+    return (
+        f"{'; '.join(missing)}; {ec2_text}. NOTHING recorded this box's exit: it died "
+        "before reaching its trap — a boot failure or a hard reclaim — which is the one "
+        "case the EC2 API and the spot-interruption event are worth consulting"
+    )
 
 
 @dataclass(frozen=True)
@@ -1122,7 +1349,8 @@ def evaluate_dispatch_absence(
     now: dt.datetime | None = None,
     horizon: dt.timedelta = DISPATCH_ABSENCE_HORIZON,
     access_faults: list[str] | None = None,
-    describe_instance_state_reason: Callable[[str], str | None] | None = None,
+    describe_instance_state_reason: Callable[[str], InstanceReading] | None = None,
+    read_box_log_tail: Callable[[str, str], str | None] | None = None,
 ) -> list[Page]:
     """Page for every ON-DEMAND dispatch whose manifest never appeared.
 
@@ -1174,18 +1402,28 @@ def evaluate_dispatch_absence(
     list to keep evaluating past an unreadable prefix and let the caller
     raise after paging what it found; leave it ``None`` for the loud default.
 
-    `alpha-engine-config-I10149` part B: the page's ``reason`` also says
-    WHICH kind of gone the instance is — a spot reclamation
-    (`ec2:DescribeInstances`' `StateReason.Message` naming
-    `Server.SpotInstanceTermination`, measured on five of eleven backfill
-    boxes on 2026-09-07) calls for a re-dispatch, where a box that died
-    mid-run or never started calls for investigation. This is text added to
-    the existing ABSENCE condition, never a third condition (§4.6's two
-    stand), and it never suppresses the page: a `describe_instance_state_reason`
-    failure folds into an "unclassified, investigate by hand" reason rather
-    than swallowing the page itself (see :func:`_classify_dispatch_absence`).
-    ``describe_instance_state_reason`` is the injection point for tests —
-    leave it ``None`` for the real `ec2:DescribeInstances` call.
+    **The page says WHY, from evidence that still exists**
+    (`alpha-engine-config-I10149` part B, repaired by `-I11049`/`-I11050`).
+    `_classify_dispatch_absence` walks a three-rung ladder — the box's own
+    exit record, then its CloudWatch stream, then `ec2:DescribeInstances` —
+    so the page names the exit code and the failing line instead of ending
+    "investigate the box directly". The EC2 rung is LAST because it is the
+    one that cannot answer: measured 2026-09-18, all six instances named by
+    that night's pages were already purged from `DescribeInstances`, which
+    keeps a terminated instance for ~1h against this detector's 3h horizon.
+
+    This is text added to the existing ABSENCE condition, never a third
+    condition (§4.6's two stand), and it never suppresses the page: a failure
+    on any rung folds into the reason rather than swallowing the page itself.
+    ``describe_instance_state_reason`` and ``read_box_log_tail`` are the
+    injection points for tests — leave them ``None`` for the real
+    `ec2:DescribeInstances` / `logs:GetLogEvents` calls.
+
+    **And the page grades the SET when there is one**
+    (`alpha-engine-config-I11051`): a dispatch carrying `--gap` is one chunk
+    of a fan-out, and :func:`_gap_fanout_detail` says how many of its
+    siblings landed, so seven of eight healing stops being indistinguishable
+    from eight of eight.
     """
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
     oldest_graded_day = resolve_trading_day(moment)
@@ -1202,7 +1440,7 @@ def evaluate_dispatch_absence(
         parsed = parse_dispatch_key(key)
         if parsed is None:
             continue
-        job, _dispatch_id = parsed
+        job, dispatch_id = parsed
         read = read_listed_document(store, key)
         if read.problem is not None or read.document is None:
             problem = f"dispatch record {key!r} is unreadable: {read.problem}"
@@ -1259,7 +1497,7 @@ def evaluate_dispatch_absence(
         # the window it is answerable for everything else.
         if resolve_trading_day(dispatched_at) < oldest_graded_day:
             continue
-        trading_day = _dispatch_target_trading_day(args, dispatched_at)
+        trading_day = _dispatch_target_trading_day(job, args, dispatched_at)
         prefix = manifest_prefix(job, trading_day.isoformat())
         verdict = _manifest_clears_dispatch(store, prefix, dispatched_at)
         if verdict.listing_problem is not None:
@@ -1274,9 +1512,15 @@ def evaluate_dispatch_absence(
             classification = "no instance_id recorded — investigate the box directly"
         else:
             classification = _classify_dispatch_absence(
+                store,
+                job,
+                dispatch_id,
                 instance_id,
                 describe_instance_state_reason or _default_describe_instance_state_reason,
+                read_box_log_tail or _default_read_box_log_tail,
+                _successor_dispatch_present(store, job, dispatch_id),
             )
+        fanout = _gap_fanout_detail(store, job, args, dispatched_at, moment, horizon)
         pages.append(
             Page(
                 condition="absence",
@@ -1288,6 +1532,7 @@ def evaluate_dispatch_absence(
                     f"{verdict.detail} under {prefix} after "
                     f"{horizon.total_seconds() / 3600:.0f}h, now "
                     f"{moment.strftime('%Y-%m-%dT%H:%M:%SZ')}; {classification}"
+                    f"{fanout}"
                 ),
                 synthetic=synthetic,
             )
@@ -1295,7 +1540,113 @@ def evaluate_dispatch_absence(
     return pages
 
 
-def _dispatch_target_trading_day(args: Any, dispatched_at: dt.datetime) -> dt.date:
+def _successor_dispatch_present(store: Store, job: str, dispatch_id: str) -> bool | None:
+    """Does a re-dispatch record for ``dispatch_id`` exist?
+
+    `alpha-engine-config-I11051`. A reclaimed attempt is re-launched by the
+    dispatcher under `{prior}-r{n}`, and the reclaimed attempt writes NO
+    manifest on the ground that the successor will. Nothing checked that the
+    successor happened, so an unkept promise looked exactly like a kept one:
+    measured 2026-09-15, one of eight EDGAR re-heal chunks was reclaimed, its
+    re-dispatch raised inside the dispatcher Lambda, and ~7 months of
+    sessions went un-re-healed for three days with no surface saying so.
+
+    ``None`` when the store could not be asked — an unanswerable question is
+    reported as unanswered, never as "no successor", which would page a kept
+    re-dispatch as a broken one.
+    """
+    for n in range(2, MAX_DISPATCH_ATTEMPTS + 1):
+        try:
+            store.get_bytes(dispatch_key(job, f"{dispatch_id}-r{n}"))
+        except KeyError:
+            continue
+        except Exception:  # noqa: BLE001 - see docstring: unanswerable, not negative
+            return None
+        return True
+    return False
+
+
+def _gap_fanout_detail(
+    store: Store,
+    job: str,
+    args: Any,
+    dispatched_at: dt.datetime,
+    moment: dt.datetime,
+    horizon: dt.timedelta,
+) -> str:
+    """ " — chunk N of M for gap X", or "" when this dispatch is not one of a set.
+
+    `alpha-engine-config-I11051` deliverable 4: **grade the layer, not the
+    dispatch.** A `--gap` is healed by fanning it out over chunks, and seven
+    of eight succeeding was indistinguishable from eight of eight on every
+    surface — each chunk is its own dispatch, and a page about one box says
+    nothing about the set it belongs to.
+
+    Rendered into the EXISTING absence page rather than emitted as a new
+    condition: §4.6's two conditions stand, and the page that already fires
+    for the missing chunk is the right carrier for the sentence saying the
+    layer is now inconsistent across that boundary.
+
+    Silent (``""``) for anything that is not a gap fan-out, and silent when
+    the store cannot be listed — the page itself is not conditional on this
+    enrichment succeeding.
+    """
+    gap = _flag_value(args, "--gap")
+    if not gap:
+        return ""
+    window = dispatched_at - _GAP_FANOUT_WINDOW
+    siblings: list[tuple[str, dt.datetime, str]] = []
+    try:
+        keys = sorted(store.list_keys(dispatch_prefix(job)))
+    except Exception:  # noqa: BLE001 - enrichment; the page fires either way
+        return ""
+    for key in keys:
+        parsed = parse_dispatch_key(key)
+        if parsed is None:
+            continue
+        read = read_listed_document(store, key)
+        if read.problem is not None or read.document is None:
+            # An unreadable sibling is not a hole in the fan-out and is not
+            # this sentence's business — `evaluate_dispatch_absence` pages on
+            # it in its own right, from the same read, one loop up.
+            continue
+        document = read.document
+        sibling_args = document.get("args")
+        if _flag_value(sibling_args, "--gap") != gap:
+            continue
+        at = _parse_dispatch_time(document.get("dispatched_at_utc"))
+        if at is None or at < window or at > dispatched_at + _GAP_FANOUT_WINDOW:
+            continue
+        siblings.append((key, at, sibling_args or ""))
+    if len(siblings) < 2:
+        return ""
+    landed = 0
+    for _key, at, sibling_args in siblings:
+        day = _dispatch_target_trading_day(job, sibling_args, at)
+        if _manifest_clears_dispatch(store, manifest_prefix(job, day.isoformat()), at).cleared:
+            landed += 1
+    return (
+        f"; this dispatch is one of {len(siblings)} chunks fanned out for gap {gap!r} "
+        f"and {landed} of them have a manifest from this fan-out — the layer is "
+        "INCONSISTENT across this chunk's boundary while the chunks around it are "
+        "healed"
+    )
+
+
+#: How far either side of a dispatch a sibling chunk of the same `--gap` is
+#: taken to belong to the same fan-out. A gap is fanned out in one burst (the
+#: eight EDGAR chunks on 2026-09-15 went out over 55 seconds); a day is
+#: generous headroom for a slow dispatcher without folding a LATER, separate
+#: heal of the same gap into the same set.
+_GAP_FANOUT_WINDOW = dt.timedelta(days=1)
+
+#: `crucible.runner.MAX_ATTEMPTS`, restated to avoid an import cycle
+#: (`crucible.runner` imports this module). The lockstep is asserted by
+#: `tests/test_cli_and_alerts.py`, never left to two constants agreeing.
+MAX_DISPATCH_ATTEMPTS = 2
+
+
+def _dispatch_target_trading_day(job: str, args: Any, dispatched_at: dt.datetime) -> dt.date:
     """The trading day a dispatch's manifest will actually be keyed under.
 
     `alpha-engine-config-I10134` resolved this from the dispatch's WALL CLOCK
@@ -1310,30 +1661,47 @@ def _dispatch_target_trading_day(args: Any, dispatched_at: dt.datetime) -> dt.da
     at 18:55Z and 20:45Z; the manifest was written to
     `runs/fault.probe/2026-09-11/run.json`, while this detector would have
     listed `runs/fault.probe/<the day it was dispatched>/`, found it empty and
-    paged an ABSENCE for a run whose artifact exists. Both directions of that
-    are wrong and the second is the one that matters: a probe that really did
-    die without an artifact would have been reported against a trading day
+    paged an ABSENCE for a run whose artifact exists.
+
+    **The precedence is a property of the JOB, not of flag ordering**
+    (`alpha-engine-config-I11048`). This function used to walk
+    `("--date", "--to")` and take the first present, on a stated premise —
+    that a range job "carries no `--date` at all" — which was measured FALSE
+    for every dispatch the fleet makes: `nous-ergon-ops`'s
+    `scripts/dispatch_crucible_v2_job.sh` builds
+    `"--date ${TRADING_DAY} --run-mode ${RUN_MODE}${EXTRA_ARGS:+ ${EXTRA_ARGS}}"`,
+    injecting `--date` unconditionally, and the job's own `--from/--to`
+    arrive after it as pass-through. So the tie-break written as unreachable
+    fired on EVERY range dispatch, and a range job was graded against a key
+    nothing writes. Measured 2026-09-18: three of the four absence pages that
+    night named runs that had SUCCEEDED (`data.heal` cleared at
+    `runs/data.heal/2026-02-02/run.json`, two `experiment.backfill` chunks at
+    their own `--to` days), and the direction that matters more is the other
+    one — a range job that really did die was reported against a trading day
     nobody could go and look at.
 
-    `--to` is read the same way, after `--date` (`alpha-engine-config-I10696`).
-    A RANGE job binds its one manifest to the END of the range — `data.heal`
-    and `experiment.backfill` both pass `trading_day=end` to `run_job` — and
-    neither carries `--date` at all, so this function resolved both from the
-    wall clock and would have paged an ABSENCE for every historical range
-    dispatch whose manifest exists. `experiment.backfill` is dispatched in
-    chunks over two years of sessions, so the very first use of it would have
-    produced the false page; `data.heal` has carried the same latent defect
-    since I10134 and is fixed by the same line. `--date` still wins where a
-    dispatch somehow carries both: it is the flag `crucible.cli.resolve_date`
-    actually reads.
+    A job in :data:`crucible.keys.RANGE_BOUND_JOBS` binds its one manifest to
+    the END of the range (`crucible.track_a.handle_data_heal` and
+    `handle_experiment_backfill` both pass `trading_day=end` to
+    `crucible.runner.run_job`), so `--to` wins for those and `--date` wins
+    for everything else — which is what `alpha-engine-config-I10696`'s fix
+    was for, and `fault.probe` keeps it.
 
-    Falls back to the wall clock when neither is present or parseable — the
-    original behaviour, which is correct for a dispatch that named no day.
-    A `--date` that is not a date is not silently substituted with a guess
-    here; it is a malformed dispatch, and `crucible.cli` refuses it at the box
-    with the usage exit code the wrapper reports as one.
+    **The strongest form does not derive this at all.** The box records the
+    key it actually bound to in its exit record
+    (`crucible.dispatch_exit`, `expected_manifest_key`), which is the
+    authoritative answer written by the party that wrote the manifest; this
+    function is what grades a dispatch made before that record existed, or
+    one whose box never reached its trap.
+
+    Falls back to the wall clock when neither flag is present or parseable —
+    the original behaviour, which is correct for a dispatch that named no
+    day. A `--date` that is not a date is not silently substituted with a
+    guess here; it is a malformed dispatch, and `crucible.cli` refuses it at
+    the box with the usage exit code the wrapper reports as one.
     """
-    for flag in ("--date", "--to"):
+    ordered = ("--to", "--date") if job in RANGE_BOUND_JOBS else ("--date", "--to")
+    for flag in ordered:
         explicit = _flag_value(args, flag)
         if explicit is None:
             continue
@@ -2711,7 +3079,8 @@ def sweep(
     transport: Callable[..., Any] | None = None,
     sweep_run_id: str,
     dry_run: bool = False,
-    describe_instance_state_reason: Callable[[str], str | None] | None = None,
+    describe_instance_state_reason: Callable[[str], InstanceReading] | None = None,
+    read_box_log_tail: Callable[[str, str], str | None] | None = None,
 ) -> dict[str, Any]:
     """Evaluate both conditions, group by cause, page once per group.
 
@@ -2735,6 +3104,7 @@ def sweep(
             now=moment,
             access_faults=access_faults,
             describe_instance_state_reason=describe_instance_state_reason,
+            read_box_log_tail=read_box_log_tail,
         )
         + evaluate_failure(store, now=moment, registry=registry, access_faults=access_faults)
         + evaluate_min_active_arms(store, now=moment, access_faults=access_faults)

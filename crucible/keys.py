@@ -38,6 +38,7 @@ __all__ = [
     "CONSOLE_JSON_KEY",
     "CONSOLE_KEY",
     "DATA_BUCKET_KEY_HELPERS",
+    "DISPATCH_EXIT_SUFFIX",
     "DISPATCH_ROOT",
     "DRIFT_INPUTS",
     "EXPERIMENTS_ROOT",
@@ -48,6 +49,7 @@ __all__ = [
     "PREDICTIONS_PREFIX",
     "PUBLIC_JSON_KEY",
     "PUBLIC_KEY",
+    "RANGE_BOUND_JOBS",
     "RELEASES_ROOT",
     "REVIEWER_PATTERN",
     "RUNS_ROOT",
@@ -84,6 +86,7 @@ __all__ = [
     "cross_section_settled_key",
     "data_panel_key",
     "declared_universe_key",
+    "dispatch_exit_key",
     "dispatch_key",
     "dispatch_prefix",
     "drift_input_key",
@@ -120,6 +123,7 @@ __all__ = [
     "morning_update_key",
     "parse_acceptance_reading",
     "parse_bus_key",
+    "parse_dispatch_exit_key",
     "parse_dispatch_key",
     "parse_fault_injection_key",
     "parse_manifest_key",
@@ -356,21 +360,68 @@ def dispatch_key(job: str, dispatch_id: str) -> str:
     return f"{dispatch_prefix(job)}{dispatch_id}.json"
 
 
+#: The suffix separating a dispatch's TERMINAL record from its request record
+#: (`alpha-engine-config-I11050`). Both live under
+#: :func:`dispatch_prefix` and both end `.json`, so the two are told apart by
+#: this suffix and by nothing else — which is why :func:`parse_dispatch_key`
+#: refuses it explicitly below rather than leaving the distinction to a
+#: caller. Without that refusal every exit record read back as a dispatch
+#: record for a `dispatch_id` ending `.exit`, with no manifest anywhere near
+#: it, and the detector meant to explain absences would have MANUFACTURED one
+#: per box.
+DISPATCH_EXIT_SUFFIX = ".exit.json"
+
+
+def dispatch_exit_key(job: str, dispatch_id: str) -> str:
+    """`runs/_dispatch/{job}/{dispatch_id}.exit.json` — what the box's own
+    exit path recorded about how this dispatch ENDED.
+
+    `alpha-engine-config-I11050`. The dispatch record is the request; this is
+    the terminal document, written from the box's EXIT trap (or, when the box
+    died before `crucible` was installed, by the bootstrap shell) before the
+    instance goes away. It is the only durable account of an exit that leaves
+    no manifest — the reclaimed path deliberately writes none — and it is
+    what `crucible.alerts` reads so an absence page names a cause instead of
+    telling a human to go and look at a box that no longer exists.
+    """
+    if not _DISCRIMINATOR_RE.match(dispatch_id):
+        raise ValueError(
+            f"dispatch_id {dispatch_id!r} must be 1-64 characters of [A-Za-z0-9_.-] "
+            "— it is a path segment, and this is the one place that is enforced."
+        )
+    return f"{dispatch_prefix(job)}{dispatch_id}{DISPATCH_EXIT_SUFFIX}"
+
+
 def parse_dispatch_key(key: str) -> tuple[str, str] | None:
     """The inverse of :func:`dispatch_key`: ``(job, dispatch_id)``.
 
     Returns ``None`` for anything not under :data:`DISPATCH_ROOT` in this
     exact three-segment-under-the-root shape, so a caller listing the whole
     root decides what an unrecognised key means rather than this function
-    guessing.
+    guessing — and ``None`` for an EXIT record
+    (:data:`DISPATCH_EXIT_SUFFIX`), which shares the prefix and the `.json`
+    suffix but is a different document about the same dispatch.
     """
     if not key.startswith(DISPATCH_ROOT) or not key.endswith(".json"):
+        return None
+    if key.endswith(DISPATCH_EXIT_SUFFIX):
         return None
     parts = key.split("/")
     if len(parts) != 4:
         return None
     _, _, job, filename = parts
     return job, filename[: -len(".json")]
+
+
+def parse_dispatch_exit_key(key: str) -> tuple[str, str] | None:
+    """The inverse of :func:`dispatch_exit_key`: ``(job, dispatch_id)``."""
+    if not key.startswith(DISPATCH_ROOT) or not key.endswith(DISPATCH_EXIT_SUFFIX):
+        return None
+    parts = key.split("/")
+    if len(parts) != 4:
+        return None
+    _, _, job, filename = parts
+    return job, filename[: -len(DISPATCH_EXIT_SUFFIX)]
 
 
 def arm_key_segment(arm_id: str) -> str:
@@ -623,6 +674,29 @@ def manifest_key(job: str, trading_day: str, *, discriminator: str | None = None
             "a key no path-shaped tool can address."
         )
     return f"runs/{job}/{trading_day}/{discriminator}/{MANIFEST_BASENAME}"
+
+
+#: The jobs whose ONE manifest is bound to the END of a range rather than to
+#: a `--date` (`alpha-engine-config-I11048`). Both handlers pass
+#: `trading_day=end` to `crucible.runner.run_job`:
+#: `crucible.track_a.handle_data_heal` and
+#: `crucible.track_a.handle_experiment_backfill`.
+#:
+#: **Why a declared set and not a flag-precedence rule over argv.** Every
+#: dispatch the fleet makes carries `--date` — `nous-ergon-ops`'s
+#: `scripts/dispatch_crucible_v2_job.sh` injects it unconditionally and the
+#: job's own `--from/--to` arrive after it as pass-through — so "prefer
+#: whichever flag appears" answers the question with the wrong flag for
+#: exactly the jobs whose manifest is not under it. The binding is a property
+#: of the JOB, so it is declared as one.
+#:
+#: **And not a hand-typed list.** `tests/test_range_bound_jobs_contract.py`
+#: parses `crucible/track_a.py` and derives the set of jobs whose `run_job`
+#: call passes `trading_day=end`; a third range job added there, or one of
+#: these two rebound to `--date`, fails that test rather than silently
+#: re-opening this defect. A membership fact that only a human keeps true is
+#: the shape every detector in this fleet has had to be repaired from.
+RANGE_BOUND_JOBS: frozenset[str] = frozenset({"data.heal", "experiment.backfill"})
 
 
 def manifest_prefix(job: str, trading_day: str) -> str:

@@ -108,6 +108,42 @@ def _admitted_entry_points() -> set[Path]:
     return admitted
 
 
+def _writes_only_into_the_dispatch_namespace(source: str) -> bool:
+    """Does every write in ``source`` key off `crucible.keys.dispatch_exit_key`?
+
+    **The third admission, and it is a PROPERTY rather than a name**
+    (`alpha-engine-config-I11050`). `runs/_dispatch/` is the one store
+    namespace whose documents are written by the SUBSTRATE about a dispatch,
+    not by a job about its work: the request record is written by the
+    dispatcher Lambda in `nous-ergon-ops` (which this guard cannot see at
+    all), and the exit record is written by the box's EXIT trap — which runs
+    after the job's process is over, including on the argparse-refusal and
+    reclaimed paths where there IS no job and no manifest by construction.
+
+    A module admitted here is therefore not an ungraded write beside the CLI;
+    it is the evidence that makes rule 1 honest for the one path that
+    deliberately files no manifest. The admission stays narrow because it is
+    keyed on the key: a module that also wrote anywhere else fails, and
+    `crucible.keys.dispatch_exit_key` refuses any key outside that prefix.
+    """
+    tree = ast.parse(source)
+    key_arguments = [
+        node.args[0] if node.args else None
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in WRITE_ATTRS
+    ]
+    if not key_arguments:
+        return False
+    return all(
+        isinstance(argument, ast.Call)
+        and isinstance(argument.func, ast.Name)
+        and argument.func.id == "dispatch_exit_key"
+        for argument in key_arguments
+    )
+
+
 def _writes_in(source: str) -> set[str]:
     return {
         node.func.attr
@@ -173,7 +209,10 @@ def test_no_workflow_writes_to_the_store_behind_the_cli(workflow: Path) -> None:
 def test_no_second_entry_point_reaches_a_store_write(module: Path) -> None:
     if module in _admitted_entry_points():
         return
-    writes = _writes_in(module.read_text(encoding="utf-8"))
+    source = module.read_text(encoding="utf-8")
+    if _writes_only_into_the_dispatch_namespace(source):
+        return
+    writes = _writes_in(source)
     assert not writes, (
         f"{module.relative_to(REPO_ROOT)} can be run as a program and reaches "
         f"{sorted(writes)}. That is a store writer beside the CLI, and it files no run "
@@ -198,6 +237,32 @@ def test_the_guard_fires_on_the_shape_it_was_built_for() -> None:
         '          aws s3 cp acceptance-reading.json "${STORE_URI}/${KEY}" --only-show-errors\n'
     )
     assert _write_lines(old_publish_step), "the workflow half of the guard measures nothing"
+
+
+def test_the_dispatch_namespace_admission_does_not_admit_a_second_write() -> None:
+    """The admission's own self-test. An entry point that writes the exit
+    record AND anything else is exactly the shape this guard exists for, and
+    it must still fail — otherwise the admission is a file list wearing a
+    predicate's clothes."""
+    exit_record_only = (
+        "def write(store, document):\n"
+        "    store.put_bytes(dispatch_exit_key(document.job, document.dispatch_id), b'{}')\n"
+        'if __name__ == "__main__":\n'
+        "    raise SystemExit(0)\n"
+    )
+    assert _writes_only_into_the_dispatch_namespace(exit_record_only)
+
+    also_writes_a_verdict = exit_record_only.replace(
+        "    raise SystemExit(0)\n",
+        "    store.put_bytes('reviews/x.json', b'{}')\n",
+    )
+    assert not _writes_only_into_the_dispatch_namespace(also_writes_a_verdict)
+
+    writes_nothing = 'if __name__ == "__main__":\n    raise SystemExit(0)\n'
+    assert not _writes_only_into_the_dispatch_namespace(writes_nothing), (
+        "a module with no writes must not be ADMITTED by this predicate — it has "
+        "nothing to admit, and a vacuous true here would admit the next one that does"
+    )
 
     # ...and the reads that must stay legal.
     legal_read = '          aws s3 cp "${STORE_URI}/board/current.json" board.json\n'

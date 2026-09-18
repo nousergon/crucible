@@ -27,6 +27,7 @@ import json
 import pytest
 
 from crucible.alerts import (
+    InstanceReading,
     Page,
     bus_row,
     cause_key,
@@ -243,8 +244,15 @@ def _write_dispatch(store: LocalStore, *, job: str, args: str, dispatch_id: str)
     )
 
 
-def _no_reason(instance_id: str) -> None:
+def _no_log(job: str, instance_id: str) -> None:
+    """A fake `read_box_log_tail` that finds no stream — the default for
+    every test that is not exercising the CloudWatch rung, so a unit test
+    never makes a real `logs:GetLogEvents` call."""
     return None
+
+
+def _no_reason(instance_id: str) -> InstanceReading:
+    return InstanceReading(False, None)
 
 
 class TestTheDispatchAbsenceReadsTheDispatchsOwnDate:
@@ -275,7 +283,10 @@ class TestTheDispatchAbsenceReadsTheDispatchsOwnDate:
             ).encode(),
         )
         pages = evaluate_dispatch_absence(
-            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
         )
         assert pages == []
 
@@ -283,7 +294,10 @@ class TestTheDispatchAbsenceReadsTheDispatchsOwnDate:
         store = LocalStore(tmp_path)
         _write_dispatch(store, job="fault.probe", args=self.ARGS, dispatch_id="01probe")
         pages = evaluate_dispatch_absence(
-            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
         )
         assert len(pages) == 1
         assert pages[0].trading_day == dt.date(2026, 9, 11)
@@ -293,7 +307,10 @@ class TestTheDispatchAbsenceReadsTheDispatchsOwnDate:
         store = LocalStore(tmp_path)
         _write_dispatch(store, job="fault.probe", args=self.ARGS, dispatch_id="01probe")
         pages = evaluate_dispatch_absence(
-            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
         )
         assert pages[0].synthetic == "replay; fault-injected: chaos_probe"
         assert group_pages(pages)[0].render().startswith("[crucible-v2] SYNTHETIC")
@@ -308,7 +325,10 @@ class TestTheDispatchAbsenceReadsTheDispatchsOwnDate:
             dispatch_id="01heal",
         )
         pages = evaluate_dispatch_absence(
-            store, now=PAST_HORIZON, describe_instance_state_reason=_no_reason
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
         )
         assert len(pages) == 1
         assert pages[0].trading_day != dt.date(2026, 9, 11)
