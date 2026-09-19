@@ -15,6 +15,7 @@ import pytest
 from conftest import sessions_ending
 from nousergon_lib.arena.window import ArmSeries, pair_on_common_window
 
+from crucible.cli import main
 from crucible.config import Settings
 from crucible.data import run_daily
 from crucible.data.point_in_time import UnavailablePointInTimeSource
@@ -545,6 +546,104 @@ class TestReplayDeterminism:
             json.loads(first)["decision"]["champion"] == json.loads(second)["decision"]["champion"]
         )
         assert json.loads(first)["ladders"] == json.loads(second)["ladders"]
+
+
+class TestDryRunReachesTheArenaCycleWrite:
+    """`experiment.grade --dry-run` is a rehearsal, not a narration.
+
+    `alpha-engine-config-I10721`. The branch this replaces printed "would
+    call grade, score every settled cut and run the slot's arena cycle" and
+    returned 0 having opened nothing — the sentence-restating-its-own-source
+    shape `alpha-engine-config-I11012` removed from `experiment.run`,
+    surviving one handler over, in `crucible.track_a`.
+
+    It was the blindest instance of the class. `experiment.grade` is the only
+    writer of `arena/{slot}/{day}/arena_cycle.json`, and that artifact is
+    what `crucible.gate._clause_arms_all_scored` reads to decide whether every
+    registered arm was scored on a given day. So the one question an operator
+    brings to this flag before replaying historical sessions — "would
+    replaying this past day rewrite that day's arena cycle, or leave it as
+    the arc first wrote it?" — was the only question the flag could not
+    answer, and the one whose wrong answer costs a five-week calendar.
+    """
+
+    def test_a_dry_run_reaches_the_cycle_write_and_performs_none_of_it(
+        self, store, source, strategy_dir, cycle_date, tmp_path
+    ) -> None:
+        from crucible.store import begin_capture, end_capture
+
+        settings, _decision_days = _seed_cycle(store, source, strategy_dir, cycle_date, tmp_path)
+        before = sorted(store.list_keys())
+
+        ledger = begin_capture()
+        try:
+            main(
+                [
+                    "experiment.grade",
+                    "--slot",
+                    "u",
+                    "--date",
+                    cycle_date.isoformat(),
+                    "--store",
+                    str(tmp_path / "store"),
+                    "--strategy-dir",
+                    str(strategy_dir),
+                    "--run-mode",
+                    "replay",
+                    "--dry-run",
+                ]
+            )
+        finally:
+            end_capture()
+
+        # Nothing NEW landed: the rehearsal is structurally incapable of the
+        # write, per rule 1's `--dry-run` exception.
+        assert sorted(store.list_keys()) == before
+        # ...and it REACHED it. This is the property the replay batch rests
+        # on, asserted rather than assumed: a replayed past session names
+        # that session's own arena cycle in the key set it would write, so a
+        # replay rewrites the cycle `arms_all_scored` grades.
+        assert arena_cycle_key("u", cycle_date.isoformat()) in ledger.keys
+        assert any(key.startswith("runs/experiment.grade/") for key in ledger.keys)
+
+    def test_the_rehearsal_fails_where_the_run_fails(
+        self, store, source, strategy_dir, cycle_date, tmp_path
+    ) -> None:
+        """A dry run over a store with no settled shadow RAISES.
+
+        The narration returned 0 here — the shape that let a rehearsal report
+        a clean run for a command that dies on its first real session
+        (`alpha-engine-config-I11012`, measured on `experiment.backfill`).
+        Nothing is seeded, so `grade` has nothing to grade.
+        """
+        from crucible.store import begin_capture, end_capture
+
+        ledger = begin_capture()
+        try:
+            with pytest.raises(MissingArtifactError):
+                main(
+                    [
+                        "experiment.grade",
+                        "--slot",
+                        "u",
+                        "--date",
+                        cycle_date.isoformat(),
+                        "--store",
+                        str(tmp_path / "store"),
+                        "--strategy-dir",
+                        str(strategy_dir),
+                        "--run-mode",
+                        "replay",
+                        "--dry-run",
+                    ]
+                )
+        finally:
+            end_capture()
+
+        # The failure is recorded the way a real failure is — the manifest is
+        # assembled through the ordinary write path and captured, not skipped.
+        assert any(key.startswith("runs/experiment.grade/") for key in ledger.keys)
+        assert arena_cycle_key("u", cycle_date.isoformat()) not in ledger.keys
 
 
 class TestKeysAndRefusals:

@@ -927,14 +927,22 @@ def handle_experiment_grade(args: argparse.Namespace) -> int:
     config = _settings(args)
     store = config.store()
     module = _slot_module(args.slot)
-    if args.dry_run:
-        print(
-            f"experiment.grade --slot {args.slot} would call {module.__name__}.grade, "
-            f"score every settled cut and run the slot's arena cycle against the store at "
-            f"{config.store_uri}. Resolve inputs and report what would be written; write "
-            "nothing."
-        )
-        return 0
+    # NO `--dry-run` branch, for the reason `experiment.run` has none
+    # (`alpha-engine-config-I11012`), applied to the one handler that kept it
+    # (`alpha-engine-config-I10721`). The branch this replaces printed
+    # "would call {module}.grade, score every settled cut and run the slot's
+    # arena cycle" and returned 0 having resolved NOTHING — a sentence
+    # restating this function's own next four lines, which could not be wrong
+    # and could not be right. It was also the blindest possible instance of
+    # it: `experiment.grade` is the only writer of
+    # `arena/{slot}/{day}/arena_cycle.json`, the artifact `arms_all_scored`
+    # grades, so the one question an operator brings to this flag — "would a
+    # replay of this past session rewrite that day's cycle?" — was the one
+    # question the flag could not answer. Under `--dry-run` the store RECORDS
+    # writes instead of performing them (`crucible.store.capturing`), so the
+    # body below runs for real against real inputs, fails exactly where the
+    # real run fails, and `crucible.cli.main` prints the key set it would
+    # have written.
     result: dict[str, Any] = {}
 
     def job(ctx: Any) -> None:
@@ -946,6 +954,11 @@ def handle_experiment_grade(args: argparse.Namespace) -> int:
         store=store,
         trading_day=args.trading_day,
         run_mode=getattr(args, "run_mode", None),
+        # Passed so the run says out loud that it wrote nothing. The manifest
+        # is captured either way — the store decides that, not this flag —
+        # but a rehearsal that printed nothing would look like a real run
+        # until the captured key set lands at the end of the invocation.
+        dry_run=bool(getattr(args, "dry_run", False)),
         # Same shape as `experiment.run` above: one job name, four slots
         # (alpha-engine-config-I9781).
         discriminator=args.slot,
