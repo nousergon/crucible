@@ -33,7 +33,6 @@ import datetime as dt
 import json
 import os
 import re
-import shlex
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -47,6 +46,7 @@ from crucible.calendar import (
     resolve_trading_day,
 )
 from crucible.components import NYSE_TZ, Component, load_registry, scheduled_components
+from crucible.dispatch_argv import dispatch_target_trading_day, flag_value
 from crucible.documents import (
     load_store_document,
     read_listed_document,
@@ -57,7 +57,6 @@ from crucible.keys import (
     ALERTS_ROOT,
     DISPATCH_ROOT,
     MIGRATIONS_ROOT,
-    RANGE_BOUND_JOBS,
     RUNS_ROOT,
     arena_cycle_key,
     dispatch_exit_key,
@@ -962,6 +961,23 @@ def _exit_record_classification(record: Any, successor_present: bool | None) -> 
         detail += f'; last error line: "{record.last_error_line}"'
     if record.log_group and record.log_stream:
         detail += f"; full console {record.log_group} :: {record.log_stream}"
+    if record.exit_class == "ok" and not record.manifest_written:
+        # `alpha-engine-config-I11050`, corrected 2026-09-18. The model used
+        # to REFUSE to serialise this combination, on the reasoning that an
+        # exit record must not excuse `crucible/AGENTS.md` rule 1. The effect
+        # was the opposite: the writer raised inside the box's EXIT trap, its
+        # `|| echo` landed in a console already shipped, and the fleet wrote
+        # zero exit records for as long as the mechanism was live. Rule 1 is
+        # enforced HERE instead, where it reaches a human, because a page is
+        # a detection surface and a ValidationError inside a dying box is not.
+        detail += (
+            " — THE JOB EXITED 0 AND NO MANIFEST IS AT THE KEY IT OWED"
+            f"{f' ({record.expected_manifest_key})' if record.expected_manifest_key else ''}"
+            ": repo rule 1 ('manifest or it did not happen') is broken by a run that "
+            "believes it succeeded, so treat the work as NOT DONE and find what "
+            "swallowed the write — this is not a dispatch failure"
+        )
+        return detail
     if record.exit_class == DISPATCH_EXIT_CLASS_RECLAIMED:
         if not record.redispatch_expected:
             detail += (
@@ -1722,90 +1738,14 @@ _GAP_FANOUT_WINDOW = dt.timedelta(days=1)
 MAX_DISPATCH_ATTEMPTS = 2
 
 
-def _dispatch_target_trading_day(job: str, args: Any, dispatched_at: dt.datetime) -> dt.date:
-    """The trading day a dispatch's manifest will actually be keyed under.
-
-    `alpha-engine-config-I10134` resolved this from the dispatch's WALL CLOCK
-    (`resolve_trading_day(dispatched_at)`), which is right for the on-demand
-    jobs it was written for and wrong for every dispatch carrying `--date`.
-    `crucible.cli.resolve_date` returns an explicit `--date` verbatim, so the
-    manifest lands under THAT day — and this function looked for it under a
-    different one.
-
-    Measured 2026-09-09: `fault.probe` was dispatched twice with
-    `--date 2026-09-11 --run-mode replay --fault-capability-class chaos_probe`
-    at 18:55Z and 20:45Z; the manifest was written to
-    `runs/fault.probe/2026-09-11/run.json`, while this detector would have
-    listed `runs/fault.probe/<the day it was dispatched>/`, found it empty and
-    paged an ABSENCE for a run whose artifact exists.
-
-    **The precedence is a property of the JOB, not of flag ordering**
-    (`alpha-engine-config-I11048`). This function used to walk
-    `("--date", "--to")` and take the first present, on a stated premise —
-    that a range job "carries no `--date` at all" — which was measured FALSE
-    for every dispatch the fleet makes: `nous-ergon-ops`'s
-    `scripts/dispatch_crucible_v2_job.sh` builds
-    `"--date ${TRADING_DAY} --run-mode ${RUN_MODE}${EXTRA_ARGS:+ ${EXTRA_ARGS}}"`,
-    injecting `--date` unconditionally, and the job's own `--from/--to`
-    arrive after it as pass-through. So the tie-break written as unreachable
-    fired on EVERY range dispatch, and a range job was graded against a key
-    nothing writes. Measured 2026-09-18: three of the four absence pages that
-    night named runs that had SUCCEEDED (`data.heal` cleared at
-    `runs/data.heal/2026-02-02/run.json`, two `experiment.backfill` chunks at
-    their own `--to` days), and the direction that matters more is the other
-    one — a range job that really did die was reported against a trading day
-    nobody could go and look at.
-
-    A job in :data:`crucible.keys.RANGE_BOUND_JOBS` binds its one manifest to
-    the END of the range (`crucible.track_a.handle_data_heal` and
-    `handle_experiment_backfill` both pass `trading_day=end` to
-    `crucible.runner.run_job`), so `--to` wins for those and `--date` wins
-    for everything else — which is what `alpha-engine-config-I10696`'s fix
-    was for, and `fault.probe` keeps it.
-
-    **The strongest form does not derive this at all.** The box records the
-    key it actually bound to in its exit record
-    (`crucible.dispatch_exit`, `expected_manifest_key`), which is the
-    authoritative answer written by the party that wrote the manifest; this
-    function is what grades a dispatch made before that record existed, or
-    one whose box never reached its trap.
-
-    Falls back to the wall clock when neither flag is present or parseable —
-    the original behaviour, which is correct for a dispatch that named no
-    day. A `--date` that is not a date is not silently substituted with a
-    guess here; it is a malformed dispatch, and `crucible.cli` refuses it at
-    the box with the usage exit code the wrapper reports as one.
-    """
-    ordered = ("--to", "--date") if job in RANGE_BOUND_JOBS else ("--date", "--to")
-    for flag in ordered:
-        explicit = _flag_value(args, flag)
-        if explicit is None:
-            continue
-        try:
-            return dt.date.fromisoformat(explicit)
-        except ValueError:
-            return resolve_trading_day(dispatched_at)
-    return resolve_trading_day(dispatched_at)
-
-
-def _flag_value(args: Any, flag: str) -> str | None:
-    """``--flag value`` or ``--flag=value`` out of a dispatch record's argv.
-
-    Positional, via :mod:`shlex`, never a substring test — same rule and same
-    reason as `crucible.synthetic.args_synthetic_marker`.
-    """
-    if not isinstance(args, str) or not args.strip():
-        return None
-    try:
-        tokens = shlex.split(args)
-    except ValueError:
-        return None
-    for index, token in enumerate(tokens):
-        if token == flag and index + 1 < len(tokens):
-            return tokens[index + 1]
-        if token.startswith(f"{flag}="):
-            return token.split("=", 1)[1]
-    return None
+#: `alpha-engine-config-I11050`: lifted to `crucible.dispatch_argv` on its
+#: second adoption (`policy-shared-code`) — `crucible.dispatch_exit` needs the
+#: SAME answer to "which manifest does this dispatch bind to" when the run
+#: left no breadcrumb, and a second private copy of this derivation is exactly
+#: what `alpha-engine-config-I11048` cost. Re-bound here under the private
+#: names this module's callers and tests already use.
+_dispatch_target_trading_day = dispatch_target_trading_day
+_flag_value = flag_value
 
 
 def _parse_dispatch_time(raw: Any) -> dt.datetime | None:

@@ -4395,10 +4395,26 @@ class DispatchExitDocument(_Strict):
                 f"anywhere else would owe an attempt nothing launches. Class was "
                 f"{self.exit_class!r}."
             )
-        if self.exit_class == "ok" and not self.manifest_written:
-            raise ValueError(
-                "exit_class 'ok' with manifest_written false: a job that succeeded and "
-                "recorded nothing is repo rule 1's failure ('manifest or it did not "
-                "happen'), and an exit record must not be the thing that excuses it."
-            )
+        # `exit_class: ok` with `manifest_written: false` is DELIBERATELY not
+        # raised here (`alpha-engine-config-I11050`, corrected 2026-09-18). It
+        # was, and the refusal is what made this whole document dead on
+        # arrival: the box's trap runs the writer, the writer raised, the
+        # `|| echo` fell into a console that had already been shipped, and
+        # ZERO exit records existed fleet-wide for the eight days the
+        # mechanism was live. The first live clean dispatch after the trap
+        # shipped (`data.heal`, dispatch 4deef7de…, 2026-09-18T19:23Z, exit 0)
+        # wrote no record for exactly this reason.
+        #
+        # The other clauses above are contradictions WITHIN the document —
+        # two fields that cannot both be true of any world, where writing
+        # either one is writing a lie. This one is a finding ABOUT the world:
+        # "the job said it succeeded and no manifest is there" is a real,
+        # observable state, and it is precisely the state a reader most needs
+        # recorded. A document that refuses to carry its own worst finding
+        # reports nothing at all.
+        #
+        # Repo rule 1 is unweakened: it is enforced where it can page, in
+        # `crucible.alerts._exit_record_classification`, which renders this
+        # combination as its own loud cause sentence. Detection moved; it did
+        # not disappear.
         return self

@@ -1039,6 +1039,37 @@ class TestThePageNamesTheCauseFromTheBoxsOwnExitRecord:
         assert "refused (code 2)" in page.reason
         assert "unrecognized arguments" in page.reason
 
+    def test_a_clean_exit_with_no_manifest_pages_repo_rule_one(self, tmp_path) -> None:
+        """Where repo rule 1 moved to (`alpha-engine-config-I11050`,
+        2026-09-18). `DispatchExitDocument` used to REFUSE `exit_class: ok`
+        with `manifest_written: false`, on the reasoning that an exit record
+        must not excuse a missing manifest. The refusal ran inside a dying
+        box and its stderr fell into a console already shipped, so the fleet
+        wrote no exit records at all. The finding belongs on a surface that
+        reaches a human: this page."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        _write_exit_record(
+            store,
+            _exit_record(
+                exit_code=0,
+                exit_class="ok",
+                last_error_line=None,
+                manifest_written=False,
+                redispatch_expected=False,
+                next_attempt_dispatch_id=None,
+            ),
+        )
+        [page] = evaluate_dispatch_absence(
+            store,
+            now=PAST_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
+        )
+        assert "THE JOB EXITED 0 AND NO MANIFEST IS AT THE KEY IT OWED" in page.reason
+        assert "manifest or it did not happen" in page.reason
+        assert "investigate the box directly" not in page.reason
+
     def test_an_unreadable_exit_record_is_not_silently_a_missing_one(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
         _write_dispatch(store)
