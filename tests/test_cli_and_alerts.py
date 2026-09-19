@@ -566,7 +566,6 @@ class TestDryRunNeverWrites:
         "alerts.sweep",
         "board",
         "console",
-        "experiment.grade",
         "gate",
         # alpha-engine-config-I10095, verified 2026-09-06 the same way: on a
         # fresh store every registered gate reads UNMET or UNMEASURABLE, so
@@ -606,6 +605,14 @@ class TestDryRunNeverWrites:
             # into the excluded set: a dry run that could not refuse an arm
             # the job would refuse is the gap this issue closed.
             "experiment.backfill",
+            # alpha-engine-config-I10721: `experiment.grade` left the
+            # fresh-store set above for `experiment.run`'s reason, one issue
+            # after it. Its dry run no longer prints a sentence restating its
+            # own source and returns 0 — it EXECUTES the slot's real `grade`
+            # against a write-capturing store, and on a fresh store that
+            # raises `MissingArtifactError` for the absent price panel, which
+            # is precisely the rehearsal fidelity this move buys.
+            "experiment.grade",
             "promote",
             "report.morning",
         }
