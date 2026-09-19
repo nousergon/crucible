@@ -35,7 +35,7 @@ dependencies = [
     # module named for no schema this repository does not write, without
     # coupling to `nousergon_lib.run_manifest`'s `data_run_manifest.v1`
     # contract.
-    "nousergon-lib[github-app,gates]==0.124.134",
+    "nousergon-lib[github-app,gates]==0.124.136",
     # Trading calendar, dual-date resolution, structured logging, alerts.
     #
     # `[openai]` is NOT optional here (alpha-engine-config-I10473). krepis
@@ -121,7 +121,7 @@ dependencies = [
 # path it never exercises. `crucible data.daily --source arctic` states the
 # missing extra by name when it is absent — it never falls back to a
 # different source, which would silently change what the run measured.
-arcticdb = ["nousergon-lib[arcticdb]==0.124.134"]
+arcticdb = ["nousergon-lib[arcticdb]==0.124.136"]
 
 [project.scripts]
 crucible = "crucible.cli:main"
