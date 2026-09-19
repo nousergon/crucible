@@ -42,7 +42,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from crucible.keys import dispatch_exit_key
+from crucible.dispatch_argv import dispatch_target_trading_day
+from crucible.keys import dispatch_exit_key, manifest_key
 from crucible.models import (
     DISPATCH_EXIT_CLASS_RECLAIMED,
     DISPATCH_EXIT_CLASSES,
@@ -238,6 +239,63 @@ def _parse_attempts(raw: str | None) -> list[dict[str, Any]] | None:
     return rows
 
 
+def _manifest_present(store: Store, key: str) -> bool:
+    try:
+        store.get_bytes(key)
+    except KeyError:
+        return False
+    return True
+
+
+def _resolve_expected_manifest(store: Store, args: argparse.Namespace) -> tuple[str | None, bool]:
+    """``(expected_manifest_key, manifest_written)`` — a three-rung ladder.
+
+    1. ``--expected-manifest-key``, whatever the caller was told.
+    2. ``--expected-manifest-key-file``, the key the RUN itself bound
+       (`crucible.runner.EXPECTED_MANIFEST_KEY_FILE`). Authoritative, and it
+       wins over the flag: a second derivation is a second answer to "which
+       manifest", which is `alpha-engine-config-I11048` exactly.
+    3. Failing both, the SAME derivation from argv that
+       `crucible.alerts` grades the absence with
+       (`crucible.dispatch_argv.dispatch_target_trading_day`) — but claimed
+       ONLY when a manifest is actually there under it.
+
+    Rung 3 exists because rung 2 was measured to be a no-op on every live
+    dispatch (`alpha-engine-config-I11050`, 2026-09-18): the box's bootstrap
+    ASSIGNS ``CRUCIBLE_STATE_DIR`` without exporting it, so
+    `crucible.runner._record_expected_manifest_key` — which reads it out of
+    the environment — returned early and wrote no breadcrumb, on every job.
+    A ladder whose only rung is one the substrate silently disables is not a
+    ladder.
+
+    **Rung 3 never ASSERTS a key.** A derived key that is not in the store is
+    indistinguishable from a derivation that does not apply — a job writing
+    one manifest per slot per day carries a discriminator this function
+    cannot know — so an absent derived key yields ``(None, False)``: "the box
+    could not say which manifest it owed", which is true, rather than a key
+    it never bound, which would page a manifest-shaped hole that does not
+    exist. Only rungs 1 and 2 can report a key that is missing, because only
+    they were told one.
+    """
+    for key in (_recorded_manifest_key(args), args.expected_manifest_key or None):
+        if key:
+            return key, _manifest_present(store, key)
+    derived = manifest_key(
+        args.job,
+        dispatch_target_trading_day(args.job, args.argv, dt.datetime.now(tz=dt.UTC)).isoformat(),
+    )
+    return (derived, True) if _manifest_present(store, derived) else (None, False)
+
+
+def _recorded_manifest_key(args: argparse.Namespace) -> str | None:
+    if not args.expected_manifest_key_file:
+        return None
+    recorded = Path(args.expected_manifest_key_file)
+    if not recorded.exists():
+        return None
+    return recorded.read_text(encoding="utf-8").strip() or None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m crucible.dispatch_exit",
@@ -299,21 +357,7 @@ def main(argv: list[str] | None = None) -> int:
                 handle.seek(max(0, size - DISPATCH_EXIT_CONSOLE_TAIL_MAX * 4))
                 console = handle.read().decode("utf-8", errors="replace")
     store = open_store(args.store)
-    expected = args.expected_manifest_key or None
-    if args.expected_manifest_key_file:
-        recorded = Path(args.expected_manifest_key_file)
-        if recorded.exists():
-            # The run's own answer wins over anything the caller derived: a
-            # second derivation is a second answer to "which manifest", which
-            # is `alpha-engine-config-I11048` exactly.
-            expected = recorded.read_text(encoding="utf-8").strip() or expected
-    manifest_written = False
-    if expected:
-        try:
-            store.get_bytes(expected)
-            manifest_written = True
-        except KeyError:
-            manifest_written = False
+    expected, manifest_written = _resolve_expected_manifest(store, args)
     document = build_exit_document(
         dispatch_id=args.dispatch_id,
         instance_id=args.instance_id,

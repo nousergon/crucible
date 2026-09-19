@@ -101,17 +101,31 @@ class TestTheClassAndTheCodeCannotContradictEachOther:
         with pytest.raises(ValidationError, match="only on the reclaimed path"):
             DispatchExitDocument.model_validate(_valid(exit_class="failed"))
 
-    def test_ok_without_a_manifest_is_refused(self) -> None:
-        """Repo rule 1 — an exit record must not excuse a missing manifest."""
-        with pytest.raises(ValidationError, match="manifest or it did not happen"):
-            DispatchExitDocument.model_validate(
-                _valid(
-                    exit_class="ok",
-                    exit_code=0,
-                    manifest_written=False,
-                    redispatch_expected=False,
-                )
+    def test_ok_without_a_manifest_is_RECORDED_not_refused(self) -> None:
+        """Repo rule 1 is enforced where it can PAGE, not where it can only
+        destroy the record (`alpha-engine-config-I11050`, 2026-09-18).
+
+        This combination used to raise. The refusal ran inside the box's EXIT
+        trap, its `|| echo` fell into a console that had already been shipped,
+        and the fleet wrote ZERO exit records for the whole time the mechanism
+        was live — including the first clean dispatch after it shipped
+        (`data.heal` 4deef7de…, 2026-09-18T19:23Z, exit 0). A document that
+        refuses to carry its own worst finding reports nothing at all.
+
+        The finding did not move to nowhere: it moved to
+        `crucible.alerts._exit_record_classification`, asserted in
+        `tests/test_alerts_dispatch_absence.py`.
+        """
+        document = DispatchExitDocument.model_validate(
+            _valid(
+                exit_class="ok",
+                exit_code=0,
+                manifest_written=False,
+                redispatch_expected=False,
             )
+        )
+        assert document.exit_class == "ok"
+        assert document.manifest_written is False
 
     def test_an_unknown_class_is_refused(self) -> None:
         with pytest.raises(ValidationError):
@@ -272,3 +286,115 @@ class TestTheRunLeavesTheKeyItActuallyBound:
             run_mode="replay",
         )
         assert ctx.run_id
+
+
+class TestACleanDispatchStillRecordsItsExit:
+    """The live regression (`alpha-engine-config-I11050`, measured 2026-09-18).
+
+    The mechanism shipped and wrote **nothing**. `data.heal` dispatch
+    `4deef7debc3225a1b4ae29ea65cd829f` ran on `i-03eeaac4e6d14b561` from
+    19:23:32Z, wrote `runs/data.heal/2026-01-30/run.json` at 21:18:32Z, logged
+    `crucible data.heal exited 0`, and left no `.exit.json` — nor did any
+    other dispatch, fleet-wide, for as long as the trap had been live.
+
+    Two causes, one class: the box's bootstrap ASSIGNS `CRUCIBLE_STATE_DIR`
+    without exporting it, so the run's breadcrumb was a no-op and
+    `expected_manifest_key` came back `None`; and the model then REFUSED
+    `exit_class: ok` with `manifest_written: false`, which turned a missing
+    breadcrumb into a missing record. Neither failure could be seen: the
+    writer's `|| echo` lands in a console the trap has already shipped.
+
+    This is the test that fails if either half comes back. It exercises the
+    CLI end to end with the real dispatch's arguments and **no breadcrumb at
+    all**, which is the configuration every live box was in.
+    """
+
+    def _argv(self, store: pathlib.Path, **over: str) -> list[str]:
+        argv = {
+            "--dispatch-id": "4deef7debc3225a1b4ae29ea65cd829f",
+            "--instance-id": "i-03eeaac4e6d14b561",
+            "--job": "data.heal",
+            "--argv": (
+                "--date 2026-01-30 --run-mode live --from 2025-07-01 --to 2026-01-30 "
+                "--gap i10733-edgar-fundamentals-reheal"
+            ),
+            "--exit-code": "0",
+            "--log-group": "/crucible/data.heal",
+            "--log-stream": "i-03eeaac4e6d14b561",
+            "--expected-manifest-key-file": str(store / "no-such-state-dir" / "manifest-key"),
+            "--store": str(store),
+        }
+        argv.update(over)
+        return [token for pair in argv.items() for token in pair] + ["--job-started"]
+
+    def test_it_derives_the_key_the_detector_grades_and_writes_the_record(
+        self, tmp_path, capsys
+    ) -> None:
+        from crucible.dispatch_exit import main
+
+        store = LocalStore(tmp_path)
+        # The manifest the range job actually bound: `--to`, not `--date`
+        # (`crucible.keys.RANGE_BOUND_JOBS`, `alpha-engine-config-I11048`).
+        store.put_bytes("runs/data.heal/2026-01-30/run.json", b"{}")
+
+        assert main(self._argv(tmp_path)) == 0
+
+        written = json.loads(
+            store.get_bytes(
+                dispatch_exit_key("data.heal", "4deef7debc3225a1b4ae29ea65cd829f")
+            ).decode()
+        )
+        assert written["exit_class"] == "ok"
+        assert written["expected_manifest_key"] == "runs/data.heal/2026-01-30/run.json"
+        assert written["manifest_written"] is True
+
+    def test_a_clean_exit_with_no_manifest_anywhere_is_still_recorded(
+        self, tmp_path, capsys
+    ) -> None:
+        """The combination the model used to refuse. It is a finding about the
+        world, not a contradiction in the document, and refusing to write it
+        deleted the only evidence that the world was in that state."""
+        from crucible.dispatch_exit import main
+
+        store = LocalStore(tmp_path)
+        assert main(self._argv(tmp_path)) == 0
+
+        written = json.loads(
+            store.get_bytes(
+                dispatch_exit_key("data.heal", "4deef7debc3225a1b4ae29ea65cd829f")
+            ).decode()
+        )
+        assert written["exit_class"] == "ok"
+        assert written["manifest_written"] is False
+        # Rung 3 never ASSERTS a key it cannot see: a derived key absent from
+        # the store is indistinguishable from a derivation that does not apply
+        # to a discriminator-bearing job.
+        assert written["expected_manifest_key"] is None
+
+    def test_the_runs_own_breadcrumb_still_wins(self, tmp_path) -> None:
+        """Rung 2 is authoritative wherever it survives: the run states which
+        manifest it bound, and no derivation may overrule it."""
+        from crucible.dispatch_exit import main
+
+        store = LocalStore(tmp_path)
+        state = tmp_path / "state"
+        state.mkdir()
+        (state / "manifest-key").write_text("runs/data.heal/2026-02-02/run.json", encoding="utf-8")
+        store.put_bytes("runs/data.heal/2026-01-30/run.json", b"{}")
+
+        assert (
+            main(
+                self._argv(
+                    tmp_path, **{"--expected-manifest-key-file": str(state / "manifest-key")}
+                )
+            )
+            == 0
+        )
+
+        written = json.loads(
+            store.get_bytes(
+                dispatch_exit_key("data.heal", "4deef7debc3225a1b4ae29ea65cd829f")
+            ).decode()
+        )
+        assert written["expected_manifest_key"] == "runs/data.heal/2026-02-02/run.json"
+        assert written["manifest_written"] is False
