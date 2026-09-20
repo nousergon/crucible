@@ -231,3 +231,54 @@ class TestDefaultCacheIsProcessWideAndSharedByBothModules:
             assert default_cache().calls == 0
         finally:
             reset_default_cache()
+
+
+class TestTheBudgetIsEnvOverridableAndZeroMeansZero:
+    """`CRUCIBLE_CE_CALL_BUDGET` is the documented escape hatch for a process
+    that legitimately reads more distinct windows than `DEFAULT_CE_CALL_BUDGET`
+    (`crucible/cost.py` module docstring). It was documented and never tested,
+    and the fleet has repeatedly shipped guards that were never shown to fire
+    (`alpha-engine-config-I11201`).
+
+    The `0` case is the one that matters: `0` is the value an operator reaches
+    for to mean "make no Cost Explorer calls at all", and a truthiness check on
+    the raw string would silently give them the default of 25 instead -- a
+    setting that reads as a hard stop while permitting 25 billed requests.
+    """
+
+    def test_the_env_var_sets_the_default_cache_budget(self, monkeypatch) -> None:
+        from crucible.cost import default_cache, reset_default_cache
+
+        monkeypatch.setenv("CRUCIBLE_CE_CALL_BUDGET", "3")
+        reset_default_cache()
+        try:
+            assert default_cache().budget == 3
+        finally:
+            reset_default_cache()
+
+    def test_zero_refuses_the_first_call_rather_than_disabling_the_budget(
+        self, monkeypatch
+    ) -> None:
+        from crucible.cost import default_cache, reset_default_cache
+
+        monkeypatch.setenv("CRUCIBLE_CE_CALL_BUDGET", "0")
+        reset_default_cache()
+        try:
+            assert default_cache().budget == 0
+            client = _CostClient()
+            with pytest.raises(CostExplorerBudgetExceededError):
+                month_to_date_usd(client, today=TODAY, tagged=False)
+            assert client.requests == [], "nothing may be sent under a zero budget"
+        finally:
+            reset_default_cache()
+
+    def test_an_unparseable_value_falls_back_to_the_declared_default(self, monkeypatch) -> None:
+        """A typo must not silently mean "unbounded". It means the default."""
+        from crucible.cost import DEFAULT_CE_CALL_BUDGET, default_cache, reset_default_cache
+
+        monkeypatch.setenv("CRUCIBLE_CE_CALL_BUDGET", "lots")
+        reset_default_cache()
+        try:
+            assert default_cache().budget == DEFAULT_CE_CALL_BUDGET
+        finally:
+            reset_default_cache()
