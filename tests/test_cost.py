@@ -272,9 +272,7 @@ class TestTheBudgetIsEnvOverridableAndZeroMeansZero:
         finally:
             reset_default_cache()
 
-    def test_an_unparseable_value_falls_back_to_the_declared_default(
-        self, monkeypatch
-    ) -> None:
+    def test_an_unparseable_value_falls_back_to_the_declared_default(self, monkeypatch) -> None:
         """A typo must not silently mean "unbounded". It means the default."""
         from crucible.cost import DEFAULT_CE_CALL_BUDGET, default_cache, reset_default_cache
 
