@@ -352,6 +352,7 @@ class ExecutionWindow:
     not_computed: tuple[tuple[str, str], ...]
     order_bps: tuple[float, ...]
     order_notional: tuple[float, ...]
+    order_day: tuple[str, ...]
     notional_usd: float
     decision_notional_usd: float
     shortfall_usd: float
@@ -388,6 +389,7 @@ def reduce_execution_window(store: Store, sessions: Sequence[str]) -> ExecutionW
     not_computed: list[tuple[str, str]] = []
     bps: list[float] = []
     notional: list[float] = []
+    order_day: list[str] = []
     total_notional = 0.0
     total_decision_notional = 0.0
     total_shortfall = 0.0
@@ -421,6 +423,7 @@ def reduce_execution_window(store: Store, sessions: Sequence[str]) -> ExecutionW
             if order["filled_quantity"] > 0:
                 bps.append(float(order["shortfall_bps"]))
                 notional.append(float(order["decision_notional_usd"]))
+                order_day.append(day)
         total_notional += float(doc["summary"]["notional_usd"])
         total_decision_notional += float(doc["summary"]["decision_notional_usd"])
         total_shortfall += float(doc["summary"]["shortfall_usd"])
@@ -432,6 +435,7 @@ def reduce_execution_window(store: Store, sessions: Sequence[str]) -> ExecutionW
         not_computed=tuple(not_computed),
         order_bps=tuple(bps),
         order_notional=tuple(notional),
+        order_day=tuple(order_day),
         notional_usd=total_notional,
         decision_notional_usd=total_decision_notional,
         shortfall_usd=total_shortfall,
@@ -441,24 +445,50 @@ def reduce_execution_window(store: Store, sessions: Sequence[str]) -> ExecutionW
 
 
 def weighted_shortfall_ci(
-    order_bps: Sequence[float], order_notional: Sequence[float]
+    order_bps: Sequence[float],
+    order_notional: Sequence[float],
+    order_day: Sequence[str],
 ) -> tuple[float | None, float | None]:
-    """A seeded 95% percentile bootstrap of the NOTIONAL-WEIGHTED mean shortfall.
+    """A seeded 95% percentile BLOCK bootstrap of the NOTIONAL-WEIGHTED mean shortfall.
 
-    Resamples orders and recomputes the weighted ratio each draw, so the
-    interval is an interval on the number the row reports rather than on an
-    unweighted mean it does not. Fewer than two orders, or a degenerate
-    zero-width result, is no interval (None), never certainty.
+    Orders are not independent: every order filled on the same trading day
+    shares that day's decision-to-fill market move, a common factor in all of
+    their shortfalls. Resampling orders i.i.d. treats a day of N correlated
+    orders as N independent observations and understates the interval width
+    by roughly sqrt(orders per day) — on a ~40-name book, close to 6x too
+    tight. This resamples whole TRADING DAYS with replacement instead: each
+    draw picks k = the number of distinct trading days in the window (with
+    replacement), takes every drawn day's orders as one block, and recomputes
+    the notional-weighted ratio over the pooled block. That keeps the
+    correlation structure inside a day intact across every draw, so the
+    interval reflects the actual number of independent observations — trading
+    days, not orders.
+
+    ``order_day`` is REQUIRED, not optional: a default would let a call site
+    keep resampling orders i.i.d. by omission, silently reintroducing the
+    defect this replaces. Fewer than two DISTINCT trading days, or a
+    degenerate zero-width result, is no interval (None), never certainty —
+    many orders crowded onto a single day is still one observation of that
+    day's common factor, not evidence of precision.
     """
     n = len(order_bps)
-    if n != len(order_notional):
-        raise ValueError(f"{n} shortfalls against {len(order_notional)} notionals")
-    if n < 2:
+    if n != len(order_notional) or n != len(order_day):
+        raise ValueError(
+            f"{n} shortfalls against {len(order_notional)} notionals and "
+            f"{len(order_day)} day labels"
+        )
+    by_day: dict[str, list[int]] = {}
+    for i, day in enumerate(order_day):
+        by_day.setdefault(day, []).append(i)
+    days = sorted(by_day)
+    k = len(days)
+    if k < 2:
         return (None, None)
     rng = random.Random(_BOOTSTRAP_SEED)
     draws: list[float] = []
     for _ in range(_BOOTSTRAP_RESAMPLES):
-        idx = [rng.randrange(n) for _ in range(n)]
+        drawn_days = [days[rng.randrange(k)] for _ in range(k)]
+        idx = [i for day in drawn_days for i in by_day[day]]
         w = sum(order_notional[i] for i in idx)
         if w <= 0:
             continue

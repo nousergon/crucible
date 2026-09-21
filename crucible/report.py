@@ -858,7 +858,7 @@ def _execution_row(
         f"; no artifact for session(s) {list(reading.missing)}" if reading.missing else ""
     )
     weighted = reading.weighted_bps
-    low, high = weighted_shortfall_ci(reading.order_bps, reading.order_notional)
+    low, high = weighted_shortfall_ci(reading.order_bps, reading.order_notional, reading.order_day)
     if reading.not_computed:
         failures = "; ".join(f"{d}: {why}" for d, why in reading.not_computed)
         return _row(
