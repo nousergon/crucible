@@ -145,6 +145,27 @@ PR_REACHABLE_JOBS: dict[str, str] = {
         "scm-platform-policy.md section 3.1 places it squarely on the "
         "pull_request path rather than excluding it."
     ),
+    # alpha-engine-config-I11228 deliverable 2 (cost-gate adoption).
+    "cost-gate.yml:cost-gate": (
+        "runs `nousergon-cost-gate` over the checkout and the resolved "
+        "base/head SHAs — a static read of the diff and the tree. It holds "
+        "no cloud credential (`permissions: contents: read` only, no "
+        "`id-token`), makes no AWS call, and its only network I/O is "
+        "installing the SHA/tag-pinned `nousergon-cost-gate` package. Its "
+        "subject is the diff, not live infrastructure, so "
+        "scm-platform-policy.md section 3.1 places it on the pull_request "
+        "path rather than excluding it."
+    ),
+    "cost-gate.yml:notify-main-failure": (
+        "sends a notification; it grades nothing and posts no check. Its own "
+        "`if:` is the compound `failure() && github.event_name != "
+        "'pull_request'`, which excludes every PR event by construction but "
+        "which this guard deliberately refuses to read as an exclusion (a "
+        "compound string, not a bare one), so it is named here instead — "
+        "mirroring `ci.yml:notify-main-failure`. The properties that make it "
+        "safe are asserted by "
+        "`test_the_cost_gate_notify_job_still_depends_on_the_excluded_job`."
+    ),
 }
 
 
@@ -159,6 +180,12 @@ REUSABLE_WORKFLOW_JOBS: dict[str, str] = {
     # nothing else, and unreachable on a PR because it needs the excluded
     # `acceptance` job.
     "ci.yml:notify-main-failure": "test_the_notify_job_still_depends_on_the_excluded_job",
+    # Same shape, cost-gate.yml (alpha-engine-config-I11228 deliverable 2):
+    # pinned by SHA to the same nousergon-lib workflow, only runs on failure,
+    # off the PR path by its own `if:`.
+    "cost-gate.yml:notify-main-failure": (
+        "test_the_cost_gate_notify_job_still_depends_on_the_excluded_job"
+    ),
 }
 
 
@@ -369,6 +396,43 @@ def test_the_notify_job_still_depends_on_the_excluded_job() -> None:
     condition = job.condition
     assert "failure()" in condition, (
         "notify-main-failure no longer runs only on failure; its allowlist entry claims it does."
+    )
+    # It is in REUSABLE_WORKFLOW_JOBS, so the step scan cannot see what it
+    # calls. Pin the target: repointing it at another workflow is exactly the
+    # repurposing this entry exists to prevent.
+    assert re.fullmatch(
+        r"nousergon/nousergon-lib/\.github/workflows/notify-ci-failure\.yml@[0-9a-f]{40}",
+        job.uses,
+    ), (
+        "notify-main-failure must call the nousergon-lib notification workflow "
+        "pinned to a 40-character SHA. Its allowlist entry assumes that target, "
+        "nothing here can scan a called workflow, and the job carries "
+        "`secrets: inherit` — a moving ref like `@main` is a supply-chain hole, "
+        "and a prefix check accepted one."
+    )
+
+
+def test_the_cost_gate_notify_job_still_depends_on_the_excluded_job() -> None:
+    """Same shape as `test_the_notify_job_still_depends_on_the_excluded_job`,
+    for `cost-gate.yml`'s own notify job (alpha-engine-config-I11228
+    deliverable 2).
+
+    `cost-gate.yml:notify-main-failure` is allowlisted on the strength of two
+    properties: it needs the `cost-gate` job and it only runs on failure, off
+    the PR path by its own `if:`. Rewriting the job body while keeping the
+    name would inherit the exemption. Assert the properties, not the name.
+    """
+    job = Workflow.load(WORKFLOW_DIR / "cost-gate.yml").jobs["notify-main-failure"]
+    assert "cost-gate" in job.needs, (
+        "notify-main-failure no longer depends on `cost-gate`. Re-derive its allowlist entry."
+    )
+    condition = job.condition
+    assert "failure()" in condition, (
+        "notify-main-failure no longer runs only on failure; its allowlist entry claims it does."
+    )
+    assert "pull_request" in condition, (
+        "notify-main-failure no longer excludes pull_request in its own `if:`; "
+        "its allowlist entry assumes that exclusion."
     )
     # It is in REUSABLE_WORKFLOW_JOBS, so the step scan cannot see what it
     # calls. Pin the target: repointing it at another workflow is exactly the
