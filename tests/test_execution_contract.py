@@ -16,12 +16,15 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import json
+import random
 from pathlib import Path
 
 import pytest
 from jsonschema import Draft202012Validator
 
 from crucible.execution import (
+    _BOOTSTRAP_RESAMPLES,
+    _BOOTSTRAP_SEED,
     DECISION_PRICE_BASIS,
     EXECUTION_METRIC_NAME,
     EXECUTION_N_FLOOR,
@@ -412,25 +415,189 @@ class TestTheFifthRow:
 
 
 class TestWeightedCI:
+    _DAYS = ["2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-14"]
+
     def test_fewer_than_two_orders_has_no_interval(self) -> None:
-        assert weighted_shortfall_ci([5.0], [100.0]) == (None, None)
+        assert weighted_shortfall_ci([5.0], [100.0], ["2026-09-08"]) == (None, None)
+
+    def test_many_orders_on_one_day_has_no_interval(self) -> None:
+        # Old (i.i.d.-over-orders) code returned a spuriously narrow interval
+        # here; a single trading day is one observation of that day's common
+        # factor no matter how many orders it holds.
+        bps = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        notional = [100.0] * 10
+        day = ["2026-09-08"] * 10
+        assert weighted_shortfall_ci(bps, notional, day) == (None, None)
 
     def test_identical_orders_have_no_interval(self) -> None:
-        assert weighted_shortfall_ci([5.0] * 10, [100.0] * 10) == (None, None)
+        days = [self._DAYS[i % len(self._DAYS)] for i in range(10)]
+        assert weighted_shortfall_ci([5.0] * 10, [100.0] * 10, days) == (None, None)
 
     def test_the_interval_brackets_the_weighted_mean(self) -> None:
         bps = [1.0, 2.0, 8.0, 3.0, 5.0, 4.0]
         notional = [10.0, 30.0, 5.0, 20.0, 15.0, 20.0]
-        low, high = weighted_shortfall_ci(bps, notional)
+        day = [
+            "2026-09-08",
+            "2026-09-08",
+            "2026-09-08",
+            "2026-09-09",
+            "2026-09-09",
+            "2026-09-09",
+        ]
+        low, high = weighted_shortfall_ci(bps, notional, day)
         mean = sum(b * n for b, n in zip(bps, notional, strict=True)) / sum(notional)
         assert low is not None and high is not None and low < mean < high
 
     def test_mismatched_lengths_raise(self) -> None:
         with pytest.raises(ValueError, match="notionals"):
-            weighted_shortfall_ci([1.0, 2.0], [1.0])
+            weighted_shortfall_ci([1.0, 2.0], [1.0], ["2026-09-08", "2026-09-09"])
+        with pytest.raises(ValueError, match="day labels"):
+            weighted_shortfall_ci([1.0, 2.0], [1.0, 1.0], ["2026-09-08"])
 
     def test_all_zero_notional_has_no_interval(self) -> None:
-        assert weighted_shortfall_ci([1.0, 2.0, 3.0], [0.0, 0.0, 0.0]) == (None, None)
+        days = ["2026-09-08", "2026-09-09", "2026-09-10"]
+        assert weighted_shortfall_ci([1.0, 2.0, 3.0], [0.0, 0.0, 0.0], days) == (None, None)
+
+    def test_determinism(self) -> None:
+        bps = [1.0, 2.0, 8.0, 3.0, 5.0, 4.0]
+        notional = [10.0, 30.0, 5.0, 20.0, 15.0, 20.0]
+        day = [
+            "2026-09-08",
+            "2026-09-08",
+            "2026-09-08",
+            "2026-09-09",
+            "2026-09-09",
+            "2026-09-09",
+        ]
+        assert weighted_shortfall_ci(bps, notional, day) == weighted_shortfall_ci(
+            bps, notional, day
+        )
+
+    def test_one_order_per_day_matches_iid_order_resampling(self) -> None:
+        # The degenerate case where clustering is a no-op: with exactly one
+        # order per trading day, resampling days IS resampling orders, so the
+        # block estimator and an i.i.d. order estimator built with the same
+        # seed and resample count must agree (here, exactly).
+        bps = [1.0, 4.0, 2.0, 9.0, 3.0, 7.0]
+        notional = [10.0, 5.0, 20.0, 8.0, 15.0, 12.0]
+        days = self._DAYS + ["2026-09-15"]
+        assert len(days) == len(bps)
+
+        block_low, block_high = weighted_shortfall_ci(bps, notional, days)
+
+        n = len(bps)
+        rng = random.Random(_BOOTSTRAP_SEED)
+        draws: list[float] = []
+        for _ in range(_BOOTSTRAP_RESAMPLES):
+            idx = [rng.randrange(n) for _ in range(n)]
+            w = sum(notional[i] for i in idx)
+            if w <= 0:
+                continue
+            draws.append(sum(bps[i] * notional[i] for i in idx) / w)
+        draws.sort()
+        iid_low = draws[int(0.025 * len(draws))]
+        iid_high = draws[int(0.975 * len(draws)) - 1]
+
+        assert block_low == pytest.approx(iid_low, abs=1e-9)
+        assert block_high == pytest.approx(iid_high, abs=1e-9)
+
+    def test_a_per_day_common_factor_widens_the_block_interval(self) -> None:
+        # Four trading days, five orders each, equal notional so weighting
+        # does not confound the comparison. Each set shares the SAME
+        # idiosyncratic within-day spread and the same zero-mean pattern of
+        # per-day shifts, so all three sets have the same weighted point
+        # estimate; they differ ONLY in the variance of the common factor
+        # each day's orders share, which is the quantity clustering exists
+        # to account for.
+        days = ["2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11"]
+        # Distinct per-day idiosyncratic patterns, all with the same mean, so
+        # the days differ from each other even with NO common factor — four
+        # identical days would make every block draw the same number and the
+        # estimator would correctly return no interval, leaving the
+        # comparison below with no baseline.
+        idiosyncratic = [
+            [-0.4, -0.2, 0.0, 0.2, 0.4],
+            [-0.5, -0.1, 0.0, 0.1, 0.5],
+            [-0.3, -0.3, 0.0, 0.3, 0.3],
+            [-0.6, -0.2, 0.0, 0.2, 0.6],
+        ]
+
+        def build(day_deltas: list[float]) -> tuple[list[float], list[float], list[str]]:
+            bps: list[float] = []
+            notl: list[float] = []
+            day_labels: list[str] = []
+            for day, delta, offsets in zip(days, day_deltas, idiosyncratic, strict=True):
+                for offset in offsets:
+                    bps.append(offset + delta)
+                    notl.append(10.0)
+                    day_labels.append(day)
+            return bps, notl, day_labels
+
+        tiny_factor = build([-0.1, 0.1, -0.1, 0.1])
+        small_factor = build([-1.0, 1.0, -1.0, 1.0])
+        large_factor = build([-5.0, 5.0, -5.0, 5.0])
+
+        def width(
+            order_bps: list[float], order_notional: list[float], order_day: list[str]
+        ) -> float:
+            low, high = weighted_shortfall_ci(order_bps, order_notional, order_day)
+            assert low is not None and high is not None
+            return high - low
+
+        w_tiny = width(*tiny_factor)
+        w_small = width(*small_factor)
+        w_large = width(*large_factor)
+
+        assert w_tiny < w_small < w_large
+        # Material, not marginal: a 50x larger common factor produces an
+        # interval an order of magnitude wider. The block estimator is
+        # reading the quantity that actually varies between independent
+        # observations, which is the per-DAY mean.
+        assert w_large > 5 * w_tiny
+
+    def test_the_iid_estimator_misses_the_common_factor_the_block_catches(self) -> None:
+        # The regression proof, stated as the comparison that actually
+        # distinguishes the two estimators. A per-day common factor inflates
+        # the MARGINAL spread of the shortfalls, so an i.i.d.-over-orders
+        # bootstrap widens too — widening alone proves nothing. What it
+        # cannot do is count observations correctly: its width scales with
+        # 1/sqrt(n_orders) whether or not the orders are clustered, while the
+        # block estimator's scales with 1/sqrt(n_days). With 5 orders on each
+        # of 4 days the block interval must therefore be materially WIDER
+        # than the i.i.d. one on the clustered set, and the gap is the
+        # precision the old code was claiming and had not earned.
+        days = ["2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11"]
+        idiosyncratic = [-0.4, -0.2, 0.0, 0.2, 0.4]
+        deltas = [-5.0, 5.0, -5.0, 5.0]
+        bps: list[float] = []
+        notional: list[float] = []
+        day_labels: list[str] = []
+        for day, delta in zip(days, deltas, strict=True):
+            for offset in idiosyncratic:
+                bps.append(offset + delta)
+                notional.append(10.0)
+                day_labels.append(day)
+
+        block_low, block_high = weighted_shortfall_ci(bps, notional, day_labels)
+        assert block_low is not None and block_high is not None
+
+        n = len(bps)
+        rng = random.Random(_BOOTSTRAP_SEED)
+        draws: list[float] = []
+        for _ in range(_BOOTSTRAP_RESAMPLES):
+            idx = [rng.randrange(n) for _ in range(n)]
+            w = sum(notional[i] for i in idx)
+            if w <= 0:
+                continue
+            draws.append(sum(bps[i] * notional[i] for i in idx) / w)
+        draws.sort()
+        iid_width = draws[int(0.975 * len(draws)) - 1] - draws[int(0.025 * len(draws))]
+
+        block_width = block_high - block_low
+        assert block_width > 1.5 * iid_width, (
+            f"block {block_width} vs iid {iid_width}: the i.i.d. estimator is not "
+            "understating the interval, so this set does not exercise the defect"
+        )
 
 
 def test_the_reducer_reads_nothing_when_nothing_was_filed(tmp_path) -> None:
