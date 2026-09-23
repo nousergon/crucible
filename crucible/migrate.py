@@ -46,6 +46,7 @@ from crucible.manifest import money_path_writes, validate
 from crucible.release import release_json_key
 from crucible.runner import resolve_code_sha
 from crucible.slots.arms import ArmSpec, read_register, register_arms, write_register
+from crucible.slots.producibility import UnproducibleChampionError, catalog_refusal
 from crucible.store import ETAG_ABSENT, PointerConflictError, sha256_hex
 
 if TYPE_CHECKING:
@@ -353,7 +354,10 @@ def run_migrate_history(
     run exits `ok`. Exhaustively: a slot whose arm has not produced, a declared
     v1 source that is absent, a champion name with no v2 recipe supplied, a
     recipe belonging to another slot, a recipe whose id the bootstrap cannot
-    reproduce, and a pointer already held by another writer. An arc stage that
+    reproduce, a recipe the release refuses at registration so the arm can
+    never produce (`alpha-engine-config-I11085`, raised as
+    :class:`~crucible.slots.producibility.UnproducibleChampionError`), and a
+    pointer already held by another writer. An arc stage that
     raised on any of them would kill every stage after it, which is the defect
     `crucible-PR317` closed one stage earlier — and every one of those states
     is reachable on an ordinary Saturday: `promote` writes the same pointer an
@@ -488,6 +492,33 @@ def run_migrate_history(
             )
             if asserted:
                 raise MigrationSourceMissing(why)
+            imported[slot] = []
+            pointers[slot] = "deferred"
+            deferred[slot] = why
+            continue
+        # `alpha-engine-config-I11085`. A pointer is a SERVING decision, so the
+        # arm it names must be one the release can produce - asked of the
+        # recipe itself, with the predicate `experiment.run` applies before
+        # producing. On 2026-09-14 this import seated R on
+        # `scanner_predictor_direct`, whose recipe refuses BY NAME until track
+        # B lands; nothing checked, and the 2026-09-19 arc died at
+        # `experiment.run[r]` resolving it. Checked BEFORE the existing-pointer
+        # branch as well, so a rerun over a pointer this migration already
+        # seated on such an arm reports the refusal instead of `unchanged`.
+        # `admission_refusal` below is the RUNTIME half (has it produced?);
+        # this is the half knowable from the tree, and a seeded or backfilled
+        # shadow cannot satisfy it.
+        refused_by_recipe = catalog_refusal(recipe)
+        if refused_by_recipe is not None:
+            why = (
+                f"v1 slot {slot!r} names champion {champion_name!r}, which resolves to "
+                f"{spec.arm_id} - an arm that cannot produce: {refused_by_recipe} Seating "
+                "the slot on it would point the serving path at an arm that writes no "
+                "shadow, and the first arc to resolve the pointer would fail at "
+                f"`experiment.run[{slot}]`."
+            )
+            if asserted:
+                raise UnproducibleChampionError(why)
             imported[slot] = []
             pointers[slot] = "deferred"
             deferred[slot] = why

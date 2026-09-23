@@ -9,16 +9,33 @@ and started by nobody.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 
 import pytest
 
 from crucible.components import DISPATCHES, Component, Deadline, load_registry
+from crucible.keys import champion_key
 from crucible.runmode import RUN_MODE_ENV, RUN_MODE_LIVE, RUN_MODE_REPLAY
-from crucible.slots import SLOTS, dispatchable_slots
+from crucible.slots import SLOTS, dispatchable_slots, get_slot
+from crucible.slots.arms import control_specs, load_arm_specs
+from crucible.slots.producibility import UnproducibleChampionError
+from crucible.store import LocalStore
 from crucible.weekly import ARC_SLOT_JOBS, ARCTIC_LIBRARY_JOBS, ArcStageFailed, arc_stages, run_arc
 
 FRIDAY = dt.date(2026, 8, 28)
+
+
+@pytest.fixture(autouse=True)
+def _a_store_the_preflight_can_read(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`run_arc` reads every dispatched slot's champion pointer before stage 1
+    (`alpha-engine-config-I11085`), from `--store` or `$CRUCIBLE_STORE` exactly
+    as each stage would. The tests below that pass `store=None` exercise argv
+    shape, not the store, so they get an EMPTY store: no pointer, nothing to
+    refuse. The check itself is exercised against real stores in
+    `TestChampionsAreProducibleBeforeStageOne`."""
+    monkeypatch.setenv("CRUCIBLE_STORE", str(tmp_path / "empty-v2-store"))
+    monkeypatch.delenv("CRUCIBLE_STRATEGY_DIR", raising=False)
 
 
 def _expected_stage_count() -> int:
@@ -398,3 +415,109 @@ class TestDeadlineOfTheArcItself:
         assert isinstance(arc_due, Deadline)
         latest = max(s.due_at for s in arc_stages(FRIDAY, registry))
         assert arc_due.due_at(FRIDAY) > latest
+
+
+# `alpha-engine-config-I11085`: production's R tree in the part that matters.
+# `scanner_predictor_direct` ranks on `predicted_alpha_ratio`, which the
+# phase-1 feature catalogue declares no producer for, so `experiment.run`
+# refuses it at registration; `no_agent_quant` is fully expressible.
+_R_RECIPES = {
+    "scanner_predictor_direct": (
+        "name: scanner_predictor_direct\nslot: r\nranker: predicted_alpha_direct\n"
+        "registered_at: '2026-07-13'\nparams:\n  top_n: 10\n"
+    ),
+    "no_agent_quant": (
+        "name: no_agent_quant\nslot: r\nranker: quant_composite\n"
+        "registered_at: '2026-06-15'\nparams:\n  top_n: 15\n  momentum_weight: 0.5\n"
+        "  trend_weight: 0.3\n  reversal_weight: 0.2\n"
+    ),
+}
+
+
+class TestChampionsAreProducibleBeforeStageOne:
+    """`alpha-engine-config-I11085`. On 2026-09-19 the arc died at
+    `experiment.run[r]` because R's pointer named an arm whose recipe refuses
+    in phase 1, and every stage after it died too. The class must fail in
+    seconds, before stage 1, naming the slot, the arm and why."""
+
+    @pytest.fixture
+    def v2(self, tmp_path) -> LocalStore:
+        store = LocalStore(tmp_path / "v2")
+        for name, body in _R_RECIPES.items():
+            store.put_bytes(f"strategy/current/arms/r/{name}.yaml", body.encode())
+        return store
+
+    @staticmethod
+    def _arm_id(store: LocalStore, name: str) -> str:
+        return next(s.arm_id for s in load_arm_specs("r", store=store) if s.name == name)
+
+    @staticmethod
+    def _point_r_at(store: LocalStore, arm_id: str) -> None:
+        store.put_bytes(champion_key("r"), json.dumps({"arm_id": arm_id}).encode())
+
+    def _run(self, store: LocalStore, *, dry_run: bool = False) -> list[list[str]]:
+        seen: list[list[str]] = []
+
+        def fake_main(argv: list[str]) -> int:
+            seen.append(argv)
+            return 0
+
+        self.seen = seen
+        run_arc(
+            FRIDAY,
+            store=str(store.root),
+            run_mode=RUN_MODE_LIVE,
+            main=fake_main,
+            dry_run=dry_run,
+        )
+        return seen
+
+    @pytest.mark.parametrize("dry_run", [False, True])
+    def test_a_pointer_at_an_arm_the_release_refuses_fails_before_stage_one(
+        self, v2: LocalStore, dry_run: bool
+    ) -> None:
+        refused = self._arm_id(v2, "scanner_predictor_direct")
+        self._point_r_at(v2, refused)
+        with pytest.raises(UnproducibleChampionError) as excinfo:
+            self._run(v2, dry_run=dry_run)
+        assert self.seen == [], "no stage may run once a served slot is known to have no feed"
+        message = str(excinfo.value)
+        assert "slot 'r'" in message
+        assert refused in message
+        assert "predicted_alpha_ratio" in message, "the reason must say WHY it cannot produce"
+        assert self._arm_id(v2, "no_agent_quant") in message, (
+            "the message must name what the operator can re-point to"
+        )
+        assert "--revert-to" in message
+
+    def test_a_pointer_at_a_producible_arm_runs_every_stage(self, v2: LocalStore) -> None:
+        self._point_r_at(v2, self._arm_id(v2, "no_agent_quant"))
+        assert len(self._run(v2)) == _expected_stage_count()
+
+    def test_no_pointer_is_not_a_refusal(self, v2: LocalStore) -> None:
+        """A slot that has never promoted serves nothing and says so; that is
+        `_serve_champion_feed`'s `(None, None)`, not a failure."""
+        assert len(self._run(v2)) == _expected_stage_count()
+
+    def test_a_pointer_at_a_control_arm_is_refused(self, v2: LocalStore) -> None:
+        control = control_specs(get_slot("r"))[0].arm_id
+        self._point_r_at(v2, control)
+        with pytest.raises(UnproducibleChampionError, match="control arm"):
+            self._run(v2)
+        assert self.seen == []
+
+    def test_a_pointer_at_a_superseded_spec_hash_is_refused(self, v2: LocalStore) -> None:
+        """The name exists but the recipe now hashes elsewhere: nothing will
+        ever write a shadow under the id the pointer names."""
+        current = self._arm_id(v2, "no_agent_quant")
+        stale = current.rsplit(":", 1)[0] + ":000000000000"
+        self._point_r_at(v2, stale)
+        with pytest.raises(UnproducibleChampionError, match=re.escape(current)):
+            self._run(v2)
+        assert self.seen == []
+
+    def test_a_pointer_at_an_arm_no_recipe_declares_is_refused(self, v2: LocalStore) -> None:
+        self._point_r_at(v2, "r:thinktank_coverage:557ccb7e7988")
+        with pytest.raises(UnproducibleChampionError, match="no recipe named 'thinktank_coverage'"):
+            self._run(v2)
+        assert self.seen == []

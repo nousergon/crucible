@@ -41,6 +41,7 @@ __all__ = [
     "SELECT_NEWEST_VERDICT_JOBS",
     "Stage",
     "arc_stages",
+    "assert_arc_champions_producible",
     "run_arc",
 ]
 
@@ -202,6 +203,42 @@ def arc_stages(trading_day: dt.date, registry: dict[str, Component] | None = Non
     return stages
 
 
+def assert_arc_champions_producible(
+    trading_day: dt.date, stages: list[Stage], *, store: str | None
+) -> None:
+    """Raise if any slot the arc dispatches has a champion pointer naming an arm
+    the release in force cannot produce. See `crucible.slots.producibility`.
+
+    The slots are the ones the arc actually DISPATCHES, read off ``stages`` —
+    never `SLOTS`, and never a list: a slot with no stage serves nothing this
+    arc, and a slot added to the arc is checked the day it joins.
+
+    The store is opened read-only (`open_store(..., dry_run=True)`: the
+    capturing wrapper has no code path to a write), from the same ``store``
+    argument, or `$CRUCIBLE_STORE`, that every stage resolves; the recipe tree
+    is the one `crucible.config.settings` resolves, so the check reads what
+    `experiment.run` will read. It never degrades: an unreadable pointer or
+    recipe tree raises here, before stage 1, rather than being reported as
+    producible.
+    """
+    from crucible.config import settings as resolve_settings  # noqa: PLC0415 - light, one site
+    from crucible.slots.producibility import (  # noqa: PLC0415 - avoids a cycle
+        assert_champions_producible,
+    )
+    from crucible.store import open_store  # noqa: PLC0415 - avoids a cycle
+
+    dispatched = [slot for slot in SLOTS if any(stage.slot == slot for stage in stages)]
+    if not dispatched:
+        return
+    assert_champions_producible(
+        open_store(store, dry_run=True),
+        dispatched,
+        strategy_dir=resolve_settings(store_uri=store).strategy_dir,
+        trading_day=trading_day.isoformat(),
+        context=f"weekly arc for {trading_day.isoformat()} refused before stage 1",
+    )
+
+
 class ArcStageFailed(RuntimeError):
     """A stage exited non-zero. Carries which one, so the arc's own manifest
     `reason` names a job rather than a traceback in a module nobody opens."""
@@ -242,13 +279,23 @@ def run_arc(
     the value from `CRUCIBLE_INTEGRATION_ARCTIC_LIBRARY` via
     `crucible.required.require_env` in its own conftest — RAISE-on-absent
     already lives there, not here).
+
+    **Before stage 1, every dispatched slot's champion pointer must name an arm
+    the release can produce** (:func:`assert_arc_champions_producible`,
+    `alpha-engine-config-I11085`). A pointer at an arm that cannot produce is
+    not a stage failure waiting to happen, it is a certainty — and discovering
+    it at `experiment.run[r]` took nine stages down with it on 2026-09-19. It
+    runs under `dry_run` too, because a rehearsal that skipped it would pass
+    the check the scheduled arc then fails.
     """
     if main is None:
         from crucible.cli import main as cli_main  # noqa: PLC0415 - cycle; see docstring
 
         main = cli_main
+    stages = arc_stages(trading_day, registry)
+    assert_arc_champions_producible(trading_day, stages, store=store)
     ran: list[Stage] = []
-    for stage in arc_stages(trading_day, registry):
+    for stage in stages:
         try:
             code = main(  # type: ignore[operator]
                 stage.argv(
