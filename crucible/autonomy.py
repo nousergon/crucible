@@ -108,15 +108,20 @@ __all__ = [
     "count_operator_actions",
     "date_partitions",
     "iter_archive_records",
+    "literal_needle",
     "trailing_calendar_month",
 ]
 
 #: How many archive objects are fetched at once within one calendar day. Each
 #: is one S3 round-trip and a gzip decode, so the work is latency, not CPU.
-#: Measured 2026-09-03: one production day is ~1,123 objects / ~36 MB, which
-#: took ~150 s sequentially — a fortnight is ~20 minutes, past the board job's
-#: timeout. Bounded rather than unbounded: a day with tens of thousands of
-#: objects must not open a socket per object.
+#: Measured 2026-09-03 at ~1,123 objects / ~36 MB a day (~150 s sequentially);
+#: restated 2026-09-23 (`alpha-engine-config-I11448`): 09-14..09-22 ran
+#: ~1,750 objects/day (1,207–2,436), 74–98 MB/day compressed and ~465k
+#: records/day, and one day through :func:`iter_archive_records` took 28.5 s
+#: wall at this concurrency. Past the fetch, the floor is `json.loads` —
+#: ~12 s/day and GIL-bound, so more workers do not buy it back; the ``needle``
+#: pre-filter is what does. Bounded rather than unbounded: a day with tens of
+#: thousands of objects must not open a socket per object.
 _ARCHIVE_WORKERS = 32
 
 #: A date partition's first level. CloudTrail's key layout is
@@ -244,6 +249,9 @@ class ArchiveRead:
     records: list[dict[str, Any]]
     objects_by_day: dict[dt.date, int]
     records_scanned: int
+    #: Objects a ``needle`` ruled out before decode (`alpha-engine-config-I11448`).
+    #: Counted in ``objects_by_day``; their records are not in ``records_scanned``.
+    objects_prefiltered: int = 0
 
     @property
     def objects_read(self) -> int:
@@ -344,10 +352,63 @@ def date_partitions(client: Any, *, bucket: str, prefix: str) -> tuple[str, ...]
     return partitions or (base,)
 
 
-def _fetch_records(client: Any, *, bucket: str, key: str) -> list[dict[str, Any]]:
-    """One archive object's records. The unit of work a worker thread does."""
+def literal_needle(value: str) -> bytes | None:
+    """``value`` as a byte needle for :func:`iter_archive_records`, or `None`
+    when its raw-JSON spelling cannot be proven to contain it literally.
+
+    A JSON encoder is free to escape any character as ``\\uXXXX``, must
+    escape ``"``, ``\\`` and control characters, and may escape ``/`` as
+    ``\\/``. :func:`_needle_rules_out` falls through on ``\\u`` and — for a
+    needle holding ``/`` — on ``\\/``, so the only characters left that could
+    hide a match are the ones that MUST be escaped. A value carrying one of
+    those, or anything outside printable ASCII, gets no needle: an unfiltered
+    read is slower, never wrong (`alpha-engine-config-I11448`).
+    """
+    if not value or not value.isascii() or not value.isprintable():
+        return None
+    if '"' in value or "\\" in value:
+        return None
+    return value.encode("ascii")
+
+
+def _needle_rules_out(raw: bytes, needle: bytes) -> bool:
+    """Whether NO record in the decompressed object ``raw`` can carry a JSON
+    string whose decoded value contains ``needle``.
+
+    A strict NECESSARY condition, never a heuristic, because the readers it
+    serves assert a count of zero and a false skip is a gate reading clean
+    because it could not see. A decoded string holding ``needle`` is spelled
+    in the raw text either literally or with at least one escape; every escape
+    that can spell a :func:`literal_needle` character is ``\\u`` or, for
+    ``/``, ``\\/``. So an object is ruled out only when the needle is absent
+    AND neither escape is present. A stray ``\\\\u`` (an escaped backslash
+    before a ``u``) also falls through — the conservative direction.
+    """
+    if needle in raw:
+        return False
+    if b"\\u" in raw:
+        return False
+    return not (b"/" in needle and b"\\/" in raw)
+
+
+def _fetch_records(
+    client: Any, *, bucket: str, key: str, needle: bytes | None = None
+) -> list[dict[str, Any]] | None:
+    """One archive object's records. The unit of work a worker thread does.
+
+    With ``needle``, an object :func:`_needle_rules_out` excludes returns
+    `None` before `json.loads` — the per-day floor measured 2026-09-23 at
+    ~12 s of GIL-bound decode over ~465k records (`alpha-engine-config-I11448`).
+    The bytes are still gunzipped (CRC-checked) and UTF-8 decoded first, so a
+    truncated or mis-encoded object still raises rather than being skipped;
+    only an object that decodes cleanly and cannot hold a match is.
+    """
     body = client.get_object(Bucket=bucket, Key=key)["Body"].read()
-    payload = json.loads(gzip.decompress(body).decode("utf-8"))
+    raw = gzip.decompress(body)
+    text = raw.decode("utf-8")
+    if needle is not None and _needle_rules_out(raw, needle):
+        return None
+    payload = json.loads(text)
     return list(payload.get("Records") or [])
 
 
@@ -359,6 +420,7 @@ def iter_archive_records(
     start: dt.date,
     end: dt.date,
     keep: Callable[[dict[str, Any]], bool] | None = None,
+    needle: bytes | None = None,
 ) -> ArchiveRead:
     """Every CloudTrail record delivered for the calendar days in the window.
 
@@ -381,9 +443,11 @@ def iter_archive_records(
     the window — including the ones that yielded nothing.
 
     **``keep`` filters per object, before anything accumulates.** Measured
-    2026-09-03 against the production archive: one day is ~1,123 objects and
-    ~181k records, so a fortnight is ~1.4M records and 6–7 GB of resident
-    dicts if every record is held. The gate wants the mutating records that
+    2026-09-03 against the production archive at ~1,123 objects and ~181k
+    records a day; restated 2026-09-23 (`alpha-engine-config-I11448`) at
+    ~1,750 objects, 74–98 MB compressed and ~465k records a day, so a
+    fortnight is ~6.5M records and far more resident dicts than a runner
+    holds if every record is kept. The gate wants the mutating records that
     name a v2 resource — a handful — so the predicate is applied as each
     object is decoded and peak memory is the size of the ANSWER rather than
     the size of the archive. ``records_scanned`` still counts everything read,
@@ -394,8 +458,19 @@ def iter_archive_records(
     fortnight took ~20 minutes — past the board job's timeout, which is a
     measurement failing for a reason that has nothing to do with what is being
     measured.
+
+    **``needle`` skips whole objects before `json.loads`** — an ASCII byte
+    string (build it with :func:`literal_needle`) that every record ``keep``
+    accepts is PROVEN to carry literally in its raw JSON. It is the caller's
+    proof, not this function's: a needle ``keep`` does not imply turns a
+    zero-asserting read into one that cannot see. An object it rules out
+    still counts in ``objects_by_day`` (it was delivered and read) and in
+    :attr:`ArchiveRead.objects_prefiltered`, but its records are never
+    decoded, so ``records_scanned`` counts only the records of objects that
+    were.
     """
     kept: list[dict[str, Any]] = []
+    prefiltered = 0
     scanned = 0
     objects_by_day: dict[dt.date, int] = {}
     paginator = client.get_paginator("list_objects_v2")
@@ -412,14 +487,23 @@ def iter_archive_records(
             workers = min(_ARCHIVE_WORKERS, len(keys))
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = [
-                    pool.submit(_fetch_records, client, bucket=bucket, key=key) for key in keys
+                    pool.submit(_fetch_records, client, bucket=bucket, key=key, needle=needle)
+                    for key in keys
                 ]
                 for future in futures:
                     records = future.result()
+                    if records is None:
+                        prefiltered += 1
+                        continue
                     scanned += len(records)
                     kept.extend(r for r in records if keep is None or keep(r))
         day += dt.timedelta(days=1)
-    return ArchiveRead(records=kept, objects_by_day=objects_by_day, records_scanned=scanned)
+    return ArchiveRead(
+        records=kept,
+        objects_by_day=objects_by_day,
+        records_scanned=scanned,
+        objects_prefiltered=prefiltered,
+    )
 
 
 def trailing_calendar_month(render_day: dt.date) -> tuple[dt.date, dt.date]:
@@ -664,6 +748,15 @@ def attribute_pointer_writes(
             return False
         return str(params.get("key") or "").lstrip("/") == object_key
 
+    # `alpha-engine-config-I11448`: ``_is_pointer_write`` accepts a record
+    # only when ``str(requestParameters.key).lstrip("/") == object_key``. The
+    # key is a letter-bearing path, so no JSON number, bool, null, list or
+    # object stringifies to it: the value is a JSON STRING whose decoded text
+    # ends with ``object_key``, which :func:`literal_needle` then proves is
+    # spelled literally in the raw bytes unless an escape (which
+    # `_needle_rules_out` falls through on) is present. `None` — unfiltered
+    # — for a key that proof does not cover.
+    needle = literal_needle(object_key)
     principals: tuple[str, ...] | None = None
     writes: list[PointerWrite] = []
     objects_read = 0
@@ -672,7 +765,13 @@ def attribute_pointer_writes(
     floor_day = since.date()
     while day >= floor_day:
         read = iter_archive_records(
-            client, bucket=bucket, prefix=prefix, start=day, end=day, keep=_is_pointer_write
+            client,
+            bucket=bucket,
+            prefix=prefix,
+            start=day,
+            end=day,
+            keep=_is_pointer_write,
+            needle=needle,
         )
         objects_read += read.objects_read
         records_scanned += read.records_scanned
@@ -805,8 +904,9 @@ STACK_APPLY_ATTRIBUTION_TOLERANCE = dt.timedelta(minutes=15)
 #: its floor is the stack apply, which is by construction recent. This read's
 #: floor is the stack's CREATION, which recedes without limit as machine
 #: applies accumulate, so an unbounded walk would read months of archive
-#: inside the board job's timeout (one production day is ~1,123 objects, a
-#: few seconds at `_ARCHIVE_WORKERS` concurrency). Reaching the bound resolves
+#: inside the board job's timeout (one production day measured 2026-09-23 at
+#: ~1,750 objects and 28.5 s wall unfiltered at `_ARCHIVE_WORKERS`
+#: concurrency, `alpha-engine-config-I11448`). Reaching the bound resolves
 #: to UNATTRIBUTABLE, which the caller reads as HUMAN — the strict direction,
 #: never "no human applied it".
 _STACK_ATTRIBUTION_MAX_DAYS = 45
@@ -898,6 +998,15 @@ def attribute_stack_applies(
             return False
         return _names_stack(record, stack_name)
 
+    # `alpha-engine-config-I11448`: ``_is_stack_apply`` accepts a record only
+    # when ``eventSource == _CLOUDFORMATION_SOURCE`` — a JSON STRING (no other
+    # JSON value compares equal to a str) whose decoded text IS the needle.
+    # The constant is printable ASCII with no character JSON must escape, so
+    # the raw bytes carry it literally unless a ``\u`` escape is present.
+    # The stack name would be an equally sound needle (`_names_stack` requires
+    # it as a substring of `stackName`), but measured 2026-09-21 it matched
+    # 216 of ~1,664 objects against this one's 116, and one needle suffices.
+    needle = literal_needle(_CLOUDFORMATION_SOURCE)
     principals: tuple[str, ...] | None = None
     applies: list[StackApply] = []
     objects_read = 0
@@ -920,7 +1029,13 @@ def attribute_stack_applies(
                 records_scanned=records_scanned,
             )
         read = iter_archive_records(
-            client, bucket=bucket, prefix=prefix, start=day, end=day, keep=_is_stack_apply
+            client,
+            bucket=bucket,
+            prefix=prefix,
+            start=day,
+            end=day,
+            keep=_is_stack_apply,
+            needle=needle,
         )
         objects_read += read.objects_read
         records_scanned += read.records_scanned

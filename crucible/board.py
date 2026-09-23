@@ -46,7 +46,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -1226,6 +1226,22 @@ def _earliest_satisfiable_rows(
 
     supplied = readings or {}
     rows: list[BoardRow] = []
+
+    # `alpha-engine-config-I11448`: the setback's CAUSE is a walk of the
+    # CloudTrail archive (`crucible.gate._last_system_change`), measured
+    # 2026-09-23 at 320 s for one call — and it was taken for every phase with
+    # a previous-day artifact, before knowing whether there was a setback at
+    # all, then thrown away on every day without one. Six of those put the
+    # render past its 25-minute timeout. So the cause is read only once a
+    # setback is found, and at most once per render: it names the last system
+    # change, which is one fact about the system, not one per phase.
+    provenance: list[str | None] = []
+
+    def _setback_cause() -> str | None:
+        if not provenance:
+            provenance.append(last_system_change_provenance(store))
+        return provenance[0]
+
     for phase in PHASES:
         if phase.gate is None:
             continue
@@ -1275,11 +1291,9 @@ def _earliest_satisfiable_rows(
         if prev_day is not None:
             previous_read = read_store_document(store, gate_key(phase.gate, prev_day.isoformat()))
             if previous_read.document is not None:
-                setback = detect_earliest_satisfiable_setback(
-                    previous_read.document,
-                    reading,
-                    cause=last_system_change_provenance(store),
-                )
+                setback = detect_earliest_satisfiable_setback(previous_read.document, reading)
+                if setback is not None:
+                    setback = replace(setback, cause=_setback_cause())
 
         if earliest is None:
             state = "MET" if reading.met else "PLANNED"
