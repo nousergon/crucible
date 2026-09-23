@@ -78,9 +78,12 @@ from crucible.slots.inputs import InputRefusal, SlotUnservableError
 from crucible.slots.vocab import refuse_unknown_keys
 
 __all__ = [
+    "ALPHA_SLOT",
     "ARM_REFUSED_METRIC",
     "ATTESTATION_STATUSES",
     "EXIT_RULES",
+    "NO_SETTLED_SESSION_METRIC",
+    "UPSTREAM_CHAMPION_ABSENT_METRIC",
     "SESSION_INPUTS_SCHEMA_VERSION",
     "SLOT",
     "Book",
@@ -100,6 +103,8 @@ __all__ = [
     "WalkForwardSpec",
     "build_walk_forward_folds",
     "construct_book",
+    "declare_no_m_champion",
+    "declared_promote_outcome",
     "grade",
     "grade_arm",
     "load_strategy_recipes",
@@ -1275,6 +1280,20 @@ COVARIANCE_LOOKBACK_TRADING_DAYS = 260
 #: compare the slots on axes that only look alike.
 S_HORIZON_TRADING_DAYS = 1
 
+#: The slot whose champion's predictions are S's alpha vector, and therefore
+#: the one upstream pointer S cannot be constructed without.
+ALPHA_SLOT = "m"
+
+#: The metric each of S's three arc stages files when the M champion pointer
+#: does not exist (`alpha-engine-config-I11452`). See
+#: :func:`declare_no_m_champion`.
+UPSTREAM_CHAMPION_ABSENT_METRIC = "upstream_champion_absent"
+
+#: The metric `experiment.grade[s]` — and `promote[s]` after it — files when
+#: the only session any S arm has recorded is the arc day's own, which is
+#: never settled (`alpha-engine-config-I11452`). See :func:`grade`.
+NO_SETTLED_SESSION_METRIC = "no_settled_session"
+
 #: The ADV series a participation-aware cost model prices trades against.
 #: Already in the feature catalog (`alpha-engine-config-I10669`: the earlier
 #: belief that this series "does not exist" was false, and filing a second
@@ -1754,6 +1773,152 @@ class ResolvedSession:
         )
 
 
+# ---------------------------------------------------------------------------
+# Declared outcomes: the arc's S stages when S is not yet constructible.
+# ---------------------------------------------------------------------------
+
+
+def _declared_metric(name: str, *, reason: str, source_path: str) -> dict[str, Any]:
+    """One `unmeasurable` MetricRecord naming why this S stage measured nothing.
+
+    No ``value`` and no ``unit``: `unmeasurable` is a first-class status and a
+    number beside it would be read as a measurement nobody made — the same
+    shape `crucible.slots.model` files for an unmeasurable CPCV battery.
+    """
+    return {
+        "name": name,
+        "module": f"crucible.slots.{SLOT}",
+        "metric_type": "gauge",
+        "n_floor": 1,
+        "status": "unmeasurable",
+        "status_reason": reason,
+        "source_path": source_path,
+        "last_updated_utc": _utc_now(),
+    }
+
+
+def declare_no_m_champion(ctx: Any, *, job: str) -> dict[str, Any] | None:
+    """S's one construction precondition, checked the same way by all three arc stages.
+
+    `alpha-engine-config-I11452`. ``None`` when `champions/m/current.json`
+    EXISTS, and the caller carries on exactly as before. Otherwise this
+    records one ``unmeasurable`` :data:`UPSTREAM_CHAMPION_ABSENT_METRIC` row
+    on ``ctx``'s manifest and returns the result the caller returns instead of
+    constructing anything, so the stage completes ``ok`` with a stated reason.
+
+    **Why a declared outcome and not a raise.** S's alpha vector is the M
+    champion's predictions and nothing else (:func:`resolve_session`), so with
+    no M champion there is no book to construct, grade or promote. That is a
+    precondition that has not been met — the same true statement
+    `crucible.slots.cycle._serve_champion_feed` makes with ``(None, None)``
+    for a slot that has never promoted, and that
+    `crucible.slots.producibility.assert_champions_producible` makes by
+    letting a slot with no pointer pass. S serves nothing today: the trader
+    serves slot M only. Raising here took the whole Saturday arc down at
+    `experiment.run[s]`, three hours before `promote[m]` — the one stage that
+    could ever seat the pointer S is waiting for.
+
+    **Why per stage and not an arc-level skip.** `gate._clause_arc_runs_ok`,
+    `crucible.alerts.evaluate_absence` and `crucible.track_f` all expand
+    `crucible.weekly.arc_stages`, and a stage the arc skipped would read to
+    all three as a MISSING manifest — a page. Each stage therefore files its
+    normal manifest, carrying this row.
+
+    **What stays loud.** Only the pointer's ABSENCE is declared. A pointer
+    that exists but names no arm, or names an arm that produced no
+    predictions for the day, still raises from :func:`resolve_session` — a
+    serving path with no feed must fail loud, and a malformed pointer is not
+    an unmet precondition. :func:`resolve_session` itself is unchanged, so
+    the trader's direct call still raises with no M pointer, and so does
+    :func:`produce_history`: a backfill asked for S history that cannot exist
+    is a request that failed, not a week that had nothing to do.
+    """
+    from crucible.keys import champion_key  # noqa: PLC0415 - avoids a cycle
+
+    pointer = champion_key(ALPHA_SLOT)
+    if ctx.store.exists(pointer):
+        return None
+    trading_day = ctx.trading_day.isoformat()
+    reason = (
+        f"slot {SLOT!r} is not constructible for {trading_day}: {pointer} is absent, so "
+        f"there is no {ALPHA_SLOT.upper()} champion whose predictions are this slot's "
+        f"alpha vector. `{job}[{SLOT}]` constructed, graded and moved nothing — a declared "
+        f"precondition, not a pass and not a miss. It clears the cycle after slot "
+        f"{ALPHA_SLOT!r} promotes a champion on evidence."
+    )
+    ctx.record_rows(rows_in=0, rows_out=0)
+    ctx.record_metric(
+        _declared_metric(UPSTREAM_CHAMPION_ABSENT_METRIC, reason=reason, source_path=pointer)
+    )
+    return {
+        "slot": SLOT,
+        "trading_day": trading_day,
+        "declared_outcome": UPSTREAM_CHAMPION_ABSENT_METRIC,
+        "reason": reason,
+    }
+
+
+def declared_promote_outcome(ctx: Any) -> dict[str, Any] | None:
+    """What `promote[s]` files instead of acting on a cycle, or ``None``.
+
+    Read by `crucible.cli._promote` off the slot module, before it loads the
+    slot's register or the graded cycle. Two declared outcomes and only two:
+
+    * the M champion pointer is absent — :func:`declare_no_m_champion`, the
+      one precondition all three S stages share;
+    * `experiment.grade[s]`'s own manifest for this day reads ``ok``, claims
+      NO arena cycle, and carries the :data:`NO_SETTLED_SESSION_METRIC` row
+      :func:`grade` files for the warm-up week. There is no decision to act
+      on, and the grade run said so on its manifest.
+
+    Anything else returns ``None`` and `promote` takes its ordinary path, so
+    `crucible.promote.read_graded_cycle` still refuses loudly when the grade
+    manifest is absent, failed, or claims a cycle that is not there. In
+    particular no ``pointer_moved`` row is filed here: a slot that could not
+    be graded has not held its pointer ON EVIDENCE, and the phase-3
+    `s_promotion_or_verdict_backed_non_promotion` clause must keep reading
+    that as unmeasurable rather than as a verdict.
+    """
+    from crucible.documents import load_store_document  # noqa: PLC0415 - avoids a cycle
+    from crucible.keys import arena_cycle_key, manifest_key  # noqa: PLC0415 - avoids a cycle
+
+    declared = declare_no_m_champion(ctx, job="promote")
+    if declared is not None:
+        return declared
+    as_of = ctx.trading_day.isoformat()
+    grade_key = manifest_key("experiment.grade", as_of, discriminator=SLOT)
+    if not ctx.store.exists(grade_key):
+        return None
+    document = load_store_document(ctx.store, grade_key)
+    if document.get("status") != "ok":
+        return None
+    claimed = {output.get("key") for output in document.get("outputs") or ()}
+    if arena_cycle_key(SLOT, as_of) in claimed:
+        return None
+    warm_up = [
+        metric
+        for metric in document.get("metrics") or ()
+        if isinstance(metric, dict) and metric.get("name") == NO_SETTLED_SESSION_METRIC
+    ]
+    if not warm_up:
+        return None
+    reason = (
+        f"`promote[{SLOT}]` for {as_of} acted on no cycle: `experiment.grade[{SLOT}]` "
+        f"({grade_key}, run_id {document.get('run_id')!r}) completed `ok` with no settled "
+        f"session to grade and declared so. {warm_up[0].get('status_reason', '')}"
+    ).strip()
+    ctx.record_rows(rows_in=0, rows_out=0)
+    ctx.record_metric(
+        _declared_metric(NO_SETTLED_SESSION_METRIC, reason=reason, source_path=grade_key)
+    )
+    return {
+        "slot": SLOT,
+        "trading_day": as_of,
+        "declared_outcome": NO_SETTLED_SESSION_METRIC,
+        "reason": reason,
+    }
+
+
 def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> ResolvedSession:
     """The point-in-time inputs for one session, from the champions' own feeds.
 
@@ -1936,8 +2101,49 @@ def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     half of the contract). S has no champion, that feed has no key builder and
     no schema in this repository, and it is tracked separately — recorded here
     rather than silently absent.
+
+    **With no M champion pointer it constructs nothing and completes ``ok``**
+    (`alpha-engine-config-I11452`, :func:`declare_no_m_champion`). The slot is
+    still LOADED first, so a refused or malformed recipe reaches this manifest
+    the same as on any other cycle; what is skipped is the register write and
+    every session document. An arm registered in a week S could not construct
+    would start its out-of-sample clock with nothing to score.
     """
     from crucible.calendar import assert_trading_day  # noqa: PLC0415 - avoids a cycle
+
+    trading_day = ctx.trading_day.isoformat()
+    assert_trading_day(
+        ctx.trading_day, context=f"experiment.run --slot {SLOT} --date {trading_day}"
+    )
+    loaded, specs = _registered_arms(ctx, settings=settings)
+    declared = declare_no_m_champion(ctx, job="experiment.run")
+    if declared is not None:
+        return {
+            **declared,
+            "arms": [],
+            "refused": [
+                {"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused
+            ],
+            "champion": None,
+            "feed_key": None,
+        }
+    return _produce_sessions(ctx, loaded=loaded, specs=specs, **kwargs)
+
+
+def _produce_sessions(
+    ctx: Any,
+    *,
+    loaded: SlotStrategies,
+    specs: list[RegisteredStrategyArm],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Register the slot's arms and record one session's inputs per arm.
+
+    The body :func:`produce` and :func:`produce_history` share. It resolves
+    the session through :func:`resolve_session`, which RAISES with no M
+    champion pointer — so the only path on which that absence is a declared
+    outcome rather than a failure is the one :func:`produce` guards.
+    """
     from crucible.keys import session_inputs_key  # noqa: PLC0415 - avoids a cycle
     from crucible.slots import get_slot  # noqa: PLC0415 - avoids a cycle
     from crucible.slots.arms import (  # noqa: PLC0415 - avoids a cycle
@@ -1948,11 +2154,6 @@ def produce(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     )
 
     trading_day = ctx.trading_day.isoformat()
-    assert_trading_day(
-        ctx.trading_day, context=f"experiment.run --slot {SLOT} --date {trading_day}"
-    )
-    loaded, specs = _registered_arms(ctx, settings=settings)
-
     register = read_register(ctx.store, SLOT)
     register, _ = register_arms(
         register, specs + control_specs(get_slot(SLOT)), filed_on=trading_day
@@ -2015,20 +2216,33 @@ def produce_history(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]
     """Record what the selected S arm SAW on ONE historical session.
 
     `experiment.backfill`'s per-session entry point for S
-    (`alpha-engine-config-I11005`), and deliberately :func:`produce` itself
-    rather than a second body: S has no serving half to omit. It writes no
-    champion feed on a production cycle either — the S feed
+    (`alpha-engine-config-I11005`), and deliberately :func:`produce`'s own
+    body rather than a second one: S has no serving half to omit. It writes
+    no champion feed on a production cycle either — the S feed
     (`strategies/current`) has no key builder and no schema in this
     repository and is tracked separately — so the produce and the history
     paths are the same path, and the equality is declared here rather than
     inherited from a silent fallback in the resolver.
+
+    The ONE difference is :func:`declare_no_m_champion`
+    (`alpha-engine-config-I11452`), which this path does not take. That
+    declared outcome exists so the weekly arc survives a week S cannot
+    construct; a backfill asked for history that cannot exist has failed,
+    and :func:`resolve_session`'s raise is what says so.
 
     U, R and M do NOT get to do this: each of those has a serving half that a
     backfill must not enter, which is why
     :func:`crucible.slots.history_producer` raises for a module that declares
     no ``produce_history`` instead of quietly using ``produce``.
     """
-    return produce(ctx, settings=settings, **kwargs)
+    from crucible.calendar import assert_trading_day  # noqa: PLC0415 - avoids a cycle
+
+    assert_trading_day(
+        ctx.trading_day,
+        context=f"experiment.run --slot {SLOT} --date {ctx.trading_day.isoformat()}",
+    )
+    loaded, specs = _registered_arms(ctx, settings=settings)
+    return _produce_sessions(ctx, loaded=loaded, specs=specs, **kwargs)
 
 
 def _close_returns(panel: Any) -> Any:
@@ -2289,6 +2503,12 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     The refusal rows are recorded here too, on this manifest, for the same
     reason they are recorded on the produce manifest: a slot that became
     unservable between the two jobs must page from whichever one ran.
+
+    Two states complete ``ok`` with a declared ``unmeasurable`` row and no
+    arena cycle (`alpha-engine-config-I11452`): no M champion pointer
+    (:func:`declare_no_m_champion`), and the warm-up week, in which the only
+    session any arm has recorded is the arc day's own. Every other way of
+    having nothing settled still raises.
     """
     from crucible.slots.cycle import (  # noqa: PLC0415 - avoids a cycle
         MissingArtifactError,
@@ -2298,6 +2518,10 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     from crucible.slots.inputs import resolve_strategy_sessions  # noqa: PLC0415 - avoids a cycle
 
     loaded, specs = _registered_arms(ctx, settings=settings)
+    refused = [{"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused]
+    declared = declare_no_m_champion(ctx, job="experiment.grade")
+    if declared is not None:
+        return {**declared, "strategy_grades": {}, "refused": refused}
     as_of = ctx.trading_day.isoformat()
     params = load_portfolio_params_from_store(
         SLOT, store=ctx.store, strategy_dir=getattr(settings, "strategy_dir", None)
@@ -2326,9 +2550,11 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     preconditions: dict[str, list[ServingPrecondition]] = {}
     graded: dict[str, dict[str, Any]] = {}
     settled: set[str] = set()
+    recorded: set[str] = set()
     for spec in specs:
         recipe = spec.recipe
         dates = [d for d in _session_dates(ctx.store, spec.arm_id) if d <= as_of]
+        recorded.update(dates)
         settleable = [d for d in dates if d in next_session]
         if not settleable:
             # The warm-up, per ARM rather than slot-wide — the same
@@ -2435,13 +2661,52 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             "attestation_coverage": float(attestation.coverage_fraction or 0.0),
         }
 
+    if not settled and recorded == {as_of}:
+        # The WARM-UP, slot-wide (`alpha-engine-config-I11452`). The only
+        # session any S arm has recorded is this arc day's own, and a decision
+        # date is held through the NEXT session, so it is never settled here.
+        # `experiment.run` is dispatched only by the weekly arc, so this is
+        # exactly S's first week after M seats a champion — and raising killed
+        # that arc at `experiment.grade[s]`. Declared, not skipped: the
+        # per-arm rows above are already on this manifest, no arena cycle is
+        # written, and `promote[s]` reads this row off this manifest
+        # (:func:`declared_promote_outcome`) rather than a cycle.
+        #
+        # What still RAISES below: nothing recorded at all (`experiment.run[s]`
+        # wrote no session that should exist), or any recorded session other
+        # than today's that did not settle (the panel lacks a session it
+        # should carry). Neither is a warm-up.
+        reason = (
+            f"slot {SLOT!r} has no settled session on or before {as_of}: every registered "
+            f"arm's only recorded session is {as_of} itself, which is held through the next "
+            "session and so is not settled yet. Nothing was graded and no arena cycle was "
+            "written — a warm-up, not a zero. The first settled session enters on the next "
+            "cycle."
+        )
+        ctx.record_metric(
+            _declared_metric(
+                NO_SETTLED_SESSION_METRIC,
+                reason=reason,
+                source_path=f"experiments/*/{as_of}/session_inputs.json",
+            )
+        )
+        return {
+            "slot": SLOT,
+            "trading_day": as_of,
+            "declared_outcome": NO_SETTLED_SESSION_METRIC,
+            "reason": reason,
+            "strategy_grades": {},
+            "refused": refused,
+        }
     if not settled:
         raise MissingArtifactError(
             f"slot {SLOT!r} has no settled session on or before {as_of}. There is nothing "
             "to grade — which is a state, not a verdict, so this run FAILS rather than "
-            "publishing an empty cycle. Record construction inputs at least one session "
-            f"back first:\n    crucible experiment.run --slot {SLOT} --date <an earlier "
-            "trading day>"
+            "publishing an empty cycle. Sessions recorded on or before it: "
+            f"{sorted(recorded) or 'none'}. A warm-up is declared only when the arc day's "
+            "own session is the ONLY one recorded; anything else is a session that should "
+            "exist or should have settled. Record construction inputs first:\n    crucible "
+            f"experiment.run --slot {SLOT} --date <trading day>"
         )
 
     result = run_grade(
@@ -2465,9 +2730,7 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         **{k: v for k, v in kwargs.items() if k not in {"arm_name", "feature_version"}},
     )
     result["strategy_grades"] = graded
-    result["refused"] = [
-        {"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused
-    ]
+    result["refused"] = refused
     return result
 
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import importlib
 import json
 import sys
 from collections.abc import Callable, Sequence
@@ -191,6 +192,16 @@ def _promote(args: argparse.Namespace) -> int:
     from crucible.slots import get_slot
 
     spec = get_slot(args.slot)
+    # `alpha-engine-config-I11452`: a slot module MAY declare an outcome that
+    # stands in for acting on a cycle — read off the module, the way
+    # `crucible.slots.dispatchable_slots` reads `produce`/`grade`, so no slot
+    # name is branched on here. Only S declares one today: no M champion
+    # pointer, or the warm-up week `experiment.grade[s]` declared on its own
+    # manifest. Anything the hook does not declare takes the ordinary path
+    # below, including every refusal `read_graded_cycle` makes.
+    declared_outcome = getattr(
+        importlib.import_module(f"crucible.slots.{spec.module}"), "declared_promote_outcome", None
+    )
     revert_to = getattr(args, "revert_to", None)
     if revert_to and not getattr(args, "reason", None):
         raise SystemExit(
@@ -245,6 +256,13 @@ def _promote(args: argparse.Namespace) -> int:
                 code_sha=code_sha,
             )
             _record_written(ctx, store, (champion_key(pointer.slot),))
+            return
+
+        if declared_outcome is not None and declared_outcome(ctx) is not None:
+            # The declared row is on this run's manifest; there is no cycle
+            # to act on and no pointer to move. Deliberately NO `pointer_moved`
+            # row: a slot that could not be graded has not held its pointer
+            # on evidence, and the phase-3 promotion clause must not read one.
             return
 
         inputs = load_slot_inputs(store, args.slot)
