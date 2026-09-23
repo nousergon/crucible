@@ -3334,7 +3334,9 @@ class CloudTrailRecord(BaseModel):
     per-object hot path (`_touches`, `_is_candidate`) stays on raw dicts,
     unchanged, for the memory/throughput reason
     `crucible.autonomy.iter_archive_records`'s own docstring measures:
-    ~181k records/day, 6-7 GB resident if every one were held or validated.
+    ~181k records/day on 2026-09-03 and ~465k on 2026-09-21
+    (`alpha-engine-config-I11448`), far past a runner's memory if every one
+    were held or validated.
     """
 
     model_config = ConfigDict(extra="allow")
