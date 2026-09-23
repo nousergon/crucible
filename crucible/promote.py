@@ -90,6 +90,7 @@ __all__ = [
     "arm_register_key",
     "arm_series_key",
     "experiments_key",
+    "load_arm_register",
     "load_slot_inputs",
     "paired_days_required",
     "read_graded_cycle",
@@ -248,6 +249,25 @@ class SlotInputs:
     pointer_etag: str = ETAG_ABSENT
 
 
+def load_arm_register(store: Store, slot: str) -> ArmRegister:
+    """Read the slot's arm register, and nothing else.
+
+    Split out of :func:`load_slot_inputs` for the operator revert
+    (``crucible promote --revert-to``), which needs only the register to
+    check the target arm is registered and unretired. Going through
+    :func:`load_slot_inputs` made a revert require every arm's score series,
+    so on 2026-09-23 the escape hatch for an unservable R champion was
+    refused because no R grade had yet run since the series writer landed:
+    the revert was blocked by the very breakage it exists to undo.
+    """
+    events = [
+        json.loads(line)
+        for line in store.get_bytes(arm_register_key(slot)).decode().splitlines()
+        if line.strip()
+    ]
+    return ArmRegister.from_dicts(events)
+
+
 def load_slot_inputs(store: Store, slot: str) -> SlotInputs:
     """Read the register, every arm's series, and the current pointer.
 
@@ -256,12 +276,7 @@ def load_slot_inputs(store: Store, slot: str) -> SlotInputs:
     is a defect rather than an omission; a loader that quietly presented the
     smaller cohort would satisfy the engine while changing what was compared.
     """
-    events = [
-        json.loads(line)
-        for line in store.get_bytes(arm_register_key(slot)).decode().splitlines()
-        if line.strip()
-    ]
-    register = ArmRegister.from_dicts(events)
+    register = load_arm_register(store, slot)
 
     series_by_arm: dict[str, ArmSeries] = {}
     for arm_id in register.all_arms():

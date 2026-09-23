@@ -182,6 +182,7 @@ def _promote(args: argparse.Namespace) -> int:
     import os
 
     from crucible.promote import (
+        load_arm_register,
         load_slot_inputs,
         read_graded_cycle,
         revert_champion,
@@ -234,7 +235,9 @@ def _promote(args: argparse.Namespace) -> int:
         if revert_to:
             pointer = revert_champion(
                 spec=spec,
-                register=load_slot_inputs(store, args.slot).register,
+                # The register only: a revert must not need score series
+                # (see `crucible.promote.load_arm_register`).
+                register=load_arm_register(store, args.slot),
                 store=store,
                 arm_id=revert_to,
                 as_of=as_of,
