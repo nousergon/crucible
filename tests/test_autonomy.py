@@ -1046,3 +1046,191 @@ class TestAttributingAStackApply:
         assert result.unattributable is None
         assert result.latest_human is None
         assert [a.machine for a in result.applies] == [True, True]
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I11448 — the byte-needle pre-filter before `json.loads`
+# ---------------------------------------------------------------------------
+
+
+class _RawBytesS3(_FakeS3):
+    """A fake whose objects may be given as exact raw JSON text.
+
+    `_FakeS3` serializes with Python's `json.dumps`, which never writes a
+    ``\\/`` and only writes ``\\u`` for non-ASCII — so the escapes a
+    necessary-condition filter has to survive could never reach it through
+    that fake. These objects carry them literally.
+    """
+
+    def __init__(self, objects: dict[str, list[dict]], raw: dict[str, str]) -> None:
+        super().__init__({**objects, **{key: [] for key in raw}})
+        self._raw = raw
+
+    def get_object(self, *, Bucket: str, Key: str):  # noqa: N803 - boto3's shape
+        if Key not in self._raw:
+            return super().get_object(Bucket=Bucket, Key=Key)
+        payload = gzip.compress(self._raw[Key].encode("utf-8"))
+
+        class _Body:
+            def read(self) -> bytes:
+                return payload
+
+        return {"Body": _Body()}
+
+
+def _day_key(day: dt.date, name: str) -> str:
+    return f"{ARCHIVE_PREFIX}/us-east-1/{day:%Y/%m/%d}/{name}.json.gz"
+
+
+def _noise(n: int) -> list[dict]:
+    """Records that carry neither the pointer key nor the CloudFormation
+    source — the ~99% of an archive day the needle exists to skip."""
+    return [_record(requestID=f"noise-{i}") for i in range(n)]
+
+
+class TestTheNeedleIsANecessaryCondition:
+    """`_needle_rules_out` may only skip an object that CANNOT hold a match:
+    the readers it serves assert a count of zero, so a false skip is a gate
+    reading clean because it could not see."""
+
+    def test_a_present_needle_is_never_ruled_out(self) -> None:
+        assert not autonomy._needle_rules_out(b'{"key":"a/b/current"}', b"a/b/current")
+
+    def test_an_absent_needle_with_no_escape_is_ruled_out(self) -> None:
+        assert autonomy._needle_rules_out(b'{"key":"a/b/other"}', b"a/b/current")
+
+    def test_a_unicode_escape_anywhere_falls_through(self) -> None:
+        raw = b'{"key":"a/b/cu\\u0072rent"}'
+        assert json.loads(raw)["key"] == "a/b/current"
+        assert not autonomy._needle_rules_out(raw, b"a/b/current")
+
+    def test_an_escaped_solidus_falls_through_for_a_needle_holding_one(self) -> None:
+        raw = b'{"key":"a\\/b\\/current"}'
+        assert json.loads(raw)["key"] == "a/b/current"
+        assert not autonomy._needle_rules_out(raw, b"a/b/current")
+
+    def test_an_escaped_solidus_does_not_disable_a_slash_free_needle(self) -> None:
+        assert autonomy._needle_rules_out(b'{"k":"x\\/y"}', b"cloudformation.amazonaws.com")
+
+    @pytest.mark.parametrize(
+        "value", ["", 'say "hi"', "back\\slash", "tab\there", "caf\u00e9", "line\nbreak"]
+    )
+    def test_a_value_json_must_escape_gets_no_needle(self, value: str) -> None:
+        assert autonomy.literal_needle(value) is None
+
+    def test_a_plain_key_gets_its_own_bytes(self) -> None:
+        assert autonomy.literal_needle(POINTER_OBJECT_KEY) == POINTER_OBJECT_KEY.encode()
+
+
+class TestTheNeedleSkipsDecodeOnly:
+    def test_a_ruled_out_object_is_counted_read_but_never_decoded(self) -> None:
+        archive = _archive({END: _noise(3)}, cover=(END,))
+        read = autonomy.iter_archive_records(
+            archive,
+            bucket="trail",
+            prefix=f"{ARCHIVE_PREFIX}/us-east-1",
+            start=END,
+            end=END,
+            needle=b"not-in-any-record",
+        )
+        assert read.objects_by_day == {END: 1}
+        assert read.objects_prefiltered == 1
+        assert read.records_scanned == 0
+        assert read.uncovered_days == ()
+
+
+def _pointer_archive(write: dict) -> _FakeS3:
+    """One day holding the pointer write in one object and noise in two."""
+    return _FakeS3(
+        {
+            _day_key(END, "a"): _noise(4),
+            _day_key(END, "b"): [*_noise(2), write],
+            _day_key(END, "c"): _noise(5),
+        }
+    )
+
+
+class TestThePointerWalkIsNeedleFiltered:
+    FLIP = dt.datetime(2026, 8, 4, 12, 0, tzinfo=dt.UTC)
+
+    def test_only_objects_carrying_the_pointer_key_are_decoded(self) -> None:
+        result = _attribute(_pointer_archive(_pointer_record(self.FLIP, "a-laptop-operator")))
+        assert result.latest_human == self.FLIP
+        # Only object "b" (two noise records plus the write) was decoded.
+        assert result.records_scanned == 3
+        assert result.objects_read == 3
+
+    def test_the_answer_is_identical_with_and_without_the_needle(self, monkeypatch) -> None:
+        for principal in ("a-laptop-operator", A_MACHINE_ROLE):
+            archive = _pointer_archive(_pointer_record(self.FLIP, principal))
+            filtered = _attribute(archive)
+            monkeypatch.setattr(autonomy, "literal_needle", lambda _value: None)
+            unfiltered = _attribute(archive)
+            monkeypatch.undo()
+            assert unfiltered.records_scanned == 12
+            assert (filtered.writes, filtered.latest_human, filtered.unattributable) == (
+                unfiltered.writes,
+                unfiltered.latest_human,
+                unfiltered.unattributable,
+            )
+            assert filtered.objects_read == unfiltered.objects_read
+
+    @pytest.mark.parametrize(
+        "spelled",
+        [
+            "crucible\\u002freleases\\u002fcurrent",
+            "crucible\\/releases\\/current",
+            "\\u0063rucible/releases/current",
+        ],
+    )
+    def test_an_escaped_pointer_key_is_still_attributed(self, spelled: str) -> None:
+        record = _pointer_record(self.FLIP, "a-laptop-operator")
+        record["requestParameters"] = {"bucketName": STORE_BUCKET, "key": "PLACEHOLDER"}
+        raw = json.dumps({"Records": [record]}).replace("PLACEHOLDER", spelled)
+        assert POINTER_OBJECT_KEY.encode() not in raw.encode()
+        archive = _RawBytesS3({_day_key(END, "a"): _noise(2)}, {_day_key(END, "b"): raw})
+        result = _attribute(archive)
+        assert result.latest_human == self.FLIP
+
+
+class TestTheStackWalkIsNeedleFiltered:
+    APPLY = dt.datetime(2026, 8, 4, 12, 0, tzinfo=dt.UTC)
+
+    def _archive(self, apply: dict) -> _FakeS3:
+        return _FakeS3(
+            {
+                _day_key(END, "a"): _noise(4),
+                _day_key(END, "b"): [*_noise(2), apply],
+                _day_key(END, "c"): _noise(5),
+            }
+        )
+
+    def test_only_objects_carrying_the_cloudformation_source_are_decoded(self) -> None:
+        result = _attribute_applies(self._archive(_apply_record(self.APPLY, "a-laptop-operator")))
+        assert result.latest_human == self.APPLY
+        assert result.records_scanned == 3
+        assert result.objects_read == 3
+
+    def test_the_answer_is_identical_with_and_without_the_needle(self, monkeypatch) -> None:
+        for principal in ("a-laptop-operator", A_MACHINE_ROLE):
+            archive = self._archive(_apply_record(self.APPLY, principal))
+            filtered = _attribute_applies(archive)
+            monkeypatch.setattr(autonomy, "literal_needle", lambda _value: None)
+            unfiltered = _attribute_applies(archive)
+            monkeypatch.undo()
+            assert unfiltered.records_scanned == 12
+            assert (filtered.applies, filtered.latest_human, filtered.unattributable) == (
+                unfiltered.applies,
+                unfiltered.latest_human,
+                unfiltered.unattributable,
+            )
+
+    def test_an_escaped_event_source_is_still_attributed(self) -> None:
+        record = _apply_record(self.APPLY, "a-laptop-operator", eventSource="PLACEHOLDER")
+        raw = json.dumps({"Records": [record]}).replace(
+            "PLACEHOLDER", "cloudformation.amazon\\u0061ws.com"
+        )
+        assert b"cloudformation.amazonaws.com" not in raw.encode()
+        archive = _RawBytesS3({_day_key(END, "a"): _noise(2)}, {_day_key(END, "b"): raw})
+        result = _attribute_applies(archive)
+        assert result.latest_human == self.APPLY

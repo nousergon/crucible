@@ -313,6 +313,66 @@ class TestTheEarliestSatisfiableRow:
         assert "SETBACK" not in row.detail
 
 
+class TestTheSetbackCauseIsReadLazily:
+    """`alpha-engine-config-I11448`: the setback's cause
+    (`last_system_change_provenance`) walks the CloudTrail archive — 320 s a
+    call, measured 2026-09-23 — and was taken once per gated phase BEFORE the
+    comparison knew whether there was a setback. Six of them put the board
+    render past its 25-minute timeout. It must be read only when a setback is
+    found, and at most once per render."""
+
+    _PREV = dt.date(2026, 9, 10)
+    _CURR = dt.date(2026, 9, 11)
+
+    def _render(self, store, monkeypatch, *, previous: str, current: dt.date) -> tuple[Any, list]:
+        from crucible import gate as gate_module
+        from crucible.gate import Clause, GateResult
+
+        calls: list[Store] = []
+
+        def _counting_provenance(s: Store) -> str:
+            calls.append(s)
+            return "the stack apply at 2026-09-10T19:49Z"
+
+        monkeypatch.setattr(gate_module, "last_system_change_provenance", _counting_provenance)
+        readings = {}
+        for phase in PHASES:
+            if phase.gate is None:
+                continue
+            store.put_bytes(
+                gate_key(phase.gate, self._PREV.isoformat()),
+                json.dumps({"gate": phase.gate, "earliest_satisfiable": previous}).encode("utf-8"),
+            )
+            readings[phase.gate] = GateResult(
+                gate=phase.gate,
+                trading_day=self._CURR,
+                window=[self._CURR],
+                clauses=[Clause("c", "req", False, "d", (), earliest_satisfiable=current)],
+            )
+        assert len(readings) > 1, "the at-most-once assertion needs several gated phases"
+        board = build_board(store, trading_day=self._CURR, readings=readings)
+        rows = [r for r in board.rows if r.id.endswith(":earliest-satisfiable")]
+        assert len(rows) == len(readings)
+        return rows, calls
+
+    def test_no_setback_reads_no_provenance(self, store, monkeypatch) -> None:
+        rows, calls = self._render(
+            store, monkeypatch, previous="2026-09-26", current=dt.date(2026, 9, 19)
+        )
+        assert all(r.setback is None for r in rows)
+        assert calls == []
+
+    def test_setbacks_in_every_phase_read_provenance_once(self, store, monkeypatch) -> None:
+        rows, calls = self._render(
+            store, monkeypatch, previous="2026-09-19", current=dt.date(2026, 9, 26)
+        )
+        assert len(calls) == 1
+        for row in rows:
+            assert row.setback is not None
+            assert row.setback["cause"] == "the stack apply at 2026-09-10T19:49Z"
+            assert "cause: the stack apply at 2026-09-10T19:49Z" in row.detail
+
+
 class TestTheObjectivesMatchTheAcceptanceSuite:
     """A bijection, asserted in both directions.
 

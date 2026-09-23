@@ -193,17 +193,25 @@ jobs:
   board:
     name: render the declared board
     runs-on: ubuntu-latest
-    # 10 was set when every clause read a stored artifact. Phase 2's
-    # `zero_human_mutating_calls` reads the CloudTrail archive over a
-    # fortnight, and MEASURED 2026-09-03 against the production archive one
-    # calendar day is ~1,123 objects / ~36 MB / ~181k records, ~150 s read
-    # sequentially — so the phase-2 window is ~9,000 objects and ~1.4M records,
-    # about 20 minutes sequentially. `crucible.autonomy` fetches a day's
-    # objects 32-at-a-time and filters each object as it decodes, which brings
-    # the archive read to a few minutes; this ceiling is the headroom around
-    # that, not a target. A board killed at its timeout publishes NOTHING —
-    # every row goes dark over one clause's reading, which is a measurement
-    # failing for a reason that has nothing to do with what it measures.
+    # 10 was set when every clause read a stored artifact. Several clauses
+    # now read the CloudTrail archive. MEASURED 2026-09-23
+    # (`alpha-engine-config-I11448`) against the production archive, one
+    # calendar day is ~1,750 objects (1,207–2,436 over 09-14..09-22),
+    # 74–98 MB compressed and ~465k records — about 2.5x the 09-03 baseline
+    # this comment used to quote (~1,123 objects / ~36 MB / ~181k records).
+    # `crucible.autonomy` fetches a day's objects 32-at-a-time, but the
+    # per-day floor past the fetch is `json.loads`, ~12 s and GIL-bound; one
+    # day took 28.5 s wall. On 09-22 and 09-23 this job was CANCELLED at this
+    # timeout twice running, because the setback cause (a backward archive
+    # walk, 320 s a call) was read for every gated phase — six times — and
+    # discarded whenever there was no setback. It is now read only when a
+    # setback is found, at most once per render, and the pointer and stack
+    # walks skip any object whose bytes cannot hold a match before decoding
+    # it; the expected render is ~5–6 minutes. This ceiling is the headroom
+    # around that, not a target. A board killed at its timeout publishes
+    # NOTHING — every row goes dark over one clause's reading, which is a
+    # measurement failing for a reason that has nothing to do with what it
+    # measures — and `notify-failure` below now fires on that `cancelled`.
     #
     # Raise this only with a new measurement. If the archive read grows past
     # it, the fix is the reader (a narrower prefix, a cheaper filter), not a
@@ -302,6 +310,12 @@ jobs:
 
   notify-failure:
     needs: [board]
-    if: ${{ failure() }}
+    # `alpha-engine-config-I11448`: a job killed at `timeout-minutes` concludes
+    # `cancelled`, not `failure`, so `failure()` alone skipped this job on the
+    # two board renders that timed out on 2026-09-22/23 and nobody was told.
+    # `always()` lets it evaluate after a cancel; `failure()` keeps every
+    # case it already covered. This workflow's concurrency never cancels a
+    # superseded run, so a `cancelled` need here is a timeout or a human.
+    if: ${{ always() && (failure() || contains(needs.*.result, 'cancelled')) }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@43bc22be8910fe1df1f5b14cf2c09537a8477bdf
     secrets: inherit

@@ -364,6 +364,33 @@ class TestPromoteCommand:
         assert pointer["promotion_source"] == "operator_bootstrap"
         assert pointer["evidence"]["reason"] == "challenger degraded live"
 
+    def test_a_revert_does_not_need_score_series(self, seeded, monkeypatch) -> None:
+        """2026-09-23: reverting R off an unservable champion was refused with
+        a KeyError because no R series existed yet. A revert reads only the
+        register; the series are the grading contract, not the operator's."""
+        store, _, ids, dates = seeded
+        seat(store, ids, dates, arm="chal")
+        for arm_id in ids.values():
+            (store.root / arm_series_key("m", arm_id)).unlink()
+        monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
+        assert (
+            main(
+                [
+                    "promote",
+                    "--slot",
+                    "m",
+                    "--date",
+                    DAY,
+                    "--revert-to",
+                    ids["champ"],
+                    "--reason",
+                    "champion unservable",
+                ]
+            )
+            == 0
+        )
+        assert json.loads(store.get_bytes(champion_key("m")))["arm_id"] == ids["champ"]
+
     def test_a_revert_under_dry_run_refuses_rather_than_reverting_for_real(
         self, seeded, monkeypatch
     ) -> None:
