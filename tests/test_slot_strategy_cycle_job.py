@@ -33,6 +33,7 @@ from crucible.features import DEFAULT_FEATURE_VERSION
 from crucible.keys import (
     arena_cycle_key,
     arm_predictions_key,
+    arm_register_key,
     champion_key,
     data_panel_key,
     features_key,
@@ -52,7 +53,9 @@ from crucible.slots.arms import read_register
 from crucible.slots.cycle import MissingArtifactError, run_grade
 from crucible.slots.inputs import SlotUnservableError
 from crucible.slots.strategy import (
+    NO_SETTLED_SESSION_METRIC,
     SLOT,
+    UPSTREAM_CHAMPION_ABSENT_METRIC,
     ExitRuleSpec,
     PitParityVerdict,
     RegisteredStrategyArm,
@@ -791,15 +794,50 @@ class TestRefusalsAreRecordedFirstAndPerArm:
     def test_an_arm_with_no_settled_session_is_refused_per_arm_not_slot_wide(self, world) -> None:
         """The warm-up. A decision date is held through the NEXT session, so the
         most recent one is never settled — and an arm whose only session is
-        today has no book yet. That is a per-arm row, not a dead slot."""
+        today has no book yet. That is a per-arm row, not a dead slot.
+
+        And since `alpha-engine-config-I11452`, not a dead ARC either: when the
+        arc day's own session is the only one recorded, the grade completes
+        `ok` with a declared `unmeasurable` row and writes no arena cycle —
+        the first Saturday after M seats a champion used to die here."""
         store, settings, _root, days = world
         _run_produce(store, settings, [days[-1]])
-        with pytest.raises(MissingArtifactError, match="no settled session"):
-            _run_grade(store, settings)
-        key = sorted(store.list_keys(manifest_prefix("experiment.grade", AS_OF.isoformat())))[-1]
-        manifest = load_store_document(store, key)
+        result, manifest, _ctx = _run_grade(store, settings)
+        assert manifest["status"] == "ok"
         rows = [m for m in manifest["metrics"] if m["name"] == "arm_refused_at_registration"]
         assert rows and "no settled session" in rows[0]["status_reason"]
+        declared = [m for m in manifest["metrics"] if m["name"] == NO_SETTLED_SESSION_METRIC]
+        assert len(declared) == 1
+        assert declared[0]["status"] == "unmeasurable"
+        assert "value" not in declared[0], "an unmeasurable row carries no number"
+        assert result["declared_outcome"] == NO_SETTLED_SESSION_METRIC
+        assert not store.exists(arena_cycle_key(SLOT, AS_OF.isoformat()))
+        assert arena_cycle_key(SLOT, AS_OF.isoformat()) not in {
+            o["key"] for o in manifest["outputs"]
+        }
+
+    def test_nothing_recorded_at_all_is_not_a_warm_up(self, world) -> None:
+        """An M champion exists and no S session was recorded on the arc day:
+        `experiment.run[s]` wrote nothing that should exist. That still fails."""
+        store, settings, _root, _days = world
+        with pytest.raises(MissingArtifactError, match="no settled session"):
+            _run_grade(store, settings)
+
+    def test_an_unsettled_session_other_than_today_is_not_a_warm_up(self, world) -> None:
+        """A recorded session BEFORE the arc day that did not settle means the
+        panel lacks a session it should carry — a missing session, not a
+        warm-up, so the declared outcome must not mask it."""
+        store, settings, _root, days = world
+        _run_produce(store, settings, [days[-2]])
+        panel = pd.read_parquet(
+            __import__("io").BytesIO(store.get_bytes(data_panel_key(AS_OF.isoformat())))
+        )
+        store.put_bytes(
+            data_panel_key(AS_OF.isoformat()),
+            panel[panel["trading_day"] != AS_OF].to_parquet(index=False),
+        )
+        with pytest.raises(MissingArtifactError, match="no settled session"):
+            _run_grade(store, settings)
 
 
 class TestTheEngineSeamsAreAdditiveAndNotDisplaceable:
@@ -934,6 +972,207 @@ class TestLineageIsProvenanceUntilThereIsARowToLinkTo:
         specs = registration_specs(SlotStrategies(registered=(parent, child), refused=()))
         assert specs[1].supersedes == parent.arm_id
         assert specs[1].notes == ""
+
+
+def _remove_m_pointer(store) -> None:
+    """The production state `alpha-engine-config-I11452` was measured in:
+    `champions/` holds U (and R) pointers and no M pointer at all."""
+    (store.root / champion_key("m")).unlink()
+    assert not store.exists(champion_key("m"))
+
+
+def _latest_manifest(store, job: str, day: dt.date) -> dict:
+    key = sorted(store.list_keys(manifest_prefix(job, day.isoformat())))[-1]
+    return load_store_document(store, key)
+
+
+def _declared_rows(manifest: dict, name: str) -> list[dict]:
+    return [m for m in manifest["metrics"] if m["name"] == name]
+
+
+class TestNoMChampionIsADeclaredOutcome:
+    """`alpha-engine-config-I11452`: with no M champion pointer, S's three arc
+    stages complete `ok` and SAY why they measured nothing — per stage, never
+    as an arc-level skip, because the gate, the absence alert and track F all
+    read a skipped stage as a missing manifest. Every loud path that protects
+    serving is unchanged."""
+
+    def _assert_declared(self, manifest: dict) -> dict:
+        assert manifest["status"] == "ok", manifest.get("reason")
+        rows = _declared_rows(manifest, UPSTREAM_CHAMPION_ABSENT_METRIC)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["status"] == "unmeasurable"
+        assert "value" not in row and "unit" not in row, "an unmeasurable row carries no number"
+        assert row["source_path"] == champion_key("m")
+        assert champion_key("m") in row["status_reason"]
+        return row
+
+    def test_run_completes_ok_and_constructs_nothing(self, world) -> None:
+        store, settings, _root, days = world
+        _remove_m_pointer(store)
+        assert _run_produce(store, settings, [days[-1]]) == []
+        self._assert_declared(_latest_manifest(store, "experiment.run", days[-1]))
+        assert not [k for k in store.list_keys("experiments/") if "session_inputs" in k]
+        # No arm is registered in a week S could not construct: its
+        # out-of-sample clock would start with nothing to score.
+        assert not store.exists(arm_register_key(SLOT))
+
+    def test_grade_completes_ok_and_writes_no_cycle(self, world) -> None:
+        store, settings, _root, _days = world
+        _remove_m_pointer(store)
+        result, manifest, _ctx = _run_grade(store, settings)
+        self._assert_declared(manifest)
+        assert result["declared_outcome"] == UPSTREAM_CHAMPION_ABSENT_METRIC
+        assert not store.exists(arena_cycle_key(SLOT, AS_OF.isoformat()))
+
+    def test_promote_completes_ok_and_files_no_verdict(self, world, monkeypatch) -> None:
+        from crucible.cli import main
+
+        store, _settings, root, _days = world
+        _remove_m_pointer(store)
+        monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
+        monkeypatch.setenv("CRUCIBLE_STRATEGY_DIR", str(root))
+        assert main(["promote", "--slot", SLOT, "--date", AS_OF.isoformat()]) == 0
+        manifest = _latest_manifest(store, "promote", AS_OF)
+        self._assert_declared(manifest)
+        # A slot that could not be graded has not held its pointer ON
+        # EVIDENCE: no `pointer_moved` row, so the phase-3 promotion clause
+        # cannot read this as a verdict-backed non-promotion.
+        assert not _declared_rows(manifest, "pointer_moved")
+        assert not store.exists(champion_key(SLOT))
+
+    def test_the_arc_s_stages_all_complete_through_the_cli(self, world, monkeypatch) -> None:
+        """The exact argv the weekly arc dispatches for S, in the arc's order,
+        against a store with U and no M pointer. Every stage returns 0 and
+        files its own `ok` manifest carrying the declared row."""
+        from crucible.cli import main
+        from crucible.weekly import arc_stages
+
+        store, _settings, root, _days = world
+        _remove_m_pointer(store)
+        assert store.exists(champion_key("u"))
+        monkeypatch.setenv("CRUCIBLE_STRATEGY_DIR", str(root))
+        stages = [
+            s
+            for s in arc_stages(AS_OF)
+            if s.slot == SLOT and s.job in {"experiment.run", "experiment.grade", "promote"}
+        ]
+        assert [s.job for s in stages] == ["experiment.run", "experiment.grade", "promote"]
+        for stage in stages:
+            argv = stage.argv(trading_day=AS_OF, store=str(store.root), run_mode="replay")
+            assert main(argv) == 0, argv
+            self._assert_declared(_latest_manifest(store, stage.job, AS_OF))
+
+    def test_an_m_pointer_whose_arm_produced_nothing_still_fails_the_run(self, world) -> None:
+        """The pointer EXISTS: a serving path with no feed fails loud."""
+        store, settings, _root, days = world
+        store.put_bytes(
+            champion_key("m"),
+            json.dumps(
+                {
+                    "schema_version": "champion_pointer.v1",
+                    "slot": "m",
+                    "arm_id": "m:never_predicted:cccccccccccc",
+                }
+            ).encode("utf-8"),
+        )
+        with pytest.raises(KeyError, match="never_predicted"):
+            _run_produce(store, settings, [days[-1]])
+        manifest = _latest_manifest(store, "experiment.run", days[-1])
+        assert manifest["status"] == "failed"
+        assert not _declared_rows(manifest, UPSTREAM_CHAMPION_ABSENT_METRIC)
+
+    def test_an_m_pointer_naming_no_arm_still_fails_the_run(self, world) -> None:
+        """A pointer that exists but names no arm is malformed, not absent."""
+        store, settings, _root, days = world
+        store.put_bytes(
+            champion_key("m"),
+            json.dumps({"schema_version": "champion_pointer.v1", "slot": "m"}).encode("utf-8"),
+        )
+        with pytest.raises(MissingArtifactError, match="has no alpha"):
+            _run_produce(store, settings, [days[-1]])
+
+    def test_resolve_session_still_raises_with_no_m_pointer(self, world) -> None:
+        """The trader's direct call is a serving path: unchanged."""
+        store, _settings, _root, days = world
+        _remove_m_pointer(store)
+        with pytest.raises(MissingArtifactError, match="has no alpha"):
+            resolve_session(store, trading_day=days[-1].isoformat())
+
+    def test_the_history_producer_still_raises_with_no_m_pointer(self, world) -> None:
+        """A backfill asked for S history that cannot exist has failed."""
+        store, settings, _root, days = world
+        _remove_m_pointer(store)
+        with pytest.raises(MissingArtifactError, match="has no alpha"):
+            run_job(
+                "experiment.backfill",
+                lambda c: strategy_module.produce_history(c, settings=settings),
+                store=store,
+                trading_day=days[-1],
+                discriminator=f"{SLOT}.stock_registry",
+                run_mode="replay",
+            )
+
+
+class TestTheWarmUpReachesPromote:
+    """The week after M seats a champion: `experiment.grade[s]` declares the
+    warm-up on its manifest and `promote[s]` reads that declaration rather
+    than a cycle that was never written (`alpha-engine-config-I11452`)."""
+
+    def test_promote_after_a_declared_warm_up_completes_ok(self, world, monkeypatch) -> None:
+        from crucible.cli import main
+
+        store, settings, root, days = world
+        _run_produce(store, settings, [days[-1]])
+        _result, grade_manifest, _ctx = _run_grade(store, settings)
+        assert _declared_rows(grade_manifest, NO_SETTLED_SESSION_METRIC)
+        monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
+        monkeypatch.setenv("CRUCIBLE_STRATEGY_DIR", str(root))
+        assert main(["promote", "--slot", SLOT, "--date", AS_OF.isoformat()]) == 0
+        manifest = _latest_manifest(store, "promote", AS_OF)
+        assert manifest["status"] == "ok"
+        rows = _declared_rows(manifest, NO_SETTLED_SESSION_METRIC)
+        assert len(rows) == 1 and rows[0]["status"] == "unmeasurable"
+        assert not _declared_rows(manifest, "pointer_moved")
+        assert not store.exists(champion_key(SLOT))
+
+    def test_a_graded_cycle_is_acted_on_not_declared(self, world, monkeypatch) -> None:
+        """Settled sessions and an M pointer: `promote[s]` takes the ordinary
+        path and files its `pointer_moved` verdict, and no declared row."""
+        from crucible.cli import main
+
+        store, settings, root, days = world
+        _run_produce(store, settings, days)
+        _run_grade(store, settings)
+        monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
+        monkeypatch.setenv("CRUCIBLE_STRATEGY_DIR", str(root))
+        assert main(["promote", "--slot", SLOT, "--date", AS_OF.isoformat()]) == 0
+        manifest = _latest_manifest(store, "promote", AS_OF)
+        assert _declared_rows(manifest, "pointer_moved")
+        assert not _declared_rows(manifest, NO_SETTLED_SESSION_METRIC)
+        assert not _declared_rows(manifest, UPSTREAM_CHAMPION_ABSENT_METRIC)
+
+    def test_an_ok_grade_that_claims_no_cycle_and_declared_nothing_still_refuses(
+        self, world, monkeypatch
+    ) -> None:
+        """Only the grade run's OWN declaration stands in for a cycle. An `ok`
+        grade manifest that claims no cycle and declared no warm-up is the
+        refusal `read_graded_cycle` already makes, unchanged."""
+        from crucible.cli import main
+        from crucible.promote import PromotionRefused
+
+        store, settings, root, days = world
+        _run_produce(store, settings, days)
+        _run_grade(store, settings)
+        key = sorted(store.list_keys(manifest_prefix("experiment.grade", AS_OF.isoformat())))[-1]
+        document = load_store_document(store, key)
+        document["outputs"] = []
+        store.put_bytes(key, json.dumps(document).encode("utf-8"))
+        monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
+        monkeypatch.setenv("CRUCIBLE_STRATEGY_DIR", str(root))
+        with pytest.raises(PromotionRefused, match="does not claim"):
+            main(["promote", "--slot", SLOT, "--date", AS_OF.isoformat()])
 
 
 class TestTheInputsAreNamedWhenTheyAreAbsent:

@@ -269,14 +269,35 @@ class TestTheHistoryProducerIsResolvedAndNeverInferred:
     def test_the_s_slot_declares_the_equality_rather_than_inheriting_it(self, monkeypatch) -> None:
         """S writes no champion feed on a production cycle either — its feed
         has no key builder and no schema in this repository — so its history
-        path IS its produce path. Asserted by dispatch, not by a docstring:
-        the point is that the equality is written down in the module, and a
-        future S serving half that forgot to split would fail here."""
+        path runs its produce path's BODY. Asserted by dispatch, not by a
+        docstring: the point is that the equality is written down in the
+        module, and a future S serving half that forgot to split would fail
+        here.
+
+        The one difference is `alpha-engine-config-I11452`'s declared
+        no-M-champion outcome, which only the ARC's `produce` consults: a
+        backfill of history that cannot exist must still fail."""
+        from types import SimpleNamespace
+
         from crucible.slots import strategy
 
         seen: list[str] = []
         monkeypatch.setattr(
-            strategy, "produce", lambda ctx, *, settings, **kwargs: seen.append("produce") or {}
+            strategy, "_produce_sessions", lambda ctx, **kwargs: seen.append("body") or {}
         )
-        strategy.produce_history(object(), settings=None)
-        assert seen == ["produce"]
+        monkeypatch.setattr(
+            strategy,
+            "_registered_arms",
+            lambda ctx, *, settings: (strategy.SlotStrategies(registered=(), refused=()), []),
+        )
+        monkeypatch.setattr(
+            strategy,
+            "declare_no_m_champion",
+            lambda ctx, *, job: seen.append("declared?") or None,
+        )
+        ctx = SimpleNamespace(trading_day=dt.date(2026, 8, 28))
+        strategy.produce(ctx, settings=None)
+        assert seen == ["declared?", "body"]
+        seen.clear()
+        strategy.produce_history(ctx, settings=None)
+        assert seen == ["body"]
