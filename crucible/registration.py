@@ -86,12 +86,20 @@ def load_registrable_recipes(
     *,
     strategy_dir: Path | str | None = None,
     store: Any = None,
+    today: str | None = None,
 ) -> RecipeLoad:
     """Every recipe filed for ``slot``, split into what registers and what does not.
 
     Reads a checkout when ``strategy_dir`` is configured and the synced store
     tree otherwise — the same two sources every other recipe reader uses, and
     the one a spot instance has.
+
+    ``today`` (a trading day, ISO) is read by S alone: an S recipe declares no
+    `registered_at`, and outside a cycle it has nothing to stamp its clock
+    from and refuses (`crucible.slots.strategy.load_strategy_slot`). A caller
+    asking what a release can produce ON a day — `crucible.slots.producibility`
+    — passes it, together with the slot's register read from ``store``, exactly
+    as the S cycle does. Omitted, the load is unchanged.
 
     Raises rather than returning an empty load: a slot whose recipe tree is
     absent, unreadable or entirely unservable is a broken release, and an
@@ -112,8 +120,16 @@ def load_registrable_recipes(
             registration_specs,
         )
 
+        register = None
+        if today is not None and store is not None:
+            from crucible.slots.arms import read_register  # noqa: PLC0415 - one call site
+
+            register = read_register(store, slot)
         loaded = load_strategy_slot(
-            store=None if strategy_dir else store, strategy_dir=strategy_dir
+            store=None if strategy_dir else store,
+            strategy_dir=strategy_dir,
+            register=register,
+            today=today,
         )
     else:
         # `load_arm_specs` takes the strategy ROOT and appends `arms/{slot}`

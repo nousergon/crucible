@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as dt
 import inspect
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,7 @@ from crucible.cli import HANDLERS, is_stub, main
 from crucible.keys import champion_key, manifest_key, shadow_key
 from crucible.migrate import MigrationPointerConflict, MigrationSourceMissing
 from crucible.slots.arms import load_arm_specs, read_register
+from crucible.slots.producibility import UnproducibleChampionError
 from crucible.store import LocalStore
 
 TRADING_DAY = "2026-08-28"
@@ -53,7 +55,31 @@ params:
 notes: fixture challenger
 """
 
-R_RECIPE = """name: scanner_predictor_direct
+# The v1 R champion here is `no_agent_quant`, an arm the phase-1 feature layer
+# can produce. Production's v1 pointer names `scanner_predictor_direct`, whose
+# recipe the release REFUSES until track B (`R_REFUSED_RECIPE` below): this
+# fixture mirrored that until `alpha-engine-config-I11085`, and so encoded the
+# defect - a v1 import seating R on an arm that cannot produce - as the
+# expected outcome. That shape now has its own refusal tests
+# (`TestAnUnproducibleChampionIsRefusedAtImport`).
+R_RECIPE = """name: no_agent_quant
+slot: r
+ranker: quant_composite
+registered_at: '2026-07-13'
+bootstrap: true
+promotion_source: operator_bootstrap
+params:
+  top_n: 15
+  momentum_weight: 0.5
+  trend_weight: 0.3
+  reversal_weight: 0.2
+notes: fixture recipe carrying v1 provenance
+"""
+
+# Production's R recipe, verbatim in the part that matters: it ranks on
+# `predicted_alpha_ratio`, a column the phase-1 feature catalogue declares no
+# producer for, so `experiment.run` refuses it BY NAME at registration.
+R_REFUSED_RECIPE = """name: scanner_predictor_direct
 slot: r
 ranker: predicted_alpha_direct
 registered_at: '2026-07-13'
@@ -61,7 +87,7 @@ bootstrap: true
 promotion_source: operator_bootstrap
 params:
   top_n: 10
-notes: fixture recipe carrying v1 provenance
+notes: fixture recipe that refuses in phase 1
 """
 
 
@@ -83,14 +109,14 @@ def v2_root(tmp_path: Path) -> Path:
     store = LocalStore(root)
     store.put_bytes("strategy/current/arms/u/momentum_sleeve.yaml", U_RECIPE.encode())
     store.put_bytes("strategy/current/arms/u/tech_score_gate.yaml", U_CHALLENGER.encode())
-    store.put_bytes("strategy/current/arms/r/scanner_predictor_direct.yaml", R_RECIPE.encode())
+    store.put_bytes("strategy/current/arms/r/no_agent_quant.yaml", R_RECIPE.encode())
     # The migration ADMITS a slot only once the arm the v1 champion resolves to
     # has PRODUCED (`crucible.migrate.admission_refusal`,
     # `alpha-engine-config-I10961`): a pointer seated on an arm that emits
     # nothing points the trader's contract at silence. Seeded, not waived —
     # production is what the predicate reads, so a fixture without it is a
     # fixture of a slot that is genuinely not admissible.
-    for slot, name in (("u", "momentum_sleeve"), ("r", "scanner_predictor_direct")):
+    for slot, name in (("u", "momentum_sleeve"), ("r", "no_agent_quant")):
         arm_id = next(
             spec.arm_id for spec in load_arm_specs(slot, store=store) if spec.name == name
         )
@@ -107,7 +133,7 @@ def v1_root(tmp_path: Path) -> Path:
         json.dumps(
             {
                 "schema_version": 1,
-                "champion": "scanner_predictor_direct",
+                "champion": "no_agent_quant",
                 "promoted_at": "2026-07-13T22:07:09.292909+00:00",
                 "promotion_source": "arena_held",
             }
@@ -130,7 +156,7 @@ def v1_root(tmp_path: Path) -> Path:
     )
     store.put_bytes(
         "research/producer_leaderboard/2026-09-11.json",
-        json.dumps({"champion": "scanner_predictor_direct", "date": "2026-09-11"}).encode(),
+        json.dumps({"champion": "no_agent_quant", "date": "2026-09-11"}).encode(),
     )
     store.put_bytes(
         "predictor/model_zoo/leaderboard/latest.json",
@@ -231,7 +257,7 @@ class TestEndToEnd:
         store = LocalStore(v2_root)
 
         r_pointer = json.loads(store.get_bytes(champion_key("r")))
-        assert r_pointer["arm_id"] == _recipe_id(v2_root, "r", "scanner_predictor_direct"), (
+        assert r_pointer["arm_id"] == _recipe_id(v2_root, "r", "no_agent_quant"), (
             "the R pointer must name the arm the published recipe produces, or no "
             "cycle ever scores the champion"
         )
@@ -249,7 +275,7 @@ class TestEndToEnd:
         )
         assert "registered_at" in u_pointer["evidence"]["reason"]
 
-        for slot, name in (("u", "momentum_sleeve"), ("r", "scanner_predictor_direct")):
+        for slot, name in (("u", "momentum_sleeve"), ("r", "no_agent_quant")):
             register = read_register(store, slot)
             assert _recipe_id(v2_root, slot, name) in set(register.all_arms())
 
@@ -315,16 +341,16 @@ class TestRefusals:
         # The slot still has a recipe; just not the one v1 names as champion.
         LocalStore(v2_root).put_bytes(
             "strategy/current/arms/r/scanner_top20_predictor.yaml",
-            R_RECIPE.replace("scanner_predictor_direct", "scanner_top20_predictor").encode(),
+            R_RECIPE.replace("no_agent_quant", "scanner_top20_predictor").encode(),
         )
-        (v2_root / "strategy/current/arms/r/scanner_predictor_direct.yaml").unlink()
+        (v2_root / "strategy/current/arms/r/no_agent_quant.yaml").unlink()
 
     def test_a_missing_recipe_raises_when_the_slot_was_NAMED(
         self, v2_root: Path, v1_root: Path
     ) -> None:
         self._drop_the_r_champions_recipe(v2_root)
         store = LocalStore(v2_root)
-        with pytest.raises(MigrationSourceMissing, match="scanner_predictor_direct"):
+        with pytest.raises(MigrationSourceMissing, match="no_agent_quant"):
             _run_asserted(v2_root, v1_root, ("u", "r"))
         assert not store.exists(champion_key("r"))
         assert not store.exists(champion_key("u")), "nothing is written before the refusal"
@@ -341,13 +367,13 @@ class TestRefusals:
         assert main(_argv(v2_root, v1_root)) == 0
         result = _printed_result(capsys)
         assert result["pointers"]["r"] == "deferred"
-        assert "scanner_predictor_direct" in result["deferred"]["r"]
+        assert "no_agent_quant" in result["deferred"]["r"]
         assert not store.exists(champion_key("r"))
 
     def test_an_unpublished_slot_is_not_swallowed(self, v2_root: Path, v1_root: Path) -> None:
         """The previous handler caught `FileNotFoundError` per slot and carried
         on, so a missing tree surfaced later as the wrong cause."""
-        (v2_root / "strategy/current/arms/r/scanner_predictor_direct.yaml").unlink()
+        (v2_root / "strategy/current/arms/r/no_agent_quant.yaml").unlink()
         with pytest.raises(FileNotFoundError, match="slot 'r'"):
             main(_argv(v2_root, v1_root))
 
@@ -400,6 +426,89 @@ class TestRefusals:
             TRADING_DAY,
         ]
         assert main(argv) == cli.USAGE_EXIT_CODE
+
+
+class TestAnUnproducibleChampionIsRefusedAtImport:
+    """`alpha-engine-config-I11085`. The 2026-09-14 import seated R on
+    `scanner_predictor_direct`, whose own recipe refuses BY NAME in phase 1,
+    and the 2026-09-19 arc died at `experiment.run[r]` resolving it. The
+    import must refuse at import, naming the arm and why.
+
+    The fixture SEEDS a shadow for the refused arm, deliberately: the
+    runtime admission predicate (`admission_refusal`, "has it produced?") is
+    then satisfied, so these tests fail unless the recipe-level refusal is
+    what stops the import. A stale or backfilled shadow is exactly how a
+    has-it-produced check can be satisfied by an arm that will never produce
+    again.
+    """
+
+    @pytest.fixture
+    def production_shaped(self, v2_root: Path, v1_root: Path) -> tuple[Path, Path, str]:
+        store = LocalStore(v2_root)
+        store.put_bytes(
+            "strategy/current/arms/r/scanner_predictor_direct.yaml", R_REFUSED_RECIPE.encode()
+        )
+        refused_id = _recipe_id(v2_root, "r", "scanner_predictor_direct")
+        store.put_bytes(shadow_key(refused_id, "2026-09-11"), json.dumps({"names": []}).encode())
+        v1 = LocalStore(v1_root)
+        pointer = json.loads(v1.get_bytes("config/producer_champion.json"))
+        v1.put_bytes(
+            "config/producer_champion.json",
+            json.dumps({**pointer, "champion": "scanner_predictor_direct"}).encode(),
+        )
+        return v2_root, v1_root, refused_id
+
+    def test_the_scheduled_path_writes_no_pointer_and_names_the_arm_and_why(
+        self, production_shaped: tuple[Path, Path, str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        v2_root, v1_root, refused_id = production_shaped
+        assert main(_argv(v2_root, v1_root)) == 0
+        store = LocalStore(v2_root)
+        assert not store.exists(champion_key("r")), (
+            "a v1 pointer must never be imported onto an arm the release cannot produce"
+        )
+        assert refused_id not in set(read_register(store, "r").all_arms())
+        result = _printed_result(capsys)
+        assert result["pointers"]["r"] == "deferred"
+        why = result["deferred"]["r"]
+        assert refused_id in why
+        assert "predicted_alpha_ratio" in why, "the reason must name the missing column"
+        assert "cannot produce" in why
+        # U is unaffected: a refusal on one slot defers that slot only.
+        assert result["pointers"]["u"] == "written"
+        manifest = json.loads(store.get_bytes(manifest_key("migrate.history", TRADING_DAY)))
+        metric = next(m for m in manifest["metrics"] if m["name"] == "arms_migrated")
+        assert refused_id in metric["status_reason"]
+
+    def test_the_asserted_path_raises_naming_the_arm_and_writes_nothing(
+        self, production_shaped: tuple[Path, Path, str]
+    ) -> None:
+        v2_root, v1_root, refused_id = production_shaped
+        store = LocalStore(v2_root)
+        with pytest.raises(UnproducibleChampionError, match=re.escape(refused_id)) as excinfo:
+            _run_asserted(v2_root, v1_root, ("u", "r"))
+        assert "predicted_alpha_ratio" in str(excinfo.value)
+        assert not store.exists(champion_key("r"))
+        assert not store.exists(champion_key("u")), "nothing is written before the refusal"
+
+    def test_a_rerun_over_the_pointer_it_already_seated_reports_the_refusal(
+        self, production_shaped: tuple[Path, Path, str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Today's production state: the 2026-09-14 import already seated R on
+        the refused arm. A rerun must not report that pointer `unchanged` as
+        though it were sound - and must not overwrite it either (a v1 import
+        never moves an existing pointer)."""
+        v2_root, v1_root, refused_id = production_shaped
+        store = LocalStore(v2_root)
+        seated = json.dumps(
+            {"arm_id": refused_id, "evidence": {"status": "migrated"}}, sort_keys=True
+        ).encode()
+        store.put_bytes(champion_key("r"), seated)
+        assert main(_argv(v2_root, v1_root)) == 0
+        result = _printed_result(capsys)
+        assert result["pointers"]["r"] == "deferred"
+        assert refused_id in result["deferred"]["r"]
+        assert store.get_bytes(champion_key("r")) == seated
 
 
 class TestTheStubIsGone:
