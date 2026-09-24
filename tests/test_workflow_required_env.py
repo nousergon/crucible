@@ -45,6 +45,7 @@ direction to err in; the reverse is a dark board.
 from __future__ import annotations
 
 import ast
+import functools
 import re
 from pathlib import Path
 
@@ -61,6 +62,7 @@ RESOLVER = "require_env"
 LIVE_MARKER = "--run-mode live"
 
 
+@functools.cache
 def _required_variables() -> dict[str, list[str]]:
     """Variable name -> the ``crucible/`` files whose call sites require it.
 
@@ -68,6 +70,10 @@ def _required_variables() -> dict[str, list[str]]:
     computed name, a parameter — FAILS the test rather than being skipped: an
     unresolvable required variable is precisely the one that would slip
     through, and silence about it would rebuild the hole this file fills.
+
+    Cached for the session (the tree does not change while the suite runs);
+    callers only read the result. A failing parse is not cached, so it fails
+    every test that asks, as before.
     """
     found: dict[str, list[str]] = {}
     for path in sorted(PACKAGE.rglob("*.py")):

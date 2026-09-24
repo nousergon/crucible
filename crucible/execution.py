@@ -44,6 +44,7 @@ import math
 import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -121,7 +122,15 @@ class ExecutionArtifactError(ValueError):
 
 
 def _validator(version: str) -> Draft202012Validator:
-    schema = json.loads((_SCHEMA_DIR / f"{version}.json").read_text(encoding="utf-8"))
+    return _checked_validator((_SCHEMA_DIR / f"{version}.json").read_text(encoding="utf-8"))
+
+
+@lru_cache(maxsize=8)
+def _checked_validator(schema_text: str) -> Draft202012Validator:
+    """Keyed on the schema TEXT, re-read on every call: an edited schema is
+    re-checked, and only the repeat metaschema walk of an unchanged one is
+    skipped."""
+    schema = json.loads(schema_text)
     Draft202012Validator.check_schema(schema)
     return Draft202012Validator(schema)
 

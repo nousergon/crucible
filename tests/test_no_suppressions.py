@@ -184,7 +184,11 @@ _COVERAGE_EXCLUSIONS_PERMITTED: frozenset[str] = frozenset()
 #: the ratchet file-by-file or line-by-line with no reviewer — the class the
 #: pragma belonged to (independent review, 2026-09-05, findings 3-5).
 _COVERAGE_REPORT_KEYS = frozenset({"fail_under", "show_missing", "exclude_lines"})
-_COVERAGE_RUN_KEYS = frozenset({"source", "omit"})
+_COVERAGE_RUN_KEYS = frozenset({"source", "omit", "core"})
+#: `core` picks how coverage.py RECORDS a line, not which lines count, so it
+#: cannot narrow the denominator. It is still pinned to exactly one value, so
+#: the table stays closed: a different recorder is a reviewed change here.
+_COVERAGE_CORE = "sysmon"
 _COVERAGE_TABLES = frozenset({"run", "report"})
 _COVERAGE_SOURCE = ["crucible"]
 _COVERAGE_FLOOR = 93
@@ -533,6 +537,9 @@ def test_no_other_coverage_narrowing_knob_is_set() -> None:
     )
     assert run["source"] == _COVERAGE_SOURCE, "the denominator is the whole package"
     assert run["omit"] == [], "omit stays empty so the scope cannot be narrowed file-by-file"
+    assert run["core"] == _COVERAGE_CORE, (
+        f"[tool.coverage.run] core is {run['core']!r}; only {_COVERAGE_CORE!r} is pinned"
+    )
     assert report["fail_under"] >= _COVERAGE_FLOOR, (
         "lowering the floor is a policy amendment, visible here as well as in the diff"
     )

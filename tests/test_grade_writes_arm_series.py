@@ -24,11 +24,9 @@ from __future__ import annotations
 import json
 
 import pytest
-from conftest import sessions_ending
+from conftest import seed_data_daily, sessions_ending
 
 from crucible.config import Settings
-from crucible.data import run_daily
-from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.keys import arm_register_key, arm_series_key
 from crucible.promote import load_slot_inputs
 from crucible.runner import run_job
@@ -57,20 +55,7 @@ def graded_slot(store, source, strategy_dir, cycle_date, tmp_path):
     sessions = sessions_ending(cycle_date, HORIZON + DECISION_DATES + 1)
     decision_days = sessions[:DECISION_DATES]
 
-    for day in [*decision_days, cycle_date]:
-        run_job(
-            "data.daily",
-            lambda c, day=day: run_daily(
-                c,
-                point_in_time=UnavailablePointInTimeSource(
-                    reason="synthetic fixture market carries no fundamentals"
-                ),
-                source=source,
-                expected_symbols=source.symbols(),
-            ),
-            store=store,
-            trading_day=day,
-        )
+    seed_data_daily(store, source, [*decision_days, cycle_date])
     for day in decision_days:
         run_job(
             "experiment.run",

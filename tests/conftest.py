@@ -104,6 +104,86 @@ def synthetic_frames(
     return frames
 
 
+#: Every store file the real `data.daily` job wrote, per distinct input. See
+#: :func:`seed_data_daily`.
+_DATA_DAILY_SEEDS: dict[tuple, dict[str, bytes]] = {}
+
+#: Environment variables that cannot change what `data.daily` writes, so they
+#: stay out of the seed key: pytest renames the current test in one, and
+#: `crucible.runner.run_job` OVERWRITES the other with its own run id at the
+#: start of every job (it is left set afterwards, so it differs per test).
+_SEED_KEY_IGNORED_ENV = frozenset({"PYTEST_CURRENT_TEST", "KREPIS_RUN_ID"})
+
+
+def _frames_fingerprint(source) -> str:
+    """A content hash of a `FramePriceSource`'s frames, so two sources that
+    differ in any value, index, column or ticker never share a seed."""
+    import hashlib
+
+    import pandas as pd
+
+    digest = hashlib.sha256()
+    digest.update(f"{type(source).__qualname__}|{source.snapshot_id()}".encode())
+    for ticker in sorted(source._frames):
+        frame = source._frames[ticker]
+        digest.update(f"|{ticker}|{list(frame.columns)}|".encode())
+        digest.update(pd.util.hash_pandas_object(frame, index=True).to_numpy().tobytes())
+    return digest.hexdigest()
+
+
+def seed_data_daily(store, source, days) -> None:
+    """Compile `days`, in order, into an EMPTY `LocalStore` with the real job.
+
+    Several grading suites seed every test the same way: the real
+    `data.daily` job over the conftest market for the same seven sessions, and
+    only then the produce/grade path each test is actually about. That seed
+    was ~60% of each such test. It is still the real `run_job("data.daily",
+    run_daily)` the first time a given input is seen in the session; every
+    later call with an identical input writes back the exact bytes that run
+    wrote, manifests included.
+
+    "Identical" is the whole key: the frames' content hash, the snapshot, the
+    days, and the process environment (minus `_SEED_KEY_IGNORED_ENV`), so
+    a test that changes the market, the window or any setting the job reads
+    from the environment gets a fresh real run. The store must be empty,
+    because a job's output may depend on what the store already holds.
+    """
+    import os
+
+    from crucible.data import run_daily
+    from crucible.data.point_in_time import UnavailablePointInTimeSource
+    from crucible.runner import run_job
+
+    assert isinstance(store, LocalStore), "seed_data_daily replays files into a LocalStore"
+    assert next(iter(store.list_keys()), None) is None, "seed_data_daily needs an empty store"
+    environment = tuple(
+        sorted((k, v) for k, v in os.environ.items() if k not in _SEED_KEY_IGNORED_ENV)
+    )
+    key = (_frames_fingerprint(source), tuple(days), environment)
+    written = _DATA_DAILY_SEEDS.get(key)
+    if written is None:
+        for day in days:
+            run_job(
+                "data.daily",
+                lambda c: run_daily(
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    expected_symbols=source.symbols(),
+                ),
+                store=store,
+                trading_day=day,
+            )
+        _DATA_DAILY_SEEDS[key] = {k: store.get_bytes(k) for k in store.list_keys()}
+        return
+    for k, payload in written.items():
+        path = store.root / k
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
+
 @pytest.fixture(autouse=True)
 def declared_run_mode(monkeypatch):
     """Every test invocation declares itself LIVE, in one place.
