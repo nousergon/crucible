@@ -342,11 +342,12 @@ class TestExecutionShortfallClause:
 
 def _evidence(days: list[str]) -> dict:
     return {
-        "schema_version": "trader_evidence.v1",
+        "schema_version": "trader_evidence.v2",
         "slot": "m",
         "champion": "m:ridge_21d:0123456789ab",
         "trading_days": len(days),
         "days_served": days,
+        "session_modes": {day: "shadow" for day in days},
         "calendar_date": days[-1],
     }
 
@@ -380,7 +381,7 @@ class TestShadowBooksClause:
         _put(store, shadow_books_key("2026-09-11"), _shadow_doc())
         clause = _shadow_clause(store)
         assert not clause.met and not clause.unmeasurable
-        assert "trader_evidence.v1" in clause.detail
+        assert "trader_evidence.v2" in clause.detail
 
     def test_an_absent_shadow_book_artifact_is_unmet(self, store) -> None:
         _put(store, TRADER_EVIDENCE_KEY, _evidence(self.SERVED))

@@ -12,7 +12,7 @@ paper); `alpha-engine-config-I10652`, `alpha-engine-config-I10653`.
 presence/status and shadow-book coverage. A contract whose schema lived only
 with its producer is a contract the consumer cannot check, so the schemas, the
 keys and the validators live here and the trader imports them, exactly as
-`trader_evidence.v1` does (`alpha-engine-config-I10648`).
+`trader_evidence.v2` does (`alpha-engine-config-I10648`, `-I11545`).
 
 **The harness never reaches into the trader** (plan §3). Nothing here opens a
 broker, a fill log or a trader database: each artifact is a document the trader

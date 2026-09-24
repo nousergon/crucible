@@ -1276,6 +1276,43 @@ components:
     dispatch: null
     deadline: null
 
+  trader.session:
+    # alpha-engine-config-I11545 (Brian's rulings of 2026-09-24: the v2 trader
+    # runs on the executor box; a shadow session counts as a served day). One
+    # trading session on the M champion, run by the TRADER under its own
+    # identity (`crucible_trader.shadow_session`): resolve the two-document
+    # contract, build the book through `crucible.portfolio`, record the day in
+    # `trader/evidence.json` with its session mode, and file the session's
+    # `execution_shortfall.v1` (`no_orders` for a shadow session) as run outputs. Admitted by
+    # `crucible.models.TRADER_JOB_VALUES` for the reason `trader.reconcile` is.
+    #
+    # `schedule`/`dispatch`/`deadline` are null for the reason they are on
+    # `trader.reconcile`: the box timer exists, but nothing it runs can reach
+    # this store until the executor role's v2 grants are applied and a trader
+    # release is pinned, and a `close_plus` deadline declared before then
+    # would page ABSENCE every trading day for a job that cannot yet start.
+    # The change that proves the first unattended run sets all three.
+    description: >-
+      Serve one trading session on the M champion (shadow until an order
+      router exists) and record the served day, with its session mode, in the
+      trader's consumer evidence.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:outputs[trader/evidence.json,trader/execution_shortfall/*]
+      outcome: run.json:metrics[portfolio_construction,hold_book_engaged]
+    log_location: cloudwatch:/crucible/trader.session
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/runs
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
   deploy:
     # alpha-engine-config-I10969. The component that moves `releases/current`
     # - the single most consequential mutation in the v2 system, and the one
