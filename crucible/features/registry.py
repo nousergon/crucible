@@ -41,6 +41,8 @@ __all__ = [
     "UNIT_SUFFIXES",
     "FeatureRegistryValidationError",
     "FeatureSpec",
+    "PENDING_COLUMNS",
+    "PendingColumn",
     "feature_names",
     "feature_version",
     "load_registry_schema",
@@ -897,6 +899,54 @@ CATALOG: tuple[FeatureSpec, ...] = (
         cross_sectional=True,
     ),
 )
+
+
+@dataclass(frozen=True)
+class PendingColumn:
+    """A column the feature layer does not produce YET, and what will.
+
+    `alpha-engine-config-I11030`. Some R rankers read a column no
+    :data:`CATALOG` entry produces, on purpose: the recipe is registered
+    now and waits for a producer that another track or phase builds. Such an
+    arm is refused by name at every `experiment.run` and writes nothing. That
+    is the design, not a defect, but only this declaration lets a surface
+    tell it apart from a recipe that reads a column nothing will ever
+    produce.
+
+    Keyed by COLUMN, never by arm: an arm cannot declare itself waiting. It
+    waits only while every column it lacks is listed here and absent from
+    :data:`CATALOG`. When a catalogue entry for the column lands, the wait
+    lapses on its own, and an arm still silent after that reads mute again.
+    """
+
+    name: str
+    #: What will materialise the column into the feature layer.
+    producer: str
+    #: The plan milestone that builds that producer (a track or a phase).
+    milestone: str
+
+    def describe(self) -> str:
+        return f"{self.name} ({self.producer}, {self.milestone})"
+
+
+#: Every column a registered recipe may wait on, and who produces it. Not in
+#: :func:`feature_version`: a declared future producer changes no column the
+#: layer writes today.
+PENDING_COLUMNS: dict[str, PendingColumn] = {
+    column.name: column
+    for column in (
+        PendingColumn(
+            name="predicted_alpha_ratio",
+            producer="the M slot materializes it into the feature layer",
+            milestone="track B",
+        ),
+        PendingColumn(
+            name="thinktank_rating_ratio",
+            producer="an LLM arm produces the per-ticker rating",
+            milestone="phase 5 (§9.1)",
+        ),
+    )
+}
 
 
 def feature_names(catalog: tuple[FeatureSpec, ...] = CATALOG) -> tuple[str, ...]:

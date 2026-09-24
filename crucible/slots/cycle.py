@@ -28,6 +28,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from nousergon_lib.arena.engine import ServingPrecondition
@@ -334,10 +335,10 @@ def partition_by_catalog(
     must never render alike, and the catalogue is what tells them apart:
 
     * a ranker column the feature CATALOG **never declared** — `predicted_alpha_ratio`
-      (the M slot materialises it, phase 3) or an LLM-derived rating (phase 5).
-      The arm's own recipe says it "refuses BY NAME until then". That is a
-      refusal at registration: the arm does not register this cycle, its
-      siblings run, and the refusal reaches the manifest as
+      (the M slot materialises it, track B) or an LLM-derived rating (phase 5).
+      The arm's own recipe says it "refuses BY NAME until then". The arm does
+      not run this cycle, its siblings run, and the refusal reaches the
+      manifest as
       :data:`ARM_REFUSED_METRIC` naming the arm and the column. Measured
       2026-09-05 on the first phase-1 replay arc (weekly@2026-08-07): the
       predictor-ranked R arm raised `TrainingIntegrityError` and took the
@@ -348,9 +349,17 @@ def partition_by_catalog(
       `TrainingIntegrityError` inside the produce loop, slot-wide, exactly as
       plan §4.4 and the 2026-08-29 ruling require.
 
+    A refusal whose every column has a declared pending producer
+    (:func:`crucible.slots.producibility.pending_dependency`) says so in its
+    reason: that arm is registered and waits by design
+    (`alpha-engine-config-I11030`). Any other refusal names a column nothing
+    will produce.
+
     An arm naming an unknown ranker still raises from :func:`get_ranker`: a
     recipe nothing can run is malformed, not refused.
     """
+    from crucible.slots.producibility import pending_dependency  # noqa: PLC0415 - avoids a cycle
+
     produced = set(catalog_columns)
     producible: list[Any] = []
     refused: list[InputRefusal] = []
@@ -360,19 +369,32 @@ def partition_by_catalog(
         if not undeclared:
             producible.append(spec)
             continue
-        refused.append(
-            InputRefusal(
-                arm=spec.name,
-                unresolvable=undeclared,
+        refusal = InputRefusal(
+            arm=spec.name,
+            unresolvable=undeclared,
+            reason=(
+                f"arm {spec.name!r} ranks with {ranker.name!r}, which reads "
+                f"{list(undeclared)}; the feature catalogue declares no producer for them "
+                "and none is declared pending (`crucible.features.PENDING_COLUMNS`), so "
+                "nothing will ever materialise them. Refused BY NAME at registration; the "
+                "slot's other arms run."
+            ),
+        )
+        dependency = pending_dependency(refusal, catalog_columns=produced)
+        if dependency is not None:
+            refusal = replace(
+                refusal,
                 reason=(
                     f"arm {spec.name!r} ranks with {ranker.name!r}, which reads "
-                    f"{list(undeclared)}; the feature catalogue declares no producer for "
-                    "them, so this is not a compromised input but a column another slot "
-                    "materialises later (predictions: the M slot, phase 3; LLM ratings: "
-                    "phase 5). Refused BY NAME at registration; the slot's other arms run."
+                    f"{list(undeclared)}; the feature catalogue does not produce them yet, "
+                    "so this is not a compromised input but a column another track "
+                    "materialises later: "
+                    + "; ".join(column.describe() for column in dependency.columns)
+                    + ". The arm is registered and waits BY DESIGN; refused BY NAME at the "
+                    "run until then; the slot's other arms run."
                 ),
             )
-        )
+        refused.append(refusal)
     return producible, refused
 
 

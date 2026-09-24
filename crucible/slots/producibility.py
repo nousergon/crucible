@@ -37,15 +37,21 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from crucible.features import PendingColumn
+    from crucible.slots.inputs import InputRefusal
     from crucible.store import Store
 
 __all__ = [
+    "PendingDependency",
     "ReleaseArms",
     "UnproducibleChampionError",
     "assert_champions_producible",
+    "catalog_input_refusal",
     "catalog_refusal",
     "champion_refusal",
+    "pending_dependency",
     "release_arms",
+    "waiting_arms",
 ]
 
 
@@ -65,7 +71,9 @@ class ReleaseArms:
     slot: str
     #: recipe name -> the arm id that recipe produces under.
     producible: dict[str, str]
-    #: recipe name -> why the release refuses it at registration.
+    #: recipe name -> why it cannot produce: refused at registration, or
+    #: registered and waiting on a declared pending producer
+    #: (`alpha-engine-config-I11030`), which no champion can be either.
     refused: dict[str, str]
 
 
@@ -75,18 +83,102 @@ def _catalog_columns() -> list[str]:
     return [feature.name for feature in CATALOG]
 
 
-def catalog_refusal(recipe: Any) -> str | None:
-    """Why a U/R ``recipe`` (an `ArmSpec`) is refused at registration, or ``None``.
+def catalog_input_refusal(recipe: Any) -> InputRefusal | None:
+    """The catalogue refusal of one U/R ``recipe``, or ``None`` when it can run.
 
     The single-recipe face of :func:`crucible.slots.cycle.partition_by_catalog`
     — the exact predicate `experiment.run` applies before producing — so a
     caller holding one recipe (`crucible.migrate`, which is handed recipes
     rather than a tree) asks the same question the produce loop will.
+    ``recipe`` needs only ``name`` and ``ranker``.
     """
     from crucible.slots.cycle import partition_by_catalog  # noqa: PLC0415 - avoids a cycle
 
     _, refused = partition_by_catalog([recipe], catalog_columns=_catalog_columns())
-    return refused[0].reason if refused else None
+    return refused[0] if refused else None
+
+
+def catalog_refusal(recipe: Any) -> str | None:
+    """Why a U/R ``recipe`` (an `ArmSpec`) cannot produce, or ``None``."""
+    refusal = catalog_input_refusal(recipe)
+    return refusal.reason if refusal else None
+
+
+@dataclass(frozen=True)
+class PendingDependency:
+    """An arm that produces nothing BY DESIGN, and the producer it waits on.
+
+    `alpha-engine-config-I11030`. Read off a catalogue refusal, never
+    declared by the arm: every column the refusal names must be absent from
+    the feature catalogue AND declared in
+    :data:`crucible.features.PENDING_COLUMNS`.
+    """
+
+    arm: str
+    columns: tuple[PendingColumn, ...]
+
+    def waits_on(self) -> str:
+        return "; ".join(column.describe() for column in self.columns)
+
+    def describe(self) -> str:
+        return f"{self.arm} waits on {self.waits_on()}"
+
+
+def pending_dependency(
+    refusal: InputRefusal | None, *, catalog_columns: Iterable[str] | None = None
+) -> PendingDependency | None:
+    """The declared producer a catalogue ``refusal`` waits on, or ``None``.
+
+    ``None`` unless EVERY unresolvable column is (a) not produced by the
+    catalogue and (b) declared in :data:`crucible.features.PENDING_COLUMNS`.
+    One undeclared column makes the whole recipe a defect: part of what it
+    reads will never exist. (a) is what makes the wait lapse. Once the
+    catalogue produces the column, the refusal is gone or no longer names it,
+    and the arm is held to production like any other.
+    """
+    from crucible.features import PENDING_COLUMNS  # noqa: PLC0415 - heavy import, few call sites
+
+    if refusal is None:
+        return None
+    produced = set(_catalog_columns() if catalog_columns is None else catalog_columns)
+    columns = []
+    for column in refusal.unresolvable:
+        if column in produced or column not in PENDING_COLUMNS:
+            return None
+        columns.append(PENDING_COLUMNS[column])
+    return PendingDependency(arm=refusal.arm, columns=tuple(columns))
+
+
+def waiting_arms(
+    slot: str, *, store: Store, strategy_dir: Path | str | None = None
+) -> dict[str, PendingDependency]:
+    """Every arm id the release declares for ``slot`` that waits BY DESIGN.
+
+    Keyed by the arm id the recipe hashes to, so a registered arm is waiting
+    only if a recipe in force hashes to its exact id and every column that
+    recipe lacks has a declared pending producer
+    (:func:`pending_dependency`). An arm whose recipe was edited, removed, or
+    reads a column nothing will produce is absent from the result, and is
+    held to production like any other. M and S recipes are not ranked on
+    catalogue columns, so their slots wait on nothing here.
+
+    Raises when the recipe tree cannot be read. The caller classifies that.
+    """
+    from crucible.slots.arms import (  # noqa: PLC0415 - avoids a cycle
+        FOREIGN_RECIPE_LOADERS,
+        load_arm_specs,
+    )
+
+    if slot in FOREIGN_RECIPE_LOADERS:
+        return {}
+    waiting: dict[str, PendingDependency] = {}
+    for recipe in load_arm_specs(
+        slot, store=store, strategy_dir=Path(strategy_dir) if strategy_dir else None
+    ):
+        dependency = pending_dependency(catalog_input_refusal(recipe))
+        if dependency is not None:
+            waiting[recipe.arm_id] = dependency
+    return waiting
 
 
 def release_arms(
@@ -147,7 +239,7 @@ def champion_refusal(arm_id: str, *, release: ReleaseArms, register: Any = None)
         return None
     if name in release.refused:
         refused_because = release.refused[name]
-        return f"the release's own recipe {name!r} is refused at registration: {refused_because}"
+        return f"the release's own recipe {name!r} cannot produce: {refused_because}"
     if name in release.producible:
         return (
             f"the release's recipe {name!r} now produces under {release.producible[name]!r}, "
