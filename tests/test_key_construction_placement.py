@@ -54,6 +54,7 @@ suppression list evading the suppression scanner.
 from __future__ import annotations
 
 import ast
+import functools
 import re
 from pathlib import Path
 
@@ -165,7 +166,8 @@ _KNOWN_ARCHITECTURAL_EXCEPTIONS: dict[str, dict[str, str]] = {
 }
 
 
-def _module_level_key_functions() -> list[tuple[str, str]]:
+@functools.cache
+def _module_level_key_functions() -> tuple[tuple[str, str], ...]:
     """(module, function name) for every `*_key`/`*_prefix` def under
     `crucible/`, excluding `crucible/keys.py` itself.
 
@@ -184,6 +186,9 @@ def _module_level_key_functions() -> list[tuple[str, str]]:
     entry, and its reason, when the walk keyed on the bare name. Two defs
     resolving to the same qualified name in one module is reported as a
     duplicate rather than collapsed.
+
+    Cached for the session: the tree does not change while the suite runs, and
+    re-parsing all of `crucible/` once per parametrized case was ~0.7 s each.
     """
     hits: list[tuple[str, str]] = []
     for path in sorted(_CRUCIBLE_ROOT.rglob("*.py")):
@@ -205,7 +210,7 @@ def _module_level_key_functions() -> list[tuple[str, str]]:
         "two *_key/*_prefix defs resolve to the same qualified name, so one registry "
         f"entry would cover both: {duplicates}"
     )
-    return hits
+    return tuple(hits)
 
 
 def _accounted_for(module: str, name: str) -> bool:

@@ -40,14 +40,12 @@ import json
 
 import numpy as np
 import pytest
-from conftest import sessions_ending
+from conftest import seed_data_daily, sessions_ending
 from nousergon_lib.arena.ladder import build_ladder
 from nousergon_lib.arena.window import ArmSeries
 
 from crucible.arena_io import ArenaCycleValidationError, validate_arena_cycle
 from crucible.config import Settings
-from crucible.data import run_daily
-from crucible.data.point_in_time import UnavailablePointInTimeSource
 from crucible.features import DEFAULT_FEATURE_VERSION
 from crucible.keys import arena_cycle_key, shadow_key
 from crucible.ledger import read_trials
@@ -76,20 +74,7 @@ def _seed_and_grade(store, source, strategy_dir, cycle_date, tmp_path):
     sessions = sessions_ending(cycle_date, HORIZON + DECISION_DATES + 1)
     decision_days = sessions[:DECISION_DATES]
 
-    for day in [*decision_days, cycle_date]:
-        run_job(
-            "data.daily",
-            lambda c: run_daily(
-                c,
-                point_in_time=UnavailablePointInTimeSource(
-                    reason="synthetic fixture market carries no fundamentals"
-                ),
-                source=source,
-                expected_symbols=source.symbols(),
-            ),
-            store=store,
-            trading_day=day,
-        )
+    seed_data_daily(store, source, [*decision_days, cycle_date])
     for day in decision_days:
         run_job(
             "experiment.run",

@@ -526,7 +526,19 @@ class LocalStore(Store):
         return path.resolve().as_uri()
 
     def list_keys(self, prefix: str = "") -> Iterator[str]:
-        for path in sorted(self.root.rglob("*")):
+        # Walk only the directory the prefix can live under, not the whole
+        # root: every key that starts with `a/b/c` sits below `root/a/b`, and
+        # the `startswith` filter below still decides membership, so the
+        # result is identical. A prefix that is absolute or traverses is never
+        # a key's prefix (`_path` refuses both), so it keeps the full walk and
+        # yields nothing, exactly as before.
+        head = prefix.rpartition("/")[0]
+        base = self.root
+        if head and not head.startswith("/") and ".." not in head.split("/"):
+            base = self.root / head
+            if not base.is_dir():
+                return
+        for path in sorted(base.rglob("*")):
             if not path.is_file():
                 continue
             key = path.relative_to(self.root).as_posix()
