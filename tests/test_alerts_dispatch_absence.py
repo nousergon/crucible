@@ -61,8 +61,9 @@ def _no_reason(instance_id: str) -> InstanceReading:
     a unit test never makes a real `ec2:DescribeInstances` call.
 
     `known=False` is the PRODUCTION reading (`alpha-engine-config-I11049`):
-    EC2 purges a terminated instance about an hour after termination, and no
-    page this detector fires is younger than three hours."""
+    EC2 purges a terminated instance about an hour after termination, and a
+    page this detector fires without an exit record is at least
+    DISPATCH_ABSENCE_HORIZON old."""
     return InstanceReading(False, None)
 
 
@@ -401,8 +402,132 @@ class TestANonJobHandlerClearsOnTheMigrationsPrefix:
 
 
 def test_the_horizon_is_stated_and_bounded() -> None:
-    """Deliverable 2: 'a horizon that is stated, not implied.'"""
-    assert DISPATCH_ABSENCE_HORIZON == dt.timedelta(hours=3)
+    """Deliverable 2: 'a horizon that is stated, not implied.' Set from the
+    `alpha-engine-config-I11032` measurement (slowest legitimate dispatch
+    5.09h, an `experiment.backfill` chunk) and bounded well inside the
+    daily sweep cadence, so it defers a page by at most one sweep."""
+    assert DISPATCH_ABSENCE_HORIZON == dt.timedelta(hours=8)
+    assert DISPATCH_ABSENCE_HORIZON < dt.timedelta(hours=24)
+
+
+#: The slowest legitimate dispatch measured for `alpha-engine-config-I11032`:
+#: an `experiment.backfill` replay chunk dispatched 2026-09-17T01:57:33Z that
+#: booted in 3 minutes and ran 5.04h before writing its own `ok` manifest.
+BACKFILL_DISPATCHED_AT = dt.datetime(2026, 9, 17, 1, 57, 33, tzinfo=dt.UTC)
+BACKFILL_ARGS = "--date 2026-09-11 --run-mode replay --slot m --arm residual_momentum"
+
+
+class TestTheHorizonIsSetFromTheMeasuredRuntimes:
+    """`alpha-engine-config-I11032`. Once `-I10981` made a manifest clear only
+    its own dispatch, the horizon decided, and 3h had been measured on
+    `data.heal` alone."""
+
+    def test_a_backfill_chunk_still_running_at_4h_does_not_page(self, tmp_path) -> None:
+        """The case the issue was filed over: a healthy chunk, mid-run, read
+        by a sweep four hours after its dispatch. Under 3h this paged."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(
+            store,
+            job="experiment.backfill",
+            args=BACKFILL_ARGS,
+            dispatched_at=BACKFILL_DISPATCHED_AT,
+        )
+        assert (
+            evaluate_dispatch_absence(
+                store,
+                now=BACKFILL_DISPATCHED_AT + dt.timedelta(hours=4),
+                describe_instance_state_reason=_no_reason,
+                read_box_log_tail=_no_log,
+            )
+            == []
+        )
+
+    def test_a_box_that_never_ends_still_pages_and_the_page_names_the_horizon(
+        self, tmp_path
+    ) -> None:
+        """Widening is not suppression: past the horizon, with no manifest
+        and no recorded end, the dispatch pages, and says after how long."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(
+            store,
+            job="experiment.backfill",
+            args=BACKFILL_ARGS,
+            dispatched_at=BACKFILL_DISPATCHED_AT,
+        )
+        [page] = evaluate_dispatch_absence(
+            store,
+            now=BACKFILL_DISPATCHED_AT + dt.timedelta(hours=9),
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
+        )
+        assert page.condition == "absence"
+        assert page.job == "experiment.backfill"
+        assert "after 8h" in page.reason
+
+
+class TestARecordedEndIsGradedAtOnce:
+    """`alpha-engine-config-I11032` deliverable 2: the exit record is a real
+    end condition (the shape `crucible_manifest_wait.sh` uses), so a wider
+    horizon does not delay the page for a box that died and said so."""
+
+    def test_an_ended_dispatch_with_no_manifest_pages_inside_the_horizon(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        _write_exit_record(store, _exit_record())
+        [page] = evaluate_dispatch_absence(
+            store,
+            now=WITHIN_HORIZON,
+            describe_instance_state_reason=_no_reason,
+            read_box_log_tail=_no_log,
+        )
+        assert "the box recorded its own exit: failed (code 1)" in page.reason
+
+    def test_an_ended_dispatch_whose_own_manifest_landed_does_not_page(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        _write_exit_record(store, _exit_record(exit_code=0, exit_class="ok", manifest_written=True))
+        store.put_bytes(
+            manifest_key("data.heal", DISPATCH_TARGET_TRADING_DAY.isoformat()),
+            _manifest_body(AFTER_DISPATCH),
+        )
+        assert (
+            evaluate_dispatch_absence(
+                store,
+                now=WITHIN_HORIZON,
+                describe_instance_state_reason=_no_reason,
+                read_box_log_tail=_no_log,
+            )
+            == []
+        )
+
+    def test_no_recorded_end_inside_the_horizon_is_still_not_due(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        assert (
+            evaluate_dispatch_absence(
+                store,
+                now=WITHIN_HORIZON,
+                describe_instance_state_reason=_no_reason,
+                read_box_log_tail=_no_log,
+            )
+            == []
+        )
+
+    def test_an_unreadable_exit_record_is_not_an_end(self, tmp_path) -> None:
+        """A writer defect must not grade a box that may still be running.
+        The horizon still applies, and the page names the defect once due."""
+        store = LocalStore(tmp_path)
+        _write_dispatch(store)
+        store.put_bytes(dispatch_exit_key("data.heal", "01abc"), b"{not json")
+        assert (
+            evaluate_dispatch_absence(
+                store,
+                now=WITHIN_HORIZON,
+                describe_instance_state_reason=_no_reason,
+                read_box_log_tail=_no_log,
+            )
+            == []
+        )
 
 
 class TestDispatchAbsenceClassification:

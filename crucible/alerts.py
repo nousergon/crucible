@@ -808,20 +808,50 @@ def evaluate_absence(
     return pages
 
 
-#: alpha-engine-config-I10134 deliverable 2: how long a dispatch is given to
-#: land a manifest before its absence pages. Stated, not implied — a job
-#: this dispatcher launches boots a spot box, installs a venv and runs a
-#: handful of trading-day sessions in well under an hour on every measured
-#: firing (`data.heal`'s four re-dispatches wrote manifests within ~30s per
-#: session once they actually started); three hours is generous headroom
-#: over that for a slow box or a spot interruption's own retry, without
-#: coming anywhere near the ten-hour gap this issue was filed over. A
-#: per-job override is not built: on-demand dispatch is deliberately the
-#: uniform, minimal case (§4.6's "≈6 rows" argument against a second
-#: per-job table applies here too), and this constant is the one place a
-#: measured firing that legitimately needs longer would argue for widening
-#: it.
-DISPATCH_ABSENCE_HORIZON = dt.timedelta(hours=3)
+#: How long a dispatch that has NOT recorded its own end is given to land a
+#: manifest before its absence pages. `alpha-engine-config-I10134` stated it
+#: at three hours, measured on `data.heal` alone. `alpha-engine-config-I11032`
+#: re-set it from a measurement over every dispatchable job, because once
+#: `alpha-engine-config-I10981` made a manifest clear only ITS OWN dispatch,
+#: this number became the thing that decides.
+#:
+#: **Measured 2026-09-24**, read-only over all live `runs/_dispatch/` records.
+#: Each record was paired with the first manifest at its target key whose
+#: `started` is at or after the dispatch, within 45 minutes of it (boot).
+#: Records a LATER run cleared were excluded, because they time the next
+#: dispatch and not this one. Dispatch to `finished`, per job:
+#:
+#: * `experiment.backfill`: n=8, p50 0.08h, **max 5.09h** (the 2026-09-17
+#:   01:57Z replay chunk of M `residual_momentum`: 3 min boot, 5.04h run).
+#:   It is the slowest dispatchable job and it exceeds the old 3h, so a
+#:   healthy chunk still running when a sweep read it more than three hours
+#:   after its dispatch paged. The issue named this case.
+#: * `data.heal`: n=16, p50 1.80h, max 1.94h (seven-month EDGAR re-heals).
+#: * every other job (`weekly`, `experiment.run/grade`, `promote`,
+#:   `iac.conformance`, `alerts.sweep`, `data.daily/weekly`, `fault.probe`,
+#:   `heartbeat`, `migrate.history`): max 0.74h, almost all of it boot. The
+#:   live `weekly` arc runs every stage in-process, and both of its 2026-09
+#:   live firings finished inside 4 minutes of starting.
+#:
+#: Eight hours is the slowest measured legitimate run with about 1.5x
+#: headroom, for a slow box or a longer backfill chunk. It is ONE number and
+#: not a per-job table. The measurement answers that argument: every job
+#: except one sits under 2h, and a table of eleven rows where ten would say
+#: "2h" is the second per-job table §4.6 argues against.
+#:
+#: **A wider horizon does not delay the pages that matter**, because it is no
+#: longer the only end condition. A box writes its exit record
+#: (`crucible.keys.dispatch_exit_key`) from its EXIT trap, so a dispatch
+#: that has one has ENDED, and it is graded on the first sweep after that
+#: whatever its age (:func:`_dispatch_has_ended`). That is the real end
+#: condition `nous-ergon-ops/scripts/lib/crucible_manifest_wait.sh` uses
+#: (termination, not a clock). It reads the store and needs no
+#: `ec2:DescribeInstances`, which purges a terminated box in about an hour.
+#: The horizon now governs only a box that recorded no end: one still
+#: running, or one that died too hard to run its trap (a spot reclaim, a
+#: kernel panic). A dispatch past it with no manifest still pages, and the
+#: page still names the horizon.
+DISPATCH_ABSENCE_HORIZON = dt.timedelta(hours=8)
 
 
 @dataclass(frozen=True)
@@ -852,13 +882,13 @@ def _default_describe_instance_state_reason(instance_id: str) -> InstanceReading
     Measured 2026-09-18 under `ne-admin`: all six instances named by that
     night's pages returned `{"Reservations": []}` — not AccessDenied, not
     throttled, simply gone. EC2 keeps a terminated instance visible for about
-    an hour; :data:`DISPATCH_ABSENCE_HORIZON` is three, and the sweep is
+    an hour; :data:`DISPATCH_ABSENCE_HORIZON` is eight, and the sweep is
     daily on top of that, so `Server.SpotInstanceTermination` — the marker
     the classifier was built on — is unreachable for every page this detector
     can fire. The transport is the defect, not the horizon
-    (`alpha-engine-config-I11032` owns the horizon and it is not widened to
-    chase this window): the durable evidence is the exit record and the
-    CloudWatch stream, and both are read before this.
+    (`alpha-engine-config-I11032` set the horizon from a runtime measurement,
+    not to chase this window): the durable evidence is the exit record and
+    the CloudWatch stream, and both are read before this.
     """
     import boto3  # noqa: PLC0415 - lazy on purpose
 
@@ -1473,6 +1503,9 @@ def evaluate_dispatch_absence(
     A dispatch inside the horizon is not yet due and is silently skipped —
     the same "only past deadlines are evaluated" rule :func:`evaluate_absence`
     states for scheduled jobs, so a box mid-run does not page for being slow.
+    **Unless the box has recorded its own end** (`alpha-engine-config-I11032`,
+    :func:`_dispatch_has_ended`): a dispatch with an exit record is not
+    mid-run, so it is graded at once whatever its age.
 
     Grouped by :func:`cause_key` exactly like a scheduled absence: an
     on-demand dispatch that never lands and a scheduled job absent on the
@@ -1573,7 +1606,7 @@ def evaluate_dispatch_absence(
                 )
             )
             continue
-        if moment - dispatched_at < horizon:
+        if moment - dispatched_at < horizon and not _dispatch_has_ended(store, job, dispatch_id):
             continue
         # The same window that bounds the other two inputs (`days_to_evaluate`),
         # applied to the one input that had no bound at all. A dispatch record
@@ -1630,6 +1663,26 @@ def evaluate_dispatch_absence(
             )
         )
     return pages
+
+
+def _dispatch_has_ended(store: Store, job: str, dispatch_id: str) -> bool:
+    """Has this dispatch's box recorded its own end?
+
+    `alpha-engine-config-I11032`. The exit record is written from the box's
+    EXIT trap, after the job and its manifest write have both returned, so
+    its presence means the run is over, not slow. That is the end condition
+    the horizon only approximates. A dispatch that has one is graded on the
+    first sweep after it, and :data:`DISPATCH_ABSENCE_HORIZON` governs only a
+    box that recorded no end.
+
+    Only a record that validates counts. An absent record means "no end
+    recorded" and the horizon applies, as it did before. An unreadable or
+    non-conforming one is a defect in the writer, and it is NOT treated as an
+    end: the horizon still applies, and once the dispatch is due
+    :func:`_classify_dispatch_absence` names the defect in the page. Treating
+    it as an end would grade a box that may still be running.
+    """
+    return isinstance(_read_dispatch_exit_record(store, job, dispatch_id), DispatchExitDocument)
 
 
 def _successor_dispatch_present(store: Store, job: str, dispatch_id: str) -> bool | None:
