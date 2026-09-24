@@ -103,6 +103,7 @@ __all__ = [
     "baseline_control_arm",
     "min_active_arms_finding",
     "partition_by_catalog",
+    "refusal_metric",
     "run_grade",
     "run_produce",
     "run_produce_history",
@@ -375,7 +376,13 @@ def partition_by_catalog(
     return producible, refused
 
 
-def _refusal_metric(slot: str, refusal: InputRefusal) -> dict[str, Any]:
+def refusal_metric(slot: str, refusal: InputRefusal) -> dict[str, Any]:
+    """The `arm_refused_at_registration` row for one catalogue refusal.
+
+    Public because two paths file it (`alpha-engine-config-I11030`):
+    `experiment.run`, and every job that loads U/R recipes through
+    `crucible.registration.load_registrable_recipes`.
+    """
     return {
         "name": ARM_REFUSED_METRIC,
         "module": f"crucible.slots.{slot}",
@@ -446,7 +453,7 @@ def _produce_arms(
 
     specs, refused = partition_by_catalog(specs, catalog_columns=[f.name for f in CATALOG])
     for refusal in refused:
-        ctx.record_metric(_refusal_metric(slot, refusal))
+        ctx.record_metric(refusal_metric(slot, refusal))
     if refused and not specs:
         # Every arm refused: the slot can serve nothing, and that PAGES
         # through the ordinary failed-manifest path (plan §7 `unservable`).

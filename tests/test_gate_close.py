@@ -785,3 +785,23 @@ class TestCrucibleGateNoLongerFilesTheClosingRecord:
             "the publishing identity cannot write it, so this call would be an "
             "AccessDenied in CI on the one day it mattered."
         )
+
+
+class TestTheScheduledEvaluatorsDeclareComponentOnesStore:
+    """`alpha-engine-config-I11519` part (b). Phase 4's `data_cutover_ready`
+    and `data_collection_reliability` locate component 1's gate documents
+    through `CRUCIBLE_DATA_COLLECTION_STORE`, and neither scheduled evaluator
+    declared it. Every published phase-4 reading therefore said "not
+    configured" for as long as both clauses have existed. The name is read off
+    the gate module's own constant, so renaming the variable there without
+    renaming it here goes red."""
+
+    @pytest.mark.parametrize("workflow", ["gate-close.yml", "board.yml"])
+    def test_the_variable_is_declared_from_the_repository_variable(self, workflow: str) -> None:
+        from crucible.gate import CRUCIBLE_DATA_COLLECTION_STORE_VAR
+
+        path = WORKFLOW.parent / workflow
+        env = yaml.safe_load(path.read_text(encoding="utf-8"))["env"]
+        assert env.get(CRUCIBLE_DATA_COLLECTION_STORE_VAR) == (
+            "${{ vars." + CRUCIBLE_DATA_COLLECTION_STORE_VAR + " }}"
+        ), f"{workflow} does not declare {CRUCIBLE_DATA_COLLECTION_STORE_VAR}"

@@ -3680,6 +3680,15 @@ PHASE4_DELIVERABLES: tuple[Deliverable, ...] = (
         "this phase (`architecture.d/146` rule 2)",
         "metron_read_artifacts_have_surviving_producer",
     ),
+    # `alpha-engine-config-I11304`: the precondition Brian's 2026-09-21 ruling
+    # puts on the irreversible v1 deletion. A decommission row, so no trader
+    # deliverable names it.
+    Deliverable(
+        "v1_deletion_gated_on_data_collection_reliability",
+        "the v1-pipeline deletion waits on component 1's published reliability streaks "
+        "(EOD 5, morning 5, weekly 2 consecutive complete cycles) reading MET and fresh",
+        "data_collection_reliability",
+    ),
     Deliverable(
         "lambdas_and_alarms_removed",
         "66 Lambdas + 153 alarms removed via IaC",
@@ -8165,6 +8174,120 @@ def _absent_upstream_champion(store: Store, slot: str) -> str | None:
     return None if hook is None else hook(store)
 
 
+def _clause_every_registered_arm_produces(store: Store, window: list[dt.date]) -> Clause:
+    """Every ACTIVE, non-control registered arm has produced something once
+    its slot's settle window has passed (`alpha-engine-config-I11030`,
+    deliverable 3).
+
+    **Registered is not producing.** Measured 2026-09-17, then again
+    2026-09-24: three R arms are ACTIVE in `arms/r/register.jsonl` and have
+    never written under `experiments/` or `arm_predictions/`
+    (`scanner_predictor_direct` since 2026-07-13, `scanner_top20_predictor`
+    since 2026-07-20, `thinktank_coverage` since 2026-06-22). Every
+    `experiment.run[r]` refuses them by name, because their rankers read
+    columns the feature catalogue declares no producer for. Every surface that
+    counted arms counted the REGISTER or an arena cycle's own scored set, so
+    all three sat inside every denominator. One of them held the R champion
+    pointer, and on 2026-09-19 that took the Saturday arc down.
+    `v1_arms_carried_or_excluded` catches the same condition only for arms a
+    v1 ledger row names. This clause holds EVERY registered arm to it.
+
+    The production predicate is `crucible.carryover.read_production`, the
+    arm's own artifacts, never the register. The settle window matches the
+    carry-over clause: `DEFAULT_HORIZON_TRADING_DAYS` sessions after the day
+    the arm's `registered` event was FILED. An arm filed yesterday has not
+    been asked.
+
+    * UNMEASURABLE when a register cannot be read or an arm's production
+      cannot be listed, and nothing else is red. Unknown output is never a
+      pass.
+    * UNMET while any such arm is mute past its window. The fix is output,
+      or a `retired` register event saying why the arm never will produce.
+      Silence is not a fix (deliverable 4).
+    * MET otherwise. Arms still inside their window are named in the detail.
+    """
+    from crucible.calendar import count_trading_days  # noqa: PLC0415 - light, one call site
+    from crucible.slots.grading import (  # noqa: PLC0415 - heavy import, one call site
+        DEFAULT_HORIZON_TRADING_DAYS,
+    )
+
+    name = "every_registered_arm_produces"
+    requirement = (
+        "every ACTIVE non-control arm in each slot's register has written output under "
+        "its own `experiments/` or `arm_predictions/` prefix once "
+        f"{DEFAULT_HORIZON_TRADING_DAYS} trading sessions have passed since its "
+        "`registered` event was filed; an arm that will never produce carries a `retired` "
+        "event saying why, never silence"
+    )
+    as_of = window[-1] if window else resolve_trading_day()
+    evidence: list[str] = []
+    access: list[str] = []
+    mute: list[str] = []
+    broken: list[str] = []
+    settling: list[str] = []
+    n_checked = 0
+    for slot in sorted(dispatchable_slots()):
+        _, key, problem, access_problem, register = _register_arms(store, slot)
+        evidence.append(key)
+        if problem is not None:
+            (access if access_problem else broken).append(problem)
+            continue
+        if register is None:
+            continue
+        for arm_id in sorted(register.active_arms()):
+            if is_control_arm(SLOTS[slot], arm_id, register):
+                continue
+            filed_on = (
+                register.state(arm_id).filed_date or register.state(arm_id).record.created_date
+            )
+            reading = read_production(store, arm_id, filed_on)
+            n_checked += 1
+            if reading.produced is None:
+                access.append(f"{arm_id}: {reading.problem}")
+                continue
+            if reading.produced:
+                continue
+            sessions = count_trading_days(dt.date.fromisoformat(filed_on), as_of)
+            if sessions < DEFAULT_HORIZON_TRADING_DAYS:
+                settling.append(f"{arm_id} ({sessions}/{DEFAULT_HORIZON_TRADING_DAYS})")
+                continue
+            evidence.append(reading.key)
+            mute.append(
+                f"{arm_id} is ACTIVE in {key}, filed {filed_on} ({sessions} sessions ago), "
+                f"and has written nothing under {reading.key}"
+            )
+    note = f"; still inside their settle window: {', '.join(settling)}" if settling else ""
+    if mute or broken:
+        parts = broken[:3]
+        if mute:
+            parts.append(f"{len(mute)} registered arm(s) MUTE: " + "; ".join(mute[:6]))
+        return Clause(name, requirement, False, "; ".join(parts) + note, tuple(evidence))
+    if access:
+        return _unmeasurable(name, requirement, "; ".join(access[:6]) + note, evidence)
+    if n_checked == 0:
+        # An absent register for ONE slot is neutral here: that slot has no
+        # arm to hold to production (whether it SHOULD have one is
+        # `every_recipe_in_the_release_is_registered`'s question, and an S
+        # register legitimately waits on the M champion). Zero arms across
+        # EVERY slot is different: a clause that graded nothing has read
+        # nothing, and MET over an empty denominator is the vacuous pass.
+        return _unmeasurable(
+            name,
+            requirement,
+            "no ACTIVE non-control arm is registered in any slot's register; a clause "
+            "over zero arms is not a reading",
+            evidence,
+        )
+    return Clause(
+        name,
+        requirement,
+        True,
+        f"all {n_checked} active non-control registered arm(s) past their settle window "
+        f"have produced{note}",
+        tuple(evidence),
+    )
+
+
 def _phase3(
     store: Store,
     window: list[dt.date],
@@ -8216,6 +8339,9 @@ def _phase3(
         # ABOUT — "all three slots" is not true of a slot whose merged
         # recipes never reached its register.
         _clause_every_recipe_registered(store, window),
+        # `alpha-engine-config-I11030` deliverable 3: the next bar after
+        # registration. On phase 3 for the reason the clause above states.
+        _clause_every_registered_arm_produces(store, window),
     ]
 
 
@@ -9094,6 +9220,34 @@ def _clause_data_cutover_ready(store: Store) -> Clause:
         "(data_collection_plan_260914.md §6.2 step 3) — read from its own published "
         "artifact, never re-derived here"
     )
+    reading = _read_data_collection_gate(name, requirement, _DATA_CUTOVER_READY_GATE)
+    if isinstance(reading, Clause):
+        return reading
+    key, _, document = reading
+    met = bool(document.get("met"))
+    clauses_met = document.get("clauses_met")
+    clauses_total = document.get("clauses_total")
+    detail = (
+        f"{key}: met={met}, {clauses_met}/{clauses_total} of component 1's cutover-ready "
+        f"clauses met, code_sha={document.get('code_sha')}"
+    )
+    return Clause(name, requirement, met, detail, (key,))
+
+
+def _read_data_collection_gate(
+    name: str, requirement: str, gate: str
+) -> Clause | tuple[str, str, dict[str, Any]]:
+    """The newest reading of component 1's sub-gate ``gate``, as
+    ``(key, read_on, document)``, or the UNMEASURABLE clause saying why there
+    is none.
+
+    The one reader both component-1 clauses share
+    (`alpha-engine-config-I11304` lifted it out of
+    :func:`_clause_data_cutover_ready` unchanged), so the two cannot come to
+    disagree about where component 1 publishes or what an absent reading
+    means. Every failure here is UNMEASURABLE, never UNMET: nothing read
+    confirms the gate said no.
+    """
     location = os.environ.get(CRUCIBLE_DATA_COLLECTION_STORE_VAR, "").strip()
     if not location:
         return _unmeasurable(
@@ -9112,24 +9266,23 @@ def _clause_data_cutover_ready(store: Store) -> Clause:
             f"could not open {location!r}: {type(exc).__name__}: {exc}",
             (location,),
         )
-    read_on, access_problem = last_read(data_store, _DATA_CUTOVER_READY_GATE)
+    read_on, access_problem = last_read(data_store, gate)
     if access_problem:
         return _unmeasurable(
             name,
             requirement,
-            f"could not list {gate_prefix(_DATA_CUTOVER_READY_GATE)!r} at {location} — a "
+            f"could not list {gate_prefix(gate)!r} at {location} — a "
             "store access failure, not 'never read'",
-            (gate_prefix(_DATA_CUTOVER_READY_GATE),),
+            (gate_prefix(gate),),
         )
     if read_on is None:
         return _unmeasurable(
             name,
             requirement,
-            f"no reading of {_DATA_CUTOVER_READY_GATE!r} has ever been filed at {location} "
-            f"under {gate_prefix(_DATA_CUTOVER_READY_GATE)!r}",
-            (gate_prefix(_DATA_CUTOVER_READY_GATE),),
+            f"no reading of {gate!r} has ever been filed at {location} under {gate_prefix(gate)!r}",
+            (gate_prefix(gate),),
         )
-    key = gate_key(_DATA_CUTOVER_READY_GATE, read_on)
+    key = gate_key(gate, read_on)
     read = _read_store_document(data_store, key)
     if read.problem is not None:
         return _unmeasurable(
@@ -9149,13 +9302,121 @@ def _clause_data_cutover_ready(store: Store) -> Clause:
             f"{key} was listed but is not readable now (concurrent write?)",
             (key,),
         )
-    document = read.document or {}
-    met = bool(document.get("met"))
-    clauses_met = document.get("clauses_met")
-    clauses_total = document.get("clauses_total")
+    return key, read_on, read.document or {}
+
+
+#: The sub-gate component 1 publishes its standing reliability streaks under
+#: (`nousergon-data-PR1850`). They are no longer a data-phase exit
+#: requirement. This harness reads them in exactly one place: the gate on the
+#: irreversible v1 deletion (`alpha-engine-config-I11304`).
+_DATA_COLLECTION_RELIABILITY_GATE = "data-collection-reliability"
+
+#: How old the newest reliability reading may be, in trading days before the
+#: day this gate reads for. Component 1 publishes it every day
+#: (`nousergon-data/.github/workflows/data-gate.yml`), so one trading day
+#: allows for a publish that lands after this gate runs. A streak is a claim
+#: about the latest due fire. A week-old claim says nothing about whether the
+#: collector is reliable NOW, which is the only question an irreversible
+#: deletion can be gated on.
+DATA_COLLECTION_RELIABILITY_MAX_AGE_TRADING_DAYS = 1
+
+_STREAK_PATTERN = re.compile(
+    r"^(?P<streak>\d+) consecutive complete cycle\(s\).*?against the (?P<target>\d+)"
+)
+
+
+def _streak_summary(clause: Any) -> str:
+    """``name: streak N/target (met=…)`` for one of component 1's streak
+    clauses, read off its own detail line.
+
+    When the detail no longer carries a count in the published shape, it says
+    ``streak unstated`` rather than guessing. The clause's own ``met`` is
+    still reported, and it is the ``met`` of the whole DOCUMENT that decides
+    this clause, never a number parsed here.
+    """
+    if not isinstance(clause, dict):
+        return f"unreadable streak clause {clause!r}"
+    label = str(clause.get("name", "<unnamed>"))
+    match = _STREAK_PATTERN.match(str(clause.get("detail") or ""))
+    streak = f"{match['streak']}/{match['target']}" if match else "unstated"
+    return f"{label}: streak {streak} (met={clause.get('met')})"
+
+
+def _clause_data_collection_reliability(store: Store, window: list[dt.date]) -> Clause:
+    """Component 1's reliability streaks, read as the precondition of the
+    irreversible v1-pipeline deletion (`alpha-engine-config-I11304`).
+
+    **The ruling** (Brian, 2026-09-21, recorded on
+    `alpha-engine-config-I10793`), in his words: *"it sounds like the only
+    time gate we should have here is for v2 phase 4 deleting the v1
+    pipelines, so a time gate here makes sense. as such we should be able to
+    work up to this point without time gates."* `nousergon-data-PR1850`
+    therefore took the streaks out of the data phase-1 exit and publishes
+    them as a standing artifact. This clause is the consuming half. It is
+    the ONLY time-based gate the ruling leaves in the programme, and no
+    other may be added.
+
+    Reads the newest `data_collection/gates/data-collection-reliability/*/gate.json`
+    through the reader :func:`_clause_data_cutover_ready` uses
+    (:func:`_read_data_collection_gate`). The coupling is the published
+    artifact alone (`architecture.d/146` rule 3), so `data_gate` is never
+    imported. The document grades three streaks: EOD 5, morning 5, weekly 2
+    consecutive complete cycles.
+
+    * MET only when the document's own ``met`` is ``True``. Truthiness is
+      not enough: a ``"true"`` string or a ``1`` is a document that does not
+      say MET.
+    * UNMET when it says anything else, naming each streak's count against
+      its target.
+    * UNMEASURABLE when there is no reading, it cannot be read, or the newest
+      one is older than :data:`DATA_COLLECTION_RELIABILITY_MAX_AGE_TRADING_DAYS`
+      trading days before the day this gate reads for. A stale streak is
+      never MET, because the deletion it gates cannot be undone.
+
+    **Scoped to the decommission.** It grades the phase-4 deliverable
+    `v1_deletion_gated_on_data_collection_reliability`, one of the
+    decommission rows. No trader deliverable names it, so no trader item
+    waits on it. Phase 4's exit already waits on the decommission itself
+    (`old_sf_execution_count_zero` reads ZERO executions), so registering it
+    on the phase adds no wait the phase did not already carry.
+    """
+    _unused((store,))
+    name = "data_collection_reliability"
+    requirement = (
+        "component 1's `data-collection-reliability` gate reads MET — its EOD, morning and "
+        "weekly collection stacks each hold their ratified streak of consecutive complete "
+        "cycles (5, 5, 2) — read from its own published artifact, fresh as of this "
+        "reading, before the irreversible v1-pipeline deletion"
+    )
+    reading = _read_data_collection_gate(name, requirement, _DATA_COLLECTION_RELIABILITY_GATE)
+    if isinstance(reading, Clause):
+        return reading
+    key, read_on, document = reading
+    as_of = window[-1] if window else resolve_trading_day()
+    oldest = as_of
+    for _ in range(DATA_COLLECTION_RELIABILITY_MAX_AGE_TRADING_DAYS):
+        oldest = previous_trading_day(oldest)
+    if read_on < oldest.isoformat():
+        return _unmeasurable(
+            name,
+            requirement,
+            f"the newest reading, {key}, is for {read_on}, older than {oldest.isoformat()} "
+            f"({DATA_COLLECTION_RELIABILITY_MAX_AGE_TRADING_DAYS} trading day(s) before "
+            f"{as_of.isoformat()}). A stale streak says nothing about whether the "
+            "collector is reliable now, and an irreversible deletion is never gated on one",
+            (key,),
+        )
+    met = document.get("met") is True
+    streaks = document.get("clauses")
+    summary = (
+        "; ".join(_streak_summary(c) for c in streaks)
+        if isinstance(streaks, list) and streaks
+        else "the document carries no streak clauses"
+    )
     detail = (
-        f"{key}: met={met}, {clauses_met}/{clauses_total} of component 1's cutover-ready "
-        f"clauses met, code_sha={document.get('code_sha')}"
+        f"{key}: met={document.get('met')!r}, {document.get('clauses_met')}/"
+        f"{document.get('clauses_total')} streak(s) held — {summary}; "
+        f"code_sha={document.get('code_sha')}"
     )
     return Clause(name, requirement, met, detail, (key,))
 
@@ -9284,6 +9545,9 @@ def _phase4(
         # cutover-readiness gate, read as a published artifact rather than
         # re-derived here (`architecture.d/146` rule 3).
         _clause_data_cutover_ready(store),
+        # `alpha-engine-config-I11304`: the ONE time gate Brian's 2026-09-21
+        # ruling keeps, on the irreversible v1 deletion. See the clause.
+        _clause_data_collection_reliability(store, window),
         # `alpha-engine-config-I10739`: this phase may not disable the only
         # producer schedule of something component 4 reads. A DIFFERENT
         # question from `data_cutover_ready` above, which asks whether

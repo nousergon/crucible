@@ -47,6 +47,17 @@ REQUIRED_KEYS = {
 SIGNAL_CLASSES = {"execution", "cost", "resource", "lineage", "outcome"}
 
 
+def _scheduling_disagreements(components: dict) -> list[str]:
+    """Every CLI job whose `JobSpec.scheduled` disagrees with its registry
+    row's `schedule` (`alpha-engine-config-I11041`)."""
+    rows = components["components"]
+    return sorted(
+        name
+        for name, spec in JOBS.items()
+        if spec.scheduled is not (rows[name].get("schedule") is not None)
+    )
+
+
 @pytest.fixture(scope="module")
 def components() -> dict:
     return yaml.safe_load(COMPONENTS_PATH.read_text(encoding="utf-8"))
@@ -62,6 +73,23 @@ class TestCoverage:
             "declared log location, alert channel or retention is unobserved, and "
             "'no data' must never render as green (principle 7)."
         )
+
+    def test_the_cli_and_the_registry_agree_about_what_is_scheduled(self, components: dict) -> None:
+        """`alpha-engine-config-I11041`. `JobSpec.scheduled` exists to be
+        checked against the registry, and nothing checked it. The first run
+        of this test found three jobs the registry schedules that the CLI
+        called unscheduled: `promote` and `explain` (arc stages) and `gate`
+        (daily since `alpha-engine-config-I10508`)."""
+        assert _scheduling_disagreements(components) == []
+
+    def test_the_scheduling_cross_check_names_a_disagreeing_job(self, components: dict) -> None:
+        """The guard above, made to fail on a parsed copy with one row
+        flipped."""
+        import copy
+
+        flipped = copy.deepcopy(components)
+        flipped["components"]["report"]["schedule"] = None
+        assert _scheduling_disagreements(flipped) == ["report"]
 
     def test_every_registry_row_is_a_real_job(self, components: dict) -> None:
         """The other direction. A row for a job that no longer exists makes
