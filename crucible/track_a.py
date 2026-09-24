@@ -615,9 +615,13 @@ def handle_experiment_register(args: argparse.Namespace) -> int:
     and a slot with nothing registrable has nothing to register, while every
     other slot's stage is unaffected; (c) the recording surface is this run's
     own manifest — each refusal as a rejection, an `unservable` MetricRecord,
-    `rows_out=0` — plus `gate._clause_every_recipe_registered`, which reads
-    RED over precisely this state and is what makes it visible rather than
-    quiet. The condition is not lost; only the arc-killing raise is.
+    `rows_out=0` — plus `gate._clause_every_recipe_registered`, which names
+    S's unregistered recipes in its detail. That clause no longer reads RED
+    over the state itself (`alpha-engine-config-I11512`): while the M
+    champion pointer is absent S registers nothing BY RULING
+    (`alpha-engine-config-I11452`), and once it exists an S recipe with no
+    register row reads RED like any other. The condition is not lost; only
+    the arc-killing raise is.
     """
     config = _settings(args)
     store = config.store()
