@@ -25,8 +25,15 @@ from typing import Any
 from crucible.backfill import run_backfill
 from crucible.calendar import is_trading_day, resolve_trading_day
 from crucible.config import settings as resolve_settings
-from crucible.data import ArcticPriceSource, PriceSource, run_daily, run_heal, run_weekly
-from crucible.data.point_in_time import FilingDatePointInTimeSource, PointInTimeSource
+from crucible.data import (
+    ArcticPriceSource,
+    PriceSource,
+    point_in_time,
+    run_daily,
+    run_heal,
+    run_weekly,
+)
+from crucible.data.point_in_time import PointInTimeSource
 from crucible.data.universe import DeclaredUniverse, load_declared_universe, universe_from_argv
 from crucible.explain import explain as explain_lineage
 from crucible.explain import render as render_lineage
@@ -129,7 +136,11 @@ def _point_in_time_source(config: Any) -> PointInTimeSource:
         store_from_uri(f"s3://{config.arctic_bucket}"),
         reason="point-in-time inputs are read from the data bucket, never written",
     )
-    return FilingDatePointInTimeSource(reader, label=config.arctic_bucket)
+    # The declared production class, read at call time and never a class named
+    # here: `crucible.features.depth.check_feature_layer_provenance` grades
+    # against the same declaration (`alpha-engine-config-I10978`).
+    source_class = point_in_time.PRODUCTION_FUNDAMENTALS_SOURCE_CLASS
+    return source_class(reader, label=config.arctic_bucket)
 
 
 def _declared_universe(args: argparse.Namespace, config: Any) -> DeclaredUniverse | None:
