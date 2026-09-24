@@ -8198,17 +8198,34 @@ def _clause_every_registered_arm_produces(store: Store, window: list[dt.date]) -
     the arm's `registered` event was FILED. An arm filed yesterday has not
     been asked.
 
-    * UNMEASURABLE when a register cannot be read or an arm's production
-      cannot be listed, and nothing else is red. Unknown output is never a
-      pass.
+    **Waiting is not mute** (the 2026-09-24 ruling: the three arms stay in
+    the mix, parked on purpose). An arm that has produced nothing is WAITING
+    when a recipe in force hashes to its exact id and every column that
+    recipe lacks is declared in `crucible.features.PENDING_COLUMNS` and not
+    yet produced by the catalogue
+    (`crucible.slots.producibility.waiting_arms`, the predicate registration
+    and `experiment.run` share). A waiting arm is named in the detail with
+    its producer, on every reading, and is not counted mute. No arm can
+    declare itself waiting: the wait is tied to a COLUMN the catalogue lacks,
+    so it lapses the day the catalogue produces it, and an arm still silent
+    then reads mute.
+
+    * UNMEASURABLE when a register cannot be read, an arm's production
+      cannot be listed, or whether a silent arm is waiting cannot be read,
+      and nothing else is red. Unknown output is never a pass.
     * UNMET while any such arm is mute past its window. The fix is output,
       or a `retired` register event saying why the arm never will produce.
       Silence is not a fix (deliverable 4).
-    * MET otherwise. Arms still inside their window are named in the detail.
+    * MET otherwise. Arms still inside their window, and waiting arms, are
+      named in the detail.
     """
     from crucible.calendar import count_trading_days  # noqa: PLC0415 - light, one call site
     from crucible.slots.grading import (  # noqa: PLC0415 - heavy import, one call site
         DEFAULT_HORIZON_TRADING_DAYS,
+    )
+    from crucible.slots.producibility import (  # noqa: PLC0415 - one call site
+        PendingDependency,
+        waiting_arms,
     )
 
     name = "every_registered_arm_produces"
@@ -8217,7 +8234,9 @@ def _clause_every_registered_arm_produces(store: Store, window: list[dt.date]) -
         "its own `experiments/` or `arm_predictions/` prefix once "
         f"{DEFAULT_HORIZON_TRADING_DAYS} trading sessions have passed since its "
         "`registered` event was filed; an arm that will never produce carries a `retired` "
-        "event saying why, never silence"
+        "event saying why, never silence; an arm whose recipe waits on a declared pending "
+        "producer for a column the feature catalogue does not yet produce is named as "
+        "waiting, never counted mute"
     )
     as_of = window[-1] if window else resolve_trading_day()
     evidence: list[str] = []
@@ -8225,6 +8244,7 @@ def _clause_every_registered_arm_produces(store: Store, window: list[dt.date]) -
     mute: list[str] = []
     broken: list[str] = []
     settling: list[str] = []
+    waiting: list[str] = []
     n_checked = 0
     for slot in sorted(dispatchable_slots()):
         _, key, problem, access_problem, register = _register_arms(store, slot)
@@ -8234,6 +8254,9 @@ def _clause_every_registered_arm_produces(store: Store, window: list[dt.date]) -
             continue
         if register is None:
             continue
+        # Read once per slot, and only when an arm in it is silent.
+        waits: dict[str, PendingDependency] | None = None
+        waits_unknown = False
         for arm_id in sorted(register.active_arms()):
             if is_control_arm(SLOTS[slot], arm_id, register):
                 continue
@@ -8241,11 +8264,28 @@ def _clause_every_registered_arm_produces(store: Store, window: list[dt.date]) -
                 register.state(arm_id).filed_date or register.state(arm_id).record.created_date
             )
             reading = read_production(store, arm_id, filed_on)
-            n_checked += 1
             if reading.produced is None:
+                n_checked += 1
                 access.append(f"{arm_id}: {reading.problem}")
                 continue
             if reading.produced:
+                n_checked += 1
+                continue
+            if waits is None:
+                try:
+                    waits = waiting_arms(slot, store=store)
+                except Exception as exc:  # noqa: BLE001 - classified into the reading below
+                    # Whether this slot's silent arms wait by design is
+                    # unknown, so the slot is UNMEASURABLE naming the class,
+                    # and no silent arm in it is assumed mute or waiting.
+                    waits, waits_unknown = {}, True
+                    evidence.append(strategy_arms_prefix(slot))
+                    access.append(f"{strategy_arms_prefix(slot)}: {type(exc).__name__}: {exc}")
+            if arm_id in waits:
+                waiting.append(f"{arm_id} waits on {waits[arm_id].waits_on()}")
+                continue
+            n_checked += 1
+            if waits_unknown:
                 continue
             sessions = count_trading_days(dt.date.fromisoformat(filed_on), as_of)
             if sessions < DEFAULT_HORIZON_TRADING_DAYS:
@@ -8254,9 +8294,16 @@ def _clause_every_registered_arm_produces(store: Store, window: list[dt.date]) -
             evidence.append(reading.key)
             mute.append(
                 f"{arm_id} is ACTIVE in {key}, filed {filed_on} ({sessions} sessions ago), "
-                f"and has written nothing under {reading.key}"
+                f"has written nothing under {reading.key}, and waits on no declared "
+                "pending producer"
             )
     note = f"; still inside their settle window: {', '.join(settling)}" if settling else ""
+    if waiting:
+        # Never silent: every waiting arm is named, on every reading.
+        note += (
+            f"; {len(waiting)} registered arm(s) WAITING on a declared pending producer, "
+            f"not counted mute: {'; '.join(waiting)}"
+        )
     if mute or broken:
         parts = broken[:3]
         if mute:
@@ -8274,16 +8321,16 @@ def _clause_every_registered_arm_produces(store: Store, window: list[dt.date]) -
         return _unmeasurable(
             name,
             requirement,
-            "no ACTIVE non-control arm is registered in any slot's register; a clause "
-            "over zero arms is not a reading",
+            "no ACTIVE non-control arm held to production is registered in any slot's "
+            f"register; a clause over zero arms is not a reading{note}",
             evidence,
         )
     return Clause(
         name,
         requirement,
         True,
-        f"all {n_checked} active non-control registered arm(s) past their settle window "
-        f"have produced{note}",
+        f"all {n_checked} active non-control registered arm(s) held to production have "
+        f"produced or are inside their settle window; 0 mute{note}",
         tuple(evidence),
     )
 

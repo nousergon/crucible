@@ -65,6 +65,11 @@ class RecipeLoad:
     #: whatever job loaded the slot. For U and R these are the catalogue
     #: refusals `experiment.run` files (`alpha-engine-config-I11030`).
     refusal_metrics: tuple[dict[str, Any], ...]
+    #: The registrable recipes that cannot produce yet, BY DESIGN, and the
+    #: declared producer each waits on
+    #: (`crucible.slots.producibility.PendingDependency`). Each is also in
+    #: ``specs``. U and R only.
+    waiting: tuple[Any, ...] = ()
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -155,39 +160,57 @@ def _partition_ranked(slot: str, specs: list[Any]) -> RecipeLoad:
     recipe as registrable. `experiment.run` then refused, by name and every
     cycle, each arm whose ranker reads a column the feature catalogue
     declares no producer for (`crucible.slots.cycle.partition_by_catalog`).
-    So the register and the run disagreed: a recipe could be REGISTERED by
-    one path and REFUSED by the other. It then sat ACTIVE in the register
-    and wrote nothing, which is the "registered is not producing" class. Measured
-    2026-09-24: `experiment.register[r]` read 4 recipes and refused 0, while
-    `experiment.run[r]` refused 3 of the same 4
-    (`scanner_predictor_direct` and `scanner_top20_predictor` on
-    `predicted_alpha_ratio`, `thinktank_coverage` on
-    `thinktank_rating_ratio`). All three are registered, and none has ever
-    written under `experiments/`.
+    So a recipe could be REGISTERED by one path and REFUSED by the other,
+    and then sit ACTIVE in the register writing nothing, with nothing saying
+    whether that was meant.
 
-    One predicate now serves both paths, so an arm the run would refuse
-    never registers. Its refusal reaches the loading job's manifest with the
-    same `arm_refused_at_registration` row the run files. A slot whose every
-    recipe is refused raises
+    A catalogue refusal now resolves one of two ways, and
+    :func:`crucible.slots.producibility.pending_dependency` is the one
+    predicate that decides which:
+
+    * **it waits on a declared producer.** Every column it lacks is listed in
+      `crucible.features.PENDING_COLUMNS` and not yet in the catalogue:
+      `predicted_alpha_ratio` (track B), `thinktank_rating_ratio` (phase 5).
+      The recipe REGISTERS, which is what its ranker says ("Registered now,
+      servable when ...") and what the 2026-09-24 ruling keeps. The run still
+      refuses it by name. `every_registered_arm_produces` names it as waiting
+      and does not count it mute. It is carried in ``waiting``;
+    * **it reads a column nothing will produce.** It never registers. Its
+      refusal reaches the loading job's manifest with the same
+      `arm_refused_at_registration` row the run files.
+
+    A slot where nothing registers raises
     :class:`~crucible.slots.inputs.SlotUnservableError`, exactly as
     `experiment.run` does, and never returns an empty load (module rule
     above).
     """
-    from crucible.features import CATALOG  # noqa: PLC0415 - heavy import, one call site
-    from crucible.slots.cycle import (  # noqa: PLC0415 - avoids a cycle
-        partition_by_catalog,
-        refusal_metric,
-    )
+    from crucible.slots.cycle import refusal_metric  # noqa: PLC0415 - avoids a cycle
     from crucible.slots.inputs import SlotUnservableError  # noqa: PLC0415 - one call site
-
-    producible, refused = partition_by_catalog(
-        specs, catalog_columns=[column.name for column in CATALOG]
+    from crucible.slots.producibility import (  # noqa: PLC0415 - avoids a cycle
+        catalog_input_refusal,
+        pending_dependency,
     )
-    if refused and not producible:
+
+    registrable: list[Any] = []
+    waiting: list[Any] = []
+    refused: list[InputRefusal] = []
+    for spec in specs:
+        refusal = catalog_input_refusal(spec)
+        if refusal is None:
+            registrable.append(spec)
+            continue
+        dependency = pending_dependency(refusal)
+        if dependency is None:
+            refused.append(refusal)
+            continue
+        registrable.append(spec)
+        waiting.append(dependency)
+    if refused and not registrable:
         raise SlotUnservableError(tuple(refused))
     return RecipeLoad(
         slot=slot,
-        specs=tuple(producible),
+        specs=tuple(registrable),
         refusals=tuple(refused),
         refusal_metrics=tuple(refusal_metric(slot, refusal) for refusal in refused),
+        waiting=tuple(waiting),
     )

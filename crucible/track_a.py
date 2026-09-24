@@ -661,6 +661,9 @@ def handle_experiment_register(args: argparse.Namespace) -> int:
         "registered": added,
         "already_present": already_present,
         "refused": refused,
+        # Registered, but cannot produce until a declared producer lands
+        # (`alpha-engine-config-I11030`). Named so a quiet arm is never silent.
+        "waiting": [dependency.describe() for dependency in load.waiting],
         "filed_on": filed_on,
     }
     if args.dry_run:

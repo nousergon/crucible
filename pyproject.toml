@@ -174,6 +174,17 @@ addopts = "-q --ignore=tests/integration"
 # scope cannot be narrowed into a flattering number.
 source = ["crucible"]
 omit = []
+# How lines are RECORDED, never which lines count: `sysmon` is Python 3.12's
+# `sys.monitoring` API, which reports each line once and then stops paying for
+# it, where the default C tracer pays on every executed line for the whole
+# run. Measured 2026-09-24 on this suite: the foundation run took 9m31s under
+# the default tracer and 5m33s under `sysmon`, with an IDENTICAL report (20744
+# statements, 1141 missed, every per-file row the same). It is set here rather
+# than as `COVERAGE_CORE` in ci.yml because the workflow may carry no coverage
+# environment variable (`tests/test_no_suppressions.py` pins both). Line
+# coverage only; this table sets no `branch`, which `sysmon` cannot measure on
+# 3.12.
+core = "sysmon"
 
 [tool.coverage.report]
 # §4.2 C3: a ratchet set at the measured value (93%, tests/ --ignore=tests/acceptance,

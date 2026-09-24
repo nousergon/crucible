@@ -76,6 +76,7 @@ import math
 import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -358,7 +359,17 @@ def _validator_for(schema_filename: str) -> Draft202012Validator:
             f"{schema_filename} missing at {path}. It ships inside the package; a "
             "missing schema means a broken build, not a degraded write."
         )
-    schema = json.loads(path.read_text(encoding="utf-8"))
+    return _checked_validator(path.read_text(encoding="utf-8"))
+
+
+@lru_cache(maxsize=8)
+def _checked_validator(schema_text: str) -> Draft202012Validator:
+    """A metaschema-checked validator for one schema TEXT.
+
+    Keyed on the text read from disk on every call, so an edited schema is
+    re-checked and a broken one still raises; only the repeat metaschema walk
+    of an unchanged file (~10 ms, once per document written) is skipped."""
+    schema = json.loads(schema_text)
     Draft202012Validator.check_schema(schema)
     return Draft202012Validator(schema)
 

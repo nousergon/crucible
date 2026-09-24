@@ -204,6 +204,17 @@ recipe refused at registration (unresolvable inputs) is recorded on the
 manifest as a rejection with its reason and does not fail the stage; its
 siblings still register.
 
+A U/R ranker may read a column the feature catalogue does not produce yet,
+on purpose (`predicted_alpha_ratio` waits on track B, `thinktank_rating_ratio`
+on phase 5). When that column is declared in
+`crucible.features.PENDING_COLUMNS`, the recipe registers and waits:
+`experiment.run` refuses it by name, and the phase-3 clause
+`every_registered_arm_produces` names it as waiting instead of mute. A column
+with no declaration there is one nothing will produce, and the recipe is
+refused at registration. The wait lapses on its own once the catalogue
+produces the column. A registered arm that is still silent after that reads
+mute.
+
 ## 6. Score it, grade it, promote it
 
 ```

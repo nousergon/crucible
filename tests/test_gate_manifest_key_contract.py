@@ -99,6 +99,7 @@ class _StubRecipeLoad:
     specs: tuple[Any, ...] = ()
     refusals: tuple[Any, ...] = ()
     refusal_metrics: tuple[dict[str, Any], ...] = ()
+    waiting: tuple[Any, ...] = ()
     n_read = 0
 
     def __init__(self, slot: str) -> None:
