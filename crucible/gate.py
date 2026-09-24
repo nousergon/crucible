@@ -8034,23 +8034,48 @@ def _clause_every_recipe_registered(store: Store, window: list[dt.date]) -> Clau
     excluded from the requirement, because a clause that stayed red over a
     ruled outcome would be muted within a week and would then be red over
     nothing.
+
+    **The recipes are loaded AS OF the read day** (`window[-1]`,
+    `alpha-engine-config-I11512`). An S recipe declares no `registered_at`;
+    its clock is stamped from its register row, or from the cycle's trading
+    day, and the loader consults the register only when it is given a day.
+    Loaded with none, every S recipe refused, so the slot raised
+    `SlotUnservableError` and this clause read UNMET for S **even once
+    `arms/s/register.jsonl` existed** — a reading that could never turn MET.
+    `crucible.slots.producibility.release_arms` passes the day for the same
+    reason. The join is unaffected: an arm id hashes the spec, never the
+    stamped date.
+
+    **An arm awaiting its slot's upstream champion is not a gap either**
+    (`alpha-engine-config-I11512`). A slot module MAY declare
+    ``absent_upstream_champion(store)``: the key of a champion pointer it
+    cannot be constructed without, when that pointer is absent. Only S
+    declares one (the M pointer), and while it names a key S registers
+    nothing BY RULING (`alpha-engine-config-I11452`: an arm registered in a
+    week S could not construct would start its out-of-sample clock with
+    nothing to score). Those recipes are named in the detail and excluded —
+    the refused-recipe reasoning, applied to the second ruled outcome. The
+    exclusion ends with the absence: once the pointer exists, an
+    unregistered S recipe reads UNMET like any other.
     """
-    _unused(window)
     name = "every_recipe_in_the_release_is_registered"
     requirement = (
         "every arm recipe in the strategy tree of the release in force has a row in its "
-        "slot's register, except a recipe refused at registration, which registers by "
-        "ruling and not by omission"
+        "slot's register, except a recipe refused at registration, or one whose slot "
+        "awaits an absent upstream champion, each of which is unregistered by ruling and "
+        "not by omission"
     )
     from crucible.registration import (  # noqa: PLC0415 - one call site
         load_registrable_recipes,
     )
     from crucible.slots import dispatchable_slots  # noqa: PLC0415 - one call site
 
+    today = window[-1].isoformat() if window else None
     evidence: list[str] = []
     access: list[str] = []
     missing: list[str] = []
     refused: list[str] = []
+    awaiting: dict[str, list[str]] = {}
     n_recipes = 0
     for slot in sorted(dispatchable_slots()):
         key = arm_register_key(slot)
@@ -8061,7 +8086,18 @@ def _clause_every_recipe_registered(store: Store, window: list[dt.date]) -> Clau
             (access if access_problem else missing).append(problem)
             continue
         try:
-            load = load_registrable_recipes(slot, store=store)
+            upstream = _absent_upstream_champion(store, slot)
+        except Exception as exc:  # noqa: BLE001 - classified into the reading below
+            # The precondition could not be READ (a denial, a transport
+            # error). Whether this slot's unregistered recipes are a gap or a
+            # ruled wait is then unknown, so the slot is UNMEASURABLE naming
+            # the class — never assumed either way.
+            access.append(f"{slot}: upstream champion pointer: {type(exc).__name__}: {exc}")
+            continue
+        if upstream is not None:
+            evidence.append(upstream)
+        try:
+            load = load_registrable_recipes(slot, store=store, today=today)
         except (FileNotFoundError, ValueError) as exc:
             # An absent or malformed recipe tree is a READING, not a crash:
             # the release declares arms that cannot be resolved at all, which
@@ -8078,26 +8114,55 @@ def _clause_every_recipe_registered(store: Store, window: list[dt.date]) -> Clau
         refused.extend(f"{slot}:{arm}" for arm in load.refused_names)
         rows = set() if register is None else set(register.all_arms())
         for spec in load.specs:
-            if spec.arm_id not in rows:
-                missing.append(
-                    f"{slot}:{spec.name} is declared by the release in force and has no row "
-                    f"in {key}, so it is in no arena and is scored by nothing"
-                )
+            if spec.arm_id in rows:
+                continue
+            if upstream is not None:
+                awaiting.setdefault(upstream, []).append(f"{slot}:{spec.name}")
+                continue
+            missing.append(
+                f"{slot}:{spec.name} is declared by the release in force and has no row "
+                f"in {key}, so it is in no arena and is scored by nothing"
+            )
     note = (
         f"; {len(refused)} refused at registration: {', '.join(sorted(refused))}" if refused else ""
     )
+    for pointer, arms in sorted(awaiting.items()):
+        note += (
+            f"; {len(arms)} awaiting an upstream champion, unregistered by ruling while "
+            f"{pointer} is absent: {', '.join(sorted(arms))}"
+        )
     if access and not missing:
         return _unmeasurable(name, requirement, "; ".join(access) + note, evidence)
     if missing:
         return Clause(name, requirement, False, "; ".join(missing[:6]) + note, tuple(evidence))
+    n_awaiting = sum(len(arms) for arms in awaiting.values())
     return Clause(
         name,
         requirement,
         True,
-        f"all {n_recipes} registrable recipe(s) across "
+        f"all {n_recipes - n_awaiting} registrable recipe(s) across "
         f"{len(sorted(dispatchable_slots()))} slot(s) have a register row{note}",
         tuple(evidence),
     )
+
+
+def _absent_upstream_champion(store: Store, slot: str) -> str | None:
+    """The key of the champion pointer ``slot`` cannot be constructed
+    without, when that pointer is absent, else ``None``.
+
+    Read off the slot module's optional ``absent_upstream_champion`` hook
+    (`alpha-engine-config-I11512`) — the way `crucible.cli._promote` reads
+    ``declared_promote_outcome`` — so no slot name is branched on here. A
+    slot that declares no hook has no upstream precondition. Raises when the
+    store cannot answer; the caller classifies that.
+    """
+    import importlib  # noqa: PLC0415 - one call site
+
+    from crucible.slots import get_slot  # noqa: PLC0415 - one call site
+
+    module = importlib.import_module(f"crucible.slots.{get_slot(slot).module}")
+    hook = getattr(module, "absent_upstream_champion", None)
+    return None if hook is None else hook(store)
 
 
 def _phase3(

@@ -101,6 +101,7 @@ __all__ = [
     "SupersededArmUndeclaredError",
     "WalkForwardFold",
     "WalkForwardSpec",
+    "absent_upstream_champion",
     "build_walk_forward_folds",
     "construct_book",
     "declare_no_m_champion",
@@ -1797,6 +1798,28 @@ def _declared_metric(name: str, *, reason: str, source_path: str) -> dict[str, A
     }
 
 
+def absent_upstream_champion(store: Any) -> str | None:
+    """The key of the upstream champion pointer S cannot be constructed without,
+    when it is ABSENT, else ``None``.
+
+    The one statement of S's construction precondition, read by
+    :func:`declare_no_m_champion` (the arc stages) and by
+    `crucible.gate._clause_every_recipe_registered` off this module, the way
+    `crucible.cli._promote` reads :func:`declared_promote_outcome`, so no
+    slot name is branched on there (`alpha-engine-config-I11512`). While it
+    names a key, S registers nothing by ruling (`alpha-engine-config-I11452`),
+    and a reader that grades that as a registration gap is red over a ruled
+    outcome.
+
+    A store that cannot answer RAISES. An unreadable pointer is not an
+    absent one.
+    """
+    from crucible.keys import champion_key  # noqa: PLC0415 - avoids a cycle
+
+    pointer = champion_key(ALPHA_SLOT)
+    return None if store.exists(pointer) else pointer
+
+
 def declare_no_m_champion(ctx: Any, *, job: str) -> dict[str, Any] | None:
     """S's one construction precondition, checked the same way by all three arc stages.
 
@@ -1833,10 +1856,8 @@ def declare_no_m_champion(ctx: Any, *, job: str) -> dict[str, Any] | None:
     :func:`produce_history`: a backfill asked for S history that cannot exist
     is a request that failed, not a week that had nothing to do.
     """
-    from crucible.keys import champion_key  # noqa: PLC0415 - avoids a cycle
-
-    pointer = champion_key(ALPHA_SLOT)
-    if ctx.store.exists(pointer):
+    pointer = absent_upstream_champion(ctx.store)
+    if pointer is None:
         return None
     trading_day = ctx.trading_day.isoformat()
     reason = (

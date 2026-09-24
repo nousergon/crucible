@@ -358,6 +358,135 @@ class TestTheGapIsGradeable:
         assert clause.unmeasurable and not clause.met
 
 
+S_RECIPE = """\
+slot: s
+name: {name}
+notes: fixture recipe for {name}
+spec:
+  benchmark: SPY
+  cost_model:
+    name: flat_bps_v0
+    placeholder: true
+    params:
+      half_spread_bps: 2.5
+      commission_bps: 0.5
+      slippage_bps: 10.0
+  rules:
+    - rule_id: position_loss_floor
+      params:
+        position_loss_floor_pct: -0.15
+"""
+
+
+class TestTheSSlotIsReadAsOfTheReadDay:
+    """`alpha-engine-config-I11512`. An S recipe declares no `registered_at`,
+    and the loader stamps it — and consults the register at all — only when
+    it is handed a trading day. The clause handed it none, so every S recipe
+    refused and S read UNMET "unservable" whether or not its register
+    existed: a reading that could never turn MET. And while the M champion
+    pointer is absent S registers nothing BY RULING
+    (`alpha-engine-config-I11452`), which the clause graded as a gap.
+
+    Measured 2026-09-24 on `gates/phase3/2026-09-23/gate.json`: UNMET naming
+    `stock_registry` and `stock_registry_sqrt_impact` as refused for want of
+    a `registered_at`, with `champions/m/current.json` absent.
+    """
+
+    ARMS = ("stock_registry", "stock_registry_sqrt_impact")
+
+    @staticmethod
+    def _clause(store: LocalStore, monkeypatch):
+        from crucible import gate as gate_module
+        from crucible.slots import dispatchable_slots
+
+        monkeypatch.setattr(
+            "crucible.slots.dispatchable_slots", lambda: {"s": dispatchable_slots()["s"]}
+        )
+        return gate_module._clause_every_recipe_registered(store, [FRIDAY])
+
+    @pytest.fixture
+    def s_tree(self, tmp_path) -> LocalStore:
+        store = LocalStore(tmp_path)
+        for name in self.ARMS:
+            store.put_bytes(strategy_arm_key("s", name), S_RECIPE.format(name=name).encode("utf-8"))
+        return store
+
+    @staticmethod
+    def _seat_m_champion(store: LocalStore) -> None:
+        from crucible.keys import champion_key
+
+        store.put_bytes(champion_key("m"), b'{"arm_id": "m:fixture_model:aaaaaaaaaaaa"}')
+
+    @staticmethod
+    def _register_s(store: LocalStore, *names: str) -> None:
+        """What `experiment.run[s]` does on its first cycle: load AS OF the
+        day, stamp the clock, append the register rows."""
+        from crucible.slots.arms import register_arms, write_register
+
+        load = load_registrable_recipes("s", store=store, today=FRIDAY.isoformat())
+        specs = [spec for spec in load.specs if spec.name in names]
+        register, _ = register_arms(read_register(store, "s"), specs, filed_on=FRIDAY.isoformat())
+        write_register(store, "s", register)
+
+    def test_no_m_champion_is_a_ruled_wait_named_in_the_detail_not_a_gap(
+        self, s_tree, monkeypatch
+    ) -> None:
+        """The live 2026-09-23 state. Red over a ruled outcome is a clause
+        that gets muted, and is then red over nothing."""
+        from crucible.keys import champion_key
+
+        clause = self._clause(s_tree, monkeypatch)
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert "unservable" not in clause.detail
+        assert "2 awaiting an upstream champion" in clause.detail
+        assert "s:stock_registry, s:stock_registry_sqrt_impact" in clause.detail
+        assert champion_key("m") in clause.detail
+        assert champion_key("m") in clause.evidence
+
+    def test_the_wait_ends_with_the_absence(self, s_tree, monkeypatch) -> None:
+        """Once the M pointer exists, an unregistered S recipe is a gap like
+        any other — the exclusion is not a standing pass for S."""
+        self._seat_m_champion(s_tree)
+        clause = self._clause(s_tree, monkeypatch)
+        assert not clause.met and not clause.unmeasurable
+        assert "s:stock_registry is declared by the release in force" in clause.detail
+        assert "awaiting" not in clause.detail
+
+    def test_a_registered_s_arm_reads_registered(self, s_tree, monkeypatch) -> None:
+        """The reading that could never turn MET. Loaded with no day, both
+        recipes refused and the clause read UNMET over a register holding
+        both of them."""
+        self._seat_m_champion(s_tree)
+        self._register_s(s_tree, *self.ARMS)
+        clause = self._clause(s_tree, monkeypatch)
+        assert clause.met, clause.detail
+        assert "all 2 registrable recipe(s)" in clause.detail
+
+    def test_one_registered_one_not_names_only_the_gap(self, s_tree, monkeypatch) -> None:
+        self._seat_m_champion(s_tree)
+        self._register_s(s_tree, "stock_registry")
+        clause = self._clause(s_tree, monkeypatch)
+        assert not clause.met
+        assert "s:stock_registry_sqrt_impact is declared" in clause.detail
+        assert "s:stock_registry is declared" not in clause.detail
+
+    def test_an_unreadable_pointer_is_unmeasurable_never_a_wait(self, s_tree, monkeypatch) -> None:
+        """Whether S's unregistered recipes are a gap or a ruled wait is
+        unknown when the pointer cannot be read, and an unknown never grades
+        MET."""
+        real_exists = LocalStore.exists
+
+        def denied(self, key):
+            if key.startswith("champions/"):
+                raise PermissionError("AccessDenied on HeadObject")
+            return real_exists(self, key)
+
+        monkeypatch.setattr(LocalStore, "exists", denied)
+        clause = self._clause(s_tree, monkeypatch)
+        assert clause.unmeasurable and not clause.met
+        assert "PermissionError" in clause.detail
+
+
 class TestASlotWhereNothingIsRegistrableDoesNotStopTheArc:
     """`crucible.weekly.run_arc` stops at the FIRST stage that raises, and
     `experiment.register` runs at 11:00 — ahead of `experiment.run`,
