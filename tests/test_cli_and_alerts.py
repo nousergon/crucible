@@ -833,41 +833,6 @@ class TestDryRunNeverWrites:
 
         self._assert_no_new_keys(tmp_path, [])
 
-    @pytest.mark.parametrize("job", ["data.heal", "data.weekly"])
-    def test_dry_run_completes_cleanly_with_an_arctic_bucket_configured(
-        self, job: str, tmp_path, monkeypatch
-    ) -> None:
-        """These two construct an `ArcticPriceSource` (which needs a
-        bucket NAME, never a real connection) before their own dry-run
-        branch prints and returns.
-
-        `data.daily` was a third row here until alpha-engine-config-I11012
-        removed its dry-run branch: its dry run now runs the real compile
-        against a write-capturing store, so a bucket NAME is no longer
-        enough — it reaches ArcticDB for real, which is the point. It has its
-        own seeded row below — a `CRUCIBLE_ARCTIC_BUCKET` config gap,
-        not a store-write concern, and unrelated to `--dry-run` itself
-        (the same `ValueError` fires with `--dry-run` omitted). Also asserted
-        as a clean return, not a two-outcome one — same reasoning as above:
-        these three never reach the store guard at all on their real
-        dry-run path (they return before `run_job` is even called), so a
-        `DryRunWriteRefusedError` here would itself be a regression, not an
-        acceptable alternative."""
-        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
-        monkeypatch.setenv("CRUCIBLE_ARCTIC_BUCKET", "fake-bucket")
-        argv = [
-            *_minimal_argv(job),
-            "--date",
-            FRIDAY.isoformat(),
-            "--store",
-            str(tmp_path),
-            "--dry-run",
-        ]
-
-        main(argv)  # must not raise at all -- see the docstring above
-
-        self._assert_no_new_keys(tmp_path, [])
-
     # ── alpha-engine-config-I11012 ─────────────────────────────────────────
     #
     # `--dry-run` used to resolve a `crucible.store.read_only` store, which
@@ -1050,6 +1015,188 @@ class TestDryRunNeverWrites:
 
         assert sorted(LocalStore(store_root).list_keys()) == []
         assert len(ledger.keys) > 1, "the compile recorded no artifact beyond its manifest"
+
+    # ── alpha-engine-config-I11079 ─────────────────────────────────────────
+    #
+    # `data.weekly` and `data.heal` were the last two handlers whose dry run
+    # printed a sentence and returned 0 before `run_job`. They used to have a
+    # shared row here asserting exactly that (they "construct an
+    # `ArcticPriceSource` ... before their own dry-run branch prints and
+    # returns"); it went when the branch did, because a bucket NAME is no
+    # longer enough once the compile runs, which is the point.
+
+    @staticmethod
+    def _test_sources(monkeypatch, source) -> None:
+        from crucible import track_a
+
+        monkeypatch.delenv("CRUCIBLE_STORE", raising=False)
+        monkeypatch.setattr(track_a, "_source", lambda args, config: source)
+        monkeypatch.setattr(
+            track_a,
+            "_point_in_time_source",
+            lambda config: UnavailablePointInTimeSource(
+                reason="synthetic fixture market carries no fundamentals"
+            ),
+        )
+
+    def test_dry_run_data_weekly_compiles_for_real_and_writes_nothing(
+        self, tmp_path, monkeypatch, source
+    ) -> None:
+        """`data.weekly --dry-run` reaches the compile's own writes, which the
+        print it replaces never did. The week's first four sessions are
+        compiled for real first, because the weekly pass refuses a gap."""
+        from conftest import sessions_ending
+
+        from crucible.data.daily import run_daily
+        from crucible.keys import data_panel_key
+        from crucible.runner import run_job
+        from crucible.store import LocalStore, begin_capture, end_capture
+
+        self._test_sources(monkeypatch, source)
+        store_root = tmp_path / "store"
+        store = LocalStore(store_root)
+        for day in sessions_ending(FRIDAY, 5)[:-1]:
+            run_job(
+                "data.daily",
+                lambda c: run_daily(
+                    c,
+                    point_in_time=UnavailablePointInTimeSource(
+                        reason="synthetic fixture market carries no fundamentals"
+                    ),
+                    source=source,
+                    expected_symbols=source.symbols(),
+                ),
+                store=store,
+                trading_day=day,
+            )
+        before = sorted(store.list_keys())
+        ledger = begin_capture()
+        try:
+            main(
+                [
+                    "data.weekly",
+                    "--date",
+                    FRIDAY.isoformat(),
+                    "--store",
+                    str(store_root),
+                    "--run-mode",
+                    "replay",
+                    "--symbols",
+                    ",".join(source.symbols()),
+                    "--dry-run",
+                ]
+            )
+        finally:
+            end_capture()
+
+        assert sorted(store.list_keys()) == before  # nothing NEW landed
+        assert data_panel_key(FRIDAY.isoformat()) in ledger.keys
+        assert any(key.startswith("runs/data.weekly/") for key in ledger.keys)
+
+    def test_dry_run_data_weekly_fails_the_way_the_run_fails_on_an_unhealed_week(
+        self, tmp_path, monkeypatch, source
+    ) -> None:
+        """The failure the old print could never report: a week with four
+        uncompiled sessions. The rehearsal raises the run's own
+        `DataGapError`, naming the heal command, and writes nothing."""
+        from crucible.data.weekly import DataGapError
+        from crucible.store import LocalStore
+
+        self._test_sources(monkeypatch, source)
+        store_root = tmp_path / "store"
+        argv = [
+            "data.weekly",
+            "--date",
+            FRIDAY.isoformat(),
+            "--store",
+            str(store_root),
+            "--run-mode",
+            "replay",
+            "--symbols",
+            ",".join(source.symbols()),
+            "--dry-run",
+        ]
+        with pytest.raises(DataGapError, match="crucible data.heal"):
+            main(argv)
+        assert sorted(LocalStore(store_root).list_keys()) == []
+
+    @staticmethod
+    def _heal_argv(store_root, symbols, *extra: str) -> list[str]:
+        #: 2026-08-24..2026-08-28 is five sessions: over the guard's laptop
+        #: allowance of three, so a laptop REAL run of it refuses.
+        return [
+            "data.heal",
+            "--gap",
+            "missing-panel",
+            "--from",
+            "2026-08-24",
+            "--to",
+            "2026-08-28",
+            "--store",
+            str(store_root),
+            "--symbols",
+            ",".join(symbols),
+            *extra,
+        ]
+
+    def test_dry_run_data_heal_off_region_rehearses_the_laptop_allowance_and_names_the_rest(
+        self, tmp_path, monkeypatch, capsys, source
+    ) -> None:
+        """Off region, the rehearsal compiles what this host may compile for
+        real (`LAPTOP_SESSION_ALLOWANCE` sessions), records the refusal the
+        real run would raise, and names the sessions it did not rehearse."""
+        import json
+
+        from crucible.data.heal import LAPTOP_SESSION_ALLOWANCE
+        from crucible.keys import data_panel_key
+        from crucible.store import LocalStore, begin_capture, end_capture
+
+        self._test_sources(monkeypatch, source)
+        monkeypatch.setattr("crucible.data.heal.in_region", lambda: (False, "laptop"))
+        store_root = tmp_path / "store"
+        ledger = begin_capture()
+        try:
+            main(self._heal_argv(store_root, source.symbols(), "--dry-run"))
+        finally:
+            end_capture()
+
+        assert sorted(LocalStore(store_root).list_keys()) == []
+        sessions = ["2026-08-24", "2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28"]
+        rehearsed = sessions[:LAPTOP_SESSION_ALLOWANCE]
+        assert [d for d in sessions if data_panel_key(d) in ledger.keys] == rehearsed
+        out = capsys.readouterr().out
+        report, _ = json.JSONDecoder().raw_decode(out, out.index('{\n  "run_id"'))
+        assert report["not_rehearsed"] == sessions[LAPTOP_SESSION_ALLOWANCE:]
+        assert report["in_region_verdict"].startswith("WOULD REFUSE on this host")
+
+    def test_the_real_off_region_heal_still_refuses(self, tmp_path, monkeypatch, source) -> None:
+        """The rehearsal REPORTS the guard; the run it rehearses still raises."""
+        from crucible.data.heal import NotInRegionError
+
+        self._test_sources(monkeypatch, source)
+        monkeypatch.setattr("crucible.data.heal.in_region", lambda: (False, "laptop"))
+        with pytest.raises(NotInRegionError):
+            main(self._heal_argv(tmp_path / "store", source.symbols()))
+
+    def test_dry_run_data_heal_in_region_rehearses_the_whole_range(
+        self, tmp_path, monkeypatch, source
+    ) -> None:
+        from crucible.keys import data_panel_key
+        from crucible.store import LocalStore, begin_capture, end_capture
+
+        self._test_sources(monkeypatch, source)
+        monkeypatch.setattr("crucible.data.heal.in_region", lambda: (True, "EC2 instance i-test"))
+        store_root = tmp_path / "store"
+        ledger = begin_capture()
+        try:
+            main(self._heal_argv(store_root, source.symbols(), "--dry-run"))
+        finally:
+            end_capture()
+
+        assert sorted(LocalStore(store_root).list_keys()) == []
+        for day in ("2026-08-24", "2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28"):
+            assert data_panel_key(day) in ledger.keys
+        assert any(key.startswith("runs/data.heal/") for key in ledger.keys)
 
     def test_the_reported_key_set_is_the_set_a_real_data_daily_writes(
         self, tmp_path, monkeypatch, source

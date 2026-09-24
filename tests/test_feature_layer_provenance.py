@@ -219,3 +219,47 @@ class TestContract:
         assert check_feature_layer_completeness.__module__ == (
             check_feature_layer_provenance.__module__
         )
+
+
+class TestTheProductionConstructorBuildsTheDeclaredSource:
+    """`alpha-engine-config-I10978`. `PRODUCTION_FUNDAMENTALS_SOURCE` is what
+    the provenance detector grades against. The source production actually
+    compiles from is built by `crucible.track_a._point_in_time_source`, which
+    named `FilingDatePointInTimeSource` itself, so the two agreed by
+    coincidence. Switching one would have left the detector red over a
+    correct layer, or green over a wrong one."""
+
+    @staticmethod
+    def _build(monkeypatch, tmp_path):
+        from types import SimpleNamespace
+
+        import crucible.config
+        from crucible.track_a import _point_in_time_source
+
+        monkeypatch.setattr(crucible.config, "store_from_uri", lambda uri: LocalStore(tmp_path))
+        return _point_in_time_source(SimpleNamespace(arctic_bucket="data-bucket"))
+
+    def test_the_built_source_is_the_one_the_detector_grades_against(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from crucible.data.point_in_time import PRODUCTION_FUNDAMENTALS_SOURCE_CLASS
+
+        source = self._build(monkeypatch, tmp_path)
+        assert source.name == PRODUCTION_FUNDAMENTALS_SOURCE
+        assert type(source) is PRODUCTION_FUNDAMENTALS_SOURCE_CLASS
+
+    def test_switching_the_declaration_switches_the_constructor(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The drift itself: move the declaration and the constructor must
+        follow, rather than keep building the class it names."""
+        from crucible.data import point_in_time
+
+        monkeypatch.setattr(
+            point_in_time,
+            "PRODUCTION_FUNDAMENTALS_SOURCE_CLASS",
+            point_in_time.SnapshotPointInTimeSource,
+        )
+        source = self._build(monkeypatch, tmp_path)
+        assert type(source) is point_in_time.SnapshotPointInTimeSource
+        assert source.name == point_in_time.SnapshotPointInTimeSource.name

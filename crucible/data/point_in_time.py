@@ -167,6 +167,7 @@ __all__ = [
     "KNOWN_GICS_RECLASSIFICATIONS",
     "MAX_FUNDAMENTAL_STALENESS_SESSIONS",
     "PRODUCTION_FUNDAMENTALS_SOURCE",
+    "PRODUCTION_FUNDAMENTALS_SOURCE_CLASS",
     "MAX_SECTOR_STALENESS_SESSIONS",
     "POINT_IN_TIME_COLUMNS",
     "POINT_IN_TIME_MODE",
@@ -1082,7 +1083,15 @@ class FilingDatePointInTimeSource(SnapshotPointInTimeSource):
 #: whole time -- nothing READ it, so a heal chunk that booted a release
 #: predating the EDGAR switch wrote a shallow-source band into an
 #: EDGAR-source layer and no reading went red.
-PRODUCTION_FUNDAMENTALS_SOURCE = FilingDatePointInTimeSource.name
+#:
+#: The CLASS is the unit (`alpha-engine-config-I10978`): the production
+#: constructor (`crucible.track_a._point_in_time_source`) builds
+#: :data:`PRODUCTION_FUNDAMENTALS_SOURCE_CLASS`, and the name the detector
+#: grades against is read off that same class. Before, the constructor named
+#: `FilingDatePointInTimeSource` itself and the two agreed by coincidence, so a
+#: switch that moved one would have left the detector grading the old source.
+PRODUCTION_FUNDAMENTALS_SOURCE_CLASS: type[SnapshotPointInTimeSource] = FilingDatePointInTimeSource
+PRODUCTION_FUNDAMENTALS_SOURCE = PRODUCTION_FUNDAMENTALS_SOURCE_CLASS.name
 
 
 def _quarter_offset(year: int, quarter: int, offset: int) -> tuple[int, int]:
