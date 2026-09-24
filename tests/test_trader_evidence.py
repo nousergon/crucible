@@ -30,13 +30,13 @@ from pydantic import ValidationError
 
 import crucible.gate as gate_module
 from crucible.keys import TRADER_EVIDENCE_KEY, TRADER_PIN_KEY
-from crucible.models import TraderEvidenceDocument
+from crucible.models import SERVED_SESSION_MODES, TraderEvidenceDocument
 
 SCHEMA_PATH = (
-    pathlib.Path(__file__).resolve().parents[1] / "crucible" / "schemas" / "trader_evidence.v1.json"
+    pathlib.Path(__file__).resolve().parents[1] / "crucible" / "schemas" / "trader_evidence.v2.json"
 )
 
-SCHEMA_VERSION = "trader_evidence.v1"
+SCHEMA_VERSION = "trader_evidence.v2"
 CHAMPION = "m:ridge_21d:0123456789ab"
 WEEK = ["2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-12"]
 
@@ -51,6 +51,8 @@ def _document(**overrides: object) -> dict:
         "calendar_date": "2026-09-13",
     }
     payload.update(overrides)
+    if "session_modes" not in overrides:
+        payload["session_modes"] = {day: "shadow" for day in payload["days_served"]}
     return payload
 
 
@@ -120,6 +122,43 @@ class TestTheCountCannotBeForged:
             )
 
 
+class TestEveryServedDayRecordsItsSessionMode:
+    """`alpha-engine-config-I11545`, Brian's ruling 2 of 2026-09-24: a shadow
+    session counts as a served day. The mode is recorded per day so the count
+    can treat the two alike while the reading still tells them apart."""
+
+    def test_both_modes_are_served_modes_by_the_ruling(self) -> None:
+        assert SERVED_SESSION_MODES == ("shadow", "live")
+
+    def test_a_mixed_week_validates_and_names_its_shadow_days(self) -> None:
+        modes = {day: "shadow" for day in WEEK[:3]} | {day: "live" for day in WEEK[3:]}
+        document = TraderEvidenceDocument.model_validate(_document(session_modes=modes))
+
+        assert document.shadow_days() == WEEK[:3]
+
+    def test_a_served_day_with_no_mode_is_refused(self) -> None:
+        modes = {day: "shadow" for day in WEEK[:4]}
+        with pytest.raises(ValidationError, match="no mode for"):
+            TraderEvidenceDocument.model_validate(_document(session_modes=modes))
+
+    def test_a_mode_for_a_day_that_was_not_served_is_refused(self) -> None:
+        modes = {day: "shadow" for day in [*WEEK, "2026-09-15"]}
+        with pytest.raises(ValidationError, match="which was not served"):
+            TraderEvidenceDocument.model_validate(_document(session_modes=modes))
+
+    def test_an_unknown_mode_is_refused(self) -> None:
+        """A third mode would be counted by nobody's ruling."""
+        modes = {day: "shadow" for day in WEEK} | {WEEK[0]: "dry_run"}
+        with pytest.raises(ValidationError):
+            TraderEvidenceDocument.model_validate(_document(session_modes=modes))
+
+    def test_the_session_modes_field_is_required(self) -> None:
+        document = _document()
+        del document["session_modes"]
+        with pytest.raises(ValidationError):
+            TraderEvidenceDocument.model_validate(document)
+
+
 class TestTheDocumentRefusesWhatItCannotActOn:
     def test_an_unknown_top_level_field_is_refused(self) -> None:
         """A field this reader does not understand is a field the producer
@@ -133,7 +172,15 @@ class TestTheDocumentRefusesWhatItCannotActOn:
 
     def test_an_unknown_schema_version_is_refused_not_guessed(self) -> None:
         with pytest.raises(ValidationError):
-            TraderEvidenceDocument.model_validate(_document(schema_version="trader_evidence.v2"))
+            TraderEvidenceDocument.model_validate(_document(schema_version="trader_evidence.v3"))
+
+    def test_a_v1_document_is_refused_not_read_as_modeless(self) -> None:
+        """v1 carried no session mode. Reading one as if every day were live
+        (or shadow) would be the guess this field exists to remove."""
+        v1 = _document(schema_version="trader_evidence.v1")
+        del v1["session_modes"]
+        with pytest.raises(ValidationError):
+            TraderEvidenceDocument.model_validate(v1)
 
     def test_an_empty_champion_is_refused(self) -> None:
         with pytest.raises(ValidationError):
@@ -169,10 +216,11 @@ class TestTheCommittedSchemaIsTheContract:
 
         assert "trading_days MUST equal" in schema["$comment"]
         assert "strictly increasing" in schema["$comment"]
+        assert "session_modes MUST key exactly" in schema["$comment"]
         assert schema["additionalProperties"] is False
 
     def test_the_schema_declares_its_own_id_and_version(self) -> None:
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
 
-        assert schema["$id"].endswith("trader_evidence.v1.json")
+        assert schema["$id"].endswith("trader_evidence.v2.json")
         assert schema["properties"]["schema_version"]["const"] == SCHEMA_VERSION

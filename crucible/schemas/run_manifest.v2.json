@@ -624,7 +624,8 @@
         "trader.reconcile",
         "trader.smoke",
         "trader.kill_switch",
-        "trader.fire_drill"
+        "trader.fire_drill",
+        "trader.session"
       ],
       "title": "Job",
       "type": "string"

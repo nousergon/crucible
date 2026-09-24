@@ -168,6 +168,8 @@ __all__ = [
     "RetirementLogRow",
     "ReviewDocument",
     "RunManifestV2",
+    "SERVED_SESSION_MODES",
+    "SessionModeLiteral",
     "SignalsRow",
     "TraderEvidenceDocument",
     "TraderReleasePinDocument",
@@ -489,11 +491,19 @@ class ComponentsDocument(_Strict):
 #:   purpose against the paper book (I10650 deliverables 2 and 5); its
 #:   `fire_drill.v1` output (`crucible.keys.trader_fire_drill_key`) is what
 #:   `crucible.gate._clause_kill_switch_fire_drill_passed` grades.
+#: * `trader.session` — one trading session served on the M champion
+#:   (`alpha-engine-config-I11545`): resolve the two-document contract, build
+#:   the book through `crucible.portfolio`, and record the served day in
+#:   `crucible.keys.TRADER_EVIDENCE_KEY` with its session mode. Until an order
+#:   router exists every session is a SHADOW session (no order leaves the
+#:   trader), and a shadow session counts as a served day by Brian's ruling of
+#:   2026-09-24 on I11545 — see :data:`SERVED_SESSION_MODES`.
 TRADER_JOB_VALUES: tuple[str, ...] = (
     "trader.reconcile",
     "trader.smoke",
     "trader.kill_switch",
     "trader.fire_drill",
+    "trader.session",
 )
 
 #: Jobs whose manifest is written by a GitHub Actions WORKFLOW rather than by
@@ -3945,11 +3955,32 @@ class DispatchRecordDocument(BaseModel):
 # different party.
 
 
-def _trader_evidence_json_schema_extra(schema: dict[str, object]) -> None:
-    """Sets `trader_evidence.v1.json`'s document-level metadata and mirrors the
-    one cross-field rule pydantic states and JSON Schema cannot.
+#: How the trader served a day. `shadow`: the session resolved the champion,
+#: built the book and recorded the day, and sent no order. `live`: the same,
+#: with the book's orders routed to the (paper) broker.
+SessionModeLiteral = Literal["shadow", "live"]
 
-    `trading_days` must equal `len(days_served)`. A model_validator enforces it
+#: The session modes that make a trading day a SERVED day — the unit
+#: `trading_days` counts and phase 4's `trader_one_week_on_v2_champion` grades.
+#:
+#: **Both modes count, and that is a ruling, not an inference.** Brian,
+#: 2026-09-24 21:08Z on `alpha-engine-config-I11545`, ruling 2: *"A shadow
+#: session counts as a served day. A shadow session resolves the champion,
+#: builds the book and records the session without sending orders. It starts
+#: the trader-week clock before order routing exists."* The mode is still
+#: RECORDED per day (`session_modes`) so the gate can say how many of the days
+#: it counted were shadow — a week of shadow sessions is a different fact from a
+#: week of routed ones, and the reading must not blur the two just because the
+#: count treats them alike.
+SERVED_SESSION_MODES: tuple[str, ...] = ("shadow", "live")
+
+
+def _trader_evidence_json_schema_extra(schema: dict[str, object]) -> None:
+    """Sets `trader_evidence.v2.json`'s document-level metadata and mirrors the
+    cross-field rules pydantic states and JSON Schema cannot.
+
+    `trading_days` must equal `len(days_served)`, and `session_modes` must key
+    exactly the days in `days_served`. A model_validator enforces it
     in-process; the published schema carries it in `description` and in a
     `$comment`, because a second implementation of the trader reads this file
     without a Python import and would otherwise be free to file a count its own
@@ -3957,12 +3988,13 @@ def _trader_evidence_json_schema_extra(schema: dict[str, object]) -> None:
     to prevent.
     """
     schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
-    schema["$id"] = "https://github.com/nousergon/crucible/schemas/trader_evidence.v1.json"
-    schema["title"] = "Crucible trader consumer evidence, v1"
+    schema["$id"] = "https://github.com/nousergon/crucible/schemas/trader_evidence.v2.json"
+    schema["title"] = "Crucible trader consumer evidence, v2"
     schema["$comment"] = (
-        "trading_days MUST equal the number of distinct entries in days_served, and "
-        "days_served MUST be strictly increasing. JSON Schema cannot state either, so "
-        "a consumer validating against this file alone must check both itself."
+        "trading_days MUST equal the number of distinct entries in days_served, "
+        "days_served MUST be strictly increasing, and session_modes MUST key exactly "
+        "the days in days_served. JSON Schema cannot state any of the three, so a "
+        "consumer validating against this file alone must check them itself."
     )
     schema["description"] = (
         "The trader's rolling account of the trading days it served on the v2 "
@@ -3984,9 +4016,11 @@ class TraderEvidenceDocument(_Strict):
         json_schema_extra=_trader_evidence_json_schema_extra,
     )
 
-    schema_version: Literal["trader_evidence.v1"] = Field(
+    schema_version: Literal["trader_evidence.v2"] = Field(
         description="Version of THIS schema. A consumer that cannot read the version "
-        "refuses the document rather than guessing."
+        "refuses the document rather than guessing. v2 added the REQUIRED "
+        "`session_modes`; no v1 document was ever written to the "
+        "production store, so nothing reads v1."
     )
     slot: Literal["m"] = Field(
         description="The slot whose champion was served. Closed to `m`: "
@@ -4011,11 +4045,24 @@ class TraderEvidenceDocument(_Strict):
         "the count so the count is checkable rather than asserted — the "
         "shape of a suite that only ever tests the happy path, one contract out.",
     )
+    session_modes: dict[str, SessionModeLiteral] = Field(
+        description="How each day in `days_served` was served: `shadow` (champion "
+        "resolved, book built, day recorded, no order sent) or `live` (the same, "
+        "with orders routed). Keys are exactly `days_served`. Both modes count as "
+        "served (`crucible.models.SERVED_SESSION_MODES`, Brian's ruling of "
+        "2026-09-24 on the trader-runtime decision); the mode is recorded so the gate "
+        "can report how many counted days were shadow rather than let the count "
+        "blur the two.",
+    )
     calendar_date: str = Field(
         pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
         description="Wall-clock date this document was last written. Provenance only, "
         "never a key (§4.12).",
     )
+
+    def shadow_days(self) -> list[str]:
+        """The served days that were shadow sessions, in `days_served` order."""
+        return [day for day in self.days_served if self.session_modes[day] == "shadow"]
 
     @model_validator(mode="after")
     def _count_is_supported_by_the_days(self) -> TraderEvidenceDocument:
@@ -4051,6 +4098,14 @@ class TraderEvidenceDocument(_Strict):
                 f"trading_days={self.trading_days} but days_served carries "
                 f"{len(self.days_served)} day(s). The count the gate reads must be "
                 "supported by the days that produced it."
+            )
+        unmoded = sorted(set(self.days_served) - set(self.session_modes))
+        stray = sorted(set(self.session_modes) - set(self.days_served))
+        if unmoded or stray:
+            raise ValueError(
+                f"session_modes must key exactly days_served: no mode for {unmoded}, a "
+                f"mode for {stray} which was not served. A day with no recorded mode "
+                "cannot say whether an order left the trader on it."
             )
         return self
 
