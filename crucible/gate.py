@@ -148,6 +148,7 @@ from crucible.models import (
     TraderEvidenceDocument,
     fire_drill_commitment,
 )
+from crucible.models import SERVED_SESSION_MODES as _SERVED_SESSION_MODES
 from crucible.portfolio import manifest_records_portfolio_engine
 from crucible.release import POINTER_KEY
 from crucible.report import ROWS as _ATTRIBUTION_ROWS
@@ -4168,6 +4169,14 @@ PHASE4_MAX_TOTAL_USD = 70.0
 #: artifact the trader AGREED to write; it never inspects trader processes, logs
 #: or a broker API.
 TRADER_EVIDENCE_KEY: str | None = _TRADER_EVIDENCE_KEY
+
+#: The session modes `trader_one_week_on_v2_champion` counts as a served day —
+#: `crucible.models.SERVED_SESSION_MODES`, resolved rather than restated so the
+#: producer's contract and the gate's count cannot disagree about what "served"
+#: means. Both modes, by Brian's ruling of 2026-09-24 on
+#: `alpha-engine-config-I11545` (ruling 2: "a shadow session counts as a served
+#: day"); the clause still reports how many counted days were shadow.
+SERVED_DAY_SESSION_MODES: tuple[str, ...] = _SERVED_SESSION_MODES
 
 #: The `spec.params` key naming which registered LLM call site an arm reaches
 #: a model through — `crucible.slots.arms.LLM_CALLSITE_PARAM`, restated here
@@ -8402,15 +8411,21 @@ def _clause_trader_week_on_v2_champion(store: Store, window: list[dt.date]) -> C
 
     **The harness may not reach into the trader** (plan §3: separate systems,
     coupled by one contract). So this clause reads the CONSUMER EVIDENCE
-    artifact the trader contract declares — and the contract declares none
-    today, which is `alpha-engine-config-I9760`'s own scope, so the clause
-    reads UNMEASURABLE naming the missing declaration rather than inventing a
-    key the trader has never agreed to write.
+    artifact the trader contract declares (`crucible.keys.TRADER_EVIDENCE_KEY`),
+    validated through `crucible.models.TraderEvidenceDocument` — the count is
+    only as good as the day list and the per-day session modes behind it.
+
+    **What a served day is.** A day whose recorded session mode is in
+    :data:`SERVED_DAY_SESSION_MODES` — shadow OR live, by Brian's ruling of
+    2026-09-24 on `alpha-engine-config-I11545` (ruling 2). The reading names how
+    many of the counted days were shadow sessions, so a MET on a week in which
+    no order left the trader cannot be mistaken for a week of routed ones.
     """
     name = "trader_one_week_on_v2_champion"
     requirement = (
-        "the trader ran one week on the v2 champion, read from the consumer-evidence "
-        "artifact the trader contract declares"
+        f"the trader served {TRADING_DAYS_PER_WEEK} trading days on one v2 champion "
+        f"(a served day is a session in mode {' or '.join(SERVED_DAY_SESSION_MODES)}), "
+        "read from the consumer-evidence artifact the trader contract declares"
     )
     if TRADER_EVIDENCE_KEY is None:
         return _unmeasurable(
@@ -8436,24 +8451,39 @@ def _clause_trader_week_on_v2_champion(store: Store, window: list[dt.date]) -> C
             f"{key} is absent — the trader has filed no evidence of a week on the v2 champion",
             (key,),
         )
-    document = read.document or {}
-    problem = _field(key, document, "trading_days", int)
-    if problem is not None:
-        return Clause(name, requirement, False, problem, (key,))
-    days = document["trading_days"]
-    if days < TRADING_DAYS_PER_WEEK:
+    try:
+        evidence = TraderEvidenceDocument.model_validate(read.document)
+    except ValidationError as exc:
         return Clause(
             name,
             requirement,
             False,
-            f"{key}: {days} trading day(s) on the v2 champion, {TRADING_DAYS_PER_WEEK} required",
+            f"{key} does not conform to trader_evidence.v2 "
+            f"({len(exc.errors())} error(s): {exc.errors()[0]['msg']})",
+            (key,),
+        )
+    served = [
+        day
+        for day in evidence.days_served
+        if evidence.session_modes[day] in SERVED_DAY_SESSION_MODES
+    ]
+    shadow = sum(1 for day in served if evidence.session_modes[day] == "shadow")
+    modes = f"{shadow} shadow, {len(served) - shadow} live"
+    if len(served) < TRADING_DAYS_PER_WEEK:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"{key}: {len(served)} trading day(s) served on v2 champion {evidence.champion} "
+            f"({modes}), {TRADING_DAYS_PER_WEEK} required",
             (key,),
         )
     return Clause(
         name,
         requirement,
         True,
-        f"{key}: {days} trading day(s) on the v2 champion",
+        f"{key}: {len(served)} trading day(s) served on v2 champion {evidence.champion} "
+        f"({modes}; a shadow session counts as served by Brian's 2026-09-24 ruling)",
         (key,),
     )
 
@@ -8758,7 +8788,7 @@ def _clause_shadow_books_cover_every_active_arm(store: Store, window: list[dt.da
             name,
             requirement,
             False,
-            f"{evidence_key} does not conform to trader_evidence.v1 ({len(exc.errors())} error(s))",
+            f"{evidence_key} does not conform to trader_evidence.v2 ({len(exc.errors())} error(s))",
             (evidence_key,),
         )
     days_served = [day for day in served if day <= session]

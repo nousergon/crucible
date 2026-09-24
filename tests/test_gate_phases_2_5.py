@@ -2599,6 +2599,21 @@ class TestPhase3DeliverablesTableTracksTheWiredClauses:
 
 
 TRADER_EVIDENCE = "consumers/trader/v2_champion_week.json"
+TRADER_CHAMPION = "m:ridge_21d:0123456789ab"
+TRADER_WEEK = ["2026-09-14", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18"]
+
+
+def _trader_evidence(days: list[str], modes: dict[str, str] | None = None) -> dict:
+    """A `trader_evidence.v2` document; every day shadow unless ``modes`` says."""
+    return {
+        "schema_version": "trader_evidence.v2",
+        "slot": "m",
+        "champion": TRADER_CHAMPION,
+        "trading_days": len(days),
+        "days_served": days,
+        "session_modes": {day: "shadow" for day in days} | (modes or {}),
+        "calendar_date": days[-1] if days else "2026-09-18",
+    }
 
 
 class TestTheTraderIsGradedThroughItsContractOrNotAtAll:
@@ -2637,7 +2652,7 @@ class TestTheTraderIsGradedThroughItsContractOrNotAtAll:
     def test_met_on_a_full_week_at_the_declared_key(self, store: LocalStore) -> None:
         """No monkeypatch: the real key, the real reading. Five trading days,
         which is one week (§4.12) and not seven calendar days."""
-        _put(store, keys_module.TRADER_EVIDENCE_KEY, {"trading_days": 5})
+        _put(store, keys_module.TRADER_EVIDENCE_KEY, _trader_evidence(TRADER_WEEK))
         clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
         assert clause.met and not clause.unmeasurable
 
@@ -2651,7 +2666,7 @@ class TestTheTraderIsGradedThroughItsContractOrNotAtAll:
 
     def test_met_on_a_full_week(self, store: LocalStore, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(gate_module, "TRADER_EVIDENCE_KEY", TRADER_EVIDENCE)
-        _put(store, TRADER_EVIDENCE, {"trading_days": 5})
+        _put(store, TRADER_EVIDENCE, _trader_evidence(TRADER_WEEK))
         clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
         assert clause.met and not clause.unmeasurable
 
@@ -2659,7 +2674,72 @@ class TestTheTraderIsGradedThroughItsContractOrNotAtAll:
         self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(gate_module, "TRADER_EVIDENCE_KEY", TRADER_EVIDENCE)
-        _put(store, TRADER_EVIDENCE, {"trading_days": 2})
+        _put(store, TRADER_EVIDENCE, _trader_evidence(TRADER_WEEK[:2]))
+        clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+        assert not clause.met and not clause.unmeasurable
+        assert "2 trading day(s) served" in clause.detail
+
+
+class TestAShadowSessionIsAServedDay:
+    """`alpha-engine-config-I11545`, Brian's ruling 2 of 2026-09-24: a shadow
+    session (champion resolved, book built, day recorded, no order sent) counts
+    as a served day. The count treats the modes alike; the reading does not."""
+
+    def test_the_gate_counts_exactly_the_modes_the_contract_declares(self) -> None:
+        from crucible.models import SERVED_SESSION_MODES
+
+        assert gate_module.SERVED_DAY_SESSION_MODES == SERVED_SESSION_MODES
+        assert set(gate_module.SERVED_DAY_SESSION_MODES) == {"shadow", "live"}
+
+    def test_a_week_of_shadow_sessions_is_met_and_says_so(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gate_module, "TRADER_EVIDENCE_KEY", TRADER_EVIDENCE)
+        _put(store, TRADER_EVIDENCE, _trader_evidence(TRADER_WEEK))
+        clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+        assert clause.met and not clause.unmeasurable
+        assert "5 shadow, 0 live" in clause.detail
+        assert TRADER_CHAMPION in clause.detail
+
+    def test_a_mixed_week_reports_the_split(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gate_module, "TRADER_EVIDENCE_KEY", TRADER_EVIDENCE)
+        live = {day: "live" for day in TRADER_WEEK[3:]}
+        _put(store, TRADER_EVIDENCE, _trader_evidence(TRADER_WEEK, live))
+        clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+        assert clause.met
+        assert "3 shadow, 2 live" in clause.detail
+
+    def test_a_short_shadow_week_is_unmet_with_the_split(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gate_module, "TRADER_EVIDENCE_KEY", TRADER_EVIDENCE)
+        _put(store, TRADER_EVIDENCE, _trader_evidence(TRADER_WEEK[:4]))
+        clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+        assert not clause.met and not clause.unmeasurable
+        assert "4 shadow, 0 live" in clause.detail
+
+    def test_a_document_without_session_modes_is_unmet_not_counted(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A count with no mode behind it cannot say whether an order left the
+        trader; it is a non-conforming document, not five served days."""
+        monkeypatch.setattr(gate_module, "TRADER_EVIDENCE_KEY", TRADER_EVIDENCE)
+        bare = _trader_evidence(TRADER_WEEK)
+        del bare["session_modes"]
+        _put(store, TRADER_EVIDENCE, bare)
+        clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
+        assert not clause.met and not clause.unmeasurable
+        assert "does not conform to trader_evidence.v2" in clause.detail
+
+    def test_a_bare_count_is_no_longer_evidence(
+        self, store: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Before I11545 the clause read `trading_days` alone. A count is only
+        as good as the day list and modes behind it."""
+        monkeypatch.setattr(gate_module, "TRADER_EVIDENCE_KEY", TRADER_EVIDENCE)
+        _put(store, TRADER_EVIDENCE, {"trading_days": 5})
         clause = gate_module._clause_trader_week_on_v2_champion(store, _window(2))
         assert not clause.met and not clause.unmeasurable
 

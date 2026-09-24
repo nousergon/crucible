@@ -1,6 +1,6 @@
 {
-  "$comment": "trading_days MUST equal the number of distinct entries in days_served, and days_served MUST be strictly increasing. JSON Schema cannot state either, so a consumer validating against this file alone must check both itself.",
-  "$id": "https://github.com/nousergon/crucible/schemas/trader_evidence.v1.json",
+  "$comment": "trading_days MUST equal the number of distinct entries in days_served, days_served MUST be strictly increasing, and session_modes MUST key exactly the days in days_served. JSON Schema cannot state any of the three, so a consumer validating against this file alone must check them itself.",
+  "$id": "https://github.com/nousergon/crucible/schemas/trader_evidence.v2.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "The trader's rolling account of the trading days it served on the v2 champion, written at the key `crucible.keys.TRADER_EVIDENCE_KEY` and read by the phase-4 gate clause `trader_one_week_on_v2_champion`. Cumulative, not dated: the question the clause asks is cumulative, and a dated artifact would make the gate reconstruct the count by listing \u2014 a second implementation of a number the trader already knows. additionalProperties: false because a field this reader does not understand is a field the producer expected it to act on.",
@@ -26,10 +26,22 @@
       "type": "array"
     },
     "schema_version": {
-      "const": "trader_evidence.v1",
-      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
+      "const": "trader_evidence.v2",
+      "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing. v2 added the REQUIRED `session_modes`; no v1 document was ever written to the production store, so nothing reads v1.",
       "title": "Schema Version",
       "type": "string"
+    },
+    "session_modes": {
+      "additionalProperties": {
+        "enum": [
+          "shadow",
+          "live"
+        ],
+        "type": "string"
+      },
+      "description": "How each day in `days_served` was served: `shadow` (champion resolved, book built, day recorded, no order sent) or `live` (the same, with orders routed). Keys are exactly `days_served`. Both modes count as served (`crucible.models.SERVED_SESSION_MODES`, Brian's ruling of 2026-09-24 on the trader-runtime decision); the mode is recorded so the gate can report how many counted days were shadow rather than let the count blur the two.",
+      "title": "Session Modes",
+      "type": "object"
     },
     "slot": {
       "const": "m",
@@ -50,8 +62,9 @@
     "champion",
     "trading_days",
     "days_served",
+    "session_modes",
     "calendar_date"
   ],
-  "title": "Crucible trader consumer evidence, v1",
+  "title": "Crucible trader consumer evidence, v2",
   "type": "object"
 }
