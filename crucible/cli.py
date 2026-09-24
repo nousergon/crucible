@@ -18,9 +18,14 @@ The delta is hand-written `--help` text; the parser below carries it.
 convention: it is where the manifest guarantee lives, and a job invoked
 around it would produce no telemetry on the path where telemetry matters.
 
-The handlers below raise `NotImplementedError` with the owning track named.
-The dispatch table, the argument surface and the date resolution are real
-today, so three tracks build against a fixed shape.
+Every job in `JOBS` dispatches to a real handler: the ones this module
+defines, the track modules' (`crucible.track_c`, `crucible.track_e`,
+`crucible.track_f`, `crucible.morning`), and `crucible.track_a.HANDLERS`,
+merged in by `HANDLERS.update(TRACK_A_HANDLERS)` below. There are no stubs
+today. `_todo` is kept only as the mechanism for a genuinely unbuilt job: a
+handler that raises `NotImplementedError` naming its owner, never one that
+exits 0. A `_todo` entry that some track's handler overrides is dead code,
+and `tests/test_cli_and_alerts.py` fails on one (`alpha-engine-config-I11067`).
 """
 
 from __future__ import annotations
@@ -73,7 +78,10 @@ class JobSpec:
 
     ``scheduled`` is here rather than only in `components.yaml` so the two
     can be checked against each other. A scheduled job whose absence nothing
-    watches is the blindness §4.6 exists to remove.
+    watches is the blindness §4.6 exists to remove. The check is
+    `tests/test_components_registry.py::TestCoverage::test_the_cli_and_the_registry_agree_about_what_is_scheduled`
+    (`alpha-engine-config-I11041`). Until it existed, `promote`, `explain` and
+    `gate` had all drifted to `False` while the registry scheduled them.
     """
 
     name: str
@@ -607,9 +615,12 @@ JOBS: dict[str, JobSpec] = {
         "Produce one arm's history over a session range, point-in-time",
         False,
     ),
-    "promote": JobSpec("promote", "Move a slot's champion pointer, evidence-gated", False),
+    # `promote` and `explain` are weekly ARC stages (`components.yaml`,
+    # `dispatch: arc`), so both are scheduled. Both read `False` here until
+    # `alpha-engine-config-I11041` compared this table with the registry.
+    "promote": JobSpec("promote", "Move a slot's champion pointer, evidence-gated", True),
     "report": JobSpec("report", "Reduce the week's manifests into the attribution table", True),
-    "explain": JobSpec("explain", "Walk a run_id or verdict back to what produced it", False),
+    "explain": JobSpec("explain", "Walk a run_id or verdict back to what produced it", True),
     # `alpha-engine-config-I10502` (phase-3 `sealed_holdout`). NOT scheduled,
     # and it must never be: unsealing the holdout is a RESERVED matter
     # (`principles.md` §3.2), so a clock that could invoke this would be an
@@ -654,10 +665,13 @@ JOBS: dict[str, JobSpec] = {
     # what a phase produced and says whether it may exit — a phase gate that
     # is a MEASUREMENT cannot be satisfied by a merge.
     "weekly": JobSpec("weekly", "Run the declared weekly arc for one trading day", True),
-    "gate": JobSpec("gate", "Read a phase's artifacts and report its exit gate", False),
-    # alpha-engine-config-I10095. `gate` stays on-demand — a gate on a schedule
-    # would be a gate whose absence pages between phases — but the RECORD of a
-    # phase's exit cannot wait for somebody to run one. This job reads every
+    # SCHEDULED: `gate` has been published daily by `gate-close.yml` since
+    # `alpha-engine-config-I10508`, and its `components.yaml` row says so and
+    # records why the earlier "on-demand" argument no longer held. This table
+    # still read `False` until `alpha-engine-config-I11041` compared the two.
+    "gate": JobSpec("gate", "Read a phase's artifacts and report its exit gate", True),
+    # alpha-engine-config-I10095. A phase's exit is an event, not a cadence,
+    # but the RECORD of that exit cannot wait for somebody to run a gate. This job reads every
     # registered phase's gate daily and files the closing record for each that
     # reads MET and has none, under a writer identity the board deliberately
     # is not.
@@ -799,35 +813,17 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     # `tests/test_no_stale_component_boundary_claims.py` for the guard that
     # keeps this comment, `README.md` and every job description honest about
     # rule 1 going forward.
-    "experiment.new": _todo(
-        "experiment.new",
-        "track A",
-        "Arm id is the hash of its spec; an edited recipe is a NEW arm carrying `supersedes`.",
-    ),
-    "experiment.register": _todo(
-        "experiment.register",
-        "track A",
-        "Derives the set from the release in force; never a hand-written list of arms.",
-    ),
-    "experiment.run": _todo(
-        "experiment.run",
-        "track A",
-        "Seeded by crucible-research/scripts/run_experiment.py (PR784).",
-    ),
-    "experiment.grade": _todo(
-        "experiment.grade",
-        "track A",
-        "Calls nousergon_lib.arena.engine.run_cycle; re-implementing §§3-6 is a defect.",
-    ),
+    # `experiment.new` / `experiment.register` / `experiment.run` /
+    # `experiment.grade` / `explain` are ABSENT for the same reason
+    # (`alpha-engine-config-I11067`): `crucible.track_a.HANDLERS`
+    # (`handle_experiment_new`, `handle_experiment_register`,
+    # `handle_experiment_run`, `handle_experiment_grade`, `handle_explain`)
+    # implements each, and the `_todo` literals that sat here were overwritten
+    # before anything could reach them. Each handler's own docstring and
+    # `JOBS[job].help` are the one description of what it does.
     # track-B
     "promote": _promote,
     "report": track_e.report_handler,
-    "explain": _todo(
-        "explain",
-        "track A",
-        "§10.8: walks the manifest lineage from a verdict to the arms, features, data "
-        "snapshot, code sha, cost and LLM calls that produced it.",
-    ),
     "migrate.history": _migrate_history,
     # Not in `JOBS` (see the note beside its subparser in `build_parser`),
     # but `dest="job"` is shared across every subparser this module builds,

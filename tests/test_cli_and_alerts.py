@@ -28,6 +28,31 @@ FRIDAY = dt.date(2026, 8, 28)
 UNIMPLEMENTED = sorted(job for job in JOBS if is_stub(HANDLERS[job]))
 
 
+def _dead_todo_literals(source: str, handlers) -> list[str]:
+    """Keys the ``HANDLERS`` literal in ``source`` binds to ``_todo(...)``
+    whose LIVE handler is not a stub, so some track overwrote them
+    (`alpha-engine-config-I11067`)."""
+    import ast
+
+    literal = next(
+        node.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "HANDLERS"
+    )
+    assert isinstance(literal, ast.Dict)
+    placeholders = [
+        ast.literal_eval(key)
+        for key, value in zip(literal.keys, literal.values, strict=True)
+        if isinstance(key, ast.Constant)
+        and isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "_todo"
+    ]
+    return sorted(job for job in placeholders if not is_stub(handlers[job]))
+
+
 def _minimal_argv(job: str) -> list[str]:
     """The fewest arguments that make ``job`` parse."""
     argv = [job]
@@ -303,6 +328,46 @@ class TestJobSurface:
             f"still stubs: {UNIMPLEMENTED}. A stub is a job whose absence from the "
             "weekly arc nothing else reports."
         )
+
+    def test_no_todo_literal_in_the_handlers_table_is_dead(self) -> None:
+        """`alpha-engine-config-I11067`. A `_todo(...)` entry that a track's
+        `HANDLERS.update(...)` overwrites is dead code. Nothing runs it,
+        and its prose drifts from the real handler with nothing to notice:
+        `alpha-engine-config-I10979` found three such entries still
+        describing an architecture retired a release earlier.
+
+        Read from the SOURCE, because at runtime the dead literal no longer
+        exists: after import, an overwritten `_todo` is indistinguishable
+        from a job that never had one.
+        """
+        from pathlib import Path
+
+        import crucible.cli as cli
+
+        source = Path(cli.__file__).read_text(encoding="utf-8")
+        dead = _dead_todo_literals(source, HANDLERS)
+        assert dead == [], (
+            f"`_todo` placeholder(s) {dead} are overwritten at import time by a track's "
+            "real handler: delete the dead literal in `crucible/cli.py`"
+        )
+
+    def test_the_dead_literal_guard_fires(self) -> None:
+        """The guard above, made to fail: a literal stubbing a job the live
+        table implements is exactly what it must catch, and a stub that is
+        still a stub is not."""
+        source = (
+            "HANDLERS: dict[str, object] = {\n"
+            '    "explain": _todo("explain", "track A", "dead"),\n'
+            '    "report": report_handler,\n'
+            "}\n"
+        )
+        assert _dead_todo_literals(source, HANDLERS) == ["explain"]
+
+        def still_a_stub(args):
+            raise NotImplementedError
+
+        still_a_stub.is_stub = True
+        assert _dead_todo_literals(source, {**HANDLERS, "explain": still_a_stub}) == []
 
 
 class TestDateResolution:

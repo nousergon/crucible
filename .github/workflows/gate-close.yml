@@ -134,6 +134,18 @@ env:
   # so an unset archive here does not file a wrong record: it files nothing and
   # the manifest says which clause could not be read.
   CRUCIBLE_CLOUDTRAIL_ARCHIVE: ${{ vars.CRUCIBLE_CLOUDTRAIL_ARCHIVE }}
+  # alpha-engine-config-I11519 (b). Component 1's store, which phase 4's
+  # `data_cutover_ready` and `data_collection_reliability` read their gate
+  # documents from (`crucible.gate.CRUCIBLE_DATA_COLLECTION_STORE_VAR`).
+  # Nothing declared it, so every scheduled reading since those clauses landed
+  # said "CRUCIBLE_DATA_COLLECTION_STORE is not configured" and read
+  # UNMEASURABLE. That is still the reading while the repository variable is
+  # unset: an empty value is "not configured", never MET. The value is the
+  # `data_collection` prefix of the bucket `CRUCIBLE_ARCTIC_BUCKET` names; the
+  # warning below prints the command. Setting the variable is the operator's
+  # step, as is the read grant on `data_collection/gates/` the
+  # issue's part (a) adds to this job's role.
+  CRUCIBLE_DATA_COLLECTION_STORE: ${{ vars.CRUCIBLE_DATA_COLLECTION_STORE }}
   # alpha-engine-config-I9967. The closing reading is POSTED to the phase's
   # tracker issue before it is filed, and the tracker is
   # `nousergon/alpha-engine-config` — a different, private repository an
@@ -216,6 +228,10 @@ jobs:
           # variable only one of them needs.
           if [ -z "$CRUCIBLE_CLOUDTRAIL_ARCHIVE" ]; then
             echo "::warning::repository variable CRUCIBLE_CLOUDTRAIL_ARCHIVE is not set, so phase 2's gate publishes UNMEASURABLE for zero_human_mutating_calls"
+          fi
+          # Same reasoning: two phase-4 clauses read UNMEASURABLE, the rest publish.
+          if [ -z "$CRUCIBLE_DATA_COLLECTION_STORE" ]; then
+            echo "::warning::repository variable CRUCIBLE_DATA_COLLECTION_STORE is not set, so phase 4's data_cutover_ready and data_collection_reliability publish UNMEASURABLE — set it with: gh variable set CRUCIBLE_DATA_COLLECTION_STORE --repo nousergon/crucible --body \"s3://\$(gh variable get CRUCIBLE_ARCTIC_BUCKET --repo nousergon/crucible)/data_collection\""
           fi
           exit "$missing"
 
