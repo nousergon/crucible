@@ -8174,6 +8174,120 @@ def _absent_upstream_champion(store: Store, slot: str) -> str | None:
     return None if hook is None else hook(store)
 
 
+def _clause_every_registered_arm_produces(store: Store, window: list[dt.date]) -> Clause:
+    """Every ACTIVE, non-control registered arm has produced something once
+    its slot's settle window has passed (`alpha-engine-config-I11030`,
+    deliverable 3).
+
+    **Registered is not producing.** Measured 2026-09-17, then again
+    2026-09-24: three R arms are ACTIVE in `arms/r/register.jsonl` and have
+    never written under `experiments/` or `arm_predictions/`
+    (`scanner_predictor_direct` since 2026-07-13, `scanner_top20_predictor`
+    since 2026-07-20, `thinktank_coverage` since 2026-06-22). Every
+    `experiment.run[r]` refuses them by name, because their rankers read
+    columns the feature catalogue declares no producer for. Every surface that
+    counted arms counted the REGISTER or an arena cycle's own scored set, so
+    all three sat inside every denominator. One of them held the R champion
+    pointer, and on 2026-09-19 that took the Saturday arc down.
+    `v1_arms_carried_or_excluded` catches the same condition only for arms a
+    v1 ledger row names. This clause holds EVERY registered arm to it.
+
+    The production predicate is `crucible.carryover.read_production`, the
+    arm's own artifacts, never the register. The settle window matches the
+    carry-over clause: `DEFAULT_HORIZON_TRADING_DAYS` sessions after the day
+    the arm's `registered` event was FILED. An arm filed yesterday has not
+    been asked.
+
+    * UNMEASURABLE when a register cannot be read or an arm's production
+      cannot be listed, and nothing else is red. Unknown output is never a
+      pass.
+    * UNMET while any such arm is mute past its window. The fix is output,
+      or a `retired` register event saying why the arm never will produce.
+      Silence is not a fix (deliverable 4).
+    * MET otherwise. Arms still inside their window are named in the detail.
+    """
+    from crucible.calendar import count_trading_days  # noqa: PLC0415 - light, one call site
+    from crucible.slots.grading import (  # noqa: PLC0415 - heavy import, one call site
+        DEFAULT_HORIZON_TRADING_DAYS,
+    )
+
+    name = "every_registered_arm_produces"
+    requirement = (
+        "every ACTIVE non-control arm in each slot's register has written output under "
+        "its own `experiments/` or `arm_predictions/` prefix once "
+        f"{DEFAULT_HORIZON_TRADING_DAYS} trading sessions have passed since its "
+        "`registered` event was filed; an arm that will never produce carries a `retired` "
+        "event saying why, never silence"
+    )
+    as_of = window[-1] if window else resolve_trading_day()
+    evidence: list[str] = []
+    access: list[str] = []
+    mute: list[str] = []
+    broken: list[str] = []
+    settling: list[str] = []
+    n_checked = 0
+    for slot in sorted(dispatchable_slots()):
+        _, key, problem, access_problem, register = _register_arms(store, slot)
+        evidence.append(key)
+        if problem is not None:
+            (access if access_problem else broken).append(problem)
+            continue
+        if register is None:
+            continue
+        for arm_id in sorted(register.active_arms()):
+            if is_control_arm(SLOTS[slot], arm_id, register):
+                continue
+            filed_on = (
+                register.state(arm_id).filed_date or register.state(arm_id).record.created_date
+            )
+            reading = read_production(store, arm_id, filed_on)
+            n_checked += 1
+            if reading.produced is None:
+                access.append(f"{arm_id}: {reading.problem}")
+                continue
+            if reading.produced:
+                continue
+            sessions = count_trading_days(dt.date.fromisoformat(filed_on), as_of)
+            if sessions < DEFAULT_HORIZON_TRADING_DAYS:
+                settling.append(f"{arm_id} ({sessions}/{DEFAULT_HORIZON_TRADING_DAYS})")
+                continue
+            evidence.append(reading.key)
+            mute.append(
+                f"{arm_id} is ACTIVE in {key}, filed {filed_on} ({sessions} sessions ago), "
+                f"and has written nothing under {reading.key}"
+            )
+    note = f"; still inside their settle window: {', '.join(settling)}" if settling else ""
+    if mute or broken:
+        parts = broken[:3]
+        if mute:
+            parts.append(f"{len(mute)} registered arm(s) MUTE: " + "; ".join(mute[:6]))
+        return Clause(name, requirement, False, "; ".join(parts) + note, tuple(evidence))
+    if access:
+        return _unmeasurable(name, requirement, "; ".join(access[:6]) + note, evidence)
+    if n_checked == 0:
+        # An absent register for ONE slot is neutral here: that slot has no
+        # arm to hold to production (whether it SHOULD have one is
+        # `every_recipe_in_the_release_is_registered`'s question, and an S
+        # register legitimately waits on the M champion). Zero arms across
+        # EVERY slot is different: a clause that graded nothing has read
+        # nothing, and MET over an empty denominator is the vacuous pass.
+        return _unmeasurable(
+            name,
+            requirement,
+            "no ACTIVE non-control arm is registered in any slot's register; a clause "
+            "over zero arms is not a reading",
+            evidence,
+        )
+    return Clause(
+        name,
+        requirement,
+        True,
+        f"all {n_checked} active non-control registered arm(s) past their settle window "
+        f"have produced{note}",
+        tuple(evidence),
+    )
+
+
 def _phase3(
     store: Store,
     window: list[dt.date],
@@ -8225,6 +8339,9 @@ def _phase3(
         # ABOUT — "all three slots" is not true of a slot whose merged
         # recipes never reached its register.
         _clause_every_recipe_registered(store, window),
+        # `alpha-engine-config-I11030` deliverable 3: the next bar after
+        # registration. On phase 3 for the reason the clause above states.
+        _clause_every_registered_arm_produces(store, window),
     ]
 
 

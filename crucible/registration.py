@@ -62,8 +62,8 @@ class RecipeLoad:
     specs: tuple[Any, ...]
     refusals: tuple[InputRefusal, ...]
     #: `MetricRecord`-shaped rows, one per refusal, for the manifest of
-    #: whatever job loaded the slot. Empty for U and R, which have no
-    #: registration-time refusal concept.
+    #: whatever job loaded the slot. For U and R these are the catalogue
+    #: refusals `experiment.run` files (`alpha-engine-config-I11030`).
     refusal_metrics: tuple[dict[str, Any], ...]
 
     @property
@@ -138,10 +138,56 @@ def load_registrable_recipes(
         specs = load_arm_specs(
             slot, store=store, strategy_dir=Path(strategy_dir) if strategy_dir else None
         )
-        return RecipeLoad(slot=slot, specs=tuple(specs), refusals=(), refusal_metrics=())
+        return _partition_ranked(slot, specs)
     return RecipeLoad(
         slot=slot,
         specs=tuple(registration_specs(loaded)),
         refusals=tuple(loaded.refused),
         refusal_metrics=tuple(loaded.refusal_metrics(slot=slot)),
+    )
+
+
+def _partition_ranked(slot: str, specs: list[Any]) -> RecipeLoad:
+    """A U/R slot's recipes, split by the SAME catalogue partition
+    `experiment.run` applies before it produces anything.
+
+    `alpha-engine-config-I11030`. Before this, a U/R load returned every
+    recipe as registrable. `experiment.run` then refused, by name and every
+    cycle, each arm whose ranker reads a column the feature catalogue
+    declares no producer for (`crucible.slots.cycle.partition_by_catalog`).
+    So the register and the run disagreed: a recipe could be REGISTERED by
+    one path and REFUSED by the other. It then sat ACTIVE in the register
+    and wrote nothing, which is the "registered is not producing" class. Measured
+    2026-09-24: `experiment.register[r]` read 4 recipes and refused 0, while
+    `experiment.run[r]` refused 3 of the same 4
+    (`scanner_predictor_direct` and `scanner_top20_predictor` on
+    `predicted_alpha_ratio`, `thinktank_coverage` on
+    `thinktank_rating_ratio`). All three are registered, and none has ever
+    written under `experiments/`.
+
+    One predicate now serves both paths, so an arm the run would refuse
+    never registers. Its refusal reaches the loading job's manifest with the
+    same `arm_refused_at_registration` row the run files. A slot whose every
+    recipe is refused raises
+    :class:`~crucible.slots.inputs.SlotUnservableError`, exactly as
+    `experiment.run` does, and never returns an empty load (module rule
+    above).
+    """
+    from crucible.features import CATALOG  # noqa: PLC0415 - heavy import, one call site
+    from crucible.slots.cycle import (  # noqa: PLC0415 - avoids a cycle
+        partition_by_catalog,
+        refusal_metric,
+    )
+    from crucible.slots.inputs import SlotUnservableError  # noqa: PLC0415 - one call site
+
+    producible, refused = partition_by_catalog(
+        specs, catalog_columns=[column.name for column in CATALOG]
+    )
+    if refused and not producible:
+        raise SlotUnservableError(tuple(refused))
+    return RecipeLoad(
+        slot=slot,
+        specs=tuple(producible),
+        refusals=tuple(refused),
+        refusal_metrics=tuple(refusal_metric(slot, refusal) for refusal in refused),
     )
