@@ -2203,7 +2203,7 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
         assert arena_cycle_key("r", FRIDAY.isoformat()) in clause.detail
         assert "no promote run manifest was filed" not in clause.detail
 
-    def test_one_clause_per_registered_slot_plus_the_seven_deliverable_clauses(
+    def test_one_clause_per_registered_slot_plus_the_eight_deliverable_clauses(
         self, store: LocalStore
     ) -> None:
         clauses = gate_module._phase3(store, _window(4), {}, trading_day=FRIDAY)
@@ -2228,6 +2228,9 @@ class TestASlotHoldsItsPointerOnEvidenceOrSaysNothingLooked:
             # clause above — v1's arms crossing, and v2's own merged recipes
             # reaching the arena at all.
             "every_recipe_in_the_release_is_registered",
+            # alpha-engine-config-I11030: registered is not producing. The
+            # output-side sibling of the clause above.
+            "every_registered_arm_produces",
         ]
 
 
