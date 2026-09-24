@@ -78,7 +78,10 @@ class JobSpec:
 
     ``scheduled`` is here rather than only in `components.yaml` so the two
     can be checked against each other. A scheduled job whose absence nothing
-    watches is the blindness §4.6 exists to remove.
+    watches is the blindness §4.6 exists to remove. The check is
+    `tests/test_components_registry.py::TestCoverage::test_the_cli_and_the_registry_agree_about_what_is_scheduled`
+    (`alpha-engine-config-I11041`). Until it existed, `promote`, `explain` and
+    `gate` had all drifted to `False` while the registry scheduled them.
     """
 
     name: str
@@ -612,9 +615,12 @@ JOBS: dict[str, JobSpec] = {
         "Produce one arm's history over a session range, point-in-time",
         False,
     ),
-    "promote": JobSpec("promote", "Move a slot's champion pointer, evidence-gated", False),
+    # `promote` and `explain` are weekly ARC stages (`components.yaml`,
+    # `dispatch: arc`), so both are scheduled. Both read `False` here until
+    # `alpha-engine-config-I11041` compared this table with the registry.
+    "promote": JobSpec("promote", "Move a slot's champion pointer, evidence-gated", True),
     "report": JobSpec("report", "Reduce the week's manifests into the attribution table", True),
-    "explain": JobSpec("explain", "Walk a run_id or verdict back to what produced it", False),
+    "explain": JobSpec("explain", "Walk a run_id or verdict back to what produced it", True),
     # `alpha-engine-config-I10502` (phase-3 `sealed_holdout`). NOT scheduled,
     # and it must never be: unsealing the holdout is a RESERVED matter
     # (`principles.md` §3.2), so a clock that could invoke this would be an
@@ -659,10 +665,13 @@ JOBS: dict[str, JobSpec] = {
     # what a phase produced and says whether it may exit — a phase gate that
     # is a MEASUREMENT cannot be satisfied by a merge.
     "weekly": JobSpec("weekly", "Run the declared weekly arc for one trading day", True),
-    "gate": JobSpec("gate", "Read a phase's artifacts and report its exit gate", False),
-    # alpha-engine-config-I10095. `gate` stays on-demand — a gate on a schedule
-    # would be a gate whose absence pages between phases — but the RECORD of a
-    # phase's exit cannot wait for somebody to run one. This job reads every
+    # SCHEDULED: `gate` has been published daily by `gate-close.yml` since
+    # `alpha-engine-config-I10508`, and its `components.yaml` row says so and
+    # records why the earlier "on-demand" argument no longer held. This table
+    # still read `False` until `alpha-engine-config-I11041` compared the two.
+    "gate": JobSpec("gate", "Read a phase's artifacts and report its exit gate", True),
+    # alpha-engine-config-I10095. A phase's exit is an event, not a cadence,
+    # but the RECORD of that exit cannot wait for somebody to run a gate. This job reads every
     # registered phase's gate daily and files the closing record for each that
     # reads MET and has none, under a writer identity the board deliberately
     # is not.
