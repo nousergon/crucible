@@ -276,17 +276,13 @@ def handle_data_weekly(args: argparse.Namespace) -> int:
     source = _source(args, config)
     point_in_time = _point_in_time_source(config)
     declared = _declared_universe(args, config)
-    if args.dry_run:
-        print(
-            f"data.weekly --date {args.trading_day} would read {source.name} and write to "
-            f"{config.store_uri}; universe: "
-            + (
-                f"{len(declared.symbols)} symbols from {declared.source_uri}"
-                if declared
-                else "NONE declared"
-            )
-        )
-        return 0
+    # NO `--dry-run` branch (alpha-engine-config-I11079), for `data.daily`'s
+    # reason: the weekly job IS the daily compile of the week's last session
+    # plus a gap check over the week, so its rehearsal costs what
+    # `data.daily`'s already does and reaches the same failures — a missing
+    # feature column, an unsatisfiable declared input, a refusing grant. The
+    # print this replaces named the source and the store URI, and could
+    # surface none of them.
     ctx = run_job(
         "data.weekly",
         lambda c: run_weekly(
@@ -298,6 +294,7 @@ def handle_data_weekly(args: argparse.Namespace) -> int:
         store=store,
         trading_day=args.trading_day,
         run_mode=getattr(args, "run_mode", None),
+        dry_run=bool(getattr(args, "dry_run", False)),
     )
     print(json.dumps({"run_id": ctx.run_id, "outputs": [o["key"] for o in ctx.outputs]}, indent=2))
     return 0
@@ -311,32 +308,38 @@ def handle_data_heal(args: argparse.Namespace) -> int:
     start = dt.date.fromisoformat(args.from_date)
     end = dt.date.fromisoformat(args.to_date)
     declared = _declared_universe(args, config)
-    if args.dry_run:
-        from crucible.data.heal import in_region, sessions_in_range
-
-        on_ec2, evidence = in_region()
-        sessions = sessions_in_range(start, end)
-        print(
-            f"data.heal would recompile {len(sessions)} session(s) {start}..{end}. "
-            f"Host: {evidence} (in region: {on_ec2})."
-        )
-        return 0
+    dry_run = bool(getattr(args, "dry_run", False))
+    # NO early return under `--dry-run` (alpha-engine-config-I11079): the
+    # body EXECUTES against a store that records its writes. How much of the
+    # range it compiles is decided in `crucible.data.heal`, by the in-region
+    # guard's own predicate — the full range where the job may run, the
+    # guard's laptop allowance where it would refuse — and the module
+    # docstring there says why a bounded prefix and not the full range.
+    result: dict[str, Any] = {}
     ctx = run_job(
         "data.heal",
-        lambda c: run_heal(
-            c,
-            source=source,
-            point_in_time=point_in_time,
-            start=start,
-            end=end,
-            gap=args.gap,
-            i_am_in_region=getattr(args, "i_am_in_region", False),
-            expected_symbols=_expected_symbols(declared, c),
+        lambda c: result.update(
+            run_heal(
+                c,
+                source=source,
+                point_in_time=point_in_time,
+                start=start,
+                end=end,
+                gap=args.gap,
+                i_am_in_region=getattr(args, "i_am_in_region", False),
+                expected_symbols=_expected_symbols(declared, c),
+                rehearsal=dry_run,
+            )
         ),
         store=store,
         trading_day=end,
+        dry_run=dry_run,
     )
-    print(json.dumps({"run_id": ctx.run_id, "outputs": [o["key"] for o in ctx.outputs]}, indent=2))
+    report: dict[str, Any] = {"run_id": ctx.run_id, "outputs": [o["key"] for o in ctx.outputs]}
+    if dry_run:
+        report["in_region_verdict"] = result.get("in_region_verdict")
+        report["not_rehearsed"] = result.get("not_rehearsed", [])
+    print(json.dumps(report, indent=2))
     return 0
 
 
