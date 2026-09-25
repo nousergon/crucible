@@ -172,6 +172,7 @@ __all__ = [
     "SessionModeLiteral",
     "SignalsRow",
     "TraderEvidenceDocument",
+    "TraderPinRequestDocument",
     "TraderReleasePinDocument",
     "TrialRow",
 ]
@@ -537,6 +538,8 @@ JOB_VALUES: tuple[str, ...] = (
     "holdout",
     "migrate.history",
     "release.pin",
+    "release.pin_request",
+    "release.pin_apply",
     "release.lock",
     "smoke",
     "alerts.sweep",
@@ -1930,6 +1933,41 @@ class TraderReleasePinDocument(_Strict):
                 "run-manifest key; a trader pin cites the trader's own smoke or nothing"
             )
         return self
+
+
+class TraderPinRequestDocument(_Strict):
+    """`trader/pin_request.json` (:data:`crucible.keys.TRADER_PIN_REQUEST_KEY`) —
+    a QUEUED trader pin, `trader_pin_request.v1` (`alpha-engine-config-I11545`).
+
+    Not a pin and never read as one: it names the sha somebody asked the
+    trader to move to, and the pin it moved FROM when they asked. The pin
+    itself still moves only through `crucible.release.pin_trader` — inside the
+    off-market-hours window, on a passing `trader.smoke` for this sha — and
+    `crucible release.pin_apply` is the one scheduled caller that reads this
+    document to decide whether to try.
+
+    ``from_sha`` is what makes the request CONVERGENT rather than a queue: a
+    request is done when the pin already names ``sha``, and STALE when the pin
+    no longer names ``from_sha`` (somebody moved it by hand after asking, and
+    applying the old request would silently undo that). ``None`` when no
+    release had ever been pinned to the trader at request time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["trader_pin_request.v1"]
+    sha: GitSha = Field(description="The release the trader should be pinned to.")
+    from_sha: GitSha | None = Field(
+        description="`trader/release_pin`'s sha when the request was written; null if unset."
+    )
+    requested_by: str = Field(min_length=1, description="Who queued it (the dispatching actor).")
+    requested_at: str = Field(
+        pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+        description="UTC instant the request was written.",
+    )
+    run_url: str | None = Field(
+        description="The workflow run that wrote it; null when written outside Actions."
+    )
 
 
 #: How long after its sealed fire instant a drill may actually fire and still

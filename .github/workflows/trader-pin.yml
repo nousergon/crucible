@@ -1,0 +1,266 @@
+name: Trader pin
+
+# The AUTOMATED trader release pin (alpha-engine-config-I11545). Brian's
+# ruling: anyone may queue a sha at any time; the next clean post-close
+# evening smokes and pins it; promotion stays explicit.
+#
+#   * `workflow_dispatch` (input `sha`, and nothing else) QUEUES it:
+#     `crucible release.pin_request` writes `trader/pin_request.json` with the
+#     pin it was asked from. It moves no pointer.
+#   * the weekday `schedule` APPLIES it: `scripts/trader_pin_guard.py` reads
+#     whether this session's post-close pipeline finished cleanly, then
+#     `crucible release.pin_apply` pins the trader iff the request is still
+#     the one pending change — through `crucible.release.pin_trader`, the same
+#     off-market-hours window and passing-`trader.smoke` gate a human
+#     `release.pin --target trader` goes through, swapping against the pin
+#     version it read.
+#
+# Between the two, the executor box smokes the queued sha at midday
+# (crucible-executor's alpha-engine-trader-pin-smoke timer, crucible-trader's
+# `scripts/trader_pin_request_smoke.sh`), under the TRADER's identity. This
+# workflow never smokes anything: the smoke is the trader's evidence about
+# itself, and the pin reads it.
+#
+# ── The request is convergent, not a queue ────────────────────────────────
+#
+# One rolling document. `noop` when the pin already names its sha (done — or
+# cancelled, by requesting the current pin); `stale` when the pin no longer
+# names the `from_sha` it recorded (a human moved it after asking), which is a
+# failed run and a page, because applying it would silently undo that move;
+# `fresh` otherwise. A newer request overwrites an older one.
+#
+# ── The identity ──────────────────────────────────────────────────────────
+#
+# `${vars.CRUCIBLE_ROLE_PREFIX}-trader-pin`, created by nous-ergon-ops
+# (infrastructure/cloudformation/crucible-v2.yaml), NOT by this repository. It
+# may read what `release.pin_trader` reads, write exactly
+# `trader/pin_request.json`, `trader/release_pin` and its own two manifest
+# prefixes, and call `states:ListExecutions` on the post-close state machine.
+# It is not the deploy role (which moves `releases/current`, never the
+# trader's pin) and not the trader's own role (the running trader must never
+# be able to pin its own release). Until that stack apply lands, this workflow
+# fails on the identity check below, naming the remedy — the detector,
+# per pull-request-policy 4.2 form 3.
+#
+# ── Why the evening, and why a deadline ───────────────────────────────────
+#
+# 23:15 UTC is 19:15 EDT / 18:15 EST: after the post-close pipeline has
+# stopped the executor box (measured 17:10-17:50 New York time), and far from
+# the 05:00 ET start of the pin blackout even with this account's measured
+# GitHub Actions delivery lag (up to ~5h). `release.pin_apply` writes a
+# manifest every session whether or not anything was queued, and its
+# components.yaml row carries a deadline, so a cron GitHub silently dropped is
+# an ABSENCE page, never a queued request that quietly never moves.
+
+on:
+  schedule:
+    # Weekdays on CALENDAR time; the guard resolves the NYSE session and
+    # skips a holiday (§4.12: the scheduler runs on calendar time, the job
+    # resolves the trading day).
+    - cron: '15 23 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'The 40-hex release sha to queue for the trader. It must already be published (the deploy of that commit ran). The next clean post-close evening pins it if the trader smoke for it passed.'
+        required: true
+
+permissions: {}
+
+# Serialised and never cancelled: a request written while an apply is
+# mid-flight must not interrupt the apply's compare-and-swap, and the apply
+# reads whichever request is current when it starts.
+concurrency:
+  group: trader-pin
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  # No infrastructure literals in this public tree (crucible AGENTS.md,
+  # Visibility; tests/test_no_infra_literals.py): the account id, the role
+  # prefix, the store and the post-close state machine's NAME all come from
+  # repository variables.
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  TRADER_PIN_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.CRUCIBLE_ROLE_PREFIX }}-trader-pin
+  BOARD_ROLE_NAME: ${{ vars.CRUCIBLE_ROLE_PREFIX }}-board
+  STORE_URI: ${{ vars.CRUCIBLE_STORE_URI }}
+  POSTCLOSE_STATE_MACHINE: ${{ vars.CRUCIBLE_POSTCLOSE_STATE_MACHINE }}
+  # ── every value the package refuses to run without ─────────────────────
+  # Both jobs run crucible with `--run-mode live`, which
+  # tests/test_workflow_required_env.py reads as "reaches the production
+  # store". Neither job reads these; declaring them costs nothing, and the
+  # reverse is the dark board that test exists to prevent.
+  CRUCIBLE_MUTED_TOPIC: ${{ vars.CRUCIBLE_MUTED_TOPIC }}
+  CRUCIBLE_PAGES_TOPIC: ${{ vars.CRUCIBLE_PAGES_TOPIC }}
+  CRUCIBLE_LIQUIDITY_FLOOR_USD: ${{ vars.CRUCIBLE_LIQUIDITY_FLOOR_USD }}
+
+jobs:
+  request:
+    name: queue a sha for the trader's next clean pin
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      # First, before anything: the role's trust condition pins
+      # `ref:refs/heads/main`, and `workflow_dispatch` accepts any ref. A
+      # branch dispatch would otherwise fail at the assume with an error STS
+      # does not explain. `test_trader_pin_workflow.py` asserts this is
+      # steps[0] of both jobs.
+      - name: This workflow runs from `main` only
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::dispatched from '${{ github.ref }}'. The trader-pin role's OIDC trust pins ref:refs/heads/main. Re-dispatch with --ref main; the sha input is what selects the release, not the ref."
+          exit 1
+
+      # Validated as data, before checkout, and passed to the command through
+      # `env` rather than interpolated into shell text.
+      - name: The sha input is a 40-hex release sha
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::sha input '${SHA}' is not a 40-character lowercase git sha. The release layout is content-addressed by the full commit sha."
+            exit 1
+          fi
+
+      - name: Repository variables are set
+        run: |
+          missing=0
+          if [ -z "$AWS_ACCOUNT_ID" ]; then
+            echo "::error::repository variable AWS_ACCOUNT_ID is not set — set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/crucible --body '<12-digit-account-id>'"
+            missing=1
+          fi
+          if [ -z "$STORE_URI" ]; then
+            echo "::error::repository variable CRUCIBLE_STORE_URI is not set — set it with: gh variable set CRUCIBLE_STORE_URI --repo nousergon/crucible --body '<s3-uri-of-the-crucible-v2-store>'"
+            missing=1
+          fi
+          exit "$missing"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --frozen
+
+      # Public repo, public logs; GitHub masks secrets, not variables.
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          role-to-assume: ${{ env.TRADER_PIN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${TRADER_PIN_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${BOARD_ROLE_NAME}/"*) echo "::error::this job assumed the board identity, which is read-only over everything it grades. Point role-to-assume at ${expected}."; exit 1 ;; esac
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. If the role does not exist yet, the crucible-v2 stack has not been applied since the nous-ergon-ops PR that adds it (alpha-engine-config-I11545) merged. That apply is operator-gated as a security boundary: run bash scripts/apply_crucible_v2_stack.sh from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until then is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+
+      # `github.actor` and the run URL reach the request through the runner's
+      # own GITHUB_* environment, never as flags: the one input is the sha.
+      - name: Queue the sha
+        env:
+          SHA: ${{ inputs.sha }}
+        run: uv run crucible release.pin_request "$SHA" --run-mode live --store "$STORE_URI"
+
+  apply:
+    name: pin the trader to the queued sha after a clean post-close
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      - name: This workflow runs from `main` only
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::running from '${{ github.ref }}'. The trader-pin role's OIDC trust pins ref:refs/heads/main."
+          exit 1
+
+      - name: Repository variables are set
+        run: |
+          missing=0
+          if [ -z "$AWS_ACCOUNT_ID" ]; then
+            echo "::error::repository variable AWS_ACCOUNT_ID is not set — set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/crucible --body '<12-digit-account-id>'"
+            missing=1
+          fi
+          if [ -z "$STORE_URI" ]; then
+            echo "::error::repository variable CRUCIBLE_STORE_URI is not set — set it with: gh variable set CRUCIBLE_STORE_URI --repo nousergon/crucible --body '<s3-uri-of-the-crucible-v2-store>'"
+            missing=1
+          fi
+          if [ -z "$POSTCLOSE_STATE_MACHINE" ]; then
+            echo "::error::repository variable CRUCIBLE_POSTCLOSE_STATE_MACHINE is not set, so the guard cannot read whether tonight's post-close finished — set it with: gh variable set CRUCIBLE_POSTCLOSE_STATE_MACHINE --repo nousergon/crucible --body '<name-of-the-post-close-state-machine>'"
+            missing=1
+          fi
+          exit "$missing"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          role-to-assume: ${{ env.TRADER_PIN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${TRADER_PIN_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${BOARD_ROLE_NAME}/"*) echo "::error::this job assumed the board identity, which is read-only over everything it grades. Point role-to-assume at ${expected}."; exit 1 ;; esac
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. If the role does not exist yet, the crucible-v2 stack has not been applied since the nous-ergon-ops PR that adds it (alpha-engine-config-I11545) merged. That apply is operator-gated as a security boundary: run bash scripts/apply_crucible_v2_stack.sh from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until then is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+
+      # Emits `session` and `postclose` (clean / unclean / skip). Exits
+      # non-zero only when it could not take the reading; `unclean` is a
+      # reading, and `release.pin_apply` decides what it means (nothing, when
+      # nothing is queued).
+      - name: Read tonight's post-close
+        id: guard
+        env:
+          POSTCLOSE_STATE_MACHINE_ARN: arn:aws:states:${{ env.AWS_REGION }}:${{ vars.AWS_ACCOUNT_ID }}:stateMachine:${{ vars.CRUCIBLE_POSTCLOSE_STATE_MACHINE }}
+        run: uv run python scripts/trader_pin_guard.py
+
+      # A rehearsal first: the same reads and gates, every write captured and
+      # reported instead of performed (crucible AGENTS.md rule 1, --dry-run).
+      - name: Rehearse the apply
+        if: ${{ steps.guard.outputs.postclose != 'skip' }}
+        env:
+          SESSION: ${{ steps.guard.outputs.session }}
+          POSTCLOSE: ${{ steps.guard.outputs.postclose }}
+        run: uv run crucible release.pin_apply --date "$SESSION" --postclose "$POSTCLOSE" --run-mode live --store "$STORE_URI" --dry-run
+
+      - name: Apply the queued pin
+        if: ${{ steps.guard.outputs.postclose != 'skip' }}
+        env:
+          SESSION: ${{ steps.guard.outputs.session }}
+          POSTCLOSE: ${{ steps.guard.outputs.postclose }}
+        run: uv run crucible release.pin_apply --date "$SESSION" --postclose "$POSTCLOSE" --run-mode live --store "$STORE_URI"
+
+  notify-failure:
+    needs: [request, apply]
+    # A job killed at `timeout-minutes` concludes `cancelled`, not `failure`
+    # (alpha-engine-config-I11448). This workflow's concurrency never cancels a
+    # superseded run, so a `cancelled` need here is a timeout or a human.
+    if: ${{ always() && (failure() || contains(needs.*.result, 'cancelled')) }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@e9b7dee3aee8b1264c36955ccfbb9dad8f8d6a81
+    secrets: inherit
