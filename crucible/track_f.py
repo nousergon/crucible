@@ -40,7 +40,6 @@ from typing import Any
 from krepis.metrics import derive_status
 
 from crucible import gate as gate_module
-from crucible import tracker
 from crucible.documents import UnreadableDocumentError, read_store_document
 from crucible.gate import (
     CLOSING_READING_SCHEMA_VERSION,
@@ -59,6 +58,7 @@ from crucible.gate import (
     parse_closing_comment,
     phase_for_gate,
     render_closing_comment,
+    tracker_adapter,
 )
 from crucible.keys import closing_record_key, manifest_key
 from crucible.runmode import RUN_MODE_LIVE
@@ -135,20 +135,22 @@ def post_closing_comment(phase: Phase, body: str) -> str:
 
     It comments and it stops. Closing the issue is Brian's authority
     (`alpha-engine-config-I9967` deliverable 1 says so in as many words), and
-    `crucible.tracker` cannot construct any other mutating request.
+    the tracker adapter (`nousergon_lib.gates.tracker`) cannot construct any
+    other mutating request.
 
-    Raises `crucible.tracker.TrackerError` when the tracker cannot be reached
+    Raises `nousergon_lib.gates.tracker.TrackerError` when the tracker cannot be reached
     or the credential is not granted. Deliberately loud: this function is
     reached only when a phase gate reads MET for the first time on a live run,
     which happens six times in the life of the rebuild, and a record filed to
     the store while the tracker was never told is the same two-instruments
     defect one instrument along.
     """
-    for existing in tracker.comment_bodies(TRACKER_REPO, phase.issue):
+    adapter = tracker_adapter(TRACKER_REPO)
+    for existing in adapter.comment_bodies(phase.issue):
         block = parse_closing_comment(existing)
         if block is not None and block.get("phase") == phase.id:
             return phase.tracker_url
-    return tracker.post_comment(TRACKER_REPO, phase.issue, body)
+    return adapter.post_comment(phase.issue, body)
 
 
 def file_closing_record(

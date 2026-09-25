@@ -171,6 +171,7 @@ if TYPE_CHECKING:
     # --help` and every unit test that imports this module stay off the
     # heavy import path.
     from nousergon_lib.arena import ArmRegister
+    from nousergon_lib.gates.tracker import Opener, Tracker
 
 __all__ = [
     "ACCEPTANCE_RATCHET_PATH",
@@ -10075,6 +10076,74 @@ LADDER_KEY = _LIB_LADDER_KEY
 #: the console's `git-host` adapter mints for an issue, so the two claims merge
 #: into one row (`console-policy` §2.5) instead of rendering the phase twice.
 TRACKER_REPO = "nousergon/alpha-engine-config"
+
+#: The variable carrying the tracker credential. Named for crucible rather
+#: than for GitHub because it is scoped to ONE repository's issues and is not
+#: interchangeable with `GH_TOKEN`/`GITHUB_TOKEN`, which in this repository's
+#: workflows means "the Actions token for `nousergon/crucible`" and cannot
+#: read the tracker at all. Passed to `nousergon_lib.gates.tracker` as
+#: configuration (`alpha-engine-config-I10953`): the lib adapter names no
+#: caller's variables, and a second system on the same tracker declares its
+#: own, so one system's grant can never silently serve the other's job.
+TRACKER_TOKEN_VAR = "CRUCIBLE_TRACKER_TOKEN"
+
+#: The variable naming the SSM prefix under which the fleet's GitHub App
+#: credentials live (`{prefix}github_app_id`, `_installation_id`,
+#: `_private_key`). When set, the adapter mints a SHORT-LIVED installation
+#: token narrowed to `issues: write` rather than reading a long-lived token.
+#: An explicit :data:`TRACKER_TOKEN_VAR` still wins (a laptop run with a token
+#: in hand). A repository VARIABLE, not a secret: it names where the
+#: credentials are, never what they are.
+TRACKER_APP_SSM_PREFIX_VAR = "CRUCIBLE_TRACKER_APP_SSM_PREFIX"
+
+
+def tracker_grant_command(repo: str) -> str:
+    """The exact operator step that grants the tracker adapter its credential.
+
+    Emitted verbatim onto every surface that is red for want of it — the
+    lib adapter appends it to each credential-absence message. An operator
+    step recorded in an issue and nowhere else is `alpha-engine-config-I1906`,
+    closed as *fixed* on a PR whose command was never run. The grant is the
+    crucible-v2 stack's BoardRole reading the fleet App's three SSM parameters
+    plus the repository variable naming their prefix; a long-lived token in
+    :data:`TRACKER_TOKEN_VAR` is the laptop override, not the grant. Short on
+    purpose: it is rendered on six board rows.
+    """
+    return (
+        f"set repo variable {TRACKER_APP_SSM_PREFIX_VAR} to the fleet GitHub App's SSM "
+        "prefix and apply the crucible-v2 stack (BoardRole reads {prefix}github_app_*; "
+        f"the App holds Issues: write on {repo}); laptop: export {TRACKER_TOKEN_VAR}"
+    )
+
+
+def tracker_adapter(repo: str = TRACKER_REPO, *, opener: Opener | None = None) -> Tracker:
+    """The tracker adapter for ``repo``, configured with crucible's credential.
+
+    `nousergon_lib.gates.tracker.Tracker` is the ONE adapter
+    (`alpha-engine-config-I10953`, lifted by `-I10951`): it may comment,
+    create, and rewrite a body, and it may never close — there is no close
+    method, and `update_issue_body`'s payload is the literal `{"body": ...}`.
+    What stays here is only crucible's vocabulary: which repository, which two
+    variables, and the grant command. Built per call, so a test that
+    substitutes the lib's module-level opener reaches every adapter this
+    package constructs. ``opener`` is the lib's injectable transport, for a
+    test that exercises the real request construction without a socket;
+    production passes nothing.
+    """
+    from nousergon_lib.gates.tracker import (  # noqa: PLC0415 - lazy: urllib, few call sites
+        Tracker,
+        TrackerConfig,
+    )
+
+    return Tracker(
+        TrackerConfig(
+            repo=repo,
+            token_var=TRACKER_TOKEN_VAR,
+            app_ssm_prefix_var=TRACKER_APP_SSM_PREFIX_VAR,
+            grant_hint=tracker_grant_command(repo),
+        ),
+        opener=opener,
+    )
 
 
 @dataclass(frozen=True)

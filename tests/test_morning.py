@@ -37,9 +37,11 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+import nousergon_lib.gates.tracker as tracker_module
 import pytest
 import yaml
 from botocore.exceptions import ClientError
+from nousergon_lib.gates.tracker import TrackerError
 
 from crucible.cli import HANDLERS, JOBS
 from crucible.components import load_registry
@@ -85,7 +87,6 @@ from crucible.morning import (
     wire_length,
 )
 from crucible.store import LocalStore
-from crucible.tracker import TrackerError
 
 TRACKER_REPO = "nousergon/alpha-engine-config"
 
@@ -154,14 +155,14 @@ def _freeze_morning_now(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def _refuse_real_tracker_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     """No test in this module may reach the network. Every test that drives
-    `morning_handler` down the live path stubs `crucible.morning.tracker`
+    `morning_handler` down the live path stubs the tracker adapter's methods
     explicitly (`_stub_tracker`); anything that reaches the real HTTP opener
-    without doing so fails loudly rather than trying a real socket."""
+    without doing so fails loudly rather than trying a real socket. The
+    opener is the lib's module-level default, read when each adapter is
+    built — `crucible.gate.tracker_adapter` builds one per call."""
 
     def _refuse(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("a test reached crucible.tracker's real HTTP opener")
-
-    import crucible.tracker as tracker_module
+        raise AssertionError("a test reached the tracker adapter's real HTTP opener")
 
     monkeypatch.setattr(tracker_module, "_default_opener", _refuse)
 
@@ -321,38 +322,44 @@ def _stub_tracker(
     create_raises: Exception | None = None,
     update_body_raises: Exception | None = None,
 ) -> dict[str, list[Any]]:
-    """Stub every tracker call `morning_handler`'s live path can make, and
+    """Stub every tracker request `morning_handler`'s live path can make, and
     record what each was called with. Returns the call log so a test can
-    assert on ORDER and ARGUMENTS without touching the network."""
+    assert on ORDER and ARGUMENTS without touching the network.
+
+    The four primitives of `nousergon_lib.gates.tracker.Tracker` are
+    replaced; `find_or_create_issue`, which composes two of them, stays the
+    real method, and the repository each call logs is the one the ADAPTER
+    was configured with — so a wrong `repo` reaching `tracker_adapter` is
+    visible here exactly as it would be at GitHub."""
     calls: dict[str, list[Any]] = {"find": [], "create": [], "post": [], "update_body": []}
 
-    def _find(repo: str, title: str, **kwargs: Any) -> int | None:
-        calls["find"].append((repo, title))
+    def _find(self: Any, title: str) -> int | None:
+        calls["find"].append((self.config.repo, title))
         if find_raises is not None:
             raise find_raises
         return existing_issue
 
-    def _create(repo: str, title: str, body: str, **kwargs: Any) -> tuple[int, str]:
-        calls["create"].append((repo, title, body))
+    def _create(self: Any, *, title: str, body: str) -> int:
+        calls["create"].append((self.config.repo, title, body))
         if create_raises is not None:
             raise create_raises
-        return 1, f"https://github.com/{repo}/issues/1"
+        return 1
 
-    def _post(repo: str, issue: int, body: str, **kwargs: Any) -> str:
-        calls["post"].append((repo, issue, body))
+    def _post(self: Any, issue: int, body: str) -> str:
+        calls["post"].append((self.config.repo, issue, body))
         if post_raises is not None:
             raise post_raises
         return comment_url
 
-    def _update_body(repo: str, issue: int, body: str, **kwargs: Any) -> None:
-        calls["update_body"].append((repo, issue, body))
+    def _update_body(self: Any, issue: int, body: str) -> None:
+        calls["update_body"].append((self.config.repo, issue, body))
         if update_body_raises is not None:
             raise update_body_raises
 
-    monkeypatch.setattr("crucible.morning.tracker.find_issue_by_title", _find)
-    monkeypatch.setattr("crucible.morning.tracker.create_issue", _create)
-    monkeypatch.setattr("crucible.morning.tracker.post_comment", _post)
-    monkeypatch.setattr("crucible.morning.tracker.update_issue_body", _update_body)
+    monkeypatch.setattr(tracker_module.Tracker, "find_issue_by_title", _find)
+    monkeypatch.setattr(tracker_module.Tracker, "create_issue", _create)
+    monkeypatch.setattr(tracker_module.Tracker, "post_comment", _post)
+    monkeypatch.setattr(tracker_module.Tracker, "update_issue_body", _update_body)
     return calls
 
 
@@ -766,7 +773,7 @@ class TestTheFullUpdate:
         self, tmp_path
     ):
         """The full update is a GitHub comment body, not a Telegram HTML
-        payload — running board free text through `_escape_html` here would
+        payload — running board free text through `report.escape` here would
         print literal `&amp;` where the board said `&`."""
         hostile = "Tom & Jerry <ok> if 2<3"
         rows = [_row("phase0", "phase", "UNMET", hostile)]
@@ -1452,9 +1459,9 @@ class TestTheJob:
             raise AssertionError("--dry-run must not reach this")
 
         monkeypatch.setattr("crucible.morning._krepis_publish", refuse)
-        monkeypatch.setattr("crucible.morning.tracker.find_issue_by_title", refuse)
-        monkeypatch.setattr("crucible.morning.tracker.create_issue", refuse)
-        monkeypatch.setattr("crucible.morning.tracker.post_comment", refuse)
+        monkeypatch.setattr(tracker_module.Tracker, "find_issue_by_title", refuse)
+        monkeypatch.setattr(tracker_module.Tracker, "create_issue", refuse)
+        monkeypatch.setattr(tracker_module.Tracker, "post_comment", refuse)
 
         assert morning_handler(_args(tmp_path, dry_run=True)) == 0
         keys = [k for k in store.list_keys(f"runs/{MORNING_JOB}/") if k.endswith("run.json")]
@@ -1661,10 +1668,10 @@ class TestTheJobRebuildsTheHistoryIndex:
             raise AssertionError("--dry-run must not reach this")
 
         monkeypatch.setattr("crucible.morning._krepis_publish", refuse)
-        monkeypatch.setattr("crucible.morning.tracker.find_issue_by_title", refuse)
-        monkeypatch.setattr("crucible.morning.tracker.create_issue", refuse)
-        monkeypatch.setattr("crucible.morning.tracker.post_comment", refuse)
-        monkeypatch.setattr("crucible.morning.tracker.update_issue_body", refuse)
+        monkeypatch.setattr(tracker_module.Tracker, "find_issue_by_title", refuse)
+        monkeypatch.setattr(tracker_module.Tracker, "create_issue", refuse)
+        monkeypatch.setattr(tracker_module.Tracker, "post_comment", refuse)
+        monkeypatch.setattr(tracker_module.Tracker, "update_issue_body", refuse)
 
         assert morning_handler(_args(tmp_path, dry_run=True)) == 0
 
