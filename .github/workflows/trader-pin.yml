@@ -38,9 +38,10 @@ name: Trader pin
 # prefixes, and call `states:ListExecutions` on the post-close state machine.
 # It is not the deploy role (which moves `releases/current`, never the
 # trader's pin) and not the trader's own role (the running trader must never
-# be able to pin its own release). Until that stack apply lands, this workflow
-# fails on the identity check below, naming the remedy — the detector,
-# per pull-request-policy 4.2 form 3.
+# be able to pin its own release). nous-ergon-ops applies that stack on merge
+# (`crucible-v2-stack-apply.yml`), with no operator step; until the role
+# exists, this workflow fails on the identity check below, naming where to
+# look.
 #
 # ── Why the evening, and why a deadline ───────────────────────────────────
 #
@@ -163,7 +164,7 @@ jobs:
           assumed="$(aws sts get-caller-identity --query Arn --output text)"
           expected="${TRADER_PIN_ROLE_ARN##*/}"
           case "${assumed}" in *":assumed-role/${BOARD_ROLE_NAME}/"*) echo "::error::this job assumed the board identity, which is read-only over everything it grades. Point role-to-assume at ${expected}."; exit 1 ;; esac
-          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. If the role does not exist yet, the crucible-v2 stack has not been applied since the nous-ergon-ops PR that adds it (alpha-engine-config-I11545) merged. That apply is operator-gated as a security boundary: run bash scripts/apply_crucible_v2_stack.sh from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until then is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. If the role does not exist yet, the nous-ergon-ops PR that adds it (alpha-engine-config-I11545) has not merged, or the crucible-v2 stack apply that merge triggers has not succeeded. No operator step is involved: nous-ergon-ops .github/workflows/crucible-v2-stack-apply.yml applies the stack on every merge that touches the template. Check that workflow's latest apply job on main (it is re-runnable by workflow_dispatch), then re-run this workflow."; exit 1 ;; esac
 
       # `github.actor` and the run URL reach the request through the runner's
       # own GITHUB_* environment, never as flags: the one input is the sha.
@@ -228,7 +229,7 @@ jobs:
           assumed="$(aws sts get-caller-identity --query Arn --output text)"
           expected="${TRADER_PIN_ROLE_ARN##*/}"
           case "${assumed}" in *":assumed-role/${BOARD_ROLE_NAME}/"*) echo "::error::this job assumed the board identity, which is read-only over everything it grades. Point role-to-assume at ${expected}."; exit 1 ;; esac
-          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. If the role does not exist yet, the crucible-v2 stack has not been applied since the nous-ergon-ops PR that adds it (alpha-engine-config-I11545) merged. That apply is operator-gated as a security boundary: run bash scripts/apply_crucible_v2_stack.sh from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until then is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. If the role does not exist yet, the nous-ergon-ops PR that adds it (alpha-engine-config-I11545) has not merged, or the crucible-v2 stack apply that merge triggers has not succeeded. No operator step is involved: nous-ergon-ops .github/workflows/crucible-v2-stack-apply.yml applies the stack on every merge that touches the template. Check that workflow's latest apply job on main (it is re-runnable by workflow_dispatch), then re-run this workflow."; exit 1 ;; esac
 
       # Emits `session` and `postclose` (clean / unclean / skip). Exits
       # non-zero only when it could not take the reading; `unclean` is a

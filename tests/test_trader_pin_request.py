@@ -32,10 +32,11 @@ from crucible.release import (
     build_trader_pin_request,
     pending_trader_pin,
     pin_trader,
+    read_trader_pin,
     read_trader_pin_request,
     write_trader_pin_request,
 )
-from crucible.store import LocalStore, PointerConflictError
+from crucible.store import ETAG_ABSENT, LocalStore, PointerConflictError
 
 SHA_C = "c" * 40
 #: Tuesday 2026-09-08 — the session every apply below binds to.
@@ -141,6 +142,126 @@ class TestTheReader:
         store.list_keys = refused  # type: ignore[method-assign]
         with pytest.raises(PermissionError):
             read_trader_pin_request(store)
+
+
+class _ListOnlyAbsenceStore(LocalStore):
+    """S3 as `trader-pin.yml`'s role sees it: a HEAD or GET on a key
+    that is NOT there is AccessDenied, not a 404, because the role holds no
+    unconditioned `s3:ListBucket`; a listing of an exact key it is granted
+    works. A HEAD or GET on a key that exists needs only `s3:GetObject`. A
+    conditional PUT is checked SERVER-side, so the backend's own version read
+    inside :meth:`compare_and_swap` is not the caller's HEAD and is not refused."""
+
+    _server_side = False
+
+    def _refuse_if_absent(self, key: str) -> None:
+        if not self._server_side and not LocalStore.exists(self, key):
+            raise PermissionError(f"AccessDenied: HeadObject {key} (no s3:ListBucket)")
+
+    def compare_and_swap(self, key: str, expected: str, payload: bytes) -> str:
+        self._server_side = True
+        try:
+            return LocalStore.compare_and_swap(self, key, expected, payload)
+        finally:
+            self._server_side = False
+
+    def exists(self, key: str) -> bool:
+        self._refuse_if_absent(key)
+        return True
+
+    def etag(self, key: str) -> str:
+        self._refuse_if_absent(key)
+        return LocalStore.etag(self, key)
+
+    def get_bytes(self, key: str) -> bytes:
+        self._refuse_if_absent(key)
+        return LocalStore.get_bytes(self, key)
+
+
+class TestTheNeverSetPinUnderAListOnlyGrant:
+    """The pin has never been set in production (`trader/release_pin` is
+    NoSuchKey, measured 2026-09-25), so the FIRST request and the FIRST apply
+    both read an absent pin, as an identity whose HEAD on it is a 403. Absence
+    must come from the exact-key listing, never from a HEAD."""
+
+    def _store(self, tmp_path):
+        seed = LocalStore(tmp_path)
+        for sha in (SHA_A, SHA_B):
+            _published(seed, sha)
+        store = _ListOnlyAbsenceStore(tmp_path)
+        with pytest.raises(PermissionError):
+            store.etag(TRADER_PIN_KEY)  # the premise: a HEAD would 403
+        return store
+
+    def test_the_absent_pin_reads_as_unset_not_as_access_denied(self, tmp_path) -> None:
+        assert read_trader_pin(self._store(tmp_path)) == (None, ETAG_ABSENT)
+
+    def test_a_set_pin_reads_with_its_version(self, tmp_path) -> None:
+        store = self._store(tmp_path)
+        _pinned_to(LocalStore(tmp_path), SHA_A)  # the operator, who may HEAD anything
+        assert read_trader_pin(store) == (SHA_A, store.etag(TRADER_PIN_KEY))
+
+    def test_a_sibling_key_does_not_read_as_the_pin(self, tmp_path) -> None:
+        store = self._store(tmp_path)
+        store.put_bytes(TRADER_PIN_KEY + ".bak", b"{}")
+        assert read_trader_pin(store) == (None, ETAG_ABSENT)
+
+    def test_an_unlistable_pin_is_a_failure_not_an_absence(self, tmp_path) -> None:
+        store = self._store(tmp_path)
+
+        def refused(prefix=""):
+            raise PermissionError("AccessDenied: s3:ListBucket")
+
+        store.list_keys = refused  # type: ignore[method-assign]
+        with pytest.raises(PermissionError):
+            read_trader_pin(store)
+
+    def test_the_first_request_records_a_null_from_sha(self, tmp_path) -> None:
+        document = _request(self._store(tmp_path), SHA_B)
+        assert document.from_sha is None
+
+    def test_the_first_request_reads_as_fresh_against_the_absent_pin(self, tmp_path) -> None:
+        store = self._store(tmp_path)
+        _request(store, SHA_B)
+        pending = pending_trader_pin(store)
+        assert (pending.state, pending.pin_sha, pending.pin_version) == (
+            "fresh",
+            None,
+            ETAG_ABSENT,
+        )
+
+    def test_the_first_apply_creates_the_pin(self, tmp_path, monkeypatch) -> None:
+        store = self._store(tmp_path)
+        _request(store, SHA_B)
+        _trader_smoke_manifest(store, SHA_B, finished_hour=19)
+        monkeypatch.setattr(track_c, "_now", lambda: AFTER_CLOSE)
+        monkeypatch.setattr(track_c, "_store", lambda _args: store)
+        args = argparse.Namespace(
+            postclose="clean", store=str(tmp_path), trading_day=SESSION, run_mode="live"
+        )
+        assert track_c.release_pin_apply_handler(args) == 0
+        assert json.loads(store.get_bytes(TRADER_PIN_KEY))["sha"] == SHA_B
+        assert pending_trader_pin(store).state == "noop"
+
+    def test_the_first_apply_loses_to_a_pin_created_after_its_read(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """`IfNoneMatch: *` is the create's compare-and-swap: a pin created
+        between the read and the swap is not overwritten."""
+        store = self._store(tmp_path)
+        _request(store, SHA_B)
+        _trader_smoke_manifest(store, SHA_B, finished_hour=19)
+        read_before = pending_trader_pin(store)
+        _pinned_to(LocalStore(tmp_path), SHA_A)  # the operator pins first
+        monkeypatch.setattr(track_c, "_now", lambda: AFTER_CLOSE)
+        monkeypatch.setattr(track_c, "_store", lambda _args: store)
+        monkeypatch.setattr(release, "pending_trader_pin", lambda _store: read_before)
+        args = argparse.Namespace(
+            postclose="clean", store=str(tmp_path), trading_day=SESSION, run_mode="live"
+        )
+        with pytest.raises(PointerConflictError):
+            track_c.release_pin_apply_handler(args)
+        assert json.loads(store.get_bytes(TRADER_PIN_KEY))["sha"] == SHA_A
 
 
 class TestPending:

@@ -138,6 +138,7 @@ __all__ = [
     "passing_trader_smoke",
     "pending_trader_pin",
     "pin_trader",
+    "read_trader_pin",
     "read_trader_pin_request",
     "read_trader_smoke",
     "write_trader_pin_request",
@@ -1347,7 +1348,7 @@ def build_trader_pin_request(
             f"refusing to queue a trader pin to {sha}: no wheel at {wheel}. The pin would "
             "refuse it too, so the request could never be applied."
         )
-    from_sha, _ = read_pointer(store, TRADER_PIN_KEY)
+    from_sha, _ = read_trader_pin(store)
     document: dict[str, Any] = {
         "schema_version": TRADER_PIN_REQUEST_SCHEMA_VERSION,
         "sha": sha,
@@ -1382,18 +1383,47 @@ def write_trader_pin_request(
     return model
 
 
+def _listed(store: Store, key: str) -> bool:
+    """Whether ``key`` exists, answered by LISTING that exact key, never a HEAD.
+
+    A HEAD (or GET) on an absent key is a 404 only to a principal holding an
+    UNCONDITIONED `s3:ListBucket`, and a 403 to everyone else — a
+    prefix-conditioned list grant does not change that, because the implicit
+    list check behind a HEAD carries no `s3:prefix`. So for the narrowly-scoped
+    identities that read the queued trader pin (`trader-pin.yml`'s role,
+    the trader box), "not there" would read as a permissions failure. A listing
+    IS grantable on one exact key (`s3:prefix` = that key), and a listing that
+    is refused raises — it never reads as "absent". Membership is exact: the
+    listing is by prefix, so a sibling such as ``<key>.bak`` never counts.
+    """
+    return key in set(store.list_keys(key))
+
+
+def read_trader_pin(store: Store) -> tuple[str | None, str]:
+    """:func:`read_pointer` for `trader/release_pin`, with ABSENCE established
+    by :func:`_listed` first: ``(None, ETAG_ABSENT)`` when the pin was never
+    set, so the caller's compare-and-swap creates it (`IfNoneMatch: *`).
+
+    The queued-pin path (`release.pin_request`, `release.pin_apply`) reads the
+    pin through this, because it runs as an identity that may list the pin's
+    exact key but holds no bucket-wide list, and the pin is ABSENT until its
+    first move. Only when the key is listed is it HEADed and read, and a HEAD
+    on a key that exists needs nothing but `s3:GetObject`. The operator's
+    `release.pin` keeps calling :func:`read_pointer` directly.
+    """
+    if not _listed(store, TRADER_PIN_KEY):
+        return None, ETAG_ABSENT
+    return read_pointer(store, TRADER_PIN_KEY)
+
+
 def read_trader_pin_request(store: Store) -> tuple[TraderPinRequestDocument, bytes] | None:
     """The queued request and its bytes, or ``None`` when nothing was ever queued.
 
-    Presence is answered by LISTING the exact key rather than a HEAD: a HEAD
-    on an absent key is a 404 only to a principal holding an unconditioned
-    `s3:ListBucket`, and a 403 to everyone else, so "not there" would read as
-    a permissions failure for exactly the narrowly-scoped identities that read
-    this document. A listing is grantable on this one key (`s3:prefix`), and a
-    listing that is refused raises — it never reads as "no request".
+    Presence is answered by :func:`_listed` — a listing of the exact key,
+    never a HEAD — and a listing that is refused raises: it never reads as
+    "no request".
     """
-    listed = store.list_keys(TRADER_PIN_REQUEST_KEY)
-    if TRADER_PIN_REQUEST_KEY not in set(listed):
+    if not _listed(store, TRADER_PIN_REQUEST_KEY):
         return None
     payload = store.get_bytes(TRADER_PIN_REQUEST_KEY)
     try:
@@ -1455,7 +1485,7 @@ def pending_trader_pin(store: Store) -> PendingTraderPin:
     ``from_sha`` says.
     """
     read = read_trader_pin_request(store)
-    pin_sha, pin_version = read_pointer(store, TRADER_PIN_KEY)
+    pin_sha, pin_version = read_trader_pin(store)
     if read is None:
         return PendingTraderPin("none", None, None, pin_sha, pin_version)
     request, payload = read
