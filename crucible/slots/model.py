@@ -88,7 +88,12 @@ from crucible.keys import (
     shadow_key,
     strategy_arms_prefix,
 )
-from crucible.slots.arms import SupersededArmUndeclaredError, resolve_declared_lineage
+from crucible.slots.arms import (
+    SupersededArmUndeclaredError,
+    read_register,
+    register_arms,
+    resolve_declared_lineage,
+)
 from crucible.slots.inputs import (
     PER_ARM_REFUSALS,
     BaseCoverage,
@@ -3838,8 +3843,20 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     grades: dict[str, dict[str, Any]] = {}
     candidates: dict[str, dict[str, Any]] = {}
     windows: dict[str, str] = {}
+    absent = _not_yet_registered(ctx, specs, as_of=as_of)
     for spec in _in_dependency_order(specs):
         recipe = spec.recipe
+        if spec.arm_id in absent:
+            # `alpha-engine-config-I11037`. An arm filed or created after the
+            # graded day did not exist on it, so it has no CPCV reading and no
+            # serving precondition to evaluate FOR that day — computing either
+            # would be grading an arm over a period it was absent from. It is
+            # not dropped silently: `run_grade` below registers the same set,
+            # the library excludes it from the cycle and names it in
+            # `ArenaCycle.not_yet_registered_arms`, and
+            # `crucible.slots.cycle.NOT_YET_REGISTERED_METRIC` puts that name,
+            # its reason and both dates on this run's manifest.
+            continue
         try:
             panel = _grade_panel(recipe, source=source, as_of=as_of, loaded=loaded, ctx=ctx)
         except PER_ARM_REFUSALS as exc:
@@ -3938,6 +3955,21 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         {"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused
     ]
     return result
+
+
+def _not_yet_registered(
+    ctx: Any, specs: Sequence[RegisteredModelArm], *, as_of: str
+) -> frozenset[str]:
+    """The arm ids in ``specs`` that did not exist on ``as_of``.
+
+    `alpha-engine-config-I11037`. Read off the register exactly as
+    `crucible.slots.cycle.run_grade` will fold it — the stored log plus this
+    run's own appends, filed on ``as_of`` — so this loop and the library's
+    cycle agree on which arms the day contains. Nothing is written here;
+    `run_grade` is the one writer of the register.
+    """
+    register, _ = register_arms(read_register(ctx.store, SLOT), list(specs), filed_on=as_of)
+    return frozenset(register.not_yet_registered(as_of))
 
 
 def _record_dead_slot_finding(ctx: Any, grades: dict[str, dict[str, Any]], *, as_of: str) -> None:

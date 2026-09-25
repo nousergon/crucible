@@ -276,7 +276,7 @@ def _promote(args: argparse.Namespace) -> int:
             # on evidence, and the phase-3 promotion clause must not read one.
             return
 
-        inputs = load_slot_inputs(store, args.slot)
+        inputs = load_slot_inputs(store, args.slot, as_of=as_of)
         # `alpha-engine-config-I10679`: the cycle `experiment.grade` computed
         # an hour earlier, read back rather than recomputed — the pointer
         # decision, the retirement verdicts and the serving preconditions

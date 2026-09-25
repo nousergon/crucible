@@ -100,9 +100,11 @@ __all__ = [
     "INCUMBENT_SOURCE_FIELD",
     "SECTOR_SOURCE_MODE_FIELD",
     "MIN_ACTIVE_ARMS_FINDING_METRIC",
+    "NOT_YET_REGISTERED_METRIC",
     "MissingArtifactError",
     "baseline_control_arm",
     "min_active_arms_finding",
+    "not_yet_registered_metric",
     "partition_by_catalog",
     "refusal_metric",
     "run_grade",
@@ -158,6 +160,20 @@ SECTOR_MODE_UNRECORDED = "unrecorded"
 #: three control/pointer metrics rather than having to open the `arena_cycle`
 #: artifact to learn the slot is unservable.
 MIN_ACTIVE_ARMS_FINDING_METRIC = "min_active_arms_finding"
+
+#: `alpha-engine-config-I11037`: the metric naming every registered arm that
+#: did NOT exist on the graded trading day, on the grade job's own manifest.
+#:
+#: A cycle graded as of D contains only the arms that were in the arena on D
+#: (`nousergon_lib.arena.engine.run_cycle`, `alpha-engine-config-I11084`); an
+#: arm filed or created after D is EXCLUDED, not aged, and the library names
+#: it in `ArenaCycle.not_yet_registered_arms`. That field lives inside the
+#: `arena_cycle` artifact. This row puts the same fact on the manifest an
+#: operator actually reads, with the arm, the reason and both dates, and it is
+#: filed on EVERY grade — including as a zero — whatever the pointer decided:
+#: a requirement the grader narrowed is a fact about the reading, the same
+#: rule `crucible.gate._unregistered_note` applies on the gate side.
+NOT_YET_REGISTERED_METRIC = "arms_not_yet_registered"
 
 #: The metric one refused arm files on the producing job's manifest — the
 #: same name the M slot uses (`crucible.slots.model.ARM_REFUSED_METRIC`),
@@ -1510,6 +1526,7 @@ def run_grade(
             "last_updated_utc": _utc_now(),
         }
     )
+    ctx.record_metric(not_yet_registered_metric(cycle, slot=slot, source_path=cycle_key))
     ctx.record_metric(
         {
             # `alpha-engine-config-I10636`: rendered unconditionally, with an
@@ -1535,6 +1552,9 @@ def run_grade(
         "arena_cycle_key": cycle_key,
         "scored_arms": list(cycle.scored_arms),
         "active_arms": list(cycle.active_arms),
+        # `alpha-engine-config-I11037`: the arms this day's cycle excluded
+        # because they did not exist yet, each with its reason and both dates.
+        "not_yet_registered_arms": [e.to_dict() for e in cycle.not_yet_registered_arms],
         "promotable_arms": promotable,
         MIN_ACTIVE_ARMS_FINDING_METRIC: floor_finding,
         INCUMBENT_SOURCE_FIELD: incumbent_source,
@@ -1554,6 +1574,37 @@ def run_grade(
             for arm, scores in sorted(verdicts.items())
             for day in sorted(scores)
         ],
+    }
+
+
+def not_yet_registered_metric(cycle: Any, *, slot: str, source_path: str) -> dict[str, Any]:
+    """The :data:`NOT_YET_REGISTERED_METRIC` row for one graded cycle.
+
+    `alpha-engine-config-I11037`. Status `OK` in both directions: an arm that
+    did not exist on the graded day is a non-question, not a fault, so naming
+    it must never page. `n_floor: 0` and a row filed even when nothing was
+    excluded, because a component emitting nothing is unobserved rather than
+    healthy — and "zero arms were excluded" is the reading that tells a later
+    reader the cycle's arm count is the register's.
+    """
+    excluded = tuple(cycle.not_yet_registered_arms)
+    named = "; ".join(f"{e.arm_id}: {e.reason}" for e in excluded)
+    return {
+        "name": NOT_YET_REGISTERED_METRIC,
+        "module": f"crucible.slots.{slot}",
+        "metric_type": "count",
+        "value": float(len(excluded)),
+        "unit": "arms",
+        "n_floor": 0,
+        "status": "OK",
+        "status_reason": (
+            f"{len(excluded)} registered arm(s) did not exist on {cycle.as_of} and are "
+            f"excluded from this day's cycle, not scored and not aged: {named}"
+            if excluded
+            else f"every registered arm existed on {cycle.as_of}; none was excluded"
+        ),
+        "source_path": source_path,
+        "last_updated_utc": _utc_now(),
     }
 
 
