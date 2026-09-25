@@ -30,10 +30,11 @@ already landed.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from crucible.calendar import resolve_trading_day
@@ -62,17 +63,20 @@ __all__ = [
     "ARM_FILING_CORRECTIONS",
     "MIGRATABLE_SLOTS",
     "SOURCES",
+    "V1_SERVED_MODEL",
     "ArmFilingCorrection",
     "ArmFilingMigrationReport",
     "CodeShaMigrationReport",
     "MigrationPointerConflict",
     "MigrationSourceMissing",
+    "V1ModelTree",
     "V1Source",
     "admission_refusal",
     "read_v1_json",
     "run_migrate_arm_filed_on",
     "run_migrate_code_sha",
     "run_migrate_history",
+    "served_model_recipe",
 ]
 
 
@@ -114,6 +118,14 @@ class V1Source:
     #: `last_promoted_on: null`, and no `promoted_at` — so reading
     #: `promoted_at` there failed every real U import.
     date_field: str | None = None
+    #: How the champion NAME above resolves to a v2 recipe. ``"name"`` (U, R):
+    #: v1 and v2 spell the arm the same way, and ``arm_recipes`` is keyed by
+    #: recipe name. :data:`V1_SERVED_MODEL` (M): v1 names a served MODEL
+    #: VERSION, no v2 recipe carries that name, and the recipe is the one
+    #: :func:`served_model_recipe` identifies from the recipes' own
+    #: `supersedes_v1` declarations (`alpha-engine-config-I10961`
+    #: deliverable 2).
+    resolves_by: str = "name"
 
     def series_prefix(self) -> str:
         """The v1 listing prefix for a dated series: everything before the
@@ -142,21 +154,37 @@ def _zoo_champion_arch(document: dict[str, Any]) -> str | None:
     """v1's M champion, which is not a pointer document but a FIELD of the zoo
     leaderboard (`alpha-engine-config-I10961` deliverable 2).
 
-    `champion_arch` is the serving architecture and
-    `serving_champion.served_version` the exact model it resolves to; the NAME
-    v2 maps to a recipe is the architecture. The leaderboard's own `champion`
-    key is a metrics block and is deliberately not read here.
+    Returns `serving_champion.served_version` — the exact model v1 SERVES —
+    and never `champion_arch.version_id`. The two differ, and measured
+    2026-09-25 they did: `champion_arch` is the latest REFRESH of the serving
+    architecture (`v3.0-meta-2026-09-23-d7f8f864`, a promotion baseline that
+    was never served), while `served_version` is what the predictor loads
+    (`v3.0-meta-2026-08-14-119e069b`). v1's lineage is the served one, and the
+    served version is also the only identity a v2 recipe declares
+    (`supersedes_v1`), so it is the name :func:`served_model_recipe` resolves.
+    A v1 that re-serves a new version therefore DEFERS the import rather than
+    attaching the new model's track record to a port of the old one.
+
+    `champion_arch: null` is v1 declaring no serving architecture: no
+    champion, reported as such by the caller. The leaderboard's own
+    `champion` key is a metrics block and is deliberately not read here.
     """
     if document.get("champion_arch") is None:
         return None
     serving = document.get("serving_champion")
-    if not isinstance(serving, dict) or not isinstance(serving.get("served_version"), str):
+    served = serving.get("served_version") if isinstance(serving, dict) else None
+    if not isinstance(served, str) or not served:
         raise MigrationSourceMissing(
-            "the v1 zoo leaderboard declares a `champion_arch` and no "
-            "`serving_champion.served_version`, so the model v1 actually serves cannot be "
-            "named and its lineage cannot be carried."
+            f"the v1 zoo leaderboard names its serving architecture "
+            f"({V1_ZOO_CHAMPION_NAME}) and no `serving_champion.served_version`, so the "
+            "model v1 actually serves cannot be named and its lineage cannot be carried."
         )
-    return V1_ZOO_CHAMPION_NAME
+    return served
+
+
+#: :attr:`V1Source.resolves_by` for a source whose champion is a served model
+#: version rather than an arm name.
+V1_SERVED_MODEL = "supersedes_v1"
 
 
 #: The exhaustive source list, with the literal v1 keys as they appear in the
@@ -202,9 +230,8 @@ SOURCES: tuple[V1Source, ...] = (
         key="predictor/model_zoo/promotions/{date}.json",
         slot="m",
         contributes=(
-            "M's promotion markers, including promoted_kind. Imported as lineage only "
-            "— the M slot's arms arrive with track B, and an imported pointer with no "
-            "arms to point at would be a champion with no register row."
+            "M's promotion markers, including promoted_kind. Lineage only: M's champion "
+            "is read from the zoo leaderboard below, never from a promotion marker."
         ),
     ),
     V1Source(
@@ -216,10 +243,12 @@ SOURCES: tuple[V1Source, ...] = (
             "v1 actually serves (`serving_champion.served_version`). Not a standalone "
             "pointer like R's and U's — it is a field of the leaderboard, and it carries no "
             "installation date, so the imported arm's clock starts at the published recipe's "
-            "own `registered_at`, exactly as U's does."
+            "own `registered_at`, exactly as U's does. The served version maps to the v2 "
+            "recipe that reproduces it through the recipes' `supersedes_v1`."
         ),
         date_field=None,
         champion=_zoo_champion_arch,
+        resolves_by=V1_SERVED_MODEL,
     ),
 )
 
@@ -238,6 +267,104 @@ def read_v1_json(store: Store, key: str) -> dict[str, Any] | None:
     # STRICT face of the one reader: a present v1 artifact that is not an
     # object stops the migration with the key named (rule 5).
     return load_store_document(store, key)
+
+
+@dataclass(frozen=True)
+class V1ModelTree:
+    """The M slot's recipe tree, in the two halves :func:`served_model_recipe`
+    needs (`alpha-engine-config-I10961` deliverable 2).
+
+    ``declared`` is every recipe FILED — `crucible.slots.model.ModelRecipe`,
+    registrable or not — because which recipe is the served MODEL and which
+    are its legs is read off the `predictions[...]` edges between them, and a
+    refused stacker must stay in that graph: dropping it would leave a leg
+    looking like the whole model. ``registrable`` is what the release
+    registers (`crucible.slots.model.RegisteredModelArm`, the wrapper
+    `register_arms` folds), and ``refused`` names every recipe it does not,
+    with the reason.
+    """
+
+    declared: tuple[Any, ...] = ()
+    registrable: tuple[Any, ...] = ()
+    refused: Mapping[str, str] = field(default_factory=dict)
+
+
+def served_model_recipe(
+    tree: V1ModelTree, *, slot: str, served_version: str
+) -> tuple[Any | None, str | None]:
+    """The registrable v2 recipe that reproduces v1's served model, or why none.
+
+    The adapter `alpha-engine-config-I10961` deliverable 2 asks for. v1 names
+    its M champion by the model VERSION it serves; a v2 M recipe is a
+    `ModelRecipe`, whose id hashes a different spec shape than
+    :func:`_bootstrap_spec` builds, so neither a name lookup nor an `ArmSpec`
+    can reach it. What connects the two is the recipe's own declaration:
+    every v2 port of that model carries `supersedes_v1: <served_version>`.
+
+    **Several recipes carry it, and only one of them is the model.** v1's
+    served `v3.0-meta` is a stack — two Layer-1 heads and a Layer-2 combine —
+    and each head is ported as its own arm because the stacker reads it as
+    `predictions[<head>]`. All three descend from the served version; the
+    MODEL is the one that no other descendant consumes. That is read from the
+    declared input edges, never from a name, so it holds for a single-model
+    port (one descendant, consumed by nothing) and for any depth of stack.
+
+    Refuses rather than guesses — each refusal is a deferral reason on the
+    scheduled path and a raise on the asserted one, exactly like every other
+    refusal in :func:`run_migrate_history`:
+
+    * no recipe declares the served version (v1 re-served, or the port was
+      never filed);
+    * more or fewer than one descendant is consumed by none of the others
+      (two unrelated ports of one model is a judgement nobody has made);
+    * the model's recipe is refused at registration, or does not register
+      under the id it hashes to — a pointer at it would name an arm that can
+      never write a shadow, which `crucible.slots.producibility` exists to
+      stop (`alpha-engine-config-I11085`).
+    """
+    descendants = [recipe for recipe in tree.declared if recipe.supersedes_v1 == served_version]
+    if not descendants:
+        return None, (
+            f"v1 slot {slot!r} serves {served_version!r} and no v2 recipe declares "
+            f"`supersedes_v1: {served_version}`, so nothing in the strategy tree reproduces "
+            "the served model. Mapping it onto some other recipe would attach v1's track "
+            "record to a model that did not earn it."
+        )
+    names = {recipe.name for recipe in descendants}
+    consumed = {
+        ref.ref
+        for recipe in descendants
+        for ref in recipe.inputs
+        if ref.kind == "predictions" and ref.ref in names
+    }
+    models = sorted(recipe.name for recipe in descendants if recipe.name not in consumed)
+    if len(models) != 1:
+        return None, (
+            f"v1 slot {slot!r} serves {served_version!r}, and {len(models)} of the v2 "
+            f"recipes declaring it ({sorted(names)}) are consumed by no other: "
+            f"{models}. The served model is the one that stacks on the rest; with "
+            "anything but exactly one such recipe, which of them reproduces it is a "
+            "judgement the tree has not recorded."
+        )
+    model = next(recipe for recipe in descendants if recipe.name == models[0])
+    if model.name in tree.refused:
+        return None, (
+            f"v1 slot {slot!r} serves {served_version!r}, reproduced by v2 recipe "
+            f"{model.name!r}, which the release refuses at registration: "
+            f"{tree.refused[model.name]} A pointer at it would name an arm that never "
+            "writes a shadow."
+        )
+    registered = next(
+        (spec for spec in tree.registrable if spec.arm_id == model.arm_id),
+        None,
+    )
+    if registered is None:
+        return None, (
+            f"v1 slot {slot!r} serves {served_version!r}, reproduced by v2 recipe "
+            f"{model.name!r} ({model.arm_id}), and the release registers no arm under that "
+            "id, so a pointer at it would never be scored."
+        )
+    return registered, None
 
 
 def _bootstrap_spec(
@@ -265,12 +392,16 @@ def _bootstrap_spec(
         registered_at=registered_at,
         bootstrap=True,
         promotion_source=promotion_source,
-        notes=(
-            f"Imported from v1 by `crucible migrate.history`. promotion_source="
-            f"{promotion_source!r}; registered_at is the v1 pointer's own date, so the "
-            "OOS clock starts where the arm actually started, not at cutover."
-        ),
+        notes=_bootstrap_notes(promotion_source),
         source_key="crucible.migrate:v1",
+    )
+
+
+def _bootstrap_notes(promotion_source: str) -> str:
+    return (
+        f"Imported from v1 by `crucible migrate.history`. promotion_source="
+        f"{promotion_source!r}; registered_at is the v1 pointer's own date, so the "
+        "OOS clock starts where the arm actually started, not at cutover."
     )
 
 
@@ -320,6 +451,7 @@ def run_migrate_history(
     v1_store: Store,
     slots: tuple[str, ...] | None = None,
     arm_recipes: dict[str, ArmSpec] | None = None,
+    model_tree: V1ModelTree | None = None,
     allow_missing: bool = False,
     dry_run: bool = False,
 ) -> dict[str, Any]:
@@ -329,6 +461,13 @@ def run_migrate_history(
     it. It is required rather than inferred: v1 named a producer, v2 names a
     ranker plus its parameters, and guessing the mapping would silently
     attach a v1 track record to a rule that is not the one that earned it.
+
+    ``model_tree`` is the M slot's recipe tree. v1's M champion is a served
+    model VERSION rather than an arm name, so it is resolved through
+    :func:`served_model_recipe` over the recipes' `supersedes_v1`
+    declarations instead of through ``arm_recipes`` — the same refusal
+    discipline, a different key. ``None`` is a caller that supplied no M tree,
+    and M then defers naming exactly that.
 
     ``dry_run`` resolves every source, recipe and existing pointer exactly as
     a real run does and reports what it WOULD write, but writes nothing: not
@@ -442,8 +581,20 @@ def run_migrate_history(
             pointers[slot] = "no_v1_pointer"
             deferred[slot] = why
             continue
-        recipe = recipes.get(champion_name)
-        if recipe is None:
+        if source.resolves_by == V1_SERVED_MODEL:
+            if model_tree is None:
+                recipe = None
+                why = (
+                    f"v1 slot {slot!r} serves {champion_name!r} and no v2 {slot.upper()} "
+                    "recipe tree was supplied to resolve it against. Supply it in "
+                    "`model_tree`."
+                )
+            else:
+                recipe, why = served_model_recipe(
+                    model_tree, slot=slot, served_version=champion_name
+                )
+        else:
+            recipe = recipes.get(champion_name)
             why = (
                 f"v1 slot {slot!r} names champion {champion_name!r} and no v2 recipe was "
                 "supplied for it. The mapping from a v1 producer name to a v2 ranker "
@@ -451,6 +602,7 @@ def run_migrate_history(
                 "record to a rule that is not the one that earned it would launder "
                 "provenance. Supply it in `arm_recipes`."
             )
+        if recipe is None:
             if asserted:
                 raise MigrationSourceMissing(why)
             imported[slot] = []
@@ -472,14 +624,26 @@ def run_migrate_history(
             continue
         v1_promotion_source = pointer.get("promotion_source", "unknown")
         registered_at, date_source = _date_of(pointer, source=source, recipe=recipe)
-        spec = _bootstrap_spec(
-            slot=slot,
-            name=recipe.name,
-            registered_at=registered_at,
-            promotion_source=v1_promotion_source,
-            ranker=recipe.ranker,
-            params=recipe.params,
-        )
+        ranked = isinstance(recipe, ArmSpec)
+        if ranked:
+            spec = _bootstrap_spec(
+                slot=slot,
+                name=recipe.name,
+                registered_at=registered_at,
+                promotion_source=v1_promotion_source,
+                ranker=recipe.ranker,
+                params=recipe.params,
+            )
+        else:
+            # An M (`RegisteredModelArm`) recipe: its id is the RECIPE's hash
+            # and is forwarded untouched, never re-derived through an
+            # `ArmSpec` (that would hash `ranker`/`params` and name a second
+            # arm). Only the provenance an import adds changes. `registered_at`
+            # is the recipe's own here by construction: the zoo source declares
+            # no date field, so `_date_of` returned it.
+            spec = dataclasses.replace(
+                recipe, bootstrap=True, notes=_bootstrap_notes(v1_promotion_source)
+            )
         if spec.arm_id != recipe.arm_id:
             # `ArmSpec.spec` hashes slot/name/ranker/params/control/control_kind
             # and no provenance, so these agree unless the recipe is a control
@@ -508,7 +672,10 @@ def run_migrate_history(
         # `admission_refusal` below is the RUNTIME half (has it produced?);
         # this is the half knowable from the tree, and a seeded or backfilled
         # shadow cannot satisfy it.
-        refused_by_recipe = catalog_refusal(recipe)
+        # An M recipe reaches here only from the release's REGISTRABLE half
+        # (`served_model_recipe`), which is the M slot's own registration
+        # refusal already applied; the catalogue partition is a U/R ranker's.
+        refused_by_recipe = catalog_refusal(recipe) if ranked else None
         if refused_by_recipe is not None:
             why = (
                 f"v1 slot {slot!r} names champion {champion_name!r}, which resolves to "
@@ -696,7 +863,7 @@ def run_migrate_history(
     return result
 
 
-def _date_of(pointer: dict[str, Any], *, source: V1Source, recipe: ArmSpec) -> tuple[str, str]:
+def _date_of(pointer: dict[str, Any], *, source: V1Source, recipe: Any) -> tuple[str, str]:
     """The imported arm's start date as an ISO date, and where it came from.
 
     Taken from the v1 artifact when the source declares a date field: the OOS
@@ -712,10 +879,12 @@ def _date_of(pointer: dict[str, Any], *, source: V1Source, recipe: ArmSpec) -> t
     which of the two was used is never implicit.
     """
     if source.date_field is None:
+        # An M arm is a `RegisteredModelArm` wrapping the `ModelRecipe` that
+        # carries the provenance; a U/R `ArmSpec` carries it itself.
+        origin = getattr(recipe, "recipe", recipe).source_key or recipe.name
         return (
             recipe.registered_at,
-            f"the recipe's registered_at ({recipe.source_key or recipe.name}); "
-            f"{source.key} carries no installation date",
+            f"the recipe's registered_at ({origin}); {source.key} carries no installation date",
         )
     raw = pointer.get(source.date_field)
     if not raw:

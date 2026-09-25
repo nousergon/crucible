@@ -27,10 +27,12 @@ from pathlib import Path
 import pytest
 
 from crucible import cli, track_a
+from crucible.carryover import V1_ZOO_LEADERBOARD_KEY
 from crucible.cli import HANDLERS, is_stub, main
 from crucible.keys import champion_key, manifest_key, shadow_key
 from crucible.migrate import MigrationPointerConflict, MigrationSourceMissing
 from crucible.slots.arms import load_arm_specs, read_register
+from crucible.slots.model import read_model_recipes
 from crucible.slots.producibility import UnproducibleChampionError
 from crucible.store import LocalStore
 
@@ -89,6 +91,55 @@ params:
   top_n: 10
 notes: fixture recipe that refuses in phase 1
 """
+
+
+# v1's zoo leaderboard, as measured 2026-09-25: `champion_arch` is the latest
+# REFRESH of the serving architecture and was never served; `served_version`
+# is what the predictor loads, and the only version a v2 port declares.
+SERVED = "v3.0-meta-2026-08-14-119e069b"
+REFRESHED = "v3.0-meta-2026-09-23-d7f8f864"
+
+_M_COMMON = """
+  label_horizon_trading_days: 21
+  refit_cadence_trading_days: 5
+  training_window:
+    kind: expanding
+    min_trading_days: 504
+  cpcv:
+    n_groups: 6
+    k_test: 2
+    embargo_trading_days: 2
+"""
+
+
+def _m_head(name: str, feature: str, *, supersedes_v1: str = SERVED) -> str:
+    return f"""slot: m
+name: {name}
+supersedes_v1: {supersedes_v1}
+registered_at: '2026-09-14'
+spec:
+  features: [{feature}]
+  estimator:
+    kind: fixed_linear
+    weights:
+      {feature}: 1.0
+    intercept: 0.0
+{_M_COMMON}"""
+
+
+def _m_stack(name: str, inputs: tuple[str, ...], *, supersedes_v1: str = SERVED) -> str:
+    listed = "\n".join(f"    - predictions[{head}]" for head in inputs)
+    return f"""slot: m
+name: {name}
+supersedes_v1: {supersedes_v1}
+registered_at: '2026-09-14'
+spec:
+  features: []
+  inputs:
+{listed}
+  estimator:
+    kind: bayesian_ridge
+{_M_COMMON}"""
 
 
 def _files(root: Path) -> dict[str, bytes]:
@@ -163,8 +214,8 @@ def v1_root(tmp_path: Path) -> Path:
         json.dumps(
             {
                 "schema_version": 1,
-                "champion_arch": {"version_id": "v3.0-meta-2026-09-11-a214ae0a"},
-                "serving_champion": {"served_version": "v3.0-meta-2026-08-14-119e069b"},
+                "champion_arch": {"version_id": REFRESHED},
+                "serving_champion": {"served_version": SERVED},
                 # v1's leaderboard `champion` is a METRICS block, not a name —
                 # the source declares how it names its champion for exactly
                 # this reason (`alpha-engine-config-I10961`).
@@ -288,12 +339,13 @@ class TestEndToEnd:
         result = _printed_result(capsys)
         # M is CONSIDERED and DEFERRED rather than absent from the map
         # (`alpha-engine-config-I10961`): its v1 champion source is declared
-        # (`predictor/model_zoo/leaderboard/latest.json`) and the mapping from
-        # v1's `champion_arch` onto an M `ModelRecipe` is not built, so the
-        # reason is on the manifest every run instead of the slot being
+        # (`predictor/model_zoo/leaderboard/latest.json`) and this fixture's
+        # strategy tree files no M recipe descending from the served model, so
+        # the reason is on the manifest every run instead of the slot being
         # invisible, which is what the hardcoded `("u", "r")` made it.
+        # `TestTheMChampion` below is the tree that resolves.
         assert result["pointers"] == {"u": "written", "r": "written", "m": "deferred"}
-        assert "no v2 recipe was supplied" in result["deferred"]["m"]
+        assert "no v2 recipe declares `supersedes_v1: " + SERVED in result["deferred"]["m"]
         assert result["sources_missing"] == [], (
             "the dated M promotions series must count as found, not fail the run"
         )
@@ -509,6 +561,199 @@ class TestAnUnproducibleChampionIsRefusedAtImport:
         assert result["pointers"]["r"] == "deferred"
         assert refused_id in result["deferred"]["r"]
         assert store.get_bytes(champion_key("r")) == seated
+
+
+M_HEADS = {
+    "v3meta_momentum_head": "momentum_5d_log_return",
+    "v3meta_volatility_head": "momentum_20d_log_return",
+}
+
+
+def _file_m(v2_root: Path, name: str, document: str) -> None:
+    LocalStore(v2_root).put_bytes(f"strategy/current/arms/m/{name}.yaml", document.encode())
+
+
+def _m_ids(v2_root: Path) -> dict[str, str]:
+    return {r.name: r.arm_id for r in read_model_recipes(store=LocalStore(v2_root))}
+
+
+def _produce(v2_root: Path, arm_id: str) -> None:
+    LocalStore(v2_root).put_bytes(shadow_key(arm_id, "2026-09-22"), b'{"names": []}')
+
+
+class TestTheMChampion:
+    """`alpha-engine-config-I10961` deliverable 2: v1's serving M model onto
+    the v2 recipe that reproduces it.
+
+    The fixture tree is v1's served `v3.0-meta` as ported: two Layer-1 heads
+    and the Layer-2 stacker that reads them as `predictions[...]`, all three
+    declaring `supersedes_v1: <served_version>`. The MODEL is the stacker.
+    """
+
+    @pytest.fixture
+    def m_tree(self, v2_root: Path) -> dict[str, str]:
+        for name, feature in M_HEADS.items():
+            _file_m(v2_root, name, _m_head(name, feature))
+        _file_m(v2_root, "v3meta_stack", _m_stack("v3meta_stack", tuple(M_HEADS)))
+        return _m_ids(v2_root)
+
+    def test_the_stacker_is_seated_once_it_produces(
+        self,
+        v2_root: Path,
+        v1_root: Path,
+        m_tree: dict[str, str],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        for arm_id in m_tree.values():
+            _produce(v2_root, arm_id)
+        v1_before = _files(v1_root)
+        assert main(_argv(v2_root, v1_root)) == 0
+        store = LocalStore(v2_root)
+
+        pointer = json.loads(store.get_bytes(champion_key("m")))
+        assert pointer["arm_id"] == m_tree["v3meta_stack"], (
+            "the served model is the recipe that stacks on the others, never a leg of it"
+        )
+        assert pointer["promotion_source"] == "operator_bootstrap"
+        assert pointer["evidence"]["status"] == "migrated"
+        assert V1_ZOO_LEADERBOARD_KEY in pointer["evidence"]["reason"], (
+            "closes-when: `evidence.reason` names the v1 source key it was imported from"
+        )
+        assert pointer["as_of"] == "2026-09-14", (
+            "the zoo leaderboard carries no installation date; the clock starts at the "
+            "recipe's registered_at, exactly as U's does"
+        )
+        assert m_tree["v3meta_stack"] in set(read_register(store, "m").all_arms())
+        result = _printed_result(capsys)
+        assert result["pointers"] == {"u": "written", "r": "written", "m": "written"}
+        assert result["arms_imported"]["m"] == [m_tree["v3meta_stack"]]
+        assert _files(v1_root) == v1_before, "the v1 store is read-only"
+
+    def test_a_rerun_leaves_the_seated_pointer_unchanged(
+        self,
+        v2_root: Path,
+        v1_root: Path,
+        m_tree: dict[str, str],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        for arm_id in m_tree.values():
+            _produce(v2_root, arm_id)
+        assert main(_argv(v2_root, v1_root)) == 0
+        store = LocalStore(v2_root)
+        before = store.get_bytes(champion_key("m")), store.get_bytes("arms/m/register.jsonl")
+        capsys.readouterr()
+        assert main(_argv(v2_root, v1_root)) == 0
+        assert _printed_result(capsys)["pointers"]["m"] == "unchanged"
+        assert (store.get_bytes(champion_key("m")), store.get_bytes("arms/m/register.jsonl")) == (
+            before
+        )
+
+    def test_a_stacker_that_has_not_produced_defers_the_seat(
+        self,
+        v2_root: Path,
+        v1_root: Path,
+        m_tree: dict[str, str],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Production's state on 2026-09-25: both heads have shadows,
+        `m:v3meta_stack` has none (`-I10947`). The recipe RESOLVES, and the
+        admission predicate still holds the seat — resolving is not producing."""
+        for name in M_HEADS:
+            _produce(v2_root, m_tree[name])
+        assert main(_argv(v2_root, v1_root)) == 0
+        assert not LocalStore(v2_root).exists(champion_key("m"))
+        result = _printed_result(capsys)
+        assert result["pointers"]["m"] == "deferred"
+        assert m_tree["v3meta_stack"] in result["deferred"]["m"]
+        assert "has produced nothing" in result["deferred"]["m"]
+
+    def test_v1_serving_a_new_version_defers_rather_than_reattaching_lineage(
+        self,
+        v2_root: Path,
+        v1_root: Path,
+        m_tree: dict[str, str],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """`champion_arch.version_id` is a refresh that was never served. Were
+        v1 to SERVE it, the ports of the old model would not reproduce it."""
+        for arm_id in m_tree.values():
+            _produce(v2_root, arm_id)
+        v1 = LocalStore(v1_root)
+        document = json.loads(v1.get_bytes(V1_ZOO_LEADERBOARD_KEY))
+        document["serving_champion"]["served_version"] = REFRESHED
+        v1.put_bytes(V1_ZOO_LEADERBOARD_KEY, json.dumps(document).encode())
+        assert main(_argv(v2_root, v1_root)) == 0
+        assert not LocalStore(v2_root).exists(champion_key("m"))
+        result = _printed_result(capsys)
+        assert result["pointers"]["m"] == "deferred"
+        assert f"supersedes_v1: {REFRESHED}" in result["deferred"]["m"]
+
+    def test_a_refused_stacker_never_lets_a_leg_take_the_seat(
+        self, v2_root: Path, v1_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The stacker reads an input nothing produces, so the release refuses
+        it at registration. Both heads are registrable and producing. Reading
+        the graph off the registrable half alone would leave the heads as the
+        only descendants — and one registrable head would have been seated as
+        v1's whole model."""
+        name = "v3meta_momentum_head"
+        _file_m(v2_root, name, _m_head(name, M_HEADS[name]))
+        _file_m(v2_root, "v3meta_stack", _m_stack("v3meta_stack", (name, "v3meta_unfiled_head")))
+        _produce(v2_root, _m_ids(v2_root)[name])
+        assert main(_argv(v2_root, v1_root)) == 0
+        assert not LocalStore(v2_root).exists(champion_key("m"))
+        why = _printed_result(capsys)["deferred"]["m"]
+        assert "'v3meta_stack'" in why
+        assert "refuses at registration" in why
+
+    def test_two_unrelated_ports_of_one_model_are_not_resolved_by_guessing(
+        self, v2_root: Path, v1_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        for name, feature in M_HEADS.items():
+            _file_m(v2_root, name, _m_head(name, feature))
+        for arm_id in _m_ids(v2_root).values():
+            _produce(v2_root, arm_id)
+        assert main(_argv(v2_root, v1_root)) == 0
+        assert not LocalStore(v2_root).exists(champion_key("m"))
+        why = _printed_result(capsys)["deferred"]["m"]
+        assert "consumed by no other" in why
+        for name in M_HEADS:
+            assert name in why
+
+    def test_the_asserted_path_raises_on_an_unresolvable_served_model(
+        self, v2_root: Path, v1_root: Path, m_tree: dict[str, str]
+    ) -> None:
+        from crucible.migrate import run_migrate_history
+        from crucible.runner import run_job
+        from crucible.store import read_only
+
+        v1 = LocalStore(v1_root)
+        document = json.loads(v1.get_bytes(V1_ZOO_LEADERBOARD_KEY))
+        document["serving_champion"]["served_version"] = REFRESHED
+        v1.put_bytes(V1_ZOO_LEADERBOARD_KEY, json.dumps(document).encode())
+        store = LocalStore(v2_root)
+        tree = cli._model_tree(store=store, strategy_dir=None)
+
+        def job(ctx: object) -> None:
+            run_migrate_history(
+                ctx,
+                v1_store=read_only(v1, reason="test reads v1 read-only"),
+                slots=("m",),
+                model_tree=tree,
+            )
+
+        with pytest.raises(MigrationSourceMissing, match=re.escape(REFRESHED)):
+            run_job("migrate.history", job, store=store, trading_day=dt.date(2026, 9, 25))
+        assert not store.exists(champion_key("m"))
+
+    def test_supersedes_v1_is_provenance_and_never_moves_the_arm_id(self, v2_root: Path) -> None:
+        name = "v3meta_momentum_head"
+        _file_m(v2_root, name, _m_head(name, M_HEADS[name]))
+        with_provenance = _m_ids(v2_root)[name]
+        _file_m(v2_root, name, _m_head(name, M_HEADS[name], supersedes_v1="spec-other"))
+        assert _m_ids(v2_root)[name] == with_provenance
+        (recipe,) = read_model_recipes(store=LocalStore(v2_root))
+        assert recipe.supersedes_v1 == "spec-other", "the loader must carry it, not drop it"
 
 
 class TestTheStubIsGone:
