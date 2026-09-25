@@ -18,11 +18,12 @@ verdict to its worst-informed author. The loser re-reads and fails the deploy
 rather than overwriting.
 
 **The flip is gated on a REAL run.** `crucible smoke --release {sha}` executes
-against live S3 read paths and writes `runs/smoke/{trading_day}/run.json`
-through the ordinary runner, so the gate produces the same telemetry every
-other job does. `status: ok` flips the pointer; anything else leaves it exactly
-where it was and fails the deploy. A smoke that "ran and had nothing to do" is
-not a thing the manifest can express (§4.2), which is what makes this gate
+against live S3 read paths and writes a manifest under
+`runs/smoke/{trading_day}/` (one per invocation) through the ordinary runner,
+so the gate produces the same telemetry every other job does. `status: ok`
+flips the pointer; anything else leaves it exactly where it was and fails the
+deploy. A smoke that "ran and had nothing to do" is not a thing the manifest
+can express (§4.2), which is what makes this gate
 meaningful rather than ceremonial.
 
 **Rollback is the same primitive backwards.** `crucible release.pin <sha>`

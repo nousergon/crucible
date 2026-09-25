@@ -7650,6 +7650,16 @@ class _DedicatedSubtreeView(Store):
         return self._store.presigned_url(integration_store_key(key), expires_s)
 
 
+def _latest_manifest_order(pair: tuple[str, dict[str, Any]]) -> tuple[str, str, str]:
+    """Sort key for "the most recent manifest": trading day, then `finished`,
+    then the key itself as a deterministic tiebreak. The day is read off the
+    KEY, which is what the store holds; a key that does not parse sorts first
+    and so is never mistaken for the latest."""
+    key, document = pair
+    parsed = parse_manifest_key(key)
+    return (parsed[1] if parsed else "", str(document.get("finished") or ""), key)
+
+
 def _clause_integration_tier_current(store: Store, window: list[dt.date]) -> Clause:
     """The integration tier produced a fresh `ok` reading
     (`alpha-engine-config-I10460`, from `-I10419`).
@@ -7677,8 +7687,12 @@ def _clause_integration_tier_current(store: Store, window: list[dt.date]) -> Cla
 
     **The most recent reading is the one graded**, not "any ok reading in the
     window": a tier that passed on Monday and has failed every night since
-    would otherwise read MET off the Monday. Listing order is the day, so the
-    last key is the latest.
+    would otherwise read MET off the Monday. "Most recent" is the latest
+    TRADING DAY and, within one day, the latest `finished`: `test.integration`
+    files one manifest per invocation (`alpha-engine-config-I11033`), so a day
+    can hold several, and listing order alone would rank a legacy bare
+    `{day}/run.json` after every discriminated `{day}/{calendar}-{run_id}/`
+    key filed later the same day.
 
     **Read under the dedicated sub-prefix, never the bare production
     prefix** (`alpha-engine-config-I10706`). The tier writes through
@@ -7725,7 +7739,7 @@ def _clause_integration_tier_current(store: Store, window: list[dt.date]) -> Cla
             "ungraded — which is the finding, not a reason to pass",
             evidence,
         )
-    key, document = read.documents[-1]
+    key, document = max(read.documents, key=_latest_manifest_order)
     dedicated_key = f"{INTEGRATION_STORE_SUBPREFIX}{key}"
     parsed = parse_manifest_key(key)
     if parsed is None:

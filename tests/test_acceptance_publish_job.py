@@ -22,9 +22,10 @@ from crucible.acceptance_publish import (
     AcceptanceReadingUnpublishable,
     acceptance_publish_handler,
 )
-from crucible.keys import acceptance_reading_key, manifest_key
+from crucible.keys import acceptance_reading_key
 from crucible.runner import CODE_SHA_ENV
 from crucible.store import LocalStore
+from tests.support.manifests import only_manifest
 
 DAY = dt.date(2026, 8, 28)
 _FAKE_SHA = "a" * 40
@@ -83,9 +84,7 @@ class TestThePublishedDocument:
         named in the manifest of the run that wrote it."""
         acceptance_publish_handler(_args(tmp_path, reading=_write_reading(tmp_path, READING)))
         store = LocalStore(tmp_path / "store")
-        manifest = json.loads(
-            store.get_bytes(manifest_key(ACCEPTANCE_PUBLISH_JOB, DAY.isoformat()))
-        )
+        manifest = only_manifest(store, ACCEPTANCE_PUBLISH_JOB, DAY.isoformat())[1]
         assert manifest["status"] == "ok", manifest.get("reason")
         assert [row["key"] for row in manifest["outputs"]] == [
             acceptance_reading_key(DAY.isoformat())
@@ -94,9 +93,7 @@ class TestThePublishedDocument:
     def test_the_clause_count_is_on_the_manifest_as_its_outcome_signal(self, tmp_path) -> None:
         acceptance_publish_handler(_args(tmp_path, reading=_write_reading(tmp_path, READING)))
         store = LocalStore(tmp_path / "store")
-        manifest = json.loads(
-            store.get_bytes(manifest_key(ACCEPTANCE_PUBLISH_JOB, DAY.isoformat()))
-        )
+        manifest = only_manifest(store, ACCEPTANCE_PUBLISH_JOB, DAY.isoformat())[1]
         metric = next(m for m in manifest["metrics"] if m["name"] == "acceptance_clauses_met")
         assert metric["value"] == 21.0
         # A red count is plan §12 rule 3's whole point and must never page: the
@@ -112,9 +109,7 @@ class TestRefusals:
         with pytest.raises(AcceptanceReadingUnpublishable, match="does not exist"):
             acceptance_publish_handler(_args(tmp_path, reading=str(tmp_path / "nope.json")))
         store = LocalStore(tmp_path / "store")
-        manifest = json.loads(
-            store.get_bytes(manifest_key(ACCEPTANCE_PUBLISH_JOB, DAY.isoformat()))
-        )
+        manifest = only_manifest(store, ACCEPTANCE_PUBLISH_JOB, DAY.isoformat())[1]
         assert manifest["status"] == "failed"
         assert not list(store.list_keys("report/acceptance/"))
 

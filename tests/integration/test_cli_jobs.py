@@ -50,7 +50,19 @@ def _manifest(
     discriminator: str | None = None,
     trading_day: str = INTEGRATION_TRADING_DAY,
 ) -> dict[str, Any]:
-    return read_manifest(store, job, trading_day, discriminator=discriminator)
+    if discriminator is not None:
+        return read_manifest(store, job, trading_day, discriminator=discriminator)
+    # An on-demand job files one manifest per invocation under a key this
+    # test cannot know in advance (`crucible.runner.invocation_discriminator`,
+    # `alpha-engine-config-I11033`), so the prefix is listed and the LATEST
+    # run is read — which covers a bare key too. An unreadable manifest under
+    # the prefix fails the read rather than being skipped.
+    read = read_manifests_under(store, manifest_prefix(job, trading_day))
+    assert read.listing_problem is None, read.listing_problem
+    assert not read.faults, read.faults
+    assert read.documents, f"no {job} manifest under {manifest_prefix(job, trading_day)}"
+    _key, document = max(read.documents, key=lambda p: (str(p[1].get("finished") or ""), p[0]))
+    return document
 
 
 def _assert_ok(

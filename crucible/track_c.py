@@ -63,10 +63,16 @@ from crucible.keys import (
     board_key,
     drift_input_key,
     drift_metrics_key,
+    manifest_key,
 )
 from crucible.manifest import RUN_MANIFEST_SCHEMA_VERSION
 from crucible.release_lock_sweep import release_lock_findings, release_lock_metric
-from crucible.runner import RunContext, run_job, spot_interruption_guard
+from crucible.runner import (
+    RunContext,
+    invocation_discriminator,
+    run_job,
+    spot_interruption_guard,
+)
 from crucible.store import Store, open_store, sha256_hex
 
 __all__ = [
@@ -198,6 +204,10 @@ def release_pin_handler(args: argparse.Namespace) -> int:
         trading_day=args.trading_day,
         dry_run=dry_run,
         run_mode=getattr(args, "run_mode", None),
+        # One manifest per INVOCATION, not per trading day: this job is on
+        # demand, so nothing bounds how often it runs on one day
+        # (`alpha-engine-config-I11033`; `crucible.runner.invocation_discriminator`).
+        discriminator=invocation_discriminator,
     )
     return 0
 
@@ -489,7 +499,11 @@ def smoke_handler(args: argparse.Namespace) -> int:
                     f"byte-for-byte, wheelhouse complete and graded."
                     + (f" Degraded: {'; '.join(degraded)}." if degraded else "")
                 ),
-                "source_path": "runs/smoke/{trading_day}/run.json",
+                # The key THIS run files under — per invocation since
+                # `alpha-engine-config-I11033`, so no template stands for it.
+                "source_path": manifest_key(
+                    ctx.job, ctx.trading_day.isoformat(), discriminator=ctx.discriminator
+                ),
                 "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "smoked_extras": smoked_extras,
             }
@@ -503,6 +517,10 @@ def smoke_handler(args: argparse.Namespace) -> int:
             trading_day=args.trading_day,
             run_mode=getattr(args, "run_mode", None),
             release_sha=args.release,
+            # One manifest per INVOCATION, not per trading day: this job is on
+            # demand, so nothing bounds how often it runs on one day
+            # (`alpha-engine-config-I11033`; `crucible.runner.invocation_discriminator`).
+            discriminator=invocation_discriminator,
             # A smoke that needed a retry is a smoke that told us something.
             # Retrying it would promote a build whose first attempt failed,
             # and the deploy would read a green manifest over an amber fact.
