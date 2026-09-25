@@ -1,0 +1,1729 @@
+{
+ "acceptance": {
+  "commit": "9efbd4fcd4b7348b85b22b64494c23c8bf38ff88",
+  "measured_at": "2026-09-25T05:16:28.203184+00:00",
+  "met": 22,
+  "met_clauses": [
+   "TestAlerting::test_the_absence_condition_reads_the_declared_deadline_table",
+   "TestAlerting::test_the_weekly_alert_count_is_a_metric_with_a_ceiling",
+   "TestAlerting::test_there_are_exactly_two_page_conditions",
+   "TestAttribution::test_the_attribution_table_has_five_rows",
+   "TestAutonomy::test_zero_human_mutating_calls_is_read_from_the_cloudtrail_archive",
+   "TestControlArms::test_every_slot_declares_a_planted_and_a_null_control",
+   "TestControlArms::test_the_grader_ranks_planted_above_real_above_null",
+   "TestCost::test_every_v2_resource_is_tagged_for_cost_attribution",
+   "TestCost::test_the_llm_spend_cap_is_declared_and_enforced",
+   "TestFaultInjection::test_each_scripted_fault_produces_one_failed_run_and_exactly_one_page[a data source withheld]",
+   "TestFaultInjection::test_each_scripted_fault_produces_one_failed_run_and_exactly_one_page[spot instance terminated mid-job]",
+   "TestFaultInjection::test_each_scripted_fault_produces_one_failed_run_and_exactly_one_page[the LLM router returns 500]",
+   "TestFaultInjection::test_each_scripted_fault_produces_one_failed_run_and_exactly_one_page[the S3 release pointer is stale]",
+   "TestFeatureLayer::test_r_and_m_read_the_same_versioned_feature_artifact",
+   "TestFeatureLayerBinding::test_a_column_the_layer_does_not_produce_raises_at_load",
+   "TestFeatureLayerBinding::test_every_recipe_column_carries_a_units_suffix",
+   "TestFeatureLayerBinding::test_the_m_slot_resolves_its_columns_through_the_registry",
+   "TestNoThirdState::test_no_job_can_declare_itself_skipped",
+   "TestNoThirdState::test_the_manifest_schema_admits_exactly_two_statuses",
+   "TestOneCommand::test_experiment_run_returns_a_verdict_in_one_command",
+   "TestTransparency::test_every_llm_call_site_is_in_the_registry",
+   "TestTransparency::test_explain_walks_a_verdict_back_to_what_produced_it"
+  ],
+  "store_versioning": "Enabled",
+  "unmeasurable": 0,
+  "unmeasurable_clauses": [],
+  "unmet": 2,
+  "unmet_clauses": [
+   "TestAttribution::test_alpha_is_factor_neutral_not_raw_excess_return",
+   "TestAutonomy::test_the_ruled_live_gate_two_live_saturdays_plus_five_replayed"
+  ]
+ },
+ "board_run": {
+  "code_sha": "9aeb864be8eb2de0ae70026b9fa60af298aca708",
+  "reason": "",
+  "status": "ok"
+ },
+ "current": {
+  "counts": {
+   "DECLARED_OFF": 0,
+   "MET": 15,
+   "OUT_OF_ORDER": 4,
+   "PLANNED": 22,
+   "UNMEASURABLE": 0,
+   "UNMEASURED": 30,
+   "UNMET": 10
+  },
+  "generated_at": "2026-09-25T01:29:28Z",
+  "row_count": 81,
+  "rows": [
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "The window is read from the run manifests of 1 live plus 5 replayed Saturdays, and no run has been made under phase-2 conditions yet. Phase 2 is alpha-engine-config-I9758; the ruled gate is \u00a76.1's 1 live + 5 replayed (narrowed from 2 live by alpha-engine-config-I10324), NOT \u00a72's superseded \"4 consecutive Saturdays\". A reader for this row can only be written once a weekly arc has run unattended.",
+    "id": "objective:autonomy",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "`crucible.keys.verdict_key` gives the real shape, and it is keyed by ARM as well as trading day \u2014 so \"did one command return a verdict today\" is a question about the arm register, not about a single pointer key. The register (`arms/{slot}/register.jsonl`) is written by `experiment.new`, which is still a stub. A reader is writable the day that job lands.",
+    "id": "objective:one_command",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "The fleet trial ledger is the real artifact (`crucible.keys.ledger_key`) and it is an append-only JSONL log, not a cost document \u2014 it carries per trial rows, not a monthly AWS figure. Nothing in this repository writes a cost reading at all today; `alpha-engine-config-I9828` is where the cost clause's own unmeasurability is tracked, and it must be answered before this row can have a reader.",
+    "id": "objective:cost",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "This objective is enforced by the manifest SCHEMA, which is a repository property rather than a store artifact. The schema passing in CI is not a reading of PRODUCTION, and rendering it MET on the strength of a green test would be the \"a merge satisfied the gate\" defect this board exists to prevent. A reader would sweep production manifests for a status outside {ok, failed}; that sweep does not exist.",
+    "id": "objective:no_third_state",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "no artifact at report/2026-09-24/attribution.json \u2014 nothing has filed a reading for this day",
+    "id": "objective:attribution",
+    "source": "objective",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "`crucible.alerts` writes one key per INCIDENT per day, deliberately \u2014 the weekly ceiling counts incidents, and there is no weekly rollup document to read. A reader must count incident keys across the week's trading days against the declared ceiling; that rollup is not written and counting it here would put the ceiling's definition in two places.",
+    "id": "objective:alerting",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "The registry half is a repository property; the explain half needs a real production verdict for `crucible explain` to walk back, and there is none. Rendering half an objective MET is how a partial reading becomes a claim of completeness.",
+    "id": "objective:transparency",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "`crucible.keys.arm_register_key` is per-SLOT and is a JSONL register, so \"every slot declares both controls\" is a read across four registers that `experiment.new` has not written yet \u2014 that job is still a stub.",
+    "id": "objective:control_arms",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "\"Flawless from day 1\" is proven on the FAILURE path, and the fault harness has not been run against the production store. Nothing about the happy path can substitute for this reading.",
+    "id": "objective:fault_injection",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "`crucible.keys.features_key` is a PARQUET panel keyed by feature version and trading day, not a JSON verdict. Whether R and M read the same version is a question about the two slots' recipes, and the answer belongs in a feature-registry reading that `features/{version}/registry.json` does not yet carry.",
+    "id": "objective:feature_layer",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": [
+     {
+      "met": true,
+      "name": "old_weekly_within_cadence"
+     },
+     {
+      "met": true,
+      "name": "dead_lambdas_deleted"
+     },
+     {
+      "met": true,
+      "name": "old_alerts_muted"
+     },
+     {
+      "met": true,
+      "name": "v2_resources_tagged_and_versioned"
+     },
+     {
+      "met": true,
+      "name": "acceptance_suite_committed"
+     }
+    ],
+    "component_state": null,
+    "detail": "5/5 clauses met; grades all 5 of 5 alpha-engine-config-I9756 deliverables",
+    "id": "phase:phase0",
+    "source": "phase",
+    "state": "MET"
+   },
+   {
+    "clauses": [
+     {
+      "met": false,
+      "name": "arc_runs_ok"
+     },
+     {
+      "met": false,
+      "name": "arms_all_scored"
+     },
+     {
+      "met": false,
+      "name": "attribution_renders"
+     },
+     {
+      "met": false,
+      "name": "explain_walks_a_verdict"
+     },
+     {
+      "met": true,
+      "name": "pointer_flipped_on_smoke"
+     },
+     {
+      "met": true,
+      "name": "independently_reviewed"
+     }
+    ],
+    "component_state": null,
+    "detail": "2/6 clauses met; holding: arc_runs_ok, arms_all_scored, attribution_renders, explain_walks_a_verdict; grades 8 of 20 alpha-engine-config-I9757 deliverables; not gate-readable: trial_ledger, trading_day_contract_test, m_slot_lifted, s_slot_lifted, promote_and_condorcet_retirement, ci_workflow, cfn_template, alerting_two_page_conditions, drift_metrics, fault_injection_scripts, console_page_from_manifests, components_yaml",
+    "id": "phase:phase1",
+    "source": "phase",
+    "state": "UNMET"
+   },
+   {
+    "clauses": [
+     {
+      "met": false,
+      "name": "replays_ok"
+     },
+     {
+      "met": true,
+      "name": "pages_commissioned"
+     },
+     {
+      "met": true,
+      "name": "two_page_conditions_on_real_channel"
+     },
+     {
+      "met": true,
+      "name": "transient_retry_class_in_runner"
+     },
+     {
+      "met": true,
+      "name": "fault_injection_against_scheduled_path"
+     },
+     {
+      "met": true,
+      "name": "runbook_in_readme"
+     },
+     {
+      "met": false,
+      "name": "aws_cost_within_ceiling"
+     }
+    ],
+    "component_state": null,
+    "detail": "5/7 clauses met; unmeasurable: aws_cost_within_ceiling; holding: replays_ok; grades all 6 of 6 alpha-engine-config-I9758 deliverables; graded while phase1 (alpha-engine-config-I9757) is UNMET \u2014 a later phase may not be exited ahead of an earlier one",
+    "id": "phase:phase2",
+    "source": "phase",
+    "state": "OUT_OF_ORDER"
+   },
+   {
+    "clauses": [
+     {
+      "met": false,
+      "name": "m_promotion_or_verdict_backed_non_promotion"
+     },
+     {
+      "met": false,
+      "name": "r_promotion_or_verdict_backed_non_promotion"
+     },
+     {
+      "met": false,
+      "name": "s_promotion_or_verdict_backed_non_promotion"
+     },
+     {
+      "met": false,
+      "name": "u_promotion_or_verdict_backed_non_promotion"
+     },
+     {
+      "met": false,
+      "name": "portfolio_engine_used_by_s_slot"
+     },
+     {
+      "met": false,
+      "name": "named_transaction_cost_model"
+     },
+     {
+      "met": false,
+      "name": "factor_neutral_attribution"
+     },
+     {
+      "met": true,
+      "name": "sealed_holdout"
+     },
+     {
+      "met": true,
+      "name": "integration_tier_current_and_ok"
+     },
+     {
+      "met": false,
+      "name": "v1_arms_carried_or_excluded"
+     },
+     {
+      "met": true,
+      "name": "every_recipe_in_the_release_is_registered"
+     },
+     {
+      "met": true,
+      "name": "every_registered_arm_produces"
+     }
+    ],
+    "component_state": null,
+    "detail": "4/12 clauses met; unmeasurable: m_promotion_or_verdict_backed_non_promotion, s_promotion_or_verdict_backed_non_promotion, portfolio_engine_used_by_s_slot, named_transaction_cost_model, factor_neutral_attribution; holding: r_promotion_or_verdict_backed_non_promotion, u_promotion_or_verdict_backed_non_promotion, v1_arms_carried_or_excluded; grades 4 of 5 alpha-engine-config-I9759 deliverables; not gate-readable: benchmark_per_slot; graded while phase1 (alpha-engine-config-I9757) is UNMET \u2014 a later phase may not be exited ahead of an earlier one",
+    "id": "phase:phase3",
+    "source": "phase",
+    "state": "OUT_OF_ORDER"
+   },
+   {
+    "clauses": [
+     {
+      "met": false,
+      "name": "trader_one_week_on_v2_champion"
+     },
+     {
+      "met": false,
+      "name": "broker_reconciliation_control_arm_passed"
+     },
+     {
+      "met": false,
+      "name": "execution_shortfall_row_graded"
+     },
+     {
+      "met": false,
+      "name": "shadow_books_cover_every_active_arm"
+     },
+     {
+      "met": false,
+      "name": "kill_switch_fire_drill_passed"
+     },
+     {
+      "met": true,
+      "name": "money_path_chain_verified"
+     },
+     {
+      "met": false,
+      "name": "aws_total_within_ceiling"
+     },
+     {
+      "met": false,
+      "name": "old_sf_execution_count_zero"
+     },
+     {
+      "met": false,
+      "name": "data_cutover_ready"
+     },
+     {
+      "met": false,
+      "name": "data_collection_reliability"
+     },
+     {
+      "met": true,
+      "name": "metron_read_artifacts_have_surviving_producer"
+     }
+    ],
+    "component_state": null,
+    "detail": "2/11 clauses met; unmeasurable: aws_total_within_ceiling; holding: trader_one_week_on_v2_champion, broker_reconciliation_control_arm_passed, execution_shortfall_row_graded, shadow_books_cover_every_active_arm, kill_switch_fire_drill_passed, old_sf_execution_count_zero, data_cutover_ready, data_collection_reliability; grades 9 of 15 alpha-engine-config-I9760 deliverables; not gate-readable: trader_release_pin_ib_paper_smoke, portfolio_adopted_by_trader, lambdas_and_alarms_removed, artifact_registry_tombstoned, codebuild_consumers_retired, system_optimized_doc_rewritten; graded while phase1 (alpha-engine-config-I9757) is UNMET \u2014 a later phase may not be exited ahead of an earlier one",
+    "id": "phase:phase4",
+    "source": "phase",
+    "state": "OUT_OF_ORDER"
+   },
+   {
+    "clauses": [
+     {
+      "met": false,
+      "name": "every_llm_arm_has_a_verdict_within_one_cycle"
+     }
+    ],
+    "component_state": null,
+    "detail": "0/1 clauses met; unmeasurable: every_llm_arm_has_a_verdict_within_one_cycle; grades 1 of 4 alpha-engine-config-I9761 deliverables; not gate-readable: judge_calibration, pit_constituent_lists, leave_one_out_ablation_replay; graded while phase1 (alpha-engine-config-I9757) is UNMET \u2014 a later phase may not be exited ahead of an earlier one",
+    "id": "phase:phase5",
+    "source": "phase",
+    "state": "OUT_OF_ORDER"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "phase 0 already meets its exit gate",
+    "id": "phase:phase0:earliest-satisfiable",
+    "source": "phase",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "phase 1 is unmet, but no unmet clause could derive an earliest-satisfiable date this render",
+    "id": "phase:phase1:earliest-satisfiable",
+    "source": "phase",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "phase 2 is unmet, but no unmet clause could derive an earliest-satisfiable date this render",
+    "id": "phase:phase2:earliest-satisfiable",
+    "source": "phase",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "phase 3 is unmet, but no unmet clause could derive an earliest-satisfiable date this render",
+    "id": "phase:phase3:earliest-satisfiable",
+    "source": "phase",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "phase 4 is unmet, but no unmet clause could derive an earliest-satisfiable date this render",
+    "id": "phase:phase4:earliest-satisfiable",
+    "source": "phase",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "phase 5 is unmet, but no unmet clause could derive an earliest-satisfiable date this render",
+    "id": "phase:phase5:earliest-satisfiable",
+    "source": "phase",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "alpha-engine-config-I9756 is closed and gates/phase0/closing.json records the reading that justified it: 5/5 clauses met on trading day 2026-09-08, at commit c06e4efb90c31b6b84e5e4d4925688ee2ea99054.",
+    "id": "phase:phase0:closing",
+    "source": "phase",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "alpha-engine-config-I9757 is closed and gates/phase1/closing.json records the reading that justified it: 6/6 clauses met on trading day 2026-09-08, at commit c06e4efb90c31b6b84e5e4d4925688ee2ea99054.",
+    "id": "phase:phase1:closing",
+    "source": "phase",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "alpha-engine-config-I9758 is closed and gates/phase2/closing.json records the reading that justified it: 7/7 clauses met on trading day 2026-09-11, at commit ef324652454d1252ca1fbe6ee338172ce9dd0480.",
+    "id": "phase:phase2:closing",
+    "source": "phase",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "alpha-engine-config-I9759 is open and no closing record has been filed. That is the expected state of a phase that has not exited; the record is written by the first live `crucible gate` reading that reads MET.",
+    "id": "phase:phase3:closing",
+    "source": "phase",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "alpha-engine-config-I9760 is open and no closing record has been filed. That is the expected state of a phase that has not exited; the record is written by the first live `crucible gate` reading that reads MET.",
+    "id": "phase:phase4:closing",
+    "source": "phase",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "alpha-engine-config-I9761 is open and no closing record has been filed. That is the expected state of a phase that has not exited; the record is written by the first live `crucible gate` reading that reads MET.",
+    "id": "phase:phase5:closing",
+    "source": "phase",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "every one of the 6 registered gates has a dated reading no older than 2026-09-23.",
+    "id": "producer:gate-readings-fresh",
+    "source": "producer",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "OVERDUE since 2026-09-04 (plan 2026-09-06) \u2014 reads: phase1 2/6",
+    "id": "schedule:day5_replays",
+    "source": "schedule",
+    "state": "UNMET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "OVERDUE since 2026-09-08 (plan 2026-09-08) \u2014 reads: phase2 5/7",
+    "id": "schedule:days6_7_scheduler",
+    "source": "schedule",
+    "state": "UNMET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "OVERDUE since 2026-09-11 (plan 2026-09-12) \u2014 reads: phase2 5/7",
+    "id": "schedule:live1",
+    "source": "schedule",
+    "state": "UNMET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "OVERDUE since 2026-09-18 (plan 2026-09-19) \u2014 reads: phase2 5/7",
+    "id": "schedule:live2_cutover",
+    "source": "schedule",
+    "state": "UNMET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "due 2026-09-25 (plan 2026-09-26), waiting on phase2 5/7",
+    "id": "schedule:live3",
+    "source": "schedule",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": "HEALTHY",
+    "detail": "HEALTHY: ran inside its declared window and ended ok.",
+    "id": "component:acceptance.publish",
+    "source": "component",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": "DEGRADED",
+    "detail": "DEGRADED: ran inside its declared window and ended ok, but 1 declared metric(s) breached their ceiling (pages_per_20_trading_days).",
+    "id": "component:alerts.sweep",
+    "source": "component",
+    "state": "UNMET"
+   },
+   {
+    "clauses": null,
+    "component_state": "DEGRADED",
+    "detail": "DEGRADED: ran inside its declared window and ended ok, but 1 declared metric(s) breached their ceiling (schedule_milestones_overdue).",
+    "id": "component:board",
+    "source": "component",
+    "state": "UNMET"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 17:00 ET the calendar day after trading day 2026-09-24 (each week's final session) has not passed (2026-09-25T21:00:00Z); no manifest yet.",
+    "id": "component:console",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "HEALTHY",
+    "detail": "HEALTHY: ran inside its declared window and ended ok.",
+    "id": "component:data.daily",
+    "source": "component",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:data.heal",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 09:00 ET the calendar day after trading day 2026-09-24 (each week's final session) has not passed (2026-09-25T13:00:00Z); no manifest yet.",
+    "id": "component:data.weekly",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "HEALTHY",
+    "detail": "HEALTHY: ran inside its declared window and ended ok.",
+    "id": "component:deploy",
+    "source": "component",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 15:00 ET the calendar day after trading day 2026-09-24 (each week's final session) has not passed (2026-09-25T19:00:00Z); no manifest yet.",
+    "id": "component:drift",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:experiment.backfill",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 14:00 ET the calendar day after trading day 2026-09-24 (each week's final session) has not passed (2026-09-25T18:00:00Z); no manifest yet.",
+    "id": "component:experiment.grade",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:experiment.new",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 11:00 ET the calendar day after trading day 2026-09-24 (each week's final session) has not passed (2026-09-25T15:00:00Z); no manifest yet.",
+    "id": "component:experiment.register",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 12:00 ET the calendar day after trading day 2026-09-24 (each week's final session) has not passed (2026-09-25T16:00:00Z); no manifest yet.",
+    "id": "component:experiment.run",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 17:15 ET the calendar day after trading day 2026-09-24 (each week's final session) has not passed (2026-09-25T21:15:00Z); no manifest yet.",
+    "id": "component:explain",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:fault.probe",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:fault.record",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "HEALTHY",
+    "detail": "HEALTHY: ran inside its declared window and ended ok.",
+    "id": "component:gate",
+    "source": "component",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": "HEALTHY",
+    "detail": "HEALTHY: ran inside its declared window and ended ok.",
+    "id": "component:gate.close",
+    "source": "component",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 18:00 ET the calendar day after trading day 2026-09-24 (each week's final session) has not passed (2026-09-25T22:00:00Z); no manifest yet.",
+    "id": "component:heartbeat",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:holdout",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 17:15 ET the calendar day after trading day 2026-09-24 (each week's final session) has not passed (2026-09-25T21:15:00Z); no manifest yet.",
+    "id": "component:iac.conformance",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 14:30 ET the calendar day after trading day 2026-09-24 (each week's final session) has not passed (2026-09-25T18:30:00Z); no manifest yet.",
+    "id": "component:migrate.history",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 15:00 ET the calendar day after trading day 2026-09-24 (each week's final session) has not passed (2026-09-25T19:00:00Z); no manifest yet.",
+    "id": "component:promote",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:release.lock",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:release.pin",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 16:00 ET the calendar day after trading day 2026-09-24 (each week's final session) has not passed (2026-09-25T20:00:00Z); no manifest yet.",
+    "id": "component:report",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 12:00 ET the calendar day after trading day 2026-09-24 (every trading day) has not passed (2026-09-25T16:00:00Z); no manifest yet.",
+    "id": "component:report.morning",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:review.record",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "HEALTHY",
+    "detail": "HEALTHY: ran inside its declared window and ended ok.",
+    "id": "component:smoke",
+    "source": "component",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:test.integration",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:trader.fire_drill",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:trader.kill_switch",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:trader.reconcile",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:trader.session",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:trader.smoke",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 17:30 ET the calendar day after trading day 2026-09-24 (each week's final session) has not passed (2026-09-25T21:30:00Z); no manifest yet.",
+    "id": "component:weekly",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "the live feature_version() 'v553618c991dd' holds 1186 session object(s), at least as many as any other version present (deepest: 'v553618c991dd' with 1186)",
+    "id": "component:feature_layer_depth",
+    "source": "component",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "no catalogue column is null on >= 50% of rows on any sampled session of 'v553618c991dd'; worst null ratio 100.00% on 'institutional_accumulation_raw' (session 2022-11-07). 8 sampled session(s) are dead ONLY before a declared source boundary (fundamental from 2022-01-04; institutional from 2022-11-15) and are boundaries, not defects: 2022-01-03, 2022-02-15, 2022-03-31, 2022-05-13, 2022-06-29, 2022-08-11 \u2014 see crucible.features.boundaries, where each carries its derivation and what would deepen it. 40 of 1186 session(s) sampled evenly across the layer (2022-01-03..2026-09-24); any contiguous band of 31 session(s) or more is sampled, a shorter one can sit between two samples unseen",
+    "id": "component:feature_layer_completeness",
+    "source": "component",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "every sampled session of the live feature_version() 'v553618c991dd' was compiled by the production point-in-time source 'edgar-filing-date'. 40 of 1186 session(s) sampled evenly across the layer (2022-01-03..2026-09-24); any contiguous band of 31 session(s) or more is sampled, a shorter one can sit between two samples unseen",
+    "id": "component:feature_layer_provenance",
+    "source": "component",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "2026-09: 3213 human mutating call(s) over 2026-09-01..2026-09-25, 7205051 records in 31626 archive objects",
+    "id": "standing:human_touch_count",
+    "source": "standing",
+    "state": "UNMET"
+   },
+   {
+    "clauses": [
+     {
+      "met": false,
+      "name": "live_saturdays_first_attempt_ok"
+     }
+    ],
+    "component_state": null,
+    "detail": "1 failed: 2026-09-18: \"ArcStageFailed: weekly arc stage experiment.run[r] raised for 2026-09-18: MissingArtifactError: the champion pointer for slot 'r' names 'r:scanner_predictor_direct:1440be66f4a8', which produced no shadow this cycle. The serving path resolves the pointer \u2014 it never imports a ranking function directly \u2014 so a pointer to an arm that did not produce means production has no feed today. at weekly.py:270\"",
+    "id": "standing:live_saturdays_first_attempt_ok",
+    "source": "standing",
+    "state": "UNMET"
+   },
+   {
+    "clauses": [
+     {
+      "met": false,
+      "name": "pages_within_ceiling"
+     }
+    ],
+    "component_state": null,
+    "detail": "7 paged incidents over 2026-09-17..2026-09-24, ceiling 2: alerts/2026-09-17/absence.absence.json, alerts/2026-09-18/absence.absence.json, alerts/2026-09-18/failure.experiment.run.json, alerts/2026-09-18/failure.weekly.json",
+    "id": "standing:pages_within_ceiling",
+    "source": "standing",
+    "state": "UNMET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "Reads v1 Step Function state, which lives in the old account surface and in no v2 artifact. A producer must file the reading; the board will not reach AWS itself, because a gate reads artifacts and never runs.",
+    "id": "cutover:old_step_functions_disabled",
+    "source": "cutover",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "Same shape: an inventory of things that must NOT exist, which only a job with v1 read access can establish. Absence is the evidence here, and absence is exactly what cannot be inferred from this store.",
+    "id": "cutover:v1_resources_deleted",
+    "source": "cutover",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "The trader is a separate system (see the crucible skill: the harness is not the trader). Which producer it reads is a fact about the trader's configuration, and it must be filed here rather than guessed from the champion pointer's existence \u2014 `crucible.keys.champion_key` gives the same key whichever system wrote it.",
+    "id": "cutover:trader_on_the_v2_contract",
+    "source": "cutover",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "Needs Cost Explorer against the `system=crucible-v2` tag, which no v2 job reads today. `alpha-engine-config-I9828` covers the credential half of the same problem for the acceptance cost clause.",
+    "id": "cutover:aws_cost_under_ceiling",
+    "source": "cutover",
+    "state": "PLANNED"
+   }
+  ],
+  "schema_version": "board.v1",
+  "trading_day": "2026-09-24"
+ },
+ "ladder": {
+  "generated_utc": "2026-09-25T01:24:26Z"
+ },
+ "previous": {
+  "counts": {
+   "DECLARED_OFF": 0,
+   "MET": 12,
+   "OUT_OF_ORDER": 4,
+   "PLANNED": 22,
+   "UNMEASURABLE": 0,
+   "UNMEASURED": 32,
+   "UNMET": 10
+  },
+  "generated_at": "2026-09-24T01:23:15Z",
+  "row_count": 80,
+  "rows": [
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "The window is read from the run manifests of 1 live plus 5 replayed Saturdays, and no run has been made under phase-2 conditions yet. Phase 2 is alpha-engine-config-I9758; the ruled gate is \u00a76.1's 1 live + 5 replayed (narrowed from 2 live by alpha-engine-config-I10324), NOT \u00a72's superseded \"4 consecutive Saturdays\". A reader for this row can only be written once a weekly arc has run unattended.",
+    "id": "objective:autonomy",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "`crucible.keys.verdict_key` gives the real shape, and it is keyed by ARM as well as trading day \u2014 so \"did one command return a verdict today\" is a question about the arm register, not about a single pointer key. The register (`arms/{slot}/register.jsonl`) is written by `experiment.new`, which is still a stub. A reader is writable the day that job lands.",
+    "id": "objective:one_command",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "The fleet trial ledger is the real artifact (`crucible.keys.ledger_key`) and it is an append-only JSONL log, not a cost document \u2014 it carries per trial rows, not a monthly AWS figure. Nothing in this repository writes a cost reading at all today; `alpha-engine-config-I9828` is where the cost clause's own unmeasurability is tracked, and it must be answered before this row can have a reader.",
+    "id": "objective:cost",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "This objective is enforced by the manifest SCHEMA, which is a repository property rather than a store artifact. The schema passing in CI is not a reading of PRODUCTION, and rendering it MET on the strength of a green test would be the \"a merge satisfied the gate\" defect this board exists to prevent. A reader would sweep production manifests for a status outside {ok, failed}; that sweep does not exist.",
+    "id": "objective:no_third_state",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "no artifact at report/2026-09-23/attribution.json \u2014 nothing has filed a reading for this day",
+    "id": "objective:attribution",
+    "source": "objective",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "`crucible.alerts` writes one key per INCIDENT per day, deliberately \u2014 the weekly ceiling counts incidents, and there is no weekly rollup document to read. A reader must count incident keys across the week's trading days against the declared ceiling; that rollup is not written and counting it here would put the ceiling's definition in two places.",
+    "id": "objective:alerting",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "The registry half is a repository property; the explain half needs a real production verdict for `crucible explain` to walk back, and there is none. Rendering half an objective MET is how a partial reading becomes a claim of completeness.",
+    "id": "objective:transparency",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "`crucible.keys.arm_register_key` is per-SLOT and is a JSONL register, so \"every slot declares both controls\" is a read across four registers that `experiment.new` has not written yet \u2014 that job is still a stub.",
+    "id": "objective:control_arms",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "\"Flawless from day 1\" is proven on the FAILURE path, and the fault harness has not been run against the production store. Nothing about the happy path can substitute for this reading.",
+    "id": "objective:fault_injection",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "`crucible.keys.features_key` is a PARQUET panel keyed by feature version and trading day, not a JSON verdict. Whether R and M read the same version is a question about the two slots' recipes, and the answer belongs in a feature-registry reading that `features/{version}/registry.json` does not yet carry.",
+    "id": "objective:feature_layer",
+    "source": "objective",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": [
+     {
+      "met": true,
+      "name": "old_weekly_within_cadence"
+     },
+     {
+      "met": true,
+      "name": "dead_lambdas_deleted"
+     },
+     {
+      "met": true,
+      "name": "old_alerts_muted"
+     },
+     {
+      "met": true,
+      "name": "v2_resources_tagged_and_versioned"
+     },
+     {
+      "met": true,
+      "name": "acceptance_suite_committed"
+     }
+    ],
+    "component_state": null,
+    "detail": "5/5 clauses met; grades all 5 of 5 alpha-engine-config-I9756 deliverables",
+    "id": "phase:phase0",
+    "source": "phase",
+    "state": "MET"
+   },
+   {
+    "clauses": [
+     {
+      "met": false,
+      "name": "arc_runs_ok"
+     },
+     {
+      "met": false,
+      "name": "arms_all_scored"
+     },
+     {
+      "met": false,
+      "name": "attribution_renders"
+     },
+     {
+      "met": false,
+      "name": "explain_walks_a_verdict"
+     },
+     {
+      "met": true,
+      "name": "pointer_flipped_on_smoke"
+     },
+     {
+      "met": true,
+      "name": "independently_reviewed"
+     }
+    ],
+    "component_state": null,
+    "detail": "2/6 clauses met; holding: arc_runs_ok, arms_all_scored, attribution_renders, explain_walks_a_verdict; grades 8 of 20 alpha-engine-config-I9757 deliverables; not gate-readable: trial_ledger, trading_day_contract_test, m_slot_lifted, s_slot_lifted, promote_and_condorcet_retirement, ci_workflow, cfn_template, alerting_two_page_conditions, drift_metrics, fault_injection_scripts, console_page_from_manifests, components_yaml",
+    "id": "phase:phase1",
+    "source": "phase",
+    "state": "UNMET"
+   },
+   {
+    "clauses": [
+     {
+      "met": false,
+      "name": "replays_ok"
+     },
+     {
+      "met": true,
+      "name": "pages_commissioned"
+     },
+     {
+      "met": true,
+      "name": "two_page_conditions_on_real_channel"
+     },
+     {
+      "met": true,
+      "name": "transient_retry_class_in_runner"
+     },
+     {
+      "met": true,
+      "name": "fault_injection_against_scheduled_path"
+     },
+     {
+      "met": true,
+      "name": "runbook_in_readme"
+     },
+     {
+      "met": false,
+      "name": "aws_cost_within_ceiling"
+     }
+    ],
+    "component_state": null,
+    "detail": "5/7 clauses met; unmeasurable: aws_cost_within_ceiling; holding: replays_ok; grades all 6 of 6 alpha-engine-config-I9758 deliverables; graded while phase1 (alpha-engine-config-I9757) is UNMET \u2014 a later phase may not be exited ahead of an earlier one",
+    "id": "phase:phase2",
+    "source": "phase",
+    "state": "OUT_OF_ORDER"
+   },
+   {
+    "clauses": [
+     {
+      "met": false,
+      "name": "m_promotion_or_verdict_backed_non_promotion"
+     },
+     {
+      "met": false,
+      "name": "r_promotion_or_verdict_backed_non_promotion"
+     },
+     {
+      "met": false,
+      "name": "s_promotion_or_verdict_backed_non_promotion"
+     },
+     {
+      "met": false,
+      "name": "u_promotion_or_verdict_backed_non_promotion"
+     },
+     {
+      "met": false,
+      "name": "portfolio_engine_used_by_s_slot"
+     },
+     {
+      "met": false,
+      "name": "named_transaction_cost_model"
+     },
+     {
+      "met": false,
+      "name": "factor_neutral_attribution"
+     },
+     {
+      "met": true,
+      "name": "sealed_holdout"
+     },
+     {
+      "met": true,
+      "name": "integration_tier_current_and_ok"
+     },
+     {
+      "met": false,
+      "name": "v1_arms_carried_or_excluded"
+     },
+     {
+      "met": false,
+      "name": "every_recipe_in_the_release_is_registered"
+     }
+    ],
+    "component_state": null,
+    "detail": "2/11 clauses met; unmeasurable: m_promotion_or_verdict_backed_non_promotion, s_promotion_or_verdict_backed_non_promotion, portfolio_engine_used_by_s_slot, named_transaction_cost_model, factor_neutral_attribution, v1_arms_carried_or_excluded; holding: r_promotion_or_verdict_backed_non_promotion, u_promotion_or_verdict_backed_non_promotion, every_recipe_in_the_release_is_registered; grades 4 of 5 alpha-engine-config-I9759 deliverables; not gate-readable: benchmark_per_slot; graded while phase1 (alpha-engine-config-I9757) is UNMET \u2014 a later phase may not be exited ahead of an earlier one",
+    "id": "phase:phase3",
+    "source": "phase",
+    "state": "OUT_OF_ORDER"
+   },
+   {
+    "clauses": [
+     {
+      "met": false,
+      "name": "trader_one_week_on_v2_champion"
+     },
+     {
+      "met": false,
+      "name": "broker_reconciliation_control_arm_passed"
+     },
+     {
+      "met": false,
+      "name": "execution_shortfall_row_graded"
+     },
+     {
+      "met": false,
+      "name": "shadow_books_cover_every_active_arm"
+     },
+     {
+      "met": false,
+      "name": "kill_switch_fire_drill_passed"
+     },
+     {
+      "met": true,
+      "name": "money_path_chain_verified"
+     },
+     {
+      "met": false,
+      "name": "aws_total_within_ceiling"
+     },
+     {
+      "met": false,
+      "name": "old_sf_execution_count_zero"
+     },
+     {
+      "met": false,
+      "name": "data_cutover_ready"
+     },
+     {
+      "met": true,
+      "name": "metron_read_artifacts_have_surviving_producer"
+     }
+    ],
+    "component_state": null,
+    "detail": "2/10 clauses met; unmeasurable: aws_total_within_ceiling, data_cutover_ready; holding: trader_one_week_on_v2_champion, broker_reconciliation_control_arm_passed, execution_shortfall_row_graded, shadow_books_cover_every_active_arm, kill_switch_fire_drill_passed, old_sf_execution_count_zero; grades 8 of 14 alpha-engine-config-I9760 deliverables; not gate-readable: trader_release_pin_ib_paper_smoke, portfolio_adopted_by_trader, lambdas_and_alarms_removed, artifact_registry_tombstoned, codebuild_consumers_retired, system_optimized_doc_rewritten; graded while phase1 (alpha-engine-config-I9757) is UNMET \u2014 a later phase may not be exited ahead of an earlier one",
+    "id": "phase:phase4",
+    "source": "phase",
+    "state": "OUT_OF_ORDER"
+   },
+   {
+    "clauses": [
+     {
+      "met": false,
+      "name": "every_llm_arm_has_a_verdict_within_one_cycle"
+     }
+    ],
+    "component_state": null,
+    "detail": "0/1 clauses met; unmeasurable: every_llm_arm_has_a_verdict_within_one_cycle; grades 1 of 4 alpha-engine-config-I9761 deliverables; not gate-readable: judge_calibration, pit_constituent_lists, leave_one_out_ablation_replay; graded while phase1 (alpha-engine-config-I9757) is UNMET \u2014 a later phase may not be exited ahead of an earlier one",
+    "id": "phase:phase5",
+    "source": "phase",
+    "state": "OUT_OF_ORDER"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "phase 0 already meets its exit gate",
+    "id": "phase:phase0:earliest-satisfiable",
+    "source": "phase",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "phase 1 is unmet, but no unmet clause could derive an earliest-satisfiable date this render",
+    "id": "phase:phase1:earliest-satisfiable",
+    "source": "phase",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "phase 2 is unmet, but no unmet clause could derive an earliest-satisfiable date this render",
+    "id": "phase:phase2:earliest-satisfiable",
+    "source": "phase",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "phase 3 is unmet, but no unmet clause could derive an earliest-satisfiable date this render",
+    "id": "phase:phase3:earliest-satisfiable",
+    "source": "phase",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "phase 4 is unmet, but no unmet clause could derive an earliest-satisfiable date this render",
+    "id": "phase:phase4:earliest-satisfiable",
+    "source": "phase",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "phase 5 is unmet, but no unmet clause could derive an earliest-satisfiable date this render",
+    "id": "phase:phase5:earliest-satisfiable",
+    "source": "phase",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "alpha-engine-config-I9756 is closed and gates/phase0/closing.json records the reading that justified it: 5/5 clauses met on trading day 2026-09-08, at commit c06e4efb90c31b6b84e5e4d4925688ee2ea99054.",
+    "id": "phase:phase0:closing",
+    "source": "phase",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "alpha-engine-config-I9757 is closed and gates/phase1/closing.json records the reading that justified it: 6/6 clauses met on trading day 2026-09-08, at commit c06e4efb90c31b6b84e5e4d4925688ee2ea99054.",
+    "id": "phase:phase1:closing",
+    "source": "phase",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "alpha-engine-config-I9758 is closed and gates/phase2/closing.json records the reading that justified it: 7/7 clauses met on trading day 2026-09-11, at commit ef324652454d1252ca1fbe6ee338172ce9dd0480.",
+    "id": "phase:phase2:closing",
+    "source": "phase",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "alpha-engine-config-I9759 is open and no closing record has been filed. That is the expected state of a phase that has not exited; the record is written by the first live `crucible gate` reading that reads MET.",
+    "id": "phase:phase3:closing",
+    "source": "phase",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "alpha-engine-config-I9760 is open and no closing record has been filed. That is the expected state of a phase that has not exited; the record is written by the first live `crucible gate` reading that reads MET.",
+    "id": "phase:phase4:closing",
+    "source": "phase",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "alpha-engine-config-I9761 is open and no closing record has been filed. That is the expected state of a phase that has not exited; the record is written by the first live `crucible gate` reading that reads MET.",
+    "id": "phase:phase5:closing",
+    "source": "phase",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "every one of the 6 registered gates has a dated reading no older than 2026-09-22.",
+    "id": "producer:gate-readings-fresh",
+    "source": "producer",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "OVERDUE since 2026-09-04 (plan 2026-09-06) \u2014 reads: phase1 2/6",
+    "id": "schedule:day5_replays",
+    "source": "schedule",
+    "state": "UNMET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "OVERDUE since 2026-09-08 (plan 2026-09-08) \u2014 reads: phase2 5/7",
+    "id": "schedule:days6_7_scheduler",
+    "source": "schedule",
+    "state": "UNMET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "OVERDUE since 2026-09-11 (plan 2026-09-12) \u2014 reads: phase2 5/7",
+    "id": "schedule:live1",
+    "source": "schedule",
+    "state": "UNMET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "OVERDUE since 2026-09-18 (plan 2026-09-19) \u2014 reads: phase2 5/7",
+    "id": "schedule:live2_cutover",
+    "source": "schedule",
+    "state": "UNMET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "due 2026-09-25 (plan 2026-09-26), waiting on phase2 5/7",
+    "id": "schedule:live3",
+    "source": "schedule",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:acceptance.publish",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "DEGRADED",
+    "detail": "DEGRADED: ran inside its declared window and ended ok, but 1 declared metric(s) breached their ceiling (pages_per_20_trading_days).",
+    "id": "component:alerts.sweep",
+    "source": "component",
+    "state": "UNMET"
+   },
+   {
+    "clauses": null,
+    "component_state": "DEGRADED",
+    "detail": "DEGRADED: ran inside its declared window and ended ok, but 1 declared metric(s) breached their ceiling (schedule_milestones_overdue).",
+    "id": "component:board",
+    "source": "component",
+    "state": "UNMET"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 17:00 ET the calendar day after trading day 2026-09-23 (each week's final session) has not passed (2026-09-24T21:00:00Z); no manifest yet.",
+    "id": "component:console",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "HEALTHY",
+    "detail": "HEALTHY: ran inside its declared window and ended ok.",
+    "id": "component:data.daily",
+    "source": "component",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:data.heal",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 09:00 ET the calendar day after trading day 2026-09-23 (each week's final session) has not passed (2026-09-24T13:00:00Z); no manifest yet.",
+    "id": "component:data.weekly",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:deploy",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 15:00 ET the calendar day after trading day 2026-09-23 (each week's final session) has not passed (2026-09-24T19:00:00Z); no manifest yet.",
+    "id": "component:drift",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:experiment.backfill",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 14:00 ET the calendar day after trading day 2026-09-23 (each week's final session) has not passed (2026-09-24T18:00:00Z); no manifest yet.",
+    "id": "component:experiment.grade",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:experiment.new",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 11:00 ET the calendar day after trading day 2026-09-23 (each week's final session) has not passed (2026-09-24T15:00:00Z); no manifest yet.",
+    "id": "component:experiment.register",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 12:00 ET the calendar day after trading day 2026-09-23 (each week's final session) has not passed (2026-09-24T16:00:00Z); no manifest yet.",
+    "id": "component:experiment.run",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 17:15 ET the calendar day after trading day 2026-09-23 (each week's final session) has not passed (2026-09-24T21:15:00Z); no manifest yet.",
+    "id": "component:explain",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:fault.probe",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:fault.record",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "HEALTHY",
+    "detail": "HEALTHY: ran inside its declared window and ended ok.",
+    "id": "component:gate",
+    "source": "component",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": "HEALTHY",
+    "detail": "HEALTHY: ran inside its declared window and ended ok.",
+    "id": "component:gate.close",
+    "source": "component",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 18:00 ET the calendar day after trading day 2026-09-23 (each week's final session) has not passed (2026-09-24T22:00:00Z); no manifest yet.",
+    "id": "component:heartbeat",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:holdout",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 17:15 ET the calendar day after trading day 2026-09-23 (each week's final session) has not passed (2026-09-24T21:15:00Z); no manifest yet.",
+    "id": "component:iac.conformance",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 14:30 ET the calendar day after trading day 2026-09-23 (each week's final session) has not passed (2026-09-24T18:30:00Z); no manifest yet.",
+    "id": "component:migrate.history",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 15:00 ET the calendar day after trading day 2026-09-23 (each week's final session) has not passed (2026-09-24T19:00:00Z); no manifest yet.",
+    "id": "component:promote",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:release.lock",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:release.pin",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 16:00 ET the calendar day after trading day 2026-09-23 (each week's final session) has not passed (2026-09-24T20:00:00Z); no manifest yet.",
+    "id": "component:report",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 12:00 ET the calendar day after trading day 2026-09-23 (every trading day) has not passed (2026-09-24T16:00:00Z); no manifest yet.",
+    "id": "component:report.morning",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:review.record",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:smoke",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:test.integration",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:trader.fire_drill",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:trader.kill_switch",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:trader.reconcile",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "ARMED",
+    "detail": "ARMED: on-demand (schedule: null); its trigger is the CLI job table, which still carries it. Silence here carries no claim of a recent run.",
+    "id": "component:trader.smoke",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": "RUNNING",
+    "detail": "RUNNING: scheduled, deadline 17:30 ET the calendar day after trading day 2026-09-23 (each week's final session) has not passed (2026-09-24T21:30:00Z); no manifest yet.",
+    "id": "component:weekly",
+    "source": "component",
+    "state": "UNMEASURED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "the live feature_version() 'v553618c991dd' holds 1185 session object(s), at least as many as any other version present (deepest: 'v553618c991dd' with 1185)",
+    "id": "component:feature_layer_depth",
+    "source": "component",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "no catalogue column is null on >= 50% of rows on any sampled session of 'v553618c991dd'; worst null ratio 100.00% on 'institutional_accumulation_raw' (session 2022-11-07). 8 sampled session(s) are dead ONLY before a declared source boundary (fundamental from 2022-01-04; institutional from 2022-11-15) and are boundaries, not defects: 2022-01-03, 2022-02-15, 2022-03-31, 2022-05-13, 2022-06-28, 2022-08-11 \u2014 see crucible.features.boundaries, where each carries its derivation and what would deepen it. 40 of 1185 session(s) sampled evenly across the layer (2022-01-03..2026-09-23); any contiguous band of 31 session(s) or more is sampled, a shorter one can sit between two samples unseen",
+    "id": "component:feature_layer_completeness",
+    "source": "component",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "every sampled session of the live feature_version() 'v553618c991dd' was compiled by the production point-in-time source 'edgar-filing-date'. 40 of 1185 session(s) sampled evenly across the layer (2022-01-03..2026-09-23); any contiguous band of 31 session(s) or more is sampled, a shorter one can sit between two samples unseen",
+    "id": "component:feature_layer_provenance",
+    "source": "component",
+    "state": "MET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "2026-09: 3180 human mutating call(s) over 2026-09-01..2026-09-24, 6688409 records in 30332 archive objects",
+    "id": "standing:human_touch_count",
+    "source": "standing",
+    "state": "UNMET"
+   },
+   {
+    "clauses": [
+     {
+      "met": false,
+      "name": "live_saturdays_first_attempt_ok"
+     }
+    ],
+    "component_state": null,
+    "detail": "1 failed: 2026-09-18: \"ArcStageFailed: weekly arc stage experiment.run[r] raised for 2026-09-18: MissingArtifactError: the champion pointer for slot 'r' names 'r:scanner_predictor_direct:1440be66f4a8', which produced no shadow this cycle. The serving path resolves the pointer \u2014 it never imports a ranking function directly \u2014 so a pointer to an arm that did not produce means production has no feed today. at weekly.py:270\"",
+    "id": "standing:live_saturdays_first_attempt_ok",
+    "source": "standing",
+    "state": "UNMET"
+   },
+   {
+    "clauses": [
+     {
+      "met": false,
+      "name": "pages_within_ceiling"
+     }
+    ],
+    "component_state": null,
+    "detail": "7 paged incidents over 2026-09-16..2026-09-23, ceiling 2: alerts/2026-09-17/absence.absence.json, alerts/2026-09-18/absence.absence.json, alerts/2026-09-18/failure.experiment.run.json, alerts/2026-09-18/failure.weekly.json",
+    "id": "standing:pages_within_ceiling",
+    "source": "standing",
+    "state": "UNMET"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "Reads v1 Step Function state, which lives in the old account surface and in no v2 artifact. A producer must file the reading; the board will not reach AWS itself, because a gate reads artifacts and never runs.",
+    "id": "cutover:old_step_functions_disabled",
+    "source": "cutover",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "Same shape: an inventory of things that must NOT exist, which only a job with v1 read access can establish. Absence is the evidence here, and absence is exactly what cannot be inferred from this store.",
+    "id": "cutover:v1_resources_deleted",
+    "source": "cutover",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "The trader is a separate system (see the crucible skill: the harness is not the trader). Which producer it reads is a fact about the trader's configuration, and it must be filed here rather than guessed from the champion pointer's existence \u2014 `crucible.keys.champion_key` gives the same key whichever system wrote it.",
+    "id": "cutover:trader_on_the_v2_contract",
+    "source": "cutover",
+    "state": "PLANNED"
+   },
+   {
+    "clauses": null,
+    "component_state": null,
+    "detail": "Needs Cost Explorer against the `system=crucible-v2` tag, which no v2 job reads today. `alpha-engine-config-I9828` covers the credential half of the same problem for the acceptance cost clause.",
+    "id": "cutover:aws_cost_under_ceiling",
+    "source": "cutover",
+    "state": "PLANNED"
+   }
+  ],
+  "schema_version": "board.v1",
+  "trading_day": "2026-09-23"
+ }
+}
