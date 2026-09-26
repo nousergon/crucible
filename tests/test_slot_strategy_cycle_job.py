@@ -37,6 +37,7 @@ from crucible.keys import (
     champion_key,
     data_panel_key,
     features_key,
+    manifest_key,
     manifest_prefix,
     session_inputs_key,
     shadow_key,
@@ -1063,6 +1064,70 @@ class TestNoMChampionIsADeclaredOutcome:
             argv = stage.argv(trading_day=AS_OF, store=str(store.root), run_mode="replay")
             assert main(argv) == 0, argv
             self._assert_declared(_latest_manifest(store, stage.job, AS_OF))
+
+    def test_promote_after_m_seats_its_first_champion_in_the_same_arc(
+        self, world, monkeypatch
+    ) -> None:
+        """The Saturday M seats its FIRST champion. The arc runs
+        `experiment.run[s]` and `experiment.grade[s]` with no M pointer, then
+        `promote[m]` seats one, then `promote[s]` runs. The grade run's own
+        declaration stands in for the cycle it never constructed; before the
+        fix the ordinary path died `KeyError` on the empty S register and took
+        the rest of the arc with it (dry-run rehearsal of 2026-09-25)."""
+        from crucible.cli import main
+        from crucible.weekly import arc_stages
+
+        store, _settings, root, _days = world
+        seated = store.get_bytes(champion_key("m"))
+        _remove_m_pointer(store)
+        monkeypatch.setenv("CRUCIBLE_STRATEGY_DIR", str(root))
+        stages = {
+            s.job: s
+            for s in arc_stages(AS_OF)
+            if s.slot == SLOT and s.job in {"experiment.run", "experiment.grade", "promote"}
+        }
+        for job in ("experiment.run", "experiment.grade"):
+            argv = stages[job].argv(trading_day=AS_OF, store=str(store.root), run_mode="replay")
+            assert main(argv) == 0, argv
+            self._assert_declared(_latest_manifest(store, job, AS_OF))
+        # `promote[m]`, between the two, seats the pointer.
+        store.put_bytes(champion_key("m"), seated)
+        argv = stages["promote"].argv(trading_day=AS_OF, store=str(store.root), run_mode="replay")
+        assert main(argv) == 0, argv
+
+        manifest = _latest_manifest(store, "promote", AS_OF)
+        assert manifest["status"] == "ok", manifest.get("reason")
+        rows = _declared_rows(manifest, UPSTREAM_CHAMPION_ABSENT_METRIC)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "unmeasurable"
+        assert "value" not in rows[0] and "unit" not in rows[0]
+        grade_key = manifest_key("experiment.grade", AS_OF.isoformat(), discriminator=SLOT)
+        assert rows[0]["source_path"] == grade_key
+        assert "promote[m]" in rows[0]["status_reason"]
+        # No verdict, no pointer, and no register row: nothing was graded.
+        assert not _declared_rows(manifest, "pointer_moved")
+        assert not _declared_rows(manifest, NO_SETTLED_SESSION_METRIC)
+        assert not store.exists(champion_key(SLOT))
+        assert not store.exists(arm_register_key(SLOT))
+
+    def test_an_m_pointer_present_when_grade_ran_takes_the_ordinary_path(
+        self, world, monkeypatch
+    ) -> None:
+        """The same-arc reading is keyed on the GRADE run's own row, never on
+        promote's view of the pointer: a grade that constructed a cycle is
+        acted on, with its `pointer_moved` verdict and no declared row."""
+        from crucible.cli import main
+
+        store, settings, root, days = world
+        _run_produce(store, settings, days)
+        _result, grade_manifest, _ctx = _run_grade(store, settings)
+        assert not _declared_rows(grade_manifest, UPSTREAM_CHAMPION_ABSENT_METRIC)
+        monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
+        monkeypatch.setenv("CRUCIBLE_STRATEGY_DIR", str(root))
+        assert main(["promote", "--slot", SLOT, "--date", AS_OF.isoformat()]) == 0
+        manifest = _latest_manifest(store, "promote", AS_OF)
+        assert _declared_rows(manifest, "pointer_moved")
+        assert not _declared_rows(manifest, UPSTREAM_CHAMPION_ABSENT_METRIC)
 
     def test_an_m_pointer_whose_arm_produced_nothing_still_fails_the_run(self, world) -> None:
         """The pointer EXISTS: a serving path with no feed fails loud."""
