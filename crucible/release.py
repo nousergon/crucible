@@ -46,12 +46,19 @@ from pydantic import BaseModel, ValidationError
 
 from crucible.calendar import is_trading_day as _nyse_is_trading_day
 from crucible.documents import load_document_bytes, load_store_document, read_manifests_under
-from crucible.keys import POINTER_KEY, TRADER_PIN_KEY, manifest_key, runs_prefix
+from crucible.keys import (
+    POINTER_KEY,
+    TRADER_PIN_KEY,
+    TRADER_PIN_REQUEST_KEY,
+    manifest_key,
+    runs_prefix,
+)
 from crucible.models import (
     ReleasePointerDocument,
     ReleaseProvenanceDocument,
     ReleaseRecordDocument,
     ReleaseRecordV3Document,
+    TraderPinRequestDocument,
     TraderReleasePinDocument,
 )
 from crucible.store import ETAG_ABSENT, PointerConflictError, S3Store, Store, sha256_hex
@@ -121,11 +128,20 @@ __all__ = [
     "TRADER_PIN_BLACKOUT_END_ET",
     "TRADER_PIN_BLACKOUT_START_ET",
     "TRADER_PIN_KEY",
+    "TRADER_PIN_REQUEST_KEY",
+    "TRADER_PIN_REQUEST_SCHEMA_VERSION",
     "TRADER_SMOKE_JOB",
+    "PendingTraderPin",
     "TraderPinRefusedError",
     "TraderSmokeEvidence",
+    "build_trader_pin_request",
     "passing_trader_smoke",
+    "pending_trader_pin",
     "pin_trader",
+    "read_trader_pin",
+    "read_trader_pin_request",
+    "read_trader_smoke",
+    "write_trader_pin_request",
     "select_trader_smoke",
     "trader_pin_window_refusal",
     "assert_sha",
@@ -1213,15 +1229,16 @@ def select_trader_smoke(
     return evidence, failures
 
 
-def passing_trader_smoke(store: Store, sha: str) -> TraderSmokeEvidence:
-    """Read every `trader.smoke` manifest and return the newest passing one for ``sha``.
+def read_trader_smoke(store: Store, sha: str) -> tuple[TraderSmokeEvidence | None, list[str]]:
+    """Every `trader.smoke` manifest, validated, reduced to the newest passing
+    one for ``sha`` plus a line per failed one — :func:`select_trader_smoke`
+    over the live store.
 
-    Raises :class:`TraderPinRefusedError` when there is none, naming every
-    failed smoke for this sha. Every manifest under the prefix is validated
-    against the run-manifest schema before it counts: a document that does not
-    conform cannot certify a pin, and an unreadable key or an unlistable prefix
-    is a refusal — "we could not read the evidence" never reads as "there is
-    evidence".
+    Raises :class:`TraderPinRefusedError` when the prefix cannot be listed or a
+    manifest under it cannot be read: "we could not read the evidence" never
+    reads as "there is none". Returning ``(None, [])`` is the one honest
+    "no smoke has run for this sha yet", which :func:`crucible.track_c`'s
+    `release.pin_apply` treats differently from a smoke that FAILED.
     """
     from crucible.manifest import validate  # noqa: PLC0415 - cycle, as write_deploy_manifest
 
@@ -1237,7 +1254,21 @@ def passing_trader_smoke(store: Store, sha: str) -> TraderSmokeEvidence:
         )
     for _key, document in read.documents:
         validate(document)
-    evidence, failures = select_trader_smoke(read.documents, sha)
+    return select_trader_smoke(read.documents, sha)
+
+
+def passing_trader_smoke(store: Store, sha: str) -> TraderSmokeEvidence:
+    """Read every `trader.smoke` manifest and return the newest passing one for ``sha``.
+
+    Raises :class:`TraderPinRefusedError` when there is none, naming every
+    failed smoke for this sha. Every manifest under the prefix is validated
+    against the run-manifest schema before it counts: a document that does not
+    conform cannot certify a pin, and an unreadable key or an unlistable prefix
+    is a refusal — "we could not read the evidence" never reads as "there is
+    evidence".
+    """
+    evidence, failures = read_trader_smoke(store, sha)
+    prefix = runs_prefix(TRADER_SMOKE_JOB)
     if evidence is None:
         detail = (
             f" Failed smokes for this sha: {' | '.join(failures)}"
@@ -1272,6 +1303,199 @@ def pin_trader(
     evidence = passing_trader_smoke(store, sha)
     version = pin(store, sha, target="trader", expect=expect, now=now, trader_smoke=evidence)
     return version, evidence
+
+
+# ── the QUEUED trader pin (alpha-engine-config-I11545) ────────────────────
+
+#: `trader/pin_request.json`'s schema (`crucible.models.TraderPinRequestDocument`).
+TRADER_PIN_REQUEST_SCHEMA_VERSION = "trader_pin_request.v1"
+
+#: :func:`pending_trader_pin`'s four answers. `none`: nothing was ever queued.
+#: `noop`: the pin already names the requested sha (done, or cancelled by
+#: requesting the current pin). `stale`: the pin no longer names the request's
+#: `from_sha` — somebody moved it after asking — so applying the request would
+#: silently undo that move. `fresh`: the pin still names `from_sha`, so the
+#: request is the one pending change.
+PENDING_TRADER_PIN_STATES = ("none", "noop", "stale", "fresh")
+
+
+def _utc_instant(instant: dt.datetime) -> str:
+    if instant.tzinfo is None:
+        raise ValueError(f"{instant!r} is naive; a request instant must be timezone-aware")
+    return instant.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_trader_pin_request(
+    store: Store,
+    sha: str,
+    *,
+    requested_by: str,
+    requested_at: dt.datetime,
+    run_url: str | None,
+) -> tuple[TraderPinRequestDocument, bytes]:
+    """The `trader_pin_request.v1` document and bytes asking to move the trader to ``sha``.
+
+    Refused — before anything is written — for a sha that is not 40-hex, and
+    for a sha with no published wheel: a request the pin could never honour
+    would sit in the store failing every evening until somebody noticed.
+    ``from_sha`` is read from the live pin here, never passed in, so the
+    request records what the pin actually said when it was made.
+    """
+    _assert_sha(sha)
+    wheel = published_wheel_key(store, sha)
+    if not store.exists(wheel):
+        raise StaleReleasePointerError(
+            f"refusing to queue a trader pin to {sha}: no wheel at {wheel}. The pin would "
+            "refuse it too, so the request could never be applied."
+        )
+    from_sha, _ = read_trader_pin(store)
+    document: dict[str, Any] = {
+        "schema_version": TRADER_PIN_REQUEST_SCHEMA_VERSION,
+        "sha": sha,
+        "from_sha": from_sha,
+        "requested_by": requested_by,
+        "requested_at": _utc_instant(requested_at),
+        "run_url": run_url,
+    }
+    model = TraderPinRequestDocument.model_validate(document)
+    return model, json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
+
+
+def write_trader_pin_request(
+    store: Store,
+    sha: str,
+    *,
+    requested_by: str,
+    requested_at: dt.datetime,
+    run_url: str | None,
+) -> TraderPinRequestDocument:
+    """Queue ``sha`` for the trader: overwrite `trader/pin_request.json`.
+
+    A plain overwrite, not a compare-and-swap: the request is convergent, so a
+    newer request replaces an older one by design, and the one race that
+    matters — the pin moving under a request — is caught at APPLY time by
+    ``from_sha`` and the pin's own compare-and-swap.
+    """
+    model, payload = build_trader_pin_request(
+        store, sha, requested_by=requested_by, requested_at=requested_at, run_url=run_url
+    )
+    store.put_bytes(TRADER_PIN_REQUEST_KEY, payload)
+    return model
+
+
+def _listed(store: Store, key: str) -> bool:
+    """Whether ``key`` exists, answered by LISTING that exact key, never a HEAD.
+
+    A HEAD (or GET) on an absent key is a 404 only to a principal holding an
+    UNCONDITIONED `s3:ListBucket`, and a 403 to everyone else — a
+    prefix-conditioned list grant does not change that, because the implicit
+    list check behind a HEAD carries no `s3:prefix`. So for the narrowly-scoped
+    identities that read the queued trader pin (`trader-pin.yml`'s role,
+    the trader box), "not there" would read as a permissions failure. A listing
+    IS grantable on one exact key (`s3:prefix` = that key), and a listing that
+    is refused raises — it never reads as "absent". Membership is exact: the
+    listing is by prefix, so a sibling such as ``<key>.bak`` never counts.
+    """
+    return key in set(store.list_keys(key))
+
+
+def read_trader_pin(store: Store) -> tuple[str | None, str]:
+    """:func:`read_pointer` for `trader/release_pin`, with ABSENCE established
+    by :func:`_listed` first: ``(None, ETAG_ABSENT)`` when the pin was never
+    set, so the caller's compare-and-swap creates it (`IfNoneMatch: *`).
+
+    The queued-pin path (`release.pin_request`, `release.pin_apply`) reads the
+    pin through this, because it runs as an identity that may list the pin's
+    exact key but holds no bucket-wide list, and the pin is ABSENT until its
+    first move. Only when the key is listed is it HEADed and read, and a HEAD
+    on a key that exists needs nothing but `s3:GetObject`. The operator's
+    `release.pin` keeps calling :func:`read_pointer` directly.
+    """
+    if not _listed(store, TRADER_PIN_KEY):
+        return None, ETAG_ABSENT
+    return read_pointer(store, TRADER_PIN_KEY)
+
+
+def read_trader_pin_request(store: Store) -> tuple[TraderPinRequestDocument, bytes] | None:
+    """The queued request and its bytes, or ``None`` when nothing was ever queued.
+
+    Presence is answered by :func:`_listed` — a listing of the exact key,
+    never a HEAD — and a listing that is refused raises: it never reads as
+    "no request".
+    """
+    if not _listed(store, TRADER_PIN_REQUEST_KEY):
+        return None
+    payload = store.get_bytes(TRADER_PIN_REQUEST_KEY)
+    try:
+        document = TraderPinRequestDocument.model_validate(
+            load_document_bytes(TRADER_PIN_REQUEST_KEY, payload)
+        )
+    except ValidationError as exc:
+        detail = "\n".join(
+            f"  - {'.'.join(str(p) for p in e['loc']) or '<root>'}: {e['msg']}"
+            for e in exc.errors()
+        )
+        raise ValueError(
+            f"{TRADER_PIN_REQUEST_KEY}: document does not conform to a trader pin request:"
+            f"\n{detail}"
+        ) from exc
+    return document, payload
+
+
+@dataclass(frozen=True)
+class PendingTraderPin:
+    """What :func:`pending_trader_pin` read, and what it concluded.
+
+    ``pin_version`` is the version token of `trader/release_pin` read in the
+    SAME pass as ``pin_sha``: the apply swaps against it, so a pin moved
+    between this read and the swap loses the race loudly instead of being
+    overwritten by a request that has just gone stale.
+    """
+
+    state: str
+    request: TraderPinRequestDocument | None
+    request_bytes: bytes | None
+    pin_sha: str | None
+    pin_version: str
+
+    def describe(self) -> str:
+        if self.request is None:
+            return "none: no trader pin has been requested"
+        asked = (
+            f"{self.request.sha} requested by {self.request.requested_by} at "
+            f"{self.request.requested_at} from {self.request.from_sha or '(unset)'}"
+        )
+        if self.state == "noop":
+            return f"noop: the trader is already pinned to {asked}"
+        if self.state == "stale":
+            return (
+                f"stale: {asked}, but the pin now names {self.pin_sha or '(unset)'}. Somebody "
+                "moved it after the request was made; applying the request would undo that. "
+                "Queue the sha again (from the current pin) or cancel by requesting the "
+                "current pin."
+            )
+        return f"fresh: {asked}; the pin still names {self.pin_sha or '(unset)'}"
+
+
+def pending_trader_pin(store: Store) -> PendingTraderPin:
+    """Classify the queued trader pin against the live pin: none/noop/stale/fresh.
+
+    `noop` is decided BEFORE `stale`: requesting the pin the trader is already
+    on is how a request is cancelled, and it must read as done whatever its
+    ``from_sha`` says.
+    """
+    read = read_trader_pin_request(store)
+    pin_sha, pin_version = read_trader_pin(store)
+    if read is None:
+        return PendingTraderPin("none", None, None, pin_sha, pin_version)
+    request, payload = read
+    if pin_sha == request.sha:
+        state = "noop"
+    elif pin_sha != request.from_sha:
+        state = "stale"
+    else:
+        state = "fresh"
+    return PendingTraderPin(state, request, payload, pin_sha, pin_version)
 
 
 def write_deploy_manifest(
