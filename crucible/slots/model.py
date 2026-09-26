@@ -156,6 +156,7 @@ __all__ = [
     "load_model_recipes",
     "produce",
     "produce_history",
+    "read_model_recipes",
     "realized_hit_rate",
     "registration_specs",
     "serving_metrics",
@@ -1161,6 +1162,16 @@ class ModelRecipe:
     target: str | None = None
     supersedes: str | None = None
     slot: str = "m"
+    #: The v1 model this arm descends from, as v1 names it (a zoo
+    #: `served_version` such as `v3.0-meta-2026-08-14-119e069b`, or a v1 spec
+    #: id). PROVENANCE ONLY, exactly like :attr:`source_key`: it is outside
+    #: :attr:`spec`, so it never moves the id, and it is not a series link —
+    #: a v2 arm starts its own series. Its one reader is `crucible
+    #: migrate.history`, which maps v1's serving M champion onto the recipe
+    #: that reproduces it (`crucible.migrate.served_model_recipe`,
+    #: `alpha-engine-config-I10961` deliverable 2). Until that reader existed
+    #: the loader accepted the key and dropped the value.
+    supersedes_v1: str | None = None
     #: Where these bytes were read from — a checkout path or a store key.
     #: Provenance, exactly as `crucible.slots.arms.ArmSpec.source_key` is, and
     #: deliberately outside :attr:`spec`: which tree a recipe was read from is
@@ -1480,8 +1491,45 @@ def _parse_model_recipe(payload: bytes, origin: str) -> ModelRecipe:
         ),
         target=None if spec.get("target") is None else str(spec["target"]),
         supersedes=document.get("supersedes"),
+        supersedes_v1=(
+            None if document.get("supersedes_v1") is None else str(document["supersedes_v1"])
+        ),
         source_key=origin,
     )
+
+
+def read_model_recipes(
+    directory: Path | str | None = None, *, store: Any = None
+) -> tuple[ModelRecipe, ...]:
+    """Every M recipe FILED under ``directory`` (or the synced store tree),
+    parsed and sorted by file name — registrable or not.
+
+    The parse half of :func:`load_model_recipes`, which partitions this by
+    producibility. It exists on its own for the one reader that needs the
+    whole DECLARED graph rather than the registrable half of it: `crucible
+    migrate.history` identifies which recipe reproduces v1's served model by
+    the `predictions[...]` edges between the recipes descending from it, and
+    reading those edges off the registrable half alone would let a refused
+    stacker drop out and a leg of it be mistaken for the model
+    (`alpha-engine-config-I10961` deliverable 2).
+    """
+    if (directory is None) == (store is None):
+        raise ValueError(
+            "load_model_recipes reads EITHER a checkout (`directory`) or the strategy "
+            "tree synced into the store (`store`), and needs exactly one of them. "
+            "Neither is a caller that resolved no source and would register nothing; "
+            "both is two trees that can disagree about what the slot declares."
+        )
+    recipes: list[ModelRecipe] = []
+    if directory is not None:
+        for path in sorted(Path(directory).glob("*.yaml")):
+            recipes.append(_parse_model_recipe(path.read_bytes(), str(path)))
+    else:
+        prefix = strategy_arms_prefix("m")
+        for key in sorted(store.list_keys(prefix)):
+            if key.endswith(".yaml"):
+                recipes.append(_parse_model_recipe(store.get_bytes(key), key))
+    return tuple(recipes)
 
 
 def load_model_recipes(
@@ -1553,22 +1601,7 @@ def load_model_recipes(
     catalogue explicitly — never so a caller can opt out, which is why there
     is no value of it that disables the check.
     """
-    if (directory is None) == (store is None):
-        raise ValueError(
-            "load_model_recipes reads EITHER a checkout (`directory`) or the strategy "
-            "tree synced into the store (`store`), and needs exactly one of them. "
-            "Neither is a caller that resolved no source and would register nothing; "
-            "both is two trees that can disagree about what the slot declares."
-        )
-    recipes: list[ModelRecipe] = []
-    if directory is not None:
-        for path in sorted(Path(directory).glob("*.yaml")):
-            recipes.append(_parse_model_recipe(path.read_bytes(), str(path)))
-    else:
-        prefix = strategy_arms_prefix("m")
-        for key in sorted(store.list_keys(prefix)):
-            if key.endswith(".yaml"):
-                recipes.append(_parse_model_recipe(store.get_bytes(key), key))
+    recipes = read_model_recipes(directory, store=store)
 
     if feature_columns is None:
         from crucible.features import CATALOG  # noqa: PLC0415
