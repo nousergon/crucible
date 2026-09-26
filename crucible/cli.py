@@ -518,6 +518,7 @@ def _migrate_history(args: argparse.Namespace) -> int:
     v1_store = read_only(store_from_uri(v1_uri), reason="migrate.history reads v1 read-only")
 
     recipes = {}
+    model_tree = None
     # `MIGRATABLE_SLOTS`, never a literal: `("u", "r")` was hardcoded here and
     # in the `run_migrate_history` call below, so the production path could not
     # resolve M on the day M's arms arrived and nothing anywhere went red
@@ -525,18 +526,24 @@ def _migrate_history(args: argparse.Namespace) -> int:
     # `crucible.migrate.admission_refusal` evaluates against the live store on
     # every run, and `slots=None` below is what reaches it.
     for slot in MIGRATABLE_SLOTS:
+        if slot == "m":
+            # M recipes are `ModelRecipe`s, which `load_arm_specs` refuses BY
+            # NAME (`crucible.slots.arms.FOREIGN_RECIPE_LOADERS`), and v1 names
+            # its M champion by the model VERSION it serves, not by an arm.
+            # So M is handed over as its whole tree and resolved inside the
+            # migration by `crucible.migrate.served_model_recipe` over the
+            # recipes' `supersedes_v1` (`alpha-engine-config-I10961`
+            # deliverable 2) — the declared graph AND the registrable half,
+            # because which recipe is the model and which are its legs is read
+            # off the edges between them.
+            model_tree = _model_tree(store=store, strategy_dir=config.strategy_dir)
+            continue
         if slot in FOREIGN_RECIPE_LOADERS:
-            # M and S recipes are a different kind of document and
-            # `load_arm_specs` refuses them BY NAME (`crucible.slots.arms.
-            # FOREIGN_RECIPE_LOADERS`). The slot is still CONSIDERED - it stays
-            # in `MIGRATABLE_SLOTS`, reaches `run_migrate_history`, and is
-            # recorded `deferred` naming the recipe that was not supplied -
-            # which is the whole difference from the hardcoded `("u", "r")`
-            # this replaced: the state is on the manifest every week instead of
-            # being invisible. Supplying an M recipe here means mapping v1's
-            # `champion_arch` onto a `ModelRecipe`, whose id is the hash of a
-            # different spec shape than `_bootstrap_spec` builds
-            # (`alpha-engine-config-I10961` deliverable 2, still open).
+            # Another slot whose recipes are a different kind of document.
+            # Still CONSIDERED: it stays in `MIGRATABLE_SLOTS`, reaches
+            # `run_migrate_history`, and is recorded `deferred` naming the
+            # recipe that was not supplied, rather than being invisible the way
+            # the hardcoded `("u", "r")` this replaced made M.
             continue
         for recipe in load_arm_specs(slot, store=store, strategy_dir=config.strategy_dir):
             if recipe.name in recipes:
@@ -556,6 +563,7 @@ def _migrate_history(args: argparse.Namespace) -> int:
             # than deferring. The scheduled arc path asserts nothing.
             slots=None,
             arm_recipes=recipes,
+            model_tree=model_tree,
             allow_missing=bool(getattr(args, "allow_missing", False)),
             dry_run=dry_run,
         )
@@ -570,6 +578,42 @@ def _migrate_history(args: argparse.Namespace) -> int:
         run_mode=getattr(args, "run_mode", None),
     )
     return 0
+
+
+def _model_tree(*, store, strategy_dir):
+    """The M slot's recipe tree for `migrate.history`, both halves of it.
+
+    ``declared`` is every filed recipe (`crucible.slots.model.
+    read_model_recipes`), ``registrable``/``refused`` the release's own
+    partition (`crucible.registration.load_registrable_recipes`, the one place
+    the per-slot dispatch lives). A slot where NOTHING registers is an answer
+    here, not an outage — the same reading `crucible.slots.producibility.
+    release_arms` gives it — so it becomes an empty registrable half and the
+    migration defers M naming the refusal, instead of this arc stage raising
+    and taking every later stage down with it (`crucible-PR317`).
+    """
+    from pathlib import Path
+
+    from crucible.migrate import V1ModelTree
+    from crucible.registration import load_registrable_recipes
+    from crucible.slots.inputs import SlotUnservableError
+    from crucible.slots.model import read_model_recipes
+
+    directory = Path(strategy_dir) / "arms" / "m" if strategy_dir else None
+    declared = read_model_recipes(directory, store=None if directory is not None else store)
+    try:
+        load = load_registrable_recipes("m", strategy_dir=strategy_dir, store=store)
+    except SlotUnservableError as exc:
+        return V1ModelTree(
+            declared=declared,
+            registrable=(),
+            refused={refusal.arm: refusal.reason for refusal in exc.refusals},
+        )
+    return V1ModelTree(
+        declared=declared,
+        registrable=load.specs,
+        refused={refusal.arm: refusal.reason for refusal in load.refusals},
+    )
 
 
 def _record_written(ctx, store, keys) -> None:
