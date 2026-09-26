@@ -33,6 +33,7 @@ from crucible.release import (
     wheel_key,
 )
 from crucible.store import LocalStore, S3Store, sha256_hex
+from tests.support.manifests import manifests_filed, only_manifest
 from tests.support.releases import (
     SYNTHETIC_DIGEST,
     publish_v4,
@@ -129,6 +130,9 @@ def _write_smoke(
     trading_day=None,
     smoked_extras=("arcticdb",),
     wheelhouse_digest=SYNTHETIC_DIGEST,
+    run_id="01JG0000000000000000000001",
+    finished="2026-08-29T13:04:11Z",
+    discriminator=None,
 ):
     """A conformant `run_manifest.v2` document (alpha-engine-config-I10682):
     `crucible.deploy._flip` now validates the smoke manifest whole through
@@ -144,7 +148,7 @@ def _write_smoke(
     reason = "" if status == "ok" else "RuntimeError: live read failed"
     manifest: dict = {
         "schema_version": "run_manifest.v2",
-        "run_id": "01JG0000000000000000000001",
+        "run_id": run_id,
         "job": "smoke",
         "run_mode": "live",
         "trading_day": day,
@@ -152,7 +156,7 @@ def _write_smoke(
         "status": status,
         "reason": reason,
         "started": "2026-08-29T13:00:00Z",
-        "finished": "2026-08-29T13:04:11Z",
+        "finished": finished,
         "code_sha": "2" * 40,
         "release_sha": sha,
         "seed": 0,
@@ -198,7 +202,9 @@ def _write_smoke(
                 "smoked_extras": list(smoked_extras),
             }
         ]
-    store.put_bytes(manifest_key("smoke", day), json.dumps(manifest).encode())
+    store.put_bytes(
+        manifest_key("smoke", day, discriminator=discriminator), json.dumps(manifest).encode()
+    )
 
 
 class TestPublish:
@@ -546,6 +552,70 @@ class TestFlip:
                 ["flip", "--sha", SHA, "--store", str(tmp_path), "--expect-pointer-file", token]
             )
 
+    def _flip(self, tmp_path, store, sha=SHA):
+        token = _token(tmp_path, store)
+        return deploy_main(
+            ["flip", "--sha", sha, "--store", str(tmp_path), "--expect-pointer-file", token]
+        )
+
+    def test_the_flip_reads_its_own_releases_smoke_among_several_on_one_day(self, tmp_path) -> None:
+        """`alpha-engine-config-I11033`: `smoke` files one manifest per
+        invocation, so a day holding two deploys holds two smokes, and the
+        flip SELECTS the one for its release. Here the other release's
+        failed smoke finished LATER — under the old bare key it would have
+        been the only manifest left, and this deploy would have read it."""
+        store = self._published(tmp_path)
+        _write_smoke(store, discriminator="2026-08-29-01JG0000000000000000000001")
+        _write_smoke(
+            store,
+            sha=OTHER,
+            status="failed",
+            run_id="01JG0000000000000000000002",
+            finished="2026-08-29T15:00:00Z",
+            discriminator="2026-08-29-01JG0000000000000000000002",
+        )
+        assert self._flip(tmp_path, store) == 0
+        assert current_release(store) == SHA
+
+    def test_among_one_releases_smokes_the_latest_is_the_evidence(self, tmp_path) -> None:
+        """A re-run smoke that FAILED after an earlier one passed must refuse
+        the flip: the latest run of this release is what the deploy just ran."""
+        store = self._published(tmp_path)
+        _write_smoke(store, discriminator="2026-08-29-01JG0000000000000000000001")
+        _write_smoke(
+            store,
+            status="failed",
+            run_id="01JG0000000000000000000002",
+            finished="2026-08-29T15:00:00Z",
+            discriminator="2026-08-29-01JG0000000000000000000002",
+        )
+        with pytest.raises(SystemExit, match="untouched"):
+            self._flip(tmp_path, store)
+        assert current_release(store) is None
+
+    def test_only_another_releases_smoke_refuses_rather_than_promoting(self, tmp_path) -> None:
+        store = self._published(tmp_path)
+        _write_smoke(store, sha=OTHER, discriminator="2026-08-29-01JG0000000000000000000002")
+        with pytest.raises(SystemExit, match="no smoke manifest for release"):
+            self._flip(tmp_path, store)
+        assert current_release(store) is None
+
+    def test_an_unreadable_smoke_beside_a_good_one_refuses_the_flip(self, tmp_path) -> None:
+        """It could be the very smoke this deploy is looking for; "we could
+        not read the evidence" never reads as "there is evidence"."""
+        from crucible.calendar import resolve_trading_day
+
+        store = self._published(tmp_path)
+        _write_smoke(store, discriminator="2026-08-29-01JG0000000000000000000001")
+        day = resolve_trading_day().isoformat()
+        store.put_bytes(
+            manifest_key("smoke", day, discriminator="2026-08-29-01JG0000000000000000000002"),
+            b"not json",
+        )
+        with pytest.raises(SystemExit, match="could not be read"):
+            self._flip(tmp_path, store)
+        assert current_release(store) is None
+
     def test_a_smoke_manifest_missing_a_required_field_refuses_the_flip(self, tmp_path) -> None:
         """alpha-engine-config-I10682: before this, `_flip` read the smoke
         manifest via `load_store_document` (parses JSON, nothing more) and
@@ -560,7 +630,7 @@ class TestFlip:
         from crucible.calendar import resolve_trading_day
 
         day = resolve_trading_day().isoformat()
-        manifest = json.loads(store.get_bytes(manifest_key("smoke", day)))
+        manifest = only_manifest(store, "smoke", day)[1]
         del manifest["status"]
         store.put_bytes(manifest_key("smoke", day), json.dumps(manifest).encode())
         token = _token(tmp_path, store)
@@ -1140,7 +1210,7 @@ class TestTheSmokeGate:
         return smoke_handler(self._args(tmp_path, sha))
 
     def _manifest(self, tmp_path):
-        return json.loads(LocalStore(tmp_path).get_bytes(manifest_key("smoke", "2026-08-28")))
+        return only_manifest(LocalStore(tmp_path), "smoke", "2026-08-28")[1]
 
     def _metric(self, manifest, name="smoke_ok"):
         return next(m for m in manifest["metrics"] if m["name"] == name)
@@ -1259,7 +1329,12 @@ class TestTheSmokeGate:
 
         pin(store, SHA)  # now the pointer is set and runs/ is non-empty
         self._run(tmp_path)
-        populated = self._metric(self._manifest(tmp_path))["value"]
+        # Two invocations, two manifests (`alpha-engine-config-I11033`): the
+        # first is no longer overwritten, and within one calendar day the
+        # per-invocation keys sort in run order.
+        first_key, second_key = manifests_filed(store, "smoke", "2026-08-28")
+        assert self._metric(json.loads(store.get_bytes(first_key)))["value"] == bootstrap
+        populated = self._metric(json.loads(store.get_bytes(second_key)))["value"]
         assert populated > bootstrap, (bootstrap, populated)
 
     def test_smoke_ok_records_the_extras_the_environment_says_were_smoked(

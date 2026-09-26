@@ -339,7 +339,7 @@ def fault_probe_handler(args: argparse.Namespace) -> int:
     is on disk.
     """
     from crucible.cli import _resolve_store
-    from crucible.runner import run_job
+    from crucible.runner import invocation_discriminator, run_job
 
     store = _resolve_store(args)
     # Already validated by `crucible.cli.main`'s usage block, which refuses a
@@ -360,6 +360,10 @@ def fault_probe_handler(args: argparse.Namespace) -> int:
         dry_run=bool(args.dry_run),
         run_mode=getattr(args, "run_mode", None),
         fault_capability_class=requested,
+        # One manifest per INVOCATION, not per trading day: this job is on
+        # demand, so nothing bounds how often it runs on one day
+        # (`alpha-engine-config-I11033`; `crucible.runner.invocation_discriminator`).
+        discriminator=invocation_discriminator,
         # The FIRST failure is the exercise. A retried probe would write one
         # manifest carrying two attempts, and `crucible fault.record`
         # distinguishes `induced` from `absorbed` on exactly that: a transient

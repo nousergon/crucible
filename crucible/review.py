@@ -300,7 +300,7 @@ def review_record_handler(args: argparse.Namespace) -> int:
     one.
     """
     from crucible.cli import _resolve_store
-    from crucible.runner import run_job
+    from crucible.runner import invocation_discriminator, run_job
 
     store = _resolve_store(args)
     commits = json.loads(Path(args.commits).read_text(encoding="utf-8"))
@@ -327,6 +327,10 @@ def review_record_handler(args: argparse.Namespace) -> int:
             trading_day=args.trading_day,
             dry_run=bool(getattr(args, "dry_run", False)),
             run_mode=getattr(args, "run_mode", None),
+            # One manifest per INVOCATION, not per trading day: this job is on
+            # demand, so nothing bounds how often it runs on one day
+            # (`alpha-engine-config-I11033`; `crucible.runner.invocation_discriminator`).
+            discriminator=invocation_discriminator,
         )
     except ReviewError as exc:
         # NOT a swallow: `run_job` has already written `status: failed` with

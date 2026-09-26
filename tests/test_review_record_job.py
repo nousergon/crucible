@@ -20,10 +20,10 @@ import json
 import pytest
 
 from crucible.cli import main as cli_main
-from crucible.keys import manifest_key
 from crucible.review import REVIEW_RECORD_JOB
 from crucible.runner import CODE_SHA_ENV
 from crucible.store import LocalStore
+from tests.support.manifests import only_manifest
 
 DAY = dt.date(2026, 8, 28)
 AUTHOR = "session_01AuthorAAAAAAAA"
@@ -86,7 +86,7 @@ def _argv(tmp_path, *, reviewer: str = REVIEWER, extra: tuple[str, ...] = ()) ->
 
 def _manifest(tmp_path) -> dict:
     store = LocalStore(tmp_path / "store")
-    return json.loads(store.get_bytes(manifest_key(REVIEW_RECORD_JOB, DAY.isoformat())))
+    return only_manifest(store, REVIEW_RECORD_JOB, DAY.isoformat())[1]
 
 
 class TestTheManifest:

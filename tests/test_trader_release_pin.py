@@ -31,6 +31,7 @@ from crucible.release import (
 )
 from crucible.runner import run_job
 from crucible.store import LocalStore
+from tests.support.manifests import only_manifest
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
@@ -257,7 +258,7 @@ class TestHandler:
         )
 
     def _manifest(self, tmp_path):
-        return json.loads(LocalStore(tmp_path).get_bytes(manifest_key("release.pin", "2026-09-08")))
+        return only_manifest(LocalStore(tmp_path), "release.pin", "2026-09-08")[1]
 
     def test_a_frozen_in_session_clock_fails_the_run_with_the_reason(
         self, tmp_path, monkeypatch
