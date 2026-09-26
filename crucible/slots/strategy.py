@@ -1888,9 +1888,23 @@ def declared_promote_outcome(ctx: Any) -> dict[str, Any] | None:
     * the M champion pointer is absent — :func:`declare_no_m_champion`, the
       one precondition all three S stages share;
     * `experiment.grade[s]`'s own manifest for this day reads ``ok``, claims
-      NO arena cycle, and carries the :data:`NO_SETTLED_SESSION_METRIC` row
-      :func:`grade` files for the warm-up week. There is no decision to act
-      on, and the grade run said so on its manifest.
+      NO arena cycle, and carries one of the two rows :func:`grade` declares
+      instead of a cycle — the :data:`NO_SETTLED_SESSION_METRIC` row for the
+      warm-up week, or the :data:`UPSTREAM_CHAMPION_ABSENT_METRIC` row
+      :func:`declare_no_m_champion` filed because the M pointer was absent
+      WHEN THE GRADE RAN. There is no decision to act on, and the grade run
+      said so on its manifest.
+
+    The second grade row matters on exactly one day: the Saturday M seats its
+    FIRST champion. The arc runs `experiment.grade[s]` before `promote[m]`
+    and `promote[s]` after it (`crucible.weekly.arc_stages`), so by the time
+    this stage runs the pointer the grade was waiting for EXISTS and the
+    first bullet no longer fires — but no S cycle was constructed or graded
+    this week, the S register is still empty, and the ordinary path dies
+    `KeyError` on `arms/s/register.jsonl`, taking the arc's `report`,
+    `console`, `explain` and `iac.conformance` down with it. Measured in the
+    2026-09-25 dry-run rehearsal, where `promote[m]` decides
+    `m:v3meta_volatility_head:97645d421bea` over the null baseline.
 
     Anything else returns ``None`` and `promote` takes its ordinary path, so
     `crucible.promote.read_graded_cycle` still refuses loudly when the grade
@@ -1916,26 +1930,35 @@ def declared_promote_outcome(ctx: Any) -> dict[str, Any] | None:
     claimed = {output.get("key") for output in document.get("outputs") or ()}
     if arena_cycle_key(SLOT, as_of) in claimed:
         return None
-    warm_up = [
+    declared_by_grade = [
         metric
         for metric in document.get("metrics") or ()
-        if isinstance(metric, dict) and metric.get("name") == NO_SETTLED_SESSION_METRIC
+        if isinstance(metric, dict)
+        and metric.get("name") in (NO_SETTLED_SESSION_METRIC, UPSTREAM_CHAMPION_ABSENT_METRIC)
     ]
-    if not warm_up:
+    if not declared_by_grade:
         return None
+    declared = declared_by_grade[0]
+    name = str(declared["name"])
+    if name == UPSTREAM_CHAMPION_ABSENT_METRIC:
+        what = (
+            f"with no {ALPHA_SLOT.upper()} champion pointer to construct on at the time it "
+            f"ran, and declared so; a pointer seated after it (by `promote[{ALPHA_SLOT}]` "
+            "earlier in this same arc) creates no S cycle for this day to act on"
+        )
+    else:
+        what = "with no settled session to grade and declared so"
     reason = (
         f"`promote[{SLOT}]` for {as_of} acted on no cycle: `experiment.grade[{SLOT}]` "
-        f"({grade_key}, run_id {document.get('run_id')!r}) completed `ok` with no settled "
-        f"session to grade and declared so. {warm_up[0].get('status_reason', '')}"
+        f"({grade_key}, run_id {document.get('run_id')!r}) completed `ok` {what}. "
+        f"{declared.get('status_reason', '')}"
     ).strip()
     ctx.record_rows(rows_in=0, rows_out=0)
-    ctx.record_metric(
-        _declared_metric(NO_SETTLED_SESSION_METRIC, reason=reason, source_path=grade_key)
-    )
+    ctx.record_metric(_declared_metric(name, reason=reason, source_path=grade_key))
     return {
         "slot": SLOT,
         "trading_day": as_of,
-        "declared_outcome": NO_SETTLED_SESSION_METRIC,
+        "declared_outcome": name,
         "reason": reason,
     }
 
