@@ -219,5 +219,5 @@ class TestTheLiveRegistryStillReadsTheSameWay:
         assert row.log_retention_days == 90
         assert row.deadline is not None
         assert row.deadline.anchor == "close_plus"
-        assert row.deadline.offset_hours == 3
+        assert row.deadline.offset_hours == 6
         assert set(row.signals) == {"execution", "cost", "resource", "lineage", "outcome"}

@@ -98,10 +98,26 @@ components:
     absence_watched_by: alerts.sweep
     schedule: weekdays after close
     dispatch: scheduler
+    # 6h = 22:00 ET, DERIVED from the producer, not chosen
+    # (alpha-engine-config-I11581). This job reads the ArcticDB `universe`
+    # library that D32 (`post-market-arctic-append`) writes. After the
+    # decoupled data cutover (nousergon-data#1930) D32 runs inside
+    # `ne-data-collection-eod`, which fires at 18:15 ET and whose derived
+    # worst case through D32 is 20:55 ET (alpha-engine-config-I11363: the
+    # dispatcher's SSM-online budget plus runtime cap for `post-market-data`
+    # and `post-market-arctic-append`, 160 min). The `data-daily` schedule in
+    # nous-ergon-ops `crucible-v2.yaml` fires at 21:15 ET, 20 min past that
+    # bound; this deadline leaves 45 min for a run measured at 2-3 min
+    # end to end (2026-09-17..24). It was 3h (19:00 ET) against an 18:30 ET
+    # firing, when v1 published D32 by ~17:20 ET.
+    #
+    # The 21:00 ET `alerts.sweep` therefore no longer grades day d's absence
+    # on day d; the next evening's pass does, through `days_to_evaluate`'s
+    # catch-up. A run that STARTS and fails still pages from the box on exit.
     deadline:
       anchor: close_plus
       cadence: daily
-      offset_hours: 3
+      offset_hours: 6
 
   data.weekly:
     description: Weekly data refresh and coverage pass.
