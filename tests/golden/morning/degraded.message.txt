@@ -1,0 +1,11 @@
+<b>STALE BOARD: board/current.json was generated 2026-09-25T01:29:28Z — 81h ago. Every reading below is that old.</b>
+<b>CRUCIBLE V2 — 2026-09-24</b>
+Phase 0  MET          5/5
+Phase 1  UNMET        2/6
+Phase 2  OUT_OF_ORDER 5/7
+Phase 3  OUT_OF_ORDER 4/12
+Phase 4  OUT_OF_ORDER 2/11
+Phase 5  OUT_OF_ORDER 0/1
+acceptance count: unreadable (AccessDenied)
+moved since 2026-09-23: cannot say (absent at board/2026-09-23/board.json)
+<a href="https://github.com/nousergon/alpha-engine-config/issues/1#issuecomment-42">Full update</a> · <a href="https://github.com/nousergon/alpha-engine-config/issues/1">History</a> · <a href="https://console.example/decision?pipeline=crucible-board">Board</a>

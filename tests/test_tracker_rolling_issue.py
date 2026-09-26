@@ -1,5 +1,6 @@
-"""`crucible.tracker.find_issue_by_title` / `create_issue` —
-`alpha-engine-config-I10123`.
+"""`Tracker.find_issue_by_title` / `create_issue`, as crucible configures
+them (`crucible.gate.tracker_adapter`) — `alpha-engine-config-I10123`, moved
+onto `nousergon_lib.gates.tracker` by `-I10953`.
 
 The morning report's full update now lives on a rolling `[v2 board] daily
 update` issue in the private tracker, found by title search and created once
@@ -21,12 +22,20 @@ import urllib.parse
 import urllib.request
 
 import pytest
+from nousergon_lib.gates.tracker import API_ROOT, SEARCH_API_ROOT, TrackerError
 
-import crucible.tracker as tracker_module
-from crucible.tracker import TrackerError, create_issue, find_issue_by_title
+from crucible.gate import TRACKER_APP_SSM_PREFIX_VAR, TRACKER_TOKEN_VAR, tracker_adapter
 
 REPO = "nousergon/alpha-engine-config"
 TITLE = "[v2 board] daily update"
+
+
+def find_issue_by_title(repo: str, title: str, *, opener) -> int | None:
+    return tracker_adapter(repo, opener=opener).find_issue_by_title(title)
+
+
+def create_issue(repo: str, title: str, body: str, *, opener) -> int:
+    return tracker_adapter(repo, opener=opener).create_issue(title=title, body=body)
 
 
 class _Opener:
@@ -49,7 +58,7 @@ def _search_result(*items: dict) -> bytes:
 
 
 def _granted(monkeypatch) -> None:
-    monkeypatch.setenv(tracker_module.TRACKER_TOKEN_VAR, "a-token")
+    monkeypatch.setenv(TRACKER_TOKEN_VAR, "a-token")
 
 
 class TestFindIssueByTitle:
@@ -96,8 +105,8 @@ class TestFindIssueByTitle:
         assert find_issue_by_title(REPO, TITLE, opener=opener) is None
 
     def test_no_credential_raises(self, monkeypatch) -> None:
-        monkeypatch.delenv(tracker_module.TRACKER_TOKEN_VAR, raising=False)
-        monkeypatch.delenv(tracker_module.TRACKER_APP_SSM_PREFIX_VAR, raising=False)
+        monkeypatch.delenv(TRACKER_TOKEN_VAR, raising=False)
+        monkeypatch.delenv(TRACKER_APP_SSM_PREFIX_VAR, raising=False)
         with pytest.raises(TrackerError, match="no tracker credential"):
             find_issue_by_title(REPO, TITLE, opener=_Opener())
 
@@ -113,7 +122,7 @@ class TestFindIssueByTitle:
         find_issue_by_title(REPO, TITLE, opener=opener)
         request = opener.seen[0]
         decoded = urllib.parse.unquote_plus(request.full_url)
-        assert decoded.startswith(tracker_module.SEARCH_API_ROOT)
+        assert decoded.startswith(SEARCH_API_ROOT)
         assert f"repo:{REPO}" in decoded
         assert "is:open" in decoded
         assert "is:issue" in decoded
@@ -121,17 +130,15 @@ class TestFindIssueByTitle:
 
 
 class TestCreateIssue:
-    def test_creates_and_returns_number_and_url(self, monkeypatch) -> None:
+    def test_creates_and_returns_the_number(self, monkeypatch) -> None:
         _granted(monkeypatch)
         opener = _Opener(
             (201, json.dumps({"number": 99, "html_url": "https://x/issues/99"}).encode())
         )
-        number, url = create_issue(REPO, TITLE, "body text", opener=opener)
-        assert number == 99
-        assert url == "https://x/issues/99"
+        assert create_issue(REPO, TITLE, "body text", opener=opener) == 99
         request = opener.seen[0]
         assert request.method == "POST"
-        assert request.full_url == f"{tracker_module.API_ROOT}/repos/{REPO}/issues"
+        assert request.full_url == f"{API_ROOT}/repos/{REPO}/issues"
         payload = json.loads(request.data.decode())
         assert payload == {"title": TITLE, "body": "body text"}
 
@@ -141,8 +148,8 @@ class TestCreateIssue:
             create_issue(REPO, "   ", "body", opener=_Opener())
 
     def test_no_credential_raises(self, monkeypatch) -> None:
-        monkeypatch.delenv(tracker_module.TRACKER_TOKEN_VAR, raising=False)
-        monkeypatch.delenv(tracker_module.TRACKER_APP_SSM_PREFIX_VAR, raising=False)
+        monkeypatch.delenv(TRACKER_TOKEN_VAR, raising=False)
+        monkeypatch.delenv(TRACKER_APP_SSM_PREFIX_VAR, raising=False)
         with pytest.raises(TrackerError, match="no tracker credential"):
             create_issue(REPO, TITLE, "body", opener=_Opener())
 

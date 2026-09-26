@@ -23,9 +23,9 @@ from crucible.alerts import MUTED_TOPIC_VAR, PAGES_TOPIC_VAR
 from crucible.calendar import is_trading_day
 from crucible.config import CLOUDTRAIL_ARCHIVE_VAR
 from crucible.features import min_panel_trading_days
+from crucible.gate import TRACKER_APP_SSM_PREFIX_VAR, TRACKER_TOKEN_VAR
 from crucible.runmode import RUN_MODE_ENV, RUN_MODE_LIVE
 from crucible.store import LocalStore
-from crucible.tracker import TRACKER_APP_SSM_PREFIX_VAR, TRACKER_TOKEN_VAR
 
 #: Enough sessions for the DEEPEST feature the catalogue declares, plus a
 #: 21-session horizon plus the dates a ladder needs.
@@ -343,7 +343,8 @@ def _reset_capability_classes_cache():
 def no_tracker_credential(monkeypatch):
     """No test reaches GitHub by accident.
 
-    `crucible.tracker` is the one adapter in this package that talks to
+    The tracker adapter (`crucible.gate.tracker_adapter`) is the one adapter in
+    this package that talks to
     something other than the store, and it reads its credential from the
     environment. A developer whose shell exports a real token would otherwise
     have the suite post comments to `nousergon/alpha-engine-config` — the

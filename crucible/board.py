@@ -1009,7 +1009,7 @@ def build_board(
     `None` leaves every phase row's `clauses` `None`, which renders as "this
     build took no reading" rather than as an empty clause list.
 
-    ``tracker_reader`` is `crucible.tracker.read_issue` unless a caller
+    ``tracker_reader`` is the tracker adapter's `read_issue` unless a caller
     substitutes one — the ONE outbound call this render makes that is not to
     the store, and the only injectable seam in this function, because the
     phase-exit rows (:func:`_closing_rows`) grade the tracker's own
@@ -1502,9 +1502,15 @@ def _closing_rows(store: Store, tracker_reader: Callable[[str, int], Any] | None
         PHASES,
         TRACKER_REPO,
         closing_reading_refusals,
+        tracker_adapter,
     )
     from crucible.keys import closing_record_key  # noqa: PLC0415 - symmetry with the above
-    from crucible.tracker import read_issue  # noqa: PLC0415 - symmetry with the above
+
+    def read_issue(repo: str, issue: int) -> Any:
+        # The lib adapter's lenient face: never raises, and an access fault
+        # is its own third fact (`IssueRead.access_problem`), rendered
+        # UNMEASURABLE below rather than as a met-or-unmet verdict.
+        return tracker_adapter(repo).read_issue(issue)
 
     reader = tracker_reader if tracker_reader is not None else read_issue
     return [
