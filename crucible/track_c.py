@@ -21,6 +21,7 @@ import datetime as dt
 import json
 import os
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from crucible import alerts, release
 from crucible.board import (
@@ -73,7 +74,9 @@ __all__ = [
     "console_handler",
     "drift_handler",
     "heartbeat_handler",
+    "release_pin_apply_handler",
     "release_pin_handler",
+    "release_pin_request_handler",
     "smoke_handler",
     "sweep_handler",
 ]
@@ -193,6 +196,220 @@ def release_pin_handler(args: argparse.Namespace) -> int:
 
     run_job(
         "release.pin",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        dry_run=dry_run,
+        run_mode=getattr(args, "run_mode", None),
+    )
+    return 0
+
+
+# ── the queued trader pin (alpha-engine-config-I11545) ──────────────────────
+#
+# Brian's ruling: anyone may queue a sha at any time; the next clean
+# post-close smokes and pins it; promotion stays explicit. Two jobs, both run
+# by `.github/workflows/trader-pin.yml` under one identity:
+#
+# * `release.pin_request` (its `workflow_dispatch`) writes the request and
+#   nothing else. It moves no pointer.
+# * `release.pin_apply` (its weekday schedule) reads the request and, when it
+#   is still the one pending change and the evening is clean, moves the pin
+#   through `release.pin_trader` — the same window and smoke gate a human
+#   `release.pin --target trader` goes through, and nothing weaker.
+
+#: The request's calendar day is read in New York time, the timezone the
+#: box's smoke timer and the NYSE session are both declared in.
+_ET = ZoneInfo("America/New_York")
+
+
+def _requester_from_environment() -> tuple[str, str | None]:
+    """``(requested_by, run_url)`` from the invocation's own environment.
+
+    Read from the environment and never from a flag, so the dispatch input is
+    the sha and nothing free-form: in Actions `GITHUB_ACTOR` is the person who
+    pressed the button and the run URL is assembled from the run's own ids; on
+    a laptop it is `$USER` and there is no run. A request with no requester is
+    refused rather than filed anonymously.
+    """
+    requested_by = os.environ.get("GITHUB_ACTOR") or os.environ.get("USER") or ""
+    if not requested_by.strip():
+        raise ValueError(
+            "release.pin_request: neither GITHUB_ACTOR nor USER is set, so the request "
+            "would name no requester. A queued pin is an explicit act by somebody."
+        )
+    server = os.environ.get("GITHUB_SERVER_URL")
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    run_url = (
+        f"{server}/{repository}/actions/runs/{run_id}" if server and repository and run_id else None
+    )
+    return requested_by.strip(), run_url
+
+
+def release_pin_request_handler(args: argparse.Namespace) -> int:
+    """Queue ``args.sha`` for the trader: write `trader/pin_request.json`.
+
+    Validates before writing (40-hex, published wheel) and records the pin it
+    was asked FROM, read live. Moves no pointer; `release.pin_apply` does that
+    on the next clean evening, or a human does it with `release.pin --target
+    trader`, in which case this request reads `noop` or `stale` afterwards.
+    """
+    dry_run = bool(getattr(args, "dry_run", False))
+    store = _store(args)
+
+    def body(ctx: RunContext) -> None:
+        requested_by, run_url = _requester_from_environment()
+        document, payload = release.build_trader_pin_request(
+            store, args.sha, requested_by=requested_by, requested_at=_now(), run_url=run_url
+        )
+        ctx.record_output(
+            release.TRADER_PIN_REQUEST_KEY,
+            payload,
+            schema_version=release.TRADER_PIN_REQUEST_SCHEMA_VERSION,
+        )
+        ctx.record_metric(
+            {
+                "name": "trader_pin_requested",
+                "module": "crucible.release",
+                "metric_type": "operational",
+                "value": 1.0,
+                "unit": "requests",
+                "n_floor": 0,
+                "status": "OK",
+                "status_reason": (
+                    f"queued {document.sha} for the trader (from "
+                    f"{document.from_sha or '(unset)'}), requested by {document.requested_by}"
+                ),
+                "source_path": release.TRADER_PIN_REQUEST_KEY,
+                "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+        print(
+            f"release.pin_request: {release.TRADER_PIN_REQUEST_KEY} -> {document.sha} "
+            f"(from {document.from_sha or '(unset)'})"
+        )
+
+    run_job(
+        "release.pin_request",
+        body,
+        store=store,
+        trading_day=args.trading_day,
+        dry_run=dry_run,
+        run_mode=getattr(args, "run_mode", None),
+    )
+    return 0
+
+
+def _request_day_et(request: Any) -> dt.date:
+    instant = dt.datetime.strptime(request.requested_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=dt.UTC
+    )
+    return instant.astimezone(_ET).date()
+
+
+def release_pin_apply_handler(args: argparse.Namespace) -> int:
+    """Apply the queued trader pin, if it is still the one pending change.
+
+    `none`/`noop` are complete, correct results (`ok`). `stale` RAISES: the pin
+    was moved after the request was made, and applying it would undo that, so a
+    human decides. `fresh` pins through :func:`crucible.release.pin_trader`,
+    swapping against the pin version read in the same pass — gated on:
+
+    * ``--postclose clean``: the workflow's guard read today's post-close
+      pipeline as finished cleanly. `unclean` with a fresh request RAISES; with
+      nothing to apply it is irrelevant and the run is `ok`.
+    * a passing `trader.smoke` for the sha. NO smoke yet is a wait (`ok`) on
+      the evening of the session the request was made in or after — the box
+      smokes a fresh request at midday, so a request queued later that day is
+      smoked tomorrow — and a failure on any later evening: the smoke that
+      should have run did not. A smoke that FAILED always raises.
+    """
+    dry_run = bool(getattr(args, "dry_run", False))
+    store = _store(args)
+
+    def body(ctx: RunContext) -> None:
+        pending = release.pending_trader_pin(store)
+        if pending.request_bytes is not None:
+            ctx.record_input(
+                release.TRADER_PIN_REQUEST_KEY,
+                pending.request_bytes,
+                schema_version=release.TRADER_PIN_REQUEST_SCHEMA_VERSION,
+            )
+        moved = 0.0
+        outcome = pending.describe()
+        if pending.state == "stale":
+            raise release.TraderPinRefusedError(f"release.pin_apply: {outcome}")
+        if pending.state == "fresh":
+            assert pending.request is not None  # `fresh` always carries its request
+            sha = pending.request.sha
+            if args.postclose != "clean":
+                raise release.TraderPinRefusedError(
+                    f"release.pin_apply: {outcome}; not applied, because the guard read no "
+                    "clean post-close for this session. The request stays queued and is "
+                    "applied on the next clean evening."
+                )
+            evidence, failures = release.read_trader_smoke(store, sha)
+            if evidence is None and failures:
+                raise release.TraderPinRefusedError(
+                    f"release.pin_apply: {outcome}; the trader smoke for {sha} FAILED: "
+                    + " | ".join(failures)
+                )
+            if evidence is None:
+                if _request_day_et(pending.request) < ctx.trading_day:
+                    raise release.TraderPinRefusedError(
+                        f"release.pin_apply: {outcome}; no `{release.TRADER_SMOKE_JOB}` "
+                        f"manifest exists for {sha}, and the request predates session "
+                        f"{ctx.trading_day.isoformat()}, whose midday smoke should have run it. "
+                        "Check the executor box's trader-pin-smoke timer."
+                    )
+                outcome += (
+                    f"; waiting: no `{release.TRADER_SMOKE_JOB}` manifest for {sha} yet (queued "
+                    "after this session's smoke); the next session's smoke runs it"
+                )
+            elif dry_run:
+                print(
+                    f"release.pin_apply: trader pin {pending.pin_sha or '(unset)'} would move "
+                    f"to {sha} (gated on {evidence.run_id})"
+                )
+                return
+            else:
+                ctx.record_input(
+                    evidence.manifest_key,
+                    store.get_bytes(evidence.manifest_key),
+                    schema_version=RUN_MANIFEST_SCHEMA_VERSION,
+                )
+                release.pin_trader(store, sha, now=_now(), expect=pending.pin_version)
+                ctx.record_output(
+                    release.TRADER_PIN_KEY,
+                    store.get_bytes(release.TRADER_PIN_KEY),
+                    schema_version=release.RELEASE_SCHEMA_VERSION,
+                )
+                moved = 1.0
+                outcome = (
+                    f"moved the trader pin from {pending.pin_sha or '(unset)'} to {sha}, as "
+                    f"requested by {pending.request.requested_by} at "
+                    f"{pending.request.requested_at}; gated on trader smoke {evidence.run_id} "
+                    f"({evidence.manifest_key})"
+                )
+        print(f"release.pin_apply: {outcome}")
+        ctx.record_metric(
+            {
+                "name": "trader_pin_moved",
+                "module": "crucible.release",
+                "metric_type": "operational",
+                "value": moved,
+                "unit": "pointer_moves",
+                "n_floor": 0,
+                "status": "OK",
+                "status_reason": outcome,
+                "source_path": release.TRADER_PIN_KEY,
+                "last_updated_utc": ctx.started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+
+    run_job(
+        "release.pin_apply",
         body,
         store=store,
         trading_day=args.trading_day,
