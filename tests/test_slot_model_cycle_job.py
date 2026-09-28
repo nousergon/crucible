@@ -25,6 +25,7 @@ import numpy as np
 import pytest
 
 from crucible.calendar import is_trading_day
+from crucible.cli import main as cli_main
 from crucible.features import DEFAULT_FEATURE_VERSION
 from crucible.keys import (
     arm_predictions_key,
@@ -34,7 +35,9 @@ from crucible.keys import (
     manifest_key,
     shadow_key,
 )
+from crucible.promote import load_slot_inputs
 from crucible.runner import run_job
+from crucible.slots.cycle import NOT_YET_REGISTERED_METRIC
 from crucible.slots.inputs import SlotUnservableError
 from crucible.slots.model import (
     ARM_REFUSED_METRIC,
@@ -1062,3 +1065,142 @@ class TestAPureStackerDoesNotEndTheSlot:
         assert panel.names == tuple(sorted(_NAMES))
         assert panel.forward_returns.shape == (len(panel.dates), len(_NAMES))
         assert np.isfinite(panel.forward_returns[0]).all(), "the label is read, not skipped"
+
+
+class TestAnArmRegisteredAfterTheGradedDay:
+    """`alpha-engine-config-I11037`: a historical grade with a later arm.
+
+    Measured in production 2026-09-17: `experiment.grade --slot m --date
+    2026-09-09` raised `end_date 2026-09-09 precedes start_date 2026-09-14`,
+    because `v3meta_momentum_head` was registered on 2026-09-14 and the slot
+    grade tried to age it on a day it did not exist. The library half
+    (`nousergon-lib-PR425`, `alpha-engine-config-I11084`) excludes such an arm
+    from the cycle; these tests pin the crucible half on the REAL job over a
+    real store: the day still grades, the other arms still score, and the
+    excluded arm is NAMED — on the manifest, not only inside the artifact —
+    with its reason and both dates. Then the two sibling loops the issue
+    names: `experiment.run` for that day, and `promote` acting on it.
+    """
+
+    LATE_DAY = SESSIONS[55]
+
+    def _register_late_arm(self, store, strategy) -> str:
+        """Produce the slot's history, then file `late` on a day AFTER
+        `GRADE_DAY` — the production order: the arm is registered today, and
+        the grade that has to exclude it is for a day before today."""
+        _warm_the_base(store, strategy)
+        for day in SESSIONS[46:52]:
+            _run_produce(store, strategy, day=day)
+        arms = strategy.strategy_dir / "arms" / SLOT
+        _write_recipe(arms, "late", features=[SECOND_COLUMN])
+        path = arms / "late.yaml"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                f"registered_at: '{SESSIONS[0]}'", f"registered_at: '{self.LATE_DAY}'"
+            ),
+            encoding="utf-8",
+        )
+        _, result = _run_produce(store, strategy, day=self.LATE_DAY)
+        [late] = [a for a in result["arms"] if ":late:" in a]
+        return late
+
+    def _grade(self, store, strategy, day=GRADE_DAY):
+        result: dict = {}
+        run_job(
+            "experiment.grade",
+            lambda c: result.update(grade(c, settings=strategy)),
+            store=store,
+            trading_day=dt.date.fromisoformat(day),
+            run_mode="replay",
+            discriminator=SLOT,
+        )
+        return result, _manifest(store, "experiment.grade", day)
+
+    def test_the_past_day_grades_and_the_other_arms_are_scored(self, store, strategy) -> None:
+        late = self._register_late_arm(store, strategy)
+        result, document = self._grade(store, strategy)
+        assert document["status"] == "ok", document["reason"]
+        assert store.exists(result["arena_cycle_key"])
+        assert late not in result["scored_arms"]
+        assert any(":base:" in a for a in result["scored_arms"])
+        assert any(":stacked:" in a for a in result["scored_arms"])
+
+    def test_the_excluded_arm_is_named_on_the_manifest_with_both_dates(
+        self, store, strategy
+    ) -> None:
+        late = self._register_late_arm(store, strategy)
+        result, document = self._grade(store, strategy)
+        [row] = [m for m in document["metrics"] if m["name"] == NOT_YET_REGISTERED_METRIC]
+        assert row["status"] == "OK", "a non-question is never a fault"
+        assert row["value"] == 1.0
+        assert late in row["status_reason"]
+        assert f"created {self.LATE_DAY}" in row["status_reason"]
+        assert f"filed {self.LATE_DAY}" in row["status_reason"]
+        [excluded] = result["not_yet_registered_arms"]
+        assert excluded["arm_id"] == late
+        assert (excluded["created_date"], excluded["filed_date"]) == (self.LATE_DAY,) * 2
+        cycle = json.loads(store.get_bytes(result["arena_cycle_key"]).decode("utf-8"))
+        assert [e["arm_id"] for e in cycle["not_yet_registered_arms"]] == [late]
+
+    def test_the_absent_arm_gets_no_cpcv_reading_or_veto_for_that_day(
+        self, store, strategy
+    ) -> None:
+        """Grading it would be grading an arm over a period it was absent
+        from; the exclusion is the manifest row above, not a CPCV figure."""
+        late = self._register_late_arm(store, strategy)
+        result, document = self._grade(store, strategy)
+        assert late not in result["model_grades"]
+        cpcv = [m for m in document["metrics"] if m["name"] == CPCV_OOS_IC_METRIC]
+        assert not [m for m in cpcv if "'late'" in m["status_reason"]]
+        assert len(cpcv) == 2
+
+    def test_the_same_arm_is_graded_once_the_day_is_on_or_after_its_filing(
+        self, store, strategy
+    ) -> None:
+        """The exclusion is point-in-time, not permanent."""
+        late = self._register_late_arm(store, strategy)
+        result, document = self._grade(store, strategy, day=self.LATE_DAY)
+        assert document["status"] == "ok", document["reason"]
+        assert late in result["scored_arms"]
+        assert late in result["model_grades"]
+        assert result["not_yet_registered_arms"] == []
+        [row] = [m for m in document["metrics"] if m["name"] == NOT_YET_REGISTERED_METRIC]
+        assert row["value"] == 0.0
+
+    def test_experiment_run_for_the_past_day_does_not_raise(self, store, strategy) -> None:
+        """Sibling loop 1. A produce for a day before an arm's registration
+        is a BACKFILL — the path that feeds the historical grade — and it
+        still runs clean with the later arm in the register."""
+        self._register_late_arm(store, strategy)
+        day = SESSIONS[53]
+        _run_produce(store, strategy, day=day)
+        document = _manifest(store, "experiment.run", day)
+        assert document["status"] == "ok", document["reason"]
+
+    def test_promote_reads_the_past_day_without_the_absent_arms_series(
+        self, store, strategy
+    ) -> None:
+        """Sibling loop 2. `experiment.grade` wrote no series for an arm the
+        day's cycle excluded, and `promote`'s loader used to demand one for
+        every arm in the register — so it raised `KeyError: ... registered
+        in slot 'm' but has no series` for every historical day."""
+        late = self._register_late_arm(store, strategy)
+        self._grade(store, strategy)
+        inputs = load_slot_inputs(store, SLOT, as_of=GRADE_DAY)
+        assert late not in inputs.series_by_arm
+        assert any(":base:" in a for a in inputs.series_by_arm)
+        # Present tense still demands every arm: the narrowing is the day's.
+        with pytest.raises(KeyError, match="late"):
+            load_slot_inputs(store, SLOT)
+
+    def test_the_promote_command_runs_for_the_past_day(self, store, strategy, monkeypatch) -> None:
+        self._register_late_arm(store, strategy)
+        self._grade(store, strategy)
+        monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
+        assert (
+            cli_main(["promote", "--slot", SLOT, "--date", GRADE_DAY, "--run-mode", "replay"]) == 0
+        )
+        document = json.loads(
+            store.get_bytes(manifest_key("promote", GRADE_DAY, discriminator=SLOT))
+        )
+        assert document["status"] == "ok", document["reason"]

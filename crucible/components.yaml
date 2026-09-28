@@ -498,6 +498,77 @@ components:
     dispatch: null
     deadline: null
 
+  release.pin_request:
+    # alpha-engine-config-I11545 (Brian's ruling: anyone may queue a sha at any
+    # time; the next clean post-close smokes and pins it; promotion stays
+    # explicit). Writes `trader/pin_request.json` and moves no pointer. On
+    # demand - `trader-pin.yml`'s `workflow_dispatch`, whose only input is the
+    # sha - so no schedule and no deadline; the log is that workflow's run.
+    description: >-
+      Queue a release sha for the trader: write the pin request the next clean
+      post-close evening applies. Moves no pointer.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:outputs[trader/pin_request.json]
+      outcome: run.json:metrics[trader_pin_requested]
+    log_location: github-actions:trader-pin.yml
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/releases
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: null
+    dispatch: null
+    deadline: null
+
+  release.pin_apply:
+    # alpha-engine-config-I11545. Reads `trader/pin_request.json` and, when it
+    # is still the one pending change (the pin still names its `from_sha`) and
+    # the workflow's guard read a clean post-close for the session, pins the
+    # trader through `crucible.release.pin_trader` - the off-market-hours
+    # window and the passing `trader.smoke` gate, exactly as a human pin.
+    # `none`/`noop` are `ok`; a `stale` request, a failed smoke, or a fresh
+    # request on an unclean evening is a failed manifest, which pages.
+    #
+    # DAILY with a deadline, and it writes a manifest every session whether or
+    # not anything was queued, so the cron silently not firing is an ABSENCE
+    # page rather than a queued request that never moves. NYSE holidays are
+    # skipped by the workflow's guard, and the deadline is trading-calendar
+    # relative, so a holiday pages nothing.
+    description: >-
+      Pin the trader to the queued release when the request is still pending,
+      the post-close pipeline finished cleanly and the trader's smoke passed.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs[trader/pin_request.json,runs/trader.smoke/**],outputs[trader/release_pin]
+      outcome: run.json:metrics[trader_pin_moved]
+    log_location: github-actions:trader-pin.yml
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/releases
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    schedule: weekdays after the post-close pipeline
+    dispatch: github-actions
+    dispatch_workflow: trader-pin.yml
+    deadline:
+      # `close_plus 10` = 02:00 ET the next morning, from the cron at 23:15 UTC
+      # plus this account's measured GitHub Actions delivery envelope
+      # (chronically +240 to +304 minutes; the measurement recorded on
+      # `gate.close` above, alpha-engine-config-I9960, -I9966). 23:15Z + 304
+      # min is 04:19Z, 00:19 EDT, so this clears the worst measured delay while
+      # still paging before the trader's pre-open work. The pin itself refuses
+      # from 05:00 ET, so a run later than that could not pin anyway.
+      anchor: close_plus
+      cadence: daily
+      offset_hours: 10
+
   release.lock:
     description: >-
       Apply Object Lock retention to a published release's identity objects

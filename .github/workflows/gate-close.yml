@@ -149,7 +149,8 @@ env:
   # alpha-engine-config-I9967. The closing reading is POSTED to the phase's
   # tracker issue before it is filed, and the tracker is
   # `nousergon/alpha-engine-config` — a different, private repository an
-  # Actions `GITHUB_TOKEN` cannot reach at all. `crucible.tracker` mints a
+  # Actions `GITHUB_TOKEN` cannot reach at all. The tracker adapter
+  # (`crucible.gate.tracker_adapter`) mints a
   # short-lived installation token narrowed to `issues: write` from the fleet's
   # existing `ne-groomer` GitHub App, whose three SSM parameters this role
   # reads by exact name. The secret is the laptop override and wins when both
@@ -367,7 +368,7 @@ jobs:
           # distinction is the point: without the tracker credential this job
           # still runs correctly on every day that no phase has turned MET,
           # which is almost every day. It fails LOUDLY on the day one has —
-          # `crucible.tracker` raises TrackerError, run_job writes a `failed`
+          # the tracker adapter raises TrackerError, run_job writes a `failed`
           # manifest naming it, and the process exits non-zero — so the
           # credential is enforced exactly when it is load-bearing rather than
           # by a daily red run nobody can act on.

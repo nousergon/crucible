@@ -63,6 +63,7 @@ __all__ = [
     "TRADER_KILL_SWITCH_KEY",
     "TRADER_PAPER_SMOKE_PREFIX",
     "TRADER_PIN_KEY",
+    "TRADER_PIN_REQUEST_KEY",
     "TRADER_RECONCILIATION_PREFIX",
     "TRADER_SHADOW_BOOKS_PREFIX",
     "TRIGGER_RE",
@@ -1450,6 +1451,22 @@ POINTER_KEY = f"{RELEASES_ROOT}current"
 #: `current` would be promoted by every merge, and release promotion to the
 #: trader is an explicit off-market-hours action (plan §4.11).
 TRADER_PIN_KEY = "trader/release_pin"
+
+#: The QUEUED trader pin (`alpha-engine-config-I11545`, Brian's ruling: anyone
+#: may queue a sha at any time; the next clean post-close smokes and pins it;
+#: promotion stays explicit). ONE rolling document, `trader_pin_request.v1`
+#: (`crucible.models.TraderPinRequestDocument`), overwritten by each new request
+#: and never deleted: it is CONVERGENT, not a queue. It is done when the pin
+#: already names its sha, stale when the pin moved away from the `from_sha` it
+#: recorded, and cancelled by requesting the current pin.
+#:
+#: Written by `crucible release.pin_request` (`trader-pin.yml`'s dispatch);
+#: read by `crucible release.pin_apply` (the same workflow's schedule) and by
+#: the trader's box-side smoke (`crucible-trader`'s
+#: `scripts/trader_pin_request_smoke.sh`, which names this string as a literal
+#: until its crucible pin is bumped). A module-level CONSTANT beside
+#: :data:`TRADER_PIN_KEY` for the reason that one is.
+TRADER_PIN_REQUEST_KEY = "trader/pin_request.json"
 
 #: The trader's consumer-evidence document (`alpha-engine-config-I10648`).
 #: ONE rolling key, not a dated one: `crucible.gate` reads a single document
