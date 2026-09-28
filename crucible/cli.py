@@ -276,7 +276,7 @@ def _promote(args: argparse.Namespace) -> int:
             # on evidence, and the phase-3 promotion clause must not read one.
             return
 
-        inputs = load_slot_inputs(store, args.slot)
+        inputs = load_slot_inputs(store, args.slot, as_of=as_of)
         # `alpha-engine-config-I10679`: the cycle `experiment.grade` computed
         # an hour earlier, read back rather than recomputed — the pointer
         # decision, the retirement verdicts and the serving preconditions
@@ -390,7 +390,7 @@ def _fault_record(args: argparse.Namespace) -> int:
             bus_key=getattr(args, "bus_key", None),
         )
 
-    from crucible.runner import run_job
+    from crucible.runner import invocation_discriminator, run_job
 
     ctx = run_job(
         FAULT_RECORD_JOB,
@@ -399,6 +399,10 @@ def _fault_record(args: argparse.Namespace) -> int:
         trading_day=args.trading_day,
         dry_run=bool(args.dry_run),
         run_mode=getattr(args, "run_mode", None),
+        # One manifest per INVOCATION, not per trading day: this job is on
+        # demand, so nothing bounds how often it runs on one day
+        # (`alpha-engine-config-I11033`; `crucible.runner.invocation_discriminator`).
+        discriminator=invocation_discriminator,
     )
     print(json.dumps({"run_id": ctx.run_id, "outputs": [o["key"] for o in ctx.outputs]}, indent=2))
     return 0
@@ -682,6 +686,18 @@ JOBS: dict[str, JobSpec] = {
         "migrate.history", "Import v1 arm history with its provenance", True
     ),
     "release.pin": JobSpec("release.pin", "Repoint a release, or pin the trader to one", False),
+    # alpha-engine-config-I11545 (Brian's ruling: anyone may queue a sha, the
+    # next clean post-close smokes and pins it). `release.pin_request` is
+    # on-demand — `trader-pin.yml`'s dispatch — and moves no pointer.
+    # `release.pin_apply` is SCHEDULED: the same workflow's weekday cron runs
+    # it every session, so its manifest is due every session and its absence
+    # pages, whether or not anything was queued.
+    "release.pin_request": JobSpec(
+        "release.pin_request", "Queue a release sha for the trader's next clean pin", False
+    ),
+    "release.pin_apply": JobSpec(
+        "release.pin_apply", "Pin the trader to the queued release, if it is still pending", True
+    ),
     # alpha-engine-config-I9898: the repair for a release published before
     # I9787's write-time Object Lock fix. On-demand, like release.pin — an
     # operator runs it against a named sha, never a schedule.
@@ -880,6 +896,8 @@ HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     # code in parallel without editing one another's lines.
     HOLDOUT_JOB: holdout_handler,
     "release.pin": track_c.release_pin_handler,
+    "release.pin_request": track_c.release_pin_request_handler,
+    "release.pin_apply": track_c.release_pin_apply_handler,
     RELEASE_LOCK_JOB: release_lock_handler,
     "smoke": track_c.smoke_handler,
     "alerts.sweep": track_c.sweep_handler,
@@ -1043,6 +1061,19 @@ def build_parser() -> argparse.ArgumentParser:
         if spec.name == "release.pin":
             sub.add_argument("sha", metavar="RELEASE_SHA")
             sub.add_argument("--target", choices=["current", "trader"], default="current")
+        if spec.name == "release.pin_request":
+            sub.add_argument("sha", metavar="RELEASE_SHA")
+        if spec.name == "release.pin_apply":
+            sub.add_argument(
+                "--postclose",
+                choices=["clean", "unclean"],
+                required=True,
+                help=(
+                    "The post-close guard's reading for this session (`trader-pin.yml`). "
+                    "A fresh request is applied only on `clean`; with nothing to apply "
+                    "the reading changes nothing."
+                ),
+            )
         if spec.name == RELEASE_LOCK_JOB:
             sub.add_argument("sha", metavar="RELEASE_SHA")
         if spec.name == "smoke":  # track-C

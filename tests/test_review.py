@@ -24,7 +24,7 @@ import pytest
 
 from crucible.cli import main as cli_main
 from crucible.gate import REVIEW_SCHEMA_VERSION
-from crucible.keys import manifest_key, review_key
+from crucible.keys import review_key
 from crucible.review import (
     COMMITS_ENDPOINT_CAP,
     REVIEW_RECORD_JOB,
@@ -36,6 +36,7 @@ from crucible.review import (
 )
 from crucible.runner import run_job
 from crucible.store import LocalStore
+from tests.support.manifests import only_manifest
 
 AUTHOR = "session_01AuthorAAAAAAAA"
 REVIEWER = "session_01ReviewerBBBBB"
@@ -247,7 +248,7 @@ class TestAnAdverseVerdictIsDurable:
         so the producer of phase-exit evidence filed no lineage at all."""
         store = LocalStore(tmp_path)
         key = _record(store, document())
-        manifest = json.loads(store.get_bytes(manifest_key(REVIEW_RECORD_JOB, FRIDAY.isoformat())))
+        manifest = only_manifest(store, REVIEW_RECORD_JOB, FRIDAY.isoformat())[1]
         assert manifest["status"] == "ok"
         assert [row["key"] for row in manifest["outputs"]] == [key]
 
@@ -350,6 +351,6 @@ class TestTheCommandLine:
         # ...and the attempt IS recorded (alpha-engine-config-I10968). "A
         # review was attempted and refused" and "no review was attempted" used
         # to be indistinguishable: the refusing path wrote nothing anywhere.
-        manifest = json.loads(store.get_bytes(manifest_key(REVIEW_RECORD_JOB, FRIDAY.isoformat())))
+        manifest = only_manifest(store, REVIEW_RECORD_JOB, FRIDAY.isoformat())[1]
         assert manifest["status"] == "failed"
         assert "independent of the author" in manifest["reason"]

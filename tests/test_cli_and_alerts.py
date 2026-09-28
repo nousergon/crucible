@@ -76,6 +76,13 @@ def _minimal_argv(job: str) -> list[str]:
         argv += ["01JG0000000000000000000000"]
     if job == "release.pin":
         argv += ["a" * 40]
+    if job == "release.pin_request":
+        # alpha-engine-config-I11545: the sha IS the request.
+        argv += ["a" * 40]
+    if job == "release.pin_apply":
+        # The post-close guard's reading; required, never defaulted, so the
+        # job cannot be run as though an evening were clean.
+        argv += ["--postclose", "clean"]
     if job == "release.lock":
         # alpha-engine-config-I9898: repair job, takes the release sha
         # positionally same as release.pin.
@@ -250,6 +257,10 @@ class TestJobSurface:
             # workflow-triggered, neither scheduled.
             "review.record",
             "acceptance.publish",
+            # alpha-engine-config-I11545: the queued trader pin — the request
+            # (dispatch) and its scheduled apply, both `trader-pin.yml`.
+            "release.pin_request",
+            "release.pin_apply",
         }
 
     @pytest.mark.parametrize("job", sorted(JOBS))
@@ -640,6 +651,9 @@ class TestDryRunNeverWrites:
         "gate.close",
         "heartbeat",
         "release.pin",
+        # alpha-engine-config-I11545: nothing is queued on a fresh store, so
+        # the apply reads `none` and its rehearsal returns 0.
+        "release.pin_apply",
         "report",
     )
     # NOTE (alpha-engine-config-I11012): `experiment.run` left this set. Its
@@ -697,6 +711,13 @@ class TestDryRunNeverWrites:
             "TestDryRun::test_a_dry_run_reports_the_diff_and_writes_nothing"
         ),
         "migrate.history": "needs seeded v1 sources",
+        "release.pin_request": (
+            "refuses on a fresh store by design -- a request for a sha with no published "
+            "wheel is refused before anything is written; its dry-run property (the "
+            "request is built and validated against a published release, and the store "
+            "gains no key at all) is asserted directly by tests/test_trader_pin_request.py"
+            "::TestRequestHandler::test_a_dry_run_builds_the_request_and_writes_nothing"
+        ),
         "holdout": (
             "its READ form writes no manifest at all and exits 1 on a fresh store (no "
             "holdout is published, which is the honest answer), so the shared "

@@ -603,6 +603,8 @@
         "holdout",
         "migrate.history",
         "release.pin",
+        "release.pin_request",
+        "release.pin_apply",
         "release.lock",
         "smoke",
         "alerts.sweep",

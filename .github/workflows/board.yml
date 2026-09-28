@@ -192,7 +192,8 @@ env:
   # The GRANT (alpha-engine-config-I9967, revised 2026-09-06): no second
   # long-lived credential. The fleet's existing `ne-groomer` GitHub App is
   # installed org-wide with Issues: write, and its credentials live in SSM;
-  # `crucible.tracker` mints a short-lived installation token narrowed to
+  # the tracker adapter (`crucible.gate.tracker_adapter`) mints a short-lived
+  # installation token narrowed to
   # `issues: write` from them under the board role, whose crucible-v2 stack
   # statement `ReadTheGroomerAppCredentialsToMintATrackerToken` reads exactly
   # the three parameters. A repository VARIABLE, like STORE_URI above: it

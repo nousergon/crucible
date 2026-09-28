@@ -146,6 +146,7 @@ from typing import Any
 from nousergon_lib import run_identity as _run_identity
 
 from crucible.calendar import assert_trading_day, resolve_trading_day
+from crucible.keys import calendar_day_discriminator
 from crucible.manifest import (
     RUN_MANIFEST_SCHEMA_VERSION,
     STATUSES,
@@ -171,6 +172,7 @@ __all__ = [
     "SpotInterruptionError",
     "TRANSIENT_CLASSIFIERS",
     "classify_transient",
+    "invocation_discriminator",
     "rebind_trading_day",
     "resolve_dispatch_attempts",
     "resolve_code_sha",
@@ -830,6 +832,36 @@ class RunContext:
             {"key": key, "sha256": sha256_hex(payload), "schema_version": schema_version}
         )
         return version
+
+
+def invocation_discriminator(ctx: RunContext) -> str:
+    """The manifest discriminator for an ON-DEMAND job: one key per invocation.
+
+    `alpha-engine-config-I11033`. A job `components.yaml` gives no `dispatch`
+    is invoked as often as someone runs it, and with no discriminator every
+    invocation on one trading day wrote `runs/{job}/{trading_day}/run.json` —
+    the last one erased the others (`crucible.alerts
+    .indistinguishable_invocation_findings` reports exactly that shape). The
+    run's own `run_id` is the one value that is new on every invocation, so it
+    is the discriminator, led by the calendar day the process ran on through
+    :func:`crucible.keys.calendar_day_discriminator` — the same shape
+    `experiment.new` has written since `alpha-engine-config-I10999`, so
+    :func:`crucible.keys.manifest_calendar_day` reads the day back off every
+    one of these keys too.
+
+    Pass the FUNCTION, not its value: ``run_job(..., discriminator=
+    invocation_discriminator)``. It is resolved per attempt against the
+    attempt's own context, so a retried run's one manifest is filed under the
+    attempt that wrote it.
+
+    Two properties a reader can rely on, and must: the key is NOT knowable
+    before the run starts, so a reader lists
+    :func:`crucible.keys.manifest_prefix` (through
+    :func:`crucible.documents.read_manifests_under`) and never builds a bare
+    key; and within one calendar day the keys sort in run order, because a
+    ULID's leading characters are its timestamp.
+    """
+    return calendar_day_discriminator(ctx.calendar_date, suffix=ctx.run_id)
 
 
 def rebind_trading_day(ctx: RunContext, day: dt.date) -> RunContext:

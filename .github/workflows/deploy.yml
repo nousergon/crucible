@@ -429,7 +429,9 @@ jobs:
           uv run python -m crucible.deploy capture --sha '${{ needs.build.outputs.sha }}' --store "$STORE_URI" --out pointer.token
 
       # The gate. A REAL run against live S3 read paths, writing
-      # runs/smoke/{trading_day}/run.json through the ordinary runner — so the
+      # runs/smoke/{trading_day}/{calendar_day}-{run_id}/run.json (one manifest
+      # per invocation, alpha-engine-config-I11033; the flip selects the one
+      # for this sha) through the ordinary runner — so the
       # gate produces the same telemetry every other job does, and a smoke that
       # "ran and had nothing to do" is not expressible (§4.2). It reads the
       # wheel and release.json for THIS sha out of the store and re-hashes the

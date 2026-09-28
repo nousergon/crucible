@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 
-from crucible.keys import arena_cycle_key, manifest_key
+from crucible.keys import arena_cycle_key, is_manifest_key, manifest_key, manifest_prefix
 from crucible.store import Store
 
 
@@ -46,3 +46,28 @@ def write_grade_manifest(
         ).encode("utf-8"),
     )
     return key
+
+
+def only_manifest(store: Store, job: str, trading_day: str) -> tuple[str, dict]:
+    """The ONE manifest ``job`` filed for ``trading_day``, and its key.
+
+    For an on-demand job, which files one manifest per invocation under a
+    discriminator the test cannot know in advance
+    (`crucible.runner.invocation_discriminator`, `alpha-engine-config-I11033`).
+    Asserts there is exactly one, so a test that ran the job once cannot pass
+    by reading some other run's manifest.
+    """
+    keys = [k for k in store.list_keys(manifest_prefix(job, trading_day)) if is_manifest_key(k)]
+    assert len(keys) == 1, f"expected one {job} manifest for {trading_day}, found {keys}"
+    return keys[0], json.loads(store.get_bytes(keys[0]))
+
+
+def manifests_filed(store: Store, job: str, trading_day: str) -> list[str]:
+    """Every manifest key ``job`` filed for ``trading_day``, bare or discriminated.
+
+    The absence check for an on-demand job: `store.exists(manifest_key(job,
+    day))` is vacuously false once the job discriminates its key, so a test
+    asserting "no manifest was written" must list the prefix instead.
+    """
+    listed = store.list_keys(manifest_prefix(job, trading_day))
+    return sorted(k for k in listed if is_manifest_key(k))

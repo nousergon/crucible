@@ -41,15 +41,16 @@ import datetime as dt
 import json
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from crucible.calendar import resolve_trading_day
-from crucible.documents import load_store_document, read_store_document
+from crucible.documents import read_manifests_under, read_store_document
 from crucible.manifest import (
     RUN_MANIFEST_SCHEMA_VERSION,
     ManifestValidationError,
-    manifest_key,
+    manifest_prefix,
 )
 from crucible.manifest import (
     validate as validate_manifest,
@@ -385,15 +386,19 @@ def _flip(args: argparse.Namespace, store: Store) -> int:
         )
     expect = token_path.read_bytes().decode("utf-8")
     trading_day = resolve_trading_day()
-    key = manifest_key("smoke", trading_day.isoformat())
-    if not store.exists(key):
+    found = smoke_manifest_for(store, trading_day, args.sha)
+    # STRICT face: a prefix we could not list, or a smoke manifest under it
+    # that is not an object, stops the flip with the key named — "we could
+    # not read the evidence" never reads as "there is evidence".
+    if found.problem is not None:
+        raise SystemExit(f"cannot read the smoke evidence for {args.sha}: {found.problem}")
+    if found.key is None or found.document is None:
         raise SystemExit(
-            f"no smoke manifest at {key}. The gate is the smoke RUN; promoting without "
-            "one would flip the pointer on a step that may never have executed."
+            f"no smoke manifest for release {args.sha} under {found.prefix}. The gate is "
+            "the smoke RUN; promoting without one would flip the pointer on a step that "
+            "may never have executed."
         )
-    # STRICT face of the one reader (`crucible.documents`): a smoke manifest
-    # that is not an object stops the flip with the key named.
-    smoke = load_store_document(store, key)
+    key, smoke = found.key, found.document
     # alpha-engine-config-I10682: validate the smoke manifest WHOLE, through
     # `crucible.manifest.validate`/`RunManifestV2`, before any field below is
     # read off it by hand. Before this, a smoke manifest missing `status` (or
@@ -468,6 +473,59 @@ def _flip(args: argparse.Namespace, store: Store) -> int:
     return 0
 
 
+@dataclass(frozen=True)
+class SmokeEvidence:
+    """The smoke manifest a deploy for one release reads, or why there is none.
+
+    ``problem`` is set when the evidence could not be READ (an unlistable
+    prefix, an unreadable manifest under it) and is never folded into
+    "absent"; ``key``/``document`` are ``None`` when the prefix was read and
+    holds no smoke for this release.
+    """
+
+    prefix: str
+    key: str | None = None
+    document: dict[str, Any] | None = None
+    problem: str | None = None
+
+
+def smoke_manifest_for(store: Store, trading_day: dt.date, sha: str) -> SmokeEvidence:
+    """The newest `smoke` manifest for release ``sha`` on ``trading_day``.
+
+    `alpha-engine-config-I11033`. `smoke` is on demand, so it files one
+    manifest per INVOCATION (`crucible.runner.invocation_discriminator`) and
+    its key is not knowable before the run: the deploy lists
+    `runs/smoke/{trading_day}/` through the one sanctioned prefix reader
+    (`crucible.documents.read_manifests_under`, `alpha-engine-config-I9929`)
+    rather than building the bare key. That also closes the shape the bare key
+    had: two deploys on one day used to share one smoke key, so a deploy could
+    read ANOTHER release's smoke — `flip_on_smoke` refused it, but the refusal
+    was the only thing standing between the flip and the wrong evidence. Now
+    the smoke is selected BY release, and among several smokes of one release
+    the latest `finished` wins, which is the one the deploy just ran.
+
+    A manifest under the prefix that cannot be read is a ``problem``, not a
+    skip: it could be the very smoke this deploy is looking for.
+    """
+    prefix = manifest_prefix("smoke", trading_day.isoformat())
+    read = read_manifests_under(store, prefix)
+    if read.listing_problem is not None:
+        return SmokeEvidence(prefix=prefix, problem=read.listing_problem)
+    if read.faults:
+        return SmokeEvidence(
+            prefix=prefix,
+            problem=(
+                f"{len(read.faults)} smoke manifest(s) under {prefix} could not be read: "
+                f"{sorted(read.faults.items())}"
+            ),
+        )
+    matching = [(k, d) for k, d in read.documents if d.get("release_sha") == sha]
+    if not matching:
+        return SmokeEvidence(prefix=prefix)
+    key, document = max(matching, key=lambda pair: (str(pair[1].get("finished") or ""), pair[0]))
+    return SmokeEvidence(prefix=prefix, key=key, document=document)
+
+
 def _record(args: argparse.Namespace, store: Store) -> int:
     """Write the deploy's own manifest, in the run-manifest schema.
 
@@ -478,9 +536,11 @@ def _record(args: argparse.Namespace, store: Store) -> int:
     would be the degraded-SUCCEEDED this whole system refuses.
 
     Reads BOTH the pointer and the smoke manifest through the GUARDED face
-    (`read_store_document`), never `current_release`/`load_store_document`'s
-    STRICT one (alpha-engine-config-I9945): this step is the one job
-    designed to always record, under `if: always()`, so a corrupt
+    (`read_store_document`; the smoke through :func:`smoke_manifest_for`,
+    which lists its prefix with `read_manifests_under`), never
+    `current_release`/`load_store_document`'s STRICT one
+    (alpha-engine-config-I9945): this step is the one job designed to always
+    record, under `if: always()`, so a corrupt
     `releases/current` OR a corrupt smoke manifest must become a
     `status: failed` manifest naming the fault — never a raise that leaves
     the deploy that observed the corruption with no manifest at all. A
@@ -498,11 +558,9 @@ def _record(args: argparse.Namespace, store: Store) -> int:
         if pointer_fault is None and pointer_read.document is not None
         else None
     )
-    smoke_key = manifest_key("smoke", trading_day.isoformat())
-    smoke_read = read_store_document(store, smoke_key)
-    smoke_fault = (
-        smoke_read.problem if smoke_read.document is None and not smoke_read.absent else None
-    )
+    smoke_found = smoke_manifest_for(store, trading_day, args.sha)
+    smoke_key = smoke_found.key or smoke_found.prefix
+    smoke_fault = smoke_found.problem
     ok = (
         args.outcome == "success"
         and pointer_fault is None

@@ -41,7 +41,7 @@ renders everything the old message rendered — the ladder, the §6.1 schedule,
 moved-since, acceptance, silence, the board link, store key and stamps — as
 GitHub-flavored Markdown, with no character budget: it is posted as a
 comment on the rolling `[v2 board] daily update` issue in the private
-`alpha-engine-config` tracker (`crucible.tracker`, App-minted token — an
+`alpha-engine-config` tracker (`nousergon_lib.gates.tracker`, App-minted token — an
 Actions token cannot reach a different, private repository), one comment per
 delivery, and its own filed copy sits at `update.md` beside the manifest.
 :func:`render_history_body` regenerates that SAME issue's own BODY into a
@@ -59,7 +59,7 @@ spell out in the message itself is now one click away.
 **Ordering is the whole safety property.** The comment is posted BEFORE the
 headline is rendered, because the headline's one indispensable line is the
 comment's permalink — a headline sent before the comment exists is the
-illegible shape again, just shorter. `crucible.tracker.post_comment` and
+illegible shape again, just shorter. `Tracker.post_comment` and
 `crucible.morning._find_or_create_rolling_issue` both RAISE rather than
 degrade, so a failed post fails the run loudly (`status: failed`) and the
 Telegram message is never sent at all — see `morning_handler`.
@@ -87,22 +87,21 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from crucible import tracker
+from nousergon_lib.gates import report
+from nousergon_lib.gates.report import UndeliveredError, wire_length
+
 from crucible.calendar import previous_trading_day
 from crucible.console.classify import not_yet_due
 from crucible.documents import load_store_document, read_document
-from crucible.gate import LADDER_KEY, PHASES, TRACKER_REPO
+from crucible.gate import LADDER_KEY, PHASES, TRACKER_REPO, tracker_adapter
 from crucible.keys import (
     BOARD_CURRENT_KEY,
     BOARD_HTML_KEY,
-    TRIGGER_RE,
-    TRIGGER_UNKNOWN,
     acceptance_reading_key,
     board_key,
     manifest_key,
@@ -273,7 +272,7 @@ NO_OPERATOR_ACTION = "pending operator action: none exposed by the board's produ
 
 #: How the board separates the clauses of one row's `detail`. Read off the
 #: live board 2026-09-02: "1/2 clauses met; holding: ...; grades 2 of 5 ...".
-#: Declared here rather than inlined so :func:`_withhold_progress` has one
+#: Declared here rather than inlined so :func:`_plain_withhold` has one
 #: definition of what it is splitting, and so a board that changed separator
 #: fails the scrubber's own tests rather than silently withholding whole rows.
 CLAUSE_SEPARATOR = "; "
@@ -305,15 +304,16 @@ FORBIDDEN_PROGRESS_TOKENS: tuple[str, ...] = (
     "progress",
 )
 
-#: What replaces a withheld clause. Carries no forbidden token itself — a
-#: marker that trips the guard it implements would make the whole-message
-#: assertion unfalsifiable.
-WITHHELD_MARKER = "[{n} clause{s} withheld — plan §12 rule 3]"
+#: WHOSE rule withheld a clause, rendered into `nousergon_lib.gates.report`'s
+#: marker (`[{n} clause{s} withheld — plan §12 rule 3]`). Carries no forbidden
+#: token itself — a marker that trips the guard it implements would make the
+#: whole-message assertion unfalsifiable.
+WITHHELD_NOTE = "plan §12 rule 3"
 
 #: The title of the rolling issue `render_full_update`'s markdown is posted
 #: to, once per delivery, in the private `alpha-engine-config` tracker
 #: (`alpha-engine-config-I10123`). A literal, not derived from anything —
-#: `crucible.tracker.find_issue_by_title` searches for it verbatim, and the
+#: `Tracker.find_issue_by_title` searches for it verbatim, and the
 #: same string is the CREATE payload's title the one time a day ever needs
 #: to create it. Never closed by automation; a human retires it if the shape
 #: of the daily update ever changes enough to want a fresh rolling issue.
@@ -419,23 +419,6 @@ BOARD_URL_UNREADABLE = (
 )
 
 
-def wire_length(text: str) -> int:
-    """How many characters ``text`` occupies on the wire, under `parse_mode="HTML"`.
-
-    Under Markdown v1, `krepis.telegram.send_message` escaped the body AFTER
-    the caller handed it over, so `len(message)` understated what Telegram
-    measured. HTML mode inverts that (`alpha-engine-config-I9925`): the
-    caller owns the markup and `send_message` escapes nothing for it — every
-    piece of interpolated content already went through :func:`_escape_html`
-    by the time it reaches a line, so what this module renders IS the wire
-    body, and `len()` is exact rather than a lower bound. Kept as a named
-    function, not inlined as `len()` at every call site, so the budget's unit
-    of measure stays one declared thing if a future parse mode needs a
-    different rule again.
-    """
-    return len(text)
-
-
 #: What `krepis.alerts.publish` puts in FRONT of this body, unescaped.
 #:
 #: **The budget is spent on the wire body, and the body is not what this
@@ -459,90 +442,26 @@ def wire_length(text: str) -> int:
 #: test_the_prefix_matches_the_one_krepis_actually_prepends` PINS this against
 #: krepis' real output by calling that formatter from the test — a
 #: disagreement fails a test instead of dropping a report.
-TRANSPORT_PREFIX = f"[{DELIVERY_SEVERITY.upper()}] {DELIVERY_SOURCE}: "
-
-
-def _escape_html(text: str) -> str:
-    """Escape ``& < >`` so ``text`` renders literally under `parse_mode="HTML"`.
-
-    `krepis.telegram.escape_html` is the ONE escaper (`alpha-engine-config-
-    I9925`): a second implementation here would let this module's idea of
-    "escaped" drift from what `send_message` assumes the caller already did.
-    Imported lazily, like every krepis reference in this tree
-    (`_krepis_publish`'s precedent): `crucible --help` and every unit test
-    that renders a message without sending one should not need `requests` —
-    `krepis.telegram` pulls it in at module scope — on the import path.
-
-    Every piece of board free text (a clause name, a `detail` sentence, a
-    failure `reason`) and every URL this module interpolates goes through
-    this before it reaches a line — an unescaped `<` in a board reason must
-    not be able to break delivery of the whole report, which is exactly the
-    HTML-entity-parse-error shape `send_message`'s plain-text retry exists
-    to catch, but a message that never needed the retry is the one that
-    reaches Brian on the first try.
-    """
-    from krepis.telegram import escape_html  # noqa: PLC0415 - lazy on purpose
-
-    return escape_html(text)
-
-
-def _filter_progress_clauses(detail: str) -> tuple[list[str], int]:
-    """The clause-withholding rule's core: what plan §12 rule 3 keeps of
-    ``detail``, and how many clauses it dropped.
-
-    Extracted from the withholding functions themselves (`alpha-engine-
-    config-I10123`) so the full update's markdown and the Telegram headline's
-    HTML share ONE decision about which clauses are forbidden — the two
-    callers below differ only in how they escape what is left, and a second
-    copy of the filtering logic is how "withheld on the headline, present on
-    the full update" becomes possible by accident.
-    """
-    clauses = detail.split(CLAUSE_SEPARATOR)
-    kept = [c for c in clauses if not any(t in f" {c.lower()} " for t in FORBIDDEN_PROGRESS_TOKENS)]
-    return kept, len(clauses) - len(kept)
-
-
-def _withhold_progress(detail: str) -> str:
-    """Drop the clauses of ``detail`` that state a forbidden progress figure,
-    for the Telegram headline's HTML.
-
-    **Withheld, never silently dropped.** The count of removed clauses is
-    rendered in their place, so a reader can see that the board said
-    something this surface refused to repeat and go read the board. A clause
-    that vanished without a trace is indistinguishable from a board that
-    never carried it, which is the defect this whole instrument exists to
-    remove one layer down.
-
-    **Clean text is passed through byte for byte, modulo HTML-escaping.** A
-    scrubber that rewrote detail it had no objection to would make the report
-    an unfaithful copy of the board, which is worse than the defect it fixes
-    — :func:`_escape_html` is not that: it changes nothing Telegram would
-    render differently, and everything it does change (`<`, `>`, `&`) is
-    exactly what would otherwise risk the whole message under
-    `parse_mode="HTML"` (`alpha-engine-config-I9925`).
-    """
-    kept, removed = _filter_progress_clauses(detail)
-    if not removed:
-        return _escape_html(detail)
-    marker = WITHHELD_MARKER.format(n=removed, s="" if removed == 1 else "s")
-    result = CLAUSE_SEPARATOR.join([*kept, marker]) if kept else marker
-    return _escape_html(result)
+TRANSPORT_PREFIX = report.transport_prefix(severity=DELIVERY_SEVERITY, source=DELIVERY_SOURCE)
 
 
 def _plain_withhold(detail: str) -> str:
-    """The same withholding rule, unescaped, for the full update's markdown.
+    """Plan §12 rule 3's clause withholding, unescaped — ONE decision for both
+    documents (`nousergon_lib.gates.report.filter_withheld_clauses`).
 
-    Plain text rather than HTML-escaped: the full update is a GitHub comment
-    body, not a Telegram HTML payload, and running `detail` through
-    :func:`_escape_html` here would print literal `&amp;` where the board
-    said `&` — correct on the wire this module used to own, wrong on the one
-    it posts to now.
+    Withheld, never silently dropped: the count of removed clauses is rendered
+    in their place, so a reader sees that the board said something this
+    surface refused to repeat. Clean text passes through byte for byte.
+    Unescaped because the full update is a GitHub comment body, not a Telegram
+    HTML payload; the headline escapes what it renders with
+    `nousergon_lib.gates.report.escape`, the one escaper.
     """
-    kept, removed = _filter_progress_clauses(detail)
-    if not removed:
-        return detail
-    marker = WITHHELD_MARKER.format(n=removed, s="" if removed == 1 else "s")
-    return CLAUSE_SEPARATOR.join([*kept, marker]) if kept else marker
+    return report.filter_withheld_clauses(
+        detail,
+        tokens=frozenset(FORBIDDEN_PROGRESS_TOKENS),
+        separator=CLAUSE_SEPARATOR,
+        note=WITHHELD_NOTE,
+    )
 
 
 def _md_cell(text: str) -> str:
@@ -555,15 +474,6 @@ def _md_cell(text: str) -> str:
     board free text is rare enough that losing it is the smaller defect.
     """
     return text.replace("|", "/").replace("\n", " ")
-
-
-class UndeliveredError(RuntimeError):
-    """The report was rendered and did not reach the operator.
-
-    A distinct type so the manifest's `reason` names the failure rather than
-    a transport's stringified internals, and so a caller cannot confuse it
-    with a failure to READ the board — those two want different responses.
-    """
 
 
 def store_uri(store: Store) -> str:
@@ -663,65 +573,43 @@ def _client_error_code(exc: BaseException) -> str | None:
     return None
 
 
-@dataclass(frozen=True)
-class _Read:
-    """One optional-artifact read: present, absent/corrupt, or denied.
+class _OneReader:
+    """`crucible.documents`' STRICT face, in the shape the lib reader fetches
+    through (`get_json`).
 
-    Three outcomes because absent and denied are different facts about an
-    artifact this job does not own and cannot write: reporting a denied read
-    as absent hides an IAM gap behind a normal-looking report (plan §6 rule
-    1's conflation, forbidden by name), and it is exactly what happened live
-    on 2026-09-03 before this fix — S3 returns 403 for a missing key when
-    the caller also lacks `s3:ListBucket` on the prefix.
+    `nousergon_lib.gates.report.read_optional` owns the three-way
+    present/absent/DENIED classification; this repository owns what counts as
+    a readable document (AGENTS.md rule 1: every read of stored JSON goes
+    through `crucible.documents`). So the lib reader is handed a store whose
+    one fetch IS that parser: absence is the store's `KeyError`, a corrupt
+    body is `UnreadableDocumentError` (a `ValueError`) carrying the same
+    sentence the guarded face publishes, and a botocore failure propagates
+    for the lib to classify by its code.
     """
 
-    document: dict[str, Any] | None
-    reason: str
-    denied_code: str | None
+    def __init__(self, store: Store) -> None:
+        self._store = store
+
+    def get_json(self, key: str) -> dict[str, Any]:
+        return load_store_document(self._store, key)
 
 
-def _read_json(store: Store, key: str) -> _Read:
+def _read_json(store: Store, key: str) -> report.Read:
     """Read and parse ``key``. Never raises for absent, corrupt or denied.
 
+    `nousergon_lib.gates.report.read_optional` over :class:`_OneReader`.
     FAILURE MODES SWALLOWED: a missing key, a malformed document, and a
     botocore read failure that is not a not-found (`AccessDenied`, a
-    throttle, a network failure before the request reached S3) are all
-    reported rather than raised, because a corrupt or unreachable PREVIOUS
-    board or acceptance reading must not stop today's report from going
-    out — the report is the thing that would tell somebody either is
-    broken. RECORDING SURFACE: `.reason` / `.denied_code` are rendered
-    verbatim into the delivered message, so every swallow here is visible
-    on the operator's phone rather than only in a log.
-
-    A `NoSuchKey`/`404`-coded `ClientError` is still ABSENT, not denied —
-    `S3Store.get_bytes` already normalizes that shape to `KeyError` in
-    production, but this branch matches it too so a caller that raises the
-    `ClientError` directly (a mock, or a future backend) degrades to the
-    same honest answer rather than a spurious "denied".
+    throttle, a network failure) — reported rather than raised, because a
+    corrupt or unreachable PREVIOUS board or acceptance reading must not stop
+    today's report from going out. RECORDING SURFACE: `.reason` /
+    `.denied_code`, rendered verbatim into the delivered message.
 
     `board/current.json` itself is NOT read through this path:
-    :func:`read_inputs` calls `store.get_bytes` directly for it, so a
-    missing, corrupt, or denied CURRENT board raises and the manifest reads
-    `failed` — that artifact is not optional.
+    :func:`read_inputs` reads it strictly, so a missing, corrupt, or denied
+    CURRENT board raises and the manifest reads `failed`.
     """
-    try:
-        raw = store.get_bytes(key)
-    except KeyError:
-        return _Read(None, f"absent at {key}", None)
-    except Exception as exc:  # reclassified below; re-raised unless it's a named botocore code
-        code = _client_error_code(exc)
-        if code is None:
-            raise
-        if code in ("NoSuchKey", "404"):
-            return _Read(None, f"absent at {key}", None)
-        return _Read(None, f"unreadable at {key}: {code}", code)
-    # The one guarded parser (`crucible.documents`): an array- or null-bodied
-    # previous board is "unreadable", never a document the next line's `.get`
-    # raises on (alpha-engine-config-I9931).
-    parsed = read_document(key, lambda: raw)
-    if parsed.problem is not None:
-        return _Read(None, f"unreadable at {key}: {parsed.problem}", None)
-    return _Read(parsed.document, "", None)
+    return report.read_optional(_OneReader(store), key)
 
 
 def _board_url(store: Store, *, now: dt.datetime) -> tuple[str | None, str, str | None]:
@@ -804,7 +692,7 @@ def read_inputs(
     # cases, and the denied case gets its own, naming the code rather than
     # a generic "unreadable at <key>" (plan §6 rule 1).
     previous_reason = (
-        previous_read.reason
+        (previous_read.reason or "")
         if previous_read.denied_code is None
         else f"unreadable ({previous_read.denied_code})"
     )
@@ -947,23 +835,18 @@ def _ladder_comparison_line(inputs: MorningInputs) -> str:
 
 
 def _staleness(generated_at: str, now: dt.datetime) -> str | None:
-    """The headline, or `None`. A stale board is never a footnote."""
-    try:
-        generated = dt.datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
-    except ValueError:
-        return (
-            f"STALE BOARD: generated_at={generated_at!r} is not a timestamp, so the age "
-            "of every reading below is unknown."
-        )
-    if generated.tzinfo is None:
-        generated = generated.replace(tzinfo=dt.UTC)
-    age = now - generated
-    if age <= STALE_AFTER:
-        return None
-    hours = age.total_seconds() / 3600
-    return (
-        f"STALE BOARD: board/current.json was generated {generated_at} — {hours:.0f}h ago. "
-        "Every reading below is that old."
+    """The headline, or `None`. A stale board is never a footnote.
+
+    `nousergon_lib.gates.report.staleness` over `board/current.json`, with the
+    `STALE BOARD` alarm word this surface has always opened with
+    (`alpha-engine-config-I10953`).
+    """
+    return report.staleness(
+        generated_at=generated_at,
+        now=now,
+        stale_after=STALE_AFTER,
+        label=BOARD_CURRENT_KEY,
+        prefix="STALE BOARD",
     )
 
 
@@ -1045,49 +928,49 @@ def _moved_lines_plain(inputs: MorningInputs) -> list[str]:
     positive claim asserted on no evidence, and it is exactly the shape
     `crucible.board._read_previous_board` exists to refuse one layer down.
     """
-    if inputs.previous is None:
-        return [f"cannot say — the {inputs.previous_day} board is {inputs.previous_reason}"]
-    moved, not_due = _moves(inputs.previous, inputs.board)
-    lines = [f"- {row_id}: {was} -> {now}" for row_id, was, now in moved] or ["nothing moved"]
-    if not_due:
+    result = _moves(inputs)
+    if result.cannot_say is not None:
+        return result.lines
+    lines = result.lines or ["nothing moved"]
+    if result.deferred:
         lines.append("")
         lines.append(
-            f"not yet due ({len(not_due)}) — RUNNING or ARMED in either board, so the "
-            "change is schedule phase, not a move:"
+            f"not yet due ({result.deferred_count}) — RUNNING or ARMED in either board, so "
+            "the change is schedule phase, not a move:"
         )
-        lines += [f"- {row_id}: {was} -> {now}" for row_id, was, now in not_due]
+        lines += result.deferred_lines
     return lines
 
 
-def _moves(
-    previous: dict[str, Any], current: dict[str, Any]
-) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str]]]:
-    """`(moved, not_yet_due)`, each `(row_id, was, now)`, sorted by id.
+def _defer_not_yet_due(was_row: dict[str, Any] | None, now_row: dict[str, Any] | None) -> bool:
+    """`alpha-engine-config-I10872`'s schedule-phase predicate, over whole rows.
+
+    A row whose `component_state` is RUNNING or ARMED in EITHER board is set
+    aside — through `crucible.console.classify.not_yet_due`, the same
+    predicate the board page's own digest uses. A row with no
+    `component_state` (a non-component row, or a board written before the
+    field existed) is always a move.
+    """
+    return not_yet_due(
+        was_row.get("component_state") if was_row else None,
+        now_row.get("component_state") if now_row else None,
+    )
+
+
+def _moves(inputs: MorningInputs) -> report.MovedResult:
+    """The previous-board diff, via `nousergon_lib.gates.report.moved_since`.
 
     `alpha-engine-config-I10872`: a blind state diff counted 30 component rows
     that were RUNNING at a 23:55Z render as "moved" against a board rendered
-    after the Saturday arc. A row whose `component_state` is RUNNING or ARMED
-    in EITHER board goes to the second list — through
-    `crucible.console.classify.not_yet_due`, the same predicate the board
-    page's own digest uses. A row with no `component_state` (a non-component
-    row, or a board written before the field existed) is always a move.
+    after the Saturday arc; :func:`_defer_not_yet_due` sets those aside into
+    `MovedResult.deferred`, rendered and counted separately, never dropped.
     """
-    before = {row["id"]: row for row in previous.get("rows", [])}
-    after = {row["id"]: row for row in current.get("rows", [])}
-    moved: list[tuple[str, str, str]] = []
-    not_due: list[tuple[str, str, str]] = []
-    for row_id in sorted(set(before) | set(after)):
-        was_row, now_row = before.get(row_id), after.get(row_id)
-        was = was_row["state"] if was_row else "ABSENT"
-        now = now_row["state"] if now_row else "VANISHED"
-        if was_row and now_row and was == now:
-            continue
-        states = (
-            was_row.get("component_state") if was_row else None,
-            now_row.get("component_state") if now_row else None,
-        )
-        (not_due if not_yet_due(*states) else moved).append((row_id, was, now))
-    return moved, not_due
+    return report.moved_since(
+        previous=inputs.previous,
+        current=inputs.board,
+        previous_reason=f"the {inputs.previous_day} board is {inputs.previous_reason}",
+        defer=_defer_not_yet_due,
+    )
 
 
 def _moved_count(inputs: MorningInputs) -> str:
@@ -1096,9 +979,11 @@ def _moved_count(inputs: MorningInputs) -> str:
     update carries those. Not-yet-due rows are never in the count; their
     number follows it when there are any."""
     if inputs.previous is None:
-        return f"cannot say ({_escape_html(inputs.previous_reason)})"
-    moved, not_due = _moves(inputs.previous, inputs.board)
-    return f"{len(moved)} (+{len(not_due)} not yet due)" if not_due else str(len(moved))
+        return f"cannot say ({report.escape(inputs.previous_reason)})"
+    result = _moves(inputs)
+    if result.deferred:
+        return f"{result.count} (+{result.deferred_count} not yet due)"
+    return str(result.count)
 
 
 def _acceptance_line(reading: dict[str, Any] | None, *, denied_code: str | None) -> str:
@@ -1311,9 +1196,9 @@ def render_message(
 
     headline = _headline(inputs, now)
     if headline:
-        lines.append(f"<b>{_escape_html(headline)}</b>")
+        lines.append(f"<b>{report.escape(headline)}</b>")
 
-    lines.append(f"<b>CRUCIBLE V2 — {_escape_html(str(board.get('trading_day')))}</b>")
+    lines.append(f"<b>CRUCIBLE V2 — {report.escape(str(board.get('trading_day')))}</b>")
 
     rows_by_id = {row.get("id"): row for row in board.get("rows", [])}
     for phase in PHASES:
@@ -1327,23 +1212,25 @@ def render_message(
             if isinstance(clauses, list) and clauses
             else "—"
         )
-        state = _escape_html(str(row.get("state")))
+        state = report.escape(str(row.get("state")))
         lines.append(f"Phase {phase.number}  {state:<{_STATE_COLUMN_WIDTH}} {fraction}")
 
     lines.append(
-        _escape_html(_acceptance_line(inputs.acceptance, denied_code=inputs.acceptance_denied_code))
+        report.escape(
+            _acceptance_line(inputs.acceptance, denied_code=inputs.acceptance_denied_code)
+        )
     )
     lines.append(f"moved since {inputs.previous_day}: {_moved_count(inputs)}")
     if inputs.operator_action:
-        lines.append(f"pending operator action: {_escape_html(inputs.operator_action)}")
+        lines.append(f"pending operator action: {report.escape(inputs.operator_action)}")
 
     link_parts = [
-        f'<a href="{_escape_html(update_url)}">Full update</a>',
-        f'<a href="{_escape_html(history_url)}">History</a>',
+        f'<a href="{report.escape(update_url)}">Full update</a>',
+        f'<a href="{report.escape(history_url)}">History</a>',
     ]
     board_link = _headline_board_link(inputs)
     if board_link:
-        link_parts.append(f'<a href="{_escape_html(board_link)}">Board</a>')
+        link_parts.append(f'<a href="{report.escape(board_link)}">Board</a>')
     lines.append(" · ".join(link_parts))
 
     message = "\n".join(lines)
@@ -1416,7 +1303,7 @@ def _tracker_repo() -> str:
     `crucible.gate.TRACKER_REPO` (`nousergon/alpha-engine-config`)
     unchanged. The integration tier points this at a dedicated rolling
     issue on the PUBLIC `nousergon/crucible` repo instead: the fleet App
-    already holds `Issues: write` org-wide (`crucible.tracker.credential`),
+    already holds `Issues: write` org-wide (`nousergon_lib.gates.tracker`),
     so the same credential reaches either repo unchanged — the override
     exists to keep nightly synthetic content out of the PRIVATE production
     tracker, not to route around a credential this adapter never had.
@@ -1431,6 +1318,11 @@ def deliver(
     console_artifact: str | None = None,
 ) -> str:
     """Send ``message`` on the operator channel. Returns the destination.
+
+    `nousergon_lib.gates.report.deliver` does the publish and the undelivered
+    check (`alpha-engine-config-I10953`); this wrapper fixes the three things
+    that are this report's own decisions — severity/source, the explicit
+    operator-chat destination, and the substitutable module transport.
 
     **``console_artifact``** (`alpha-engine-config-I10458`): the durable
     surface this message is ALSO published to — in production, the store key
@@ -1491,53 +1383,30 @@ def deliver(
 
     **`parse_mode="HTML"`** (`alpha-engine-config-I9925`, krepis 0.59.50):
     `message` already carries `<b>` headings and every interpolated board
-    string already went through :func:`_escape_html` — this call site is
+    string already went through `nousergon_lib.gates.report.escape` — this call site is
     where that contract is discharged, not where escaping happens. Passed
     explicitly rather than left to krepis' Markdown-v1 default so a heading
     written as `<b>…</b>` is not sent to a transport that would render the
     literal angle brackets.
     """
-    publish = transport if transport is not None else _krepis_publish
-    result = publish(
+    return report.deliver(
         message,
         severity=DELIVERY_SEVERITY,
         source=DELIVERY_SOURCE,
-        sns=False,
-        telegram=True,
-        silent=False,
-        dedup_key=None,
-        destination=_operator_chat(),
         console_artifact=console_artifact,
-        raise_on_total_failure=True,
+        destination=_operator_chat(),
         parse_mode="HTML",
+        transport=transport if transport is not None else _krepis_publish,
     )
-    if not hasattr(result, "any_ok"):
-        raise TypeError(
-            f"{type(result).__name__} carries no `any_ok`; a transport result that cannot "
-            "say whether the report was delivered cannot be recorded as delivered."
-        )
-    suppressed = bool(getattr(result, "dedup_skipped", False)) or bool(
-        getattr(result, "muted", False)
-    )
-    if not result.any_ok or suppressed:
-        raise UndeliveredError(
-            f"the {MORNING_JOB} report reached nobody "
-            f"(any_ok={result.any_ok}, dedup_skipped={getattr(result, 'dedup_skipped', False)}, "
-            f"muted={getattr(result, 'muted', False)}). The delivery IS the deliverable; a "
-            "rendered report nobody received is the accountability gap this job closes."
-        )
-    return str(getattr(result, "telegram_destination", None) or "telegram")
 
 
-#: Where the trigger is read from, in priority order.
-#:
-#: `GITHUB_EVENT_NAME` FIRST, and that ordering is the whole provenance
-#: argument: GitHub Actions sets it itself on every run, and `GITHUB_*` is a
-#: reserved prefix a workflow's own `env:` block cannot override. A human who
-#: dispatches the report therefore cannot produce evidence saying a schedule
-#: did. `CRUCIBLE_TRIGGER` is second and exists for a non-GitHub dispatcher,
-#: where it is the only thing that can say.
-TRIGGER_VARS: tuple[str, ...] = ("GITHUB_EVENT_NAME", "CRUCIBLE_TRIGGER")
+#: The variable a non-GitHub dispatcher names its trigger in. It is read
+#: AFTER `GITHUB_EVENT_NAME`, and that ordering is the whole provenance
+#: argument (`nousergon_lib.gates.report.TRIGGER_VARS`): GitHub Actions sets
+#: that one itself on every run, and `GITHUB_*` is a reserved prefix a
+#: workflow's own `env:` block cannot override, so a human who dispatches the
+#: report cannot produce evidence saying a schedule did.
+TRIGGER_OVERRIDE_VAR = "CRUCIBLE_TRIGGER"
 
 
 def resolve_trigger(environ: dict[str, str] | None = None) -> str:
@@ -1553,20 +1422,10 @@ def resolve_trigger(environ: dict[str, str] | None = None) -> str:
     declared value, not a swallow: it is written to the store like any other
     trigger, so a run whose starter is unknown is VISIBLE as unknown rather
     than missing, and it satisfies no predicate asking for a schedule.
+    `nousergon_lib.gates.report.resolve_trigger` does the reading
+    (`alpha-engine-config-I10953`).
     """
-    env = environ if environ is not None else os.environ
-    for var in TRIGGER_VARS:
-        value = (env.get(var) or "").strip()
-        if not value:
-            continue
-        if not TRIGGER_RE.match(value):
-            raise ValueError(
-                f"{var}={value!r} is not a usable trigger name (must match "
-                f"{TRIGGER_RE.pattern}). It becomes an S3 key segment; refusing is the "
-                "only reading that is not a guess about what started this run."
-            )
-        return value
-    return TRIGGER_UNKNOWN
+    return report.resolve_trigger(override_var=TRIGGER_OVERRIDE_VAR, environ=environ)
 
 
 #: The rolling issue's initial body, the one time a day ever creates it. It
@@ -1592,16 +1451,13 @@ def _find_or_create_rolling_issue() -> int:
 
     Never called under `--dry-run` — see `morning_handler`. A SECOND open
     issue carrying this exact title is a loud `TrackerError`, not a pick
-    (`crucible.tracker.find_issue_by_title`'s own contract): posting to
+    (`nousergon_lib.gates.tracker.Tracker.find_issue_by_title`'s own contract): posting to
     whichever one a race or a manual duplicate left behind is a full update
     nobody can find from the headline that links it.
     """
-    repo = _tracker_repo()
-    number = tracker.find_issue_by_title(repo, ROLLING_ISSUE_TITLE)
-    if number is not None:
-        return number
-    number, _url = tracker.create_issue(repo, ROLLING_ISSUE_TITLE, _ROLLING_ISSUE_BODY)
-    return number
+    return tracker_adapter(_tracker_repo()).find_or_create_issue(
+        title=ROLLING_ISSUE_TITLE, body=_ROLLING_ISSUE_BODY
+    )
 
 
 #: The basename of one delivery's compact history facts
@@ -1816,7 +1672,7 @@ def morning_handler(args: argparse.Namespace) -> int:
     **Ordering is the whole safety property** (`alpha-engine-config-I10123`):
     the full update is posted to the tracker BEFORE the headline is ever
     rendered, because the headline's one indispensable line is the comment's
-    own permalink. `_find_or_create_rolling_issue` and `tracker.post_comment`
+    own permalink. `_find_or_create_rolling_issue` and `Tracker.post_comment`
     both raise on any fault, so a failed post fails the run loudly — the
     manifest reads `failed`, and the headline is never sent at all.
 
@@ -1862,9 +1718,10 @@ def morning_handler(args: argparse.Namespace) -> int:
             print(update)
             return
         repo = _tracker_repo()
+        adapter = tracker_adapter(repo)
         issue_number = _find_or_create_rolling_issue()
         history_url = f"https://github.com/{repo}/issues/{issue_number}"
-        update_url = tracker.post_comment(repo, issue_number, update)
+        update_url = adapter.post_comment(issue_number, update)
         message = render_message(inputs, now=now, update_url=update_url, history_url=history_url)
         payload = message.encode("utf-8")
         artifact = morning_report_key(ctx.trading_day.isoformat(), ctx.calendar_date.isoformat())
@@ -1948,7 +1805,7 @@ def morning_handler(args: argparse.Namespace) -> int:
         # manifest's `reason` names it, and `alerts.sweep`'s failure
         # condition pages on it) rather than silently leaving a stale index.
         history_body = render_history_body(store, console_url=console_url)
-        tracker.update_issue_body(repo, issue_number, history_body)
+        adapter.update_issue_body(issue_number, history_body)
 
     run_job(
         MORNING_JOB,

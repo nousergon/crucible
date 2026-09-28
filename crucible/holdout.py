@@ -593,7 +593,11 @@ def holdout_handler(args: Any) -> int:
 
     from crucible.cli import UsageError  # noqa: PLC0415 - avoid an import cycle at module load
     from crucible.config import settings  # noqa: PLC0415 - avoid an import cycle at module load
-    from crucible.runner import RunContext, run_job  # noqa: PLC0415 - same cycle
+    from crucible.runner import (  # noqa: PLC0415 - same cycle
+        RunContext,
+        invocation_discriminator,
+        run_job,
+    )
 
     unsealing = bool(getattr(args, "unseal", False))
     sealing = getattr(args, "seal", None)
@@ -705,6 +709,10 @@ def holdout_handler(args: Any) -> int:
         trading_day=args.trading_day,
         dry_run=dry_run,
         run_mode=getattr(args, "run_mode", None),
+        # One manifest per INVOCATION, not per trading day: this job is on
+        # demand, so nothing bounds how often it runs on one day
+        # (`alpha-engine-config-I11033`; `crucible.runner.invocation_discriminator`).
+        discriminator=invocation_discriminator,
     )
     _ = result
     print(f"holdout unsealed under {args.ruling}: {len(released)} top-level key(s) released")
