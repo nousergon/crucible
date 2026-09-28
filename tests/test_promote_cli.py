@@ -231,6 +231,33 @@ class TestPromoteCommand:
         assert manifest["status"] == "ok"
         assert any(o["key"] == champion_key("m") for o in manifest["outputs"])
 
+    def test_a_day_older_than_the_live_pointer_decides_but_writes_nothing(
+        self, seeded, monkeypatch
+    ) -> None:
+        """`alpha-engine-config-I11084`: replaying a past arc must not move
+        today's pointer backwards. The cycle for ``DAY`` would promote
+        ``chal``; a pointer already dated after ``DAY`` keeps ``champ``, the
+        retirement log stays empty, and the manifest is `ok` and says why."""
+        store, register, ids, dates = seeded
+        seat(store, ids, dates)
+        pointer_bytes = store.get_bytes(champion_key("m"))
+        newer = json.loads(pointer_bytes)
+        newer["as_of"] = "2026-09-04"
+        store.put_bytes(champion_key("m"), json.dumps(newer).encode())
+        pointer_bytes = store.get_bytes(champion_key("m"))
+        grade(store, register, ids, dates)
+        monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
+
+        assert main(["promote", "--slot", "m", "--date", DAY, "--run-mode", "replay"]) == 0
+
+        assert store.get_bytes(champion_key("m")) == pointer_bytes
+        assert not store.exists(retirement_log_key("m"))
+        manifest = json.loads(store.get_bytes(f"runs/promote/{DAY}/m/run.json"))
+        assert manifest["status"] == "ok"
+        names = {m["name"] for m in manifest["metrics"]}
+        assert "pointer_write_superseded" in names
+        assert "pointer_moved" not in names
+
     def test_a_cold_slot_bootstrap_cycle_is_refused_not_seated(self, seeded, monkeypatch) -> None:
         """`alpha-engine-config-I9759` gave a cold slot (no incumbent) a
         first champion won on evidence, by substituting §10.1's null control

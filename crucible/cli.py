@@ -181,6 +181,23 @@ def _resolve_store(args: argparse.Namespace):
         raise SystemExit(str(exc)) from exc
 
 
+def _newer_pointer_as_of(store, slot: str, as_of: str) -> str | None:
+    """The live pointer's `as_of` when it is later than ``as_of``, else ``None``.
+
+    Read from the document itself rather than through `read_champion`, whose
+    serving gates (producing run, attestation) answer a different question:
+    an operator-seated pointer is still the newest decision for its slot.
+    """
+    from crucible.documents import load_store_document
+
+    try:
+        document = load_store_document(store, champion_key(slot))
+    except KeyError:
+        return None
+    live = str(document.get("as_of") or "")
+    return live if live > as_of else None
+
+
 def _promote(args: argparse.Namespace) -> int:
     """`crucible promote --slot <s> [--revert-to <arm> --reason <why>]`.
 
@@ -277,6 +294,13 @@ def _promote(args: argparse.Namespace) -> int:
             return
 
         inputs = load_slot_inputs(store, args.slot, as_of=as_of)
+        # `alpha-engine-config-I11084`: a promote for a day OLDER than the
+        # live pointer's `as_of` -- a replay of a past arc, or a late re-run --
+        # still decides, but writes nothing: no pointer, no retirement, no
+        # experiments row. Its cycle was graded against today's incumbent,
+        # so acting on it would move the pointer backwards in time over a
+        # promotion a later cycle already made.
+        superseded_by = _newer_pointer_as_of(store, args.slot, as_of)
         # `alpha-engine-config-I10679`: the cycle `experiment.grade` computed
         # an hour earlier, read back rather than recomputed — the pointer
         # decision, the retirement verdicts and the serving preconditions
@@ -289,7 +313,7 @@ def _promote(args: argparse.Namespace) -> int:
             register=inputs.register,
             cycle=graded_cycle,
             pointer_etag=inputs.pointer_etag,
-            store=None if args.dry_run else store,
+            store=None if args.dry_run or superseded_by is not None else store,
             manifest_key=promote_manifest,
             run_id=ctx.run_id,
             code_sha=code_sha,
@@ -304,6 +328,31 @@ def _promote(args: argparse.Namespace) -> int:
             # (alpha-engine-config-I9922) — before that fix this branch's
             # sibling call still wrote an `ok` manifest for a promotion that
             # never happened.
+            return
+        if superseded_by is not None:
+            # Deliberately NOT `pointer_moved`: a day that could not act on
+            # its own cycle has neither moved nor held the pointer on
+            # evidence, and the phase-3 promotion clause must not read one.
+            ctx.record_metric(
+                {
+                    "name": "pointer_write_superseded",
+                    "module": "crucible.promote",
+                    "metric_type": "operational",
+                    "value": 1.0,
+                    "unit": "count",
+                    "n_floor": 0,
+                    "status": "OK",
+                    "status_reason": (
+                        f"the live {args.slot} pointer is as of {superseded_by}, newer than "
+                        f"{as_of}; the cycle decided {result.decision.status!r} "
+                        f"(moved={result.decision.moved}) and wrote nothing"
+                    ),
+                    "source_path": champion_key(args.slot),
+                    "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                }
+            )
             return
         _record_written(ctx, store, result.keys_written)
         # §11: the console renders "cycles since the pointer last moved", and
