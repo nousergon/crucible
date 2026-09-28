@@ -307,6 +307,9 @@ def release_pin_request_handler(args: argparse.Namespace) -> int:
         trading_day=args.trading_day,
         dry_run=dry_run,
         run_mode=getattr(args, "run_mode", None),
+        # On demand, like `release.pin`: one manifest per invocation
+        # (`alpha-engine-config-I11033`).
+        discriminator=invocation_discriminator,
     )
     return 0
 
