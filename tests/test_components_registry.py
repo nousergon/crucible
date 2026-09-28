@@ -265,7 +265,7 @@ class TestDeadlinesAreMachineReadable:
         deadline = load_registry()["data.daily"].deadline
         assert deadline is not None
         assert deadline.describe(dt.date(2026, 8, 28)) == (
-            "3h after the close of trading day 2026-08-28 (every trading day)"
+            "6h after the close of trading day 2026-08-28 (every trading day)"
         )
 
     def test_a_deadline_resolves_against_the_trading_calendar(self) -> None:
@@ -279,7 +279,7 @@ class TestDeadlinesAreMachineReadable:
         deadline = load_registry()["data.daily"].deadline
         assert deadline is not None
         due = deadline.due_at(dt.date(2026, 8, 28))
-        assert due == dt.datetime(2026, 8, 28, 23, 0, tzinfo=dt.UTC)  # 19:00 ET
+        assert due == dt.datetime(2026, 8, 29, 2, 0, tzinfo=dt.UTC)  # 22:00 ET
         with pytest.raises(NonTradingDayKeyError):
             deadline.due_at(dt.date(2026, 8, 29))  # a Saturday
 

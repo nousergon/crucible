@@ -388,16 +388,24 @@ class TestIncidentIdentity:
         assert incident_key(friday) == incident_key(saturday)
 
     def test_a_persistent_absence_pages_once_and_writes_one_row(self, tmp_path, transport):
-        """The reproduction, run: the sweep fires 21:00 ET every calendar day
-        and Friday, Saturday and Sunday nights all resolve to Friday's
-        session. One absent Friday artifact produced three transport sends,
-        three bus rows and a BREACH of the declared two-a-month ceiling
-        without anything new having gone wrong."""
+        """The reproduction, run: the sweep fires 21:00 ET every calendar day,
+        and on a long weekend Saturday, Sunday and holiday-Monday nights all
+        resolve to Friday's session. One absent Friday artifact produced three
+        transport sends, three bus rows and a BREACH of the declared
+        two-a-month ceiling without anything new having gone wrong.
+
+        The nights were Friday, Saturday and Sunday of an ordinary weekend
+        until `data.daily`'s deadline moved to 22:00 ET with its 21:15 ET
+        schedule (alpha-engine-config-I11581): Friday's own 21:00 ET pass now
+        precedes that deadline and sees nothing due, so the three passes that
+        observe one Friday are the three nights AFTER it. Labor Day 2026 puts
+        all three on Friday's session without leaning on the catch-up window.
+        """
         store = LocalStore(tmp_path)
         nights = [
-            dt.datetime(2026, 8, 29, 1, 0, tzinfo=dt.UTC),
-            dt.datetime(2026, 8, 30, 1, 0, tzinfo=dt.UTC),
-            dt.datetime(2026, 8, 31, 1, 0, tzinfo=dt.UTC),
+            dt.datetime(2026, 9, 6, 1, 0, tzinfo=dt.UTC),  # Sat 2026-09-05 21:00 EDT
+            dt.datetime(2026, 9, 7, 1, 0, tzinfo=dt.UTC),  # Sun 2026-09-06 21:00 EDT
+            dt.datetime(2026, 9, 8, 1, 0, tzinfo=dt.UTC),  # Mon 2026-09-07 (Labor Day) 21:00 EDT
         ]
         for index, night in enumerate(nights):
             result = sweep(store, now=night, transport=transport, sweep_run_id=f"{index}" * 26)

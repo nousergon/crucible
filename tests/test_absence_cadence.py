@@ -22,8 +22,8 @@ import datetime as dt
 import pytest
 
 from crucible.alerts import evaluate_absence
-from crucible.calendar import NonTradingDayKeyError, is_week_final_trading_day
-from crucible.components import CADENCES, Deadline, load_registry
+from crucible.calendar import NonTradingDayKeyError, is_trading_day, is_week_final_trading_day
+from crucible.components import CADENCES, NYSE_TZ, Deadline, load_registry
 from crucible.store import LocalStore
 
 #: A Tuesday. Mid-week: a weekly row binds to Friday and is not due here.
@@ -106,12 +106,21 @@ class TestAWeeklyRowIsNotPagedMidWeek:
 
     @staticmethod
     def _close_of(trading_day: dt.date) -> dt.datetime:
-        """A moment on the calendar day AFTER ``trading_day``, late enough
-        that every deadline in the registry for it has passed, while still
-        resolving to ``trading_day`` as the current session."""
-        return dt.datetime.combine(
-            trading_day + dt.timedelta(days=1), dt.time(23, 30), tzinfo=dt.UTC
-        )
+        """One minute before the NEXT session's close: late enough that every
+        deadline in the registry for ``trading_day`` has passed, while still
+        resolving to ``trading_day`` as the current session.
+
+        Was 23:30Z on the calendar day after, which for a midweek day is
+        19:30 ET on the next SESSION, after its close - so it resolved to the
+        next day and only passed because that day's `data.daily` deadline
+        (then 19:00 ET) had also gone by. Once that deadline moved to 22:00 ET
+        (alpha-engine-config-I11581) the moment it named was no longer "late
+        enough", which is what it had claimed to be all along.
+        """
+        following = trading_day + dt.timedelta(days=1)
+        while not is_trading_day(following):
+            following += dt.timedelta(days=1)
+        return dt.datetime.combine(following, dt.time(15, 59), tzinfo=NYSE_TZ)
 
     def test_no_weekly_row_appears_on_a_midweek_trading_day(self, tmp_path) -> None:
         assert not (self._absent_jobs(tmp_path, MIDWEEK) & WEEKLY_ROWS)

@@ -128,3 +128,51 @@ class TestHolidayGuard:
         with pytest.raises(SystemExit):
             track_a.handle_data_daily(args)
         assert called.get("ran") is True
+
+
+class TestTheGuardReadsTheExchangeDateNotTheBoxDate:
+    """alpha-engine-config-I11581: the guard's "today" is the NYSE calendar date.
+
+    The dispatcher's boxes run on UTC. After the decoupled data cutover
+    (nousergon-data#1930) the `data-daily` schedule fires at 21:15 America/
+    New_York, which is 01:15Z (EDT) or 02:15Z (EST) on the NEXT UTC date. Read
+    as the box's local date, every Friday firing would see a Saturday and file a
+    holiday no-op in place of Friday's compile, and the eve of every weekday
+    holiday would do the same — with a real `ok` manifest, so nothing would page.
+    """
+
+    #: Friday 2026-09-25, 21:15 EDT — a Saturday on the box's UTC clock.
+    FRIDAY_EVENING_UTC = dt.datetime(2026, 9, 26, 1, 15, tzinfo=dt.UTC)
+    #: Friday 2026-11-27 (the day after Thanksgiving), 21:15 EST.
+    WINTER_FRIDAY_EVENING_UTC = dt.datetime(2026, 11, 28, 2, 15, tzinfo=dt.UTC)
+
+    def test_a_friday_evening_firing_resolves_friday_not_the_utc_saturday(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(track_a, "_now", lambda: self.FRIDAY_EVENING_UTC)
+        assert track_a._today() == dt.date(2026, 9, 25)
+
+    def test_the_same_holds_across_the_november_clock_change(self, monkeypatch) -> None:
+        monkeypatch.setattr(track_a, "_now", lambda: self.WINTER_FRIDAY_EVENING_UTC)
+        assert track_a._today() == dt.date(2026, 11, 27)
+
+    def test_a_friday_evening_firing_compiles_friday(self, monkeypatch) -> None:
+        monkeypatch.setattr(track_a, "_now", lambda: self.FRIDAY_EVENING_UTC)
+        called = {}
+
+        def fake_settings(args):
+            called["ran"] = True
+            raise SystemExit("stopped before touching a real store")
+
+        monkeypatch.setattr(track_a, "_settings", fake_settings)
+        args = _args()
+        args.trading_day = resolve_trading_day(self.FRIDAY_EVENING_UTC)
+        assert args.trading_day == dt.date(2026, 9, 25)
+        with pytest.raises(SystemExit):
+            track_a.handle_data_daily(args)
+        assert called.get("ran") is True
+
+    def test_a_naive_box_clock_cannot_reach_the_guard(self, monkeypatch) -> None:
+        monkeypatch.setattr(track_a, "_now", lambda: dt.datetime(2026, 9, 26, 1, 15))
+        with pytest.raises(ValueError, match="timezone-aware"):
+            track_a._today()

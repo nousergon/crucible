@@ -24,6 +24,7 @@ from typing import Any
 
 from crucible.backfill import run_backfill
 from crucible.calendar import is_trading_day, resolve_trading_day
+from crucible.components import NYSE_TZ
 from crucible.config import settings as resolve_settings
 from crucible.data import (
     ArcticPriceSource,
@@ -67,11 +68,35 @@ _SLOT_MODULES = dispatchable_slots()
 _ALL_SLOTS_PHASE = next(p for p in PHASES if p.id == "phase3")
 
 
+def _now() -> dt.datetime:
+    """The wall clock, timezone-aware. A thin, monkeypatchable seam — the only
+    clock `_today` reads."""
+    return dt.datetime.now(dt.UTC)
+
+
 def _today() -> dt.date:
-    """The wall-clock calendar date. A thin, monkeypatchable seam —
-    `dt.date.today` is a built-in classmethod tests cannot patch directly —
-    used only by the `data.daily` holiday guard below (alpha-engine-config-I9781)."""
-    return dt.date.today()
+    """The NYSE calendar date at this instant — never the box's local date.
+
+    Used only by the `data.daily` holiday guard below (alpha-engine-config-I9781).
+
+    Was `dt.date.today()`, the box's LOCAL date, and the dispatcher's boxes run
+    on UTC. That was harmless while `data-daily` fired at 18:30 America/New_York
+    (22:30Z / 23:30Z, the same calendar date). It stopped being harmless when
+    the decoupled data cutover (nousergon-data#1930) moved the EOD collection
+    to 18:15-20:55 ET and `data-daily` to 21:15 ET — 01:15Z or 02:15Z on the
+    NEXT UTC date (alpha-engine-config-I11581). Read as a UTC date, every
+    Friday firing sees a Saturday and every weekday-holiday eve sees the
+    holiday, and the guard files a holiday no-op with a real `ok` manifest in
+    place of that session's compile — so the absence watcher sees a manifest
+    and nothing pages. The exchange's own date is the only one this guard's
+    question ("is today a session?") can be asked of.
+    """
+    now = _now()
+    if now.tzinfo is None:
+        # A naive instant has no date on the exchange's calendar; guessing a
+        # zone for it is the defect this function exists to remove.
+        raise ValueError("_today needs a timezone-aware instant; got a naive datetime")
+    return now.astimezone(NYSE_TZ).date()
 
 
 def _settings(args: argparse.Namespace) -> Any:
