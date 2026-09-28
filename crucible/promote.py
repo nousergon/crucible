@@ -268,18 +268,31 @@ def load_arm_register(store: Store, slot: str) -> ArmRegister:
     return ArmRegister.from_dicts(events)
 
 
-def load_slot_inputs(store: Store, slot: str) -> SlotInputs:
+def load_slot_inputs(store: Store, slot: str, *, as_of: str | None = None) -> SlotInputs:
     """Read the register, every arm's series, and the current pointer.
 
     **A registered arm with no series raises.** The engine's own contract is
     that every registered arm is scored every cycle and that a missing series
     is a defect rather than an omission; a loader that quietly presented the
     smaller cohort would satisfy the engine while changing what was compared.
+
+    **Point-in-time when ``as_of`` is given** (`alpha-engine-config-I11037`).
+    "Every registered arm" means every arm that EXISTED on the day being
+    promoted. An arm filed or created after ``as_of`` was excluded from that
+    day's cycle by the library (`ArenaCycle.not_yet_registered_arms`), so
+    `experiment.grade` wrote it no series — and demanding one made `promote`
+    raise for every historical day the moment any arm registered, which is
+    the grade-side defect one job further on. The cohort is not narrowed for
+    any other reason: an arm that existed on ``as_of`` and has no series
+    still raises.
     """
     register = load_arm_register(store, slot)
+    absent = frozenset(register.not_yet_registered(as_of)) if as_of is not None else frozenset()
 
     series_by_arm: dict[str, ArmSeries] = {}
     for arm_id in register.all_arms():
+        if arm_id in absent:
+            continue
         try:
             payload = load_store_document(store, arm_series_key(slot, arm_id))
         except KeyError as exc:
