@@ -122,6 +122,56 @@ class TestAFreshOkReadingIsTheOnlyThingThatPasses:
         assert latest in clause.detail
 
 
+class TestSeveralReadingsOnOneDay:
+    """`alpha-engine-config-I11033`: `test.integration` files one manifest
+    per invocation, so a trading day can hold several. The latest `finished`
+    that day is the reading — not whichever key happens to list last."""
+
+    def _seed_run(
+        self, store: LocalStore, day: dt.date, *, discriminator, finished, status="ok"
+    ) -> str:
+        key = _dedicated_key(day, discriminator=discriminator)
+        payload = json.loads(_manifest(day, status=status, reason=f"{status} at {finished}"))
+        payload["finished"] = finished
+        store.put_bytes(key, json.dumps(payload).encode())
+        return key
+
+    def test_a_later_failed_rerun_the_same_day_is_the_reading(self, tmp_path: object) -> None:
+        store = LocalStore(tmp_path)  # type: ignore[arg-type]
+        day = _window()[-1]
+        self._seed_run(store, day, discriminator="2026-08-28-01A", finished="2026-08-28T06:00:00Z")
+        later = self._seed_run(
+            store,
+            day,
+            discriminator="2026-08-28-01B",
+            finished="2026-08-28T07:00:00Z",
+            status="failed",
+        )
+        clause = _clause_integration_tier_current(store, _window())
+        assert not clause.met, clause.detail
+        assert later in clause.detail
+
+    def test_a_legacy_bare_key_does_not_outrank_a_later_discriminated_run(
+        self, tmp_path: object
+    ) -> None:
+        """`{day}/run.json` lists AFTER `{day}/2026-...-{run_id}/run.json`
+        ('r' > '2'), so "the last key listed" would grade the older bare run
+        on the day the new key shape lands."""
+        store = LocalStore(tmp_path)  # type: ignore[arg-type]
+        day = _window()[-1]
+        self._seed_run(store, day, discriminator=None, finished="2026-08-28T06:00:00Z")
+        later = self._seed_run(
+            store,
+            day,
+            discriminator="2026-08-28-01B",
+            finished="2026-08-28T07:00:00Z",
+            status="failed",
+        )
+        clause = _clause_integration_tier_current(store, _window())
+        assert not clause.met, clause.detail
+        assert later in clause.detail
+
+
 class TestStalenessIsThisGatesOwnWindow:
     def test_a_green_reading_older_than_the_window_is_unmet(self, tmp_path: object) -> None:
         """The staleness rule, and the whole reason `-I10419` asked for the

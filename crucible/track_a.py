@@ -42,7 +42,7 @@ from crucible.gate import PHASES
 from crucible.keys import arm_register_key, calendar_day_discriminator
 from crucible.manifest import manifest_key
 from crucible.registration import load_registrable_recipes
-from crucible.runner import run_job
+from crucible.runner import invocation_discriminator, run_job
 from crucible.slots import arm_name as name_component
 from crucible.slots import dispatchable_slots, history_producer
 from crucible.slots.arms import (
@@ -334,6 +334,10 @@ def handle_data_heal(args: argparse.Namespace) -> int:
         store=store,
         trading_day=end,
         dry_run=dry_run,
+        # One manifest per INVOCATION, not per trading day: this job is on
+        # demand, so nothing bounds how often it runs on one day
+        # (`alpha-engine-config-I11033`; `crucible.runner.invocation_discriminator`).
+        discriminator=invocation_discriminator,
     )
     report: dict[str, Any] = {"run_id": ctx.run_id, "outputs": [o["key"] for o in ctx.outputs]}
     if dry_run:

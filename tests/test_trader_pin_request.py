@@ -37,6 +37,7 @@ from crucible.release import (
     write_trader_pin_request,
 )
 from crucible.store import ETAG_ABSENT, LocalStore, PointerConflictError
+from tests.support.manifests import only_manifest
 
 SHA_C = "c" * 40
 #: Tuesday 2026-09-08 — the session every apply below binds to.
@@ -472,9 +473,7 @@ class TestRequestHandler:
         )
 
     def _manifest(self, tmp_path):
-        return json.loads(
-            LocalStore(tmp_path).get_bytes(manifest_key("release.pin_request", SESSION.isoformat()))
-        )
+        return only_manifest(LocalStore(tmp_path), "release.pin_request", SESSION.isoformat())[1]
 
     def test_the_requester_and_run_come_from_the_actions_environment(
         self, tmp_path, monkeypatch

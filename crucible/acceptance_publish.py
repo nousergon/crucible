@@ -141,7 +141,7 @@ def acceptance_publish_body(ctx: RunContext, *, reading_path: Path) -> None:
 def acceptance_publish_handler(args: argparse.Namespace) -> int:
     """`crucible acceptance.publish --reading PATH [--store URI]`."""
     from crucible.cli import _resolve_store
-    from crucible.runner import run_job
+    from crucible.runner import invocation_discriminator, run_job
 
     store = _resolve_store(args)
 
@@ -155,6 +155,10 @@ def acceptance_publish_handler(args: argparse.Namespace) -> int:
         trading_day=args.trading_day,
         dry_run=bool(getattr(args, "dry_run", False)),
         run_mode=getattr(args, "run_mode", None),
+        # One manifest per INVOCATION, not per trading day: this job is on
+        # demand, so nothing bounds how often it runs on one day
+        # (`alpha-engine-config-I11033`; `crucible.runner.invocation_discriminator`).
+        discriminator=invocation_discriminator,
     )
     print(json.dumps({"run_id": ctx.run_id, "job": ctx.job}, indent=2))
     return 0

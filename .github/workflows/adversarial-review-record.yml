@@ -246,7 +246,7 @@ jobs:
           #
           # `crucible review.record`, not the module entry point it used to
           # reach (alpha-engine-config-I10968): the recording path is a
-          # registered job, so it writes `runs/review.record/{day}/run.json`
+          # registered job, so it writes a manifest under `runs/review.record/{day}/`
           # in a `try/finally` alongside the verdict. A refused self-review
           # therefore leaves a `failed` manifest naming the refusal, where it
           # previously left nothing at all — "a review was attempted and

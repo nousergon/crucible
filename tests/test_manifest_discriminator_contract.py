@@ -226,37 +226,58 @@ class TestEveryJobIsClassified:
 class TestTheIndistinguishableSetIsMeasuredNotHidden:
     """The detector's domain is the whole registry, proven end to end.
 
-    This is the assertion that makes the finding a measurement rather than a
-    note: for every job the static classification calls
-    `indistinguishable`, a store seeded with that job's undiscriminated
-    manifest produces a finding naming that exact key. A detector built
-    around an enumerated list would pass the static half and fail here the
-    moment the registry grew.
+    Two halves since `alpha-engine-config-I11033` emptied the set: the static
+    scan says no on-demand job writes an undiscriminated key any more, and
+    the runtime detector still names every on-demand job whose bare key
+    appears in the store — which is what an old run, or a regression, leaves
+    behind. A detector built around an enumerated list would pass the static
+    half and fail the runtime one the moment the registry grew.
     """
 
-    def test_the_sweep_names_every_indistinguishable_job(self, scanned, tmp_path) -> None:
+    def test_no_job_classifies_as_indistinguishable(self, scanned) -> None:
+        """`alpha-engine-config-I11033`'s closes-when, as the static half.
+
+        Until that issue every on-demand `run_job` call wrote the bare key,
+        and this test asserted the set was NON-empty so the detector had
+        something to measure. The set is now empty: every on-demand job
+        passes a discriminator (`crucible.runner.invocation_discriminator`
+        where nothing more natural exists). A new on-demand row that forgets
+        one fails HERE, naming itself — never by joining an exemption list.
+        """
         discriminated, _unresolved = scanned
         registry = load_registry()
-        day = dt.date(2026, 9, 11)
-        expected = {
+        indistinguishable = sorted(
             name
             for name, component in registry.items()
             if name not in set(TRADER_JOB_VALUES) | set(WORKFLOW_JOB_VALUES)
             and classify(name, component.dispatch, discriminated.get(name, False))
             == INDISTINGUISHABLE
-        }
-        assert expected, (
-            "no job classifies as indistinguishable — this guard has stopped "
-            "measuring anything, and the assertion below would be vacuous"
         )
+        assert indistinguishable == [], (
+            f"on-demand job(s) {indistinguishable} pass no discriminator to run_job, so N "
+            "invocations on one trading day collapse to one manifest. Pass "
+            "`discriminator=invocation_discriminator` (or a natural per-invocation axis)."
+        )
+
+    def test_the_sweep_names_every_on_demand_job_whose_bare_key_appears(self, tmp_path) -> None:
+        """The detector's domain is still the whole on-demand registry, proven
+        end to end. With nothing left to classify as indistinguishable, the
+        bare key is what an OLD run (or a regression) leaves behind, so every
+        on-demand job is seeded with one and every one must be named — a
+        detector built around an enumerated list would fail here the moment
+        the registry grew."""
+        registry = load_registry()
+        day = dt.date(2026, 9, 11)
+        on_demand = set(on_demand_graded_jobs(registry))
+        assert on_demand, "no on-demand job is graded; the assertion below would be vacuous"
         store = LocalStore(tmp_path)
-        for name in expected:
+        for name in on_demand:
             store.put_bytes(
                 manifest_key(name, day.isoformat()),
                 json.dumps({"status": "ok", "run_id": f"01{name}"}).encode(),
             )
         findings = indistinguishable_invocation_findings(store, days=[day], registry=registry)
-        assert {f.job for f in findings} == expected
+        assert {f.job for f in findings} == on_demand
 
     def test_a_discriminated_manifest_produces_no_finding(self, tmp_path) -> None:
         """The other direction, so the detector cannot be a count of

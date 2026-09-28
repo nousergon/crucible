@@ -18,15 +18,14 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import json
 
 import pytest
 
 import crucible.integration_summary as integration_summary_module
 from crucible.integration_summary import INTEGRATION_TEST_JOB, integration_test_handler
-from crucible.keys import manifest_key
 from crucible.runner import CODE_SHA_ENV
 from crucible.store import LocalStore
+from tests.support.manifests import only_manifest
 
 DAY = dt.date(2026, 8, 28)
 
@@ -65,9 +64,7 @@ def test_a_passing_pytest_run_writes_an_ok_manifest(tmp_path, monkeypatch) -> No
             trading_day=DAY, store=str(tmp_path / "store"), dry_run=False, run_mode=None
         )
     )
-    manifest = json.loads(
-        store.get_bytes(manifest_key(INTEGRATION_TEST_JOB, DAY.isoformat())).decode("utf-8")
-    )
+    manifest = only_manifest(store, INTEGRATION_TEST_JOB, DAY.isoformat())[1]
     assert manifest["status"] == "ok", manifest.get("reason")
     assert manifest["job"] == INTEGRATION_TEST_JOB
 
@@ -85,9 +82,7 @@ def test_a_failing_pytest_run_writes_a_failed_manifest_and_raises(tmp_path, monk
                 trading_day=DAY, store=str(tmp_path / "store"), dry_run=False, run_mode=None
             )
         )
-    manifest = json.loads(
-        store.get_bytes(manifest_key(INTEGRATION_TEST_JOB, DAY.isoformat())).decode("utf-8")
-    )
+    manifest = only_manifest(store, INTEGRATION_TEST_JOB, DAY.isoformat())[1]
     assert manifest["status"] == "failed"
     assert "1 failed" in manifest["reason"]
 

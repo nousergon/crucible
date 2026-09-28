@@ -48,6 +48,7 @@ from crucible.holdout import (
 )
 from crucible.keys import holdout_unseal_key, holdout_unseal_prefix, strategy_holdout_key
 from crucible.store import LocalStore
+from tests.support.manifests import only_manifest
 
 #: A closed weekday two sessions before `FRIDAY`'s week — a fixed literal, so
 #: what this suite tests does not move with the clock.
@@ -362,7 +363,7 @@ class TestTheCli:
         record = json.loads(store.get_bytes(holdout_unseal_key(FRIDAY.isoformat(), RULING)))
         assert record["ruling"] == RULING
         assert record["operator"] == "brian"
-        manifest = json.loads(store.get_bytes(f"runs/holdout/{FRIDAY.isoformat()}/run.json"))
+        manifest = only_manifest(store, "holdout", FRIDAY.isoformat())[1]
         assert manifest["status"] == "ok"
         assert [row["name"] for row in manifest["metrics"]] == ["holdout_unseal"]
         assert any(RULING in out["key"] for out in manifest["outputs"])

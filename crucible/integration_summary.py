@@ -11,7 +11,8 @@ declared log location, alert channel, retention or console surface (§9.2).
 This module is what replaces both steps with one job: a thin handler that
 shells out to `pytest tests/integration` and reports pass/fail through
 `crucible.runner.run_job`, writing a real
-`runs/test.integration/{trading_day}/run.json` like every other job. It
+run manifest under `runs/test.integration/{trading_day}/` like every other
+job (one per invocation, `crucible.runner.invocation_discriminator`). It
 deliberately does not re-implement anything `tests/integration` already
 does — it invokes the suite exactly as `integration-nightly.yml` did, and
 reports the process's own exit code.
@@ -108,7 +109,7 @@ def integration_test_handler(args: argparse.Namespace) -> int:
     job's own `run.json` lands, mirroring `crucible board`/`crucible drift`.
     """
     from crucible.cli import _resolve_store
-    from crucible.runner import run_job
+    from crucible.runner import invocation_discriminator, run_job
 
     store = _resolve_store(args)
 
@@ -122,6 +123,10 @@ def integration_test_handler(args: argparse.Namespace) -> int:
         trading_day=args.trading_day,
         dry_run=bool(getattr(args, "dry_run", False)),
         run_mode=getattr(args, "run_mode", None),
+        # One manifest per INVOCATION, not per trading day: this job is on
+        # demand, so nothing bounds how often it runs on one day
+        # (`alpha-engine-config-I11033`; `crucible.runner.invocation_discriminator`).
+        discriminator=invocation_discriminator,
     )
     print(json.dumps({"run_id": ctx.run_id, "job": ctx.job}, indent=2))
     return 0

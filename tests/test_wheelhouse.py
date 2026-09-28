@@ -22,7 +22,6 @@ import yaml
 from jsonschema import Draft202012Validator
 
 from crucible.deploy import main as deploy_main
-from crucible.manifest import manifest_key
 from crucible.release import (
     RELEASE_SCHEMA_VERSION,
     ReleaseHasNoWheelhouseError,
@@ -48,6 +47,7 @@ from crucible.wheelhouse import (
     verify_against_lock,
     wheelhouse_digest,
 )
+from tests.support.manifests import only_manifest
 from tests.support.releases import (
     SYNTHETIC_DIGEST,
     SYNTHETIC_WHEELS,
@@ -310,7 +310,7 @@ class TestTheSmokeGradesTheWheelhouse:
         )
 
     def _manifest(self, tmp_path):
-        return json.loads(LocalStore(tmp_path).get_bytes(manifest_key("smoke", "2026-08-28")))
+        return only_manifest(LocalStore(tmp_path), "smoke", "2026-08-28")[1]
 
     def test_a_smoke_from_the_published_wheelhouse_passes_and_names_it(
         self, tmp_path, monkeypatch
@@ -402,14 +402,14 @@ class TestTheRunManifestNamesItsDependencySet:
         monkeypatch.setenv(WHEELHOUSE_DIGEST_ENV, SYNTHETIC_DIGEST)
         store = LocalStore(tmp_path)
         run_job("smoke", lambda ctx: None, store=store, trading_day=TRADING_DAY)
-        manifest = json.loads(store.get_bytes(manifest_key("smoke", "2026-08-28")))
+        manifest = only_manifest(store, "smoke", "2026-08-28")[1]
         assert manifest["wheelhouse_digest"] == SYNTHETIC_DIGEST
 
     def test_a_run_installed_from_no_wheelhouse_names_none(self, tmp_path, monkeypatch) -> None:
         monkeypatch.delenv(WHEELHOUSE_DIGEST_ENV, raising=False)
         store = LocalStore(tmp_path)
         run_job("smoke", lambda ctx: None, store=store, trading_day=TRADING_DAY)
-        manifest = json.loads(store.get_bytes(manifest_key("smoke", "2026-08-28")))
+        manifest = only_manifest(store, "smoke", "2026-08-28")[1]
         assert "wheelhouse_digest" not in manifest
 
 

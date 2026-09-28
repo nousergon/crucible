@@ -245,8 +245,8 @@ jobs:
       # `crucible test.integration` (`alpha-engine-config-I10459`) is a
       # registered CLI job: a thin handler that shells to
       # `pytest tests/integration --tb=short` and writes a real
-      # `run_manifest.v2` document at `runs/test.integration/{trading_day}/
-      # run.json` in the dedicated store, in a `try/finally` (rule 1) — this
+      # `run_manifest.v2` document under `runs/test.integration/{trading_day}/`
+      # (one per invocation, alpha-engine-config-I11033) in the dedicated store, in a `try/finally` (rule 1) — this
       # replaces the two hand-rolled steps this workflow used to carry (a
       # bare `pytest` invocation, then a raw `store.put_bytes` write of a
       # plain `integration_summary.v1` object that was never manifest-or-it-
@@ -263,7 +263,7 @@ jobs:
       - name: Fail the run if the integration tier failed
         if: steps.tests.outcome != 'success'
         run: |
-          echo "::error::crucible test.integration failed — see the 'Integration tier (crucible test.integration)' step above. Its manifest (runs/test.integration/{trading_day}/run.json in the dedicated store) still recorded the failure — real telemetry, never a silently absent one."
+          echo "::error::crucible test.integration failed — see the 'Integration tier (crucible test.integration)' step above. Its manifest (under runs/test.integration/{trading_day}/ in the dedicated store) still recorded the failure — real telemetry, never a silently absent one."
           exit 1
 
   notify-failure:
