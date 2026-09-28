@@ -29,14 +29,14 @@ import pathlib
 import subprocess
 import urllib.request
 
+import nousergon_lib.gates.tracker as tracker_module
 import pytest
 import yaml
 
-import crucible.tracker as tracker_module
 from crucible.cli import HANDLERS, JOBS
 from crucible.components import load_registry
 from crucible.documents import UnreadableDocumentError, read_store_document
-from crucible.gate import GATES, PHASES, Clause, GateResult, Phase
+from crucible.gate import GATES, PHASES, TRACKER_TOKEN_VAR, Clause, GateResult, Phase
 from crucible.keys import closing_record_key, gate_key, manifest_key
 from crucible.store import LocalStore
 from crucible.track_f import CLOSE_OUTCOMES, GATE_CLOSE_JOB, gate_close_handler
@@ -124,9 +124,9 @@ def _run(
     monkeypatch.delenv("GITHUB_SHA", raising=False)
     monkeypatch.setenv("CRUCIBLE_COMMIT", COMMIT)
     if granted:
-        monkeypatch.setenv(tracker_module.TRACKER_TOKEN_VAR, "a-token")
+        monkeypatch.setenv(TRACKER_TOKEN_VAR, "a-token")
     else:
-        monkeypatch.delenv(tracker_module.TRACKER_TOKEN_VAR, raising=False)
+        monkeypatch.delenv(TRACKER_TOKEN_VAR, raising=False)
 
     def _evaluate(_store, *, gate: str, trading_day, weeks=None) -> GateResult:
         assert trading_day == DAY

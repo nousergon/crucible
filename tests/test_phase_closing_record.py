@@ -10,8 +10,9 @@ twice, so what is tested here is the machinery that replaces it:
 * `crucible.track_f.file_closing_record` — written once, from a MET reading on
   a LIVE run, by compare-and-swap against an absent key, and only after the
   same reading has been posted to the tracker;
-* `crucible.tracker` — the one adapter, which may comment, create, and rewrite a
-  body, and may never close;
+* `crucible.gate.tracker_adapter` — the one adapter (`nousergon_lib.gates.tracker`
+  configured with crucible's credential, `alpha-engine-config-I10953`), which may
+  comment, create, and rewrite a body, and may never close;
 * `crucible.board._closing_rows` — the detector: a phase issue CLOSED with no
   closing record beside it renders UNMET on every daily board.
 
@@ -28,26 +29,29 @@ import pathlib
 import urllib.error
 import urllib.request
 
+import nousergon_lib.gates.tracker as tracker_module
 import pytest
+from nousergon_lib.gates.tracker import IssueRead, TrackerError
 
-import crucible.tracker as tracker_module
 from crucible.board import build_board
 from crucible.documents import UnreadableDocumentError, read_store_document
 from crucible.gate import (
     CLOSING_READING_SCHEMA_VERSION,
     PHASES,
+    TRACKER_APP_SSM_PREFIX_VAR,
     TRACKER_REPO,
+    TRACKER_TOKEN_VAR,
     Clause,
     GateResult,
     closing_reading,
     gate_prefix,
     last_read,
+    tracker_adapter,
 )
 from crucible.keys import closing_record_key, gate_key
 from crucible.runner import RunContext, run_job
 from crucible.store import ETAG_ABSENT, LocalStore, PointerConflictError
 from crucible.track_f import closing_record_line, file_closing_record, post_closing_comment
-from crucible.tracker import IssueRead, TrackerError
 
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 DAY = dt.date(2026, 8, 28)
@@ -74,7 +78,7 @@ class _Opener:
     """A GitHub API stand-in that records every request it was handed.
 
     The whole request — method, URL, headers, body — is asserted against,
-    because `crucible.tracker`'s central claim is about which requests it can
+    because the tracker adapter's central claim is about which requests it can
     construct at all, and a stub that only returned canned bodies would leave
     exactly that claim untested.
     """
@@ -99,11 +103,11 @@ def _comment(body: str) -> dict[str, str]:
 
 
 def _granted(monkeypatch) -> None:
-    monkeypatch.setenv(tracker_module.TRACKER_TOKEN_VAR, "a-token")
+    monkeypatch.setenv(TRACKER_TOKEN_VAR, "a-token")
 
 
 def _revoked(monkeypatch) -> None:
-    monkeypatch.delenv(tracker_module.TRACKER_TOKEN_VAR, raising=False)
+    monkeypatch.delenv(TRACKER_TOKEN_VAR, raising=False)
 
 
 # ── The key ───────────────────────────────────────────────────────────────
@@ -141,14 +145,16 @@ class TestTheClosingRecordKey:
 
 class TestTheTrackerMayCommentAndMayNeverClose:
     def test_the_module_constructs_no_request_that_could_close_an_issue(self) -> None:
-        """A property of the SOURCE, not a convention. Closing or reopening a
+        """A property of the SOURCE, not a convention — now the source of
+        `nousergon_lib.gates.tracker` at the pinned version, the adapter
+        crucible configures (`alpha-engine-config-I10953`). Closing or reopening a
         phase issue is Brian's authority; an agent that took it would take the
         one protection reserved for him (`gate-taxonomy-policy` §6 makes a
         human's own act permanent, and a machine claiming it is indelible).
 
         Facts asserted over the module's syntax tree: the only non-default
-        HTTP methods it can name are `POST` and `PATCH`, every path it can
-        hand `_request` is one of a small closed set, and every `PATCH`
+        HTTP methods it can name are `POST` and `PATCH`, every MUTATING
+        request is one of a small closed set of (method, path) pairs, and every `PATCH`
         call's payload is the LITERAL `{"body": ...}` — never a dict that
         could carry `state`, which is the one field of a PATCH to
         `/issues/{n}` that could close or reopen it.
@@ -170,35 +176,38 @@ class TestTheTrackerMayCommentAndMayNeverClose:
             and isinstance(node.value, ast.Constant)
         }
         assert methods == {"POST", "PATCH"}, methods
-        paths = {
-            ast.unparse(node.args[1])
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_request"
-            and len(node.args) > 1
+
+        def _calls(name: str) -> list[ast.Call]:
+            return [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == name
+            ]
+
+        def _method(call: ast.Call) -> str | None:
+            for kw in call.keywords:
+                if kw.arg == "method" and isinstance(kw.value, ast.Constant):
+                    return kw.value.value
+            return None
+
+        # Every MUTATING request names its method as a literal, and the set
+        # of (method, path) pairs is closed. A GET may read anything.
+        mutating = {
+            (_method(call), ast.unparse(call.args[0]))
+            for call in _calls("_request")
+            if _method(call) is not None
         }
-        assert paths == {
-            "f'/issues/{issue}'",
-            "f'/issues/{issue}/comments?per_page=100&page={page}'",
-            "f'/issues/{issue}/comments'",
-            "'/issues'",
-        }, paths
+        assert mutating == {
+            ("POST", "'/issues'"),
+            ("POST", "f'/issues/{issue}/comments'"),
+            ("PATCH", "f'/issues/{issue}'"),
+        }, mutating
+        # The off-repo builder (the search API) is only ever a read.
+        assert [c for c in _calls("_send") if _method(c) is not None] == []
 
-        def _is_patch_call(node: ast.AST) -> bool:
-            return (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "_request"
-                and any(
-                    kw.arg == "method"
-                    and isinstance(kw.value, ast.Constant)
-                    and kw.value.value == "PATCH"
-                    for kw in node.keywords
-                )
-            )
-
-        patch_calls = [node for node in ast.walk(tree) if _is_patch_call(node)]
+        patch_calls = [call for call in _calls("_request") if _method(call) == "PATCH"]
         assert len(patch_calls) == 1, "exactly one call site may PATCH at all"
         (patch_call,) = patch_calls
         (payload_kw,) = [kw for kw in patch_call.keywords if kw.arg == "payload"]
@@ -213,7 +222,7 @@ class TestTheTrackerMayCommentAndMayNeverClose:
     ) -> None:
         _granted(monkeypatch)
         opener = _Opener((201, json.dumps({"html_url": "https://x/1"}).encode()))
-        url = tracker_module.post_comment(TRACKER_REPO, 9757, "hello", opener=opener)
+        url = tracker_adapter(TRACKER_REPO, opener=opener).post_comment(9757, "hello")
         assert url == "https://x/1"
         (request,) = opener.seen
         assert request.get_method() == "POST"
@@ -230,10 +239,10 @@ class TestTheTrackerReadNeverRaises:
         self, monkeypatch
     ) -> None:
         _revoked(monkeypatch)
-        read = tracker_module.read_issue(TRACKER_REPO, 9757)
+        read = tracker_adapter(TRACKER_REPO).read_issue(9757)
         assert read.state is None
         assert read.access_problem is True
-        assert tracker_module.TRACKER_APP_SSM_PREFIX_VAR in read.problem
+        assert TRACKER_APP_SSM_PREFIX_VAR in read.problem
         assert TRACKER_REPO in read.problem
 
     @pytest.mark.parametrize(
@@ -249,7 +258,7 @@ class TestTheTrackerReadNeverRaises:
         self, monkeypatch, response, fragment
     ) -> None:
         _granted(monkeypatch)
-        read = tracker_module.read_issue(TRACKER_REPO, 9757, opener=_Opener(response))
+        read = tracker_adapter(TRACKER_REPO, opener=_Opener(response)).read_issue(9757)
         assert read.state is None
         assert read.access_problem is True
         assert fragment in read.problem
@@ -260,7 +269,7 @@ class TestTheTrackerReadNeverRaises:
         def boom(_request):
             raise urllib.error.URLError("no route to host")
 
-        read = tracker_module.read_issue(TRACKER_REPO, 9757, opener=boom)
+        read = tracker_adapter(TRACKER_REPO, opener=boom).read_issue(9757)
         assert read.access_problem is True
         assert "failed at the transport" in read.problem
 
@@ -274,17 +283,21 @@ class TestTheTrackerReadNeverRaises:
             raise urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b"denied"))
 
         monkeypatch.setattr(urllib.request, "urlopen", raise_403)
-        read = tracker_module.read_issue(TRACKER_REPO, 9757)
+        read = tracker_adapter(TRACKER_REPO).read_issue(9757)
         assert "GitHub answered 403" in read.problem
 
     def test_both_states_read_back_and_only_closed_reads_closed(self, monkeypatch) -> None:
         _granted(monkeypatch)
-        assert tracker_module.read_issue(
-            TRACKER_REPO, 1, opener=_Opener((200, _issue("closed")))
-        ).closed
-        assert not tracker_module.read_issue(
-            TRACKER_REPO, 1, opener=_Opener((200, _issue("open")))
-        ).closed
+        assert (
+            tracker_adapter(TRACKER_REPO, opener=_Opener((200, _issue("closed"))))
+            .read_issue(1)
+            .closed
+        )
+        assert (
+            not tracker_adapter(TRACKER_REPO, opener=_Opener((200, _issue("open"))))
+            .read_issue(1)
+            .closed
+        )
 
 
 class TestTheCommentListingIsStrict:
@@ -292,7 +305,7 @@ class TestTheCommentListingIsStrict:
         _granted(monkeypatch)
         full = json.dumps([_comment(f"c{i}") for i in range(100)]).encode()
         opener = _Opener((200, full), (200, json.dumps([_comment("last")]).encode()))
-        bodies = tracker_module.comment_bodies(TRACKER_REPO, 9757, opener=opener)
+        bodies = tracker_adapter(TRACKER_REPO, opener=opener).comment_bodies(9757)
         assert len(bodies) == 101
         assert bodies[-1] == "last"
         assert "page=2" in opener.seen[1].full_url
@@ -304,7 +317,7 @@ class TestTheCommentListingIsStrict:
         full = json.dumps([_comment("c") for _ in range(100)]).encode()
         opener = _Opener(*[(200, full)] * 10)
         with pytest.raises(TrackerError, match="more than 1000 comments"):
-            tracker_module.comment_bodies(TRACKER_REPO, 9757, opener=opener)
+            tracker_adapter(TRACKER_REPO, opener=opener).comment_bodies(9757)
 
     @pytest.mark.parametrize(
         "response,fragment",
@@ -319,12 +332,12 @@ class TestTheCommentListingIsStrict:
     ) -> None:
         _granted(monkeypatch)
         with pytest.raises(TrackerError, match=fragment):
-            tracker_module.comment_bodies(TRACKER_REPO, 9757, opener=_Opener(response))
+            tracker_adapter(TRACKER_REPO, opener=_Opener(response)).comment_bodies(9757)
 
     def test_a_missing_credential_raises_on_the_write_path(self, monkeypatch) -> None:
         _revoked(monkeypatch)
         with pytest.raises(TrackerError, match="CRUCIBLE_TRACKER_APP_SSM_PREFIX"):
-            tracker_module.comment_bodies(TRACKER_REPO, 9757)
+            tracker_adapter(TRACKER_REPO).comment_bodies(9757)
 
 
 class TestThePostRefusesRatherThanRecordingNothing:
@@ -332,26 +345,26 @@ class TestThePostRefusesRatherThanRecordingNothing:
         "responses,fragment",
         [
             (((422, b"unprocessable"),), "GitHub answered 422"),
-            (((201, b"not json"),), "was accepted but GitHub's answer was not JSON"),
+            (((201, b"not json"),), "did not answer with JSON"),
             (((201, b"{}"),), "carries no html_url"),
         ],
     )
     def test_it_raises_naming_what_happened(self, monkeypatch, responses, fragment) -> None:
         _granted(monkeypatch)
         with pytest.raises(TrackerError, match=fragment):
-            tracker_module.post_comment(TRACKER_REPO, 1, "b", opener=_Opener(*responses))
+            tracker_adapter(TRACKER_REPO, opener=_Opener(*responses)).post_comment(1, "b")
 
     def test_an_empty_body_is_refused(self, monkeypatch) -> None:
         _granted(monkeypatch)
         with pytest.raises(TrackerError, match="empty comment"):
-            tracker_module.post_comment(TRACKER_REPO, 1, "   ")
+            tracker_adapter(TRACKER_REPO).post_comment(1, "   ")
 
     def test_a_missing_credential_names_the_grant_and_says_nothing_was_filed(
         self, monkeypatch
     ) -> None:
         _revoked(monkeypatch)
-        with pytest.raises(TrackerError, match="not filed to the store either"):
-            tracker_module.post_comment(TRACKER_REPO, 1, "b")
+        with pytest.raises(TrackerError, match="not filed anywhere else either"):
+            tracker_adapter(TRACKER_REPO).post_comment(1, "b")
 
     def test_a_transport_failure_raises(self, monkeypatch) -> None:
         _granted(monkeypatch)
@@ -360,12 +373,7 @@ class TestThePostRefusesRatherThanRecordingNothing:
             raise urllib.error.URLError("down")
 
         with pytest.raises(TrackerError, match="failed at the transport"):
-            tracker_module.post_comment(TRACKER_REPO, 1, "b", opener=boom)
-
-    def test_an_explicit_credential_beats_the_environment(self, monkeypatch) -> None:
-        _revoked(monkeypatch)
-        assert tracker_module.credential("explicit") == "explicit"
-        assert tracker_module.credential(" ") is None
+            tracker_adapter(TRACKER_REPO, opener=boom).post_comment(1, "b")
 
 
 class TestPostingIsIdempotentAtTheTracker:
@@ -595,7 +603,7 @@ class TestTheBoardRendersAPhaseClosedWithNoRecord:
         row = rows["phase:phase1:closing"]
         assert row.state == "UNMEASURABLE"
         assert row.red is True
-        assert tracker_module.TRACKER_APP_SSM_PREFIX_VAR in row.detail
+        assert TRACKER_APP_SSM_PREFIX_VAR in row.detail
 
     def test_a_filed_record_on_a_closed_issue_is_met(self, tmp_path, monkeypatch) -> None:
         _granted(monkeypatch)
