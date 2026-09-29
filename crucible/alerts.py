@@ -417,6 +417,9 @@ def incident_id(group: PageGroup) -> str:
 #: manifests — which is how the sweep knows which days it did not run.
 SWEEP_JOB = "alerts.sweep"
 
+#: The job whose manifest is the info heartbeat's console surface (`-I10593`).
+HEARTBEAT_JOB = "heartbeat"
+
 #: How far back a sweep looks for days it did not run. One trading week.
 #:
 #: Both page conditions used to evaluate ONLY ``resolve_trading_day(now)``, so
@@ -2861,7 +2864,10 @@ def heartbeat(
     It is delivered on the same transport as a page ON PURPOSE. A heartbeat
     carried by a healthy second channel would prove that channel alive and say
     nothing about the one the pages use — which is the failure it exists to
-    detect, dressed as its own detector.
+    detect, dressed as its own detector. Since `alpha-engine-config-I10593`
+    (Brian, 2026-09-29) the `info` form skips krepis' Telegram leg for the
+    console (this run's manifest); it still publishes to the pages SNS topic,
+    and the `error` form still reaches the operator chat.
 
     **And it evaluates the rows that declare IT as their watcher.**
     `components.yaml` gives `alerts.sweep` `absence_watched_by: heartbeat` —
@@ -2983,11 +2989,28 @@ def heartbeat(
     if ledgers_diverged:
         message += " " + str(cost_reconciliation["status_reason"])
     if not dry_run:
+        from krepis.alerts import (  # noqa: PLC0415 - lazy on purpose
+            DESTINATION_CONSOLE_ONLY,
+            DESTINATION_OPERATOR_CHAT,
+        )
+
+        from crucible.morning import store_uri  # noqa: PLC0415 - avoids a cycle
+
+        severity = "error" if (unwatched or nobody_listening or ledgers_diverged) else "info"
+        surface = f"{store_uri(store)}/{manifest_key(HEARTBEAT_JOB, trading_day.isoformat())}"
         publish = transport if transport is not None else _krepis_publish
         publish(
             message,
-            severity="error" if (unwatched or nobody_listening or ledgers_diverged) else "info",
+            severity=severity,
             source="crucible-v2/heartbeat",
+            # `alpha-engine-config-I10593`, Brian's ruling 2026-09-29: the
+            # `info` proof of life goes to the console (this run's manifest)
+            # and SNS, not Telegram. The `error` form still reaches the
+            # operator chat, because each of its causes is a real finding.
+            destination=DESTINATION_OPERATOR_CHAT
+            if severity == "error"
+            else DESTINATION_CONSOLE_ONLY,
+            console_artifact=surface,
             dedup_key=f"heartbeat:{trading_day.isoformat()}",
             dedup_window_min=None,
             sns_topic_arn=topic_arn(),
