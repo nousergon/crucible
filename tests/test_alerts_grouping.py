@@ -630,6 +630,34 @@ class TestHeartbeat:
         assert transport.pages == 1
         assert "alive" in transport.calls[0].message
 
+    def test_an_info_heartbeat_goes_to_the_console_not_to_telegram(
+        self, tmp_path, transport
+    ) -> None:
+        """`alpha-engine-config-I10593`, Brian's 2026-09-29 ruling: the info
+        proof of life is console-only, naming this run's manifest as the
+        durable surface krepis requires before it will skip Telegram."""
+        from krepis.alerts import DESTINATION_CONSOLE_ONLY
+
+        store = LocalStore(tmp_path)
+        _write_manifest(store, "alerts.sweep", status="ok")
+        heartbeat(store, now=SATURDAY_NIGHT, transport=transport)
+        kwargs = transport.calls[0].kwargs
+        assert kwargs["severity"] == "info"
+        assert kwargs["destination"] == DESTINATION_CONSOLE_ONLY
+        assert kwargs["console_artifact"].endswith("/run.json")
+        assert "/runs/heartbeat/" in kwargs["console_artifact"]
+
+    def test_an_error_heartbeat_still_reaches_the_operator_chat(self, tmp_path, transport) -> None:
+        """Each cause of the error form is a real finding, so it pages."""
+        from krepis.alerts import DESTINATION_OPERATOR_CHAT
+
+        store = LocalStore(tmp_path)
+        summary = heartbeat(store, now=SATURDAY_NIGHT, transport=transport, run_id="H" * 26)
+        heartbeat_call = next(c for c in transport.calls if "alive" in c.message)
+        assert summary["watched_absences"], "fixture no longer makes the sweep absent"
+        assert heartbeat_call.kwargs["severity"] == "error"
+        assert heartbeat_call.kwargs["destination"] == DESTINATION_OPERATOR_CHAT
+
     def test_an_unreadable_manifest_counts_as_failed_not_as_absent(
         self, tmp_path, transport
     ) -> None:
