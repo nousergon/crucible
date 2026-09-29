@@ -1133,6 +1133,33 @@ _NOT_YET_FILED_REASON = (
 )
 
 
+#: Why the DECLARED axis narrowed one (`alpha-engine-config-I11084`).
+_DECLARED_NO_CYCLE_REASON = (
+    "that day's `experiment.grade` read `ok` and declared no cycle could be built — no "
+    "settled session yet, or no upstream champion when it ran"
+)
+
+
+def _grade_declared_no_cycle(store: Store, slot: str, day: dt.date) -> str | None:
+    """The metric ``slot``'s grade for ``day`` declared instead of a cycle, or ``None``.
+
+    Only S declares one (`crucible.slots.strategy.declared_grade_outcome`,
+    which `promote[s]` reads too). An absent, unreadable or failed manifest
+    declares nothing, so the missing cycle stays a gap.
+    """
+    from crucible.slots import strategy  # noqa: PLC0415 - keeps the solver off the gate import
+
+    if slot != strategy.SLOT:
+        return None
+    read = _read_store_document(
+        store, manifest_key("experiment.grade", day.isoformat(), discriminator=slot)
+    )
+    if read.problem is not None or read.absent or read.document is None:
+        return None
+    declared = strategy.declared_grade_outcome(read.document, day.isoformat())
+    return None if declared is None else str(declared["name"])
+
+
 def _unregistered_note(unregistered: list[str], *, reason: str = _UNREGISTERED_REASON) -> str:
     """How a narrowed requirement is REPORTED — always, and named one by one.
 
@@ -1205,6 +1232,7 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
     unmeasurable: list[str] = []
     undispatchable: list[str] = []
     not_yet_filed: list[str] = []
+    declared_no_cycle: list[str] = []
     evidence: list[str] = []
     # Each slot's register is read ONCE, before the day loop. `_register_arms`
     # reads a single key per SLOT, not per day — re-reading it inside the day
@@ -1284,6 +1312,18 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
                     # quietly dropped.
                     undispatchable.append(f"{slot}@{day.isoformat()}")
                     continue
+                declared = _grade_declared_no_cycle(store, slot, day)
+                if declared is not None:
+                    # The FOURTH axis (`alpha-engine-config-I11084`): that
+                    # day's own grade read `ok` and declared why no cycle
+                    # could be built, the same reading `promote[s]` acts on.
+                    # Demanding a cycle there is demanding one no re-run can
+                    # produce. Named below, never dropped.
+                    declared_no_cycle.append(f"{slot}@{day.isoformat()} ({declared})")
+                    evidence.append(
+                        manifest_key("experiment.grade", day.isoformat(), discriminator=slot)
+                    )
+                    continue
                 gaps.append(f"{slot}@{day.isoformat()}: no arena_cycle artifact")
                 continue
             cycle = read.document or {}
@@ -1339,6 +1379,8 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
             parts.append(_unregistered_note(undispatchable, reason=_UNDISPATCHABLE_REASON))
         if not_yet_filed:
             parts.append(_unregistered_note(not_yet_filed, reason=_NOT_YET_FILED_REASON))
+        if declared_no_cycle:
+            parts.append(_unregistered_note(declared_no_cycle, reason=_DECLARED_NO_CYCLE_REASON))
         return Clause(
             "arms_all_scored",
             requirement,
@@ -1357,6 +1399,8 @@ def _clause_arms_all_scored(store: Store, window: list[dt.date]) -> Clause:
         detail += f"; {_unregistered_note(undispatchable, reason=_UNDISPATCHABLE_REASON)}"
     if not_yet_filed:
         detail += f"; {_unregistered_note(not_yet_filed, reason=_NOT_YET_FILED_REASON)}"
+    if declared_no_cycle:
+        detail += f"; {_unregistered_note(declared_no_cycle, reason=_DECLARED_NO_CYCLE_REASON)}"
     return Clause(
         "arms_all_scored",
         requirement,

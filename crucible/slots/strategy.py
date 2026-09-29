@@ -83,6 +83,7 @@ __all__ = [
     "ATTESTATION_STATUSES",
     "EXIT_RULES",
     "NO_SETTLED_SESSION_METRIC",
+    "declared_grade_outcome",
     "UPSTREAM_CHAMPION_ABSENT_METRIC",
     "SESSION_INPUTS_SCHEMA_VERSION",
     "SLOT",
@@ -1879,6 +1880,34 @@ def declare_no_m_champion(ctx: Any, *, job: str) -> dict[str, Any] | None:
     }
 
 
+def declared_grade_outcome(document: dict[str, Any], as_of: str) -> dict[str, Any] | None:
+    """The row `experiment.grade[s]` filed INSTEAD of a cycle for ``as_of``, or ``None``.
+
+    ``document`` is that day's grade manifest. It declared a no-cycle outcome
+    when it reads ``ok``, claims no arena cycle, and carries a
+    :data:`NO_SETTLED_SESSION_METRIC` or :data:`UPSTREAM_CHAMPION_ABSENT_METRIC`
+    row. One reading for both consumers: `promote[s]` below, and the gate's
+    `arms_all_scored`, which must not demand a cycle the grade said it could
+    not build (`alpha-engine-config-I11084`).
+    """
+    from crucible.keys import arena_cycle_key  # noqa: PLC0415 - avoids a cycle
+
+    if document.get("status") != "ok":
+        return None
+    claimed = {
+        output.get("key") for output in document.get("outputs") or () if isinstance(output, dict)
+    }
+    if arena_cycle_key(SLOT, as_of) in claimed:
+        return None
+    for metric in document.get("metrics") or ():
+        if isinstance(metric, dict) and metric.get("name") in (
+            NO_SETTLED_SESSION_METRIC,
+            UPSTREAM_CHAMPION_ABSENT_METRIC,
+        ):
+            return metric
+    return None
+
+
 def declared_promote_outcome(ctx: Any) -> dict[str, Any] | None:
     """What `promote[s]` files instead of acting on a cycle, or ``None``.
 
@@ -1915,7 +1944,7 @@ def declared_promote_outcome(ctx: Any) -> dict[str, Any] | None:
     that as unmeasurable rather than as a verdict.
     """
     from crucible.documents import load_store_document  # noqa: PLC0415 - avoids a cycle
-    from crucible.keys import arena_cycle_key, manifest_key  # noqa: PLC0415 - avoids a cycle
+    from crucible.keys import manifest_key  # noqa: PLC0415 - avoids a cycle
 
     declared = declare_no_m_champion(ctx, job="promote")
     if declared is not None:
@@ -1925,20 +1954,9 @@ def declared_promote_outcome(ctx: Any) -> dict[str, Any] | None:
     if not ctx.store.exists(grade_key):
         return None
     document = load_store_document(ctx.store, grade_key)
-    if document.get("status") != "ok":
+    declared = declared_grade_outcome(document, as_of)
+    if declared is None:
         return None
-    claimed = {output.get("key") for output in document.get("outputs") or ()}
-    if arena_cycle_key(SLOT, as_of) in claimed:
-        return None
-    declared_by_grade = [
-        metric
-        for metric in document.get("metrics") or ()
-        if isinstance(metric, dict)
-        and metric.get("name") in (NO_SETTLED_SESSION_METRIC, UPSTREAM_CHAMPION_ABSENT_METRIC)
-    ]
-    if not declared_by_grade:
-        return None
-    declared = declared_by_grade[0]
     name = str(declared["name"])
     if name == UPSTREAM_CHAMPION_ABSENT_METRIC:
         what = (
