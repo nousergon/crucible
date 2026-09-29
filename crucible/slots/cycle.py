@@ -99,6 +99,8 @@ __all__ = [
     "BASELINE_CONTROL_KIND",
     "INCUMBENT_SOURCE_FIELD",
     "SECTOR_SOURCE_MODE_FIELD",
+    "SERIES_AS_OF_FIELD",
+    "SERIES_WRITE_SUPERSEDED_METRIC",
     "MIN_ACTIVE_ARMS_FINDING_METRIC",
     "NOT_YET_REGISTERED_METRIC",
     "MissingArtifactError",
@@ -121,6 +123,13 @@ __all__ = [
 #: write site, so the producer's stamp and the manifest `outputs` row it is
 #: recorded under cannot drift apart.
 ARM_SERIES_SCHEMA_VERSION = "arm_series.v1"
+
+#: The grade date a series document was written for (`alpha-engine-config-I11084`).
+#: Additive: `load_slot_inputs` reads `arm_id`, `scores` and `misses` only.
+SERIES_AS_OF_FIELD = "as_of"
+
+#: Named on the grade manifest when a replay kept a later grade's series.
+SERIES_WRITE_SUPERSEDED_METRIC = "series_write_superseded"
 
 #: `alpha-engine-config-I9759` / `-I10687`: §10.1's control kind that stands
 #: in for an ABSENT incumbent. The null control is pure noise by
@@ -276,6 +285,31 @@ def _sector_mode_dates(
     return {
         mode: sorted(days) for mode, days in sorted(sector_modes_by_arm.get(arm_id, {}).items())
     }
+
+
+def _superseding_series(
+    store: Store, slot: str, arm_id: str, as_of: str, series: ArmSeries
+) -> str | None:
+    """Why the stored series is newer than a grade for ``as_of``, else ``None``.
+
+    A stamped document is newer when its ``as_of`` is later. A document
+    written before the stamp existed is newer when it holds a scored or missed
+    day later than every day this grade holds, which only a later grade can
+    have settled.
+    """
+    try:
+        stored = load_store_document(store, arm_series_key(slot, arm_id))
+    except KeyError:
+        return None
+    stamped = str(stored.get(SERIES_AS_OF_FIELD) or "")
+    if stamped:
+        return f"as of {stamped}" if stamped > as_of else None
+    stored_days = set(stored.get("scores") or {}) | set(stored.get("misses") or ())
+    ours = set(series.scores) | set(series.misses or ())
+    latest = max(stored_days, default="")
+    if latest and latest > max(ours, default=""):
+        return f"unstamped, scored through {latest}"
+    return None
 
 
 def _read_panel(store: Store, trading_day: dt.date) -> pd.DataFrame:
@@ -1165,12 +1199,25 @@ def run_grade(
     # — an empty `scores` map is "this arm has nothing settled to say", which
     # the loader must be able to read as such and cannot read from an absent
     # key.
+    #
+    # `alpha-engine-config-I11084`: the series is a ROLLING document, one per
+    # arm, so a replay of an earlier day would overwrite the live series with
+    # one truncated at that day and silently drop every score a later grade
+    # settled. The dated artifacts below (verdicts, `arena_cycle`) are that
+    # day's own record and are still written; the rolling one is kept when a
+    # later grade wrote it, and the manifest says so.
+    superseded: dict[str, str] = {}
     for arm_id, arm_series in series_by_arm.items():
+        newer = _superseding_series(ctx.store, slot, arm_id, as_of.isoformat(), arm_series)
+        if newer is not None:
+            superseded[arm_id] = newer
+            continue
         ctx.record_output(
             arm_series_key(slot, arm_id),
             json.dumps(
                 {
                     "schema_version": ARM_SERIES_SCHEMA_VERSION,
+                    SERIES_AS_OF_FIELD: as_of.isoformat(),
                     "arm_id": arm_series.arm_id,
                     "scores": {day: float(score) for day, score in arm_series.scores.items()},
                     "misses": sorted(arm_series.misses or ()),
@@ -1180,6 +1227,25 @@ def run_grade(
                 sort_keys=True,
             ).encode(),
             schema_version=ARM_SERIES_SCHEMA_VERSION,
+        )
+    if superseded:
+        ctx.record_metric(
+            {
+                "name": SERIES_WRITE_SUPERSEDED_METRIC,
+                "module": f"crucible.slots.{slot}",
+                "metric_type": "operational",
+                "value": float(len(superseded)),
+                "unit": "count",
+                "n_floor": 0,
+                "status": "OK",
+                "status_reason": (
+                    f"{len(superseded)} of {len(series_by_arm)} {slot} series kept as a later "
+                    f"grade wrote them ({sorted(set(superseded.values()))[-1]}); a grade for "
+                    f"{as_of} does not truncate them"
+                )[:500],
+                "source_path": arm_series_key(slot, sorted(superseded)[0]),
+                "last_updated_utc": _utc_now(),
+            }
         )
 
     # §10.1: a control never serves. Expressed as a SERVING PRECONDITION —
