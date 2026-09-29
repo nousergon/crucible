@@ -1,4 +1,13 @@
-"""Month-to-date AWS spend, read from Cost Explorer.
+"""Month-to-date AWS spend, read from the expense collector's Cost Explorer series.
+
+**This module makes no Cost Explorer call (`alpha-engine-config-I11707`).**
+The account's only Cost Explorer identity is nousergon-data's
+expense-collector Lambda. Twice a day it publishes a per-`system`-tag DAILY
+series in `expenses/latest.json`, and :class:`CollectorSpendClient` answers
+the `get_cost_and_usage` request shapes below out of that file. The readers,
+the cache and the budget are unchanged: they grade whatever client they are
+handed, and the gate hands them this one. The history below is why the
+readers are shaped the way they are.
 
 Normative source: plan §6 row 2 (`AWS <= $40`) and row 4 (`AWS total <=
 $70/mo`) — the two phase gates that are a dollar figure.
@@ -67,11 +76,14 @@ __all__ = [
     "ClosedMonthReading",
     "CostExplorerBudgetExceededError",
     "CostExplorerCache",
+    "CollectorSpendClient",
     "CostReading",
     "CostUnreadableError",
     "DailyReading",
     "DEFAULT_CE_CALL_BUDGET",
     "DEFAULT_CE_OPEN_WINDOW_TTL_SECONDS",
+    "EXPENSES_MAX_AGE",
+    "EXPENSES_URI_VAR",
     "closed_month_usd",
     "default_cache",
     "default_client",
@@ -349,18 +361,187 @@ class ClosedMonthReading:
         }
 
 
-def default_client() -> Any:
-    """A Cost Explorer client, constructed lazily.
+#: Environment variable naming the expense collector's rollup, an
+#: `s3://bucket/key` URI. The workflows build it from repository variables, so
+#: no bucket name lives in this tree.
+EXPENSES_URI_VAR = "CRUCIBLE_EXPENSES_URI"
 
-    `boto3` is imported inside the function for the same reason
-    `crucible.store.S3Store` does it: importing `crucible.gate` must not
-    require an AWS SDK to be installed or credentials to be resolvable, and a
-    module-level client would make every unit test that imports the gate
-    reach for a credential chain.
+#: The collector runs at 00:15 and 12:15 UTC. A rollup older than this has
+#: missed at least two runs, and a spend reading built from it is stale.
+EXPENSES_MAX_AGE = dt.timedelta(hours=36)
+
+
+class CollectorSpendClient:
+    """Answers this module's `get_cost_and_usage` request shapes from the
+    expense collector's per-system daily series, with no Cost Explorer call
+    (`alpha-engine-config-I11707`).
+
+    The series lives at `providers[key=aws].detail.daily_by_system` in
+    `expenses/latest.json`: one entry per closed UTC day, each carrying Cost
+    Explorer's own `Estimated` flag and one amount per `system` tag value
+    (the untagged remainder included, so a day's values sum to the account
+    total).
+
+    **Anything the file cannot answer RAISES.** A rollup older than
+    :data:`EXPENSES_MAX_AGE`, a missing or truncated series, a series error
+    the collector recorded, or a requested day outside the series is no
+    number, and `_get_cost_and_usage` turns each into
+    :class:`CostUnreadableError` -- the same UNMEASURABLE the gate renders for
+    a denied Cost Explorer read.
     """
-    import boto3  # noqa: PLC0415 - lazy on purpose; see the docstring
 
-    return boto3.client("ce")
+    def __init__(
+        self,
+        uri: str,
+        *,
+        s3: Any = None,
+        now: Callable[[], dt.datetime] | None = None,
+        max_age: dt.timedelta = EXPENSES_MAX_AGE,
+    ) -> None:
+        if not uri.startswith("s3://") or "/" not in uri[len("s3://") :]:
+            raise CostUnreadableError(f"{EXPENSES_URI_VAR} is not an s3://bucket/key URI: {uri!r}")
+        self._bucket, self._key = uri[len("s3://") :].split("/", 1)
+        self._s3 = s3
+        self._now = now or (lambda: dt.datetime.now(dt.UTC))
+        self._max_age = max_age
+        self._days: dict[dt.date, dict[str, Any]] | None = None
+
+    def _load(self) -> dict[dt.date, dict[str, Any]]:
+        if self._days is not None:
+            return self._days
+        import json  # noqa: PLC0415 - only this path parses the rollup
+
+        if self._s3 is None:
+            import boto3  # noqa: PLC0415 - lazy for the reason default_client gives
+
+            self._s3 = boto3.client("s3")
+        body = self._s3.get_object(Bucket=self._bucket, Key=self._key)["Body"].read()
+        doc = json.loads(body)
+        as_of = dt.datetime.fromisoformat(doc["as_of"])
+        if self._now() - as_of > self._max_age:
+            raise CostUnreadableError(
+                f"the expense collector's rollup is from {doc['as_of']}, older than "
+                f"{self._max_age}; the collector has missed runs, so this is no number"
+            )
+        aws = next((p for p in doc.get("providers") or [] if p.get("key") == "aws"), None)
+        detail = (aws or {}).get("detail") or {}
+        series = detail.get("daily_by_system")
+        if series is None:
+            raise CostUnreadableError(
+                "the expense collector's AWS row carries no daily_by_system series"
+                + (
+                    f": {detail['daily_by_system_error']}"
+                    if "daily_by_system_error" in detail
+                    else ""
+                )
+            )
+        if series.get("tag_key") != TAG_KEY:
+            raise CostUnreadableError(
+                f"the collector's series is grouped by {series.get('tag_key')!r}, not {TAG_KEY!r}"
+            )
+        if not series.get("complete"):
+            raise CostUnreadableError(
+                "the collector's series is truncated (Cost Explorer returned a second page it "
+                "did not fetch); a missing day is not a free day"
+            )
+        self._days = {dt.date.fromisoformat(d["date"]): d for d in series.get("days") or []}
+        return self._days
+
+    def _day_usd(self, day: dt.date, *, tagged: bool) -> tuple[float, bool]:
+        days = self._load()
+        entry = days.get(day)
+        if entry is None:
+            covers = f"{min(days).isoformat()}..{max(days).isoformat()}" if days else "no days"
+            raise CostUnreadableError(
+                f"the expense collector's series has no {day.isoformat()}; it covers {covers}"
+            )
+        by_system = entry.get("by_system_usd") or {}
+        amount = (
+            float(by_system.get(TAG_VALUE, 0.0))
+            if tagged
+            else sum(float(v) for v in by_system.values())
+        )
+        return amount, bool(entry.get("estimated", False))
+
+    def get_cost_and_usage(self, **request: Any) -> dict[str, Any]:
+        start = dt.date.fromisoformat(request["TimePeriod"]["Start"])
+        end = dt.date.fromisoformat(request["TimePeriod"]["End"])
+        granularity = request["Granularity"]
+        want_filter = {"Tags": {"Key": TAG_KEY, "Values": [TAG_VALUE]}}
+        flt = request.get("Filter")
+        if flt not in (None, want_filter):
+            raise CostUnreadableError(f"the collector's series cannot answer filter {flt!r}")
+        tagged = flt is not None
+        if end <= start:
+            raise CostUnreadableError(f"empty interval {start.isoformat()}..{end.isoformat()}")
+
+        # One period per day (DAILY) or per calendar-month segment (MONTHLY),
+        # the shape Cost Explorer itself returns for these requests.
+        segments: list[tuple[dt.date, dt.date]] = []
+        cursor = start
+        while cursor < end:
+            if granularity == "DAILY":
+                nxt = cursor + dt.timedelta(days=1)
+            elif granularity == "MONTHLY":
+                nxt = min(end, (cursor.replace(day=28) + dt.timedelta(days=4)).replace(day=1))
+            else:
+                raise CostUnreadableError(f"unsupported granularity {granularity!r}")
+            segments.append((cursor, nxt))
+            cursor = nxt
+
+        periods = []
+        for seg_start, seg_end in segments:
+            total, estimated, day = 0.0, False, seg_start
+            while day < seg_end:
+                amount, est = self._day_usd(day, tagged=tagged)
+                total += amount
+                estimated = estimated or est
+                day += dt.timedelta(days=1)
+            periods.append(
+                {
+                    "TimePeriod": {"Start": seg_start.isoformat(), "End": seg_end.isoformat()},
+                    "Total": {"UnblendedCost": {"Amount": f"{total:.10f}", "Unit": "USD"}},
+                    "Estimated": estimated,
+                }
+            )
+        return {"ResultsByTime": periods}
+
+    def list_cost_allocation_tags(self, **request: Any) -> dict[str, Any]:
+        """Activation, established from evidence rather than asked for.
+
+        Cost Explorer indexes spend under a tag key only once Billing has
+        activated it, so any non-zero `system=crucible-v2` amount in the
+        series proves `Active`. No such amount proves nothing -- it is what an
+        inactive key AND an idle estate both produce -- so that RAISES.
+        """
+        if request.get("TagKeys") not in (None, [TAG_KEY]):
+            raise CostUnreadableError(f"the collector's series answers only {TAG_KEY!r}")
+        days = self._load()
+        if any(
+            float((d.get("by_system_usd") or {}).get(TAG_VALUE, 0.0)) > 0 for d in days.values()
+        ):
+            return {"CostAllocationTags": [{"TagKey": TAG_KEY, "Status": "Active"}]}
+        raise CostUnreadableError(
+            f"no spend under {TAG_KEY}={TAG_VALUE} in the collector's series, so whether "
+            f"{TAG_KEY!r} is activated as a cost-allocation tag cannot be established from it"
+        )
+
+
+def default_client() -> Any:
+    """The spend source the gate reads: :class:`CollectorSpendClient` over
+    the rollup `CRUCIBLE_EXPENSES_URI` names. Never a Cost Explorer client
+    (`alpha-engine-config-I11707`).
+
+    Constructed lazily, and `boto3` is imported only when the rollup is first
+    read, for the same reason `crucible.store.S3Store` does it: importing
+    `crucible.gate` must not require an AWS SDK or a credential chain.
+    """
+    uri = os.environ.get(EXPENSES_URI_VAR)
+    if not uri:
+        raise CostUnreadableError(
+            f"{EXPENSES_URI_VAR} is unset, so there is no spend source to read"
+        )
+    return CollectorSpendClient(uri)
 
 
 def month_to_date_usd(

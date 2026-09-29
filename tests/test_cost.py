@@ -282,3 +282,181 @@ class TestTheBudgetIsEnvOverridableAndZeroMeansZero:
             assert default_cache().budget == DEFAULT_CE_CALL_BUDGET
         finally:
             reset_default_cache()
+
+
+# ---------------------------------------------------------------------------
+# The expense collector's series is the spend source (alpha-engine-config-I11707)
+# ---------------------------------------------------------------------------
+
+
+class _FakeS3:
+    def __init__(self, doc: dict) -> None:
+        import json  # noqa: PLC0415 - local to the fake
+
+        self.body = json.dumps(doc).encode()
+        self.gets = 0
+
+    def get_object(self, *, Bucket: str, Key: str) -> dict:
+        assert (Bucket, Key) == ("bucket", "expenses/latest.json")
+        self.gets += 1
+        import io  # noqa: PLC0415 - local to the fake
+
+        return {"Body": io.BytesIO(self.body)}
+
+
+def _rollup(
+    *,
+    as_of: str = "2026-09-29T12:15:51+00:00",
+    start: dt.date = dt.date(2026, 8, 1),
+    end: dt.date = dt.date(2026, 9, 29),
+    tagged: float = 2.0,
+    untagged: float = 1.0,
+    complete: bool = True,
+    estimated_from: dt.date = dt.date(2026, 9, 27),
+) -> dict:
+    days, d = [], start
+    while d < end:
+        days.append(
+            {
+                "date": d.isoformat(),
+                "estimated": d >= estimated_from,
+                "by_system_usd": {"crucible-v2": tagged, "(untagged)": untagged},
+            }
+        )
+        d += dt.timedelta(days=1)
+    return {
+        "as_of": as_of,
+        "providers": [
+            {"key": "openrouter", "detail": {}},
+            {
+                "key": "aws",
+                "detail": {
+                    "daily_by_system": {
+                        "tag_key": "system",
+                        "untagged_key": "(untagged)",
+                        "start": start.isoformat(),
+                        "end": end.isoformat(),
+                        "complete": complete,
+                        "days": days,
+                    }
+                },
+            },
+        ],
+    }
+
+
+def _client(doc: dict, *, now: str = "2026-09-29T21:30:00+00:00"):
+    from crucible.cost import CollectorSpendClient  # noqa: PLC0415
+
+    return CollectorSpendClient(
+        "s3://bucket/expenses/latest.json",
+        s3=_FakeS3(doc),
+        now=lambda: dt.datetime.fromisoformat(now),
+    )
+
+
+class TestTheCollectorSeriesAnswersEveryReader:
+    """The three readers the dollar clause uses, driven through the real
+    request builder and cache against the collector's series."""
+
+    def test_month_to_date_tagged_and_whole_account(self) -> None:
+        from crucible.cost import month_to_date_usd  # noqa: PLC0415
+
+        client = _client(_rollup())
+        cache = CostExplorerCache(budget=10)
+        tagged = month_to_date_usd(client, today=dt.date(2026, 9, 29), tagged=True, cache=cache)
+        whole = month_to_date_usd(client, today=dt.date(2026, 9, 29), tagged=False, cache=cache)
+        assert tagged.amount_usd == pytest.approx(28 * 2.0)
+        assert whole.amount_usd == pytest.approx(28 * 3.0)
+
+    def test_trailing_thirty_days_is_thirty_daily_periods(self) -> None:
+        from crucible.cost import trailing_daily_usd  # noqa: PLC0415
+
+        reading = trailing_daily_usd(
+            _client(_rollup()),
+            today=dt.date(2026, 9, 29),
+            days=30,
+            tagged=False,
+            cache=CostExplorerCache(budget=10),
+        )
+        assert len(reading.amounts_usd) == 30
+        assert reading.total_usd == pytest.approx(90.0)
+
+    def test_the_closed_month_carries_the_estimated_flag(self) -> None:
+        from crucible.cost import closed_month_usd  # noqa: PLC0415
+
+        final = closed_month_usd(
+            _client(_rollup()),
+            today=dt.date(2026, 9, 2),
+            tagged=True,
+            cache=CostExplorerCache(budget=10),
+        )
+        assert final.amount_usd == pytest.approx(31 * 2.0)
+        assert final.estimated is False
+        provisional = closed_month_usd(
+            _client(_rollup(estimated_from=dt.date(2026, 8, 30))),
+            today=dt.date(2026, 9, 2),
+            tagged=True,
+            cache=CostExplorerCache(budget=10),
+        )
+        assert provisional.estimated is True
+
+    def test_the_rollup_is_read_once_per_client(self) -> None:
+        from crucible.cost import month_to_date_usd, trailing_daily_usd  # noqa: PLC0415
+
+        client = _client(_rollup())
+        cache = CostExplorerCache(budget=10)
+        month_to_date_usd(client, today=dt.date(2026, 9, 29), tagged=True, cache=cache)
+        trailing_daily_usd(client, today=dt.date(2026, 9, 29), days=30, tagged=True, cache=cache)
+        assert client._s3.gets == 1
+
+
+class TestTheCollectorSeriesRaisesWhenItCannotAnswer:
+    """Every one of these is no number, and the gate renders it UNMEASURABLE."""
+
+    def _mtd(self, client):
+        from crucible.cost import month_to_date_usd  # noqa: PLC0415
+
+        return month_to_date_usd(
+            client, today=dt.date(2026, 9, 29), tagged=False, cache=CostExplorerCache(budget=10)
+        )
+
+    def test_a_stale_rollup(self) -> None:
+        with pytest.raises(CostUnreadableError, match="older than"):
+            self._mtd(_client(_rollup(as_of="2026-09-27T12:15:00+00:00")))
+
+    def test_a_truncated_series(self) -> None:
+        with pytest.raises(CostUnreadableError, match="truncated"):
+            self._mtd(_client(_rollup(complete=False)))
+
+    def test_a_day_outside_the_series(self) -> None:
+        with pytest.raises(CostUnreadableError, match="has no 2026-09-28"):
+            self._mtd(_client(_rollup(end=dt.date(2026, 9, 28))))
+
+    def test_a_missing_series_names_the_collectors_error(self) -> None:
+        doc = _rollup()
+        doc["providers"][1]["detail"] = {"daily_by_system_error": "RuntimeError: AccessDenied"}
+        with pytest.raises(CostUnreadableError, match="AccessDenied"):
+            self._mtd(_client(doc))
+
+    def test_an_unknown_filter(self) -> None:
+        with pytest.raises(CostUnreadableError, match="filter"):
+            _client(_rollup()).get_cost_and_usage(
+                TimePeriod={"Start": "2026-09-01", "End": "2026-09-29"},
+                Granularity="MONTHLY",
+                Filter={"Dimensions": {"Key": "SERVICE", "Values": ["Amazon EC2"]}},
+            )
+
+
+class TestTagActivationIsEstablishedFromEvidence:
+    def test_tagged_spend_proves_active(self) -> None:
+        status = cost_allocation_tag_status(_client(_rollup()), cache=CostExplorerCache(budget=5))
+        assert status.active
+
+    def test_no_tagged_spend_proves_nothing(self) -> None:
+        from crucible.tags import CostAllocationTagUnreadableError  # noqa: PLC0415
+
+        with pytest.raises(CostAllocationTagUnreadableError):
+            cost_allocation_tag_status(
+                _client(_rollup(tagged=0.0)), cache=CostExplorerCache(budget=5)
+            )
