@@ -26,12 +26,26 @@ def test_the_s3_client_is_an_s3_client() -> None:
     assert client.meta.service_model.service_name == "s3"
 
 
-def test_the_cost_explorer_client_is_a_cost_explorer_client(no_live_cost_explorer) -> None:
-    # The autouse fixture replaces `_ce_client` with a refusal so no test
-    # reaches Cost Explorer by accident; it hands back the real constructor
-    # for exactly this assertion, which builds a client and calls nothing.
-    client = no_live_cost_explorer()
-    assert client.meta.service_model.service_name == "ce"
+def test_the_spend_client_reads_the_collector_not_cost_explorer(
+    no_live_cost_explorer, monkeypatch
+) -> None:
+    # The autouse fixture replaces `_ce_client` with a refusal; it hands back
+    # the real constructor for exactly this assertion, which builds a client
+    # and reads nothing (alpha-engine-config-I11707).
+    from crucible.cost import EXPENSES_URI_VAR, CollectorSpendClient
+
+    monkeypatch.setenv(EXPENSES_URI_VAR, "s3://test-bucket/expenses/latest.json")
+    assert isinstance(no_live_cost_explorer(), CollectorSpendClient)
+
+
+def test_an_unset_spend_source_raises_rather_than_reading_cost_explorer(
+    no_live_cost_explorer, monkeypatch
+) -> None:
+    from crucible.cost import EXPENSES_URI_VAR, CostUnreadableError
+
+    monkeypatch.delenv(EXPENSES_URI_VAR, raising=False)
+    with pytest.raises(CostUnreadableError, match=EXPENSES_URI_VAR):
+        no_live_cost_explorer()
 
 
 def test_the_typing_shim_returns_none_and_touches_nothing() -> None:

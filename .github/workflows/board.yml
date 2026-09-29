@@ -103,14 +103,13 @@ concurrency:
 
 env:
   AWS_REGION: us-east-1
-  # alpha-engine-config-I11707: Cost Explorer reads are PAUSED. Every
-  # `ce:ListCostAllocationTags` bills $0.01, and the `ce:GetCostAndUsage`
-  # reads have been denied by the budget action since 2026-09-20 anyway. A
-  # budget of 0 makes each read raise `CostExplorerBudgetExceededError`
-  # before any request is sent, so the dollar and tag-activation clauses
-  # render UNMEASURABLE. Delete this line when the gates read spend from
-  # the expense collector's output instead (I11707 stage 2).
-  CRUCIBLE_CE_CALL_BUDGET: "0"
+  # alpha-engine-config-I11707: the dollar clauses read AWS spend from the
+  # expense collector's rollup (`crucible.cost.CollectorSpendClient`), never
+  # from Cost Explorer -- the collector is the account's only Cost Explorer
+  # identity. Built from the repository variable, so no bucket name lives in
+  # this public tree; `CRUCIBLE_ARCTIC_BUCKET` is the same data bucket the
+  # `data_collection` store is read from.
+  CRUCIBLE_EXPENSES_URI: s3://${{ vars.CRUCIBLE_ARCTIC_BUCKET }}/expenses/latest.json
   # AWS_ACCOUNT_ID and STORE_URI come from repository variables
   # (alpha-engine-config-I9906) — this repo goes PUBLIC at phase-1 exit
   # (I9775) and `AGENTS.md` forbids infrastructure identifiers, bucket names

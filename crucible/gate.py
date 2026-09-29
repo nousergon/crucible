@@ -6657,6 +6657,8 @@ COST_LEADING_DAYS = 7
 
 
 def _ce_client() -> Any:
+    """The spend source: the expense collector's rollup, never Cost Explorer
+    itself (`crucible.cost.CollectorSpendClient`, alpha-engine-config-I11707)."""
     from crucible.cost import default_client  # noqa: PLC0415 - lazy on purpose
 
     return default_client()
@@ -6740,8 +6742,9 @@ def _clause_aws_cost_within_ceiling(
 
     scope = f"tagged `{TAG_KEY}={TAG_VALUE}`" if tagged else "the whole account"
     requirement = (
-        f"AWS spend for {scope} is at most ${ceiling_usd:.2f}/month, read from Cost "
-        f"Explorer: UNMET once month-to-date exceeds it, otherwise graded on the total of "
+        f"AWS spend for {scope} is at most ${ceiling_usd:.2f}/month, read from the expense "
+        f"collector's Cost Explorer series: UNMET once month-to-date exceeds it, otherwise "
+        f"graded on the total of "
         f"the trailing {COST_TRAILING_DAYS} complete days, UNMET when the leading "
         f"{COST_LEADING_DAYS}-day mean × {COST_TRAILING_DAYS} exceeds the ceiling, and UNMET "
         "when the prior CLOSED calendar month (read on the 1st-3rd) exceeded it"
