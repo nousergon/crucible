@@ -32,6 +32,7 @@ from crucible.promote import load_slot_inputs
 from crucible.runner import run_job
 from crucible.slots import universe
 from crucible.slots.arms import ArmRegister
+from crucible.slots.cycle import SERIES_AS_OF_FIELD, SERIES_WRITE_SUPERSEDED_METRIC
 
 HORIZON = 21
 DECISION_DATES = 6
@@ -122,3 +123,75 @@ class TestGradeWritesTheSeriesPromoteReads:
         (store.root / arm_series_key("u", victim)).unlink()
         with pytest.raises(KeyError, match="has no series"):
             load_slot_inputs(store, "u")
+
+
+def _regrade(store, strategy_dir, cycle_date, tmp_path) -> list[dict]:
+    settings = Settings(
+        store_uri=str(tmp_path / "store"),
+        arctic_bucket="unused-in-this-test",
+        strategy_dir=strategy_dir,
+        origins={"store_uri": "test", "strategy_dir": "test"},
+    )
+    metrics: list[dict] = []
+
+    def job(ctx):
+        universe.grade(ctx, settings=settings)
+        metrics.extend(ctx.metrics)
+
+    run_job("experiment.grade", job, store=store, trading_day=cycle_date)
+    return metrics
+
+
+class TestAReplayGradeKeepsALaterSeries:
+    """`alpha-engine-config-I11084`. The series is rolling, so replaying an
+    earlier day's grade overwrote the live series with one truncated at that
+    day, dropping every score a later grade had settled."""
+
+    def test_the_series_is_stamped_with_its_grade_date(self, graded_slot, cycle_date) -> None:
+        store, _result = graded_slot
+        for arm_id in _registered_arms(store):
+            payload = json.loads(store.get_bytes(arm_series_key("u", arm_id)))
+            assert payload[SERIES_AS_OF_FIELD] == cycle_date.isoformat()
+
+    def test_a_later_stamped_series_is_kept(
+        self, graded_slot, strategy_dir, cycle_date, tmp_path
+    ) -> None:
+        store, _result = graded_slot
+        victim = _registered_arms(store)[0]
+        key = arm_series_key("u", victim)
+        later = json.loads(store.get_bytes(key))
+        later[SERIES_AS_OF_FIELD] = "2099-01-02"
+        later["scores"]["2099-01-01"] = 0.5
+        store.put_bytes(key, json.dumps(later).encode())
+        before = store.get_bytes(key)
+
+        metrics = _regrade(store, strategy_dir, cycle_date, tmp_path)
+
+        assert store.get_bytes(key) == before
+        kept = [m for m in metrics if m["name"] == SERIES_WRITE_SUPERSEDED_METRIC]
+        assert len(kept) == 1 and kept[0]["value"] == 1.0
+
+    def test_an_unstamped_series_holding_a_later_day_is_kept(
+        self, graded_slot, strategy_dir, cycle_date, tmp_path
+    ) -> None:
+        store, _result = graded_slot
+        victim = _registered_arms(store)[0]
+        key = arm_series_key("u", victim)
+        legacy = json.loads(store.get_bytes(key))
+        del legacy[SERIES_AS_OF_FIELD]
+        legacy["scores"]["2099-01-01"] = 0.5
+        store.put_bytes(key, json.dumps(legacy).encode())
+        before = store.get_bytes(key)
+
+        _regrade(store, strategy_dir, cycle_date, tmp_path)
+
+        assert store.get_bytes(key) == before
+
+    def test_a_same_day_regrade_still_rewrites(
+        self, graded_slot, strategy_dir, cycle_date, tmp_path
+    ) -> None:
+        """The guard firing only on a LATER grade: a re-run of the same day
+        writes, and names no superseded series."""
+        store, _result = graded_slot
+        metrics = _regrade(store, strategy_dir, cycle_date, tmp_path)
+        assert not [m for m in metrics if m["name"] == SERIES_WRITE_SUPERSEDED_METRIC]
