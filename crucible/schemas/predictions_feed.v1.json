@@ -25,6 +25,89 @@
       "title": "Predicted Alpha",
       "type": "object"
     },
+    "predicted_alpha_std": {
+      "anyOf": [
+        {
+          "additionalProperties": {
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Name -> TOTAL predictive std of the champion's label, sqrt(aleatoric + epistemic) when both are known \u2014 the executor's conviction-gate input. Absent, never zeroed, when the champion's fit has no honest figure; `predicted_alpha_std_method` then says `omitted`.",
+      "title": "Predicted Alpha Std"
+    },
+    "predicted_alpha_std_aleatoric": {
+      "anyOf": [
+        {
+          "additionalProperties": {
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Name -> sqrt(1/alpha_), the learned-noise std. Bayesian fits only.",
+      "title": "Predicted Alpha Std Aleatoric"
+    },
+    "predicted_alpha_std_epistemic": {
+      "anyOf": [
+        {
+          "additionalProperties": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Name -> sqrt(x^T Sigma_w x), the estimation-error std. Bayesian fits only; the only vector the executor's GUW Omega may be built from.",
+      "title": "Predicted Alpha Std Epistemic"
+    },
+    "predicted_alpha_std_method": {
+      "anyOf": [
+        {
+          "enum": [
+            "bayesian_posterior_predictive",
+            "purged_kfold_oos_residual",
+            "omitted"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "How predicted_alpha_std was produced, carried through from the republished document.",
+      "title": "Predicted Alpha Std Method"
+    },
+    "predicted_alpha_std_note": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The method's detail or, under `omitted`, why no std exists.",
+      "title": "Predicted Alpha Std Note"
+    },
     "schema_version": {
       "const": "predictions_feed.v1",
       "description": "Version of THIS schema. A consumer that cannot read the version refuses the document rather than guessing.",
