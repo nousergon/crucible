@@ -117,6 +117,7 @@ __all__ = [
     "BaseCoverageBelowFloorError",
     "BasePredictionsUnavailableError",
     "EmptyDesignMatrixError",
+    "FactorResidualUnavailableError",
     "InputCycleError",
     "InputRef",
     "InputRefusal",
@@ -270,6 +271,31 @@ class EmptyDesignMatrixError(UnproducibleInputError):
         self.unresolvable: tuple[str, ...] = tuple(unresolvable)
 
 
+class FactorResidualUnavailableError(UnproducibleInputError):
+    """A factor-residual arm's factor model cannot be built on this panel.
+
+    `alpha-engine-config-I11791`. An arm declaring `target:
+    factor_residual_forward_return` residualizes its label against the
+    beta/sector/size ETF proxies of the attribution spec
+    (`strategy/slots/attribution.yaml`), read off the SAME feature layer the
+    arm trains on. When that spec is absent, or a proxy carries no close on a
+    session the betas or the label need, no residual exists to fit.
+
+    A per-arm refusal (:data:`PER_ARM_REFUSALS`), not a slot-wide failure,
+    and deliberately: only an arm that DECLARED this target reads the proxies,
+    so the remedy — publish the spec, or compile the layer with the proxies
+    over the sessions the window reaches — touches that arm alone, and every
+    sibling's design matrix is unaffected. Nothing is substituted for a
+    missing proxy: a zero factor return would leave the factor's whole move
+    in the label the arm exists to strip it from.
+    """
+
+    def __init__(self, message: str, *, arm: str, unresolvable: Sequence[str]) -> None:
+        super().__init__(message)
+        self.arm = arm
+        self.unresolvable: tuple[str, ...] = tuple(unresolvable)
+
+
 #: The typed refusals a slot's per-arm loop absorbs, EXHAUSTIVE and named
 #: once so the produce loop and the grade loop absorb the same set.
 #:
@@ -285,6 +311,7 @@ class EmptyDesignMatrixError(UnproducibleInputError):
 PER_ARM_REFUSALS: tuple[type[Exception], ...] = (
     BasePredictionsUnavailableError,
     EmptyDesignMatrixError,
+    FactorResidualUnavailableError,
 )
 
 
