@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://nousergon.dev/crucible/schemas/arm_predictions.v1.json",
   "title": "arm_predictions.v1",
-  "description": "One M arm's cross-section of predicted alpha for ONE trading day. The producer/consumer contract a stacked arm reads through (alpha-engine-config-I9777). The trading day is carried IN the document as well as in the key so a consumer can refuse a payload written for another day rather than train on it.",
+  "description": "One M arm's cross-section of predicted alpha for ONE trading day. The producer/consumer contract a stacked arm reads through (alpha-engine-config-I9777). The trading day is carried IN the document as well as in the key so a consumer can refuse a payload written for another day rather than train on it. Since alpha-engine-config-I11791 the M producer also writes predicted_alpha_std (and, for a Bayesian fit, its aleatoric and epistemic parts) with the method that produced it; a document written before that carries none of those fields and stays valid.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -27,6 +27,59 @@
       "minProperties": 1,
       "additionalProperties": {"type": "number"},
       "propertyNames": {"pattern": "^[A-Za-z0-9.-]+$"}
+    },
+    "predicted_alpha_std": {
+      "type": "object",
+      "description": "ticker -> TOTAL predictive std of the label, sqrt(aleatoric + epistemic) when both are known (alpha-engine-config-I11791). The executor's conviction-gate input. Strictly positive: a zero std is a claim of certainty no estimator here can make, so the field is omitted, never zeroed, when no honest figure exists.",
+      "minProperties": 1,
+      "additionalProperties": {"type": "number", "exclusiveMinimum": 0},
+      "propertyNames": {"pattern": "^[A-Za-z0-9.-]+$"}
+    },
+    "predicted_alpha_std_aleatoric": {
+      "type": "object",
+      "description": "ticker -> sqrt(1/alpha_), the std implied by the fit's learned noise precision. Written only under bayesian_posterior_predictive.",
+      "minProperties": 1,
+      "additionalProperties": {"type": "number", "exclusiveMinimum": 0},
+      "propertyNames": {"pattern": "^[A-Za-z0-9.-]+$"}
+    },
+    "predicted_alpha_std_epistemic": {
+      "type": "object",
+      "description": "ticker -> sqrt(x^T Sigma_w x), the estimation-error std from the weight posterior. Written only under bayesian_posterior_predictive; the only vector the executor's GUW Omega may be built from.",
+      "minProperties": 1,
+      "additionalProperties": {"type": "number", "minimum": 0},
+      "propertyNames": {"pattern": "^[A-Za-z0-9.-]+$"}
+    },
+    "predicted_alpha_std_method": {
+      "enum": ["bayesian_posterior_predictive", "purged_kfold_oos_residual", "omitted"],
+      "description": "How predicted_alpha_std was produced. 'omitted' means no honest figure exists for this fit: no std field is present and predicted_alpha_std_note says why."
+    },
+    "predicted_alpha_std_note": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The method's detail (e.g. how many out-of-sample residuals the variance rests on) or, under 'omitted', the reason no std was written."
     }
-  }
+  },
+  "dependentRequired": {
+    "predicted_alpha_std": ["predicted_alpha_std_method", "predicted_alpha_std_note"],
+    "predicted_alpha_std_aleatoric": ["predicted_alpha_std"],
+    "predicted_alpha_std_epistemic": ["predicted_alpha_std"],
+    "predicted_alpha_std_method": ["predicted_alpha_std_note"]
+  },
+  "allOf": [
+    {
+      "if": {"required": ["predicted_alpha_std_method"], "properties": {"predicted_alpha_std_method": {"const": "omitted"}}},
+      "then": {"not": {"anyOf": [{"required": ["predicted_alpha_std"]}, {"required": ["predicted_alpha_std_aleatoric"]}, {"required": ["predicted_alpha_std_epistemic"]}]}}
+    },
+    {
+      "if": {"required": ["predicted_alpha_std_method"], "properties": {"predicted_alpha_std_method": {"const": "bayesian_posterior_predictive"}}},
+      "then": {"required": ["predicted_alpha_std", "predicted_alpha_std_aleatoric", "predicted_alpha_std_epistemic"]}
+    },
+    {
+      "if": {"required": ["predicted_alpha_std_method"], "properties": {"predicted_alpha_std_method": {"const": "purged_kfold_oos_residual"}}},
+      "then": {
+        "required": ["predicted_alpha_std"],
+        "not": {"anyOf": [{"required": ["predicted_alpha_std_aleatoric"]}, {"required": ["predicted_alpha_std_epistemic"]}]}
+      }
+    }
+  ]
 }

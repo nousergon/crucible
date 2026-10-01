@@ -96,11 +96,16 @@ from crucible.slots.arms import (
 )
 from crucible.slots.inputs import (
     PER_ARM_REFUSALS,
+    UNCERTAINTY_OMITTED,
+    UNCERTAINTY_OOS_RESIDUAL,
+    UNCERTAINTY_POSTERIOR,
     BaseCoverage,
     BasePredictionsUnavailableError,
     EmptyDesignMatrixError,
+    FactorResidualUnavailableError,
     InputRef,
     InputRefusal,
+    PredictionUncertainty,
     SlotUnservableError,
     UnresolvedInputError,
     parse_input_ref,
@@ -114,15 +119,20 @@ __all__ = [
     "CPCV_OOS_IC_METRIC",
     "DEAD_SLOT_METRIC",
     "DISPERSION_METRICS",
+    "FACTOR_RESIDUAL_TARGET",
     "FLOOR_VETO_METRICS",
     "HIGH_CONFIDENCE_P_UP",
     "MIN_DISPERSION_RATIO",
     "SERVING_VETO_WINDOW_METRIC",
     "SETTLED_WINDOW_DECISION_DATES",
     "UNPRODUCED_VETO_METRICS",
+    "GAUSSIAN_ONE_SIGMA_COVERAGE",
+    "UNCERTAINTY_CALIBRATION_METRIC",
+    "Z_VAR_BAND",
     "M_SELECTION_TOP_N",
     "OOS_METHOD",
     "SLOT",
+    "TARGETS",
     "PROPORTION_METRICS",
     "UNITS_SUFFIXES",
     "ZERO_VETO_METRICS",
@@ -133,6 +143,9 @@ __all__ = [
     "FeatureLayerSource",
     "FeaturePanel",
     "Fit",
+    "FitUncertainty",
+    "PredictiveStd",
+    "UncertaintyCalibration",
     "MetricScaleError",
     "ModelGrade",
     "InputRef",
@@ -148,6 +161,7 @@ __all__ = [
     "calibrate_up_probability",
     "design_panel",
     "predict_cross_section",
+    "predict_uncertainty",
     "score_cross_section",
     "produce_arm_predictions",
     "TrainingWindowSpec",
@@ -155,7 +169,11 @@ __all__ = [
     "assert_units_suffixes",
     "cpcv_oos_ic",
     "evaluate_behavioural_veto",
+    "evaluate_uncertainty_calibration",
     "evaluate_input_completeness",
+    "factor_residual_panel",
+    "neutralize_cross_section",
+    "point_in_time_factor_betas",
     "grade",
     "grade_arm",
     "load_model_recipes",
@@ -637,6 +655,14 @@ class FeaturePanel:
     #: session it produces, which is what makes the intersection a figure on
     #: the board rather than a cross-section a reader notices is short.
     input_coverage: tuple[BaseCoverage, ...] = ()
+    #: Alternative FIT labels, keyed by :data:`TARGETS` name, each shaped like
+    #: :attr:`forward_returns` (`alpha-engine-config-I11791`). Empty on every
+    #: panel except one built for a :data:`FACTOR_RESIDUAL_TARGET` arm by
+    #: :func:`factor_residual_panel`. It is what such an arm is FITTED to and
+    #: what its std is calibrated against; :attr:`forward_returns` is left
+    #: untouched beside it because it is what EVERY arm is GRADED against, so
+    #: an easier label cannot win the slot by being easier.
+    target_returns: dict[str, np.ndarray] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         shape = (len(self.dates), len(self.names))
@@ -644,6 +670,11 @@ class FeaturePanel:
             raise ValueError(
                 f"forward_returns has shape {self.forward_returns.shape}, expected {shape}"
             )
+        for name, block in self.target_returns.items():
+            if block.shape != shape:
+                raise ValueError(
+                    f"target_returns[{name!r}] has shape {block.shape}, expected {shape}"
+                )
         for name, block in self.features.items():
             if block.shape != shape:
                 raise ValueError(f"feature {name!r} has shape {block.shape}, expected {shape}")
@@ -668,6 +699,7 @@ class FeaturePanel:
             feature_version=self.feature_version,
             resolved_inputs=self.resolved_inputs,
             input_coverage=self.input_coverage,
+            target_returns={k: v[:n] for k, v in self.target_returns.items()},
         )
 
     def with_zeroed(self, columns: tuple[str, ...]) -> FeaturePanel:
@@ -1158,13 +1190,30 @@ class ModelRecipe:
     #: `alpha-engine-config/strategy/`.
     max_incomplete_row_ratio: float | None = None
     #: What the arm is FITTED to (`alpha-engine-config-I10695`). `None` is the
-    #: slot's forward return, which every arm is graded against; the one
-    #: alternative, `abs_forward_return`, is a MAGNITUDE head — v1's volatility
-    #: L1, whose output is a stacked input and never a directional ranking.
+    #: slot's forward return, which every arm is graded against.
+    #: `abs_forward_return` is a MAGNITUDE head — v1's volatility L1, whose
+    #: output is a stacked input and never a directional ranking.
+    #: :data:`FACTOR_RESIDUAL_TARGET` is the forward return net of its
+    #: point-in-time beta/sector/size exposure (`alpha-engine-config-I11791`).
     #: Grading is unchanged by this field: it scores every arm against the
     #: signed forward return, so a magnitude head cannot win the slot on the
     #: strength of predicting how far a name moves.
     target: str | None = None
+    #: The trailing window, in SESSIONS, over which a
+    #: :data:`FACTOR_RESIDUAL_TARGET` arm estimates each name's factor betas
+    #: (`alpha-engine-config-I11791`). REQUIRED with that target and refused
+    #: with any other: a beta window is a tuned belief about how fast
+    #: exposures drift, so it is pre-registered with the arm rather than
+    #: defaulted by the harness, where a changed default would re-define every
+    #: such arm without moving its id.
+    factor_beta_window_trading_days: int | None = None
+    #: Cross-sectionally residualize every design column on the same
+    #: point-in-time factor betas before fitting and scoring
+    #: (:func:`neutralize_cross_section`). Only with
+    #: :data:`FACTOR_RESIDUAL_TARGET`, whose panel is the one that carries the
+    #: betas; a label stripped of factor return fitted on features that still
+    #: carry factor exposure spends its capacity re-learning the exposure.
+    neutralize_features: bool = False
     supersedes: str | None = None
     slot: str = "m"
     #: The v1 model this arm descends from, as v1 names it (a zoo
@@ -1209,6 +1258,41 @@ class ModelRecipe:
             raise ValueError(
                 f"arm {self.name!r}: target={self.target!r} is not one of {list(TARGETS)}"
             )
+        if self.target == FACTOR_RESIDUAL_TARGET:
+            if self.factor_beta_window_trading_days is None:
+                raise ValueError(
+                    f"arm {self.name!r}: target={FACTOR_RESIDUAL_TARGET!r} needs "
+                    "`factor_beta_window_trading_days` — the trailing session count its "
+                    "factor betas are estimated over. It is part of what the label IS, so "
+                    "it is declared and hashed, never defaulted."
+                )
+            if self.factor_beta_window_trading_days < MIN_FACTOR_BETA_WINDOW_TRADING_DAYS:
+                raise ValueError(
+                    f"arm {self.name!r}: factor_beta_window_trading_days="
+                    f"{self.factor_beta_window_trading_days} is below "
+                    f"{MIN_FACTOR_BETA_WINDOW_TRADING_DAYS}. A time-series regression on a "
+                    "handful of sessions fits the noise of the window, and its residual "
+                    "is then the label minus that noise."
+                )
+        else:
+            stray = [
+                key
+                for key, declared in (
+                    (
+                        "factor_beta_window_trading_days",
+                        self.factor_beta_window_trading_days is not None,
+                    ),
+                    ("neutralize_features", self.neutralize_features),
+                )
+                if declared
+            ]
+            if stray:
+                raise ValueError(
+                    f"arm {self.name!r}: {stray} only mean something with "
+                    f"target={FACTOR_RESIDUAL_TARGET!r}, whose panel carries the factor "
+                    f"betas; target={self.target!r} has none, so the declaration would be "
+                    "accepted and ignored."
+                )
         if self.estimator.kind == "fixed_linear":
             weighted = set(self.estimator.params["weights"])
             if weighted != set(self.design_columns):
@@ -1305,6 +1389,10 @@ class ModelRecipe:
             # Same rule again: an arm fitted to the forward return keeps the
             # id it registered under before this field existed.
             payload["target"] = self.target
+        if self.factor_beta_window_trading_days is not None:
+            payload["factor_beta_window_trading_days"] = int(self.factor_beta_window_trading_days)
+        if self.neutralize_features:
+            payload["neutralize_features"] = True
         return payload
 
     @property
@@ -1337,7 +1425,14 @@ REQUIRED_RECIPE_FIELDS: tuple[str, ...] = (
 #: ignored nowhere: it is a guarantee the loader cannot honour, and the
 #: loader refuses it by name.
 M_SPEC_KEYS: frozenset[str] = frozenset(
-    {*REQUIRED_RECIPE_FIELDS, "inputs", "max_incomplete_row_ratio", "target"}
+    {
+        *REQUIRED_RECIPE_FIELDS,
+        "inputs",
+        "max_incomplete_row_ratio",
+        "target",
+        "factor_beta_window_trading_days",
+        "neutralize_features",
+    }
 )
 
 #: Every top-level key a filed M recipe may declare (`alpha-engine-config-
@@ -1439,6 +1534,17 @@ class SlotRecipes:
         ]
 
 
+def _parse_bool(value: Any, *, field: str, origin: str) -> bool:
+    """A YAML boolean, refused when it is anything else.
+
+    `bool("false")` is ``True``; a recipe whose string is read as its
+    opposite is an arm nobody declared.
+    """
+    if not isinstance(value, bool):
+        raise ValueError(f"{origin}: spec.{field} must be true or false; got {value!r}")
+    return value
+
+
 def _parse_model_recipe(payload: bytes, origin: str) -> ModelRecipe:
     """One recipe document, from wherever its bytes came from.
 
@@ -1495,6 +1601,14 @@ def _parse_model_recipe(payload: bytes, origin: str) -> ModelRecipe:
             else float(spec["max_incomplete_row_ratio"])
         ),
         target=None if spec.get("target") is None else str(spec["target"]),
+        factor_beta_window_trading_days=(
+            None
+            if spec.get("factor_beta_window_trading_days") is None
+            else int(spec["factor_beta_window_trading_days"])
+        ),
+        neutralize_features=_parse_bool(
+            spec.get("neutralize_features", False), field="neutralize_features", origin=origin
+        ),
         supersedes=document.get("supersedes"),
         supersedes_v1=(
             None if document.get("supersedes_v1") is None else str(document["supersedes_v1"])
@@ -1639,6 +1753,8 @@ def design_panel(
     store: Any = None,
     lookback_trading_days: int = 0,
     ctx: Any = None,
+    attribution: Any = None,
+    strategy_dir: Path | str | None = None,
 ) -> FeaturePanel:
     """The ONE way to obtain a panel an M arm can be fitted on.
 
@@ -1652,6 +1768,18 @@ def design_panel(
     :func:`crucible.slots.inputs.resolve_declared_inputs`, so a panel handed
     to :func:`train_arm` or :func:`grade_arm` carries the arm's WHOLE design
     matrix or the call already failed.
+
+    **A :data:`FACTOR_RESIDUAL_TARGET` arm also gets its label here**
+    (`alpha-engine-config-I11791`): the layer is read
+    `factor_beta_window_trading_days` sessions deeper, with ``close_raw``,
+    and :func:`factor_residual_panel` builds the residual label and trims the
+    extra sessions back off — so the panel spans the same sessions it would
+    for any other arm. ``attribution`` is the factor spec; when ``None`` it is
+    read from ``strategy_dir`` or the store exactly as the S slot reads it.
+    With `neutralize_features`, every design column — stacked inputs included
+    — is then residualized on the same betas (:func:`neutralize_cross_
+    section`), once, here, so the fit, the walk-forward and the serving row
+    all read the same neutralized values.
 
     **Base ids are resolved here, from the loaded recipe set.** The caller
     never supplies them, so the mapping cannot name an arm other than the one
@@ -1678,6 +1806,40 @@ def design_panel(
             arm=recipe.name,
             unresolvable=("spec.features", "spec.inputs"),
         )
+    if recipe.target == FACTOR_RESIDUAL_TARGET:
+        params = (
+            attribution
+            if attribution is not None
+            else _load_factor_spec(
+                recipe,
+                store=store if store is not None else source.store,
+                strategy_dir=strategy_dir,
+            )
+        )
+        raw = source.panel(
+            trading_day=trading_day,
+            columns=tuple(dict.fromkeys((*columns, "close_raw"))),
+            lookback_trading_days=lookback_trading_days
+            + int(recipe.factor_beta_window_trading_days or 0),
+            label_horizon_trading_days=recipe.label_horizon_trading_days,
+            ctx=ctx,
+        )
+        panel, betas = factor_residual_panel(recipe, raw, params)
+        if recipe.inputs:
+            panel = resolve_declared_inputs(
+                panel,
+                store=store if store is not None else source.store,
+                recipe=recipe,
+                base_arm_ids=_base_arm_ids(recipe, recipes),
+                ctx=ctx,
+            )
+        if not recipe.neutralize_features:
+            return panel
+        neutral = {
+            column: neutralize_cross_section(panel.column(column), betas)
+            for column in recipe.design_columns
+        }
+        return replace(panel, features={**panel.features, **neutral})
     panel = (
         source.label_panel(
             trading_day=trading_day,
@@ -1710,6 +1872,230 @@ def design_panel(
         base_arm_ids=_base_arm_ids(recipe, recipes),
         ctx=ctx,
     )
+
+
+# ---------------------------------------------------------------------------
+# The factor-residual target (`alpha-engine-config-I11791`).
+# ---------------------------------------------------------------------------
+
+
+def point_in_time_factor_betas(
+    stock_log_returns: np.ndarray, factor_log_returns: np.ndarray, *, window: int
+) -> np.ndarray:
+    """Each name's factor betas on each session, from the TRAILING window only.
+
+    ``stock_log_returns`` is ``(T, N)`` and ``factor_log_returns`` ``(T, k)``,
+    both one-session log returns on the panel's own session axis (row ``j``
+    is the return from close ``j - 1`` to close ``j``). The betas on row ``i``
+    are the OLS slopes, with an intercept, of the ``window`` returns on rows
+    ``i - window + 1 .. i`` — returns realized by the close of session ``i``,
+    which is the label's START. Nothing at or after row ``i + 1`` enters, so
+    the exposure a label is stripped of is one that could have been estimated
+    on the day the prediction was made; ``TestNoLookAhead`` asserts it by
+    truncation.
+
+    The intercept is estimated and DISCARDED: it is the name's own drift, which
+    is stock-specific return, and removing it would strip from the label the
+    very thing the arm exists to predict.
+
+    A window with any non-finite FACTOR return leaves the whole row NULL, and
+    a name with any non-finite return in the window leaves that name NULL on
+    that row — an unmeasurable beta is not a beta of zero, and a zero would
+    leave the factor's whole move in the residual without saying so. Collinear
+    proxies (sector ETFs move with the market) are solved by `lstsq`'s
+    minimum-norm solution, as `nousergon_lib.quant.factor_risk` does: the
+    per-factor split is then not identified, but the TOTAL explained return —
+    the only thing the residual depends on — is.
+    """
+    n_dates, n_names = stock_log_returns.shape
+    if factor_log_returns.shape[0] != n_dates:
+        raise ValueError(
+            f"{factor_log_returns.shape[0]} factor session(s) against {n_dates} stock "
+            "session(s); the two return blocks must share the panel's session axis"
+        )
+    n_factors = factor_log_returns.shape[1]
+    if window < n_factors + 2:
+        raise ValueError(
+            f"a {window}-session window cannot determine {n_factors} betas and an "
+            "intercept; it needs at least k + 2 sessions"
+        )
+    betas = np.full((n_dates, n_names, n_factors), np.nan)
+    design_ones = np.ones((window, 1))
+    for i in range(window - 1, n_dates):
+        lo = i - window + 1
+        factors = factor_log_returns[lo : i + 1]
+        if not np.isfinite(factors).all():
+            continue
+        block = stock_log_returns[lo : i + 1]
+        complete = np.isfinite(block).all(axis=0)
+        if not complete.any():
+            continue
+        design = np.hstack([design_ones, factors])
+        coef, *_ = np.linalg.lstsq(design, block[:, complete], rcond=None)
+        betas[i, complete, :] = coef[1:].T
+    return betas
+
+
+def _log_closes(closes: np.ndarray) -> np.ndarray:
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.log(np.where(closes > 0, closes, np.nan))
+
+
+def factor_residual_panel(
+    recipe: ModelRecipe, panel: FeaturePanel, params: Any
+) -> tuple[FeaturePanel, np.ndarray]:
+    """``panel`` with its :data:`FACTOR_RESIDUAL_TARGET` label, and the betas.
+
+    ``panel`` must carry ``close_raw`` and reach ``recipe.
+    factor_beta_window_trading_days`` sessions further back than the window
+    the arm trains on; :func:`design_panel` reads it that way. ``params`` is
+    the fleet's :class:`crucible.attribution.AttributionFactorParams` — the
+    SAME beta/sector/size proxy spec the S slot's book is attributed against,
+    deliberately not a per-arm choice: an arm able to pick its own factors
+    could pick a set that leaves whatever it predicts in the residual.
+
+    **The label.** For session ``t`` and horizon ``h``::
+
+        y_res[t, n] = log(1 + R[t, n]) - sum_k beta[t, n, k] * F_k(t -> t + h)
+
+    where ``R`` is the panel's own forward simple return (close ``t`` to
+    close ``t + h``), ``F_k`` is factor ``k``'s forward log return over the
+    SAME sessions (a spread factor's is its long leg's minus its short leg's),
+    and ``beta[t]`` is :func:`point_in_time_factor_betas` over the
+    ``factor_beta_window_trading_days`` one-session log returns ending at
+    close ``t``. Log returns, so a factor model linear in daily returns is
+    linear over the horizon too and the decomposition is exact rather than a
+    compounding approximation; the v1 champion's anchor is a 21-session LOG
+    alpha, so the served number keeps those units.
+
+    **Why there is no look-ahead.** The betas use returns realized by close
+    ``t``. The factor returns over ``t -> t + h`` are not a prediction input:
+    they are part of the realized return being decomposed, exactly as the
+    label's own ``R`` is, and they settle on the same session — so the purge
+    :func:`settled_training_days` already applies to ``R`` covers them.
+
+    **Returned trimmed.** The first ``factor_beta_window_trading_days`` rows
+    have no full window behind them; they are dropped so every row the arm
+    trains on carries a label, rather than counted against the arm's
+    incomplete-row ceiling as if the layer had failed. ``close_raw`` is
+    dropped too unless the recipe declares it as a feature.
+
+    :attr:`FeaturePanel.forward_returns` is NOT touched. It is what every arm
+    is graded against, and this label is only what this arm is fitted to.
+    """
+    window = recipe.factor_beta_window_trading_days
+    if window is None:
+        raise ValueError(f"arm {recipe.name!r} declares no factor_beta_window_trading_days")
+    closes = panel.column("close_raw")
+    index = {name: i for i, name in enumerate(panel.names)}
+    factor_names = tuple(sorted(params.factors))
+    proxies = sorted(
+        {p for f in params.factors.values() for p in (f.proxy, f.short_proxy) if p is not None}
+    )
+    absent = [p for p in proxies if p not in index]
+    if absent:
+        raise FactorResidualUnavailableError(
+            f"arm {recipe.name!r}: factor proxy(ies) {absent} named by the attribution spec "
+            f"are not in the feature layer's cross-section on {panel.dates[-1]}. The layer "
+            "carries a proxy only when the spec declares it at compile time "
+            "(`crucible.data.daily`); no factor return is invented for a missing one.",
+            arm=recipe.name,
+            unresolvable=tuple(absent),
+        )
+    log_closes = _log_closes(closes)
+    unpriced: dict[str, list[str]] = {}
+    for proxy in proxies:
+        priced = np.isfinite(log_closes[:, index[proxy]])
+        missing = [d for d, ok in zip(panel.dates, priced, strict=True) if not ok]
+        if missing:
+            unpriced[proxy] = missing
+    if unpriced:
+        raise FactorResidualUnavailableError(
+            f"arm {recipe.name!r}: factor proxy(ies) carry no close on session(s) the betas "
+            f"or the label need: "
+            f"{ {p: [days[0], days[-1], len(days)] for p, days in unpriced.items()} } "
+            "([first, last, count]). A zero factor return would leave that factor's move in "
+            "the residual, so the arm is refused rather than fitted on one.",
+            arm=recipe.name,
+            unresolvable=tuple(sorted(unpriced)),
+        )
+
+    n_dates = len(panel.dates)
+    daily = np.full_like(log_closes, np.nan)
+    daily[1:] = log_closes[1:] - log_closes[:-1]
+
+    def leg(series: np.ndarray, factor: Any) -> np.ndarray:
+        long = series[:, index[factor.proxy]]
+        if factor.short_proxy is None:
+            return long
+        return long - series[:, index[factor.short_proxy]]
+
+    factor_daily = np.column_stack([leg(daily, params.factors[f]) for f in factor_names])
+    betas = point_in_time_factor_betas(daily, factor_daily, window=int(window))
+
+    horizon = recipe.label_horizon_trading_days
+    forward_log_closes = np.full_like(log_closes, np.nan)
+    if horizon < n_dates:
+        forward_log_closes[:-horizon] = log_closes[horizon:] - log_closes[:-horizon]
+    factor_forward = np.column_stack(
+        [leg(forward_log_closes, params.factors[f]) for f in factor_names]
+    )
+    with np.errstate(invalid="ignore"):
+        stock_forward = np.log1p(panel.forward_returns)
+    residual = stock_forward - np.einsum("tnk,tk->tn", betas, factor_forward)
+
+    trim = min(int(window), n_dates)
+    keep = set(recipe.features)
+    trimmed = replace(
+        panel,
+        dates=panel.dates[trim:],
+        features={k: v[trim:] for k, v in panel.features.items() if k in keep},
+        forward_returns=panel.forward_returns[trim:],
+        target_returns={**panel.target_returns, FACTOR_RESIDUAL_TARGET: residual[trim:]},
+    )
+    return trimmed, betas[trim:]
+
+
+def neutralize_cross_section(values: np.ndarray, betas: np.ndarray) -> np.ndarray:
+    """``values`` residualized, per session, on that session's factor betas.
+
+    For each session, an OLS of the column on ``[1, beta_1 .. beta_k]`` across
+    every name carrying both, and the residual in its place. Same-session
+    only: the betas on a row are point-in-time (:func:`point_in_time_factor_
+    betas`), so a neutralized feature knows nothing the raw one did not. A
+    name without a beta, or a session with fewer than ``k + 2`` such names, is
+    NULL rather than passed through raw — half a cross-section neutralized and
+    half not is a column measuring two different things.
+    """
+    n_dates, n_names = values.shape
+    n_factors = betas.shape[2]
+    out = np.full((n_dates, n_names), np.nan)
+    for t in range(n_dates):
+        usable = np.isfinite(values[t]) & np.isfinite(betas[t]).all(axis=1)
+        if int(usable.sum()) < n_factors + 2:
+            continue
+        design = np.hstack([np.ones((int(usable.sum()), 1)), betas[t][usable]])
+        coef, *_ = np.linalg.lstsq(design, values[t][usable], rcond=None)
+        out[t, usable] = values[t][usable] - design @ coef
+    return out
+
+
+def _load_factor_spec(recipe: ModelRecipe, *, store: Any, strategy_dir: Path | str | None) -> Any:
+    """The attribution spec a factor-residual arm residualizes against."""
+    from crucible.attribution import (  # noqa: PLC0415 - only factor-residual arms pay for it
+        AttributionParamsError,
+        load_attribution_params_from_store,
+    )
+
+    try:
+        return load_attribution_params_from_store(store=store, strategy_dir=strategy_dir)
+    except AttributionParamsError as exc:
+        raise FactorResidualUnavailableError(
+            f"arm {recipe.name!r}: target={FACTOR_RESIDUAL_TARGET!r} residualizes against the "
+            f"attribution spec, which could not be read: {exc}",
+            arm=recipe.name,
+            unresolvable=("strategy/slots/attribution.yaml",),
+        ) from exc
 
 
 def _base_arm_ids(recipe: ModelRecipe, recipes: Sequence[ModelRecipe]) -> dict[str, str]:
@@ -1995,7 +2381,7 @@ def feature_completeness(
     nan_rows_by_column: dict[str, int] = {}
     for index, column in enumerate(recipe.design_columns):
         nan_rows_by_column[column] = int((~np.isfinite(matrix[:, index])).sum())
-    nan_rows_by_column["forward_return"] = int((~np.isfinite(labels)).sum())
+    nan_rows_by_column[_label_column(recipe)] = int((~np.isfinite(labels)).sum())
 
     dropped = rows[~complete]
     excluded_names = tuple(sorted({panel.names[int(r) % n_names] for r in dropped}))
@@ -2078,8 +2464,45 @@ def settled_training_days(panel: FeaturePanel, *, as_of: str, label_horizon: int
     return settled
 
 
+def _target_labels(recipe: ModelRecipe, panel: FeaturePanel, rows: np.ndarray) -> np.ndarray:
+    """The label the recipe is FITTED to, on the panel's flattened ``rows``.
+
+    One function, because the fit, the out-of-sample residuals the std rests
+    on and the calibration check must all measure error against the same
+    quantity — a magnitude head's std is a std of ``|r|``, not of ``r``, and a
+    factor-residual arm's is a std of the residual it predicts.
+
+    Never called by the GRADER's score: :func:`grade_arm` and
+    :func:`cpcv_oos_ic` rank every arm against ``panel.forward_returns``
+    whatever it was fitted to.
+    """
+    raw = panel.forward_returns.reshape(-1)[rows]
+    if recipe.target == "abs_forward_return":
+        return np.abs(raw)
+    if recipe.target == FACTOR_RESIDUAL_TARGET:
+        block = panel.target_returns.get(FACTOR_RESIDUAL_TARGET)
+        if block is None:
+            raise ValueError(
+                f"arm {recipe.name!r} is fitted to {FACTOR_RESIDUAL_TARGET!r}, and this panel "
+                f"carries no such label (it carries {sorted(panel.target_returns)}). Build "
+                "the panel through `design_panel`, which computes it; fitting the raw "
+                "forward return in its place would be a different arm wearing this id."
+            )
+        return block.reshape(-1)[rows]
+    return raw
+
+
+def _label_column(recipe: ModelRecipe) -> str:
+    """The completeness record's name for the label column."""
+    return FACTOR_RESIDUAL_TARGET if recipe.target == FACTOR_RESIDUAL_TARGET else "forward_return"
+
+
 def _fit_rows(
-    recipe: ModelRecipe, panel: FeaturePanel, day_indices: list[int]
+    recipe: ModelRecipe,
+    panel: FeaturePanel,
+    day_indices: list[int],
+    *,
+    with_uncertainty: bool = False,
 ) -> tuple[FittedEstimator, int, FeatureCompleteness]:
     """Fit the recipe on the named panel days. Raises on an unsound fit.
 
@@ -2087,11 +2510,20 @@ def _fit_rows(
     and the walk-forward grader — because a grading path that fits by
     slightly different code from the serving path is how "the model changed"
     and "the measurement changed" become indistinguishable.
+
+    ``with_uncertainty`` asks a fit with no native posterior for its
+    out-of-sample residual std (:func:`_purged_kfold_uncertainty`). The
+    serving fit and every walk-forward refit ask; a CV sub-fit does not, and
+    carries :data:`_NOT_COMPUTED` — it exists to measure an error, never to
+    serve one, and asking would nest a k-fold inside every fold.
     """
     n_names = len(panel.names)
     rows = np.array([d * n_names + n for d in day_indices for n in range(n_names)], dtype=int)
     matrix = _design(recipe, panel, rows)
-    labels = panel.forward_returns.reshape(-1)[rows]
+    # The FITTED label, so a row whose factor-residual label is unmeasurable
+    # (a name with no full beta window) is selected out and counted exactly
+    # as a row with an unsettled return is.
+    labels = _target_labels(recipe, panel, rows)
 
     # SELECT, then assert. The order is the whole design: `_assert_trainable`
     # is unchanged and still refuses any non-finite cell (Brian ruling
@@ -2116,12 +2548,97 @@ def _fit_rows(
         )
     matrix = matrix[complete]
     labels = labels[complete]
-    if recipe.target == "abs_forward_return":
-        labels = np.abs(labels)
 
     _assert_trainable(recipe, matrix, labels)
     fitted = _fit_estimator(recipe, matrix, labels)
+    if with_uncertainty and fitted.uncertainty.method != UNCERTAINTY_POSTERIOR:
+        fitted = replace(fitted, uncertainty=_purged_kfold_uncertainty(recipe, panel, day_indices))
     return fitted, int(matrix.shape[0]), record
+
+
+def _purged_kfold_uncertainty(
+    recipe: ModelRecipe, panel: FeaturePanel, day_indices: Sequence[int]
+) -> FitUncertainty:
+    """The out-of-sample residual variance of ``recipe`` over its own window.
+
+    `alpha-engine-config-I11791`, for every estimator with no posterior. The
+    training days are split into the recipe's ``cpcv.n_groups`` contiguous
+    blocks; each block is predicted by a fit on the OTHER blocks, purged and
+    embargoed exactly as :func:`cpcv_oos_ic` purges — every day whose
+    ``label_horizon`` window reaches into the test block is dropped before
+    it, and ``embargo_trading_days`` after it. That is the slot's own CPCV
+    construction at ``k_test = 1``: each training day is predicted exactly
+    once, by a fit that never saw its label, so the pooled mean squared
+    residual is an honest estimate of the serving fit's error rather than of
+    how well it memorised its rows.
+
+    Mean SQUARED residual, not the residuals' variance: a std is a claim
+    about ``E[(y - y_hat)^2]``, and a biased fit's bias is error the trader
+    should see, not a mean to be subtracted away.
+
+    Returns an OMITTED reading — never a small number — when any block
+    cannot be fitted or the pooled variance is not positive. An arm with a
+    zero out-of-sample residual is leaking its label, and serving that as
+    certainty is the failure this function exists to prevent.
+    """
+    days = sorted(int(d) for d in day_indices)
+    k = recipe.cpcv.n_groups
+    horizon = recipe.label_horizon_trading_days
+    embargo = recipe.cpcv.embargo_trading_days
+    n_names = len(panel.names)
+    if len(days) < k:
+        return FitUncertainty(
+            method=UNCERTAINTY_OMITTED,
+            note=(
+                f"{len(days)} training day(s) cannot be split into the recipe's "
+                f"{k} purged folds, so no out-of-sample residual exists to estimate a "
+                "std from; an in-sample residual would understate the error"
+            ),
+        )
+    squared = 0.0
+    count = 0
+    for start, end in _contiguous_groups(len(days), k):
+        test = days[start : end + 1]
+        first, last = test[0], test[-1]
+        train = [d for d in days if d < first - horizon or d > last + embargo]
+        try:
+            fold, _, _ = _fit_rows(recipe, panel, train)
+        except (TrainingIntegrityError, np.linalg.LinAlgError) as exc:
+            return FitUncertainty(
+                method=UNCERTAINTY_OMITTED,
+                note=(
+                    f"the purged fold testing {panel.dates[first]}..{panel.dates[last]} "
+                    f"could not be fitted on {len(train)} day(s): {exc}"
+                ),
+            )
+        rows = _flatten(np.asarray(test), n_names)
+        predicted = fold.predict(_design(recipe, panel, rows))
+        actual = _target_labels(recipe, panel, rows)
+        usable = np.isfinite(predicted) & np.isfinite(actual)
+        squared += float(np.sum((actual[usable] - predicted[usable]) ** 2))
+        count += int(usable.sum())
+    variance = squared / count if count else float("nan")
+    if not (math.isfinite(variance) and variance > 0.0):
+        return FitUncertainty(
+            method=UNCERTAINTY_OMITTED,
+            note=(
+                f"the purged {k}-fold read an out-of-sample residual variance of "
+                f"{variance!r} over {count} residual(s); a non-positive or undefined "
+                "error is a leak or an empty block, not a certainty to serve"
+            ),
+        )
+    return FitUncertainty(
+        method=UNCERTAINTY_OOS_RESIDUAL,
+        note=(
+            f"{recipe.estimator.kind} has no posterior: mean squared out-of-sample "
+            f"residual of a purged {k}-fold over the fit's {len(days)} training day(s) "
+            f"({count} residual(s), {horizon}-session purge, {embargo}-session embargo). "
+            "Cross-sectionally flat; no aleatoric/epistemic split is measured, so none "
+            "is written"
+        ),
+        residual_variance=variance,
+        n_residuals=count,
+    )
 
 
 def train_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> Fit:
@@ -2152,7 +2669,7 @@ def train_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> Fit:
     if recipe.training_window.kind == "rolling":
         usable = usable[-recipe.training_window.min_trading_days :]
 
-    fitted, n_rows, completeness = _fit_rows(recipe, panel, usable)
+    fitted, n_rows, completeness = _fit_rows(recipe, panel, usable, with_uncertainty=True)
     return Fit(
         arm_id=recipe.arm_id,
         recipe=recipe,
@@ -2239,6 +2756,52 @@ def predict_cross_section(fit: Fit, panel: FeaturePanel, *, trading_day: str) ->
     return predicted
 
 
+def predict_uncertainty(
+    fit: Fit, panel: FeaturePanel, *, trading_day: str, names: Sequence[str]
+) -> PredictionUncertainty:
+    """``fit``'s predictive std for ``names`` on one session — the served std.
+
+    `alpha-engine-config-I11791`. ``names`` is the cross-section
+    :func:`score_cross_section` already scored, so the std covers exactly the
+    names that carry an alpha. Through :meth:`FittedEstimator.predict_std`,
+    the same call the walk-forward calibration check makes, so the std that
+    is served is the std that was graded.
+
+    A non-finite or non-positive std on a scored name is a defect in the fit
+    and RAISES, exactly as a non-finite prediction does: writing it would be
+    a hole, and writing a zero in its place would be a claim of certainty.
+    """
+    row = panel.dates.index(trading_day)
+    index = {n: i for i, n in enumerate(panel.names)}
+    wanted = set(names)
+    chosen = [n for n in panel.names if n in wanted]
+    rows = row * len(panel.names) + np.array([index[n] for n in chosen], dtype=int)
+    std = fit.fitted.predict_std(_design(fit.recipe, panel, rows))
+    if std.total is None:
+        return PredictionUncertainty(method=std.method, note=std.note)
+    bad = [n for n, v in zip(chosen, std.total, strict=True) if not (np.isfinite(v) and v > 0)]
+    if bad:
+        raise TrainingIntegrityError(
+            f"arm {fit.recipe.name}: {len(bad)} scored name(s) produced a non-finite or "
+            f"non-positive predictive std on {trading_day}, first five {bad[:5]}. A std "
+            "of zero is a claim of certainty, and a hole is a name the executor would "
+            "size with no noise penalty; neither is written."
+        )
+
+    def as_map(values: np.ndarray | None) -> dict[str, float] | None:
+        if values is None:
+            return None
+        return {n: float(v) for n, v in zip(chosen, values, strict=True)}
+
+    return PredictionUncertainty(
+        method=std.method,
+        note=std.note,
+        std=as_map(std.total),
+        aleatoric=as_map(std.aleatoric),
+        epistemic=as_map(std.epistemic),
+    )
+
+
 def produce_arm_predictions(ctx: Any, *, fit: Fit, panel: FeaturePanel, trading_day: str) -> str:
     """Write ONE arm's cross-section for ONE session. The M produce path.
 
@@ -2257,17 +2820,124 @@ def produce_arm_predictions(ctx: Any, *, fit: Fit, panel: FeaturePanel, trading_
     # universe change nobody can see.
     for coverage in panel.input_coverage:
         ctx.record_metric(coverage.as_metric(slot=SLOT, trading_day=trading_day, phase="serving"))
+    predicted = predict_cross_section(fit, panel, trading_day=trading_day)
     return write_arm_predictions(
         ctx,
         arm_id=fit.arm_id,
         trading_day=trading_day,
         feature_version=panel.feature_version,
-        predicted_alpha=predict_cross_section(fit, panel, trading_day=trading_day),
+        predicted_alpha=predicted,
+        uncertainty=predict_uncertainty(
+            fit, panel, trading_day=trading_day, names=tuple(predicted)
+        ),
     )
 
 
+#: The factor-residual label (`alpha-engine-config-I11791`): the forward
+#: return with its point-in-time exposure to the attribution spec's
+#: beta/sector/size factors removed. See :func:`factor_residual_panel`.
+FACTOR_RESIDUAL_TARGET = "factor_residual_forward_return"
+
 #: The fit targets a recipe may declare. `None` on the recipe means the first.
-TARGETS: tuple[str, ...] = ("forward_return", "abs_forward_return")
+TARGETS: tuple[str, ...] = ("forward_return", "abs_forward_return", FACTOR_RESIDUAL_TARGET)
+
+#: The shortest factor-beta window a recipe may declare. An order-of-magnitude
+#: guard, not a tuned value: the attribution spec carries six factors, and a
+#: regression with an intercept needs `k + 2` sessions merely to be
+#: determined — a few more than that and the betas are the window's noise.
+#: The tuned window is the recipe's (`factor_beta_window_trading_days`).
+MIN_FACTOR_BETA_WINDOW_TRADING_DAYS = 20
+
+
+@dataclass(frozen=True)
+class PredictiveStd:
+    """Per-row predictive std for one design matrix, and how it was produced.
+
+    ``total`` is ``None`` exactly when ``method`` is
+    :data:`~crucible.slots.inputs.UNCERTAINTY_OMITTED`; ``aleatoric`` and
+    ``epistemic`` are present only under the posterior method. All three are
+    STDs, not variances, matching the fields the executor reads.
+    """
+
+    method: str
+    note: str
+    total: np.ndarray | None = None
+    aleatoric: np.ndarray | None = None
+    epistemic: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class FitUncertainty:
+    """What one fit knows about its own predictive error.
+
+    `alpha-engine-config-I11791`. The executor's conviction gate turns
+    turnover throttling OFF (q = 1) when the champion's predictions carry no
+    std, so a predictor that discards its noise estimate silently disables a
+    risk control the moment it is promoted. Every fit that reaches serving or
+    the walk-forward grader therefore carries one of three readings:
+
+    * **posterior** (`bayesian_ridge`): the evidence-maximised noise
+      precision ``alpha_`` and the weight posterior covariance ``Sigma_w``
+      over the CENTRED design, scikit-learn's ``BayesianRidge.predict(
+      return_std=True)`` term for term: aleatoric ``1/alpha_``, epistemic
+      ``(x - centre)^T Sigma_w (x - centre)``. No extra fit.
+    * **out-of-sample residual** (`ols`, `ridge`, `fixed_linear`,
+      `lightgbm`): none of these has a posterior, and an IN-sample residual
+      variance understates the error of a fit that chose its weights on those
+      very rows. The variance is the mean squared residual of a purged k-fold
+      over the fit's own training days — :func:`_purged_kfold_uncertainty`,
+      the slot's CPCV purge and embargo at ``k_test = 1`` — so every residual
+      it rests on was predicted by a fit that never saw that day's label. It
+      is cross-sectionally flat by construction and carries no
+      aleatoric/epistemic split, which is recorded rather than invented.
+    * **omitted**: neither is available (the k-fold could not be fitted, or
+      read a zero variance). ``note`` says why, and the document carries no
+      std — never a zero, which downstream reads as certainty.
+    """
+
+    method: str
+    note: str
+    noise_variance: float | None = None
+    weight_covariance: np.ndarray | None = None
+    feature_centre: np.ndarray | None = None
+    residual_variance: float | None = None
+    n_residuals: int = 0
+
+    def predict_std(self, matrix: np.ndarray) -> PredictiveStd:
+        if self.method == UNCERTAINTY_POSTERIOR:
+            centred = matrix - self.feature_centre
+            epistemic_var = np.einsum("ij,jk,ik->i", centred, self.weight_covariance, centred)
+            # A posterior covariance is PSD, so a negative quadratic form is
+            # rounding at the 1e-17 scale and nothing else.
+            epistemic_var = np.maximum(epistemic_var, 0.0)
+            aleatoric_var = np.full(matrix.shape[0], float(self.noise_variance))
+            return PredictiveStd(
+                method=self.method,
+                note=self.note,
+                total=np.sqrt(aleatoric_var + epistemic_var),
+                aleatoric=np.sqrt(aleatoric_var),
+                epistemic=np.sqrt(epistemic_var),
+            )
+        if self.method == UNCERTAINTY_OOS_RESIDUAL:
+            return PredictiveStd(
+                method=self.method,
+                note=self.note,
+                total=np.full(matrix.shape[0], math.sqrt(float(self.residual_variance))),
+            )
+        return PredictiveStd(method=self.method, note=self.note)
+
+
+#: The reading a fit carries when nobody asked it for one — a CPCV fold or a
+#: purged k-fold's own sub-fit, which exist to MEASURE an error and are never
+#: served. Stated, so a path that forgot to ask reads as omitted rather than
+#: as a fit with no error.
+_NOT_COMPUTED = FitUncertainty(
+    method=UNCERTAINTY_OMITTED,
+    note=(
+        "this fit was not asked for a predictive std: it is a cross-validation "
+        "sub-fit, and only a fit that serves or is walked forward carries one"
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -2278,12 +2948,18 @@ class FittedEstimator:
     booster. ONE `predict`, called by the serving path, the CPCV folds and the
     walk-forward grader alike, so no caller multiplies weights by hand and a
     non-linear kind cannot be scored by code that assumes a linear one.
+
+    ``uncertainty`` is the same idea for the std (`alpha-engine-config-
+    I11791`): ONE :meth:`predict_std`, called by the produce path and by the
+    walk-forward grader's calibration check, so the std that is served is the
+    std that was calibrated.
     """
 
     kind: str
     coefficients: np.ndarray | None = None
     intercept: float = 0.0
     booster: Any = None
+    uncertainty: FitUncertainty = _NOT_COMPUTED
 
     def predict(self, matrix: np.ndarray) -> np.ndarray:
         if self.kind == "lightgbm":
@@ -2293,6 +2969,9 @@ class FittedEstimator:
             return np.asarray(self.booster.predict(matrix, num_threads=1), dtype="float64")
         return matrix @ self.coefficients + self.intercept
 
+    def predict_std(self, matrix: np.ndarray) -> PredictiveStd:
+        return self.uncertainty.predict_std(matrix)
+
 
 def _fit_estimator(recipe: ModelRecipe, matrix: np.ndarray, labels: np.ndarray) -> FittedEstimator:
     """Dispatch on the recipe's closed estimator vocabulary."""
@@ -2301,8 +2980,13 @@ def _fit_estimator(recipe: ModelRecipe, matrix: np.ndarray, labels: np.ndarray) 
         coefficients, intercept = _fit_linear(estimator, matrix, labels)
         return FittedEstimator(kind=estimator.kind, coefficients=coefficients, intercept=intercept)
     if estimator.kind == "bayesian_ridge":
-        coefficients, intercept = _fit_bayesian_ridge(recipe, matrix, labels)
-        return FittedEstimator(kind=estimator.kind, coefficients=coefficients, intercept=intercept)
+        coefficients, intercept, posterior = _fit_bayesian_ridge_posterior(recipe, matrix, labels)
+        return FittedEstimator(
+            kind=estimator.kind,
+            coefficients=coefficients,
+            intercept=intercept,
+            uncertainty=posterior,
+        )
     if estimator.kind == "fixed_linear":
         weights = estimator.params["weights"]
         return FittedEstimator(
@@ -2355,6 +3039,14 @@ def _fit_lightgbm(estimator: EstimatorSpec, matrix: np.ndarray, labels: np.ndarr
 def _fit_bayesian_ridge(
     recipe: ModelRecipe, matrix: np.ndarray, labels: np.ndarray
 ) -> tuple[np.ndarray, float]:
+    """The point estimate of :func:`_fit_bayesian_ridge_posterior`."""
+    coefficients, intercept, _ = _fit_bayesian_ridge_posterior(recipe, matrix, labels)
+    return coefficients, intercept
+
+
+def _fit_bayesian_ridge_posterior(
+    recipe: ModelRecipe, matrix: np.ndarray, labels: np.ndarray
+) -> tuple[np.ndarray, float, FitUncertainty]:
     """Bayesian ridge by evidence maximisation (MacKay), centred.
 
     The algorithm and the defaults are scikit-learn's `BayesianRidge` — the
@@ -2368,6 +3060,14 @@ def _fit_bayesian_ridge(
     **Non-convergence raises.** The iteration's result at `max_iter` is a
     ridge fit at whatever penalty it had reached, which is a model nobody
     declared; the fit fails rather than serving it.
+
+    **The posterior is kept, not discarded** (`alpha-engine-config-I11791`).
+    The learned noise precision ``alpha`` and the weight posterior
+    ``Sigma_w = (lambda I + alpha X^T X)^-1`` over the centred design are
+    returned as a :class:`FitUncertainty` — scikit-learn's ``sigma_`` and
+    ``alpha_``, the terms ``predict(return_std=True)`` is built from. Until
+    this existed they were computed on every iteration and thrown away, so
+    the M slot's one Bayesian estimator served a point estimate only.
     """
     params = recipe.estimator.params
     max_iter = int(params.get("max_iter", 300))
@@ -2411,7 +3111,26 @@ def _fit_bayesian_ridge(
             "penalty the evidence never settled on — a model nobody declared."
         )
     coefficients = _coefficients(alpha, lam)
-    return coefficients, label_mean - float(centre @ coefficients)
+    n_features = centred.shape[1]
+    # Solved, not inverted through the SVD: with fewer rows than features the
+    # thin SVD has no basis for the null space, where the posterior is the
+    # prior (1/lambda). The p x p solve is exact in both regimes and p is a
+    # handful of columns.
+    weight_covariance = np.linalg.solve(
+        lam * np.eye(n_features) + alpha * (centred.T @ centred), np.eye(n_features)
+    )
+    posterior = FitUncertainty(
+        method=UNCERTAINTY_POSTERIOR,
+        note=(
+            f"bayesian_ridge posterior predictive over {n_samples} training row(s): "
+            f"aleatoric = 1/alpha_ (alpha_={alpha:.6g}), epistemic = x^T Sigma_w x "
+            f"(lambda_={lam:.6g}), total = sqrt(aleatoric + epistemic)"
+        ),
+        noise_variance=1.0 / alpha,
+        weight_covariance=weight_covariance,
+        feature_centre=centre,
+    )
+    return coefficients, label_mean - float(centre @ coefficients), posterior
 
 
 def _fit_linear(
@@ -2749,6 +3468,212 @@ class SettledCrossSections:
         )
 
 
+# ---------------------------------------------------------------------------
+# Uncertainty calibration — a serving precondition (`alpha-engine-config-I11791`).
+# ---------------------------------------------------------------------------
+
+#: The band the mean squared STANDARDISED out-of-sample error must fall in.
+#: A std is a claim that ``E[((y - y_hat) / sigma)^2] = 1``; inside
+#: ``[0.8, 1.25]`` the claim is off by at most ~12% in std terms either way,
+#: which is the precision the executor's conviction band (IR 0.35..0.75) can
+#: absorb. Symmetric in log terms (0.8 = 1/1.25): an overconfident std
+#: (z_var high) inflates the gate's IR and switches the throttle off, an
+#: underconfident one (z_var low) throttles a model that has edge.
+Z_VAR_BAND: tuple[float, float] = (0.8, 1.25)
+
+#: The ±1 sigma coverage a Gaussian std would show. RECORDED beside the band
+#: and deliberately not gated: daily equity returns are fat-tailed, and a std
+#: whose VARIANCE is exactly right covers more than 68% of a fat-tailed
+#: distribution within one sigma (a unit-variance Student-t with 4 degrees of
+#: freedom covers ~78%). Gating on it would veto a correctly calibrated arm
+#: for the shape of the market, not for its std.
+GAUSSIAN_ONE_SIGMA_COVERAGE = 0.6827
+
+#: The metric the per-arm calibration reading files on the grading manifest.
+UNCERTAINTY_CALIBRATION_METRIC = "model_uncertainty_z_var"
+
+
+@dataclass(frozen=True)
+class UncertaintyCalibration:
+    """Whether an arm's served std describes its out-of-sample error.
+
+    Measured on the walk-forward's SETTLED block (:class:`SettledCrossSections`'
+    dates): every prediction and every std there come from a fit trained only
+    on days whose labels had settled before the scored day, by the same
+    :meth:`FittedEstimator.predict_std` the produce path serves through.
+
+    * ``z_var`` — mean of ``((y - y_hat) / sigma)^2`` over every settled
+      name-date pair, against :data:`Z_VAR_BAND`. **The gated statistic.**
+      Uncentred on purpose: bias is error the std must cover.
+    * ``coverage_1sigma`` — share of pairs with ``|z| <= 1``, against
+      :data:`GAUSSIAN_ONE_SIGMA_COVERAGE`. Recorded, not gated (see there).
+    * ``ir_xs`` — mean over dates of ``std_xs(y_hat) / median(sigma)``: the
+      statistic the executor's conviction gate computes off this very std.
+    * ``oos_ic`` — mean per-date rank IC over the same block, and
+      ``ir_xs_to_ic`` their ratio. For a calibrated linear-Gaussian signal the
+      cross-sectional IR and the IC agree to first order, so a ratio far
+      above 1 says the gate will read more conviction than the ranking has.
+      Recorded, not gated: an IC is a noisy quantity over a short block and a
+      ratio against it noisier still.
+
+    ``status`` is ``pass`` | ``fail`` | ``insufficient``. ``insufficient`` —
+    no std, or too short a block — FAILS the precondition, because an
+    uncomputed gate is not a pass (champion-challenger-policy.md §5.1).
+    """
+
+    status: str
+    reason: str
+    method: str = UNCERTAINTY_OMITTED
+    z_var: float | None = None
+    z_mean: float | None = None
+    coverage_1sigma: float | None = None
+    ir_xs: float | None = None
+    oos_ic: float | None = None
+    ir_xs_to_ic: float | None = None
+    n_dates: int = 0
+    n_pairs: int = 0
+    band: tuple[float, float] = Z_VAR_BAND
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "method": self.method,
+            "z_var": self.z_var,
+            "z_var_band": list(self.band),
+            "z_mean": self.z_mean,
+            "coverage_1sigma": self.coverage_1sigma,
+            "coverage_1sigma_target": GAUSSIAN_ONE_SIGMA_COVERAGE,
+            "ir_xs": self.ir_xs,
+            "oos_ic": self.oos_ic,
+            "ir_xs_to_ic": self.ir_xs_to_ic,
+            "n_dates": self.n_dates,
+            "n_pairs": self.n_pairs,
+        }
+
+    def as_precondition(self) -> ServingPrecondition:
+        """A SERVING precondition, the shape the §5.3 veto already takes.
+
+        The engine reads a failed precondition as INELIGIBLE: a challenger
+        cannot be promoted over the incumbent, and an incumbent that fails it
+        forces the pointer off itself. That is the intent — a miscalibrated
+        std served to the executor switches its turnover throttle off or
+        clamps it on, whichever arm carries it.
+        """
+        return ServingPrecondition(
+            name="uncertainty_calibration",
+            passed=self.status == "pass",
+            reason=self.reason,
+        )
+
+
+def evaluate_uncertainty_calibration(
+    predicted: np.ndarray,
+    realized: np.ndarray,
+    sigma: np.ndarray | None,
+    *,
+    method: str,
+    omitted_reason: str = "",
+    min_dates: int = SETTLED_WINDOW_DECISION_DATES,
+    band: tuple[float, float] = Z_VAR_BAND,
+) -> UncertaintyCalibration:
+    """Calibrate ``sigma`` against the realized error of ``predicted``.
+
+    All three arrays are ``(n_dates, n_names)`` and RAW — the fitted label,
+    not the demeaned excess :class:`SettledCrossSections` carries — because
+    the std is a claim about the error of the number served. Non-finite or
+    non-positive cells are excluded pair by pair.
+    """
+    if sigma is None:
+        return UncertaintyCalibration(
+            status="insufficient",
+            method=method,
+            reason=(
+                "uncertainty calibration could not be computed: the arm served no "
+                f"predictive std ({omitted_reason or 'no reason recorded'}). An arm with no "
+                "std disables the executor's conviction gate on promotion, and an "
+                "uncomputed gate is not a pass (champion-challenger-policy.md §5.1)"
+            ),
+        )
+    n_dates = int(predicted.shape[0])
+    if n_dates < min_dates:
+        return UncertaintyCalibration(
+            status="insufficient",
+            method=method,
+            n_dates=n_dates,
+            reason=(
+                f"uncertainty calibration needs {min_dates} settled out-of-sample decision "
+                f"date(s) and has {n_dates}: the window being short, not a producer being "
+                "absent"
+            ),
+        )
+    usable = np.isfinite(predicted) & np.isfinite(realized) & np.isfinite(sigma) & (sigma > 0.0)
+    n_pairs = int(usable.sum())
+    if n_pairs == 0:
+        return UncertaintyCalibration(
+            status="insufficient",
+            method=method,
+            n_dates=n_dates,
+            reason=f"no settled name-date pair over {n_dates} date(s) carried a finite std",
+        )
+    z = (realized[usable] - predicted[usable]) / sigma[usable]
+    z_var = float(np.mean(z**2))
+    coverage = float(np.mean(np.abs(z) <= 1.0))
+
+    irs: list[float] = []
+    ics: list[float] = []
+    for t in range(n_dates):
+        row = usable[t]
+        if int(row.sum()) < 2:
+            continue
+        irs.append(float(np.std(predicted[t][row]) / np.median(sigma[t][row])))
+        ic = _rank_ic(predicted[t][row], realized[t][row])
+        if ic is not None:
+            ics.append(ic)
+    ir_xs = float(np.mean(irs)) if irs else None
+    oos_ic = float(np.mean(ics)) if ics else None
+    ratio = ir_xs / oos_ic if ir_xs is not None and oos_ic is not None and oos_ic > 0 else None
+
+    lo, hi = band
+    measured = (
+        f"z_var={z_var:.4f} over {n_pairs} out-of-sample name-date pair(s) on {n_dates} "
+        f"settled date(s) (band [{lo}, {hi}]), ±1σ coverage {coverage:.3f} "
+        f"(Gaussian {GAUSSIAN_ONE_SIGMA_COVERAGE}), IR_xs "
+        f"{'n/a' if ir_xs is None else f'{ir_xs:.4f}'} vs OOS IC "
+        f"{'n/a' if oos_ic is None else f'{oos_ic:.4f}'}"
+    )
+    if lo <= z_var <= hi:
+        status, reason = "pass", f"std calibrated ({method}): {measured}"
+    elif z_var > hi:
+        status = "fail"
+        reason = (
+            f"std OVERCONFIDENT ({method}): {measured}. The realized error is "
+            f"{math.sqrt(z_var):.2f}x the served std, so the executor's conviction gate "
+            "would read an inflated IR and leave turnover unthrottled"
+        )
+    else:
+        status = "fail"
+        reason = (
+            f"std UNDERCONFIDENT ({method}): {measured}. The served std is "
+            f"{1.0 / math.sqrt(z_var):.2f}x the realized error, so the executor's "
+            "conviction gate would throttle a ranking that has edge"
+        )
+    return UncertaintyCalibration(
+        status=status,
+        reason=reason,
+        method=method,
+        z_var=z_var,
+        z_mean=float(np.mean(z)),
+        coverage_1sigma=coverage,
+        ir_xs=ir_xs,
+        oos_ic=oos_ic,
+        ir_xs_to_ic=ratio,
+        n_dates=n_dates,
+        n_pairs=n_pairs,
+        band=band,
+    )
+
+
 @dataclass(frozen=True)
 class ModelGrade:
     """One arm's cycle grade: the OOS series, the CPCV battery, the fit.
@@ -2785,6 +3710,14 @@ class ModelGrade:
     #: :func:`grade_arm`'s "two windows" paragraph
     #: (`alpha-engine-config-I10709`).
     settled: SettledCrossSections = field(default_factory=SettledCrossSections)
+    #: The served std held against the same settled block
+    #: (`alpha-engine-config-I11791`). A serving precondition, read by
+    #: :func:`grade`; never part of the score.
+    calibration: UncertaintyCalibration = field(
+        default_factory=lambda: UncertaintyCalibration(
+            status="insufficient", reason="uncertainty calibration was not computed"
+        )
+    )
 
     def __post_init__(self) -> None:
         if self.status not in ("ok", "unmeasurable"):
@@ -2892,6 +3825,13 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
     settled_dates: list[str] = []
     settled_predicted: list[np.ndarray] = []
     settled_realized: list[np.ndarray] = []
+    # The calibration block (`alpha-engine-config-I11791`): the same settled
+    # dates, RAW rather than demeaned, with the std the walked fit served.
+    calibration_predicted: list[np.ndarray] = []
+    calibration_realized: list[np.ndarray] = []
+    calibration_sigma: list[np.ndarray] = []
+    std_methods: set[str] = set()
+    std_omitted: str = ""
     in_sample_n = 0
     scores: dict[str, float] = {}
     unrankable: list[str] = []
@@ -2910,12 +3850,24 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
             in_sample_n += 1
             continue
         if fitted is None or last_refit is None or (i - last_refit) >= cadence:
-            fitted, _, _ = _fit_rows(recipe, panel, train_days)
+            # `with_uncertainty`: the walked fit carries the same std the
+            # serving fit does, so the calibration below grades the served
+            # construction rather than a cheaper stand-in for it.
+            fitted, _, _ = _fit_rows(recipe, panel, train_days, with_uncertainty=True)
             last_refit = i
         rows = i * n_names + np.arange(n_names)
-        predicted = fitted.predict(_design(recipe, panel, rows))
+        design = _design(recipe, panel, rows)
+        predicted = fitted.predict(design)
         actual = panel.forward_returns.reshape(-1)[rows]
         if i in realized_by_as_of:
+            std = fitted.predict_std(design)
+            std_methods.add(std.method)
+            if std.total is None:
+                std_omitted = std_omitted or f"{day}: {std.note}"
+            else:
+                calibration_predicted.append(predicted)
+                calibration_realized.append(_target_labels(recipe, panel, rows))
+                calibration_sigma.append(std.total)
             # Demeaned per date: M's benchmark is the cross-section it scored
             # (plan §9.1), so the quantity with a settled outcome is the
             # excess, not the raw return. An unrankable date is still a
@@ -2964,6 +3916,20 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
         recipe=recipe,
         cpcv=recipe.cpcv,
         label_horizon_trading_days=recipe.label_horizon_trading_days,
+    )
+    # One method per arm in practice; joined rather than picked, so an arm
+    # whose std construction changed mid-window says so on the artifact.
+    std_method = " + ".join(sorted(std_methods)) or UNCERTAINTY_OMITTED
+
+    def _block(values: list[np.ndarray]) -> np.ndarray:
+        return np.array(values, dtype="float64").reshape(len(values), n_names)
+
+    calibration = evaluate_uncertainty_calibration(
+        _block(calibration_predicted),
+        _block(calibration_realized),
+        None if std_omitted else _block(calibration_sigma),
+        method=std_method,
+        omitted_reason=std_omitted,
     )
     oos_start = min(scores) if scores else recipe.registered_at
     if scores:
@@ -3016,6 +3982,7 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
                 len(settled_dates), n_names
             ),
         ),
+        calibration=calibration,
     )
 
 
@@ -3364,6 +4331,7 @@ def _produce_arms(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
                     recipe.training_window.min_trading_days + recipe.label_horizon_trading_days
                 ),
                 ctx=ctx,
+                strategy_dir=getattr(settings, "strategy_dir", None),
             )
         except PER_ARM_REFUSALS as exc:
             # A DELIBERATE per-arm refusal, and the only swallow in this loop.
@@ -3798,7 +4766,13 @@ def _grade_lookback(recipe: ModelRecipe) -> int:
 
 
 def _grade_panel(
-    recipe: ModelRecipe, *, source: Any, as_of: str, loaded: SlotRecipes, ctx: Any
+    recipe: ModelRecipe,
+    *,
+    source: Any,
+    as_of: str,
+    loaded: SlotRecipes,
+    ctx: Any,
+    strategy_dir: Path | str | None = None,
 ) -> FeaturePanel:
     """The panel :func:`grade` walks, at :func:`_grade_lookback` where it can be.
 
@@ -3823,6 +4797,7 @@ def _grade_panel(
             store=ctx.store,
             lookback_trading_days=lookback,
             ctx=ctx,
+            strategy_dir=strategy_dir,
         )
 
     try:
@@ -3859,7 +4834,13 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
       out-of-sample decision dates, and `insufficient` only while that window
       is short. The veto is evaluated in a second pass over the graded arms,
       because the incumbent's inputs must come off the same producer and the
-      same window as every candidate's — see :func:`_baseline_serving_metrics`.
+      same window as every candidate's — see :func:`_baseline_serving_metrics`;
+    * an **uncertainty-calibration serving precondition** per arm
+      (`alpha-engine-config-I11791`), from :class:`UncertaintyCalibration`
+      over the same settled block: the served std's standardised
+      out-of-sample error must fall in :data:`Z_VAR_BAND`. Recorded on the
+      grade as ``uncertainty_calibration`` and on the manifest as
+      :data:`UNCERTAINTY_CALIBRATION_METRIC`.
 
     The refusal rows are recorded here too, on this manifest, for the same
     reason they are recorded on the produce manifest: a slot that became
@@ -3876,6 +4857,7 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     grades: dict[str, dict[str, Any]] = {}
     candidates: dict[str, dict[str, Any]] = {}
     windows: dict[str, str] = {}
+    calibrations: dict[str, UncertaintyCalibration] = {}
     absent = _not_yet_registered(ctx, specs, as_of=as_of)
     for spec in _in_dependency_order(specs):
         recipe = spec.recipe
@@ -3891,7 +4873,14 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             # its reason and both dates on this run's manifest.
             continue
         try:
-            panel = _grade_panel(recipe, source=source, as_of=as_of, loaded=loaded, ctx=ctx)
+            panel = _grade_panel(
+                recipe,
+                source=source,
+                as_of=as_of,
+                loaded=loaded,
+                ctx=ctx,
+                strategy_dir=getattr(settings, "strategy_dir", None),
+            )
         except PER_ARM_REFUSALS as exc:
             # The produce-side warm-up, seen again here — and, since
             # `alpha-engine-config-I11021`, every other TYPED per-arm input
@@ -3939,6 +4928,9 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         # nobody made. `CPCVResult.mean_ic` refuses to be read at all in that
         # state, which is what surfaced this.
         ctx.record_metric(row)
+        calibration = model_grade.calibration
+        ctx.record_metric(_calibration_metric(recipe, calibration, as_of=as_of))
+        calibrations[spec.arm_id] = calibration
         candidates[spec.arm_id], windows[spec.arm_id] = serving_metrics(
             predict_cross_section(model_grade.fit, panel, trading_day=as_of),
             settled=model_grade.settled,
@@ -3953,6 +4945,9 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             "settled_n": model_grade.settled.n_dates,
             "settled_first": model_grade.settled.dates[0] if model_grade.settled.dates else None,
             "settled_last": model_grade.settled.dates[-1] if model_grade.settled.dates else None,
+            # `alpha-engine-config-I11791`: the served std held against the
+            # same settled block — z_var, ±1σ coverage, IR_xs vs OOS IC.
+            "uncertainty_calibration": calibration.to_dict(),
         }
 
     # The veto runs in a SECOND pass, because the incumbent's own veto inputs
@@ -3966,7 +4961,12 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
     )
     for arm_id, candidate in candidates.items():
         veto = evaluate_behavioural_veto(candidate, incumbent, has_incumbent=has_incumbent)
-        preconditions[arm_id] = [veto.as_precondition()]
+        # Two serving preconditions, both evaluated here and handed to the
+        # engine as results (policy §5.3). The calibration one is
+        # `alpha-engine-config-I11791`: an arm whose std does not describe its
+        # out-of-sample error is INELIGIBLE, because serving it would switch
+        # the executor's conviction gate off (or clamp it on) on promotion.
+        preconditions[arm_id] = [veto.as_precondition(), calibrations[arm_id].as_precondition()]
         grades[arm_id]["veto"] = veto.status
         grades[arm_id]["veto_metrics"] = veto.metrics
         if windows[arm_id]:
@@ -3988,6 +4988,32 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         {"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused
     ]
     return result
+
+
+def _calibration_metric(
+    recipe: ModelRecipe, calibration: UncertaintyCalibration, *, as_of: str
+) -> dict[str, Any]:
+    """One arm's :data:`UNCERTAINTY_CALIBRATION_METRIC` row.
+
+    ``OK`` inside the band, ``FAIL`` outside it, ``unmeasurable`` — with no
+    value and no unit, for the reason an unmeasurable CPCV battery carries
+    none — when there was no std or too short a block.
+    """
+    row: dict[str, Any] = {
+        "name": UNCERTAINTY_CALIBRATION_METRIC,
+        "module": f"crucible.slots.{SLOT}",
+        "metric_type": "gauge",
+        "n_floor": 1,
+        "status": {"pass": "OK", "fail": "FAIL"}.get(calibration.status, "unmeasurable"),
+        "status_reason": f"arm {recipe.name!r}: {calibration.reason}",
+        "source_path": arena_cycle_key(SLOT, as_of),
+        "last_updated_utc": _utc_now(),
+        "horizon_trading_days": recipe.label_horizon_trading_days,
+    }
+    if calibration.z_var is not None:
+        row["value"] = float(calibration.z_var)
+        row["unit"] = "ratio"
+    return row
 
 
 def _not_yet_registered(

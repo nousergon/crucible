@@ -3939,6 +3939,39 @@ class PredictionsFeedDocument(_Strict):
         "producer that failed and wrote anyway, and the trader must page rather than "
         "flatten the book on it.",
     )
+    # `alpha-engine-config-I11791`. Carried through from the republished
+    # arm_predictions.v1 document, never computed here. Optional because a
+    # document written before the producer emitted them carries none; the
+    # trader, not this schema, decides that a champion with no std is a
+    # failure (the executor's conviction gate turns OFF without one).
+    predicted_alpha_std: dict[str, Annotated[float, Field(gt=0)]] | None = Field(
+        default=None,
+        description="Name -> TOTAL predictive std of the champion's label, "
+        "sqrt(aleatoric + epistemic) when both are known — the executor's "
+        "conviction-gate input. Absent, never zeroed, when the champion's fit has no "
+        "honest figure; `predicted_alpha_std_method` then says `omitted`.",
+    )
+    predicted_alpha_std_aleatoric: dict[str, Annotated[float, Field(gt=0)]] | None = Field(
+        default=None,
+        description="Name -> sqrt(1/alpha_), the learned-noise std. Bayesian fits only.",
+    )
+    predicted_alpha_std_epistemic: dict[str, Annotated[float, Field(ge=0)]] | None = Field(
+        default=None,
+        description="Name -> sqrt(x^T Sigma_w x), the estimation-error std. Bayesian "
+        "fits only; the only vector the executor's GUW Omega may be built from.",
+    )
+    predicted_alpha_std_method: (
+        Literal["bayesian_posterior_predictive", "purged_kfold_oos_residual", "omitted"] | None
+    ) = Field(
+        default=None,
+        description="How predicted_alpha_std was produced, carried through from the "
+        "republished document.",
+    )
+    predicted_alpha_std_note: str | None = Field(
+        default=None,
+        min_length=1,
+        description="The method's detail or, under `omitted`, why no std exists.",
+    )
 
 
 # ── alpha-engine-config-I9847 (wave 2): the dispatcher's absence-input ────
