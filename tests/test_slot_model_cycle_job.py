@@ -119,13 +119,35 @@ GRADE_DAY = SESSIONS[51]
 @pytest.fixture
 def store(tmp_path):
     """A real store carrying a real feature layer and a real price panel."""
+    return _build_store(tmp_path)
+
+
+@pytest.fixture
+def stationary_store(tmp_path):
+    """The same store over a constant-volatility random walk.
+
+    `store`'s closes are a linear trend plus fixed-size noise, so a return's
+    variance shrinks as the price level rises — a real heteroskedasticity a
+    std estimated on the early window correctly fails to describe later
+    (`alpha-engine-config-I11791`). A test asserting that a CALIBRATED arm
+    stays eligible needs a label whose noise does not move under it.
+    """
+    return _build_store(tmp_path, stationary=True)
+
+
+def _build_store(tmp_path, *, stationary: bool = False):
     import pandas as pd
 
     backing = LocalStore(tmp_path / "store")
     rng = np.random.default_rng(20260906)
     rows = []
+    walk = np.zeros(len(_NAMES))
     for i, day in enumerate(SESSIONS):
-        closes = 100.0 + i * 0.5 + rng.normal(0.0, 1.0, len(_NAMES))
+        if stationary:
+            walk = walk + rng.normal(0.0, 0.01, len(_NAMES))
+            closes = 100.0 * np.exp(walk)
+        else:
+            closes = 100.0 + i * 0.5 + rng.normal(0.0, 1.0, len(_NAMES))
         frame = pd.DataFrame(
             {
                 "ticker": list(_NAMES),
@@ -495,6 +517,74 @@ class TestGradeRunsTheSharedEngine:
         cycle = json.loads(store.get_bytes(result["arena_cycle_key"]).decode("utf-8"))
         assert "not_a_control_arm" in json.dumps(cycle)
         assert not [a for a in result["promotable_arms"] if "control" in a]
+
+
+class TestAMiscalibratedStdIsIneligibleToServe:
+    """`alpha-engine-config-I11791`, on the real grade job over a real store.
+
+    The calibration reading is a SERVING precondition beside the §5.3 veto,
+    so the engine itself bars a miscalibrated arm from the pointer. The veto
+    is forced to `pass` here so the calibration is the only gate under test:
+    the fixture's features carry no edge, and with the veto live the arm
+    would be ineligible for a reason this class is not about.
+    """
+
+    def _graded(self, store, strategy, monkeypatch, *, shrink: float):
+        from crucible.slots import model as model_module
+        from crucible.slots.model import PredictiveStd, VetoResult
+
+        monkeypatch.setattr(
+            model_module,
+            "evaluate_behavioural_veto",
+            lambda *a, **k: VetoResult("pass"),
+        )
+        if shrink != 1.0:
+            original = model_module.FittedEstimator.predict_std
+
+            def shrunk(self, matrix):
+                std = original(self, matrix)
+                return PredictiveStd(method=std.method, note=std.note, total=std.total / shrink)
+
+            monkeypatch.setattr(model_module.FittedEstimator, "predict_std", shrunk)
+        runner = TestGradeRunsTheSharedEngine()
+        runner._produce_a_series(store, strategy)
+        _, result = runner._grade(store, strategy, GRADE_DAY)
+        cycle = json.loads(store.get_bytes(result["arena_cycle_key"]).decode("utf-8"))
+        base = next(arm for arm in result["model_grades"] if ":base:" in arm)
+        return result, json.dumps(cycle), base
+
+    def test_a_calibrated_arm_stays_eligible(self, stationary_store, strategy, monkeypatch) -> None:
+        result, cycle, base = self._graded(stationary_store, strategy, monkeypatch, shrink=1.0)
+        reading = result["model_grades"][base]["uncertainty_calibration"]
+        assert reading["status"] == "pass", reading["reason"]
+        assert base not in json.loads(cycle)["decision"]["ineligible"], (
+            "a calibrated arm whose veto passed must stay eligible to serve"
+        )
+
+    def test_a_std_shrunk_three_fold_bars_the_arm_from_the_pointer(
+        self, stationary_store, strategy, monkeypatch
+    ) -> None:
+        from crucible.slots.model import UNCERTAINTY_CALIBRATION_METRIC
+
+        store = stationary_store
+        result, cycle, base = self._graded(store, strategy, monkeypatch, shrink=3.0)
+        reading = result["model_grades"][base]["uncertainty_calibration"]
+        assert reading["status"] == "fail"
+        assert reading["z_var"] > reading["z_var_band"][1]
+
+        ineligible = json.loads(cycle)["decision"]["ineligible"]
+        assert base in ineligible, "a miscalibrated arm must be ineligible to serve"
+        failed = [p for p in ineligible[base] if not p["passed"]]
+        assert [p["name"] for p in failed] == ["uncertainty_calibration"]
+        assert "OVERCONFIDENT" in failed[0]["reason"]
+
+        rows = [
+            m
+            for m in _manifest(store, "experiment.grade", GRADE_DAY)["metrics"]
+            if m["name"] == UNCERTAINTY_CALIBRATION_METRIC
+            and base.split(":")[1] in m["status_reason"]
+        ]
+        assert [r["status"] for r in rows] == ["FAIL"]
 
 
 class TestTheOutOfSampleClockStartsOnASession:

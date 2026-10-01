@@ -117,11 +117,18 @@ __all__ = [
     "BaseCoverageBelowFloorError",
     "BasePredictionsUnavailableError",
     "EmptyDesignMatrixError",
+    "FactorResidualUnavailableError",
     "InputCycleError",
     "InputRef",
     "InputRefusal",
     "PER_ARM_REFUSALS",
+    "PREDICTION_STD_FIELDS",
+    "PredictionUncertainty",
     "SlotUnservableError",
+    "UNCERTAINTY_METHODS",
+    "UNCERTAINTY_OMITTED",
+    "UNCERTAINTY_OOS_RESIDUAL",
+    "UNCERTAINTY_POSTERIOR",
     "UnproducibleInputError",
     "UnresolvedInputError",
     "arm_name_from_id",
@@ -141,6 +148,43 @@ __all__ = [
 ]
 
 ARM_PREDICTIONS_SCHEMA_VERSION = "arm_predictions.v1"
+
+#: How a predictions document's `predicted_alpha_std` was produced. A CLOSED
+#: vocabulary, recorded on every document this harness writes
+#: (`alpha-engine-config-I11791`), because the executor's conviction gate and
+#: its Garlappi-Uppal-Wang penalty read these fields and cannot tell a
+#: posterior from a residual estimate from the numbers alone.
+#:
+#: * :data:`UNCERTAINTY_POSTERIOR` — a Bayesian fit's own posterior
+#:   predictive: aleatoric ``1/alpha_`` (the learned noise precision) plus
+#:   epistemic ``x^T Sigma_w x``. All three fields are written.
+#: * :data:`UNCERTAINTY_OOS_RESIDUAL` — an estimator with no posterior. The
+#:   variance is the mean squared OUT-OF-SAMPLE residual of a purged k-fold
+#:   over the fit's own training days. Only the TOTAL is written: an
+#:   out-of-sample residual carries noise and estimation error together, and
+#:   splitting it would be a decomposition nobody measured.
+#: * :data:`UNCERTAINTY_OMITTED` — no honest figure exists for this fit. No
+#:   std field is written, and `predicted_alpha_std_note` says why. A zero or
+#:   a placeholder would read downstream as certainty.
+UNCERTAINTY_POSTERIOR = "bayesian_posterior_predictive"
+UNCERTAINTY_OOS_RESIDUAL = "purged_kfold_oos_residual"
+UNCERTAINTY_OMITTED = "omitted"
+UNCERTAINTY_METHODS: tuple[str, ...] = (
+    UNCERTAINTY_POSTERIOR,
+    UNCERTAINTY_OOS_RESIDUAL,
+    UNCERTAINTY_OMITTED,
+)
+
+#: The per-name std fields, named exactly as the v1 predictor's champion
+#: artifact names them, because those are the names the executor reads
+#: (`executor/optimizer_shadow.py::_build_alpha_uncertainty`): the TOTAL is
+#: the conviction gate's input and the EPISTEMIC is the only vector the GUW
+#: Omega may be built from.
+PREDICTION_STD_FIELDS: tuple[str, ...] = (
+    "predicted_alpha_std",
+    "predicted_alpha_std_aleatoric",
+    "predicted_alpha_std_epistemic",
+)
 
 #: The closed set of input kinds. Closed on purpose: a kind resolved by name
 #: at runtime is an input whose recipe does not describe where it comes from,
@@ -227,6 +271,31 @@ class EmptyDesignMatrixError(UnproducibleInputError):
         self.unresolvable: tuple[str, ...] = tuple(unresolvable)
 
 
+class FactorResidualUnavailableError(UnproducibleInputError):
+    """A factor-residual arm's factor model cannot be built on this panel.
+
+    `alpha-engine-config-I11791`. An arm declaring `target:
+    factor_residual_forward_return` residualizes its label against the
+    beta/sector/size ETF proxies of the attribution spec
+    (`strategy/slots/attribution.yaml`), read off the SAME feature layer the
+    arm trains on. When that spec is absent, or a proxy carries no close on a
+    session the betas or the label need, no residual exists to fit.
+
+    A per-arm refusal (:data:`PER_ARM_REFUSALS`), not a slot-wide failure,
+    and deliberately: only an arm that DECLARED this target reads the proxies,
+    so the remedy — publish the spec, or compile the layer with the proxies
+    over the sessions the window reaches — touches that arm alone, and every
+    sibling's design matrix is unaffected. Nothing is substituted for a
+    missing proxy: a zero factor return would leave the factor's whole move
+    in the label the arm exists to strip it from.
+    """
+
+    def __init__(self, message: str, *, arm: str, unresolvable: Sequence[str]) -> None:
+        super().__init__(message)
+        self.arm = arm
+        self.unresolvable: tuple[str, ...] = tuple(unresolvable)
+
+
 #: The typed refusals a slot's per-arm loop absorbs, EXHAUSTIVE and named
 #: once so the produce loop and the grade loop absorb the same set.
 #:
@@ -242,6 +311,7 @@ class EmptyDesignMatrixError(UnproducibleInputError):
 PER_ARM_REFUSALS: tuple[type[Exception], ...] = (
     BasePredictionsUnavailableError,
     EmptyDesignMatrixError,
+    FactorResidualUnavailableError,
 )
 
 
@@ -651,6 +721,65 @@ def _validate(document: Mapping[str, Any]) -> None:
         )
 
 
+@dataclass(frozen=True)
+class PredictionUncertainty:
+    """One cross-section's predictive std, and how it was produced.
+
+    ``std`` is the TOTAL, ``sqrt(aleatoric + epistemic)`` when the two are
+    separately known. ``aleatoric`` and ``epistemic`` are themselves STDs (the
+    square roots of their variance terms), matching the v1 artifact the
+    executor reads. All three are ``None`` under :data:`UNCERTAINTY_OMITTED`,
+    and the components are ``None`` under :data:`UNCERTAINTY_OOS_RESIDUAL`.
+    """
+
+    method: str
+    note: str
+    std: Mapping[str, float] | None = None
+    aleatoric: Mapping[str, float] | None = None
+    epistemic: Mapping[str, float] | None = None
+
+    def __post_init__(self) -> None:
+        if self.method not in UNCERTAINTY_METHODS:
+            raise ArmPredictionsContractError(
+                f"uncertainty method {self.method!r} is not one of {list(UNCERTAINTY_METHODS)}"
+            )
+        if not self.note:
+            raise ArmPredictionsContractError(
+                "a predictive std must say how it was produced (or why it is absent); "
+                "an unexplained figure is indistinguishable from a placeholder"
+            )
+
+    def fields(self) -> dict[str, dict[str, float]]:
+        """The per-name maps this record contributes to a document."""
+        out: dict[str, dict[str, float]] = {}
+        for name, values in zip(
+            PREDICTION_STD_FIELDS, (self.std, self.aleatoric, self.epistemic), strict=True
+        ):
+            if values is not None:
+                out[name] = {str(k): float(v) for k, v in values.items()}
+        return out
+
+
+def _assert_uncertainty_matches(
+    predicted_alpha: Mapping[str, float], uncertainty: PredictionUncertainty
+) -> None:
+    """The cross-field rules JSON Schema cannot state.
+
+    Every std map covers EXACTLY the names the cross-section scored: a name
+    with an alpha and no std is a name the executor would size at zero
+    penalty, and a std for a name nobody scored is a figure about nothing.
+    """
+    names = set(predicted_alpha)
+    for field_name, values in uncertainty.fields().items():
+        if set(values) != names:
+            missing = sorted(names - set(values))[:5]
+            extra = sorted(set(values) - names)[:5]
+            raise ArmPredictionsContractError(
+                f"{field_name} must cover exactly the {len(names)} scored name(s); "
+                f"missing {missing}, extra {extra}"
+            )
+
+
 def write_arm_predictions(
     ctx: Any,
     *,
@@ -658,6 +787,7 @@ def write_arm_predictions(
     trading_day: str,
     feature_version: str,
     predicted_alpha: Mapping[str, float],
+    uncertainty: PredictionUncertainty | None = None,
 ) -> str:
     """The PRODUCER half. Validates before it writes, and records the output.
 
@@ -665,14 +795,25 @@ def write_arm_predictions(
     producer able to emit a non-conforming document defeats the schema, and
     the consumer would then be the first thing to notice — a week later, on
     someone else's arm.
+
+    ``uncertainty`` (`alpha-engine-config-I11791`) adds the per-name
+    `predicted_alpha_std` maps and records their method. The M produce path
+    always passes one — :data:`UNCERTAINTY_OMITTED` with a reason when no
+    honest figure exists — and the parameter is optional only so documents
+    predating the field stay writable by the tests that pin them.
     """
-    document = {
+    document: dict[str, Any] = {
         "schema_version": ARM_PREDICTIONS_SCHEMA_VERSION,
         "arm_id": arm_id,
         "trading_day": trading_day,
         "feature_version": feature_version,
         "predicted_alpha": {str(k): float(v) for k, v in predicted_alpha.items()},
     }
+    if uncertainty is not None:
+        _assert_uncertainty_matches(predicted_alpha, uncertainty)
+        document.update(uncertainty.fields())
+        document["predicted_alpha_std_method"] = uncertainty.method
+        document["predicted_alpha_std_note"] = uncertainty.note
     _validate(document)
     key = arm_predictions_key(arm_id, trading_day)
     ctx.record_output(

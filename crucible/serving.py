@@ -54,7 +54,7 @@ guarantee.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import ValidationError
@@ -63,7 +63,7 @@ from crucible.champion import read_champion
 from crucible.documents import UnreadableDocumentError, load_document_bytes
 from crucible.keys import arm_predictions_key, predictions_key
 from crucible.models import PredictionsFeedDocument
-from crucible.slots.inputs import ARM_PREDICTIONS_SCHEMA_VERSION
+from crucible.slots.inputs import ARM_PREDICTIONS_SCHEMA_VERSION, PREDICTION_STD_FIELDS
 from crucible.store import Store
 
 __all__ = [
@@ -105,6 +105,15 @@ class PredictionsFeed:
     source_key: str
     predicted_alpha: dict[str, float]
     schema_version: str = PREDICTIONS_FEED_SCHEMA_VERSION
+    #: `alpha-engine-config-I11791`: the champion's per-name std fields and
+    #: their method, republished verbatim from the source document. Empty
+    #: when the source carries none — the feed never computes one.
+    uncertainty: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def predicted_alpha_std(self) -> dict[str, float] | None:
+        """The TOTAL std the executor's conviction gate reads, or ``None``."""
+        return self.uncertainty.get("predicted_alpha_std")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -115,6 +124,7 @@ class PredictionsFeed:
             "feature_version": self.feature_version,
             "source_key": self.source_key,
             "predicted_alpha": dict(self.predicted_alpha),
+            **self.uncertainty,
         }
 
     def to_bytes(self) -> bytes:
@@ -212,6 +222,7 @@ def publish_predictions_feed(
         feature_version=str(document["feature_version"]),
         source_key=source_key,
         predicted_alpha={str(k): float(v) for k, v in document["predicted_alpha"].items()},
+        uncertainty=_uncertainty_fields(document),
     )
     _validate(feed.to_dict())
     key = predictions_key(trading_day)
@@ -220,6 +231,32 @@ def publish_predictions_feed(
     else:
         store.put_bytes(key, feed.to_bytes())
     return key
+
+
+#: The source-document keys the feed republishes beside `predicted_alpha`.
+_UNCERTAINTY_KEYS: tuple[str, ...] = (
+    *PREDICTION_STD_FIELDS,
+    "predicted_alpha_std_method",
+    "predicted_alpha_std_note",
+)
+
+
+def _uncertainty_fields(document: dict[str, Any]) -> dict[str, Any]:
+    """The source's std fields, verbatim, for whichever of them it carries.
+
+    `alpha-engine-config-I11791`. A republication, like everything else here:
+    the std the trader reads is the std the champion's produce run wrote and
+    its grade calibrated, never one this module derives.
+    """
+    out: dict[str, Any] = {}
+    for key in _UNCERTAINTY_KEYS:
+        if key not in document:
+            continue
+        value = document[key]
+        out[key] = (
+            {str(k): float(v) for k, v in value.items()} if isinstance(value, dict) else value
+        )
+    return out
 
 
 def _assert_source_is_this_session(
@@ -303,4 +340,9 @@ def read_predictions_feed(store: Store, trading_day: str) -> PredictionsFeed:
         source_key=document.source_key,
         predicted_alpha=dict(document.predicted_alpha),
         schema_version=document.schema_version,
+        uncertainty={
+            key: (dict(value) if isinstance(value, dict) else value)
+            for key in _UNCERTAINTY_KEYS
+            if (value := getattr(document, key)) is not None
+        },
     )

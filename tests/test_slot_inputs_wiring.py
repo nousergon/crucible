@@ -379,9 +379,20 @@ STILL_ORPHANED_M_CALLABLES: list[str] = [
     "design_panel",
     "evaluate_behavioural_veto",
     "evaluate_input_completeness",
+    # `alpha-engine-config-I11791`: the std calibration check, reached from
+    # `grade_arm` (itself pinned above), and the served std, reached from
+    # `produce_arm_predictions`. Pinned for the reason `grade` is.
+    "evaluate_uncertainty_calibration",
+    # `alpha-engine-config-I11791`: the factor-residual target's label
+    # builder, its point-in-time betas and the feature neutralizer, reached
+    # only from `design_panel` (itself pinned above). Pinned for that reason.
+    "factor_residual_panel",
     "grade",
     "grade_arm",
+    "neutralize_cross_section",
+    "point_in_time_factor_betas",
     "predict_cross_section",
+    "predict_uncertainty",
     "produce",
     "produce_arm_predictions",
     # The history entry point `experiment.backfill` runs, reached through
