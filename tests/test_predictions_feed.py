@@ -22,6 +22,7 @@ import pathlib
 import pytest
 from jsonschema import Draft202012Validator
 
+from crucible import serving as serving_module
 from crucible.champion import (
     CHAMPION_SCHEMA_VERSION,
     ChampionPointer,
@@ -101,6 +102,59 @@ def _seat_champion(store: LocalStore, pointer: ChampionPointer | None = None) ->
     write_champion(store, pointer, expected=read_champion_etag(store, pointer.slot))
     store.put_bytes(pointer.manifest_key, _manifest())
     return pointer
+
+
+class TestTheChampionsStdReachesTheTrader:
+    """`alpha-engine-config-I11791`: the executor's conviction gate turns OFF
+    when the champion's predictions carry no std, so the std the champion's
+    produce run wrote must reach the trader's key — republished, like every
+    other field, never derived here."""
+
+    def _with_std(self, extra: dict) -> bytes:
+        document = json.loads(_arm_predictions().decode("utf-8"))
+        document.update(extra)
+        return json.dumps(document, sort_keys=True).encode("utf-8")
+
+    def test_a_posterior_std_is_republished_field_for_field(self, store) -> None:
+        _seat_champion(store)
+        extra = {
+            "predicted_alpha_std": {"AAA": 0.05, "BBB": 0.06},
+            "predicted_alpha_std_aleatoric": {"AAA": 0.049, "BBB": 0.049},
+            "predicted_alpha_std_epistemic": {"AAA": 0.00995, "BBB": 0.0346},
+            "predicted_alpha_std_method": "bayesian_posterior_predictive",
+            "predicted_alpha_std_note": "posterior",
+        }
+        store.put_bytes(arm_predictions_key(ARM, DAY), self._with_std(extra))
+        publish_predictions_feed(store, trading_day=DAY)
+        feed = read_predictions_feed(store, DAY)
+        assert feed.predicted_alpha_std == extra["predicted_alpha_std"]
+        assert {k: v for k, v in feed.to_dict().items() if k in extra} == extra
+        Draft202012Validator(json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))).validate(
+            json.loads(store.get_bytes(predictions_key(DAY)))
+        )
+
+    def test_an_omitted_std_reaches_the_trader_as_absent_with_its_reason(self, store) -> None:
+        _seat_champion(store)
+        extra = {"predicted_alpha_std_method": "omitted", "predicted_alpha_std_note": "why"}
+        store.put_bytes(arm_predictions_key(ARM, DAY), self._with_std(extra))
+        publish_predictions_feed(store, trading_day=DAY)
+        feed = read_predictions_feed(store, DAY)
+        assert feed.predicted_alpha_std is None
+        assert feed.uncertainty == extra
+
+    def test_a_zero_std_is_refused_at_the_trader_key(self) -> None:
+        with pytest.raises(PredictionsFeedContractError, match="predicted_alpha_std"):
+            serving_module._validate(
+                PredictionsFeed(
+                    slot="m",
+                    trading_day=DAY,
+                    champion=ARM,
+                    feature_version="features.v3",
+                    source_key=arm_predictions_key(ARM, DAY),
+                    predicted_alpha={"AAA": 0.01},
+                    uncertainty={"predicted_alpha_std": {"AAA": 0.0}},
+                ).to_dict()
+            )
 
 
 class TestTheProducerRepublishesAndNeverRecomputes:
