@@ -102,6 +102,7 @@ from crucible.slots.inputs import (
     BaseCoverage,
     BasePredictionsUnavailableError,
     EmptyDesignMatrixError,
+    FactorResidualUnavailableError,
     InputRef,
     InputRefusal,
     PredictionUncertainty,
@@ -118,6 +119,7 @@ __all__ = [
     "CPCV_OOS_IC_METRIC",
     "DEAD_SLOT_METRIC",
     "DISPERSION_METRICS",
+    "FACTOR_RESIDUAL_TARGET",
     "FLOOR_VETO_METRICS",
     "HIGH_CONFIDENCE_P_UP",
     "MIN_DISPERSION_RATIO",
@@ -130,6 +132,7 @@ __all__ = [
     "M_SELECTION_TOP_N",
     "OOS_METHOD",
     "SLOT",
+    "TARGETS",
     "PROPORTION_METRICS",
     "UNITS_SUFFIXES",
     "ZERO_VETO_METRICS",
@@ -168,6 +171,9 @@ __all__ = [
     "evaluate_behavioural_veto",
     "evaluate_uncertainty_calibration",
     "evaluate_input_completeness",
+    "factor_residual_panel",
+    "neutralize_cross_section",
+    "point_in_time_factor_betas",
     "grade",
     "grade_arm",
     "load_model_recipes",
@@ -649,6 +655,14 @@ class FeaturePanel:
     #: session it produces, which is what makes the intersection a figure on
     #: the board rather than a cross-section a reader notices is short.
     input_coverage: tuple[BaseCoverage, ...] = ()
+    #: Alternative FIT labels, keyed by :data:`TARGETS` name, each shaped like
+    #: :attr:`forward_returns` (`alpha-engine-config-I11791`). Empty on every
+    #: panel except one built for a :data:`FACTOR_RESIDUAL_TARGET` arm by
+    #: :func:`factor_residual_panel`. It is what such an arm is FITTED to and
+    #: what its std is calibrated against; :attr:`forward_returns` is left
+    #: untouched beside it because it is what EVERY arm is GRADED against, so
+    #: an easier label cannot win the slot by being easier.
+    target_returns: dict[str, np.ndarray] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         shape = (len(self.dates), len(self.names))
@@ -656,6 +670,11 @@ class FeaturePanel:
             raise ValueError(
                 f"forward_returns has shape {self.forward_returns.shape}, expected {shape}"
             )
+        for name, block in self.target_returns.items():
+            if block.shape != shape:
+                raise ValueError(
+                    f"target_returns[{name!r}] has shape {block.shape}, expected {shape}"
+                )
         for name, block in self.features.items():
             if block.shape != shape:
                 raise ValueError(f"feature {name!r} has shape {block.shape}, expected {shape}")
@@ -680,6 +699,7 @@ class FeaturePanel:
             feature_version=self.feature_version,
             resolved_inputs=self.resolved_inputs,
             input_coverage=self.input_coverage,
+            target_returns={k: v[:n] for k, v in self.target_returns.items()},
         )
 
     def with_zeroed(self, columns: tuple[str, ...]) -> FeaturePanel:
@@ -1170,13 +1190,30 @@ class ModelRecipe:
     #: `alpha-engine-config/strategy/`.
     max_incomplete_row_ratio: float | None = None
     #: What the arm is FITTED to (`alpha-engine-config-I10695`). `None` is the
-    #: slot's forward return, which every arm is graded against; the one
-    #: alternative, `abs_forward_return`, is a MAGNITUDE head — v1's volatility
-    #: L1, whose output is a stacked input and never a directional ranking.
+    #: slot's forward return, which every arm is graded against.
+    #: `abs_forward_return` is a MAGNITUDE head — v1's volatility L1, whose
+    #: output is a stacked input and never a directional ranking.
+    #: :data:`FACTOR_RESIDUAL_TARGET` is the forward return net of its
+    #: point-in-time beta/sector/size exposure (`alpha-engine-config-I11791`).
     #: Grading is unchanged by this field: it scores every arm against the
     #: signed forward return, so a magnitude head cannot win the slot on the
     #: strength of predicting how far a name moves.
     target: str | None = None
+    #: The trailing window, in SESSIONS, over which a
+    #: :data:`FACTOR_RESIDUAL_TARGET` arm estimates each name's factor betas
+    #: (`alpha-engine-config-I11791`). REQUIRED with that target and refused
+    #: with any other: a beta window is a tuned belief about how fast
+    #: exposures drift, so it is pre-registered with the arm rather than
+    #: defaulted by the harness, where a changed default would re-define every
+    #: such arm without moving its id.
+    factor_beta_window_trading_days: int | None = None
+    #: Cross-sectionally residualize every design column on the same
+    #: point-in-time factor betas before fitting and scoring
+    #: (:func:`neutralize_cross_section`). Only with
+    #: :data:`FACTOR_RESIDUAL_TARGET`, whose panel is the one that carries the
+    #: betas; a label stripped of factor return fitted on features that still
+    #: carry factor exposure spends its capacity re-learning the exposure.
+    neutralize_features: bool = False
     supersedes: str | None = None
     slot: str = "m"
     #: The v1 model this arm descends from, as v1 names it (a zoo
@@ -1221,6 +1258,41 @@ class ModelRecipe:
             raise ValueError(
                 f"arm {self.name!r}: target={self.target!r} is not one of {list(TARGETS)}"
             )
+        if self.target == FACTOR_RESIDUAL_TARGET:
+            if self.factor_beta_window_trading_days is None:
+                raise ValueError(
+                    f"arm {self.name!r}: target={FACTOR_RESIDUAL_TARGET!r} needs "
+                    "`factor_beta_window_trading_days` — the trailing session count its "
+                    "factor betas are estimated over. It is part of what the label IS, so "
+                    "it is declared and hashed, never defaulted."
+                )
+            if self.factor_beta_window_trading_days < MIN_FACTOR_BETA_WINDOW_TRADING_DAYS:
+                raise ValueError(
+                    f"arm {self.name!r}: factor_beta_window_trading_days="
+                    f"{self.factor_beta_window_trading_days} is below "
+                    f"{MIN_FACTOR_BETA_WINDOW_TRADING_DAYS}. A time-series regression on a "
+                    "handful of sessions fits the noise of the window, and its residual "
+                    "is then the label minus that noise."
+                )
+        else:
+            stray = [
+                key
+                for key, declared in (
+                    (
+                        "factor_beta_window_trading_days",
+                        self.factor_beta_window_trading_days is not None,
+                    ),
+                    ("neutralize_features", self.neutralize_features),
+                )
+                if declared
+            ]
+            if stray:
+                raise ValueError(
+                    f"arm {self.name!r}: {stray} only mean something with "
+                    f"target={FACTOR_RESIDUAL_TARGET!r}, whose panel carries the factor "
+                    f"betas; target={self.target!r} has none, so the declaration would be "
+                    "accepted and ignored."
+                )
         if self.estimator.kind == "fixed_linear":
             weighted = set(self.estimator.params["weights"])
             if weighted != set(self.design_columns):
@@ -1317,6 +1389,10 @@ class ModelRecipe:
             # Same rule again: an arm fitted to the forward return keeps the
             # id it registered under before this field existed.
             payload["target"] = self.target
+        if self.factor_beta_window_trading_days is not None:
+            payload["factor_beta_window_trading_days"] = int(self.factor_beta_window_trading_days)
+        if self.neutralize_features:
+            payload["neutralize_features"] = True
         return payload
 
     @property
@@ -1349,7 +1425,14 @@ REQUIRED_RECIPE_FIELDS: tuple[str, ...] = (
 #: ignored nowhere: it is a guarantee the loader cannot honour, and the
 #: loader refuses it by name.
 M_SPEC_KEYS: frozenset[str] = frozenset(
-    {*REQUIRED_RECIPE_FIELDS, "inputs", "max_incomplete_row_ratio", "target"}
+    {
+        *REQUIRED_RECIPE_FIELDS,
+        "inputs",
+        "max_incomplete_row_ratio",
+        "target",
+        "factor_beta_window_trading_days",
+        "neutralize_features",
+    }
 )
 
 #: Every top-level key a filed M recipe may declare (`alpha-engine-config-
@@ -1451,6 +1534,17 @@ class SlotRecipes:
         ]
 
 
+def _parse_bool(value: Any, *, field: str, origin: str) -> bool:
+    """A YAML boolean, refused when it is anything else.
+
+    `bool("false")` is ``True``; a recipe whose string is read as its
+    opposite is an arm nobody declared.
+    """
+    if not isinstance(value, bool):
+        raise ValueError(f"{origin}: spec.{field} must be true or false; got {value!r}")
+    return value
+
+
 def _parse_model_recipe(payload: bytes, origin: str) -> ModelRecipe:
     """One recipe document, from wherever its bytes came from.
 
@@ -1507,6 +1601,14 @@ def _parse_model_recipe(payload: bytes, origin: str) -> ModelRecipe:
             else float(spec["max_incomplete_row_ratio"])
         ),
         target=None if spec.get("target") is None else str(spec["target"]),
+        factor_beta_window_trading_days=(
+            None
+            if spec.get("factor_beta_window_trading_days") is None
+            else int(spec["factor_beta_window_trading_days"])
+        ),
+        neutralize_features=_parse_bool(
+            spec.get("neutralize_features", False), field="neutralize_features", origin=origin
+        ),
         supersedes=document.get("supersedes"),
         supersedes_v1=(
             None if document.get("supersedes_v1") is None else str(document["supersedes_v1"])
@@ -1651,6 +1753,8 @@ def design_panel(
     store: Any = None,
     lookback_trading_days: int = 0,
     ctx: Any = None,
+    attribution: Any = None,
+    strategy_dir: Path | str | None = None,
 ) -> FeaturePanel:
     """The ONE way to obtain a panel an M arm can be fitted on.
 
@@ -1664,6 +1768,18 @@ def design_panel(
     :func:`crucible.slots.inputs.resolve_declared_inputs`, so a panel handed
     to :func:`train_arm` or :func:`grade_arm` carries the arm's WHOLE design
     matrix or the call already failed.
+
+    **A :data:`FACTOR_RESIDUAL_TARGET` arm also gets its label here**
+    (`alpha-engine-config-I11791`): the layer is read
+    `factor_beta_window_trading_days` sessions deeper, with ``close_raw``,
+    and :func:`factor_residual_panel` builds the residual label and trims the
+    extra sessions back off — so the panel spans the same sessions it would
+    for any other arm. ``attribution`` is the factor spec; when ``None`` it is
+    read from ``strategy_dir`` or the store exactly as the S slot reads it.
+    With `neutralize_features`, every design column — stacked inputs included
+    — is then residualized on the same betas (:func:`neutralize_cross_
+    section`), once, here, so the fit, the walk-forward and the serving row
+    all read the same neutralized values.
 
     **Base ids are resolved here, from the loaded recipe set.** The caller
     never supplies them, so the mapping cannot name an arm other than the one
@@ -1690,6 +1806,40 @@ def design_panel(
             arm=recipe.name,
             unresolvable=("spec.features", "spec.inputs"),
         )
+    if recipe.target == FACTOR_RESIDUAL_TARGET:
+        params = (
+            attribution
+            if attribution is not None
+            else _load_factor_spec(
+                recipe,
+                store=store if store is not None else source.store,
+                strategy_dir=strategy_dir,
+            )
+        )
+        raw = source.panel(
+            trading_day=trading_day,
+            columns=tuple(dict.fromkeys((*columns, "close_raw"))),
+            lookback_trading_days=lookback_trading_days
+            + int(recipe.factor_beta_window_trading_days or 0),
+            label_horizon_trading_days=recipe.label_horizon_trading_days,
+            ctx=ctx,
+        )
+        panel, betas = factor_residual_panel(recipe, raw, params)
+        if recipe.inputs:
+            panel = resolve_declared_inputs(
+                panel,
+                store=store if store is not None else source.store,
+                recipe=recipe,
+                base_arm_ids=_base_arm_ids(recipe, recipes),
+                ctx=ctx,
+            )
+        if not recipe.neutralize_features:
+            return panel
+        neutral = {
+            column: neutralize_cross_section(panel.column(column), betas)
+            for column in recipe.design_columns
+        }
+        return replace(panel, features={**panel.features, **neutral})
     panel = (
         source.label_panel(
             trading_day=trading_day,
@@ -1722,6 +1872,230 @@ def design_panel(
         base_arm_ids=_base_arm_ids(recipe, recipes),
         ctx=ctx,
     )
+
+
+# ---------------------------------------------------------------------------
+# The factor-residual target (`alpha-engine-config-I11791`).
+# ---------------------------------------------------------------------------
+
+
+def point_in_time_factor_betas(
+    stock_log_returns: np.ndarray, factor_log_returns: np.ndarray, *, window: int
+) -> np.ndarray:
+    """Each name's factor betas on each session, from the TRAILING window only.
+
+    ``stock_log_returns`` is ``(T, N)`` and ``factor_log_returns`` ``(T, k)``,
+    both one-session log returns on the panel's own session axis (row ``j``
+    is the return from close ``j - 1`` to close ``j``). The betas on row ``i``
+    are the OLS slopes, with an intercept, of the ``window`` returns on rows
+    ``i - window + 1 .. i`` — returns realized by the close of session ``i``,
+    which is the label's START. Nothing at or after row ``i + 1`` enters, so
+    the exposure a label is stripped of is one that could have been estimated
+    on the day the prediction was made; ``TestNoLookAhead`` asserts it by
+    truncation.
+
+    The intercept is estimated and DISCARDED: it is the name's own drift, which
+    is stock-specific return, and removing it would strip from the label the
+    very thing the arm exists to predict.
+
+    A window with any non-finite FACTOR return leaves the whole row NULL, and
+    a name with any non-finite return in the window leaves that name NULL on
+    that row — an unmeasurable beta is not a beta of zero, and a zero would
+    leave the factor's whole move in the residual without saying so. Collinear
+    proxies (sector ETFs move with the market) are solved by `lstsq`'s
+    minimum-norm solution, as `nousergon_lib.quant.factor_risk` does: the
+    per-factor split is then not identified, but the TOTAL explained return —
+    the only thing the residual depends on — is.
+    """
+    n_dates, n_names = stock_log_returns.shape
+    if factor_log_returns.shape[0] != n_dates:
+        raise ValueError(
+            f"{factor_log_returns.shape[0]} factor session(s) against {n_dates} stock "
+            "session(s); the two return blocks must share the panel's session axis"
+        )
+    n_factors = factor_log_returns.shape[1]
+    if window < n_factors + 2:
+        raise ValueError(
+            f"a {window}-session window cannot determine {n_factors} betas and an "
+            "intercept; it needs at least k + 2 sessions"
+        )
+    betas = np.full((n_dates, n_names, n_factors), np.nan)
+    design_ones = np.ones((window, 1))
+    for i in range(window - 1, n_dates):
+        lo = i - window + 1
+        factors = factor_log_returns[lo : i + 1]
+        if not np.isfinite(factors).all():
+            continue
+        block = stock_log_returns[lo : i + 1]
+        complete = np.isfinite(block).all(axis=0)
+        if not complete.any():
+            continue
+        design = np.hstack([design_ones, factors])
+        coef, *_ = np.linalg.lstsq(design, block[:, complete], rcond=None)
+        betas[i, complete, :] = coef[1:].T
+    return betas
+
+
+def _log_closes(closes: np.ndarray) -> np.ndarray:
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.log(np.where(closes > 0, closes, np.nan))
+
+
+def factor_residual_panel(
+    recipe: ModelRecipe, panel: FeaturePanel, params: Any
+) -> tuple[FeaturePanel, np.ndarray]:
+    """``panel`` with its :data:`FACTOR_RESIDUAL_TARGET` label, and the betas.
+
+    ``panel`` must carry ``close_raw`` and reach ``recipe.
+    factor_beta_window_trading_days`` sessions further back than the window
+    the arm trains on; :func:`design_panel` reads it that way. ``params`` is
+    the fleet's :class:`crucible.attribution.AttributionFactorParams` — the
+    SAME beta/sector/size proxy spec the S slot's book is attributed against,
+    deliberately not a per-arm choice: an arm able to pick its own factors
+    could pick a set that leaves whatever it predicts in the residual.
+
+    **The label.** For session ``t`` and horizon ``h``::
+
+        y_res[t, n] = log(1 + R[t, n]) - sum_k beta[t, n, k] * F_k(t -> t + h)
+
+    where ``R`` is the panel's own forward simple return (close ``t`` to
+    close ``t + h``), ``F_k`` is factor ``k``'s forward log return over the
+    SAME sessions (a spread factor's is its long leg's minus its short leg's),
+    and ``beta[t]`` is :func:`point_in_time_factor_betas` over the
+    ``factor_beta_window_trading_days`` one-session log returns ending at
+    close ``t``. Log returns, so a factor model linear in daily returns is
+    linear over the horizon too and the decomposition is exact rather than a
+    compounding approximation; the v1 champion's anchor is a 21-session LOG
+    alpha, so the served number keeps those units.
+
+    **Why there is no look-ahead.** The betas use returns realized by close
+    ``t``. The factor returns over ``t -> t + h`` are not a prediction input:
+    they are part of the realized return being decomposed, exactly as the
+    label's own ``R`` is, and they settle on the same session — so the purge
+    :func:`settled_training_days` already applies to ``R`` covers them.
+
+    **Returned trimmed.** The first ``factor_beta_window_trading_days`` rows
+    have no full window behind them; they are dropped so every row the arm
+    trains on carries a label, rather than counted against the arm's
+    incomplete-row ceiling as if the layer had failed. ``close_raw`` is
+    dropped too unless the recipe declares it as a feature.
+
+    :attr:`FeaturePanel.forward_returns` is NOT touched. It is what every arm
+    is graded against, and this label is only what this arm is fitted to.
+    """
+    window = recipe.factor_beta_window_trading_days
+    if window is None:
+        raise ValueError(f"arm {recipe.name!r} declares no factor_beta_window_trading_days")
+    closes = panel.column("close_raw")
+    index = {name: i for i, name in enumerate(panel.names)}
+    factor_names = tuple(sorted(params.factors))
+    proxies = sorted(
+        {p for f in params.factors.values() for p in (f.proxy, f.short_proxy) if p is not None}
+    )
+    absent = [p for p in proxies if p not in index]
+    if absent:
+        raise FactorResidualUnavailableError(
+            f"arm {recipe.name!r}: factor proxy(ies) {absent} named by the attribution spec "
+            f"are not in the feature layer's cross-section on {panel.dates[-1]}. The layer "
+            "carries a proxy only when the spec declares it at compile time "
+            "(`crucible.data.daily`); no factor return is invented for a missing one.",
+            arm=recipe.name,
+            unresolvable=tuple(absent),
+        )
+    log_closes = _log_closes(closes)
+    unpriced: dict[str, list[str]] = {}
+    for proxy in proxies:
+        priced = np.isfinite(log_closes[:, index[proxy]])
+        missing = [d for d, ok in zip(panel.dates, priced, strict=True) if not ok]
+        if missing:
+            unpriced[proxy] = missing
+    if unpriced:
+        raise FactorResidualUnavailableError(
+            f"arm {recipe.name!r}: factor proxy(ies) carry no close on session(s) the betas "
+            f"or the label need: "
+            f"{ {p: [days[0], days[-1], len(days)] for p, days in unpriced.items()} } "
+            "([first, last, count]). A zero factor return would leave that factor's move in "
+            "the residual, so the arm is refused rather than fitted on one.",
+            arm=recipe.name,
+            unresolvable=tuple(sorted(unpriced)),
+        )
+
+    n_dates = len(panel.dates)
+    daily = np.full_like(log_closes, np.nan)
+    daily[1:] = log_closes[1:] - log_closes[:-1]
+
+    def leg(series: np.ndarray, factor: Any) -> np.ndarray:
+        long = series[:, index[factor.proxy]]
+        if factor.short_proxy is None:
+            return long
+        return long - series[:, index[factor.short_proxy]]
+
+    factor_daily = np.column_stack([leg(daily, params.factors[f]) for f in factor_names])
+    betas = point_in_time_factor_betas(daily, factor_daily, window=int(window))
+
+    horizon = recipe.label_horizon_trading_days
+    forward_log_closes = np.full_like(log_closes, np.nan)
+    if horizon < n_dates:
+        forward_log_closes[:-horizon] = log_closes[horizon:] - log_closes[:-horizon]
+    factor_forward = np.column_stack(
+        [leg(forward_log_closes, params.factors[f]) for f in factor_names]
+    )
+    with np.errstate(invalid="ignore"):
+        stock_forward = np.log1p(panel.forward_returns)
+    residual = stock_forward - np.einsum("tnk,tk->tn", betas, factor_forward)
+
+    trim = min(int(window), n_dates)
+    keep = set(recipe.features)
+    trimmed = replace(
+        panel,
+        dates=panel.dates[trim:],
+        features={k: v[trim:] for k, v in panel.features.items() if k in keep},
+        forward_returns=panel.forward_returns[trim:],
+        target_returns={**panel.target_returns, FACTOR_RESIDUAL_TARGET: residual[trim:]},
+    )
+    return trimmed, betas[trim:]
+
+
+def neutralize_cross_section(values: np.ndarray, betas: np.ndarray) -> np.ndarray:
+    """``values`` residualized, per session, on that session's factor betas.
+
+    For each session, an OLS of the column on ``[1, beta_1 .. beta_k]`` across
+    every name carrying both, and the residual in its place. Same-session
+    only: the betas on a row are point-in-time (:func:`point_in_time_factor_
+    betas`), so a neutralized feature knows nothing the raw one did not. A
+    name without a beta, or a session with fewer than ``k + 2`` such names, is
+    NULL rather than passed through raw — half a cross-section neutralized and
+    half not is a column measuring two different things.
+    """
+    n_dates, n_names = values.shape
+    n_factors = betas.shape[2]
+    out = np.full((n_dates, n_names), np.nan)
+    for t in range(n_dates):
+        usable = np.isfinite(values[t]) & np.isfinite(betas[t]).all(axis=1)
+        if int(usable.sum()) < n_factors + 2:
+            continue
+        design = np.hstack([np.ones((int(usable.sum()), 1)), betas[t][usable]])
+        coef, *_ = np.linalg.lstsq(design, values[t][usable], rcond=None)
+        out[t, usable] = values[t][usable] - design @ coef
+    return out
+
+
+def _load_factor_spec(recipe: ModelRecipe, *, store: Any, strategy_dir: Path | str | None) -> Any:
+    """The attribution spec a factor-residual arm residualizes against."""
+    from crucible.attribution import (  # noqa: PLC0415 - only factor-residual arms pay for it
+        AttributionParamsError,
+        load_attribution_params_from_store,
+    )
+
+    try:
+        return load_attribution_params_from_store(store=store, strategy_dir=strategy_dir)
+    except AttributionParamsError as exc:
+        raise FactorResidualUnavailableError(
+            f"arm {recipe.name!r}: target={FACTOR_RESIDUAL_TARGET!r} residualizes against the "
+            f"attribution spec, which could not be read: {exc}",
+            arm=recipe.name,
+            unresolvable=("strategy/slots/attribution.yaml",),
+        ) from exc
 
 
 def _base_arm_ids(recipe: ModelRecipe, recipes: Sequence[ModelRecipe]) -> dict[str, str]:
@@ -2007,7 +2381,7 @@ def feature_completeness(
     nan_rows_by_column: dict[str, int] = {}
     for index, column in enumerate(recipe.design_columns):
         nan_rows_by_column[column] = int((~np.isfinite(matrix[:, index])).sum())
-    nan_rows_by_column["forward_return"] = int((~np.isfinite(labels)).sum())
+    nan_rows_by_column[_label_column(recipe)] = int((~np.isfinite(labels)).sum())
 
     dropped = rows[~complete]
     excluded_names = tuple(sorted({panel.names[int(r) % n_names] for r in dropped}))
@@ -2090,16 +2464,37 @@ def settled_training_days(panel: FeaturePanel, *, as_of: str, label_horizon: int
     return settled
 
 
-def _target_labels(recipe: ModelRecipe, labels: np.ndarray) -> np.ndarray:
-    """The label the recipe is FITTED to, from the panel's forward return.
+def _target_labels(recipe: ModelRecipe, panel: FeaturePanel, rows: np.ndarray) -> np.ndarray:
+    """The label the recipe is FITTED to, on the panel's flattened ``rows``.
 
     One function, because the fit, the out-of-sample residuals the std rests
     on and the calibration check must all measure error against the same
-    quantity — a magnitude head's std is a std of ``|r|``, not of ``r``.
+    quantity — a magnitude head's std is a std of ``|r|``, not of ``r``, and a
+    factor-residual arm's is a std of the residual it predicts.
+
+    Never called by the GRADER's score: :func:`grade_arm` and
+    :func:`cpcv_oos_ic` rank every arm against ``panel.forward_returns``
+    whatever it was fitted to.
     """
+    raw = panel.forward_returns.reshape(-1)[rows]
     if recipe.target == "abs_forward_return":
-        return np.abs(labels)
-    return labels
+        return np.abs(raw)
+    if recipe.target == FACTOR_RESIDUAL_TARGET:
+        block = panel.target_returns.get(FACTOR_RESIDUAL_TARGET)
+        if block is None:
+            raise ValueError(
+                f"arm {recipe.name!r} is fitted to {FACTOR_RESIDUAL_TARGET!r}, and this panel "
+                f"carries no such label (it carries {sorted(panel.target_returns)}). Build "
+                "the panel through `design_panel`, which computes it; fitting the raw "
+                "forward return in its place would be a different arm wearing this id."
+            )
+        return block.reshape(-1)[rows]
+    return raw
+
+
+def _label_column(recipe: ModelRecipe) -> str:
+    """The completeness record's name for the label column."""
+    return FACTOR_RESIDUAL_TARGET if recipe.target == FACTOR_RESIDUAL_TARGET else "forward_return"
 
 
 def _fit_rows(
@@ -2125,7 +2520,10 @@ def _fit_rows(
     n_names = len(panel.names)
     rows = np.array([d * n_names + n for d in day_indices for n in range(n_names)], dtype=int)
     matrix = _design(recipe, panel, rows)
-    labels = panel.forward_returns.reshape(-1)[rows]
+    # The FITTED label, so a row whose factor-residual label is unmeasurable
+    # (a name with no full beta window) is selected out and counted exactly
+    # as a row with an unsettled return is.
+    labels = _target_labels(recipe, panel, rows)
 
     # SELECT, then assert. The order is the whole design: `_assert_trainable`
     # is unchanged and still refuses any non-finite cell (Brian ruling
@@ -2149,7 +2547,7 @@ def _fit_rows(
             "grade the arm on a cross-section nobody pre-registered it against."
         )
     matrix = matrix[complete]
-    labels = _target_labels(recipe, labels[complete])
+    labels = labels[complete]
 
     _assert_trainable(recipe, matrix, labels)
     fitted = _fit_estimator(recipe, matrix, labels)
@@ -2215,7 +2613,7 @@ def _purged_kfold_uncertainty(
             )
         rows = _flatten(np.asarray(test), n_names)
         predicted = fold.predict(_design(recipe, panel, rows))
-        actual = _target_labels(recipe, panel.forward_returns.reshape(-1)[rows])
+        actual = _target_labels(recipe, panel, rows)
         usable = np.isfinite(predicted) & np.isfinite(actual)
         squared += float(np.sum((actual[usable] - predicted[usable]) ** 2))
         count += int(usable.sum())
@@ -2435,8 +2833,20 @@ def produce_arm_predictions(ctx: Any, *, fit: Fit, panel: FeaturePanel, trading_
     )
 
 
+#: The factor-residual label (`alpha-engine-config-I11791`): the forward
+#: return with its point-in-time exposure to the attribution spec's
+#: beta/sector/size factors removed. See :func:`factor_residual_panel`.
+FACTOR_RESIDUAL_TARGET = "factor_residual_forward_return"
+
 #: The fit targets a recipe may declare. `None` on the recipe means the first.
-TARGETS: tuple[str, ...] = ("forward_return", "abs_forward_return")
+TARGETS: tuple[str, ...] = ("forward_return", "abs_forward_return", FACTOR_RESIDUAL_TARGET)
+
+#: The shortest factor-beta window a recipe may declare. An order-of-magnitude
+#: guard, not a tuned value: the attribution spec carries six factors, and a
+#: regression with an intercept needs `k + 2` sessions merely to be
+#: determined — a few more than that and the betas are the window's noise.
+#: The tuned window is the recipe's (`factor_beta_window_trading_days`).
+MIN_FACTOR_BETA_WINDOW_TRADING_DAYS = 20
 
 
 @dataclass(frozen=True)
@@ -3456,7 +3866,7 @@ def grade_arm(recipe: ModelRecipe, panel: FeaturePanel, *, as_of: str) -> ModelG
                 std_omitted = std_omitted or f"{day}: {std.note}"
             else:
                 calibration_predicted.append(predicted)
-                calibration_realized.append(_target_labels(recipe, actual))
+                calibration_realized.append(_target_labels(recipe, panel, rows))
                 calibration_sigma.append(std.total)
             # Demeaned per date: M's benchmark is the cross-section it scored
             # (plan §9.1), so the quantity with a settled outcome is the
@@ -3921,6 +4331,7 @@ def _produce_arms(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
                     recipe.training_window.min_trading_days + recipe.label_horizon_trading_days
                 ),
                 ctx=ctx,
+                strategy_dir=getattr(settings, "strategy_dir", None),
             )
         except PER_ARM_REFUSALS as exc:
             # A DELIBERATE per-arm refusal, and the only swallow in this loop.
@@ -4355,7 +4766,13 @@ def _grade_lookback(recipe: ModelRecipe) -> int:
 
 
 def _grade_panel(
-    recipe: ModelRecipe, *, source: Any, as_of: str, loaded: SlotRecipes, ctx: Any
+    recipe: ModelRecipe,
+    *,
+    source: Any,
+    as_of: str,
+    loaded: SlotRecipes,
+    ctx: Any,
+    strategy_dir: Path | str | None = None,
 ) -> FeaturePanel:
     """The panel :func:`grade` walks, at :func:`_grade_lookback` where it can be.
 
@@ -4380,6 +4797,7 @@ def _grade_panel(
             store=ctx.store,
             lookback_trading_days=lookback,
             ctx=ctx,
+            strategy_dir=strategy_dir,
         )
 
     try:
@@ -4455,7 +4873,14 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
             # its reason and both dates on this run's manifest.
             continue
         try:
-            panel = _grade_panel(recipe, source=source, as_of=as_of, loaded=loaded, ctx=ctx)
+            panel = _grade_panel(
+                recipe,
+                source=source,
+                as_of=as_of,
+                loaded=loaded,
+                ctx=ctx,
+                strategy_dir=getattr(settings, "strategy_dir", None),
+            )
         except PER_ARM_REFUSALS as exc:
             # The produce-side warm-up, seen again here — and, since
             # `alpha-engine-config-I11021`, every other TYPED per-arm input
