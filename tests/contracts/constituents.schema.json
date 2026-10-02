@@ -1,0 +1,251 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/constituents.schema.json",
+  "title": "S&P 500/400 constituents (market_data/weekly/{date}/constituents.json, v1)",
+  "description": "Producer: collectors/constituents.py::collect. SSGA SPDR (SPY/MDY) membership + Wikipedia GICS sector/sub-industry. No embedded schema_version today (config#6946 era); this file is v1 of the external contract, versioned by filename/git history per architecture.d/146 rule 3 rather than a payload field -- a future payload schema_version is an additive, backward-compatible change. Consumer: crucible/data/universe.py (v2 declared universe), crucible-executor. Plan \u00a73 boundary table row 4.",
+  "x-key-pattern": "market_data/weekly/{date}/constituents.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "date",
+    "tickers",
+    "sector_map",
+    "sector_etf_map",
+    "sub_industry_map",
+    "sub_sector_etf_map",
+    "sp500_count",
+    "sp400_count",
+    "total_count",
+    "fetched_at"
+  ],
+  "properties": {
+    "date": {
+      "type": "string",
+      "format": "date"
+    },
+    "tickers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "sp500_tickers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "sp400_tickers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "index_overlap": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Names held by BOTH SPY and MDY on this date (a rebalance in flight), so present in both sp500_tickers and sp400_tickers and once in tickers. Omitted when empty. alpha-engine-config-I11470."
+    },
+    "sector_map": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "sector_etf_map": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "sub_industry_map": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "sub_sector_etf_map": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "sector_fallback": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "sector"
+        ],
+        "properties": {
+          "source": {
+            "type": "string",
+            "enum": [
+              "yfinance",
+              "declared_override",
+              "previous_snapshot"
+            ]
+          },
+          "sector": {
+            "type": "string",
+            "minLength": 1
+          },
+          "yf_sector": {
+            "type": "string"
+          },
+          "yf_industry": {
+            "type": "string"
+          },
+          "yfinance_error": {
+            "type": "string"
+          },
+          "valid_through": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          },
+          "snapshot_date": {
+            "type": "string"
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "source": {
+                  "const": "yfinance"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "yf_sector",
+                "yf_industry"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "source": {
+                  "const": "declared_override"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "valid_through",
+                "why"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "source": {
+                  "const": "previous_snapshot"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "snapshot_date"
+              ]
+            }
+          }
+        ]
+      },
+      "description": "Constituents whose sector_map/sector_etf_map entry did not come from Wikipedia's GICS table. `source` says where it came from: `yfinance` (alpha-engine-config-I11468; `yf_sector`/`yf_industry` are the raw evidence it was mapped from), `declared_override` (a dated `_SECTOR_OVERRIDES` entry, `valid_through` + `why`), or `previous_snapshot` (the sector the member carried in the snapshot dated `snapshot_date`, alpha-engine-config-I11785). `yfinance_error` records a failed yfinance lookup that a later source covered. Every ticker in `tickers` has a sector_map entry; the producer raises or withholds rather than publish one without. Absent on snapshots written before I11468."
+    },
+    "withheld_members": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reason",
+          "absent_from_snapshot"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string"
+          },
+          "absent_from_snapshot": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Brand-new index members the funds hold but no source could classify yet, left OUT of `tickers` and every map for this snapshot (alpha-engine-config-I11785). `absent_from_snapshot` is the previous snapshot that proves the member is new. They join on the first run a source classifies them. Usually empty; absent on snapshots written before I11785."
+    },
+    "sp500_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sp400_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "total_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "fetched_at": {
+      "type": "string",
+      "x-provenance": true,
+      "description": "Wall-clock stamp of the fetch, not a data value (alpha-engine-config-I10894): shadow/parity.py excludes it from `values.breaches` and reports it under `provenance_diffs`, because a shadow run and its live counterpart never fetch at the same instant."
+    },
+    "weight_map": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+      },
+      "description": "Per-constituent index weight as FRACTIONS normalised to sum 1.0 WITHIN each index (alpha-engine-config-I11295), from the Weight column of the SSGA holdings file. Cross-index normalisation would make a ticker's weight depend on the other fund's roster, which is not what 'weight in the S&P 500' means -- so `index_of` names the index a value is relative to and must be read alongside it. ABSENT OR EMPTY MEANS UNKNOWN, NEVER ZERO: a cache-served run carries weight_method='cache_no_weights' and no weights, because a weight is only meaningful as of a date and a stale one is undetectable downstream."
+    },
+    "index_of": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "enum": [
+          "S&P 500",
+          "S&P 400"
+        ]
+      },
+      "description": "The index each weighted ticker belongs to, so a consumer can renormalise or filter to one index without re-deriving membership from counts -- the ordering-contract failure mode of alpha-engine-config-I6946."
+    },
+    "weight_method": {
+      "type": "string",
+      "description": "Weight provenance a consumer must honour rather than infer: 'ssga_holdings_file' when weights came from the live file, 'cache_no_weights' when the local cache was served and carries none."
+    },
+    "weight_sum_raw_sp500": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "The S&P 500 equity roster's PRE-normalisation weight sum, in the source file's own units. The only place a units flip or an equity-filter change stays visible: normalisation would otherwise absorb it and every weight would still sum to 1.0 while being wrong. Null when that index was not fetched."
+    },
+    "weight_sum_raw_sp400": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "The S&P 400 equity roster's PRE-normalisation weight sum, in the source file's own units. The only place a units flip or an equity-filter change stays visible: normalisation would otherwise absorb it and every weight would still sum to 1.0 while being wrong. Null when that index was not fetched."
+    }
+  }
+}
