@@ -11,7 +11,7 @@ compares this copy's validation shape with the producer's on every run, so a
 stale copy reads UNMET there.
 
 The fixture is trimmed from the real 2026-09-25 document (903 members, read
-read-only from `s3://alpha-engine-research/market_data/weekly/2026-09-25/`), which
+read-only from the research bucket's `market_data/weekly/2026-09-25/`), which
 validates against the producer schema as published. Only three members are kept,
 and the counts are restated to match them.
 
@@ -41,8 +41,8 @@ from crucible.data.universe import MalformedUniverseError, load_declared_univers
 
 SCHEMA_PATH = Path(__file__).parent / "contracts" / "constituents.schema.json"
 
-POINTER_URI = "s3://alpha-engine-research/market_data/latest_weekly.json"
-TARGET_URI = "s3://alpha-engine-research/market_data/weekly/2026-09-25/constituents.json"
+POINTER_URI = "s3://research-bucket/market_data/latest_weekly.json"
+TARGET_URI = "s3://research-bucket/market_data/weekly/2026-09-25/constituents.json"
 
 _POINTER = {"date": "2026-09-25", "s3_prefix": "market_data/weekly/2026-09-25/"}
 
