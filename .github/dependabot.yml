@@ -24,6 +24,23 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # pandas 3 is UNRESOLVABLE here, not merely unreviewed. The `arcticdb`
+    # extra pulls `nousergon-lib[arcticdb]` -> `arcticdb`, and every
+    # non-yanked arcticdb release (newest 6.26.0; 6.27.0 is yanked) declares
+    # `pandas<3`, on every platform. Dependabot re-locks with `pandas==3.x`,
+    # uv cannot satisfy it, and the whole weekly `uv` job goes red while the
+    # other updates in the same run still open their PR — measured on runs
+    # 35123752417 (2026-09-16), 35890673631 (2026-09-23) and 36746299304
+    # (2026-09-30). Reproduced locally: `uv lock --upgrade-package
+    # pandas==3.0.6` fails on the linux split as well as win32.
+    #
+    # pandas 2.x minor/patch releases still arrive through this config. Remove
+    # this entry when an arcticdb release drops the `pandas<3` bound — that is
+    # the only event that makes the update possible, and it is visible on
+    # arcticdb's PyPI metadata (`requires_dist`).
+    ignore:
+      - dependency-name: pandas
+        versions: [">=3"]
     groups:
       minor-and-patch:
         update-types:
