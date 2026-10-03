@@ -38,19 +38,26 @@ paired weeks. R and S keep the 4-week anytime-valid bar. The asymmetry is
 deliberate: a universe cut is re-decided weekly and is cheap to reverse, and
 requiring anytime-valid support of a cut's edge promoted nothing for months.
 
-**M serves on a point-estimate lead too, but keeps the 4-week age**
-(`alpha-engine-config-I10689`, applying Brian's `universe_cut` ruling above
-per his 2026-09-13 direction — fully autonomous v2, alpha as the experiment,
-velocity over waiting). At 4 paired weekly dates the anytime-valid interval
-is wide for the same reason it was inert for `universe_cut` at 2, so the
-2026-11-14 cycle — the earliest an M champion is even possible
-(`alpha-engine-config-I9759`) — would likely read `held` under
-`anytime_valid`, which the phase-4 trader contract does not accept. M keeps
-`promote_min_weeks=4` rather than adopting `universe_cut`'s 2: unlike a
-universe cut, a wrong M call swaps one predictor among a scored set, not the
-whole universe, so only the evidence mode is relaxed and the age rule is
-left at the fleet default. See the per-slot delta record in
-`champion-challenger-policy.md` §5.0.
+**Every `point` slot promotes only an arm that beats the champion AND every
+other challenger** — Brian's ruling 2026-10-03 (`alpha-engine-config#11849`):
+"if after minimum two weeks an arm outperforms the champion and all other
+challengers then it gets promoted. Otherwise we compare the common window of
+weeks for each arm in making our comparison." That is the library's
+`promote_against="every_arm"`, declared on U and M: each head-to-head rests on
+that pair's own longest common window, and every one of them is on the
+`arena_cycle` record (`decision.rivals`) every cycle. The `anytime_valid`
+slots, R and S, are unchanged.
+
+**M serves on a point-estimate lead after 2 paired weeks, against every
+arm** (`alpha-engine-config-I10689`, ratified with a directive on
+`alpha-engine-config#11849`, 2026-10-03). At small n the anytime-valid
+interval is wide for the same reason it was inert for `universe_cut`, and
+Brian ruled he does not "want to go with no champion for an unknown number of
+weeks". His directive then set M's age to 2 paired weeks — it was 4 — and
+required the promoted arm to outperform the champion and every other
+challenger. The §5.3 behavioural veto and input completeness are unchanged
+and still outrank any lead. See the per-slot delta record in
+`evaluation-policy.md` § Per-slot promotion deltas.
 
 **Strategy content is not here.** An arm is an immutable recipe living in the
 private config repository, loaded at runtime; its id is the hash of its spec.
@@ -68,6 +75,8 @@ from nousergon_lib.arena import ArmRegister
 from nousergon_lib.arena.engine import (
     EVIDENCE_ANYTIME_VALID,
     EVIDENCE_POINT,
+    PROMOTE_AGAINST_EVERY_ARM,
+    PROMOTE_AGAINST_INCUMBENT,
     ArenaConfig,
 )
 
@@ -76,6 +85,8 @@ __all__ = [
     "EVIDENCE_ANYTIME_VALID",
     "EVIDENCE_POINT",
     "ESTIMATOR_KINDS",
+    "PROMOTE_AGAINST_EVERY_ARM",
+    "PROMOTE_AGAINST_INCUMBENT",
     "EXIT_RULES",
     "PORTFOLIO_PARAM_FIELDS",
     "REQUIRED_ARM_FIELDS",
@@ -175,6 +186,12 @@ class SlotSpec:
     #: sequence, or the point estimate. Brian ruling 2026-09-12
     #: (`alpha-engine-config-I10546`) puts the U slot on `point`.
     promote_evidence: str = EVIDENCE_ANYTIME_VALID
+    #: WHO a promotable challenger must beat: the incumbent alone (the library
+    #: default), or — Brian ruling 2026-10-03, `alpha-engine-config#11849` —
+    #: the incumbent AND every other eligible challenger head to head, each
+    #: pair on its own longest common window (`every_arm`). Declared here and
+    #: decided by the library, same as the two bars above.
+    promote_against: str = PROMOTE_AGAINST_INCUMBENT
     #: The fraction of a session's panel a STACKED arm's base model must have
     #: expressed an opinion on before that session may be built. Brian's
     #: ruling 2026-09-17 (`alpha-engine-config-I10947`, option (a)): a stacked
@@ -213,6 +230,7 @@ class SlotSpec:
             retired_trailing_cycles=self.retired_trailing_cycles,
             promote_min_weeks=self.promote_min_weeks,
             promote_evidence=self.promote_evidence,
+            promote_against=self.promote_against,
         )
 
 
@@ -233,9 +251,14 @@ SLOTS: dict[str, SlotSpec] = {
         benchmark="population",
         # Brian ruling 2026-09-12, `alpha-engine-config-I10546`/`-I10547`:
         # the universe cut promotes the point-estimate leader after 2 paired
-        # weeks. The other three slots keep the 4-week anytime-valid bar.
+        # weeks. R and S keep the 4-week anytime-valid bar.
         promote_min_weeks=2,
         promote_evidence=EVIDENCE_POINT,
+        # Brian ruling 2026-10-03, `alpha-engine-config#11849`: the leader
+        # must beat the champion AND every other challenger, each on that
+        # pair's common window. Applied to every `point` slot; the
+        # `anytime_valid` slots (R, S) are unchanged pending his word.
+        promote_against=PROMOTE_AGAINST_EVERY_ARM,
         control_arms=_controls("u"),
     ),
     "r": SlotSpec(
@@ -252,15 +275,21 @@ SLOTS: dict[str, SlotSpec] = {
         # CPCV OOS IC on canonical 21 trading-day labels; the population is
         # the scored cross-section, not an index.
         benchmark="population",
-        # Brian ruling 2026-09-13, `alpha-engine-config-I10689`, applying the
-        # `universe_cut` ruling (`-I10546`) to M: `promote_evidence: point`
-        # so the first promotable cycle (2026-11-14) can actually decide
-        # rather than reading `held` under a 4-paired-week anytime-valid
-        # interval. `promote_min_weeks` STAYS at the 4-week default — a
-        # narrower deviation than `universe_cut`'s 2, since a wrong M call
-        # swaps one predictor among a scored set, not the whole universe.
-        promote_min_weeks=4,
+        # `promote_evidence: point` — Brian ruling 2026-09-13
+        # (`alpha-engine-config-I10689`), ratified 2026-10-03 on
+        # `alpha-engine-config#11849`: "I don't want to go with no champion
+        # for an unknown number of weeks."
+        #
+        # `promote_min_weeks=2` and `promote_against=every_arm` — his
+        # directive of the same ruling, verbatim: "All arms should be
+        # compared each week, performance tracked, and if after minimum two
+        # weeks an arm outperforms the champion and all other challengers
+        # then it gets promoted. Otherwise we compare the common window of
+        # weeks for each arm in making our comparison." Was 4 weeks against
+        # the incumbent alone.
+        promote_min_weeks=2,
         promote_evidence=EVIDENCE_POINT,
+        promote_against=PROMOTE_AGAINST_EVERY_ARM,
         # `alpha-engine-config-I10947`: measured over 2024-05-01..2026-06-04,
         # `residual_momentum`'s scored set ran from 887/903 names (98.2%) on
         # the oldest session to 905/908 (99.7%) on the newest -- it drops the

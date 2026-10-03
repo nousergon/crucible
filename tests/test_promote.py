@@ -221,22 +221,31 @@ class TestEligibilityAgeIsTheEngines:
         )
 
     def test_the_slots_carry_the_ruled_bars(self) -> None:
-        """`alpha-engine-config-I10689`: M moved to `point` evidence (like U)
-        but keeps the 4-week age (unlike U's 2) — so it is asserted
-        separately from both the anytime-valid pair and from U's 2-week bar."""
-        assert (get_slot("u").promote_min_weeks, get_slot("u").promote_evidence) == (2, "point")
-        assert (get_slot("m").promote_min_weeks, get_slot("m").promote_evidence) == (4, "point")
+        """`alpha-engine-config-I10689` put M on `point` evidence; Brian's
+        2026-10-03 ruling (`alpha-engine-config#11849`) ratified that and
+        set M to 2 paired weeks against EVERY arm, the same bar U carries.
+        R and S keep the 4-week anytime-valid bar against the incumbent."""
+        for slot in ("u", "m"):
+            spec = get_slot(slot)
+            assert (spec.promote_min_weeks, spec.promote_evidence, spec.promote_against) == (
+                2,
+                "point",
+                "every_arm",
+            )
+            assert paired_days_required(spec) == 2 * TRADING_DAYS_PER_WEEK == 10
         for slot in ("r", "s"):
             spec = get_slot(slot)
-            assert (spec.promote_min_weeks, spec.promote_evidence) == (4, "anytime_valid")
+            assert (spec.promote_min_weeks, spec.promote_evidence, spec.promote_against) == (
+                4,
+                "anytime_valid",
+                "incumbent",
+            )
             assert paired_days_required(spec) == 4 * TRADING_DAYS_PER_WEEK == 20
-        assert paired_days_required(get_slot("m")) == 4 * TRADING_DAYS_PER_WEEK == 20
-        assert paired_days_required(get_slot("u")) == 2 * TRADING_DAYS_PER_WEEK == 10
 
     def test_a_lead_below_the_bar_does_not_move_the_pointer(self) -> None:
         """`anytime_valid` slot (S, not M — M moved to `point` under
         `alpha-engine-config-I10689`; see
-        `TestMSlotPromotesThePointEstimateLeaderAtFourWeeks` for its own age
+        `TestMSlotPromotesAnArmThatBeatsEveryArmAtTwoWeeks` for its own age
         behaviour)."""
         spec = narrow(get_slot("s"))
         dates = trading_days(3 * TRADING_DAYS_PER_WEEK)
@@ -265,18 +274,21 @@ class TestEligibilityAgeIsTheEngines:
         assert age_held_leaders(spec, decision) == ()
 
 
-class TestMSlotPromotesThePointEstimateLeaderAtFourWeeks:
-    """Brian ruling 2026-09-13 (`alpha-engine-config-I10689`), applying the
-    `universe_cut` ruling (`-I10546`) to M: `promote_evidence: point` with
-    `promote_min_weeks` left at the fleet default of 4 — the narrower
-    deviation, since a wrong M call swaps one predictor among a scored set,
-    not the whole universe. Below the age bar, M still holds like every
-    other slot; unlike an `anytime_valid` slot, the held leader is named
-    on the POINT estimate, not on a confidence-sequence bound."""
+class TestMSlotPromotesAnArmThatBeatsEveryArmAtTwoWeeks:
+    """Brian ruling 2026-10-03 (`alpha-engine-config#11849`), ratifying
+    `promote_evidence: point` for M (`alpha-engine-config-I10689`) with this
+    directive, verbatim: "All arms should be compared each week, performance
+    tracked, and if after minimum two weeks an arm outperforms the champion
+    and all other challengers then it gets promoted. Otherwise we compare the
+    common window of weeks for each arm in making our comparison."
+
+    Below the age bar, M still holds like every other slot; unlike an
+    `anytime_valid` slot, the held leader is named on the POINT estimate,
+    not on a confidence-sequence bound."""
 
     def test_a_lead_below_the_bar_does_not_move_the_pointer(self) -> None:
         spec = get_slot("m")
-        dates = trading_days(3 * TRADING_DAYS_PER_WEEK)
+        dates = trading_days(TRADING_DAYS_PER_WEEK)
         reg, ids = register_with("m", ["champ", "chal"], dates[0])
         decision = _decide(spec, reg, ids, dates, champ=0.0, chal=0.01)
         assert decision.champion == ids["champ"]
@@ -289,13 +301,81 @@ class TestMSlotPromotesThePointEstimateLeaderAtFourWeeks:
 
     def test_a_lead_at_the_bar_promotes(self) -> None:
         spec = get_slot("m")
-        dates = trading_days(4 * TRADING_DAYS_PER_WEEK)
+        dates = trading_days(2 * TRADING_DAYS_PER_WEEK)
         reg, ids = register_with("m", ["champ", "chal"], dates[0])
         decision = _decide(spec, reg, ids, dates, champ=0.0, chal=0.01)
         assert decision.champion == ids["chal"]
         assert decision.moved is True
         assert decision.status == "decided"
         assert age_held_leaders(spec, decision) == ()
+
+    def _three_arm_cycle(self):
+        """``b`` was registered two weeks after ``a``. Against the champion,
+        ``b``'s lead (+0.035 over 2 weeks) is BIGGER than ``a``'s (+0.030
+        over 4 weeks) — but on the two weeks the challengers share, ``a``
+        beats ``b`` (0.000 vs -0.005)."""
+        spec = get_slot("m")
+        dates = trading_days(4 * TRADING_DAYS_PER_WEEK)
+        early, late = dates[: 2 * TRADING_DAYS_PER_WEEK], dates[2 * TRADING_DAYS_PER_WEEK :]
+        reg, ids = register_with("m", ["champ", "a", "b"], dates[0])
+        series_by_arm = {
+            ids["champ"]: ArmSeries(
+                ids["champ"], {**dict.fromkeys(early, 0.0), **dict.fromkeys(late, -0.04)}
+            ),
+            ids["a"]: ArmSeries(
+                ids["a"], {**dict.fromkeys(early, 0.02), **dict.fromkeys(late, 0.0)}
+            ),
+            ids["b"]: ArmSeries(ids["b"], dict.fromkeys(late, -0.005)),
+        }
+        return spec, dates, reg, ids, series_by_arm
+
+    def test_the_promoted_arm_beats_the_champion_and_every_other_challenger(self) -> None:
+        spec, dates, reg, ids, series_by_arm = self._three_arm_cycle()
+        cycle = _cycle_for(spec, dates[-1], reg, series_by_arm, incumbent=ids["champ"])
+        assert cycle.decision.champion == ids["a"], (
+            "the arm with the bigger lead over the champion on a SHORTER window "
+            "must not win when the other challenger beats it head to head"
+        )
+        assert cycle.decision.status == "decided"
+        assert "promote_against=every_arm" in cycle.decision.reason
+
+    def test_the_bigger_lead_wins_under_the_old_rule(self) -> None:
+        """The control: the same series under M's previous rule (best lead
+        over the incumbent alone) promote ``b``, so the test above is
+        measuring the ruling and not the fixture."""
+        spec, dates, reg, ids, series_by_arm = self._three_arm_cycle()
+        old = replace(spec, promote_against="incumbent")
+        cycle = _cycle_for(old, dates[-1], reg, series_by_arm, incumbent=ids["champ"])
+        assert cycle.decision.champion == ids["b"]
+
+    def test_every_head_to_head_is_on_the_cycle_record(self) -> None:
+        """ "All arms should be compared each week, performance tracked" —
+        each pair on that pair's own common window."""
+        spec, dates, reg, ids, series_by_arm = self._three_arm_cycle()
+        cycle = _cycle_for(spec, dates[-1], reg, series_by_arm, incumbent=ids["champ"])
+        (verdict,) = cycle.to_dict()["decision"]["rivals"]
+        assert {verdict["arm_a"], verdict["arm_b"]} == {ids["a"], ids["b"]}
+        assert verdict["winner"] == ids["a"]
+        assert verdict["n_dates"] == 2 * TRADING_DAYS_PER_WEEK
+        assert verdict["confidence_sequence"] is not None
+
+    def test_the_behavioural_veto_still_outranks_the_head_to_head_winner(self) -> None:
+        """§5.3 is unchanged: a vetoed arm never serves, and an arm that may
+        not serve is not a rival either."""
+        spec, dates, reg, ids, series_by_arm = self._three_arm_cycle()
+        cycle = _cycle_for(
+            spec,
+            dates[-1],
+            reg,
+            series_by_arm,
+            incumbent=ids["champ"],
+            preconditions={
+                ids["a"]: [ServingPrecondition("behavioural_veto", False, "n_high_confidence=0")]
+            },
+        )
+        assert cycle.decision.champion == ids["b"]
+        assert ids["a"] in cycle.decision.ineligible
+        assert cycle.to_dict()["decision"]["rivals"] == []
 
 
 class TestUSlotPromotesThePointEstimateLeaderAtTwoWeeks:
@@ -586,6 +666,7 @@ class TestChampionPointer:
         assert pointer["promotion_source"] == "evidence"
         assert pointer["evidence"]["confidence_sequence"]["lower"] > 0
         assert pointer["evidence"]["paired_dates"] >= 20
+        assert pointer["evidence"]["promote_against"] == "every_arm"
 
     def test_revert_records_the_operator_as_the_source(self, tmp_path) -> None:
         from crucible.champion import champion_key

@@ -643,6 +643,7 @@ def _write_pointer_if_moved(
         "moved": decision.moved,
         "promote_min_weeks": spec.promote_min_weeks,
         "promote_evidence": spec.promote_evidence,
+        "promote_against": spec.promote_against,
         "paired_dates_required": paired_days_required(spec),
         "eligible_arms": sorted(
             arm for arm in cycle.active_arms if arm not in (decision.ineligible or {})
@@ -844,6 +845,7 @@ def _append_experiment_events(
                 "reason": decision.reason,
                 "promote_min_weeks": spec.promote_min_weeks,
                 "promote_evidence": spec.promote_evidence,
+                "promote_against": spec.promote_against,
                 "paired_dates_required": paired_days_required(spec),
             }
         )

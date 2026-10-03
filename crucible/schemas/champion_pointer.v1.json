@@ -157,6 +157,22 @@
           "default": null,
           "title": "Paired Dates Required"
         },
+        "promote_against": {
+          "anyOf": [
+            {
+              "enum": [
+                "incumbent",
+                "every_arm"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Promote Against"
+        },
         "promote_evidence": {
           "anyOf": [
             {

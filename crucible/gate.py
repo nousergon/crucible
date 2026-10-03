@@ -9898,8 +9898,10 @@ def _phase5(
 #:   requires, so a shorter window could only ever read UNMET for the slots
 #:   sitting at that bar. It stays four after Brian's 2026-09-12 ruling
 #:   (`alpha-engine-config-I10546`, `-I10547`) dropped the U slot to 2 paired
-#:   weeks on a point estimate: R, M and S are still at four, and a window
-#:   narrowed to the SMALLEST slot's bar would make their clauses unmeetable.
+#:   weeks on a point estimate, and after his 2026-10-03 ruling
+#:   (`alpha-engine-config#11849`) dropped M to 2 as well: R and S are still
+#:   at four, and a window narrowed to the SMALLEST slot's bar would make
+#:   their clauses unmeetable.
 #:   Read the per-slot bar off `crucible.slots`, never off this number.
 #: * phase 4 — TWO, covering §6 row 4's "one week" trader claim plus a second
 #:   week of cadence evidence for the SF count. Phase 0's window narrowed to
