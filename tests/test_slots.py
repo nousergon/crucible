@@ -81,9 +81,8 @@ class TestConfiguredValues:
         the per-slot VALUE and the library owns the rule that reads it.
 
         M is excluded from this parametrization — see
-        `test_the_m_slot_promotes_the_point_estimate_leader_at_four_weeks`
-        below (`alpha-engine-config-I10689`); it keeps the 4-week age but not
-        the anytime-valid evidence mode."""
+        `test_the_m_slot_promotes_an_arm_that_beats_every_arm_at_two_weeks`
+        below (`alpha-engine-config-I10689`, `alpha-engine-config#11849`)."""
         assert get_slot(slot).promote_min_weeks == 4
         assert arena_config_for(slot).promote_min_weeks == 4
         assert arena_config_for(slot).promote_evidence == "anytime_valid"
@@ -97,17 +96,33 @@ class TestConfiguredValues:
         assert arena_config_for("u").promote_min_weeks == 2
         assert arena_config_for("u").promote_evidence == "point"
 
-    def test_the_m_slot_promotes_the_point_estimate_leader_at_four_weeks(self) -> None:
-        """Brian's ruling, 2026-09-13 (`alpha-engine-config-I10689`),
-        applying the `universe_cut` ruling (`-I10546`) to M: the anytime-valid
-        interval is wide at 4 paired weeks for the same reason it was inert
-        for `universe_cut` at 2, so M promotes on the point-estimate lead
-        too. Unlike `universe_cut`, M keeps `promote_min_weeks == 4` rather
-        than 2 — a wrong M call swaps one predictor among a scored set, not
-        the whole universe, so only the evidence mode is relaxed."""
-        assert get_slot("m").promote_min_weeks == 4
-        assert arena_config_for("m").promote_min_weeks == 4
+    def test_the_m_slot_promotes_an_arm_that_beats_every_arm_at_two_weeks(self) -> None:
+        """Brian's ruling, 2026-10-03 (`alpha-engine-config#11849`): RATIFY
+        `promote_evidence: point` for M (`alpha-engine-config-I10689`) — "I
+        don't want to go with no champion for an unknown number of weeks" —
+        with the directive, verbatim: "All arms should be compared each week,
+        performance tracked, and if after minimum two weeks an arm
+        outperforms the champion and all other challengers then it gets
+        promoted. Otherwise we compare the common window of weeks for each
+        arm in making our comparison." M was 4 weeks against the incumbent
+        alone."""
+        assert get_slot("m").promote_min_weeks == 2
+        assert arena_config_for("m").promote_min_weeks == 2
         assert arena_config_for("m").promote_evidence == "point"
+        assert arena_config_for("m").promote_against == "every_arm"
+
+    @pytest.mark.parametrize("slot", ["u", "m"])
+    def test_every_point_slot_promotes_against_every_arm(self, slot: str) -> None:
+        """The 2026-10-03 rule is applied to every `point` slot."""
+        assert arena_config_for(slot).promote_evidence == "point"
+        assert arena_config_for(slot).promote_against == "every_arm"
+
+    @pytest.mark.parametrize("slot", ["r", "s"])
+    def test_the_anytime_valid_slots_still_promote_against_the_incumbent(self, slot: str) -> None:
+        """R and S are NOT changed by the 2026-10-03 ruling: whether they
+        should follow is Brian's question, and the library refuses
+        `every_arm` with `anytime_valid` until it is answered."""
+        assert arena_config_for(slot).promote_against == "incumbent"
 
     @pytest.mark.parametrize("slot", ["u", "r", "m", "s"])
     def test_the_declared_bar_is_the_one_the_library_decides_on(self, slot: str) -> None:
@@ -121,6 +136,7 @@ class TestConfiguredValues:
         cfg = arena_config_for(slot)
         assert spec.promote_min_weeks == cfg.promote_min_weeks
         assert spec.promote_evidence == cfg.promote_evidence
+        assert spec.promote_against == cfg.promote_against
 
     @pytest.mark.parametrize("slot", ["u", "r"])
     def test_a_selection_slot_is_never_benchmarked_against_spy(self, slot: str) -> None:

@@ -39,7 +39,12 @@ dependencies = [
     # 0.124.159 scores an arm retired AFTER the graded day (nousergon-lib-PR453,
     # alpha-engine-config-I11084): replaying the 09-18 weekly arc against a
     # register carrying a 09-25 retirement raised in `elapsed_weeks`.
-    "nousergon-lib[github-app,gates]==0.124.159",
+    #
+    # 0.124.165 carries `ArenaConfig.promote_against` (nousergon-lib-PR461,
+    # alpha-engine-config#11849): M and U promote only an arm that beats the
+    # champion AND every other eligible challenger, each pair on its own
+    # common window.
+    "nousergon-lib[github-app,gates]==0.124.165",
     # Trading calendar, dual-date resolution, structured logging, alerts.
     #
     # `[openai]` is NOT optional here (alpha-engine-config-I10473). krepis
@@ -125,7 +130,7 @@ dependencies = [
 # path it never exercises. `crucible data.daily --source arctic` states the
 # missing extra by name when it is absent — it never falls back to a
 # different source, which would silently change what the run measured.
-arcticdb = ["nousergon-lib[arcticdb]==0.124.159"]
+arcticdb = ["nousergon-lib[arcticdb]==0.124.165"]
 
 [project.scripts]
 crucible = "crucible.cli:main"

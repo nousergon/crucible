@@ -2470,6 +2470,12 @@ class ChampionEvidence(BaseModel):
     #: carries no promotion evidence at all — never because a promotion may
     #: omit it.
     promote_evidence: Literal["anytime_valid", "point"] | None = None
+    #: WHO the promoted arm had to beat, mirroring
+    #: `nousergon_lib.arena.engine.ArenaConfig.promote_against`
+    #: (`alpha-engine-config#11849`). Optional for the same reason as
+    #: `promote_evidence`: every pointer written before 2026-10-03 predates it,
+    #: and was decided against the incumbent alone.
+    promote_against: Literal["incumbent", "every_arm"] | None = None
     paired_dates_required: Annotated[int, Field(ge=1)] | None = None
     operator: str | None = None
     eligible_arms: list[str] | None = None
@@ -3564,6 +3570,9 @@ class EligibilityHoldEventRow(_ExperimentEventBase):
     #: Optional so rows already on the feed still validate; the writer always
     #: sets it.
     promote_evidence: Literal["anytime_valid", "point"] | None = None
+    #: Who a held leader had to beat (`alpha-engine-config#11849`). Optional
+    #: so rows already on the feed still validate; the writer always sets it.
+    promote_against: Literal["incumbent", "every_arm"] | None = None
     paired_dates_required: Annotated[int, Field(ge=1)]
 
 
