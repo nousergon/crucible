@@ -134,6 +134,36 @@ class TestCausalGrouping:
     def test_the_declared_causes_claim_their_failures(self, reason: str, expected: str) -> None:
         assert cause_key(_failed("data.daily", reason)).startswith(expected)
 
+    def test_an_arc_stage_failure_and_the_arcs_own_failure_are_one_incident(self) -> None:
+        """Measured on the bus 2026-10-02: `failure.experiment.grade.json` and
+        `failure.weekly.json`, two rows against the ceiling for one cause —
+        and the same pair on 2026-09-04 and 2026-09-18. The arc's reason
+        names the stage that stopped it; that stage's incident is the arc's.
+        VERIFIED RED before the change: two groups."""
+        stage = _failed(
+            "experiment.grade", "ValueError: need ≥ 8 observations for 6 factors, got 1"
+        )
+        arc = _failed(
+            "weekly",
+            "ArcStageFailed: weekly arc stage experiment.grade[s] raised for 2026-08-28: "
+            "ValueError: need ≥ 8 observations for 6 factors, got 1",
+        )
+        groups = group_pages([stage, arc])
+        assert len(groups) == 1
+        assert {m.job for m in groups[0].members} == {"experiment.grade", "weekly"}
+        assert cause_key(arc) == cause_key(stage) == "experiment.grade:2026-08-28"
+
+    def test_an_arc_failure_that_names_no_stage_keeps_its_own_key(self) -> None:
+        """The pre-stage-1 refusal is the arc's own incident, not a stage's."""
+        arc = _failed("weekly", "MissingArtifactError: refused before stage 1")
+        assert cause_key(arc) == "weekly:2026-08-28"
+
+    def test_a_non_arc_job_quoting_the_phrase_is_not_regrouped(self) -> None:
+        """Only the arc's own page is re-keyed; another job's reason that
+        happens to quote the arc's wording groups on its own job."""
+        page = _failed("report", "KeyError: last week's weekly arc stage drift raised for x")
+        assert cause_key(page) == "report:2026-08-28"
+
     def test_a_group_with_no_members_is_not_a_page(self) -> None:
         with pytest.raises(ValueError, match="no members"):
             PageGroup("x", ())

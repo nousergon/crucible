@@ -29,6 +29,7 @@ built on an absent input — a well-formed artifact containing nothing.
 from __future__ import annotations
 
 import datetime as dt
+import re
 from dataclasses import dataclass
 
 from crucible.components import Component, load_registry
@@ -42,6 +43,7 @@ __all__ = [
     "Stage",
     "arc_stages",
     "assert_arc_champions_producible",
+    "failed_stage_job",
     "run_arc",
 ]
 
@@ -242,6 +244,33 @@ def assert_arc_champions_producible(
 class ArcStageFailed(RuntimeError):
     """A stage exited non-zero. Carries which one, so the arc's own manifest
     `reason` names a job rather than a traceback in a module nobody opens."""
+
+
+#: The one shape both `ArcStageFailed` messages in :func:`run_arc` start with,
+#: read back by :func:`failed_stage_job`. Written next to the two f-strings
+#: that produce it so the reader and the writer cannot drift apart silently;
+#: `tests/test_weekly.py` round-trips a real `run_arc` failure through it.
+_ARC_STAGE_FAILED_RE = re.compile(
+    r"\bweekly arc stage (?P<job>[A-Za-z0-9_.]+)(?:\[[^\]]+\])? (?:raised|exited) "
+)
+
+
+def failed_stage_job(reason: str) -> str | None:
+    """The JOB of the arc stage an :class:`ArcStageFailed` reason names, or None.
+
+    ``experiment.grade[s]`` reads back as ``experiment.grade``: the slot is a
+    discriminator on the stage, not a different job, and the stage's own
+    failure page is filed under the job name. ``None`` for any reason that is
+    not a stage failure (the pre-stage-1 refusal, an arc-level crash), so the
+    caller keeps whatever it would otherwise have done.
+
+    Exists for :func:`crucible.alerts.cause_key` (`alpha-engine-config-I11931`
+    follow-up): an arc stage that fails writes its OWN failed manifest and the
+    arc writes a second one naming it, and grading those as two causes made
+    one bad Saturday two incidents against the ceiling.
+    """
+    match = _ARC_STAGE_FAILED_RE.search(reason)
+    return match.group("job") if match else None
 
 
 def run_arc(
