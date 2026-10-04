@@ -8808,25 +8808,63 @@ def _clause_execution_shortfall_row_graded(store: Store, window: list[dt.date]) 
     return Clause(name, requirement, False, f"row reads {status}: {reason}", evidence)
 
 
+#: How many sessions the newest shadow-book document a trader can have filed
+#: trails the session a phase-4 reading is taken for (`alpha-engine-config-I10653`,
+#: C29 of the 2026-10-03 run). Two, each from the producer's own contract, not a
+#: tolerance:
+#:
+#: 1. **Fills at close, held through the successor.** A decision day's book is
+#:    advanced only once the session it was held through has closed and that
+#:    session's panel is published (`crucible_trader.shadow_inputs`), so the book
+#:    for ``D`` cannot exist before ``D+1`` has closed.
+#: 2. **The producer runs the morning after.** `crucible_trader.shadow_books_daily`
+#:    binds to the LAST CLOSED session at run time and advances the session
+#:    before it; the executor box runs it at 11:00 New York time, because the
+#:    panel lands at 18:30 and the box is stopped by then.
+#:
+#: The gate for ``D`` is taken the evening of ``D`` (`runs/gate/{D}/run.json`,
+#: ~22:00 New York time), so the newest book it can find is ``D-2``. Reading
+#: ``shadow_books/{D}.json`` instead asked for a document that is written two
+#: sessions after every reading of ``D`` has been taken, which no trader on any
+#: schedule could satisfy: the clause was UNMET by construction.
+SHADOW_BOOK_SETTLEMENT_LAG_SESSIONS = 2
+
+
 def _clause_shadow_books_cover_every_active_arm(store: Store, window: list[dt.date]) -> Clause:
     """`alpha-engine-config-I10746` deliverable 2 (`-I10653` deliverable 4).
 
-    Reads `crucible.execution.shadow_book_coverage` for the window's last
-    session, with `days_served` from the trader's own evidence document
+    Reads `crucible.execution.shadow_book_coverage` for the NEWEST shadow-book
+    document filed within :data:`SHADOW_BOOK_SETTLEMENT_LAG_SESSIONS` sessions
+    of the window's last session (newest first, so a book filed early is read
+    as it is), with `days_served` from the trader's own evidence document
     (`trader/evidence.json`, validated through `TraderEvidenceDocument`)
-    restricted to days on or before that session. An absent evidence
-    document is UNMET, not UNMEASURABLE (I10746): without it no served day can
-    be checked, which is a trader that has not run, not a store we could not
-    read. A corrupt shadow-book artifact raises out of the reader and is read
-    UNMET naming the key. Shadow books are evidence only — never a promotion
-    input (I10653 deliverable 5) — and nothing here feeds one.
+    restricted to days on or before THAT book's session. A served day after it
+    is not yet checkable -- its book does not exist yet -- and is checked by the
+    reading that finds it; every book carries its whole `days_advanced` history,
+    so no served day escapes a later reading. No book inside the lag is UNMET,
+    naming every key looked for: a producer that stopped is a finding, and the
+    bound is what keeps a stale book from standing in for a current one.
+
+    An absent evidence document is UNMET, not UNMEASURABLE (I10746): without it
+    no served day can be checked, which is a trader that has not run, not a
+    store we could not read. A corrupt shadow-book artifact raises out of the
+    reader and is read UNMET naming the key. Shadow books are evidence only --
+    never a promotion input (I10653 deliverable 5) -- and nothing here feeds one.
     """
     name = "shadow_books_cover_every_active_arm"
-    session = _last_session(window[-1]).isoformat()
+    candidates = [
+        day.isoformat()
+        for day in reversed(
+            _sessions_ending(_last_session(window[-1]), SHADOW_BOOK_SETTLEMENT_LAG_SESSIONS + 1)
+        )
+    ]
+    keys = [shadow_books_key(day) for day in candidates]
     requirement = (
-        f"`{shadow_books_key(session)}` carries an advanced shadow book for every active arm "
-        "in the register, none failed, each advanced on every day the trader served "
-        f"(`days_served` in `{TRADER_EVIDENCE_KEY}`) since its inception"
+        f"the newest of `{keys[-1]}`..`{keys[0]}` (a book is filed "
+        f"{SHADOW_BOOK_SETTLEMENT_LAG_SESSIONS} sessions after the one it reads at the latest: "
+        "fills at close, advanced the morning after its successor closes) carries an advanced "
+        "shadow book for every active arm in the register, none failed, each advanced on every "
+        f"day the trader served (`days_served` in `{TRADER_EVIDENCE_KEY}`) since its inception"
     )
     evidence_key = TRADER_EVIDENCE_KEY
     read = _read_store_document(store, evidence_key)
@@ -8852,6 +8890,17 @@ def _clause_shadow_books_cover_every_active_arm(store: Store, window: list[dt.da
             False,
             f"{evidence_key} does not conform to trader_evidence.v2 ({len(exc.errors())} error(s))",
             (evidence_key,),
+        )
+    session = next((day for day in candidates if store.exists(shadow_books_key(day))), None)
+    if session is None:
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"no shadow books filed for any of the sessions {candidates[-1]}..{candidates[0]} "
+            f"({', '.join(keys)} are all absent) — a trader on its declared schedule has filed "
+            f"{keys[-1]} by this reading",
+            (*keys, evidence_key),
         )
     days_served = [day for day in served if day <= session]
     try:
