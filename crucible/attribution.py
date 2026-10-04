@@ -29,7 +29,10 @@ over the window, ``Σy = n·a + B·Σx + Σe``. The portfolio-level factor expos
 the summed factor-return series is therefore the additive, in-model return
 each factor is credited with; what the caller's *realized* portfolio return
 does not carry in that sum is `residual_alpha` — the intercept, holding
-selection, and everything the named factors do not span. This is a top-down
+selection, and everything the named factors do not span. The loadings may
+be fit over a longer window than the one attributed (`attributed_factor_returns`,
+`alpha-engine-config-I11964`): a book that earns one session a week cannot
+identify six loadings from its own sessions. This is a top-down
 decomposition (gross return minus explained return), not a re-estimate of
 `Σe` per holding: the realized gross return is the caller's own measured
 figure (whatever priced the book), and only that figure ties exactly to what
@@ -329,6 +332,7 @@ def compute_factor_attribution(
     params: AttributionFactorParams,
     gross_return: float,
     cost_bps_total: float,
+    attributed_factor_returns: Mapping[str, Sequence[float]] | None = None,
 ) -> dict[str, Any]:
     """Fit the factor model through `nousergon_lib.quant.factor_risk` and decompose.
 
@@ -342,6 +346,19 @@ def compute_factor_attribution(
     the same cost-model charge `crucible.portfolio.portfolio_evidence` already
     records, carried here rather than re-priced so gross and net tie to one
     number.
+
+    ``attributed_factor_returns`` separates the window the model is FIT over
+    from the sessions the return is ATTRIBUTED over
+    (`alpha-engine-config-I11964`): when given, it maps every factor to its
+    return on exactly the sessions ``gross_return`` was earned on, and each
+    factor's contribution is its exposure times that series' sum. Absent, the
+    fit window is the attributed window, as before. A caller whose book earns
+    fewer sessions than the factor count needs this: S books earn one
+    session per weekly arc, and fitting six loadings on their own sessions
+    raised on every arc until the eighth.
+
+    ``window_sessions`` is always the FIT window — the schema's own
+    definition ("the return window the factor model was fit over").
 
     Returns the validated `factor_attribution.v1` evidence document.
     """
@@ -371,6 +388,23 @@ def compute_factor_attribution(
                 f"holding {ticker!r} has {len(series)} observations, expected {window_sessions}"
             )
 
+    if attributed_factor_returns is None:
+        attributed_factor_returns = factor_returns
+    elif set(attributed_factor_returns) != factor_names:
+        missing = sorted(factor_names - set(attributed_factor_returns))
+        extra = sorted(set(attributed_factor_returns) - factor_names)
+        raise ValueError(
+            f"attributed_factor_returns does not match the attribution spec's factors "
+            f"(missing={missing}, extra={extra}). A factor with no return over the "
+            "attributed sessions would be credited nothing, silently."
+        )
+    attributed_lengths = {len(series) for series in attributed_factor_returns.values()}
+    if len(attributed_lengths) != 1 or 0 in attributed_lengths:
+        raise ValueError(
+            "attributed_factor_returns must give every factor the same, non-zero number of "
+            f"sessions; got lengths {sorted(attributed_lengths)}"
+        )
+
     model = estimate_factor_model(holding_returns, factor_returns, shrinkage=params.shrinkage)
     risk = portfolio_risk(model, weights)
     exposures: dict[str, float] = risk["factor_exposures"]
@@ -382,10 +416,11 @@ def compute_factor_attribution(
         fdef = params.factors[name]
         exposure = float(exposures[name])
         # Additive in-model return contribution: exposure × the factor's own
-        # summed return over the window (see module docstring — Σy = n·a +
-        # B·Σx + Σe, so exposure·Σx_k is exactly what factor k is credited
-        # with in that sum).
-        contribution = exposure * float(sum(factor_returns[name]))
+        # summed return over the ATTRIBUTED sessions (see module docstring —
+        # Σy = n·a + B·Σx + Σe, so exposure·Σx_k is exactly what factor k is
+        # credited with in that sum; the loadings may come from a longer fit
+        # window, `alpha-engine-config-I11964`).
+        contribution = exposure * float(sum(attributed_factor_returns[name]))
         category_totals[fdef.category] += contribution
         explained_return += contribution
         row: dict[str, Any] = {

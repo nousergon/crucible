@@ -87,7 +87,7 @@ from crucible.synthetic import (
     manifest_synthetic_marker,
     synthetic_routing_active,
 )
-from crucible.weekly import ARC_JOB
+from crucible.weekly import ARC_JOB, failed_stage_job
 
 __all__ = [
     "ALERT_BUS_SCHEMA_VERSION",
@@ -334,7 +334,20 @@ def cause_key(page: Page) -> str:
     for key, needle in CAUSE_MATCHERS:
         if needle.lower() in haystack:
             return f"{prefix}{key}:{page.trading_day.isoformat()}"
-    return f"{prefix}{page.job}:{page.trading_day.isoformat()}"
+    # The weekly ARC failing because one of its stages failed is that stage's
+    # incident, not a second one. The stage files its own failed manifest and
+    # the arc files another whose reason names it (`ArcStageFailed: weekly arc
+    # stage experiment.grade[s] raised for …`), and grading them on their own
+    # job names put two rows on the bus for one cause: measured on
+    # 2026-09-04 (data.weekly), 2026-09-18 (experiment.run[r]) and 2026-10-02
+    # (experiment.grade[s]). Keyed on the STAGE's job, the arc's page joins
+    # the stage's group as a second member. The arc's reason embeds the
+    # stage's own error text, so a stage failure a CAUSE_MATCHER claims is
+    # claimed identically above and never reaches this line.
+    subject = page.job
+    if page.job == ARC_JOB:
+        subject = failed_stage_job(page.reason) or subject
+    return f"{prefix}{subject}:{page.trading_day.isoformat()}"
 
 
 def group_pages(pages: Sequence[Page]) -> list[PageGroup]:

@@ -21,7 +21,14 @@ from crucible.slots import SLOTS, dispatchable_slots, get_slot
 from crucible.slots.arms import control_specs, load_arm_specs
 from crucible.slots.producibility import UnproducibleChampionError
 from crucible.store import LocalStore
-from crucible.weekly import ARC_SLOT_JOBS, ARCTIC_LIBRARY_JOBS, ArcStageFailed, arc_stages, run_arc
+from crucible.weekly import (
+    ARC_SLOT_JOBS,
+    ARCTIC_LIBRARY_JOBS,
+    ArcStageFailed,
+    arc_stages,
+    failed_stage_job,
+    run_arc,
+)
 
 FRIDAY = dt.date(2026, 8, 28)
 
@@ -335,6 +342,46 @@ class TestRunsTheRealCommand:
 
         with pytest.raises(RuntimeError, match="provider_5xx"):
             run_arc(FRIDAY, store=None, run_mode=RUN_MODE_LIVE, main=fake_main)
+
+
+class TestFailedStageJobReadsBackWhatRunArcWrote:
+    """`failed_stage_job` parses the reason `run_arc` writes. Round-tripped
+    through the real `run_arc`, so the parser and the two f-strings it reads
+    cannot drift apart while both their tests stay green."""
+
+    def test_an_exited_stage_reads_back_as_its_job(self) -> None:
+        first = next(s for s in arc_stages(FRIDAY) if s.job != "data.weekly")
+
+        def fake_main(argv: list[str]) -> int:
+            return 0 if argv[0] == "data.weekly" else 3
+
+        with pytest.raises(ArcStageFailed) as caught:
+            run_arc(FRIDAY, store=None, run_mode=RUN_MODE_LIVE, main=fake_main)
+        assert failed_stage_job(f"ArcStageFailed: {caught.value}") == first.job
+
+    def test_a_raising_slot_stage_reads_back_as_its_job_without_the_slot(self) -> None:
+        stage = next(s for s in arc_stages(FRIDAY) if s.slot)
+
+        def fake_main(argv: list[str]) -> int:
+            if argv[0] == stage.job and stage.slot in argv:
+                raise ValueError("need >= 8 observations for 6 factors, got 1")
+            return 0
+
+        with pytest.raises(ArcStageFailed) as caught:
+            run_arc(FRIDAY, store=None, run_mode=RUN_MODE_LIVE, main=fake_main)
+        assert f"{stage.job}[{stage.slot}]" in str(caught.value)
+        assert failed_stage_job(f"ArcStageFailed: {caught.value}") == stage.job
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "ValueError: need >= 8 observations for 6 factors, got 1",
+            "MissingArtifactError: weekly arc for 2026-10-02 refused before stage 1",
+            "",
+        ],
+    )
+    def test_a_reason_that_is_not_a_stage_failure_reads_as_none(self, reason: str) -> None:
+        assert failed_stage_job(reason) is None
 
 
 class TestArcticLibraryThreading:

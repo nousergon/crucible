@@ -1084,28 +1084,62 @@ def _attribute_book(
 ) -> dict[str, Any]:
     """The `factor_attribution.v1` evidence for ``constructed``'s book.
 
-    Decomposes the book's realized gross return (the same panel window
-    `construct_book` walked) against the factor spec's ETF proxies. Every
-    input series is read from ``returns`` — the same `_close_returns(panel)`
-    frame the book was constructed over — so the decomposition and the
-    construction it explains are measured against the identical panel, never
-    a second read.
+    Two windows, deliberately distinct (`alpha-engine-config-I11964`):
 
-    Fails loud (module rule 5) on any proxy or holding the panel carries no
-    row for: S is graded against a market index, and a decomposition missing
-    a factor is not the deliverable — nothing here is stubbed or zero-filled
-    to make a thin panel pass.
+    * the **fit window** — the trailing ``COVARIANCE_LOOKBACK_TRADING_DAYS``
+      daily sessions of ``returns`` ending on the book's last SETTLE session,
+      the same span and the same zero-filled matrix the book's own covariance
+      is estimated over (`_build_sessions`). The loadings B, the factor
+      covariance F and the idiosyncratic variance D are fit here, through
+      `nousergon_lib.quant.factor_risk`, at its own ``n >= k + 2`` floor.
+    * the **attributed sessions** — the sessions the book actually EARNED,
+      i.e. each decision day's successor (a decision is held through the next
+      session, `_build_sessions`). The book's gross return is decomposed over
+      these, against each factor's return on those same sessions.
+
+    Fitting the loadings on the book's own sessions conflated the two: S
+    records one decision per WEEKLY arc, so the 2026-10-02 arc handed a
+    six-factor regression one observation and failed the whole slot. And the
+    old reader took each factor's return on the DECISION day, one session
+    before the return the book earned, so the decomposition and the gross it
+    decomposed were never the same session.
+
+    Every series is read from ``returns`` — the same `_close_returns(panel)`
+    frame the book was constructed over — never a second read. Fails loud
+    (module rule 5) on any proxy or holding the panel carries no column for,
+    and on a proxy with no return on a session it is needed for: S is graded
+    against a market index, and a decomposition missing a factor is not the
+    deliverable.
     """
     from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
 
-    dates = constructed.book.dates
+    index = [str(day) for day in returns.index]
+    successor = dict(zip(index[:-1], index[1:], strict=True))
+    settle_days: list[str] = []
+    for day in constructed.book.dates:
+        if day not in successor:
+            raise MissingArtifactError(
+                f"attribution over the book graded {as_of}: decision day {day!r} has no "
+                "successor session in the price panel, so the return the book earned on it "
+                "cannot be read. A book is only constructed over settled sessions; this "
+                "one was not."
+            )
+        settle_days.append(successor[day])
+
+    # The panel's first session has no predecessor, so its `pct_change` row is
+    # structurally NaN — not a return of zero. It is never part of a fit.
+    fit = returns.loc[: settle_days[-1]]
+    fit = fit.loc[[day for day in fit.index if day != index[0]]]
+    fit = fit.tail(COVARIANCE_LOOKBACK_TRADING_DAYS)
+    fit_days = [str(day) for day in fit.index]
+
     holding_returns: dict[str, list[float]] = {}
     for ticker in universe.tickers:
         if ticker == CASH_TICKER:
             # The book's own realized-return construction (`_build_sessions`)
             # charges cash a flat 0.0 every session — the identical sentinel,
             # not a second convention for the same position.
-            holding_returns[ticker] = [0.0] * len(dates)
+            holding_returns[ticker] = [0.0] * len(fit_days)
             continue
         if ticker not in returns.columns:
             raise MissingArtifactError(
@@ -1113,12 +1147,19 @@ def _attribute_book(
                 "in the price panel this book was constructed over. A book position with "
                 "no return series cannot be attributed and none is invented for it."
             )
-        holding_returns[ticker] = [float(returns.loc[day, ticker]) for day in dates]
+        # `nan_to_num`, exactly as `_build_sessions` builds the covariance
+        # panel the optimiser solved against: the loadings are fit over the
+        # matrix the book was constructed from, not a second cleaning of it.
+        holding_returns[ticker] = [
+            float(x) for x in np.nan_to_num(fit[ticker].to_numpy(dtype="float64"), nan=0.0)
+        ]
 
     factor_returns: dict[str, list[float]] = {}
+    attributed_factor_returns: dict[str, list[float]] = {}
     for name, fdef in params.factors.items():
         proxies = {fdef.proxy, *([fdef.short_proxy] if fdef.short_proxy is not None else [])}
-        proxy_returns: dict[str, list[float]] = {}
+        fit_proxy: dict[str, list[float]] = {}
+        earned_proxy: dict[str, list[float]] = {}
         for ticker in proxies:
             if ticker not in returns.columns:
                 raise MissingArtifactError(
@@ -1127,19 +1168,37 @@ def _attribute_book(
                     "optional for the S slot and no proxy is substituted for a missing one "
                     f"— compile the panel with {ticker!r} in the universe."
                 )
-            proxy_returns[ticker] = [float(returns.loc[day, ticker]) for day in dates]
-        factor_returns[name] = factor_return_series(fdef, proxy_returns)
+            fit_proxy[ticker] = [float(returns.loc[day, ticker]) for day in fit_days]
+            earned_proxy[ticker] = [float(returns.loc[day, ticker]) for day in settle_days]
+            gaps = [
+                day
+                for day, value in zip(
+                    fit_days + settle_days,
+                    fit_proxy[ticker] + earned_proxy[ticker],
+                    strict=True,
+                )
+                if not np.isfinite(value)
+            ]
+            if gaps:
+                raise MissingArtifactError(
+                    f"attribution factor {name!r} proxies {ticker!r}, which has no return on "
+                    f"{len(gaps)} session(s) of the panel at {as_of} (first {gaps[0]}). A "
+                    "factor series with a hole is not zero-filled into a loading."
+                )
+        factor_returns[name] = factor_return_series(fdef, fit_proxy)
+        attributed_factor_returns[name] = factor_return_series(fdef, earned_proxy)
 
     weights = dict(zip(universe.tickers, constructed.weights[-1], strict=True))
     return compute_factor_attribution(
-        trading_day=dates[-1],
-        window_sessions=len(dates),
+        trading_day=settle_days[-1],
+        window_sessions=len(fit_days),
         holding_returns=holding_returns,
         weights=weights,
         factor_returns=factor_returns,
         params=params,
         gross_return=float(sum(constructed.book.portfolio_returns)),
         cost_bps_total=float(constructed.evidence["cost_bps_total"]),
+        attributed_factor_returns=attributed_factor_returns,
     )
 
 

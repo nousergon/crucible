@@ -380,3 +380,63 @@ def test_params_digest_is_stable_and_order_independent() -> None:
     )
     assert params_digest(_PARAMS) == params_digest(reordered)
     assert params_digest(_PARAMS).startswith("sha256:")
+
+
+def test_loadings_fit_on_one_window_attribute_a_shorter_one() -> None:
+    """`alpha-engine-config-I11964`: a book that earned ONE session is
+    attributed against the loadings a longer fit window identified, and its
+    gross return is decomposed over that one session's factor returns."""
+    earned = {"market": [0.012], "sector_tech": [-0.004], "size_factor": [0.003]}
+    gross = sum(
+        WEIGHTS[t] * sum(HOLDING_BETAS[t][f] * earned[f][0] for f in earned) for t in WEIGHTS
+    )
+    doc = compute_factor_attribution(
+        trading_day=TRADING_DAY,
+        window_sessions=WINDOW,
+        holding_returns=HOLDING_RETURNS,
+        weights=WEIGHTS,
+        factor_returns={"market": MARKET, "sector_tech": SECTOR, "size_factor": SIZE},
+        params=_PARAMS,
+        gross_return=gross,
+        cost_bps_total=0.0,
+        attributed_factor_returns=earned,
+    )
+    assert doc["window_sessions"] == WINDOW
+    for row in doc["factors"]:
+        expected = _weighted_portfolio_beta(row["name"]) * earned[row["name"]][0]
+        assert math.isclose(row["contribution_return"], expected, abs_tol=1e-9)
+    assert math.isclose(doc["residual_alpha"], 0.0, abs_tol=1e-9)
+
+
+def test_attributed_factor_returns_must_name_every_factor() -> None:
+    with pytest.raises(ValueError, match="attributed_factor_returns does not match"):
+        compute_factor_attribution(
+            trading_day=TRADING_DAY,
+            window_sessions=WINDOW,
+            holding_returns=HOLDING_RETURNS,
+            weights=WEIGHTS,
+            factor_returns={"market": MARKET, "sector_tech": SECTOR, "size_factor": SIZE},
+            params=_PARAMS,
+            gross_return=0.0,
+            cost_bps_total=0.0,
+            attributed_factor_returns={"market": [0.01], "sector_tech": [0.0]},
+        )
+
+
+def test_attributed_factor_returns_must_share_one_non_empty_length() -> None:
+    with pytest.raises(ValueError, match="same, non-zero number of sessions"):
+        compute_factor_attribution(
+            trading_day=TRADING_DAY,
+            window_sessions=WINDOW,
+            holding_returns=HOLDING_RETURNS,
+            weights=WEIGHTS,
+            factor_returns={"market": MARKET, "sector_tech": SECTOR, "size_factor": SIZE},
+            params=_PARAMS,
+            gross_return=0.0,
+            cost_bps_total=0.0,
+            attributed_factor_returns={
+                "market": [0.01],
+                "sector_tech": [0.0, 0.1],
+                "size_factor": [],
+            },
+        )
