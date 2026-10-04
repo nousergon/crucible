@@ -1240,6 +1240,117 @@ class TestTheWarmUpReachesPromote:
             main(["promote", "--slot", SLOT, "--date", AS_OF.isoformat()])
 
 
+#: Production's own factor spec SHAPE (`strategy/current/slots/attribution.yaml`
+#: on 2026-10-02): six factors, so `estimate_factor_model`'s `n >= k + 2` floor
+#: is EIGHT — one a weekly-cadence book's own sessions do not reach until its
+#: eighth arc.
+PRODUCTION_SHAPED_ATTRIBUTION_YAML = """\
+attribution:
+  benchmark_proxy: SPY
+  shrinkage: ledoit_wolf
+  factors:
+    market:
+      category: beta
+      proxy: SPY
+    size:
+      category: size
+      proxy: IWM
+      short_proxy: SPY
+    sector_technology:
+      category: sector
+      proxy: XLK
+    sector_health_care:
+      category: sector
+      proxy: XLV
+    sector_financials:
+      category: sector
+      proxy: XLF
+    sector_energy:
+      category: sector
+      proxy: XLE
+"""
+
+
+class TestAWeeklyBookIsAttributedOverTheSessionItEarned:
+    """`alpha-engine-config-I11964`: the 2026-10-02 weekly arc failed at
+    `experiment.grade[s]` with ``ValueError: need ≥ 8 observations for 6
+    factors, got 1``.
+
+    S records one decision per WEEKLY arc and a decision is held through the
+    next session, so on that arc each arm had exactly one settled session —
+    and `_attribute_book` fit six loadings on the book's own sessions. The
+    loadings are now fit over the trailing daily panel the book's covariance
+    is estimated on, and the book's return is decomposed over the session it
+    actually EARNED (the decision day's successor, not the decision day).
+    """
+
+    @pytest.fixture
+    def weekly_world(self, world):
+        store, settings, root, days = world
+        panel = pd.read_parquet(
+            __import__("io").BytesIO(store.get_bytes(data_panel_key(AS_OF.isoformat())))
+        )
+        panel_days = sorted(set(panel["trading_day"]))
+        extra = [
+            _price_rows(panel_days, ticker=ticker, seed=seed)
+            for ticker, seed in (("XLV", 29), ("XLF", 31), ("XLE", 37))
+        ]
+        store.put_bytes(
+            data_panel_key(AS_OF.isoformat()),
+            pd.concat([panel, *extra], ignore_index=True).to_parquet(index=False),
+        )
+        (root / "slots" / "attribution.yaml").write_text(
+            PRODUCTION_SHAPED_ATTRIBUTION_YAML, encoding="utf-8"
+        )
+        # Two arcs a week apart, the second being the arc day itself: one
+        # settled session, exactly the 2026-10-02 shape (09-18 settled, 10-02
+        # not).
+        decision_days = [days[1], days[-1]]
+        _run_produce(store, settings, decision_days)
+        return store, settings, decision_days
+
+    def test_one_settled_weekly_session_grades_ok_with_attribution(self, weekly_world) -> None:
+        from crucible.attribution import manifest_records_factor_attribution
+
+        store, settings, _decision_days = weekly_world
+        result, manifest, _ctx = _run_grade(store, settings)
+
+        assert manifest["status"] == "ok", manifest.get("reason")
+        construction = manifest_records_portfolio_engine(manifest)
+        assert construction is not None and construction["sessions"] == 1
+        evidence = manifest_records_factor_attribution(manifest)
+        assert evidence is not None
+        # Fit over the daily panel, at the library's own floor — never lowered.
+        assert evidence["window_sessions"] >= 6 + 2
+        assert evidence["model"]["n_obs"] == evidence["window_sessions"]
+        assert evidence["model"]["n_factors"] == 6
+        assert result["strategy_grades"]
+
+    def test_contributions_use_the_settle_session_not_the_decision_day(self, weekly_world) -> None:
+        from crucible.attribution import manifest_records_factor_attribution
+
+        store, settings, decision_days = weekly_world
+        _result, manifest, _ctx = _run_grade(store, settings)
+        evidence = manifest_records_factor_attribution(manifest)
+        assert evidence is not None
+
+        panel = pd.read_parquet(
+            __import__("io").BytesIO(store.get_bytes(data_panel_key(AS_OF.isoformat())))
+        )
+        returns = strategy_module._close_returns(panel)
+        settle = _next_session(decision_days[0]).isoformat()
+        assert evidence["trading_day"] == settle
+        decision = decision_days[0].isoformat()
+        for row in evidence["factors"]:
+            earned = float(returns.loc[settle, row["proxy"]])
+            entered = float(returns.loc[decision, row["proxy"]])
+            if "short_proxy" in row:
+                earned -= float(returns.loc[settle, row["short_proxy"]])
+                entered -= float(returns.loc[decision, row["short_proxy"]])
+            assert row["contribution_return"] == pytest.approx(row["exposure"] * earned), row
+            assert row["contribution_return"] != pytest.approx(row["exposure"] * entered), row
+
+
 class TestTheInputsAreNamedWhenTheyAreAbsent:
     """Every refusal on this path names the KEY the operator's next action is
     about. A reason that does not name it sends them looking."""
