@@ -170,7 +170,7 @@ class TestTheThreeRowsRender:
 
     def test_every_standing_row_names_an_artifact_and_says_what_red_means(self, store) -> None:
         rows = _standing_rows(store, FRIDAY.isoformat(), _touch())
-        assert len(rows) == 3
+        assert len(rows) == 4
         for row in rows:
             assert row.source == "standing"
             assert row.artifact.strip()
