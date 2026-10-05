@@ -6681,9 +6681,14 @@ def _ce_client() -> Any:
 
 
 def _clause_aws_cost_within_ceiling(
-    window: list[dt.date], *, name: str, ceiling_usd: float, tagged: bool
+    window: list[dt.date],
+    *,
+    name: str,
+    ceiling_usd: float,
+    tagged: bool,
+    cost_scope: str | None = None,
 ) -> Clause:
-    """Plan §6 row 2 (`<= $40`, tagged) and row 4 (`<= $70/mo`, whole account).
+    """Plan §6 row 2 ($40, tagged) and row 4 ($70, harness + trader + shared).
 
     One reader at two ceilings and two scopes, for the reason
     `_clause_old_weekly_within_cadence` takes a ceiling: a second copy of a
@@ -6756,7 +6761,11 @@ def _clause_aws_cost_within_ceiling(
         trailing_daily_usd,
     )
 
-    scope = f"tagged `{TAG_KEY}={TAG_VALUE}`" if tagged else "the whole account"
+    scope = (
+        f"allocated {cost_scope} (harness + trader + shared)"
+        if cost_scope
+        else (f"tagged `{TAG_KEY}={TAG_VALUE}`" if tagged else "the whole account")
+    )
     requirement = (
         f"AWS spend for {scope} is at most ${ceiling_usd:.2f}/month, read from the expense "
         f"collector's Cost Explorer series: UNMET once month-to-date exceeds it, otherwise "
@@ -6765,25 +6774,43 @@ def _clause_aws_cost_within_ceiling(
         f"{COST_LEADING_DAYS}-day mean × {COST_TRAILING_DAYS} exceeds the ceiling, and UNMET "
         "when the prior CLOSED calendar month (read on the 1st-3rd) exceeded it"
     )
-    evidence = ("ce:GetCostAndUsage",)
+    evidence = ("expenses/latest.json",)
+    try:
+        client = _ce_client()
+        if cost_scope:
+            client = client.for_scope(cost_scope)
+    except Exception as exc:
+        # Access/contract failures are recorded on the clause, never treated as zero spend.
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"cost allocation unavailable: {type(exc).__name__}: {exc}",
+            evidence,
+            unmeasurable=True,
+        )
 
     # I9946: evaluated first and prefixed onto every detail below, so a
     # closed-month-over-ceiling UNMET is not shadowed by a MET in-progress
     # reading, and a closed-month-under or PROVISIONAL reading is visible
     # beside whichever in-progress verdict follows.
     closed_note = ""
+    closed_unknown = False
     if window[-1].day <= 3:
         try:
-            closed = closed_month_usd(_ce_client(), today=window[-1], tagged=tagged)
+            closed = closed_month_usd(client, today=window[-1], tagged=tagged)
         except CostUnreadableError as exc:
+            closed_unknown = True
             closed_note = f"prior closed month could not be read: CostUnreadableError: {exc}; "
         except Exception as exc:
+            closed_unknown = True
             closed_note = (
                 f"prior closed month could not be read: {type(exc).__name__}: {exc}. That is "
                 "a statement about our access, not about what was spent; "
             )
         else:
             if closed.amount_usd == 0.0:
+                closed_unknown = True
                 # The same $0.00 trap as the in-progress readings, one level
                 # up: a correctly-tagged closed month with no resources and an
                 # entirely untagged estate both read $0.00 here.
@@ -6793,6 +6820,7 @@ def _clause_aws_cost_within_ceiling(
                     "misfiltered or broken reading returns as well as a free month); "
                 )
             elif closed.estimated:
+                closed_unknown = True
                 closed_note = (
                     f"closed month {closed.start.isoformat()}..{closed.end.isoformat()} "
                     f"${closed.amount_usd:.2f}: PROVISIONAL, Cost Explorer has not finalised "
@@ -6816,7 +6844,7 @@ def _clause_aws_cost_within_ceiling(
                 )
 
     try:
-        reading = month_to_date_usd(_ce_client(), today=window[-1], tagged=tagged)
+        reading = month_to_date_usd(client, today=window[-1], tagged=tagged)
     except CostUnreadableError as exc:
         return _unmeasurable(name, requirement, f"CostUnreadableError: {exc}", evidence)
     except Exception as exc:
@@ -6864,7 +6892,7 @@ def _clause_aws_cost_within_ceiling(
         # `system` key read `Inactive` while the stack was fully tagged, and
         # this clause pointed the reader at the wrong audit.
         try:
-            tag_status = cost_allocation_tag_status(_ce_client())
+            tag_status = cost_allocation_tag_status(client)
         except CostAllocationTagUnreadableError as exc:
             return _unmeasurable(
                 name,
@@ -6925,7 +6953,7 @@ def _clause_aws_cost_within_ceiling(
         )
     try:
         trailing = trailing_daily_usd(
-            _ce_client(), today=window[-1], days=COST_TRAILING_DAYS, tagged=tagged
+            client, today=window[-1], days=COST_TRAILING_DAYS, tagged=tagged
         )
     except CostUnreadableError as exc:
         return _unmeasurable(
@@ -6975,6 +7003,13 @@ def _clause_aws_cost_within_ceiling(
             requirement,
             False,
             f"{month_to_date}; {trailing_total}: OVER (leading pace)",
+            evidence,
+        )
+    if closed_unknown:
+        return _unmeasurable(
+            name,
+            requirement,
+            f"{month_to_date}; {trailing_total}: under, but required closed month is unknown",
             evidence,
         )
     return Clause(name, requirement, True, f"{month_to_date}; {trailing_total}: under", evidence)
@@ -9672,7 +9707,11 @@ def _phase4(
         _clause_kill_switch_fire_drill_passed(store, window),
         _clause_money_path_chain_verified(store),
         _clause_aws_cost_within_ceiling(
-            window, name="aws_total_within_ceiling", ceiling_usd=PHASE4_MAX_TOTAL_USD, tagged=False
+            window,
+            name="aws_total_within_ceiling",
+            ceiling_usd=PHASE4_MAX_TOTAL_USD,
+            tagged=False,
+            cost_scope="crucible-and-trader",
         ),
         # The phase-0 reader at phase 4's ceiling: decommissioned means ZERO
         # starts, not "within cadence". `alpha-engine-config-I9860` adds the
@@ -10081,6 +10120,7 @@ def evaluate(
 STANDING_SLOS: tuple[str, ...] = (
     "live_saturdays_first_attempt_ok",
     "pages_within_ceiling",
+    "aws_account_within_ceiling",
 )
 
 
@@ -10102,6 +10142,12 @@ def standing_slo_clauses(store: Store, *, trading_day: dt.date) -> list[Clause]:
     clauses = [
         _clause_live_saturdays_first_attempt_ok(store, window),
         _clause_pages_within_ceiling(store, window),
+        _clause_aws_cost_within_ceiling(
+            window,
+            name="aws_account_within_ceiling",
+            ceiling_usd=PHASE4_MAX_TOTAL_USD,
+            tagged=False,
+        ),
     ]
     read = tuple(c.name for c in clauses)
     if read != STANDING_SLOS:

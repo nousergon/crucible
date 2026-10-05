@@ -1892,7 +1892,16 @@ def _feature_layer_provenance_row(store: Store) -> BoardRow:
 #: Keyed by clause name and checked against `crucible.gate.STANDING_SLOS` at
 #: import, so a clause added to or removed from that tuple is a loud failure
 #: here rather than a row that silently stops rendering.
+# Cost boundary: Brian ruling 2026-10-05, alpha-engine-config-I12022.
 STANDING_SLO_DECLARATIONS: dict[str, dict[str, str]] = {
+    "aws_account_within_ceiling": {
+        "title": "whole-account AWS cost remains visible beside the component gate",
+        "artifact": "expenses/latest.json",
+        "means_when_red": (
+            "whole-account AWS cost exceeds the unchanged $70/month reference ceiling; "
+            "this standing SLO includes other systems and does not block Crucible phase 4."
+        ),
+    },
     "live_saturdays_first_attempt_ok": {
         "title": "the live weekly Saturday runs `ok` on its first attempt",
         "artifact": "runs/weekly/<saturday>/run.json",

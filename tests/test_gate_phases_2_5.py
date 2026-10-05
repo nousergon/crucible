@@ -2023,7 +2023,7 @@ class TestAClosedCalendarMonthIsAlsoGraded:
             ceiling_usd=PHASE4_MAX_TOTAL_USD,
             tagged=False,
         )
-        assert clause.met and not clause.unmeasurable, clause.detail
+        assert not clause.met and clause.unmeasurable, clause.detail
         assert "PROVISIONAL" in clause.detail
         assert "$80.00" in clause.detail
 
@@ -2038,7 +2038,7 @@ class TestAClosedCalendarMonthIsAlsoGraded:
             ceiling_usd=PHASE4_MAX_TOTAL_USD,
             tagged=False,
         )
-        assert clause.met and not clause.unmeasurable, clause.detail
+        assert not clause.met and clause.unmeasurable, clause.detail
         assert "not graded" in clause.detail
 
 
