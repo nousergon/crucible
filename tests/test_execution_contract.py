@@ -25,6 +25,7 @@ from jsonschema import Draft202012Validator
 from crucible.execution import (
     _BOOTSTRAP_RESAMPLES,
     _BOOTSTRAP_SEED,
+    CONTROL_NON_BOOK_STATUS,
     DECISION_PRICE_BASIS,
     EXECUTION_METRIC_NAME,
     EXECUTION_N_FLOOR,
@@ -41,9 +42,10 @@ from crucible.execution import (
     validate_shadow_books,
     weighted_shortfall_ci,
 )
-from crucible.keys import shadow_key
+from crucible.keys import arm_register_key, shadow_key
 from crucible.portfolio import COST_MODELS, CostModel
 from crucible.report import REPORT_WINDOW_TRADING_DAYS, ROWS, build_attribution
+from crucible.slots.arms import read_register, write_register
 from crucible.store import LocalStore
 
 SCHEMAS = Path(__file__).resolve().parents[1] / "crucible" / "schemas"
@@ -661,6 +663,29 @@ def _failed(arm: str, reason: str = "no ADV for a participation-aware model") ->
     }
 
 
+def _control(arm: str, reason: str = "scored by the grade's seeded control selection") -> dict:
+    """The ruled non-book entry for a control arm (alpha-engine-config-I12021)."""
+    return {
+        **_failed(arm),
+        "status": CONTROL_NON_BOOK_STATUS,
+        "failure_reason": None,
+        "non_book_reason": reason,
+    }
+
+
+def _register_controls(store: LocalStore, *names: str, created: str = WEEK[0]) -> list[str]:
+    """File ``names`` as CONTROL arms in the S register; return their ids."""
+    register = read_register(store, "s")
+    ids = []
+    for name in names:
+        register, record = register.register(
+            "s", name, {"kind": name}, created, control=True, filed_on=created
+        )
+        ids.append(record.arm_id)
+    write_register(store, "s", register)
+    return ids
+
+
 def _shadow_metric(book: dict) -> dict:
     return {
         "name": SHADOW_BOOK_METRIC_NAME,
@@ -801,7 +826,7 @@ class TestShadowBookCoverage:
         _put(store, shadow_books_key(DAY), _shadow_doc())
         reading = shadow_book_coverage(store, DAY, days_served=[WEEK[0], WEEK[1], WEEK[2], DAY])
         assert reading.met, reading.detail
-        assert reading.sources == (shadow_books_key(DAY),)
+        assert reading.sources == (shadow_books_key(DAY), arm_register_key("s"))
 
     def test_a_failed_book_is_unmet_and_named(self, tmp_path) -> None:
         store = LocalStore(tmp_path)
@@ -825,3 +850,132 @@ class TestShadowBookCoverage:
         store.put_bytes(shadow_books_key(DAY), b"\xff")
         with pytest.raises(ExecutionArtifactError, match="not readable JSON"):
             shadow_book_coverage(store, DAY)
+
+
+class TestControlArmsAreARuledNonBook:
+    """alpha-engine-config-I12021: Brian's ruling (2026-10-05) — a control is listed
+    with `control_scored_by_grade` and a reason, never dropped, never failed for
+    lacking a recipe; coverage requires an advanced book of CHALLENGERS only."""
+
+    def _store(self, tmp_path, books_for) -> tuple[LocalStore, list[str]]:
+        store = LocalStore(tmp_path)
+        controls = _register_controls(store, "control_null_s", "control_planted_s")
+        _put(store, shadow_books_key(DAY), _shadow_doc(books_for(controls)))
+        return store, controls
+
+    def test_the_10_01_shape_with_every_challenger_advanced_is_met(self, tmp_path) -> None:
+        store, controls = self._store(
+            tmp_path, lambda c: [_control(c[0]), _control(c[1]), _book(ARM), _book(CHALLENGER)]
+        )
+        reading = shadow_book_coverage(store, DAY, days_served=[WEEK[0], WEEK[1], WEEK[2], DAY])
+        assert reading.met, reading.detail
+        assert "2 active challenger(s)" in reading.detail
+        assert f"2 control(s) listed as {CONTROL_NON_BOOK_STATUS!r}" in reading.detail
+
+    def test_a_control_missing_from_the_document_is_unmet(self, tmp_path) -> None:
+        store, controls = self._store(tmp_path, lambda c: [_control(c[0]), _book(ARM)])
+        reading = shadow_book_coverage(store, DAY)
+        assert not reading.met
+        assert controls[1] in reading.detail and "never dropped" in reading.detail
+
+    def test_a_control_registered_after_the_session_is_not_required(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _register_controls(store, "control_null_s", created="2026-09-14")
+        _put(store, shadow_books_key(DAY), _shadow_doc([_book(ARM)]))
+        assert shadow_book_coverage(store, DAY).met
+
+    def test_a_control_listed_without_any_book_is_refused(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        controls = _register_controls(store, "control_null_s")
+        _put(store, shadow_books_key(DAY), _shadow_doc([_book(ARM)], active=[controls[0], ARM]))
+        with pytest.raises(ExecutionArtifactError, match="carry no book"):
+            shadow_book_coverage(store, DAY)
+
+    @pytest.mark.parametrize("status", ["failed", "advanced"])
+    def test_a_control_with_any_other_status_is_unmet(self, tmp_path, status) -> None:
+        def books(c: list[str]) -> list[dict]:
+            other = (
+                _failed(c[0], "no filed recipe registers it") if status == "failed" else _book(c[0])
+            )
+            return [other, _control(c[1]), _book(ARM)]
+
+        store, controls = self._store(tmp_path, books)
+        reading = shadow_book_coverage(store, DAY)
+        assert not reading.met
+        assert controls[0] in reading.detail and f"control recorded as {status!r}" in reading.detail
+
+    def test_a_failed_challenger_beside_ruled_controls_is_unmet(self, tmp_path) -> None:
+        store, _ = self._store(
+            tmp_path,
+            lambda c: [_control(c[0]), _control(c[1]), _book(ARM), _failed(CHALLENGER)],
+        )
+        reading = shadow_book_coverage(store, DAY)
+        assert not reading.met and CHALLENGER in reading.detail
+
+    def test_a_challenger_dressed_as_a_control_is_unmet(self, tmp_path) -> None:
+        """The register, not the document, decides who is a control."""
+        store, _ = self._store(
+            tmp_path, lambda c: [_control(c[0]), _control(c[1]), _book(ARM), _control(CHALLENGER)]
+        )
+        reading = shadow_book_coverage(store, DAY)
+        assert not reading.met
+        assert CHALLENGER in reading.detail and "does not mark it a control" in reading.detail
+
+    def test_controls_alone_measure_nothing(self, tmp_path) -> None:
+        store, _ = self._store(tmp_path, lambda c: [_control(c[0]), _control(c[1])])
+        reading = shadow_book_coverage(store, DAY)
+        assert not reading.met and "no active challenger" in reading.detail
+
+    def test_an_unreadable_register_is_unmet_naming_it(self, tmp_path) -> None:
+        store = LocalStore(tmp_path)
+        _put(store, shadow_books_key(DAY), _shadow_doc())
+        store.put_bytes(arm_register_key("s"), b"not json\n")
+        reading = shadow_book_coverage(store, DAY)
+        assert not reading.met and arm_register_key("s") in reading.detail
+
+    def test_the_non_book_entry_needs_its_reason(self) -> None:
+        entry = _control("s:control_null_s:0123456789ab", reason=" ")
+        with pytest.raises(ExecutionArtifactError, match="no non_book_reason"):
+            validate_shadow_books(_shadow_doc([entry, _book(ARM)]))
+
+    def test_the_non_book_entry_carries_no_failure_reason(self) -> None:
+        entry = {**_control("s:control_null_s:0123456789ab"), "failure_reason": "x"}
+        with pytest.raises(ExecutionArtifactError, match="also carries a failure_reason"):
+            validate_shadow_books(_shadow_doc([entry, _book(ARM)]))
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("gross_return_ratio", 0.01),
+            ("cost_model", FLAT.record()),
+            ("inception_trading_day", DAY),
+            ("weights", {"AAA": 1.0}),
+        ],
+    )
+    def test_the_non_book_entry_holds_nothing(self, field, value) -> None:
+        entry = {**_control("s:control_null_s:0123456789ab"), field: value}
+        with pytest.raises(ExecutionArtifactError, match="non-book holds nothing"):
+            validate_shadow_books(_shadow_doc([entry, _book(ARM)]))
+
+    def test_the_non_book_entry_with_advanced_days_is_refused(self) -> None:
+        entry = {**_control("s:control_null_s:0123456789ab"), "days_advanced": [DAY], "sessions": 1}
+        with pytest.raises(ExecutionArtifactError, match="non-book holds nothing"):
+            validate_shadow_books(_shadow_doc([entry, _book(ARM)]))
+
+    def test_the_non_book_entry_carries_no_metric(self) -> None:
+        entry = _control("s:control_null_s:0123456789ab")
+        doc = _shadow_doc([entry, _book(ARM)])
+        doc["metrics"].append(_shadow_metric({**entry, "cumulative_net_return_ratio": 0.0}))
+        with pytest.raises(ExecutionArtifactError, match="non-book earned nothing"):
+            validate_shadow_books(doc)
+
+    @pytest.mark.parametrize("builder", [_book, _failed])
+    def test_only_a_control_entry_may_carry_a_non_book_reason(self, builder) -> None:
+        entry = {**builder(ARM), "non_book_reason": "x"}
+        with pytest.raises(ExecutionArtifactError, match="carries a non_book_reason"):
+            validate_shadow_books(_shadow_doc([entry]))
+
+    def test_the_schema_admits_the_ruled_status_and_nothing_else(self) -> None:
+        entry = {**_control("s:control_null_s:0123456789ab"), "status": "control_skipped"}
+        with pytest.raises(ExecutionArtifactError):
+            validate_shadow_books(_shadow_doc([entry, _book(ARM)]))
