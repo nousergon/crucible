@@ -379,6 +379,9 @@ STILL_ORPHANED_M_CALLABLES: list[str] = [
     "design_panel",
     "evaluate_behavioural_veto",
     "evaluate_input_completeness",
+    # 2026-10-05: the `servable_as_of` serving precondition, reached from
+    # `grade` only. Pinned for the reason `grade` is.
+    "evaluate_servable_as_of",
     # `alpha-engine-config-I11791`: the std calibration check, reached from
     # `grade_arm` (itself pinned above), and the served std, reached from
     # `produce_arm_predictions`. Pinned for the reason `grade` is.

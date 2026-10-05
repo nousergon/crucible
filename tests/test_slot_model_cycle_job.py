@@ -43,7 +43,9 @@ from crucible.slots.model import (
     ARM_REFUSED_METRIC,
     CPCV_OOS_IC_METRIC,
     FEATURE_COMPLETENESS_METRIC,
+    SERVABLE_AS_OF_PRECONDITION,
     SLOT,
+    UNSERVABLE_AS_OF_METRIC,
     FeatureLayerSource,
     ModelRecipe,
     RegisteredModelArm,
@@ -517,6 +519,67 @@ class TestGradeRunsTheSharedEngine:
         cycle = json.loads(store.get_bytes(result["arena_cycle_key"]).decode("utf-8"))
         assert "not_a_control_arm" in json.dumps(cycle)
         assert not [a for a in result["promotable_arms"] if "control" in a]
+
+
+class TestAnArmWithNoCrossSectionForTheDayCannotTakeThePointer:
+    """2026-10-05: the 2026-10-02 shape, on the real grade job.
+
+    `m:v3meta_stack:1bb8d3646649` was refused by that day's `experiment.run[m]`
+    and wrote no `arm_predictions` for the session, yet had a long paired
+    history — and an arm with NO serving precondition is one the engine reads
+    as eligible, so `promote` seated it over a feed naming the old champion.
+    Here the stacked arm's cross-section for the graded day is removed after
+    a real produce run, which is exactly the store that day left behind.
+    """
+
+    def _graded(self, store, strategy, *, remove_stacked: bool):
+        runner = TestGradeRunsTheSharedEngine()
+        runner._produce_a_series(store, strategy)
+        register = store.get_bytes(arm_register_key(SLOT)).decode("utf-8")
+        stacked = next(
+            json.loads(line)["arm_id"]
+            for line in register.splitlines()
+            if line.strip() and ":stacked:" in line
+        )
+        if remove_stacked:
+            (store.root / arm_predictions_key(stacked, GRADE_DAY)).unlink()
+        _, result = runner._grade(store, strategy, GRADE_DAY)
+        cycle = json.loads(store.get_bytes(result["arena_cycle_key"]).decode("utf-8"))
+        rows = [
+            m
+            for m in _manifest(store, "experiment.grade", GRADE_DAY)["metrics"]
+            if m["name"] == UNSERVABLE_AS_OF_METRIC
+        ]
+        return stacked, result, cycle, rows
+
+    def test_the_arm_is_barred_by_name_in_the_decision_and_on_the_manifest(
+        self, store, strategy
+    ) -> None:
+        stacked, result, cycle, rows = self._graded(store, strategy, remove_stacked=True)
+
+        checks = cycle["decision"]["ineligible"][stacked]
+        servable = [c for c in checks if c["name"] == SERVABLE_AS_OF_PRECONDITION]
+        assert len(servable) == 1 and not servable[0]["passed"]
+        assert arm_predictions_key(stacked, GRADE_DAY) in servable[0]["reason"]
+
+        assert list(result["unservable_as_of"]) == [stacked]
+        assert len(rows) == 1
+        assert rows[0]["value"] == 1.0
+        assert rows[0]["status"] == "OK", "a barred challenger is a pointer fact, not a fault"
+        assert stacked in rows[0]["status_reason"]
+
+    def test_an_arm_that_served_the_day_is_not_barred_and_the_zero_is_filed(
+        self, store, strategy
+    ) -> None:
+        stacked, result, cycle, rows = self._graded(store, strategy, remove_stacked=False)
+        for checks in cycle["decision"]["ineligible"].values():
+            assert not [
+                c for c in checks if c["name"] == SERVABLE_AS_OF_PRECONDITION and not c["passed"]
+            ]
+        assert result["unservable_as_of"] == {}
+        assert [r["value"] for r in rows] == [0.0]
+        assert not [a for a in result["model_grades"] if "control" in a]
+        assert result["model_grades"][stacked]["servable_as_of"] is True
 
 
 class TestAMiscalibratedStdIsIneligibleToServe:

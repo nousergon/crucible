@@ -123,11 +123,13 @@ __all__ = [
     "FLOOR_VETO_METRICS",
     "HIGH_CONFIDENCE_P_UP",
     "MIN_DISPERSION_RATIO",
+    "SERVABLE_AS_OF_PRECONDITION",
     "SERVING_VETO_WINDOW_METRIC",
     "SETTLED_WINDOW_DECISION_DATES",
     "UNPRODUCED_VETO_METRICS",
     "GAUSSIAN_ONE_SIGMA_COVERAGE",
     "UNCERTAINTY_CALIBRATION_METRIC",
+    "UNSERVABLE_AS_OF_METRIC",
     "Z_VAR_BAND",
     "M_SELECTION_TOP_N",
     "OOS_METHOD",
@@ -171,6 +173,7 @@ __all__ = [
     "evaluate_behavioural_veto",
     "evaluate_uncertainty_calibration",
     "evaluate_input_completeness",
+    "evaluate_servable_as_of",
     "factor_residual_panel",
     "neutralize_cross_section",
     "point_in_time_factor_betas",
@@ -250,6 +253,16 @@ DEAD_SLOT_METRIC = "serving_veto_has_no_producer"
 #: temporary state gets read as a permanent one and a permanent one gets
 #: waited out.
 SERVING_VETO_WINDOW_METRIC = "serving_veto_window"
+
+#: The serving precondition that bars an arm from the M pointer when it has
+#: no servable cross-section for the graded day (2026-10-05). See
+#: :func:`evaluate_servable_as_of`.
+SERVABLE_AS_OF_PRECONDITION = "servable_as_of"
+
+#: The grade-manifest row naming every arm :data:`SERVABLE_AS_OF_PRECONDITION`
+#: barred this cycle — filed on every grade, as a zero when none was, so
+#: "no arm was barred" is a reading rather than an absence.
+UNSERVABLE_AS_OF_METRIC = "arms_unservable_as_of"
 
 #: Settled out-of-sample DECISION DATES an arm needs before its realized
 #: veto inputs exist. The metric's own name declares the window —
@@ -4972,8 +4985,31 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         if windows[arm_id]:
             grades[arm_id]["veto_window_reason"] = windows[arm_id]
 
+    # The THIRD serving precondition, and the only one about TODAY rather
+    # than about the arm's history (2026-10-05). On 2026-10-02 `promote`
+    # seated `m:v3meta_stack:1bb8d3646649`, which that same day's
+    # `experiment.run[m]` had refused (its base heads lacked predictions for
+    # four sessions of its window), so it wrote no `arm_predictions` for the
+    # day: the feed `experiment.run` had already published named the old
+    # champion, the pointer named the new one, and the trader refused the
+    # disagreement. Its history was fine — the arena had paired windows
+    # through 09-02 — and every other precondition passed, because an arm
+    # whose grade panel or produce run was refused got NO precondition at all,
+    # which the engine reads as eligible. Barring it HERE puts the refusal
+    # into the decision: the engine picks among arms that can serve, the
+    # incumbent holds if none of them beats it, and the barred arm is named
+    # with its reason in `decision.ineligible` and on this manifest.
+    servable = evaluate_servable_as_of(
+        ctx.store, _servable_candidates(ctx, specs, champion=champion, as_of=as_of), as_of=as_of
+    )
+    for arm_id, check in servable.items():
+        preconditions.setdefault(arm_id, []).append(check)
+        if arm_id in grades:
+            grades[arm_id]["servable_as_of"] = check.passed
+
     _record_dead_slot_finding(ctx, grades, as_of=as_of)
     _record_serving_veto_window(ctx, grades, windows, as_of=as_of)
+    _record_unservable_as_of(ctx, servable, as_of=as_of)
 
     result = run_grade(
         ctx,
@@ -4984,10 +5020,136 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         **{k: v for k, v in kwargs.items() if k != "feature_version"},
     )
     result["model_grades"] = grades
+    result["unservable_as_of"] = {
+        arm_id: check.reason for arm_id, check in sorted(servable.items()) if not check.passed
+    }
     result["refused"] = [
         {"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused
     ]
     return result
+
+
+def evaluate_servable_as_of(
+    store: Any, arm_ids: Sequence[str], *, as_of: str
+) -> dict[str, ServingPrecondition]:
+    """One :data:`SERVABLE_AS_OF_PRECONDITION` per arm: can it serve ``as_of``?
+
+    Asked of the serving path itself — :func:`crucible.serving.servable_source`
+    runs exactly the checks `publish_predictions_feed` runs before it writes
+    the trader's feed — so "the decision may seat this arm" and "the feed can
+    be published for this arm" are one answer, not two copies of it free to
+    drift.
+
+    **A declared swallow** (`crucible/AGENTS.md`, fail-loud). (a) Swallowed:
+    `MissingArtifactError` (the arm wrote no cross-section for the session —
+    the 2026-10-02 shape, a stack refused at produce time) and
+    `PredictionsFeedContractError` (it wrote one the serving path refuses).
+    (b) The deliverable survives because neither is a broken grade: the arm's
+    history is still scored and ladder-aged, only the POINTER is closed to
+    it. (c) Recording surface: a FAILED precondition whose reason is the
+    serving path's own message, which the engine files under
+    `decision.ineligible` in the `arena_cycle` artifact, and the
+    :data:`UNSERVABLE_AS_OF_METRIC` row on the grade manifest.
+    """
+    from crucible.serving import (  # noqa: PLC0415 - avoids a cycle
+        PredictionsFeedContractError,
+        servable_source,
+    )
+    from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
+
+    checks: dict[str, ServingPrecondition] = {}
+    for arm_id in sorted(arm_ids):
+        try:
+            source_key = servable_source(store, arm_id=arm_id, trading_day=as_of)
+        except (MissingArtifactError, PredictionsFeedContractError) as exc:
+            checks[arm_id] = ServingPrecondition(
+                name=SERVABLE_AS_OF_PRECONDITION,
+                passed=False,
+                reason=(
+                    f"arm {arm_id} cannot serve {as_of}: {exc} Seating it would leave "
+                    f"champions/{SLOT}/current.json and predictions/{as_of}.json naming "
+                    "two different arms, which the trader refuses."
+                ),
+            )
+        else:
+            checks[arm_id] = ServingPrecondition(
+                name=SERVABLE_AS_OF_PRECONDITION,
+                passed=True,
+                reason=f"arm {arm_id} produced a servable cross-section for {as_of} ({source_key})",
+            )
+    return checks
+
+
+def _servable_candidates(
+    ctx: Any, specs: Sequence[RegisteredModelArm], *, champion: str | None, as_of: str
+) -> tuple[str, ...]:
+    """The arms :func:`evaluate_servable_as_of` is asked about.
+
+    Every arm the cycle will SCORE as of ``as_of`` — read off the register as
+    `crucible.slots.cycle.run_grade` folds it, not off ``specs``, because an
+    arm refused at registration this cycle is still in the register with a
+    series, and an arm with no precondition is one the engine reads as
+    eligible. Three exclusions, each deliberate:
+
+    - **controls**, which `run_grade` already bars with `not_a_control_arm`
+      and which must stay ELIGIBLE when the null control stands in as the
+      baseline incumbent (`alpha-engine-config-I10687`);
+    - **the incumbent**. The engine forces the pointer OFF an incumbent that
+      fails a precondition, and an incumbent with no cross-section for the
+      day has already failed `experiment.run[m]` loudly at
+      `publish_predictions_feed`. Turning a production failure into an
+      automatic pointer move is a different decision with a different owner;
+      this precondition exists to stop the pointer moving ONTO an arm that
+      cannot serve, not to move it off one;
+    - **arms that did not exist on ``as_of``**, which the library excludes
+      from the cycle already (`alpha-engine-config-I11037`).
+    """
+    from crucible.slots import get_slot, is_control_arm  # noqa: PLC0415 - avoids a cycle
+
+    slot_spec = get_slot(SLOT)
+    register, _ = register_arms(read_register(ctx.store, SLOT), list(specs), filed_on=as_of)
+    absent = frozenset(register.not_yet_registered(as_of))
+    return tuple(
+        arm_id
+        for arm_id in register.scored_arms(as_of, slot_spec.retired_trailing_cycles)
+        if arm_id != champion
+        and arm_id not in absent
+        and not is_control_arm(slot_spec, arm_id, register)
+    )
+
+
+def _record_unservable_as_of(
+    ctx: Any, servable: dict[str, ServingPrecondition], *, as_of: str
+) -> None:
+    """File :data:`UNSERVABLE_AS_OF_METRIC` — on every grade, zero included.
+
+    Status ``OK`` in both directions, like
+    `crucible.slots.cycle.not_yet_registered_metric`: a barred challenger is a
+    fact about the pointer, not a fault in the grade, and the incumbent keeps
+    serving. The row exists so the arm is NAMED on the manifest an operator
+    reads, rather than only inside the `arena_cycle` artifact.
+    """
+    barred = {arm: check for arm, check in sorted(servable.items()) if not check.passed}
+    ctx.record_metric(
+        {
+            "name": UNSERVABLE_AS_OF_METRIC,
+            "module": f"crucible.slots.{SLOT}",
+            "metric_type": "count",
+            "value": float(len(barred)),
+            "unit": "arms",
+            "n_floor": 0,
+            "status": "OK",
+            "status_reason": (
+                f"{len(barred)} of {len(servable)} challenger arm(s) produced no servable "
+                f"cross-section for {as_of} and are barred from the pointer this cycle "
+                f"({SERVABLE_AS_OF_PRECONDITION}): {', '.join(barred)}"
+                if barred
+                else f"every one of {len(servable)} challenger arm(s) can serve {as_of}"
+            ),
+            "source_path": arena_cycle_key(SLOT, as_of),
+            "last_updated_utc": _utc_now(),
+        }
+    )
 
 
 def _calibration_metric(
