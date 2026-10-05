@@ -72,6 +72,12 @@ from crucible.keys import (
 )
 from crucible.keys import manifest_key as _promote_manifest_key
 from crucible.models import EXPERIMENT_EVENT_ROW_ADAPTER, RetirementLogRow
+from crucible.serving import (
+    PREDICTIONS_FEED_SLOT,
+    PredictionsFeedContractError,
+    publish_promoted_feed,
+    servable_source,
+)
 from crucible.slots import EVIDENCE_POINT, SlotSpec, is_control_arm
 from crucible.store import ETAG_ABSENT, Store
 
@@ -451,6 +457,16 @@ def run_promotion(
         )
         if pointer is not None:
             written.append(champion_key(spec.slot))
+            if spec.slot == PREDICTIONS_FEED_SLOT:
+                # The second half of the trader contract, moved WITH the first.
+                # `experiment.run[m]` published this session's feed for the
+                # PREVIOUS champion before the grade ran, so a promotion that
+                # stopped at the pointer left the two naming different arms —
+                # which the trader refuses (2026-10-05). Pointer first, then
+                # feed: a failure here fails this run, whose manifest the
+                # pointer names, so `read_champion` refuses the pointer and the
+                # trader is never handed a feed and a pointer that disagree.
+                written.append(publish_promoted_feed(store, pointer=pointer))
 
     return PromotionResult(
         cycle=cycle,
@@ -678,8 +694,51 @@ def _write_pointer_if_moved(
         evidence=evidence,
         attestation=attestation,
     )
+    if spec.slot == PREDICTIONS_FEED_SLOT:
+        _refuse_unservable_champion(store, spec, decision)
     write_champion(store, pointer, expected=expected)
     return pointer
+
+
+def _refuse_unservable_champion(store: Store, spec: SlotSpec, decision: PointerDecision) -> None:
+    """Refuse to MOVE the feed slot's pointer onto an arm with nothing to serve.
+
+    2026-10-05: `promote --slot m` for 2026-10-02 seated
+    `m:v3meta_stack:1bb8d3646649`, which that day's `experiment.run[m]` had
+    refused, so it wrote no `arm_predictions` for the session. The feed
+    `experiment.run` had already published named the old champion, and the
+    trader refused the pointer/feed disagreement.
+
+    The exclusion belongs at the DECISION — `crucible.slots.model.grade`'s
+    ``servable_as_of`` serving precondition, which bars the arm, lets the
+    engine choose among servable arms, and names the barred arm in
+    `decision.ineligible`. This is the second witness on the write to the one
+    contract the trader reads, the same shape as the control-arm guard above:
+    a RAISE, never a silent `return None`, because a writer that quietly
+    declined would leave the pointer on the incumbent while the `arena_cycle`
+    and the EXPERIMENTS feed both recorded a promotion that did not happen
+    (policy §7.2's dominant bug class). Reaching it means the decision layer
+    did not fire — a cycle graded before that precondition existed, or a
+    grade that no longer supplies it — and the incumbent stays because the
+    run fails before the pointer is touched.
+    """
+    # Local, as in `crucible.serving`: `crucible.slots.cycle` imports the
+    # grading stack, and only the error TYPE is wanted here.
+    from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415
+
+    try:
+        servable_source(store, arm_id=decision.champion, trading_day=decision.as_of)
+    except (MissingArtifactError, PredictionsFeedContractError) as exc:
+        raise PromotionRefused(
+            f"slot {spec.slot}: the pointer decision for {decision.as_of} would move the "
+            f"champion from {decision.incumbent!r} to {decision.champion!r}, which has no "
+            f"servable cross-section for that session — {exc} Seating it would leave "
+            f"{champion_key(spec.slot)} and the session's predictions feed naming two "
+            "different arms, and the trader refuses that disagreement. The exclusion "
+            "belongs at the decision (`experiment.grade`'s `servable_as_of` serving "
+            "precondition); reaching this guard means it did not fire. The incumbent "
+            "pointer is left as it is."
+        ) from exc
 
 
 def _apply_retirements_to_register(
