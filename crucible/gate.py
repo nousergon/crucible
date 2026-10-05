@@ -5036,7 +5036,10 @@ def _human_pointer_flip(
     system, only about who moved a pointer, and the safe reading of that is
     available without refusing to grade.
     """
-    from crucible.autonomy import attribute_pointer_writes  # noqa: PLC0415 - heavy, one call site
+    from crucible.autonomy import (  # noqa: PLC0415 - heavy, one call site
+        attribute_pointer_writes,
+        configured_day_cache,
+    )
     from crucible.config import settings  # noqa: PLC0415 - one call site
 
     location = archive if archive is not None else settings().cloudtrail_archive
@@ -5047,8 +5050,9 @@ def _human_pointer_flip(
         )
     naked = location.removeprefix("s3://")
     try:
+        client = s3 if s3 is not None else _s3_client()
         attribution = attribute_pointer_writes(
-            s3 if s3 is not None else _s3_client(),
+            client,
             bucket=naked.partition("/")[0],
             prefix=naked.partition("/")[2],
             object_bucket=store.bucket,
@@ -5056,6 +5060,7 @@ def _human_pointer_flip(
             since=floor,
             until=pointer_at,
             cfn=cfn,
+            cache=configured_day_cache(client),
         )
     except Exception as exc:  # noqa: BLE001 - recorded in the detail, never silent
         return pointer_at, (
@@ -5134,7 +5139,10 @@ def _human_stack_apply(
     A hand-run `aws cloudformation deploy` from the laptop authenticates as an
     operator profile, which is no stack role, and still restarts the window.
     """
-    from crucible.autonomy import attribute_stack_applies  # noqa: PLC0415 - heavy, one call site
+    from crucible.autonomy import (  # noqa: PLC0415 - heavy, one call site
+        attribute_stack_applies,
+        configured_day_cache,
+    )
     from crucible.config import settings  # noqa: PLC0415 - one call site
 
     if created is None:
@@ -5168,14 +5176,16 @@ def _human_stack_apply(
         )
     naked = location.removeprefix("s3://")
     try:
+        client = s3 if s3 is not None else _s3_client()
         attribution = attribute_stack_applies(
-            s3 if s3 is not None else _s3_client(),
+            client,
             bucket=naked.partition("/")[0],
             prefix=naked.partition("/")[2],
             stack_name=settings().stack_name,
             since=created,
             until=stack_at,
             cfn=cfn,
+            cache=configured_day_cache(client),
         )
     except Exception as exc:  # noqa: BLE001 - recorded in the detail, never silent
         return (
@@ -5516,6 +5526,7 @@ def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Cl
     """
     from crucible.autonomy import (  # noqa: PLC0415 - heavy import, one call site
         ArchiveMissingError,
+        configured_day_cache,
         count_operator_actions,
     )
     from crucible.config import settings  # noqa: PLC0415 - one call site
@@ -5609,8 +5620,9 @@ def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Cl
             evidence,
         )
     try:
+        client = _s3_client()
         counted = count_operator_actions(
-            _s3_client(),
+            client,
             bucket=archive.removeprefix("s3://").partition("/")[0],
             prefix=archive.removeprefix("s3://").partition("/")[2],
             start=change.at.date(),
@@ -5622,6 +5634,10 @@ def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Cl
             # "zero human mutating calls" is graded rather than only where
             # it happened to be added first.
             reserved=frozenset(settings().autonomy_reserved_events),
+            # alpha-engine-config-I11792: closed days' raw candidates come from
+            # this workflow's own day cache when one is configured; the
+            # allowlist and `reserved` are applied after, on every read.
+            cache=configured_day_cache(client),
         )
     except ArchiveMissingError as exc:
         return _unmeasurable(name, requirement, f"ArchiveMissingError: {exc}", evidence)
