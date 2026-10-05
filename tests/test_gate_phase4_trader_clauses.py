@@ -19,9 +19,11 @@ from test_execution_contract import (
     ARM,
     CHALLENGER,
     _book,
+    _control,
     _failed,
     _no_orders_doc,
     _order,
+    _register_controls,
     _shadow_doc,
     _shortfall_doc,
 )
@@ -40,6 +42,7 @@ from crucible.gate import (
 )
 from crucible.keys import (
     TRADER_EVIDENCE_KEY,
+    arm_register_key,
     execution_shortfall_key,
     shadow_books_key,
     trader_reconciliation_key,
@@ -366,7 +369,11 @@ class TestShadowBooksClause:
         _put(store, shadow_books_key("2026-09-11"), _shadow_doc())
         clause = _shadow_clause(store)
         assert clause.met and not clause.unmeasurable, clause.detail
-        assert set(clause.evidence) == {shadow_books_key("2026-09-11"), TRADER_EVIDENCE_KEY}
+        assert set(clause.evidence) == {
+            shadow_books_key("2026-09-11"),
+            arm_register_key("s"),
+            TRADER_EVIDENCE_KEY,
+        }
 
     def test_an_absent_evidence_document_is_unmet_not_unmeasurable(self, store) -> None:
         _put(store, shadow_books_key("2026-09-11"), _shadow_doc())
@@ -416,6 +423,30 @@ class TestShadowBooksClause:
         clause = _shadow_clause(store)
         assert not clause.met and not clause.unmeasurable
         assert shadow_books_key("2026-09-11") in clause.detail
+
+    def test_ruled_controls_beside_advanced_challengers_are_met(self, store) -> None:
+        """alpha-engine-config-I12021: the clause requires books of challengers only."""
+        controls = _register_controls(store, "control_null_s", "control_planted_s")
+        _put(store, TRADER_EVIDENCE_KEY, _evidence(self.SERVED))
+        books = [_control(controls[0]), _control(controls[1]), _book(ARM), _book(CHALLENGER)]
+        _put(store, shadow_books_key("2026-09-11"), _shadow_doc(books))
+        clause = _shadow_clause(store)
+        assert clause.met, clause.detail
+        assert "control_scored_by_grade" in clause.requirement
+
+    def test_a_control_failed_for_lacking_a_recipe_is_unmet(self, store) -> None:
+        """The 2026-10-01 defect: a control failed rather than recorded as ruled."""
+        controls = _register_controls(store, "control_null_s", "control_planted_s")
+        _put(store, TRADER_EVIDENCE_KEY, _evidence(self.SERVED))
+        books = [
+            _failed(controls[0], "no filed recipe registers it"),
+            _control(controls[1]),
+            _book(ARM),
+            _book(CHALLENGER),
+        ]
+        _put(store, shadow_books_key("2026-09-11"), _shadow_doc(books))
+        clause = _shadow_clause(store)
+        assert not clause.met and controls[0] in clause.detail
 
 
 # ── registration and fault 5 ────────────────────────────────────────────────

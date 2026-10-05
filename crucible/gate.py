@@ -85,7 +85,11 @@ from crucible.components import Component, load_registry
 from crucible.documents import DocumentRead, read_manifests_under
 from crucible.documents import read_path_document as _read_path_document
 from crucible.documents import read_store_document as _read_store_document
-from crucible.execution import ExecutionArtifactError, shadow_book_coverage
+from crucible.execution import (
+    CONTROL_NON_BOOK_STATUS,
+    ExecutionArtifactError,
+    shadow_book_coverage,
+)
 from crucible.holdout import (
     HOLDOUT_JOB,
     RULING_REFERENCE_PATTERN,
@@ -8834,15 +8838,20 @@ def _clause_shadow_books_cover_every_active_arm(store: Store, window: list[dt.da
     document is UNMET, not UNMEASURABLE (I10746): without it no served day can
     be checked, which is a trader that has not run, not a store we could not
     read. A corrupt shadow-book artifact raises out of the reader and is read
-    UNMET naming the key. Shadow books are evidence only — never a promotion
+    UNMET naming the key. Controls (`ArmRecord.control` in the register) need
+    no book: each is held to the ruled `CONTROL_NON_BOOK_STATUS` instead, and
+    any other status on a control is UNMET (`alpha-engine-config-I12021`).
+    Shadow books are evidence only — never a promotion
     input (I10653 deliverable 5) — and nothing here feeds one.
     """
     name = "shadow_books_cover_every_active_arm"
     session = _last_session(window[-1]).isoformat()
     requirement = (
-        f"`{shadow_books_key(session)}` carries an advanced shadow book for every active arm "
-        "in the register, none failed, each advanced on every day the trader served "
-        f"(`days_served` in `{TRADER_EVIDENCE_KEY}`) since its inception"
+        f"`{shadow_books_key(session)}` carries an advanced shadow book for every active "
+        "challenger in the register, none failed, each advanced on every day the trader served "
+        f"(`days_served` in `{TRADER_EVIDENCE_KEY}`) since its inception; every active control "
+        f"is listed with the ruled non-book status `{CONTROL_NON_BOOK_STATUS}` (plan §10.6: "
+        '"a simulated book per registered challenger")'
     )
     evidence_key = TRADER_EVIDENCE_KEY
     read = _read_store_document(store, evidence_key)

@@ -55,14 +55,17 @@ from crucible.documents import UnreadableDocumentError, load_store_document
 from crucible.keys import (
     TRADER_EXECUTION_SHORTFALL_PREFIX,
     TRADER_SHADOW_BOOKS_PREFIX,
+    arm_register_key,
     execution_shortfall_key,
     shadow_books_key,
 )
 from crucible.models import MetricRecordRow
 from crucible.portfolio import COST_MODEL_KINDS, COST_MODELS
+from crucible.slots.arms import read_register
 from crucible.store import Store
 
 __all__ = [
+    "CONTROL_NON_BOOK_STATUS",
     "DECISION_PRICE_BASIS",
     "EXECUTION_METRIC_NAME",
     "EXECUTION_N_FLOOR",
@@ -90,6 +93,16 @@ SHADOW_BOOKS_SCHEMA_VERSION = "shadow_books.v1"
 #: The only decision-price basis the artifact admits: the price at the instant
 #: the sizing decision was taken. Recorded in the document, not implied by code.
 DECISION_PRICE_BASIS = "sizing_decision"
+
+#: The RULED non-book disposition of a control arm on `shadow_books.v1`
+#: (Brian, 2026-10-05, `alpha-engine-config-I12021`). Plan §10.6 row 6 asks for
+#: "a simulated book per registered challenger"; a control (`ArmRecord.control`)
+#: is scored by the grade's seeded selection (`crucible.slots.grading`), has no
+#: construction recipe, and — the planted control being look-ahead — could not
+#: honestly be paper-traded. So every daily document LISTS each active control
+#: with this status and a `non_book_reason`: never dropped, never a failed book,
+#: and never admissible for an arm the register does not mark control.
+CONTROL_NON_BOOK_STATUS = "control_scored_by_grade"
 
 #: Every simulated shadow fill is at the session close (plan §10.6 row 6).
 SHADOW_FILL_BASIS = "close"
@@ -556,6 +569,12 @@ def validate_shadow_books(
     for book in doc["books"]:
         _validate_book(book, doc["trading_day"], origin)
         rows = by_arm.get(book["arm_id"], [])
+        if book["status"] == CONTROL_NON_BOOK_STATUS and rows:
+            raise ExecutionArtifactError(
+                f"{origin}: control {book['arm_id']!r} is recorded as "
+                f"{CONTROL_NON_BOOK_STATUS!r} yet carries {len(rows)} "
+                f"{SHADOW_BOOK_METRIC_NAME!r} metric(s); a non-book earned nothing anyone measured"
+            )
         if book["status"] == "advanced":
             if len(rows) != 1:
                 raise ExecutionArtifactError(
@@ -588,6 +607,36 @@ def _validate_book(book: Mapping[str, Any], trading_day: str, origin: str) -> No
         "cumulative_net_return_ratio",
         "turnover_one_way_ratio",
     )
+    non_book_reason = book.get("non_book_reason")
+    if book["status"] == CONTROL_NON_BOOK_STATUS:
+        if not (non_book_reason or "").strip():
+            raise ExecutionArtifactError(
+                f"{origin}: control {arm!r} is recorded as {CONTROL_NON_BOOK_STATUS!r} with no "
+                "non_book_reason; the ruled disposition is a status AND a reason"
+            )
+        if book["failure_reason"] is not None:
+            raise ExecutionArtifactError(
+                f"{origin}: control {arm!r} is recorded as {CONTROL_NON_BOOK_STATUS!r} and also "
+                "carries a failure_reason; a control is either the ruled non-book or a failure"
+            )
+        if (
+            any(book[name] is not None for name in numeric)
+            or book["cost_model"] is not None
+            or book["inception_trading_day"] is not None
+            or days
+            or book["weights"]
+        ):
+            raise ExecutionArtifactError(
+                f"{origin}: control {arm!r} is recorded as {CONTROL_NON_BOOK_STATUS!r} but carries "
+                "book content (a figure, cost model, inception, advanced day or weight); a "
+                "non-book holds nothing"
+            )
+        return
+    if non_book_reason is not None:
+        raise ExecutionArtifactError(
+            f"{origin}: {book['status']} book {arm!r} carries a non_book_reason, which only a "
+            f"{CONTROL_NON_BOOK_STATUS!r} control entry may"
+        )
     if book["status"] == "failed":
         if not (book["failure_reason"] or "").strip():
             raise ExecutionArtifactError(f"{origin}: failed book {arm!r} names no failure_reason")
@@ -651,14 +700,27 @@ def shadow_book_coverage(
     *,
     days_served: Sequence[str] | None = None,
 ) -> ShadowCoverage:
-    """Does every active arm carry an advanced shadow book, over every served day?
+    """Does every active CHALLENGER carry an advanced shadow book, over every served day?
 
     The reading a phase-4 clause returns MET/UNMET from (I10653 deliverable 4).
-    UNMET, with the reason, when: the session's artifact is absent; any active
-    arm's book failed; or — given the trader's own ``days_served`` — an active
-    book on or after its inception is missing a day the trader served. A
-    non-conforming artifact RAISES rather than reading UNMET, because a
-    corrupt document is a producer defect, not a coverage gap.
+    Plan §10.6 row 6 asks for "a simulated book per registered challenger"; a
+    control arm is instead held to its RULED non-book disposition
+    (`CONTROL_NON_BOOK_STATUS`, `alpha-engine-config-I12021`).
+
+    Which arms are controls is read from the REGISTER the document names
+    (`arms/{slot}/register.jsonl`, `ArmRecord.control`), never from the
+    document's own say-so: a producer that could mark a challenger
+    `control_scored_by_grade` would excuse any book it failed to build.
+
+    UNMET, with the reason, when: the session's artifact is absent; the
+    register is unreadable; the document lists no active challenger; any
+    challenger's book failed or is recorded as a control non-book; any control
+    carries any status but the ruled one; a control the register held active
+    on ``trading_day`` is missing from the document; or — given the trader's
+    own ``days_served`` — an advanced book on or after its inception is
+    missing a day the trader served. A non-conforming artifact RAISES rather
+    than reading UNMET, because a corrupt document is a producer defect, not a
+    coverage gap.
     """
     key = shadow_books_key(trading_day)
     if not store.exists(key):
@@ -668,29 +730,77 @@ def shadow_book_coverage(
             (key,),
         )
     doc = validate_shadow_books(_load(store, key), origin=key)
-    if not doc["active_arms"]:
+    register_key = arm_register_key(doc["slot"])
+    sources = (key, register_key)
+    try:
+        register = read_register(store, doc["slot"])
+    except Exception as exc:
+        # Failure mode swallowed: the register log is unreadable or does not
+        # fold. Recording surface: this UNMET reading, which names the key and
+        # the error — without the register no control can be told from a
+        # challenger, so nothing is excused.
         return ShadowCoverage(
             False,
-            f"{key}: the register the trader read lists no active arm, so no shadow book "
+            f"{register_key} is unreadable ({type(exc).__name__}: {exc}); without the register "
+            "no control can be told from a challenger",
+            sources,
+        )
+
+    def is_control(arm_id: str) -> bool:
+        return arm_id in register and register.state(arm_id).record.control
+
+    challengers = [a for a in doc["active_arms"] if not is_control(a)]
+    if not challengers:
+        return ShadowCoverage(
+            False,
+            f"{key}: the register the trader read lists no active challenger, so no shadow book "
             "measures anything",
-            (key,),
+            sources,
         )
     findings: list[str] = []
+    listed = set(doc["active_arms"])
+    dropped = [
+        a for a in register.active_arms(as_of=trading_day) if is_control(a) and a not in listed
+    ]
+    if dropped:
+        findings.append(
+            f"control(s) {dropped} active in {register_key} on {trading_day} are missing from the "
+            f"document; a control is listed as {CONTROL_NON_BOOK_STATUS!r}, never dropped"
+        )
     for book in doc["books"]:
+        arm = book["arm_id"]
+        if is_control(arm):
+            if book["status"] != CONTROL_NON_BOOK_STATUS:
+                findings.append(
+                    f"{arm}: control recorded as {book['status']!r}"
+                    + (f" ({book['failure_reason']})" if book["failure_reason"] else "")
+                    + f"; the ruled disposition is {CONTROL_NON_BOOK_STATUS!r}"
+                )
+            continue
+        if book["status"] == CONTROL_NON_BOOK_STATUS:
+            findings.append(
+                f"{arm}: recorded as {CONTROL_NON_BOOK_STATUS!r} but {register_key} does not mark "
+                "it a control; a challenger needs an advanced book"
+            )
+            continue
         if book["status"] == "failed":
-            findings.append(f"{book['arm_id']}: failed ({book['failure_reason']})")
+            findings.append(f"{arm}: failed ({book['failure_reason']})")
             continue
         if days_served is not None:
             inception = book["inception_trading_day"]
             advanced = set(book["days_advanced"])
             gap = [d for d in days_served if d >= inception and d not in advanced]
             if gap:
-                findings.append(f"{book['arm_id']}: not advanced on served day(s) {gap}")
+                findings.append(f"{arm}: not advanced on served day(s) {gap}")
     if findings:
-        return ShadowCoverage(False, f"{key}: " + "; ".join(findings), (key,))
+        return ShadowCoverage(False, f"{key}: " + "; ".join(findings), sources)
+    controls = len(doc["active_arms"]) - len(challengers)
     return ShadowCoverage(
         True,
-        f"{key}: {len(doc['books'])} active arm(s), every book advanced"
-        + ("" if days_served is None else f" on all {len(days_served)} served day(s)"),
-        (key,),
+        f"{key}: {len(challengers)} active challenger(s), every book advanced"
+        + ("" if days_served is None else f" on all {len(days_served)} served day(s)")
+        + (
+            "" if not controls else f"; {controls} control(s) listed as {CONTROL_NON_BOOK_STATUS!r}"
+        ),
+        sources,
     )

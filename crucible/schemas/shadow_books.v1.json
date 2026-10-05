@@ -2,7 +2,7 @@
   "$id": "https://github.com/nousergon/crucible/schemas/shadow_books.v1.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "shadow_books.v1",
-  "description": "One trading session's simulated paper book per ACTIVE registered arm, written by the trader (`nousergon/crucible-trader`) at `crucible.execution.shadow_books_key(trading_day)` (plan §10.6 row 6; `alpha-engine-config-I10653`). Fills at close, constructed by `crucible.slots.strategy.construct_book` and charged by the arm's own `crucible.portfolio.CostModel` — the same engine and charge the S grade applies. NOT `crucible.keys.shadow_key` (an arm's grading-cycle SELECTION); the distinct `trader/shadow_books/` prefix keeps the two objects from sharing a key shape. Cross-field rules JSON Schema cannot state (every active arm carries exactly one book; cost_model is a registered model with exactly its declared parameters; net = gross − cost; sessions = len(days_advanced); one metric per advanced book equal to its cumulative return) are enforced by `crucible.execution.validate_shadow_books`. Evidence only: shadow books are not a promotion input in phase 4.",
+  "description": "One trading session's simulated paper book per ACTIVE registered arm, written by the trader (`nousergon/crucible-trader`) at `crucible.execution.shadow_books_key(trading_day)` (plan §10.6 row 6; `alpha-engine-config-I10653`). Fills at close, constructed by `crucible.slots.strategy.construct_book` and charged by the arm's own `crucible.portfolio.CostModel` — the same engine and charge the S grade applies. NOT `crucible.keys.shadow_key` (an arm's grading-cycle SELECTION); the distinct `trader/shadow_books/` prefix keeps the two objects from sharing a key shape. Cross-field rules JSON Schema cannot state (every active arm carries exactly one book — a control arm's being its ruled `control_scored_by_grade` non-book entry; cost_model is a registered model with exactly its declared parameters; net = gross − cost; sessions = len(days_advanced); one metric per advanced book equal to its cumulative return) are enforced by `crucible.execution.validate_shadow_books`. Evidence only: shadow books are not a promotion input in phase 4.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -130,15 +130,23 @@
         "status": {
           "enum": [
             "advanced",
-            "failed"
+            "failed",
+            "control_scored_by_grade"
           ],
-          "description": "`failed` is recorded and the producer then exits non-zero: the book is a finding, not an absence."
+          "description": "`failed` is recorded and the producer then exits non-zero: the book is a finding, not an absence. `control_scored_by_grade` is the RULED non-book disposition of a control arm (`ArmRecord.control`; alpha-engine-config-I12021, plan §10.6 \"a simulated book per registered challenger\"): a control is scored by the grade's seeded selection, never constructed as a paper book, and is listed with this status rather than dropped. Admissible only for an arm the register marks control, which `crucible.execution.shadow_book_coverage` checks against the register."
         },
         "failure_reason": {
           "type": [
             "string",
             "null"
           ]
+        },
+        "non_book_reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why this arm carries no book. Required (non-empty) exactly when status is `control_scored_by_grade`; absent or null otherwise."
         },
         "cost_model": {
           "oneOf": [
