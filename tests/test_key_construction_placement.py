@@ -101,6 +101,16 @@ _KNOWN_ARCHITECTURAL_EXCEPTIONS: dict[str, dict[str, str]] = {
             "the crucible store key grammar at all; unrelated AWS domain."
         ),
     },
+    "autonomy": {
+        "S3DayCache.key": (
+            "the object name of a CloudTrail day-cache entry under an operator-CONFIGURED "
+            "s3:// URI (CRUCIBLE_CLOUDTRAIL_DAY_CACHE), addressed with a raw S3 client, "
+            "never through a Store — so it is not the crucible store key grammar. Its "
+            "segments are the cache's own schema version and a hash of autonomy-local "
+            "predicate scopes."
+        ),
+        # Added with the CloudTrail day cache, alpha-engine-config-I11792.
+    },
     "migrate": {
         "V1Source.series_prefix": (
             "a v1 listing prefix — everything before the `{date}` placeholder in a "

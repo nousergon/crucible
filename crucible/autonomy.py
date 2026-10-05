@@ -83,12 +83,14 @@ from __future__ import annotations
 
 import datetime as dt
 import gzip
+import hashlib
 import json
 import re
+import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from crucible.models import CloudTrailRecord
 
@@ -96,6 +98,9 @@ __all__ = [
     "machine_principals",
     "ArchiveMissingError",
     "ArchiveRead",
+    "CACHE_CLOSED_AFTER_DAYS",
+    "DayCache",
+    "S3DayCache",
     "OperatorAction",
     "OperatorActionCount",
     "PointerAttribution",
@@ -105,6 +110,7 @@ __all__ = [
     "StackUnmeasurableError",
     "attribute_pointer_writes",
     "attribute_stack_applies",
+    "configured_day_cache",
     "count_operator_actions",
     "date_partitions",
     "iter_archive_records",
@@ -252,6 +258,16 @@ class ArchiveRead:
     #: Objects a ``needle`` ruled out before decode (`alpha-engine-config-I11448`).
     #: Counted in ``objects_by_day``; their records are not in ``records_scanned``.
     objects_prefiltered: int = 0
+    #: Covered days whose kept records came from the per-day result cache
+    #: rather than a download (`alpha-engine-config-I11792`). Their objects
+    #: are still counted in ``objects_by_day`` — the listing that proves
+    #: coverage is never cached — and their scanned/prefiltered counts are the
+    #: ones recorded when the day was first read.
+    days_from_cache: int = 0
+    #: One line per cache read or write that failed. A failed cache is never
+    #: fatal — the day is scanned, which is the uncached behaviour exactly —
+    #: but it is reported rather than swallowed.
+    cache_failures: tuple[str, ...] = ()
 
     @property
     def objects_read(self) -> int:
@@ -412,6 +428,162 @@ def _fetch_records(
     return list(payload.get("Records") or [])
 
 
+# ── alpha-engine-config-I11792: a per-calendar-day result cache ────────────
+# Every month-to-date board render re-downloaded every closed day of the
+# month — ~95 MB compressed per day, measured 2026-10-05 over 09-20..10-04
+# (86–106 MB/day, 831–3,244 objects/day) — so a late-month render pulled
+# 2–3 GB of archive to re-derive answers that cannot have changed. That is
+# billed S3 internet egress from a GitHub-hosted runner. A CLOSED day's kept
+# records are a pure function of (the day's object set, the keep predicate,
+# the needle), so they are read once and stored as one small JSON document.
+
+#: A day is cacheable only once it is at least this many days before TODAY
+#: (UTC): ``day <= today - CACHE_CLOSED_AFTER_DAYS``. CloudTrail files each
+#: object under the UTC date it was DELIVERED, so no new object lands in a
+#: day's folder once that day has ended — measured 2026-10-05, the latest PUT
+#: into each of 09-28..10-04 was between 23:55:54 and 23:59:31 of the same
+#: day. Delivery is documented as typically ~5 minutes and NOT guaranteed, so
+#: the margin is a whole day of slack past "the day has ended" (today-1 would
+#: cache yesterday minutes after midnight, while S3 PUTs for 23:5x deliveries
+#: may still be landing), never a tolerance being leaned on. It is also not
+#: the only guard: every read re-lists the day and a cached entry is used only
+#: when the listed key set matches the one it was computed from, so an object
+#: that does arrive late invalidates the entry instead of being missed.
+CACHE_CLOSED_AFTER_DAYS = 2
+
+#: Bumped whenever the cached document's shape or meaning changes; a reader
+#: ignores every document carrying any other value.
+_CACHE_SCHEMA = 1
+
+
+class DayCache(Protocol):
+    """Where per-day results live. ``get`` returns `None` for a miss."""
+
+    def get(self, scope: str, day: dt.date) -> dict[str, Any] | None: ...
+
+    def put(self, scope: str, day: dt.date, document: dict[str, Any]) -> None: ...
+
+
+def _scope_digest(scope: str) -> str:
+    return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24]
+
+
+@dataclass(frozen=True)
+class S3DayCache:
+    """A :class:`DayCache` over ``s3://{bucket}/{prefix}``.
+
+    One object per (scope, day):
+    ``{prefix}/v{schema}/{sha256(scope)[:24]}/{YYYY}/{MM}/{DD}.json``. The
+    scope is hashed into the key so a scope carrying a bucket or object key
+    never shapes a path, and is stored verbatim in the document so a reader
+    can refuse a collision rather than trust the hash.
+    """
+
+    client: Any
+    bucket: str
+    prefix: str
+
+    def key(self, scope: str, day: dt.date) -> str:
+        base = self.prefix.strip("/")
+        tail = f"v{_CACHE_SCHEMA}/{_scope_digest(scope)}/{day:%Y/%m/%d}.json"
+        return f"{base}/{tail}" if base else tail
+
+    def get(self, scope: str, day: dt.date) -> dict[str, Any] | None:
+        try:
+            body = self.client.get_object(Bucket=self.bucket, Key=self.key(scope, day))["Body"]
+        except Exception as exc:  # noqa: BLE001 - a miss and a denial both mean "scan"
+            if _is_missing_key(exc):
+                return None
+            raise
+        document = json.loads(body.read().decode("utf-8"))
+        return document if isinstance(document, dict) else None
+
+    def put(self, scope: str, day: dt.date, document: dict[str, Any]) -> None:
+        self.client.put_object(
+            Bucket=self.bucket,
+            Key=self.key(scope, day),
+            Body=json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8"),
+            ContentType="application/json",
+        )
+
+
+def _is_missing_key(exc: Exception) -> bool:
+    """Whether ``exc`` is S3 saying the key does not exist (a cache MISS)."""
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        code = str((response.get("Error") or {}).get("Code") or "")
+        return code in {"NoSuchKey", "404", "NotFound"}
+    return isinstance(exc, KeyError | FileNotFoundError)
+
+
+def configured_day_cache(client: Any) -> S3DayCache | None:
+    """The day cache ``CRUCIBLE_CLOUDTRAIL_DAY_CACHE`` names, or `None`.
+
+    Unset means no cache — the uncached read, exactly as before. It is a
+    per-workflow setting, never a default, because each scheduled identity
+    may write only its OWN prefix: the board role caches under the
+    ``board/`` prefix it already owns. A cache one identity writes and
+    another grades from would let the writer shape the reader's answer.
+    """
+    from crucible.config import settings  # noqa: PLC0415 - avoid an import cycle at module load
+
+    location = settings().cloudtrail_day_cache
+    if not location:
+        return None
+    if not location.startswith("s3://"):
+        raise ValueError(f"CRUCIBLE_CLOUDTRAIL_DAY_CACHE must be an s3:// URI, got {location!r}")
+    bucket, _, prefix = location.removeprefix("s3://").strip("/").partition("/")
+    return S3DayCache(client, bucket, prefix)
+
+
+def _keys_digest(keys: list[str]) -> str:
+    return hashlib.sha256("\n".join(sorted(keys)).encode("utf-8")).hexdigest()
+
+
+def _cached_day(
+    document: dict[str, Any] | None, *, scope: str, day: dt.date, keys: list[str]
+) -> tuple[list[dict[str, Any]], int, int] | None:
+    """A cached day's (records, scanned, prefiltered), or `None` to rescan.
+
+    Every field is checked against what THIS read just listed. The coverage
+    decision is never taken from the cache — ``objects_by_day`` comes from the
+    live listing — and a document computed over a different object set (a
+    late delivery, a different region set) is a miss, not a hit.
+    """
+    if not isinstance(document, dict):
+        return None
+    if (
+        document.get("schema") != _CACHE_SCHEMA
+        or document.get("scope") != scope
+        or document.get("day") != day.isoformat()
+        or document.get("objects") != len(keys)
+        or document.get("keys_sha256") != _keys_digest(keys)
+    ):
+        return None
+    records = document.get("records")
+    scanned = document.get("records_scanned")
+    prefiltered = document.get("objects_prefiltered")
+    if not isinstance(records, list) or not all(isinstance(r, dict) for r in records):
+        return None
+    if not isinstance(scanned, int) or not isinstance(prefiltered, int):
+        return None
+    return records, scanned, prefiltered
+
+
+def _cacheable(day: dt.date, today: dt.date) -> bool:
+    return day <= today - dt.timedelta(days=CACHE_CLOSED_AFTER_DAYS)
+
+
+def _utc_today() -> dt.date:
+    return dt.datetime.now(dt.UTC).date()
+
+
+def _note_cache_failure(failures: list[str], what: str, day: dt.date, exc: Exception) -> None:
+    line = f"day cache {what} for {day.isoformat()} failed ({type(exc).__name__}: {exc})"
+    failures.append(line)
+    print(f"crucible.autonomy: {line}; the day was scanned instead", file=sys.stderr)
+
+
 def iter_archive_records(
     client: Any,
     *,
@@ -421,6 +593,9 @@ def iter_archive_records(
     end: dt.date,
     keep: Callable[[dict[str, Any]], bool] | None = None,
     needle: bytes | None = None,
+    cache: DayCache | None = None,
+    cache_scope: str | None = None,
+    today: dt.date | None = None,
 ) -> ArchiveRead:
     """Every CloudTrail record delivered for the calendar days in the window.
 
@@ -468,10 +643,38 @@ def iter_archive_records(
     :attr:`ArchiveRead.objects_prefiltered`, but its records are never
     decoded, so ``records_scanned`` counts only the records of objects that
     were.
+
+    **``cache`` + ``cache_scope`` reuse a CLOSED day's kept records**
+    (`alpha-engine-config-I11792`). ``cache_scope`` is the caller's name for
+    exactly what ``keep`` and ``needle`` select — two different predicates
+    must never share a scope, and a predicate whose meaning changes must
+    change its scope. Both are required, and ``keep`` must be given: caching
+    an unfiltered day would store the whole archive. Three properties hold:
+
+    * the day is ALWAYS listed, and ``objects_by_day`` always comes from that
+      listing, so a cached day can never turn an uncovered day into a covered
+      one — a day with no delivered objects is never looked up or stored;
+    * a cached day is used only when its stored key set matches the listing
+      (count and digest), so a late delivery is a miss, never a stale hit;
+    * only a day ``<= today - CACHE_CLOSED_AFTER_DAYS`` (UTC) is ever read
+      from or written to the cache — today and yesterday are always scanned.
+
+    A failed cache read or write falls back to the scan and is reported in
+    :attr:`ArchiveRead.cache_failures`; a cache can make a read cheaper, never
+    different.
     """
+    use_cache = cache is not None and bool(cache_scope) and keep is not None
+    if cache is not None and not use_cache:
+        raise ValueError(
+            "a day cache needs both a cache_scope naming the keep predicate and the "
+            "keep predicate itself; caching an unfiltered read would store the archive"
+        )
+    reference_day = today if today is not None else _utc_today()
     kept: list[dict[str, Any]] = []
     prefiltered = 0
     scanned = 0
+    days_from_cache = 0
+    cache_failures: list[str] = []
     objects_by_day: dict[dt.date, int] = {}
     paginator = client.get_paginator("list_objects_v2")
     partitions = date_partitions(client, bucket=bucket, prefix=prefix)
@@ -483,7 +686,28 @@ def iter_archive_records(
             for page in paginator.paginate(Bucket=bucket, Prefix=day_prefix):
                 keys.extend(entry["Key"] for entry in page.get("Contents") or [])
         objects_by_day[day] = len(keys)
+        cacheable = use_cache and bool(keys) and _cacheable(day, reference_day)
+        if cacheable:
+            assert cache is not None and cache_scope is not None  # narrowed by use_cache
+            try:
+                hit = _cached_day(
+                    cache.get(cache_scope, day), scope=cache_scope, day=day, keys=keys
+                )
+            except Exception as exc:  # noqa: BLE001 - reported, and the day is scanned
+                _note_cache_failure(cache_failures, "read", day, exc)
+                hit = None
+            if hit is not None:
+                records_hit, scanned_hit, prefiltered_hit = hit
+                kept.extend(records_hit)
+                scanned += scanned_hit
+                prefiltered += prefiltered_hit
+                days_from_cache += 1
+                day += dt.timedelta(days=1)
+                continue
         if keys:
+            day_kept: list[dict[str, Any]] = []
+            day_scanned = 0
+            day_prefiltered = 0
             workers = min(_ARCHIVE_WORKERS, len(keys))
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = [
@@ -493,16 +717,40 @@ def iter_archive_records(
                 for future in futures:
                     records = future.result()
                     if records is None:
-                        prefiltered += 1
+                        day_prefiltered += 1
                         continue
-                    scanned += len(records)
-                    kept.extend(r for r in records if keep is None or keep(r))
+                    day_scanned += len(records)
+                    day_kept.extend(r for r in records if keep is None or keep(r))
+            kept.extend(day_kept)
+            scanned += day_scanned
+            prefiltered += day_prefiltered
+            if cacheable:
+                assert cache is not None and cache_scope is not None
+                try:
+                    cache.put(
+                        cache_scope,
+                        day,
+                        {
+                            "schema": _CACHE_SCHEMA,
+                            "scope": cache_scope,
+                            "day": day.isoformat(),
+                            "objects": len(keys),
+                            "keys_sha256": _keys_digest(keys),
+                            "records_scanned": day_scanned,
+                            "objects_prefiltered": day_prefiltered,
+                            "records": day_kept,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001 - reported; the answer is unaffected
+                    _note_cache_failure(cache_failures, "write", day, exc)
         day += dt.timedelta(days=1)
     return ArchiveRead(
         records=kept,
         objects_by_day=objects_by_day,
         records_scanned=scanned,
         objects_prefiltered=prefiltered,
+        days_from_cache=days_from_cache,
+        cache_failures=tuple(cache_failures),
     )
 
 
@@ -534,6 +782,8 @@ def count_operator_actions(
     marker: str = "crucible-v2",
     cfn: Any | None = None,
     reserved: frozenset[str] = frozenset(),
+    cache: DayCache | None = None,
+    today: dt.date | None = None,
 ) -> OperatorActionCount:
     """Count human-originated mutating calls against v2 over the window.
 
@@ -568,6 +818,15 @@ def count_operator_actions(
     Any uncovered day therefore raises :class:`ArchiveMissingError` NAMING the
     days, which the gate renders as UNMEASURABLE — the honest answer until the
     trail has the window's worth of history.
+
+    **``cache`` stores the RAW candidates, never the count**
+    (`alpha-engine-config-I11792`). What a closed day caches is the
+    mutating, ``marker``-naming records :func:`iter_archive_records` kept —
+    before the machine-principal allowlist and ``reserved`` are applied. Both
+    of those are per-caller and change with config (a role added to the
+    stack, an operator-declared reservation), so they are applied fresh to
+    every read, cached day or not; a cached filtered count would silently
+    keep yesterday's answer to a question whose terms changed.
     """
     if not bucket:
         raise ArchiveMissingError(
@@ -584,7 +843,17 @@ def count_operator_actions(
         return record.get("readOnly") is not True and _touches(record, marker)
 
     read = iter_archive_records(
-        client, bucket=bucket, prefix=prefix, start=start, end=end, keep=_is_candidate
+        client,
+        bucket=bucket,
+        prefix=prefix,
+        start=start,
+        end=end,
+        keep=_is_candidate,
+        cache=cache,
+        # Names `_is_candidate` exactly: its only parameter is ``marker``.
+        # Bump the version whenever `_is_candidate` or `_touches` changes.
+        cache_scope=f"operator-candidates/v1/marker={marker}",
+        today=today,
     )
     uncovered = read.uncovered_days
     if uncovered:
@@ -708,6 +977,8 @@ def attribute_pointer_writes(
     since: dt.datetime,
     until: dt.datetime,
     cfn: Any | None = None,
+    cache: DayCache | None = None,
+    today: dt.date | None = None,
 ) -> PointerAttribution:
     """Who wrote ``object_key`` in ``(since, until]``, from the archive.
 
@@ -757,6 +1028,12 @@ def attribute_pointer_writes(
     # `_needle_rules_out` falls through on) is present. `None` — unfiltered
     # — for a key that proof does not cover.
     needle = literal_needle(object_key)
+    # Names `_is_pointer_write` and the needle exactly (I11792). The machine
+    # allowlist is applied below, on every read, never cached.
+    scope = (
+        f"pointer-writes/v1/events={','.join(sorted(_POINTER_WRITE_EVENTS))}"
+        f"/bucket={object_bucket}/key={object_key}/needle={needle!r}"
+    )
     principals: tuple[str, ...] | None = None
     writes: list[PointerWrite] = []
     objects_read = 0
@@ -772,6 +1049,9 @@ def attribute_pointer_writes(
             end=day,
             keep=_is_pointer_write,
             needle=needle,
+            cache=cache,
+            cache_scope=scope,
+            today=today,
         )
         objects_read += read.objects_read
         records_scanned += read.records_scanned
@@ -969,6 +1249,8 @@ def attribute_stack_applies(
     since: dt.datetime,
     until: dt.datetime,
     cfn: Any | None = None,
+    cache: DayCache | None = None,
+    today: dt.date | None = None,
 ) -> StackApplyAttribution:
     """Who applied ``stack_name`` in ``(since, until]``, from the archive.
 
@@ -1007,6 +1289,12 @@ def attribute_stack_applies(
     # it as a substring of `stackName`), but measured 2026-09-21 it matched
     # 216 of ~1,664 objects against this one's 116, and one needle suffices.
     needle = literal_needle(_CLOUDFORMATION_SOURCE)
+    # Names `_is_stack_apply` and the needle exactly (I11792). The machine
+    # allowlist is applied below, on every read, never cached.
+    scope = (
+        f"stack-applies/v1/source={_CLOUDFORMATION_SOURCE}"
+        f"/events={','.join(sorted(_STACK_APPLY_EVENTS))}/stack={stack_name}/needle={needle!r}"
+    )
     principals: tuple[str, ...] | None = None
     applies: list[StackApply] = []
     objects_read = 0
@@ -1036,6 +1324,9 @@ def attribute_stack_applies(
             end=day,
             keep=_is_stack_apply,
             needle=needle,
+            cache=cache,
+            cache_scope=scope,
+            today=today,
         )
         objects_read += read.objects_read
         records_scanned += read.records_scanned

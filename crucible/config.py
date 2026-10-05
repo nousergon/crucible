@@ -56,6 +56,8 @@ __all__ = [
     "DEFAULT_ARCTIC_BUCKET",
     "DEFAULT_AUTONOMY_RESERVED_EVENTS",
     "DEFAULT_CLOUDTRAIL_ARCHIVE",
+    "CLOUDTRAIL_DAY_CACHE_VAR",
+    "DEFAULT_CLOUDTRAIL_DAY_CACHE",
     "DEFAULT_CONSOLE_URL",
     "DEFAULT_IAC_DECLARED_INVENTORY_PARAM",
     "DEFAULT_STACK_NAME",
@@ -130,6 +132,17 @@ CLOUDTRAIL_ARCHIVE_VAR = "CRUCIBLE_CLOUDTRAIL_ARCHIVE"
 #: default is ever reached.
 DEFAULT_CLOUDTRAIL_ARCHIVE = ""
 
+#: The environment variable naming the per-calendar-day CloudTrail result
+#: cache (`crucible.autonomy.configured_day_cache`, `alpha-engine-config-I11792`).
+CLOUDTRAIL_DAY_CACHE_VAR = "CRUCIBLE_CLOUDTRAIL_DAY_CACHE"
+
+#: Empty by default: no cache, the uncached archive read exactly. Set per
+#: WORKFLOW, never defaulted, because each scheduled identity may write only
+#: its own prefix — the board caches under the `board/` prefix it already
+#: owns — and a cache one identity writes must not become another's grading
+#: input. An `s3://bucket/prefix` URI.
+DEFAULT_CLOUDTRAIL_DAY_CACHE = ""
+
 #: The SNS topic v2 pages are published to, and the topic the SUPERSEDED v1
 #: system's alerts are routed to during the overlap. **No default,
 #: deliberately**, for the same reason as `DEFAULT_ARCTIC_BUCKET`: a topic
@@ -195,6 +208,8 @@ class Settings:
     #: three data jobs; empty means "nothing declared", and the job refuses.
     universe_uri: str = DEFAULT_UNIVERSE_URI
     cloudtrail_archive: str = DEFAULT_CLOUDTRAIL_ARCHIVE
+    #: See :data:`DEFAULT_CLOUDTRAIL_DAY_CACHE`. Empty means no cache.
+    cloudtrail_day_cache: str = DEFAULT_CLOUDTRAIL_DAY_CACHE
     stack_name: str = DEFAULT_STACK_NAME
     #: See :data:`DEFAULT_IAC_DECLARED_INVENTORY_PARAM`. Read by
     #: `crucible.iac_conformance.declared_inventory_from_ssm`.
@@ -278,6 +293,7 @@ class Settings:
             "arctic_bucket": self.arctic_bucket,
             "universe_uri": self.universe_uri,
             "cloudtrail_archive": self.cloudtrail_archive,
+            "cloudtrail_day_cache": self.cloudtrail_day_cache,
             "stack_name": self.stack_name,
             "iac_declared_inventory_param": self.iac_declared_inventory_param,
             "console_url": self.console_url,
@@ -306,6 +322,7 @@ def settings(
     universe_uri: str | None = None,
     llm_cap_usd: float | None = None,
     cloudtrail_archive: str | None = None,
+    cloudtrail_day_cache: str | None = None,
     stack_name: str | None = None,
     console_url: str | None = None,
     autonomy_reserved_events: str | None = None,
@@ -328,6 +345,9 @@ def settings(
     )
     resolved_archive, origins["cloudtrail_archive"] = _resolve(
         cloudtrail_archive, CLOUDTRAIL_ARCHIVE_VAR, DEFAULT_CLOUDTRAIL_ARCHIVE
+    )
+    resolved_day_cache, origins["cloudtrail_day_cache"] = _resolve(
+        cloudtrail_day_cache, CLOUDTRAIL_DAY_CACHE_VAR, DEFAULT_CLOUDTRAIL_DAY_CACHE
     )
     resolved_stack, origins["stack_name"] = _resolve(
         stack_name, "CRUCIBLE_STACK", DEFAULT_STACK_NAME
@@ -370,6 +390,7 @@ def settings(
         strategy_dir=resolved_dir,
         universe_uri=resolved_universe,
         cloudtrail_archive=resolved_archive,
+        cloudtrail_day_cache=resolved_day_cache or DEFAULT_CLOUDTRAIL_DAY_CACHE,
         stack_name=resolved_stack,
         console_url=resolved_console.rstrip("/") if resolved_console else DEFAULT_CONSOLE_URL,
         autonomy_reserved_events=reserved_events,
