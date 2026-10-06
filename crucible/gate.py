@@ -2887,7 +2887,17 @@ def _clause_old_weekly_within_cadence(
                 "(`sf-pipeline-policy.md` §5)"
             )
         if minimum_succeeded:
-            succeeded = [e for e in runs if e.status == "SUCCEEDED"]
+            # Brian 2026-10-06: "if a weekly sf is marked success, then EVERY
+            # SINGLE component should have run successfully." A recovery
+            # rerun ends SUCCEEDED having skipped every stage it was told to
+            # (`watch-rerun-2026-10-02-3`: 19 skipped), so under the
+            # partial-runs rule its status proves nothing on its own; it
+            # counts only through the stage combination below.
+            succeeded = [
+                e
+                for e in runs
+                if e.status == "SUCCEEDED" and not (partial_runs_count and e.is_rerun)
+            ]
             if len(runs) >= minimum and len(succeeded) < minimum_succeeded:
                 # Every run this week FAILED (or was still running when the
                 # producer filed). The ruling's trigger is a cycle that
