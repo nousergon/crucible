@@ -876,12 +876,15 @@ def handle_experiment_run(args: argparse.Namespace) -> int:
 
 
 def handle_serve_daily(args: argparse.Namespace) -> int:
-    """`serve.daily --slot m` — publish the champion's feed for one session.
+    """`serve.daily --slot {m,u,s}` — one slot's daily output for one session.
 
-    `alpha-engine-config-I12047`. The body is the slot module's own
-    ``serve_daily`` (:func:`crucible.slots.model.serve_daily` for M), which
-    scores the session from the champion's fit of record and publishes through
-    the one serving path. The slot is the manifest discriminator, as for
+    `alpha-engine-config-I12047` (M) and `alpha-engine-config-I12021` (U, S).
+    The body is the slot module's own ``serve_daily``:
+    :func:`crucible.slots.model.serve_daily` scores the M champion from its
+    fit of record and publishes the predictions feed;
+    :func:`crucible.slots.universe.serve_daily` publishes the U champion's
+    cut; :func:`crucible.slots.strategy.serve_daily` records every live S
+    challenger's construction inputs from those two. The slot is the manifest discriminator, as for
     `experiment.run`, so a second daily-serving slot files its own manifest
     under the same job. Same dry-run shape as `experiment.run`: the body runs
     against a store that records its writes instead of performing them.

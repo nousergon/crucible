@@ -27,12 +27,12 @@ from typing import TYPE_CHECKING, Any
 
 from crucible.config import Settings
 from crucible.keys import universe_members_key
-from crucible.slots.cycle import run_grade, run_produce, run_produce_history
+from crucible.slots.cycle import run_grade, run_produce, run_produce_history, run_serve_daily
 
 if TYPE_CHECKING:
     from crucible.runner import RunContext
 
-__all__ = ["SLOT", "grade", "produce", "produce_history"]
+__all__ = ["SLOT", "grade", "produce", "produce_history", "serve_daily"]
 
 SLOT = "u"
 
@@ -57,6 +57,23 @@ def produce_history(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> di
     so the champion pointer is neither read nor required to have produced.
     """
     return run_produce_history(ctx, slot=SLOT, settings=settings, **kwargs)
+
+
+def serve_daily(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> dict[str, Any]:
+    """`serve.daily --slot u`: publish the U champion's cut for ONE session.
+
+    `alpha-engine-config-I12021`. The S slot's eligibility mask on a session
+    the weekly arc did not produce. Champion only, feed only: no shadow, no
+    cross-section, no register write, so no U arm's graded series changes —
+    see :func:`crucible.slots.cycle.run_serve_daily`.
+    """
+    return run_serve_daily(
+        ctx,
+        slot=SLOT,
+        settings=settings,
+        feed_key=universe_members_key,
+        **kwargs,
+    )
 
 
 def grade(ctx: RunContext, *, settings: Settings, **kwargs: Any) -> dict[str, Any]:

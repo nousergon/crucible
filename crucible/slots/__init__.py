@@ -350,9 +350,11 @@ def daily_servers() -> dict[str, ModuleType]:
 
     `alpha-engine-config-I12047`. Read off the modules, never listed, for the
     reason :func:`dispatchable_slots` is: the job grows the day a slot's
-    daily entry point lands, with no second list to update. M is the only
-    member today; S's daily book producer is the intended second, under the
-    same job name, discriminated by its slot.
+    daily entry point lands, with no second list to update. Members today:
+    M (the champion's predictions feed), U (the champion's cut) and S (every
+    live challenger's construction inputs, `alpha-engine-config-I12021`),
+    under one job name, discriminated by slot. R has none: nothing downstream
+    reads an R feed on a session the arc did not produce.
     """
     import importlib  # noqa: PLC0415 - lazy: the submodules import from this package
 

@@ -716,9 +716,12 @@ JOBS: dict[str, JobSpec] = {
     # after `data.daily`, every trading day: it publishes the champion's feed
     # for the session from the champion's fit of record, so the trader has a
     # feed for every session rather than only the one after the weekly arc.
+    # alpha-engine-config-I12021 adds `--slot u` (the U champion's cut) and
+    # `--slot s` (every live S challenger's construction inputs), so the daily
+    # shadow books and the S grade read inputs recorded on every session.
     "serve.daily": JobSpec(
         "serve.daily",
-        "Publish one slot's champion feed for one trading day, from its fit of record",
+        "Publish one slot's daily output for one trading day: M feed, U cut, or S inputs",
         True,
     ),
     # `promote` and `explain` are weekly ARC stages (`components.yaml`,
