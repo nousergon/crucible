@@ -59,7 +59,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from crucible.champion import read_champion
+from crucible.champion import ChampionPointer, read_champion
 from crucible.documents import UnreadableDocumentError, load_document_bytes
 from crucible.keys import arm_predictions_key, predictions_key
 from crucible.models import PredictionsFeedDocument
@@ -72,7 +72,9 @@ __all__ = [
     "PredictionsFeed",
     "PredictionsFeedContractError",
     "publish_predictions_feed",
+    "publish_promoted_feed",
     "read_predictions_feed",
+    "servable_source",
 ]
 
 PREDICTIONS_FEED_SCHEMA_VERSION = "predictions_feed.v1"
@@ -179,12 +181,6 @@ def publish_predictions_feed(
     schema, and the trader would be the thing that discovered it, at market
     open, with money.
     """
-    # Imported here, not at module scope: `crucible.slots.cycle` imports the
-    # grading stack, and `crucible.promote` — this module's caller — is on
-    # the import path of the CLI's fastest job. A local import keeps the
-    # error TYPE shared without making every promote run pay for the loop.
-    from crucible.slots.cycle import MissingArtifactError
-
     try:
         pointer = read_champion(store, slot)
     except KeyError:
@@ -192,17 +188,86 @@ def publish_predictions_feed(
         # would fail every promote run taken before the slot's first
         # promotion, which is every promote run the M slot has ever had.
         return None
+    return _publish(store, arm_id=pointer.arm_id, trading_day=trading_day, slot=slot, ctx=ctx)
 
-    source_key = arm_predictions_key(pointer.arm_id, trading_day)
+
+def publish_promoted_feed(
+    store: Store,
+    *,
+    pointer: ChampionPointer,
+    ctx: Any = None,
+) -> str:
+    """Republish the feed for a pointer `promote` has JUST written; return the key.
+
+    `crucible promote --slot m` moves the pointer AFTER `experiment.run[m]`
+    already published ``predictions/{as_of}.json`` for the PREVIOUS champion
+    — so a promotion that did not also republish left the two halves of the
+    trader contract naming two different arms, and the trader's resolver
+    refuses exactly that disagreement (2026-10-05: the 2026-10-02 M promotion).
+
+    Why this does not go through :func:`publish_predictions_feed`: that
+    function resolves the pointer with :func:`~crucible.champion.read_champion`,
+    whose producing-run gate requires the pointer's manifest to read ``ok``.
+    For a pointer written by the promote run in flight, that manifest IS this
+    run's, and `crucible.runner.run_job` writes it only when the job returns —
+    so the gate cannot pass from inside the job that is satisfying it. It is
+    not bypassed for the trader: the trader still resolves the pointer
+    through `read_champion`, so a promote run that fails after this write
+    leaves a pointer the reader refuses, and the feed is never served alone.
+    Everything else — the source document's existence, schema, arm, session
+    and non-empty cross-section, and the outgoing `predictions_feed.v1`
+    schema — is the same code path :func:`publish_predictions_feed` runs.
+    """
+    if pointer.slot != PREDICTIONS_FEED_SLOT:
+        raise ValueError(
+            f"slot {pointer.slot!r} serves no predictions feed; only slot "
+            f"{PREDICTIONS_FEED_SLOT!r} does (R and U serve under their own keys, S a book)"
+        )
+    return _publish(
+        store,
+        arm_id=pointer.arm_id,
+        trading_day=pointer.as_of,
+        slot=pointer.slot,
+        ctx=ctx,
+    )
+
+
+def servable_source(store: Store, *, arm_id: str, trading_day: str) -> str:
+    """The `arm_predictions.v1` key the feed WOULD republish for ``arm_id``.
+
+    Raises exactly what a publication for ``arm_id`` on ``trading_day`` would
+    raise — :class:`~crucible.slots.cycle.MissingArtifactError` when the arm
+    wrote no cross-section for the session, and
+    :class:`PredictionsFeedContractError` when it wrote one the serving path
+    refuses — so a caller deciding whether an arm CAN serve a session asks the
+    serving path itself rather than a second, drift-prone copy of its checks.
+    `crucible.slots.model.grade` reads this as the ``servable_as_of`` serving
+    precondition, which is what keeps `promote` from seating an arm that has
+    nothing to serve (2026-10-05).
+    """
+    source_key, _ = _load_source(store, arm_id=arm_id, trading_day=trading_day)
+    return source_key
+
+
+def _load_source(
+    store: Store, *, arm_id: str, trading_day: str, named_by: str | None = None
+) -> tuple[str, dict[str, Any]]:
+    # Imported here, not at module scope: `crucible.slots.cycle` imports the
+    # grading stack, and `crucible.promote` — this module's caller — is on
+    # the import path of the CLI's fastest job. A local import keeps the
+    # error TYPE shared without making every promote run pay for the loop.
+    from crucible.slots.cycle import MissingArtifactError
+
+    source_key = arm_predictions_key(arm_id, trading_day)
     try:
         payload = store.get_bytes(source_key)
     except KeyError as exc:
+        subject = f"{named_by} names {arm_id!r}, which" if named_by else f"arm {arm_id!r}"
         raise MissingArtifactError(
-            f"the champion pointer for slot {slot!r} names {pointer.arm_id!r}, which "
-            f"wrote no prediction cross-section for {trading_day} ({source_key!r} is "
-            "not in the store). The serving path resolves the pointer — it never "
-            "imports a ranking function directly — so a pointer to an arm that did "
-            "not produce means production has no feed today."
+            f"{subject} wrote no prediction cross-section for {trading_day} "
+            f"({source_key!r} is not in the store). The serving path resolves the "
+            "pointer — it never imports a ranking function directly — so a pointer "
+            "to an arm that did not produce means production has no feed today."
         ) from exc
 
     try:
@@ -213,12 +278,22 @@ def publish_predictions_feed(
             f"feed for {trading_day} would republish: {exc}"
         ) from exc
 
-    _assert_source_is_this_session(document, source_key, pointer.arm_id, trading_day)
+    _assert_source_is_this_session(document, source_key, arm_id, trading_day)
+    return source_key, document
+
+
+def _publish(store: Store, *, arm_id: str, trading_day: str, slot: str, ctx: Any) -> str:
+    source_key, document = _load_source(
+        store,
+        arm_id=arm_id,
+        trading_day=trading_day,
+        named_by=f"the champion pointer for slot {slot!r}",
+    )
 
     feed = PredictionsFeed(
         slot=slot,
         trading_day=trading_day,
-        champion=pointer.arm_id,
+        champion=arm_id,
         feature_version=str(document["feature_version"]),
         source_key=source_key,
         predicted_alpha={str(k): float(v) for k, v in document["predicted_alpha"].items()},

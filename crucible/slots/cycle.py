@@ -112,6 +112,7 @@ __all__ = [
     "run_grade",
     "run_produce",
     "run_produce_history",
+    "run_serve_daily",
 ]
 
 #: The version stamped on the per-arm score series `run_grade` writes and
@@ -754,6 +755,162 @@ def run_produce_history(
         "served": False,
         "feature_version": feature_version,
     }
+
+
+#: The CLI job a slot's daily serving entry point runs under
+#: (`crucible.slots.daily_servers`). Restated rather than imported from
+#: `crucible.slots.model`, which imports this module.
+DAILY_SERVE_JOB = "serve.daily"
+
+#: The metric every `serve.daily` manifest for a feed-serving slot carries:
+#: 1 when the session's feed was published (or was already there and is
+#: served as it stands), 0 when the slot has no champion and owes none. The
+#: same name `crucible.slots.model.DAILY_FEED_METRIC` files for M, so the
+#: job's declared outcome signal reads one metric whichever slot ran.
+DAILY_FEED_METRIC = "daily_feed_published"
+
+
+def _daily_feed_metric(slot: str, value: float, key: str, reason: str) -> dict[str, Any]:
+    return {
+        "name": DAILY_FEED_METRIC,
+        "module": f"crucible.slots.{slot}",
+        "metric_type": "count",
+        "value": value,
+        "unit": "feeds",
+        "n_floor": 0,
+        "status": "OK",
+        "status_reason": reason,
+        "source_path": key,
+        "last_updated_utc": _utc_now(),
+    }
+
+
+def run_serve_daily(
+    ctx: RunContext,
+    *,
+    slot: str,
+    settings: Settings,
+    feed_key: Any,
+    feature_version: str = DEFAULT_FEATURE_VERSION,
+) -> dict[str, Any]:
+    """Publish the slot's champion feed for ONE session. Produces no arm's history.
+
+    `alpha-engine-config-I12021` (Brian's ruling 2026-10-05: a daily producer,
+    so grading and the paper books share point-in-time inputs). The S slot's
+    eligibility mask is the U champion's cut for the session
+    (`crucible.slots.strategy.resolve_session`), and the only writer of a U
+    cut was `experiment.run[u]` on the weekly arc — so a daily S session had
+    no cut to construct on. This is the U champion's half of the nightly chain.
+
+    Per session: resolve the champion pointer, run THAT arm's recipe over the
+    session's compiled feature layer, and publish the selection through
+    :func:`_serve_champion_feed` — the one serving path, so the feed is the
+    same `feed.v1` document `experiment.run` writes on an arc day, for the
+    same arm and the same features.
+
+    **What it never does.** It writes no `shadow.json` and no
+    `cross_section.json`: those are the arm's GRADED series, walked by
+    :func:`_shadow_dates`, and a U arm is graded on its weekly decision
+    dates at the canonical horizon. A daily shadow would silently re-grade the
+    slot on overlapping 21-session windows. It does not register arms or run
+    challengers; only the champion serves. It never overwrites a feed already
+    written for the session (the arc day's, or an earlier run's) — that one is
+    served as it stands, once its own `trading_day` and `slot` are checked.
+
+    **No champion is not a failure**: no feed is owed, the metric says so at
+    0, and S records the absence as its own eligibility source. A pointer
+    naming an arm no recipe in force declares, a recipe whose declared feature
+    is absent from the catalog, an absent feature layer, and a ranker that
+    selects nothing all RAISE, so the manifest fails and pages.
+    """
+    trading_day = ctx.trading_day
+    day = trading_day.isoformat()
+    assert_trading_day(trading_day, context=f"{DAILY_SERVE_JOB} --slot {slot} --date {day}")
+    key = feed_key(day)
+    champion = _incumbent(ctx.store, slot)
+    if champion is None:
+        ctx.record_rows(rows_in=0, rows_out=0)
+        ctx.record_metric(
+            _daily_feed_metric(
+                slot,
+                0.0,
+                key,
+                f"slot {slot} has no champion pointer; nothing has been promoted, so no "
+                f"feed is owed for {day}",
+            )
+        )
+        return {"slot": slot, "trading_day": day, "champion": None, "feed_key": None}
+
+    if ctx.store.exists(key):
+        raw = ctx.store.get_bytes(key)
+        existing = load_store_document(ctx.store, key)
+        if existing.get("trading_day") != day or existing.get("slot") != slot:
+            raise MissingArtifactError(
+                f"{key} carries slot {existing.get('slot')!r} and trading_day "
+                f"{existing.get('trading_day')!r}, not {slot!r} and {day!r}. A feed filed "
+                "under another session's key is look-ahead if it is later and stale if it "
+                "is earlier; it is never served and never overwritten here."
+            )
+        ctx.record_input(key, raw, schema_version="feed.v1")
+        ctx.record_rows(rows_in=0, rows_out=0)
+        ctx.record_metric(
+            _daily_feed_metric(
+                slot,
+                1.0,
+                key,
+                f"slot {slot}: the feed for {day} was already published (champion "
+                f"{existing.get('champion')!r}) and is served as it stands",
+            )
+        )
+        return {
+            "slot": slot,
+            "trading_day": day,
+            "champion": existing.get("champion"),
+            "feed_key": key,
+            "reused": True,
+        }
+
+    specs = [
+        s
+        for s in load_arm_specs(slot, store=ctx.store, strategy_dir=settings.strategy_dir)
+        if s.arm_id == champion
+    ]
+    if not specs:
+        raise MissingArtifactError(
+            f"the champion pointer for slot {slot!r} names {champion!r}, which no recipe in "
+            "the release in force declares. Its cut cannot be computed without its recipe, "
+            "and a feed for any other arm is not the champion's."
+        )
+    from crucible.features import CATALOG  # noqa: PLC0415 - one call site, keeps import light
+
+    specs, refused = partition_by_catalog(specs, catalog_columns=[f.name for f in CATALOG])
+    for refusal in refused:
+        ctx.record_metric(refusal_metric(slot, refusal))
+    if refused:
+        raise SlotUnservableError(tuple(refused))
+    (spec,) = specs
+
+    features = _read_features(ctx.store, feature_version, trading_day)
+    feature_key = features_key(feature_version, day)
+    ctx.record_input(feature_key, ctx.store.get_bytes(feature_key), schema_version="features.v1")
+    try:
+        shadow = produce_shadow(spec, features, trading_day, feature_version=feature_version)
+    except MissingFeatureError as exc:
+        raise_training_integrity(spec.arm_id, exc)
+    served, written = _serve_champion_feed(
+        ctx, slot=slot, trading_day=trading_day, produced=[shadow], feed_key=feed_key
+    )
+    ctx.record_rows(rows_in=int(len(features)), rows_out=1)
+    ctx.record_metric(
+        _daily_feed_metric(
+            slot,
+            1.0,
+            key,
+            f"slot {slot}: published the feed for {day} from champion {served}: "
+            f"{len(shadow.selection)} of {len(shadow.population)} names selected",
+        )
+    )
+    return {"slot": slot, "trading_day": day, "champion": served, "feed_key": written}
 
 
 def run_grade(

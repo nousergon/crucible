@@ -35,6 +35,7 @@ from crucible.promote import (
 )
 from crucible.slots import get_slot, is_control_arm
 from crucible.store import LocalStore
+from tests.support.servable import seed_arm_predictions
 
 #: `alpha-engine-config-I10506`: a real-shaped, non-placeholder sha for
 #: every test that reaches the pointer write — `run_promotion`/
@@ -644,6 +645,7 @@ class TestChampionPointer:
         dates = trading_days(40)
         reg, ids = register_with("m", ["champ", "chal"], dates[0])
         store = LocalStore(tmp_path)
+        seed_arm_predictions(store, ids["chal"], dates[-1])
         run_promotion(
             spec=spec,
             register=reg,
@@ -1064,6 +1066,7 @@ class TestControlArmsNeverServe:
         dates = trading_days(40)
         spec, reg, ids, control, series_by_arm = self._slot_with_a_winning_control(dates)
         seed_register(store, "m", reg)
+        seed_arm_predictions(store, ids["real_b"], dates[-1])
 
         result = run_promotion(
             spec=spec,
@@ -1092,6 +1095,7 @@ class TestControlArmsNeverServe:
         dates = trading_days(40)
         spec, reg, ids, control, series_by_arm = self._slot_with_a_winning_control(dates)
         seed_register(store, "m", reg)
+        seed_arm_predictions(store, ids["real_b"], dates[-1])
 
         cycle = run_promotion(
             spec=spec,
@@ -1114,6 +1118,7 @@ class TestControlArmsNeverServe:
         dates = trading_days(40)
         spec, reg, ids, control, series_by_arm = self._slot_with_a_winning_control(dates)
         seed_register(store, "m", reg)
+        seed_arm_predictions(store, ids["real_b"], dates[-1])
 
         cycle = run_promotion(
             spec=spec,
@@ -1136,6 +1141,7 @@ class TestControlArmsNeverServe:
         dates = trading_days(40)
         spec, reg, ids, control, series_by_arm = self._slot_with_a_winning_control(dates)
         seed_register(store, "m", reg)
+        seed_arm_predictions(store, ids["real_b"], dates[-1])
 
         cycle = run_promotion(
             spec=spec,
@@ -1246,6 +1252,7 @@ class TestIsControlArmIsRegisterBackedAtPromoteCallSites:
         spec, reg, ids, collider_name, series_by_arm = self._slot_with_a_filed_name_collision(dates)
         collider_id = ids[collider_name]
         seed_register(store, "m", reg)
+        seed_arm_predictions(store, collider_id, dates[-1])
 
         cycle = run_promotion(
             spec=spec,
@@ -1293,6 +1300,7 @@ class TestPointerWriteIsConditional:
         spec = narrow(get_slot("m"))
         reg, ids = register_with("m", ["champ", "chal"], dates[0])
         seed_register(store, "m", reg)
+        seed_arm_predictions(store, ids["chal"], dates[-1])
         stale = read_champion_etag(store, "m")
 
         # Another writer publishes between our read and our write.

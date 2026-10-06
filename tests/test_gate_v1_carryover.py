@@ -20,6 +20,10 @@ moves:
 * a `carried` arm registered past its settle window that has produced
   nothing -> UNMET; the same arm inside the window -> not that finding;
 * a `carried` parameter v1 has since re-tuned -> UNMET;
+* a `carried` arm v2 later RETIRED on its own evidence -> satisfied by the
+  retire record and named; the same arm absent with no record -> UNMET;
+* a `carried` arm waiting on a declared pending producer -> named WAITING,
+  as `every_registered_arm_produces` reads it, never MUTE;
 * any v1 source unreadable (absent, malformed, denied, location unset) ->
   UNMEASURABLE, never MET.
 """
@@ -514,6 +518,249 @@ class TestProductionIsNotRegistration:
         clause = clause_fn(Denied(v2.root), _window(), v1_store=v1)
         assert not clause.met
         assert "could not be listed" in clause.detail
+
+
+def _put_retired(store: LocalStore, slot: str, name: str, *, date: str, reason: str) -> None:
+    """Append a `retired` event for the fixture arm, as the v2 arena writes one."""
+    key = arm_register_key(slot)
+    event = {"kind": "retired", "arm_id": _arm_id(slot, name), "date": date, "reason": reason}
+    store.put_bytes(
+        key, store.get_bytes(key) + (json.dumps(event, sort_keys=True) + "\n").encode("utf-8")
+    )
+
+
+class TestRetiredOnV2EvidenceStaysCarried:
+    """CO2 of the 2026-10-05 carry-over ledger (`alpha-engine-config-I10716`).
+
+    Measured on the 2026-10-05 phase-3 gate: three `carried` U rows read "not
+    an active arm" because the v2 U arena RETIRED `u:tech_score_gate` and
+    `u:mom_12_1_sleeve` on 2026-09-25 (cap and grace). The carry happened; the
+    arm then lost on the record, and policy §6.3 keeps that retire record
+    permanently. Rewriting the rows to point at live arms would claim a carry
+    that never happened.
+    """
+
+    REASON = "5 arm(s) beat it pairwise (cap 5) and it is 16 week(s) old (grace 4)"
+
+    def test_a_carried_arm_v2_retired_on_its_own_evidence_is_satisfied_and_named(
+        self, v2: LocalStore, v1: LocalStore
+    ) -> None:
+        _put_retired(v2, "u", "attractiveness_top_60", date="2026-09-04", reason=self.REASON)
+        clause = _read(v2, v1)
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert "not an active arm" not in clause.detail
+        assert "RETIRED on v2's own evidence" in clause.detail
+        assert (
+            f"scanner_cut/attractiveness_top_60 -> u:attractiveness_top_60 retired 2026-09-04: "
+            f"{self.REASON}" in clause.detail
+        )
+
+    def test_two_v1_arms_carried_onto_one_retired_v2_arm_are_both_satisfied(
+        self, v2: LocalStore, v1: LocalStore
+    ) -> None:
+        """The live shape: `scanner_spec/tech_score_gate` and
+        `scanner_cut/tech_score_top_60` both carry onto `u:tech_score_gate`."""
+        document = json.loads(v1.get_bytes(V1_SCANNER_SPEC_KEY))
+        document["arms"]["tech_score_gate"] = {}
+        _put_json(v1, V1_SCANNER_SPEC_KEY, document)
+        document = json.loads(v1.get_bytes(V1_SCANNER_CUT_KEY))
+        document["arms"]["tech_score_top_60"] = {}
+        _put_json(v1, V1_SCANNER_CUT_KEY, document)
+        _put_register(v2, "u", ["momentum_sleeve", "attractiveness_top_60", "tech_score_gate"])
+        for name in ("momentum_sleeve", "attractiveness_top_60"):
+            _put_produced(v2, "u", name)
+        _put_retired(v2, "u", "tech_score_gate", date="2026-09-25", reason=self.REASON)
+        rows = _arm_rows()
+        rows += [
+            {
+                "v1_slot": slot,
+                "v1_arm": v1_arm,
+                "disposition": "carried",
+                "v2_arm": "tech_score_gate",
+            }
+            for slot, v1_arm in (
+                ("scanner_spec", "tech_score_gate"),
+                ("scanner_cut", "tech_score_top_60"),
+            )
+        ]
+        _put_ledger(v2, arms=rows)
+        clause = _read(v2, v1)
+        assert clause.met, clause.detail
+        assert "2 carried row(s) whose v2 arm was RETIRED" in clause.detail
+
+    def test_an_arm_absent_with_no_retire_record_is_still_unmet(
+        self, v2: LocalStore, v1: LocalStore
+    ) -> None:
+        """The carve-out is the RECORD, not the absence: an arm that is simply
+        not in the register is still the gap the clause exists to catch."""
+        _put_register(v2, "u", ["momentum_sleeve"])
+        _put_produced(v2, "u", "momentum_sleeve")
+        clause = _read(v2, v1)
+        assert not clause.met and not clause.unmeasurable
+        assert "scanner_cut/attractiveness_top_60 -> attractiveness_top_60" in clause.detail
+        assert "not an active arm" in clause.detail
+        assert "RETIRED" not in clause.detail
+
+    def test_a_retired_vintage_does_not_excuse_an_active_arm_of_the_same_name(
+        self, v2: LocalStore, v1: LocalStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An ACTIVE arm is graded on its own production, whatever an older
+        vintage of the same name did. (The fixture store holds no U recipe
+        tree, so the slot is read as waiting on nothing.)"""
+        monkeypatch.setattr("crucible.slots.producibility.waiting_arms", lambda *_a, **_k: {})
+        old = {
+            "kind": "registered",
+            "arm_id": "u:attractiveness_top_60:0ld0ld",
+            "date": SETTLED,
+            "reason": "",
+            "record": {
+                "arm_id": "u:attractiveness_top_60:0ld0ld",
+                "slot": "u",
+                "name": "attractiveness_top_60",
+                "spec_hash": "0ld0ld",
+                "created_date": SETTLED,
+            },
+        }
+        retired = {
+            "kind": "retired",
+            "arm_id": "u:attractiveness_top_60:0ld0ld",
+            "date": "2026-07-01",
+            "reason": self.REASON,
+        }
+        key = arm_register_key("u")
+        v2.put_bytes(
+            key,
+            v2.get_bytes(key)
+            + "".join(json.dumps(e, sort_keys=True) + "\n" for e in (old, retired)).encode(),
+        )
+        (Path(v2.root) / shadow_key(_arm_id("u", "attractiveness_top_60"), "2026-09-04")).unlink()
+        clause = _read(v2, v1)
+        assert not clause.met and not clause.unmeasurable
+        assert "carried-unproduced" in clause.detail
+        assert "RETIRED" not in clause.detail
+
+
+#: One R recipe the run can produce and one that waits BY DESIGN on
+#: `predicted_alpha_ratio` (`alpha-engine-config-I11030`), in the shape
+#: `tests/test_registered_arm_produces.py` seeds them.
+_R_RECIPE = """\
+name: {name}
+slot: r
+ranker: {ranker}
+registered_at: '2026-06-15'
+params:
+  top_n: 10
+notes: fixture recipe for {name}
+"""
+
+
+class TestWaitingIsOneVerdictAcrossClauses:
+    """CO3 of the 2026-10-05 carry-over ledger.
+
+    Measured on the 2026-10-05 phase-3 gate: `scanner_predictor_direct` and
+    `scanner_top20_predictor` read MUTE on this clause and WAITING on
+    `every_registered_arm_produces` — the same arms, the same day, the same
+    production listing. Their recipes wait on `predicted_alpha_ratio`, which
+    the catalogue declares pending (I11030). One fact gets one verdict: this
+    clause reads the sibling's predicate rather than keeping a second one.
+    """
+
+    @pytest.fixture
+    def waiting_r(self, v2: LocalStore, v1: LocalStore) -> str:
+        from crucible.keys import experiments_prefix, strategy_arm_key
+        from crucible.slots import get_slot
+        from crucible.slots.arms import (
+            control_specs,
+            load_arm_specs,
+            read_register,
+            register_arms,
+            write_register,
+        )
+
+        for name, ranker in (
+            ("no_agent_quant", "quant_composite"),
+            ("scanner_predictor_direct", "predicted_alpha_direct"),
+        ):
+            v2.put_bytes(
+                strategy_arm_key("r", name),
+                _R_RECIPE.format(name=name, ranker=ranker).encode("utf-8"),
+            )
+        (Path(v2.root) / arm_register_key("r")).unlink()
+        specs = load_arm_specs("r", store=v2)
+        register, _ = register_arms(
+            read_register(v2, "r"), [*specs, *control_specs(get_slot("r"))], filed_on=SETTLED
+        )
+        write_register(v2, "r", register)
+        ids = {spec.name: spec.arm_id for spec in specs}
+        v2.put_bytes(f"{experiments_prefix(ids['no_agent_quant'])}2026-09-04/shadow.json", b"{}")
+        _put_json(v2, champion_key("r"), {"arm_id": ids["no_agent_quant"]})
+        document = json.loads(v1.get_bytes(V1_PRODUCER_ARENA_KEY))
+        document["active_arms"].append("producer:scanner_predictor_direct:2f3a4b5c6d7e")
+        _put_json(v1, V1_PRODUCER_ARENA_KEY, document)
+        rows = _arm_rows()
+        rows.append(
+            {
+                "v1_slot": "producer",
+                "v1_arm": "scanner_predictor_direct",
+                "disposition": "carried",
+                "v2_arm": "scanner_predictor_direct",
+            }
+        )
+        _put_ledger(v2, arms=rows)
+        return ids["scanner_predictor_direct"]
+
+    def test_a_carried_arm_waiting_on_a_declared_producer_is_named_not_mute(
+        self, v2: LocalStore, v1: LocalStore, waiting_r: str
+    ) -> None:
+        clause = _read(v2, v1)
+        assert clause.met and not clause.unmeasurable, clause.detail
+        assert "MUTE" not in clause.detail
+        assert "1 carried row(s) WAITING on a declared pending producer" in clause.detail
+        assert "producer/scanner_predictor_direct" in clause.detail
+        assert "predicted_alpha_ratio" in clause.detail
+
+    def test_the_sibling_clause_gives_the_same_arm_the_same_verdict(
+        self, v2: LocalStore, v1: LocalStore, waiting_r: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from crucible import gate as gate_module
+        from crucible.slots import dispatchable_slots
+
+        monkeypatch.setattr(
+            "crucible.slots.dispatchable_slots", lambda: {"r": dispatchable_slots()["r"]}
+        )
+        sibling = gate_module._clause_every_registered_arm_produces(v2, _window())
+        carried = _read(v2, v1)
+        assert f"{waiting_r} waits on predicted_alpha_ratio" in sibling.detail
+        assert "WAITING" in carried.detail and "MUTE" not in carried.detail
+
+    def test_the_wait_lapses_once_the_catalogue_produces_the_column(
+        self, v2: LocalStore, v1: LocalStore, waiting_r: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The waiver is tied to a column the catalogue LACKS, so it lapses by
+        itself, and a still-silent carried arm reads mute again."""
+        from crucible.slots import producibility
+
+        real = producibility._catalog_columns
+        monkeypatch.setattr(
+            producibility, "_catalog_columns", lambda: [*real(), "predicted_alpha_ratio"]
+        )
+        clause = _read(v2, v1)
+        assert not clause.met and not clause.unmeasurable
+        assert "carried-unproduced" in clause.detail
+        assert "producer/scanner_predictor_direct" in clause.detail
+        assert "WAITING" not in clause.detail
+
+    def test_an_unreadable_recipe_tree_is_never_a_pass(
+        self, v2: LocalStore, v1: LocalStore, waiting_r: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def denied(*_args, **_kwargs):
+            raise PermissionError("AccessDenied on ListObjectsV2")
+
+        monkeypatch.setattr("crucible.slots.arms.load_arm_specs", denied)
+        clause = _read(v2, v1)
+        assert not clause.met
+        assert "PermissionError" in clause.detail
+        assert "could not be read" in clause.detail
 
 
 class TestChampionMutations:

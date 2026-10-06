@@ -45,7 +45,7 @@ from crucible.manifest import manifest_key
 from crucible.registration import load_registrable_recipes
 from crucible.runner import invocation_discriminator, run_job
 from crucible.slots import arm_name as name_component
-from crucible.slots import dispatchable_slots, history_producer
+from crucible.slots import daily_servers, dispatchable_slots, history_producer
 from crucible.slots.arms import (
     ForeignRecipeSchemaError,
     read_register,
@@ -875,6 +875,97 @@ def handle_experiment_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_serve_daily(args: argparse.Namespace) -> int:
+    """`serve.daily --slot {m,u,s}` — one slot's daily output for one session.
+
+    `alpha-engine-config-I12047` (M) and `alpha-engine-config-I12021` (U, S).
+    The body is the slot module's own ``serve_daily``:
+    :func:`crucible.slots.model.serve_daily` scores the M champion from its
+    fit of record and publishes the predictions feed;
+    :func:`crucible.slots.universe.serve_daily` publishes the U champion's
+    cut; :func:`crucible.slots.strategy.serve_daily` records every live S
+    challenger's construction inputs from those two. The slot is the manifest discriminator, as for
+    `experiment.run`, so a second daily-serving slot files its own manifest
+    under the same job. Same dry-run shape as `experiment.run`: the body runs
+    against a store that records its writes instead of performing them.
+    """
+    servers = daily_servers()
+    if args.slot not in servers:
+        raise SystemExit(
+            f"slot {args.slot!r} has no daily serving entry point; "
+            f"`crucible.slots.daily_servers()` reads {sorted(servers)} live. Exiting 0 here "
+            "would read as a feed that was published."
+        )
+    config = _settings(args)
+    store = config.store()
+    today = _today()
+    if getattr(args, "date", None) is None and not is_trading_day(today):
+        # `data.daily`'s holiday guard, for the same reason: the weekday
+        # schedule fires on a market holiday, `--date` then resolves to the
+        # prior session, and re-serving it would overwrite that session's real
+        # manifest. The firing still files an `ok` manifest — discriminated by
+        # the calendar day it fired on — so a holiday no-op and a job that has
+        # stopped working are never indistinguishable.
+        detail = (
+            f"{today.isoformat()} is not an NYSE trading day; the schedule fired on a "
+            f"holiday. No feed is owed beyond {args.trading_day.isoformat()}'s."
+        )
+
+        def _holiday_noop(ctx: Any) -> None:
+            ctx.record_metric(
+                {
+                    "name": "serve.daily.holiday_noop",
+                    "module": "crucible.track_a",
+                    "metric_type": "gauge",
+                    "value": 1.0,
+                    "unit": "count",
+                    "n_floor": 0,
+                    "status": "OK",
+                    "status_reason": detail,
+                    "source_path": manifest_key(
+                        "serve.daily", args.trading_day.isoformat(), discriminator=args.slot
+                    ),
+                    "last_updated_utc": ctx.started.astimezone(dt.UTC).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                }
+            )
+
+        ctx = run_job(
+            "serve.daily",
+            _holiday_noop,
+            store=store,
+            trading_day=args.trading_day,
+            run_mode=getattr(args, "run_mode", None),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            discriminator=f"{args.slot}.{today.isoformat()}",
+        )
+        print(json.dumps({"run_id": ctx.run_id, "outputs": [], "detail": detail}, indent=2))
+        return 0
+    module = servers[args.slot]
+    result: dict[str, Any] = {}
+    ctx = run_job(
+        "serve.daily",
+        lambda c: result.update(module.serve_daily(c, settings=config)),
+        store=store,
+        trading_day=args.trading_day,
+        run_mode=getattr(args, "run_mode", None),
+        dry_run=bool(getattr(args, "dry_run", False)),
+        discriminator=args.slot,
+    )
+    print(
+        json.dumps(
+            {
+                "run_id": ctx.run_id,
+                "champion": result.get("champion"),
+                "outputs": [o["key"] for o in ctx.outputs],
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def handle_experiment_backfill(args: argparse.Namespace) -> int:
     """`experiment.backfill` — one arm's history over a session range.
 
@@ -1151,6 +1242,7 @@ HANDLERS = {
     "experiment.run": handle_experiment_run,
     "experiment.backfill": handle_experiment_backfill,
     "experiment.grade": handle_experiment_grade,
+    "serve.daily": handle_serve_daily,
     "explain": handle_explain,
 }
 

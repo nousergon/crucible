@@ -29,6 +29,7 @@ from crucible.promote import (
 from crucible.store import LocalStore
 from tests.support.manifests import write_grade_manifest
 from tests.support.panels import trading_days
+from tests.support.servable import seed_arm_predictions
 
 DAY = "2026-08-28"
 
@@ -208,6 +209,7 @@ class TestPromoteCommand:
         store, register, ids, dates = seeded
         seat(store, ids, dates)
         grade(store, register, ids, dates)
+        seed_arm_predictions(store, ids["chal"], DAY)
         monkeypatch.setenv("CRUCIBLE_STORE", str(store.root))
 
         assert main(["promote", "--slot", "m", "--date", DAY]) == 0

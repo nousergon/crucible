@@ -297,6 +297,52 @@ components:
     dispatch: null
     deadline: null
 
+  serve.daily:
+    description: >-
+      One slot's daily output for one trading day, so the weekly arc is not the
+      only producer of what a session needs. M publishes the champion's
+      predictions feed from its fit of record, without refitting
+      (alpha-engine-config-I12047). U publishes the champion's cut as the U
+      feed, and S records every live challenger's point-in-time construction
+      inputs from those two (alpha-engine-config-I12021), which the S grade and
+      the daily shadow books share. The slot is the manifest discriminator.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs[predictions/{trading_day}.json,arm_predictions/*/{trading_day}.json,universe/{trading_day}/members.json,experiments/*/{trading_day}/session_inputs.json],rows_in,rows_out,rows_rejected
+      outcome: run.json:metrics[daily_feed_published,daily_session_inputs_recorded]
+    log_location: cloudwatch:/crucible/serve.daily
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/slots
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    # Every trading day AFTER `data.daily`, because it reads the session's
+    # feature layer `data.daily` compiles. One EventBridge schedule per slot in
+    # nous-ergon-ops `crucible-v2.yaml`, each with its own `args: --slot X`:
+    # `serve-daily-m` (weekdays 22:15 ET), fired past `data.daily`'s 22:00 ET
+    # deadline rather than chained inside it — a failed compile must not take
+    # the serve down with no manifest of its own, and a serve that reads an
+    # absent feature day fails loud on its own manifest. `--slot u` reads the
+    # same feature layer and can fire with M. `--slot s` reads both of their
+    # outputs, so it fires after them; one that fires early fails loud on the
+    # absent M predictions or U cut rather than recording a partial session.
+    #
+    # 7h = 23:00 ET: 45 min past the M firing for a run that fits each served
+    # arm once (the fit of record, re-derived and proven) and scores one
+    # session; U ranks one cross-section and S resolves one session, both in
+    # seconds. The trader reads the feed at the next session's open and the
+    # shadow books read S's inputs after the next session's close, so the
+    # deadline is hours ahead of every consumer.
+    schedule: weekdays after data.daily
+    dispatch: scheduler
+    deadline:
+      anchor: close_plus
+      cadence: daily
+      offset_hours: 7
+
   experiment.grade:
     description: Run one slot's arena cycle — ladder, pairings, pointer, retirements.
     lifecycle: ACTIVE

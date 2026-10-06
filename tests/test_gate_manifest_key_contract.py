@@ -148,6 +148,7 @@ def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
     from crucible.slots import get_slot
     from tests.support.manifests import write_grade_manifest
     from tests.support.panels import trading_days
+    from tests.support.servable import seed_arm_predictions
 
     spec = get_slot(slot)
     dates = trading_days(40, FRIDAY)
@@ -165,6 +166,10 @@ def _seed_slot_for_promote(store: LocalStore, slot: str) -> None:
         )
         if name.startswith("control_null_"):
             baseline = record.arm_id
+        elif slot == "m":
+            # What `experiment.run[m]` writes for an arm that produced the
+            # session; `promote` refuses to seat an M arm without it.
+            seed_arm_predictions(store, record.arm_id, FRIDAY.isoformat())
         series = ArmSeries(arm_id=record.arm_id, scores={d: value for d in dates})
         series_by_arm[record.arm_id] = series
         store.put_bytes(

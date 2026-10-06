@@ -1234,3 +1234,328 @@ class TestTheStackWalkIsNeedleFiltered:
         archive = _RawBytesS3({_day_key(END, "a"): _noise(2)}, {_day_key(END, "b"): raw})
         result = _attribute_applies(archive)
         assert result.latest_human == self.APPLY
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I11792 — the per-calendar-day result cache
+# ---------------------------------------------------------------------------
+
+#: A month-to-date-shaped window of four calendar days ending TODAY: the first
+#: two are closed (<= today - 2); the last two are yesterday and today.
+CACHE_START = dt.date(2026, 9, 1)
+CACHE_END = dt.date(2026, 9, 4)
+CACHE_TODAY = CACHE_END
+CACHE_DAYS = tuple(CACHE_START + dt.timedelta(days=i) for i in range(4))
+
+
+class _MemoryCache:
+    """A :class:`crucible.autonomy.DayCache` over a dict, counting traffic."""
+
+    def __init__(self) -> None:
+        self.documents: dict[tuple[str, dt.date], dict] = {}
+        self.gets: list[dt.date] = []
+        self.puts: list[dt.date] = []
+
+    def get(self, scope: str, day: dt.date) -> dict | None:
+        self.gets.append(day)
+        document = self.documents.get((scope, day))
+        # A copy, as a real store returns: the reader must not alias it.
+        return json.loads(json.dumps(document)) if document is not None else None
+
+    def put(self, scope: str, day: dt.date, document: dict) -> None:
+        self.puts.append(day)
+        self.documents[(scope, day)] = json.loads(json.dumps(document))
+
+
+class _BrokenCache(_MemoryCache):
+    def get(self, scope: str, day: dt.date) -> dict | None:
+        raise RuntimeError("cache unreachable")
+
+    def put(self, scope: str, day: dt.date, document: dict) -> None:
+        raise RuntimeError("cache unwritable")
+
+
+class _CountingS3(_FakeS3):
+    """Records which archive objects were downloaded."""
+
+    def __init__(self, objects: dict[str, list[dict]]) -> None:
+        super().__init__(objects)
+        self.fetched: list[str] = []
+        self._lock = threading.Lock()
+
+    def get_object(self, *, Bucket: str, Key: str):  # noqa: N803 - boto3's shape
+        with self._lock:
+            self.fetched.append(Key)
+        return super().get_object(Bucket=Bucket, Key=Key)
+
+
+def _cache_archive(
+    records_by_day: dict[dt.date, list[dict]] | None = None,
+    *,
+    cover: tuple[dt.date, ...] = CACHE_DAYS,
+) -> _CountingS3:
+    objects: dict[str, list[dict]] = {}
+    for day in cover:
+        objects[f"{ARCHIVE_PREFIX}/us-east-1/{day:%Y/%m/%d}/part.json.gz"] = list(
+            (records_by_day or {}).get(day, [])
+        )
+    return _CountingS3(objects)
+
+
+def _fetched_days(client: _CountingS3) -> set[dt.date]:
+    days = set()
+    for key in client.fetched:
+        yyyy, mm, dd = key.split("/")[-4:-1]
+        days.add(dt.date(int(yyyy), int(mm), int(dd)))
+    return days
+
+
+def _cached_count(client, cache, **over):
+    kwargs = {
+        "start": CACHE_START,
+        "end": CACHE_END,
+        "cache": cache,
+        "today": CACHE_TODAY,
+    }
+    kwargs.update(over)
+    return _count(client, **kwargs)
+
+
+def _human_on(day: dt.date, request_id: str, **over) -> dict:
+    return _record(eventTime=f"{day.isoformat()}T12:00:00Z", requestID=request_id, **over)
+
+
+class TestTheDayCache:
+    """Closed days are scanned once, ever; the answer never changes."""
+
+    def test_a_miss_scans_and_stores_only_closed_days(self) -> None:
+        client = _cache_archive({day: [_human_on(day, f"r-{day}")] for day in CACHE_DAYS})
+        cache = _MemoryCache()
+        result = _cached_count(client, cache)
+        assert result.count == 4
+        assert _fetched_days(client) == set(CACHE_DAYS)
+        # 09-01 and 09-02 are <= 09-04 - 2; 09-03 (yesterday) and 09-04 are not.
+        assert sorted(cache.puts) == [CACHE_DAYS[0], CACHE_DAYS[1]]
+
+    def test_a_hit_downloads_only_the_open_days_and_answers_identically(self) -> None:
+        records = {day: [_human_on(day, f"r-{day}")] for day in CACHE_DAYS}
+        cache = _MemoryCache()
+        first = _cached_count(_cache_archive(records), cache)
+        second_client = _cache_archive(records)
+        second = _cached_count(second_client, cache)
+        assert _fetched_days(second_client) == {CACHE_DAYS[2], CACHE_DAYS[3]}
+        assert second.to_dict() == first.to_dict()
+        assert second.to_dict() == _cached_count(_cache_archive(records), None).to_dict()
+
+    def test_the_raw_read_reports_which_days_came_from_the_cache(self) -> None:
+        cache = _MemoryCache()
+        kwargs = {
+            "bucket": "trail",
+            "prefix": ARCHIVE_PREFIX,
+            "start": CACHE_START,
+            "end": CACHE_END,
+            "keep": lambda r: True,
+            "cache": cache,
+            "cache_scope": "test/v1",
+            "today": CACHE_TODAY,
+        }
+        records = {CACHE_DAYS[0]: [_record(), _record()]}
+        first = autonomy.iter_archive_records(_cache_archive(records), **kwargs)
+        second = autonomy.iter_archive_records(_cache_archive(records), **kwargs)
+        assert first.days_from_cache == 0
+        assert second.days_from_cache == 2
+        assert second.records_scanned == first.records_scanned == 2
+        assert second.objects_by_day == first.objects_by_day
+
+    def test_a_hole_is_never_cached_and_stays_a_hole(self) -> None:
+        """A closed day with no delivered objects is neither stored nor looked
+        up, and a cached document for a day that is now EMPTY cannot cover
+        it — coverage is taken from the live listing alone."""
+        hole = CACHE_DAYS[1]
+        cache = _MemoryCache()
+        with pytest.raises(ArchiveMissingError, match=hole.isoformat()):
+            _cached_count(_cache_archive(cover=tuple(d for d in CACHE_DAYS if d != hole)), cache)
+        assert hole not in cache.puts
+        assert hole not in cache.gets
+
+        # Now plant a perfectly valid-looking document for that day, as if a
+        # previous read had covered it, and read again over the hole.
+        _cached_count(_cache_archive(), cache)
+        assert hole in cache.puts
+        with pytest.raises(ArchiveMissingError, match=hole.isoformat()):
+            _cached_count(_cache_archive(cover=tuple(d for d in CACHE_DAYS if d != hole)), cache)
+
+    def test_today_and_yesterday_are_never_cached(self) -> None:
+        today = CACHE_END
+        cache = _MemoryCache()
+        _cached_count(_cache_archive(), cache, today=today)
+        _cached_count(_cache_archive(), cache, today=today)
+        assert today not in cache.puts and today not in cache.gets
+        assert today - dt.timedelta(days=1) not in cache.puts
+        assert today - dt.timedelta(days=1) not in cache.gets
+        assert set(cache.puts) == {CACHE_DAYS[0], CACHE_DAYS[1]}
+
+    def test_the_closed_day_margin_is_two_days(self) -> None:
+        assert autonomy.CACHE_CLOSED_AFTER_DAYS == 2
+
+    def test_filters_are_applied_after_the_cache(self) -> None:
+        """The cache holds RAW candidates: a reservation or a machine role
+        added after a day was cached must change the answer for that day."""
+        closed = CACHE_DAYS[0]
+        records = {closed: [_human_on(closed, "r-1", eventName="AssumeRoleWithSAML")]}
+        cache = _MemoryCache()
+        assert _cached_count(_cache_archive(records), cache).count == 1
+        assert closed in cache.puts
+
+        client = _cache_archive(records)
+        reserved = _cached_count(client, cache, reserved=frozenset({"AssumeRoleWithSAML"}))
+        assert closed not in _fetched_days(client), "the day must come from the cache"
+        assert reserved.count == 0
+
+        human_role = "AWSReservedSSO_admin"
+        as_machine = _cached_count(
+            _cache_archive(records),
+            cache,
+            cfn=_FakeCfn(roles=(*DEFAULT_MACHINE_ROLES, human_role)),
+        )
+        assert as_machine.count == 0
+        assert _cached_count(_cache_archive(records), cache).count == 1
+
+    def test_a_late_delivery_invalidates_the_cached_day(self) -> None:
+        closed = CACHE_DAYS[0]
+        cache = _MemoryCache()
+        _cached_count(_cache_archive(), cache)
+        late = _cache_archive()
+        late._objects[f"{ARCHIVE_PREFIX}/us-east-1/{closed:%Y/%m/%d}/late.json.gz"] = [
+            _human_on(closed, "late")
+        ]
+        result = _cached_count(late, cache)
+        assert closed in _fetched_days(late)
+        assert [a.request_id for a in result.actions] == ["late"]
+
+    def test_a_document_for_another_scope_or_schema_is_a_miss(self) -> None:
+        closed = CACHE_DAYS[0]
+        cache = _MemoryCache()
+        _cached_count(_cache_archive(), cache)
+        for (_scope, day), document in cache.documents.items():
+            if day == closed:
+                document["schema"] = 999
+        client = _cache_archive()
+        _cached_count(client, cache)
+        assert closed in _fetched_days(client)
+        assert CACHE_DAYS[1] not in _fetched_days(client)
+
+    def test_a_broken_cache_falls_back_to_the_scan_and_says_so(self) -> None:
+        records = {day: [_human_on(day, f"r-{day}")] for day in CACHE_DAYS}
+        read = autonomy.iter_archive_records(
+            _cache_archive(records),
+            bucket="trail",
+            prefix=ARCHIVE_PREFIX,
+            start=CACHE_START,
+            end=CACHE_END,
+            keep=lambda r: True,
+            cache=_BrokenCache(),
+            cache_scope="test/v1",
+            today=CACHE_TODAY,
+        )
+        assert len(read.records) == 4
+        assert len(read.cache_failures) == 4  # two reads and two writes
+        assert _cached_count(_cache_archive(records), _BrokenCache()).count == 4
+
+    def test_a_cache_without_a_scope_or_predicate_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="cache_scope"):
+            autonomy.iter_archive_records(
+                _cache_archive(),
+                bucket="trail",
+                prefix=ARCHIVE_PREFIX,
+                start=CACHE_START,
+                end=CACHE_END,
+                cache=_MemoryCache(),
+                cache_scope="test/v1",
+            )
+
+    def test_the_pointer_and_stack_reads_cache_under_their_own_scopes(self) -> None:
+        from crucible.autonomy import attribute_stack_applies
+
+        closed = CACHE_DAYS[0]
+        cache = _MemoryCache()
+        until = dt.datetime(2026, 9, 1, 12, 0, tzinfo=dt.UTC)
+        write = _pointer_record(until, A_MACHINE_ROLE)
+        records = {closed: [write]}
+        common = {
+            "since": dt.datetime(2026, 8, 31, tzinfo=dt.UTC),
+            "until": until,
+            "cache": cache,
+            "today": CACHE_TODAY,
+        }
+        first = _attribute(_cache_archive(records), **common)
+        again_client = _cache_archive(records)
+        again = _attribute(again_client, **common)
+        assert again == first
+        assert closed not in _fetched_days(again_client)
+        attribute_stack_applies(
+            _cache_archive(records),
+            bucket="trail",
+            prefix=f"{ARCHIVE_PREFIX}/us-east-1",
+            stack_name="a-test-stack",
+            cfn=_FakeCfn(),
+            **common,
+        )
+        scopes = {scope.split("/", 1)[0] for scope, _day in cache.documents}
+        assert scopes == {"pointer-writes", "stack-applies"}
+
+
+class _FakeS3WithPut(_FakeS3):
+    def __init__(self) -> None:
+        super().__init__({})
+        self.stored: dict[str, bytes] = {}
+
+    def put_object(self, *, Bucket: str, Key: str, Body: bytes, ContentType: str):  # noqa: N803
+        self.stored[Key] = Body
+
+    def get_object(self, *, Bucket: str, Key: str):  # noqa: N803 - boto3's shape
+        if Key not in self.stored:
+            error = RuntimeError("NoSuchKey")
+            error.response = {"Error": {"Code": "NoSuchKey"}}  # type: ignore[attr-defined]
+            raise error
+        payload = self.stored[Key]
+
+        class _Body:
+            def read(self) -> bytes:
+                return payload
+
+        return {"Body": _Body()}
+
+
+class TestS3DayCache:
+    def test_round_trip_and_a_missing_key_is_a_miss(self) -> None:
+        client = _FakeS3WithPut()
+        cache = autonomy.S3DayCache(client, "cache-bucket", "crucible/board/ct-cache")
+        assert cache.get("scope/v1", CACHE_START) is None
+        cache.put("scope/v1", CACHE_START, {"schema": 1, "records": []})
+        assert cache.get("scope/v1", CACHE_START) == {"schema": 1, "records": []}
+        (key,) = client.stored
+        assert key.startswith("crucible/board/ct-cache/v1/")
+        assert key.endswith("/2026/09/01.json")
+        assert "scope" not in key, "the scope is hashed, never spelled, in the key"
+
+    def test_a_denied_read_is_raised_not_read_as_a_miss(self) -> None:
+        class _Denied(_FakeS3WithPut):
+            def get_object(self, *, Bucket: str, Key: str):  # noqa: N803
+                error = RuntimeError("AccessDenied")
+                error.response = {"Error": {"Code": "AccessDenied"}}  # type: ignore[attr-defined]
+                raise error
+
+        with pytest.raises(RuntimeError, match="AccessDenied"):
+            autonomy.S3DayCache(_Denied(), "b", "p").get("s", CACHE_START)
+
+    def test_configured_day_cache_reads_the_setting(self, monkeypatch) -> None:
+        monkeypatch.delenv("CRUCIBLE_CLOUDTRAIL_DAY_CACHE", raising=False)
+        assert autonomy.configured_day_cache(object()) is None
+        monkeypatch.setenv("CRUCIBLE_CLOUDTRAIL_DAY_CACHE", "s3://a-bucket/crucible/board/c")
+        cache = autonomy.configured_day_cache(object())
+        assert cache is not None
+        assert (cache.bucket, cache.prefix) == ("a-bucket", "crucible/board/c")
+        monkeypatch.setenv("CRUCIBLE_CLOUDTRAIL_DAY_CACHE", "/board/c")
+        with pytest.raises(ValueError, match="s3://"):
+            autonomy.configured_day_cache(object())

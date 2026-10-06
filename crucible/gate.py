@@ -85,7 +85,11 @@ from crucible.components import Component, load_registry
 from crucible.documents import DocumentRead, read_manifests_under
 from crucible.documents import read_path_document as _read_path_document
 from crucible.documents import read_store_document as _read_store_document
-from crucible.execution import ExecutionArtifactError, shadow_book_coverage
+from crucible.execution import (
+    CONTROL_NON_BOOK_STATUS,
+    ExecutionArtifactError,
+    shadow_book_coverage,
+)
 from crucible.holdout import (
     HOLDOUT_JOB,
     RULING_REFERENCE_PATTERN,
@@ -2010,6 +2014,35 @@ LEGACY_WEEKLY_RERUN_NAME_RE = re.compile(
 )
 
 
+#: Per-stage dispositions a filed execution's ``stage_scope`` may carry, and
+#: the strength of each claim when the week's executions are COMBINED.
+#:
+#: **Why this exists: Brian's ruling of 2026-10-06** on
+#: `alpha-engine-config-I9756`: *"the weekly sf has failed on its first try
+#: every single week since it began over 6 months ago. [...] We need to count
+#: weekly sf as success if it runs successfully even if it is made up of
+#: partial runs."* A recovery rerun is launched to redo the stages that did
+#: not finish, with a `skip_*` flag on everything that already did, so no
+#: single execution of a repaired week ever ends SUCCEEDED having run every
+#: stage — the success floor alone can only be met by a week that never broke.
+#:
+#: The vocabulary and the ranking are the v1 pipeline's own
+#: (`nousergon-data/infrastructure/lambdas/weekly-run-scope/run_scope.py`,
+#: `DISPOSITIONS` and `AUTHORITY`), which the producer obtains by invoking that
+#: Lambda in dry-run mode once per execution. They are restated rather than
+#: imported because there is no shared package, and they are ranked the same
+#: way for the same reason: a later skip cannot unmake an earlier dispatch,
+#: and only a completion outranks a failure.
+LEGACY_WEEKLY_STAGE_AUTHORITY: dict[str, int] = {
+    "NOT_REACHED": 0,
+    "DISABLED": 1,
+    "ENABLED_FAILED": 2,
+    "ENABLED_COMPLETED": 3,
+}
+LEGACY_WEEKLY_STAGE_COMPLETED = "ENABLED_COMPLETED"
+LEGACY_WEEKLY_STAGE_DISABLED = "DISABLED"
+
+
 def rerun_names_another_week(name: object, anchor: dt.date) -> bool:
     """True when `name` is a `watch-rerun-*` naming a week other than `anchor`.
 
@@ -2319,6 +2352,16 @@ class _LegacyWeeklyExecution:
     name: str
     status: str
     duration_seconds: float | None
+    #: stage -> (disposition, disabled_by), or `None` when the producer filed
+    #: no per-stage record for this execution (every document filed before
+    #: the 2026-10-06 partial-runs ruling). `None` is never "no stages": it
+    #: makes the execution unusable for combining, and says so.
+    stage_scope: dict[str, tuple[str, str | None]] | None = None
+    #: The derivation itself reported it could not read the execution.
+    scope_degraded: bool = False
+    #: The `skip_*` flags the execution's INPUT set true, or `None` when not
+    #: filed. Read only from the week's first non-rerun run, as the preset.
+    skip_flags: frozenset[str] | None = None
 
     @property
     def is_rerun(self) -> bool:
@@ -2371,6 +2414,127 @@ class _LegacyWeeklyExecution:
         )
 
 
+def _legacy_stage_scope(
+    where: str, entry: dict[str, Any]
+) -> tuple[str | None, dict[str, tuple[str, str | None]] | None, bool]:
+    """Parse one execution's optional ``stage_scope``: (problem, stages, degraded).
+
+    Absent is not a problem — it is every document filed before the
+    2026-10-06 partial-runs ruling, and it reads as "this execution cannot be
+    combined". A PRESENT field that is malformed is a problem, because a
+    shape this reader does not understand must never be graded as a stage
+    record.
+    """
+    if "stage_scope" not in entry:
+        return (None, None, False)
+    raw = entry["stage_scope"]
+    if not isinstance(raw, dict):
+        return (f"{where}: `stage_scope` is {raw!r}, not an object", None, False)
+    degraded = raw.get("degraded", False)
+    if not isinstance(degraded, bool):
+        return (f"{where}: `stage_scope.degraded` is {degraded!r}, not a boolean", None, False)
+    stages = raw.get("stages")
+    if not isinstance(stages, dict):
+        return (f"{where}: `stage_scope.stages` is {stages!r}, not an object", None, False)
+    out: dict[str, tuple[str, str | None]] = {}
+    for stage, row in stages.items():
+        if not isinstance(row, dict):
+            return (f"{where}: stage {stage!r} is {row!r}, not an object", None, False)
+        disposition = row.get("disposition")
+        if disposition not in LEGACY_WEEKLY_STAGE_AUTHORITY:
+            return (
+                f"{where}: stage {stage!r} disposition {disposition!r} is outside "
+                f"{sorted(LEGACY_WEEKLY_STAGE_AUTHORITY)}",
+                None,
+                False,
+            )
+        disabled_by = row.get("disabled_by")
+        if disabled_by is not None and not isinstance(disabled_by, str):
+            return (f"{where}: stage {stage!r} `disabled_by` is {disabled_by!r}", None, False)
+        out[stage] = (disposition, disabled_by)
+    return (None, out, degraded)
+
+
+def _legacy_partial_runs_complete(
+    runs: list[_LegacyWeeklyExecution],
+) -> tuple[bool, str]:
+    """Did the week's gate-passing executions TOGETHER run every stage?
+
+    Brian's ruling of 2026-10-06 (see `LEGACY_WEEKLY_STAGE_AUTHORITY`). Each
+    stage takes the strongest claim any of the week's executions made about
+    it. The week is complete when every stage's strongest claim is
+    ``ENABLED_COMPLETED``, or ``DISABLED`` by a flag the week's SCHEDULED run
+    already carried — the operator preset (e.g. ``skip_parity``, a recorded
+    ruling). A stage switched off only by a recovery rerun's skip-set was never
+    run by any execution, so it fails: work done outside the state machine is
+    not evidenced here and is not counted.
+
+    The scheduled run is the week's first gate-passing execution that is not a
+    ``watch-rerun-*``. Its ``skip_flags`` define the preset; a week with no such
+    run has no preset, so every ``DISABLED`` stage fails.
+
+    Stages that run after the pipeline's own ``RunScope`` state (report card,
+    director, leaderboard, cost aggregation) are not in the per-stage record
+    and are therefore not graded by this combination.
+    """
+    if not runs:
+        return (False, "no gate-passing execution to combine")
+    unrecorded = [e.name for e in runs if e.stage_scope is None]
+    if unrecorded:
+        return (
+            False,
+            "partial runs cannot be combined: no per-stage record filed for "
+            + ", ".join(unrecorded[:4]),
+        )
+    degraded = [e.name for e in runs if e.scope_degraded]
+    if degraded:
+        return (
+            False,
+            "partial runs cannot be combined: the per-stage record is degraded for "
+            + ", ".join(degraded[:4]),
+        )
+    scheduled = next((e for e in runs if not e.is_rerun), None)
+    preset = (scheduled.skip_flags or frozenset()) if scheduled is not None else frozenset()
+    best: dict[str, tuple[str, str | None, str]] = {}
+    for execution in runs:
+        for stage, (disposition, disabled_by) in (execution.stage_scope or {}).items():
+            held = best.get(stage)
+            if held is None or (
+                LEGACY_WEEKLY_STAGE_AUTHORITY[disposition] > LEGACY_WEEKLY_STAGE_AUTHORITY[held[0]]
+            ):
+                best[stage] = (disposition, disabled_by, execution.name)
+    if not best:
+        return (False, "partial runs cannot be combined: the per-stage records list no stage")
+    gaps: list[str] = []
+    completed = 0
+    preset_disabled = 0
+    for stage in sorted(best):
+        disposition, disabled_by, by = best[stage]
+        if disposition == LEGACY_WEEKLY_STAGE_COMPLETED:
+            completed += 1
+        elif disposition == LEGACY_WEEKLY_STAGE_DISABLED and disabled_by in preset:
+            preset_disabled += 1
+        elif disposition == LEGACY_WEEKLY_STAGE_DISABLED:
+            gaps.append(f"{stage} DISABLED by {disabled_by or 'an unnamed flag'} ({by}), not run")
+        else:
+            gaps.append(f"{stage} {disposition} ({by})")
+    names = ", ".join(e.name for e in runs[:4])
+    if gaps:
+        return (
+            False,
+            f"combining {len(runs)} execution(s) ({names}) leaves {len(gaps)} of "
+            f"{len(best)} stage(s) not completed: "
+            + "; ".join(gaps[:8])
+            + ("" if len(gaps) <= 8 else f"; and {len(gaps) - 8} more"),
+        )
+    return (
+        True,
+        f"partial runs complete the cycle: {completed} stage(s) completed and "
+        f"{preset_disabled} disabled by the scheduled run's preset across "
+        f"{len(runs)} execution(s) ({names}) (Brian ruling 2026-10-06)",
+    )
+
+
 def _legacy_weekly_executions(
     key: str, document: dict[str, Any]
 ) -> tuple[str | None, list[_LegacyWeeklyExecution] | None]:
@@ -2400,11 +2564,22 @@ def _legacy_weekly_executions(
             isinstance(duration, bool) or not isinstance(duration, int | float) or duration < 0
         ):
             return (f"{where}: `duration_seconds` is {duration!r}, not a duration or null", None)
+        scope_problem, stage_scope, scope_degraded = _legacy_stage_scope(where, entry)
+        if scope_problem is not None:
+            return (scope_problem, None)
+        flags = entry.get("skip_flags")
+        if flags is not None and (
+            not isinstance(flags, list) or not all(isinstance(f, str) and f for f in flags)
+        ):
+            return (f"{where}: `skip_flags` is {flags!r}, not a list of flag names", None)
         out.append(
             _LegacyWeeklyExecution(
                 name=name,
                 status=status,
                 duration_seconds=None if duration is None else float(duration),
+                stage_scope=stage_scope,
+                scope_degraded=scope_degraded,
+                skip_flags=None if flags is None else frozenset(flags),
             )
         )
     # The v1 field stays in the v2 document for backward reading, so the two
@@ -2433,6 +2608,7 @@ def _clause_old_weekly_within_cadence(
     skips_count_as_runs: bool = False,
     minimum_succeeded: int = 0,
     reruns_fail: bool = True,
+    partial_runs_count: bool = False,
 ) -> Clause:
     """The v1 weekly cycle count, read from a filed document, against a ceiling.
 
@@ -2459,6 +2635,12 @@ def _clause_old_weekly_within_cadence(
       the ruling asks for. Reruns are still NAMED in the detail on every
       reading. Phase 4 keeps ``True``: a decommissioned pipeline emits
       nothing, reruns included.
+
+    * ``partial_runs_count`` — Brian's ruling of 2026-10-06: a week whose
+      gate-passing executions each stopped short but TOGETHER completed every
+      stage meets the success floor (`_legacy_partial_runs_complete`). Phase 0
+      passes ``True``; phase 4 leaves it ``False``, because it grades a
+      pipeline that must emit nothing at all.
 
     ``maximum=None`` removes the ceiling, which is what "rerun until it is
     successful" means; phase 4 keeps ``0``.
@@ -2587,6 +2769,12 @@ def _clause_old_weekly_within_cadence(
             else ""
         )
         + (
+            " — or whose gate-passing executions TOGETHER completed every stage "
+            "(partial runs count; Brian ruling 2026-10-06)"
+            if minimum_succeeded and partial_runs_count
+            else ""
+        )
+        + (
             ", and no `watch-rerun-*` execution at all"
             if reruns_fail
             else " (reruns permitted and named)"
@@ -2615,6 +2803,7 @@ def _clause_old_weekly_within_cadence(
     reruns: list[str] = []
     rerun_notes: list[str] = []
     elsewhere: list[str] = []
+    combined: list[str] = []
     skipped_total = 0
     for anchor, key in zip(anchors, evidence, strict=True):
         # Read through the guarded reader, never `json.loads` + indexing. This
@@ -2698,20 +2887,38 @@ def _clause_old_weekly_within_cadence(
                 "(`sf-pipeline-policy.md` §5)"
             )
         if minimum_succeeded:
-            succeeded = [e for e in runs if e.status == "SUCCEEDED"]
+            # Brian 2026-10-06: "if a weekly sf is marked success, then EVERY
+            # SINGLE component should have run successfully." A recovery
+            # rerun ends SUCCEEDED having skipped every stage it was told to
+            # (`watch-rerun-2026-10-02-3`: 19 skipped), so under the
+            # partial-runs rule its status proves nothing on its own; it
+            # counts only through the stage combination below.
+            succeeded = [
+                e
+                for e in runs
+                if e.status == "SUCCEEDED" and not (partial_runs_count and e.is_rerun)
+            ]
             if len(runs) >= minimum and len(succeeded) < minimum_succeeded:
                 # Every run this week FAILED (or was still running when the
                 # producer filed). The ruling's trigger is a cycle that
                 # worked: fix the pipeline and re-run it; the next filing of
-                # this week's document carries the successful execution.
-                failed = [e for e in runs if e.status != "SUCCEEDED"]
-                unsucceeded.append(
-                    f"{key}: {len(runs)} gate-passing execution(s), "
-                    f"{len(succeeded)} SUCCEEDED (floor {minimum_succeeded}) — "
-                    + ", ".join(f"{e.name}: {e.status}" for e in failed[:4])
-                    + ". Phase 0 exits on a SUCCESSFUL run: fix and rerun "
-                    "(Brian ruling 2026-09-04)"
+                # this week's document carries the successful execution —
+                # or, since 2026-10-06, the reruns that together finish it.
+                partial_ok, partial_detail = (
+                    _legacy_partial_runs_complete(runs) if partial_runs_count else (False, "")
                 )
+                if partial_ok:
+                    combined.append(f"{key}: {partial_detail}")
+                else:
+                    failed = [e for e in runs if e.status != "SUCCEEDED"]
+                    unsucceeded.append(
+                        f"{key}: {len(runs)} gate-passing execution(s), "
+                        f"{len(succeeded)} SUCCEEDED (floor {minimum_succeeded}) — "
+                        + ", ".join(f"{e.name}: {e.status}" for e in failed[:4])
+                        + ". Phase 0 exits on a SUCCESSFUL run: fix and rerun "
+                        "(Brian ruling 2026-09-04)"
+                        + (f"; {partial_detail}" if partial_detail else "")
+                    )
     if missing or malformed or stale or over or under or unsucceeded or reruns:
         parts: list[str] = []
         if missing:
@@ -2768,6 +2975,7 @@ def _clause_old_weekly_within_cadence(
         f"{WEEKLY_RUN_DAY_GATE_SKIP_MAX_SECONDS:g}s Succeed-skip"
         f"{'s' if skipped_total != 1 else ''} "
         f"{'counted' if skips_count_as_runs else 'excluded'})"
+        + ("; " + "; ".join(combined) if combined else "")
         + ("; " + "; ".join(rerun_notes) if rerun_notes else "")
         + ("; " + "; ".join(elsewhere) if elsewhere else ""),
         tuple(evidence),
@@ -3912,6 +4120,9 @@ def _phase0(
             minimum=LEGACY_WEEKLY_MIN_RUNS_PER_WEEK,
             minimum_succeeded=1,
             reruns_fail=False,
+            # Brian ruling 2026-10-06 (`alpha-engine-config-I9756`): partial
+            # runs that together complete the weekly count as its success.
+            partial_runs_count=True,
         ),
         _clause_dead_lambdas_deleted(store, window),
         _clause_old_alerts_muted(store, window),
@@ -5036,7 +5247,10 @@ def _human_pointer_flip(
     system, only about who moved a pointer, and the safe reading of that is
     available without refusing to grade.
     """
-    from crucible.autonomy import attribute_pointer_writes  # noqa: PLC0415 - heavy, one call site
+    from crucible.autonomy import (  # noqa: PLC0415 - heavy, one call site
+        attribute_pointer_writes,
+        configured_day_cache,
+    )
     from crucible.config import settings  # noqa: PLC0415 - one call site
 
     location = archive if archive is not None else settings().cloudtrail_archive
@@ -5047,8 +5261,9 @@ def _human_pointer_flip(
         )
     naked = location.removeprefix("s3://")
     try:
+        client = s3 if s3 is not None else _s3_client()
         attribution = attribute_pointer_writes(
-            s3 if s3 is not None else _s3_client(),
+            client,
             bucket=naked.partition("/")[0],
             prefix=naked.partition("/")[2],
             object_bucket=store.bucket,
@@ -5056,6 +5271,7 @@ def _human_pointer_flip(
             since=floor,
             until=pointer_at,
             cfn=cfn,
+            cache=configured_day_cache(client),
         )
     except Exception as exc:  # noqa: BLE001 - recorded in the detail, never silent
         return pointer_at, (
@@ -5134,7 +5350,10 @@ def _human_stack_apply(
     A hand-run `aws cloudformation deploy` from the laptop authenticates as an
     operator profile, which is no stack role, and still restarts the window.
     """
-    from crucible.autonomy import attribute_stack_applies  # noqa: PLC0415 - heavy, one call site
+    from crucible.autonomy import (  # noqa: PLC0415 - heavy, one call site
+        attribute_stack_applies,
+        configured_day_cache,
+    )
     from crucible.config import settings  # noqa: PLC0415 - one call site
 
     if created is None:
@@ -5168,14 +5387,16 @@ def _human_stack_apply(
         )
     naked = location.removeprefix("s3://")
     try:
+        client = s3 if s3 is not None else _s3_client()
         attribution = attribute_stack_applies(
-            s3 if s3 is not None else _s3_client(),
+            client,
             bucket=naked.partition("/")[0],
             prefix=naked.partition("/")[2],
             stack_name=settings().stack_name,
             since=created,
             until=stack_at,
             cfn=cfn,
+            cache=configured_day_cache(client),
         )
     except Exception as exc:  # noqa: BLE001 - recorded in the detail, never silent
         return (
@@ -5516,6 +5737,7 @@ def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Cl
     """
     from crucible.autonomy import (  # noqa: PLC0415 - heavy import, one call site
         ArchiveMissingError,
+        configured_day_cache,
         count_operator_actions,
     )
     from crucible.config import settings  # noqa: PLC0415 - one call site
@@ -5609,8 +5831,9 @@ def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Cl
             evidence,
         )
     try:
+        client = _s3_client()
         counted = count_operator_actions(
-            _s3_client(),
+            client,
             bucket=archive.removeprefix("s3://").partition("/")[0],
             prefix=archive.removeprefix("s3://").partition("/")[2],
             start=change.at.date(),
@@ -5622,6 +5845,10 @@ def _clause_zero_human_mutating_calls(store: Store, window: list[dt.date]) -> Cl
             # "zero human mutating calls" is graded rather than only where
             # it happened to be added first.
             reserved=frozenset(settings().autonomy_reserved_events),
+            # alpha-engine-config-I11792: closed days' raw candidates come from
+            # this workflow's own day cache when one is configured; the
+            # allowlist and `reserved` are applied after, on every read.
+            cache=configured_day_cache(client),
         )
     except ArchiveMissingError as exc:
         return _unmeasurable(name, requirement, f"ArchiveMissingError: {exc}", evidence)
@@ -7892,6 +8119,13 @@ def _clause_v1_arms_carried_or_excluded(
       ledger is absent or malformed;
     * MET otherwise.
 
+    Two silent-or-absent carried arms are named, never counted against it: a
+    carried arm v2 later RETIRED on its own evidence (policy §6.3 keeps the
+    retire record permanently, so the carry stays satisfied — the row is not
+    rewritten to point at a live arm), and a carried arm WAITING on a declared
+    pending producer, read with the predicate `every_registered_arm_produces`
+    reads, so one fact gets one verdict across the two clauses.
+
     ``v1_store`` is for tests; the phase assembler passes none and the store is
     resolved from `CRUCIBLE_ARCTIC_BUCKET` (no default — a bucket name may not
     live in this repo).
@@ -7908,8 +8142,9 @@ def _clause_v1_arms_carried_or_excluded(
         "config/factor_attractiveness_weights.json) has a row in the published carry-over "
         "ledger; no row records no decision; every row claiming a v2 home is confirmed by the "
         "v2 store (a register row, a champion pointer); every carried arm has produced at "
-        "least once past its slot's settle window; and no deferral's condition has cleared "
-        "while its import is still outstanding"
+        "least once past its slot's settle window, or waits on a declared pending producer, "
+        "or was retired on v2's own evidence (a permanent retire record); and no deferral's "
+        "condition has cleared while its import is still outstanding"
     )
     ledger_key = v1_carryover_key()
     if v1_store is None:
@@ -7960,6 +8195,9 @@ def _clause_v1_arms_carried_or_excluded(
     register_keys: dict[str, str] = {}
     champions: dict[str, ChampionPointerReading] = {}
     production: dict[tuple[str, str], ProductionReading] = {}
+    retired: dict[str, dict[str, str]] = {}
+    waiting: dict[tuple[str, str], str] = {}
+    waiting_problems: dict[str, str] = {}
     for v2_slot in sorted(set(V1_SLOT_TO_V2_SLOT.values())):
         arm_ids, key, problem, access_problem, register = _register_arms(store, v2_slot)
         evidence.append(key)
@@ -7975,10 +8213,21 @@ def _clause_v1_arms_carried_or_excluded(
         evidence.append(pointer.key)
         champions[v2_slot] = pointer
         filed_on = _register_filing_dates(register)
+        retired[v2_slot] = _register_retire_records(register)
+        silent: list[str] = []
         for arm_id in arm_ids:
-            production[(v2_slot, arm_name(arm_id))] = read_production(
-                store, arm_id, filed_on.get(arm_id)
-            )
+            reading = read_production(store, arm_id, filed_on.get(arm_id))
+            production[(v2_slot, arm_name(arm_id))] = reading
+            if reading.produced is False:
+                silent.append(arm_id)
+        if silent:
+            waits, waits_problem = _carryover_waits(store, v2_slot)
+            if waits_problem is not None:
+                evidence.append(strategy_arms_prefix(v2_slot))
+                waiting_problems[v2_slot] = waits_problem
+            for arm_id in silent:
+                if arm_id in waits:
+                    waiting[(v2_slot, arm_name(arm_id))] = waits[arm_id]
     findings = grade_carryover(
         v1,
         rows,
@@ -7989,6 +8238,9 @@ def _clause_v1_arms_carried_or_excluded(
             production=production,
             trading_day=window[-1],
             settle_window_sessions=DEFAULT_HORIZON_TRADING_DAYS,
+            retired=retired,
+            waiting=waiting,
+            waiting_problems=waiting_problems,
         ),
     )
     if findings.met:
@@ -7999,6 +8251,7 @@ def _clause_v1_arms_carried_or_excluded(
             "; ".join(
                 f"{found.dimension}: all {found.n_live} live v1 item(s) disposed of "
                 f"({_carryover_counts(found)})"
+                + "".join(f"; {note}" for note in _carryover_notes(found))
                 for found in findings.dimensions
             ),
             tuple(evidence),
@@ -8006,10 +8259,13 @@ def _clause_v1_arms_carried_or_excluded(
     parts: list[str] = []
     for found in findings.dimensions:
         if found.met:
+            notes = _carryover_notes(found)
+            if notes:
+                parts.append(f"{found.dimension} [met]: " + "; ".join(notes))
             continue
         parts.append(
             f"{found.dimension} [{', '.join(found.conditions)}]: "
-            + "; ".join(_carryover_detail(found))
+            + "; ".join([*_carryover_detail(found), *_carryover_notes(found)])
         )
     parts.append(
         "ledger: "
@@ -8038,6 +8294,66 @@ def _register_filing_dates(register: ArmRegister | None) -> dict[str, str]:
         if isinstance(arm_id, str) and isinstance(date, str):
             dates.setdefault(arm_id, date)
     return dates
+
+
+def _register_retire_records(register: ArmRegister | None) -> dict[str, str]:
+    """arm NAME -> "retired <date>: <reason>" for every retired arm.
+
+    Policy §6.3 keeps a retire record permanently, so a ledger row carried onto
+    an arm v2 later retired on its own evidence stays carried
+    (`crucible.carryover.V2Evidence.retired`). Keyed by name because a ledger
+    row names an arm, never a vintage; an ACTIVE arm of the same name is graded
+    on its own reading first.
+    """
+    if register is None:
+        return {}
+    records: dict[str, str] = {}
+    for arm_id in register.all_arms():
+        state = register.state(arm_id)
+        if state.active:
+            continue
+        records.setdefault(
+            arm_name(arm_id),
+            f"retired {state.retired_date}: {state.retired_reason or 'no reason recorded'}",
+        )
+    return records
+
+
+def _carryover_waits(store: Store, slot: str) -> tuple[dict[str, str], str | None]:
+    """arm id -> the declared pending producer it waits on, for ``slot``.
+
+    The SAME predicate `every_registered_arm_produces` reads
+    (`crucible.slots.producibility.waiting_arms`), so one silent arm gets one
+    verdict across both clauses. A recipe tree that cannot be read is returned
+    as a problem, never as "waits on nothing" — that would call a waiting arm
+    mute on an unknown.
+    """
+    from crucible.slots.producibility import waiting_arms  # noqa: PLC0415 - one call site
+
+    try:
+        waits = waiting_arms(slot, store=store)
+    except Exception as exc:  # noqa: BLE001 - classified into the reading by the grader
+        return {}, f"{strategy_arms_prefix(slot)}: {type(exc).__name__}: {exc}"
+    return {arm_id: dependency.waits_on() for arm_id, dependency in waits.items()}, None
+
+
+def _carryover_notes(found: Any) -> list[str]:
+    """What is named on every reading without being a finding: carried arms
+    v2 retired on its own evidence, and carried arms waiting on a declared
+    pending producer. Never silent, never counted against the clause."""
+    notes: list[str] = []
+    if found.retired:
+        notes.append(
+            f"{len(found.retired)} carried row(s) whose v2 arm was RETIRED on v2's own "
+            "evidence, satisfied by the permanent retire record (policy §6.3): "
+            + ", ".join(f"{r.label} -> {why}" for r, why in found.retired)
+        )
+    if found.waiting:
+        notes.append(
+            f"{len(found.waiting)} carried row(s) WAITING on a declared pending producer, "
+            "not counted mute: " + ", ".join(f"{r.label} ({why})" for r, why in found.waiting)
+        )
+    return notes
 
 
 def _carryover_counts(found: Any) -> str:
@@ -8848,7 +9164,10 @@ def _clause_shadow_books_cover_every_active_arm(store: Store, window: list[dt.da
     An absent evidence document is UNMET, not UNMEASURABLE (I10746): without it
     no served day can be checked, which is a trader that has not run, not a
     store we could not read. A corrupt shadow-book artifact raises out of the
-    reader and is read UNMET naming the key. Shadow books are evidence only --
+    reader and is read UNMET naming the key. Controls (`ArmRecord.control` in
+    the register) need no book: each is held to the ruled
+    `CONTROL_NON_BOOK_STATUS` instead, and any other status on a control is
+    UNMET (`alpha-engine-config-I12021`). Shadow books are evidence only --
     never a promotion input (I10653 deliverable 5) -- and nothing here feeds one.
     """
     name = "shadow_books_cover_every_active_arm"
@@ -8863,8 +9182,11 @@ def _clause_shadow_books_cover_every_active_arm(store: Store, window: list[dt.da
         f"the newest of `{keys[-1]}`..`{keys[0]}` (a book is filed "
         f"{SHADOW_BOOK_SETTLEMENT_LAG_SESSIONS} sessions after the one it reads at the latest: "
         "fills at close, advanced the morning after its successor closes) carries an advanced "
-        "shadow book for every active arm in the register, none failed, each advanced on every "
-        f"day the trader served (`days_served` in `{TRADER_EVIDENCE_KEY}`) since its inception"
+        "shadow book for every active challenger in the register, none failed, each advanced "
+        f"on every day the trader served (`days_served` in `{TRADER_EVIDENCE_KEY}`) since its "
+        "inception; every active control is listed with the ruled non-book status "
+        f"`{CONTROL_NON_BOOK_STATUS}` (plan §10.6: "
+        '"a simulated book per registered challenger")'
     )
     evidence_key = TRADER_EVIDENCE_KEY
     read = _read_store_document(store, evidence_key)

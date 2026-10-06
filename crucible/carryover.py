@@ -70,6 +70,22 @@ Three readings (`crucible.gate.Clause`):
   value has been re-tuned in v1 since it was carried, or the ledger is absent
   or malformed.
 * **MET** — none of the above.
+
+Two readings of a silent or absent carried arm are NOT gaps, and each is
+named in the detail on every reading rather than passed silently:
+
+* **retired on v2's own evidence** — a `carried` row whose v2 arm is no
+  longer active because the v2 arena RETIRED it. The carry happened; the arm
+  then lost on the record, and policy §6.3 keeps that retire record
+  permanently. Grading the row "not an active arm" would ask the ledger to be
+  rewritten every time the arena does its job, and rewriting the row to point
+  at a live arm would claim a carry that never happened.
+* **waiting on a declared pending producer** — a `carried` arm that has
+  produced nothing because the recipe it hashes to waits on a column the
+  feature catalogue declares pending (`crucible.slots.producibility.
+  waiting_arms`, the predicate `every_registered_arm_produces` reads). One
+  fact gets one verdict: the same arm cannot be WAITING on one clause and
+  MUTE on the next.
 """
 
 from __future__ import annotations
@@ -854,6 +870,18 @@ class V2Evidence:
     #: trading sessions (the slot's own horizon constant).
     trading_day: dt.date
     settle_window_sessions: int
+    #: v2 slot -> RETIRED arm name -> its retire record ("retired <date>:
+    #: <reason>"). A retire record is permanent (policy §6.3), so a carried
+    #: arm v2 later retired on its own evidence stays carried.
+    retired: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    #: (v2 slot, arm name) -> the declared pending producer a silent arm
+    #: waits on, read with `crucible.slots.producibility.waiting_arms` — the
+    #: predicate `every_registered_arm_produces` reads, so the two clauses
+    #: cannot disagree about one arm.
+    waiting: Mapping[tuple[str, str], str] = field(default_factory=dict)
+    #: v2 slot -> why whether its silent arms wait could not be read. Unknown
+    #: is never a pass, and never assumed mute either.
+    waiting_problems: Mapping[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -878,6 +906,13 @@ class DimensionFindings:
     unproduced: tuple[tuple[LedgerRow, str], ...] = ()
     #: `(row, why)` for a row whose recorded v1 value is no longer v1's live one.
     drifted: tuple[tuple[LedgerRow, str], ...] = ()
+    #: NOT findings — named on every reading, never counted against `met`.
+    #: `(row, retire record)` for a carried arm v2 later retired on its own
+    #: evidence (policy §6.3 keeps the record permanently).
+    retired: tuple[tuple[LedgerRow, str], ...] = ()
+    #: `(row, what it waits on)` for a carried arm past its settle window
+    #: that waits on a declared pending producer.
+    waiting: tuple[tuple[LedgerRow, str], ...] = ()
     counts: dict[str, int] = field(default_factory=dict)
     n_live: int = 0
 
@@ -950,6 +985,21 @@ def _register_satisfies(row: LedgerRow, v2: V2Evidence) -> str | None:
     return None
 
 
+def _retire_record(row: LedgerRow, v2: V2Evidence) -> str | None:
+    """The v2 retire record of ``row``'s arm, or ``None``.
+
+    Only when no ACTIVE arm of that name exists: an active arm is graded on
+    its own reading, and a retired vintage of the same name does not excuse
+    it. A retire record is what §6.3 keeps permanently, so the carry it
+    closes stays satisfied — the arm crossed, competed and lost on the record.
+    """
+    v2_slot = V1_SLOT_TO_V2_SLOT[row.group]
+    names = v2.registers.get(v2_slot)
+    if names is not None and row.target in names:
+        return None
+    return v2.retired.get(v2_slot, {}).get(row.target or "")
+
+
 def _production_of(row: LedgerRow, v2: V2Evidence) -> tuple[ProductionReading | None, str]:
     v2_slot = V1_SLOT_TO_V2_SLOT[row.group]
     return v2.production.get((v2_slot, row.target or "")), v2_slot
@@ -984,7 +1034,14 @@ def _grade_arms(
     )
     unsatisfied: list[tuple[LedgerRow, str]] = []
     unproduced: list[tuple[LedgerRow, str]] = []
+    retired: list[tuple[LedgerRow, str]] = []
+    waiting: list[tuple[LedgerRow, str]] = []
     for row in sorted((r for r in rows if r.disposition == "carried"), key=_by_label):
+        record = _retire_record(row, v2)
+        if record is not None:
+            # Carried, then retired on v2's own evidence. Satisfied, and named.
+            retired.append((row, f"{V1_SLOT_TO_V2_SLOT[row.group]}:{row.target} {record}"))
+            continue
         why = _register_satisfies(row, v2)
         if why is not None:
             # Registration is the FIRST bar. An arm that never registered is
@@ -1005,21 +1062,40 @@ def _grade_arms(
         if reading.produced:
             continue
         past, why_window = _past_settle_window(reading, v2)
-        if past:
-            unproduced.append(
+        if not past:
+            continue
+        waits_on = v2.waiting.get((v2_slot, row.target or ""))
+        if waits_on is not None:
+            # The reading `every_registered_arm_produces` gives the same arm.
+            waiting.append((row, f"{v2_slot}:{row.target} waits on {waits_on}"))
+            continue
+        waits_problem = v2.waiting_problems.get(v2_slot)
+        if waits_problem is not None:
+            unsatisfied.append(
                 (
                     row,
-                    f"{v2_slot}:{row.target} is registered and has produced nothing under "
-                    f"{reading.key} ({why_window}). REGISTERED IS NOT PRODUCING: a carried "
-                    "arm that can never emit carries nothing",
+                    f"{v2_slot}:{row.target} has produced nothing ({why_window}), and whether "
+                    f"it waits on a declared pending producer could not be read "
+                    f"({waits_problem}) — unknown is never a pass",
                 )
             )
+            continue
+        unproduced.append(
+            (
+                row,
+                f"{v2_slot}:{row.target} is registered and has produced nothing under "
+                f"{reading.key} ({why_window}) and waits on no declared pending producer. "
+                "REGISTERED IS NOT PRODUCING: a carried arm that can never emit carries nothing",
+            )
+        )
     return DimensionFindings(
         dimension=dim.name,
         unlisted=_unlisted(live, rows),
         undecided=undecided,
         unsatisfied=tuple(unsatisfied),
         unproduced=tuple(unproduced),
+        retired=tuple(retired),
+        waiting=tuple(waiting),
         counts=_counts(dim, rows),
         n_live=len(live),
     )

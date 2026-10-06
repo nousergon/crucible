@@ -83,6 +83,7 @@ from crucible.keys import (
     arena_cycle_key,
     arm_predictions_key,
     cross_section_key,
+    experiments_prefix,
     features_key,
     features_prefix,
     shadow_key,
@@ -117,17 +118,21 @@ from crucible.slots.vocab import refuse_unknown_keys
 
 __all__ = [
     "CPCV_OOS_IC_METRIC",
+    "DAILY_FEED_METRIC",
+    "DAILY_SERVE_JOB",
     "DEAD_SLOT_METRIC",
     "DISPERSION_METRICS",
     "FACTOR_RESIDUAL_TARGET",
     "FLOOR_VETO_METRICS",
     "HIGH_CONFIDENCE_P_UP",
     "MIN_DISPERSION_RATIO",
+    "SERVABLE_AS_OF_PRECONDITION",
     "SERVING_VETO_WINDOW_METRIC",
     "SETTLED_WINDOW_DECISION_DATES",
     "UNPRODUCED_VETO_METRICS",
     "GAUSSIAN_ONE_SIGMA_COVERAGE",
     "UNCERTAINTY_CALIBRATION_METRIC",
+    "UNSERVABLE_AS_OF_METRIC",
     "Z_VAR_BAND",
     "M_SELECTION_TOP_N",
     "OOS_METHOD",
@@ -143,6 +148,7 @@ __all__ = [
     "FeatureLayerSource",
     "FeaturePanel",
     "Fit",
+    "FitReconstructionError",
     "FitUncertainty",
     "PredictiveStd",
     "UncertaintyCalibration",
@@ -171,6 +177,7 @@ __all__ = [
     "evaluate_behavioural_veto",
     "evaluate_uncertainty_calibration",
     "evaluate_input_completeness",
+    "evaluate_servable_as_of",
     "factor_residual_panel",
     "neutralize_cross_section",
     "point_in_time_factor_betas",
@@ -179,6 +186,7 @@ __all__ = [
     "load_model_recipes",
     "produce",
     "produce_history",
+    "serve_daily",
     "read_model_recipes",
     "realized_hit_rate",
     "registration_specs",
@@ -250,6 +258,16 @@ DEAD_SLOT_METRIC = "serving_veto_has_no_producer"
 #: temporary state gets read as a permanent one and a permanent one gets
 #: waited out.
 SERVING_VETO_WINDOW_METRIC = "serving_veto_window"
+
+#: The serving precondition that bars an arm from the M pointer when it has
+#: no servable cross-section for the graded day (2026-10-05). See
+#: :func:`evaluate_servable_as_of`.
+SERVABLE_AS_OF_PRECONDITION = "servable_as_of"
+
+#: The grade-manifest row naming every arm :data:`SERVABLE_AS_OF_PRECONDITION`
+#: barred this cycle — filed on every grade, as a zero when none was, so
+#: "no arm was barred" is a reading rather than an absence.
+UNSERVABLE_AS_OF_METRIC = "arms_unservable_as_of"
 
 #: Settled out-of-sample DECISION DATES an arm needs before its realized
 #: veto inputs exist. The metric's own name declares the window —
@@ -4521,6 +4539,337 @@ def produce_history(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]
     return result
 
 
+# ---------------------------------------------------------------------------
+# The daily serving job (`serve.daily --slot m`).
+# ---------------------------------------------------------------------------
+
+#: The CLI job that publishes the champion's feed on every trading day. One
+#: name for every slot that serves daily; the slot is its `--slot` and its
+#: manifest discriminator, and :func:`crucible.slots.daily_servers` reads
+#: which slots qualify off the modules, exactly as `dispatchable_slots` does.
+DAILY_SERVE_JOB = "serve.daily"
+
+#: The metric every `serve.daily --slot m` manifest carries: 1 when the feed
+#: for the session was published, 0 when the slot has no champion and owes
+#: none. A run that could not publish fails instead, so a 0 never means
+#: "tried and could not".
+DAILY_FEED_METRIC = "daily_feed_published"
+
+
+class FitReconstructionError(TrainingIntegrityError):
+    """The carried-forward fit does not reproduce the cross-section its own
+    fitting run published.
+
+    The daily job never persists or reads weights; it re-derives the fit of
+    record from the same inputs, at the same `as_of`, through the same
+    :func:`design_panel` / :func:`train_arm` calls the fitting run made, and
+    then PROVES the result is that fit by scoring the fit's own session and
+    comparing against the `arm_predictions.v1` document the fitting run
+    wrote. A disagreement means the inputs changed under the fit (a healed
+    feature day inside the training window, a new feature-layer vintage) or
+    the code did — and in either case the weights that would be served today
+    are not the weights that were graded, so nothing is served.
+    """
+
+
+#: Relative tolerance for the reconstruction proof. The re-derivation is the
+#: same deterministic computation over the same bytes, so the expected
+#: difference is zero; the tolerance exists only so a BLAS reordering of one
+#: dot product cannot refuse a feed, and is nine orders of magnitude below
+#: any cross-sectional alpha that ranks differently.
+_RECONSTRUCTION_RTOL = 1e-9
+_RECONSTRUCTION_ATOL = 1e-12
+
+
+def _sessions_after(anchor: str, trading_day: str) -> int:
+    """Trading sessions in ``(anchor, trading_day]`` — the age of a fit."""
+    from crucible.calendar import is_trading_day  # noqa: PLC0415 - avoids a cycle
+
+    day = dt.date.fromisoformat(anchor) + dt.timedelta(days=1)
+    end = dt.date.fromisoformat(trading_day)
+    count = 0
+    while day <= end:
+        if is_trading_day(day):
+            count += 1
+        day += dt.timedelta(days=1)
+    return count
+
+
+def _fit_of_record(store: Any, recipe: ModelRecipe, *, trading_day: str) -> str:
+    """The session ``recipe``'s most recent fit was made as of, before ``trading_day``.
+
+    A FIT session is one the slot's own produce path ran for the arm —
+    `experiment.run[m]` on the weekly arc, or `experiment.backfill` — and it
+    is recognised by the artifact only that path writes: the arm's
+    `cross_section.json` (with its `arm_predictions.v1` beside it). This job
+    writes `arm_predictions.v1` and never a cross-section, so a session it
+    served can never be mistaken for one the arm was fitted on.
+
+    Refused when there is none, and when the newest is older than the
+    recipe's declared `refit_cadence_trading_days`: carrying a fit forward
+    for longer than the arm declares it lives is serving an arm on a cadence
+    it never declared and was never graded on (`grade_arm` walks forward on
+    that same cadence).
+    """
+    from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
+
+    prefix = experiments_prefix(recipe.arm_id)
+    fitted: list[str] = []
+    for key in store.list_keys(prefix):
+        day, _, leaf = key[len(prefix) :].partition("/")
+        if (
+            leaf == "cross_section.json"
+            and day < trading_day
+            and store.exists(arm_predictions_key(recipe.arm_id, day))
+        ):
+            fitted.append(day)
+    if not fitted:
+        raise MissingArtifactError(
+            f"arm {recipe.arm_id!r} has never been fitted before {trading_day}: no session "
+            f"under {prefix!r} carries both a cross-section and its arm_predictions.v1 "
+            "document. The daily job serves the champion's fit of record and never fits "
+            "one itself, so there is nothing to carry forward; the weekly arc's "
+            "`experiment.run --slot m` is what fits it."
+        )
+    anchor = max(fitted)
+    age = _sessions_after(anchor, trading_day)
+    if age > recipe.refit_cadence_trading_days:
+        raise MissingArtifactError(
+            f"arm {recipe.arm_id!r}'s newest fit is as of {anchor}, {age} session(s) "
+            f"before {trading_day}, past the recipe's refit_cadence_trading_days="
+            f"{recipe.refit_cadence_trading_days}. A fit older than the arm's own declared "
+            "cadence is not the arm the arena graded; the missing weekly fit is the defect "
+            "to repair, not a reason to serve a staler one."
+        )
+    return anchor
+
+
+def _carried_forward_fit(
+    ctx: Any,
+    recipe: ModelRecipe,
+    *,
+    anchor: str,
+    recipes: Sequence[ModelRecipe],
+    strategy_dir: Path | str | None,
+) -> tuple[Fit, str]:
+    """``recipe``'s fit of record as of ``anchor``, PROVEN to be that fit.
+
+    Returns the fit and the feature-layer version it was fitted on. Re-derived,
+    because fitted weights are not persisted anywhere — only their
+    predictions are — and re-derived through exactly the calls
+    :func:`_produce_arms` made on ``anchor``: :func:`design_panel` at the same
+    session, lookback and layer version, then :func:`train_arm` at the same
+    ``as_of``. The proof is the fit's own session: the re-derived fit must
+    reproduce, name for name, the `arm_predictions.v1` cross-section the
+    fitting run published for ``anchor``. Otherwise :class:`FitReconstructionError`.
+    """
+    from crucible.documents import load_document_bytes  # noqa: PLC0415
+    from crucible.slots.inputs import read_arm_predictions  # noqa: PLC0415
+
+    # The reader validates the document and records it as this run's input;
+    # the layer version is read off the same validated document.
+    published = read_arm_predictions(ctx.store, arm_id=recipe.arm_id, trading_day=anchor, ctx=ctx)
+    key = arm_predictions_key(recipe.arm_id, anchor)
+    version = str(load_document_bytes(key, ctx.store.get_bytes(key))["feature_version"])
+    panel = design_panel(
+        recipe,
+        source=FeatureLayerSource(store=ctx.store, version=version),
+        trading_day=anchor,
+        recipes=recipes,
+        store=ctx.store,
+        lookback_trading_days=_produce_lookback(recipe),
+        ctx=ctx,
+        strategy_dir=strategy_dir,
+    )
+    fit = train_arm(recipe, panel, as_of=anchor)
+    rederived = predict_cross_section(fit, panel, trading_day=anchor)
+    if set(rederived) != set(published):
+        raise FitReconstructionError(
+            f"arm {recipe.arm_id!r}: the fit re-derived as of {anchor} scores "
+            f"{len(rederived)} name(s) on {anchor}, the published cross-section has "
+            f"{len(published)}; first differences "
+            f"{sorted(set(rederived) ^ set(published))[:5]}. The inputs under the fit "
+            "changed, so these are not the weights that were graded."
+        )
+    names = sorted(published)
+    if not np.allclose(
+        [rederived[n] for n in names],
+        [published[n] for n in names],
+        rtol=_RECONSTRUCTION_RTOL,
+        atol=_RECONSTRUCTION_ATOL,
+    ):
+        worst = max(names, key=lambda n: abs(rederived[n] - published[n]))
+        raise FitReconstructionError(
+            f"arm {recipe.arm_id!r}: the fit re-derived as of {anchor} does not reproduce "
+            f"the cross-section its fitting run published for {anchor} (worst {worst}: "
+            f"{rederived[worst]!r} vs {published[worst]!r}). The inputs or the code under "
+            "the fit changed, so these are not the weights that were graded."
+        )
+    return fit, version
+
+
+def _serving_closure(champion: ModelRecipe, recipes: Sequence[ModelRecipe]) -> list[ModelRecipe]:
+    """The champion and every base it stacks on, transitively, bases first.
+
+    A stacked champion's design row for a session reads its bases'
+    `arm_predictions.v1` for that SAME session, so serving it daily means
+    scoring the bases daily too. Order is :func:`_in_dependency_order`'s, so
+    one ordering rule governs the weekly fit and the daily score.
+    """
+    by_id = {r.arm_id: r for r in recipes}
+    wanted: dict[str, ModelRecipe] = {}
+    pending = [champion]
+    while pending:
+        recipe = pending.pop()
+        if recipe.name not in wanted:
+            wanted[recipe.name] = recipe
+            pending.extend(by_id[b] for b in _base_arm_ids(recipe, recipes).values())
+    ordered = _in_dependency_order([RegisteredModelArm(recipe=r) for r in wanted.values()])
+    return [spec.recipe for spec in ordered]
+
+
+def serve_daily(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
+    """Publish `predictions/{trading_day}.json` for the CURRENT champion. Never fits.
+
+    `alpha-engine-config-I12047` (Brian's ruling: a daily M job). The trader's
+    session binds to the last closed trading day and requires that day's feed,
+    and refuses an older one by design — while `experiment.run[m]`, the only
+    other producer of the feed, runs on the weekly arc. So every session but
+    the one after the arc held the book.
+
+    Per session: read `champions/m/current.json`; for the champion and every
+    base it stacks on, score the session's cross-section from that arm's fit
+    of record (:func:`_fit_of_record`, proven by :func:`_carried_forward_fit`)
+    and write it through :func:`produce_arm_predictions` — the same writer the
+    weekly fit uses, so the document, its `predicted_alpha_std` and its
+    coverage metrics are the same shape; then publish the feed through
+    :func:`crucible.serving.publish_predictions_feed`, the one serving path,
+    so the feed is a republication of that document and the trader's contract
+    check (`champion` equals the pointer's `arm_id`, `trading_day` equals the
+    key's) holds by construction.
+
+    **What it never does.** It does not refit, so the weights served Monday to
+    Friday are the weights the arc fitted — exactly the walk-forward
+    `grade_arm` grades, which carries a fit forward between refits on the
+    recipe's cadence. It writes no `shadow.json` or `cross_section.json`, so it
+    adds nothing to any arm's graded series and no session it serves becomes a
+    fit of record. It does not overwrite an arm's `arm_predictions.v1`: a
+    session the fitting path already produced (the arc day, a backfilled day,
+    a re-run) is served from that document as it stands.
+
+    **No champion is not a failure** — the same reading
+    :func:`crucible.serving.publish_predictions_feed` gives: nothing has been
+    promoted, no feed is owed, and the result says so. An unusable pointer,
+    a champion with no fit of record, a fit that cannot be reproduced and a
+    session whose feature layer is absent all RAISE, so the manifest fails and
+    pages; a feed for the wrong arm or the wrong day is never written.
+    """
+    from crucible.calendar import assert_trading_day  # noqa: PLC0415 - avoids a cycle
+    from crucible.champion import read_champion  # noqa: PLC0415 - avoids a cycle
+    from crucible.serving import publish_predictions_feed  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
+
+    trading_day = ctx.trading_day.isoformat()
+    assert_trading_day(
+        ctx.trading_day, context=f"{DAILY_SERVE_JOB} --slot {SLOT} --date {trading_day}"
+    )
+    try:
+        pointer = read_champion(ctx.store, SLOT)
+    except KeyError:
+        # Not swallowed: the absence is this run's recorded outcome — the
+        # metric below at 0 with its reason, and `champion: None` in the
+        # result — exactly as `publish_predictions_feed` reports it for the
+        # weekly path. A pointer that EXISTS and is unusable raises
+        # `ChampionUnusableError` out of `read_champion` untouched.
+        ctx.record_rows(rows_in=0, rows_out=0)
+        ctx.record_metric(
+            _daily_feed_metric(
+                0.0,
+                trading_day,
+                f"slot {SLOT} has no champion pointer; nothing has been promoted, so no "
+                f"feed is owed for {trading_day}",
+            )
+        )
+        return {"slot": SLOT, "trading_day": trading_day, "champion": None, "champion_feed": None}
+
+    loaded = _load_slot(ctx, settings=settings)
+    recipes = list(loaded.registered)
+    champion = next((r for r in recipes if r.arm_id == pointer.arm_id), None)
+    if champion is None:
+        raise MissingArtifactError(
+            f"the champion pointer for slot {SLOT!r} names {pointer.arm_id!r}, which no "
+            f"recipe in the release in force declares (registered: "
+            f"{sorted(r.arm_id for r in recipes)}). Its fit cannot be re-derived without "
+            "its recipe, and a feed for any other arm would fail the trader's contract."
+        )
+
+    strategy_dir = getattr(settings, "strategy_dir", None)
+    scored: dict[str, str] = {}
+    reused: list[str] = []
+    for recipe in _serving_closure(champion, recipes):
+        if ctx.store.exists(arm_predictions_key(recipe.arm_id, trading_day)):
+            # The fitting path (or an earlier run of this job) already wrote
+            # this arm's cross-section for the session; it is served as it
+            # stands and never overwritten with a carried-forward score.
+            reused.append(recipe.arm_id)
+            continue
+        anchor = _fit_of_record(ctx.store, recipe, trading_day=trading_day)
+        fit, version = _carried_forward_fit(
+            ctx, recipe, anchor=anchor, recipes=recipes, strategy_dir=strategy_dir
+        )
+        panel = design_panel(
+            recipe,
+            source=FeatureLayerSource(store=ctx.store, version=version),
+            trading_day=trading_day,
+            recipes=recipes,
+            store=ctx.store,
+            ctx=ctx,
+            strategy_dir=strategy_dir,
+        )
+        _, serving = score_cross_section(fit, panel, trading_day=trading_day)
+        ctx.record_metric(serving.as_metric(slot=SLOT, phase="serving"))
+        if serving.rows_excluded:
+            ctx.record_rejected(serving.detail, serving.rows_excluded)
+        produce_arm_predictions(ctx, fit=fit, panel=panel, trading_day=trading_day)
+        scored[recipe.arm_id] = anchor
+
+    feed = publish_predictions_feed(ctx.store, trading_day=trading_day, ctx=ctx)
+    ctx.record_rows(rows_in=len(scored) + len(reused), rows_out=1)
+    ctx.record_metric(
+        _daily_feed_metric(
+            1.0,
+            trading_day,
+            f"slot {SLOT}: published the feed for {trading_day} from champion "
+            f"{pointer.arm_id}; scored {len(scored)} arm(s) from their fit of record, "
+            f"served {len(reused)} already-produced cross-section(s) as they stand",
+        )
+    )
+    return {
+        "slot": SLOT,
+        "trading_day": trading_day,
+        "champion": pointer.arm_id,
+        "champion_feed": feed,
+        # `{arm_id: the session its fit of record was made as of}`.
+        "scored_from_fit_of": scored,
+        "reused": reused,
+    }
+
+
+def _daily_feed_metric(value: float, trading_day: str, reason: str) -> dict[str, Any]:
+    return {
+        "name": DAILY_FEED_METRIC,
+        "module": f"crucible.slots.{SLOT}",
+        "metric_type": "count",
+        "value": value,
+        "unit": "feeds",
+        "n_floor": 0,
+        "status": "OK",
+        "status_reason": reason,
+        "source_path": f"predictions/{trading_day}.json",
+        "last_updated_utc": _utc_now(),
+    }
+
+
 #: IRLS iterations the up-probability calibration is allowed. A logistic fit
 #: on two parameters converges in a handful; not converging inside this many
 #: is a degenerate block (perfect separation, a constant predictor), and the
@@ -4972,8 +5321,31 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         if windows[arm_id]:
             grades[arm_id]["veto_window_reason"] = windows[arm_id]
 
+    # The THIRD serving precondition, and the only one about TODAY rather
+    # than about the arm's history (2026-10-05). On 2026-10-02 `promote`
+    # seated `m:v3meta_stack:1bb8d3646649`, which that same day's
+    # `experiment.run[m]` had refused (its base heads lacked predictions for
+    # four sessions of its window), so it wrote no `arm_predictions` for the
+    # day: the feed `experiment.run` had already published named the old
+    # champion, the pointer named the new one, and the trader refused the
+    # disagreement. Its history was fine — the arena had paired windows
+    # through 09-02 — and every other precondition passed, because an arm
+    # whose grade panel or produce run was refused got NO precondition at all,
+    # which the engine reads as eligible. Barring it HERE puts the refusal
+    # into the decision: the engine picks among arms that can serve, the
+    # incumbent holds if none of them beats it, and the barred arm is named
+    # with its reason in `decision.ineligible` and on this manifest.
+    servable = evaluate_servable_as_of(
+        ctx.store, _servable_candidates(ctx, specs, champion=champion, as_of=as_of), as_of=as_of
+    )
+    for arm_id, check in servable.items():
+        preconditions.setdefault(arm_id, []).append(check)
+        if arm_id in grades:
+            grades[arm_id]["servable_as_of"] = check.passed
+
     _record_dead_slot_finding(ctx, grades, as_of=as_of)
     _record_serving_veto_window(ctx, grades, windows, as_of=as_of)
+    _record_unservable_as_of(ctx, servable, as_of=as_of)
 
     result = run_grade(
         ctx,
@@ -4984,10 +5356,136 @@ def grade(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
         **{k: v for k, v in kwargs.items() if k != "feature_version"},
     )
     result["model_grades"] = grades
+    result["unservable_as_of"] = {
+        arm_id: check.reason for arm_id, check in sorted(servable.items()) if not check.passed
+    }
     result["refused"] = [
         {"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused
     ]
     return result
+
+
+def evaluate_servable_as_of(
+    store: Any, arm_ids: Sequence[str], *, as_of: str
+) -> dict[str, ServingPrecondition]:
+    """One :data:`SERVABLE_AS_OF_PRECONDITION` per arm: can it serve ``as_of``?
+
+    Asked of the serving path itself — :func:`crucible.serving.servable_source`
+    runs exactly the checks `publish_predictions_feed` runs before it writes
+    the trader's feed — so "the decision may seat this arm" and "the feed can
+    be published for this arm" are one answer, not two copies of it free to
+    drift.
+
+    **A declared swallow** (`crucible/AGENTS.md`, fail-loud). (a) Swallowed:
+    `MissingArtifactError` (the arm wrote no cross-section for the session —
+    the 2026-10-02 shape, a stack refused at produce time) and
+    `PredictionsFeedContractError` (it wrote one the serving path refuses).
+    (b) The deliverable survives because neither is a broken grade: the arm's
+    history is still scored and ladder-aged, only the POINTER is closed to
+    it. (c) Recording surface: a FAILED precondition whose reason is the
+    serving path's own message, which the engine files under
+    `decision.ineligible` in the `arena_cycle` artifact, and the
+    :data:`UNSERVABLE_AS_OF_METRIC` row on the grade manifest.
+    """
+    from crucible.serving import (  # noqa: PLC0415 - avoids a cycle
+        PredictionsFeedContractError,
+        servable_source,
+    )
+    from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
+
+    checks: dict[str, ServingPrecondition] = {}
+    for arm_id in sorted(arm_ids):
+        try:
+            source_key = servable_source(store, arm_id=arm_id, trading_day=as_of)
+        except (MissingArtifactError, PredictionsFeedContractError) as exc:
+            checks[arm_id] = ServingPrecondition(
+                name=SERVABLE_AS_OF_PRECONDITION,
+                passed=False,
+                reason=(
+                    f"arm {arm_id} cannot serve {as_of}: {exc} Seating it would leave "
+                    f"champions/{SLOT}/current.json and predictions/{as_of}.json naming "
+                    "two different arms, which the trader refuses."
+                ),
+            )
+        else:
+            checks[arm_id] = ServingPrecondition(
+                name=SERVABLE_AS_OF_PRECONDITION,
+                passed=True,
+                reason=f"arm {arm_id} produced a servable cross-section for {as_of} ({source_key})",
+            )
+    return checks
+
+
+def _servable_candidates(
+    ctx: Any, specs: Sequence[RegisteredModelArm], *, champion: str | None, as_of: str
+) -> tuple[str, ...]:
+    """The arms :func:`evaluate_servable_as_of` is asked about.
+
+    Every arm the cycle will SCORE as of ``as_of`` — read off the register as
+    `crucible.slots.cycle.run_grade` folds it, not off ``specs``, because an
+    arm refused at registration this cycle is still in the register with a
+    series, and an arm with no precondition is one the engine reads as
+    eligible. Three exclusions, each deliberate:
+
+    - **controls**, which `run_grade` already bars with `not_a_control_arm`
+      and which must stay ELIGIBLE when the null control stands in as the
+      baseline incumbent (`alpha-engine-config-I10687`);
+    - **the incumbent**. The engine forces the pointer OFF an incumbent that
+      fails a precondition, and an incumbent with no cross-section for the
+      day has already failed `experiment.run[m]` loudly at
+      `publish_predictions_feed`. Turning a production failure into an
+      automatic pointer move is a different decision with a different owner;
+      this precondition exists to stop the pointer moving ONTO an arm that
+      cannot serve, not to move it off one;
+    - **arms that did not exist on ``as_of``**, which the library excludes
+      from the cycle already (`alpha-engine-config-I11037`).
+    """
+    from crucible.slots import get_slot, is_control_arm  # noqa: PLC0415 - avoids a cycle
+
+    slot_spec = get_slot(SLOT)
+    register, _ = register_arms(read_register(ctx.store, SLOT), list(specs), filed_on=as_of)
+    absent = frozenset(register.not_yet_registered(as_of))
+    return tuple(
+        arm_id
+        for arm_id in register.scored_arms(as_of, slot_spec.retired_trailing_cycles)
+        if arm_id != champion
+        and arm_id not in absent
+        and not is_control_arm(slot_spec, arm_id, register)
+    )
+
+
+def _record_unservable_as_of(
+    ctx: Any, servable: dict[str, ServingPrecondition], *, as_of: str
+) -> None:
+    """File :data:`UNSERVABLE_AS_OF_METRIC` — on every grade, zero included.
+
+    Status ``OK`` in both directions, like
+    `crucible.slots.cycle.not_yet_registered_metric`: a barred challenger is a
+    fact about the pointer, not a fault in the grade, and the incumbent keeps
+    serving. The row exists so the arm is NAMED on the manifest an operator
+    reads, rather than only inside the `arena_cycle` artifact.
+    """
+    barred = {arm: check for arm, check in sorted(servable.items()) if not check.passed}
+    ctx.record_metric(
+        {
+            "name": UNSERVABLE_AS_OF_METRIC,
+            "module": f"crucible.slots.{SLOT}",
+            "metric_type": "count",
+            "value": float(len(barred)),
+            "unit": "arms",
+            "n_floor": 0,
+            "status": "OK",
+            "status_reason": (
+                f"{len(barred)} of {len(servable)} challenger arm(s) produced no servable "
+                f"cross-section for {as_of} and are barred from the pointer this cycle "
+                f"({SERVABLE_AS_OF_PRECONDITION}): {', '.join(barred)}"
+                if barred
+                else f"every one of {len(servable)} challenger arm(s) can serve {as_of}"
+            ),
+            "source_path": arena_cycle_key(SLOT, as_of),
+            "last_updated_utc": _utc_now(),
+        }
+    )
 
 
 def _calibration_metric(

@@ -862,6 +862,7 @@ def _read_human_touch_count(render_day: dt.date, *, cfn: Any | None = None) -> H
     from crucible.autonomy import (  # noqa: PLC0415 - heavy import, one call site
         ArchiveMissingError,
         StackUnmeasurableError,
+        configured_day_cache,
         count_operator_actions,
         trailing_calendar_month,
     )
@@ -882,14 +883,21 @@ def _read_human_touch_count(render_day: dt.date, *, cfn: Any | None = None) -> H
     bucket = cfg.cloudtrail_archive.removeprefix("s3://").partition("/")[0]
     prefix = cfg.cloudtrail_archive.removeprefix("s3://").partition("/")[2]
     try:
+        s3 = _autonomy_s3_client()
         counted = count_operator_actions(
-            _autonomy_s3_client(),
+            s3,
             bucket=bucket,
             prefix=prefix,
             start=month_start,
             end=month_end,
             cfn=cfn,
             reserved=frozenset(cfg.autonomy_reserved_events),
+            # alpha-engine-config-I11792: month-to-date re-read every closed
+            # day of the month on every render. Closed days come from the
+            # board's own day cache when CRUCIBLE_CLOUDTRAIL_DAY_CACHE is set;
+            # the machine allowlist and `reserved` above are still applied to
+            # every record, cached or not.
+            cache=configured_day_cache(s3),
         )
     except (ArchiveMissingError, StackUnmeasurableError) as exc:
         return HumanTouchReading(month_label, 0, (), f"{type(exc).__name__}: {exc}", measured=False)

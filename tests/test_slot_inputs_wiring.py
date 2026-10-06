@@ -379,6 +379,9 @@ STILL_ORPHANED_M_CALLABLES: list[str] = [
     "design_panel",
     "evaluate_behavioural_veto",
     "evaluate_input_completeness",
+    # 2026-10-05: the `servable_as_of` serving precondition, reached from
+    # `grade` only. Pinned for the reason `grade` is.
+    "evaluate_servable_as_of",
     # `alpha-engine-config-I11791`: the std calibration check, reached from
     # `grade_arm` (itself pinned above), and the served std, reached from
     # `produce_arm_predictions`. Pinned for the reason `grade` is.
@@ -410,6 +413,12 @@ STILL_ORPHANED_M_CALLABLES: list[str] = [
     # `FeatureCompleteness` reading for it. Reached from `produce`, and pinned
     # for the same reason `produce` is.
     "score_cross_section",
+    # `alpha-engine-config-I12047`: the daily serving entry point `serve.daily`
+    # runs, reached through `crucible.slots.daily_servers()` — the same
+    # read-off-the-module dispatch as `produce`. That M resolves it is pinned
+    # where a static scan cannot see: `tests/test_serve_daily.py::
+    # TestTheJobSurface::test_m_u_and_s_are_the_slots_with_a_daily_serving_entry_point`.
+    "serve_daily",
     "serving_metrics",
     "settled_training_days",
     "train_arm",
