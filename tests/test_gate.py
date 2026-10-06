@@ -1455,6 +1455,169 @@ class TestPhaseZeroOldWeeklyCadence:
         assert "at least 1 SUCCEEDED" in clause.detail
         assert ">= 1 gate-passing execution" in clause.detail
 
+    @staticmethod
+    def _partial_week(anchor: dt.date, *runs: tuple[str, str, dict, list[str]]) -> dict:
+        """A week of failed gate-passing runs, each with a per-stage record."""
+        document = _legacy_week(anchor, runs=0)
+        for name, status, stages, flags in runs:
+            document["executions"].append(
+                {
+                    "name": name,
+                    "start": f"{anchor.isoformat()}T09:00:49+00:00",
+                    "stop": f"{anchor.isoformat()}T12:00:00+00:00",
+                    "duration_seconds": 10751.0,
+                    "status": status,
+                    "sns_topic_arn": f"arn:aws:sns:us-east-1:acct:{muted_alerts_topic_name()}",
+                    "skip_flags": flags,
+                    "stage_scope": {
+                        "degraded": False,
+                        "stages": {
+                            stage: {"disposition": d, "disabled_by": by}
+                            for stage, (d, by) in stages.items()
+                        },
+                    },
+                }
+            )
+        document["executions_started"] = len(document["executions"])
+        return document
+
+    def test_partial_runs_that_together_complete_the_week_meet_it(self, tmp_path) -> None:
+        """Brian's 2026-10-06 ruling: the weekly has failed its first try every
+        week for six months, so a week whose runs each stopped short but
+        TOGETHER completed every stage is a successful week. The preset
+        `skip_parity` stage stays off and does not count against it."""
+        store = _seed_phase0_met(tmp_path)
+        anchor = weekly_anchor(FRIDAY)
+        rerun = f"watch-rerun-{anchor.isoformat()}-1"
+        document = self._partial_week(
+            anchor,
+            (
+                "scheduled",
+                "FAILED",
+                {
+                    "DataPhase1": ("ENABLED_COMPLETED", None),
+                    "Backtester": ("ENABLED_FAILED", None),
+                    "Evaluator": ("NOT_REACHED", None),
+                    "Parity": ("DISABLED", "skip_parity"),
+                },
+                ["skip_parity"],
+            ),
+            (
+                rerun,
+                "FAILED",
+                {
+                    "DataPhase1": ("DISABLED", "skip_data_phase"),
+                    "Backtester": ("ENABLED_COMPLETED", None),
+                    "Evaluator": ("ENABLED_COMPLETED", None),
+                    "Parity": ("DISABLED", "skip_parity"),
+                },
+                ["skip_parity", "skip_data_phase"],
+            ),
+        )
+        _put(store, legacy_weekly_executions_key(anchor.isoformat()), document)
+        clause = _clause(
+            evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
+        )
+        assert clause.met, clause.detail
+        assert "partial runs complete the cycle: 3 stage(s) completed and 1 disabled" in (
+            clause.detail
+        )
+        assert "TOGETHER completed every stage" in clause.requirement
+
+    def test_a_stage_only_a_rerun_skipped_was_never_run_and_fails(self, tmp_path) -> None:
+        """A stage the scheduled run never reached and the recovery rerun
+        switched off was run by no execution. Work done outside the state
+        machine is not evidenced in the record, so the week stays UNMET and
+        names the stage."""
+        store = _seed_phase0_met(tmp_path)
+        anchor = weekly_anchor(FRIDAY)
+        document = self._partial_week(
+            anchor,
+            (
+                "scheduled",
+                "FAILED",
+                {"DataPhase1": ("ENABLED_FAILED", None), "Evaluator": ("NOT_REACHED", None)},
+                [],
+            ),
+            (
+                f"watch-rerun-{anchor.isoformat()}-1",
+                "SUCCEEDED",
+                {
+                    "DataPhase1": ("DISABLED", "skip_data_phase"),
+                    "Evaluator": ("ENABLED_COMPLETED", None),
+                },
+                ["skip_data_phase"],
+            ),
+        )
+        # The rerun SUCCEEDED, but it is the only success and it skipped a
+        # stage the scheduled run failed — success floor met on status alone.
+        _put(store, legacy_weekly_executions_key(anchor.isoformat()), document)
+        clause = _clause(
+            evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
+        )
+        # Status-level success still meets the 2026-09-04 floor; the partial
+        # rule only ever ADDS a way to pass.
+        assert clause.met, clause.detail
+
+        document["executions"][-1]["status"] = "FAILED"
+        document["executions"][-1]["stage_scope"]["stages"]["Evaluator"] = {
+            "disposition": "ENABLED_COMPLETED",
+            "disabled_by": None,
+        }
+        document["executions"][-1]["stage_scope"]["stages"]["Ranker"] = {
+            "disposition": "DISABLED",
+            "disabled_by": "skip_ranker",
+        }
+        _put(store, legacy_weekly_executions_key(anchor.isoformat()), document)
+        clause = _clause(
+            evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
+        )
+        assert not clause.met
+        assert "0 SUCCEEDED" in clause.detail
+        assert "DataPhase1 ENABLED_FAILED (scheduled)" in clause.detail
+        assert "Ranker DISABLED by skip_ranker" in clause.detail
+
+    def test_a_week_without_per_stage_records_cannot_be_combined(self, tmp_path) -> None:
+        """Every week filed before the ruling carries no `stage_scope`. Such a
+        week grades exactly as before, and says why it could not combine."""
+        store = _seed_phase0_met(tmp_path)
+        anchor = weekly_anchor(FRIDAY)
+        _put(
+            store,
+            legacy_weekly_executions_key(anchor.isoformat()),
+            _legacy_week(anchor, runs=2, run_status="FAILED"),
+        )
+        clause = _clause(
+            evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
+        )
+        assert not clause.met
+        assert "no per-stage record filed for uuid_run_0" in clause.detail
+
+    def test_a_degraded_or_malformed_stage_record_is_never_combined(self, tmp_path) -> None:
+        store = _seed_phase0_met(tmp_path)
+        anchor = weekly_anchor(FRIDAY)
+        document = self._partial_week(
+            anchor, ("scheduled", "FAILED", {"Evaluator": ("ENABLED_COMPLETED", None)}, [])
+        )
+        document["executions"][-1]["stage_scope"]["degraded"] = True
+        _put(store, legacy_weekly_executions_key(anchor.isoformat()), document)
+        clause = _clause(
+            evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
+        )
+        assert not clause.met
+        assert "per-stage record is degraded for scheduled" in clause.detail
+
+        document["executions"][-1]["stage_scope"] = {
+            "degraded": False,
+            "stages": {"Evaluator": {"disposition": "DONE"}},
+        }
+        _put(store, legacy_weekly_executions_key(anchor.isoformat()), document)
+        clause = _clause(
+            evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
+        )
+        assert not clause.met
+        assert "disposition 'DONE' is outside" in clause.detail
+
     def test_a_still_running_rerun_is_not_yet_a_success(self, tmp_path) -> None:
         """A RUNNING execution has no duration and no verdict. It counts as a
         gate-passing run (it is not a skip) and NOT as a success; the week

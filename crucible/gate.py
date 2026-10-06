@@ -2014,6 +2014,35 @@ LEGACY_WEEKLY_RERUN_NAME_RE = re.compile(
 )
 
 
+#: Per-stage dispositions a filed execution's ``stage_scope`` may carry, and
+#: the strength of each claim when the week's executions are COMBINED.
+#:
+#: **Why this exists: Brian's ruling of 2026-10-06** on
+#: `alpha-engine-config-I9756`: *"the weekly sf has failed on its first try
+#: every single week since it began over 6 months ago. [...] We need to count
+#: weekly sf as success if it runs successfully even if it is made up of
+#: partial runs."* A recovery rerun is launched to redo the stages that did
+#: not finish, with a `skip_*` flag on everything that already did, so no
+#: single execution of a repaired week ever ends SUCCEEDED having run every
+#: stage — the success floor alone can only be met by a week that never broke.
+#:
+#: The vocabulary and the ranking are the v1 pipeline's own
+#: (`nousergon-data/infrastructure/lambdas/weekly-run-scope/run_scope.py`,
+#: `DISPOSITIONS` and `AUTHORITY`), which the producer obtains by invoking that
+#: Lambda in dry-run mode once per execution. They are restated rather than
+#: imported because there is no shared package, and they are ranked the same
+#: way for the same reason: a later skip cannot unmake an earlier dispatch,
+#: and only a completion outranks a failure.
+LEGACY_WEEKLY_STAGE_AUTHORITY: dict[str, int] = {
+    "NOT_REACHED": 0,
+    "DISABLED": 1,
+    "ENABLED_FAILED": 2,
+    "ENABLED_COMPLETED": 3,
+}
+LEGACY_WEEKLY_STAGE_COMPLETED = "ENABLED_COMPLETED"
+LEGACY_WEEKLY_STAGE_DISABLED = "DISABLED"
+
+
 def rerun_names_another_week(name: object, anchor: dt.date) -> bool:
     """True when `name` is a `watch-rerun-*` naming a week other than `anchor`.
 
@@ -2323,6 +2352,16 @@ class _LegacyWeeklyExecution:
     name: str
     status: str
     duration_seconds: float | None
+    #: stage -> (disposition, disabled_by), or `None` when the producer filed
+    #: no per-stage record for this execution (every document filed before
+    #: the 2026-10-06 partial-runs ruling). `None` is never "no stages": it
+    #: makes the execution unusable for combining, and says so.
+    stage_scope: dict[str, tuple[str, str | None]] | None = None
+    #: The derivation itself reported it could not read the execution.
+    scope_degraded: bool = False
+    #: The `skip_*` flags the execution's INPUT set true, or `None` when not
+    #: filed. Read only from the week's first non-rerun run, as the preset.
+    skip_flags: frozenset[str] | None = None
 
     @property
     def is_rerun(self) -> bool:
@@ -2375,6 +2414,127 @@ class _LegacyWeeklyExecution:
         )
 
 
+def _legacy_stage_scope(
+    where: str, entry: dict[str, Any]
+) -> tuple[str | None, dict[str, tuple[str, str | None]] | None, bool]:
+    """Parse one execution's optional ``stage_scope``: (problem, stages, degraded).
+
+    Absent is not a problem — it is every document filed before the
+    2026-10-06 partial-runs ruling, and it reads as "this execution cannot be
+    combined". A PRESENT field that is malformed is a problem, because a
+    shape this reader does not understand must never be graded as a stage
+    record.
+    """
+    if "stage_scope" not in entry:
+        return (None, None, False)
+    raw = entry["stage_scope"]
+    if not isinstance(raw, dict):
+        return (f"{where}: `stage_scope` is {raw!r}, not an object", None, False)
+    degraded = raw.get("degraded", False)
+    if not isinstance(degraded, bool):
+        return (f"{where}: `stage_scope.degraded` is {degraded!r}, not a boolean", None, False)
+    stages = raw.get("stages")
+    if not isinstance(stages, dict):
+        return (f"{where}: `stage_scope.stages` is {stages!r}, not an object", None, False)
+    out: dict[str, tuple[str, str | None]] = {}
+    for stage, row in stages.items():
+        if not isinstance(row, dict):
+            return (f"{where}: stage {stage!r} is {row!r}, not an object", None, False)
+        disposition = row.get("disposition")
+        if disposition not in LEGACY_WEEKLY_STAGE_AUTHORITY:
+            return (
+                f"{where}: stage {stage!r} disposition {disposition!r} is outside "
+                f"{sorted(LEGACY_WEEKLY_STAGE_AUTHORITY)}",
+                None,
+                False,
+            )
+        disabled_by = row.get("disabled_by")
+        if disabled_by is not None and not isinstance(disabled_by, str):
+            return (f"{where}: stage {stage!r} `disabled_by` is {disabled_by!r}", None, False)
+        out[stage] = (disposition, disabled_by)
+    return (None, out, degraded)
+
+
+def _legacy_partial_runs_complete(
+    runs: list[_LegacyWeeklyExecution],
+) -> tuple[bool, str]:
+    """Did the week's gate-passing executions TOGETHER run every stage?
+
+    Brian's ruling of 2026-10-06 (see `LEGACY_WEEKLY_STAGE_AUTHORITY`). Each
+    stage takes the strongest claim any of the week's executions made about
+    it. The week is complete when every stage's strongest claim is
+    ``ENABLED_COMPLETED``, or ``DISABLED`` by a flag the week's SCHEDULED run
+    already carried — the operator preset (e.g. ``skip_parity``, a recorded
+    ruling). A stage switched off only by a recovery rerun's skip-set was never
+    run by any execution, so it fails: work done outside the state machine is
+    not evidenced here and is not counted.
+
+    The scheduled run is the week's first gate-passing execution that is not a
+    ``watch-rerun-*``. Its ``skip_flags`` define the preset; a week with no such
+    run has no preset, so every ``DISABLED`` stage fails.
+
+    Stages that run after the pipeline's own ``RunScope`` state (report card,
+    director, leaderboard, cost aggregation) are not in the per-stage record
+    and are therefore not graded by this combination.
+    """
+    if not runs:
+        return (False, "no gate-passing execution to combine")
+    unrecorded = [e.name for e in runs if e.stage_scope is None]
+    if unrecorded:
+        return (
+            False,
+            "partial runs cannot be combined: no per-stage record filed for "
+            + ", ".join(unrecorded[:4]),
+        )
+    degraded = [e.name for e in runs if e.scope_degraded]
+    if degraded:
+        return (
+            False,
+            "partial runs cannot be combined: the per-stage record is degraded for "
+            + ", ".join(degraded[:4]),
+        )
+    scheduled = next((e for e in runs if not e.is_rerun), None)
+    preset = (scheduled.skip_flags or frozenset()) if scheduled is not None else frozenset()
+    best: dict[str, tuple[str, str | None, str]] = {}
+    for execution in runs:
+        for stage, (disposition, disabled_by) in (execution.stage_scope or {}).items():
+            held = best.get(stage)
+            if held is None or (
+                LEGACY_WEEKLY_STAGE_AUTHORITY[disposition] > LEGACY_WEEKLY_STAGE_AUTHORITY[held[0]]
+            ):
+                best[stage] = (disposition, disabled_by, execution.name)
+    if not best:
+        return (False, "partial runs cannot be combined: the per-stage records list no stage")
+    gaps: list[str] = []
+    completed = 0
+    preset_disabled = 0
+    for stage in sorted(best):
+        disposition, disabled_by, by = best[stage]
+        if disposition == LEGACY_WEEKLY_STAGE_COMPLETED:
+            completed += 1
+        elif disposition == LEGACY_WEEKLY_STAGE_DISABLED and disabled_by in preset:
+            preset_disabled += 1
+        elif disposition == LEGACY_WEEKLY_STAGE_DISABLED:
+            gaps.append(f"{stage} DISABLED by {disabled_by or 'an unnamed flag'} ({by}), not run")
+        else:
+            gaps.append(f"{stage} {disposition} ({by})")
+    names = ", ".join(e.name for e in runs[:4])
+    if gaps:
+        return (
+            False,
+            f"combining {len(runs)} execution(s) ({names}) leaves {len(gaps)} of "
+            f"{len(best)} stage(s) not completed: "
+            + "; ".join(gaps[:8])
+            + ("" if len(gaps) <= 8 else f"; and {len(gaps) - 8} more"),
+        )
+    return (
+        True,
+        f"partial runs complete the cycle: {completed} stage(s) completed and "
+        f"{preset_disabled} disabled by the scheduled run's preset across "
+        f"{len(runs)} execution(s) ({names}) (Brian ruling 2026-10-06)",
+    )
+
+
 def _legacy_weekly_executions(
     key: str, document: dict[str, Any]
 ) -> tuple[str | None, list[_LegacyWeeklyExecution] | None]:
@@ -2404,11 +2564,22 @@ def _legacy_weekly_executions(
             isinstance(duration, bool) or not isinstance(duration, int | float) or duration < 0
         ):
             return (f"{where}: `duration_seconds` is {duration!r}, not a duration or null", None)
+        scope_problem, stage_scope, scope_degraded = _legacy_stage_scope(where, entry)
+        if scope_problem is not None:
+            return (scope_problem, None)
+        flags = entry.get("skip_flags")
+        if flags is not None and (
+            not isinstance(flags, list) or not all(isinstance(f, str) and f for f in flags)
+        ):
+            return (f"{where}: `skip_flags` is {flags!r}, not a list of flag names", None)
         out.append(
             _LegacyWeeklyExecution(
                 name=name,
                 status=status,
                 duration_seconds=None if duration is None else float(duration),
+                stage_scope=stage_scope,
+                scope_degraded=scope_degraded,
+                skip_flags=None if flags is None else frozenset(flags),
             )
         )
     # The v1 field stays in the v2 document for backward reading, so the two
@@ -2437,6 +2608,7 @@ def _clause_old_weekly_within_cadence(
     skips_count_as_runs: bool = False,
     minimum_succeeded: int = 0,
     reruns_fail: bool = True,
+    partial_runs_count: bool = False,
 ) -> Clause:
     """The v1 weekly cycle count, read from a filed document, against a ceiling.
 
@@ -2463,6 +2635,12 @@ def _clause_old_weekly_within_cadence(
       the ruling asks for. Reruns are still NAMED in the detail on every
       reading. Phase 4 keeps ``True``: a decommissioned pipeline emits
       nothing, reruns included.
+
+    * ``partial_runs_count`` — Brian's ruling of 2026-10-06: a week whose
+      gate-passing executions each stopped short but TOGETHER completed every
+      stage meets the success floor (`_legacy_partial_runs_complete`). Phase 0
+      passes ``True``; phase 4 leaves it ``False``, because it grades a
+      pipeline that must emit nothing at all.
 
     ``maximum=None`` removes the ceiling, which is what "rerun until it is
     successful" means; phase 4 keeps ``0``.
@@ -2591,6 +2769,12 @@ def _clause_old_weekly_within_cadence(
             else ""
         )
         + (
+            " — or whose gate-passing executions TOGETHER completed every stage "
+            "(partial runs count; Brian ruling 2026-10-06)"
+            if minimum_succeeded and partial_runs_count
+            else ""
+        )
+        + (
             ", and no `watch-rerun-*` execution at all"
             if reruns_fail
             else " (reruns permitted and named)"
@@ -2619,6 +2803,7 @@ def _clause_old_weekly_within_cadence(
     reruns: list[str] = []
     rerun_notes: list[str] = []
     elsewhere: list[str] = []
+    combined: list[str] = []
     skipped_total = 0
     for anchor, key in zip(anchors, evidence, strict=True):
         # Read through the guarded reader, never `json.loads` + indexing. This
@@ -2707,15 +2892,23 @@ def _clause_old_weekly_within_cadence(
                 # Every run this week FAILED (or was still running when the
                 # producer filed). The ruling's trigger is a cycle that
                 # worked: fix the pipeline and re-run it; the next filing of
-                # this week's document carries the successful execution.
-                failed = [e for e in runs if e.status != "SUCCEEDED"]
-                unsucceeded.append(
-                    f"{key}: {len(runs)} gate-passing execution(s), "
-                    f"{len(succeeded)} SUCCEEDED (floor {minimum_succeeded}) — "
-                    + ", ".join(f"{e.name}: {e.status}" for e in failed[:4])
-                    + ". Phase 0 exits on a SUCCESSFUL run: fix and rerun "
-                    "(Brian ruling 2026-09-04)"
+                # this week's document carries the successful execution —
+                # or, since 2026-10-06, the reruns that together finish it.
+                partial_ok, partial_detail = (
+                    _legacy_partial_runs_complete(runs) if partial_runs_count else (False, "")
                 )
+                if partial_ok:
+                    combined.append(f"{key}: {partial_detail}")
+                else:
+                    failed = [e for e in runs if e.status != "SUCCEEDED"]
+                    unsucceeded.append(
+                        f"{key}: {len(runs)} gate-passing execution(s), "
+                        f"{len(succeeded)} SUCCEEDED (floor {minimum_succeeded}) — "
+                        + ", ".join(f"{e.name}: {e.status}" for e in failed[:4])
+                        + ". Phase 0 exits on a SUCCESSFUL run: fix and rerun "
+                        "(Brian ruling 2026-09-04)"
+                        + (f"; {partial_detail}" if partial_detail else "")
+                    )
     if missing or malformed or stale or over or under or unsucceeded or reruns:
         parts: list[str] = []
         if missing:
@@ -2772,6 +2965,7 @@ def _clause_old_weekly_within_cadence(
         f"{WEEKLY_RUN_DAY_GATE_SKIP_MAX_SECONDS:g}s Succeed-skip"
         f"{'s' if skipped_total != 1 else ''} "
         f"{'counted' if skips_count_as_runs else 'excluded'})"
+        + ("; " + "; ".join(combined) if combined else "")
         + ("; " + "; ".join(rerun_notes) if rerun_notes else "")
         + ("; " + "; ".join(elsewhere) if elsewhere else ""),
         tuple(evidence),
@@ -3916,6 +4110,9 @@ def _phase0(
             minimum=LEGACY_WEEKLY_MIN_RUNS_PER_WEEK,
             minimum_succeeded=1,
             reruns_fail=False,
+            # Brian ruling 2026-10-06 (`alpha-engine-config-I9756`): partial
+            # runs that together complete the weekly count as its success.
+            partial_runs_count=True,
         ),
         _clause_dead_lambdas_deleted(store, window),
         _clause_old_alerts_muted(store, window),
