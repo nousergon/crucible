@@ -66,7 +66,7 @@ def _minimal_argv(job: str) -> list[str]:
     ):
         argv += ["--slot", "r"]
     if job == "serve.daily":
-        # alpha-engine-config-I12047: M is the one slot with a daily serving
+        # alpha-engine-config-I12047 / -I12021: M, U and S have a daily serving
         # entry point (`crucible.slots.daily_servers`); `--slot r` is refused.
         argv += ["--slot", "m"]
     if job in ("experiment.run", "experiment.new", "experiment.backfill"):

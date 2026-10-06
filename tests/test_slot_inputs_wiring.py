@@ -417,7 +417,7 @@ STILL_ORPHANED_M_CALLABLES: list[str] = [
     # runs, reached through `crucible.slots.daily_servers()` — the same
     # read-off-the-module dispatch as `produce`. That M resolves it is pinned
     # where a static scan cannot see: `tests/test_serve_daily.py::
-    # TestTheJobSurface::test_m_is_the_slot_with_a_daily_serving_entry_point`.
+    # TestTheJobSurface::test_m_u_and_s_are_the_slots_with_a_daily_serving_entry_point`.
     "serve_daily",
     "serving_metrics",
     "settled_training_days",

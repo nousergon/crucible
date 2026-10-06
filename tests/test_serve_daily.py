@@ -392,8 +392,10 @@ class _NonTradingDayCtx:
 
 
 class TestTheJobSurface:
-    def test_m_is_the_slot_with_a_daily_serving_entry_point(self) -> None:
-        assert set(daily_servers()) == {"m"}
+    def test_m_u_and_s_are_the_slots_with_a_daily_serving_entry_point(self) -> None:
+        """M's feed (I12047), then U's cut and S's construction inputs, which
+        need it (I12021). R has none: nothing reads an R feed between arcs."""
+        assert set(daily_servers()) == {"m", "u", "s"}
 
     def _args(self, tmp_path, **over) -> argparse.Namespace:
         base = dict(

@@ -81,6 +81,8 @@ __all__ = [
     "ALPHA_SLOT",
     "ARM_REFUSED_METRIC",
     "ATTESTATION_STATUSES",
+    "DAILY_INPUTS_METRIC",
+    "DAILY_SERVE_JOB",
     "EXIT_RULES",
     "NO_SETTLED_SESSION_METRIC",
     "declared_grade_outcome",
@@ -118,6 +120,7 @@ __all__ = [
     "registration_specs",
     "render_verdict",
     "resolve_session",
+    "serve_daily",
 ]
 
 #: The metric one refused arm files on the manifest of whatever job loaded the
@@ -2059,9 +2062,22 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
     champion feed is for. With no U champion every priced name is eligible and
     the document SAYS so — an absence recorded, which is distinct from a cut
     that happened to include everything.
+
+    The cut is the champion's `shadow.json` for the session when the arc
+    produced one, else the U champion feed `universe/{day}/members.json` that
+    `serve.daily --slot u` publishes on every other session
+    (`alpha-engine-config-I12021`). The two are the same selection — the feed
+    is :func:`crucible.slots.cycle._serve_champion_feed`'s republication of
+    that arm's shadow — and the feed is accepted only when it names the same
+    champion and the same session; the key actually read is the recorded
+    `eligibility_source`.
     """
     from crucible.documents import load_store_document  # noqa: PLC0415 - avoids a cycle
-    from crucible.keys import champion_key, shadow_key  # noqa: PLC0415 - avoids a cycle
+    from crucible.keys import (  # noqa: PLC0415 - avoids a cycle
+        champion_key,
+        shadow_key,
+        universe_members_key,
+    )
     from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
     from crucible.slots.inputs import read_arm_predictions  # noqa: PLC0415 - avoids a cycle
 
@@ -2091,15 +2107,34 @@ def resolve_session(store: Any, *, trading_day: str, ctx: Any = None) -> Resolve
     )
     if u_champion:
         u_shadow = shadow_key(u_champion, trading_day)
-        if not store.exists(u_shadow):
+        u_feed = universe_members_key(trading_day)
+        if store.exists(u_shadow):
+            cut = {str(t) for t in load_store_document(store, u_shadow)["selection"]}
+            eligibility_source = u_shadow
+        elif store.exists(u_feed):
+            feed = load_store_document(store, u_feed)
+            if (
+                feed.get("slot") != "u"
+                or feed.get("trading_day") != trading_day
+                or feed.get("champion") != u_champion
+            ):
+                raise MissingArtifactError(
+                    f"{u_feed} serves slot {feed.get('slot')!r}, session "
+                    f"{feed.get('trading_day')!r} and champion {feed.get('champion')!r}; the "
+                    f"S slot needs the cut of U champion {u_champion!r} for {trading_day}. "
+                    "A cut from another arm or another session is not this session's "
+                    "eligibility mask."
+                )
+            cut = {str(t) for t in feed["members"]}
+            eligibility_source = u_feed
+        else:
             raise MissingArtifactError(
                 f"the U champion pointer names {u_champion!r}, which wrote no cut at "
-                f"{u_shadow}. The serving path resolves the pointer — it never imports a "
-                "ranking function — so a pointer to an arm that did not produce means "
-                "the S slot has no eligibility mask for this session."
+                f"{u_shadow}, and no U feed is published at {u_feed}. The serving path "
+                "resolves the pointer — it never imports a ranking function — so the S "
+                "slot has no eligibility mask for this session. Publish the cut with:\n"
+                f"    crucible serve.daily --slot u --date {trading_day}"
             )
-        cut = {str(t) for t in load_store_document(store, u_shadow)["selection"]}
-        eligibility_source = u_shadow
 
     tickers = tuple(sorted(predicted))
     eligibility = tuple(True if cut is None else t in cut for t in tickers)
@@ -2364,6 +2399,165 @@ def produce_history(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]
     )
     loaded, specs = _registered_arms(ctx, settings=settings)
     return _produce_sessions(ctx, loaded=loaded, specs=specs, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# The daily producer (`serve.daily --slot s`).
+# ---------------------------------------------------------------------------
+
+#: The CLI job the daily producer runs under — the same job `serve.daily
+#: --slot m` and `--slot u` run under, discriminated by slot
+#: (`crucible.slots.daily_servers`).
+DAILY_SERVE_JOB = "serve.daily"
+
+#: The metric every `serve.daily --slot s` manifest carries: the number of
+#: live challengers whose construction inputs for the session are on the
+#: store after the run (written now, or already there and left as they
+#: stand). A challenger that is owed inputs and gets none FAILS the run, so
+#: the value never undercounts silently.
+DAILY_INPUTS_METRIC = "daily_session_inputs_recorded"
+
+
+def serve_daily(ctx: Any, *, settings: Any, **kwargs: Any) -> dict[str, Any]:
+    """Record every live S challenger's point-in-time construction inputs for ONE session.
+
+    `alpha-engine-config-I12021`, defect A, under Brian's 2026-10-05 ruling
+    ("Daily producer"). The daily shadow books construct each challenger's
+    book from `experiments/{arm}/{day}/session_inputs.json` for EVERY decision
+    day, and the S grade walks the same documents — but their only writer was
+    `experiment.run --slot s` on the weekly arc, so four sessions in five had
+    no inputs and every book failed. This is the S link of the nightly chain,
+    run after `serve.daily --slot m` (the M champion's `arm_predictions.v1`,
+    the alpha vector) and `serve.daily --slot u` (the U champion's cut, the
+    eligibility mask) for the same session.
+
+    **The same document the arc writes, from the same resolver.** The session
+    is resolved ONCE through :func:`resolve_session`, exactly as
+    :func:`_produce_sessions` does, so grading and the paper books read one
+    artifact whichever job filed it.
+
+    **Which arms.** The challengers live in the register ON this session
+    (`ArmRegister.active_arms(as_of=...)`, point-in-time) whose filed recipe
+    registers in the release in force. Controls are a ruled non-book
+    (Brian, 2026-10-05: scored by the grade, `control_scored_by_grade` on the
+    shadow-book document) and are counted, not recorded. A recipe the arc has
+    not yet registered is not owed inputs: registering is the arc's act, and
+    a session recorded before registration would start an arm's
+    out-of-sample clock early. A LIVE challenger with no registering recipe
+    is never dropped silently — every other live challenger is recorded
+    first, then the run raises naming it, because its book cannot be built.
+
+    **What it never does.** It does not write the register, and it never
+    overwrites a session's inputs already on the store (the arc's, or an
+    earlier run's): a re-run is served from them as they stand. The weekly
+    arc is unchanged — its `experiment.run --slot s` still records the arc
+    session itself, after `experiment.run --slot m` has refitted and
+    re-published that session's predictions, so the arc session's inputs and
+    the alpha document they name stay one vintage.
+
+    **No M champion pointer is the one declared outcome**
+    (:func:`declare_no_m_champion`): nothing is constructible, the run files
+    ``ok`` with the reason. Everything else that leaves a live challenger
+    without inputs fails the manifest: no M predictions for the session
+    (named as the `serve.daily --slot m` link it waits on), no U cut for it
+    (raised from :func:`resolve_session`).
+    """
+    from crucible.calendar import assert_trading_day  # noqa: PLC0415 - avoids a cycle
+    from crucible.documents import load_store_document  # noqa: PLC0415 - avoids a cycle
+    from crucible.keys import champion_key, session_inputs_key  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots import get_slot, is_control_arm  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots.arms import read_register  # noqa: PLC0415 - avoids a cycle
+    from crucible.slots.cycle import MissingArtifactError  # noqa: PLC0415 - avoids a cycle
+
+    trading_day = ctx.trading_day.isoformat()
+    assert_trading_day(
+        ctx.trading_day, context=f"{DAILY_SERVE_JOB} --slot {SLOT} --date {trading_day}"
+    )
+    loaded, specs = _registered_arms(ctx, settings=settings)
+    refused = [{"arm": r.arm, "unresolvable": list(r.unresolvable)} for r in loaded.refused]
+    declared = declare_no_m_champion(ctx, job=DAILY_SERVE_JOB)
+    if declared is not None:
+        return {**declared, "arms": [], "reused": [], "refused": refused}
+
+    register = read_register(ctx.store, SLOT)
+    slot_spec = get_slot(SLOT)
+    live = register.active_arms(as_of=trading_day)
+    controls = [a for a in live if is_control_arm(slot_spec, a, register)]
+    challengers = [a for a in live if a not in controls]
+    by_id = {spec.arm_id: spec for spec in specs}
+    unbuildable = [a for a in challengers if a not in by_id]
+    owed = [by_id[a] for a in challengers if a in by_id]
+    reused = [
+        spec.arm_id
+        for spec in owed
+        if ctx.store.exists(session_inputs_key(spec.arm_id, trading_day))
+    ]
+    pending = [spec for spec in owed if spec.arm_id not in reused]
+
+    written: list[str] = []
+    names = 0
+    if pending:
+        # The alpha vector's absence named as the chain link that owes it,
+        # rather than as the store's bare `KeyError` out of the resolver.
+        m_champion = load_store_document(ctx.store, champion_key(ALPHA_SLOT)).get("arm_id")
+        alpha_key = arm_predictions_key(str(m_champion), trading_day)
+        if m_champion and not ctx.store.exists(alpha_key):
+            raise MissingArtifactError(
+                f"the {ALPHA_SLOT.upper()} champion {m_champion!r} has no predictions for "
+                f"{trading_day} at {alpha_key}, so no S challenger can record construction "
+                "inputs for the session. The daily chain publishes them first:\n"
+                f"    crucible serve.daily --slot {ALPHA_SLOT} --date {trading_day}"
+            )
+        # Resolved ONCE for the session, for the reason `_produce_sessions`
+        # gives: the alpha vector, the cut and the caps are the slot's inputs,
+        # not an arm's.
+        session = resolve_session(ctx.store, trading_day=trading_day, ctx=ctx)
+        names = len(session.tickers)
+        payload = json.dumps(session.to_dict(), indent=2, sort_keys=True).encode("utf-8")
+        for spec in pending:
+            ctx.record_output(
+                session_inputs_key(spec.arm_id, trading_day),
+                payload,
+                schema_version=SESSION_INPUTS_SCHEMA_VERSION,
+            )
+            written.append(spec.arm_id)
+
+    ctx.record_rows(rows_in=names, rows_out=len(written))
+    ctx.record_metric(
+        {
+            "name": DAILY_INPUTS_METRIC,
+            "module": f"crucible.slots.{SLOT}",
+            "metric_type": "count",
+            "value": float(len(written) + len(reused)),
+            "unit": "arms",
+            "n_floor": 0,
+            "status": "OK",
+            "status_reason": (
+                f"slot {SLOT}: {len(written)} live challenger(s) recorded construction "
+                f"inputs for {trading_day}, {len(reused)} already recorded and left as they "
+                f"stand; {len(controls)} control(s) are a ruled non-book, scored by the grade"
+            ),
+            # Display-only, as on `_produce_sessions`' `arms_produced` row.
+            "source_path": f"experiments/*/{trading_day}/session_inputs.json",
+            "last_updated_utc": _utc_now(),
+        }
+    )
+    if unbuildable:
+        raise MissingArtifactError(
+            f"live S challenger(s) {unbuildable} have no filed recipe that registers on "
+            f"{trading_day} (refused: {refused or 'none'}), so no construction inputs were "
+            f"recorded for them; {len(written) + len(reused)} other challenger(s) were. "
+            "Their shadow books cannot be built, and an `ok` run would read as every "
+            "active member accounted for."
+        )
+    return {
+        "slot": SLOT,
+        "trading_day": trading_day,
+        "arms": written,
+        "reused": reused,
+        "controls": controls,
+        "refused": refused,
+    }
 
 
 def _close_returns(panel: Any) -> Any:
