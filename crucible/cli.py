@@ -712,6 +712,15 @@ JOBS: dict[str, JobSpec] = {
         "Produce one arm's history over a session range, point-in-time",
         False,
     ),
+    # alpha-engine-config-I12047 (Brian's ruling: a daily M job). SCHEDULED,
+    # after `data.daily`, every trading day: it publishes the champion's feed
+    # for the session from the champion's fit of record, so the trader has a
+    # feed for every session rather than only the one after the weekly arc.
+    "serve.daily": JobSpec(
+        "serve.daily",
+        "Publish one slot's champion feed for one trading day, from its fit of record",
+        True,
+    ),
     # `promote` and `explain` are weekly ARC stages (`components.yaml`,
     # `dispatch: arc`), so both are scheduled. Both read `False` here until
     # `alpha-engine-config-I11041` compared this table with the registry.
@@ -1034,6 +1043,7 @@ def build_parser() -> argparse.ArgumentParser:
             "promote",
             "experiment.new",
             "experiment.register",
+            "serve.daily",
         ):
             sub.add_argument("--slot", choices=["u", "r", "m", "s"], required=True)
         if spec.name == "promote":

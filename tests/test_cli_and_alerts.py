@@ -65,6 +65,10 @@ def _minimal_argv(job: str) -> list[str]:
         "experiment.register",
     ):
         argv += ["--slot", "r"]
+    if job == "serve.daily":
+        # alpha-engine-config-I12047: M is the one slot with a daily serving
+        # entry point (`crucible.slots.daily_servers`); `--slot r` is refused.
+        argv += ["--slot", "m"]
     if job in ("experiment.run", "experiment.new", "experiment.backfill"):
         argv += ["--arm", "arm_abc"]
     if job == "experiment.backfill":
@@ -198,6 +202,10 @@ class TestJobSurface:
             # from the weekly cadence alone.
             "experiment.backfill",
             "experiment.grade",
+            # alpha-engine-config-I12047 (Brian's ruling: a daily M job): the
+            # champion's feed for every session, from its fit of record,
+            # scheduled after `data.daily`.
+            "serve.daily",
             "promote",
             "report",
             "explain",
@@ -655,6 +663,10 @@ class TestDryRunNeverWrites:
         # the apply reads `none` and its rehearsal returns 0.
         "release.pin_apply",
         "report",
+        # alpha-engine-config-I12047: a fresh store has no M champion, so the
+        # run reads "no feed owed", records it, and returns 0 having written
+        # nothing beyond its (captured) manifest.
+        "serve.daily",
     )
     # NOTE (alpha-engine-config-I11012): `experiment.run` left this set. Its
     # dry run no longer prints a sentence restating its own source and

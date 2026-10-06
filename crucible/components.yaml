@@ -297,6 +297,44 @@ components:
     dispatch: null
     deadline: null
 
+  serve.daily:
+    description: >-
+      Publish one slot's champion feed for one trading day from the champion's
+      fit of record, without refitting (alpha-engine-config-I12047). M is the
+      only slot with a daily serving entry point; the slot is the manifest
+      discriminator.
+    lifecycle: ACTIVE
+    signals:
+      execution: run.json
+      cost: run.json:cost_usd
+      resource: run.json:resource
+      lineage: run.json:inputs,outputs[predictions/{trading_day}.json],rows_in,rows_out,rows_rejected
+      outcome: run.json:metrics[daily_feed_published]
+    log_location: cloudwatch:/crucible/serve.daily
+    log_retention_days: 90
+    alert_channel: telegram:crucible-pages
+    console_surface: crucible/slots
+    artifact_retention: forever
+    absence_watched_by: alerts.sweep
+    # Every trading day AFTER `data.daily`, because it reads the session's
+    # feature layer `data.daily` compiles. Its own EventBridge schedule
+    # (`serve-daily-m` in nous-ergon-ops `crucible-v2.yaml`, weekdays 22:15 ET
+    # with `args: --slot m`), fired past `data.daily`'s 22:00 ET deadline
+    # rather than chained inside it: a failed compile must not take the serve
+    # down with no manifest of its own, and a serve that reads an absent
+    # feature day fails loud on its own manifest.
+    #
+    # 7h = 23:00 ET: 45 min past the firing for a run that fits each served
+    # arm once (the fit of record, re-derived and proven) and scores one
+    # session. The trader reads the feed at the next session's open, so the
+    # deadline is hours ahead of the consumer.
+    schedule: weekdays after data.daily
+    dispatch: scheduler
+    deadline:
+      anchor: close_plus
+      cadence: daily
+      offset_hours: 7
+
   experiment.grade:
     description: Run one slot's arena cycle — ladder, pairings, pointer, retirements.
     lifecycle: ACTIVE
