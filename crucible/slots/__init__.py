@@ -101,6 +101,7 @@ __all__ = [
     "arm_name",
     "attribution_factor_symbols",
     "declared_benchmark_symbols",
+    "daily_servers",
     "dispatchable_slots",
     "history_producer",
     "get_slot",
@@ -341,6 +342,25 @@ def dispatchable_slots() -> dict[str, ModuleType]:
             "no slot module exposes both `produce` and `grade`; the weekly arc would "
             "run no experiment at all and report `ok`"
         )
+    return found
+
+
+def daily_servers() -> dict[str, ModuleType]:
+    """The slots `serve.daily` can run: those whose module exposes ``serve_daily``.
+
+    `alpha-engine-config-I12047`. Read off the modules, never listed, for the
+    reason :func:`dispatchable_slots` is: the job grows the day a slot's
+    daily entry point lands, with no second list to update. M is the only
+    member today; S's daily book producer is the intended second, under the
+    same job name, discriminated by its slot.
+    """
+    import importlib  # noqa: PLC0415 - lazy: the submodules import from this package
+
+    found: dict[str, ModuleType] = {}
+    for slot, spec in SLOTS.items():
+        module = importlib.import_module(f"crucible.slots.{spec.module}")
+        if callable(getattr(module, "serve_daily", None)):
+            found[slot] = module
     return found
 
 

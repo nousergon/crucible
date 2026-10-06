@@ -597,6 +597,7 @@
         "experiment.run",
         "experiment.backfill",
         "experiment.grade",
+        "serve.daily",
         "promote",
         "report",
         "explain",

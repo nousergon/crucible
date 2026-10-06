@@ -413,6 +413,12 @@ STILL_ORPHANED_M_CALLABLES: list[str] = [
     # `FeatureCompleteness` reading for it. Reached from `produce`, and pinned
     # for the same reason `produce` is.
     "score_cross_section",
+    # `alpha-engine-config-I12047`: the daily serving entry point `serve.daily`
+    # runs, reached through `crucible.slots.daily_servers()` — the same
+    # read-off-the-module dispatch as `produce`. That M resolves it is pinned
+    # where a static scan cannot see: `tests/test_serve_daily.py::
+    # TestTheJobSurface::test_m_is_the_slot_with_a_daily_serving_entry_point`.
+    "serve_daily",
     "serving_metrics",
     "settled_training_days",
     "train_arm",
