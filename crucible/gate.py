@@ -7912,6 +7912,13 @@ def _clause_v1_arms_carried_or_excluded(
       ledger is absent or malformed;
     * MET otherwise.
 
+    Two silent-or-absent carried arms are named, never counted against it: a
+    carried arm v2 later RETIRED on its own evidence (policy §6.3 keeps the
+    retire record permanently, so the carry stays satisfied — the row is not
+    rewritten to point at a live arm), and a carried arm WAITING on a declared
+    pending producer, read with the predicate `every_registered_arm_produces`
+    reads, so one fact gets one verdict across the two clauses.
+
     ``v1_store`` is for tests; the phase assembler passes none and the store is
     resolved from `CRUCIBLE_ARCTIC_BUCKET` (no default — a bucket name may not
     live in this repo).
@@ -7928,8 +7935,9 @@ def _clause_v1_arms_carried_or_excluded(
         "config/factor_attractiveness_weights.json) has a row in the published carry-over "
         "ledger; no row records no decision; every row claiming a v2 home is confirmed by the "
         "v2 store (a register row, a champion pointer); every carried arm has produced at "
-        "least once past its slot's settle window; and no deferral's condition has cleared "
-        "while its import is still outstanding"
+        "least once past its slot's settle window, or waits on a declared pending producer, "
+        "or was retired on v2's own evidence (a permanent retire record); and no deferral's "
+        "condition has cleared while its import is still outstanding"
     )
     ledger_key = v1_carryover_key()
     if v1_store is None:
@@ -7980,6 +7988,9 @@ def _clause_v1_arms_carried_or_excluded(
     register_keys: dict[str, str] = {}
     champions: dict[str, ChampionPointerReading] = {}
     production: dict[tuple[str, str], ProductionReading] = {}
+    retired: dict[str, dict[str, str]] = {}
+    waiting: dict[tuple[str, str], str] = {}
+    waiting_problems: dict[str, str] = {}
     for v2_slot in sorted(set(V1_SLOT_TO_V2_SLOT.values())):
         arm_ids, key, problem, access_problem, register = _register_arms(store, v2_slot)
         evidence.append(key)
@@ -7995,10 +8006,21 @@ def _clause_v1_arms_carried_or_excluded(
         evidence.append(pointer.key)
         champions[v2_slot] = pointer
         filed_on = _register_filing_dates(register)
+        retired[v2_slot] = _register_retire_records(register)
+        silent: list[str] = []
         for arm_id in arm_ids:
-            production[(v2_slot, arm_name(arm_id))] = read_production(
-                store, arm_id, filed_on.get(arm_id)
-            )
+            reading = read_production(store, arm_id, filed_on.get(arm_id))
+            production[(v2_slot, arm_name(arm_id))] = reading
+            if reading.produced is False:
+                silent.append(arm_id)
+        if silent:
+            waits, waits_problem = _carryover_waits(store, v2_slot)
+            if waits_problem is not None:
+                evidence.append(strategy_arms_prefix(v2_slot))
+                waiting_problems[v2_slot] = waits_problem
+            for arm_id in silent:
+                if arm_id in waits:
+                    waiting[(v2_slot, arm_name(arm_id))] = waits[arm_id]
     findings = grade_carryover(
         v1,
         rows,
@@ -8009,6 +8031,9 @@ def _clause_v1_arms_carried_or_excluded(
             production=production,
             trading_day=window[-1],
             settle_window_sessions=DEFAULT_HORIZON_TRADING_DAYS,
+            retired=retired,
+            waiting=waiting,
+            waiting_problems=waiting_problems,
         ),
     )
     if findings.met:
@@ -8019,6 +8044,7 @@ def _clause_v1_arms_carried_or_excluded(
             "; ".join(
                 f"{found.dimension}: all {found.n_live} live v1 item(s) disposed of "
                 f"({_carryover_counts(found)})"
+                + "".join(f"; {note}" for note in _carryover_notes(found))
                 for found in findings.dimensions
             ),
             tuple(evidence),
@@ -8026,10 +8052,13 @@ def _clause_v1_arms_carried_or_excluded(
     parts: list[str] = []
     for found in findings.dimensions:
         if found.met:
+            notes = _carryover_notes(found)
+            if notes:
+                parts.append(f"{found.dimension} [met]: " + "; ".join(notes))
             continue
         parts.append(
             f"{found.dimension} [{', '.join(found.conditions)}]: "
-            + "; ".join(_carryover_detail(found))
+            + "; ".join([*_carryover_detail(found), *_carryover_notes(found)])
         )
     parts.append(
         "ledger: "
@@ -8058,6 +8087,66 @@ def _register_filing_dates(register: ArmRegister | None) -> dict[str, str]:
         if isinstance(arm_id, str) and isinstance(date, str):
             dates.setdefault(arm_id, date)
     return dates
+
+
+def _register_retire_records(register: ArmRegister | None) -> dict[str, str]:
+    """arm NAME -> "retired <date>: <reason>" for every retired arm.
+
+    Policy §6.3 keeps a retire record permanently, so a ledger row carried onto
+    an arm v2 later retired on its own evidence stays carried
+    (`crucible.carryover.V2Evidence.retired`). Keyed by name because a ledger
+    row names an arm, never a vintage; an ACTIVE arm of the same name is graded
+    on its own reading first.
+    """
+    if register is None:
+        return {}
+    records: dict[str, str] = {}
+    for arm_id in register.all_arms():
+        state = register.state(arm_id)
+        if state.active:
+            continue
+        records.setdefault(
+            arm_name(arm_id),
+            f"retired {state.retired_date}: {state.retired_reason or 'no reason recorded'}",
+        )
+    return records
+
+
+def _carryover_waits(store: Store, slot: str) -> tuple[dict[str, str], str | None]:
+    """arm id -> the declared pending producer it waits on, for ``slot``.
+
+    The SAME predicate `every_registered_arm_produces` reads
+    (`crucible.slots.producibility.waiting_arms`), so one silent arm gets one
+    verdict across both clauses. A recipe tree that cannot be read is returned
+    as a problem, never as "waits on nothing" — that would call a waiting arm
+    mute on an unknown.
+    """
+    from crucible.slots.producibility import waiting_arms  # noqa: PLC0415 - one call site
+
+    try:
+        waits = waiting_arms(slot, store=store)
+    except Exception as exc:  # noqa: BLE001 - classified into the reading by the grader
+        return {}, f"{strategy_arms_prefix(slot)}: {type(exc).__name__}: {exc}"
+    return {arm_id: dependency.waits_on() for arm_id, dependency in waits.items()}, None
+
+
+def _carryover_notes(found: Any) -> list[str]:
+    """What is named on every reading without being a finding: carried arms
+    v2 retired on its own evidence, and carried arms waiting on a declared
+    pending producer. Never silent, never counted against the clause."""
+    notes: list[str] = []
+    if found.retired:
+        notes.append(
+            f"{len(found.retired)} carried row(s) whose v2 arm was RETIRED on v2's own "
+            "evidence, satisfied by the permanent retire record (policy §6.3): "
+            + ", ".join(f"{r.label} -> {why}" for r, why in found.retired)
+        )
+    if found.waiting:
+        notes.append(
+            f"{len(found.waiting)} carried row(s) WAITING on a declared pending producer, "
+            "not counted mute: " + ", ".join(f"{r.label} ({why})" for r, why in found.waiting)
+        )
+    return notes
 
 
 def _carryover_counts(found: Any) -> str:
