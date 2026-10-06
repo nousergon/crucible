@@ -222,6 +222,46 @@ class TestTheSchemaConstrainsTheDocument:
         payload["window"] = {"start": "not-a-date", "end": "2026-08-29"}
         assert _errors(payload) != []
 
+    def test_a_per_stage_record_validates_and_is_optional(self) -> None:
+        """Brian's 2026-10-06 partial-runs ruling. `stage_scope` and
+        `skip_flags` are optional, like `window`: every week filed before them
+        keeps validating."""
+        payload = _ruled_week(FRIDAY)
+        assert _errors(payload) == []
+        payload["executions"][2]["skip_flags"] = ["skip_parity"]
+        payload["executions"][2]["stage_scope"] = {
+            "degraded": False,
+            "stages": {
+                "Backtester": {"disposition": "ENABLED_COMPLETED", "disabled_by": None},
+                "Parity": {"disposition": "DISABLED", "disabled_by": "skip_parity"},
+            },
+        }
+        assert _errors(payload) == []
+
+    def test_a_per_stage_record_refuses_an_unknown_disposition(self) -> None:
+        payload = _ruled_week(FRIDAY)
+        payload["executions"][2]["stage_scope"] = {
+            "degraded": False,
+            "stages": {"Backtester": {"disposition": "DONE"}},
+        }
+        assert _errors(payload) != []
+
+    def test_a_per_stage_record_refuses_an_execution_arn(self) -> None:
+        """The consuming repository forbids account identifiers, so the
+        producer files dispositions only, never the provenance ARN the
+        pipeline's own artifact carries."""
+        payload = _ruled_week(FRIDAY)
+        payload["executions"][2]["stage_scope"] = {
+            "degraded": False,
+            "stages": {
+                "Backtester": {
+                    "disposition": "ENABLED_COMPLETED",
+                    "recorded_by_execution_arn": "arn:aws:states:us-east-1:000:execution:x:y",
+                }
+            },
+        }
+        assert _errors(payload) != []
+
 
 # ── the consumer grades the ruled metric ────────────────────────────────────
 

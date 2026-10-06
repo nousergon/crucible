@@ -83,6 +83,55 @@
         "sns_topic_arn": {
           "description": "The `sns_topic_arn` this execution's INPUT carried, or null when the input declared none — the fact alpha-engine-config-I9756's third deliverable ('mute the v1 weekly alerts') is measured on, read via states:DescribeExecution and consumed by crucible.gate._clause_old_alerts_muted (alpha-engine-config-I9964). OPTIONAL, and deliberately not a schema-version bump: documents filed between I9962 and I9964 carry every other v2 field and answer the cadence clause correctly, and bumping the version would make that clause -- phase 0's only currently-graded one -- read UNMEASURABLE on the weeks already filed. The consumer therefore keys on the FIELD's presence, not on the version: an execution entry without this key is unmeasurable for routing and measurable for cadence, which is exactly what the two documents are.",
           "type": ["string", "null"]
+        },
+        "skip_flags": {
+          "description": "The `skip_*` input flags this execution's INPUT set true, read from the same states:DescribeExecution call as `sns_topic_arn`. OPTIONAL, no schema-version bump (same reasoning as `sns_topic_arn`). Consumed by crucible.gate._legacy_partial_runs_complete: the week's first non-rerun run's flags are the operator preset, and only a stage DISABLED by a preset flag may stand in for a completed one (Brian ruling 2026-10-06, alpha-engine-config-I9756).",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "stage_scope": {
+          "description": "This execution's per-stage dispositions, as the v1 pipeline's own run-scope derivation (nousergon-data weekly-run-scope, invoked dry-run by the producer) reported them. OPTIONAL, no schema-version bump: a document without it grades exactly as before, and an execution without it cannot be combined. Consumed by crucible.gate._legacy_partial_runs_complete, which implements Brian's 2026-10-06 ruling that partial runs which together complete the weekly count as its success (alpha-engine-config-I9756). Carries no ARNs: the consuming repository forbids account identifiers.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "degraded",
+            "stages"
+          ],
+          "properties": {
+            "degraded": {
+              "description": "True when the derivation could not read the execution; such a record grades nothing.",
+              "type": "boolean"
+            },
+            "stages": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "disposition"
+                ],
+                "properties": {
+                  "disposition": {
+                    "enum": [
+                      "NOT_REACHED",
+                      "DISABLED",
+                      "ENABLED_FAILED",
+                      "ENABLED_COMPLETED"
+                    ]
+                  },
+                  "disabled_by": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }
