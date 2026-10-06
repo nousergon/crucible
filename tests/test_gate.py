@@ -1549,15 +1549,15 @@ class TestPhaseZeroOldWeeklyCadence:
                 ["skip_data_phase"],
             ),
         )
-        # The rerun SUCCEEDED, but it is the only success and it skipped a
-        # stage the scheduled run failed — success floor met on status alone.
+        # The rerun SUCCEEDED, but a rerun's status never stands in for the
+        # week (Brian 2026-10-06): the scheduled run's failed stage was never
+        # completed, so the week is UNMET even before the rerun fails.
         _put(store, legacy_weekly_executions_key(anchor.isoformat()), document)
         clause = _clause(
             evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
         )
-        # Status-level success still meets the 2026-09-04 floor; the partial
-        # rule only ever ADDS a way to pass.
-        assert clause.met, clause.detail
+        assert not clause.met, clause.detail
+        assert "DataPhase1 ENABLED_FAILED (scheduled)" in clause.detail
 
         document["executions"][-1]["status"] = "FAILED"
         document["executions"][-1]["stage_scope"]["stages"]["Evaluator"] = {
@@ -1617,6 +1617,33 @@ class TestPhaseZeroOldWeeklyCadence:
         )
         assert not clause.met
         assert "disposition 'DONE' is outside" in clause.detail
+
+    def test_a_succeeded_rerun_alone_is_not_a_successful_week(self, tmp_path) -> None:
+        """Brian 2026-10-06: a weekly marked success means EVERY component
+        ran. `watch-rerun-2026-10-02-3` SUCCEEDED with 19 stages skipped, so a
+        rerun's status never stands in for the week; only the combined stage
+        record does."""
+        store = _seed_phase0_met(tmp_path)
+        anchor = weekly_anchor(FRIDAY)
+        document = _legacy_week(anchor, runs=1, run_status="FAILED")
+        document["executions"].append(
+            {
+                "name": f"watch-rerun-{anchor.isoformat()}-3",
+                "start": f"{anchor.isoformat()}T18:00:00+00:00",
+                "stop": f"{anchor.isoformat()}T18:40:00+00:00",
+                "duration_seconds": 2400.0,
+                "status": "SUCCEEDED",
+                "sns_topic_arn": f"arn:aws:sns:us-east-1:acct:{muted_alerts_topic_name()}",
+            }
+        )
+        document["executions_started"] = len(document["executions"])
+        _put(store, legacy_weekly_executions_key(anchor.isoformat()), document)
+        clause = _clause(
+            evaluate(store, gate="phase0", trading_day=FRIDAY), "old_weekly_within_cadence"
+        )
+        assert not clause.met, clause.detail
+        assert "0 SUCCEEDED" in clause.detail
+        assert "no per-stage record filed" in clause.detail
 
     def test_a_still_running_rerun_is_not_yet_a_success(self, tmp_path) -> None:
         """A RUNNING execution has no duration and no verdict. It counts as a
